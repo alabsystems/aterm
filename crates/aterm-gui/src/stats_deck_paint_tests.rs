@@ -4712,12 +4712,13 @@ fn hit_map() {
         }
         let header = hit_at(hits, p.strip.x + 20.0, 6.0, s);
         assert_eq!(header, Some(HitKind::Header), "{at}");
-        let cores = match p.cores {
-            CoresAt::Block { at, .. } => hit_at(hits, at.x + 2.0, 40.0, s),
-            CoresAt::Row(room) => {
+        let cores = match (p.gauge, p.cores) {
+            (Some(slot), _) => hit_at(hits, slot.at.x + 2.0, 40.0, s),
+            (None, Some(room)) => {
                 let y = p.rows.top(DECK_RESOURCES.len() as u32) + p.rows.cell / 2.0;
                 hit_at(hits, room.x + 2.0, y, s)
             }
+            (None, None) => None,
         };
         assert_eq!(cores, Some(HitKind::Cores), "{at}");
     }

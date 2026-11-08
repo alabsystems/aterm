@@ -408,15 +408,16 @@ pub fn resolve(
     })
 }
 
-/// The history of `asked`, oldest first: this Mac's ledger rows about it (by key, or by label for
-/// a row written before its key was learned), as `here`, and every Mac's journal events about it.
-/// A ledger row's free-text reason is never shown, only its kind and the other row's label.
+/// The history of `asked`, oldest first, each line with its instant: this Mac's ledger rows about
+/// it (by key, or by label for a row written before its key was learned), as `here`, and every
+/// Mac's journal events about it. A ledger row's free-text reason is never shown, only its kind
+/// and the other row's label.
 #[must_use]
 pub fn history(
     asked: &Asked,
     ledger: &[super::accounts::Event],
     journal: Option<&AccountSeen>,
-) -> Vec<String> {
+) -> Vec<(i64, String)> {
     let mut out: Vec<(i64, u8, String)> = Vec::new();
     for event in ledger {
         let mine = match (&asked.pk, &event.pk) {
@@ -444,7 +445,7 @@ pub fn history(
         out.push((line.t, 1, history_line(line)));
     }
     out.sort();
-    out.into_iter().map(|(_, _, line)| line).collect()
+    out.into_iter().map(|(t, _, line)| (t, line)).collect()
 }
 
 /// One history line as text: "2026-11-03T17:00:00Z m17 signed-in claude".
@@ -864,7 +865,8 @@ mod tests {
                     1,
                     "old key must not borrow the replacement label's events"
                 );
-                assert!(lines[0].contains(" here auth before"));
+                assert_eq!(lines[0].0, 10, "the line keeps its row's instant");
+                assert!(lines[0].1.contains(" here auth before"));
             },
         );
     }
@@ -1101,10 +1103,25 @@ mod tests {
         };
         let lines = history(&asked, &ledger, Some(&journal));
         assert_eq!(lines.len(), 3, "{lines:?}");
-        assert!(lines[0].contains(" here auth before"));
-        assert!(lines[1].contains(" m17 signed-in claude (heard by this Mac)"));
-        assert!(lines[2].contains(" here rotate now"));
-        assert!(lines.iter().all(|l| !l.contains("secret")));
+        assert_eq!(
+            lines.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            [10, 20, 30],
+            "each line carries its instant, oldest first"
+        );
+        for (t, line) in &lines {
+            assert!(
+                line.starts_with(&super::super::usage::rfc3339_utc(*t)),
+                "{line}"
+            );
+        }
+        assert!(lines[0].1.contains(" here auth before"));
+        assert!(
+            lines[1]
+                .1
+                .contains(" m17 signed-in claude (heard by this Mac)")
+        );
+        assert!(lines[2].1.contains(" here rotate now"));
+        assert!(lines.iter().all(|(_, l)| !l.contains("secret")));
     }
 
     /// The report's journal section names each row the journal knows by its label and key, and a

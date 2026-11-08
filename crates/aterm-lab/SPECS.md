@@ -1162,3 +1162,30 @@ src/work_overlap_tests.rs	the_script_keys_each_conversation_by_its_token	work-ov
 src/work_overlap_tests.rs	the_seconds_prompt_and_ledger_rows_are_read_where_aterm_typed_them	work-overlap-plan	
 src/work_overlap_tests.rs	a_survey_records_work_fields_are_read_by_sid	work-overlap-plan	
 ```
+
+## 31. Added 2026-11-07: the `claude` stand-in's statusLine, and line E's captures (glass S5c)
+
+`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §6 S5, §7. The `claude` stand-in
+(`fleet_fixture.rs`) runs the statusLine its `--settings` names as Claude Code 2.1.318 does and
+draws its row under the composer's bottom rule; `outlook-captures` gains scenes I, J and K (the
+design's cases (b), (c) and (d), under Cruise), whose stand-in runs the build's own usage tap with
+the own login's seeded week, so the window's line E is the quota row. The scenes A to H run no
+statusLine and capture line D's fallback unit. `swarm`'s stand-in reads its tap command through
+the same `status_line` (its own `status_command_from_args` is gone, and its test
+`cli_and_settings_parsing_cover_flags_and_negative_cases`, now parsing the CLI alone, is
+`cli_parsing_covers_flags_and_negative_cases`). Read the same way as §1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+fixture-status-line	contract	fleet_fixture::{status_line,status_payload,run_status_line,status_row,screen}	status_line(a) = the first `--settings <json>` or `--settings=<json>` before a literal `--` whose JSON has statusLine.command c: StatusLine{command: c, every: statusLine.refreshInterval as whole seconds where > 0, else None}; None where no such value. status_payload(s, cwd, l) = a JSON object with session_id (s or null), cwd, model, version and cost.total_api_duration_ms 0, plus rate_limits = J::parse(l) exactly where that is an object. run_status_line(c, p) runs `/bin/sh -c c` (aterm_uds::spawnfd::command) with p on its stdin and CLAUDE_PID = this pid, and is the first line of its stdout with control characters dropped, None where that line is absent or blank. status_row(t, cols) = "  " ++ t where chars(t) ≤ cols − 4, else "  " ++ the first cols − 5 chars of t ++ "…". screen in Idle or Busy with a status row r puts status_row(r, cols) directly under the composer's bottom rule and the mode row under it; with none, the mode row directly under the rule. Against aterm-phase's claude-2.1.318-tap-row-{week,week-100col,week-70col,week-30col,no-figure,silent-command} fixtures the row under the bottom rule equals the measured one at the measured width.	fleet_fixture.rs::{the_status_row_is_where_claude_2_1_318_draws_it,the_settings_name_the_status_command_and_its_refresh,a_run_hands_the_payload_and_shows_the_first_line}	JSON parsing, a child process with piped stdio, char counting	1,8
+outlook-glass-seeds	contract	outlook_captures::{plan,Plan::rate_limits,seed}	plan(c).tapped ⇔ c ∈ {I, J, K}, under autopilot "cruise" (else "off"); the own login is the first roster row (`me` for A–H, `main` for I–K), active in the store, the only row naming an address. seed writes <home>/.claude/fleet-fixture-rate-limits.json exactly where plan.tapped and the own login has a seen window: each window as {used_percentage: pct_x10/10, resets_at: now + reset}; so the tap's reading of status_payload over it holds the store's own week (I 63%, J 75%), and K's payload has no rate_limits (the tap prints NO_WEEK).	outlook_captures.rs::{the_seeds_are_synthetic_and_stay_in_their_world,the_tapped_scenes_hand_the_tap_the_stores_week}	JSON building, the accounts store's writer	1,8
+```
+
+```tsv
+file	test	primary	also
+src/fleet_fixture.rs	the_status_row_is_where_claude_2_1_318_draws_it	fixture-status-line	
+src/fleet_fixture.rs	the_settings_name_the_status_command_and_its_refresh	fixture-status-line	
+src/fleet_fixture.rs	a_run_hands_the_payload_and_shows_the_first_line	fixture-status-line	
+src/outlook_captures.rs	the_seeds_are_synthetic_and_stay_in_their_world	outlook-glass-seeds	
+src/outlook_captures.rs	the_tapped_scenes_hand_the_tap_the_stores_week	outlook-glass-seeds	
+```

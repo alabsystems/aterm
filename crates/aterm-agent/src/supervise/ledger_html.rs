@@ -372,7 +372,7 @@ const fn noted_marks(w: Noted) -> &'static str {
         }
         Noted::Receipt => "watcher: a RECEIPT line, what aterm checked at a landing",
         Noted::Captured => {
-            "watcher: a CAPTURED line, the rows of a screen of the reset program kept"
+            "watcher: a CAPTURED line, the rows of a reset-program or unread usage screen kept"
         }
     }
 }

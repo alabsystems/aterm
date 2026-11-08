@@ -35,6 +35,12 @@ pub const STAGED_ANSWERS: &str = "shipped-state.txt";
 /// Environment variable naming where the generator writes [`STAGED_ANSWERS`].
 pub const ANSWERS_OUT: &str = "ATERM_SHIPPED_STATE_OUT";
 
+/// Main's field-hold test, executed from the same binary as its desk readers.
+pub const FIELD_HOLD_TEST: &str =
+    "seamless::carry_tests::fixture_generator::check_landed_handoff_fields";
+/// Environment variable naming the release directory the field hold judges.
+pub const FIELD_HOLD_RELEASE: &str = "ATERM_HANDOFF_FIELD_HOLD_RELEASE";
+
 /// Release identity pins stamped into generated fixtures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pins {
@@ -892,22 +898,58 @@ impl MainReader {
             fs::write(corpus_path, merged)
                 .map_err(|e| Error::new(format!("main corpus write: {e}")))?;
             answers = Ok(rendered);
+            // Judge the producer facts with main's hold, using this release's own
+            // baseline. A red is recorded alongside the readers and cannot stop
+            // already-public producer bytes from landing.
+            let hold_start = std::time::Instant::now();
+            let field_hold = match run(command()
+                .args(["--ignored", "--exact", FIELD_HOLD_TEST])
+                .env(
+                    FIELD_HOLD_RELEASE,
+                    tree.join(HANDOFF_FIXTURE_ROOT).join(pins.tag()),
+                )) {
+                Ok(out) => {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let (passed, failed, _) = crate::gates::libtest_tally(&stdout);
+                    if out.status.success() && passed == 1 && failed == 0 {
+                        "field hold: PASS".to_string()
+                    } else {
+                        format!(
+                            "field hold: FAIL (passed {passed}, failed {failed}): {} {}",
+                            stdout.split_whitespace().collect::<Vec<_>>().join(" "),
+                            String::from_utf8_lossy(&out.stderr)
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        )
+                    }
+                }
+                Err(e) => format!("field hold: COULD NOT RUN: {e}"),
+            };
+            timings.push(format!(
+                "field hold {:.3}s",
+                hold_start.elapsed().as_secs_f64()
+            ));
             // These modules own the enabled readers of tests/fixtures/handoff,
             // including their indirect helpers and adoption negative controls.
             let test_start = std::time::Instant::now();
             let tested = run(command().args(consumer_args()))
-                .map_err(|e| Error::new(format!("main desk consumers: {e}")))?;
+                .map_err(|e| Error::new(format!("main desk consumers: {e}; {field_hold}")))?;
             timings.push(format!("tests {:.3}s", test_start.elapsed().as_secs_f64()));
             let stdout = String::from_utf8_lossy(&tested.stdout);
             let (passed, failed, failing) = crate::gates::libtest_tally(&stdout);
             if !tested.status.success() || failed > 0 || passed == 0 {
                 return Err(Error::new(format!(
-                    "FAIL: {} (passed {passed}, failed {failed}); {}",
+                    "FAIL: {} (passed {passed}, failed {failed}); {}; {field_hold}",
                     failing.join(", "),
                     String::from_utf8_lossy(&tested.stderr)
                 )));
             }
-            Ok(format!("PASS ({passed} desk-reader tests)"))
+            if field_hold == "field hold: PASS" {
+                Ok(format!("PASS ({passed} desk-reader tests); {field_hold}"))
+            } else {
+                Ok(format!("{field_hold}; PASS ({passed} desk-reader tests)"))
+            }
         })();
         let mut reading = Reading {
             answers,

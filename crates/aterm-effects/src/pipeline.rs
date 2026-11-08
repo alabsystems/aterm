@@ -1351,6 +1351,16 @@ impl EffectsPipeline {
         self.companion.hit_rect()
     }
 
+    /// How far (rows) the resident companion's head law draws its body down its row this frame,
+    /// and the share of its height it fits it to
+    /// ([`crate::kitty_pet::PetBrain::head_sink_fit`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn companion_head_sink_fit(&self) -> (f32, f32) {
+        self.companion.brain().head_sink_fit()
+    }
+
     /// A test's negative control: the resident companion keeps its old paths
     /// ([`crate::kitty_pet::PetBrain::set_old_paths`]).
     #[cfg(any(test, debug_assertions))]

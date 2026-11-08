@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 use super::*;
 use aterm_capacity::host_executable::Store;
+use std::time::Duration;
 use std::{fs, io::Write as _, os::unix::fs::PermissionsExt as _};
 
 fn observation() -> Value {
@@ -80,7 +81,11 @@ fn cached_inspector_helper() {
     let Some(path) = std::env::var_os(CHILD_STORE) else {
         return;
     };
-    let result = lookup_at(Path::new(&path), "s-a");
+    let result = lookup_started(
+        Path::new(&path),
+        "s-a",
+        Instant::now() - Duration::from_secs(5),
+    );
     assert_eq!(result.unwrap(), observation());
     println!("inspector-helper-ran");
 }

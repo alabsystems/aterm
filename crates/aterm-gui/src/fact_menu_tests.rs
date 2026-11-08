@@ -769,7 +769,7 @@ fn the_account_menu_says_why_the_week_is_missing() {
             ..menu_facts(FactMask::default(), true)
         };
         let menu = shown(&rows(Fact::Account, &facts));
-        let head = format!("note \u{25f7}  {}", gap.words());
+        let head = format!("note    {}", gap.words());
         let at = menu
             .iter()
             .position(|row| *row == head)
@@ -801,7 +801,7 @@ fn the_account_menu_says_why_the_week_is_missing() {
             );
         }
         let metered = FactMenuFacts {
-            weekly_meter: Some(weekly_meter_bar("weekly 62% left")),
+            weekly_meter: Some(weekly_meter_bar("weekly 38% used")),
             ..facts
         };
         assert!(
@@ -811,8 +811,9 @@ fn the_account_menu_says_why_the_week_is_missing() {
     }
 }
 
-/// THE ACCOUNT MENU TAKES THE FOOTER'S WEEK as the footer says it: a figure's words (tenths
-/// too) give the meter and the session's row its whole percent, an aged figure its age as a
+/// THE ACCOUNT MENU TAKES THE FOOTER'S WEEK as the footer says it: a figure's words (`weekly 39%
+/// used`, a bound `weekly ≥38% used`) give the meter and the session's row its whole percent
+/// left, an aged figure its age as a
 /// store row's, a 7d wall gives `weekly out` (no meter, never a percentage) and the session's
 /// row a limited one, and with neither the footer's reason goes to the menu's why.
 #[test]
@@ -826,21 +827,16 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
     };
     let left = |pct: u32, age: &str| Some(RowWeek::Left(pct, age.to_owned()));
     assert_eq!(
-        weekly_facts(&sub(Some("weekly 61.5% left"), None), false, NOW),
+        weekly_facts(&sub(Some("weekly 39% used"), None), false, NOW),
         (
             left(61, ""),
-            Some("\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 61.5% left".into()),
+            Some("\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 39% used".into()),
             None
         ),
-        "tenths keep the meter and the row's percent"
+        "the words give the meter and the row's percent left"
     );
     assert_eq!(
-        weekly_facts(
-            &sub(Some("weekly 62% left \u{b7} 16m ago"), None),
-            false,
-            NOW
-        )
-        .0,
+        weekly_facts(&sub(Some("weekly \u{2265}38% used"), None), false, NOW).0,
         left(62, ""),
         "an aged figure's words with no figure behind them"
     );
@@ -850,7 +846,7 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
             resets_at: NOW + 86_400,
             at: NOW - 40 * 60,
         }),
-        ..sub(Some("weekly 62% left \u{b7} 40m ago"), None)
+        ..sub(Some("weekly \u{2265}38% used"), None)
     };
     assert_eq!(
         weekly_facts(&aged, false, NOW).0,
@@ -892,8 +888,8 @@ fn the_account_menu_takes_the_footers_week_or_its_reason() {
         "a 7d wall over every reason"
     );
     assert_eq!(
-        weekly_meter_bar("weekly 61.5% left"),
-        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 61.5% left"
+        weekly_meter_bar("weekly 39% used"),
+        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 39% used"
     );
 }
 
@@ -1398,22 +1394,22 @@ fn the_sessions_week_reaches_the_row_its_login_is_judged_to() {
 #[test]
 fn account_menu_shows_weekly_meter_and_rotation_accounts() {
     assert_eq!(
-        weekly_meter_bar("weekly 0% left"),
-        "\u{25b1}\u{25b1}\u{25b1}\u{25b1}\u{25b1}  weekly 0% left"
+        weekly_meter_bar("weekly 100% used"),
+        "\u{25b1}\u{25b1}\u{25b1}\u{25b1}\u{25b1}  weekly 100% used"
     );
     assert_eq!(
-        weekly_meter_bar("weekly 73% left"),
-        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 73% left"
+        weekly_meter_bar("weekly 27% used"),
+        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b1}  weekly 27% used"
     );
     assert_eq!(
-        weekly_meter_bar("weekly 100% left"),
-        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b0}  weekly 100% left"
+        weekly_meter_bar("weekly 0% used"),
+        "\u{25b0}\u{25b0}\u{25b0}\u{25b0}\u{25b0}  weekly 0% used"
     );
     let facts = FactMenuFacts {
         title: "Accounts \u{b7} tab 1".into(),
         spoken: "Accounts, tab 1".into(),
         subscription: Some("sol-m27@example.test \u{b7} max 20x".into()),
-        weekly_meter: Some(weekly_meter_bar("weekly 0% left")),
+        weekly_meter: Some(weekly_meter_bar("weekly 100% used")),
         cli: Some(aterm_agent::harness::accounts::Cli::Claude),
         accounts: vec![
             AccountMenuRow {
@@ -1942,7 +1938,7 @@ fn a_muse_sessions_account_menu_is_its_own_login() {
         title: "Accounts \u{b7} tab 1".into(),
         spoken: "Accounts, tab 1".into(),
         subscription: Some("someone@example.test \u{b7} max usage".into()),
-        weekly_meter: Some(weekly_meter_bar("weekly 51% left")),
+        weekly_meter: Some(weekly_meter_bar("weekly 49% used")),
         own_login: Some("Muse's own login \u{2014} no rotation pool; switch with its /login"),
         refresh_usage: true,
         ..menu_facts(FactMask::default(), true)

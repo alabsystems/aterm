@@ -13,11 +13,25 @@ use std::{
     os::unix::ffi::OsStrExt as _,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 fn refused() -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, "retained custodian is not ready")
+}
+
+fn startup_status(
+    status: &CtlStream,
+    expected_pid: u32,
+    started: Instant,
+) -> io::Result<(aterm_json::Value, Instant)> {
+    let deadline = runtime::control_deadline(started);
+    let born = runtime::read_json(status, deadline)?;
+    if born["version"].as_u64() != Some(3) || born["pid"].as_u64() != Some(u64::from(expected_pid))
+    {
+        return Err(refused());
+    }
+    Ok((born, deadline))
 }
 struct Connected {
     endpoint: PathBuf,
@@ -99,7 +113,7 @@ fn connect_existing(
     program: &Program,
     instance: &Instance,
 ) -> io::Result<Forwarder> {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = runtime::control_deadline(Instant::now());
     instance.validate()?;
     let stream = aterm_uds::connect::until(instance.socket_path(), deadline)?;
     if wire::local_peer(&stream)?
@@ -127,11 +141,7 @@ fn start(endpoint: &Path, store: &Store, program: &Program) -> io::Result<Forwar
         ));
     program.validate()?;
     let child = spawnfd::detached_with_two_fds(command, child_control.into(), child_status.into())?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let born = runtime::read_json(&status, deadline)?;
-    if born["version"].as_u64() != Some(3) || born["pid"].as_u64() != Some(u64::from(child.id())) {
-        return Err(refused());
-    }
+    let (born, deadline) = startup_status(&status, child.id(), Instant::now())?;
     let birth = born["birth"].as_u64().ok_or_else(refused)?;
     let socket = runtime::path_field(&born, "socket_hex")?;
     let instance = store
@@ -204,4 +214,47 @@ pub fn submit_accounted_expected(
     expected: std::os::fd::OwnedFd,
 ) -> io::Result<()> {
     existing()?.submit_accounted_expected(submission, expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn native_startup_status_survives_scheduling_delay() {
+        let (status, sender) = aterm_uds::kept_out(CtlStream::pair).unwrap();
+        let peer = wire::local_peer(&status).unwrap();
+        runtime::write_json(
+            &sender,
+            &aterm_json::json!({"version":3,"pid":peer.pid,"birth":peer.birth}),
+            Instant::now() + Duration::from_secs(60),
+        )
+        .unwrap();
+        let (born, _) =
+            startup_status(&status, peer.pid, Instant::now() - Duration::from_secs(11)).unwrap();
+        assert_eq!(born["birth"].as_u64(), Some(peer.birth));
+        assert_eq!(
+            startup_status(&status, peer.pid, Instant::now() - Duration::from_secs(61))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+        for (version, delta) in [(4, 0), (3, 1)] {
+            let (status, sender) = aterm_uds::kept_out(CtlStream::pair).unwrap();
+            let peer = wire::local_peer(&status).unwrap();
+            runtime::write_json(
+                &sender,
+                &aterm_json::json!({"version":version,"pid":peer.pid + delta,"birth":peer.birth}),
+                runtime::control_deadline(Instant::now()),
+            )
+            .unwrap();
+            assert_eq!(
+                startup_status(&status, peer.pid, Instant::now())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+    }
 }

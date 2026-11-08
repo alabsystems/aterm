@@ -2319,11 +2319,11 @@ fn agy_usage_card_weekly_parses_gemini_and_third_party_rows() {
         "  Claude and GPT models  Weekly Limit Remaining     100%  2026-10-31 00:51 PDT".to_owned(),
     );
     let gemini = usage_card_weekly(&rows).expect("gemini weekly");
-    assert_eq!(gemini.text, "weekly 78% left");
+    assert_eq!(gemini.text, "weekly 22% used");
     assert_eq!(gemini.reset.as_deref(), Some("2026-10-29 09:31 PDT"));
     for model in ["Claude Opus 4.6", "Opus 5.5", "Sonnet 5.5"] {
         let claude = usage_card_weekly_for_model(&rows, Some(model)).expect("claude weekly");
-        assert_eq!(claude.text, "weekly 100% left", "{model}");
+        assert_eq!(claude.text, "weekly 0% used", "{model}");
         assert_eq!(
             claude.reset.as_deref(),
             Some("2026-10-31 00:51 PDT"),

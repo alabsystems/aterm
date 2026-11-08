@@ -15,7 +15,7 @@ use crate::items::{Ctx, Item};
 use crate::model::{ItemReport, Mode, Probe, User};
 use crate::port::{GithubError, GithubFailure, Secret, System};
 use crate::sync::repository_refresh::{Admission, Execution, RepositoryPass, Ticket};
-use aterm_converge::{Class, Layer, Remedy, Requires};
+use aterm_converge::{Class, Layer, Remedy, Requires, StoodAside};
 use aterm_secrets::converge::RepositoryWork;
 use aterm_types::macos_setup::FailureKind;
 use std::io;
@@ -60,6 +60,14 @@ pub(crate) fn automatic_inventory_counts_captured(
     captured: &InitialRepositoryInputs,
 ) -> Result<Option<(usize, usize)>, String> {
     captured.validate_default_context(sys, ctx)?;
+    if captured.local.is_err()
+        && let Some(selection) = super::RepositorySelection::capture(sys, ctx)?
+        && selection.count() == 0
+    {
+        captured.validate_selection(sys, ctx)?;
+        selection.ensure_current(sys)?;
+        return Ok(Some((0, 0)));
+    }
     let local = captured.local.as_ref().map_err(|block| block.why.clone())?;
     let inventory = local
         .inventory
@@ -197,6 +205,9 @@ struct NativeRepositories {
     /// What the last apply's clones made of their hook installers ([`repos::Cloned::hooks`]),
     /// which the read-back's row says.
     hooks: Mutex<Vec<String>>,
+    selection: Mutex<Option<super::RepositorySelection>>,
+    aside: Mutex<Option<StoodAside>>,
+    acknowledge: Mutex<bool>,
 }
 
 /// What one step read for the next ([`NativeRepositories::carried`]).
@@ -464,6 +475,14 @@ impl InitialRepositoryInputs {
         Ok(())
     }
 
+    pub(crate) fn validate_selection(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        self.validate_default_context(sys, ctx)?;
+        if self.local.is_ok() && !self.is_current_now(sys)? {
+            return Err("captured repository inputs changed before selection readback".into());
+        }
+        Ok(())
+    }
+
     fn current_with(
         &self,
         sys: &dyn System,
@@ -560,6 +579,9 @@ impl NativeRepositories {
             unasked: false,
             carried: Mutex::new(None),
             hooks: Mutex::new(Vec::new()),
+            selection: Mutex::new(None),
+            aside: Mutex::new(None),
+            acknowledge: Mutex::new(false),
         }
     }
 
@@ -611,6 +633,14 @@ impl Item for NativeRepositories {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        *self
+            .selection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        *self
+            .acknowledge
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = false;
         // What the last apply's clones made of their hook installers: whatever this read says,
         // the switch turned off since included, its row says that too.
         let hooks = std::mem::take(&mut *self.hooks.lock().unwrap_or_else(PoisonError::into_inner));
@@ -621,8 +651,48 @@ impl Item for NativeRepositories {
                     why: "repository setup is disabled in init.toml's [github] table".into(),
                 };
             }
+            let paired = self.read(sys);
+            if paired.is_err()
+                && self.captured.as_ref().map_or_else(
+                    || self.prepared.get().is_none(),
+                    |captured| captured.inputs.local.is_err(),
+                )
+            {
+                match super::RepositorySelection::for_user(sys, &self.user) {
+                    Ok(Some(selection)) => {
+                        if let Err(why) = self.ensure_current(sys) {
+                            return Probe::Blocked { why };
+                        }
+                        if selection.count() == 0 {
+                            return Probe::NotApplicable {
+                            why: "the private inventory selects no repositories; GitHub sign-in was not checked".into(),
+                        };
+                        }
+                        match selection.needs_credential(sys) {
+                            Ok(true) => {
+                                let from = selection.waiting();
+                                *self
+                                    .selection
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner) = Some(selection);
+                                return Probe::Change {
+                                from,
+                                to: "record the development credential need in the existing vault protocol".into(),
+                            };
+                            }
+                            Ok(false) => {}
+                            Err(why) => return Probe::Blocked { why },
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(block) => {
+                        self.reading.set(block.wait.map(Reading::Waits));
+                        return block.probe(self.unasked, sys.macos());
+                    }
+                }
+            }
             let check = (|| {
-                let (plan, standing) = self.read(sys)?;
+                let (plan, standing) = paired?;
                 if plan.empty_inventory {
                     self.ensure_current(sys).map_err(Block::from)?;
                     return Ok((plan, standing, None));
@@ -711,6 +781,25 @@ impl Item for NativeRepositories {
                     .into(),
             }
             };
+            let probe = if matches!(probe, Probe::Ok { .. }) {
+                match super::RepositorySelection::acknowledgment_due(sys, &self.user) {
+                    Ok(true) => {
+                        *self
+                            .acknowledge
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) =
+                            self.work == RepositoryWork::Repair;
+                        Probe::Change {
+                            from: "the delivered development credential has no consumer acknowledgment yet".into(),
+                            to: "confirm the paired credential route under this pass's repository intent".into(),
+                        }
+                    }
+                    Ok(false) => probe,
+                    Err(why) => Probe::Blocked { why },
+                }
+            } else {
+                probe
+            };
             self.carry(Carried::Probed(plan, standing));
             probe
         })();
@@ -756,6 +845,63 @@ impl Item for NativeRepositories {
     ) -> Result<(), String> {
         authorized()?;
         self.ensure_current(sys)?;
+        *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        let selection = self
+            .selection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let selection = match selection {
+            Some(selection) => Some(selection),
+            None if self.captured.as_ref().map_or_else(
+                || self.prepared_inputs(sys).local.is_err(),
+                |captured| captured.inputs.local.is_err(),
+            ) =>
+            {
+                super::RepositorySelection::for_user(sys, &self.user).map_err(|block| block.why)?
+            }
+            None => None,
+        };
+        if let Some(selection) = selection {
+            selection.ensure_current(sys)?;
+            authorized()?;
+            if selection.count() == 0 {
+                return Ok(());
+            }
+            if selection.needs_credential(sys)? {
+                let current = || {
+                    authorized()?;
+                    self.ensure_current(sys)
+                };
+                let _ = selection.request_credential(sys, &current)?;
+                *self.aside.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(StoodAside::Waiting(selection.waiting()));
+                return Ok(());
+            }
+        }
+        if std::mem::take(
+            &mut *self
+                .acknowledge
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        ) {
+            let Some(Carried::Probed(plan, _)) = self.take() else {
+                return Err("credential acknowledgment has no paired consumer reading".into());
+            };
+            let current = || {
+                authorized()?;
+                self.ensure_current(sys)
+            };
+            current()?;
+            if let Lookups::Not(why) = self.lookups(sys, &plan)? {
+                return Err(why);
+            }
+            current()?;
+            self.acknowledge_credential(sys, &current)?;
+            current()?;
+            self.carry(Carried::Applied(plan));
+            return Ok(());
+        }
         let work = self.begin_refresh(sys)?;
         let result = self.apply_batch(sys, ctx, authorized, work);
         if result.is_err() {
@@ -764,12 +910,36 @@ impl Item for NativeRepositories {
         result
     }
 
+    fn stood_aside(&self) -> Option<StoodAside> {
+        self.aside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
         self.reading.detail()
     }
 }
 
 impl NativeRepositories {
+    fn acknowledge_credential(
+        &self,
+        sys: &dyn System,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        current()?;
+        if !super::RepositorySelection::consumer_ack_due(sys, &self.user)? {
+            return Ok(());
+        }
+        if let Some(selection) =
+            super::RepositorySelection::for_user(sys, &self.user).map_err(|block| block.why)?
+        {
+            selection.credential_satisfied(sys, current)?;
+        }
+        Ok(())
+    }
+
     fn apply_batch(
         &self,
         sys: &dyn System,
@@ -851,6 +1021,11 @@ impl NativeRepositories {
             }
         }
         if standing.missing.is_empty() && standing.dependencies.is_empty() {
+            if failed.is_empty() {
+                current()?;
+                self.acknowledge_credential(sys, &current)?;
+                current()?;
+            }
             self.carry(Carried::Applied(plan));
             return if failed.is_empty() {
                 Ok(())
@@ -899,6 +1074,9 @@ impl NativeRepositories {
             failed.push(why);
         }
         if failed.is_empty() {
+            current()?;
+            self.acknowledge_credential(sys, &current)?;
+            current()?;
             *self.hooks.lock().unwrap_or_else(PoisonError::into_inner) = cloned.hooks;
             Ok(())
         } else {
@@ -1015,8 +1193,8 @@ struct Plan {
 /// State words for a person where the step that stopped decided one. A step that decided
 /// none leaves the page its own words for a waiting row.
 #[derive(Clone, Debug)]
-struct Block {
-    why: String,
+pub(super) struct Block {
+    pub(super) why: String,
     wait: Option<Wait>,
 }
 
@@ -1049,7 +1227,7 @@ impl Block {
     }
 
     /// A step that stopped for `wait`, with its line.
-    fn of(wait: Wait) -> impl FnOnce(String) -> Self {
+    pub(super) fn of(wait: Wait) -> impl FnOnce(String) -> Self {
         move |why| Self {
             why,
             wait: Some(wait),
@@ -2084,6 +2262,231 @@ pub(super) mod tests {
             );
         }
 
+        // A complete inventory can arrive before its credential. Selection, planning and
+        // the durable want must not run Git or pretend the account wants no repositories.
+        let cold = readback_fixture(true);
+        let inventory_only = cold
+            .source_text
+            .lines()
+            .filter(|line| !line.starts_with("gh_access_token="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        aterm_uds::atomic_file::write(&cold.source, inventory_only.as_bytes(), 0o600).unwrap();
+        client::sync(&cold.paths, None).unwrap();
+        cold.sys.remove(&cold.token).unwrap();
+        cold.sys
+            .remove(Path::new(crate::items::github::CLT_GIT))
+            .unwrap();
+        cold.sys
+            .simulate(|_, command| panic!("credential-pending work started {}", command.display()));
+        let debt = aterm_tempfile::tempdir().unwrap();
+        assert!(matches!(
+            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+            OwedClone::Waiting(_)
+        ));
+        let pending = NativeRepositories::new(cold.who.clone(), None);
+        assert!(matches!(
+            pending.probe(&cold.sys, &cold.ctx),
+            Probe::Change { .. }
+        ));
+        run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Plan,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert!(
+            aterm_secrets::need::peek(&cold.paths).unwrap().is_empty(),
+            "Plan never raises a want"
+        );
+        // Existing synthetic-policy opt-in tests the consumer lifecycle, not real release.
+        aterm_secrets::need::test_alab_policy(&cold.paths);
+        run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        let first = aterm_secrets::need::peek(&cold.paths).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(!first[0].state.ended());
+        let first_id = first[0].id;
+        run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            aterm_secrets::need::peek(&cold.paths).unwrap()[0].id,
+            first_id
+        );
+        assert!(
+            pending
+                .apply_guarded(&cold.sys, &cold.ctx, &|| Err("late Stop".into()))
+                .is_err()
+        );
+        assert_eq!(
+            aterm_secrets::need::peek(&cold.paths).unwrap()[0].id,
+            first_id
+        );
+
+        // Ordinary materialization supplies the credential before this need was published.
+        // Successful paired consumption retires that unnecessary request; it proves neither
+        // delivery through the request protocol nor remote GitHub authentication.
+        aterm_uds::atomic_file::write(&cold.source, cold.source_text.as_bytes(), 0o600).unwrap();
+        client::sync(&cold.paths, None).unwrap();
+        cold.sys
+            .file(cold.token.to_str().unwrap(), TOKEN.as_bytes())
+            .stat_of(cold.token.to_str().unwrap(), stat(false, 0o600));
+        cold.sys
+            .file(crate::items::github::CLT_GIT, b"synthetic git");
+        cold.sys.simulate(|_, command| {
+            let command = command.display();
+            assert!(
+                !command.contains("ls-remote")
+                    && !command.contains(" fetch ")
+                    && !command.contains(" clone "),
+                "a local acknowledgment started {command}"
+            );
+            None
+        });
+        assert!(
+            matches!(
+                crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+                OwedClone::Due(_)
+            ),
+            "automatic already-present work must still own the local credential acknowledgment"
+        );
+        let supplied = run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stage(&supplied).outcome, crate::model::Outcome::Changed);
+        let consumed_need = aterm_secrets::need::peek(&cold.paths).unwrap().remove(0);
+        assert_eq!(consumed_need.state, aterm_secrets::need::State::Retired);
+        assert_eq!(
+            consumed_need.retired.as_ref().unwrap().reason,
+            aterm_secrets::need::Reason::NotNeeded
+        );
+        let confirmed = run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Plan,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stage(&confirmed).outcome, crate::model::Outcome::Ok);
+        aterm_uds::atomic_file::write(&cold.source, inventory_only.as_bytes(), 0o600).unwrap();
+        client::sync(&cold.paths, None).unwrap();
+        cold.sys.remove(&cold.token).unwrap();
+        cold.sys
+            .remove(Path::new(crate::items::github::CLT_GIT))
+            .unwrap();
+        cold.sys
+            .simulate(|_, command| panic!("missing credential started {}", command.display()));
+        run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        let rearmed = aterm_secrets::need::peek(&cold.paths).unwrap();
+        assert_ne!(rearmed[0].id, first_id);
+        let rearmed_id = rearmed[0].id;
+        run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            aterm_secrets::need::peek(&cold.paths).unwrap()[0].id,
+            rearmed_id
+        );
+        let stale = NativeRepositories::new(cold.who.clone(), None);
+        assert!(matches!(
+            stale.probe(&cold.sys, &cold.ctx),
+            Probe::Change { .. }
+        ));
+        let empty_only =
+            "github-repositories.json={\"schema\":2,\"account\":\"alice\",\"repositories\":[]}\n";
+        aterm_uds::atomic_file::write(&cold.source, empty_only.as_bytes(), 0o600).unwrap();
+        client::sync(&cold.paths, None).unwrap();
+        metadata(&cold.sys, &cold.who, aterm_json::json!([]));
+        assert!(
+            stale
+                .apply_guarded(&cold.sys, &cold.ctx, &|| Ok(()))
+                .is_err(),
+            "old selection cannot request for a new inventory"
+        );
+        let empty_rows = run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            stage(&empty_rows).outcome,
+            crate::model::Outcome::NotApplicable
+        );
+        assert!(matches!(
+            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+            OwedClone::Nothing(_)
+        ));
+        let after_empty = aterm_secrets::need::peek(&cold.paths).unwrap();
+        assert_eq!(after_empty[0].id, rearmed_id);
+        assert_ne!(
+            after_empty[0].state,
+            aterm_secrets::need::State::Fulfilled,
+            "empty work is no credential-consumer success"
+        );
+
+        // The plain-file fixture has no release policy by default; a credential intent
+        // records the existing policy refusal rather than claiming automatic delivery.
+        let forbidden = readback_fixture(false);
+        let without_credential = forbidden
+            .source_text
+            .lines()
+            .filter(|line| !line.starts_with("gh_access_token="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        aterm_uds::atomic_file::write(&forbidden.source, without_credential.as_bytes(), 0o600)
+            .unwrap();
+        client::sync(&forbidden.paths, None).unwrap();
+        forbidden.sys.remove(&forbidden.token).unwrap();
+        let denied = run_with(
+            &forbidden.sys,
+            &forbidden.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stage(&denied).outcome, crate::model::Outcome::Failed);
+        let refused = aterm_secrets::need::peek(&forbidden.paths).unwrap();
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].state, aterm_secrets::need::State::Retired);
+
         // A fully materialized empty selection owes no repository or sign-in
         // work, including on an account where Git and its helper are absent.
         let fixture = readback_fixture(false);
@@ -2670,6 +3073,7 @@ pub(super) mod tests {
                 };
                 let mut sys = Fake::root();
                 sys.euid = who.uid;
+                sys.logged_in(&who);
                 sys.stat_of(home.to_str().unwrap(), stat(true, 0o700));
                 sys.file(crate::items::github::CLT_GIT, b"synthetic git");
                 let token_path = home.join(super::super::TOKEN_FILE);

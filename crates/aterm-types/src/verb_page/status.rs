@@ -60,9 +60,9 @@ pub(crate) const PAGE: Page = Page {
         row(
             "host",
             "integration input input_bytes input_wait_ms fg_rss_mb disk disk_free_mb disk_room_mb \
-         disk_age_ms job job_quiet_ms program_check left syspolicyd syspolicyd_workers \
-         syspolicyd_full_ms syspolicyd_pid syspolicyd_up_ms service_mem service_mem_top occupancy \
-         occupancy_hold ready slots idle_ready_min waits waits_ready",
+         disk_age_ms job job_quiet_ms program_check program_check_stranded left syspolicyd \
+         syspolicyd_workers syspolicyd_full_ms syspolicyd_pid syspolicyd_up_ms service_mem \
+         service_mem_top occupancy occupancy_hold ready slots idle_ready_min waits waits_ready",
         ),
         row(
             "harness",
@@ -262,7 +262,8 @@ pub(crate) const PAGE: Page = Page {
                      input=<clear|pending|typeahead|stalled|stopped|-> input_bytes= \
                      input_wait_ms= fg_rss_mb= disk=<ok|low|short|emergency|-> disk_free_mb= \
                      disk_room_mb= disk_age_ms= job=<verdict|none> job_quiet_ms= \
-                     program_check=<n>:<oldest_ms>|0|- left=<n>:<oldest_ms>|0:-|- \
+                     program_check=<n>:<oldest_ms>|0|- \
+                     program_check_stranded=<n>:<oldest_ms>|0|- left=<n>:<oldest_ms>|0:-|- \
                      syspolicyd=<-|ok|full|stuck> syspolicyd_workers= syspolicyd_full_ms= \
                      syspolicyd_pid= syspolicyd_up_ms= \
                      service_mem=<-|ok|large|huge> service_mem_top=<name>:<MiB>|- \
@@ -303,6 +304,15 @@ pub(crate) const PAGE: Page = Page {
                     "counts this tab's programs macOS's program check holds now, members of its \
                      jobs and their orphans, this user's only, so a lower bound, with the oldest \
                      held to now in ms; `-` off macOS or with no reading that speaks for now",
+                ),
+                row(
+                    "program_check_stranded=",
+                    "counts those of them whose check went to a `syspolicyd` that is no longer \
+                     running, `0` only when every held program of this user is judged (each \
+                     started after the running `syspolicyd`), and `-` also while one may be \
+                     stranded and nothing read tells: aterm first read it unrun after that \
+                     `syspolicyd` started, a program held since it started is its queue, it has \
+                     run under 10 minutes awake, its pool reads full, or no look read it lately",
                 ),
                 row(
                     "left=",

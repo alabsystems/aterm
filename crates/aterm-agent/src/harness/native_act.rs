@@ -817,15 +817,18 @@ pub enum Constructor {
     ColdRestart,
     /// A fresh built-in Upgrade qualified by the host's settled current native binding.
     AskedUpgrade,
+    /// A checked live Memory restart under the built-in's scoped authorization.
+    AskedRelaunch,
 }
 
 impl Constructor {
     /// The canonical discovery order. A capability is not an action ticket.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::OwnImage,
         Self::PrivateRestart,
         Self::ColdRestart,
         Self::AskedUpgrade,
+        Self::AskedRelaunch,
     ];
 
     /// This constructor's strict wire word.
@@ -836,6 +839,7 @@ impl Constructor {
             Self::PrivateRestart => "private-restart",
             Self::ColdRestart => "cold-restart",
             Self::AskedUpgrade => "asked-upgrade",
+            Self::AskedRelaunch => "asked-relaunch",
         }
     }
 }
@@ -895,6 +899,35 @@ pub struct AskedUpgradeIntent {
     pub predecessor: String,
 }
 
+/// A Memory restart request. Its purpose and ask are data, never mutation authority.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AskedRelaunchIntent {
+    /// Same-host positively settled predecessor.
+    pub predecessor: String,
+    /// Exact source-owned restart ask.
+    pub ask: String,
+}
+
+/// Mutually exclusive typed succession purposes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AskedIntent {
+    /// Fresh upgrade under existing settlement qualification.
+    Upgrade(AskedUpgradeIntent),
+    /// Fresh live restart, additionally requiring scoped checked-producer authorization.
+    Relaunch(AskedRelaunchIntent),
+}
+
+impl AskedIntent {
+    /// The exact passive predecessor name, not an authority token.
+    #[must_use]
+    pub fn predecessor(&self) -> &str {
+        match self {
+            Self::Upgrade(intent) => &intent.predecessor,
+            Self::Relaunch(intent) => &intent.predecessor,
+        }
+    }
+}
+
 /// A preparation's complete data-only expectation; the host independently derives authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prepare {
@@ -916,7 +949,7 @@ pub struct Prepare {
     /// Explicit native semantic duty, Upgrade or Relaunch only.
     pub duty: Scope,
     /// A typed request for fresh asked admission, distinct from cold/crash continuation.
-    pub asked_upgrade: Option<AskedUpgradeIntent>,
+    pub asked: Option<AskedIntent>,
     /// The complete planned mutation.
     pub plan: NativePlan,
 }
@@ -925,10 +958,10 @@ impl Prepare {
     /// Required constructor capability; this is not an admission qualification.
     #[must_use]
     pub const fn constructor(&self) -> Constructor {
-        if self.asked_upgrade.is_some() {
-            Constructor::AskedUpgrade
-        } else {
-            self.plan.constructor()
+        match &self.asked {
+            Some(AskedIntent::Upgrade(_)) => Constructor::AskedUpgrade,
+            Some(AskedIntent::Relaunch(_)) => Constructor::AskedRelaunch,
+            None => self.plan.constructor(),
         }
     }
 }
@@ -1230,11 +1263,10 @@ impl Request {
                     },
                     _ => return None,
                 };
-                let asked_upgrade = match words.remove("asked-predecessor") {
+                let asked = match words.remove("asked-predecessor") {
                     None => None,
                     Some(predecessor)
                         if aterm_codec::hex::is_lower(predecessor, 32)
-                            && duty == Scope::Upgrade
                             && matches!(
                                 &plan,
                                 NativePlan::Restart {
@@ -1244,9 +1276,26 @@ impl Request {
                                 }
                             ) =>
                     {
-                        Some(AskedUpgradeIntent {
-                            predecessor: predecessor.to_owned(),
-                        })
+                        let predecessor = predecessor.to_owned();
+                        match words.remove("asked-relaunch") {
+                            None if duty == Scope::Upgrade => {
+                                Some(AskedIntent::Upgrade(AskedUpgradeIntent { predecessor }))
+                            }
+                            Some(kind) if duty == Scope::Relaunch => {
+                                let ask = text_blob(take(&mut words, "asked-ask")?, 256)?;
+                                if ask.is_empty() || ask.contains(['\r', '\n', '\0']) {
+                                    return None;
+                                }
+                                if kind != "memory" {
+                                    return None;
+                                }
+                                Some(AskedIntent::Relaunch(AskedRelaunchIntent {
+                                    predecessor,
+                                    ask,
+                                }))
+                            }
+                            _ => return None,
+                        }
                     }
                     Some(_) => return None,
                 };
@@ -1270,7 +1319,7 @@ impl Request {
                     expected_human_seq,
                     deadline_us,
                     duty,
-                    asked_upgrade,
+                    asked,
                     plan,
                 };
                 if verb == "cancel-prepare" {
@@ -1396,8 +1445,16 @@ impl Request {
                 if let Some(seq) = p.expected_human_seq {
                     write!(out, " human-seq={seq}").ok()?;
                 }
-                if let Some(asked) = &p.asked_upgrade {
-                    write!(out, " asked-predecessor={}", asked.predecessor).ok()?;
+                if let Some(asked) = &p.asked {
+                    write!(out, " asked-predecessor={}", asked.predecessor()).ok()?;
+                    if let AskedIntent::Relaunch(intent) = asked {
+                        write!(
+                            out,
+                            " asked-relaunch=memory asked-ask={}",
+                            aterm_codec::hex::encode_lower(intent.ask.as_bytes())
+                        )
+                        .ok()?;
+                    }
                 }
                 match &p.plan {
                     NativePlan::OwnImage {
@@ -1941,6 +1998,9 @@ pub fn monotonic_us() -> Option<u64> {
 }
 
 #[cfg(test)]
+#[path = "native_asked_relaunch_wire_tests.rs"]
+mod asked_relaunch_wire_tests;
+#[cfg(test)]
 #[path = "native_asked_upgrade_wire_tests.rs"]
 mod asked_upgrade_wire_tests;
 
@@ -1955,7 +2015,7 @@ mod tests {
             inode: 19,
         };
         Request::prepare(Prepare {
-            asked_upgrade: None,
+            asked: None,
             id: "12".repeat(16),
             host_epoch: "34".repeat(16),
             holder: "grok-alab@4242".into(),
@@ -2079,6 +2139,7 @@ mod tests {
             ("private-restart", vec![Constructor::PrivateRestart]),
             ("cold-restart", vec![Constructor::ColdRestart]),
             ("asked-upgrade", vec![Constructor::AskedUpgrade]),
+            ("asked-relaunch", vec![Constructor::AskedRelaunch]),
             (
                 "own-image,private-restart",
                 vec![Constructor::OwnImage, Constructor::PrivateRestart],
@@ -2092,7 +2153,7 @@ mod tests {
                 ],
             ),
             (
-                "own-image,private-restart,cold-restart,asked-upgrade",
+                "own-image,private-restart,cold-restart,asked-upgrade,asked-relaunch",
                 Constructor::ALL.to_vec(),
             ),
         ] {

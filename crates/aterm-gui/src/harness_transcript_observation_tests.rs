@@ -52,7 +52,13 @@ fn transcript_usage_rejects_answers_before_the_process_started() {
             answered: &answered,
             said: &said,
         };
-        let word = super::super::account_usage_of(&store, &captured, "transcript", &read, ACCT_NOW);
+        let word = super::super::account_usage_of(
+            (root.path(), &store),
+            &captured,
+            "transcript",
+            &read,
+            ACCT_NOW,
+        );
         let allowed = started.is_some_and(|start| start <= ACCT_NOW - 60);
         assert_eq!(word, if allowed { "usage" } else { "not-this-process" });
         assert_eq!(called.get(), allowed);
@@ -138,9 +144,18 @@ fn transcript_usage_and_walls_admit_the_captured_source_at_the_writer() {
                 answered: &answered,
                 said: &said,
             };
-            let writer = if change == "store" { &other } else { &store };
-            let result =
-                super::super::account_usage_of(writer, &captured, "transcript", &read, ACCT_NOW);
+            let (writer, state) = if change == "store" {
+                (&other, root.path().join("other"))
+            } else {
+                (&store, root.path().join("state"))
+            };
+            let result = super::super::account_usage_of(
+                (&state, writer),
+                &captured,
+                "transcript",
+                &read,
+                ACCT_NOW,
+            );
             let accepted = matches!(change, "same" | "renew");
             assert_eq!(
                 result == "usage",

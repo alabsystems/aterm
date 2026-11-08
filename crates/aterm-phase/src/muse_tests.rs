@@ -1738,7 +1738,7 @@ fn the_signed_in_cards_name_the_account_and_the_weekly_quota() {
     assert_eq!(
         usage_card_weekly(&rows),
         Some(UsageCardWeekly {
-            text: "weekly 29% left".to_owned(),
+            text: "weekly 71% used".to_owned(),
             reset: Some("Oct 25 at 5:00 PM".to_owned()),
         })
     );

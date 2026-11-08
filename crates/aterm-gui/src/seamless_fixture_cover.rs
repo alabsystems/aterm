@@ -1182,6 +1182,25 @@ mod tests {
     }
 
     #[test]
+    fn the_new_release_baseline_exposes_a_retired_no_handoff_row() {
+        let mut fields = DeskFields::default();
+        fields.manifest.walk(&Inner {
+            hint: None,
+            always: 1,
+        });
+        let new_release: Recorded = aterm_toml::from_str(&fields.to_toml()).unwrap();
+        let mut old_release: Recorded = aterm_toml::from_str(&fields.to_toml()).unwrap();
+        old_release.manifest.written.push("Inner.retired".into());
+        let list = [("manifest", "Inner.hint"), ("manifest", "Inner.retired")];
+        assert!(fields.uncovered(Some(&old_release), &list).is_empty());
+        assert_eq!(
+            fields.uncovered(Some(&new_release), &list),
+            ["manifest Inner.retired (listed, but no desk reaches it)"]
+        );
+        assert!(fields.uncovered(Some(&new_release), &list[..1]).is_empty());
+    }
+
+    #[test]
     fn a_release_being_recorded_is_never_its_own_baseline() {
         let root = aterm_tempfile::tempdir().expect("a fixtures root");
         for release in ["v0.107.0", "v0.108.0"] {

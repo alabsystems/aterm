@@ -11,64 +11,9 @@ use super::*;
 use crate::harness::account_progress::{AccountProgress, ProgressPhase};
 use crate::harness::accounts::{self, Class};
 use crate::harness::footer::FooterFacts;
-use crate::harness::outlook::tests::{
-    D, Fx, H, MIN, NOW, SAT7, SAT8, T5, case_b, scenario_b, scenario_c, scenario_d, worst_case,
-};
+use crate::harness::outlook::tests::{SAT8, scenario_b, scenario_c, scenario_d, worst_case};
 use crate::harness::outlook::{Refusal, round_down};
-
-/// Mon 9 Nov 09:00: case (c)'s `alt1` week resets.
-const MON9: i64 = T5 + 3 * D + 16 * H;
-/// Wed 11 Nov 09:00: case (c)'s `alt2` week resets. (The design's table says 18:00, but a week
-/// that resets 6 d 1 h ahead began inside the pace's 24-hour lookback, so its 90% would count
-/// as a day's rise; 09:00 keeps the design's 36% a day.)
-const WED9: i64 = T5 + 5 * D + 16 * H;
-
-/// Case (a): one Max 20x account at 40% of its week at Thu 17:00, its reset Sat 10:00, read here
-/// from 30% a day before: 10% a day, about 57% by its reset.
-fn case_a() -> Fx {
-    let mut fx = Fx::new(&[("main", Class::Preferred)]);
-    fx.now = T5;
-    fx.plan("main", "max", Some("20x"), T5 - H);
-    for (t, x10) in [(T5 - 24 * H, 300), (T5 - 12 * H, 350)] {
-        fx.fig("main", t, None, Some((x10, SAT7)));
-    }
-    fx.read("main", None, Some((400, SAT7)), T5);
-    fx.ran("main", T5);
-    fx.session("s-main", "main", T5);
-    fx
-}
-
-/// Case (c): `main` at 75% (resets Sat 10:00), `alt1` at 80% (Mon 09:00) and `alt2` at 90% (Wed
-/// 09:00), all Max 20x and read now, at 36% a day (`main` read from 39% a day before): the work
-/// moves main → alt1 → alt2, every account is out from early Saturday until main's reset, then
-/// main carries, then alt1.
-fn case_c() -> Fx {
-    let mut fx = Fx::new(&[
-        ("main", Class::Preferred),
-        ("alt1", Class::Preferred),
-        ("alt2", Class::Preferred),
-    ]);
-    fx.now = T5;
-    for label in ["main", "alt1", "alt2"] {
-        fx.plan(label, "max", Some("20x"), T5 - H);
-    }
-    for (t, x10) in [(T5 - 24 * H, 390), (T5 - 12 * H, 570)] {
-        fx.fig("main", t, None, Some((x10, SAT7)));
-    }
-    fx.read("main", None, Some((750, SAT7)), T5);
-    fx.read("alt1", None, Some((800, MON9)), T5);
-    fx.read("alt2", None, Some((900, WED9)), T5);
-    fx.ran("main", T5);
-    fx.session("s-main", "main", T5);
-    fx
-}
-
-/// Case (d): one account, never read.
-fn case_d() -> Fx {
-    let mut fx = Fx::new(&[("main", Class::Preferred)]);
-    fx.now = T5;
-    fx
-}
+use crate::harness::quota_scenes::{D, Fx, H, MIN, NOW, SAT7, T5, case_a, case_b, case_c, case_d};
 
 /// Both accounts walled now at 97%: the work waits until main's reset.
 fn walled() -> Fx {
@@ -203,9 +148,9 @@ fn laid(view: &QuotaView, room: usize) -> Option<QuotaLine> {
     view.lay(room, &mut line).then_some(line)
 }
 
-/// Every word the glass says of `view`: the row at every room, the title, the spoken words and
+/// The words the glass says of `view` now: the row at every room, the title, the spoken words and
 /// the fallback unit's forms.
-fn every_word(view: &QuotaView) -> Vec<String> {
+fn words_now(view: &QuotaView) -> Vec<String> {
     let mut out: Vec<String> = (0..=200)
         .filter_map(|room| laid(view, room))
         .map(|line| line.text())
@@ -217,6 +162,18 @@ fn every_word(view: &QuotaView) -> Vec<String> {
             .iter()
             .map(|form| form.iter().map(|p| p.text.as_str()).collect::<String>()),
     );
+    out
+}
+
+/// Every word the glass says of `view`: [`words_now`], and every chart column's title at every
+/// grain (on UTC), a past column's naming the reading it holds as read then.
+fn every_word(view: &QuotaView) -> Vec<String> {
+    let mut out = words_now(view);
+    let utc = Offsets::fixed(0);
+    for per_day in PER_DAY {
+        let n = cells(&view.chart, per_day).len();
+        out.extend((0..n).filter_map(|cell| view.column_title(per_day, cell, &utc)));
+    }
     out
 }
 
@@ -979,10 +936,11 @@ fn no_glass_word_names_5h_7d_or_left() {
 /// NO INFERRED 100: a wall says `out` and no figure, though its reading said 97%, and the
 /// footer's own figure of 97% (a reading, never `out`) does not override a wall standing now;
 /// a curve that reaches 99.5% or more by the reset, short of a fill, says `~99%`; an unread
-/// account the worst case assumes full is `?`, and no word of any scenario says `100`. Negative
-/// controls: the tail rounded half up without the cap (`(x10 + 5) / 10`) says `~100%` for case
-/// (b) under a lead of 64%; `own` taken over the row's figure whatever it is says `main 97%` on
-/// a walled tab.
+/// account the worst case assumes full is `?`, and no word of any scenario says `100`, a chart
+/// column's title included. Negative controls: the tail rounded half up without the cap
+/// (`(x10 + 5) / 10`) says `~100%` for case (b) under a lead of 64%; `own` taken over the row's
+/// figure whatever it is says `main 97%` on a walled tab; a hand-off's title saying the fill it
+/// leaves by `whole_spoken` (as S5b did) says `the work moves from alt2 (100%) to main`.
 #[test]
 fn no_inferred_100() {
     let wall = walled().outlook().quota("main", None, true);
@@ -994,7 +952,7 @@ fn no_inferred_100() {
         .quota("main", Some(Figure::Exact(970)), true);
     assert_eq!(footer.tab().unwrap().figure, Figure::Out);
     assert!(footer.title.contains("out now"), "{}", footer.title);
-    for words in every_word(&footer) {
+    for words in words_now(&footer) {
         assert!(!words.contains("97"), "{words}");
     }
     let high = case_b()
@@ -1475,4 +1433,148 @@ fn a_paused_recovery_shows_no_forecast() {
             assert_eq!(facts.account_forecast_refusal(), None);
         }
     }
+}
+
+/// HOVERING A CHART COLUMN NAMES ITS INSTANT (§2.6): every cell of case (b)'s and case (c)'s
+/// charts but the now cell has a title that names a span or an instant, at every grain; a past
+/// cell the reading it holds, a level its projected fill, a `→` its hand-off with the account
+/// it leaves at its fill (`out` where the projection fills it), said exactly where the work moves
+/// at a vendor reset, a `╳` its stop until the reset that ends it. Negative control: making
+/// [`QuotaView::column_title`] map every cell through the past arm titles case (c)'s `→` cell
+/// `no reading on this Mac`, and the hand-off pin fails.
+#[test]
+fn a_chart_column_names_its_instant() {
+    let utc = Offsets::fixed(0);
+    let mut seen = Vec::new();
+    for (name, fx) in [("b", case_b()), ("c", case_c())] {
+        let view = fx.outlook().quota("main", None, true);
+        for per_day in PER_DAY {
+            let all = cells(&view.chart, per_day);
+            let k = usize::from(per_day);
+            assert_eq!(view.column_title(per_day, k, &utc), None, "the now cell");
+            assert_eq!(
+                view.column_title(per_day, all.len(), &utc),
+                None,
+                "past the end"
+            );
+            for (i, cell) in all.iter().enumerate().filter(|(i, _)| *i != k) {
+                let title = view
+                    .column_title(per_day, i, &utc)
+                    .unwrap_or_else(|| panic!("case ({name}) cell {i} {cell:?} at {per_day}"));
+                assert!(title.contains(" \u{b7} "), "{title}");
+                assert!(!title.contains("ultra"), "{title}");
+                seen.push((name, per_day, *cell, title));
+            }
+        }
+    }
+    let at = |name: &str, per_day: u8, cell: Cell| {
+        seen.iter()
+            .filter(|(n, p, c, _)| *n == name && *p == per_day && *c == cell)
+            .map(|(.., t)| t.as_str())
+            .collect::<Vec<_>>()
+    };
+    // Case (b) at 12 a day: the oldest past cell, Wed 4 Nov 17:00–19:00, holds 42%.
+    let past: Vec<_> = seen
+        .iter()
+        .filter(|(n, p, c, _)| *n == "b" && *p == 12 && matches!(c, Cell::Read(_)))
+        .map(|(.., t)| t.as_str())
+        .collect();
+    assert_eq!(
+        past[0],
+        "Wed 4 Nov 17:00\u{2013}19:00 \u{b7} main 42% (read on this Mac)"
+    );
+    assert_eq!(
+        at("b", 12, Cell::Reset),
+        ["Sat 10:00 \u{b7} main's week resets"]
+    );
+    let gaps = at("b", 12, Cell::Gap);
+    assert!(!gaps.is_empty());
+    assert!(
+        gaps.iter().all(|t| t.ends_with(" \u{b7} every account out")
+            && t.starts_with("from ~Thu 12 Nov ")),
+        "{gaps:?}"
+    );
+    // Case (c): the hand-offs, each with the account the work leaves and its fill.
+    let moves = at("c", 12, Cell::Handoff);
+    assert!(moves.len() >= 2, "{moves:?}");
+    assert!(moves[0].contains("the work moves from main (") && moves[0].ends_with(") to alt1"));
+    assert!(moves[1].contains("the work moves from alt1 (") && moves[1].ends_with(") to alt2"));
+    // A move off an account the projection fills says `out`, never 100% (§2.1); the move at
+    // main's reset, where the wall lifts, says that reset exactly (§2.3), as the gap does.
+    assert!(moves.iter().any(|t| t.contains(" (out) to ")), "{moves:?}");
+    assert!(
+        moves.contains(&"Sat 10:00 \u{b7} the work moves to main"),
+        "{moves:?}"
+    );
+    let out: Vec<_> = at("c", 12, Cell::Gap);
+    assert!(
+        out.iter()
+            .all(|t| t.ends_with("every account out until main's reset")),
+        "{out:?}"
+    );
+    let ahead: Vec<_> = seen
+        .iter()
+        .filter(|(n, p, c, _)| *n == "c" && *p == 12 && matches!(c, Cell::Ahead(_)))
+        .map(|(.., t)| t.as_str())
+        .collect();
+    assert!(
+        ahead
+            .iter()
+            .all(|t| t.starts_with('~') && t.ends_with("(projected)")),
+        "{ahead:?}"
+    );
+}
+
+/// A SPAN IS SAID WITH ITS DATE ONCE: an end on the same local day keeps only its time, one on
+/// another day says its day too. Negative control: saying the end with [`when`] alone drops the
+/// second date.
+#[test]
+fn a_span_is_dated_once() {
+    let utc = Offsets::fixed(0);
+    assert_eq!(
+        span_dated(T5 - 21 * H, T5 - 19 * H, &utc),
+        "Wed 4 Nov 20:00\u{2013}22:00"
+    );
+    assert_eq!(
+        span_dated(T5 + 7 * H, T5 + 9 * H, &utc),
+        "Fri 6 Nov 00:00\u{2013}02:00"
+    );
+    assert_eq!(
+        span_dated(T5 + 6 * H, T5 + 8 * H, &utc),
+        "Thu 5 Nov 23:00\u{2013}Fri 6 Nov 01:00"
+    );
+}
+
+/// The reset milestone is laid bold wherever the glass draws it (the tail's `↺`, the chart's reset
+/// cell, the fallback unit's piece): its font glyph, laid regular, reads fainter at 1x than the
+/// quiet `·` beside it, though §1.3 inks it `lit`. Negative control: [`heavy`] reduced to
+/// `role == Role::Warn` (as S5b laid it) leaves case (b)'s tail `↺` regular, which the first
+/// assertion names.
+#[test]
+fn the_reset_mark_is_laid_bold() {
+    let mut seen = (0, 0);
+    for (name, view) in scenarios() {
+        for room in 0..=200 {
+            let Some(line) = laid(&view, room) else {
+                continue;
+            };
+            for (i, (c, role, bold)) in line.cells.iter().enumerate() {
+                if *c == RESET_MARK {
+                    seen.0 += 1;
+                    assert!(bold, "{name} at {room}: cell {i} ({role:?}) is regular");
+                }
+            }
+        }
+        for form in view.fallback() {
+            for piece in form.iter().filter(|p| p.text.contains(RESET_MARK)) {
+                seen.1 += 1;
+                assert!(piece.bold, "{name}: fallback piece {piece:?} is regular");
+            }
+        }
+    }
+    assert!(
+        seen.0 > 0 && seen.1 > 0,
+        "the scenarios draw a reset on the row and in the fallback: {seen:?}"
+    );
+    assert!(!heavy('·', Role::Quiet) && heavy('↺', Role::Lit) && heavy('╳', Role::Warn));
 }

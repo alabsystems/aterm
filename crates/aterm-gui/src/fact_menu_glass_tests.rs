@@ -68,6 +68,17 @@ fn owner(app: &App) -> Option<MenuOwner> {
     app.autopilot_menu.as_ref().map(|menu| menu.owner)
 }
 
+/// Name the pane's account `label` (its roster label), so line D's unit carries the account
+/// fact: recovery words are the Accounts card's and title's, never the rule's
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.1).
+fn name_the_account(app: &App, session: u64, label: &str) {
+    let entry = app.pool.get(session).expect("session");
+    let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    let mut facts = timeline.claude_footer().expect("published facts").clone();
+    facts.account = Some(label.into());
+    assert!(timeline.set_claude_footer(PGID, None, Some(facts)));
+}
+
 #[test]
 fn a_transcript_limit_without_a_recovery_observation_has_a_menu_and_copy() {
     use aterm_agent::harness::{footer::UNOBSERVED_RECOVERY_FINDING, session_usage::Wall};
@@ -279,6 +290,7 @@ fn recovery_copy_requires_activation_and_preserves_the_full_detail() {
     progress.phase = ProgressPhase::Waiting;
     progress.details.push(detail.clone());
     progress.next_at = Some(1_793_040_160);
+    name_the_account(&app, session, "current");
     {
         let entry = app.pool.get(session).expect("session");
         let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -320,6 +332,7 @@ fn recovery_copy_cannot_overwrite_clipboard_after_progress_is_cleared() {
     let mut progress = AccountProgress::unknown(1_793_040_000);
     progress.phase = ProgressPhase::Waiting;
     progress.details.push("current: sign-in required".into());
+    name_the_account(&app, session, "current");
     {
         let entry = app.pool.get(session).expect("session");
         let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -342,13 +355,6 @@ fn recovery_copy_cannot_overwrite_clipboard_after_progress_is_cleared() {
             .as_deref(),
         Some(sentinel)
     );
-    {
-        let entry = app.pool.get(session).expect("session");
-        let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-        let mut facts = timeline.claude_footer().expect("published facts").clone();
-        facts.account = Some("current".into());
-        assert!(timeline.set_claude_footer(PGID, None, Some(facts)));
-    }
     app.on_claude_footer_changed(session);
     menu_frame(&mut app, wid);
     press_fact(&mut app, wid, session, Fact::Account, MouseButton::Right);

@@ -374,10 +374,7 @@ fn a_completed_cold_predecessor_keeps_the_new_asked_prepare_exact_across_lost_ac
         common(line).or_else(|| match request(line) {
             Request::Prepare(plan) => {
                 assert_eq!(plan.constructor(), Constructor::AskedUpgrade);
-                assert_eq!(
-                    plan.asked_upgrade.unwrap().predecessor,
-                    expected_predecessor
-                );
+                assert_eq!(plan.asked.unwrap().predecessor(), expected_predecessor);
                 None
             }
             other => panic!("lost asked Prepare never dispatches {other:?}"),
@@ -956,7 +953,7 @@ fn a_cold_completion_keeps_the_selected_intent_and_the_original_seed_with_or_wit
     shell.pid = if vendor.pid == 2 { 3 } else { 2 };
     shell.group = shell.pid;
     let original = Prepare {
-        asked_upgrade: None,
+        asked: None,
         id: "ab".repeat(16),
         host_epoch: "ef".repeat(16),
         holder: "aterm-harness@fixture".into(),

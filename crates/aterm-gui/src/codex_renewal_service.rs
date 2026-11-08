@@ -669,7 +669,7 @@ pub(in crate::native_act) fn append_child(
         .unwrap_or_else(|p| p.into_inner())
         .supervisor_authority(crate::metrics::now_us());
     let child = Prepare {
-        asked_upgrade: None,
+        asked: None,
         id: aterm_agent::harness::native_act::operation_id().map_err(|_| "continuation-entropy")?,
         revision: snapshot.revision(),
         expected_human_seq: Some(ctx.human_input.seq()),

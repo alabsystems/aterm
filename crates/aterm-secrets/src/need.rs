@@ -48,6 +48,9 @@ pub const STILL_SECS: u64 = 7 * 86_400;
 /// The most open requests one requester holds; past that, its records are inert.
 pub const MAX_OPEN: usize = 16;
 
+/// The longest note a `Retired` record carries (§5).
+pub const MAX_NOTE: usize = 160;
+
 /// Where a need stands (the model's `st`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum State {
@@ -363,6 +366,14 @@ pub struct Need {
     pub line: String,
     /// The vault seq the line is stated at.
     pub seq: Option<u64>,
+}
+
+impl Need {
+    /// Whether `selector`, a want key or a ledger id in hex, names it (`need retire`).
+    #[must_use]
+    pub fn named(&self, selector: &str) -> bool {
+        self.want.key() == selector || aterm_codec::hex::encode_lower(&self.id) == selector
+    }
 }
 
 /// What this Mac's applied vault version shows of a want's entries (§9.4): names only.
@@ -758,13 +769,21 @@ fn changed(retirement: &Retirement, facts: &Facts) -> bool {
     }
 }
 
-/// A person's note as a `Retired` record carries it (§5): at most 160 characters, each control
+/// `text` as a `Retired` record's field holds it (§5): at most `cap` characters, each control
 /// character read as a space, since the table refuses a record that holds one.
-fn note_of(text: &str) -> String {
+#[must_use]
+pub fn record_text(text: &str, cap: usize) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
-        .take(160)
+        .take(cap)
         .collect()
+}
+
+/// A person's note as a `Retired` record carries it (§5): at most [`MAX_NOTE`] characters, each
+/// control character read as a space ([`record_text`]).
+#[must_use]
+pub fn note_of(text: &str) -> String {
+    record_text(text, MAX_NOTE)
 }
 
 fn retire_with(need: &Need, retirement: Retirement, line: String, now: u64) -> Need {

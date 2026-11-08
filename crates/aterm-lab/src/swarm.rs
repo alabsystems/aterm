@@ -264,32 +264,6 @@ pub fn standin_configured() -> bool {
         .unwrap_or(false)
 }
 
-/// Extract `statusLine.command` from `--settings <json>` or `--settings=<json>` in `args`.
-#[must_use]
-pub fn status_command_from_args(args: &[String]) -> Option<String> {
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        if arg == "--" {
-            break;
-        }
-        let val = if arg == "--settings" {
-            it.next().map(String::as_str)
-        } else {
-            arg.strip_prefix("--settings=")
-        };
-        if let Some(json) = val
-            && let Ok(parsed) = J::parse(json)
-            && let Some(cmd) = parsed
-                .get("statusLine")
-                .and_then(|s| s.get("command"))
-                .and_then(J::as_str)
-        {
-            return Some(cmd.to_owned());
-        }
-    }
-    None
-}
-
 /// Extract `--resume <id>` or `--resume=<id>` from `args`.
 #[must_use]
 fn resume_from_args(args: &[String]) -> Option<String> {
@@ -508,7 +482,7 @@ pub fn claude_main(args: &[String]) -> i32 {
     let pid = std::process::id();
     let proc_start = kernel_start(pid).unwrap_or_default();
     let session = resume_from_args(args).unwrap_or_else(|| CONVERSATION.to_owned());
-    let tap_cmd = status_command_from_args(args);
+    let tap_cmd = crate::fleet_fixture::status_line(args).map(|line| line.command);
     let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
 
     let _ = std::fs::create_dir_all(&ctl_dir);
@@ -1150,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_and_settings_parsing_cover_flags_and_negative_cases() {
+    fn cli_parsing_covers_flags_and_negative_cases() {
         let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
         assert_eq!(parse_args(&s(&["rotate"])).unwrap(), RotateOpts::default());
         assert_eq!(
@@ -1163,12 +1137,5 @@ mod tests {
         assert!(parse_args(&s(&[])).is_err());
         assert!(parse_args(&s(&["other"])).is_err());
         assert!(parse_args(&s(&["rotate", "--unknown"])).is_err());
-
-        let tap_val = tap::settings_value(Path::new("/usr/local/bin/aterm")).expect("tap value");
-        assert_eq!(
-            status_command_from_args(&s(&["--settings", &tap_val])).as_deref(),
-            Some("/usr/local/bin/aterm harness tap")
-        );
-        assert_eq!(status_command_from_args(&s(&["--model", "opus"])), None);
     }
 }

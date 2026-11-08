@@ -1725,7 +1725,7 @@ fn an_unavailable_supervisor_read_withdraws_current_claims_across_execution_expi
                 app.harness_progress_next_poll,
                 Some(now + Duration::from_secs(1))
             );
-            let footer = aterm_agent::harness::footer::account_progress_text(&view, false);
+            let footer = aterm_agent::harness::footer::account_progress_text(&view);
             assert!(footer.contains(&aterm_agent::harness::footer::account_progress_phase(&view)));
             let old_next = aterm_agent::harness::usage::rfc3339_utc(200);
             assert!(!footer.contains(&old_next));

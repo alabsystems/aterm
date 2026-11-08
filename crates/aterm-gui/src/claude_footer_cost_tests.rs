@@ -90,31 +90,33 @@ fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
     publish(
         &app,
         session,
-        selected("first@example.com", "Max 5x", Some("weekly 29% left")),
+        selected("first@example.com", "Max 5x", Some("weekly 71% used")),
     );
     assert_eq!(cost(&mut app, wid).composed, 1);
     let first = glass_row(&app, wid, rule);
-    assert!(first.contains("\u{2386} first "), "{first:?}");
-    assert!(!first.contains("@example.com"), "the name alone: {first:?}");
+    assert!(first.contains("\u{2386} this login 71%"), "{first:?}");
+    assert!(
+        !first.contains("first") && !first.contains("@example.com"),
+        "the email is the hover's: {first:?}"
+    );
     assert!(
         !first.contains("Max 5x"),
         "the plan is the hover's: {first:?}"
     );
-    assert!(first.contains("weekly 29% left"), "{first:?}");
     assert_eq!(glass_row(&app, wid, rule + 1), mode);
     assert_eq!(cost(&mut app, wid), Cost::default());
 
     publish(&app, session, selected("second@example.com", "Pro", None));
     assert_eq!(cost(&mut app, wid).composed, 1);
     let second = glass_row(&app, wid, rule);
-    assert!(second.contains("\u{2386} second "), "{second:?}");
+    assert!(second.contains("\u{2386} this login"), "{second:?}");
     assert!(!second.contains("Pro"), "{second:?}");
     assert!(
-        !second.contains("weekly"),
+        !second.contains("71%"),
         "no week told, none shown: {second:?}"
     );
     assert!(
-        !second.contains("first") && !second.contains("29%"),
+        !second.contains("first") && !second.contains("second"),
         "{second:?}"
     );
     assert_eq!(glass_row(&app, wid, rule + 1), mode);
@@ -122,20 +124,22 @@ fn selected_subscription_repaints_without_old_account_data_or_extra_rows() {
 }
 
 #[test]
-fn unicode_subscription_text_survives_the_native_splice_and_rests_without_allocations() {
+fn unicode_account_label_survives_the_native_splice_and_rests_without_allocations() {
     for email in [
         "jose\u{0301}@example.com",
         "x\u{0301}\u{0323}@example.com",
-        // The rule shows the name before the last `@`: this one keeps an `@` beside the emoji.
-        "使用者-jose\u{0301}-x\u{0301}\u{0323}-\u{1f469}\u{200d}\u{1f4bb}@b@example.com",
+        // A roster label may hold an `@`: this one keeps it beside the emoji, in the label's
+        // twelve cells (`quota_view::NAME_CELLS`).
+        "使用-x\u{0301}\u{0323}-\u{1f469}\u{200d}\u{1f4bb}@b@example.com",
     ] {
         let name = email.rsplit_once('@').map_or(email, |(name, _)| name);
-        let shown = format!("\u{2386}{name}\u{b7}");
+        let shown = format!("\u{2386}{name}71%");
         let facts = FooterFacts {
+            account: Some(name.into()),
             subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
                 email: Some(email.into()),
                 plan: Some("Pro".into()),
-                weekly: Some("weekly 29% left".into()),
+                weekly: Some("weekly 71% used".into()),
                 ..Default::default()
             }),
             ..FooterFacts::default()
@@ -1253,58 +1257,43 @@ fn the_stamp_lane_vouches_for_rows_exactly_where_the_renderer_does() {
     }
 }
 
-/// The account unit under the outlook with `used` cells of its week's bar used, as the resolver
-/// hands it (`docs/DESIGN-accounts-outlook-2026-10-25.md` §2).
-fn outlook_unit(used: usize) -> FooterFacts {
-    use aterm_agent::harness::outlook::{BarCell, Glance, VerdictWords};
-    let ten: [BarCell; 10] = std::array::from_fn(|i| match i {
-        i if i < used => BarCell::Used,
-        i if i < used + 2 => BarCell::More,
-        i if i == used + 2 => BarCell::Tick,
-        _ => BarCell::Left,
-    });
+/// The account unit as the resolver hands it, this tab's week `tenths` tenths used and no
+/// outlook verdict (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.1).
+fn quota_unit(tenths: u16) -> FooterFacts {
+    use aterm_agent::harness::outlook::Figure;
+    use aterm_agent::harness::quota_view::QuotaView;
+    let mut view = QuotaView::sample();
+    view.named[0].figure = Figure::Exact(tenths * 100);
+    view.tail.verdict = None;
     FooterFacts {
+        account: Some("main".into()),
         subscription: Some(SubscriptionDisplay {
             email: Some("me@example.test".into()),
             plan: Some("Max 20x".into()),
-            weekly: Some(format!("weekly {}% left", 100 - used * 10)),
+            weekly: Some(format!("weekly {}% used", tenths * 10)),
             ..SubscriptionDisplay::default()
         }),
-        glance: Some(Glance {
-            bar: Some((ten, std::array::from_fn(|i| ten[i * 2]))),
-            reset: Some("Thu 09:00".into()),
-            five: Some("5h 62% left".into()),
-            verdict: Some(VerdictWords {
-                full: "continuous 7d".into(),
-                short: "continuous 7d".into(),
-                shortest: None,
-                warn: false,
-                kept_narrow: false,
-            }),
-            title: Some("50% used, ~70% by its reset at today's pace".into()),
-            title_verdict: Some("continuous 7d".into()),
-            spoken: Some("At today's pace about 70% used by then.".into()),
-        }),
+        quota: Some(view),
         ..facts()
     }
 }
 
-/// T21: THE OUTLOOK'S GLANCE COSTS A FRAME AT REST NOTHING. With the week's bar on the rule, 30
-/// frames cost nothing; the resolver handing the same glance again (an outlook replayed with
-/// nothing moved) changes nothing and costs nothing; a bar that moved by a cell composes the
-/// rule exactly once and rests again, its new repaint key standing; a verdict that moved alone
-/// (the figure unchanged) does the same. Negative control: the glance left out of the
-/// fingerprint, so the moved verdict never reaches the glass. (A clock hashed into the
-/// fingerprint is an equivalent mutant here: the pane keeps its fingerprint while its facts are
-/// equal, so the hash is not taken at rest.)
+/// T21: THE QUOTA VIEW COSTS A FRAME AT REST NOTHING. With the account unit on the rule, 30
+/// frames cost nothing; the resolver handing the same view again (an outlook replayed with
+/// nothing moved) changes nothing and costs nothing; a figure that moved composes the rule
+/// exactly once and rests again, its new repaint key standing; a verdict that moved alone (the
+/// figure unchanged) does the same. Negative control: the view left out of the fingerprint, so
+/// the moved verdict never reaches the glass. (A clock hashed into the fingerprint is an
+/// equivalent mutant here: the pane keeps its fingerprint while its facts are equal, so the hash
+/// is not taken at rest.)
 #[test]
-fn a_glance_at_rest_costs_nothing_and_a_moved_bar_composes_once() {
-    let (mut app, wid, session) = glass_with(&AT_REST, outlook_unit(5));
+fn a_quota_view_at_rest_costs_nothing_and_a_moved_figure_composes_once() {
+    let (mut app, wid, session) = glass_with(&AT_REST, quota_unit(5));
     let rule = AT_REST.bottom();
     let at_rest = glass_row(&app, wid, rule);
     assert!(
-        at_rest.contains('\u{2386}') && at_rest.contains('\u{2501}'),
-        "the unit and its bar are on the rule: {at_rest:?}"
+        at_rest.contains("\u{2386} main 50%") && at_rest.contains("\u{21ba} Sat 10:00"),
+        "the unit and its reset are on the rule: {at_rest:?}"
     );
     for i in 0..30 {
         assert_eq!(cost(&mut app, wid), Cost::default(), "frame {i}");
@@ -1316,44 +1305,42 @@ fn a_glance_at_rest_costs_nothing_and_a_moved_bar_composes_once() {
         let entry = app.pool.get(session).expect("session");
         let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         assert!(
-            !timeline.set_claude_footer(4242, None, Some(outlook_unit(5))),
-            "the same glance again changes nothing"
+            !timeline.set_claude_footer(4242, None, Some(quota_unit(5))),
+            "the same view again changes nothing"
         );
     }
     for i in 0..30 {
         assert_eq!(cost(&mut app, wid), Cost::default(), "replayed, frame {i}");
     }
-    assert_eq!(pass(&mut app, wid), key, "the same glance keeps the key");
+    assert_eq!(pass(&mut app, wid), key, "the same view keeps the key");
 
-    publish(&app, session, outlook_unit(6));
+    publish(&app, session, quota_unit(6));
     let moved = cost(&mut app, wid);
     assert_eq!(
         (moved.composed, moved.reads),
         (1, 0),
-        "a moved bar composes once and reads no pane ({moved:?})"
+        "a moved figure composes once and reads no pane ({moved:?})"
     );
     let now = glass_row(&app, wid, rule);
-    assert_ne!(now, at_rest, "the moved bar is on the glass");
-    assert!(now.contains("40% left"), "{now:?}");
+    assert_ne!(now, at_rest, "the moved figure is on the glass");
+    assert!(now.contains("\u{2386} main 60%"), "{now:?}");
     for i in 0..30 {
         assert_eq!(cost(&mut app, wid), Cost::default(), "moved, frame {i}");
     }
     let moved_key = pass(&mut app, wid);
-    assert_ne!(moved_key, key, "CONTROL: the key moved with the bar");
+    assert_ne!(moved_key, key, "CONTROL: the key moved with the figure");
     assert_eq!(pass(&mut app, wid), moved_key, "the key it moved to stands");
 
-    // The outlook alone moves (a stop now ahead, the figure as it was): the glance is in the
+    // The outlook alone moves (a stop now ahead, the figure as it was): the view is in the
     // repaint key, so the rule composes once and says the stop in words.
-    let mut stop = outlook_unit(6);
-    if let Some(glance) = stop.glance.as_mut() {
-        glance.verdict = Some(aterm_agent::harness::outlook::VerdictWords {
+    let mut stop = quota_unit(6);
+    if let Some(view) = stop.quota.as_mut() {
+        view.tail.verdict = Some(aterm_agent::harness::quota_view::Phrase {
             full: "\u{2573} ~Wed 22:00\u{2013}Thu 09:00".into(),
             short: "\u{2573} ~Wed 22:00".into(),
-            shortest: Some("\u{2573} ~Wed 22:00".into()),
-            warn: true,
-            kept_narrow: true,
+            ink: aterm_agent::harness::quota_view::Role::Warn,
+            kept: true,
         });
-        glance.title_verdict = Some("stop ~Wed 22:00\u{2013}Thu 09:00".into());
     }
     publish(&app, session, stop);
     let told = cost(&mut app, wid);
@@ -1364,7 +1351,7 @@ fn a_glance_at_rest_costs_nothing_and_a_moved_bar_composes_once() {
     );
     let stopped = glass_row(&app, wid, rule);
     assert!(
-        stopped.contains("\u{2573} ~Wed 22:00") && stopped.contains("40% left"),
+        stopped.contains("\u{2573} ~Wed 22:00") && stopped.contains("\u{2386} main 60%"),
         "the stop is on the glass beside the same figure: {stopped:?}"
     );
     for i in 0..30 {

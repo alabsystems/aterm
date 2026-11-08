@@ -13,7 +13,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 18, "0.18");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 19, "0.19");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {
@@ -2319,7 +2319,9 @@ pub fn status_card_account(rows: &[String]) -> Option<(String, Option<String>)> 
     Some((email.to_owned(), plan))
 }
 
-/// Weekly subscription quota percentage and reset text read from a Muse Code `/usage` card.
+/// Weekly subscription quota percentage and reset text read from a Muse Code `/usage` card:
+/// `text` says the share used (`weekly 22% used`), as the glass says every week
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.1: no `% left`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UsageCardWeekly {
     pub text: String,
@@ -2344,7 +2346,7 @@ pub fn usage_card_weekly(rows: &[String]) -> Option<UsageCardWeekly> {
         .map(|(_, words)| crate::text::trim(words).to_owned())
         .filter(|words| !words.is_empty());
     Some(UsageCardWeekly {
-        text: format!("weekly {}% left", 100u32.saturating_sub(used)),
+        text: format!("weekly {}% used", used.min(100)),
         reset,
     })
 }

@@ -14,7 +14,9 @@
 //! Rows, each `"v":1` and at most [`ROW_MAX`] bytes:
 //! - `fig`: a recorded tap reading's windows; `beat`: a recorded reading whose figures and keys
 //!   equal the last `fig` row's; `plan`: a row's tier, from the footer's gated profile read;
-//!   `event`: a closed word the tap's transaction committed (`another-account`).
+//!   `event`: a closed word a store transaction committed, written after it: `another-account`
+//!   (the tap's), `wall` (a model's week a session's screen said is at its wall) and
+//!   `grant-seen` (a limit-reset offer first seen or changed).
 //! - `close` and `day`, derived from the `fig` rows by [`compact_locked`]: one per window anchor
 //!   once it ended ([`derive_closes`]), one per local day once it ended ([`day_summaries`]).
 //!
@@ -23,6 +25,10 @@
 //! closes, events, plans and rows of unknown kinds to [`DAILY_S`], and past that only the newest
 //! `plan` row; a file past [`BOUND_BYTES`] gives up rows in a fixed order. It writes every kept
 //! row back as it read it.
+//!
+//! Its readers write nothing: `accounts stats` and the accounts report say how far each window
+//! moved over a span ([`since_of`]), and `accounts history` an account's days ([`day_summaries`]
+//! over the rows with the closes derived in memory, [`resets_used`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom, Write as _};
@@ -135,6 +141,12 @@ impl Fig {
     fn same_figure(&self, other: &Fig) -> bool {
         (self.pct_x10, self.reset, self.epoch) == (other.pct_x10, other.reset, other.epoch)
     }
+
+    /// The figure in whole points, rounded half up ([`WindowFig::whole`]).
+    #[must_use]
+    pub const fn whole(&self) -> u32 {
+        self.pct_x10.saturating_add(5) / 10
+    }
 }
 
 /// A row's tier, as the footer's gated profile read named it ([`note_plan`]).
@@ -240,6 +252,12 @@ pub struct Day {
 pub enum EventWord {
     /// Another account signed in to the home ([`accounts::Kind::Epoch`]).
     AnotherAccount,
+    /// A model's week a session's screen said is at its wall, on record for the stats
+    /// ([`accounts::WeekWalled`]): its bucket in `w`, the wall's reset where it named one.
+    Wall,
+    /// A limit-reset offer ([`accounts::Offer`]) first seen, or seen with another kind, count or
+    /// use-by instant: its kind, its count in `n`, its use-by instant where one was read.
+    GrantSeen,
     /// A word this build does not know.
     Other(String),
 }
@@ -250,6 +268,8 @@ impl EventWord {
     pub fn as_str(&self) -> &str {
         match self {
             EventWord::AnotherAccount => "another-account",
+            EventWord::Wall => "wall",
+            EventWord::GrantSeen => "grant-seen",
             EventWord::Other(word) => word,
         }
     }
@@ -262,6 +282,8 @@ impl EventWord {
         }
         Some(match text {
             "another-account" => EventWord::AnotherAccount,
+            "wall" => EventWord::Wall,
+            "grant-seen" => EventWord::GrantSeen,
             other => EventWord::Other(other.to_owned()),
         })
     }
@@ -278,15 +300,65 @@ pub fn is_word(text: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
-/// What an `event` row says.
+/// What an `event` row says: a closed word and numbers, never a label beyond the series' own,
+/// text or a vendor's flag name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventSaid {
     /// What happened.
     pub e: EventWord,
-    /// The window it concerns, where one does.
+    /// The window or bucket it concerns, where one does (a `wall` row's bucket id).
     pub w: Option<String>,
     /// When it happened, where that is not the row's `t`.
     pub at: Option<i64>,
+    /// The reset it names, where one was named (a `wall` row's).
+    pub reset: Option<i64>,
+    /// The reset kind it counts, where one was named (a `grant-seen` row's `weekly`).
+    pub kind: Option<String>,
+    /// How many it counts (a `grant-seen` row's resets left).
+    pub n: Option<u32>,
+    /// Its deadline, where one was read (a `grant-seen` row's use-by instant).
+    pub use_by: Option<i64>,
+}
+
+impl EventSaid {
+    /// An event of `e` that says nothing more.
+    #[must_use]
+    pub const fn of(e: EventWord) -> EventSaid {
+        EventSaid {
+            e,
+            w: None,
+            at: None,
+            reset: None,
+            kind: None,
+            n: None,
+            use_by: None,
+        }
+    }
+
+    /// The `wall` row of a model's week a session's screen said is at its wall: its bucket, the
+    /// reset the wall named and when the screen said it.
+    #[must_use]
+    pub fn wall(walled: &accounts::WeekWalled) -> EventSaid {
+        EventSaid {
+            w: Some(walled.bucket.to_owned()),
+            at: Some(walled.at),
+            reset: walled.reset,
+            ..EventSaid::of(EventWord::Wall)
+        }
+    }
+
+    /// The `grant-seen` row of a limit-reset offer: its kind's word where one was named, the
+    /// resets left, the use-by instant where one was read and when it was seen.
+    #[must_use]
+    pub fn grant_seen(offer: &accounts::Offer) -> EventSaid {
+        EventSaid {
+            at: Some(offer.at),
+            kind: offer.kind.map(|kind| kind.word().to_owned()),
+            n: Some(offer.left),
+            use_by: offer.use_by,
+            ..EventSaid::of(EventWord::GrantSeen)
+        }
+    }
 }
 
 /// What one row says.
@@ -360,6 +432,36 @@ pub struct SeriesRow {
     pub said: Said,
 }
 
+/// The keys a reader knows of one account: its lab key ([`accounts::Account::pk`]) and its
+/// account key ([`accounts::Account::key`]), either or both. A `fig`, `close` or `day` row carries
+/// the keys its record held ([`SeriesRow::keys`]), which tell one account's rows from another's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Keys<'a> {
+    /// The lab key (`ac-…`).
+    pub ac: Option<&'a str>,
+    /// The account key (`c-…`).
+    pub key: Option<AccountKey>,
+}
+
+impl Keys<'_> {
+    /// Whether a row carrying `carried` (its lab key, its account key) is another account's: it
+    /// carries a key of a kind these hold, and a different one.
+    #[must_use]
+    pub fn others(&self, (ac, key): (Option<&str>, Option<AccountKey>)) -> bool {
+        matches!((self.ac, ac), (Some(mine), Some(theirs)) if mine != theirs)
+            || matches!((self.key, key), (Some(mine), Some(theirs)) if mine != theirs)
+    }
+
+    /// Whether a row carrying `carried` is this account's: it carries a key these hold, and no
+    /// other ([`Keys::others`]).
+    #[must_use]
+    pub fn names(&self, carried: (Option<&str>, Option<AccountKey>)) -> bool {
+        let (ac, key) = carried;
+        !self.others(carried)
+            && ((self.ac.is_some() && ac == self.ac) || (self.key.is_some() && key == self.key))
+    }
+}
+
 /// `o[key]` as a bounded word.
 fn word(o: &Map, key: &str) -> Option<String> {
     o.get(key)
@@ -419,6 +521,19 @@ impl SeriesRow {
                 _ => None,
             },
             Said::Beat | Said::Plan(_) | Said::Close(_) | Said::Day(_) | Said::Event(_) => None,
+        }
+    }
+
+    /// The keys the row carries (its record's lab key and account key, either of which may be
+    /// absent): a `fig`, `close` or `day` row's; `None` for a kind that carries none (a `beat`
+    /// repeats the last `fig` row's).
+    #[must_use]
+    pub fn keys(&self) -> Option<(Option<&str>, Option<AccountKey>)> {
+        match &self.said {
+            Said::Fig { ac, key, .. } => Some((ac.as_deref(), *key)),
+            Said::Close(c) => Some((c.ac.as_deref(), c.key)),
+            Said::Day(d) => Some((d.ac.as_deref(), d.key)),
+            Said::Beat | Said::Plan(_) | Said::Event(_) => None,
         }
     }
 
@@ -512,11 +627,18 @@ impl SeriesRow {
             }
             Said::Event(e) => {
                 o.insert("e".into(), Value::from(e.e.as_str()));
-                if let Some(w) = &e.w {
-                    o.insert("w".into(), Value::from(w.clone()));
+                for (key, word) in [("w", &e.w), ("kind", &e.kind)] {
+                    if let Some(word) = word {
+                        o.insert(key.into(), Value::from(word.clone()));
+                    }
                 }
-                if let Some(at) = e.at {
-                    o.insert("at".into(), Value::from(at));
+                for (key, number) in [("at", e.at), ("reset", e.reset), ("use_by", e.use_by)] {
+                    if let Some(number) = number {
+                        o.insert(key.into(), Value::from(number));
+                    }
+                }
+                if let Some(n) = e.n {
+                    o.insert("n".into(), Value::from(n));
                 }
                 "event"
             }
@@ -636,6 +758,12 @@ impl SeriesRow {
                 e: EventWord::parse(o.get("e")?.as_str()?)?,
                 w: word(o, "w"),
                 at: o.get("at").and_then(Value::as_i64),
+                reset: o.get("reset").and_then(Value::as_i64),
+                kind: word(o, "kind"),
+                n: o.get("n")
+                    .and_then(Value::as_u64)
+                    .and_then(|n| u32::try_from(n).ok()),
+                use_by: o.get("use_by").and_then(Value::as_i64),
             }),
             _ => return None,
         };
@@ -840,9 +968,9 @@ type Reading = (
 );
 
 /// Appends to `label`'s series on `machine` under `harness_state`, waiting at most `wait` for
-/// the series lock: the rows the outbox holds for the file, then `events` `another-account`
-/// rows, then `reading`'s `fig` row, or a `beat` where its figures and keys equal the last `fig`
-/// row's. Where the lock stays held, the event rows go to the outbox. An append that takes the
+/// the series lock: the rows the outbox holds for the file, then an `event` row of each of
+/// `events`, then `reading`'s `fig` row, or a `beat` where its figures and keys equal the last
+/// `fig` row's. Where the lock stays held, the event rows go to the outbox. An append that takes the
 /// file past [`BOUND_BYTES`] compacts it at once, under the same lock; then, the lock released,
 /// a pass over every series runs where one is due and this append claims it ([`compact_due`]).
 /// A compaction that fails waits for the next append: the rows are written.
@@ -850,7 +978,7 @@ fn note_rows(
     harness_state: &Path,
     label: &str,
     machine: &str,
-    (events, reading): (usize, Option<Reading>),
+    (events, reading): (&[EventSaid], Option<Reading>),
     now: i64,
     wait: Duration,
 ) -> std::io::Result<Noted> {
@@ -859,19 +987,16 @@ fn note_rows(
     };
     let reading =
         reading.filter(|((five_hour, seven_day), _)| five_hour.is_some() || seven_day.is_some());
-    if events == 0 && reading.is_none() && !outbox_holds(&path) {
+    if events.is_empty() && reading.is_none() && !outbox_holds(&path) {
         return Ok(Noted::Nothing);
     }
     let dir = dir_in(harness_state);
-    let event_rows: Vec<SeriesRow> = (0..events)
-        .map(|_| SeriesRow {
+    let event_rows: Vec<SeriesRow> = events
+        .iter()
+        .map(|event| SeriesRow {
             t: now,
             by: machine.to_owned(),
-            said: Said::Event(EventSaid {
-                e: EventWord::AnotherAccount,
-                w: None,
-                at: None,
-            }),
+            said: Said::Event(event.clone()),
         })
         .collect();
     let noted = {
@@ -881,7 +1006,7 @@ fn note_rows(
         };
         let mut rows = outbox_take_locked(&path);
         let mut noted = match rows.first() {
-            _ if events > 0 => Noted::Event,
+            _ if !events.is_empty() => Noted::Event,
             Some(_) if rows.iter().any(|r| matches!(r.said, Said::Event(_))) => Noted::Event,
             Some(_) => Noted::Plan,
             None => Noted::Nothing,
@@ -985,7 +1110,7 @@ pub(crate) fn note_within(
         harness_state,
         label,
         machine,
-        (0, Some((figs, keys))),
+        (&[], Some((figs, keys))),
         now,
         wait,
     )
@@ -1033,11 +1158,12 @@ pub fn note_committed(
     committed: &Committed<'_>,
     now: i64,
 ) -> std::io::Result<Noted> {
-    let events = committed
+    let events: Vec<EventSaid> = committed
         .events
         .iter()
         .filter(|e| e.kind == accounts::Kind::Epoch)
-        .count();
+        .map(|_| EventSaid::of(EventWord::AnotherAccount))
+        .collect();
     let reading = committed.recorded().then(|| {
         (
             (
@@ -1051,7 +1177,35 @@ pub fn note_committed(
         harness_state,
         label,
         machine,
-        (events, reading),
+        (&events, reading),
+        now,
+        LOCK_WAIT,
+    )
+}
+
+/// Appends an `event` row of each of `events` to `label`'s series on `machine` under
+/// `harness_state`, after the rows the outbox holds for the file, in one locked append; where the
+/// lock stays held past [`LOCK_WAIT`] they wait in the outbox for the next append to the file.
+/// Called by the host right after the store transaction that committed them (a model's week at
+/// its wall, [`accounts::record_usage`]; a limit-reset offer, [`accounts::note_offer`]), never
+/// under `accounts.lock`.
+/// # Errors
+/// As [`note`].
+pub fn note_events(
+    harness_state: &Path,
+    label: &str,
+    machine: &str,
+    events: &[EventSaid],
+    now: i64,
+) -> std::io::Result<Noted> {
+    if events.is_empty() {
+        return Ok(Noted::Nothing);
+    }
+    note_rows(
+        harness_state,
+        label,
+        machine,
+        (events, None),
         now,
         LOCK_WAIT,
     )
@@ -1106,11 +1260,90 @@ pub fn newest_plan(rows: &[SeriesRow]) -> Option<&PlanSaid> {
 }
 
 fn read_path(path: &Path) -> Vec<SeriesRow> {
+    read_file(path)
+}
+
+/// Every readable row of the series file at `path`, in file order (at most [`READ_MAX`] bytes;
+/// nothing where it cannot be read). Readers take no lock.
+#[must_use]
+pub fn read_file(path: &Path) -> Vec<SeriesRow> {
     accounts::read_bounded(path, READ_MAX)
         .ok()
         .flatten()
         .map(|text| text.lines().filter_map(SeriesRow::parse).collect())
         .unwrap_or_default()
+}
+
+/// One schema-1 line of a series file as it is stored ([`stored_rows`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stored {
+    /// Its `t`.
+    pub t: i64,
+    /// The line exactly as stored.
+    pub line: String,
+    /// What it says, where this build reads its kind ([`SeriesRow::parse`]).
+    pub row: Option<SeriesRow>,
+}
+
+/// Every schema-1 line of the series file at `path` exactly as it is stored, in file order, each
+/// read once: a row of a kind this build does not know included ([`Envelope`]), with no row. At
+/// most [`READ_MAX`] bytes; nothing where it cannot be read.
+#[must_use]
+pub fn stored_rows(path: &Path) -> Vec<Stored> {
+    accounts::read_bounded(path, READ_MAX)
+        .ok()
+        .flatten()
+        .map(|text| {
+            text.lines()
+                .filter(|line| line.len() <= ROW_MAX)
+                .filter_map(|line| {
+                    let v: Value = aterm_json::from_str(line).ok()?;
+                    let o = v.as_object()?;
+                    Some(Stored {
+                        t: Envelope::of(o)?.t,
+                        line: line.to_owned(),
+                        row: SeriesRow::of(o),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the series file at `path` is one of `machine`'s (`u-<label>@<machine>.jsonl`,
+/// [`series_name`]): the rows a machine read itself.
+#[must_use]
+pub fn is_of_machine(path: &Path, machine: &str) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".jsonl"))
+        .and_then(|stem| stem.rsplit_once('@'))
+        .is_some_and(|(_, of)| of == machine)
+}
+
+/// Every series file in the series directory `dir` (`u-*.jsonl`, regular files), sorted by
+/// path; none where the directory does not exist.
+/// # Errors
+/// The directory could not be listed.
+pub fn series_paths(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("u-")
+                && name.ends_with(".jsonl")
+                && entry.file_type().is_ok_and(|t| t.is_file())
+        })
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort();
+    Ok(paths)
 }
 
 /// Every readable row of `label`'s series on `machine` under `harness_state`, in file order
@@ -1334,15 +1567,43 @@ pub fn derive_closes(rows: &[SeriesRow], now: i64) -> Vec<SeriesRow> {
 }
 
 /// The local day `t` falls on under `tz_at` (seconds east of UTC at an instant): a day number.
-fn local_day(t: i64, tz_at: fn(i64) -> i64) -> i64 {
+#[must_use]
+pub fn local_day(t: i64, tz_at: fn(i64) -> i64) -> i64 {
     t.saturating_add(tz_at(t)).div_euclid(DAY_S)
 }
 
-/// The instant local day `day` begins under `tz_at`.
-fn midnight(day: i64, tz_at: fn(i64) -> i64) -> i64 {
+/// The instant local day `day` begins under `tz_at`: its local midnight, or where a zone change
+/// moved the clocks forward across that midnight (a zone that springs forward at 00:00), the
+/// day's first instant, the change. A day the clocks skipped whole begins where the next one
+/// does.
+#[must_use]
+pub fn midnight(day: i64, tz_at: fn(i64) -> i64) -> i64 {
     let local = day.saturating_mul(DAY_S);
     let guess = local.saturating_sub(tz_at(local));
-    local.saturating_sub(tz_at(guess))
+    let t = local.saturating_sub(tz_at(guess));
+    if local_day(t, tz_at) >= day {
+        return t;
+    }
+    // `t` is the midnight the old offset would give, still on the day before: step an hour at a
+    // time to an instant on the day (no zone moves its clocks by more than a day), then halve the
+    // last hour, which holds the change, down to its second.
+    let (mut before, mut on) = (t, t.saturating_add(3600));
+    for _ in 0..48 {
+        if local_day(on, tz_at) >= day {
+            break;
+        }
+        before = on;
+        on = on.saturating_add(3600);
+    }
+    while on.saturating_sub(before) > 1 {
+        let mid = before.saturating_add(on.saturating_sub(before) / 2);
+        if local_day(mid, tz_at) >= day {
+            on = mid;
+        } else {
+            before = mid;
+        }
+    }
+    on
 }
 
 /// What one local day's rows add up to, as [`day_summaries`] reads them.
@@ -1492,6 +1753,209 @@ pub fn day_summaries(
                 }),
             })
         })
+        .collect()
+}
+
+/// The limit resets used inside `window`'s anchors in `rows` by `now`, oldest first and each
+/// once: every `close` row's `epochs`, a stored one's or one [`derive_closes`] gives an anchor
+/// that ended, and for an anchor no close holds yet, its figures' `epoch` inside it and each run
+/// an epoch or a refill began ([`runs`]), as its close will name them.
+#[must_use]
+pub fn resets_used(rows: &[SeriesRow], window: &str, now: i64) -> Vec<i64> {
+    let derived = derive_closes(rows, now);
+    let closes: Vec<&Close> = rows
+        .iter()
+        .chain(&derived)
+        .filter_map(|r| match &r.said {
+            Said::Close(c) if c.w == window => Some(c),
+            _ => None,
+        })
+        .collect();
+    let closed: BTreeSet<i64> = closes.iter().map(|c| c.reset).collect();
+    let mut out: BTreeSet<i64> = closes
+        .iter()
+        .flat_map(|c| c.epochs.iter().copied())
+        .collect();
+    let length = match window {
+        accounts::SESSION_LIMIT => accounts::SESSION_WINDOW_S,
+        _ => accounts::WEEK_WINDOW_S,
+    };
+    let open: Vec<&Fig> = rows
+        .iter()
+        .filter_map(|r| r.fig(window))
+        .filter(|f| !closed.contains(&f.reset) && f.at <= now)
+        .collect();
+    out.extend(open.iter().filter_map(|f| {
+        f.epoch
+            .filter(|e| *e > f.reset.saturating_sub(length) && *e <= f.reset)
+    }));
+    for run in runs(open.iter().copied()) {
+        match run.began {
+            Began::Epoch(at) => {
+                out.insert(at);
+            }
+            Began::Refill => out.extend(run.figs.first().map(|f| f.at)),
+            Began::Window => {}
+        }
+    }
+    out.into_iter().filter(|t| *t <= now).collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Since
+
+/// What a window did over a span ([`Since`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Moved {
+    /// It rose by this many whole points; never negative.
+    Rose(u32),
+    /// The window its figure is of began at this instant (`reset − length`), after the
+    /// baseline.
+    NewWindow(i64),
+    /// A limit reset was used at this instant, after the baseline: the figure counts from there.
+    ResetUsed(i64),
+}
+
+/// How far one window moved over a span ([`since_of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Since {
+    /// The span it was read over, from the baseline to now: the span asked where the baseline
+    /// was read at its start (within a reading heartbeat), else the baseline's age, longer where
+    /// the series holds no figure near the start and shorter where it holds none that old.
+    pub span_s: i64,
+    /// What it did.
+    pub moved: Moved,
+}
+
+/// The newest row of `rows` at or before `now` that parts two accounts, where one does: an
+/// `another-account` event, or a `fig` row of another account than `keys` ([`Keys::others`]),
+/// which the record's keys tell where no event was written (a label given to another account);
+/// and the indices after it, by `t`, a tie in the order given (the file's: an `event` row
+/// precedes the `fig` row of its own transaction, which so counts as after it).
+fn after_parting(rows: &[SeriesRow], keys: Keys<'_>, now: i64) -> (Option<usize>, Vec<usize>) {
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by_key(|i| (rows[*i].t, *i));
+    let parts = |row: &SeriesRow| match &row.said {
+        Said::Event(e) => e.e == EventWord::AnotherAccount,
+        Said::Fig { ac, key, .. } => keys.others((ac.as_deref(), *key)),
+        Said::Beat | Said::Plan(_) | Said::Close(_) | Said::Day(_) => false,
+    };
+    match order
+        .iter()
+        .rposition(|i| rows[*i].t <= now && parts(&rows[*i]))
+    {
+        Some(at) => {
+            let after = order.split_off(at + 1);
+            (order.last().copied(), after)
+        }
+        None => (None, order),
+    }
+}
+
+/// How far `window`'s figure `current` moved over the last `span_s` before `now`, read against
+/// `rows`, a series of the account `keys` names: its baseline is the newest `fig` of the window
+/// served at or before `now − span_s`, else the oldest one, and the span is the baseline's age
+/// unless it was served within [`accounts::READING_HEARTBEAT_S`] of the span's start; it is
+/// taken only after the newest row that parts two accounts ([`after_parting`]), so it never
+/// compares two accounts. Where the baseline's reset is not `current`'s, a new window began
+/// (`current.reset − length`); else, where a limit reset was used after it (`current`'s epoch, a
+/// later row's, or a refill drop, [`runs`]), that instant, the newest; else the rise in whole
+/// points, never negative. `None` where `current` is `None` (no figure, a void or cut one, or
+/// another account's record) or no `fig` row of the window comes after that parting.
+#[must_use]
+pub fn since_of(
+    rows: &[SeriesRow],
+    keys: Keys<'_>,
+    (window_id, length_s): (&str, i64),
+    current: Option<&WindowFig>,
+    span_s: i64,
+    now: i64,
+) -> Option<Since> {
+    let current = current?;
+    let figs: Vec<&Fig> = after_parting(rows, keys, now)
+        .1
+        .into_iter()
+        .filter_map(|i| rows[i].fig(window_id))
+        .filter(|f| f.at <= now)
+        .collect();
+    let start = now.saturating_sub(span_s);
+    let base = match figs.iter().filter(|f| f.at <= start).max_by_key(|f| f.at) {
+        Some(base) => *base,
+        None => *figs.iter().min_by_key(|f| f.at)?,
+    };
+    let span_s = if (0..=accounts::READING_HEARTBEAT_S).contains(&start.saturating_sub(base.at)) {
+        span_s
+    } else {
+        now.saturating_sub(base.at)
+    };
+    let moved = if base.reset != current.reset {
+        Moved::NewWindow(current.reset.saturating_sub(length_s))
+    } else {
+        let now_fig = Fig::of(current);
+        let later: Vec<&Fig> = figs
+            .iter()
+            .copied()
+            .filter(|f| f.reset == current.reset && f.at > base.at)
+            .chain((now_fig.at > base.at).then_some(&now_fig))
+            .collect();
+        let epochs = later
+            .iter()
+            .filter_map(|f| f.epoch)
+            .chain(current.epoch_at)
+            .filter(|e| *e > base.at);
+        let refills = runs(std::iter::once(base).chain(later.iter().copied()))
+            .into_iter()
+            .skip(1)
+            .filter_map(|run| match run.began {
+                Began::Epoch(at) => Some(at),
+                Began::Refill => run.figs.first().map(|f| f.at),
+                Began::Window => None,
+            });
+        match epochs.chain(refills).filter(|at| *at <= now).max() {
+            Some(at) => Moved::ResetUsed(at),
+            None => Moved::Rose(current.whole().saturating_sub(base.whole())),
+        }
+    };
+    Some(Since { span_s, moved })
+}
+
+/// The indices of the rows of `rows` (a series of the account `keys` names) that [`since_of`]
+/// reads over `span_s` before `now`, for either window: the newest row that parts two accounts
+/// ([`after_parting`]), and after it the `fig` rows with a figure served after the span's start
+/// and each window's newest figure served at or before it. [`since_of`] says the same over these
+/// rows, and over any of `rows` that holds them, as over all of them, so a reader holds no more
+/// of a series for its `since` ([`report_view`]).
+#[must_use]
+pub fn since_rows(rows: &[SeriesRow], keys: Keys<'_>, span_s: i64, now: i64) -> BTreeSet<usize> {
+    let start = now.saturating_sub(span_s);
+    let (parting, after) = after_parting(rows, keys, now);
+    let mut out: BTreeSet<usize> = parting.into_iter().collect();
+    for w in [accounts::SESSION_LIMIT, accounts::WEEK_LIMIT] {
+        let base = after
+            .iter()
+            .filter_map(|i| rows[*i].fig(w))
+            .map(|f| f.at)
+            .filter(|at| *at <= start)
+            .max();
+        out.extend(after.iter().copied().filter(|i| {
+            rows[*i]
+                .fig(w)
+                .is_some_and(|f| f.at > start || Some(f.at) == base)
+        }));
+    }
+    out
+}
+
+/// What a report holds of a series ([`read`]) at `now`: the outlook's view ([`outlook_view`])
+/// and the rows `since` over `span_s` reads for the account `keys` names ([`since_rows`]), in
+/// file order, so the report never holds a whole series for either.
+#[must_use]
+pub fn report_view(rows: Vec<SeriesRow>, keys: Keys<'_>, span_s: i64, now: i64) -> Vec<SeriesRow> {
+    let since = since_rows(&rows, keys, span_s, now);
+    rows.into_iter()
+        .enumerate()
+        .filter(|(i, row)| in_outlook_view(row, now) || since.contains(i))
+        .map(|(_, row)| row)
         .collect()
 }
 
@@ -1939,24 +2403,7 @@ pub fn compact_dir(dir: &Path, now: i64, tz_at: fn(i64) -> i64) -> std::io::Resu
 
 /// The pass [`compact_dir`] runs, its stamp written.
 fn pass_over(dir: &Path, now: i64, tz_at: fn(i64) -> i64) -> std::io::Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("u-")
-                && name.ends_with(".jsonl")
-                && entry.file_type().is_ok_and(|t| t.is_file())
-        })
-        .map(|entry| entry.path())
-        .collect();
-    paths.sort();
-    for path in paths {
+    for path in series_paths(dir)? {
         let Ok(Some(_lock)) = lock_within(dir, LOCK_WAIT) else {
             continue;
         };

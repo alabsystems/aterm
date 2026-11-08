@@ -654,6 +654,14 @@ fn account_progress_gallery() {
         let retained = (observer_busy || autopilot_off).then(|| progress.clone());
         let mut facts = probe::facts();
         facts.account = progress.account.clone();
+        if facts.account.is_none() {
+            // A recovery that names no account still runs under the pane's own login, which
+            // line D's unit names (`this login`): recovery words are never the rule's.
+            facts.subscription = Some(aterm_agent::harness::profile::SubscriptionDisplay {
+                email: Some("fixture@example.test".into()),
+                ..Default::default()
+            });
+        }
         facts.account_progress = Some(progress);
         facts.account_progress_busy = observer_busy;
         if name == "transcript-wall"

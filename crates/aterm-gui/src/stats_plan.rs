@@ -6,18 +6,149 @@ use aterm_vitals::MultiScaleSpec;
 use aterm_vitals::words::TotalsForm;
 
 use crate::deck_face::FaceMetrics;
-use crate::stats_deck::{CORES_NAME, DECK_RESOURCES, FOLDED_PT, FULL_TABLE_PT};
+use crate::stats_deck::{CORES_NAME, DECK_RESOURCES};
 use crate::stats_paint::Bar;
-use crate::stats_units::{Form, PLAN_SCALE, UnitFacts, UnitRow};
+use crate::stats_units::{Form, Forms, PLAN_SCALE, UnitFacts, UnitRow};
 
 /// Stats deck layout form.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub(crate) enum DeckForm {
-    /// Two blocks of four rows in 62 pt.
+    /// Two blocks of rows in one band ([`DeckRows::folded_pt`]).
     #[default]
     Folded,
-    /// Header line and seven rows in full height, only where `stats_deck_size` is full.
+    /// Header line and one table of rows in full height ([`DeckRows::full_table_pt`]), only
+    /// where `stats_deck_size` is full.
     Full,
+}
+
+/// The rows a deck holds, and so its height: the deck's height is a constant of its rows
+/// (`docs/DESIGN-stats-deck-instruments-2026-11-06.md` §11, "The rule", A4), which no reading,
+/// machine or width changes. A row with no reader keeps its place and says so; units come and go
+/// by width, rows never do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DeckRows {
+    /// The record's rows, which the deck paints until A4's step N5: in Folded, block A's CPU,
+    /// GPU, Memory and Disk and block B's Network, Processes, an empty row and Cores (62 pt); in
+    /// Full, the six resource rows and a spare in wide and mid, and the Cores row and a spare in
+    /// narrow and slim at a 10.5 pt pitch (100 pt).
+    Resources,
+    /// A4's instruments (§3, §11): in Folded, block A's CPU, GPU, Memory, Disk and Heat and block
+    /// B's Network, Processes, Latency (empty until F8), Cores and Machine (73.5 pt); in Full,
+    /// CPU, GPU, Memory, Disk, Heat, Network, Latency, Processes, Cores and Machine at every kind
+    /// and the 12 pt pitch (136 pt).
+    ///
+    /// Outside tests only [`plan_folded_with`] and [`plan_full_with`] make it, and each carries
+    /// its own `expect(dead_code)` until N5 paints with it. The variant carries none: rustc 1.96
+    /// and earlier (the cells lint on rustup's unpinned `stable`, which can be one) count what an
+    /// expected-dead item names as live, so an expectation here would go unfulfilled there
+    /// (`docs/measured/main-reds-2026-10-20.md` §1.1).
+    Instruments,
+}
+
+/// Folded's first row's top, pt below the deck's top (A1 §2.2).
+const FOLD_TOP0: f64 = 14.0;
+/// Folded's row pitch, pt.
+const FOLD_PITCH: f64 = 11.5;
+/// Folded's strip cell, pt: 17 device px at 2×, 9 at 1×.
+const FOLD_CELL: f64 = 8.5;
+/// Folded's band below its last row's pitch, pt: a band of n rows is 14 + n × 11.5 + 2 pt.
+const FOLD_FOOT: f64 = 2.0;
+/// What the run-queue tile takes past the Cores row's squares, pt at 1× (A4 §7): A1 §4.1's wall,
+/// a device px with a point clear each side, then its 3 pt tile.
+const CORES_QUEUE: f64 = 3.0 + 3.0;
+/// The names the instruments' rows draw in the name column besides each resource's and the
+/// Cores row's (A4 §3): the Machine row's name is the computer's type, in its own slot
+/// ([`MachineRow`]).
+const INSTRUMENT_NAMES: [&str; 2] = ["Heat", "Latency"];
+
+impl DeckRows {
+    /// The rows the deck paints. A4's step N5 paints [`Self::Instruments`], with the host's facts
+    /// ([`plan_folded_with`], [`plan_full_with`]), and deletes [`Self::Resources`] with this.
+    pub(crate) const PAINTED: Self = Self::Resources;
+
+    /// Folded's rows in each block.
+    const fn folded_count(self) -> u32 {
+        match self {
+            Self::Resources => 4,
+            Self::Instruments => 5,
+        }
+    }
+
+    /// Full's rows, and their pitch, at `kind`: the record's narrow and slim tables fit eight
+    /// rows in 100 pt at 10.5 pt; the instruments' take the 12 pt pitch at every kind, keeping
+    /// their cell and type sizes, so one Full height serves every kind (A4 §11).
+    const fn full_rows(self, kind: FullKind) -> (u32, f64) {
+        match (self, kind) {
+            (Self::Resources, FullKind::Wide | FullKind::Mid) => (7, 12.0),
+            (Self::Resources, FullKind::Narrow | FullKind::Slim) => (8, 10.5),
+            (Self::Instruments, _) => (10, 12.0),
+        }
+    }
+
+    /// The Folded deck's height, pt: its first row's top, its rows' pitches and the foot (62 and
+    /// 73.5, A4 §11).
+    pub(crate) const fn folded_pt(self) -> f64 {
+        FOLD_TOP0 + self.folded_count() as f64 * FOLD_PITCH + FOLD_FOOT
+    }
+
+    /// The Full table's height, pt, before what it adds to the Folded height is rounded up to
+    /// whole terminal cells: its first row's top and its rows' pitches, the same at every kind
+    /// (100 and 136, A4 §11).
+    pub(crate) const fn full_table_pt(self) -> f64 {
+        let rows = Rows::full(FullKind::Wide, self);
+        rows.top0 + rows.count as f64 * rows.pitch
+    }
+
+    /// What the Full form adds to the Folded height, device px at `scale`, rounded up to whole
+    /// terminal cells of `cell_px`: the tab re-grids only when the form changes.
+    pub(crate) fn full_delta_px(self, scale: f64, cell_px: usize) -> usize {
+        if !(scale.is_finite() && scale > 0.0) {
+            return 0;
+        }
+        let need = ((self.full_table_pt() - self.folded_pt()) * scale).round() as usize;
+        let cell = cell_px.max(1);
+        need.div_ceil(cell) * cell
+    }
+
+    /// The Folded dial's centre, pt below the deck's top: the middle of the band.
+    const fn gauge_cy(self) -> f64 {
+        match self {
+            Self::Resources => 31.0,
+            Self::Instruments => FOLD_GAUGE_CY,
+        }
+    }
+
+    /// Whether Full at `kind` holds the Cores row: the record's narrow and slim, whose slot left
+    /// of the names holds no gauge; the instruments' at every kind (A4 §7).
+    const fn full_cores_row(self, kind: FullKind) -> bool {
+        match self {
+            Self::Resources => matches!(kind, FullKind::Narrow | FullKind::Slim),
+            Self::Instruments => true,
+        }
+    }
+
+    /// The names its rows draw in the name column besides each resource's and the Cores row's:
+    /// the instruments' Heat and Latency rows' ([`INSTRUMENT_NAMES`]); the record's rows draw none.
+    const fn row_names(self) -> &'static [&'static str] {
+        match self {
+            Self::Resources => &[],
+            Self::Instruments => &INSTRUMENT_NAMES,
+        }
+    }
+
+    /// Whether it holds the Machine row (A4 §8): block B's last in Folded, Full's last.
+    const fn machine_row(self) -> bool {
+        matches!(self, Self::Instruments)
+    }
+
+    /// What the Cores row's square forms take past their clusters, pt: the instruments' run-queue
+    /// tile ([`CORES_QUEUE`]); the record's row draws none.
+    const fn cores_queue(self) -> f64 {
+        match self {
+            Self::Resources => 0.0,
+            Self::Instruments => CORES_QUEUE,
+        }
+    }
 }
 
 /// Configured `[sys] stats_deck_size` preference.
@@ -77,16 +208,6 @@ pub(crate) const fn deck_form_for(pref: DeckSizePref) -> DeckForm {
     }
 }
 
-/// Returns the extra height in device pixels required by the full deck.
-pub(crate) fn full_delta_px(scale: f64, cell_px: usize) -> usize {
-    if !(scale.is_finite() && scale > 0.0) {
-        return 0;
-    }
-    let need = ((FULL_TABLE_PT - FOLDED_PT) * scale).round() as usize;
-    let cell = cell_px.max(1);
-    need.div_ceil(cell) * cell
-}
-
 const X0: f64 = 12.0;
 const MIN_TABLE_W: f64 = 160.0;
 const DETAILS_MIN: f64 = 120.0;
@@ -121,12 +242,13 @@ const LEGEND_GAP: f64 = 8.0;
 /// The widest a legend's tab title stands, pt, before it is fitted (`Tab 1` is 25).
 const TAB_HEAD_MAX: f64 = 48.0;
 /// The strain gauge at the Folded deck's top left (the refined deck's Folded form, 2026-10-24):
-/// its dial's radius, pt. The dial is 54 pt across (Full's is 62) and sits 4 pt inside the
-/// 62 pt band at its top and its foot, the largest the band holds with room for the bezel's
-/// bloom.
+/// its dial's radius, pt. The dial is 54 pt across (Full's is 62) and sat 4 pt inside the record's
+/// 62 pt band at its top and its foot, the largest that band held with room for the bezel's
+/// bloom; the instruments' taller band keeps it (A4 §2), 9.75 pt clear of each edge.
 pub(crate) const FOLD_GAUGE_R: f64 = 27.0;
-/// The dial's centre, pt below the deck's top: the middle of the 62 pt band.
-pub(crate) const FOLD_GAUGE_CY: f64 = 31.0;
+/// The dial's centre in the instruments' Folded band, pt below the deck's top: the middle of its
+/// 73.5 pt (A4 §2, §11). The record's band centres it at 31.
+pub(crate) const FOLD_GAUGE_CY: f64 = 36.75;
 /// From the dial's right edge to its divider, and from the divider to block A, pt (Full's slot
 /// leaves 11 and 9).
 const FOLD_GAUGE_GAP: f64 = 9.0;
@@ -194,12 +316,16 @@ const MARK_ADVANCE: f64 = 1.1 * HEADER_PT;
 pub(crate) const KEY_GAP: f64 = 10.0;
 
 /// The name column at `pt`: `base`, or the widest name it draws and a margin. It draws each deck
-/// row's name ([`DECK_RESOURCES`]) and the Cores row's while that row stands.
-fn name_width(base: f64, pt: f64, m: &FaceMetrics) -> f64 {
+/// row's name ([`DECK_RESOURCES`]), the Cores row's and `more`, the names the rows of a
+/// [`DeckRows`] draw besides ([`DeckRows::row_names`]). "Processes" stays the widest on both
+/// faces, so the instruments' Heat and Latency rows move no name column
+/// (`the_instruments_rows_move_no_column`).
+fn name_width(base: f64, pt: f64, m: &FaceMetrics, more: &[&str]) -> f64 {
     let widest = DECK_RESOURCES
         .map(aterm_vitals::words::resource_name)
         .into_iter()
         .chain([CORES_NAME])
+        .chain(more.iter().copied())
         .map(|name| m.width(name, pt, true))
         .fold(0.0, f64::max);
     base.max((widest + 1.5).ceil())
@@ -757,13 +883,16 @@ pub(crate) struct Rows {
     pub(crate) figure_pt: f64,
     /// Scope bar height.
     pub(crate) bar_h: f64,
+    /// The rows they hold.
+    pub(crate) deck: DeckRows,
 }
 
 impl Rows {
-    const fn full(kind: FullKind) -> Self {
-        let (pitch, cell, count, baseline, bar_h) = match kind {
-            FullKind::Wide | FullKind::Mid => (12.0, 9.0, 7, 8.0, 6.0),
-            FullKind::Narrow | FullKind::Slim => (10.5, 8.0, 8, 7.0, 5.0),
+    const fn full(kind: FullKind, deck: DeckRows) -> Self {
+        let (count, pitch) = deck.full_rows(kind);
+        let (cell, baseline, bar_h) = match kind {
+            FullKind::Wide | FullKind::Mid => (9.0, 8.0, 6.0),
+            FullKind::Narrow | FullKind::Slim => (8.0, 7.0, 5.0),
         };
         let (name_pt, amount_pt, figure_pt) = match kind {
             FullKind::Wide | FullKind::Mid => (10.5, 10.0, 10.0),
@@ -781,16 +910,17 @@ impl Rows {
             amount_pt,
             figure_pt,
             bar_h,
+            deck,
         }
     }
 
-    const fn folded(kind: BlockKind) -> Self {
+    const fn folded(kind: BlockKind, deck: DeckRows) -> Self {
         Self {
             header_baseline: 9.5,
-            top0: 14.0,
-            pitch: 11.5,
-            cell: 8.5,
-            count: 4,
+            top0: FOLD_TOP0,
+            pitch: FOLD_PITCH,
+            cell: FOLD_CELL,
+            count: deck.folded_count(),
             baseline: 7.5,
             name_pt: match kind {
                 BlockKind::Wide | BlockKind::Mid => 10.0,
@@ -799,6 +929,7 @@ impl Rows {
             amount_pt: 9.5,
             figure_pt: 9.5,
             bar_h: 5.0,
+            deck,
         }
     }
 
@@ -819,30 +950,109 @@ impl Rows {
 /// Width tier for the `Full` deck form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FullKind {
-    /// Cores block, a strip of six hours at a 5 pt pitch, the meter, and Details.
+    /// The gauge's slot, a strip of six hours at a 5 pt pitch, the meter, and Details.
     Wide,
-    /// Cores block, a strip of six hours at a 4 pt pitch, and the meter.
+    /// The gauge's slot, a strip of six hours at a 4 pt pitch, and the meter.
     Mid,
-    /// Cores row, a strip of six hours at a 5 pt pitch, and the meter.
+    /// A strip of six hours at a 5 pt pitch, and the meter.
     Narrow,
-    /// Cores row, a strip of six hours at a 4 pt pitch and the meter, or a strip from 80 pt and
-    /// the bar under each %.
+    /// A strip of six hours at a 4 pt pitch and the meter, or a strip from 80 pt and the bar
+    /// under each %.
     Slim,
 }
 
 impl FullKind {
     /// All full kinds from widest to narrowest.
     pub(crate) const ALL: [Self; 4] = [Self::Wide, Self::Mid, Self::Narrow, Self::Slim];
+
+    /// Candidate [`CoresMode`]s for its Cores row in priority order: wide and mid's cell-high
+    /// squares fit beside the gauge's slot as Folded's wide and mid blocks' do.
+    pub(crate) const fn cores_ladder(self) -> &'static [CoresMode] {
+        match self {
+            Self::Wide | Self::Mid => &[CoresMode::Big, CoresMode::Stack, CoresMode::Tiny],
+            Self::Narrow | Self::Slim => &[CoresMode::Stack, CoresMode::Tiny],
+        }
+    }
 }
 
-/// Placement of CPU cores in the `Full` deck form.
+/// The slot left of a Full wide or mid table's names, past a divider: it holds the strain gauge
+/// (the refined deck, 2026-10-24), and a click in it opens the CPU lens, which keeps the
+/// per-core view.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum CoresAt {
-    /// The slot left of the rows, past a divider: it holds the strain gauge (the refined deck,
-    /// 2026-10-24), and a click in it opens the CPU lens, which keeps the per-core view.
-    Block { at: Col, divider: f64 },
-    /// Eighth row spanning from the strip to the right margin.
-    Row(Col),
+pub(crate) struct GaugeSlot {
+    pub(crate) at: Col,
+    /// X-coordinate of the divider between the slot and the names.
+    pub(crate) divider: f64,
+}
+
+/// The Machine row's columns (A4 §8, §9): the computer's name in the room left of its now
+/// glyphs, and the glyphs, which end where the row's % would (each other row's value now), as
+/// the units end against their %; the row's lane stands on the strip and the battery's charge in
+/// the bar column. The glyphs keep the place of all four (lid, power, place, docked) whether or
+/// not they draw, as a wall keeps its space (A1 §4.0): a desktop draws no lid or docked glyph,
+/// a display comes and goes, and none of it moves the name.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MachineRow {
+    /// The name's slot, from the name column's left edge; 0 wide where nothing fits.
+    pub(crate) name: Col,
+    /// The four glyphs' place.
+    pub(crate) glyphs: Col,
+}
+
+/// The Machine row's glyphs (A4 §8): lid, power, place and docked.
+const MACHINE_GLYPHS: f64 = 4.0;
+/// Between two of the Machine row's glyphs, pt.
+const GLYPH_GAP: f64 = 2.0;
+/// From the Machine row's name to its first glyph, pt.
+const NAME_TO_GLYPHS: f64 = 3.0;
+/// The Machine row's name, pt; set at weight 600, measured bold (A4 §8).
+pub(crate) const MACHINE_NAME_PT: f64 = 10.0;
+
+/// The Machine row of a table whose name column is `name`, whose well is `well` and whose %
+/// column, where it stands, is `pct`, in a cell `cell` pt tall: each glyph a square of the
+/// units' height at [`PLAN_SCALE`] (9 pt in Folded's 8.5 pt cell), [`GLYPH_GAP`] apart, ending
+/// where the % ends, or the well where no % stands; the name takes the room from its column's
+/// left edge to [`NAME_TO_GLYPHS`] short of them.
+fn machine_row(name: Col, well: Col, pct: Option<Col>, cell: f64) -> MachineRow {
+    let glyph = (cell * PLAN_SCALE).ceil() / PLAN_SCALE;
+    let w = MACHINE_GLYPHS * glyph + (MACHINE_GLYPHS - 1.0) * GLYPH_GAP;
+    let end = pct.map_or(well.end(), Col::end);
+    let glyphs = Col::new(end - w, w);
+    MachineRow {
+        name: Col::new(name.x, (glyphs.x - NAME_TO_GLYPHS - name.x).max(0.0)),
+        glyphs,
+    }
+}
+
+/// The Machine row's name in `room` pt (A4 §9, "Fit"): the first of `forms` (the computer's type,
+/// then its family form; a Mac's type is already its family) that fits whole, else the family
+/// form cut at its last word boundary that fits, with an ellipsis, never mid-word; with no form
+/// read, or nothing of them fitting, `noun`, the OS's noun for the machine, where it fits; else
+/// nothing. Measured at [`MACHINE_NAME_PT`] in bold, which stands no narrower than weight 600.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "A4 step N5 paints the Machine row")
+)]
+pub(crate) fn machine_name(forms: &[&str], noun: &str, room: f64, m: &FaceMetrics) -> String {
+    let fits = |s: &str| m.width(s, MACHINE_NAME_PT, true) <= room + 0.01;
+    let mut named: Vec<&str> = Vec::new();
+    for form in forms.iter().map(|f| f.trim()).filter(|f| !f.is_empty()) {
+        if !named.contains(&form) {
+            named.push(form);
+        }
+    }
+    if let Some(form) = named.iter().find(|form| fits(form)) {
+        return (*form).to_owned();
+    }
+    let cut = named.last().and_then(|family| {
+        family
+            .match_indices(' ')
+            .rev()
+            .map(|(at, _)| format!("{}\u{2026}", family[..at].trim_end()))
+            .find(|head| fits(head))
+    });
+    cut.or_else(|| fits(noun).then(|| noun.to_owned()))
+        .unwrap_or_default()
 }
 
 /// Column layout plan for the `Full` deck form.
@@ -857,7 +1067,12 @@ pub(crate) struct FullPlan {
     /// Details leave room.
     pub(crate) offset: f64,
     pub(crate) rows: Rows,
-    pub(crate) cores: CoresAt,
+    /// The gauge's slot left of the names, in a wide or mid table.
+    pub(crate) gauge: Option<GaugeSlot>,
+    /// The Cores row's room, from the units' left edge to the centred table's right edge (the
+    /// right margin less [`Self::offset`]), where the table holds the row ([`DeckRows`]): the
+    /// record's narrow and slim tables, the instruments' every table (A4 §7).
+    pub(crate) cores: Option<Col>,
     pub(crate) name: Col,
     pub(crate) well: Col,
     pub(crate) strip: Strip,
@@ -867,9 +1082,11 @@ pub(crate) struct FullPlan {
     /// each row draws its bar under its % ([`Self::bar_under`]).
     pub(crate) meter: Meter,
     pub(crate) details: Option<Col>,
-    /// The units column between the well and the %, in a wide or mid table where any of the
-    /// first four rows draws units (A1 §2.5).
+    /// The units column between the well and the %, in a wide or mid table where any row draws
+    /// units (A1 §2.5, A4 §5).
     pub(crate) units: Option<UnitsCol>,
+    /// The Machine row, where the table holds it (A4 §8).
+    pub(crate) machine: Option<MachineRow>,
 }
 
 impl FullPlan {
@@ -879,79 +1096,103 @@ impl FullPlan {
         self.pct.filter(|_| self.meter.bar.is_none())
     }
 
-    /// Chooses the Cores row's [`CoresMode`] for `clusters`: narrow and slim have the row;
-    /// wide and mid draw the strain gauge in [`CoresAt::Block`] and have none.
+    /// Chooses the Cores row's [`CoresMode`] for `clusters`, where the table holds the row.
     pub(crate) fn cores_mode(
         &self,
         clusters: &[Cluster<'_>],
         m: &FaceMetrics,
     ) -> Option<CoresMode> {
-        let CoresAt::Row(room) = self.cores else {
-            return None;
-        };
+        let room = self.cores?;
         Some(cores_row_mode(
             clusters,
             room.w,
             self.rows.cell,
-            &[CoresMode::Stack, CoresMode::Tiny],
+            self.kind.cores_ladder(),
             CORES_CAPTION_PT,
+            self.rows.deck.cores_queue(),
             m,
         ))
     }
 
     fn shift(&mut self, dx: f64) {
-        self.cores = match self.cores {
-            CoresAt::Block { at, divider } => CoresAt::Block {
-                at: Col::new(at.x + dx, at.w),
-                divider: divider + dx,
-            },
-            CoresAt::Row(room) => CoresAt::Row(Col::new(room.x + dx, room.w)),
-        };
+        if let Some(slot) = &mut self.gauge {
+            slot.at.x += dx;
+            slot.divider += dx;
+        }
         self.name.x += dx;
         self.well.x += dx;
         self.strip.x += dx;
         self.meter.shift(dx);
-        for col in [&mut self.pct, &mut self.details].into_iter().flatten() {
+        for col in [&mut self.pct, &mut self.details, &mut self.cores]
+            .into_iter()
+            .flatten()
+        {
             col.x += dx;
         }
         if let Some(units) = &mut self.units {
             units.at.x += dx;
         }
     }
+
+    /// Lays its Machine row, where its rows hold one, from its columns as laid.
+    fn lay_machine(&mut self) {
+        self.machine = self
+            .rows
+            .deck
+            .machine_row()
+            .then(|| machine_row(self.name, self.well, self.pct, self.rows.cell));
+    }
 }
 
-/// Computes the [`FullPlan`] for deck width `w_pt` with no units column, the plan the deck paints
-/// until A1's step R6 paints the units and plans with the machine's [`UnitFacts`]
-/// ([`plan_full_with`]).
+/// Computes the [`FullPlan`] the deck paints for deck width `w_pt`: its rows
+/// ([`DeckRows::PAINTED`]) with no units column, until A4's step N5 paints the instruments'
+/// rows and their units with the machine's [`UnitFacts`] ([`plan_full_with`]).
 pub(crate) fn plan_full(w_pt: f64, m: &FaceMetrics) -> FullPlan {
-    plan_full_with(w_pt, m, &UnitFacts::NONE)
+    full_by(w_pt, m, &UnitFacts::NONE, full_spec, DeckRows::PAINTED)
 }
 
-/// Computes the [`FullPlan`] for deck width `w_pt`: the widest kind that fits, and in a wide or
-/// mid table the units column `units` measures where it costs the strip nothing of its horizon
-/// (A1 §2.5, step R5).
-pub(crate) fn plan_full_with(w_pt: f64, m: &FaceMetrics, units: &UnitFacts<'_>) -> FullPlan {
-    full_by(w_pt, m, units, full_spec)
+/// Computes the instruments' [`FullPlan`] for deck width `w_pt` (A4 §11): ten rows at every
+/// kind, the widest kind that fits, and in a wide or mid table the units column `units`
+/// measures where it costs the strip nothing of its horizon (A1 §2.5, step R5). Its columns are
+/// [`plan_full`]'s with no facts: the instruments' rows move none.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "A4 step N5 paints the instruments' rows with the host's facts"
+    )
+)]
+pub(crate) fn plan_full_with(w_pt: f64, m: &FaceMetrics, units: &UnitFacts) -> FullPlan {
+    full_by(w_pt, m, units, full_spec, DeckRows::Instruments)
 }
 
-/// [`plan_full_with`] with each kind's meter measures from `specs`.
-fn full_by(w_pt: f64, m: &FaceMetrics, units: &UnitFacts<'_>, specs: FullSpecs) -> FullPlan {
+/// [`plan_full_with`] of `deck`'s rows with each kind's meter measures from `specs`.
+fn full_by(
+    w_pt: f64,
+    m: &FaceMetrics,
+    units: &UnitFacts,
+    specs: FullSpecs,
+    deck: DeckRows,
+) -> FullPlan {
     let w = whole_width(w_pt);
     let laid = FullKind::ALL.into_iter().find_map(|kind| {
-        let (plan, fits) = lay_full(w, kind, m, true, 0.0, specs);
+        let (plan, fits) = lay_full(w, kind, m, true, 0.0, specs, deck);
         fits.then_some(plan)
     });
-    if let Some(plan) = laid {
-        return full_units(plan, m, units, specs).unwrap_or(plan);
-    }
-    let right = w - X0;
-    // Under slim's width the % column goes before the strip does: the strip takes its place.
-    let (mut plan, _) = lay_full(w, FullKind::Slim, m, true, 0.0, specs);
-    if plan.strip.end() > right {
-        plan = lay_full(w, FullKind::Slim, m, false, 0.0, specs).0;
-    }
-    plan.pct = plan.pct.filter(|pct| pct.end() <= right);
-    plan.ground_only = w < MIN_TABLE_W || plan.strip.end() > right;
+    let mut plan = if let Some(plan) = laid {
+        full_units(plan, m, units, specs).unwrap_or(plan)
+    } else {
+        let right = w - X0;
+        // Under slim's width the % column goes before the strip does: the strip takes its place.
+        let (mut plan, _) = lay_full(w, FullKind::Slim, m, true, 0.0, specs, deck);
+        if plan.strip.end() > right {
+            plan = lay_full(w, FullKind::Slim, m, false, 0.0, specs, deck).0;
+        }
+        plan.pct = plan.pct.filter(|pct| pct.end() <= right);
+        plan.ground_only = w < MIN_TABLE_W || plan.strip.end() > right;
+        plan
+    };
+    plan.lay_machine();
     plan
 }
 
@@ -960,11 +1201,11 @@ fn full_by(w_pt: f64, m: &FaceMetrics, units: &UnitFacts<'_>, specs: FullSpecs) 
 /// ones it has with no units column, and its Details give way to the units as Folded block A's
 /// do (A1 §2.4's as-built note). Narrow and slim draw none: mid's first width leaves no room for
 /// a column ([`units_cap`] is `None` there), so a form a narrow table drew would go again as the
-/// deck widened.
+/// deck widened. Its one column holds every row's form, block B's rows' with block A's (A4 §5).
 fn full_units(
     bare: FullPlan,
     m: &FaceMetrics,
-    units: &UnitFacts<'_>,
+    units: &UnitFacts,
     specs: FullSpecs,
 ) -> Option<FullPlan> {
     if !matches!(bare.kind, FullKind::Wide | FullKind::Mid) {
@@ -974,8 +1215,17 @@ fn full_units(
     // Where the % stood, before the table was centred.
     let at = bare.pct?.x - bare.offset;
     let room = bare.w - X0 - (bare.strip.x - bare.offset) - UNITS_TO_PCT;
-    let col = plan_units(at, room, bare.strip.spec, bare.rows.cell, &spec, units)?;
-    let (mut plan, _) = lay_full(bare.w, bare.kind, m, true, col.at.w, specs);
+    let col = plan_units(
+        at,
+        room,
+        bare.strip.spec,
+        bare.rows.cell,
+        &spec,
+        units,
+        &UnitRow::ALL,
+        f64::INFINITY,
+    )?;
+    let (mut plan, _) = lay_full(bare.w, bare.kind, m, true, col.at.w, specs, bare.rows.deck);
     plan.units = Some(UnitsCol {
         at: Col::new(col.at.x + plan.offset, col.at.w),
         ..col
@@ -1005,10 +1255,11 @@ fn full_meter_spec(kind: FullKind, m: &FaceMetrics, specs: FullSpecs) -> MeterSp
     }
 }
 
-/// The Full plan of `kind` at `w`, and whether it fits; `pct` lays the % column between the well
-/// and the strip, and without it the strip stands where the column would. A units column `u` pt
-/// wide (0 for none) stands where the % column would, and the % column [`UNITS_TO_PCT`] past it;
-/// the caller places the column's forms ([`full_units`]).
+/// The Full plan of `kind` holding `deck`'s rows at `w`, and whether it fits; `pct` lays the %
+/// column between the well and the strip, and without it the strip stands where the column
+/// would. A units column `u` pt wide (0 for none) stands where the % column would, and the %
+/// column [`UNITS_TO_PCT`] past it; the caller places the column's forms ([`full_units`]) and
+/// lays the Machine row ([`FullPlan::lay_machine`]).
 fn lay_full(
     w: f64,
     kind: FullKind,
@@ -1016,15 +1267,19 @@ fn lay_full(
     pct: bool,
     u: f64,
     specs: FullSpecs,
+    deck: DeckRows,
 ) -> (FullPlan, bool) {
     let right = w - X0;
-    let rows = Rows::full(kind);
+    let rows = Rows::full(kind, deck);
     let (name_x, name_base) = match kind {
         FullKind::Wide | FullKind::Mid => (97.0, 56.0),
         FullKind::Narrow => (X0, 52.0),
         FullKind::Slim => (X0, 48.0),
     };
-    let name = Col::new(name_x, name_width(name_base, rows.name_pt, m));
+    let name = Col::new(
+        name_x,
+        name_width(name_base, rows.name_pt, m, deck.row_names()),
+    );
     let well = Col::new(name.end(), 10.0);
     // The units (the activity now, by part), the % column (the value now) and then the strip,
     // which reads outward from now.
@@ -1043,22 +1298,21 @@ fn lay_full(
         well.end() + BARE_STRIP_GAP
     };
     let spec = full_meter_spec(kind, m, specs);
-    let cores = match kind {
-        FullKind::Wide | FullKind::Mid => CoresAt::Block {
-            at: Col::new(X0, CORES_BLOCK_W),
-            divider: 88.0,
-        },
-        FullKind::Narrow | FullKind::Slim => {
-            CoresAt::Row(Col::new(pct_col.x, (right - pct_col.x).max(0.0)))
-        }
-    };
     let mut plan = FullPlan {
         w,
         kind,
         ground_only: false,
         offset: 0.0,
         rows,
-        cores,
+        gauge: matches!(kind, FullKind::Wide | FullKind::Mid).then_some(GaugeSlot {
+            at: Col::new(X0, CORES_BLOCK_W),
+            divider: 88.0,
+        }),
+        // The Cores row spans from where the units stand, with or without a units column, to
+        // the right margin; a centred table narrows it to its own right edge below.
+        cores: deck
+            .full_cores_row(kind)
+            .then(|| Col::new(units_x, (right - units_x).max(0.0))),
         name,
         well,
         strip: Strip::full(strip_x, least_cols(&spec, least_strip(&spec)), spec.pitch),
@@ -1066,6 +1320,7 @@ fn lay_full(
         meter: Meter::default(),
         details: None,
         units: None,
+        machine: None,
     };
     // Wide needs its Details; slim, the last kind, takes whatever fits. Laid again around its
     // units, a table keeps the kind it has without them, and its Details give way to the column.
@@ -1077,7 +1332,8 @@ fn lay_full(
     plan.strip = Strip::full(strip_x, cols, spec.pitch);
     plan.meter = meter;
     plan.details = details;
-    // What the widest strip, bar and Details leave centres the table.
+    // What the widest strip, bar and Details leave centres the table, and a Cores row spans the
+    // centred table: the right margin less the offset at each side.
     let laid_end = details
         .or(meter.run)
         .or(meter.bar)
@@ -1086,6 +1342,9 @@ fn lay_full(
     if kind == FullKind::Wide && extra > 0.0 {
         plan.offset = (extra / 2.0).floor();
         plan.shift(plan.offset);
+        if let Some(room) = &mut plan.cores {
+            room.w = (room.w - 2.0 * plan.offset).max(0.0);
+        }
     }
     let fits = plan.strip.end() <= right && (!pct || plan.strip.width() >= spec.pct_strip);
     (plan, fits)
@@ -1151,23 +1410,42 @@ pub(crate) struct BlockPlan {
     pub(crate) details: Option<Col>,
     /// Horizontal span available for Block B's Cores row.
     pub(crate) cores: Col,
-    /// Block A's units column, between the well and the %, where any row draws units; block B
-    /// has none (A1 ruling 15).
+    /// The block's units column, between the well and the %, where any of its rows draws units:
+    /// block A's (A1 §2.4), and the instruments' block B's (A4 §5), at most [`B_UNITS_MAX`].
     pub(crate) units: Option<UnitsCol>,
+    /// Block B's Machine row, where its rows hold one (A4 §8).
+    pub(crate) machine: Option<MachineRow>,
 }
 
-/// Block A's units column (`docs/DESIGN-stats-deck-units-2026-11-04.md` §2.4): where the % column
+/// A table's units column (`docs/DESIGN-stats-deck-units-2026-11-04.md` §2.4): where the % column
 /// stood without it, [`UNITS_TO_PCT`] short of the % column, and as wide as the widest form its
 /// rows take at 1×. Each form stands right-aligned in it, against its row's %.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct UnitsCol {
     pub(crate) at: Col,
-    /// U_cap: the widest column the block holds without its strip losing the top preset
-    /// ([`units_cap`]).
+    /// The widest column the table takes: U_cap, the widest it holds without its strip losing
+    /// the top preset ([`units_cap`]), and in block B no wider than [`B_UNITS_MAX`].
     pub(crate) cap: f64,
-    /// Each row's form, in [`UnitRow::ALL`]'s order; `None` draws no units on its row.
-    pub(crate) forms: [Option<Form>; 4],
+    /// Each row's form, in [`UnitRow::ALL`]'s order; `None` draws no units on its row, as on
+    /// every row the table does not hold.
+    pub(crate) forms: Forms,
 }
+
+impl UnitsCol {
+    /// `row`'s form; `None` where it draws no units here.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "A4 step N5 paints each row's units")
+    )]
+    pub(crate) const fn form(&self, row: UnitRow) -> Option<Form> {
+        self.forms[row.index()]
+    }
+}
+
+/// Block B's widest units column, pt (A4 §5, U_B): its forms (the interface tiles, 15 pt at 1×,
+/// and the processes' flow, pile and stuck columns, 15) and Latency's TCP waits tile when F8
+/// builds the row stand within it, so its strip keeps six hours from 1039 pt.
+const B_UNITS_MAX: f64 = 17.0;
 
 impl BlockPlan {
     /// The % column where no bar column fits (fnarrow and fslim): each row that prints a % draws
@@ -1185,6 +1463,7 @@ impl BlockPlan {
             self.rows.cell,
             self.kind.cores_ladder(),
             self.kind.cores_caption_pt(),
+            self.rows.deck.cores_queue(),
             m,
         )
     }
@@ -1198,12 +1477,15 @@ pub(crate) struct FoldedGauge {
     pub(crate) at: Col,
     /// X-coordinate of the divider between the dial and block A.
     pub(crate) divider: f64,
+    /// The dial's centre, pt below the deck's top: the band's middle ([`FOLD_GAUGE_CY`] in the
+    /// instruments' band).
+    pub(crate) cy: f64,
 }
 
 impl FoldedGauge {
     /// The dial's centre, pt.
     pub(crate) fn centre(&self) -> (f64, f64) {
-        (self.at.x + self.at.w / 2.0, FOLD_GAUGE_CY)
+        (self.at.x + self.at.w / 2.0, self.cy)
     }
 
     /// The dial's box, pt: `x0, y0, x1, y1` (the painter notes the same box from [`Self::centre`]).
@@ -1230,28 +1512,43 @@ pub(crate) struct FoldedPlan {
     pub(crate) blocks: [BlockPlan; 2],
 }
 
-/// Computes the [`FoldedPlan`] for deck width `w_pt` with no units column, the plan the deck
-/// paints until A1's step R6 paints the units and plans with the machine's [`UnitFacts`]
-/// ([`plan_folded_with`]).
+/// Computes the [`FoldedPlan`] the deck paints for deck width `w_pt`: its rows
+/// ([`DeckRows::PAINTED`]) with no units column, until A4's step N5 paints the instruments'
+/// rows and their units with the machine's [`UnitFacts`] ([`plan_folded_with`]).
 pub(crate) fn plan_folded(w_pt: f64, m: &FaceMetrics) -> FoldedPlan {
-    plan_folded_with(w_pt, m, &UnitFacts::NONE)
+    folded_by(w_pt, m, &UnitFacts::NONE, fold_spec, DeckRows::PAINTED)
 }
 
-/// Computes the [`FoldedPlan`] for deck width `w_pt`. The gauge comes first: the blocks take the
-/// widest kind that fits beside it, and only where not even slim fits beside it with its %
-/// (under 461 pt on Helvetica Neue) does the deck draw no gauge and give the blocks its room.
-/// Block A then takes the units column `units` measures where it costs the strip nothing of its
-/// horizon ([`plan_units`]).
-pub(crate) fn plan_folded_with(w_pt: f64, m: &FaceMetrics, units: &UnitFacts<'_>) -> FoldedPlan {
-    folded_by(w_pt, m, units, fold_spec)
+/// Computes the instruments' [`FoldedPlan`] for deck width `w_pt` (A4 §11): five rows a block.
+/// The gauge comes first: the blocks take the widest kind that fits beside it, and only where
+/// not even slim fits beside it with its % (under 461 pt on Helvetica Neue) does the deck draw no
+/// gauge and give the blocks its room. Each block then takes the units column `units` measures
+/// where it costs the strip nothing of its horizon ([`plan_units`]), block B's no wider than
+/// [`B_UNITS_MAX`] (A4 §5), and block B lays its Machine row (A4 §8). Its columns are
+/// [`plan_folded`]'s with no facts: the instruments' rows move none.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "A4 step N5 paints the instruments' rows with the host's facts"
+    )
+)]
+pub(crate) fn plan_folded_with(w_pt: f64, m: &FaceMetrics, units: &UnitFacts) -> FoldedPlan {
+    folded_by(w_pt, m, units, fold_spec, DeckRows::Instruments)
 }
 
-/// [`plan_folded_with`] with each kind's meter measures from `specs`.
-fn folded_by(w_pt: f64, m: &FaceMetrics, units: &UnitFacts<'_>, specs: FoldSpecs) -> FoldedPlan {
+/// [`plan_folded_with`] of `deck`'s rows with each kind's meter measures from `specs`.
+fn folded_by(
+    w_pt: f64,
+    m: &FaceMetrics,
+    units: &UnitFacts,
+    specs: FoldSpecs,
+    deck: DeckRows,
+) -> FoldedPlan {
     let w = whole_width(w_pt);
-    match lay_folded(w, true, m, units, specs) {
+    match lay_folded(w, true, m, units, specs, deck) {
         (plan, true) => plan,
-        (_, false) => lay_folded(w, false, m, units, specs).0,
+        (_, false) => lay_folded(w, false, m, units, specs, deck).0,
     }
 }
 
@@ -1260,8 +1557,9 @@ fn lay_folded(
     w: f64,
     gauge: bool,
     m: &FaceMetrics,
-    units: &UnitFacts<'_>,
+    units: &UnitFacts,
     specs: FoldSpecs,
+    deck: DeckRows,
 ) -> (FoldedPlan, bool) {
     let g = if gauge { FOLD_GAUGE_W } else { 0.0 };
     let mut b = ((w - 2.0 * X0 - BLOCK_GUTTER - g) / 2.0).floor().max(0.0);
@@ -1272,22 +1570,32 @@ fn lay_folded(
     }
     let kind = BlockKind::ALL
         .into_iter()
-        .find(|&kind| lay_block(xa, b, kind, m, true, 0.0, specs).1);
+        .find(|&kind| lay_block(xa, b, kind, m, true, 0.0, specs, deck).1);
     // Where not even slim fits, the % column goes and the strip takes its place.
     let block = |x: f64| match kind {
-        Some(kind) => lay_block(x, b, kind, m, true, 0.0, specs).0,
-        None => lay_block(x, b, BlockKind::Slim, m, false, 0.0, specs).0,
+        Some(kind) => lay_block(x, b, kind, m, true, 0.0, specs, deck).0,
+        None => lay_block(x, b, BlockKind::Slim, m, false, 0.0, specs, deck).0,
     };
     let mut blocks = [block(xa), block(xa + b + BLOCK_GUTTER)];
-    // Block A's kind and horizon are the ones it has with no units column.
-    if let Some(kind) = kind
-        && let Some(col) = block_units(&blocks[0], units, specs)
-    {
-        blocks[0] = BlockPlan {
-            units: Some(col),
-            ..lay_block(xa, b, kind, m, true, col.at.w, specs).0
-        };
+    // Each block's kind and horizon are the ones it has with no units column.
+    let rows: [(&[UnitRow], f64); 2] = [
+        (&UnitRow::BLOCK_A, f64::INFINITY),
+        (&UnitRow::BLOCK_B, B_UNITS_MAX),
+    ];
+    for (blk, (rows, bound)) in blocks.iter_mut().zip(rows) {
+        if let Some(kind) = kind
+            && let Some(col) = block_units(blk, units, specs, rows, bound)
+        {
+            *blk = BlockPlan {
+                units: Some(col),
+                ..lay_block(blk.at.x, b, kind, m, true, col.at.w, specs, deck).0
+            };
+        }
     }
+    let machine = &mut blocks[1];
+    machine.machine = deck
+        .machine_row()
+        .then(|| machine_row(machine.name, machine.well, machine.pct, machine.rows.cell));
     let plan = FoldedPlan {
         w,
         ground_only: w < MIN_TABLE_W || blocks.iter().any(|blk| blk.strip.end() > blk.at.end()),
@@ -1295,6 +1603,7 @@ fn lay_folded(
         gauge: gauge.then(|| FoldedGauge {
             at: Col::new(xa - g, 2.0 * FOLD_GAUGE_R),
             divider: xa - FOLD_GAUGE_GAP,
+            cy: deck.gauge_cy(),
         }),
         blocks,
     };
@@ -1314,10 +1623,14 @@ const fn fold_spec(kind: BlockKind) -> MeterSpec {
 /// Each Folded kind's meter measures: [`fold_spec`], or another block's in a law's control.
 type FoldSpecs = fn(BlockKind) -> MeterSpec;
 
-/// One Folded block of `kind` at `x`, `b` wide, and whether it fits; `pct` lays the % column
-/// between the well and the strip, and without it the strip stands where the column would. A
-/// units column `u` pt wide (0 for none) stands where the % column would, and the % column
-/// [`UNITS_TO_PCT`] past it.
+/// One Folded block of `kind` at `x`, `b` wide, holding `deck`'s rows, and whether it fits; `pct`
+/// lays the % column between the well and the strip, and without it the strip stands where the
+/// column would. A units column `u` pt wide (0 for none) stands where the % column would, and the
+/// % column [`UNITS_TO_PCT`] past it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a block's place, kind and face, and the measures a law's control varies"
+)]
 fn lay_block(
     x: f64,
     b: f64,
@@ -1326,15 +1639,16 @@ fn lay_block(
     pct: bool,
     u: f64,
     specs: FoldSpecs,
+    deck: DeckRows,
 ) -> (BlockPlan, bool) {
-    let rows = Rows::folded(kind);
+    let rows = Rows::folded(kind, deck);
     let (name_base, well_w, pct_gap, pct_w) = match kind {
         BlockKind::Wide => (52.0, 10.0, 2.0, 30.0),
         BlockKind::Mid => (52.0, 10.0, 2.0, 28.0),
         BlockKind::Narrow | BlockKind::Slim => (48.0, 7.0, 0.0, 26.0),
     };
     let spec = specs(kind);
-    let name = Col::new(x, name_width(name_base, rows.name_pt, m));
+    let name = Col::new(x, name_width(name_base, rows.name_pt, m, deck.row_names()));
     let well = Col::new(name.end(), well_w);
     // The units (the activity now, by part), the % column (the value now) and then the strip,
     // which reads outward from now.
@@ -1367,6 +1681,7 @@ fn lay_block(
         details: None,
         cores: Col::new(cores_x, (end - cores_x).max(0.0)),
         units: None,
+        machine: None,
     };
     // Slim, the last kind, stands the bar under each % where no column fits; the block fits
     // where its strip does, and with its % where the strip holds six minutes beside it.
@@ -1382,8 +1697,15 @@ fn lay_block(
     }
 }
 
-/// Block A's units column ([`plan_units`]), given `bare`, the block laid with none.
-fn block_units(bare: &BlockPlan, units: &UnitFacts<'_>, specs: FoldSpecs) -> Option<UnitsCol> {
+/// A block's units column for `rows` at most `bound` pt wide ([`plan_units`]), given `bare`, the
+/// block laid with none.
+fn block_units(
+    bare: &BlockPlan,
+    units: &UnitFacts,
+    specs: FoldSpecs,
+    rows: &[UnitRow],
+    bound: f64,
+) -> Option<UnitsCol> {
     let room = bare.at.end() - bare.strip.x - UNITS_TO_PCT;
     let spec = specs(bare.kind);
     plan_units(
@@ -1393,33 +1715,38 @@ fn block_units(bare: &BlockPlan, units: &UnitFacts<'_>, specs: FoldSpecs) -> Opt
         bare.rows.cell,
         &spec,
         units,
+        rows,
+        bound,
     )
 }
 
-/// A table's units (A1 §2.4, §2.5): each row takes the first form of its ladder that `units`
-/// draws within U_cap at 1× ([`units_cap`]), and the column, at `at` where the bare table's %
-/// stood, is as wide as the widest of them; `None` where no row takes one. The bare table's strip
-/// holds `held` with `room` from its start to the table's end less the column's gap to the %,
-/// and its kind lays `spec`'s meter: the column keeps that kind and horizon. `cell` is the
-/// table's strip cell, which the forms' height is.
+/// A table's units (A1 §2.4, §2.5): each of `rows` takes the first form of its ladder that
+/// `units` draws within U_cap at 1× ([`units_cap`]), or within `bound` where that is narrower,
+/// and the column, at `at` where the bare table's % stood, is as wide as the widest of them;
+/// `None` where no row takes one. The bare table's strip holds `held` with `room` from its start
+/// to the table's end less the column's gap to the %, and its kind lays `spec`'s meter: the
+/// column keeps that kind and horizon. `cell` is the table's strip cell, which the forms' height
+/// is.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the bare table's measures and the rows and bound its column takes"
+)]
 fn plan_units(
     at: f64,
     room: f64,
     held: MultiScaleSpec,
     cell: f64,
     spec: &MeterSpec,
-    units: &UnitFacts<'_>,
+    units: &UnitFacts,
+    rows: &[UnitRow],
+    bound: f64,
 ) -> Option<UnitsCol> {
-    if !units.draw_any(cell) {
+    if !units.draw_any(cell, rows) {
         return None;
     }
-    let cap = units_cap(room, held, spec)?;
-    let forms = units.forms_within(cap, cell);
-    let w = UnitRow::ALL
-        .into_iter()
-        .zip(forms)
-        .filter_map(|(row, form)| units.width(row, form?, PLAN_SCALE, cell))
-        .fold(0.0, f64::max);
+    let cap = units_cap(room, held, spec)?.min(bound);
+    let forms = units.forms_within(cap, cell, rows);
+    let w = units.widest(&forms, cell);
     (w > 0.0).then_some(UnitsCol {
         at: Col::new(at, w),
         cap,
@@ -1488,9 +1815,11 @@ pub(crate) fn breakpoints(m: &FaceMetrics) -> Breakpoints {
             .find(|&w| fits(w))
             .unwrap_or(f64::INFINITY)
     };
-    let full = FullKind::ALL.map(|kind| first(&|w| lay_full(w, kind, m, true, 0.0, full_spec).1));
-    let block =
-        BlockKind::ALL.map(|kind| first(&|b| lay_block(X0, b, kind, m, true, 0.0, fold_spec).1));
+    let deck = DeckRows::PAINTED;
+    let full =
+        FullKind::ALL.map(|kind| first(&|w| lay_full(w, kind, m, true, 0.0, full_spec, deck).1));
+    let block = BlockKind::ALL
+        .map(|kind| first(&|b| lay_block(X0, b, kind, m, true, 0.0, fold_spec, deck).1));
     let folded = block.map(|b| 2.0 * b + 2.0 * X0 + BLOCK_GUTTER + FOLD_GAUGE_W);
     Breakpoints {
         full,
@@ -1529,12 +1858,15 @@ fn total_cores(clusters: &[Cluster<'_>]) -> usize {
     clusters.iter().map(|c| c.count).sum()
 }
 
-/// Returns the width required by a Cores row in `mode`, or `f64::INFINITY` if it cannot fit.
+/// Returns the width required by a Cores row in `mode`, or `f64::INFINITY` if it cannot fit: each
+/// cluster's count, name and squares, and in a square form `queue` pt past them, the run-queue
+/// tile and its wall in the instruments' row (A4 §7). A count draws no tile.
 pub(crate) fn cores_row_width(
     clusters: &[Cluster<'_>],
     mode: CoresMode,
     cell: f64,
     caption_pt: f64,
+    queue: f64,
     m: &FaceMetrics,
 ) -> f64 {
     let squares = |count: usize| {
@@ -1562,18 +1894,20 @@ pub(crate) fn cores_row_width(
                     + 3.0
                     + squares(cluster.count)
             });
-            each.sum::<f64>() + 8.0 * clusters.len().saturating_sub(1) as f64
+            each.sum::<f64>() + 8.0 * clusters.len().saturating_sub(1) as f64 + queue
         }
     }
 }
 
-/// Chooses the first [`CoresMode`] in `ladder` that fits `room`, or `CountOnly`.
+/// Chooses the first [`CoresMode`] in `ladder` that fits `room` with `queue` pt past its squares
+/// ([`cores_row_width`]), or `CountOnly`.
 pub(crate) fn cores_row_mode(
     clusters: &[Cluster<'_>],
     room: f64,
     cell: f64,
     ladder: &[CoresMode],
     caption_pt: f64,
+    queue: f64,
     m: &FaceMetrics,
 ) -> CoresMode {
     if total_cores(clusters) == 0 {
@@ -1582,7 +1916,7 @@ pub(crate) fn cores_row_mode(
     ladder
         .iter()
         .copied()
-        .find(|&mode| cores_row_width(clusters, mode, cell, caption_pt, m) <= room)
+        .find(|&mode| cores_row_width(clusters, mode, cell, caption_pt, queue, m) <= room)
         .unwrap_or(CoresMode::CountOnly)
 }
 
@@ -2519,7 +2853,7 @@ pub(crate) fn header_full(
     );
     match at {
         StateAt::Free(names_end) => {
-            if let CoresAt::Row(_) = plan.cores {
+            if plan.gauge.is_none() {
                 head.span(plan.name.x, names_end, false);
             }
         }
@@ -2787,7 +3121,7 @@ fn header_folded_under(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stats_units::Gpu;
+    use crate::stats_units::{Gpu, Heat};
 
     const TEXT: HeaderText<'static> = HeaderText {
         tab: "Tab 2",
@@ -2822,8 +3156,8 @@ mod tests {
 
     fn full_cols(plan: &FullPlan) -> Vec<Col> {
         let mut cols = Vec::new();
-        if let CoresAt::Block { at, divider } = plan.cores {
-            cols.extend([at, Col::new(divider, 0.0)]);
+        if let Some(slot) = plan.gauge {
+            cols.extend([slot.at, Col::new(slot.divider, 0.0)]);
         }
         cols.extend([plan.name, plan.well]);
         cols.extend(plan.units.map(|units| units.at));
@@ -2899,11 +3233,15 @@ mod tests {
         assert_eq!((p.strip.end(), p.strip.span_s()), (632.0, 21_600));
         assert_eq!(p.details, col(879.0, 148.0));
         assert_eq!(
-            p.cores,
-            CoresAt::Block {
-                at: Col::new(12.0, 68.0),
-                divider: 88.0
-            }
+            (p.gauge, p.cores, p.machine),
+            (
+                Some(GaugeSlot {
+                    at: Col::new(12.0, 68.0),
+                    divider: 88.0
+                }),
+                None,
+                None
+            )
         );
         assert_eq!([2.0, 1.0].map(|s| px(p.strip.x, s)), [406.0, 203.0]);
         assert_eq!([2.0, 1.0].map(|s| px(p.strip.cell, s)), [8.0, 4.0]);
@@ -2949,7 +3287,7 @@ mod tests {
         assert_eq!(p.strip.span_s(), 21_600);
         let p = at(500.0);
         assert_eq!(full_meter(&p), ((114.0, 48, 5.0), col(360.0, 128.0), None));
-        assert_eq!(p.cores, CoresAt::Row(Col::new(77.0, 411.0)));
+        assert_eq!((p.gauge, p.cores), (None, Some(Col::new(77.0, 411.0))));
         // A bar column stands beside six hours (A1 step R5): at 450 pt the narrow table's strip
         // would hold four (39 boxes of 5 pt), so each bar stands under its % and the strip holds
         // six hours.
@@ -2959,7 +3297,7 @@ mod tests {
             (p.strip.x, p.strip.cols, p.strip.span_s()),
             (103.0, 84, 21_600)
         );
-        assert_eq!(p.cores, CoresAt::Row(Col::new(70.0, 368.0)));
+        assert_eq!((p.gauge, p.cores), (None, Some(Col::new(70.0, 368.0))));
         // Where no bar as long as its legend fits, it stands under each % and the strip takes
         // the room: four hours at 350 pt.
         let p = at(350.0);
@@ -3001,7 +3339,8 @@ mod tests {
             p.gauge,
             Some(FoldedGauge {
                 at: Col::new(12.0, 54.0),
-                divider: 75.0
+                divider: 75.0,
+                cy: 31.0
             })
         );
         assert_eq!(
@@ -3951,7 +4290,7 @@ mod tests {
                     assert!(faults.is_empty(), "{faults:?}");
                 }
                 if full.offset > 0.0
-                    && let (CoresAt::Block { at, .. }, Some(details)) = (full.cores, full.details)
+                    && let (Some(GaugeSlot { at, .. }), Some(details)) = (full.gauge, full.details)
                 {
                     assert!(
                         (at.x - (w - details.end())).abs() <= 1.0,
@@ -4012,7 +4351,7 @@ mod tests {
 
     #[test]
     fn deck_height_is_a_function_of_the_window() {
-        use crate::stats_deck::{StatsBars, deck_px};
+        use crate::stats_deck::{FOLDED_PT, StatsBars, deck_px};
         use DeckForm::{Folded, Full};
         let _: fn(DeckSizePref) -> DeckForm = deck_form_for;
         let _: fn(StatsBars, DeckForm, f64, usize) -> usize = deck_px;
@@ -4022,23 +4361,211 @@ mod tests {
         assert_eq!(deck_form_for(DeckSizePref::Full), Full);
         assert_eq!(deck_form_for(DeckSizePref::Folded), Folded);
 
-        assert_eq!(full_delta_px(2.0, 28), 84);
+        // The deck paints the record's rows until A4's step N5: main's 62 and 100 pt.
+        let painted = DeckRows::PAINTED;
+        assert_eq!(
+            (FOLDED_PT, painted.folded_pt(), painted.full_table_pt()),
+            (62.0, 62.0, 100.0)
+        );
+        assert_eq!(painted.full_delta_px(2.0, 28), 84);
         assert_eq!(deck_px(StatsBars::Deck, Full, 2.0, 28), 208);
+        // The instruments' 73.5 and 136 pt add 62.5 pt to Folded: five 28 px cells at 2×.
+        let instruments = DeckRows::Instruments;
+        assert_eq!(
+            (instruments.folded_pt(), instruments.full_table_pt()),
+            (73.5, 136.0)
+        );
+        assert_eq!(instruments.full_delta_px(2.0, 28), 140);
         for s in [1.0, 2.0] {
             let folded = (FOLDED_PT * s).round() as usize;
-            let table = (FULL_TABLE_PT * s).round() as usize;
+            let table = (painted.full_table_pt() * s).round() as usize;
             for cell in 10..=40 {
                 let at = format!("{cell} px cells at {s}×");
                 assert_eq!(deck_px(StatsBars::Deck, Folded, s, cell), folded, "{at}");
                 let full = deck_px(StatsBars::Deck, Full, s, cell);
                 assert_eq!((full - folded) % cell, 0, "{at}");
-                assert_eq!(full - folded, full_delta_px(s, cell), "{at}");
+                assert_eq!(full - folded, painted.full_delta_px(s, cell), "{at}");
                 assert!((table..table + cell).contains(&full), "{at}");
+                let delta = instruments.full_delta_px(s, cell);
+                let need = ((136.0 - 73.5) * s).round() as usize;
+                assert!(
+                    delta.is_multiple_of(cell) && (need..need + cell).contains(&delta),
+                    "{at}"
+                );
                 for bars in [StatsBars::Sill, StatsBars::Off] {
                     for deck in [Folded, Full] {
                         assert_eq!(deck_px(bars, deck, s, cell), 0, "{bars:?} {at}");
                     }
                 }
+            }
+        }
+    }
+
+    /// A4 §11's rule in Folded: the deck's height is a constant of its rows, which no reading, no
+    /// machine and no width changes. The instruments' band is 14 + 5 × 11.5 + 2 = 73.5 pt at
+    /// every whole width from 160 to 3200 pt, for every machine (some with no heat, disk, network
+    /// or processes reader), on either face: each block holds five rows of the same geometry,
+    /// block B its Machine row, and the dial, r 27 as built, is centred in the band at 36.75 pt,
+    /// 9.75 pt clear of its top and its foot. The plan the deck paints holds the record's four
+    /// rows a block in 62 pt and its dial at 31 pt, as on main. CONTROL: the dial at main's 31 pt
+    /// in the taller band stands 4 pt below its top and 15.5 pt above its foot.
+    #[test]
+    fn folded_is_73_5_pt_at_every_width_and_machine() {
+        let band = |rows: &Rows| rows.top(rows.count) + FOLD_FOOT;
+        let mut seen = 0;
+        for m in [hn(), FaceMetrics::test_stack()] {
+            for facts in std::iter::once(UnitFacts::NONE).chain(unit_machines()) {
+                for w in (160..=3200).map(f64::from) {
+                    let p = plan_folded_with(w, &m, &facts);
+                    let what = || format!("{facts:?} at {w} pt");
+                    for blk in &p.blocks {
+                        assert_eq!(
+                            blk.rows,
+                            Rows::folded(blk.kind, DeckRows::Instruments),
+                            "{}",
+                            what()
+                        );
+                        assert_eq!((blk.rows.count, band(&blk.rows)), (5, 73.5), "{}", what());
+                    }
+                    assert_eq!(
+                        p.blocks.map(|blk| blk.machine.is_some()),
+                        [false, true],
+                        "{}",
+                        what()
+                    );
+                    if let Some(g) = p.gauge {
+                        let [_, y0, _, y1] = g.dial();
+                        assert_eq!((y0, 73.5 - y1), (9.75, 9.75), "{}", what());
+                    }
+                    seen += 1;
+                }
+            }
+            for w in (160..=3200).map(f64::from) {
+                let p = plan_folded(w, &m);
+                for blk in &p.blocks {
+                    assert_eq!(
+                        (blk.rows.count, band(&blk.rows), blk.machine, blk.units),
+                        (4, 62.0, None, None),
+                        "the painted plan at {w} pt"
+                    );
+                }
+                assert!(p.gauge.is_none_or(|g| g.centre().1 == 31.0), "{w} pt");
+            }
+        }
+        assert!(seen > 0);
+        let main = FoldedGauge {
+            cy: DeckRows::Resources.gauge_cy(),
+            ..plan_folded_with(1039.0, &hn(), &this_mac())
+                .gauge
+                .expect("a gauge")
+        };
+        let [_, y0, _, y1] = main.dial();
+        assert_eq!((y0, 73.5 - y1), (4.0, 15.5), "CONTROL");
+    }
+
+    /// A4 §11's rule in Full: ten rows (CPU, GPU, Memory, Disk, Heat, Network, Latency,
+    /// Processes, Cores, Machine) in 16 + 10 × 12 = 136 pt at every kind, narrow and slim at wide's
+    /// 12 pt pitch with their own cell and type, at every whole width from 160 to 3200 pt, for
+    /// every machine, on either face: a resize across kinds never changes the deck's height. Every
+    /// kind holds the Cores row and the Machine row. The plan the deck paints holds the record's
+    /// rows in 100 pt at every kind, as on main. CONTROL: ten rows at the record's 10.5 pt narrow
+    /// pitch take 121 pt, so a resize from mid to narrow would re-grid the tab.
+    #[test]
+    fn full_is_136_pt_at_every_kind() {
+        let height = |rows: &Rows| rows.top(rows.count);
+        let mut kinds = Vec::new();
+        for m in [hn(), FaceMetrics::test_stack()] {
+            for facts in std::iter::once(UnitFacts::NONE).chain(unit_machines()) {
+                for w in (160..=3200).map(f64::from) {
+                    let p = plan_full_with(w, &m, &facts);
+                    let what = format!("{facts:?} at {w} pt, {:?}", p.kind);
+                    assert_eq!(p.rows, Rows::full(p.kind, DeckRows::Instruments), "{what}");
+                    assert_eq!(
+                        (p.rows.count, p.rows.pitch, height(&p.rows)),
+                        (10, 12.0, 136.0),
+                        "{what}"
+                    );
+                    assert!(p.cores.is_some() && p.machine.is_some(), "{what}");
+                    if !kinds.contains(&p.kind) {
+                        kinds.push(p.kind);
+                    }
+                }
+            }
+            for w in (160..=3200).map(f64::from) {
+                let p = plan_full(w, &m);
+                assert_eq!(height(&p.rows), 100.0, "the painted plan at {w} pt");
+                assert_eq!(p.machine, None, "the painted plan at {w} pt");
+                assert_eq!(
+                    p.cores.is_some(),
+                    matches!(p.kind, FullKind::Narrow | FullKind::Slim),
+                    "the painted plan at {w} pt"
+                );
+            }
+        }
+        assert_eq!(kinds.len(), FullKind::ALL.len(), "{kinds:?}");
+        for kind in FullKind::ALL {
+            let rows = Rows::full(kind, DeckRows::Instruments);
+            let main = Rows::full(kind, DeckRows::Resources);
+            assert_eq!(
+                (rows.cell, rows.name_pt),
+                (main.cell, main.name_pt),
+                "{kind:?}"
+            );
+        }
+        let narrow = Rows {
+            pitch: 10.5,
+            ..Rows::full(FullKind::Narrow, DeckRows::Instruments)
+        };
+        assert_eq!(height(&narrow), 121.0, "CONTROL");
+    }
+
+    /// A4 §11's rows move no column: planned with no units facts, the instruments' rows lay the
+    /// columns the deck paints today, at every whole and half width from 160 to 3200 pt on either
+    /// face, Folded and Full; only the rows, the dial's centre, Full's Cores row beside the
+    /// gauge's slot and the Machine row differ. The name column measures the Heat and Latency
+    /// rows' names only for the instruments' rows ([`DeckRows::row_names`]), and "Processes"
+    /// stays the widest. CONTROL: a row named "Temperatures" would widen the name column at every
+    /// such width and kind, so the check would find the name, the well and every column past them
+    /// moved.
+    #[test]
+    fn the_instruments_rows_move_no_column() {
+        let painted = DeckRows::PAINTED;
+        let wider =
+            |m: &FaceMetrics, rows: &Rows| name_width(0.0, rows.name_pt, m, &["Temperatures"]);
+        for m in [hn(), FaceMetrics::test_stack()] {
+            for w in (320..=6400).map(|half| f64::from(half) / 2.0) {
+                let (p, i) = (
+                    plan_folded(w, &m),
+                    plan_folded_with(w, &m, &UnitFacts::NONE),
+                );
+                let as_painted = FoldedPlan {
+                    gauge: i.gauge.map(|g| FoldedGauge {
+                        cy: painted.gauge_cy(),
+                        ..g
+                    }),
+                    blocks: i.blocks.map(|blk| BlockPlan {
+                        rows: Rows::folded(blk.kind, painted),
+                        machine: None,
+                        ..blk
+                    }),
+                    ..i
+                };
+                assert_eq!(as_painted, p, "Folded at {w} pt");
+                for blk in p.blocks {
+                    assert!(
+                        wider(&m, &blk.rows) > blk.name.w,
+                        "CONTROL: Folded at {w} pt"
+                    );
+                }
+                let (p, i) = (plan_full(w, &m), plan_full_with(w, &m, &UnitFacts::NONE));
+                let as_painted = FullPlan {
+                    rows: Rows::full(i.kind, painted),
+                    cores: i.cores.filter(|_| painted.full_cores_row(i.kind)),
+                    machine: None,
+                    ..i
+                };
+                assert_eq!(as_painted, p, "Full at {w} pt");
+                assert!(wider(&m, &p.rows) > p.name.w, "CONTROL: Full at {w} pt");
             }
         }
     }
@@ -4056,15 +4583,26 @@ mod tests {
         assert_eq!(DeckSizePref::from_word("huge"), None);
     }
 
+    /// The machines the Cores row's law sweeps (A4 §7): from 4 to 256 cores, in one unnamed
+    /// cluster and in one to six named clusters, split as evenly as the count allows.
     fn machines() -> Vec<Vec<Cluster<'static>>> {
-        const NAMES: [&[&str]; 4] = [
+        const NAMES: [&[&str]; 6] = [
             &["Performance"],
             &["Performance", "Efficiency"],
             &["Super", "Performance", "Efficiency"],
             &["Super", "Performance", "Mid 2", "Efficiency"],
+            &["Super", "Performance", "Mid 2", "Mid 1", "Efficiency"],
+            &[
+                "Prime",
+                "Super",
+                "Performance",
+                "Mid 2",
+                "Mid 1",
+                "Efficiency",
+            ],
         ];
         let mut machines = Vec::new();
-        for n in 4..=128_usize {
+        for n in 4..=256_usize {
             machines.push(vec![Cluster {
                 count: n,
                 name: None,
@@ -4079,6 +4617,7 @@ mod tests {
                             count: n / k + usize::from(i < n % k),
                             name: Some(name),
                         })
+                        .filter(|cluster| cluster.count > 0)
                         .collect(),
                 );
             }
@@ -4086,94 +4625,241 @@ mod tests {
         machines
     }
 
-    fn assert_row_fits(
-        clusters: &[Cluster<'_>],
-        mode: CoresMode,
-        ladder: &[CoresMode],
+    /// Where a Cores row stands: its room, cell, ladder and caption, the queue its square forms
+    /// take, and the form the plan chose for each machine.
+    #[derive(Clone, Copy, Debug)]
+    struct CoresRoom {
         room: f64,
         cell: f64,
+        ladder: &'static [CoresMode],
         caption_pt: f64,
+        queue: f64,
+    }
+
+    /// What breaks A4 §7's fit for `clusters` in `at` where the plan chose `mode`: a form other
+    /// than the first of its ladder that fits with the queue tile, or none where one fits; squares
+    /// wider than the room; or a count that cuts a cluster or overflows.
+    fn cores_fault(
+        clusters: &[Cluster<'_>],
+        mode: CoresMode,
+        at: CoresRoom,
         m: &FaceMetrics,
-    ) {
-        let total = count_words(clusters);
-        if mode == CoresMode::CountOnly {
-            let words = cores_count_text(clusters, room, caption_pt, m);
-            assert!(
-                words == total
-                    || (words.starts_with(&format!("{total}: ")) && !words.ends_with('…')),
-                "{clusters:?} in {room} pt says {words:?}"
-            );
-            assert!(m.width(&words, caption_pt, false) <= room);
+    ) -> Option<String> {
+        let width = |mode| cores_row_width(clusters, mode, at.cell, at.caption_pt, at.queue, m);
+        let want = if total_cores(clusters) == 0 {
+            CoresMode::CountOnly
         } else {
-            assert!(ladder.contains(&mode), "{mode:?} is not this row's");
-            assert!(
-                cores_row_width(clusters, mode, cell, caption_pt, m) <= room,
-                "{clusters:?} in {room} pt"
-            );
+            at.ladder
+                .iter()
+                .copied()
+                .find(|&mode| width(mode) <= at.room)
+                .unwrap_or(CoresMode::CountOnly)
+        };
+        if mode != want {
+            return Some(format!("{clusters:?} in {at:?}: {mode:?}, not {want:?}"));
+        }
+        if mode == CoresMode::CountOnly {
+            let total = count_words(clusters);
+            let words = cores_count_text(clusters, at.room, at.caption_pt, m);
+            let whole = words == total
+                || (words.starts_with(&format!("{total}: ")) && !words.ends_with('…'));
+            let fits = m.width(&words, at.caption_pt, false) <= at.room + 0.01;
+            return (!(whole && fits)).then(|| format!("{clusters:?} in {at:?} says {words:?}"));
+        }
+        (width(mode) > at.room).then(|| format!("{clusters:?} in {at:?}: {mode:?} overflows"))
+    }
+
+    /// A plan that holds a Cores row: Folded's block B or a Full table.
+    #[derive(Clone, Copy, Debug)]
+    enum CoresPlan {
+        Block(BlockPlan),
+        Full(FullPlan),
+    }
+
+    impl CoresPlan {
+        /// Where its row stands, with the queue `deck`'s square forms take (A4 §7: the
+        /// instruments' run-queue tile and its wall; the record's row draws none).
+        fn at(&self, deck: DeckRows) -> CoresRoom {
+            let queue = match deck {
+                DeckRows::Resources => 0.0,
+                DeckRows::Instruments => CORES_QUEUE,
+            };
+            match self {
+                Self::Block(b) => CoresRoom {
+                    room: b.cores.w,
+                    cell: b.rows.cell,
+                    ladder: b.kind.cores_ladder(),
+                    caption_pt: b.kind.cores_caption_pt(),
+                    queue,
+                },
+                Self::Full(p) => CoresRoom {
+                    room: p.cores.map_or(0.0, |room| room.w),
+                    cell: p.rows.cell,
+                    ladder: p.kind.cores_ladder(),
+                    caption_pt: CORES_CAPTION_PT,
+                    queue,
+                },
+            }
+        }
+
+        /// The form the plan chooses for `clusters`.
+        fn mode(&self, clusters: &[Cluster<'_>], m: &FaceMetrics) -> CoresMode {
+            match self {
+                Self::Block(b) => b.cores_mode(clusters, m),
+                Self::Full(p) => p.cores_mode(clusters, m).expect("a Cores row"),
+            }
         }
     }
 
+    /// A4 §7: the Cores row draws every core or a count, never a cluster cut, for 4 to 256 cores
+    /// in one to six clusters ([`machines`]), in Folded's block B and in every Full kind (the
+    /// instruments' rows) or narrow and slim (the record's, which the deck paints), on either
+    /// face. Its room steps with the width within each kind, gauge and units column, so the law
+    /// reads each such layout at its least and its widest room over every whole width from 160
+    /// to 3200 pt, and at 940, 1039 and 1440: there the plan's form is the first of its ladder
+    /// whose squares, with the instruments' run-queue tile and its wall, fit, else a count that
+    /// names every cluster or the total alone; a machine with no cores read says so. In Full, at
+    /// every such width, the row spans the centred table: from where its units stand to the right
+    /// margin less the table's offset, never past the margin. CONTROLS: a form chosen without the
+    /// queue tile's 6 pt overflows the instruments' row; a centred wide table's room not narrowed
+    /// by its offset ends that offset past the right margin.
     #[test]
-    fn cores_fit_every_machine() {
+    fn the_cores_row_draws_every_core_or_a_count() {
+        type Key = (&'static str, Option<usize>, bool, bool, DeckRows);
         let machines = machines();
+        let mac = this_mac();
+        let (mut checked, mut unqueued, mut centred) = (0, 0, 0);
         for m in [hn(), FaceMetrics::test_stack()] {
-            let bp = breakpoints(&m);
-            let full_rows = [bp.full[2], bp.full[3]].map(|w| plan_full(w, &m));
-            let folded = bp.folded.map(|w| plan_folded(w, &m).blocks[1]);
-            for clusters in &machines {
-                for plan in &full_rows {
-                    let CoresAt::Row(room) = plan.cores else {
-                        panic!("{:?} has a Cores row", plan.kind);
-                    };
-                    let mode = plan.cores_mode(clusters, &m).expect("a Cores row");
-                    let ladder = [CoresMode::Stack, CoresMode::Tiny];
-                    assert_row_fits(
-                        clusters,
-                        mode,
-                        &ladder,
-                        room.w,
-                        plan.rows.cell,
-                        CORES_CAPTION_PT,
-                        &m,
-                    );
-                }
-                for block in &folded {
-                    let mode = block.cores_mode(clusters, &m);
-                    let caption_pt = block.kind.cores_caption_pt();
-                    let ladder = block.kind.cores_ladder();
-                    assert_row_fits(
-                        clusters,
-                        mode,
-                        ladder,
-                        block.cores.w,
-                        block.rows.cell,
-                        caption_pt,
-                        &m,
-                    );
+            // Each layout's least and widest room, by the plan that laid it, and the owner's.
+            let mut rooms: Vec<(Key, CoresPlan, CoresPlan)> = Vec::new();
+            let mut ats: Vec<(CoresPlan, DeckRows)> = Vec::new();
+            for deck in [DeckRows::PAINTED, DeckRows::Instruments] {
+                for w in (160..=3200).map(f64::from) {
+                    let folded = folded_by(w, &m, &mac, fold_spec, deck);
+                    let full = full_by(w, &m, &mac, full_spec, deck);
+                    let mut laid = Vec::new();
+                    if !folded.ground_only {
+                        let b = folded.blocks[1];
+                        let kind = BlockKind::ALL.iter().position(|&k| k == b.kind);
+                        let gauge = folded.gauge.is_some();
+                        let key = ("Folded", kind, gauge, b.units.is_some(), deck);
+                        laid.push((key, CoresPlan::Block(b)));
+                    }
+                    if let Some(room) = full.cores.filter(|_| !full.ground_only) {
+                        // The row spans the centred table: from where its units stand (the
+                        // units column, else the %, else slim's well end with no %) to the
+                        // right margin less the offset, never past the margin.
+                        let left = full
+                            .units
+                            .map(|units| units.at.x)
+                            .or(full.pct.map(|pct| pct.x))
+                            .unwrap_or(full.well.end());
+                        let right = full.w - X0;
+                        assert!(
+                            (room.x - left).abs() < 1e-9
+                                && (room.end() - (right - full.offset)).abs() < 1e-9
+                                && room.end() <= right,
+                            "{deck:?} at {w} pt, {:?}: the Cores row {room:?} spans from {left} \
+                             to {right} less the offset {}",
+                            full.kind,
+                            full.offset,
+                        );
+                        if full.offset > 0.0 {
+                            let unnarrowed = Col::new(room.x, room.w + 2.0 * full.offset);
+                            assert!(unnarrowed.end() > right, "CONTROL at {w} pt");
+                            centred += 1;
+                        }
+                        let kind = FullKind::ALL.iter().position(|&k| k == full.kind);
+                        let key = (
+                            "Full",
+                            kind,
+                            full.gauge.is_some(),
+                            full.units.is_some(),
+                            deck,
+                        );
+                        laid.push((key, CoresPlan::Full(full)));
+                    }
+                    for (key, plan) in laid {
+                        if [940.0, 1039.0, 1440.0].contains(&w) {
+                            ats.push((plan, deck));
+                        }
+                        let room = plan.at(deck).room;
+                        match rooms.iter_mut().find(|(k, _, _)| *k == key) {
+                            Some((_, least, widest)) => {
+                                if room < least.at(deck).room {
+                                    *least = plan;
+                                }
+                                if room > widest.at(deck).room {
+                                    *widest = plan;
+                                }
+                            }
+                            None => rooms.push((key, plan, plan)),
+                        }
+                    }
                 }
             }
-
+            ats.extend(
+                rooms
+                    .iter()
+                    .flat_map(|&(key, least, widest)| [(least, key.4), (widest, key.4)]),
+            );
+            // One plan for each room it lays: the row reads nothing else of it.
+            let mut distinct: Vec<(CoresPlan, DeckRows)> = Vec::new();
+            for (plan, deck) in ats {
+                let at = plan.at(deck);
+                let same = |(p, d): &(CoresPlan, DeckRows)| {
+                    let b = p.at(*d);
+                    (b.room, b.cell, b.ladder, b.caption_pt, b.queue)
+                        == (at.room, at.cell, at.ladder, at.caption_pt, at.queue)
+                };
+                if !distinct.iter().any(same) {
+                    distinct.push((plan, deck));
+                }
+            }
+            let ats = distinct;
+            for clusters in &machines {
+                for &(plan, deck) in &ats {
+                    let at = plan.at(deck);
+                    if let Some(fault) = cores_fault(clusters, plan.mode(clusters, &m), at, &m) {
+                        panic!("{fault}");
+                    }
+                    checked += 1;
+                    if unqueued > 0 || deck != DeckRows::Instruments {
+                        continue;
+                    }
+                    let blind = cores_row_mode(
+                        clusters,
+                        at.room,
+                        at.cell,
+                        at.ladder,
+                        at.caption_pt,
+                        0.0,
+                        &m,
+                    );
+                    if cores_fault(clusters, blind, at, &m).is_some() {
+                        unqueued += 1;
+                    }
+                }
+            }
             let unread = [Cluster {
                 count: 0,
                 name: None,
             }];
             for clusters in [&[][..], &unread] {
-                let rows = full_rows.iter().map(|plan| {
-                    let CoresAt::Row(room) = plan.cores else {
-                        panic!("{:?} has a Cores row", plan.kind);
-                    };
-                    (plan.cores_mode(clusters, &m).expect("a Cores row"), room.w)
-                });
-                let blocks = folded
-                    .iter()
-                    .map(|block| (block.cores_mode(clusters, &m), block.cores.w));
-                for (mode, room) in rows.chain(blocks) {
-                    assert_eq!(mode, CoresMode::CountOnly);
-                    let words = cores_count_text(clusters, room, CORES_CAPTION_PT, &m);
+                for &(plan, deck) in &ats {
+                    assert_eq!(plan.mode(clusters, &m), CoresMode::CountOnly);
+                    let at = plan.at(deck);
+                    let words = cores_count_text(clusters, at.room, at.caption_pt, &m);
                     assert!(words.ends_with("not read"), "the row says {words:?}");
                 }
             }
         }
+        assert!(checked > 0);
+        assert!(
+            unqueued > 0,
+            "CONTROL: a form chosen without the queue tile fits"
+        );
+        assert!(centred > 0, "CONTROL: no centred table holds a Cores row");
     }
 
     #[test]
@@ -4200,6 +4886,17 @@ mod tests {
         );
         assert_eq!(
             plan_folded(1119.0, &m).blocks[1].cores_mode(&m5, &m),
+            CoresMode::Big
+        );
+        // The instruments' Full rows hold the Cores row at every kind, beside the gauge's slot in
+        // wide and mid, and the queue tile it takes past the squares (A4 §7).
+        let mac = this_mac();
+        assert_eq!(
+            plan_full_with(1119.0, &m, &mac).cores_mode(&m5, &m),
+            Some(CoresMode::Big)
+        );
+        assert_eq!(
+            plan_folded_with(1119.0, &m, &mac).blocks[1].cores_mode(&m5, &m),
             CoresMode::Big
         );
         assert_eq!(
@@ -4697,25 +5394,37 @@ mod tests {
 
     const GIB: u64 = 1 << 30;
 
-    /// This Mac (A1 §1.3): 4 Super and 6 Efficiency cores, a 10-core GPU and its Neural Engine,
-    /// 32 GiB and a disk reader.
-    fn this_mac() -> UnitFacts<'static> {
+    /// This Mac's heat chain (A4 §4): the pressure ladder, its Super and Efficiency clocks, the
+    /// CPU's, GPU's and Neural Engine's watts and the work per joule.
+    const THIS_MACS_HEAT: Heat = Heat {
+        ladder: true,
+        clocks: 2,
+        watts: 3,
+        work: true,
+    };
+
+    /// This Mac (A1 §1.3, A4 §4, §5): a 10-core GPU and its Neural Engine, 32 GiB, a disk
+    /// reader, the whole heat chain, and the network and processes readers.
+    fn this_mac() -> UnitFacts {
         UnitFacts {
-            clusters: &[4, 6],
             gpu: Some(Gpu {
                 cores: Some(10),
                 neural_engine: true,
             }),
             memory: Some(32 * GIB),
             disk: true,
+            heat: Some(THIS_MACS_HEAT),
+            network: true,
+            processes: true,
         }
     }
 
     /// The machines the planner's units laws sweep: this Mac with its Neural Engine and without
-    /// it, a 12 + 4 core Max with a 40-core GPU, a 24 + 8 core Ultra with 80 GPU cores, three
-    /// clusters, a GPU with no core count, a one-cluster Intel Mac whose GPU reads 0 cores, a
-    /// 128-core Linux box with no GPU reading, and machines that read one row alone.
-    fn unit_machines() -> Vec<UnitFacts<'static>> {
+    /// it, a Max with a 40-core GPU, an Ultra with 80 GPU cores, a GPU with no core count and one
+    /// watt tile, an Intel Mac whose GPU reads 0 cores and whose CPU is of one kind, a Linux box
+    /// with no GPU reading whose heat is its ladder alone, a Windows box with no heat, disk,
+    /// network or processes reader, and machines that read one row alone.
+    fn unit_machines() -> Vec<UnitFacts> {
         let mac = this_mac();
         let gpu = |cores, neural_engine| {
             Some(Gpu {
@@ -4723,47 +5432,61 @@ mod tests {
                 neural_engine,
             })
         };
+        let ladder = Some(Heat {
+            ladder: true,
+            clocks: 0,
+            watts: 0,
+            work: false,
+        });
         vec![
             mac,
             UnitFacts {
                 gpu: gpu(Some(10), false),
+                heat: Some(Heat {
+                    watts: 2,
+                    ..THIS_MACS_HEAT
+                }),
                 ..mac
             },
             UnitFacts {
-                clusters: &[12, 4],
                 gpu: gpu(Some(40), true),
                 memory: Some(64 * GIB),
-                disk: true,
+                ..mac
             },
             UnitFacts {
-                clusters: &[24, 8],
                 gpu: gpu(Some(80), true),
                 memory: Some(192 * GIB),
-                disk: true,
+                ..mac
             },
             UnitFacts {
-                clusters: &[5, 6, 4],
-                gpu: gpu(Some(20), true),
-                memory: Some(48 * GIB),
-                disk: true,
-            },
-            UnitFacts {
-                clusters: &[4, 4],
                 gpu: gpu(None, false),
                 memory: Some(8 * GIB),
-                disk: true,
+                heat: Some(Heat {
+                    watts: 1,
+                    ..THIS_MACS_HEAT
+                }),
+                ..mac
             },
             UnitFacts {
-                clusters: &[16],
                 gpu: gpu(Some(0), false),
                 memory: Some(16 * GIB),
-                disk: true,
+                heat: Some(Heat {
+                    clocks: 1,
+                    watts: 2,
+                    ..THIS_MACS_HEAT
+                }),
+                ..mac
             },
             UnitFacts {
-                clusters: &[128],
                 gpu: None,
                 memory: Some(512 * GIB),
-                disk: true,
+                heat: ladder,
+                ..mac
+            },
+            UnitFacts {
+                gpu: gpu(None, false),
+                memory: Some(16 * GIB),
+                ..UnitFacts::NONE
             },
             UnitFacts {
                 disk: true,
@@ -4771,6 +5494,14 @@ mod tests {
             },
             UnitFacts {
                 gpu: gpu(None, true),
+                ..UnitFacts::NONE
+            },
+            UnitFacts {
+                heat: ladder,
+                ..UnitFacts::NONE
+            },
+            UnitFacts {
+                processes: true,
                 ..UnitFacts::NONE
             },
         ]
@@ -4782,9 +5513,19 @@ mod tests {
             .unwrap_or(row.ladder().len())
     }
 
-    /// Each units row's [`rung`] in a table whose units column is `units`.
-    fn rungs(units: Option<UnitsCol>) -> [usize; 4] {
-        let forms = units.map_or([None; 4], |units| units.forms);
+    /// Each units row's form across a plan's units columns: Folded's blocks hold different rows.
+    fn forms_of(cols: &[Option<UnitsCol>]) -> Forms {
+        let mut forms = [None; UnitRow::ALL.len()];
+        for units in cols.iter().flatten() {
+            for row in UnitRow::ALL {
+                forms[row.index()] = forms[row.index()].or(units.form(row));
+            }
+        }
+        forms
+    }
+
+    /// Each units row's [`rung`] for `forms`.
+    fn rungs(forms: Forms) -> [usize; UnitRow::ALL.len()] {
         std::array::from_fn(|i| rung(UnitRow::ALL[i], forms[i]))
     }
 
@@ -4795,7 +5536,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct Widening {
         w: f64,
-        rungs: [usize; 4],
+        rungs: [usize; UnitRow::ALL.len()],
         horizons: Vec<u32>,
         kinds: Vec<usize>,
         kept: Vec<(&'static str, bool)>,
@@ -4806,7 +5547,7 @@ mod tests {
         let kind = |blk: BlockPlan| BlockKind::ALL.iter().position(|&k| k == blk.kind);
         Widening {
             w: p.w,
-            rungs: rungs(a.units),
+            rungs: rungs(forms_of(&[a.units, b.units])),
             horizons: vec![a.strip.span_s(), b.strip.span_s()],
             kinds: [a, b].map(|blk| kind(blk).expect("a kind")).to_vec(),
             kept: vec![
@@ -4824,7 +5565,7 @@ mod tests {
         let kind = FullKind::ALL.iter().position(|&k| k == p.kind);
         Widening {
             w: p.w,
-            rungs: rungs(p.units),
+            rungs: rungs(forms_of(&[p.units])),
             horizons: vec![p.strip.span_s()],
             kinds: vec![kind.expect("a kind")],
             kept: vec![
@@ -4844,7 +5585,7 @@ mod tests {
                 let [was, now] = pair else {
                     return None;
                 };
-                let rows = (0..4)
+                let rows = (0..UnitRow::ALL.len())
                     .filter(|&i| now.rungs[i] > was.rungs[i])
                     .map(|i| format!("{:?} {}→{}", UnitRow::ALL[i], was.rungs[i], now.rungs[i]));
                 let pairs = |a: &[u32], b: &[u32]| -> Vec<(usize, u32, u32)> {
@@ -4912,33 +5653,50 @@ mod tests {
         }
     }
 
-    /// A1 §2.2 and §2.3's points for this Mac: at 1039 pt block A lays its units 148–194 (U 46
-    /// within a U_cap of 54), the % 197–227, a six-hour strip of 49 boxes 234–478 and the bar
-    /// 485–541; at 1440 pt the same units and % (U_cap 254: no form grows past Column, ruling
-    /// 17), a strip of 81 boxes 234–638 and the bar 645–741. Every edge stands on whole device px
-    /// at 1× and 2×, and block B is the plan without units. With no facts block A is the plan the
-    /// deck paints, its % at 148 and its strip of 57 boxes at 185: planned units are inert until
-    /// A1's step R6 paints them.
+    /// A1 §2.2 and §2.3's points for this Mac, and A4's (§5, §7, §8, §11): at 1039 pt block A
+    /// lays its units 148–194 (U 46 within a U_cap of 54), the % 197–227, a six-hour strip of 49
+    /// boxes 234–478 and the bar 485–541; block B its units 634–649 (U_B 15 within 17, its U_cap
+    /// 54), the % 652–682, a six-hour strip of 54 boxes 689–958 and the bar 965–1027, its Cores
+    /// row's room 634–1027, and its Machine row's name in 570–637 and its glyphs 640–682, ending
+    /// with the %. At 1440 pt block A lays the same units and % (U_cap 254: no form grows past
+    /// Column, ruling 17), a strip of 81 boxes 234–638 and the bar 645–741; block B a strip of 86
+    /// boxes 889–1318 and the bar 1325–1427 (b 657, so 17 caps its column), and the same
+    /// Machine row. The dial keeps r 27 at 36.75 pt, the band's middle. Every edge stands on
+    /// whole device px at 1× and 2×. The plan the deck paints is main's: no units, the record's
+    /// rows, block A's % at 148 and its strip of 57 boxes at 185, the dial at 31 pt.
     #[test]
     fn folded_1039_and_1440_plan_units_percent_strip_and_bar_at_their_points() {
+        use UnitRow::{Disk, Memory, Network, Processes};
         let m = hn();
         let mac = this_mac();
-        for (w, b_at, cap, cols, strip_end, bar) in [
+        let block_a = [UnitRow::Gpu, Memory, Disk, UnitRow::Heat];
+        let forms = |rows: &[UnitRow]| {
+            let mut forms = [None; UnitRow::ALL.len()];
+            for &row in rows {
+                forms[row.index()] = Some(Form::Column);
+            }
+            forms
+        };
+        for (w, x_b, cap, cols, strip_end, bar, b_cols, b_bar) in [
             (
                 1039.0,
-                Col::new(570.0, 457.0),
+                570.0,
                 54.0,
                 49,
                 478.0,
                 Col::new(485.0, 56.0),
+                54,
+                Col::new(965.0, 62.0),
             ),
             (
                 1440.0,
-                Col::new(770.0, 657.0),
+                770.0,
                 254.0,
                 81,
                 638.0,
                 Col::new(645.0, 96.0),
+                86,
+                Col::new(1325.0, 102.0),
             ),
         ] {
             let p = plan_folded_with(w, &m, &mac);
@@ -4947,20 +5705,22 @@ mod tests {
                 p,
                 "W {w}"
             );
-            let bare = plan_folded(w, &m);
             assert_eq!(
-                (p.blocks[1], p.divider, p.gauge),
-                (bare.blocks[1], bare.divider, bare.gauge),
+                p.gauge,
+                Some(FoldedGauge {
+                    at: Col::new(12.0, 54.0),
+                    divider: 75.0,
+                    cy: 36.75
+                }),
                 "W {w}"
             );
-            assert_eq!((p.blocks[1].at, p.blocks[1].units), (b_at, None), "W {w}");
-            let a = p.blocks[0];
+            let [a, b] = p.blocks;
             assert_eq!(
                 a.units,
                 Some(UnitsCol {
                     at: Col::new(148.0, 46.0),
                     cap,
-                    forms: [Some(Form::Column); 4],
+                    forms: forms(&block_a),
                 }),
                 "W {w}"
             );
@@ -4984,10 +5744,65 @@ mod tests {
                 (Some(bar), None, None)
             );
             assert_eq!(bar.end(), a.at.end(), "W {w}: the bar ends the block");
-            assert_on_pixels(&block_cols(&a), &format!("W {w}"));
-            assert_in_order(&block_cols(&a), a.at.x, a.at.end(), &format!("W {w}"));
+
+            assert_eq!(
+                b.units,
+                Some(UnitsCol {
+                    at: Col::new(x_b + 64.0, 15.0),
+                    cap: 17.0,
+                    forms: forms(&[Network, Processes]),
+                }),
+                "W {w}"
+            );
+            assert_eq!(
+                (b.kind, b.name, b.well, b.pct),
+                (
+                    BlockKind::Wide,
+                    Col::new(x_b, 52.0),
+                    Col::new(x_b + 52.0, 10.0),
+                    Some(Col::new(x_b + 82.0, 30.0))
+                ),
+                "W {w}"
+            );
+            assert_eq!(
+                (b.strip.x, b.strip.cols, b.strip.span_s()),
+                (x_b + 119.0, b_cols, 21_600),
+                "W {w}"
+            );
+            assert_eq!(
+                (b.meter.bar, b.meter.run, b.details),
+                (Some(b_bar), None, None),
+                "W {w}"
+            );
+            assert_eq!(b_bar.end(), b.at.end(), "W {w}: the bar ends the block");
+            assert_eq!(b.cores, Col::new(x_b + 64.0, b.at.end() - x_b - 64.0));
+            assert_eq!(
+                b.machine,
+                Some(MachineRow {
+                    name: Col::new(x_b, 67.0),
+                    glyphs: Col::new(x_b + 70.0, 42.0),
+                }),
+                "W {w}"
+            );
+            for blk in [a, b] {
+                assert_eq!(
+                    blk.rows,
+                    Rows::folded(BlockKind::Wide, DeckRows::Instruments)
+                );
+                assert_on_pixels(&block_cols(&blk), &format!("W {w}"));
+                assert_in_order(&block_cols(&blk), blk.at.x, blk.at.end(), &format!("W {w}"));
+            }
         }
-        let a = plan_folded(1039.0, &m).blocks[0];
+        // At 1039 pt block B's U_cap is 54: only its own bound, U_B, keeps its column to 17.
+        let b = plan_folded(1039.0, &m).blocks[1];
+        let room = b.at.end() - b.strip.x - UNITS_TO_PCT;
+        assert_eq!(
+            units_cap(room, b.strip.spec, &fold_spec(b.kind)),
+            Some(54.0)
+        );
+
+        let p = plan_folded(1039.0, &m);
+        let a = p.blocks[0];
         assert_eq!(
             (a.units, a.pct, a.strip.x, a.strip.cols, a.meter.bar),
             (
@@ -4998,32 +5813,49 @@ mod tests {
                 Some(Col::new(476.0, 65.0))
             )
         );
+        assert_eq!(p.gauge.map(|g| g.centre()), Some((39.0, 31.0)));
         assert_eq!(
-            plan_folded_with(1039.0, &m, &UnitFacts::NONE),
-            plan_folded(1039.0, &m)
+            p.blocks.map(|blk| (blk.rows, blk.units, blk.machine)),
+            [(
+                Rows::folded(BlockKind::Wide, DeckRows::Resources),
+                None,
+                None
+            ); 2]
+        );
+        // The instruments' rows move no column: with no facts their plan is the painted one's.
+        let bare = plan_folded_with(1039.0, &m, &UnitFacts::NONE);
+        assert_eq!(
+            bare.blocks
+                .map(|blk| (blk.at, blk.name, blk.pct, blk.strip, blk.meter)),
+            p.blocks
+                .map(|blk| (blk.at, blk.name, blk.pct, blk.strip, blk.meter))
         );
     }
 
-    /// A1 §2.4's ladder by width for this Mac, and A2 §3.5's with its Neural Engine: U_cap is
-    /// b − 403 for a block A b pt wide, so a form U pt wide draws from W = 2U + 931 pt. Widening
-    /// from 900 pt, the GPU's undivided tank comes at 947 pt (957 with the tile), the CPU's
-    /// Cluster at 959, Disk's two tiles' place at 969, the CPU's Stack at 977, Memory's Half at
-    /// 983, the GPU's Column at 993 (1003), the CPU's Column at 1011 and Memory's waffle at 1023.
-    /// At the owner's 940 pt no units draw.
+    /// A1 §2.4's ladder by width for this Mac, with A2 §3.5's Neural Engine tile and A4's rows
+    /// (§4, §5): U_cap is b − 403 for a block b pt wide, in block A and in block B, whose own
+    /// bound is 17, so a form U pt wide draws from W = 2U + 931 pt. Widening from 900 pt, the
+    /// GPU's undivided tank comes at 947 pt (957 with the tile), block B's interface tiles and
+    /// processes columns at 961, Disk's two tiles' place at 969, Memory's Half at 983, the heat
+    /// chain at 991, the GPU's Column at 993 (1003) and Memory's waffle at 1023. A Linux box's
+    /// heat ladder alone draws from 937. The CPU row draws none (A4 §7). At the owner's 940 pt no
+    /// units draw.
     #[test]
     fn this_macs_forms_step_up_where_the_design_says() {
-        use Form::{Cluster, Column, Half, Stack, Undivided};
-        use UnitRow::{Cpu, Disk, Memory};
+        use Form::{Column, Half, Undivided};
+        use UnitRow::{Disk, Memory, Network, Processes};
         let m = hn();
-        let steps = |facts: &UnitFacts<'_>| {
-            let mut was = [None; 4];
+        let steps = |facts: &UnitFacts| {
+            let mut was = [None; UnitRow::ALL.len()];
             let mut steps = Vec::new();
             for w in (900..=1100).map(f64::from) {
-                let a = plan_folded_with(w, &m, facts).blocks[0];
-                if let Some(units) = a.units {
-                    assert_eq!(units.cap, a.at.w - 403.0, "W {w}");
+                let p = plan_folded_with(w, &m, facts);
+                for (blk, bound) in p.blocks.iter().zip([f64::INFINITY, B_UNITS_MAX]) {
+                    if let Some(units) = blk.units {
+                        assert_eq!(units.cap, (blk.at.w - 403.0).min(bound), "W {w}");
+                    }
                 }
-                let forms = a.units.map_or([None; 4], |units| units.forms);
+                let forms = forms_of(&p.blocks.map(|blk| blk.units));
                 for (i, form) in forms.into_iter().enumerate() {
                     if form != was[i] {
                         steps.push((w, UnitRow::ALL[i], form));
@@ -5041,158 +5873,293 @@ mod tests {
             }),
             ..mac
         };
-        assert_eq!(
-            steps(&without),
-            [
-                (947.0, UnitRow::Gpu, Some(Undivided)),
-                (959.0, Cpu, Some(Cluster)),
+        let ladder = |undivided: f64, column: f64| {
+            let mut want = vec![
+                (undivided, UnitRow::Gpu, Some(Undivided)),
+                (961.0, Network, Some(Column)),
+                (961.0, Processes, Some(Column)),
                 (969.0, Disk, Some(Column)),
-                (977.0, Cpu, Some(Stack)),
                 (983.0, Memory, Some(Half)),
-                (993.0, UnitRow::Gpu, Some(Column)),
-                (1011.0, Cpu, Some(Column)),
+                (991.0, UnitRow::Heat, Some(Column)),
+                (column, UnitRow::Gpu, Some(Column)),
                 (1023.0, Memory, Some(Column)),
-            ]
+            ];
+            want.sort_by(|a, b| a.0.total_cmp(&b.0));
+            want
+        };
+        assert_eq!(steps(&without), ladder(947.0, 993.0));
+        assert_eq!(steps(&mac), ladder(957.0, 1003.0));
+        let linux = UnitFacts {
+            gpu: None,
+            heat: Some(Heat {
+                ladder: true,
+                clocks: 0,
+                watts: 0,
+                work: false,
+            }),
+            ..mac
+        };
+        assert_eq!(
+            steps(&linux).first(),
+            Some(&(937.0, UnitRow::Heat, Some(Column)))
         );
         assert_eq!(
-            steps(&mac),
-            [
-                (957.0, UnitRow::Gpu, Some(Undivided)),
-                (959.0, Cpu, Some(Cluster)),
-                (969.0, Disk, Some(Column)),
-                (977.0, Cpu, Some(Stack)),
-                (983.0, Memory, Some(Half)),
-                (1003.0, UnitRow::Gpu, Some(Column)),
-                (1011.0, Cpu, Some(Column)),
-                (1023.0, Memory, Some(Column)),
-            ]
+            plan_folded_with(940.0, &m, &mac)
+                .blocks
+                .map(|blk| blk.units),
+            [None, None]
         );
-        assert_eq!(plan_folded_with(940.0, &m, &mac).blocks[0].units, None);
-        // A 12 + 4 core Max takes Stack at 1039 pt and a 24 + 8 core Ultra Cluster (A1 §4.1).
-        for (clusters, form) in [(&[12_usize, 4][..], Stack), (&[24, 8][..], Cluster)] {
-            let facts = UnitFacts { clusters, ..mac };
-            let units = plan_folded_with(1039.0, &m, &facts).blocks[0].units;
-            assert_eq!(units.and_then(|u| u.forms[0]), Some(form), "{clusters:?}");
+    }
+
+    /// What breaks A1 §2.4's units law in `blk`, a block or table laid around its units column
+    /// for `rows`, given `bare`, the same laid with none, and `relay`, which lays it again around
+    /// a column `u` pt wide: a column beside a horizon short of the top preset, or that costs the
+    /// table its kind, its bar column or the top preset; a form past the cap, a form on a row not
+    /// the table's, or a column wider than its widest form; a cap other than U_cap, or `bound`
+    /// where that is narrower; a U_cap that is not tight.
+    fn units_faults(
+        bare: (FullOrBlock, f64, f64, &MeterSpec),
+        blk: (FullOrBlock, Option<UnitsCol>),
+        rows: &[UnitRow],
+        bound: f64,
+        facts: &UnitFacts,
+        relay: &dyn Fn(f64) -> FullOrBlock,
+    ) -> Vec<String> {
+        let top = Strip::spec_for(f64::INFINITY);
+        let (bare, room, cell, spec) = bare;
+        let (laid, units) = blk;
+        let Some(units) = units else {
+            return Vec::new();
+        };
+        let held = bare.spec;
+        let mut faults = Vec::new();
+        if held != top {
+            faults.push(format!("units beside a horizon of {held:?}"));
+        }
+        let keeps = |t: FullOrBlock| t.fits && t.kind == bare.kind && t.bar && t.spec == top;
+        if !keeps(laid) {
+            faults.push("the column costs the table six hours, its kind or its bar".to_owned());
+        }
+        for row in UnitRow::ALL {
+            let Some(form) = units.form(row) else {
+                continue;
+            };
+            if !rows.contains(&row) {
+                faults.push(format!("{row:?} draws in a table that does not hold it"));
+            }
+            match facts.width(row, form, PLAN_SCALE, cell) {
+                Some(fw) if fw <= units.cap => {}
+                fw => faults.push(format!(
+                    "{row:?}'s {form:?} of {fw:?} pt past {}",
+                    units.cap
+                )),
+            }
+        }
+        let widest = facts.widest(&units.forms, cell);
+        if units.at.w != widest {
+            faults.push(format!(
+                "a column of {} pt, its widest form {widest}",
+                units.at.w
+            ));
+        }
+        if units.at.w > bound {
+            faults.push(format!("a column of {} pt past {bound} pt", units.at.w));
+        }
+        let cap = units_cap(room, held, spec);
+        if cap.map(|cap| cap.min(bound)) != Some(units.cap) {
+            faults.push(format!(
+                "a cap of {}, not {cap:?} within {bound}",
+                units.cap
+            ));
+        }
+        if let Some(cap) = cap {
+            for (u, kept) in [(units.at.w, true), (cap, true), (cap + 1.0, false)] {
+                if keeps(relay(u)) != kept {
+                    faults.push(format!("a column of {u} pt keeps the preset: {}", !kept));
+                }
+            }
+        }
+        faults
+    }
+
+    /// What [`units_faults`] reads of a laid table.
+    #[derive(Clone, Copy, Debug)]
+    struct FullOrBlock {
+        fits: bool,
+        kind: usize,
+        bar: bool,
+        spec: MultiScaleSpec,
+    }
+
+    impl FullOrBlock {
+        fn block((b, fits): (BlockPlan, bool)) -> Self {
+            Self {
+                fits,
+                kind: BlockKind::ALL
+                    .iter()
+                    .position(|&k| k == b.kind)
+                    .unwrap_or(4),
+                bar: b.meter.bar.is_some(),
+                spec: b.strip.spec,
+            }
+        }
+
+        fn full((p, fits): (FullPlan, bool)) -> Self {
+            Self {
+                fits,
+                kind: FullKind::ALL.iter().position(|&k| k == p.kind).unwrap_or(4),
+                bar: p.meter.bar.is_some(),
+                spec: p.strip.spec,
+            }
         }
     }
 
-    /// A1 §2.4, §2.5 and ruling 11: the units column never costs a strip its preset, its kind or
-    /// its bar column, in Folded's block A or in Full (step R5), at any whole width from 160 to
-    /// 3200 pt, for any machine, on either face. Units draw only where the table's strip holds the
-    /// top preset without them, and in Full only in a wide or mid table; every form taken is
-    /// within U_cap, and the column is as wide as the widest of them. U_cap is tight: the table
-    /// laid with a column up to U_cap keeps the top preset, and with a column a point wider loses
-    /// it (CONTROL). Folded's block B, the gauge and the divider never move.
+    /// A1 §2.4, §2.5 and ruling 11, with A4 §5: a units column never costs its strip the top
+    /// preset, its kind or its bar column, in Folded's block A, in its block B and in Full (step
+    /// R5), at any whole width from 160 to 3200 pt, for any machine, on either face. Units draw
+    /// only where the table's strip holds the top preset without them, and in Full only in a wide
+    /// or mid table; each block draws its own rows' forms, every form within its cap, and the
+    /// column is as wide as the widest of them. U_cap is tight: laid with a column up to U_cap
+    /// the table keeps the top preset, and with a column a point wider loses it. Block B moves by
+    /// its column, at most 17 pt (U_B), and keeps six hours from 1039 pt, as block A keeps them;
+    /// the gauge and the divider never move. CONTROL: at 1039 pt a 21 pt column would keep block
+    /// B's six hours (its U_cap is 54), and the law refuses it as past U_B.
     #[test]
-    fn the_units_column_never_costs_the_strip_its_preset() {
-        let top = Strip::spec_for(f64::INFINITY);
-        let (mut drawn, mut drawn_full) = (0, 0);
+    fn the_units_columns_keep_the_strips_preset_and_block_b_moves_17_pt_at_most() {
+        let (mut drawn, mut drawn_b, mut drawn_full) = (0, 0, 0);
+        let deck = DeckRows::Instruments;
         for m in [hn(), FaceMetrics::test_stack()] {
             for facts in unit_machines() {
                 for w in (160..=3200).map(f64::from) {
-                    let bare = plan_full(w, &m);
+                    let bare = plan_full_with(w, &m, &UnitFacts::NONE);
                     let p = plan_full_with(w, &m, &facts);
                     let what = || format!("Full, {facts:?} at {w} pt");
-                    let Some(units) = p.units else {
+                    if p.units.is_none() {
                         assert_eq!(p, bare, "{}", what());
                         continue;
-                    };
+                    }
                     drawn_full += 1;
                     assert!(
                         matches!(p.kind, FullKind::Wide | FullKind::Mid),
                         "{}",
                         what()
                     );
-                    assert_eq!(
-                        (p.kind, bare.strip.spec, p.strip.spec),
-                        (bare.kind, top, top),
-                        "{}",
-                        what()
+                    assert_eq!(p.kind, bare.kind, "{}", what());
+                    let spec = full_meter_spec(p.kind, &m, full_spec);
+                    let room = bare.w - X0 - (bare.strip.x - bare.offset) - UNITS_TO_PCT;
+                    let relay = |u: f64| {
+                        FullOrBlock::full(lay_full(p.w, p.kind, &m, true, u, full_spec, deck))
+                    };
+                    let faults = units_faults(
+                        (FullOrBlock::full((bare, true)), room, p.rows.cell, &spec),
+                        (FullOrBlock::full((p, true)), p.units),
+                        &UnitRow::ALL,
+                        f64::INFINITY,
+                        &facts,
+                        &relay,
                     );
-                    assert!(
-                        p.meter.bar.is_some() && p.strip.end() <= p.w - X0,
-                        "{}",
-                        what()
-                    );
-                    let widths: Vec<f64> = UnitRow::ALL
-                        .into_iter()
-                        .zip(units.forms)
-                        .filter_map(|(row, form)| facts.width(row, form?, PLAN_SCALE, p.rows.cell))
-                        .collect();
-                    assert!(widths.iter().all(|&fw| fw <= units.cap), "{}", what());
-                    assert_eq!(widths.iter().copied().fold(0.0, f64::max), units.at.w);
-                    for (u, keeps) in [
-                        (0.0, true),
-                        (units.at.w, true),
-                        (units.cap, true),
-                        (units.cap + 1.0, false),
-                    ] {
-                        let (laid, fits) = lay_full(p.w, p.kind, &m, true, u, full_spec);
-                        let kept = fits
-                            && laid.kind == p.kind
-                            && laid.meter.bar.is_some()
-                            && laid.strip.spec == top;
-                        assert_eq!(kept, keeps, "{}: a column of {u} pt", what());
-                    }
+                    assert!(faults.is_empty(), "{}: {faults:?}", what());
                 }
                 for w in (160..=3200).map(f64::from) {
-                    let bare = plan_folded(w, &m);
+                    let bare = plan_folded_with(w, &m, &UnitFacts::NONE);
                     let p = plan_folded_with(w, &m, &facts);
                     let what = || format!("{facts:?} at {w} pt");
                     assert_eq!(
-                        (p.blocks[1], p.gauge, p.divider, p.ground_only),
-                        (bare.blocks[1], bare.gauge, bare.divider, bare.ground_only),
+                        (p.gauge, p.divider, p.ground_only),
+                        (bare.gauge, bare.divider, bare.ground_only),
                         "{}",
                         what()
                     );
-                    let (a, a0) = (p.blocks[0], bare.blocks[0]);
-                    let Some(units) = a.units else {
-                        assert_eq!(a, a0, "{}", what());
-                        continue;
-                    };
-                    drawn += 1;
-                    assert_eq!(
-                        a0.strip.spec,
-                        top,
-                        "{}: units beside a shorter horizon",
-                        what()
-                    );
-                    assert_eq!(
-                        (a.kind, a.at, a.strip.spec),
-                        (a0.kind, a0.at, top),
-                        "{}",
-                        what()
-                    );
-                    assert!(
-                        a.meter.bar.is_some() && a.strip.end() <= a.at.end(),
-                        "{}",
-                        what()
-                    );
-                    let widths: Vec<f64> = UnitRow::ALL
-                        .into_iter()
-                        .zip(units.forms)
-                        .filter_map(|(row, form)| facts.width(row, form?, PLAN_SCALE, a.rows.cell))
-                        .collect();
-                    assert!(widths.iter().all(|&fw| fw <= units.cap), "{}", what());
-                    assert_eq!(widths.iter().copied().fold(0.0, f64::max), units.at.w);
-                    for (u, keeps) in [
-                        (0.0, true),
-                        (units.at.w, true),
-                        (units.cap, true),
-                        (units.cap + 1.0, false),
-                    ] {
-                        let (laid, fits) =
-                            lay_block(a.at.x, a.at.w, a.kind, &m, true, u, fold_spec);
-                        let kept = fits
-                            && laid.kind == a.kind
-                            && laid.meter.bar.is_some()
-                            && laid.strip.spec == top;
-                        assert_eq!(kept, keeps, "{}: a column of {u} pt", what());
+                    let blocks = [
+                        (UnitRow::BLOCK_A.as_slice(), f64::INFINITY),
+                        (UnitRow::BLOCK_B.as_slice(), B_UNITS_MAX),
+                    ];
+                    for (i, (rows, bound)) in blocks.into_iter().enumerate() {
+                        let (blk, blk0) = (p.blocks[i], bare.blocks[i]);
+                        let Some(units) = blk.units else {
+                            assert_eq!(blk, blk0, "{}", what());
+                            continue;
+                        };
+                        if i == 0 {
+                            drawn += 1;
+                        } else {
+                            drawn_b += 1;
+                            if w >= 1039.0 {
+                                assert_eq!(blk.strip.span_s(), 21_600, "{}", what());
+                            }
+                        }
+                        // The block moves by its column, from where its % stood.
+                        assert_eq!(
+                            (blk.kind, blk.at, units.at.x, blk.pct.map(|pct| pct.x)),
+                            (
+                                blk0.kind,
+                                blk0.at,
+                                blk0.pct.expect("a %").x,
+                                Some(units.at.end() + UNITS_TO_PCT)
+                            ),
+                            "{}",
+                            what()
+                        );
+                        let room = blk0.at.end() - blk0.strip.x - UNITS_TO_PCT;
+                        let spec = fold_spec(blk.kind);
+                        let relay = |u: f64| {
+                            FullOrBlock::block(lay_block(
+                                blk.at.x, blk.at.w, blk.kind, &m, true, u, fold_spec, deck,
+                            ))
+                        };
+                        let faults = units_faults(
+                            (FullOrBlock::block((blk0, true)), room, blk.rows.cell, &spec),
+                            (FullOrBlock::block((blk, true)), blk.units),
+                            rows,
+                            bound,
+                            &facts,
+                            &relay,
+                        );
+                        assert!(faults.is_empty(), "block {i}, {}: {faults:?}", what());
                     }
                 }
             }
         }
-        assert!(drawn > 0 && drawn_full > 0, "CONTROL: no plan drew units");
+        assert!(
+            drawn > 0 && drawn_b > 0 && drawn_full > 0,
+            "CONTROL: a table drew no units"
+        );
+
+        let m = hn();
+        let mac = this_mac();
+        let p = plan_folded_with(1039.0, &m, &mac);
+        let (b, b0) = (p.blocks[1], plan_folded(1039.0, &m).blocks[1]);
+        let wide = lay_block(b.at.x, b.at.w, b.kind, &m, true, 21.0, fold_spec, deck);
+        let column = UnitsCol {
+            at: Col::new(b0.pct.expect("a %").x, 21.0),
+            cap: 21.0,
+            ..b.units.expect("block B's units")
+        };
+        let room = b0.at.end() - b0.strip.x - UNITS_TO_PCT;
+        let relay = |u: f64| {
+            FullOrBlock::block(lay_block(
+                b.at.x, b.at.w, b.kind, &m, true, u, fold_spec, deck,
+            ))
+        };
+        let faults = units_faults(
+            (
+                FullOrBlock::block((b0, true)),
+                room,
+                b.rows.cell,
+                &fold_spec(b.kind),
+            ),
+            (FullOrBlock::block(wide), Some(column)),
+            &UnitRow::BLOCK_B,
+            B_UNITS_MAX,
+            &mac,
+            &relay,
+        );
+        assert_eq!(wide.0.strip.span_s(), 21_600, "CONTROL");
+        assert!(
+            faults.iter().any(|f| f.ends_with("past 17 pt"))
+                && !faults.iter().any(|f| f.contains("six hours")),
+            "CONTROL: {faults:?}"
+        );
     }
 
     /// U_cap (A1 §2.4, step R5) leaves the meter a room its bar column holds in
@@ -5263,14 +6230,15 @@ mod tests {
     /// A1 §2.4's monotone law at every width (step R5): as the deck widens a point at a time from
     /// 160 to 3200 pt, in Folded and in Full, on either face, with no units facts and for every
     /// machine, no strip's horizon shortens, no table takes a narrower kind, nothing a table laid
-    /// goes (a table at all, the gauge, a %, a bar column), and no row's form steps down its ladder.
-    /// CONTROL: U_cap as A1 first wrote it, keeping whatever preset block A's bare strip holds,
-    /// leaves this Mac 122 pt at 924 pt, where the strip holds four hours, so every row draws its
-    /// Column there, and nothing at 925 pt, where six hours leave −3; the same check finds the step
-    /// down. The step downs main's meter measures make on this planner below 925 pt are this
-    /// law's other control (`mains_meter_rules_shorten_the_horizon_as_the_deck_widens`); a planner
-    /// that lays a kind wherever [`share_meter`] lays its column, without [`column_holds`], fails
-    /// this law, its kinds narrowing at 661, 675, 687 and 701 pt.
+    /// goes (a table at all, the gauge, a %, a bar column), and no row's form steps down its ladder,
+    /// block B's (A4 §5) with block A's. CONTROL: U_cap as A1 first wrote it, keeping whatever
+    /// preset block A's bare strip holds, leaves this Mac 122 pt at 924 pt, where the strip holds
+    /// four hours, so every block A row draws its Column there, and nothing at 925 pt, where six
+    /// hours leave −3; the same check finds the step down. The step downs main's meter measures
+    /// make on this planner below 925 pt are this law's other control
+    /// (`mains_meter_rules_shorten_the_horizon_as_the_deck_widens`); a planner that lays a kind
+    /// wherever [`share_meter`] lays its column, without [`column_holds`], fails this law, its
+    /// kinds narrowing at 661, 675, 687 and 701 pt.
     #[test]
     fn a_wider_deck_never_draws_a_shorter_horizon_or_a_smaller_unit_form() {
         let widths = || (160..=3200).map(f64::from);
@@ -5305,12 +6273,13 @@ mod tests {
             // negative; the rule takes a column only where it is not.
             let slack = (-20..=room as i32).rev().map(f64::from).find(|&u| keeps(u));
             let cap = slack.filter(|&u| u >= 0.0);
-            let forms = cap.map_or([None; 4], |cap| mac.forms_within(cap, a.rows.cell));
-            let rungs = std::array::from_fn(|i| rung(UnitRow::ALL[i], forms[i]));
+            let forms = cap.map_or([None; UnitRow::ALL.len()], |cap| {
+                mac.forms_within(cap, a.rows.cell, &UnitRow::BLOCK_A)
+            });
             (
                 (slack, cap),
                 Widening {
-                    rungs,
+                    rungs: rungs(forms),
                     ..folded_widening(&p)
                 },
             )
@@ -5320,11 +6289,14 @@ mod tests {
             (below.0, above.0),
             ((Some(122.0), Some(122.0)), (Some(-3.0), None))
         );
-        assert_eq!((below.1.rungs, above.1.rungs), ([0; 4], [3, 2, 2, 1]));
+        assert_eq!(
+            (below.1.rungs, above.1.rungs),
+            ([0, 0, 0, 0, 1, 1], [2, 2, 1, 1, 1, 1])
+        );
         let faults = widening_faults(&[below.1, above.1]);
         assert_eq!(
             faults,
-            ["924→925 pt: Cpu 0→3, Gpu 0→2, Memory 0→2, Disk 0→1"],
+            ["924→925 pt: Gpu 0→2, Memory 0→2, Disk 0→1, Heat 0→1"],
             "CONTROL"
         );
     }
@@ -5359,13 +6331,15 @@ mod tests {
         let widths = || (160..=1200).map(f64::from);
         let folded = |m: &FaceMetrics, specs: FoldSpecs| {
             let seq: Vec<_> = widths()
-                .map(|w| folded_widening(&folded_by(w, m, &UnitFacts::NONE, specs)))
+                .map(|w| {
+                    folded_widening(&folded_by(w, m, &UnitFacts::NONE, specs, DeckRows::PAINTED))
+                })
                 .collect();
             widening_faults(&seq)
         };
         let full = |m: &FaceMetrics, specs: FullSpecs| {
             let seq: Vec<_> = widths()
-                .map(|w| full_widening(&full_by(w, m, &UnitFacts::NONE, specs)))
+                .map(|w| full_widening(&full_by(w, m, &UnitFacts::NONE, specs, DeckRows::PAINTED)))
                 .collect();
             widening_faults(&seq)
         };
@@ -5414,7 +6388,16 @@ mod tests {
         let by_share = |w: f64| {
             let a = plan_folded(w, &m).blocks[0];
             BlockKind::ALL.into_iter().position(|k| {
-                let (blk, _) = lay_block(a.at.x, a.at.w, k, &m, true, 0.0, fold_spec);
+                let (blk, _) = lay_block(
+                    a.at.x,
+                    a.at.w,
+                    k,
+                    &m,
+                    true,
+                    0.0,
+                    fold_spec,
+                    DeckRows::PAINTED,
+                );
                 k == BlockKind::Slim
                     || share_meter(a.at.end() - blk.strip.x, &fold_spec(k)).is_some()
             })
@@ -5428,11 +6411,15 @@ mod tests {
         assert_eq!(narrowed, [661.0, 675.0, 687.0, 701.0], "CONTROL");
     }
 
-    /// A1 §2.5's points for this Mac in Full (step R5): at 1039 pt the units 166–212 (U 46 within
-    /// a U_cap of 471), the % 215–245, a six-hour strip of 81 boxes 252–656, the bar 665–784, the
-    /// run and Details 888–1027, which give way to the units as block A's do; at 1440 pt the same
-    /// units and %, a strip of 120 boxes to 851, the bar 860–1100 and Details 1204–1428. Every edge
-    /// stands on whole device px at 1× and 2×. With no facts the table is the one the deck paints.
+    /// A1 §2.5's points for this Mac in Full (step R5), with A4's (§5, §7, §8, §11): at 1039 pt
+    /// the units 166–212 (U 46 within a U_cap of 471, every row's form in the one column, block
+    /// B's rows' with block A's), the % 215–245, a six-hour strip of 81 boxes 252–656, the bar
+    /// 665–784, the run and Details 888–1027, which give way to the units as block A's do; at
+    /// 1440 pt the same units and %, a strip of 120 boxes to 851, the bar 860–1100 and Details
+    /// 1204–1428. Ten rows at 12 pt in 136 pt; the gauge's slot 12–80 past its divider at 88; the
+    /// Cores row from the units to the right margin; the Machine row's name in 97–200 and its
+    /// glyphs 203–245, ending with the %. Every edge stands on whole device px at 1× and 2×. The
+    /// plan the deck paints is main's: no units, no Cores or Machine row beside the gauge's slot.
     #[test]
     fn full_1039_and_1440_plan_units_percent_strip_and_bar_at_their_points() {
         let m = hn();
@@ -5472,7 +6459,7 @@ mod tests {
                 Some(UnitsCol {
                     at: Col::new(166.0, 46.0),
                     cap,
-                    forms: [Some(Form::Column); 4],
+                    forms: [Some(Form::Column); UnitRow::ALL.len()],
                 }),
                 "W {w}"
             );
@@ -5487,25 +6474,59 @@ mod tests {
                 (Some(bar), Some(88.0), Some(details)),
                 "W {w}"
             );
+            assert_eq!(
+                (p.gauge, p.cores, p.machine),
+                (
+                    Some(GaugeSlot {
+                        at: Col::new(12.0, 68.0),
+                        divider: 88.0
+                    }),
+                    Some(Col::new(166.0, w - X0 - 166.0)),
+                    Some(MachineRow {
+                        name: Col::new(97.0, 103.0),
+                        glyphs: Col::new(203.0, 42.0),
+                    })
+                ),
+                "W {w}"
+            );
+            assert_eq!(p.rows, Rows::full(FullKind::Wide, DeckRows::Instruments));
             assert_on_pixels(&full_cols(&p), &format!("W {w}"));
             assert_in_order(&full_cols(&p), 0.0, w - X0, &format!("W {w}"));
-            assert_eq!(plan_full_with(w, &m, &UnitFacts::NONE), plan_full(w, &m));
-            assert_eq!(plan_full(w, &m).units, None);
+            let painted = plan_full(w, &m);
+            assert_eq!(
+                (painted.units, painted.cores, painted.machine),
+                (None, None, None)
+            );
+            assert_eq!(
+                painted.rows,
+                Rows::full(FullKind::Wide, DeckRows::Resources)
+            );
+            let bare = plan_full_with(w, &m, &UnitFacts::NONE);
+            assert_eq!(
+                (bare.name, bare.pct, bare.strip, bare.meter, bare.details),
+                (
+                    painted.name,
+                    painted.pct,
+                    painted.strip,
+                    painted.meter,
+                    painted.details
+                )
+            );
         }
     }
 
-    /// A1 §2.5 as built (step R5): in Full a wide or mid table draws units, and a narrow or slim
-    /// one none, for any machine, on either face. U_cap is W − 568 pt in both on Helvetica Neue,
-    /// so this Mac's GPU draws its undivided tank from 581 pt (576 without the Neural Engine
-    /// tile), the CPU's Cluster at 582, Disk at 587, the CPU's Stack at 591, Memory's Half at 594,
-    /// the GPU's Column at 604 (599), the CPU's Column at 608 and Memory's waffle at 614.
-    /// CONTROL: a narrow table's U_cap reaches 78 pt at 555 pt, where it would draw every row's
-    /// Column, and the first mid table, at 565 pt, has none: a form a narrow table drew would go
-    /// again as the deck widened.
+    /// A1 §2.5 as built (step R5), with A4's rows: in Full a wide or mid table draws units, and a
+    /// narrow or slim one none, for any machine, on either face. U_cap is W − 568 pt in both on
+    /// Helvetica Neue, so this Mac's GPU draws its undivided tank from 581 pt (576 without the
+    /// Neural Engine tile), the interface tiles and the processes columns at 583, Disk at 587,
+    /// Memory's Half at 594, the heat chain at 598, the GPU's Column at 604 (599) and Memory's
+    /// waffle at 614. CONTROL: a narrow table's U_cap reaches 78 pt at 555 pt, where it would draw
+    /// every row's Column, and the first mid table, at 565 pt, has none: a form a narrow table
+    /// drew would go again as the deck widened.
     #[test]
     fn full_draws_units_in_wide_and_mid_tables_and_none_narrower() {
-        use Form::{Cluster, Column, Half, Stack, Undivided};
-        use UnitRow::{Cpu, Disk, Memory};
+        use Form::{Column, Half, Undivided};
+        use UnitRow::{Disk, Memory, Network, Processes};
         for m in [hn(), FaceMetrics::test_stack()] {
             for facts in unit_machines() {
                 for w in (160..=3200).map(f64::from) {
@@ -5517,15 +6538,15 @@ mod tests {
             }
         }
         let m = hn();
-        let steps = |facts: &UnitFacts<'_>| {
-            let mut was = [None; 4];
+        let steps = |facts: &UnitFacts| {
+            let mut was = [None; UnitRow::ALL.len()];
             let mut steps = Vec::new();
             for w in (500..=1100).map(f64::from) {
                 let p = plan_full_with(w, &m, facts);
                 if let Some(units) = p.units {
                     assert_eq!(units.cap, w - 568.0, "W {w}");
                 }
-                let forms = p.units.map_or([None; 4], |units| units.forms);
+                let forms = forms_of(&[p.units]);
                 for (i, form) in forms.into_iter().enumerate() {
                     if form != was[i] {
                         steps.push((w, UnitRow::ALL[i], form));
@@ -5546,12 +6567,12 @@ mod tests {
         let ladder = |undivided: f64, column: f64| {
             let mut want = vec![
                 (undivided, UnitRow::Gpu, Some(Undivided)),
-                (582.0, Cpu, Some(Cluster)),
+                (583.0, Network, Some(Column)),
+                (583.0, Processes, Some(Column)),
                 (587.0, Disk, Some(Column)),
-                (591.0, Cpu, Some(Stack)),
                 (594.0, Memory, Some(Half)),
+                (598.0, UnitRow::Heat, Some(Column)),
                 (column, UnitRow::Gpu, Some(Column)),
-                (608.0, Cpu, Some(Column)),
                 (614.0, Memory, Some(Column)),
             ];
             want.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -5560,8 +6581,9 @@ mod tests {
         assert_eq!(steps(&mac), ladder(581.0, 604.0));
         assert_eq!(steps(&without), ladder(576.0, 599.0));
 
+        let deck = DeckRows::Instruments;
         let cap_at = |w: f64, kind: FullKind| {
-            let (bare, fits) = lay_full(w, kind, &m, true, 0.0, full_spec);
+            let (bare, fits) = lay_full(w, kind, &m, true, 0.0, full_spec, deck);
             let spec = full_meter_spec(kind, &m, full_spec);
             let room = bare.w - X0 - (bare.strip.x - bare.offset) - UNITS_TO_PCT;
             (fits, units_cap(room, bare.strip.spec, &spec))
@@ -5577,8 +6599,8 @@ mod tests {
             "CONTROL"
         );
         assert_eq!(
-            mac.forms_within(78.0, Rows::full(FullKind::Narrow).cell),
-            [Some(Column); 4],
+            mac.forms_within(78.0, Rows::full(FullKind::Narrow, deck).cell, &UnitRow::ALL),
+            [Some(Column); UnitRow::ALL.len()],
             "CONTROL"
         );
     }
@@ -5587,14 +6609,17 @@ mod tests {
     /// and every row's form fits it at 1× and at 2× (where a hairline is half a point, so no form
     /// is wider), right-aligned against its %: each form's left edge inside the column and on a
     /// whole device px at both scales, and every column of the table in order on whole device px,
-    /// in Folded's block A and in Full (step R5's half), at every whole width from 160 to 3200 pt.
+    /// in each Folded block and in Full (step R5's half, A4 §5), at every whole width from 160 to
+    /// 3200 pt.
     #[test]
     fn units_fit_their_column_at_every_folded_and_full_width_at_1x_and_2x() {
-        let (mut seen, mut seen_full) = (0, 0);
-        let fit = |facts: &UnitFacts<'_>, units: UnitsCol, cell: f64, what: &str| {
+        let (mut seen, mut seen_b, mut seen_full) = (0, 0, 0);
+        let fit = |facts: &UnitFacts, units: UnitsCol, cell: f64, what: &str| {
             let mut laid = 0;
-            for (row, form) in UnitRow::ALL.into_iter().zip(units.forms) {
-                let Some(form) = form else { continue };
+            for row in UnitRow::ALL {
+                let Some(form) = units.form(row) else {
+                    continue;
+                };
                 for s in [1.0, 2.0] {
                     let fw = facts.width(row, form, s, cell).expect("drawn");
                     let x = units.at.end() - fw;
@@ -5622,23 +6647,32 @@ mod tests {
                     seen_full += fit(&facts, units, p.rows.cell, &what);
                 }
                 for w in (160..=3200).map(f64::from) {
-                    let a = plan_folded_with(w, &m, &facts).blocks[0];
-                    let Some(units) = a.units else { continue };
-                    let what = || format!("{facts:?} at {w} pt");
-                    let pct = a.pct.expect("a % column beside the units");
-                    assert_eq!(
-                        (units.at.x, units.at.end() + UNITS_TO_PCT),
-                        (a.well.end() + 2.0, pct.x),
-                        "{}",
-                        what()
-                    );
-                    assert_in_order(&block_cols(&a), a.at.x, a.at.end(), &what());
-                    assert_on_pixels(&block_cols(&a), &what());
-                    seen += fit(&facts, units, a.rows.cell, &what());
+                    for (i, blk) in plan_folded_with(w, &m, &facts).blocks.iter().enumerate() {
+                        let Some(units) = blk.units else { continue };
+                        let what = || format!("block {i}, {facts:?} at {w} pt");
+                        let pct = blk.pct.expect("a % column beside the units");
+                        assert_eq!(
+                            (units.at.x, units.at.end() + UNITS_TO_PCT),
+                            (blk.well.end() + 2.0, pct.x),
+                            "{}",
+                            what()
+                        );
+                        assert_in_order(&block_cols(blk), blk.at.x, blk.at.end(), &what());
+                        assert_on_pixels(&block_cols(blk), &what());
+                        let laid = fit(&facts, units, blk.rows.cell, &what());
+                        if i == 0 {
+                            seen += laid;
+                        } else {
+                            seen_b += laid;
+                        }
+                    }
                 }
             }
         }
-        assert!(seen > 0 && seen_full > 0, "CONTROL: no form was laid");
+        assert!(
+            seen > 0 && seen_b > 0 && seen_full > 0,
+            "CONTROL: no form was laid"
+        );
     }
 
     /// A2 §3.5 (S5's planner half): the Neural Engine tile and its clear are 5 pt beside the tank,
@@ -5659,7 +6693,7 @@ mod tests {
             }),
             ..mac
         };
-        let cell = Rows::folded(BlockKind::Wide).cell;
+        let cell = Rows::folded(BlockKind::Wide, DeckRows::Instruments).cell;
         for form in [Form::Column, Form::Undivided] {
             for s in [1.0, 2.0] {
                 let with = mac.width(UnitRow::Gpu, form, s, cell).expect("a tank");
@@ -5667,12 +6701,12 @@ mod tests {
                 assert_eq!(with - alone, 5.0, "{form:?} at {s}×");
             }
         }
-        let gpu_form = |facts: &UnitFacts<'_>, w: f64| {
+        let gpu_form = |facts: &UnitFacts, w: f64| {
             plan_folded_with(w, &m, facts).blocks[0]
                 .units
-                .and_then(|units| units.forms[1])
+                .and_then(|units| units.form(UnitRow::Gpu))
         };
-        let first = |facts: &UnitFacts<'_>, form: Form| {
+        let first = |facts: &UnitFacts, form: Form| {
             (900..=1100)
                 .map(f64::from)
                 .find(|&w| gpu_form(facts, w) == Some(form))
@@ -5700,7 +6734,10 @@ mod tests {
         let at_993 = plan_folded_with(993.0, &m, &mac).blocks[0]
             .units
             .expect("units at 993 pt");
-        assert_eq!((at_993.cap, at_993.forms[1]), (31.0, Some(Form::Undivided)));
+        assert_eq!(
+            (at_993.cap, at_993.form(UnitRow::Gpu)),
+            (31.0, Some(Form::Undivided))
+        );
         assert_eq!(gpu_form(&tank, 993.0), Some(Form::Column), "CONTROL");
         let column = mac.width(UnitRow::Gpu, Form::Column, PLAN_SCALE, cell);
         assert_eq!(column, Some(36.0), "CONTROL");
@@ -5713,8 +6750,8 @@ mod tests {
     /// and the plan reads no count of the tiles a reading draws ([`UnitFacts::disk`]), so a second
     /// device draws inside the column the plan laid. CONTROL: on this Mac a form as wide as the
     /// tiles drawn would take Disk with home's tile alone at 949–968 pt, where U_cap leaves no
-    /// room for a second, and lay U at 14 pt at 969–976 pt, where two tiles take 19: a second
-    /// device would there drop the row's form or move the % and the strip 5 pt.
+    /// room for a second, and lay U at the GPU's 13 pt at 969–982 pt, where two tiles take 19: a
+    /// second device would there drop the row's form or move the % and the strip 6 pt.
     #[test]
     fn a_front_tab_on_another_device_moves_no_column() {
         use aterm_vitals::units::DISK_UNITS;
@@ -5729,7 +6766,7 @@ mod tests {
                 for w in (160..=3200).map(f64::from) {
                     let a = plan_folded_with(w, &m, &facts).blocks[0];
                     let Some(units) = a.units else { continue };
-                    if units.forms[3] != Some(Form::Column) {
+                    if units.form(UnitRow::Disk) != Some(Form::Column) {
                         continue;
                     }
                     let cell = a.rows.cell;
@@ -5749,17 +6786,15 @@ mod tests {
 
         let m = hn();
         let mac = this_mac();
-        let cell = Rows::folded(BlockKind::Wide).cell;
+        let cell = Rows::folded(BlockKind::Wide, DeckRows::Instruments).cell;
         let others = UnitFacts { disk: false, ..mac };
         let (home, two) = (cell.ceil(), place(cell, PLAN_SCALE));
-        // The column a form of `disk` pt would lay beside the other rows' forms within `cap`.
+        // The column a form of `disk` pt would lay beside block A's other rows' forms within
+        // `cap`.
         let laid = |cap: f64, disk: f64| {
-            UnitRow::ALL
-                .into_iter()
-                .zip(others.forms_within(cap, cell))
-                .filter_map(|(row, form)| others.width(row, form?, PLAN_SCALE, cell))
-                .chain((disk <= cap).then_some(disk))
-                .fold(0.0, f64::max)
+            let forms = others.forms_within(cap, cell, &UnitRow::BLOCK_A);
+            let rest = others.widest(&forms, cell);
+            if disk <= cap { rest.max(disk) } else { rest }
         };
         let (mut drops, mut moves) = (Vec::new(), Vec::new());
         for w in 900..=1100 {
@@ -5778,58 +6813,222 @@ mod tests {
             }
         }
         assert_eq!(drops, (949..=968).collect::<Vec<_>>(), "CONTROL");
-        assert_eq!(moves, (969..=976).collect::<Vec<_>>(), "CONTROL");
+        assert_eq!(moves, (969..=982).collect::<Vec<_>>(), "CONTROL");
     }
 
-    /// A1 §2.4's as-built note: block A's Details give way to its units, as [`lay_meter`] gives
-    /// Details way to a row's run and its strip. Past the units column block A is the block laid
-    /// bare U + 3 pt narrower, its strip, meter and Details moved right by the column, at every
-    /// whole width from 160 to 3200 pt, for every machine, on either face, and block B lays its
-    /// own as with no units; so block A may lay no Details where block B lays them. CONTROL: on
-    /// Helvetica Neue block B lays Details and this Mac's block A none at 1825–1878 and
-    /// 2243–2340 pt, and block A lays them and block B none at 1923–1976 pt: a rule that made
-    /// the two blocks agree fails the check there.
+    /// A1 §2.4's as-built note, with A4 §5: each block's Details give way to its own units, as
+    /// [`lay_meter`] gives Details way to a row's run and its strip. Past its units column a
+    /// block is the block laid bare U + 3 pt narrower, its strip, meter and Details moved right by
+    /// the column, at every whole width from 160 to 3200 pt, for every machine, on either face, in
+    /// block A and now in block B; so one block may lay no Details where the other lays them.
+    /// Bare, both blocks lay Details at 1825–1878 pt and from 2243 on Helvetica Neue; each
+    /// block's windows move right by twice its column and gap, block B's (U 15) 36 pt and block
+    /// A's (U 46) 98. CONTROL: this Mac's block B lays Details and its block A none at 1861–1914
+    /// and 2279–2340 pt, and block A lays them and block B none at 1923–1976: a rule that made the
+    /// two blocks agree fails the check there; and block B, which A1's rule left bare, lays none
+    /// at 1825–1860 and 2243–2278 pt, where the bare block lays them.
     #[test]
-    fn block_as_units_cost_its_details_their_width_and_block_b_nothing() {
-        let (mut b_only, mut a_only) = (Vec::new(), Vec::new());
+    fn each_blocks_units_cost_its_own_details_their_width() {
+        let (mut b_only, mut a_only, mut b_lost) = (Vec::new(), Vec::new(), Vec::new());
+        let deck = DeckRows::Instruments;
         for (face, m) in [("hn", hn()), ("stack", FaceMetrics::test_stack())] {
             for (i, facts) in unit_machines().into_iter().enumerate() {
                 for w in 160..=3200 {
                     let p = plan_folded_with(f64::from(w), &m, &facts);
                     let [a, b] = p.blocks;
-                    let Some(units) = a.units else { continue };
-                    let what = || format!("{facts:?} at {w} pt on {face}");
-                    let shift = units.at.w + UNITS_TO_PCT;
-                    let (bare, fits) =
-                        lay_block(a.at.x, a.at.w - shift, a.kind, &m, true, 0.0, fold_spec);
-                    assert!(fits, "{}", what());
-                    let moved = |col: Col| Col::new(col.x + shift, col.w);
-                    assert_eq!(
-                        (a.strip, a.meter.bar, a.meter.run, a.details),
-                        (
-                            Strip {
-                                x: bare.strip.x + shift,
-                                ..bare.strip
-                            },
-                            bare.meter.bar.map(moved),
-                            bare.meter.run.map(moved),
-                            bare.details.map(moved)
-                        ),
-                        "{}",
-                        what()
-                    );
+                    for blk in [a, b] {
+                        let Some(units) = blk.units else { continue };
+                        let what = || format!("{facts:?} at {w} pt on {face}");
+                        let shift = units.at.w + UNITS_TO_PCT;
+                        let (bare, fits) = lay_block(
+                            blk.at.x,
+                            blk.at.w - shift,
+                            blk.kind,
+                            &m,
+                            true,
+                            0.0,
+                            fold_spec,
+                            deck,
+                        );
+                        assert!(fits, "{}", what());
+                        let moved = |col: Col| Col::new(col.x + shift, col.w);
+                        assert_eq!(
+                            (blk.strip, blk.meter.bar, blk.meter.run, blk.details),
+                            (
+                                Strip {
+                                    x: bare.strip.x + shift,
+                                    ..bare.strip
+                                },
+                                bare.meter.bar.map(moved),
+                                bare.meter.run.map(moved),
+                                bare.details.map(moved)
+                            ),
+                            "{}",
+                            what()
+                        );
+                    }
                     if (face, i) == ("hn", 0) {
                         match (a.details.is_some(), b.details.is_some()) {
                             (false, true) => b_only.push(w),
                             (true, false) => a_only.push(w),
                             _ => {}
                         }
+                        let b0 = plan_folded_with(f64::from(w), &m, &UnitFacts::NONE).blocks[1];
+                        if b0.details.is_some() && b.details.is_none() {
+                            b_lost.push(w);
+                        }
                     }
                 }
             }
         }
-        let want: Vec<i32> = (1825..=1878).chain(2243..=2340).collect();
-        assert_eq!(b_only, want, "CONTROL");
+        assert_eq!(
+            b_only,
+            (1861..=1914).chain(2279..=2340).collect::<Vec<_>>(),
+            "CONTROL"
+        );
         assert_eq!(a_only, (1923..=1976).collect::<Vec<_>>(), "CONTROL");
+        assert_eq!(
+            b_lost,
+            (1825..=1860).chain(2243..=2278).collect::<Vec<_>>(),
+            "CONTROL"
+        );
+    }
+
+    /// Whether `said`, the Machine row's name in `room` pt for a machine whose name forms are
+    /// `forms` and whose OS calls it `noun`, breaks A4 §9's fit: wider than its room; not the
+    /// first form that fits whole; a cut of the family form that is not at a word boundary, or
+    /// is shorter than the longest such cut that fits; the noun where a cut fits; nothing where
+    /// the noun fits.
+    fn name_fault(
+        forms: &[&str],
+        noun: &str,
+        room: f64,
+        said: &str,
+        m: &FaceMetrics,
+    ) -> Option<String> {
+        let fits = |s: &str| m.width(s, MACHINE_NAME_PT, true) <= room + 0.01;
+        let at = || format!("{forms:?} in {room} pt says {said:?}");
+        if !said.is_empty() && !fits(said) {
+            return Some(format!("{}, too wide", at()));
+        }
+        if let Some(whole) = forms.iter().find(|form| fits(form)) {
+            return (said != *whole).then(|| format!("{}, not {whole:?}", at()));
+        }
+        let family = forms.last().copied().unwrap_or_default();
+        let cuts: Vec<String> = family
+            .match_indices(' ')
+            .map(|(i, _)| format!("{}\u{2026}", family[..i].trim_end()))
+            .filter(|cut| fits(cut))
+            .collect();
+        if let Some(head) = said.strip_suffix('\u{2026}') {
+            let at_word = family.starts_with(head) && family[head.len()..].starts_with(' ');
+            return (!at_word || cuts.last().map(String::as_str) != Some(said))
+                .then(|| format!("{}, not the last word boundary that fits", at()));
+        }
+        if !cuts.is_empty() {
+            return Some(format!("{}, where {:?} fits", at(), cuts.last()));
+        }
+        let want = if fits(noun) { noun } else { "" };
+        (said != want).then(|| format!("{}, not {want:?}", at()))
+    }
+
+    /// A4 §8 and §9's fit, over a Mac's name, a VirtualMac's, a ThinkPad's (its DMI name the
+    /// vendor and product, its family the shorter form) and an unread machine's, in every slot
+    /// the Machine row has at every whole width from 160 to 3200 pt, in Folded's block B and in
+    /// Full, with and without units, on either face: the name is the first form that fits whole,
+    /// else its family cut at the last word boundary that fits, with an ellipsis, never
+    /// mid-word, else the OS's noun where it fits, else nothing, and never wider than its slot.
+    /// The row's four glyphs keep their place whether or not they draw, end where its % ends (or
+    /// its well, with no %), short of the strip, and the name's slot ends 3 pt short of them. At
+    /// 1039 pt this Mac names "MacBook Air" in block B's 67 pt and in Full's 103, and at 581 pt
+    /// in Full's 70 beside its 13 pt units column; at 940 pt, where block B lays no units, its
+    /// 49 pt take the noun, as Full's narrow 54 pt and block B's slim 36 do at 500 pt.
+    /// CONTROL: [`FaceMetrics::fit`]'s cut of the last form cuts mid-word.
+    #[test]
+    fn the_machine_name_fits_its_slot() {
+        type Fixture = (&'static [&'static str], &'static str);
+        const NAMES: [Fixture; 4] = [
+            (&["MacBook Air"], "Mac"),
+            (&["Virtual Machine"], "Mac"),
+            (
+                &["Lenovo ThinkPad X1 Carbon Gen 12", "ThinkPad X1 Carbon"],
+                "Computer",
+            ),
+            (&[], "Computer"),
+        ];
+        let mac = this_mac();
+        let mut slots_seen = 0;
+        for m in [hn(), FaceMetrics::test_stack()] {
+            let mut slots: Vec<f64> = Vec::new();
+            for facts in [UnitFacts::NONE, mac] {
+                for w in (160..=3200).map(f64::from) {
+                    let b = plan_folded_with(w, &m, &facts).blocks[1];
+                    let full = plan_full_with(w, &m, &facts);
+                    let rows = [
+                        (b.machine, b.name, b.well, b.pct, b.strip, b.rows.cell),
+                        (
+                            full.machine,
+                            full.name,
+                            full.well,
+                            full.pct,
+                            full.strip,
+                            full.rows.cell,
+                        ),
+                    ];
+                    for (machine, name, well, pct, strip, cell) in rows {
+                        let row = machine.expect("a Machine row");
+                        let what = format!("{facts:?} at {w} pt: {row:?}");
+                        let glyph = cell.ceil();
+                        assert_eq!(row.glyphs.w, 4.0 * glyph + 6.0, "{what}");
+                        assert_eq!(row.glyphs.end(), pct.map_or(well.end(), Col::end), "{what}");
+                        assert!(row.glyphs.end() <= strip.x, "{what}");
+                        assert_eq!(row.name.x, name.x, "{what}");
+                        assert_eq!(
+                            row.name.w,
+                            (row.glyphs.x - NAME_TO_GLYPHS - name.x).max(0.0),
+                            "{what}"
+                        );
+                        if !slots.contains(&row.name.w) {
+                            slots.push(row.name.w);
+                        }
+                    }
+                }
+            }
+            for &(forms, noun) in &NAMES {
+                for &room in &slots {
+                    let said = machine_name(forms, noun, room, &m);
+                    if let Some(fault) = name_fault(forms, noun, room, &said, &m) {
+                        panic!("{fault}");
+                    }
+                }
+            }
+            slots_seen += slots.len();
+        }
+        assert!(slots_seen > 2);
+
+        let m = hn();
+        let slot = |w: f64| {
+            let b = plan_folded_with(w, &m, &mac).blocks[1];
+            let full = plan_full_with(w, &m, &mac);
+            [b.machine, full.machine].map(|row| row.expect("a Machine row").name.w)
+        };
+        assert_eq!((slot(1039.0), slot(940.0)[0]), ([67.0, 103.0], 49.0));
+        assert_eq!((slot(500.0), slot(581.0)[1]), ([36.0, 54.0], 70.0));
+        let named = |forms: &[&str], noun: &str, room: f64| machine_name(forms, noun, room, &m);
+        let [air, virtual_mac, thinkpad, unread] = NAMES;
+        assert_eq!(named(air.0, air.1, 67.0), "MacBook Air");
+        assert_eq!(named(air.0, air.1, 49.0), "Mac");
+        assert_eq!(named(air.0, air.1, 54.0), "Mac");
+        assert_eq!(named(air.0, air.1, 70.0), "MacBook Air");
+        assert_eq!(named(virtual_mac.0, virtual_mac.1, 67.0), "Virtual\u{2026}");
+        assert_eq!(named(thinkpad.0, thinkpad.1, 67.0), "ThinkPad\u{2026}");
+        assert_eq!(named(thinkpad.0, thinkpad.1, 103.0), "ThinkPad X1 Carbon");
+        assert_eq!(named(unread.0, unread.1, 67.0), "Computer");
+        assert_eq!(named(unread.0, unread.1, 10.0), "");
+        let cut = m.fit(air.0, 49.0, MACHINE_NAME_PT, true);
+        assert!(
+            name_fault(air.0, air.1, 49.0, &cut, &m).is_some(),
+            "CONTROL: {cut:?}"
+        );
     }
 }

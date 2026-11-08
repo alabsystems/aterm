@@ -5867,6 +5867,32 @@ fn missing_validation_tools_stop_before_staging_or_product_compilation() {
 }
 
 #[test]
+fn after_cut_records_a_red_hold_as_a_fact_without_refusing_the_public_release() {
+    let mut world = World::new();
+    let verdict = "field hold: FAIL: meta CheckpointMeta.program_state_began (listed, but no desk reaches it)";
+    world.after_cut = Ok(verdict.into());
+    assert_eq!(world.run(bump()).0, 0);
+    assert!(
+        world
+            .out
+            .iter()
+            .any(|line| line.contains("after-cut") && line.contains(verdict))
+    );
+    let event = world
+        .out
+        .iter()
+        .filter_map(|line| line.strip_prefix("release-event: "))
+        .map(|json| aterm_json::from_str::<aterm_json::Value>(json).unwrap())
+        .find(|event| {
+            event["stage"].as_str() == Some("after-cut") && event["outcome"].as_str() == Some("ok")
+        })
+        .expect("the completed after-cut is journaled");
+    assert!(event["detail"].as_str().unwrap().contains(verdict));
+    assert!(world.fixtures_on_main);
+    assert!(world.journal().unwrap().finished());
+}
+
+#[test]
 fn structured_stage_events_include_source_log_and_separate_waiting_from_execution() {
     let mut world = World::new();
     assert_eq!(world.run(bump()).0, 0);

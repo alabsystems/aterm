@@ -2,7 +2,7 @@
 name: drive-aterm
 description: Drive, observe and screenshot another aterm session (a tab or window on this machine) over its control socket, or drive and read one on another fleet Mac that lets this one drive it. Use when asked to watch or control another terminal or another agent's session, wait for a command to really finish, or run several sessions at once.
 ---
-<!-- aterm skill v18 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v19 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # Driving another aterm session
 
@@ -112,8 +112,9 @@ cat script.py | aterm ctl "@$SID" paste --stdin                  # with paste se
 - `key if=<re>` checks and presses under one lock (`if-gen=<gen>` and `if-fp=<hash>` from
   `status` fence it to your read). `OK skipped` (exit 0): the guard failed and nothing was
   written; re-read.
-- **A pattern is one whitespace-free token**: write `esc.to.interrupt`, never `'esc to
-  interrupt'` (the wire splits on whitespace, so `turn` would arm `esc` and type the rest).
+- **A pattern is one whitespace-free token**: write `Do.you.want.to.proceed`, never `'Do
+  you want to proceed'` (the wire splits on whitespace, arming `Do` and reading the rest as
+  the next words).
 
 ## One turn
 
@@ -128,12 +129,14 @@ The host's global `-e` command is not inherited, and the explicit folder never f
 `--host any` remains for AI workers only. A refusal never authorizes a different route.
 
 ```sh
-aterm ctl "@$SID" turn 'make test'                                         # a shell
-aterm ctl "@$SID" turn settle=gone:esc.to.interrupt timeout=600000 'msg'   # an interactive agent
+aterm ctl "@$SID" turn 'make test'                          # a shell
+aterm ctl "@$SID" turn typed=1 settle=submitted 'msg'       # an interactive agent, then:
+aterm ctl "@$SID" await agent idle,prompt,question,wall since=<agent_rev> timeout=600000
 ```
 
-`turn` types, verifies the submit, waits to settle, then prints the verdict (stderr) and
-screen (stdout). `ERR busy turn=<id>` or `ERR busy lease=<holder>`: another driver, or your
+`turn` types, verifies the submit, waits to settle (`settle=submitted`: for the submit
+alone), then prints the verdict (stderr; an agent's carries `agent_rev=`) and screen
+(stdout). `ERR busy turn=<id>` or `ERR busy lease=<holder>`: another driver, or your
 own lease, holds it. Run a long turn as a long wait (below); read the screen before retrying
 a killed `turn`.
 
@@ -143,10 +146,11 @@ it key by key and returns `task_rev=<n>`; `await task @<sid>:<n> timeout=<ms>` w
 
 ## Wait
 
-- An agent can sit still mid-turn with its prompt up. Wait for its busy footer to leave
-  (`await gone esc.to.interrupt timeout=600000` while it shows), or on `await agent
-  idle,prompt,question,wall since=<agent_rev>` from the turn's verdict (the client re-arms up
-  to `timeout=`, default 1h).
+- An agent can sit still mid-turn with its prompt up, so wait on the server's verdict, `await
+  agent idle,prompt,question,wall since=<agent_rev>` from the turn's verdict (the client
+  re-arms up to `timeout=`, default 1h), which reads Claude Code's window title beside its
+  screen. Never wait on a footer hint: under a status line Claude Code draws no `esc to
+  interrupt`, and `await gone` answers at once when its row is not drawn as it arms.
 - aterm parses no Codex screen: a codex's `agent=` stays `unknown`, `aterm drive phase` reads
   `idle` and `drive answer` answers `NO-BOX`. Read `status` before you type to it, then wait on
   its own report (a claim) with `await log kind=program since=<log_seq> ep=<log_ep>

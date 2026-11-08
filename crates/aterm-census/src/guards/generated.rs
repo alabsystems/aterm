@@ -16,8 +16,6 @@
 //! `linguist-generated` row that names no file (a moved output); and a Rust file that seals
 //! itself but is not declared, so a prune that took its whole header would go unseen.
 
-use std::borrow::Cow;
-
 use super::{Finding, Rule, Tree};
 use crate::seal::{self, HEAD_LINES, MARK, Seal};
 
@@ -38,7 +36,8 @@ const ATTRIBUTES: &str = ".gitattributes";
 const ATTRIBUTE: &str = "linguist-generated";
 
 fn generated_seal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let rows = text(tree, ATTRIBUTES)
+    let rows = tree
+        .text(ATTRIBUTES)
         .map(|t| declarations(&t))
         .unwrap_or_default();
     let mut declared = vec![false; tree.corpus.paths.len()];
@@ -68,7 +67,7 @@ fn generated_seal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         if !declared && !rust {
             continue;
         }
-        let Some(body) = text(tree, rel) else {
+        let Some(body) = tree.text(rel) else {
             continue;
         };
         let finding = |line: usize, detail: String| Finding {
@@ -185,19 +184,6 @@ fn component(want: &str, have: &str) -> bool {
         }
     }
     go(want.as_bytes(), have.as_bytes())
-}
-
-/// The text at root-relative `rel`: the corpus's copy when it holds one, else the file's.
-fn text<'t>(tree: &'t Tree<'_>, rel: &str) -> Option<Cow<'t, str>> {
-    if let Some(file) = tree.corpus.get(rel) {
-        return Some(Cow::Borrowed(file.raw.as_str()));
-    }
-    if let Some(script) = tree.corpus.scripts.iter().find(|s| s.rel == rel) {
-        return Some(Cow::Borrowed(script.raw.as_str()));
-    }
-    crate::tree::read_to_string(&tree.root.join(rel))
-        .ok()
-        .map(Cow::Owned)
 }
 
 #[cfg(test)]

@@ -143,7 +143,7 @@ fn assert_progress_projection(
 ) {
     use aterm_agent::harness::footer::{FactsOwner, FooterFacts};
     assert_eq!(progress.eligible, eligible);
-    let footer = aterm_agent::harness::footer::account_progress_text(progress, false);
+    let footer = aterm_agent::harness::footer::account_progress_text(progress);
     if let Some(eligible) = eligible {
         assert!(footer.contains(&format!("{eligible} eligible")));
     } else {

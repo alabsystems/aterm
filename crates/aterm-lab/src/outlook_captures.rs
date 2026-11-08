@@ -9,14 +9,23 @@
 //! ([`crate::fleet_fixture::claude`], by a link of that name), so the footer reads the profile it
 //! was seeded with. Each scene's footer is shot at the three widths of §2.4 and the covered, gap and
 //! never-read scenes' Accounts card at 60 and 44 cells; beside each png the card's rows
-//! (`controls fact-menu`) and a `manifest.tsv` row. `--aterm` points the same seeds at another
-//! build (main's, for the shots side by side).
+//! (`controls fact-menu`) and a `manifest-<tag>.tsv` row. `--aterm` points the same seeds at
+//! another build (main's, for the shots side by side).
+//!
+//! Scenes I, J and K are the harness glass's cases (b), (c) and (d)
+//! (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1, §6 S5, §7), under Cruise, their
+//! accounts `main`, `alt1` and `alt2`: the fixture's `--settings` names the build's own usage tap
+//! (`<aterm> harness tap`) as its statusLine, which the fixture runs with `main`'s seeded figures
+//! as its payload's `rate_limits` ([`crate::fleet_fixture::RATE_LIMITS`]) and prints under its
+//! bottom rule, so line E is the quota row the window draws over the tap's words. The scenes
+//! A to H run no statusLine: their line D carries the account unit as the fallback.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::account_series;
 use aterm_agent::harness::accounts::{self, Class, TapRead, WindowFig, WindowRead};
+use aterm_agent::harness::tap;
 
 use crate::band::Band;
 use crate::instance::{
@@ -29,8 +38,10 @@ const H: i64 = 3600;
 const D: i64 = 86_400;
 
 /// The scenes of §2.4: A covered, B a gap, C an alt never read, D a 5-hour stop, E no pace yet,
-/// F walled, G an aged figure, H no figure.
-pub const SCENES: [char; 8] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
+/// F walled, G an aged figure, H no figure; and the glass design's line E: I one account out
+/// before its reset (case (b)), J three accounts whose work moves then waits (case (c)), K no
+/// figure yet (case (d)).
+pub const SCENES: [char; 11] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'];
 
 /// The scenes whose Accounts card is shot: covered, a gap, an alt never read (§8.2).
 pub const CARD_SCENES: [char; 3] = ['A', 'B', 'C'];
@@ -83,14 +94,64 @@ struct Seen {
 /// What a scene seeds.
 #[derive(Clone, Debug)]
 pub struct Plan {
-    /// The roster's rows in order: `me` (this Mac's own login), then logins with a folder each.
+    /// The roster's rows in order: the first this Mac's own login (`me`, or `main` in the glass
+    /// scenes), then logins with a folder each.
     rows: Vec<(&'static str, Class)>,
     /// The store's readings.
     seen: Vec<(&'static str, Seen)>,
-    /// `me`'s series: `(offset, pct_x10)` of its week.
+    /// The own login's series: `(offset, pct_x10)` of its week.
     series: Vec<(i64, u32)>,
     /// The profile's cached figures `(week %, five-hour %, age in seconds)`, or none read.
     profile: Option<(u32, u32, i64)>,
+    /// The plan rows earlier footers' gated profile reads wrote: `(label, tier, age)`, each of a
+    /// roster row (the own login's only where its profile was read).
+    plans: &'static [(&'static str, &'static str, i64)],
+    /// The fixture runs the build's usage tap as its statusLine, its payload's `rate_limits` the
+    /// own login's seen figures: line E is the quota row.
+    tapped: bool,
+    /// The Autopilot mode the instance runs under.
+    autopilot: &'static str,
+}
+
+impl Plan {
+    /// This Mac's own login: the roster's first row.
+    fn own(&self) -> &'static str {
+        self.rows.first().map_or("me", |row| row.0)
+    }
+
+    /// The own login's seen figures.
+    fn own_seen(&self) -> Option<Seen> {
+        let own = self.own();
+        self.seen
+            .iter()
+            .find(|(label, _)| *label == own)
+            .map(|(_, seen)| *seen)
+    }
+
+    /// The `rate_limits` of the fixture's statusLine payload where it runs the tap
+    /// ([`crate::fleet_fixture::RATE_LIMITS`]): the own login's seen windows at `now`, as Claude
+    /// Code hands them; `None` where it runs none or the own login was never read (case (d): the
+    /// tap then prints `week · no figure yet`).
+    fn rate_limits(&self, now: i64) -> Option<String> {
+        let seen = self.own_seen().filter(|_| self.tapped)?;
+        let window = |w: Option<(u32, i64, i64)>| {
+            w.map(|(pct_x10, reset, _)| {
+                aterm_json::json!({
+                    "used_percentage": f64::from(pct_x10) / 10.0,
+                    "resets_at": now + reset
+                })
+            })
+        };
+        let mut limits = aterm_json::Map::new();
+        for (name, w) in [("five_hour", seen.five), ("seven_day", seen.week)] {
+            if let Some(w) = window(w) {
+                limits.insert(name.to_owned(), w);
+            }
+        }
+        (!limits.is_empty())
+            .then(|| aterm_json::to_string(&aterm_json::Value::Object(limits)).ok())
+            .flatten()
+    }
 }
 
 /// This Mac's own login's address: synthetic.
@@ -99,6 +160,29 @@ const ME_EMAIL: &str = "me@example.test";
 /// `me`'s week resets Thu 09:00 when now is Sun 19:30; its five hours at 22:00.
 const ME_WEEK: i64 = 3 * D + 13 * H + 30 * M;
 const ME_FIVE: i64 = 2 * H + 30 * M;
+
+/// The plan rows of the scenes A to H: `me`'s read an hour ago where its profile was, the alts'
+/// on their own sessions.
+const ME_PLANS: &[(&str, &str, i64)] = &[
+    ("me", "20x", H),
+    ("alt1", "20x", 2 * D),
+    ("alt2", "5x", 6 * D),
+];
+
+/// The glass scenes' plan rows: every account Max 20x, read an hour ago (aterm-agent's
+/// `harness::quota_scenes`).
+const MAIN_PLANS: &[(&str, &str, i64)] =
+    &[("main", "20x", H), ("alt1", "20x", H), ("alt2", "20x", H)];
+
+/// Case (b)'s and (c)'s `main` week resets 41 hours on (Sat 10:00 when now is Thu 17:00), (c)'s
+/// `alt1` 3 d 16 h on (Mon 09:00) and its `alt2` 5 d 16 h on (aterm-agent's
+/// `harness::quota_scenes::WED9`, which keeps the design's 36% a day).
+const MAIN_WEEK: i64 = 41 * H;
+const ALT1_WEEK: i64 = 3 * D + 16 * H;
+const ALT2_WEEK: i64 = 5 * D + 16 * H;
+
+/// The glass scenes' five hours: `main`'s 20% used, resetting in 2 h 30 min (never printed).
+const MAIN_FIVE: (u32, i64, i64) = (200, 2 * H + 30 * M, 0);
 
 /// Scene `scene`'s seeds, the appendix of the design moved to now.
 #[must_use]
@@ -132,6 +216,7 @@ pub fn plan(scene: char) -> Plan {
                 ],
                 series: pace,
                 profile: Some((58, 38, aged)),
+                ..untapped()
             }
         }
         'B' => Plan {
@@ -139,6 +224,7 @@ pub fn plan(scene: char) -> Plan {
             seen: vec![("me", me(580, 380, 0)), ("alt1", alt1(920))],
             series: pace,
             profile: Some((58, 38, 0)),
+            ..untapped()
         },
         'C' => Plan {
             rows: vec![
@@ -149,6 +235,7 @@ pub fn plan(scene: char) -> Plan {
             seen: vec![("me", me(580, 380, 0)), ("alt1", alt1(920))],
             series: pace,
             profile: Some((58, 38, 0)),
+            ..untapped()
         },
         'D' => Plan {
             rows: two,
@@ -164,6 +251,7 @@ pub fn plan(scene: char) -> Plan {
             ],
             series: pace,
             profile: Some((58, 81, 0)),
+            ..untapped()
         },
         'E' => Plan {
             rows: two,
@@ -179,19 +267,87 @@ pub fn plan(scene: char) -> Plan {
             ],
             series: vec![(-40 * M, 20), (0, 30)],
             profile: Some((3, 38, 0)),
+            ..untapped()
         },
         'F' => Plan {
             rows: two,
             seen: vec![("me", me(1000, 380, 0)), ("alt1", alt1(310))],
             series: pace,
             profile: Some((100, 38, 0)),
+            ..untapped()
         },
-        _ => Plan {
+        'H' => Plan {
             rows: two,
             seen: vec![("alt1", alt1(310))],
             series: Vec::new(),
             profile: None,
+            ..untapped()
         },
+        'I' => Plan {
+            rows: vec![("main", Class::Preferred)],
+            seen: vec![(
+                "main",
+                Seen {
+                    week: Some((630, MAIN_WEEK, 0)),
+                    five: Some(MAIN_FIVE),
+                },
+            )],
+            series: vec![(-24 * H, 420), (-18 * H, 500), (-10 * H, 500), (0, 630)],
+            profile: Some((63, 20, 0)),
+            ..tapped()
+        },
+        'J' => Plan {
+            rows: vec![
+                ("main", Class::Preferred),
+                ("alt1", Class::Preferred),
+                ("alt2", Class::Preferred),
+            ],
+            seen: vec![
+                (
+                    "main",
+                    Seen {
+                        week: Some((750, MAIN_WEEK, 0)),
+                        five: Some(MAIN_FIVE),
+                    },
+                ),
+                ("alt1", week(800, ALT1_WEEK, 0)),
+                ("alt2", week(900, ALT2_WEEK, 0)),
+            ],
+            series: vec![(-24 * H, 390), (-12 * H, 570), (0, 750)],
+            profile: Some((75, 20, 0)),
+            ..tapped()
+        },
+        _ => Plan {
+            rows: vec![("main", Class::Preferred)],
+            seen: Vec::new(),
+            series: Vec::new(),
+            profile: None,
+            ..tapped()
+        },
+    }
+}
+
+/// The rest of a plan of the scenes A to H: `me`'s plan rows, no statusLine, Autopilot off.
+fn untapped() -> Plan {
+    Plan {
+        rows: Vec::new(),
+        seen: Vec::new(),
+        series: Vec::new(),
+        profile: None,
+        plans: ME_PLANS,
+        tapped: false,
+        autopilot: "off",
+    }
+}
+
+/// The rest of a plan of the glass scenes I to K: `main`'s plan rows, the usage tap as the
+/// fixture's statusLine, Autopilot Cruise (the design's §1 is under Cruise).
+fn tapped() -> Plan {
+    Plan {
+        plans: MAIN_PLANS,
+        tapped: true,
+        autopilot: "cruise",
+        ..untapped()
     }
 }
 
@@ -203,9 +359,13 @@ fn harness_state(world: &World) -> PathBuf {
         .join(aterm_agent::harness::cli::HARNESS)
 }
 
-/// The synthetic Claude Code profile of `me`: its account, its Max 20x plan and, where `plan`
-/// read them, its cached figures.
+/// The synthetic Claude Code profile of the own login: its account, its Max 20x plan and, where
+/// `plan` read them, its cached figures, resetting where the store's own readings say (`me`'s
+/// [`ME_WEEK`] and [`ME_FIVE`] where it has none).
 fn profile(plan: &Plan, now: i64) -> String {
+    let seen = plan.own_seen().unwrap_or_default();
+    let week_reset = seen.week.map_or(ME_WEEK, |(_, reset, _)| reset);
+    let five_reset = seen.five.map_or(ME_FIVE, |(_, reset, _)| reset);
     let account = aterm_json::json!({
         "accountUuid": "outlook-fixture-me",
         "emailAddress": ME_EMAIL,
@@ -222,11 +382,11 @@ fn profile(plan: &Plan, now: i64) -> String {
                 "utilization": {
                     "seven_day": {
                         "utilization": week,
-                        "resets_at": crate::util::utc_stamp(now + ME_WEEK)
+                        "resets_at": crate::util::utc_stamp(now + week_reset)
                     },
                     "five_hour": {
                         "utilization": five,
-                        "resets_at": crate::util::utc_stamp(now + ME_FIVE)
+                        "resets_at": crate::util::utc_stamp(now + five_reset)
                     }
                 }
             }
@@ -237,17 +397,26 @@ fn profile(plan: &Plan, now: i64) -> String {
 }
 
 /// Seed `world` for `plan` at `now`: the profile in its HOME, the roster beside its
-/// `aterm.toml`, a placeholder file in each other login's folder, the store's readings with `me`
-/// active, and `me`'s series. Nothing outside `world` is written.
+/// `aterm.toml`, a placeholder file in each other login's folder, the store's readings with the
+/// own login active, its series, the plan rows and, where the fixture runs the tap, its
+/// statusLine payload's `rate_limits`. Nothing outside `world` is written.
 /// # Errors
 /// A file could not be written, or the store refused a reading.
 pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
     let io = |what: &str, e: std::io::Error| format!("outlook seed: {what}: {e}");
+    let own = plan.own();
     crate::util::write_fresh(&world.home.join(".claude.json"), profile(plan, now))
         .map_err(|e| io("profile", e))?;
+    if let Some(limits) = plan.rate_limits(now) {
+        let path = world.home.join(crate::fleet_fixture::RATE_LIMITS);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| io("rate limits", e))?;
+        }
+        crate::util::write_fresh(&path, limits).map_err(|e| io("rate limits", e))?;
+    }
     let mut rows = Vec::new();
     for &(label, class) in &plan.rows {
-        let dir = (label != "me").then(|| world.home.join("logins").join(label));
+        let dir = (label != own).then(|| world.home.join("logins").join(label));
         if let Some(dir) = &dir {
             std::fs::create_dir_all(dir).map_err(|e| io(label, e))?;
             crate::util::write_fresh(&dir.join("a-login-file"), "{}").map_err(|e| io(label, e))?;
@@ -256,9 +425,9 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
             label: label.into(),
             class,
             dir: dir.map(|d| d.to_string_lossy().into_owned()),
-            // `me` names the profile's address, so the footer's gate reads its profile under a
-            // roster of several rows.
-            email: (label == "me").then(|| ME_EMAIL.into()),
+            // The own login names the profile's address, so the footer's gate reads its profile
+            // under a roster of several rows.
+            email: (label == own).then(|| ME_EMAIL.into()),
             ..accounts::Row::default()
         });
     }
@@ -269,7 +438,7 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
     std::fs::create_dir_all(&state_dir).map_err(|e| io("state", e))?;
     let store = accounts::Store::at(&state_dir);
     let (mut state, _) = store.load(now)?;
-    state.active = Some("me".into());
+    state.active = Some(own.into());
     let window = |seen: Option<(u32, i64, i64)>| {
         seen.map(|(pct_x10, reset, _)| WindowRead {
             pct_x10,
@@ -293,10 +462,8 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
     for &(offset, pct_x10) in &plan.series {
         let at = now + offset;
         let reset = plan
-            .seen
-            .iter()
-            .find(|(label, _)| *label == "me")
-            .and_then(|(_, s)| s.week)
+            .own_seen()
+            .and_then(|s| s.week)
             .map_or(now + ME_WEEK, |(_, reset, _)| now + reset);
         let fig = WindowFig {
             pct_x10,
@@ -306,18 +473,14 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
             source: accounts::SOURCE_TAP.into(),
             epoch_at: None,
         };
-        account_series::note(&state_dir, "me", &state.machine, None, Some(&fig), at)
+        account_series::note(&state_dir, own, &state.machine, None, Some(&fig), at)
             .map_err(|e| io("series", e))?;
     }
-    // The appendix's plans, as earlier footers' gated profile reads wrote them (`me`'s an hour
-    // ago, where its profile was read; the alts' on their own sessions); `pool1`'s was never
-    // seen. The instance's own read of `me` writes nothing new for the same tier.
-    for (label, tier, ago) in [
-        ("me", "20x", H),
-        ("alt1", "20x", 2 * D),
-        ("alt2", "5x", 6 * D),
-    ] {
-        let read = label != "me" || plan.profile.is_some();
+    // The plans, as earlier footers' gated profile reads wrote them (the own login's only where
+    // its profile was read); `pool1`'s was never seen. The instance's own read of the own login
+    // writes nothing new for the same tier.
+    for &(label, tier, ago) in plan.plans {
+        let read = label != own || plan.profile.is_some();
         if read && plan.rows.iter().any(|(l, _)| *l == label) {
             let said = account_series::PlanSaid {
                 word: "max".into(),
@@ -353,12 +516,15 @@ struct Opts {
 
 const HELP: &str =
     "usage: targo --unverified lab outlook-captures --out DIR [--aterm ATERM] [--tag NAME]
-       [--scenes ABCDEFGH] [--look day|night|both] [--scale 1|2|both]
+       [--scenes ABCDEFGHIJK] [--look day|night|both] [--scale 1|2|both]
 
 The accounts outlook on a private headless instance per scene, look and scale, seeded with
 synthetic identities only: the footer at 170, 100 and 70 columns, and the A, B and C scenes'
-Accounts card at 60 and 44 cells. Writes outlook-<tag>-<scene>-<width>-<look>-<scale>x.png, the
-card's rows beside each card png, and manifest.tsv.
+Accounts card at 60 and 44 cells. Scenes I, J and K are the harness glass's line E (its cases
+(b), (c) and (d), under Cruise): the fixture runs the build's usage tap as its statusLine and
+prints its row under the bottom rule, which the glass takes over. Writes
+outlook-<tag>-<scene>-<width>-<look>-<scale>x.png, the card's rows beside each card png, and
+manifest-<tag>.tsv.
 ";
 
 fn opts(args: &[String]) -> Result<Opts, Fail> {
@@ -443,42 +609,71 @@ pub fn cmd_outlook_captures(args: &[String]) -> Res {
 /// stops before its world is removed.
 struct Lab {
     inst: Instance,
-    _world: World,
+    world: World,
+    /// The fixture runs the usage tap as its statusLine ([`Plan::tapped`]).
+    tapped: bool,
+}
+
+/// The `--settings` value that names `aterm`'s usage tap as the fixture's statusLine, exactly as
+/// a relaunch line aterm types names it ([`tap::settings_value`]), so the window reads the
+/// fixture as tapped: `aterm` by its canonical path, or by a link in `world` where that path
+/// cannot be named in the command.
+fn tap_settings(aterm: &Path, world: &World) -> Result<String, Fail> {
+    let exe = std::fs::canonicalize(aterm).unwrap_or_else(|_| aterm.to_path_buf());
+    let exe = if tap::exe_admissible(&exe) {
+        exe
+    } else {
+        let link = world.dir.join("aterm-tap");
+        std::os::unix::fs::symlink(&exe, &link).map_err(|e| Fail::die(format!("tap link: {e}")))?;
+        link
+    };
+    tap::settings_value(&exe).ok_or_else(|| {
+        Fail::die(format!(
+            "outlook-captures: {} cannot be named in a statusLine command",
+            exe.display()
+        ))
+    })
 }
 
 /// Seed a world for `scene` in `look` and start `aterm` in it at `scale`, its one tab the lab's
-/// `claude` fixture at `cols` columns.
+/// `claude` fixture at `cols` columns, under the scene's Autopilot mode, its `--settings` naming
+/// `aterm`'s usage tap where the scene runs it.
 fn launch(aterm: &Path, scene: char, look: Look, scale: u8, cols: u16) -> Result<Lab, Fail> {
+    let plan = plan(scene);
     let config = config_after(
         &config_with(&[format!("theme = {:?}", look.theme())]),
         true,
         &[],
     );
-    let config = with_harness_keys(&config, &["autopilot = \"off\"".into()]);
+    let config = with_harness_keys(&config, &[format!("autopilot = {:?}", plan.autopilot)]);
     let world = World::new(&config)?;
     let now = crate::util::now_secs();
-    seed(&world, &plan(scene), now).map_err(Fail::die)?;
+    seed(&world, &plan, now).map_err(Fail::die)?;
     let bin = world.dir.join("bin");
     std::fs::create_dir_all(&bin).map_err(|e| Fail::die(format!("bin: {e}")))?;
     let claude = bin.join("claude");
     std::os::unix::fs::symlink(&crate::paths::paths().exe, &claude)
         .map_err(|e| Fail::die(format!("claude link: {e}")))?;
+    let mut args = vec![
+        "--columns".into(),
+        cols.to_string(),
+        "--lines".into(),
+        LINES.to_string(),
+        "--scale".into(),
+        scale.to_string(),
+        "-e".into(),
+        claude.to_string_lossy().into_owned(),
+        "idle".into(),
+    ];
+    if plan.tapped {
+        args.extend(["--settings".into(), tap_settings(aterm, &world)?]);
+    }
     let mut inst = Instance::start_in(
         &world,
         Launch {
             aterm: aterm.to_path_buf(),
             headless: true,
-            args: vec![
-                "--columns".into(),
-                cols.to_string(),
-                "--lines".into(),
-                LINES.to_string(),
-                "--scale".into(),
-                scale.to_string(),
-                "-e".into(),
-                claude.to_string_lossy().into_owned(),
-                "idle".into(),
-            ],
+            args,
             env: world.env(),
             cwd: world.home.clone(),
             sandbox: None,
@@ -489,7 +684,8 @@ fn launch(aterm: &Path, scene: char, look: Look, scale: u8, cols: u16) -> Result
     inst.await_socket(BOOT)?;
     Ok(Lab {
         inst,
-        _world: world,
+        world,
+        tapped: plan.tapped,
     })
 }
 
@@ -507,7 +703,10 @@ fn shoot(o: &Opts, aterm: &Path, scene: char, look: Look, scale: u8) -> Result<V
         ))
     };
     let scratch = o.out.join(format!(".outlook-{}-{scene}-frame.png", o.tag));
-    settle(inst)?;
+    let rl = lab
+        .tapped
+        .then(|| tap::rl_dir_in(&harness_state(&lab.world)));
+    settle(inst, rl.as_deref())?;
     let mut at = first;
     for (what, cols) in WIDTHS {
         resize(inst, (at, cols), &scratch)?;
@@ -638,25 +837,46 @@ fn open_card(inst: &Instance, scratch: &Path) -> Result<String, Fail> {
     }
 }
 
-/// Wait until the window knows the fixture as Claude Code (`status program=claude`), then for
-/// the footer's resolver to look at the roster: it looks every 10 s and its memo replays at its
-/// first look, so the frames after 12 s hold the account unit. [`SHOWN`] is a hang detector.
+/// Wait until the window knows the fixture as Claude Code (`status program=claude`) and, where
+/// the fixture runs the usage tap, until the tap has written a reading of its own row into `rl`
+/// (the glass's claim reads it); then for the footer's resolver to look: it looks every 10 s and
+/// its memo replays at its first look, so the frames after 12 s hold the account unit, or line
+/// E's quota row where the tap's row is claimed. [`SHOWN`] is a hang detector.
 /// # Errors
-/// The fixture never showed as Claude Code within [`SHOWN`], or the lab was stopped.
-fn settle(inst: &Instance) -> Result<(), Fail> {
+/// The fixture never showed as Claude Code, or its tap wrote no reading, within [`SHOWN`], or
+/// the lab was stopped.
+fn settle(inst: &Instance, rl: Option<&Path>) -> Result<(), Fail> {
     let end = Instant::now() + SHOWN;
     while Instant::now() < end {
         let status = inst.ctl(&["status"]);
-        if status.stdout.contains("program=claude") {
+        if status.stdout.contains("program=claude") && rl.is_none_or(read_own_row) {
             crate::stop::sleep(Duration::from_secs(12))?;
             return Ok(());
         }
         crate::stop::sleep(Duration::from_millis(500))?;
     }
     Err(Fail::die(format!(
-        "outlook-captures: the fixture never showed as Claude Code within {} s",
+        "outlook-captures: the fixture never showed as Claude Code{} within {} s",
+        if rl.is_some() {
+            ", its usage tap reading its own row,"
+        } else {
+            ""
+        },
         SHOWN.as_secs()
     )))
+}
+
+/// Whether a reading in the usage tap's directory `rl` says Claude Code shows the tap's own row
+/// ([`tap::Reading::claimable`]).
+fn read_own_row(rl: &Path) -> bool {
+    std::fs::read_dir(rl).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            crate::util::read_regular_text(&entry.path())
+                .ok()
+                .and_then(|text| tap::Reading::of_json(&text))
+                .is_some_and(|reading| reading.claimable())
+        })
+    })
 }
 
 /// Take the frame as `png`: the verb's verdict line.
@@ -780,7 +1000,7 @@ fn arm(aterm: &Path, gate: &std::sync::Barrier) -> Result<(String, String), Fail
     let lab = launch(aterm, 'A', Look::Day, 1, WIDTHS[0].1);
     let ready = lab.as_ref().map_err(|f| f.msg.clone().unwrap_or_default());
     let shown = match &ready {
-        Ok(lab) => settle(&lab.inst),
+        Ok(lab) => settle(&lab.inst, None),
         Err(_) => Ok(()),
     };
     gate.wait();
@@ -1129,15 +1349,17 @@ mod tests {
         assert!(cost.contains("series rows"), "{cost}");
     }
 
-    /// Every scene seeds `me` first and as this Mac's own login, writes only inside its world,
-    /// and C's `pool1` is never read; B's and C's `alt1` stand at 92%. Control: A reads `pool1`.
+    /// Every scene seeds its own login first and as this Mac's own (`me`, `main` in the glass
+    /// scenes I to K), writes only inside its world, and C's `pool1` is never read; B's and C's
+    /// `alt1` stand at 92%. Control: A reads `pool1`.
     #[test]
     fn the_seeds_are_synthetic_and_stay_in_their_world() {
         for scene in SCENES {
             let world = World::new(crate::instance::CONFIG_OFF).expect("a world");
             let now = 1_792_956_600;
             let plan = plan(scene);
-            assert_eq!(plan.rows.first().map(|r| r.0), Some("me"), "{scene}");
+            let own = if scene < 'I' { "me" } else { "main" };
+            assert_eq!(plan.rows.first().map(|r| r.0), Some(own), "{scene}");
             seed(&world, &plan, now).expect("seeded");
             let profile = std::fs::read_to_string(world.home.join(".claude.json")).expect("read");
             assert!(profile.contains(ME_EMAIL), "{scene}: {profile}");
@@ -1150,18 +1372,61 @@ mod tests {
             let (state, _) = accounts::Store::at(&harness_state(&world))
                 .load(now)
                 .expect("the store loads");
-            assert_eq!(state.active.as_deref(), Some("me"));
+            assert_eq!(state.active.as_deref(), Some(own));
             let read = |label: &str| state.accounts.contains_key(label);
             match scene {
                 'C' => assert!(!read("pool1"), "C: pool1 is never read"),
                 'A' => assert!(read("pool1"), "CONTROL: A reads pool1"),
                 'H' => assert!(!read("me"), "H: me has no figure"),
+                'K' => assert!(!read("main"), "K: main has no figure"),
                 _ => {}
             }
             if matches!(scene, 'B' | 'C') {
                 let alt1 = &state.accounts["alt1"];
                 let week = alt1.windows.get(accounts::WEEK_LIMIT).expect("a week");
                 assert_eq!(week.pct_x10, 920, "{scene}");
+            }
+        }
+    }
+
+    /// The glass scenes' fixture hands its statusLine `main`'s week as the store holds it: the
+    /// tap's reading of the seeded payload ([`crate::fleet_fixture::status_payload`]) says the
+    /// store's figure and reset, so the tap's words, the lead and the chart agree (case (b) 63%,
+    /// case (c) 75%); case (d) seeds no `rate_limits`, so the tap says `week · no figure yet`.
+    /// NEGATIVE CONTROL: scene A, whose fixture runs no statusLine, seeds none either.
+    #[test]
+    fn the_tapped_scenes_hand_the_tap_the_stores_week() {
+        let now = 1_792_956_600;
+        let vars = tap::TapVars {
+            sid: Some("s-01".into()),
+            pid: Some("7".into()),
+            ..tap::TapVars::default()
+        };
+        for (scene, x10) in [('I', Some(630)), ('J', Some(750)), ('K', None), ('A', None)] {
+            let world = World::new(crate::instance::CONFIG_OFF).expect("a world");
+            let plan = plan(scene);
+            assert_eq!(plan.tapped, scene != 'A', "{scene}");
+            seed(&world, &plan, now).expect("seeded");
+            let seeded =
+                std::fs::read_to_string(world.home.join(crate::fleet_fixture::RATE_LIMITS)).ok();
+            let payload =
+                crate::fleet_fixture::status_payload(Some("s"), &world.home, seeded.as_deref());
+            let reading = tap::Reading::of_stdin(&payload, &vars, now).expect("a reading");
+            let (store, _) = accounts::Store::at(&harness_state(&world))
+                .load(now)
+                .expect("the store loads");
+            let held = store
+                .accounts
+                .get(plan.own())
+                .and_then(|a| a.windows.get(accounts::WEEK_LIMIT))
+                .map(|w| (w.pct_x10, w.reset));
+            let tapped = reading.seven_day.map(|w| (w.x10(), w.resets_at));
+            assert_eq!(tapped.map(|t| t.0), x10, "{scene}: {payload}");
+            if x10.is_some() {
+                assert_eq!(tapped, held, "{scene}: the tap's week is the store's");
+            } else {
+                assert!(seeded.is_none(), "{scene}: no rate_limits seeded");
+                assert_eq!(reading.week_words(now, None), tap::NO_WEEK, "{scene}");
             }
         }
     }

@@ -1268,22 +1268,200 @@ fn sealed_native_outcomes_keep_exact_foreign_authority_without_granting_passive_
     );
 }
 
+/// Script kernel observations through the production member reader, without claiming an actual
+/// system keep-awake was caught before it could launch a utility or between its fork and exec.
+#[cfg(target_os = "macos")]
 #[test]
-fn only_an_orphaned_system_keep_awake_outlives_its_group() {
-    let keep_awake = Some(std::path::Path::new(KEEP_AWAKE));
-    assert!(
-        !keeps_group(1, keep_awake),
-        "launchd adopted it: its runner died"
+fn a_keep_awake_member_requires_a_finite_timer_exec_and_an_unchanged_full_identity() {
+    use aterm_uds::process::{Birth, Identity, Lineage, ProcessPresence};
+    use std::cell::RefCell;
+
+    let original = Lineage {
+        identity: Identity {
+            pid: 4242,
+            birth: Birth(700),
+            idversion: Some(9),
+        },
+        uniqueid: 90,
+        parent: 1,
+        pgid: 4240,
+        launcher_version: Some(8),
+        tty: None,
+    };
+    let timer = [KEEP_AWAKE, "-i", "-t", "60"];
+    let probe = |after, execd, image: Option<&str>, argv: Option<&[&str]>| {
+        let calls = RefCell::new(Vec::new());
+        let mut lineage = [Some(original), after].into_iter();
+        let kept = member_keeps_with(
+            4240,
+            original.identity.pid,
+            |pid| {
+                assert_eq!(pid, original.identity.pid);
+                calls.borrow_mut().push("lineage");
+                lineage.next().expect("at most two lineage reads")
+            },
+            |pid| {
+                assert_eq!(pid, original.identity.pid);
+                calls.borrow_mut().push("exec");
+                execd
+            },
+            |pid| {
+                assert_eq!(pid, original.identity.pid);
+                calls.borrow_mut().push("image");
+                image.map(std::path::PathBuf::from)
+            },
+            |pid| {
+                assert_eq!(pid, original.identity.pid);
+                calls.borrow_mut().push("argv");
+                argv.map(|words| {
+                    words
+                        .iter()
+                        .map(|word| std::ffi::OsString::from(*word))
+                        .collect()
+                })
+            },
+            |_| panic!("a readable lineage does not need a presence fallback"),
+        );
+        (kept, calls.into_inner())
+    };
+    assert_eq!(
+        probe(Some(original), Some(true), Some(KEEP_AWAKE), Some(&timer)),
+        (false, vec!["lineage", "exec", "image", "argv", "lineage"]),
+        "the stable executed system finite timer is reachable"
     );
-    assert!(keeps_group(4242, keep_awake), "its runner lives");
-    for other in [
-        "/bin/sleep",
-        "/private/tmp/caffeinate",
-        "/usr/bin/caffeinate2",
+    for argv in [
+        &["caffeinate", "-i", "-t", "1"][..],
+        &[KEEP_AWAKE, "-i", "-t", "4294967295"][..],
     ] {
-        assert!(keeps_group(1, Some(std::path::Path::new(other))), "{other}");
+        assert!(
+            !probe(Some(original), Some(true), Some(KEEP_AWAKE), Some(argv)).0,
+            "PATH invocation and the bounded positive decimal endpoints are reachable"
+        );
     }
-    assert!(keeps_group(1, None), "an unread image keeps the group");
+    for execd in [Some(false), None] {
+        assert_eq!(
+            probe(Some(original), execd, Some(KEEP_AWAKE), Some(&timer)),
+            (true, vec!["lineage", "exec"]),
+            "an inherited or unread exec state cannot qualify its image"
+        );
+    }
+    for image in [
+        None,
+        Some("/bin/sleep"),
+        Some("/private/tmp/caffeinate"),
+        Some("/usr/bin/caffeinate2"),
+    ] {
+        assert_eq!(
+            probe(Some(original), Some(true), image, Some(&timer)),
+            (true, vec!["lineage", "exec", "image"])
+        );
+    }
+    for argv in [
+        None,
+        Some(&[KEEP_AWAKE][..]),
+        Some(&[KEEP_AWAKE, "-i"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", "60", "/bin/sh"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", "60", "--", "/bin/sh"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", "0"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", "08"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", "09"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", "060"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", "0001"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", "+60"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", "-60"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", "4294967296"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", "60.0"][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", ""][..]),
+        Some(&[KEEP_AWAKE, "-i", "-t", " 60"][..]),
+        Some(&[KEEP_AWAKE, "-s", "-t", "60"][..]),
+        Some(&["other", "-i", "-t", "60"][..]),
+    ] {
+        assert_eq!(
+            probe(Some(original), Some(true), Some(KEEP_AWAKE), argv),
+            (true, vec!["lineage", "exec", "image", "argv"]),
+            "unread, unsupported, indefinite, or utility-bearing argv keeps the group"
+        );
+    }
+    for after in [
+        None,
+        Some(Lineage {
+            identity: Identity {
+                birth: Birth(701),
+                ..original.identity
+            },
+            ..original
+        }),
+        Some(Lineage {
+            identity: Identity {
+                idversion: Some(10),
+                ..original.identity
+            },
+            ..original
+        }),
+        Some(Lineage {
+            parent: 4241,
+            ..original
+        }),
+        Some(Lineage {
+            pgid: 4241,
+            ..original
+        }),
+    ] {
+        assert_eq!(
+            probe(after, Some(true), Some(KEEP_AWAKE), Some(&timer)),
+            (true, vec!["lineage", "exec", "image", "argv", "lineage"]),
+            "the image, argv, and exec state cannot cross a changed or unread lineage"
+        );
+    }
+    for (presence, expected) in [
+        (ProcessPresence::Unknown, true),
+        (ProcessPresence::Present, true),
+        (ProcessPresence::Absent, false),
+    ] {
+        assert_eq!(
+            member_keeps_with(
+                4240,
+                original.identity.pid,
+                |_| None,
+                |_| panic!("an unread lineage cannot qualify an exec"),
+                |_| panic!("an unread lineage cannot qualify an image"),
+                |_| panic!("an unread lineage cannot qualify argv"),
+                |_| presence,
+            ),
+            expected,
+            "only positive absence releases an unread member"
+        );
+    }
+    for (before, expected) in [
+        (
+            Lineage {
+                pgid: 4241,
+                ..original
+            },
+            false,
+        ),
+        (
+            Lineage {
+                parent: 4241,
+                ..original
+            },
+            true,
+        ),
+    ] {
+        assert_eq!(
+            member_keeps_with(
+                4240,
+                original.identity.pid,
+                |_| Some(before),
+                |_| panic!("group and parent decide before exec"),
+                |_| panic!("group and parent decide before image"),
+                |_| panic!("group and parent decide before argv"),
+                |_| panic!("a readable lineage needs no presence fallback"),
+            ),
+            expected
+        );
+    }
 }
 
 /// A group whose leader exited, leaving `leftover` in it adopted by launchd.
@@ -1307,8 +1485,9 @@ fn orphaned_in_a_group(leftover: &str) -> (u32, i32) {
     // `$!` names the forked shell, which runs the leftover's own image only once its exec lands.
     let program = leftover.split_whitespace().next().expect("a program");
     aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the leftover's exec", || {
-        (aterm_uds::process::read_process_path(left).as_deref()
-            == Some(std::path::Path::new(program)))
+        (aterm_uds::process::read_process_execd(left) == Some(true)
+            && aterm_uds::process::read_process_path(left).as_deref()
+                == Some(std::path::Path::new(program)))
         .then_some(())
     });
     assert_eq!(

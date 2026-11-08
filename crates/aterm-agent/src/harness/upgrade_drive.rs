@@ -1233,6 +1233,10 @@ pub(super) trait Kernel {
     /// [`Self::restart_background`] is, so that no kernel reads the machine at that look unless it
     /// says so.
     fn process_start(&self, pid: u32) -> Option<String>;
+    /// Shell rendering facts from the same injected platform source as the restart's job.
+    fn shell_dialect(&self, shell: u32, processes: &[ProcRow]) -> Option<super::upgrade::Dialect> {
+        super::relaunch::shell_dialect(shell, processes)
+    }
     /// The work under `pid` a restart would end ([`live_background`]; [`UNREADABLE_TABLE`] where
     /// the process table was not read), which the last look before a signal requires to be none
     /// unless the owner pressed the restart.
@@ -4731,9 +4735,7 @@ impl St {
         if let Some(native_record) = native_record {
             st.native_record = native_record;
         }
-        if st.native_completed_prepare.is_none() {
-            st.native_completed_prepare = native_completed_prepare;
-        }
+        st.keep_completed_native(native_completed_prepare);
         if st.native_noexec_prepare.is_none() {
             st.native_noexec_prepare = native_noexec_prepare;
         }
@@ -4859,6 +4861,13 @@ impl St {
         }
     }
 
+    /// Passive predecessor identity survives a new plan; current authority never does.
+    fn keep_completed_native(&mut self, completed: Option<Box<super::native_act::Prepare>>) {
+        if self.native_completed_prepare.is_none() {
+            self.native_completed_prepare = completed;
+        }
+    }
+
     pub(super) fn kept_by_restart(&self, tab: &str, st: &mut St) {
         if self.preserve_unresolved_native(st) {
             return;
@@ -4866,6 +4875,7 @@ impl St {
         st.native_coordination |= super::native_restart::coordinated(self);
         st.native_record = self.native_record.clone();
         self.carry_noexec(st);
+        st.keep_completed_native(self.native_completed_prepare.clone());
         if let Some(word) = self.owners_hold(tab) {
             st.request = word;
             st.request_tab.clone_from(&self.request_tab);

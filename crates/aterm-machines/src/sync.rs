@@ -1854,7 +1854,9 @@ fn builds_after(record: Option<&Record>, build: &str) -> Vec<String> {
 /// before what it brings, and a node-hosted fabric after the node. The optional repository
 /// prerequisite and potentially long clones follow fleet, node and account work.
 /// The prerequisite owns its unattended package attempt after the base store lock is gone.
-/// Clone tuning runs last, over every clone the pass leaves in place.
+/// Clone tuning follows acquisition, over every clone the pass leaves in place. The single
+/// credential publisher follows all synchronous local producers, so their new needs reach
+/// this pass's table operation. Independent processes may still raise needs afterward.
 fn sync_items<'a>(
     ports: &'a dyn Ports,
     trigger: Trigger,
@@ -1873,7 +1875,6 @@ fn sync_items<'a>(
         Kind::Fleet,
         Kind::Node,
         Kind::SharedData,
-        Kind::Requests,
         Kind::Accounts,
         Kind::Release,
     ]
@@ -1900,6 +1901,7 @@ fn sync_items<'a>(
         trigger,
         mode,
     )));
+    items.push(Box::new(Synced::new(Kind::Requests, ports, trigger, mode)));
     items
 }
 

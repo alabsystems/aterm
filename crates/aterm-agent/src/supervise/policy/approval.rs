@@ -5465,24 +5465,10 @@ fn consents(opt: &Opt) -> bool {
     opens_with(&opt.label, CONSENT) && !kept_for_good(opt) && !cut_short(&opt.label)
 }
 
-const CREDITS: &[&str] = &["usage credit", "extra usage"];
-
+/// Whether the consent `opt` of the box `p` is one to usage credits: its label, the box's title
+/// or its rows name them ([`aterm_phase::credits::WORDS`]).
 fn credits_consent(p: &PromptV2, rows: &[String], opt: &Opt) -> bool {
-    let names = |text: &str| {
-        let text = text.to_lowercase();
-        CREDITS.iter().any(|w| text.contains(w))
-    };
-    let end = p.span.1.saturating_add(1).min(rows.len());
-    let frame = |w: &&str| w.chars().all(|c| ('\u{2500}'..='\u{257f}').contains(&c));
-    let body = rows
-        .get(p.span.0.min(end)..end)
-        .unwrap_or_default()
-        .iter()
-        .flat_map(|r| r.split_whitespace())
-        .filter(|w| !frame(w))
-        .collect::<Vec<_>>()
-        .join(" ");
-    names(&opt.label) || names(&p.title) || names(&body)
+    aterm_phase::credits::names(&opt.label) || aterm_phase::credits::box_names(p, rows)
 }
 
 fn credits_decline(

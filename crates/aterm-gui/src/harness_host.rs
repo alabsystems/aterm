@@ -9405,13 +9405,43 @@ impl WorkerIdle {
             return Flushed::Nothing;
         };
         let mut mine = false;
+        let mut seen = None;
         let done = account_transact_of(&self.sid, &self.hooks, seat, |state, now| {
+            let before = state
+                .accounts
+                .get(&owed.label)
+                .and_then(|a| a.offer.clone());
             let events = owed.write(state, &self.sid, now);
             mine = !events.is_empty();
+            seen = state
+                .accounts
+                .get(&owed.label)
+                .and_then(|a| a.offer.as_ref())
+                .filter(|offer| before.as_ref().is_none_or(|was| !was.says(offer)))
+                .map(|offer| {
+                    (
+                        state.machine.clone(),
+                        account_series::EventSaid::grant_seen(offer),
+                        now,
+                    )
+                });
             Ok(events)
         });
         match done {
-            Ok(_) if mine => Flushed::Written,
+            Ok(_) if mine => {
+                // The readings series takes the offer first seen, or seen changed, once the
+                // store committed it (docs/DESIGN-account-stats-2026-10-15.md §5).
+                if let Some((machine, said, now)) = seen {
+                    let _ = account_series::note_events(
+                        &seat.state,
+                        &owed.label,
+                        &machine,
+                        &[said],
+                        now,
+                    );
+                }
+                Flushed::Written
+            }
             Ok(_) => Flushed::NotMine,
             Err(why) if why == accounts::LOCK_HELD => {
                 with_kept_of(&self.kept, |k| {
@@ -19207,6 +19237,7 @@ fn live_acts(
     let holds_store = store.clone();
     let launch_store = store.clone();
     let carry_store = store.clone();
+    let restart_store = store.clone();
     let offered_store = store.clone();
     let end_store = store.clone();
     let driven_store = store.clone();
@@ -19574,6 +19605,20 @@ fn live_acts(
                 }
                 // Every other restart re-applies the login its process had; the tap's logins
                 // ride in `o.usage_tap` (`tap::Armed::lone_for`), as every relaunch line's do.
+                Restart::Memory => {
+                    let ctx = restart_store
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .by_sid(&aterm_session::SessionId::new(sid))
+                        .map(|handle| Arc::clone(&handle.ctx));
+                    let Some(ctx) = ctx else {
+                        return RestartSaid::step("wait:session-ended");
+                    };
+                    let authorize = |checked: &relaunch::CheckedRelaunch| {
+                        crate::native_act::authorize_checked_relaunch(&ctx, checked)
+                    };
+                    relaunch::restart_here_authorized(&o, why, ask, &authorize)
+                }
                 _ => relaunch::restart_here(&o, why, ask),
             };
             w10(sid, &format!("restart:{}", why.word()), &r.report);
@@ -20666,7 +20711,7 @@ fn account_usage_live(
         answered: &answered,
         said: &said,
     };
-    account_usage_of(&store, &roster, sid, &read, now)
+    account_usage_of((&state, &store), &roster, sid, &read, now)
 }
 
 /// What `seen` says, as true at `at` in the zone `offset` seconds east of UTC.
@@ -20757,9 +20802,10 @@ struct UsageRead<'a> {
     said: &'a dyn Fn(i64) -> accounts::UsageSaid,
 }
 
-/// The usage recorder's call, assembled ([`account_usage_live`]).
+/// The usage recorder's call, assembled ([`account_usage_live`]), on the accounts `store` under
+/// the harness state `state`.
 fn account_usage_of(
-    store: &accounts::Store,
+    (state, store): (&Path, &accounts::Store),
     captured: &accounts::UsageRoster,
     sid: &str,
     read: &UsageRead<'_>,
@@ -20784,7 +20830,19 @@ fn account_usage_of(
     } else {
         now
     };
-    accounts::record_usage(store, captured, sid, &who, &(read.said)(at), now).as_str()
+    let recorded = accounts::record_usage(store, captured, sid, &who, &(read.said)(at), now);
+    // The readings series takes the wall the store just committed, under its own lock
+    // (docs/DESIGN-account-stats-2026-10-15.md §5).
+    if let Some((account, walled)) = recorded.walled() {
+        let _ = account_series::note_events(
+            state,
+            account,
+            &walled.by,
+            &[account_series::EventSaid::wall(walled)],
+            now,
+        );
+    }
+    recorded.as_str()
 }
 
 /// The production [`Acts::account_gone`].

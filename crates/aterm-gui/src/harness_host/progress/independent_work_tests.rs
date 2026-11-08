@@ -167,7 +167,7 @@ fn independent_pool_work_is_visible_without_replacing_a_current_account_decision
         prepared.context.rows,
     );
     drop(kept);
-    let text = aterm_agent::harness::footer::account_progress_text(&value, false);
+    let text = aterm_agent::harness::footer::account_progress_text(&value);
     assert!(
         text.to_ascii_lowercase().contains("sign")
             && text.contains(&prepared.current.label)

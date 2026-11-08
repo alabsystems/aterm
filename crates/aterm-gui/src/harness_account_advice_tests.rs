@@ -140,18 +140,14 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         now,
         offset: |_| 0,
     });
-    let glance = forecast.glance("main", Some(580), true).unwrap();
-    assert!(glance.verdict.is_some() && glance.title_verdict.is_some());
-    assert!(glance.spoken.is_some());
-    assert!(
-        glance
-            .bar
-            .as_ref()
-            .unwrap()
-            .0
-            .iter()
-            .any(|cell| { matches!(cell, outlook::BarCell::More | outlook::BarCell::Tick) })
-    );
+    let own = Some(outlook::Figure::Exact(580));
+    let view = forecast.quota("main", own, true);
+    assert!(view.tail.verdict.is_some() && !view.chart.runs.is_empty());
+    assert!(!view.spoken.is_empty());
+    let observed = forecast
+        .observations_only(outlook::Refusal::SessionPaused)
+        .quota("main", own, true);
+    assert!(observed.tail.verdict.is_none() && observed.chart.runs.is_empty());
     {
         let mut timeline = ctx.timeline.lock().unwrap();
         let pid = i32::try_from(std::process::id()).unwrap();
@@ -166,7 +162,8 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
                     floor: Some(born),
                     session_id: ACCT_TALK_A.into(),
                 }),
-                glance: Some(glance.clone()),
+                quota: Some(view.clone()),
+                quota_observed: Some(observed.clone()),
                 ..Default::default()
             }),
         );
@@ -186,7 +183,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
             .unwrap_or_default()
     });
     app.harness = Some(host.clone());
-    let check_glance = |paused: bool| {
+    let check_view = |paused: bool| {
         let facts = ctx
             .timeline
             .lock()
@@ -195,32 +192,23 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
             .unwrap()
             .clone();
         assert_eq!(
-            facts.glance.as_ref(),
-            Some(&glance),
+            (facts.quota.as_ref(), facts.quota_observed.as_ref()),
+            (Some(&view), Some(&observed)),
             "raw pool evidence stays intact"
         );
         assert_eq!(facts.account_forecasts_paused(), paused);
-        let shown = facts.glance_view().unwrap();
+        let shown = facts.quota_view().unwrap();
         if paused {
-            assert!(shown.verdict.is_none() && shown.title_verdict.is_none());
-            assert!(shown.title.is_none() && shown.spoken.is_none());
-            assert_eq!((&shown.reset, &shown.five), (&glance.reset, &glance.five));
-            let (old_ten, old_five) = glance.bar.as_ref().unwrap();
-            let (ten, five) = shown.bar.as_ref().unwrap();
-            for (before, after) in old_ten.iter().chain(old_five).zip(ten.iter().chain(five)) {
-                assert_eq!(
-                    *after == outlook::BarCell::Used,
-                    *before == outlook::BarCell::Used
-                );
-                assert!(matches!(
-                    after,
-                    outlook::BarCell::Used | outlook::BarCell::Left
-                ));
-            }
-            // The former direct-Glance projection would still expose this real wait.
-            assert!(facts.glance.as_ref().unwrap().verdict.is_some());
+            assert_eq!(shown, &observed);
+            assert_eq!(
+                shown.tab().map(|named| named.figure),
+                view.tab().map(|named| named.figure),
+                "the observation stays"
+            );
+            // The raw view would still expose this real wait.
+            assert!(facts.quota.as_ref().unwrap().tail.verdict.is_some());
         } else {
-            assert_eq!(shown.as_ref(), &glance);
+            assert_eq!(shown, &view);
         }
     };
     let model = aterm_models_harness::account_progress_policy_model();
@@ -331,7 +319,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()),
         Some(retained.clone())
     );
-    check_glance(false);
+    check_view(false);
     let wanted = HashMap::from([(sid.clone(), Program::Claude)]);
     let mut worker = idle_worker();
     worker.agent = Program::Claude;
@@ -414,7 +402,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
     let paused = crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
     assert_eq!(paused.phase, ProgressPhase::Paused);
     assert!(paused.forecasts_paused);
-    check_glance(true);
+    check_view(true);
     // This real concurrent writer is outside the policy trace. Restore its prior view
     // before continuing that trace; contention must never revive the stored forecast.
     progress::lifecycle_tests::with_progress_writer(&host.shared.state, || read(&mut app));
@@ -426,9 +414,9 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
         assert_eq!(busy.phase, ProgressPhase::Unknown);
         assert!(busy.forecasts_paused);
     }
-    check_glance(true);
+    check_view(true);
     read(&mut app);
-    check_glance(true);
+    check_view(true);
     // Former presentation kept the same normal wait/deadline despite a known Off verdict.
     let mut former = policy.clone();
     former.insert("view", 1);
@@ -549,7 +537,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
     let resumed = crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
     assert_eq!(resumed.phase, ProgressPhase::Paused);
     assert!(resumed.forecasts_paused);
-    check_glance(true);
+    check_view(true);
     assert_eq!(resumed.observed_at, retained.observed_at);
     assert_eq!(
         resumed.details.first().map(String::as_str),
@@ -574,7 +562,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
     let fresh = crate::harness_recovery_verb::snapshot(&ctx.timeline.lock().unwrap()).unwrap();
     assert_eq!(fresh, retained);
     assert!(!fresh.forecasts_paused);
-    check_glance(false);
+    check_view(false);
     assert!(
         idle.kept
             .lock()
@@ -619,7 +607,7 @@ fn autopilot_off_retires_a_normal_wait_until_a_fresh_same_binding_decision() {
     );
     assert_eq!((working.eligible, working.next_at), (None, None));
     assert!(working.forecasts_paused);
-    check_glance(true);
+    check_view(true);
     let reply = crate::harness_recovery_verb::cmd("recovery", true, || Ok(Some(working.clone())));
     for field in [
         "phase=verifying",

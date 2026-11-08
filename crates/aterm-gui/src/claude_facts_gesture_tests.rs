@@ -408,9 +408,10 @@ fn hovering_a_fact_moves_no_fact() {
     );
 }
 
-/// THE POINTER ON ANY PART OF THE ACCOUNT UNIT LIGHTS THE WHOLE UNIT: on the week as on the
-/// email, the unit is one fact on the glass, its mark and both joins take the lit accent, one
-/// underline lies under the whole of it, and no other fact changes.
+/// THE POINTER ON ANY PART OF THE ACCOUNT UNIT LIGHTS THE WHOLE UNIT: line D's fallback unit,
+/// shown while line E is not the quota row (whose own lights `claude_footer::quota::tests`
+/// hold). On the verdict as on the name, the unit is one fact on the glass, every glyph before its warned verdict lifts (the
+/// verdict keeps its warn), one underline lies under the whole of it, and no other fact changes.
 #[test]
 fn hovering_any_part_of_the_account_lights_the_whole_unit() {
     let (mut app, wid, session, _reader) = wider_app();
@@ -425,12 +426,14 @@ fn hovering_any_part_of_the_account_lights_the_whole_unit() {
                 model: Some("Opus 5.5".into()),
                 effort: Some("xhigh".into()),
                 path: Some("~/aterm".into()),
+                account: Some("main".into()),
                 subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
                     email: Some("owner@example.com".into()),
                     plan: Some("Max 20x".into()),
-                    weekly: Some("weekly 61% left".into()),
+                    weekly: Some("weekly 63% used".into()),
                     ..Default::default()
                 }),
+                quota: Some(aterm_agent::harness::quota_view::QuotaView::sample()),
                 ..Default::default()
             }),
         ));
@@ -441,8 +444,8 @@ fn hovering_any_part_of_the_account_lights_the_whole_unit() {
     let account = fact_hit(&app, wid, Fact::Account);
     assert_eq!(
         glyphs(&app, wid, &account),
-        "\u{2386}owner\u{b7}weekly61%left",
-        "one fact from the mark to the week's last word"
+        "\u{2386}main63%\u{b7}\u{21ba}Sat10:00\u{b7}\u{2573}~Thu12Nov05:00",
+        "one fact from the mark to the verdict's last word"
     );
     assert_eq!(
         app.windows[&wid]
@@ -470,21 +473,13 @@ fn hovering_any_part_of_the_account_lights_the_whole_unit() {
             })
             .collect()
     };
-    let marks = |glyphs: &[(usize, char, [u8; 3], bool)]| -> Vec<(usize, [u8; 3])> {
-        glyphs
-            .iter()
-            .filter(|g| matches!(g.1, '\u{2386}' | '\u{b7}'))
-            .map(|g| (g.0, g.2))
-            .collect()
-    };
     let rest = glyph_cells(&app, Fact::Account);
     let model_rest = glyph_cells(&app, Fact::Model);
     assert!(rest.iter().all(|g| !g.3), "CONTROL: nothing lit at rest");
-    assert_eq!(
-        marks(&rest).len(),
-        2,
-        "the account's mark and the week's join"
-    );
+    let warned = rest
+        .iter()
+        .position(|g| g.1 == '\u{2573}')
+        .expect("the verdict's gap");
     for col in [account.cols.0, account.cols.1 - 1] {
         let (x, y) = px_of(&app, wid, (account.frame_row, col));
         app.on_cursor_moved(wid, x, y);
@@ -495,13 +490,25 @@ fn hovering_any_part_of_the_account_lights_the_whole_unit() {
             "{col}"
         );
         let lit = glyph_cells(&app, Fact::Account);
-        let (lit_marks, rest_marks) = (marks(&lit), marks(&rest));
+        // The name wears the lit ink at rest; where the hovered letter ink is that same ink
+        // (no palette) it stays. Every other glyph before the verdict lifts.
+        let lit_ink = rest.iter().find(|g| g.1 == 'm').map(|g| g.2);
         assert!(
-            lit_marks
-                .iter()
-                .zip(&rest_marks)
-                .all(|(l, r)| l.0 == r.0 && l.1 != r.1 && l.1 == lit_marks[0].1),
-            "{col}: the mark and every join take the lit accent: {lit_marks:?}, at rest {rest_marks:?}"
+            lit.iter()
+                .zip(&rest)
+                .enumerate()
+                .all(|(i, (l, r))| l.0 == r.0
+                    && if i < warned {
+                        l.2 != r.2 || Some(r.2) == lit_ink
+                    } else {
+                        l.2 == r.2
+                    }),
+            "{col}: every glyph before the verdict lifts, the verdict keeps its warn: {lit:?}, \
+             at rest {rest:?}"
+        );
+        assert!(
+            lit.iter().zip(&rest).any(|(l, r)| l.2 != r.2),
+            "{col}: NEGATIVE CONTROL: the hover changed some ink"
         );
         // The underline lies under the ink, so an end glyph nudged off its cell's middle may
         // stand past it; every glyph between, the joins among them, is under it where its ink

@@ -161,6 +161,16 @@ fn env_of(cmd: &Command, key: &str) -> Option<String> {
         .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
 }
 
+fn field_hold_pass(cmd: &Command) -> Option<Output> {
+    cmd.get_args()
+        .any(|arg| arg == fixtures::FIELD_HOLD_TEST)
+        .then(|| Output {
+            status: exit(0),
+            stdout: b"test result: ok. 1 passed; 0 failed; 0 ignored\n".to_vec(),
+            stderr: Vec::new(),
+        })
+}
+
 fn passed() -> String {
     format!(
         "test result: ok. {} passed; 0 failed; 0 ignored; 0 measured; 9 filtered out\n",
@@ -574,6 +584,87 @@ fn an_unavailable_main_reader_never_falls_back_to_the_line_reader() {
 }
 
 #[test]
+fn main_reader_field_hold_names_a_stale_row_and_lands_the_facts() {
+    let row = "meta CheckpointMeta.program_state_began (listed, but no desk reaches it)";
+    for outcome in ["pass", "red", "missing", "unavailable"] {
+        let o = Origin::new();
+        let staged = fixtures::stage(
+            &targo(),
+            &o.work,
+            &o.stage_root(),
+            &pins(7),
+            &mut generator(&["history"], &Cell::new(0)),
+        )
+        .unwrap();
+        // The producer has retired the field in every case. The command seam
+        // models main with the stale list entry, then with that entry removed.
+        let fields = "[meta]\nwritten = []\n";
+        fs::write(staged.dir.join("fields.toml"), fields).unwrap();
+        let (mut compiles, mut holds, mut consumers) = (0, 0, 0);
+        let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |preview| {
+            fixtures::MainReader::new(&o.work).unwrap().read(&targo(), preview, &pins(7), &mut |cmd| {
+                let tree = cmd.get_current_dir().unwrap();
+                let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
+                let mut status = exit(0);
+                let stdout = if args.iter().any(|a| a == "--no-run") {
+                    compiles += 1;
+                    artifact(tree, &o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"))
+                } else if args.iter().any(|a| a == fixtures::FIELD_HOLD_TEST) {
+                    holds += 1;
+                    assert!(args.iter().any(|a| a == "--ignored"));
+                    assert!(args.iter().any(|a| a == "--exact"));
+                    let release = PathBuf::from(env_of(cmd, fixtures::FIELD_HOLD_RELEASE).unwrap());
+                    assert_eq!(release, tree.join(HANDOFF_FIXTURE_ROOT).join("v0.6.0"));
+                    assert_eq!(fs::read_to_string(release.join("fields.toml")).unwrap(), fields);
+                    assert_eq!(Path::new(cmd.get_program()), o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"));
+                    if outcome == "unavailable" {
+                        return Err(std::io::Error::other("field hold did not start"));
+                    } else if outcome == "missing" {
+                        "test result: ok. 0 passed; 0 failed; 0 ignored\n".into()
+                    } else if outcome == "red" {
+                        status = exit(101);
+                        format!("{row}\ntest {} ... FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored\n", fixtures::FIELD_HOLD_TEST)
+                    } else {
+                        "test result: ok. 1 passed; 0 failed; 0 ignored\n".into()
+                    }
+                } else if args.iter().any(|a| a == "--ignored") {
+                    fs::write(env_of(cmd, fixtures::ANSWERS_OUT).unwrap(), staged_answers(&["history"])).unwrap();
+                    "test result: ok. 1 passed; 0 failed; 0 ignored\n".into()
+                } else {
+                    consumers += 1;
+                    "test result: ok. 2 passed; 0 failed; 0 ignored\n".into()
+                };
+                Ok(Output { status, stdout: stdout.into_bytes(), stderr: Vec::new() })
+            })
+        }).unwrap();
+        assert_eq!((compiles, holds, consumers), (1, 1, 1));
+        let words = landed.words(&pins(7));
+        println!(
+            "field-hold {outcome}: {compiles} compile, {holds} hold, {consumers} consumer; {words}"
+        );
+        assert!(
+            words.contains(match outcome {
+                "pass" => "field hold: PASS",
+                "unavailable" => "field hold: COULD NOT RUN",
+                _ => "field hold: FAIL",
+            }),
+            "{words}"
+        );
+        assert_eq!(words.contains(row), outcome == "red", "{words}");
+        let message = git(&o.work, &["show", "-s", "--format=%B", "origin/main"]);
+        assert_eq!(message.contains(row), outcome == "red", "{message}");
+        assert_eq!(
+            o.on_main(&format!("{HANDOFF_FIXTURE_ROOT}/v0.6.0/fields.toml")),
+            fields.as_bytes()
+        );
+        assert_eq!(
+            o.on_main(fixtures::SHIPPED_STATE_CORPUS),
+            staged_answers(&["history"]).as_bytes()
+        );
+    }
+}
+
+#[test]
 fn main_reader_records_then_checks_the_splice_without_blessing_old_answers() {
     for red in [false, true] {
         let o = Origin::new();
@@ -591,6 +682,7 @@ fn main_reader_records_then_checks_the_splice_without_blessing_old_answers() {
         let expected = rendered.clone();
         let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |preview| {
             fixtures::MainReader::new(&o.work).unwrap().read(&targo(), preview, &pins(7), &mut |cmd| {
+                if let Some(out) = field_hold_pass(cmd) { return Ok(out); }
                 calls += 1;
                 let tree = cmd.get_current_dir().unwrap();
                 let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
@@ -934,6 +1026,9 @@ fn main_reader_reopens_warm_but_never_reuses_previous_answers_or_tree() {
             .join(format!("target/debug/deps/aterm_gui-{take:016x}"));
         fs::write(&binary, format!("compiled tip {take}")).unwrap();
         let reading = reader.read(&targo(), tip.trim(), &pins(7), &mut |cmd| {
+            if let Some(out) = field_hold_pass(cmd) {
+                return Ok(out);
+            }
             calls += 1;
             let tree = cmd.get_current_dir().unwrap();
             assert_eq!(
@@ -1099,6 +1194,9 @@ fn a_landing_that_loses_the_race_lands_on_the_winners_tip() {
         read_tips.push(seen.clone());
         let answers = staged_answers(&["history"]).replace("fnv1a64:6", seen.trim());
         let reading = reader.read(&targo(), preview, &pins(7), &mut |cmd| {
+            if let Some(out) = field_hold_pass(cmd) {
+                return Ok(out);
+            }
             let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
             let stdout = if args.iter().any(|a| a == "--no-run") {
                 let source = cmd.get_current_dir().unwrap();
@@ -1208,6 +1306,7 @@ fn a_race_reuses_only_cargo_unrelated_inputs_and_never_hides_a_red() {
         let started = std::time::Instant::now();
         let landed = fixtures::land(&raced, &staged, &pins(7), 5, &mut |preview| {
             reader.read(&targo(), preview, &pins(7), &mut |cmd| {
+                if let Some(out) = field_hold_pass(cmd) { return Ok(out); }
                 let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
                 let tree = cmd.get_current_dir().unwrap();
                 let mut status = exit(0);

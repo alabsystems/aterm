@@ -413,10 +413,10 @@ pub fn retire(
     note: &str,
 ) -> crate::Result<Vec<Need>> {
     with_ledger(paths, |rows, facts| {
-        let matches = |need: &Need| need.want.key() == selector || hex(&need.id) == selector;
+        let matches = |need: &Need| need.named(selector);
         if !rows.iter().any(matches) {
             return Err(Error::new(format!(
-                "no need on this Mac is {selector} (aterm secrets need ls names them); a need another Mac raised is retired on that Mac or on the vault's admin Mac"
+                "no need on this Mac is {selector} (aterm secrets need ls names them); a need another Mac raised is withdrawn on that Mac, and one awaiting a person is declined there, or on the vault's admin Mac by the id aterm secrets need ls --all prints"
             )));
         }
         let mut changed = Vec::new();

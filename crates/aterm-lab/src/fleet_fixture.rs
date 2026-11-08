@@ -2,9 +2,22 @@
 // Copyright 2026 Andrew Yates
 
 //! Stand-in `claude` and `build-loop` session fixtures for `fleet-sim`.
+//!
+//! The `claude` stand-in runs the statusLine command its `--settings` names ([`status_line`]) as
+//! Claude Code 2.1.318 does: `/bin/sh -c <command>` with a payload on its stdin (its conversation,
+//! its model and the `rate_limits` seeded at [`RATE_LIMITS`]), at its start and every
+//! `refreshInterval` seconds, and draws the command's first line under the composer's bottom
+//! rule from column 2, cut with `…` where it would reach the last two columns, in the
+//! statusLine's ink (`#999999`, its rules in Claude's `#888888`); a command that prints nothing
+//! loses the row (aterm-phase's `claude-2.1.318-tap-row-*.txt`,
+//! `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.2, §6 S5).
 
 use std::io::Write as _;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use crate::pyjson::{COMPACT, J};
 
 /// Each fixture session's prompt, report and tool, picked by `<n>`: each text near the
 /// 400-byte excerpt record, so a fleet read is over its budget and the client's cut is
@@ -113,6 +126,163 @@ pub const HOSTILE: usize = 999;
 /// Subdirectory under `$HOME` where each `claude` fixture writes its startup environment.
 pub const ENV_DIR: &str = ".claude/fleet-sim-env";
 
+/// Under `$HOME`, the `rate_limits` object the `claude` stand-in hands its statusLine command,
+/// as Claude Code's payload carries it (`{"seven_day": {"used_percentage": 63.0, "resets_at":
+/// <unix seconds>}, …}`): a lab verb seeds it (`outlook-captures`). Read at each run; where there
+/// is none, or it is not a JSON object, the payload carries no `rate_limits`, as Claude Code's
+/// does before its first reply.
+pub const RATE_LIMITS: &str = ".claude/fleet-fixture-rate-limits.json";
+
+/// The version the `claude` stand-in says it is (`--version`, its session record, its banner).
+const VERSION: &str = "2.1.300";
+
+/// The model the `claude` stand-in says it runs.
+const MODEL: &str = "claude-opus-5-5";
+
+/// The statusLine a `--settings` value names ([`status_line`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusLine {
+    /// `statusLine.command`, which Claude Code runs with `/bin/sh -c`.
+    pub command: String,
+    /// `statusLine.refreshInterval`: how long Claude Code waits between runs while nothing else
+    /// asks for one; `None` where the settings name no positive whole number of seconds, and the
+    /// stand-in, which changes nothing a run would show, runs it once.
+    pub every: Option<Duration>,
+}
+
+/// The statusLine named by the first `--settings <json>` or `--settings=<json>` in `args`, before
+/// a literal `--`, whose JSON names a `statusLine.command`; `None` where none does (a settings
+/// file's path is not read).
+#[must_use]
+pub fn status_line(args: &[String]) -> Option<StatusLine> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--" {
+            break;
+        }
+        let value = if arg == "--settings" {
+            it.next().map(String::as_str)
+        } else {
+            arg.strip_prefix("--settings=")
+        };
+        let Some(line) = value
+            .and_then(|json| J::parse(json).ok())
+            .and_then(|settings| settings.get("statusLine").cloned())
+        else {
+            continue;
+        };
+        if let Some(command) = line.get("command").and_then(J::as_str) {
+            let every = line
+                .get("refreshInterval")
+                .and_then(J::as_i64)
+                .and_then(|s| u64::try_from(s).ok())
+                .filter(|s| *s > 0)
+                .map(Duration::from_secs);
+            return Some(StatusLine {
+                command: command.to_owned(),
+                every,
+            });
+        }
+    }
+    None
+}
+
+/// The payload Claude Code pipes into its statusLine command, as the stand-in builds it: its
+/// conversation `session` (`null` where its records could not be written), `cwd`, model and
+/// version, no API time, and `rate_limits` where `limits` is a JSON object.
+#[must_use]
+pub fn status_payload(session: Option<&str>, cwd: &Path, limits: Option<&str>) -> String {
+    let mut payload = J::obj([
+        ("session_id", session.map_or(J::Null, J::s)),
+        ("cwd", J::s(cwd.to_string_lossy())),
+        (
+            "model",
+            J::obj([("id", J::s(MODEL)), ("display_name", J::s("Opus 5.5"))]),
+        ),
+        ("version", J::s(VERSION)),
+        ("cost", J::obj([("total_api_duration_ms", J::Int(0))])),
+    ]);
+    if let Some(limits) = limits
+        .and_then(|text| J::parse(text).ok())
+        .filter(|limits| matches!(limits, J::Obj(_)))
+    {
+        payload.set("rate_limits", limits);
+    }
+    payload.dump(COMPACT)
+}
+
+/// One run of the statusLine `command` as Claude Code runs it: `/bin/sh -c <command>` with
+/// `payload` on its stdin and `CLAUDE_PID` naming this process, in this process's directory and
+/// environment (the tab's, `ATERM_PARENT_SESSION_ID` among it). Its row: the first line it
+/// printed, control characters dropped; `None` where it printed nothing (or only blanks), could
+/// not start, or its output was not read, which loses the row.
+#[must_use]
+fn run_status_line(command: &str, payload: &str) -> Option<String> {
+    use aterm_uds::spawnfd::Stdio;
+    let mut cmd = aterm_uds::spawnfd::command("/bin/sh");
+    cmd.args(["-c", command])
+        .env("CLAUDE_PID", std::process::id().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(payload.as_bytes());
+    }
+    let out = child.wait_with_output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let row: String = text
+        .lines()
+        .next()?
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    (!row.trim().is_empty()).then_some(row)
+}
+
+/// The statusLine's row as Claude Code 2.1.318 draws it under the composer's bottom rule in a
+/// pane `cols` wide: indented two cells, and where it would reach the last two columns, cut
+/// with `…` at column `cols − 3` (aterm-phase's `claude-2.1.318-tap-row-week-30col.txt`).
+#[must_use]
+fn status_row(text: &str, cols: usize) -> String {
+    let room = cols.saturating_sub(4);
+    if text.chars().count() <= room {
+        return format!("  {text}");
+    }
+    let kept: String = text.chars().take(room.saturating_sub(1)).collect();
+    format!("  {kept}\u{2026}")
+}
+
+/// Run `line` now and then every [`StatusLine::every`], on a thread of its own, each run's
+/// payload naming `session`, `cwd` and the `rate_limits` at [`RATE_LIMITS`] as it reads then:
+/// the row the latest run printed, `None` until the first run ends and after one that printed
+/// nothing.
+fn keep_status(line: StatusLine, session: Option<String>, cwd: std::path::PathBuf) -> Shown {
+    let shown: Shown = Arc::new(Mutex::new(None));
+    let kept = Arc::clone(&shown);
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    std::thread::spawn(move || {
+        loop {
+            let limits = home
+                .as_ref()
+                .and_then(|home| crate::util::read_regular_text(&home.join(RATE_LIMITS)).ok());
+            let payload = status_payload(session.as_deref(), &cwd, limits.as_deref());
+            let row = run_status_line(&line.command, &payload);
+            *kept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = row;
+            let Some(every) = line.every else {
+                return;
+            };
+            std::thread::sleep(every);
+        }
+    });
+    shown
+}
+
+/// The row the stand-in's statusLine printed last ([`keep_status`]).
+type Shown = Arc<Mutex<Option<String>>>;
+
 /// Returns `(prompt, said, tool)` for fixture index `n`.
 #[must_use]
 pub fn words(n: usize) -> (String, String, &'static str) {
@@ -168,7 +338,7 @@ impl Mode {
 /// Runs the `claude <mode> [<n>]` fixture.
 pub fn claude(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--version") {
-        println!("2.1.300 (Claude Code fixture of aterm-lab fleet-sim)");
+        println!("{VERSION} (Claude Code fixture of aterm-lab fleet-sim)");
         return 0;
     }
     if args.first().map(String::as_str) == Some("follow") {
@@ -176,7 +346,7 @@ pub fn claude(args: &[String]) -> i32 {
             eprintln!("claude (fleet-sim fixture): usage: claude follow <mode file>");
             return 2;
         };
-        return follow(std::path::Path::new(file));
+        return follow(std::path::Path::new(file), args);
     }
     let Some(mode) = args.first().and_then(|w| Mode::of(w)) else {
         eprintln!(
@@ -187,8 +357,9 @@ pub fn claude(args: &[String]) -> i32 {
     let n = args.get(1).and_then(|n| n.parse().ok()).unwrap_or(0);
     let (prompt, said, tool) = words(n);
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-    let _ = write_session(&cwd, mode, &prompt, &said, tool);
+    let session = write_session(&cwd, mode, &prompt, &said, tool).ok();
     let _ = write_env();
+    let shown = status_line(args).map(|line| keep_status(line, session, cwd.clone()));
     if args.iter().any(|arg| arg == "--subscription-fixture")
         && let Some(home) = std::env::var_os("HOME")
     {
@@ -199,16 +370,40 @@ pub fn claude(args: &[String]) -> i32 {
     let _ = write!(out, "\x1b]2;\u{2733} {}\x07", summary.join(" "));
     let _ = out.flush();
     drop(out);
-    paint_until_gone(|tick, cols, rows| screen(mode, tick, cols, rows, &cwd, &prompt, &said))
+    paint_until_gone(|tick, cols, rows| {
+        let status = last_row(shown.as_ref());
+        let words = Words {
+            prompt: &prompt,
+            said: &said,
+            status: status.as_deref(),
+        };
+        screen(mode, tick, cols, rows, &cwd, &words)
+    })
 }
 
-fn follow(file: &std::path::Path) -> i32 {
+/// `claude follow <mode file>`: the screen of the mode the file names at each frame.
+fn follow(file: &std::path::Path, args: &[String]) -> i32 {
     let (prompt, said, tool) = words(0);
     let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
-    let _ = write_session(&cwd, Mode::Idle, &prompt, &said, tool);
+    let session = write_session(&cwd, Mode::Idle, &prompt, &said, tool).ok();
+    let shown = status_line(args).map(|line| keep_status(line, session, cwd.clone()));
     paint_until_gone(|tick, cols, rows| {
-        screen(followed_mode(file), tick, cols, rows, &cwd, &prompt, &said)
+        let status = last_row(shown.as_ref());
+        let words = Words {
+            prompt: &prompt,
+            said: &said,
+            status: status.as_deref(),
+        };
+        screen(followed_mode(file), tick, cols, rows, &cwd, &words)
     })
+}
+
+/// The row the statusLine printed last, where the stand-in runs one.
+fn last_row(shown: Option<&Shown>) -> Option<String> {
+    shown?
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// The mode word `file` holds, trimmed; a missing, unreadable or unknown word is [`Mode::Idle`].
@@ -289,6 +484,46 @@ fn stdin_closed(wait: Duration) -> bool {
     }
 }
 
+/// The inks Claude Code 2.1.318 draws two kinds of row in on its dark theme, which the stand-in
+/// wears so the glass reads its rules and its statusLine's row as it reads Claude's (the glass's
+/// arcs and tracks start from the rule's grey, `aterm_effects::glass_inks`); every other row is in
+/// the terminal's own ink.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ink {
+    /// A rule: `#888888`.
+    Rule,
+    /// The statusLine's row: `#999999`.
+    Status,
+}
+
+impl Ink {
+    /// The SGR that sets it as the foreground.
+    const fn sgr(self) -> &'static str {
+        match self {
+            Ink::Rule => "\x1b[38;2;136;136;136m",
+            Ink::Status => "\x1b[38;2;153;153;153m",
+        }
+    }
+
+    /// The ink of row `at` of `rows`, a frame [`screen`] drew: a rule (a row of `─` alone) in
+    /// [`Ink::Rule`]; the statusLine's row, which stands directly under the composer's bottom
+    /// rule (the rule under `❯ `) where there is one and is not the mode row, in [`Ink::Status`];
+    /// `None` for the rest.
+    fn of(rows: &[String], at: usize) -> Option<Ink> {
+        let rule = |row: &str| !row.is_empty() && row.chars().all(|c| c == '\u{2500}');
+        let row = rows.get(at)?;
+        if rule(row) {
+            return Some(Ink::Rule);
+        }
+        let status = at >= 2
+            && rule(&rows[at - 1])
+            && rows[at - 2] == "\u{276f} "
+            && !row.trim().is_empty()
+            && !row.starts_with("  \u{23f5}\u{23f5}");
+        status.then_some(Ink::Status)
+    }
+}
+
 fn paint_until_gone(draw: impl Fn(u64, usize, usize) -> Vec<String>) -> i32 {
     let mut out = std::io::stdout().lock();
     if out.write_all(b"\x1b[?1049h\x1b[2J").is_err() {
@@ -301,7 +536,14 @@ fn paint_until_gone(draw: impl Fn(u64, usize, usize) -> Vec<String>) -> i32 {
         let drawn = draw(tick, cols.max(20), rows.max(12));
         let mut frame = String::from("\x1b[H");
         for (r, row) in drawn.iter().enumerate() {
-            frame.push_str(&format!("\x1b[{};1H\x1b[2K{row}", r + 1));
+            match Ink::of(&drawn, r) {
+                Some(ink) => frame.push_str(&format!(
+                    "\x1b[{};1H\x1b[2K{}{row}\x1b[39m",
+                    r + 1,
+                    ink.sgr()
+                )),
+                None => frame.push_str(&format!("\x1b[{};1H\x1b[2K{row}", r + 1)),
+            }
         }
         if let Some(r) = drawn.iter().rposition(|row| row == "❯ ") {
             frame.push_str(&format!("\x1b[{};3H", r + 1));
@@ -324,15 +566,23 @@ fn clip(text: &str, cols: usize) -> String {
     text.chars().take(cols).collect()
 }
 
+/// What a frame of the `claude` stand-in says: its prompt, its reply, and its statusLine's row
+/// ([`keep_status`]), drawn under the composer's bottom rule where there is one.
+struct Words<'a> {
+    prompt: &'a str,
+    said: &'a str,
+    status: Option<&'a str>,
+}
+
 fn screen(
     mode: Mode,
     tick: u64,
     cols: usize,
     rows: usize,
     cwd: &std::path::Path,
-    prompt: &str,
-    said: &str,
+    words: &Words<'_>,
 ) -> Vec<String> {
+    let (prompt, said) = (words.prompt, words.said);
     let rule = "─".repeat(cols);
     let said_shown: String = said
         .chars()
@@ -340,7 +590,7 @@ fn screen(
         .collect();
     let mut top = vec![
         String::new(),
-        " ▐▛███▛█   Claude Code v2.1.300".to_owned(),
+        format!(" ▐▛███▛█   Claude Code v{VERSION}"),
         "▝▜██████▀  Opus 5.5 with xhigh effort · Claude Max".to_owned(),
         clip(&format!(" ▝▝   ▝▝   {}", cwd.display()), cols),
         String::new(),
@@ -367,6 +617,7 @@ fn screen(
             bottom.push(rule.clone());
             bottom.push("❯ ".to_owned());
             bottom.push(rule);
+            bottom.extend(words.status.map(|text| status_row(text, cols)));
             bottom.push(
                 if mode == Mode::Busy {
                     "  ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents"
@@ -458,7 +709,7 @@ fn write_session(
     prompt: &str,
     said: &str,
     tool: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<String> {
     use aterm_codec::json::escape;
     let home = std::env::var_os("HOME").ok_or(std::io::ErrorKind::NotFound)?;
     let dir = std::path::Path::new(&home).join(".claude");
@@ -490,7 +741,7 @@ fn write_session(
     transcript.push_str(&row(
         "assistant",
         format!(
-            "{{\"id\":\"msg_fleet_sim_1\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}",
+            "{{\"id\":\"msg_fleet_sim_1\",\"role\":\"assistant\",\"model\":\"{MODEL}\",\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}",
             escape(said)
         ),
     ));
@@ -504,7 +755,7 @@ fn write_session(
         transcript.push_str(&row(
             "assistant",
             format!(
-                "{{\"id\":\"msg_fleet_sim_2\",\"role\":\"assistant\",\"model\":\"claude-opus-5-5\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_fleet_sim\",\"name\":\"{name}\",\"input\":{{}}}}]}}"
+                "{{\"id\":\"msg_fleet_sim_2\",\"role\":\"assistant\",\"model\":\"{MODEL}\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_fleet_sim\",\"name\":\"{name}\",\"input\":{{}}}}]}}"
             ),
         ));
     }
@@ -512,23 +763,216 @@ fn write_session(
     crate::util::write_fresh(
         &dir.join("sessions").join(format!("{pid}.json")),
         format!(
-            "{{\"pid\":{pid},\"sessionId\":\"{session}\",\"cwd\":\"{}\",\"startedAt\":{},\"version\":\"2.1.300\",\"kind\":\"interactive\"}}\n",
+            "{{\"pid\":{pid},\"sessionId\":\"{session}\",\"cwd\":\"{}\",\"startedAt\":{},\"version\":\"{VERSION}\",\"kind\":\"interactive\"}}\n",
             escape(&cwd_text),
             crate::util::now_ms()
         ),
-    )
+    )?;
+    Ok(session)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_agent::harness::tap;
+
+    fn said<'a>(prompt: &'a str, said: &'a str, status: Option<&'a str>) -> Words<'a> {
+        Words {
+            prompt,
+            said,
+            status,
+        }
+    }
+
+    /// The row under the last composer bottom rule of `rows` (the rule spans the whole width).
+    fn under_the_rule(rows: &[String]) -> Option<&str> {
+        let rule = rows
+            .iter()
+            .rposition(|r| !r.is_empty() && r.chars().all(|c| c == '\u{2500}'))?;
+        rows.get(rule + 1).map(String::as_str)
+    }
+
+    /// The stand-in draws its statusLine's row where Claude Code 2.1.318 drew it in every
+    /// measured screen of aterm-phase's `claude-2.1.318-tap-row-*` fixtures (the row under the
+    /// composer's bottom rule, from column 2, cut with `…` at `cols − 3` in the 30-column pane),
+    /// and a silent command's screen has no row there. The drawn rows read as the tap's own words
+    /// ([`tap::parse_line`], the glass's claim) at 170, 100 and 70 columns and not at 30.
+    /// NEGATIVE CONTROLS: the row drawn uncut at 30 columns is not the measured one, and with a
+    /// row the silent screen's mode row would not sit under the rule.
+    #[test]
+    fn the_status_row_is_where_claude_2_1_318_draws_it() {
+        const WEEK: &str = "week 63% used \u{b7} resets Sat 10:00";
+        let cwd = std::path::Path::new("/tmp/af/m00/home");
+        let fixtures = aterm_tempfile::manifest_dir().join("../aterm-phase/src/fixtures");
+        for (name, words, claimed) in [
+            ("claude-2.1.318-tap-row-week.txt", Some(WEEK), true),
+            ("claude-2.1.318-tap-row-week-100col.txt", Some(WEEK), true),
+            ("claude-2.1.318-tap-row-week-70col.txt", Some(WEEK), true),
+            ("claude-2.1.318-tap-row-week-30col.txt", Some(WEEK), false),
+            (
+                "claude-2.1.318-tap-row-no-figure.txt",
+                Some(tap::NO_WEEK),
+                true,
+            ),
+            ("claude-2.1.318-tap-row-silent-command.txt", None, false),
+        ] {
+            let path = fixtures.join(name);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let measured: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
+            let measured_row = under_the_rule(&measured).expect(name);
+            let cols = measured
+                .iter()
+                .rev()
+                .find(|r| r.starts_with('\u{2500}'))
+                .map(|r| r.chars().count())
+                .expect(name);
+            let drawn = screen(Mode::Idle, 3, cols, 40, cwd, &said("p", "s", words));
+            let row = under_the_rule(&drawn).expect(name);
+            match words {
+                Some(_) => assert_eq!(row, measured_row, "{name} at {cols} columns"),
+                None => {
+                    assert!(row.starts_with("  \u{23f5}\u{23f5}"), "{name}: {row:?}");
+                    assert!(measured_row.starts_with("  \u{23f5}\u{23f5}"), "{name}");
+                    let with = screen(Mode::Idle, 3, cols, 40, cwd, &said("p", "s", Some(WEEK)));
+                    assert_ne!(
+                        under_the_rule(&with),
+                        Some(measured_row),
+                        "CONTROL: a row would stand where the silent screen has none"
+                    );
+                }
+            }
+            let parsed = row.strip_prefix("  ").and_then(tap::parse_line);
+            assert_eq!(parsed.is_some(), claimed, "{name}: {row:?}");
+        }
+        assert_ne!(
+            format!("  {WEEK}"),
+            status_row(WEEK, 30),
+            "CONTROL: uncut, the 30-column row would run into the last two columns"
+        );
+    }
+
+    /// The stand-in draws its rules in Claude's rule grey and its statusLine's row in the
+    /// statusLine's ink, and the rest in the terminal's own: the composer's two rules, the row
+    /// under the bottom one where a statusLine printed one, never the prompt or the mode row.
+    /// NEGATIVE CONTROL: with no statusLine row the mode row stands under the bottom rule, and it
+    /// keeps the terminal's ink.
+    #[test]
+    fn the_rules_and_the_status_row_wear_claudes_inks() {
+        let cwd = std::path::Path::new("/tmp/af/m00/home");
+        for mode in [Mode::Idle, Mode::Busy] {
+            let rows = screen(mode, 3, 100, 30, cwd, &said("p", "s", Some("week 5% used")));
+            let inks: Vec<Option<Ink>> = (0..rows.len()).map(|at| Ink::of(&rows, at)).collect();
+            assert_eq!(
+                inks[25..],
+                [
+                    Some(Ink::Rule),
+                    None,
+                    Some(Ink::Rule),
+                    Some(Ink::Status),
+                    None
+                ],
+                "{mode:?}: {rows:?}"
+            );
+            assert_eq!(rows[28], "  week 5% used");
+            let silent = screen(mode, 3, 100, 30, cwd, &said("p", "s", None));
+            assert!(silent[29].starts_with("  \u{23f5}\u{23f5}"), "{silent:?}");
+            assert_eq!(
+                Ink::of(&silent, 29),
+                None,
+                "CONTROL: {mode:?}: the mode row"
+            );
+            assert_eq!(Ink::of(&silent, 28), Some(Ink::Rule));
+        }
+    }
+
+    /// `status_line` reads the statusLine command and its refresh from either spelling of
+    /// `--settings` (aterm's tap value among them), not past a literal `--`; a settings value that
+    /// names no command, or a flag that is not `--settings`, names none.
+    #[test]
+    fn the_settings_name_the_status_command_and_its_refresh() {
+        let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        let tap_val =
+            tap::settings_value(std::path::Path::new("/usr/local/bin/aterm")).expect("tap value");
+        let named = StatusLine {
+            command: "/usr/local/bin/aterm harness tap".into(),
+            every: Some(Duration::from_secs(10)),
+        };
+        assert_eq!(
+            status_line(&s(&["idle", "--settings", &tap_val])),
+            Some(named.clone())
+        );
+        assert_eq!(
+            status_line(&s(&[&format!("--settings={tap_val}"), "idle"])),
+            Some(named)
+        );
+        assert_eq!(
+            status_line(&s(&[
+                "--settings",
+                r#"{"statusLine":{"type":"command","command":"x"}}"#
+            ])),
+            Some(StatusLine {
+                command: "x".into(),
+                every: None,
+            })
+        );
+        assert_eq!(status_line(&s(&["--", "--settings", &tap_val])), None);
+        assert_eq!(
+            status_line(&s(&["--settings", r#"{"model":"opus"}"#])),
+            None
+        );
+        assert_eq!(status_line(&s(&["--model", "opus"])), None);
+    }
+
+    /// One run hands the command the payload on its stdin and `CLAUDE_PID` naming the stand-in,
+    /// and its row is the first line it printed; the payload carries the seeded `rate_limits` as
+    /// the tap reads them ([`tap::Reading::of_stdin`]). A command that prints nothing, or only a
+    /// blank line, has no row (Claude Code then loses the row). NEGATIVE CONTROL: a seed that is
+    /// not a JSON object leaves the payload without `rate_limits`, and the tap reads no figure.
+    #[test]
+    fn a_run_hands_the_payload_and_shows_the_first_line() {
+        let scratch = aterm_tempfile::tempdir().expect("scratch");
+        let kept = scratch.path().join("payload");
+        let limits = r#"{"seven_day":{"used_percentage":63.0,"resets_at":1793000000}}"#;
+        let payload = status_payload(Some("s"), scratch.path(), Some(limits));
+        let row = run_status_line(
+            &format!(
+                "cat > '{}'; printf 'week %s\\nsecond\\n' \"$CLAUDE_PID\"",
+                kept.display()
+            ),
+            &payload,
+        );
+        assert_eq!(row, Some(format!("week {}", std::process::id())));
+        assert_eq!(std::fs::read_to_string(&kept).expect("handed"), payload);
+        let vars = tap::TapVars {
+            sid: Some("s-01".into()),
+            pid: Some("7".into()),
+            ..tap::TapVars::default()
+        };
+        let read = tap::Reading::of_stdin(&payload, &vars, 1_792_900_000).expect("a reading");
+        let week = read.seven_day.expect("the seeded week");
+        assert_eq!((week.x10(), week.resets_at), (630, 1_793_000_000));
+        assert_eq!(run_status_line("true", &payload), None);
+        assert_eq!(run_status_line("printf '\\n'", &payload), None);
+        let unseeded = status_payload(None, scratch.path(), Some("[1, 2]"));
+        assert!(!unseeded.contains("rate_limits"), "{unseeded}");
+        let read = tap::Reading::of_stdin(&unseeded, &vars, 1_792_900_000).expect("a reading");
+        assert!(!read.has_figures(), "CONTROL: no seed, no figure");
+    }
 
     #[test]
     fn every_frame_fills_its_screen_and_busy_says_esc_to_interrupt() {
         let cwd = std::path::Path::new("/tmp/af/m00/home");
         for cols in [20, 46, 60, 100] {
             for mode in [Mode::Busy, Mode::Question, Mode::Prompt, Mode::Idle] {
-                let rows = screen(mode, 7, cols, 30, cwd, "a prompt", HOSTILE_SAID);
+                let rows = screen(
+                    mode,
+                    7,
+                    cols,
+                    30,
+                    cwd,
+                    &said("a prompt", HOSTILE_SAID, None),
+                );
                 assert_eq!(rows.len(), 30, "{mode:?}: {cols}");
                 assert!(
                     rows.iter().all(|r| r.chars().count() <= cols),
@@ -544,9 +988,9 @@ mod tests {
                 );
             }
         }
-        let busy = screen(Mode::Busy, 7, 100, 30, cwd, "p", "s");
+        let busy = screen(Mode::Busy, 7, 100, 30, cwd, &said("p", "s", None));
         assert!(busy[29].contains("esc to interrupt"), "{busy:?}");
-        let idle = screen(Mode::Idle, 7, 100, 30, cwd, "p", "s");
+        let idle = screen(Mode::Idle, 7, 100, 30, cwd, &said("p", "s", None));
         assert!(!idle[29].contains("esc to interrupt"), "{idle:?}");
     }
 

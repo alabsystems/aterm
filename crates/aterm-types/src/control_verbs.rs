@@ -1114,8 +1114,8 @@ pub const VERBS: &[VerbSpec] = &[
          pending_age_ms=- last=- watch_ms=-`; `devtools state=<allowed|denied|unlisted|unknown> \
          subject= requests= not_allowed= answer_age_ms= window_s=<s> probe= probe_age_ms= \
          grant=<granted|not_granted|unknown> list=<on|off|absent|unknown> list_probe= \
-         program_check=<n|-> program_check_oldest_ms=<ms|->`; `observer fda= responsible= log= \
-         taskport=`; `access_card \
+         program_check=<n|-> program_check_oldest_ms=<ms|-> program_check_stranded=<n|->`; \
+         `observer fda= responsible= log= taskport=`; `access_card \
          state=<quiet|asked|opened|granted|declined> asked_at= opened_at= verified_at= renew_at= \
          needs=`; `remediate fda= files= debugger= devtools=`; then a `note <pct>` when `anchor=` \
          is `displaced` or `deleted`, and the closing `note <pct>`. `--json` is `OK 1` and one \
@@ -1135,7 +1135,10 @@ pub const VERBS: &[VerbSpec] = &[
          `not_granted`); `program_check=` counts this user's programs waiting at macOS's program \
          check now by the latest jobs reading (one is pulled when none is fresh), a lower bound, \
          and `program_check_oldest_ms=` the longest held (`-` with none held, off macOS, or with \
-         no reading). Only a person changes these, at the places `remediate` names: \
+         no reading); `program_check_stranded=` counts those held since before the syspolicyd \
+         running now started, whose check went to one no longer running, instance-wide (`sys \
+         jobs` names each; `-` while one may be stranded and nothing read tells, as `status` \
+         says). Only a person changes these, at the places `remediate` names: \
          `settings:<pane>` is a System Settings pane, `aterm-settings:<page>` a page of aterm's \
          Settings (the debugger's is Settings ▸ Security); `devtools hand-over` opens the \
          Developer Tools pane and `await consent [kind=debugger]` waits for a change. Setup's \

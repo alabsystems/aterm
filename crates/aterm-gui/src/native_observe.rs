@@ -257,14 +257,16 @@ impl Kernel for System {
 }
 
 /// The system's keep-awake, which [`cohort_gone`] lets outlive its group's other members.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 const KEEP_AWAKE: &str = "/usr/bin/caffeinate";
 
 /// Whether process group `group` can no longer act, the shipping `group_gone` of every native
 /// kernel: the kernel finds none of it (`ESRCH`), or on macOS each member left is an orphaned
-/// keep-awake ([`keeps_group`]). Claude Code holds one (`caffeinate -i -t 300`) in its own group
-/// while it works, and a kill of Claude leaves it there for up to five minutes, past every native
-/// plan's deadline: it runs nothing but its timer. `None` when the kernel cannot say.
+/// executed system finite idle timer. Claude Code can leave its keep-awake behind after it
+/// exits. The exception requires its exact executable, orphaned parent, completed exec and stable
+/// full identity around an argv read matching only `caffeinate -i -t <positive decimal seconds>`.
+/// Utility operands and unsupported or unread argv keep the group live. `None` when the kernel
+/// cannot say.
 pub(crate) fn cohort_gone(group: u32) -> Option<bool> {
     #[cfg(unix)]
     {
@@ -298,8 +300,8 @@ pub(crate) fn cohort_gone(group: u32) -> Option<bool> {
 /// ([`member_keeps`]). A listing and the reads of its members are no one snapshot: a listed member
 /// read as gone may have forked first, its child in the group and unlisted. So the group is idle
 /// only when a second listing, taken after the reads, names no pid the first did not and each
-/// member it names still reads idle; any later child needs a parent in the group then, and each is
-/// a keep-awake read twice. `between` runs between the first listing and the reads: a test's
+/// member it names still reads idle; each exception requires a completed exec and unchanged
+/// lineage around its image read. `between` runs between the first listing and the reads: a test's
 /// interleaving, nothing in [`cohort_gone`].
 #[cfg(target_os = "macos")]
 fn darwin_cohort_idle(group: i32, between: &mut dyn FnMut()) -> Option<bool> {
@@ -335,30 +337,72 @@ fn darwin_listing(group: i32) -> Option<Vec<libc::pid_t>> {
     Some(listed)
 }
 
-/// Whether the listed member `pid` of `group` keeps it alive ([`keeps_group`]). One the kernel no
-/// longer finds, or finds in another group, left it; one it finds and cannot read keeps it.
+/// Whether the listed member `pid` keeps `group` alive. A member positively absent or in another
+/// group left it; an unread member keeps it. Only a stable, executed, orphaned system finite
+/// idle timer is exempt.
 #[cfg(target_os = "macos")]
 fn member_keeps(group: i32, pid: i32) -> bool {
-    let Some(info) = aterm_uds::process::read_short_info(pid) else {
-        return aterm_uds::process::process_presence(pid)
-            != aterm_uds::process::ProcessPresence::Absent;
-    };
-    if i32::try_from(info.pbsi_pgid).ok() != Some(group) {
-        return false;
-    }
-    keeps_group(
-        info.pbsi_ppid,
-        aterm_uds::process::read_process_path(pid).as_deref(),
+    member_keeps_with(
+        group,
+        pid,
+        aterm_uds::process::read_lineage,
+        aterm_uds::process::read_process_execd,
+        aterm_uds::process::read_process_path,
+        aterm_uds::process::read_process_argv,
+        aterm_uds::process::process_presence,
     )
 }
 
-/// Whether a member of a group whose other work is to be proven over keeps it alive: every member
-/// does but an orphaned keep-awake, [`KEEP_AWAKE`] reparented to launchd once the process that ran
-/// it died. A keep-awake whose parent lives, or one that runs a command (that command is a member
-/// of its own), keeps it.
-#[cfg(any(target_os = "macos", test))]
-fn keeps_group(parent: u32, path: Option<&std::path::Path>) -> bool {
-    parent != 1 || path != Some(std::path::Path::new(KEEP_AWAKE))
+/// Reads the actual member policy through the same observations as [`member_keeps`]. The final
+/// lineage includes Apple's pid version, so an exec or pid reuse during the image and argv reads
+/// refuses the exception. A fork's inherited image is not evidence that it executed that program.
+#[cfg(target_os = "macos")]
+fn member_keeps_with(
+    group: i32,
+    pid: i32,
+    mut lineage: impl FnMut(i32) -> Option<aterm_uds::process::Lineage>,
+    execd: impl FnOnce(i32) -> Option<bool>,
+    path: impl FnOnce(i32) -> Option<std::path::PathBuf>,
+    argv: impl FnOnce(i32) -> Option<Vec<std::ffi::OsString>>,
+    presence: impl FnOnce(i32) -> aterm_uds::process::ProcessPresence,
+) -> bool {
+    let Some(before) = lineage(pid) else {
+        return presence(pid) != aterm_uds::process::ProcessPresence::Absent;
+    };
+    if i32::try_from(before.pgid).ok() != Some(group) {
+        return false;
+    }
+    if before.parent != 1 || execd(pid) != Some(true) {
+        return true;
+    }
+    if path(pid).as_deref() != Some(std::path::Path::new(KEEP_AWAKE))
+        || !argv(pid).as_deref().is_some_and(finite_keep_awake)
+    {
+        return true;
+    }
+    lineage(pid) != Some(before)
+}
+
+/// Only this finite idle timer is exempt. `caffeinate` with utility operands can still fork and
+/// exec that utility after both group listings; its executable image alone cannot prove quiescence.
+/// Its base-zero timeout parser also requires us to reject leading zeros rather than treating
+/// an invalid octal spelling such as `08` as a positive decimal duration.
+#[cfg(target_os = "macos")]
+fn finite_keep_awake(argv: &[std::ffi::OsString]) -> bool {
+    let [program, idle, timer, seconds] = argv else {
+        return false;
+    };
+    (program == KEEP_AWAKE || program == "caffeinate")
+        && idle == "-i"
+        && timer == "-t"
+        && seconds.to_str().is_some_and(|value| {
+            value
+                .as_bytes()
+                .first()
+                .is_some_and(|first| matches!(first, b'1'..=b'9'))
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+                && value.parse::<u32>().is_ok()
+        })
 }
 
 /// Capacity belongs to the owned witness, even if an external Arc/Weak race outlives its

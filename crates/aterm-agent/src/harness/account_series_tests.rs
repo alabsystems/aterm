@@ -128,14 +128,7 @@ fn plan_row(t: i64, tier: &str) -> SeriesRow {
 }
 
 fn event_row(t: i64) -> SeriesRow {
-    row_of(
-        t,
-        Said::Event(EventSaid {
-            e: EventWord::AnotherAccount,
-            w: None,
-            at: None,
-        }),
-    )
+    row_of(t, Said::Event(EventSaid::of(EventWord::AnotherAccount)))
 }
 
 /// Writes `lines` as the whole file at `path`.
@@ -2039,4 +2032,451 @@ fn the_bound_gives_rows_up_in_its_order() {
     let bytes = std::fs::read(&path).unwrap();
     assert!(!compact_locked(&path, NOW + 60, utc).unwrap().rewrote);
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+/// A `wall` and a `grant-seen` row read back as written, closed words and numbers only (`w`, a
+/// bucket id; `kind`, a reset kind's word; `n`, `at`, `reset`, `use_by`), and the reader knows
+/// both words. NEGATIVE CONTROL: no events append nothing and make no file.
+#[test]
+fn wall_and_grant_seen_rows_read_back_whole() {
+    let dir = tmp("event-rows");
+    assert_eq!(
+        note_events(dir.path(), "me", MACHINE, &[], 100).unwrap(),
+        Noted::Nothing
+    );
+    assert!(read(dir.path(), "me", MACHINE).is_empty());
+    assert!(!dir_in(dir.path()).exists(), "no file made");
+    let wall = EventSaid::wall(&accounts::WeekWalled {
+        bucket: "seven_day_overage_included",
+        reset: Some(5_000),
+        at: 90,
+        by: MACHINE.to_string(),
+    });
+    let grant = EventSaid::grant_seen(&accounts::Offer {
+        kind: Some(aterm_phase::ResetKind::Weekly),
+        left: 2,
+        use_by: Some(7_000),
+        at: 95,
+        by: MACHINE.to_string(),
+    });
+    assert_eq!(
+        note_events(
+            dir.path(),
+            "me",
+            MACHINE,
+            &[wall.clone(), grant.clone()],
+            100
+        )
+        .unwrap(),
+        Noted::Event
+    );
+    let rows = read(dir.path(), "me", MACHINE);
+    assert_eq!(
+        rows.iter().map(|r| r.said.clone()).collect::<Vec<_>>(),
+        [Said::Event(wall.clone()), Said::Event(grant.clone())]
+    );
+    assert_eq!((wall.e.as_str(), grant.e.as_str()), ("wall", "grant-seen"));
+    assert_eq!(EventWord::parse("wall"), Some(EventWord::Wall));
+    assert_eq!(EventWord::parse("grant-seen"), Some(EventWord::GrantSeen));
+    let path = path_of(dir.path(), "me", MACHINE).unwrap();
+    let text = std::fs::read_to_string(path).unwrap();
+    let keys: Vec<Vec<String>> = text
+        .lines()
+        .map(|line| {
+            let v: Value = aterm_json::from_str(line).unwrap();
+            let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            vec!["at", "by", "e", "k", "reset", "t", "v", "w"],
+            vec!["at", "by", "e", "k", "kind", "n", "t", "use_by", "v"],
+        ]
+    );
+}
+
+/// SINCE NEVER CROSSES ANOTHER ACCOUNT. The home's week read 40% a day and more ago; then
+/// another account signed in to it (its `event` row and, in the same transaction, the first
+/// reading of the new account, 20%), which read 25% and now 30%. The baseline is the new
+/// account's first reading, the span shortened to its age, so the week rose 10 points; a series
+/// whose last row is that event has no baseline at all, and no current figure has no `since`.
+/// Negative control: taking the baseline from every row (the cut after the event left at the
+/// series' start) compares the new account with the old one's 40%, reads the fall as a reset
+/// used, and the first assertion fails.
+#[test]
+fn since_never_crosses_another_account() {
+    let reset = NOW + 3 * D;
+    let current = accounts::WindowFig {
+        pct_x10: 300,
+        reset,
+        at: NOW - 60,
+        by: MACHINE.into(),
+        source: accounts::SOURCE_TAP.into(),
+        epoch_at: None,
+    };
+    let rows = [
+        fig_row(NOW - 30 * H, None, Some(fig_of(400, reset, NOW - 30 * H))),
+        event_row(NOW - 5 * H),
+        fig_row(
+            NOW - 5 * H,
+            None,
+            Some(fig_of(200, reset, NOW - 5 * H - 30)),
+        ),
+        fig_row(NOW - 2 * H, None, Some(fig_of(250, reset, NOW - 2 * H))),
+    ];
+    let since = |rows: &[SeriesRow], current: Option<&accounts::WindowFig>| {
+        since_of(
+            rows,
+            Keys::default(),
+            (WEEK_LIMIT, accounts::WEEK_WINDOW_S),
+            current,
+            D,
+            NOW,
+        )
+    };
+    assert_eq!(
+        since(&rows, Some(&current)),
+        Some(Since {
+            span_s: 5 * H + 30,
+            moved: Moved::Rose(10)
+        })
+    );
+    let mut ended = rows.to_vec();
+    ended.push(event_row(NOW - H));
+    assert_eq!(
+        since(&ended, Some(&current)),
+        None,
+        "nothing after the event"
+    );
+    assert_eq!(since(&rows, None), None, "no current figure");
+}
+
+// A zone that springs forward at local midnight (as America/Santiago does): four hours west of
+// UTC until the change, three after it, the change at 00:00 local of day `SPRING_DAY`, which so
+// begins at 01:00.
+const SPRING_DAY: i64 = M0 / D + 10;
+const AT_MIDNIGHT: i64 = SPRING_DAY * D + 4 * H;
+
+fn springs_at_midnight(t: i64) -> i64 {
+    if t < AT_MIDNIGHT { -4 * H } else { -3 * H }
+}
+
+// A zone that falls back at local midnight (as America/Asuncion does): three hours west until
+// the change, four after it, so 00:00 of `SPRING_DAY` becomes 23:00 of the day before, and the
+// day begins at the second 00:00.
+const FALLS_AT_MIDNIGHT: i64 = SPRING_DAY * D + 3 * H;
+
+fn falls_at_midnight(t: i64) -> i64 {
+    if t < FALLS_AT_MIDNIGHT {
+        -3 * H
+    } else {
+        -4 * H
+    }
+}
+
+/// A DAY BEGINS WHERE A ZONE SPRINGS FORWARD ACROSS ITS MIDNIGHT. Where the clocks move from
+/// 00:00 to 01:00, the day's first instant is the change: `midnight` names it, the instant
+/// before is still the day before, and the day's row from a reading at 01:30 is 23 hours long,
+/// on its own date at the new offset. Where the clocks fall back at midnight, the day begins at
+/// the second 00:00, so the day before, which holds the repeated hour, is 25 hours long.
+/// Negative control: the midnight of the offset read at the
+/// change (`local - tz_at(guess)` returned as it was) is 23:00 of the day before, and the first
+/// assertion fails (left `AT_MIDNIGHT - 3600`).
+#[test]
+fn a_day_begins_where_a_zone_springs_forward_across_its_midnight() {
+    assert_eq!(midnight(SPRING_DAY, springs_at_midnight), AT_MIDNIGHT);
+    assert_eq!(
+        local_day(AT_MIDNIGHT - 1, springs_at_midnight),
+        SPRING_DAY - 1
+    );
+    assert_eq!(local_day(AT_MIDNIGHT, springs_at_midnight), SPRING_DAY);
+    let reading = fig_row(
+        AT_MIDNIGHT + 30 * 60,
+        None,
+        Some(fig_of(100, AT_MIDNIGHT + 3 * D, AT_MIDNIGHT + 30 * 60)),
+    );
+    let got = days(&day_summaries(
+        &[reading],
+        AT_MIDNIGHT - D,
+        AT_MIDNIGHT + D,
+        springs_at_midnight,
+    ));
+    assert_eq!(got.len(), 1, "{got:?}");
+    let (t, day) = &got[0];
+    assert_eq!((*t, day.span_s, day.tz_s), (AT_MIDNIGHT, D - H, -3 * H));
+    assert_eq!(
+        (t + day.tz_s).div_euclid(D),
+        SPRING_DAY,
+        "the row's own date"
+    );
+
+    let second = FALLS_AT_MIDNIGHT + H;
+    assert_eq!(midnight(SPRING_DAY, falls_at_midnight), second);
+    assert_eq!(local_day(second - 1, falls_at_midnight), SPRING_DAY - 1);
+    assert_eq!(
+        second - midnight(SPRING_DAY - 1, falls_at_midnight),
+        D + H,
+        "the day before holds the repeated hour"
+    );
+}
+
+/// SINCE NEVER CROSSES A READING OF ANOTHER ACCOUNT. The label's record was given to another
+/// account with no `another-account` event (a fleet gave the label away, or no login keyed the
+/// reading): the rows of the account before carry its lab key, the new account's carry its own.
+/// Its week, now 30%, is read against its own first reading (20%, five hours ago), never the
+/// other account's 70% a day ago, by lab key or by account key; a reader that knows no key reads
+/// all of them as before. Negative control: the parting rows left to the events alone (the
+/// `Said::Fig` arm of `after_parting` false) compares 30% with 70%, reads the fall as a reset
+/// used, and the first assertion fails.
+#[test]
+fn since_never_crosses_a_reading_of_another_account() {
+    const OTHER: &str = "ac-fedcba9876543210";
+    let before = profile::AccountKey::claude("11111111-1111-4111-8111-111111111111").unwrap();
+    let after = profile::AccountKey::claude("22222222-2222-4222-8222-222222222222").unwrap();
+    let reset = NOW + 3 * D;
+    let current = accounts::WindowFig {
+        pct_x10: 300,
+        reset,
+        at: NOW - 60,
+        by: MACHINE.into(),
+        source: accounts::SOURCE_TAP.into(),
+        epoch_at: None,
+    };
+    let keyed = |t: i64, pct: u32, ac: &str, key| SeriesRow {
+        t,
+        by: MACHINE.into(),
+        said: Said::Fig {
+            five_hour: None,
+            seven_day: Some(fig_of(pct, reset, t)),
+            ac: Some(ac.to_owned()),
+            key: Some(key),
+        },
+    };
+    let rows = [
+        keyed(NOW - 30 * H, 650, OTHER, before),
+        keyed(NOW - 24 * H, 700, OTHER, before),
+        keyed(NOW - 5 * H, 200, AC, after),
+        keyed(NOW - 2 * H, 250, AC, after),
+    ];
+    let since = |keys: Keys<'_>| {
+        since_of(
+            &rows,
+            keys,
+            (WEEK_LIMIT, accounts::WEEK_WINDOW_S),
+            Some(&current),
+            D,
+            NOW,
+        )
+    };
+    let own = Some(Since {
+        span_s: 5 * H,
+        moved: Moved::Rose(10),
+    });
+    assert_eq!(
+        since(Keys {
+            ac: Some(AC),
+            key: None
+        }),
+        own,
+        "by lab key"
+    );
+    assert_eq!(
+        since(Keys {
+            ac: None,
+            key: Some(after)
+        }),
+        own,
+        "by account key"
+    );
+    assert!(
+        matches!(
+            since(Keys::default()).map(|s| s.moved),
+            Some(Moved::ResetUsed(_))
+        ),
+        "a reader that knows no key cannot tell them"
+    );
+}
+
+/// SINCE SAYS THE SPAN ITS BASELINE COVERS. A week read 30% on Tuesday at 09:00 and nothing
+/// after on this Mac until 60% now, Thursday at 10:05: the rise is 30 points over the 49 hours
+/// it took, never `+30 since 24h`; a baseline read within a reading heartbeat before the span's
+/// start stands for the span asked. Negative control: the span asked kept for every baseline at
+/// or before the start (the `span_s` it was) says 24 hours, and the first assertion fails.
+#[test]
+fn since_says_the_span_its_baseline_covers() {
+    let reset = NOW + 3 * D;
+    let current = accounts::WindowFig {
+        pct_x10: 600,
+        reset,
+        at: NOW - 60,
+        by: MACHINE.into(),
+        source: accounts::SOURCE_TAP.into(),
+        epoch_at: None,
+    };
+    let since = |rows: &[SeriesRow]| {
+        since_of(
+            rows,
+            Keys::default(),
+            (WEEK_LIMIT, accounts::WEEK_WINDOW_S),
+            Some(&current),
+            D,
+            NOW,
+        )
+    };
+    let gap = [fig_row(
+        NOW - 49 * H,
+        None,
+        Some(fig_of(300, reset, NOW - 49 * H)),
+    )];
+    assert_eq!(
+        since(&gap),
+        Some(Since {
+            span_s: 49 * H,
+            moved: Moved::Rose(30)
+        })
+    );
+    let at_start = NOW - D - accounts::READING_HEARTBEAT_S;
+    let near = [fig_row(at_start, None, Some(fig_of(300, reset, at_start)))];
+    assert_eq!(
+        since(&near),
+        Some(Since {
+            span_s: D,
+            moved: Moved::Rose(30)
+        })
+    );
+}
+
+/// What `since_of` says of both windows of `rows` for `keys` over `span_s` at `now`.
+fn both_since(
+    rows: &[SeriesRow],
+    keys: Keys<'_>,
+    (span_s, now): (i64, i64),
+    current: (&accounts::WindowFig, &accounts::WindowFig),
+) -> [Option<Since>; 2] {
+    [
+        since_of(
+            rows,
+            keys,
+            (SESSION_LIMIT, accounts::SESSION_WINDOW_S),
+            Some(current.0),
+            span_s,
+            now,
+        ),
+        since_of(
+            rows,
+            keys,
+            (WEEK_LIMIT, accounts::WEEK_WINDOW_S),
+            Some(current.1),
+            span_s,
+            now,
+        ),
+    ]
+}
+
+/// SINCE ROWS HOLD WHAT SINCE READS. Over a series of another account's readings, a reading no
+/// key names, an event, the account's own readings (two served at one instant, one served
+/// before it was written, a refill, rows of one window only), beats and plans, `since_of` over
+/// the rows `since_rows` keeps says what it says over every row, for each window, each key and
+/// each span and instant asked, while keeping fewer rows; so does it over a report's view, which
+/// adds the outlook's rows (the readings before the event among them, but not the event).
+/// Negative control: `since_rows` without the parting row (`parting.into_iter()` left out of
+/// `out`) lets the report's view part at the older reading of another account, reads the
+/// reading no key names as a baseline over 52 hours, and the view's assertion fails.
+#[test]
+fn since_rows_hold_what_since_reads() {
+    const OTHER: &str = "ac-fedcba9876543210";
+    let five = NOW + 2 * H;
+    let week = NOW + 3 * D;
+    let keyed = |t: i64, f: Option<(u32, i64)>, w: Option<(u32, i64)>, ac: &str| SeriesRow {
+        t,
+        by: MACHINE.into(),
+        said: Said::Fig {
+            five_hour: f.map(|(p, at)| fig_of(p, five, at)),
+            seven_day: w.map(|(p, at)| fig_of(p, week, at)),
+            ac: Some(ac.to_owned()),
+            key: None,
+        },
+    };
+    let mut rows = vec![
+        plan_row(NOW - 40 * D, "5x"),
+        keyed(NOW - 60 * H, None, Some((900, NOW - 60 * H)), OTHER),
+        fig_row(NOW - 55 * H, None, Some(fig_of(950, week, NOW - 55 * H))),
+        event_row(NOW - 50 * H),
+        keyed(NOW - 50 * H, None, Some((100, NOW - 50 * H)), AC),
+        keyed(
+            NOW - 30 * H,
+            Some((50, NOW - 30 * H)),
+            Some((150, NOW - 30 * H)),
+            AC,
+        ),
+        keyed(NOW - 26 * H, None, Some((200, NOW - 26 * H)), AC),
+        keyed(NOW - 25 * H, None, Some((210, NOW - 26 * H)), AC),
+        row_of(NOW - 25 * H + 60, Said::Beat),
+        keyed(
+            NOW - 10 * H,
+            Some((400, NOW - 11 * H)),
+            Some((300, NOW - 10 * H)),
+            AC,
+        ),
+        keyed(
+            NOW - 6 * H,
+            Some((100, NOW - 6 * H)),
+            Some((320, NOW - 6 * H)),
+            AC,
+        ),
+        plan_row(NOW - 5 * H, "20x"),
+        keyed(NOW - H, Some((150, NOW - H)), None, AC),
+    ];
+    rows.push(row_of(NOW - 30, Said::Beat));
+    let now_fig = |pct_x10, reset| accounts::WindowFig {
+        pct_x10,
+        reset,
+        at: NOW - 60,
+        by: MACHINE.into(),
+        source: accounts::SOURCE_TAP.into(),
+        epoch_at: None,
+    };
+    let current = (now_fig(160, five), now_fig(330, week));
+    let keys = [
+        Keys {
+            ac: Some(AC),
+            key: None,
+        },
+        Keys::default(),
+    ];
+    for keys in keys {
+        for span_s in [H, 5 * H, D, 2 * D, 52 * H, 10 * D] {
+            for now in [NOW, NOW - 8 * H, NOW - 27 * H] {
+                let all = both_since(&rows, keys, (span_s, now), (&current.0, &current.1));
+                let kept = since_rows(&rows, keys, span_s, now);
+                let reduced: Vec<SeriesRow> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| kept.contains(i))
+                    .map(|(_, r)| r.clone())
+                    .collect();
+                assert_eq!(
+                    both_since(&reduced, keys, (span_s, now), (&current.0, &current.1)),
+                    all,
+                    "{keys:?} over {span_s} at {now}: {kept:?}"
+                );
+                assert!(reduced.len() < rows.len(), "{kept:?}");
+                let view = report_view(rows.clone(), keys, span_s, now);
+                assert!(
+                    outlook_view(rows.clone(), now)
+                        .iter()
+                        .all(|row| view.contains(row)),
+                    "the view holds the outlook's"
+                );
+                assert_eq!(
+                    both_since(&view, keys, (span_s, now), (&current.0, &current.1)),
+                    all,
+                    "the view: {keys:?} over {span_s} at {now}"
+                );
+            }
+        }
+    }
 }

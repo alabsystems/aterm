@@ -959,7 +959,7 @@ impl PetBrain {
         self.observe_console_with_exclusions(input, facts, pane, &[]);
     }
 
-    /// Cells the last world observation classified (at most `MAX_WORLD_ROWS` × `MAX_WORLD_COLS` per presented frame, none when it kept the reading it held), so a running product can report the cost.
+    /// Cells the last world observation classified (at most `MAX_WORLD_ROWS` × `MAX_WORLD_COLS` per presented frame, and on a pane past that budget `MAX_BODY_ROWS` × `MAX_WORLD_COLS` more about the body, [`crate::pet_world::PetWorld::body_window`]; none when it kept the reading it held), so a running product can report the cost.
     #[inline]
     #[must_use]
     pub const fn observed_cells(&self) -> usize {
@@ -1038,6 +1038,28 @@ impl PetBrain {
             }
             _ => None,
         };
+        // A pane past the map's budget is read about its caret, and the rows about the body
+        // (where it was last drawn, [`crate::pet_world::KEPT_ROWS`] over and under it) in a
+        // second window about the body's centre column ([`OldPath::WorldReadsTheBodysRows`]).
+        let keep = match self.console.last_body {
+            Some(body)
+                if (pane.rows > crate::pet_world::MAX_WORLD_ROWS
+                    || pane.cols > crate::pet_world::MAX_WORLD_COLS)
+                    && body.row.is_finite()
+                    && body.rows.is_finite()
+                    && body.col.is_finite()
+                    && body.cols.is_finite()
+                    && !self.old_path(OldPath::WorldReadsTheBodysRows) =>
+            {
+                let kept = crate::pet_world::KEPT_ROWS as f32;
+                let first = (body.row - kept).max(0.0).floor() as usize;
+                let end = (body.row + body.rows + kept).ceil().max(0.0) as usize;
+                let mid = (body.col + body.cols * 0.5).max(0.0) as usize;
+                Some((first.min(pane.rows), end.min(pane.rows), mid.min(pane.cols)))
+            }
+            _ => None,
+        };
+        let centre = (held_center, keep);
         // Taking the reading held again ([`PetReading`]) would leave the
         // world, the observation count, the row signatures, the faux caret and
         // the contact as they stand: the same cells give the same world, whose
@@ -1046,7 +1068,7 @@ impl PetBrain {
             && self
                 .console
                 .reading
-                .holds((input, fill), facts, pane, reserve, held_center)
+                .holds((input, fill), facts, pane, reserve, centre)
         {
             self.console.reading.keep(input);
             return;
@@ -1110,7 +1132,7 @@ impl PetBrain {
             },
             ..reserve
         };
-        world.observe_with_exclusions_near(input, facts, pane, seen, held_center);
+        world.observe_with_exclusions_near(input, facts, pane, seen, centre);
         if world.stamp().is_some()
             && (prior_stamp != world.stamp()
                 || prior_selection != world.selection_target()
@@ -1181,12 +1203,14 @@ impl PetBrain {
         } else {
             None
         };
-        if matches!(self.console.world.as_ref(), Some(w) if w.stamp().is_some()) {
-            self.console
-                .reading
-                .note((input, fill), facts, pane, reserve, held_center);
-        } else {
-            self.console.reading.forget();
+        match self.console.world.as_deref() {
+            Some(w) if w.stamp().is_some() => {
+                let read = (w.coverage(), w.body_window());
+                self.console
+                    .reading
+                    .note((input, fill), facts, pane, reserve, held_center, read);
+            }
+            _ => self.console.reading.forget(),
         }
     }
 
@@ -10096,6 +10120,27 @@ mod tests {
             }
         }
 
+        /// A pane past the map's budget, `rows` by `cols` ([`crate::pet_world::MAX_WORLD_ROWS`],
+        /// [`crate::pet_world::MAX_WORLD_COLS`]): its rows 2 and 4 (counted from 1) lettered to
+        /// the margin, a body seated between them at the 21st column, the caret in row 3's third
+        /// column.
+        fn past_the_budget(host: Host, (rows, cols): (u16, u16)) -> Self {
+            let mut t = Self::new(host);
+            let row: String = "the quick brown fox jumps over the lazy dog "
+                .repeat(usize::from(cols))
+                .chars()
+                .take(usize::from(cols))
+                .collect();
+            t.term = Terminal::new(rows, cols);
+            t.term.process(
+                format!("\x1b]11;#000000\x07\x1b[2;1H{row}\x1b[4;1H{row}\x1b[3;3H").as_bytes(),
+            );
+            for brain in [&mut t.kept, &mut t.fresh] {
+                brain.row = 2.0;
+            }
+            t
+        }
+
         /// The host fills, both brains observe, and what each holds is equal.
         fn observe(&mut self, what: &str, reserve: PetReserve<'_>) {
             let host = self.host;
@@ -10344,6 +10389,36 @@ mod tests {
                 t.kept_frames,
                 t.frames
             );
+        }
+        // Past the map's budget the console reads the rows about the body in a second window
+        // ([`crate::pet_world::PetWorld::body_window`]), which moves with the body while the
+        // screen stands still: on a pane 100 rows tall and one 300 columns wide, a caret sent
+        // far from the body and back, and far again, 120 frames each, the body following it.
+        for host in [Host::Reuse, Host::Refill, Host::Banded] {
+            let far: [((u16, u16), &[u8]); 2] =
+                [((100, 80), b"\x1b[80;3H"), ((20, 300), b"\x1b[12;290H")];
+            for (grid, far) in far {
+                let mut t = Twin::past_the_budget(host, grid);
+                t.frames("settled", 240);
+                let mut read = 0;
+                for (what, at) in [("far", far), ("home", b"\x1b[3;3H"), ("far again", far)] {
+                    t.term.process(at);
+                    for _ in 0..120 {
+                        t.frames(what, 1);
+                        read += usize::from(matches!(
+                            t.kept.console.world.as_deref(),
+                            Some(w) if w.body_window().rows > 0
+                        ));
+                    }
+                }
+                assert!(
+                    read >= 40 && t.kept_frames >= 400,
+                    "fixture, {host:?} on {grid:?}: the window about the body read in {read} \
+                     frames, the reading kept in {} of {}",
+                    t.kept_frames,
+                    t.frames
+                );
+            }
         }
     }
 

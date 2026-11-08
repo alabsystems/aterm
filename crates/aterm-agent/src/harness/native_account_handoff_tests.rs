@@ -66,7 +66,7 @@ fn laid_out(phase: ImagePhase) -> (St, Prepare) {
     back.env[0].1 = "/model/back".into();
     back.account_intent = Some(Box::new(intent("/model/back", "78")));
     let old = Prepare {
-        asked_upgrade: None,
+        asked: None,
         id: "ab".repeat(16),
         host_epoch: "cd".repeat(16),
         holder: "model-holder".into(),

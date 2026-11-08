@@ -256,6 +256,7 @@ impl Host {
                     tab: None,
                     job: None,
                     started_ms: None,
+                    stranded: false,
                 })
             })
             .collect();
@@ -278,6 +279,8 @@ impl Host {
             },
             process_limit: self.process_limit,
             held,
+            program_check_daemon: None,
+            program_check_judged: false,
             grant_ms: None,
             exits: Vec::new(),
         })

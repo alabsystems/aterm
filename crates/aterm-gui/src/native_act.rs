@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use aterm_agent::harness::contract::Scope;
 use aterm_agent::harness::native_act::{
-    Binding, CancelPrepare, ClaimOutcome, ColdEnvironmentFacts, ColdIntent, Constructor, Decision,
-    Image, ImagePhase, NativePlan, Prepare, Process, Request, RestartCommand, Retirement,
+    AskedIntent, Binding, CancelPrepare, ClaimOutcome, ColdEnvironmentFacts, ColdIntent,
+    Constructor, Decision, Image, ImagePhase, NativePlan, Prepare, Process, Request,
+    RestartCommand, Retirement,
 };
 
 use crate::session_timeline::{
@@ -31,6 +32,9 @@ use closed_restart::ClosedRestart;
 
 #[path = "native_asked_upgrade.rs"]
 mod asked_upgrade;
+#[path = "native_relaunch_permit.rs"]
+mod relaunch_permit;
+pub(crate) use relaunch_permit::authorize as authorize_checked_relaunch;
 
 #[path = "native_account_continuation.rs"]
 mod account_continuation;
@@ -268,6 +272,7 @@ impl Clock {
 #[derive(Debug, Default)]
 pub(crate) struct Operations {
     asked_binding: asked_upgrade::CurrentBinding,
+    relaunch_pending: Option<Arc<relaunch_permit::Permit>>,
     #[cfg(unix)]
     exec_prepare: Option<Arc<exec_handoff::Preparation>>,
     #[cfg(unix)]
@@ -328,6 +333,7 @@ impl Operations {
         )
     )]
     fn reclaim(&mut self, now_us: u64) -> Vec<Arc<Mutex<Operation>>> {
+        relaunch_permit::reclaim_pending(self, now_us);
         let mut retired = self.compact_account_lineages();
         // Compaction can release the committed current root's final account pin.
         // Preserve its positive settlement before expiry removes the operation.
@@ -542,14 +548,18 @@ impl<'a> PrepareSlot<'a> {
         })
     }
 
-    fn publish(&mut self, table: &mut Operations, operation: Arc<Mutex<Operation>>) {
+    fn publish(&mut self, table: &mut Operations, operation: Arc<Mutex<Operation>>) -> bool {
         {
             let op = operation.lock().unwrap_or_else(|p| p.into_inner());
+            if !relaunch_permit::accept(table, &op) {
+                return false;
+            }
             table.admitted_binding(&op);
         }
         table.reservations.remove(&self.id);
         table.by_id.insert(self.id.clone(), operation);
         self.published = true;
+        true
     }
 }
 
@@ -582,7 +592,7 @@ struct Authority {
 
 impl Authority {
     fn asked_matches(&self, request: &Prepare) -> bool {
-        request.asked_upgrade.is_none()
+        request.asked.is_none()
             || self
                 .asked
                 .as_ref()
@@ -1713,7 +1723,7 @@ fn validate_plan(
     kernel: &dyn Kernel,
     crash_proven: bool,
 ) -> bool {
-    if request.asked_upgrade.is_some() && !asked_upgrade::shape(request) {
+    if request.asked.is_some() && !asked_upgrade::shape(request) {
         return false;
     }
     match &request.plan {
@@ -2318,7 +2328,7 @@ fn prepare_inner(
     };
     // A fresh asked move must not retire the current vendor on stale account authority.
     // Acquire outside Meta/native predicates and retain through accepted publication.
-    let _asked_account_guard = if request.asked_upgrade.is_some() {
+    let _asked_account_guard = if request.asked.is_some() {
         let NativePlan::Restart {
             process, forward, ..
         } = &request.plan
@@ -2402,7 +2412,7 @@ fn prepare_inner(
     {
         return DENIED.into();
     }
-    if request.asked_upgrade.is_some() {
+    if request.asked.is_some() {
         let qualified = match table.qualify_asked(ctx, &request, &authority, master, kernel) {
             Ok(qualified) => qualified,
             Err(reason) => {
@@ -2536,7 +2546,12 @@ fn prepare_inner(
         cold_resolving: false,
         resolved_cold: None,
     }));
-    slot.publish(&mut table, Arc::clone(&operation));
+    if !slot.publish(&mut table, Arc::clone(&operation)) {
+        drop(table);
+        drop(meta);
+        drop(operation);
+        return DENIED.into();
+    }
     {
         if let Some(connection) = caller.connection {
             table.coordinated_connections.insert(connection);
@@ -3995,7 +4010,7 @@ fn serve_with_publication(
             .map(|custody| custody.handoff_guard())
     });
     let reply = execute(request);
-    if matches!(&saved, Request::Prepare(prepare) if prepare.asked_upgrade.is_some()) {
+    if matches!(&saved, Request::Prepare(prepare) if prepare.asked.is_some()) {
         let class = if reply == DENIED {
             "denied"
         } else if reply == UNKNOWN {
@@ -4194,7 +4209,7 @@ fn serve_request(
     }
     let asked_signal = if matches!(request, Request::Signal(_)) {
         let op = operation.lock().unwrap_or_else(|p| p.into_inner());
-        if op.request.asked_upgrade.is_some() && !op.signal_sent {
+        if op.request.asked.is_some() && !op.signal_sent {
             let NativePlan::Restart {
                 process, forward, ..
             } = &op.request.plan
@@ -4229,7 +4244,7 @@ fn serve_request(
     .then(|| ctx.meta.lock().unwrap_or_else(|p| p.into_inner()));
     let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
     if !same_actor(&op, &caller, kernel) {
-        let asked = op.request.asked_upgrade.is_some();
+        let asked = op.request.asked.is_some();
         drop(op);
         drop(mutation_meta);
         drop(_asked_account_guard);
@@ -4307,6 +4322,13 @@ fn serve_request(
                 completed_reply(&operation)
             }
             Phase::Started
+                if matches!(op.request.asked, Some(AskedIntent::Relaunch(_)))
+                    && op.signal_sent
+                    && op.signal_accepted == Some(true) =>
+            {
+                "OK native-act state=signalled\n".into()
+            }
+            Phase::Started
                 if op
                     .resume_phase
                     .is_some_and(|phase| launch_unissued(&op, phase, kernel)) =>
@@ -4327,7 +4349,7 @@ fn serve_request(
                         op.resume_phase.unwrap().word()
                     ),
                     Err(reason) => {
-                        let asked = op.request.asked_upgrade.is_some();
+                        let asked = op.request.asked.is_some();
                         drop(op);
                         drop(mutation_meta);
                         drop(_asked_account_guard);
@@ -4354,7 +4376,7 @@ fn serve_request(
                     "OK native-act state=precommitted\n".into()
                 }
                 Err(reason) => {
-                    let asked = op.request.asked_upgrade.is_some();
+                    let asked = op.request.asked.is_some();
                     drop(op);
                     drop(mutation_meta);
                     drop(_asked_account_guard);
@@ -4372,7 +4394,7 @@ fn serve_request(
             }
             if op.authority.builtin {
                 if !matches!(op.phase, Phase::Precommitted(p) if p == phase) {
-                    let asked = op.request.asked_upgrade.is_some();
+                    let asked = op.request.asked.is_some();
                     drop(op);
                     drop(mutation_meta);
                     drop(_asked_account_guard);
@@ -4384,7 +4406,7 @@ fn serve_request(
                 let outcome = match observe_image_outcome(&op, master, phase, kernel) {
                     Ok(outcome) => outcome,
                     Err(reason) => {
-                        let asked = op.request.asked_upgrade.is_some();
+                        let asked = op.request.asked.is_some();
                         drop(op);
                         drop(mutation_meta);
                         drop(_asked_account_guard);
@@ -4465,7 +4487,7 @@ fn serve_request(
                 if completion.is_some()
                     && phase == ImagePhase::Forward
                     && (matches!(op.request.plan, NativePlan::Restart { cold: Some(_), .. })
-                        || op.request.asked_upgrade.is_some())
+                        || op.request.asked.is_some())
                 {
                     op.committed_image = Some(outcome);
                 }
@@ -4587,6 +4609,22 @@ fn serve_request(
             // Mark dispatch before the syscall: retrying an ambiguous ACK never signals a
             // newly reused pid or performs a second mutation. Only this retained plan is used.
             let process = process.clone();
+            // Kernel observations can outlive the earlier scalar checks. Fence the
+            // original human sequence and deadline again at actual first dispatch.
+            if ctx.human_input.seq() != op.human_seq
+                || op.clock.remaining(op.request.deadline_us).is_none()
+            {
+                return DENIED.into();
+            }
+            if matches!(op.request.asked, Some(AskedIntent::Relaunch(_)))
+                && op
+                    .authority
+                    .asked
+                    .as_mut()
+                    .is_none_or(|qualification| !qualification.consume_first_signal())
+            {
+                return DENIED.into();
+            }
             op.signal_sent = true;
             if let Some(seal) = &op.authority.renewal {
                 seal.did_signal();

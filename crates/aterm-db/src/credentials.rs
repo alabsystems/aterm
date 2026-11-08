@@ -50,7 +50,7 @@ pub const MAX_RECORD: usize = 4096;
 /// The most request ids one `Sweep` names.
 pub const MAX_COVERS: usize = 64;
 /// The longest `Retired` note (§5).
-pub const MAX_NOTE: usize = 160;
+pub const MAX_NOTE: usize = need::MAX_NOTE;
 /// The longest `Retired` evidence.
 pub const MAX_EVIDENCE: usize = 96;
 const COMMAND_DOMAIN: &[u8] = b"aterm/credentials/command/1\0";
@@ -1070,17 +1070,17 @@ fn successor_record(me: &Actor, need: &Need) -> Result<([u8; 16], Record)> {
     Ok((nonce, record))
 }
 
+/// A `Retired` record: its evidence and note as the schema takes them, each control character
+/// read as a space and each held to its cap, whatever its caller hands it (a ledger row's
+/// evidence is read back as it was written).
 fn retired_record(id: &[u8; 16], reason: Reason, evidence: &str, note: &str) -> Record {
     let mut body = Map::new();
     body.insert("reason".into(), Value::from(reason.word()));
     body.insert(
         "evidence".into(),
-        Value::from(evidence.chars().take(MAX_EVIDENCE).collect::<String>()),
+        Value::from(need::record_text(evidence, MAX_EVIDENCE)),
     );
-    body.insert(
-        "note".into(),
-        Value::from(note.chars().take(MAX_NOTE).collect::<String>()),
-    );
+    body.insert("note".into(), Value::from(need::note_of(note)));
     Record::new("retired", id, body)
 }
 
@@ -1831,6 +1831,101 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
         Ok(())
     })?;
     Ok(Some(report))
+}
+
+/// What a decline on the vault's admin Mac did ([`custodian_decline`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decline {
+    /// This Mac opens no admin custody of the vault now, and why (a Mac that is no admin, or an
+    /// admin whose applied version is changing or incomplete): it declines nothing for the lab.
+    NoCustody(String),
+    /// What the selector named.
+    Named {
+        /// The requests another Mac raised that it declined, each as the table now reads it.
+        declined: Vec<Thread>,
+        /// The ledger ids of this Mac's own needs whose table ids (those `need ls --all`
+        /// prints) the selector names: its ledger declines those.
+        own: Vec<[u8; 16]>,
+    },
+}
+
+/// A person's decline (§6.2), on a Mac that can sign with the vault's current key, of each
+/// request another Mac raised that `selector` names (its want key or its request id) and a
+/// custodian handed to a person: one attested `declined` each, keeping `note`, so a request
+/// whose requester is gone or cannot decline it ends rather than wait for a lapse. Another Mac
+/// is another by the table's reading ([`Macs`]), so a recovered Writer's original actor is this
+/// Mac's own. A published request was given, and this Mac's own are its ledger's to decline, so
+/// they come back by their ledger ids instead.
+///
+/// # Errors
+/// The table's generation link, this Mac's vault facts, its need ledger or the table cannot be
+/// read, the table cannot be written (this Mac is not a current Commons Writer, or its own
+/// history there needs recovery), or a decline cannot be signed or attested.
+pub fn custodian_decline(paths: &Paths, selector: &str, note: &str) -> Result<Decline> {
+    let logical = crate::generation::logical_paths(paths)?;
+    let paths = &logical;
+    let admin = match client::admin_cached(paths) {
+        Ok(admin) => admin,
+        Err(error) => return Ok(Decline::NoCustody(error.to_string())),
+    };
+    let now_ms = now_ms();
+    let facts = facts(paths, now_ms)?;
+    let ledger = need::peek(paths).map_err(crate::table::failure)?;
+    let signer = admin.custodian_signer().map_err(crate::table::failure)?;
+    let retirement = Retirement {
+        reason: Reason::Declined,
+        evidence: "a person on the vault's admin Mac".to_owned(),
+        note: need::note_of(note),
+        generation: None,
+    };
+    with_store(paths, |session, store, scope| {
+        let mut context = context(&facts, session, scope, now_ms)?;
+        context.signer = Some(signer);
+        let log = Log::read_with(session, store, scope, decode)?;
+        let me = session.actor();
+        let book = Book::read(&log, &context);
+        let this_mac = book.macs.of(me);
+        let named: Vec<Thread> = book
+            .threads
+            .into_values()
+            .filter(|thread| {
+                thread.want.key() == selector || hex::encode_lower(&thread.id) == selector
+            })
+            .collect();
+        let own = ledger
+            .iter()
+            .map(|need| need.id)
+            .filter(|id| named.iter().any(|thread| thread.id == request_key(&me, id)))
+            .collect();
+        let mut declined: Vec<Thread> = named
+            .into_iter()
+            .filter(|thread| {
+                book.macs.of(thread.requester) != this_mac
+                    && thread.needs_person
+                    && thread.published.is_none()
+                    && !thread.ended()
+            })
+            .collect();
+        if !declined.is_empty() {
+            session.writer()?;
+            log.writable(me)?;
+            let network = scope.trust().network;
+            let sign =
+                |record: custody::Attested<'_>| admin.attest_credential_record(&network, record);
+            for thread in &mut declined {
+                let record = retired_record(
+                    &thread.id,
+                    retirement.reason,
+                    &retirement.evidence,
+                    &retirement.note,
+                )
+                .attest(&sign)?;
+                commit(session, store, &log, &record)?;
+                thread.retired = Some((retirement.clone(), true));
+            }
+        }
+        Ok(Decline::Named { declined, own })
+    })
 }
 
 #[cfg(test)]

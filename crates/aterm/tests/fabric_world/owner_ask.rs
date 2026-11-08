@@ -2411,13 +2411,20 @@ fn hosted_stand_in_as(
     (owner, a, s)
 }
 
-/// A crash onto a newer managed build. `--resume` marks the line, so a typed relaunch would keep
-/// the twin, but a cold one execs what its command names and holds the child to that image. Named
-/// the script twin, the agent ran on the build while the relaunch waited on an outcome that never
-/// matched, `supervisor=-` until its claim was given back a minute later.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[test]
-fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
+struct ColdNative {
+    // Retire the instance and its children before removing its owner's private world.
+    a: Inst,
+    _owner: Owner,
+    sid: String,
+    prefix: PathBuf,
+    twin: PathBuf,
+    build: PathBuf,
+    next_build: PathBuf,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn cold_native_settled() -> ColdNative {
     use std::os::unix::fs::PermissionsExt as _;
     let owner = Owner::boot();
     let root = owner.tmp.join("a");
@@ -2522,15 +2529,34 @@ fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
             .then_some(())
     });
 
+    ColdNative {
+        a,
+        _owner: owner,
+        sid: s,
+        prefix,
+        twin,
+        build,
+        next_build,
+    }
+}
+
+/// A crash onto a newer managed build, followed by an asked upgrade of that actual image.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
+    let fixture = cold_native_settled();
+    let a = &fixture.a;
+    let s = &fixture.sid;
+    let prefix = &fixture.prefix;
+    let twin = &fixture.twin;
+    let next_build = &fixture.next_build;
+
     // The second operation is an asked upgrade of the adopted process, not another
     // cold restart or a raw signal exempted from native coordination.
     std::fs::create_dir_all(next_build.parent().unwrap()).unwrap();
     std::fs::write(next_build.with_file_name("fixture-version"), "2.1.319").unwrap();
-    aterm_uds::deadline::ad_hoc_copy(
-        &aterm_tempfile::bin_exe("aterm-claude-fixture"),
-        &next_build,
-    );
-    let mut proof = aterm_uds::spawnfd::command(&next_build)
+    aterm_uds::deadline::ad_hoc_copy(&aterm_tempfile::bin_exe("aterm-claude-fixture"), next_build);
+    let mut proof = aterm_uds::spawnfd::command(next_build)
         .arg("--version")
         .stdout(OwnedStdio::piped())
         .spawn()
@@ -2541,15 +2567,15 @@ fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
         aterm_uds::deadline::ECHO_HANG,
     );
     assert!(proof.wait().unwrap().success());
-    until_on(&a, &s, DEADLINE, "activation wake is armed", || {
-        host_log(&a)
+    until_on(a, s, DEADLINE, "activation wake is armed", || {
+        host_log(a)
             .contains("activation wake is armed")
             .then_some(())
     });
     let staged_twin = twin.with_file_name(".claude-next");
     let mut prelude = atpkg::platform::twin_prelude(
         "claude",
-        &prefix,
+        prefix,
         None,
         atpkg::selfupdate::verbs_of("claude"),
         &atpkg::yolo::policy_of("claude"),
@@ -2560,8 +2586,8 @@ fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1".into(),
     ])
     .unwrap();
-    atpkg::platform::install_twin_to_env(&staged_twin, &next_build, &exports, &prelude).unwrap();
-    std::fs::rename(&staged_twin, &twin).unwrap();
+    atpkg::platform::install_twin_to_env(&staged_twin, next_build, &exports, &prelude).unwrap();
+    std::fs::rename(&staged_twin, twin).unwrap();
     let notices = prefix.join(atpkg::activation_notice::NOTICE_DIR);
     std::fs::create_dir_all(&notices).unwrap();
     std::fs::write(notices.join(".m.tmp"), "1\n").unwrap();
@@ -2570,17 +2596,17 @@ fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
         notices.join(atpkg::activation_notice::CLAUDE_MARKER),
     )
     .unwrap();
-    let upgraded = until_on(&a, &s, DEADLINE, "the asked second build", || {
-        launches(&a).get(2).cloned()
+    let upgraded = until_on(a, s, DEADLINE, "the asked second build", || {
+        launches(a).get(2).cloned()
     });
     assert_eq!(upgraded.1, format!("--resume {CONVERSATION}"));
     assert_eq!(
         aterm_uds::process::read_process_path(i32::try_from(upgraded.0).unwrap()),
-        Some(std::fs::canonicalize(&next_build).unwrap()),
+        Some(std::fs::canonicalize(next_build).unwrap()),
     );
-    until_on(&a, &s, DEADLINE, "the second build adopted", || {
-        (kv(&status_of(&a, &s), "supervisor").is_some_and(|v| v.starts_with("aterm-harness"))
-            && host_log(&a).lines().any(|line| {
+    until_on(a, s, DEADLINE, "the second build adopted", || {
+        (kv(&status_of(a, s), "supervisor").is_some_and(|v| v.starts_with("aterm-harness"))
+            && host_log(a).lines().any(|line| {
                 line.contains("upgrade pid=")
                     && line
                         .split_whitespace()
@@ -2596,7 +2622,68 @@ fn a_cold_relaunch_onto_a_newer_twin_execs_the_build_and_settles() {
             }))
         .then_some(())
     });
-    assert_eq!(launches(&a).len(), 3, "one launch of each actual image");
+    assert_eq!(launches(a).len(), 3, "one launch of each actual image");
+}
+
+/// The actual host's Memory hook must use a fresh typed relaunch after cold settlement.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+fn a_memory_restart_after_cold_settlement_resumes_the_same_native_build() {
+    use aterm_agent::harness::native_act::{Image, Process};
+    let fixture = cold_native_settled();
+    let a = &fixture.a;
+    let s = &fixture.sid;
+    let original = launches(a)
+        .get(1)
+        .cloned()
+        .expect("the adopted cold launch");
+    let original_process = Process::observe(original.0).expect("the live adopted source");
+    let expected_image = Image::at(&fixture.build).expect("the proven private native image");
+    assert_eq!(original_process.image, expected_image);
+    // Only this already-running process sees the memory screen. Its resumed successor
+    // starts on the normal restored screen, so the control cannot request a restart loop.
+    let memory = body(include_str!(
+        "../../../aterm-phase/src/fixtures/memory-banner-idle.txt"
+    ));
+    std::fs::write(a.root.join("sc/restored.txt"), idle_composer()).unwrap();
+    std::fs::write(a.root.join("sc/idle.txt"), memory).unwrap();
+    // Empty Enter redraws the native fixture; it creates no assistant response/model fact.
+    let redrawn = a.verb(&format!("@{s} key enter"));
+    assert!(redrawn.ok(), "empty Enter: {}", redrawn.header());
+    let resumed = until_on(a, s, DEADLINE, "the checked Memory successor", || {
+        launches(a).get(2).cloned()
+    });
+    assert_ne!(resumed.0, original.0);
+    assert_eq!(resumed.1, format!("--resume {CONVERSATION}"));
+    let actual = until_on(
+        a,
+        s,
+        DEADLINE,
+        "the Memory successor's exact native image",
+        || Process::observe(resumed.0).filter(|process| process.image == expected_image),
+    );
+    assert_ne!(actual.birth, original_process.birth);
+    let row = format!("harness @{s}: restart:memory ");
+    let session_field = format!("session={CONVERSATION}");
+    until_on(a, s, DEADLINE, "the real Memory restart adopted", || {
+        let log = host_log(a);
+        (log.contains("asked native prepare result=admitted")
+            && log.lines().any(|line| {
+                line.contains(&row)
+                    && line.split_whitespace().any(|word| word == session_field)
+                    && line.split_whitespace().any(|word| word == "from=2.1.318")
+                    && line
+                        .split_whitespace()
+                        .any(|word| word == "to=2.1.318(same)")
+                    && line.split_whitespace().any(|word| word == "step=adopted")
+            }))
+        .then_some(())
+    });
+    assert_eq!(
+        launches(a).len(),
+        3,
+        "initial, cold and same-build Memory launches only"
+    );
 }
 
 /// A stored route is admitted from the owned helper, without a parent-kernel environment prerequisite.

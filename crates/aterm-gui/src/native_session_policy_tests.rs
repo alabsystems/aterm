@@ -128,7 +128,11 @@ fn a_session_policy_does_not_enable_its_sibling_and_disable_keeps_reconciliation
     assert_eq!(
         native_reply(&sibling.ctx, "constructors"),
         Reply::Constructors(if cold_restart_qualified() {
-            vec![Constructor::ColdRestart, Constructor::AskedUpgrade]
+            vec![
+                Constructor::ColdRestart,
+                Constructor::AskedUpgrade,
+                Constructor::AskedRelaunch,
+            ]
         } else {
             Vec::new()
         })

@@ -429,7 +429,8 @@ pub(crate) enum HarnessChip {
     Context,
     /// Token/time usage fact.
     Usage,
-    /// The subscription and account fact (`⎆ email · plan · weekly`).
+    /// The account fact: line E's quota row, one chip over its parts, or line D's fallback unit
+    /// (`⎆ main 63% · ↺ Sat 10:00`).
     Account,
     /// Permission-mode indicator.
     Mode,

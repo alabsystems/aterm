@@ -55,11 +55,11 @@ pub(crate) fn cmd_privacy(
     )
 }
 
-/// The report from the main hop's facts and `held`, this user's programs macOS's program check holds now, read here on the control worker since it may pull a reading.
+/// The report from the main hop's facts and `held`, this user's programs macOS's program check holds now and how many of them are stranded, read here on the control worker since it may pull a reading.
 fn privacy(
     form: PrivacyForm,
     hop: impl FnOnce() -> Result<PrivacyAppFacts, MainHopError>,
-    held: impl FnOnce() -> Option<(u32, u64)>,
+    held: impl FnOnce() -> Option<crate::vitals_jobs::HeldCount>,
 ) -> String {
     let identity = signing_identity();
     let facts = match hop() {
@@ -475,7 +475,13 @@ mod tests {
         let reply = privacy(
             PrivacyForm::Lines,
             || Ok(app.privacy_facts(Scope::Owner)),
-            || Some((2, 35_940_000)),
+            || {
+                Some(crate::vitals_jobs::HeldCount {
+                    held: 2,
+                    oldest_ms: 35_940_000,
+                    stranded: Some(1),
+                })
+            },
         );
         let (head, body) = reply.split_once('\n').expect("a framed reply");
         assert_eq!(head, format!("OK {}", body.lines().count()), "{reply}");
@@ -486,7 +492,9 @@ mod tests {
         );
         assert!(
             body.lines().any(|l| l.starts_with("devtools ")
-                && l.ends_with(" program_check=2 program_check_oldest_ms=35940000")),
+                && l.ends_with(
+                    " program_check=2 program_check_oldest_ms=35940000 program_check_stranded=1"
+                )),
             "the worker's count: {reply}"
         );
         let json = privacy(

@@ -5,6 +5,38 @@ use super::*;
 use std::os::unix::fs::PermissionsExt as _;
 
 #[test]
+fn an_actual_sdk_lease_waits_for_native_gc_to_finish() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let layout = atpkg::store::Layout {
+        prefix: scratch.path().join("manager"),
+    };
+    let subject = atpkg::lease::Subject::build("trust", 1).unwrap();
+    let build = layout.build_dir("trust", 1);
+    std::fs::create_dir_all(&build).unwrap();
+    let lease = retain_sdk_lease(&layout, &build, Instant::now() - Duration::from_secs(3)).unwrap();
+    assert_eq!(lease.subject(), &subject);
+    lease.check_current().unwrap();
+    assert!(matches!(
+        atpkg::lease::reclaim(&layout.prefix, &subject),
+        atpkg::lease::Reclaim::Keep(atpkg::lease::Holders::Held(_))
+    ));
+    assert_eq!(
+        retain_sdk_lease(&layout, &build, Instant::now() - Duration::from_secs(61))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    drop(lease);
+    let atpkg::lease::Reclaim::Clear(guard) = atpkg::lease::reclaim(&layout.prefix, &subject)
+    else {
+        panic!("native lease no longer holds after drop")
+    };
+    drop(guard);
+    std::fs::remove_dir(&build).unwrap();
+    assert!(retain_sdk_lease(&layout, &build, Instant::now()).is_err());
+}
+
+#[test]
 fn retained_sdk_capture_and_validation_wait_for_unchanged_inputs() {
     let parent = trust_resource_provenance::process::account_home()
         .unwrap()

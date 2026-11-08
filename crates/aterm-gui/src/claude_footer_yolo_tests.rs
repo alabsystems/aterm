@@ -982,3 +982,43 @@ fn a_hosted_off_pane_wears_the_border_and_rewrites_with_it() {
         }
     }
 }
+
+#[test]
+fn a_vacated_mode_row_cell_exposes_no_underlying_link_on_hover() {
+    let (mut app, wid, session, _reader, _host) = app();
+    let url = "https://example.com/status";
+    let mode =
+        format!("  \u{23F5}\u{23F5} bypass permissions on \u{B7} {url} \u{B7} \u{2190} for agents");
+    draw(&app, session, &mode);
+    claude(&app, session);
+    frame(&mut app, wid);
+    let row = mode_row(&app, wid);
+    let glass = glass_of(&app, wid, row);
+    let grid = grid_text(&app, session, 23);
+    let kept_col = col_of(&glass, url);
+    let orig_col = col_of(&grid, url);
+    let vacated_col = orig_col + url.len() - 1;
+    assert!(
+        kept_col + url.len() <= vacated_col,
+        "tail of original grid span is vacated on glass: kept={kept_col} vacated={vacated_col}"
+    );
+    let link_mod = if cfg!(target_os = "macos") {
+        aterm_window::keyboard::ModifiersState::SUPER
+    } else {
+        aterm_window::keyboard::ModifiersState::CONTROL
+    };
+    app.windows.get_mut(&wid).unwrap().mods = link_mod;
+
+    let (kept_x, kept_y) = px_of(&app, wid, (row, kept_col));
+    app.on_cursor_moved(wid, kept_x, kept_y);
+    assert_eq!(app.link_under_pointer(wid).as_deref(), Some(url));
+    assert!(app.windows[&wid].hover_pointer);
+
+    let (vacated_x, vacated_y) = px_of(&app, wid, (row, vacated_col));
+    assert!(app.glass_swallows_at(wid, vacated_x, vacated_y));
+    app.on_cursor_moved(wid, vacated_x, vacated_y);
+    assert_eq!(app.link_under_pointer(wid), None);
+    assert!(app.path_link_under_pointer(wid).is_none());
+    assert!(!app.windows[&wid].hover_pointer);
+    assert!(app.windows[&wid].link_hover.is_none());
+}

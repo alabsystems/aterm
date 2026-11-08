@@ -100,17 +100,17 @@ fn stage_name(base: &OsStr, n: u32) -> OsString {
     name
 }
 
-/// Whether `name` is one of the stage names from `base` ([`stage_name`]): `base` itself, or
-/// `base-<n>` with `n` a decimal from 1, written without a leading zero.
+/// Whether `name` is an exact output of [`stage_name`], including its `u32` ordinal domain.
 fn is_stage(name: &OsStr, base: &OsStr) -> bool {
     match name
         .as_encoded_bytes()
         .strip_prefix(base.as_encoded_bytes())
     {
         Some([]) => true,
-        Some([b'-', first, rest @ ..]) => {
-            (b'1'..=b'9').contains(first) && rest.iter().all(u8::is_ascii_digit)
-        }
+        Some([b'-', digits @ ..]) => std::str::from_utf8(digits)
+            .ok()
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .is_some_and(|ordinal| stage_name(base, ordinal).as_os_str() == name),
         _ => false,
     }
 }

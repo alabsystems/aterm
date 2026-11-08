@@ -3,6 +3,8 @@
 
 use super::*;
 use aterm_agent::harness::native_act::{ColdBilling, ColdEnvironmentFacts, ColdIntent};
+#[path = "native_memory_relaunch_tests.rs"]
+mod memory;
 
 #[derive(Debug)]
 struct ResolutionContext(Arc<AtomicBool>);
@@ -21,6 +23,9 @@ struct DeferredFacts {
     revoke_during_admission: AtomicBool,
     admissions: AtomicU32,
     command: RestartCommand,
+    actual_launcher: Option<Image>,
+    system_clock: bool,
+    signal_foreground_gate: Mutex<Option<PublicationGate>>,
 }
 
 impl DeferredFacts {
@@ -46,6 +51,9 @@ impl DeferredFacts {
             revoke_during_admission: AtomicBool::new(false),
             admissions: AtomicU32::new(0),
             command,
+            actual_launcher: None,
+            system_clock: false,
+            signal_foreground_gate: Mutex::new(None),
         }
     }
 
@@ -111,7 +119,11 @@ impl Kernel for DeferredFacts {
         self.base.constructor_enabled(kind)
     }
     fn clock(&self) -> Clock {
-        self.base.clock()
+        if self.system_clock {
+            Clock::System
+        } else {
+            self.base.clock()
+        }
     }
     fn process(&self, pid: u32) -> Option<Process> {
         self.base.process(pid)
@@ -120,13 +132,25 @@ impl Kernel for DeferredFacts {
         self.base.image(image)
     }
     fn foreground(&self, master: i32) -> Option<u32> {
+        let pause = self.signal_foreground_gate.lock().unwrap().take();
+        if let Some((entered, gate)) = pause {
+            entered.send(()).unwrap();
+            let (lock, changed) = &*gate;
+            let (released, timeout) = changed
+                .wait_timeout_while(lock.lock().unwrap(), PATIENCE, |go| !*go)
+                .unwrap();
+            assert!(
+                *released && !timeout.timed_out(),
+                "final foreground probe was not released"
+            );
+        }
         self.base.foreground(master)
     }
     fn own_target(&self, holder: &str, target: &Image) -> bool {
         self.base.own_target(holder, target)
     }
     fn own_launcher(&self, image: &Image) -> bool {
-        self.base.own_launcher(image)
+        self.base.own_launcher(image) || self.actual_launcher.as_ref() == Some(image)
     }
     fn birth_alive(&self, process: &Process) -> Option<bool> {
         self.base.birth_alive(process)
@@ -486,9 +510,11 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
                 .unwrap()
                 .supervisor_authority(crate::metrics::now_us())
                 .revision();
-            asked.asked_upgrade = Some(aterm_agent::harness::native_act::AskedUpgradeIntent {
-                predecessor: binding.id.clone(),
-            });
+            asked.asked = Some(aterm_agent::harness::native_act::AskedIntent::Upgrade(
+                aterm_agent::harness::native_act::AskedUpgradeIntent {
+                    predecessor: binding.id.clone(),
+                },
+            ));
             let mut asked_command = kernel.command.clone();
             asked_command.image = image(10);
             asked_command.program = "/image-10".into();
@@ -902,7 +928,10 @@ fn deferred_resolution_keeps_the_prepare_and_requires_its_selected_identity_at_e
             let mut fresh = asked;
             fresh.id = "de".repeat(16);
             fresh.deadline_us = kernel.base.clock.load(Ordering::SeqCst) + 60_000_000;
-            fresh.asked_upgrade.as_mut().unwrap().predecessor = next.id;
+            let Some(AskedIntent::Upgrade(intent)) = fresh.asked.as_mut() else {
+                panic!("the successor is an asked upgrade");
+            };
+            intent.predecessor = next.id;
             let NativePlan::Restart {
                 process,
                 forward,

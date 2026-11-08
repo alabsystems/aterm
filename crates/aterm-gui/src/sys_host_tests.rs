@@ -354,13 +354,13 @@ fn privacys_count_pulls_a_reading_when_none_speaks_for_now() {
             pulls
         })
     };
-    let (count, oldest) = shared
+    let count = shared
         .program_check_now()
         .expect("the pulled reading's count");
-    assert_eq!(count, 1);
-    assert!(oldest >= 35_940_000, "{oldest}");
+    assert_eq!(count.held, 1);
+    assert!(count.oldest_ms >= 35_940_000, "{count:?}");
     assert_eq!(
-        shared.program_check_now().map(|(n, _)| n),
+        shared.program_check_now().map(|c| c.held),
         Some(1),
         "the reading now held speaks for now"
     );
@@ -710,11 +710,11 @@ fn privacys_count_ages_a_carried_view_from_its_pass() {
     }));
     snap.jobs_age_ms = 25_000;
     shared.publish_for_test(snap, Vec::new());
-    let (count, oldest) = shared
+    let count = shared
         .program_check_now()
         .expect("a view that speaks for now");
-    assert_eq!(count, 1);
-    assert!(oldest >= 27_000, "{oldest}");
+    assert_eq!(count.held, 1);
+    assert!(count.oldest_ms >= 27_000, "{count:?}");
 }
 
 #[test]

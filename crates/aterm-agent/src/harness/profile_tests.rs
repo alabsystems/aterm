@@ -161,7 +161,7 @@ fn subscription_display_uses_one_selected_accounts_email_plan_and_weekly_cache()
     let display = parse_subscription(text.as_bytes(), now).unwrap();
     assert_eq!(display.email.as_deref(), Some("owner@example.com"));
     assert_eq!(display.plan.as_deref(), Some("Max 5x"));
-    assert_eq!(display.weekly.as_deref(), Some("weekly 29% left"));
+    assert_eq!(display.weekly.as_deref(), Some("weekly 71% used"));
     assert!(!format!("{display:?}").contains(SENTINEL));
     assert!(!format!("{:?}", parse(text.as_bytes()).unwrap()).contains("owner@example.com"));
 
@@ -184,8 +184,8 @@ fn subscription_display_uses_one_selected_accounts_email_plan_and_weekly_cache()
     let aged = parse_subscription(text.as_bytes(), now + 15 * 60 + 1).unwrap();
     assert_eq!(
         aged.weekly.as_deref(),
-        Some("weekly 29% left \u{b7} 15m ago"),
-        "past fifteen minutes the cache shows with its age"
+        Some("weekly \u{2265}71% used"),
+        "past fifteen minutes the cache shows as a lower bound"
     );
     for time in [now - 61, now + 60 * 60 + 1, DAY + 10 * 24 * 60 * 60] {
         let display = parse_subscription(text.as_bytes(), time).unwrap();
@@ -196,8 +196,37 @@ fn subscription_display_uses_one_selected_accounts_email_plan_and_weekly_cache()
     }
 }
 
-/// Every weekly figure's age rule: current for fifteen minutes, then shown with its age up to an
-/// hour; nothing older, from the future or past its reset. Tenths as the `/usage` cache has them.
+/// Line D's fallback unit takes the figure alone from any weekly words: an exact share, a lower
+/// bound, a wall's `out`, a screen's share; none from a gap's words. Negative control: the
+/// retired `% left` words give none, so no unit ever says a share left.
+#[test]
+fn weekly_figure_words_reads_every_weekly_form() {
+    const AT: i64 = 1_792_050_000;
+    let figure = WeeklyFigure {
+        used_x10: 380,
+        resets_at: AT + 86_400,
+        at: AT,
+    };
+    let exact = figure.words(AT).expect("current");
+    let bound = figure.words(AT + 30 * 60).expect("aged");
+    assert_eq!(weekly_figure_words(&exact), Some("38%"));
+    assert_eq!(weekly_figure_words(&bound), Some("\u{2265}38%"));
+    assert_eq!(weekly_figure_words(WEEKLY_OUT), Some("out"));
+    assert_eq!(weekly_figure_words("weekly 22% used"), Some("22%"));
+    for gap in [WeeklyGap::TapOff, WeeklyGap::NoReply, WeeklyGap::Stale] {
+        assert_eq!(weekly_figure_words(gap.words()), None, "{gap:?}");
+    }
+    assert_eq!(
+        weekly_figure_words("weekly 62% left"),
+        None,
+        "NEGATIVE CONTROL: the retired words"
+    );
+}
+
+/// Every weekly figure's age rule: exact for fifteen minutes, then a lower bound (`≥`, use only
+/// rises within a window) up to an hour; nothing older, from the future or past its reset. The
+/// share is the one used, never `% left` (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+/// §2.1): an exact tenth rounds half up, a bound down.
 #[test]
 fn a_weekly_figure_is_current_for_fifteen_minutes_then_aged_for_an_hour() {
     const AT: i64 = 1_792_050_000;
@@ -207,21 +236,15 @@ fn a_weekly_figure_is_current_for_fifteen_minutes_then_aged_for_an_hour() {
         at: AT,
     };
     let words = |elapsed: i64| figure.words(AT + elapsed);
-    assert_eq!(words(0).as_deref(), Some("weekly 62% left"));
-    assert_eq!(words(15 * 60).as_deref(), Some("weekly 62% left"));
+    assert_eq!(words(0).as_deref(), Some("weekly 38% used"));
+    assert_eq!(words(15 * 60).as_deref(), Some("weekly 38% used"));
     assert!(figure.current(AT + 15 * 60) && !figure.current(AT + 15 * 60 + 1));
-    assert_eq!(
-        words(16 * 60).as_deref(),
-        Some("weekly 62% left \u{b7} 16m ago")
-    );
-    assert_eq!(
-        words(60 * 60).as_deref(),
-        Some("weekly 62% left \u{b7} 60m ago")
-    );
+    assert_eq!(words(16 * 60).as_deref(), Some("weekly \u{2265}38% used"));
+    assert_eq!(words(60 * 60).as_deref(), Some("weekly \u{2265}38% used"));
     assert_eq!(words(61 * 60), None, "older than an hour");
     assert_eq!(
         words(-60).as_deref(),
-        Some("weekly 62% left"),
+        Some("weekly 38% used"),
         "stamped up to a minute ahead of this clock: just read"
     );
     assert!(figure.current(AT - 60));
@@ -235,7 +258,7 @@ fn a_weekly_figure_is_current_for_fifteen_minutes_then_aged_for_an_hour() {
         used_x10: 385,
         ..figure
     };
-    assert_eq!(tenths.words(AT).as_deref(), Some("weekly 61.5% left"));
+    assert_eq!(tenths.words(AT).as_deref(), Some("weekly 39% used"));
     let older = WeeklyFigure {
         at: AT - 1,
         ..tenths
@@ -364,7 +387,7 @@ fn subscription_shared_profile_is_bound_to_the_captured_secure_storage_login() {
         "the week shown is the profile's own account's"
     );
     assert_eq!(first.plan.as_deref(), Some("Max 5x"));
-    assert_eq!(first.weekly.as_deref(), Some("weekly 29% left"));
+    assert_eq!(first.weekly.as_deref(), Some("weekly 71% used"));
     assert!(read(&second_env, Some(&roster)).is_none());
 
     write("second@example.com");
@@ -2406,11 +2429,11 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
     let usage_json = br#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"name":"Gemini Models","buckets":[{"id":"gemini-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":0.782786,"reset_time":"2026-10-29T16:31:22Z"}]},{"name":"Claude and GPT models","buckets":[{"id":"3p-weekly","name":"Weekly Limit Remaining","window":"weekly","remaining_fraction":1.0,"reset_time":"2026-10-31T00:51:20Z"}]}]}}}"#;
     let now = 1_792_796_000;
     let gemini_fig = parse_agy_usage_json(usage_json, false, now).expect("gemini weekly");
-    assert_eq!(gemini_fig.words(now).as_deref(), Some("weekly 78% left"));
+    assert_eq!(gemini_fig.words(now).as_deref(), Some("weekly 22% used"));
     let third_party_fig = parse_agy_usage_json(usage_json, true, now).expect("3p weekly");
     assert_eq!(
         third_party_fig.words(now).as_deref(),
-        Some("weekly 100% left")
+        Some("weekly 0% used")
     );
 
     // The stand-ins the fetches below run live here: it is removed only once each showed it ran.
@@ -2458,7 +2481,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
             Some(&store),
         )
         .expect("fetched agy subscription");
-        assert_eq!(fetched_sub.weekly.as_deref(), Some("weekly 78% left"));
+        assert_eq!(fetched_sub.weekly.as_deref(), Some("weekly 22% used"));
         assert!(store.last().is_some(), "fetch persisted reading to store");
         // The same fetch also cached the 3p-weekly bucket for Claude/GPT models.
         let cached_3p = agy_subscription_with_store(
@@ -2471,7 +2494,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
             Some(&store),
         )
         .expect("cached 3p subscription");
-        assert_eq!(cached_3p.weekly.as_deref(), Some("weekly 100% left"));
+        assert_eq!(cached_3p.weekly.as_deref(), Some("weekly 0% used"));
         // With the in-memory cache cleared and another reader holding the store lock past
         // `FRESH_OPEN_S`, a stale store reading whose weekly window is still open is the fallback.
         AGY_USAGE_CACHE
@@ -2491,7 +2514,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
         .expect("locked fallback subscription");
         assert_eq!(
             locked_fallback.weekly.as_deref(),
-            Some("weekly 78% left · 18m ago")
+            Some("weekly \u{2265}22% used")
         );
         drop(held_lock);
         // Mid-session /login switch to a new email bypasses the previous account's
@@ -2527,7 +2550,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
         )
         .expect("switched agy subscription");
         assert_eq!(switched_sub.email.as_deref(), Some("second@example.com"));
-        assert_eq!(switched_sub.weekly.as_deref(), Some("weekly 42% left"));
+        assert_eq!(switched_sub.weekly.as_deref(), Some("weekly 58% used"));
         std::fs::remove_file(&local_agy).expect("remove local agy");
         std::fs::write(cfg.join("cli.log"), log_bytes).expect("restore cli.log");
         AGY_USAGE_CACHE
@@ -2666,7 +2689,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
     // until its reset time passes.
     let expired_prev = SubscriptionDisplay {
         email: Some("interviewstreetuser@gmail.com".to_owned()),
-        weekly: Some("weekly 78% left".to_owned()),
+        weekly: Some("weekly 22% used".to_owned()),
         weekly_figure: Some(gemini_fig),
         ..SubscriptionDisplay::default()
     };
@@ -2684,7 +2707,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
 
     let screen_prev = SubscriptionDisplay {
         email: Some("interviewstreetuser@gmail.com".to_owned()),
-        weekly: Some("weekly 78% left".to_owned()),
+        weekly: Some("weekly 22% used".to_owned()),
         weekly_figure: None,
         ..SubscriptionDisplay::default()
     };
@@ -2697,7 +2720,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
         now + USAGE_SHOWN_S + 10,
     )
     .expect("subscription with screen weekly");
-    assert_eq!(kept_screen.weekly.as_deref(), Some("weekly 78% left"));
+    assert_eq!(kept_screen.weekly.as_deref(), Some("weekly 22% used"));
 
     // Switching models between Gemini (third_party=false) and Claude (third_party=true)
     // on the same email does not carry Gemini's cached weekly_figure across the bucket boundary.
@@ -3636,7 +3659,7 @@ fn a_running_agys_footer_reads_its_usage_once() {
     let (first, events) =
         super::super::provider_read::captured(|| pass(&SubscriptionDisplay::default(), now));
     assert_eq!(reads(), 1);
-    assert_eq!(first.weekly.as_deref(), Some("weekly 50% left"));
+    assert_eq!(first.weekly.as_deref(), Some("weekly 50% used"));
     assert_eq!(events.len(), 1);
     assert_eq!(
         events[0].why,
@@ -3650,8 +3673,10 @@ fn a_running_agys_footer_reads_its_usage_once() {
         "the figure past its current age is not read again"
     );
     assert!(
-        aged.weekly.as_deref().is_some_and(|w| w.contains("ago")),
-        "it stands with its age: {:?}",
+        aged.weekly
+            .as_deref()
+            .is_some_and(|w| w.contains('\u{2265}')),
+        "it stands as a lower bound: {:?}",
         aged.weekly
     );
     let gone = pass(&aged, now + 24 * 3600);

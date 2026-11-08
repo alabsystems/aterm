@@ -70,11 +70,17 @@ where
 }
 
 /// What a file is now, followed through links: its path as resolved, device, inode, length and
-/// modification time to the nanosecond. A rewrite, a replacement or a removal changes it.
+/// modification time to the nanosecond. This is metadata identity, not a content digest:
+/// an in-place rewrite preserving length and modification time can retain it.
 #[must_use]
 pub fn identity(path: &Path) -> Option<String> {
     let real = std::fs::canonicalize(path).ok()?;
     let meta = std::fs::metadata(&real).ok()?;
+    metadata_identity(&real, &meta)
+}
+
+/// Describe metadata captured from a held file, without reopening its path.
+pub(crate) fn metadata_identity(path: &Path, meta: &std::fs::Metadata) -> Option<String> {
     let modified = meta
         .modified()
         .ok()?
@@ -90,7 +96,7 @@ pub fn identity(path: &Path) -> Option<String> {
     let node = String::new();
     Some(format!(
         "{} {node} {} {modified}",
-        real.display(),
+        path.display(),
         meta.len()
     ))
 }

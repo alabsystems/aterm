@@ -1098,16 +1098,26 @@ fn draw_wedge(c: &mut Canvas, cp: u32) {
 /// on the same `eighth` rule as U+2580–259F, so they seam with the classic eighth
 /// blocks: one-eighth bars 2..7 (1 and 8 live at U+258F/2595 and U+2594/2581), the
 /// edge pairs, the 1-3-5-8 scanline set, and the upper/right k-eighths fills.
+///
+/// A one-eighth bar starts at its eighth's boundary and is as thick as the edge bars
+/// (`eighth(1, ·)`, at least a pixel), whatever the rounding makes of its own eighth: a line
+/// drawn in them (the quota row's projected week) keeps one stroke from level to level, where
+/// `eighth(k − 1)..eighth(k)` is 1 px at some levels and 2 px at others in a 14-px cell.
 fn draw_legacy_block(c: &mut Canvas, cp: u32) {
     let (w, h) = (c.w, c.h);
+    let bar = |k: u32, e: usize| {
+        let t = eighth(1, e).max(1);
+        let from = eighth(k - 1, e).min(e - t);
+        (from, from + t)
+    };
     match cp {
         0x1FB70..=0x1FB75 => {
-            let k = cp - 0x1FB70 + 2;
-            c.rect(eighth(k - 1, w), 0, eighth(k, w), h);
+            let (x0, x1) = bar(cp - 0x1FB70 + 2, w);
+            c.rect(x0, 0, x1, h);
         }
         0x1FB76..=0x1FB7B => {
-            let k = cp - 0x1FB76 + 2;
-            c.rect(0, eighth(k - 1, h), w, eighth(k, h));
+            let (y0, y1) = bar(cp - 0x1FB76 + 2, h);
+            c.rect(0, y0, w, y1);
         }
         0x1FB7C..=0x1FB7F => {
             let (ew, eh) = (eighth(1, w), eighth(1, h));
@@ -1666,5 +1676,53 @@ mod tests {
         for x in 0..w {
             assert_eq!(lit(&rq, x, 0), x >= w - eighth(2, w), "1FB87 col {x}");
         }
+    }
+
+    /// The one-eighth bars keep one stroke: at every cell height from 4 to 48 px each of
+    /// U+1FB76–1FB7B is as many rows thick as `▁` and `▔` (U+2581, U+2594), starting at its
+    /// eighth's boundary, and the vertical ones U+1FB70–1FB75 as many columns as `▏` and `▕`;
+    /// levels stay ordered top to bottom. NEGATIVE CONTROL: at a 14-px cell the bars as their
+    /// own eighths (`eighth(k − 1)..eighth(k)`) are 1 px at U+1FB77 and U+1FB7B (the quota
+    /// row's levels 6 and 2) and 2 px at the rest.
+    #[test]
+    fn the_one_eighth_bars_keep_one_stroke() {
+        let rows = |cov: &[u8], w: usize| {
+            cov.chunks(w)
+                .enumerate()
+                .filter(|(_, row)| row.iter().all(|&b| b == 255))
+                .map(|(y, _)| y)
+                .collect::<Vec<_>>()
+        };
+        for h in 4..=48 {
+            let w = 8;
+            let t = rows(&coverage('\u{2581}', w, h).unwrap(), w).len();
+            assert_eq!(t, rows(&coverage('\u{2594}', w, h).unwrap(), w).len());
+            let mut last = None;
+            for cp in (0x1FB76u32..=0x1FB7B).rev() {
+                let k = cp - 0x1FB76 + 2;
+                let lit = rows(&coverage(char::from_u32(cp).unwrap(), w, h).unwrap(), w);
+                assert_eq!(lit.len(), t, "U+{cp:04X} at {h} px: {lit:?}");
+                assert_eq!(lit[0], eighth(k - 1, h).min(h - t), "U+{cp:04X} at {h} px");
+                assert!(last.is_none_or(|y| lit[0] <= y), "U+{cp:04X} at {h} px");
+                last = Some(lit[0]);
+            }
+            let (w, cols) = (h, |cov: &[u8], w: usize, x: usize| {
+                cov.chunks(w).all(|row| row[x] == 255)
+            });
+            let t = (0..w)
+                .filter(|&x| cols(&coverage('\u{258F}', w, 8).unwrap(), w, x))
+                .count();
+            for cp in 0x1FB70u32..=0x1FB75 {
+                let cov = coverage(char::from_u32(cp).unwrap(), w, 8).unwrap();
+                let lit = (0..w).filter(|&x| cols(&cov, w, x)).count();
+                assert_eq!(lit, t, "U+{cp:04X} at {w} px wide");
+            }
+        }
+        let own = |k: u32| eighth(k, 14) - eighth(k - 1, 14);
+        assert_eq!(
+            (2..=7).map(own).collect::<Vec<_>>(),
+            [2, 1, 2, 2, 2, 1],
+            "NEGATIVE CONTROL: the bars as their own eighths change stroke"
+        );
     }
 }

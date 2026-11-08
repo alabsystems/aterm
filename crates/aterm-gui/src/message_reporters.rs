@@ -4881,6 +4881,51 @@ pub(crate) fn not_started_record(
         .key(NOT_STARTED_KEY)
 }
 
+/// The key of the record naming this user's programs stranded at macOS's program check (leftover
+/// §5.1: held since before the syspolicyd running now started, which answers alone).
+pub(crate) const STRANDED_KEY: &str = "program-check.stranded";
+
+/// Builds the record of the programs `rows` names stranded at macOS's program check, held since
+/// before `daemon`, the syspolicyd running now, started (leftover §5.1, §6.5): their check went to
+/// a syspolicyd that is no longer running. It is posted at a program's first verdict
+/// ([`crate::vitals_host::newly_stranded`]) and gives no age (`sys jobs` shows it growing); it
+/// names at most [`aterm_messages::DETAIL_LINES_CAP`] − 1 rows, so its last line stays, and its
+/// title counts every one. A fact for later, never an Entry or a Now, and aterm ends none of them:
+/// whether a held program ends on a signal is unmeasured (leftover U11), while new programs start.
+pub(crate) fn stranded_record(rows: &[&aterm_vitals::jobs::Named], daemon: u32) -> Message {
+    let n = rows.len();
+    let (title, rest) = if n == 1 {
+        (
+            "macOS's program check stranded 1 program".to_owned(),
+            "aterm leaves it as it is (whether a held program ends on a signal is unmeasured); \
+             new programs start, so stop what started it and run it again",
+        )
+    } else {
+        (
+            format!("macOS's program check stranded {n} programs"),
+            "aterm leaves them as they are (whether a held program ends on a signal is \
+             unmeasured); new programs start, so stop what started each and run it again",
+        )
+    };
+    let line = |named: &&aterm_vitals::jobs::Named| {
+        format!(
+            "pid {} {}: held since before the syspolicyd running now (pid {daemon}) started, so \
+             its check went to a syspolicyd that is no longer running",
+            named.pid,
+            aterm_vitals::jobs::wire::exe_word(&named.name)
+        )
+    };
+    Message::new(tags::SYSTEM, Severity::Info, title)
+        .lines(
+            rows.iter()
+                .take(aterm_messages::DETAIL_LINES_CAP - 1)
+                .map(line),
+        )
+        .line(rest)
+        .record()
+        .key(STRANDED_KEY)
+}
+
 /// The key of each record of a leftover process `end` signalled (leftover §6.5's `proc.` stem). A
 /// record never folds into another under one key: each end keeps its own row in the log.
 pub(crate) const PROC_END_KEY: &str = "proc.end";

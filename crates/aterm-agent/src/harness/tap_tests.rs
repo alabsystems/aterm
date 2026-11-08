@@ -2149,11 +2149,16 @@ fn a_new_reading_keeps_format_one() {
 /// figure from 0 to 100% in tenths, its reset later today, one to six days on and seven days on
 /// (each form of [`super::super::outlook::when`]) on three local clocks, or not ahead, or a month
 /// on (no week's reset, so none said), and [`NO_WEEK`], each read back at its width in cells,
-/// alone, padded with blanks and beside a
-/// notice two blanks away, and never with a word one blank after it. It refuses the
-/// five-hour-and-week rows of builds before this one (as aterm-phase's 2.1.300 and 2.1.312
-/// fixtures measured them) and an owner's own text. Negative controls: a parser that takes any
-/// `week ` head fails the refusals; a printer that says tenths (`63.4%`) fails the round trip.
+/// alone, padded with blanks, beside a notice two blanks away and beside one a single blank away
+/// (manual mode's, 2026-11-07: the words end where the tap's form does, never at a gap), and never
+/// run on into a word. It refuses the five-hour-and-week rows of builds before this one (as
+/// aterm-phase's 2.1.300 and 2.1.312 fixtures measured them), an owner's own text, and every row
+/// Claude Code cuts with `…` at `cols − 3` in a pane too narrow for the words (as the lab's
+/// stand-in draws them, aterm-phase's `-30col`), at every width and each form of the words.
+/// Negative controls: a parser that takes any `week ` head fails the refusals; a printer that
+/// says tenths (`63.4%`) fails the round trip; S2's parser, which ended the words only at a gap,
+/// fails the one-blank notice; S5b's, which ended them at any blank, read the cuts `week 63% used
+/// ·…` and `week 63% used …` (19 to 27 columns) as the bare form.
 #[test]
 fn parse_line_reads_every_line_the_tap_prints() {
     use super::super::outlook::Offsets;
@@ -2188,10 +2193,11 @@ fn parse_line_reads_every_line_the_tap_prints() {
                     line.clone(),
                     format!("{line}   "),
                     format!("{line}  Now using usage credits"),
+                    format!("{line} Now using usage credits"),
                 ] {
                     assert_eq!(parse_line(&text), Some(width), "{text}");
                 }
-                assert_eq!(parse_line(&format!("{line} credits")), None, "{line}");
+                assert_eq!(parse_line(&format!("{line}credits")), None, "{line}");
             }
         }
     }
@@ -2204,6 +2210,17 @@ fn parse_line_reads_every_line_the_tap_prints() {
     assert_eq!(
         parse_line(&format!("{NO_WEEK}     Now using usage credits")),
         Some(20)
+    );
+    assert_eq!(
+        parse_line(&format!("{NO_WEEK} Now using usage credits")),
+        Some(20),
+        "a notice one blank after the words"
+    );
+    // An owner's command that prints the tap's head reads as its words: whose row it is, the
+    // reading says (`Reading::claimable`), not the text.
+    assert_eq!(
+        parse_line("week 63% used \u{b7} resets Sat 10:00 \u{b7} mine"),
+        Some(32)
     );
     for refused in [
         "5h 42% \u{b7} 7d 61%",
@@ -2225,13 +2242,32 @@ fn parse_line_reads_every_line_the_tap_prints() {
         "week 63% used \u{b7} resets Thu 05 Nov 05:00",
         "week 63% used \u{b7} resets Thu 5 Now 05:00",
         "week 63% used \u{b7} resets Sat 10:000",
-        "week 63% used \u{b7} resets Sat 10:00 \u{b7} mine",
+        "week 63% used \u{b7} resets Sat 10:00\u{b7} mine",
+        "week 63% usedX",
         "week \u{b7} no figure",
         "main \u{b7} Opus 5.5 \u{b7} 42%",
         "~/aterm main* opus",
     ] {
         assert_eq!(parse_line(refused), None, "{refused}");
     }
+    // Claude's cut: in a pane `cols` wide the row keeps `cols − 5` cells of the words, then `…`,
+    // wherever the words do not fit `cols − 4` (the lab stand-in's `status_row`).
+    let mut cuts = 0;
+    for line in [
+        "week 63% used \u{b7} resets Sat 10:00",
+        "week 7% used \u{b7} resets 15:00",
+        "week 100% used \u{b7} resets Thu 12 Nov 05:00",
+        NO_WEEK,
+    ] {
+        let n = line.chars().count();
+        for cols in 5..n + 4 {
+            let kept: String = line.chars().take(cols - 5).collect();
+            let cut = format!("{kept}\u{2026}");
+            assert_eq!(parse_line(&cut), None, "{cols} columns: {cut}");
+            cuts += 1;
+        }
+    }
+    assert_eq!(cuts, 31 + 26 + 39 + 19, "every cut width of each form");
 }
 
 /// THE OWNER'S COMMAND RUNS AS CLAUDE CODE RUNS IT: `/bin/sh -c`, the payload on its stdin

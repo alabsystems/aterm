@@ -95,6 +95,16 @@ pub const TIMED: [StageId; 4] = [
     StageId::ObjcDrives,
 ];
 
+/// Stages that run over the run's crate selection: over an empty one each only says the change
+/// cone holds no crate (`stages::EMPTY_CONE`), so it is a named skip ([`named_skip`]).
+pub const OVER_SELECTION: [StageId; 5] = [
+    StageId::TestCompile,
+    StageId::Test,
+    StageId::Doctests,
+    StageId::Tippy,
+    StageId::SpecCheckers,
+];
+
 impl StageId {
     /// Named skip reason under `--no-windows` for a [`WINDOWED`] stage.
     #[must_use]
@@ -120,6 +130,12 @@ impl StageId {
     #[must_use]
     pub fn timed(self) -> bool {
         TIMED.contains(&self)
+    }
+
+    /// Whether this stage runs over the crate selection ([`OVER_SELECTION`]).
+    #[must_use]
+    pub fn over_selection(self) -> bool {
+        OVER_SELECTION.contains(&self)
     }
 }
 
@@ -224,13 +240,16 @@ fn retire_old_lanes_with(
 }
 
 /// Whether stage `id` is a named skip in `ctx` before it starts anything: a windowed stage
-/// ([`WINDOWED`]) under `--no-windows`, or one that measures the handed bundle (the measuring
-/// tests, the gui smoke) with no `--app`. It claims no memory and takes no quiet machine.
+/// ([`WINDOWED`]) under `--no-windows`, one that measures the handed bundle (the measuring
+/// tests, the gui smoke) with no `--app`, or one that runs over the crate selection
+/// ([`OVER_SELECTION`]) when the selection is empty. It claims no memory, takes no quiet machine
+/// and compiles nothing ([`has_compiler_stage`]).
 #[must_use]
 pub fn named_skip(ctx: &Ctx, id: StageId) -> bool {
     let needs_app = matches!(id, StageId::MeasuringTests | StageId::GuiSmoke);
     (ctx.no_windows && id.no_windows_skip().is_some())
         || (needs_app && ctx.measure_artifact.is_none())
+        || (id.over_selection() && ctx.scope.selects_nothing())
 }
 
 /// The stages `ctx` runs, unordered: its checks' ([`crate::checks::stages_of`]), only the
@@ -1187,6 +1206,50 @@ mod tests {
                 (StageId::ObjcDrives, 12 * GIB)
             ]
         );
+    }
+
+    /// An empty change cone (a change to documents alone) plans no memory and no compile for the
+    /// stages that run over the selection: each only says the cone holds no crate, so none waits
+    /// for a claim it never uses (a changelog's lint row waited nine minutes for 24.5 GiB).
+    /// NEGATIVE CONTROL: a cone of one crate plans the cold figure for the doctests and the lint,
+    /// and compiles.
+    #[test]
+    fn an_empty_cone_plans_no_memory_for_the_stages_over_its_selection() {
+        const GIB: u64 = 1 << 30;
+        let run = |crates: Vec<String>| {
+            ctx(
+                &[Check::Doc, Check::Lint, Check::Fmt],
+                Scope::changed("origin/main", crates, true),
+            )
+            .with_memory(crate::memory::Book::at(
+                None,
+                Some(24 * GIB),
+                Some(43 * GIB / 2),
+            ))
+        };
+        let claims = |c: &Ctx| -> Vec<(StageId, u64)> {
+            plan(c).into_iter().map(|s| (s.id, s.mem)).collect()
+        };
+        let empty = run(Vec::new());
+        assert_eq!(
+            claims(&empty),
+            [
+                (StageId::Doctests, 0),
+                (StageId::Tippy, 0),
+                (StageId::Formatting, 0)
+            ]
+        );
+        assert!(!has_compiler_stage(&empty));
+        let one = run(vec!["seed".to_string()]);
+        let over: Vec<(StageId, u64)> = claims(&one)
+            .into_iter()
+            .filter(|(id, _)| id.over_selection())
+            .collect();
+        assert!(
+            over.len() == 2 && over.iter().all(|(_, mem)| *mem > 0),
+            "{over:?}"
+        );
+        assert!(has_compiler_stage(&one));
     }
 
     #[test]

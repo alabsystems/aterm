@@ -937,7 +937,7 @@ fn the_held_row_tied_by_a_session_mate_counts_in_the_tabs_program_check() {
     assert_eq!(held_rows(&v), vec![(7001, 0, Some(1))]);
     assert_eq!(
         program_check_field(Some(&v), &[1], 2_000),
-        "program_check=1:2000"
+        "program_check=1:2000 program_check_stranded=-"
     );
 }
 
@@ -951,7 +951,7 @@ fn a_held_row_with_no_mate_counts_for_no_tab() {
     assert_eq!(held_rows(&v), vec![(7001, 0, None)]);
     assert_eq!(
         program_check_field(Some(&v), &[1], 2_000),
-        "program_check=0"
+        "program_check=0 program_check_stranded=-"
     );
 }
 
@@ -1103,6 +1103,125 @@ fn a_held_finding_prints_one_row_with_its_age() {
             "finding kind=process-table own=576",
         ]
     );
+}
+
+/// A held row the host judged stranded is named apart and still counted held, with its row's held
+/// time, which a held row that turns stranded keeps; only while the host judged against a daemon,
+/// and never for a row the check does not hold.
+#[test]
+fn a_stranded_held_row_is_named_apart_and_still_counted_held() {
+    use aterm_vitals::jobs::StartWait;
+    let mut w = World::new();
+    let mut band = sleeper(401, "band");
+    band.held = true;
+    w.call(1, 300, 400, band, None);
+    let mut git = sleeper(402, "git");
+    (git.ppid, git.pgid, git.sid, git.held) = (400, 400, 400, true);
+    w.add(git);
+    let mut x86 = held_orphan(7010, "x86tool", true);
+    x86.wait = StartWait::Translating;
+    w.add(x86);
+    w.daemon = Some(11291);
+    let v = w.observe();
+    assert!(
+        v.findings.program_check_stranded.is_empty(),
+        "none stranded yet"
+    );
+    for pid in [401, 7010] {
+        w.p(pid).stranded = true;
+    }
+    let rows = |list: &[Named]| {
+        list.iter()
+            .map(|n| (n.pid, n.for_ms, n.tab))
+            .collect::<Vec<_>>()
+    };
+    for ticks in 1..=2 {
+        let v = w.tick(TICK_MS);
+        let held = ticks * TICK_MS;
+        assert_eq!(
+            held_rows(&v),
+            [(401, held, Some(1)), (402, held, Some(1))],
+            "a stranded row is still held"
+        );
+        assert!(
+            v.findings
+                .program_check_stranded
+                .iter()
+                .all(|n| n.pid != 7010),
+            "CONTROL: a row the check does not hold is never stranded: {:?}",
+            v.findings
+        );
+        assert_eq!(rows(&v.findings.translating), [(7010, held, None)]);
+        assert_eq!(
+            rows(&v.findings.program_check_stranded),
+            [(401, held, Some(1))],
+            "named apart, its held time and tab its program-check row's"
+        );
+        assert_eq!(v.findings.program_check_daemon, Some(11291));
+    }
+    w.daemon = None;
+    let v = w.tick(TICK_MS);
+    assert_eq!(held_rows(&v).len(), 2);
+    assert!(
+        v.findings.program_check_stranded.is_empty() && v.findings.program_check_daemon.is_none(),
+        "CONTROL: with no daemon judged against, nothing is named stranded: {:?}",
+        v.findings
+    );
+}
+
+/// A stranded finding prints a row of its own after the held rows, with the daemon it was judged
+/// against, and a JSON item of its own; a held row that is not stranded prints only its
+/// program-check row, and a scope keeps only its own tabs' stranded rows.
+#[test]
+fn a_stranded_finding_prints_its_own_row_with_the_daemon() {
+    use aterm_vitals::sys::jobs_view::{findings_in, findings_json};
+    let held = |pid, name: &str, tab| Named {
+        pid,
+        exec_version: Some(u64::from(pid)),
+        name: name.into(),
+        tab,
+        job: None,
+        for_ms: 1_860_000,
+    };
+    let band = held(11271, "band-dd34e7089f8bb855", Some(1));
+    let f = Findings {
+        program_check: vec![
+            band.clone(),
+            held(11300, "git", Some(1)),
+            held(11400, "gh", Some(2)),
+        ],
+        program_check_stranded: vec![band, held(11400, "gh", Some(2))],
+        program_check_daemon: Some(11291),
+        own_procs: 300,
+        ..Findings::default()
+    };
+    let mine = findings_in(&f, &[1], false);
+    assert_eq!(
+        mine.wire_lines(),
+        [
+            "finding kind=program-check pid=11271 exe=band-dd34e7089f8bb855 for_ms=1860000",
+            "finding kind=program-check pid=11300 exe=git for_ms=1860000",
+            "finding kind=program-check-stranded pid=11271 exe=band-dd34e7089f8bb855 \
+             for_ms=1860000 daemon=11291",
+            "finding kind=process-table own=300",
+        ],
+        "CONTROL: the held row that is not stranded, and another tab's stranded one, print no \
+         stranded row"
+    );
+    let j = findings_json(&mine);
+    assert!(
+        aterm_vitals::sys::json::contract_violations(&j).is_empty(),
+        "{}",
+        j.to_text()
+    );
+    let text = j.to_text();
+    assert!(
+        text.contains(
+            r#"{"kind":"program_check_stranded","pid":11271,"exe":"band-dd34e7089f8bb855","for_ms":1860000,"daemon":11291}"#
+        ),
+        "{text}"
+    );
+    assert_eq!(text.matches("program_check_stranded").count(), 1, "{text}");
 }
 
 /// A HELD FINDING NAMES THE KIND OF JOB IT IS A MEMBER OF: a held member of a live agent call
@@ -1271,6 +1390,7 @@ fn unstarted_findings_list_by_pid_whatever_order_they_come_in() {
         tab: None,
         job: None,
         started_ms: None,
+        stranded: false,
     };
     let su = |stopped, traced| StartWait::StoppedUnstarted { stopped, traced };
     let held = vec![

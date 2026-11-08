@@ -20,7 +20,7 @@ use std::{
 };
 use trust_resource_controller as wire;
 
-const EXCHANGE: Duration = Duration::from_secs(8);
+use crate::runtime::CONTROL_HANG as EXCHANGE;
 const POLL: Duration = Duration::from_millis(100);
 
 /// The owner authenticates the actual producer, host and resource descriptions.

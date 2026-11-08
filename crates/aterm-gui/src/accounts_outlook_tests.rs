@@ -11,7 +11,9 @@ use crate::claude_lights::Fact;
 use crate::{App, WindowId};
 use aterm_agent::harness::accounts::{Class, Roster, Row, TapRead, WindowFig, WindowRead};
 use aterm_agent::harness::footer::FooterFacts;
+use aterm_agent::harness::outlook::Figure;
 use aterm_agent::harness::profile::SubscriptionDisplay;
+use aterm_agent::harness::quota_view::QuotaView;
 
 /// Sun 25 Oct 2026 19:30, UTC.
 const NOW: i64 = 1_792_956_600;
@@ -147,11 +149,10 @@ fn files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 
 /// T21: THE OUTLOOK IS REPLAYED AT MOST ONCE A MINUTE, on the resolver's thread, and reads
 /// the store only when its stamps move. Ten minutes of reads every second (a busy resolver)
-/// replay it at most eleven times, read the store once, give the pane the same glance but where
-/// the clock alone moves it (`me`'s 5-hour figure, read ten minutes before, stops being a figure
-/// of now at its fifteenth minute and leaves the rule), and write nothing; the card's snapshot is
-/// posted and carries the replay. Negative control: a memo replayed on every read replays 600
-/// times.
+/// replay it at most eleven times, read the store once, build the pane's quota view at most once
+/// a replay (a pass between replays is handed the one it built), its line D unit's words standing
+/// while the clock alone moves, and write nothing; the card's snapshot is posted and carries the
+/// replay. Negative control: a memo replayed on every read replays 600 times.
 #[test]
 fn the_outlook_replays_at_most_once_a_minute() {
     let dir = seeded();
@@ -163,13 +164,16 @@ fn the_outlook_replays_at_most_once_a_minute() {
     };
     let start = Instant::now();
     let _ = crate::work_counts::take_account_store_reads();
-    let mut glances = Vec::new();
+    let own = Some(Figure::Exact(580));
+    let mut views: Vec<QuotaView> = Vec::new();
     for s in 0..600i64 {
         let instant = start + Duration::from_secs(u64::try_from(s).expect("seconds"));
-        let glance = memo.glance((instant, NOW + s), Some(&roster), "me", Some(580), true);
-        let glance = glance.unwrap_or_else(|| panic!("second {s}: the pane's row has a glance"));
-        if glances.last() != Some(&glance) {
-            glances.push(glance);
+        let views_now = memo.quota((instant, NOW + s), Some(&roster), "me", own, true);
+        let view = views_now
+            .unwrap_or_else(|| panic!("second {s}: the pane's row has a view"))
+            .view;
+        if views.last() != Some(&view) {
+            views.push(view);
         }
     }
     assert!(
@@ -177,18 +181,17 @@ fn the_outlook_replays_at_most_once_a_minute() {
         "at most once a minute: {} replays",
         memo.replays
     );
-    assert_eq!(
-        glances.len(),
-        2,
-        "a replay with nothing moved gives the same glance, but for the 5-hour figure's age: \
-         {glances:#?}"
+    assert!(
+        (1..=memo.replays).contains(&views.len()),
+        "at most one view a replay: {} views over {} replays",
+        views.len(),
+        memo.replays
     );
-    let (fresh, aged) = (&glances[0], &glances[1]);
-    assert!(fresh.five.is_some() && aged.five.is_none(), "{glances:#?}");
+    let (first, last) = (&views[0], &views[views.len() - 1]);
     assert_eq!(
-        (&aged.bar, &aged.reset, &aged.verdict, &aged.title),
-        (&fresh.bar, &fresh.reset, &fresh.verdict, &fresh.title),
-        "nothing else moved"
+        first.fallback(),
+        last.fallback(),
+        "the unit's words stand while only the clock moves"
     );
     assert_eq!(
         crate::work_counts::take_account_store_reads(),
@@ -212,7 +215,7 @@ fn the_outlook_replays_at_most_once_a_minute() {
     store.save(&state).expect("save");
     let replays = memo.replays;
     let later = start + Duration::from_secs(600 + 11);
-    let _ = memo.glance((later, NOW + 611), Some(&roster), "me", Some(580), true);
+    let _ = memo.quota((later, NOW + 611), Some(&roster), "me", own, true);
     assert_eq!(
         crate::work_counts::take_account_store_reads(),
         1,
@@ -494,49 +497,45 @@ fn no_store_no_outlook() {
         ..OutlookMemo::default()
     };
     let _ = crate::work_counts::take_account_store_reads();
+    let own = Some(Figure::Exact(580));
     assert!(
-        memo.glance(
-            (Instant::now(), NOW),
-            Some(&roster()),
-            "me",
-            Some(580),
-            true
-        )
-        .is_none()
+        memo.quota((Instant::now(), NOW), Some(&roster()), "me", own, true)
+            .is_none()
     );
     assert_eq!(crate::work_counts::take_account_store_reads(), 0);
     assert!(snapshot().is_none());
     let dir = seeded();
     assert!(
-        memo.glance((Instant::now(), NOW), None, "me", Some(580), true)
+        memo.quota((Instant::now(), NOW), None, "me", own, true)
             .is_none(),
-        "no roster, no glance"
+        "no roster, no view"
     );
     assert_eq!(crate::work_counts::take_account_store_reads(), 0);
     drop(dir);
     set_dir(None);
 }
 
-/// The pane's facts on `me`, with `glance` where the resolver gave one.
-fn me_facts(glance: Option<aterm_agent::harness::outlook::Glance>) -> FooterFacts {
+/// The pane's facts on `me`, with the quota view where the resolver gave one.
+fn me_facts(quota: Option<QuotaView>) -> FooterFacts {
     FooterFacts {
+        account: Some("me".into()),
         subscription: Some(SubscriptionDisplay {
             email: Some("me@example.test".into()),
             plan: Some("Max 20x".into()),
-            weekly: Some("weekly 42% left".into()),
+            weekly: Some("weekly 58% used".into()),
             label: Some("me".into()),
             ..SubscriptionDisplay::default()
         }),
-        glance,
+        quota,
         ..facts()
     }
 }
 
 /// A WALLED ACCOUNT'S HOVER SAYS OUT ONCE: a store whose `me` read 97% of its week ten minutes
-/// ago and then walled gives the footer's `weekly out` and a glance with no title words of its
-/// own, so the account fact's hover reads `weekly out` once, then what the policy does at the
-/// wall (the move to `alt1`), and never a percentage. Negative control: a glance that titles the
-/// wall `out` (the S1 slice before its review) reads `weekly out (out)`.
+/// ago and then walled gives the footer's `weekly out`, and the quota view's title says `out now`
+/// once, then what the policy does at the wall (the move to `alt1`), and never the 97% read
+/// before it. Negative control: the footer's figure handed as a reading (97% used) is not said
+/// over the standing wall either.
 #[test]
 fn a_walled_accounts_hover_says_out_once() {
     let dir = scratch();
@@ -557,17 +556,21 @@ fn a_walled_accounts_hover_says_out_once() {
         .at(Instant::now(), NOW, Some(&roster), false)
         .expect("an outlook")
         .clone();
-    let glance = outlook.glance("me", None, true).expect("me's glance");
-    let mut facts = me_facts(Some(glance));
-    if let Some(sub) = facts.subscription.as_mut() {
-        sub.weekly = Some(aterm_agent::harness::profile::WEEKLY_OUT.into());
+    for own in [Some(Figure::Out), Some(Figure::Exact(970))] {
+        let mut facts = me_facts(Some(outlook.quota("me", own, true)));
+        if let Some(sub) = facts.subscription.as_mut() {
+            sub.weekly = Some(aterm_agent::harness::profile::WEEKLY_OUT.into());
+        }
+        let (title, _) = crate::claude_facts::fact_title(&facts, None, Fact::Account);
+        assert!(
+            title.starts_with("me \u{b7} ")
+                && title.matches("out now").count() == 1
+                && title.contains("the work moves to alt1 at the turn's end")
+                && !title.contains("97%")
+                && title.ends_with("click: accounts"),
+            "{own:?}: {title}"
+        );
     }
-    let (title, _) = crate::claude_facts::fact_title(&facts, None, Fact::Account);
-    assert_eq!(
-        title,
-        "\u{2386} me@example.test \u{b7} Max 20x \u{b7} weekly out \u{b7} \u{2192} alt1 at turn \
-         end \u{b7} click: accounts"
-    );
     drop(dir);
     set_dir(None);
 }
@@ -733,7 +736,7 @@ fn paused_outlook_gallery() {
     use aterm_agent::harness::account_progress::{
         AccountProgress, ProgressPhase, SESSION_AUTOPILOT_OFF_FINDING,
     };
-    use aterm_agent::harness::outlook::{BarCell, Refusal};
+    use aterm_agent::harness::outlook::Refusal;
 
     let (gallery, _permit) =
         crate::scripted_redraw_fixture::gallery_directory("ATERM_PAUSED_OUTLOOK_GALLERY");
@@ -748,17 +751,13 @@ fn paused_outlook_gallery() {
         .unwrap()
         .clone();
     assert!(outlook.week.is_some());
-    let glance = outlook.glance("me", Some(580), true).unwrap();
-    assert!(glance.verdict.is_some());
-    assert!(
-        glance
-            .bar
-            .as_ref()
-            .unwrap()
-            .0
-            .iter()
-            .any(|cell| { matches!(cell, BarCell::More | BarCell::Tick) })
-    );
+    let own = Some(Figure::Exact(580));
+    let view = outlook.quota("me", own, true);
+    assert!(view.tail.verdict.is_some() && !view.chart.runs.is_empty());
+    let observed = outlook
+        .observations_only(Refusal::SessionPaused)
+        .quota("me", own, true);
+    assert!(observed.tail.verdict.is_none() && observed.chart.runs.is_empty());
     let (read, enrolled) = memo.held.as_ref().unwrap().read.clone().unwrap();
     let worker_rows = crate::fact_menu::account_menu_rows_from(
         &roster,
@@ -777,7 +776,8 @@ fn paused_outlook_gallery() {
     for paused in [false, true] {
         let name = if paused { "paused" } else { "permitted" };
         for cols in [120, 60] {
-            let mut facts = me_facts(Some(glance.clone()));
+            let mut facts = me_facts(Some(view.clone()));
+            facts.quota_observed = Some(observed.clone());
             if paused {
                 let mut progress = AccountProgress::unknown(NOW - 600);
                 progress.phase = ProgressPhase::Paused;
@@ -824,7 +824,12 @@ fn paused_outlook_gallery() {
                 .unwrap()
                 .clone();
             assert_eq!(facts.account_forecasts_paused(), paused);
-            assert_eq!(facts.glance.as_ref(), Some(&glance));
+            assert_eq!(facts.quota.as_ref(), Some(&view));
+            assert_eq!(
+                facts.quota_view(),
+                Some(if paused { &observed } else { &view }),
+                "a paused recovery shows the observations alone"
+            );
             assert_eq!(snapshot().unwrap().outlook.as_deref(), Some(&outlook));
             app.hold_account_menu_reads_for_test();
             let anchor = app
@@ -993,7 +998,8 @@ fn watching_account_observations_gallery() {
     progress.phase = ProgressPhase::Watching;
     progress.account = Some("me".into());
     progress.known = Some(2);
-    let inventory = aterm_agent::harness::footer::account_progress_text(&progress, false);
+    // No check is due, so the words read no clock.
+    let rotation = aterm_agent::harness::footer::rotation_words(&progress, |_| String::new());
     let facts = FooterFacts {
         subscription: Some(SubscriptionDisplay {
             email: Some("me@example.test".into()),
@@ -1004,7 +1010,13 @@ fn watching_account_observations_gallery() {
             ..Default::default()
         }),
         account_progress: Some(progress),
-        glance: outlook.glance("me", Some(admitted.used_x10), true),
+        quota: Some(outlook.quota(
+            "me",
+            Some(aterm_agent::harness::outlook::Figure::of_weekly(
+                &admitted, now,
+            )),
+            true,
+        )),
         ..facts()
     };
     let before_files = files(dir.path());
@@ -1026,14 +1038,14 @@ fn watching_account_observations_gallery() {
                 .as_ref()
                 .unwrap_err()
                 .clone();
-            facts.glance = memo.glance(
-                (instant, now + 10),
-                Some(&roster),
-                "me",
-                Some(admitted.used_x10),
-                true,
+            let own = Some(aterm_agent::harness::outlook::Figure::of_weekly(
+                &admitted, now,
+            ));
+            assert!(
+                memo.quota((instant, now + 10), Some(&roster), "me", own, true)
+                    .is_none()
             );
-            assert!(facts.glance.is_none());
+            (facts.quota, facts.quota_observed) = (None, None);
             Err(why)
         } else {
             Ok(worker_rows.clone())
@@ -1067,11 +1079,20 @@ fn watching_account_observations_gallery() {
                 shown.subscription.as_ref().unwrap().weekly_figure,
                 Some(admitted)
             );
-            assert_eq!(shown.glance.is_none(), unavailable);
+            assert_eq!(shown.quota.is_none(), unavailable);
             let observed = shown.account_progress_view().unwrap();
             assert_eq!((observed.known, observed.eligible), (Some(2), None));
+            // The view's words where the outlook replayed; the profile's own without one.
+            let (title_week, spoken_week) = if unavailable {
+                (weekly.clone(), weekly.replace('\u{2265}', "at least "))
+            } else {
+                (
+                    "at least 25% of its week used".to_owned(),
+                    "at least 25 percent of its week used".to_owned(),
+                )
+            };
             for (said, expected_week) in [
-                (app.fact_title(session, Fact::Account).0, weekly.clone()),
+                (app.fact_title(session, Fact::Account).0, title_week),
                 (
                     crate::claude_facts::fact_spoken_of(
                         &shown,
@@ -1080,11 +1101,17 @@ fn watching_account_observations_gallery() {
                         aterm_agent::harness::footer::FactMask::default(),
                     )
                     .0,
-                    weekly.replace(" · ", ", "),
+                    spoken_week,
                 ),
             ] {
-                assert!(said.contains(&inventory), "{cols}: {said}");
-                assert!(said.contains(&expected_week), "{cols}: {said}");
+                // Said last, lower-cased on the title and capitalised aloud.
+                let rotation_at = said
+                    .find(&rotation[1..])
+                    .unwrap_or_else(|| panic!("{cols}: the rotation's words: {said}"));
+                let week_at = said
+                    .find(&expected_week)
+                    .unwrap_or_else(|| panic!("{cols}: {expected_week:?} in {said}"));
+                assert!(week_at < rotation_at, "{cols}: the rotation last: {said}");
             }
             app.hold_account_menu_reads_for_test();
             let anchor = app
@@ -1144,8 +1171,14 @@ fn watching_account_observations_gallery() {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            let left = format!("{}%", 100 - admitted.used_x10 / 10);
-            assert!(drawn.contains(&left), "{cols}: {drawn}");
+            // The card's week row says what is left (S6 moves it to the used words); the meter
+            // that stands for an unread state says the pane's own weekly words.
+            let figure = if unavailable {
+                weekly.clone()
+            } else {
+                format!("{}%", 100 - admitted.used_x10 / 10)
+            };
+            assert!(drawn.contains(&figure), "{cols}: {figure:?} in {drawn}");
             if unavailable {
                 assert!(
                     drawn.contains("Account state unavailable"),
@@ -1325,8 +1358,7 @@ fn the_cards_rows_fit_speak_and_keep_roster_order() {
         }
     }
     assert!(plots > 0, "the card draws bars");
-    let glance = outlook.glance("me", Some(580), true).expect("me's glance");
-    let facts = me_facts(Some(glance));
+    let facts = me_facts(Some(outlook.quota("me", Some(Figure::Exact(580)), true)));
     let (title, _) = crate::claude_facts::fact_title(&facts, None, Fact::Account);
     let (spoken, _) = crate::claude_facts::fact_spoken_of(
         &facts,
@@ -1337,7 +1369,7 @@ fn the_cards_rows_fit_speak_and_keep_roster_order() {
     for words in [&title, &spoken] {
         assert_eq!(box_drawing(words), None, "{words:?}");
     }
-    assert!(title.contains("me@example.test"), "{title:?}");
+    assert!(title.starts_with("me \u{b7} "), "{title:?}");
     drop(dir);
     set_dir(None);
 }
@@ -1388,12 +1420,22 @@ fn a_forecast_interrupts_nobody() {
         reads: Some(scratch_reads()),
         ..OutlookMemo::default()
     };
-    let glance = memo
-        .glance((Instant::now(), NOW), Some(&roster), "me", Some(580), true)
-        .expect("a glance");
-    let verdict = glance.verdict.clone().expect("a verdict");
-    assert!(verdict.warn, "the seed projects a stop: {verdict:?}");
-    publish(&app, session, me_facts(Some(glance)));
+    let view = memo
+        .quota(
+            (Instant::now(), NOW),
+            Some(&roster),
+            "me",
+            Some(Figure::Exact(580)),
+            true,
+        )
+        .expect("a view")
+        .view;
+    let verdict = view.tail.verdict.clone().expect("a verdict");
+    assert!(
+        verdict.ink == aterm_agent::harness::quota_view::Role::Warn,
+        "the seed projects a stop: {verdict:?}"
+    );
+    publish(&app, session, me_facts(Some(view)));
     for _ in 0..5 {
         pass(&mut app, wid);
     }

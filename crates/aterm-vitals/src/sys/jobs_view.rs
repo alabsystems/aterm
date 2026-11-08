@@ -263,25 +263,37 @@ pub fn status_fields(view: Option<&JobsView>, keys: &[u64], age_ms: u64) -> Stri
 
 /// `status`'s `program_check=` field: how many programs of the sessions `keys` macOS's program
 /// check holds in `view` (members of their jobs, orphans of them included) and the oldest held
-/// to now, `age_ms` being the view's age; `0` with none, `-` with no view.
+/// to now, `age_ms` being the view's age; `0` with none, `-` with no view. Then
+/// `program_check_stranded=`, the same of those stranded ([`Findings::program_check_stranded`]):
+/// `0` only when the view judged every held row ([`Findings::program_check_judged`]), and `-`
+/// otherwise with none, since one may be stranded and nothing read tells.
 #[must_use]
 pub fn program_check_field(view: Option<&JobsView>, keys: &[u64], age_ms: u64) -> String {
     let Some(view) = view else {
-        return "program_check=-".to_owned();
+        return "program_check=- program_check_stranded=-".to_owned();
     };
-    let held = view
-        .findings
-        .program_check
-        .iter()
-        .filter(|n| n.tab.is_some_and(|t| keys.contains(&t)));
-    let (n, oldest) = held.fold((0usize, 0u64), |(n, oldest), h| {
-        (n + 1, oldest.max(h.for_ms))
-    });
-    if n == 0 {
-        "program_check=0".to_owned()
-    } else {
-        format!("program_check={n}:{}", oldest.saturating_add(age_ms))
-    }
+    let count = |list: &[crate::jobs::Named]| {
+        let (n, oldest) = list
+            .iter()
+            .filter(|n| n.tab.is_some_and(|t| keys.contains(&t)))
+            .fold((0usize, 0u64), |(n, oldest), h| {
+                (n + 1, oldest.max(h.for_ms))
+            });
+        if n == 0 {
+            "0".to_owned()
+        } else {
+            format!("{n}:{}", oldest.saturating_add(age_ms))
+        }
+    };
+    let f = &view.findings;
+    let stranded = match (f.program_check_daemon, count(&f.program_check_stranded)) {
+        (Some(_), n) if n != "0" || f.program_check_judged => n,
+        _ => "-".to_owned(),
+    };
+    format!(
+        "program_check={} program_check_stranded={stranded}",
+        count(&f.program_check)
+    )
 }
 
 /// Formats the `brief` jobs line.
@@ -322,6 +334,14 @@ pub fn findings_in(f: &Findings, keys: &[u64], all: bool) -> Findings {
             .collect(),
         program_check_aterm: f.program_check_aterm,
         program_check_after_grant: f.program_check_after_grant,
+        program_check_stranded: f
+            .program_check_stranded
+            .iter()
+            .filter(|n| mine(n.tab))
+            .cloned()
+            .collect(),
+        program_check_daemon: f.program_check_daemon,
+        program_check_judged: f.program_check_judged,
         program_check_episode: f.program_check_episode,
         program_check_drained: f.program_check_drained,
         translating: f
@@ -563,6 +583,18 @@ pub fn findings_json(f: &Findings) -> Jv {
     items.extend(f.d_state.iter().map(|n| named("d_state", n)));
     items.extend(f.busy_orphans.iter().map(|n| named("busy_orphan", n)));
     items.extend(f.program_check.iter().map(|n| named("program_check", n)));
+    items.extend(f.program_check_stranded.iter().map(|n| {
+        Jv::obj([
+            ("kind", Jv::s("program_check_stranded")),
+            ("pid", Jv::u(u64::from(n.pid))),
+            ("exe", Jv::s(exe_word(&n.name))),
+            ("for_ms", Jv::u(n.for_ms)),
+            (
+                "daemon",
+                Jv::known_or(f.program_check_daemon.map(u64::from), "not_sampled"),
+            ),
+        ])
+    }));
     items.extend(f.translating.iter().map(|n| named("translating", n)));
     items.extend(f.not_started.iter().map(|n| named("not_started", n)));
     items.extend(f.stopped_unstarted.iter().map(|s| {
@@ -724,20 +756,79 @@ mod tests {
             },
             ..JobsView::default()
         };
-        assert_eq!(program_check_field(None, &[7], 0), "program_check=-");
+        assert_eq!(
+            program_check_field(None, &[7], 0),
+            "program_check=- program_check_stranded=-"
+        );
         assert_eq!(
             program_check_field(Some(&view), &[7], 2_000),
-            "program_check=2:1142000",
+            "program_check=2:1142000 program_check_stranded=-",
             "the oldest of this tab's two, counted on past a view 2 s old"
         );
         assert_eq!(
             program_check_field(Some(&view), &[8], 2_000),
-            "program_check=1:7000"
+            "program_check=1:7000 program_check_stranded=-"
         );
         assert_eq!(
             program_check_field(Some(&view), &[9], 2_000),
-            "program_check=0",
+            "program_check=0 program_check_stranded=-",
             "another tab's held program, and one no tab holds, are not this tab's"
+        );
+    }
+
+    /// `program_check_stranded=` counts this tab's stranded programs and the oldest to now beside
+    /// its held ones: a count whenever one is named, `0` only when the view judged every held row,
+    /// and `-` with none named otherwise, or with no syspolicyd judged against.
+    #[test]
+    fn status_counts_a_tabs_stranded_programs_beside_its_held_ones() {
+        let held = |pid, tab, for_ms| Named {
+            pid,
+            exec_version: Some(u64::from(pid)),
+            name: "band".into(),
+            tab: Some(tab),
+            job: None,
+            for_ms,
+        };
+        let judged = |stranded, every| JobsView {
+            findings: Findings {
+                program_check: vec![held(1, 7, 1_860_000), held(2, 7, 30_000), held(3, 8, 5_000)],
+                program_check_stranded: stranded,
+                program_check_daemon: Some(11291),
+                program_check_judged: every,
+                ..Findings::default()
+            },
+            ..JobsView::default()
+        };
+        let view = judged(vec![held(1, 7, 1_860_000), held(3, 8, 5_000)], false);
+        assert_eq!(
+            program_check_field(Some(&view), &[7], 2_000),
+            "program_check=2:1862000 program_check_stranded=1:1862000",
+            "this tab's one stranded, its oldest to now, though not every row was judged; \
+             another tab's is not this tab's"
+        );
+        assert_eq!(
+            program_check_field(Some(&judged(Vec::new(), true)), &[7], 2_000),
+            "program_check=2:1862000 program_check_stranded=0",
+            "CONTROL: every row judged, none stranded"
+        );
+        assert_eq!(
+            program_check_field(Some(&judged(Vec::new(), false)), &[7], 2_000),
+            "program_check=2:1862000 program_check_stranded=-",
+            "none stranded, but a row was not judged: no verdict"
+        );
+        let unjudged = JobsView {
+            findings: Findings {
+                program_check_daemon: None,
+                program_check_stranded: Vec::new(),
+                program_check_judged: true,
+                ..view.findings.clone()
+            },
+            ..JobsView::default()
+        };
+        assert_eq!(
+            program_check_field(Some(&unjudged), &[7], 2_000),
+            "program_check=2:1862000 program_check_stranded=-",
+            "CONTROL: no daemon judged against is no verdict"
         );
     }
     use crate::sys::json::contract_violations;

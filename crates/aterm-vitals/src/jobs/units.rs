@@ -3224,6 +3224,9 @@ impl Jobs {
                     if after_grant(h, named.tab) {
                         f.program_check_after_grant += 1;
                     }
+                    if h.stranded && tick.program_check_daemon.is_some() {
+                        f.program_check_stranded.push(named.clone());
+                    }
                     f.program_check.push(named);
                 }
                 StartWait::Translating => f.translating.push(named),
@@ -3237,10 +3240,17 @@ impl Jobs {
                 }
             }
         }
-        for list in [&mut f.program_check, &mut f.translating, &mut f.not_started] {
+        for list in [
+            &mut f.program_check,
+            &mut f.program_check_stranded,
+            &mut f.translating,
+            &mut f.not_started,
+        ] {
             list.sort_by_key(|n| n.pid);
         }
         f.stopped_unstarted.sort_by_key(|s| s.named.pid);
+        f.program_check_daemon = tick.program_check_daemon;
+        f.program_check_judged = tick.program_check_judged && tick.program_check_daemon.is_some();
         f.program_check_episode = self.held_episode.map(Backlog::view);
         f.program_check_drained = self.held_drained;
         if self.held_episode.is_some() {

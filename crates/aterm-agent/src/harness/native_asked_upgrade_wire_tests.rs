@@ -39,9 +39,9 @@ fn prepare() -> Prepare {
         expected_human_seq: Some(3),
         deadline_us: 91,
         duty: Scope::Upgrade,
-        asked_upgrade: Some(AskedUpgradeIntent {
+        asked: Some(AskedIntent::Upgrade(AskedUpgradeIntent {
             predecessor: "56".repeat(16),
-        }),
+        })),
         plan: NativePlan::Restart {
             process: process.clone(),
             observation: None,
@@ -77,7 +77,10 @@ fn asked_upgrade_roundtrips_the_exact_predecessor_and_original_recipe() {
         &"ab".repeat(17),
     ] {
         let mut invalid_plan = prepare();
-        invalid_plan.asked_upgrade.as_mut().unwrap().predecessor = predecessor.into();
+        let Some(AskedIntent::Upgrade(intent)) = invalid_plan.asked.as_mut() else {
+            unreachable!()
+        };
+        intent.predecessor = predecessor.into();
         assert!(Request::prepare(invalid_plan).encode().is_none());
         let invalid = wire.replace(
             &format!("asked-predecessor={}", "56".repeat(16)),
@@ -139,7 +142,7 @@ fn asked_upgrade_refuses_foreign_plan_shapes_in_parser_and_encoder() {
     for invalid in variants {
         assert!(Request::prepare(invalid.clone()).encode().is_none());
         let mut ordinary = invalid;
-        ordinary.asked_upgrade = None;
+        ordinary.asked = None;
         assert_eq!(ordinary.constructor(), ordinary.plan.constructor());
         let wire = Request::prepare(ordinary)
             .encode()
@@ -153,7 +156,7 @@ fn asked_upgrade_refuses_foreign_plan_shapes_in_parser_and_encoder() {
 #[test]
 fn absent_asked_intent_preserves_existing_constructor_selection() {
     let mut ordinary = prepare();
-    ordinary.asked_upgrade = None;
+    ordinary.asked = None;
     assert_eq!(ordinary.constructor(), Constructor::PrivateRestart);
     let request = Request::prepare(ordinary);
     let wire = request.encode().unwrap();

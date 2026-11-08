@@ -25,11 +25,13 @@ mod inventory;
 mod keychain;
 mod native;
 mod repos;
+mod selection;
 mod source;
 pub use checkout_inputs::RepositoryCheckoutMetadata;
 pub use credentials::{sync_vault_git_credentials, vault_git_credentials};
 pub use native::InitialRepositoryInputs;
 pub(crate) use native::{automatic_inventory_counts, automatic_inventory_counts_captured};
+pub use selection::RepositorySelection;
 pub use source::{
     RepositoryControlPaths, RepositoryInputMark, RepositoryInputPathCache, RepositoryRefreshCursor,
     repository_checkout_watch_paths, repository_input_control_watch_paths, repository_input_mark,

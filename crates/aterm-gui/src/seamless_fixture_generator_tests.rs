@@ -4707,23 +4707,49 @@ fn fx_record_fields() {
     let baseline = newest_recorded(&root, &out);
     let fields = DeskFields::of_release(&out);
     std::fs::write(out.join(FIELDS_FILE), fields.to_toml()).expect("write fields.toml");
+    fx_assert_field_hold(
+        &fields,
+        baseline
+            .as_ref()
+            .map(|(tag, record)| (tag.as_str(), record)),
+    );
+}
+
+// After-cut uses the recorded release itself as the baseline: an older release can
+// still mention a retired field and would hide a stale NO_HANDOFF_WRITES entry.
+#[test]
+#[ignore = "after-cut checks the staged release with main's compiled reader"]
+fn check_landed_handoff_fields() {
+    use crate::seamless::fixture_cover::{DeskFields, FIELDS_FILE, Recorded};
+    let release = std::path::PathBuf::from(
+        std::env::var_os("ATERM_HANDOFF_FIELD_HOLD_RELEASE")
+            .expect("after-cut names the release directory"),
+    );
+    let text = std::fs::read_to_string(release.join(FIELDS_FILE)).expect("release's fields.toml");
+    let baseline: Recorded = aterm_toml::from_str(&text).expect("release's recorded fields");
+    let tag = release.file_name().expect("release tag").to_string_lossy();
+    fx_assert_field_hold(&DeskFields::of_release(&release), Some((&tag, &baseline)));
+}
+
+fn fx_assert_field_hold(
+    fields: &crate::seamless::fixture_cover::DeskFields,
+    baseline: Option<(&str, &crate::seamless::fixture_cover::Recorded)>,
+) {
     let off_macos: &[(&str, &str)] = if cfg!(target_os = "macos") {
         &[]
     } else {
         NO_HANDOFF_WRITES_OFF_MACOS
     };
     let unhanded: Vec<(&str, &str)> = NO_HANDOFF_WRITES.iter().chain(off_macos).copied().collect();
-    let uncovered = fields.uncovered(baseline.as_ref().map(|(_, recorded)| recorded), &unhanded);
+    let uncovered = fields.uncovered(baseline.map(|(_, recorded)| recorded), &unhanded);
     assert!(
         uncovered.is_empty(),
         "carried fields and variants no desk here writes{}; give each a value in \
          a desk, as a real session would carry it, or name one no handoff writes \
          in NO_HANDOFF_WRITES with why (tests/fixtures/handoff/README.md):\n  {}",
-        baseline
-            .as_ref()
-            .map_or_else(String::new, |(release, _)| format!(
-                " (held since {release})"
-            )),
+        baseline.map_or_else(String::new, |(release, _)| format!(
+            " (held since {release})"
+        )),
         uncovered.join("\n  ")
     );
 }

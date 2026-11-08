@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The account unit's outlook inks (`docs/DESIGN-accounts-outlook-2026-10-25.md` §3.4, T20): the
-//! bar's meter and track and a projected stop's words, on the pane's rule in the glass's tokens
-//! (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1) under every palette, and on the
-//! Accounts card under the macOS accents, over every built-in scheme.
+//! The account unit's inks (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2, §4.1): its
+//! name, figure, reset, joins and a projected stop's words on the pane's rule in the glass's
+//! tokens under every palette, and the outlook's bar on the Accounts card under the macOS
+//! accents (`docs/DESIGN-accounts-outlook-2026-10-25.md` §3.4, T20), over every built-in scheme.
 
 use super::*;
 use crate::autopilot_menu::{MenuRow, NoteTone, PlotCell, PlotInk};
 use crate::native_appearance::{SystemAccent, install_system_accent};
-use aterm_agent::harness::outlook::{BarCell, Glance, VerdictWords};
+use aterm_agent::harness::outlook::BarCell;
+use aterm_agent::harness::quota_view::QuotaView;
 use aterm_effects::cli_marks::{ICON_CONTRAST, NAME_CONTRAST};
 use aterm_effects::color_math::contrast_ratio;
 use aterm_effects::glass_inks::day_vivid;
@@ -55,40 +56,22 @@ fn bar() -> [BarCell; 10] {
     })
 }
 
-/// The account unit of scenario B (a stop) or A (covered) of §2.4, as the resolver hands it.
+/// The account unit with a projected stop (its verdict in the warn ink) or none, as the resolver
+/// hands it.
 fn unit(stop: bool) -> FooterFacts {
-    let ten = bar();
-    let verdict = if stop {
-        VerdictWords {
-            full: "\u{2573} ~Wed 22:00\u{2013}Thu 09:00".into(),
-            short: "\u{2573} ~Wed 22:00".into(),
-            shortest: Some("\u{2573} ~Wed 22:00".into()),
-            warn: true,
-            kept_narrow: true,
-        }
-    } else {
-        VerdictWords {
-            full: "continuous 7d".into(),
-            short: "continuous 7d".into(),
-            shortest: None,
-            warn: false,
-            kept_narrow: false,
-        }
-    };
+    let mut view = QuotaView::sample();
+    if !stop {
+        view.tail.verdict = None;
+    }
     FooterFacts {
+        account: Some("main".into()),
         subscription: Some(SubscriptionDisplay {
             email: Some("me@example.test".into()),
             plan: Some("Max 20x".into()),
-            weekly: Some("weekly 42% left".into()),
+            weekly: Some("weekly 63% used".into()),
             ..SubscriptionDisplay::default()
         }),
-        glance: Some(Glance {
-            bar: Some((ten, std::array::from_fn(|i| ten[i * 2]))),
-            reset: Some("Thu 09:00".into()),
-            five: Some("5h 62% left".into()),
-            verdict: Some(verdict),
-            ..Glance::default()
-        }),
+        quota: Some(view),
         ..FooterFacts::default()
     }
 }
@@ -131,19 +114,16 @@ fn rule_greys(blank: RenderCell) -> [RenderCell; 3] {
     })
 }
 
-/// T20: THE OUTLOOK'S INKS READ ON EVERY GROUND, AND DAY STAYS VIVID. Over every built-in scheme,
-/// under every palette and none, on three rule greys: the bar's `━ ╍ ┽` wear the marks ink of
-/// their column ([`GlassInks::mark`]), at 3:1 or more and at 4.5:1 on a light ground, its `─ ┄`
-/// the track ink at 3:1 or more, a stop's words the warn ink at 4.5:1 or more; on Aterm Day
-/// under Cruise and Land the meter keeps the glass's vivid law
-/// ([`aterm_effects::glass_inks::day_vivid`]: OKLCh C 0.12, or nearly the most sRGB holds at its
-/// hue and lightness where that is less); the bar never takes the warn ink, and wherever
-/// the warn ink is used its words lead with `╳`, a projected stop's mark (a stop is said, not
-/// coloured). The system accent reads nowhere on the rule
-/// (`lines_b_d_and_e_ignore_the_system_accent`). Negative control: the dashes mixed toward the
-/// ground (`mix(meter, bg, 0.4)`) wash out on Day.
+/// THE UNIT'S INKS READ ON EVERY GROUND, AND DAY STAYS VIVID. Over every built-in scheme, under
+/// every palette and none, on three rule greys, each word of the account unit wears its role's
+/// token ([`footer::Tone`]): the name and the reset's `↺` the lit ink, the figure and the time the
+/// value ink, the joins the quiet ink, each at 4.5:1 or more; a stop's words the warn ink, bold,
+/// at 4.5:1 or more, leading with `╳` (a stop is said, not coloured), and no warn ink without
+/// one; the unit's `⎆` its column's marks ink, which on Aterm Day under Cruise and Land keeps the
+/// glass's vivid law ([`aterm_effects::glass_inks::day_vivid`]). Negative control: the mark mixed
+/// toward the ground (`mix(mark, bg, 0.4)`) washes out on Day.
 #[test]
-fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
+fn the_units_inks_read_on_every_ground_and_day_stays_vivid() {
     use aterm_effects::harness_card::CardPalette;
     let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
     let palettes = [
@@ -154,7 +134,7 @@ fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
     ];
     let room = 200;
     let at = rule_at_room(room);
-    let (mut meters, mut tracks, mut warns, mut days) = (0usize, 0usize, 0usize, 0usize);
+    let (mut lits, mut values, mut quiets, mut warns, mut days) = (0, 0, 0, 0, 0usize);
     let mut washed = 0usize;
     for name in builtin_names() {
         let Some(scheme) = builtin(name) else {
@@ -166,7 +146,6 @@ fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
             bg: rgb(scheme.background),
             ..RenderCell::default()
         };
-        let dark = crate::claude_card::dark_ground(blank);
         for palette in palettes {
             let what = format!("{name}, {palette:?}");
             let vivid = name == "Aterm Day"
@@ -180,50 +159,43 @@ fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
                         compose_rule_spans(&fit, None, rule, blank, (&glass, at), room, None);
                     let set = footer::set_facts(&fit.segments);
                     let mut said = String::new();
-                    let mut bar_cells = 0;
                     for glyph in &set.glyphs {
                         let col = paint.facts_at + 1 + glyph.cell;
                         let cell = paint.cells[col];
                         assert_eq!(cell.ch, glyph.ch, "{what}: the composed cell");
                         let k = reads(cell.fg, blank.bg);
-                        if glyph.meter {
-                            bar_cells += 1;
-                            if matches!(glyph.ch, '\u{2500}' | '\u{2504}') {
-                                assert!(k >= ICON_CONTRAST, "{what}: track {k:.2}:1");
-                                tracks += 1;
-                            } else {
-                                let floor = if dark { ICON_CONTRAST } else { NAME_CONTRAST };
-                                assert!(k >= floor, "{what}: meter {k:.2}:1");
-                                assert_eq!(
-                                    cell.fg,
-                                    rgb_of(glass.mark(at.t(col))),
-                                    "{what}: the bar keeps its column's marks ink, never the warn"
+                        if glyph.mark {
+                            if glyph.ch == footer::ACCOUNT_MARK && vivid {
+                                let c = chroma(cell.fg);
+                                assert!(
+                                    day_vivid(pack_rgb(cell.fg)),
+                                    "{what}: the unit's mark on Day at OKLCH C {c:.3}, {:?}",
+                                    cell.fg
                                 );
-                                if vivid {
-                                    let c = chroma(cell.fg);
-                                    assert!(
-                                        day_vivid(pack_rgb(cell.fg)),
-                                        "{what}: the meter on Day at OKLCH C {c:.3}, {:?}",
-                                        cell.fg
-                                    );
-                                    let mixed = mix(cell.fg, blank.bg, 0.4);
-                                    washed += usize::from(!day_vivid(pack_rgb(mixed)));
-                                    days += 1;
-                                }
-                                meters += 1;
+                                let mixed = mix(cell.fg, blank.bg, 0.4);
+                                washed += usize::from(!day_vivid(pack_rgb(mixed)));
+                                days += 1;
                             }
-                        } else if glyph.warn {
-                            assert!(k >= NAME_CONTRAST, "{what}: warn {k:.2}:1");
-                            assert_eq!(cell.fg, rgb_of(glass.warn()), "{what}: the warn ink");
-                            said.push(glyph.ch);
-                            warns += 1;
+                            continue;
                         }
+                        let (ink, count) = match glyph.tone {
+                            footer::Tone::Lit => (glass.lit(), &mut lits),
+                            footer::Tone::Value => (glass.value(), &mut values),
+                            footer::Tone::Quiet => (glass.quiet(), &mut quiets),
+                            footer::Tone::Warn => {
+                                assert!(cell.bold, "{what}: the warn ink is bold");
+                                said.push(glyph.ch);
+                                (glass.warn(), &mut warns)
+                            }
+                        };
+                        assert_eq!(cell.fg, rgb_of(ink), "{what}: {:?}'s token", glyph.ch);
+                        assert!(k >= NAME_CONTRAST, "{what}: {:?} at {k:.2}:1", glyph.ch);
+                        *count += 1;
                     }
-                    assert_eq!(bar_cells, 10, "{what}: the bar is drawn");
                     if stop {
                         // `said` holds the warn ink's glyphs, its blanks not among them.
                         assert!(
-                            said.starts_with('\u{2573}') && said.contains("~Wed22:00"),
+                            said.starts_with('\u{2573}') && said.contains("~Thu12Nov05:00"),
                             "{what}: the warn ink says the stop in words: {said:?}"
                         );
                     } else {
@@ -236,12 +208,12 @@ fn the_outlooks_inks_read_on_every_ground_and_day_stays_vivid() {
     let schemes = builtin_names().len();
     assert!(schemes >= 17, "{schemes} built-ins");
     assert!(
-        meters >= schemes * palettes.len() * 3 * 2 * 7 && tracks > 0 && warns > 0,
-        "{meters} meter, {tracks} track, {warns} warn cells"
+        lits > 0 && values > 0 && quiets > 0 && warns > 0,
+        "{lits} lit, {values} value, {quiets} quiet, {warns} warn cells"
     );
-    assert!(days > 0, "Aterm Day's meter was looked at");
-    // CONTROL: the washed-out look the owner ruled against (2026-10-17): the dashes mixed toward
-    // Day's ground lose their chroma below the floor.
+    assert!(days > 0, "Aterm Day's mark was looked at");
+    // CONTROL: the washed-out look the owner ruled against (2026-10-17): the mark mixed toward
+    // Day's ground loses its chroma below the floor.
     assert!(
         washed > 0,
         "CONTROL: a mix toward Day's ground keeps its chroma"

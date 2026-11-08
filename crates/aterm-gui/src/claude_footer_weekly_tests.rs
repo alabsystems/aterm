@@ -402,7 +402,7 @@ fn the_footer_shows_its_own_taps_week_for_its_own_login_under_the_age_rule() {
     reading(pid, NOW - 60, (380, RESET), None, None);
     assert_eq!(
         weekly(tap_on),
-        words("weekly 62% left"),
+        words("weekly 38% used"),
         "this tab's own reading"
     );
     let figure = |at: i64| {
@@ -420,7 +420,7 @@ fn the_footer_shows_its_own_taps_week_for_its_own_login_under_the_age_rule() {
     );
     assert_eq!(
         weekly(asks(tapped, unarmed)),
-        words("weekly 62% left"),
+        words("weekly 38% used"),
         "a process that carries the tap is read with the switch since turned off"
     );
     assert_eq!(
@@ -438,8 +438,8 @@ fn the_footer_shows_its_own_taps_week_for_its_own_login_under_the_age_rule() {
     reading(pid, NOW - 16 * 60, (380, RESET), None, None);
     assert_eq!(
         weekly(tap_on),
-        words("weekly 62% left \u{b7} 16m ago"),
-        "past fifteen minutes, with its age"
+        words("weekly \u{2265}38% used"),
+        "past fifteen minutes, a lower bound"
     );
     assert_eq!(
         read(tap_on).weekly_figure,
@@ -501,19 +501,19 @@ fn the_footer_shows_its_own_taps_week_for_its_own_login_under_the_age_rule() {
     );
 
     profile(Some((71, NOW - 120)));
-    assert_eq!(weekly(tap_on), words("weekly 62% left"), "the tap is newer");
+    assert_eq!(weekly(tap_on), words("weekly 38% used"), "the tap is newer");
     profile(Some((71, NOW - 30)));
     assert_eq!(
         weekly(tap_on),
-        words("weekly 29% left"),
+        words("weekly 71% used"),
         "the cache is newer"
     );
     reading(pid, NOW - 20 * 60, (380, RESET), None, None);
     profile(Some((71, NOW - 30 * 60)));
     assert_eq!(
         weekly(tap_on),
-        words("weekly 62% left \u{b7} 20m ago"),
-        "the newer of two aged figures, with its age"
+        words("weekly \u{2265}38% used"),
+        "the newer of two aged figures, a lower bound"
     );
     let _ = std::fs::remove_dir_all(root());
 }
@@ -583,7 +583,7 @@ fn a_named_logins_tap_figure_is_its_own_and_its_restart_taps_the_login_every_rel
     reading(pid, NOW - 60, (380, RESET), Some(LOGIN), None);
     assert_eq!(
         weekly(tap_on),
-        words("weekly 62% left"),
+        words("weekly 38% used"),
         "its own login's tap"
     );
     reading(pid, NOW - 60, (380, RESET), Some("/logins/work-2"), None);
@@ -731,14 +731,14 @@ fn a_footer_kept_over_a_registry_miss_keeps_its_taps_week() {
     let shown = reread(&timeline, &mut identity, asks(tapped, armed));
     assert_eq!(
         (shown.weekly, shown.weekly_gap),
-        words("weekly 62% left"),
+        words("weekly 38% used"),
         "the control: the registry row read"
     );
     std::fs::remove_file(records().join(format!("sessions/{PID}.json"))).unwrap();
     let kept = reread(&timeline, &mut identity, asks(tapped, armed));
     assert_eq!(
         (kept.weekly, kept.weekly_gap),
-        words("weekly 62% left"),
+        words("weekly 38% used"),
         "the registry row missed once"
     );
     let _ = std::fs::remove_dir_all(root());
@@ -964,7 +964,7 @@ fn a_footer_with_no_weekly_figure_says_why() {
 }
 
 /// The accounts store's week reaches the footer through the resolver: a weekly wall it
-/// holds says `weekly out` (never an inferred `0% left`), a figure newer than the footer's own
+/// holds says `weekly out` (never an inferred `100% used`), a figure newer than the footer's own
 /// aged one wins, and a refused profile read reads none of it.
 #[test]
 fn the_resolver_reads_the_stores_week_under_the_same_rule() {
@@ -986,13 +986,13 @@ fn the_resolver_reads_the_stores_week_under_the_same_rule() {
     save(Some(NOW - 5 * 60), false);
     assert_eq!(
         weekly(asks(tapped, stored)),
-        words("weekly 60% left"),
+        words("weekly 40% used"),
         "the store's newer figure over the footer's own aged one"
     );
     save(Some(NOW - 30 * 60), false);
     assert_eq!(
         weekly(asks(tapped, stored)),
-        words("weekly 62% left \u{b7} 20m ago"),
+        words("weekly \u{2265}38% used"),
         "the footer's own over an older one"
     );
     save(Some(NOW - 60), true);
@@ -1037,11 +1037,11 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
     };
     assert_eq!(
         words(&with(Some(fig(380, NOW - 60)), None)),
-        (false, Some("weekly 62% left".into()))
+        (false, Some("weekly 38% used".into()))
     );
     assert_eq!(
         words(&with(Some(fig(380, NOW - 20 * 60)), None)),
-        (false, Some("weekly 62% left \u{b7} 20m ago".into()))
+        (false, Some("weekly \u{2265}38% used".into()))
     );
     assert_eq!(
         words(&with(Some(fig(380, NOW - 2 * 86_400)), None)),
@@ -1064,7 +1064,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
             Some(fig(380, NOW - 20 * 60)),
             Some(sample(40, NOW - 5 * 60))
         )),
-        (false, Some("weekly 60% left".into())),
+        (false, Some("weekly 40% used".into())),
         "the newer of the two"
     );
     assert_eq!(
@@ -1072,7 +1072,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
             Some(fig(380, NOW - 3 * 3600)),
             Some(sample(38, NOW - 60))
         )),
-        (false, Some("weekly 62% left".into())),
+        (false, Some("weekly 38% used".into())),
         "equal values do not make a newer panel sample a tap heartbeat"
     );
     assert_eq!(
@@ -1080,7 +1080,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
             Some(fig(380, NOW - 20 * 60)),
             Some(sample(38, NOW - 60))
         )),
-        (false, Some("weekly 62% left".into())),
+        (false, Some("weekly 38% used".into())),
         "older records with no per-window time retain the sample's actual timestamp"
     );
     assert_eq!(
@@ -1088,7 +1088,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
             Some(fig(380, NOW + 60)),
             Some(sample(40, NOW - 5 * 60))
         )),
-        (false, Some("weekly 62% left".into())),
+        (false, Some("weekly 38% used".into())),
         "a reading stamped a minute ahead of this clock is just read"
     );
     assert_eq!(
@@ -1096,7 +1096,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
             Some(fig(380, NOW + 61)),
             Some(sample(40, NOW - 5 * 60))
         )),
-        (false, Some("weekly 60% left".into())),
+        (false, Some("weekly 40% used".into())),
         "one stamped further ahead loses to one it can show"
     );
     let mut walled = with(None, None);
@@ -1170,7 +1170,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
     );
     assert_eq!(
         words(&legacy.accounts["main"]),
-        (false, Some("weekly 62% left".into())),
+        (false, Some("weekly 38% used".into())),
         "legacy absence retains its timestamp; values cannot reconstruct an observation's origin"
     );
 
@@ -1182,7 +1182,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
     state = reload(&state, NOW);
     assert_eq!(
         words(&state.accounts["main"]),
-        (false, Some("weekly 62% left".into())),
+        (false, Some("weekly 38% used".into())),
         "the real fresh probe survives storage and reaches the weekly consumer"
     );
     let beat = NOW + accounts::READING_HEARTBEAT_S;
@@ -1201,7 +1201,7 @@ fn the_stores_weekly_figures_take_the_same_age_rule() {
         store_week(&state.accounts["main"], beat)
             .figure
             .and_then(|figure| figure.words(beat)),
-        Some("weekly 62% left".into())
+        Some("weekly 38% used".into())
     );
     let kept = state.clone();
     assert!(accounts::note_reading(&mut state, "main", &read, beat + 1).is_empty());
@@ -1222,7 +1222,7 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
     save_main(Some(NOW - 60), false);
     assert_eq!(
         weekly(asks(untapped, stored)),
-        words("weekly 60% left"),
+        words("weekly 40% used"),
         "the control: the default home's own account's week"
     );
     let dir = own_config_dir();
@@ -1302,21 +1302,21 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
     let shown = read(on_personal);
     assert_eq!(
         (shown.weekly.as_deref(), shown.label.as_deref()),
-        (Some("weekly 60% left"), Some("personal")),
+        (Some("weekly 40% used"), Some("personal")),
         "the store's week under the label this process's login is judged to"
     );
     let _ = std::fs::remove_dir_all(root());
 }
 
-/// THE OUTLOOK'S GLANCE SPEAKS ONLY UNDER THE LABEL THE GATE PASSED: the default home's row,
+/// THE QUOTA VIEW SPEAKS ONLY UNDER THE LABEL THE GATE PASSED: the default home's row,
 /// `personal`, beside a second row; with no address on the row the account gate refuses the
 /// profile, and though the footer still names the account the store judges the login to
 /// (`personal`), the pane shows none of the outlook's figures, as its weekly shows none of the
-/// store's. Control: the row's address named, the gate passes and the glance shows. Negative
-/// control: a glance taken under the footer's account label shows on the refused pane.
+/// store's. Control: the row's address named, the gate passes and the view shows. Negative
+/// control: a view taken under the footer's account label shows on the refused pane.
 #[test]
-fn a_pane_whose_gate_refused_shows_no_glance() {
-    fresh("footer-glance-gate");
+fn a_pane_whose_gate_refused_shows_no_quota_view() {
+    fresh("footer-quota-gate");
     profile(None);
     save_as("personal", Some(NOW - 60), false);
     fn two(email: Option<&str>) -> Option<accounts::Roster> {
@@ -1368,7 +1368,15 @@ fn a_pane_whose_gate_refused_shows_no_glance() {
         Some("personal"),
         "CONTROL: the gate passed"
     );
-    assert!(passed.glance.is_some(), "CONTROL: the glance shows");
+    assert!(
+        passed
+            .quota
+            .as_ref()
+            .and_then(|v| v.tab())
+            .map(|n| n.label.as_str())
+            == Some("personal"),
+        "CONTROL: the view shows, this tab's row the gated label's"
+    );
     let refused = facts(unnamed);
     assert_eq!(
         (
@@ -1378,7 +1386,7 @@ fn a_pane_whose_gate_refused_shows_no_glance() {
         (Some("personal"), None),
         "the gate refused, the footer still names the account"
     );
-    assert_eq!(refused.glance, None);
+    assert_eq!((refused.quota, refused.quota_observed), (None, None));
     crate::accounts_outlook::TEST_STATE_DIR.with(|d| *d.borrow_mut() = None);
     let _ = std::fs::remove_dir_all(root());
 }
@@ -1393,7 +1401,7 @@ fn a_weekly_wall_beats_the_footers_own_aged_figure() {
     reading(PID as u32, NOW - 20 * 60, (970, RESET), None, None);
     assert_eq!(
         weekly(asks(tapped, armed)),
-        words("weekly 3% left \u{b7} 20m ago"),
+        words("weekly \u{2265}97% used"),
         "the control: no wall"
     );
     weekly_wall();
@@ -1405,7 +1413,7 @@ fn a_weekly_wall_beats_the_footers_own_aged_figure() {
     reading(PID as u32, NOW - 60, (970, RESET), None, None);
     assert_eq!(
         weekly(asks(tapped, armed)),
-        words("weekly 3% left"),
+        words("weekly 97% used"),
         "a current reading says its own"
     );
     let _ = std::fs::remove_dir_all(root());

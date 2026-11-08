@@ -670,10 +670,18 @@ impl Reading {
 
 /// THE TAP'S WORDS AT THE HEAD OF `text`, a row read from its third cell (Claude Code indents
 /// the statusLine two): their width in cells where `text` starts with exactly a line the tap
-/// prints ([`Reading::week_words`], [`NO_WEEK`]) and nothing follows it but blanks, or a notice
-/// of Claude Code's own two blanks or more away (`Now using usage credits`); `None` for any other
-/// text: an owner's own row, the five-hour-and-week row of builds before this one (`5h 42% · 7d
-/// 61%`), or a figure the tap never prints (`101%`, `07%`, `63.5%`).
+/// prints ([`Reading::week_words`], [`NO_WEEK`]) and ends there or at a blank; `None` for any
+/// other text: an owner's own row, the five-hour-and-week row of builds before this one (`5h 42%
+/// · 7d 61%`), a figure the tap never prints (`101%`, `07%`, `63.5%`), one run on into a
+/// word (`week 63% usedX`), or one Claude Code cut with `…` at `cols − 3` in a narrow pane
+/// (`week 63% used · rese…`, `week 63% used …`), whose reset clause is not whole.
+///
+/// It reads the tap's grammar and stops where its form ends, never at a gap
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.2): Claude Code's own notice may sit one
+/// blank after the words (manual mode, aterm-phase's
+/// `claude-2.1.318-tap-row-week-credits-manual-60col.txt`) or further, and whatever follows is
+/// the caller's to judge. Whose row it is, the tap's or an owner's command that prints the same
+/// head, is the reading's to say ([`Reading::claimable`]), not the text's.
 #[must_use]
 pub fn parse_line(text: &str) -> Option<usize> {
     let words = if text.starts_with(NO_WEEK) {
@@ -682,8 +690,10 @@ pub fn parse_line(text: &str) -> Option<usize> {
         week_len(text)?
     };
     let rest = text.get(words..)?;
-    (rest.trim_start_matches(' ').is_empty() || rest.starts_with("  "))
-        .then(|| text[..words].chars().count())
+    // A blank ends the words, unless Claude's cut (`…` at `cols − 3`) is the next thing on the
+    // row: a row cut just after `used ` is a cut row, not the bare form beside a notice.
+    let cut = rest.trim_start_matches(' ').starts_with('\u{2026}');
+    (rest.is_empty() || (rest.starts_with(' ') && !cut)).then(|| text[..words].chars().count())
 }
 
 /// The length in bytes of a figure's row at the head of `text` ([`parse_line`]): `week `, a whole
@@ -700,8 +710,11 @@ fn week_len(text: &str) -> Option<usize> {
         return None;
     }
     let rest = rest.get(digits..)?.strip_prefix("% used")?;
+    // The reset clause is whole or absent: its separator with anything short of a whole clause
+    // after it is a row Claude cut inside it (`week 63% used · rese…`), never the bare form.
     let reset = match rest.strip_prefix(RESETS) {
         Some(when) => RESETS.len() + super::outlook::when_len(when)?,
+        None if rest.starts_with(" \u{b7}") => return None,
         None => 0,
     };
     Some(text.len() - rest.len() + reset)

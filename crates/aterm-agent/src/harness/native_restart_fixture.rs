@@ -33,7 +33,7 @@ pub(in crate::harness) fn retain_bound_preparation(state: &mut St) {
         expected_human_seq: Some(0),
         deadline_us: 100,
         duty: Scope::Relaunch,
-        asked_upgrade: None,
+        asked: None,
         plan: NativePlan::Restart {
             process: process.clone(),
             shell: process.clone(),

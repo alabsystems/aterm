@@ -88,26 +88,24 @@ fn tabs(sides: &[Side]) -> Vec<(&'static str, RenderCell)> {
     tabs
 }
 
-/// The marks [`every_fact`] draws: the join before the week.
-const MARKS: [char; 9] = [
+/// The marks [`every_fact`] draws: the account unit's one `⎆`, its figure attached markless.
+const MARKS: [char; 7] = [
     footer::MODEL_MARK,
     footer::PATH_MARK,
     footer::BRANCH_MARK,
     footer::ACCOUNT_MARK,
-    footer::JOIN_MARK,
     footer::WALL_MARK,
     footer::CONTEXT_MARK,
     footer::USAGE_MARK,
-    footer::RESET_MARK,
 ];
 
 fn every_fact() -> footer::RuleFit {
     use footer::Segment;
     footer::RuleFit {
         segments: vec![
-            Segment::plain(footer::ACCOUNT_MARK, "me@example.test"),
-            Segment::joined(footer::WEEKLY_MARK, "40%"),
-            Segment::plain(footer::WALL_MARK, format!("5h {} 3pm", footer::RESET_MARK)),
+            Segment::plain(footer::ACCOUNT_MARK, "main"),
+            Segment::attached(footer::ACCOUNT_MARK, "40%"),
+            Segment::plain(footer::WALL_MARK, "until 3pm"),
             Segment {
                 split: Some("Opus 5.5 ".len()),
                 quiet: (false, true),

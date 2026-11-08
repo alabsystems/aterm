@@ -5016,7 +5016,7 @@ fn split_pattern_note(parts: &[String]) -> Option<String> {
     }?;
     Some(format!(
         "note: '{arg}' contains whitespace and is split on the wire; \
-         write the pattern as ONE token (e.g. esc.to.interrupt)"
+         write the pattern as ONE token (e.g. Do.you.want.to.proceed)"
     ))
 }
 

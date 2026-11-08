@@ -3237,7 +3237,8 @@ impl App {
             .map_or((0, 0), |ws| ws.last_mouse_window_cell);
         let window_row = window_cell.0;
         let cell_is_under_pointer = self.pointer_is_inside_focused_pane(wid)
-            && !self.chrome_owns_terminal_row(wid, usize::from(window_row));
+            && !self.chrome_owns_terminal_row(wid, usize::from(window_row))
+            && !self.glass_swallows_at(wid, px, py);
         if self.rewound_front(wid).is_some() {
             self.set_hover_cursor(wid, CursorIcon::Text, false, true);
             return Resolved(None);
@@ -4399,8 +4400,16 @@ impl App {
             return None;
         }
         let (px, py) = ws.last_cursor_px;
+        if crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
+            != crate::claude_lights::OverChips::No
+        {
+            return None;
+        }
         if let Some((_, url)) = self.claude_glass_hit_at(wid, px, py) {
             return url.map(|url| (url.to_owned(), false));
+        }
+        if self.glass_swallows_at(wid, px, py) {
+            return None;
         }
         let term = term_lock(&ws.front_terminal()?.term);
         let col = pointer_cell(&term, row, col).0;
@@ -4428,7 +4437,11 @@ impl App {
             return None;
         }
         let (px, py) = ws.last_cursor_px;
-        if self.claude_glass_hit_at(wid, px, py).is_some() {
+        if crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
+            != crate::claude_lights::OverChips::No
+            || self.claude_glass_hit_at(wid, px, py).is_some()
+            || self.glass_swallows_at(wid, px, py)
+        {
             return None;
         }
         let front = ws.front_terminal()?;

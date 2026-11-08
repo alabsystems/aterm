@@ -493,8 +493,8 @@ impl Shared {
         }
     }
 
-    /// `privacy`'s `program_check=` ([`crate::vitals_jobs::program_check_of`]) from the newest jobs view this copy holds, pulled once when none speaks for now (leftover §9); `None` with no view that speaks for now after it. A control worker's call: the pull waits for the probe.
-    pub(crate) fn program_check_now(&self) -> Option<(u32, u64)> {
+    /// `privacy`'s `program_check=` and `program_check_stranded=` ([`crate::vitals_jobs::program_check_of`]) from the newest jobs view this copy holds, pulled once when none speaks for now (leftover §9); `None` with no view that speaks for now after it. A control worker's call: the pull waits for the probe.
+    pub(crate) fn program_check_now(&self) -> Option<crate::vitals_jobs::HeldCount> {
         let read = || {
             let (snap, at, reader) = self.jobs_snapshot()?;
             let view = snap.jobs.as_deref()?;
@@ -1863,8 +1863,9 @@ pub(crate) fn untargeted_left(
 }
 
 impl crate::App {
-    /// `status`'s `job=`, `job_quiet_ms=` and `program_check=` fields for `session`, from one
-    /// adopted view at one age; `program_check=-` off macOS, where nothing is held at a check.
+    /// `status`'s `job=`, `job_quiet_ms=`, `program_check=` and `program_check_stranded=` fields
+    /// for `session`, from one adopted view at one age; both `-` off macOS, where nothing is held
+    /// at a check.
     pub(crate) fn status_job_fields(&self, session: u64) -> String {
         let now = Instant::now();
         let view = self.vitals.snapshot.clone().zip(self.vitals.adopted_at);

@@ -48,117 +48,7 @@ const LOCAL: Duration = Duration::from_secs(60);
 /// The hang detector on a git step that reaches the network or checks out a merge.
 const NETWORK: Duration = Duration::from_secs(600);
 
-/// One dev-set run: its exit code, each finished check's row, its wall seconds, and what its
-/// last event says it finished.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Judged {
-    /// The run's exit code ([`exit`]).
-    pub code: i32,
-    /// Each check the run finished, in the order it finished them.
-    pub checks: Vec<CheckRow>,
-    /// The run's wall seconds.
-    pub secs: u64,
-    /// The run's own `run-finished` event (`report::run_event`); `None` where none was read.
-    pub finished: Option<Finished>,
-}
-
-impl Judged {
-    /// Whether its rows are the run's whole record: its `run-finished` event names its exit code
-    /// and exactly the checks its rows name, each with its word. A line the events file lost
-    /// leaves a check the event names with no row, or the event itself missing.
-    #[must_use]
-    pub fn whole(&self) -> bool {
-        let mut rows: Vec<(&str, &str)> = self
-            .checks
-            .iter()
-            .map(|row| (row.check.as_str(), row.word.as_str()))
-            .collect();
-        rows.sort_unstable();
-        self.finished.as_ref().is_some_and(|finished| {
-            let mut named: Vec<(&str, &str)> = finished
-                .checks
-                .iter()
-                .map(|(check, word)| (check.as_str(), word.as_str()))
-                .collect();
-            named.sort_unstable();
-            finished.code == self.code && named == rows
-        })
-    }
-}
-
-/// What a run's `run-finished` event states: its exit code and each check it finished, with its
-/// outcome word.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Finished {
-    /// The run's exit code.
-    pub code: i32,
-    /// Each check and its word.
-    pub checks: Vec<(String, String)>,
-}
-
-impl Finished {
-    /// What a `verify-event: {…}` line states, when it is a `run-finished` event.
-    #[must_use]
-    pub fn of_event(line: &str) -> Option<Self> {
-        let value: aterm_json::Value =
-            aterm_json::from_str(line.strip_prefix("verify-event: ")?).ok()?;
-        if value.get("event")?.as_str()? != "run-finished" {
-            return None;
-        }
-        let checks = value
-            .get("checks")?
-            .as_array()?
-            .iter()
-            .map(|c| {
-                Some((
-                    c.get("check")?.as_str()?.to_owned(),
-                    c.get("outcome")?.as_str()?.to_owned(),
-                ))
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self {
-            code: i32::try_from(value.get("code")?.as_i64()?).ok()?,
-            checks,
-        })
-    }
-}
-
-/// One finished check, as its `check-finished` event states it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CheckRow {
-    /// The check's name.
-    pub check: String,
-    /// Its outcome word: `ok`, `skip`, `FAIL` or `NOT RUN`.
-    pub word: String,
-    /// The ids of the findings the event carries (at most `report::FINDINGS_SHOWN`).
-    pub findings: Vec<String>,
-    /// How many findings the check had.
-    pub findings_total: usize,
-}
-
-impl CheckRow {
-    /// The row a `verify-event: {…}` line states, when it is a `check-finished` event.
-    #[must_use]
-    pub fn of_event(line: &str) -> Option<Self> {
-        let json = line.strip_prefix("verify-event: ")?;
-        let value: aterm_json::Value = aterm_json::from_str(json).ok()?;
-        if value.get("event")?.as_str()? != "check-finished" {
-            return None;
-        }
-        let findings = value
-            .get("findings")?
-            .as_array()?
-            .iter()
-            .map(|f| f.as_str().map(str::to_owned))
-            .collect::<Option<Vec<_>>>()?;
-        Some(Self {
-            check: value.get("check")?.as_str()?.to_owned(),
-            word: value.get("outcome")?.as_str()?.to_owned(),
-            findings,
-            findings_total: usize::try_from(value.get("findings_total")?.as_u64()?).ok()?,
-        })
-    }
-}
+pub use crate::event_log::{CheckRow, Finished, Judged};
 
 /// The branch's own crates: a red in one of them is the branch's, whatever main's lane says.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -452,7 +342,11 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
             } else {
                 format!(
                     "verify land: {tip} does not compose: its new commits touch the branch's {}",
-                    overlap.join(", ")
+                    overlap
+                        .iter()
+                        .map(|path| display_git_path(path))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )
             },
         );
@@ -577,11 +471,15 @@ fn judge(
     Ok(None)
 }
 
-fn conflicted(seams: &mut Seams<'_>, main: &str, paths: &[String]) -> i32 {
+fn conflicted(seams: &mut Seams<'_>, main: &str, paths: &[Vec<u8>]) -> i32 {
     (seams.say)(&format!(
         "verify land: FAIL — merging {main} conflicts in {}; nothing was pushed. Fix: resolve \
          them, commit the merge and run it again",
-        paths.join(", ")
+        paths
+            .iter()
+            .map(|path| display_git_path(path))
+            .collect::<Vec<_>>()
+            .join(", ")
     ));
     exit::FAILED
 }
@@ -607,7 +505,21 @@ enum Merge {
     /// Merged and committed: the merge commit.
     Clean(String),
     /// Stopped on conflicts, left for the person: the conflicted paths.
-    Conflict(Vec<String>),
+    Conflict(Vec<Vec<u8>>),
+}
+
+/// Render Git path bytes on one diagnostic line, preserving invalid bytes as escapes.
+fn display_git_path(path: &[u8]) -> String {
+    let shown = match std::str::from_utf8(path) {
+        Ok(path) => path.escape_debug().to_string(),
+        Err(_) => path
+            .iter()
+            .copied()
+            .flat_map(std::ascii::escape_default)
+            .map(char::from)
+            .collect(),
+    };
+    format!("\"{shown}\"")
 }
 
 /// The checkout's git.
@@ -616,16 +528,37 @@ struct Git<'a> {
     make: &'a dyn Fn(&Path) -> Command,
 }
 
+/// A status-only Git result. Tailed stdout cannot supply semantic data through this type.
+struct GitStatus {
+    status: std::process::ExitStatus,
+    stderr: Vec<u8>,
+}
+
 impl Git<'_> {
-    fn run(&self, args: &[&str], within: Duration) -> Result<std::process::Output, String> {
+    fn status(&self, args: &[&str], within: Duration) -> Result<GitStatus, String> {
         let mut cmd = (self.make)(self.root);
         cmd.args(args);
-        aterm_uds::deadline::output_until(&mut cmd, Instant::now() + within)
-            .map_err(|e| format!("git {}: {e}", args.join(" ")))
+        let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + within)
+            .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+        Ok(GitStatus {
+            status: out.status,
+            stderr: out.stderr,
+        })
+    }
+
+    fn complete(&self, args: &[&str], within: Duration) -> Result<std::process::Output, String> {
+        let mut cmd = (self.make)(self.root);
+        cmd.args(args);
+        aterm_uds::deadline::output_until_complete_stdout_with_limit(
+            &mut cmd,
+            Instant::now() + within,
+            aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
+        )
+        .map_err(|error| format!("git {}: {error}", args.join(" ")))
     }
 
     fn ok(&self, args: &[&str], within: Duration) -> Result<String, String> {
-        let out = self.run(args, within)?;
+        let out = self.complete(args, within)?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
         } else {
@@ -688,7 +621,7 @@ impl Git<'_> {
     }
 
     fn is_ancestor(&self, ancestor: &str, of: &str) -> Result<bool, String> {
-        let out = self.run(&["merge-base", "--is-ancestor", ancestor, of], LOCAL)?;
+        let out = self.status(&["merge-base", "--is-ancestor", ancestor, of], LOCAL)?;
         match out.status.code() {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
@@ -700,23 +633,26 @@ impl Git<'_> {
     }
 
     /// The paths whose content differs between the trees of `from` and `to`.
-    fn files(&self, from: &str, to: &str) -> Result<BTreeSet<String>, String> {
-        let out = self.run(
-            &[
-                "diff-tree",
-                "-r",
-                "-z",
-                "--name-only",
-                "--no-renames",
-                "--ignore-submodules=none",
-                from,
-                to,
-            ],
-            LOCAL,
-        )?;
+    fn files(&self, from: &str, to: &str) -> Result<BTreeSet<Vec<u8>>, String> {
+        self.paths(&[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-only",
+            "--no-renames",
+            "--ignore-submodules=none",
+            from,
+            to,
+        ])
+    }
+
+    /// Read Git's NUL-delimited path protocol without trimming or decoding its data.
+    fn paths(&self, args: &[&str]) -> Result<BTreeSet<Vec<u8>>, String> {
+        let out = self.complete(args, LOCAL)?;
         if !out.status.success() {
             return Err(format!(
-                "git diff-tree {from} {to}: {}",
+                "git {}: {}",
+                args.join(" "),
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
@@ -724,13 +660,13 @@ impl Git<'_> {
             .stdout
             .split(|b| *b == 0)
             .filter(|p| !p.is_empty())
-            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .map(<[u8]>::to_vec)
             .collect())
     }
 
     /// The tree a clean merge of `ours` and `theirs` makes, or `None` where it conflicts.
     fn merge_tree(&self, ours: &str, theirs: &str) -> Result<Option<String>, String> {
-        let out = self.run(
+        let out = self.complete(
             &["merge-tree", "--write-tree", "--no-messages", ours, theirs],
             LOCAL,
         )?;
@@ -751,7 +687,7 @@ impl Git<'_> {
 
     /// Merge main commit `main` into the checkout and update its submodules.
     fn merge(&self, main: &str, subject: &str) -> Result<Merge, String> {
-        let out = self.run(
+        let out = self.status(
             &[
                 "-c",
                 "submodule.recurse=false",
@@ -766,16 +702,14 @@ impl Git<'_> {
             NETWORK,
         )?;
         if !out.status.success() {
-            let conflicted = self.local(&["diff", "--name-only", "--diff-filter=U"])?;
+            let conflicted = self.paths(&["diff", "-z", "--name-only", "--diff-filter=U"])?;
             if conflicted.is_empty() {
                 return Err(format!(
                     "git merge {main}: {}",
                     String::from_utf8_lossy(&out.stderr).trim()
                 ));
             }
-            return Ok(Merge::Conflict(
-                conflicted.lines().map(str::to_owned).collect(),
-            ));
+            return Ok(Merge::Conflict(conflicted.into_iter().collect()));
         }
         self.update_submodules()?;
         Ok(Merge::Clean(self.head()?))

@@ -1973,22 +1973,54 @@ fn rendered(app: &mut App, wid: WindowId) -> (usize, usize, Vec<u8>) {
 }
 
 /// LINES B, D AND E IGNORE THE SYSTEM ACCENT (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
-/// §4.1, S4): a Claude Code pane under the harness, unsupervised (no palette: the neutral inks)
-/// and supervised (Cruise's palette: the arc, the letters and the hero), rendered by the capture
-/// route under two system accents, is pixel-identical on its top rule (line B), its composer
-/// rule (line D) and the row under it (line E). CONTROLS: the two accents reach the band the
-/// glass once read them from; the supervised pane's lines B and D wear the palette, so their
-/// pixels differ from the unsupervised pane's; and the harness held off changes line D's pixels,
-/// so the comparison sees its inks.
+/// §4.1, S4, S5): a Claude Code pane under the harness, unsupervised (no palette: the neutral
+/// inks) and supervised (Cruise's palette: the arc, the letters and the hero), its line E the
+/// glass's quota row (the tap's words under the bottom rule, a reading that says the row is the
+/// tap's own, case (b)'s view), rendered by the capture route under two system accents, is
+/// pixel-identical on its top rule (line B), its composer rule (line D) and the quota row (line
+/// E). CONTROLS: the two accents reach the band the glass once read them from; line E is
+/// claimed (the row's three hits); the supervised pane's lines B, D and E wear the palette, so
+/// their pixels differ from the unsupervised pane's; and the harness held off changes line D's
+/// pixels, so the comparison sees its inks.
 #[test]
 fn lines_b_d_and_e_ignore_the_system_accent() {
     use crate::native_appearance::{SystemAccent, install_system_accent};
+    use aterm_agent::harness::footer::FooterFacts;
+    use aterm_agent::harness::profile::SubscriptionDisplay;
+    let view = aterm_agent::harness::quota_scenes::cases()
+        .into_iter()
+        .find(|(name, _)| *name == "b")
+        .map(|(_, view)| view)
+        .expect("case (b)");
     let shot = |accent: [u8; 3], supervised: bool, off: bool| {
         install_system_accent(Some(SystemAccent {
             on_dark: accent,
             on_light: accent,
         }));
         let (mut app, wid, session, _reader, _host) = claude_pane(110);
+        draw_claude(&app, session, "  week 63% used \u{b7} resets Sat 10:00");
+        {
+            let entry = app.pool.get(session).expect("session");
+            let mut timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            timeline.note_foreground_group(PGID);
+            assert!(timeline.set_claude_footer(
+                PGID,
+                None,
+                Some(FooterFacts {
+                    model: Some("Opus 5.5".into()),
+                    effort: Some("xhigh".into()),
+                    path: Some("~/aterm".into()),
+                    branch: Some("main".into()),
+                    account: Some("main".into()),
+                    subscription: Some(SubscriptionDisplay {
+                        tap_own: true,
+                        ..SubscriptionDisplay::default()
+                    }),
+                    quota: Some(view.clone()),
+                    ..FooterFacts::default()
+                }),
+            ));
+        }
         if supervised {
             let ctx = app.pool.get(session).expect("session").ctx.clone();
             crate::session_timeline::claim_supervisor(
@@ -2004,6 +2036,18 @@ fn lines_b_d_and_e_ignore_the_system_accent() {
             policy(&mut app, MASTER_OFF);
         }
         frame(&mut app, wid);
+        frame(&mut app, wid);
+        let quota_hits = app.windows[&wid]
+            .claude_lights
+            .fact_hits
+            .iter()
+            .filter(|h| h.part.is_some())
+            .count();
+        assert_eq!(
+            quota_hits,
+            if off { 0 } else { 3 },
+            "CONTROL: line E is the quota row (supervised: {supervised}, off: {off})"
+        );
         let band = crate::chrome_band::band_colors(app.theme).accent;
         let rule = footer_row(&app, wid);
         let (w, h, rgba) = rendered(&mut app, wid);
@@ -2039,7 +2083,7 @@ fn lines_b_d_and_e_ignore_the_system_accent() {
     let (_, held) = shot(blue, false, true);
     install_system_accent(None);
     let (plain, cruise) = (&seen[0], &seen[1]);
-    for (k, line) in [(0, "B"), (1, "D")] {
+    for (k, line) in [(0, "B"), (1, "D"), (2, "E")] {
         assert!(
             plain[k] != cruise[k],
             "CONTROL: the supervised pane's line {line} wears the palette"

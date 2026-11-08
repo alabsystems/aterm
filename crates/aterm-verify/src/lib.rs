@@ -51,6 +51,7 @@ pub mod smoke;
 pub mod smoke_stages;
 pub mod soak;
 pub mod stages;
+pub mod status;
 pub mod test_history;
 pub mod test_index;
 pub mod test_plan;
@@ -2610,6 +2611,9 @@ pub fn head_commit(root: &Path, path_env: &OsStr) -> Option<String> {
 /// The whole CLI, in-process.
 #[must_use]
 pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
+    if args.first().is_some_and(|arg| arg == "status") {
+        return status::run(&args[1..], cwd);
+    }
     #[cfg(unix)]
     if args.first().is_some_and(|a| a == "watch") {
         return watch::run(&args[1..], cwd);

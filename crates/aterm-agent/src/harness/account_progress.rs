@@ -461,12 +461,9 @@ mod tests {
         assert_eq!(progress.eligible, Some(0));
         assert_eq!(progress.phase, ProgressPhase::Waiting);
         assert!(progress.details[0].contains("current: signed out"));
-        for narrow in [false, true] {
-            assert!(
-                super::super::footer::account_progress_text(&progress, narrow)
-                    .contains("current: signed out")
-            );
-        }
+        assert!(
+            super::super::footer::account_progress_text(&progress).contains("current: signed out")
+        );
     }
 
     #[test]
@@ -568,12 +565,10 @@ mod tests {
             assert!(progress.details.iter().any(|line| line == generic));
             if prefer {
                 assert!(progress.details[0].starts_with("current:"));
-                for narrow in [false, true] {
-                    assert!(
-                        super::super::footer::account_progress_text(&progress, narrow)
-                            .contains(&progress.details[0])
-                    );
-                }
+                assert!(
+                    super::super::footer::account_progress_text(&progress)
+                        .contains(&progress.details[0])
+                );
             } else {
                 assert_eq!(progress.details[0], generic);
             }

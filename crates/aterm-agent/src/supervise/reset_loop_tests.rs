@@ -2207,7 +2207,7 @@ impl IdleHost for Transcribed {
 }
 
 #[derive(Default)]
-struct NoteSink(Vec<String>);
+pub(super) struct NoteSink(pub(super) Vec<String>);
 
 impl Review for NoteSink {
     fn approved(&mut self, _seq: u64, _command: &str) -> Result<(), String> {
@@ -2231,7 +2231,7 @@ impl Review for NoteSink {
 }
 
 /// A capture names the version the agent's newest transcript row names, and the grid; the same
-/// sighting is kept once however often it is read; a loop keeps at most `RESET_CAPTURES` of each
+/// sighting is kept once however often it is read; a loop keeps at most `CAPTURES_EACH` of each
 /// sight, and a sight whose room is used up leaves another's: a dialog with no reset on offer and
 /// an answer are still kept after the offers' room is gone. NEGATIVE CONTROLS: an agy session's
 /// screen of the same rows, and a Claude Code screen with no reset program, are kept never.
@@ -2256,13 +2256,13 @@ fn a_capture_names_its_build_and_a_loop_keeps_each_sighting_once() {
     let mut s = session(&mut m, Some("@s-1".to_string()));
     s.program = Some("claude".to_string());
     let mut noted = NoteSink::default();
-    s.reset_capture(&dialog(RESET_GRANT), &opts, &mut noted);
-    s.reset_capture(&dialog(RESET_GRANT), &opts, &mut noted);
+    s.screen_capture(&dialog(RESET_GRANT), &opts, &mut noted);
+    s.screen_capture(&dialog(RESET_GRANT), &opts, &mut noted);
     let idle = Screen {
         rows: idle_screen(),
         ..Screen::default()
     };
-    s.reset_capture(&idle, &opts, &mut noted);
+    s.screen_capture(&idle, &opts, &mut noted);
     assert_eq!(noted.0.len(), 1, "{:#?}", noted.0);
     let c = crate::supervise::journal::Capture::of_line(&noted.0[0]).expect("a capture");
     assert_eq!(c.what, "reset-offer");
@@ -2280,13 +2280,13 @@ fn a_capture_names_its_build_and_a_loop_keeps_each_sighting_once() {
         c.fixture("2026-11-04")
     );
     assert_eq!(screen(&c.fixture("2026-11-04")), c.rows);
-    for n in 0..2 * crate::supervise::run::reset_loop::RESET_CAPTURES {
+    for n in 0..2 * crate::supervise::run::capture_loop::CAPTURES_EACH {
         let grant = format!("Use a weekly reset ({} left, until Oct 5)", n + 3);
-        s.reset_capture(&dialog(&grant), &opts, &mut noted);
+        s.screen_capture(&dialog(&grant), &opts, &mut noted);
     }
     assert_eq!(
         noted.0.len(),
-        crate::supervise::run::reset_loop::RESET_CAPTURES,
+        crate::supervise::run::capture_loop::CAPTURES_EACH,
         "{:#?}",
         noted.0.len()
     );
@@ -2294,18 +2294,18 @@ fn a_capture_names_its_build_and_a_loop_keeps_each_sighting_once() {
         rows: limit_options_panel(&[RESET_STOP, RESET_WAIT, RESET_CREDITS], 0, true),
         ..dialog(RESET_GRANT)
     };
-    s.reset_capture(&plain, &opts, &mut noted);
+    s.screen_capture(&plain, &opts, &mut noted);
     let answer = Screen {
         rows: screen(aterm_phase::reset::fixtures::SPENT_SESSION_2_1_312),
         ..Screen::default()
     };
-    s.reset_capture(&answer, &opts, &mut noted);
-    s.reset_capture(
+    s.screen_capture(&answer, &opts, &mut noted);
+    s.screen_capture(
         &dialog("Use a weekly reset (99 left, until Oct 5)"),
         &opts,
         &mut noted,
     );
-    let whats: Vec<String> = noted.0[crate::supervise::run::reset_loop::RESET_CAPTURES..]
+    let whats: Vec<String> = noted.0[crate::supervise::run::capture_loop::CAPTURES_EACH..]
         .iter()
         .filter_map(|line| crate::supervise::journal::Capture::of_line(line))
         .map(|c| c.what)
@@ -2316,7 +2316,7 @@ fn a_capture_names_its_build_and_a_loop_keeps_each_sighting_once() {
     let mut agy = session(&mut m, Some("@s-2".to_string()));
     agy.program = Some("agy".to_string());
     let mut none = NoteSink::default();
-    agy.reset_capture(&dialog(RESET_GRANT), &opts, &mut none);
+    agy.screen_capture(&dialog(RESET_GRANT), &opts, &mut none);
     assert!(none.0.is_empty(), "{:#?}", none.0);
 }
 

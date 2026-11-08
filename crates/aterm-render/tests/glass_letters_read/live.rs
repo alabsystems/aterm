@@ -565,12 +565,17 @@ fn a_coloured_line_keeps_every_letter_at_its_bar_and_one_run_under_it() {
 /// held to its dimmest level's bar ([`with_least_level_bar`]), one the judges read at AA reads
 /// under it on Default Light (on GitHub Light, at that bar, none on this line falls under it: the
 /// least reads 4.508). The last two words are magentas of the coloured line and the flood: W1's
-/// #b43fb4 and #b441b4 on Default Light, #bb43bb and the flood's #c1479f on GitHub Light. A letter
-/// the judges read at 4.495 to 4.5 is held by aterm-effects'
-/// `a_letter_the_judges_read_at_aa_keeps_aa` and `a_letter_on_a_dim_page_keeps_a_level_in_hand`.
+/// #b43fb4 and #b441b4 on Default Light, #bb43bb and the flood's #c1479f on GitHub Light. The
+/// first is the face's [`uncored_word`] in #b43fb4: a glyph whose core holds its word from every
+/// glass holds it under the last control too. A letter the judges read at 4.495 to 4.5 is held by
+/// aterm-effects' `a_letter_the_judges_read_at_aa_keeps_aa` and
+/// `a_letter_on_a_dim_page_keeps_a_level_in_hand`.
 #[test]
 fn an_app_ink_at_aa_keeps_aa_under_the_glass() {
-    const TEXT: &str = "gypsy pygmy jiggy foggy poppy guppy wow wigwag";
+    let text = format!(
+        "gypsy pygmy jiggy foggy poppy guppy {} wigwag",
+        uncored_word(PAGE, "180;63;180")
+    );
     // Each page's inks, its letters' readings at this size straddling 4.5 to 4.6 (a step of a
     // level moves a glyph's worst solid pixel by a few hundredths), and two magentas.
     const PAGES: [(u32, u32, [&str; 8]); 2] = [
@@ -603,7 +608,7 @@ fn an_app_ink_at_aa_keeps_aa_under_the_glass() {
             ],
         ),
     ];
-    let word = |at: usize| TEXT[..at].matches(' ').count();
+    let word = |at: usize| text[..at].matches(' ').count();
     for (fg, bg, inks) in PAGES {
         let ink = move |at: usize| Some(inks[word(at) % inks.len()].to_owned());
         let read = || {
@@ -613,7 +618,7 @@ fn an_app_ink_at_aa_keeps_aa_under_the_glass() {
                 fg,
                 bg,
                 LiveLine {
-                    text: TEXT,
+                    text: &text,
                     ink: &ink,
                     yields: true,
                 },
@@ -631,10 +636,10 @@ fn an_app_ink_at_aa_keeps_aa_under_the_glass() {
             law.at_aa, law.under_aa, law.least_at_aa
         );
         assert!(
-            law.rail_run * 2 >= TEXT.len(),
+            law.rail_run * 2 >= text.len(),
             "#{bg:06x}: the rail's run is {} columns of {}",
             law.rail_run,
-            TEXT.len()
+            text.len()
         );
         assert!(
             law.judged_at_aa > 0,
@@ -663,4 +668,49 @@ fn an_app_ink_at_aa_keeps_aa_under_the_glass() {
             least.judged_at_aa
         );
     }
+}
+
+/// The first of `wow` and `xxx` in `ink` (`r;g;b`) on the page `(fg, bg)` at 24 px no glyph of
+/// which holds the word from every glass by its core alone: a core whose letter bar lies over its
+/// own reading keeps its word whole whatever its solid levels' bars (aterm-effects' `uncored_word`,
+/// the yield's own test of the same law, says why). #b43fb4's on Default Light is `wow` under
+/// macOS's SF Mono, where the control was measured on it, and `xxx` under Linux's bundled JetBrains
+/// Mono, whose `o` core (coverage 253) reads 4.4976 there (Linux arm64, 2026-11-07).
+fn uncored_word((fg, bg): (u32, u32), ink: &str) -> &'static str {
+    let mut renderer = Renderer::from_system(24.0, Theme::default()).expect("the window face");
+    let (cw, ch) = renderer.cell_size();
+    let rgb_ink = ink
+        .split(';')
+        .map(|c| c.parse::<u32>().expect("a channel"))
+        .fold(0, |rgb, c| rgb << 8 | c);
+    ["wow", "xxx"]
+        .into_iter()
+        .find(|word| {
+            let mut term = Terminal::new(1, 8);
+            term.set_default_foreground(rgb(fg));
+            term.set_default_background(rgb(bg));
+            term.process(format!("\x1b[38;2;{ink}m{word}").as_bytes());
+            let input = term.cell_frame(1, 8);
+            let glyphs = renderer.glyph_ink_for(&input);
+            let frame = glyphs
+                .for_frame(&input, (cw, ch))
+                .expect("the frame's glyph evidence");
+            let corrected = frame.corrected();
+            (0..word.len()).all(|col| {
+                let (_, coverage) = frame.coverage(0, col).expect("the glyph's raster");
+                let core = coverage
+                    .core_level(
+                        aterm_render::linear_luminance(rgb_ink),
+                        aterm_render::linear_luminance(bg),
+                        corrected,
+                    )
+                    .expect("an inked glyph");
+                let read = contrast(
+                    aterm_render::blend_text(bg, rgb_ink, bg, core, corrected),
+                    bg,
+                ) as f32;
+                letter_bar(read, false) <= read
+            })
+        })
+        .expect("a word no core holds")
 }

@@ -70,6 +70,8 @@ pub struct Proc {
     pub held: bool,
     /// What keeps a `held` process from starting: macOS's program check unless set.
     pub wait: aterm_vitals::jobs::StartWait,
+    /// The host judged it stranded at the check (its check went to a syspolicyd no longer running).
+    pub stranded: bool,
     /// Which program the pid runs (the host reads its pid version, which moves on exec).
     pub exec: u64,
     /// A fork that never ran a program of its own (zsh's `zpty` worker).
@@ -126,6 +128,7 @@ impl Proc {
             traced: false,
             held: false,
             wait: aterm_vitals::jobs::StartWait::ProgramCheck,
+            stranded: false,
             exec: 1,
             forked: false,
             aterm: false,
@@ -178,6 +181,8 @@ pub struct World {
     /// The reader reads pid versions (macOS): with none (Linux), only a command's text tells
     /// the engine its shell ran `exec`.
     pub versions: bool,
+    /// The syspolicyd the host judged stranded rows against (`JobTick::program_check_daemon`).
+    pub daemon: Option<u32>,
     /// When aterm's Developer Tools grant took effect, on the world's clock (each held row's
     /// start is its `born`).
     pub grant_ms: Option<u64>,
@@ -211,6 +216,7 @@ impl World {
             vars: HashMap::new(),
             looked: HashMap::new(),
             versions: true,
+            daemon: None,
             grant_ms: None,
             exits: Vec::new(),
         };
@@ -537,6 +543,8 @@ impl World {
             lanes: self.lanes,
             process_limit: self.limit,
             held: self.held(),
+            program_check_daemon: self.daemon,
+            program_check_judged: false,
             grant_ms: self.grant_ms,
             exits: std::mem::take(&mut self.exits),
         };
@@ -651,6 +659,7 @@ impl World {
                 tab: p.tie,
                 job: None,
                 started_ms: p.born,
+                stranded: p.stranded,
             })
             .collect()
     }

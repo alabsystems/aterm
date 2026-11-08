@@ -819,21 +819,8 @@ pub struct ResetSighting {
 #[must_use]
 pub fn reset_sighting(rows: &[String]) -> Option<ResetSighting> {
     let seen = |sight: ResetSight, from: usize, to: usize| {
-        let key = rows
-            .get(from..=to)
-            .unwrap_or_default()
-            .iter()
-            .map(|row| crate::text::trim(row))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let ruled = from
-            .checked_sub(1)
-            .filter(|&over| is_panel_rule(&rows[over]) || is_rule(&rows[over]));
-        ResetSighting {
-            sight,
-            key,
-            top: ruled.unwrap_or(from),
-        }
+        let (key, top) = sighted(rows, from, to);
+        ResetSighting { sight, key, top }
     };
     if let Some((pending, row)) = reset_pending(rows) {
         let title = (0..row)
@@ -845,28 +832,11 @@ pub fn reset_sighting(rows: &[String]) -> Option<ResetSighting> {
             row,
         ));
     }
-    if let Some(p) = crate::prompt::parse_prompt_v2(rows) {
-        let uses = p
-            .options
-            .iter()
-            .any(|o| spends_reset(&o.label) || uses_a_reset(&o.label));
-        let sight = if p.kind == PromptKind::UsageLimit {
-            Some(if uses {
-                ResetSight::Offer
-            } else {
-                ResetSight::Dialog
-            })
-        } else if reset_title(&p.title).is_some() {
-            Some(ResetSight::Confirmation)
-        } else if uses {
-            Some(ResetSight::Chooser)
-        } else {
-            None
-        };
-        if let Some(sight) = sight {
-            let (top, bottom) = p.span;
-            return Some(seen(sight, top.saturating_sub(1), bottom));
-        }
+    if let Some(p) = crate::prompt::parse_prompt_v2(rows)
+        && let Some(sight) = reset_box(&p)
+    {
+        let (top, bottom) = p.span;
+        return Some(seen(sight, top, bottom));
     }
     let (command, answer, last) = reset_answer(rows)?;
     let foot = crate::phase::composer_frame(rows).map_or(rows.len(), |frame| frame.top);
@@ -876,6 +846,45 @@ pub fn reset_sighting(rows: &[String]) -> Option<ResetSighting> {
         .iter()
         .all(|row| crate::text::trim(row).is_empty());
     newest.then(|| seen(ResetSight::Answer(reset_line(&answer)), command, last))
+}
+
+/// What the box `p` shows of the reset program, where it is one of its boxes: the usage-limit
+/// dialog, with a reset on offer or none, a confirmation, or another box with a row that uses or
+/// spends a reset (the chooser).
+pub(crate) fn reset_box(p: &PromptV2) -> Option<ResetSight> {
+    let uses = p
+        .options
+        .iter()
+        .any(|o| spends_reset(&o.label) || uses_a_reset(&o.label));
+    if p.kind == PromptKind::UsageLimit {
+        Some(if uses {
+            ResetSight::Offer
+        } else {
+            ResetSight::Dialog
+        })
+    } else if reset_title(&p.title).is_some() {
+        Some(ResetSight::Confirmation)
+    } else if uses {
+        Some(ResetSight::Chooser)
+    } else {
+        None
+    }
+}
+
+/// A sighting's key and top: `rows[from..=to]` trimmed and joined by `\n`, and the first row a
+/// capture of it keeps, `from` or the rule drawn right over it.
+pub(crate) fn sighted(rows: &[String], from: usize, to: usize) -> (String, usize) {
+    let key = rows
+        .get(from..=to)
+        .unwrap_or_default()
+        .iter()
+        .map(|row| crate::text::trim(row))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let ruled = from
+        .checked_sub(1)
+        .filter(|&over| is_panel_rule(&rows[over]) || is_rule(&rows[over]));
+    (key, ruled.unwrap_or(from))
 }
 
 /// The newest `/rate-limit-options` or `/limit-reset` command row with a `⎿` row under it: the

@@ -163,6 +163,24 @@ pub(crate) fn newly_not_started<'a>(
         .collect()
 }
 
+/// The programs `after` names stranded at macOS's program check that `before` did not: its
+/// `program_check_stranded` rows whose pid `before`'s lacks, so a view adopted again names none and
+/// each program is told once while it stands stranded. A view that names no syspolicyd names none,
+/// so the next that names one names each it finds; the pass keeps a verdict while it reads the row
+/// unrun, so a stale look, a full pool or a backlog unnames none.
+pub(crate) fn newly_stranded<'a>(
+    before: Option<&aterm_vitals::jobs::Findings>,
+    after: &'a aterm_vitals::jobs::Findings,
+) -> Vec<&'a aterm_vitals::jobs::Named> {
+    after
+        .program_check_stranded
+        .iter()
+        .filter(|n| {
+            !before.is_some_and(|b| b.program_check_stranded.iter().any(|w| w.pid == n.pid))
+        })
+        .collect()
+}
+
 /// The rows `f` names as not started for another reason than macOS's program check, each with
 /// what keeps it: translating, then not started, then stopped or traced.
 fn not_started_rows(
@@ -4764,12 +4782,13 @@ impl crate::App {
 
     /// Records what the view just adopted says of macOS's program check: one `program-check.`
     /// record per episode edge it makes against `before` ([`held_edge`]), one naming the programs
-    /// it first says have not started for another reason ([`newly_not_started`]), one when it
-    /// first names programs aterm started after its Developer Tools grant took
-    /// ([`after_grant_edge`]), and, once the view stands in no episode, the verdict refresh held
-    /// back ([`Self::start_devtools_refresh`]): one an episode held ([`Self::refresh_devtools_verdict`])
-    /// or one that did not settle since, held first, so it is asked again at the first view that
-    /// stands in none, this one included.
+    /// it first says have not started for another reason ([`newly_not_started`]), one naming the
+    /// programs it first says are stranded ([`newly_stranded`]) while it names the syspolicyd they
+    /// were judged against, one when it first names programs aterm started after its Developer
+    /// Tools grant took ([`after_grant_edge`]), and, once the view stands in no episode, the
+    /// verdict refresh held back ([`Self::start_devtools_refresh`]): one an episode held
+    /// ([`Self::refresh_devtools_verdict`]) or one that did not settle since, held first, so it is
+    /// asked again at the first view that stands in none, this one included.
     fn note_held_episode(&mut self, before: Option<&aterm_vitals::jobs::JobsView>) {
         let Some(after) = self.vitals.snapshot.as_ref().and_then(|s| s.jobs.clone()) else {
             return;
@@ -4783,6 +4802,12 @@ impl crate::App {
         let fresh = newly_not_started(before.map(|v| &v.findings), &after.findings);
         if !fresh.is_empty() {
             let _ = self.post_message(crate::message_reporters::not_started_record(&fresh));
+        }
+        let stranded = newly_stranded(before.map(|v| &v.findings), &after.findings);
+        if let Some(daemon) = after.findings.program_check_daemon
+            && !stranded.is_empty()
+        {
+            let _ = self.post_message(crate::message_reporters::stranded_record(&stranded, daemon));
         }
         if let Some(n) = after_grant_edge(before.map(|v| &v.findings), &after.findings) {
             let _ = self.post_message(crate::message_reporters::program_check_after_grant(n));

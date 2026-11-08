@@ -16,6 +16,23 @@ pub const MAX_WORLD_ROWS: usize = 64;
 pub const MAX_WORLD_COLS: usize = 256;
 pub const MAX_WORLD_CELLS: usize = MAX_WORLD_ROWS * MAX_WORLD_COLS;
 pub const MAX_WORLD_ANCHORS: usize = 8;
+/// What a pane past the map's budget ([`MAX_WORLD_ROWS`], [`MAX_WORLD_COLS`]) is read about
+/// ([`PetWorld::observe_with_exclusions_near`]): the body's centre (rows and columns of the pane)
+/// when the console hides its caret, and the pane's rows about the body (`first..end`) and the
+/// body's centre column, which a second window reads where the caret's does not read them all
+/// ([`PetWorld::body_window`]).
+pub(crate) type PetCentre = (Option<(f32, f32)>, Option<(usize, usize, usize)>);
+/// How many rows over and under the box the body was last drawn in the console asks the window
+/// about the body to read ([`PetWorld::body_window`]): the rows the laws that keep a body off
+/// the rows beside its own read about it, the row over its feet and the row under them (the
+/// head law's, `PetBrain::head_target`) and the row two over them (a bound's,
+/// `PetBrain::arc_under_letters`), with rows to spare for a body that moves on before the next
+/// frame reads them.
+pub const KEPT_ROWS: usize = 3;
+/// How many rows the window about the body reads at the most ([`PetWorld::body_window`]): a
+/// body's rows (two, a stretched one three) and the [`KEPT_ROWS`] over and under them; with the
+/// map's [`MAX_WORLD_COLS`] columns, `MAX_BODY_ROWS * MAX_WORLD_COLS` cells.
+pub const MAX_BODY_ROWS: usize = 12;
 const MAX_BLOCK_PROBES: usize = 64;
 const MAX_REGIONS: usize = 32;
 /// How far (cells) a rectangle's edge may run past a cell boundary without touching the cell
@@ -431,6 +448,11 @@ pub struct PetWorld {
     /// coloured background.
     hull: Vec<(u16, u16)>,
     coverage: PetPane,
+    /// The window about the body on a pane past the map's budget ([`Self::body_window`]), and
+    /// the glyphs it read (row `r`'s at `r * MAX_WORLD_COLS`): none of the rows the caret's
+    /// window ([`Self::coverage`]) reads across the window's columns.
+    body: PetPane,
+    body_glyphs: Vec<Option<PetGlyph>>,
     /// Map-local cells only the live caret's 3x3 ring protects ([`Forgive`]).
     caret_cells: [CaretCell; 9],
     caret_cells_len: u8,
@@ -480,6 +502,8 @@ impl PetWorld {
             ground_caret_cells_len: 0,
             hull: Vec::new(),
             coverage: PetPane::EMPTY,
+            body: PetPane::EMPTY,
+            body_glyphs: Vec::new(),
             caret_cells: [CaretCell::EMPTY; 9],
             caret_cells_len: 0,
             stamp: None,
@@ -499,6 +523,7 @@ impl PetWorld {
     pub const fn retire(&mut self) {
         self.stamp = None;
         self.coverage = PetPane::EMPTY;
+        self.body = PetPane::EMPTY;
         self.ground_split = false;
         self.caret_cells_len = 0;
         self.ground_caret_cells_len = 0;
@@ -641,10 +666,15 @@ impl PetWorld {
         pane: PetPane,
         reserve: PetReserve<'_>,
     ) -> bool {
-        self.observe_with_exclusions_near(input, facts, pane, reserve, None)
+        self.observe_with_exclusions_near(input, facts, pane, reserve, (None, None))
     }
 
-    /// Observes cells around `hint_rect` when the console hides its cursor.
+    /// Observes cells around `held_center` (the body's centre, rows and columns of the pane)
+    /// when the console hides its cursor, on a pane past the map's budget ([`MAX_WORLD_ROWS`],
+    /// [`MAX_WORLD_COLS`]) about the caret where it shows; and the glyphs of the pane's rows
+    /// `keep` (`first..end`, the rows about the body, and the body's centre column) in a second
+    /// window where that one does not read them all ([`Self::body_window`]). A cell neither
+    /// reads is not read: the glyph readers take no reading of it.
     #[inline]
     pub(crate) fn observe_with_exclusions_near(
         &mut self,
@@ -652,7 +682,7 @@ impl PetWorld {
         facts: &PetWorldFacts,
         pane: PetPane,
         reserve: PetReserve<'_>,
-        held_center: Option<(f32, f32)>,
+        (held_center, keep): PetCentre,
     ) -> bool {
         self.retire();
         let PetReserve {
@@ -672,18 +702,6 @@ impl PetWorld {
                 i += 1;
             }
             true
-        }
-        #[inline]
-        const fn span_contains(spans: &[(usize, usize)], col: usize) -> bool {
-            let mut i = 0;
-            while i < spans.len() {
-                let (lo, hi) = spans[i];
-                if lo <= col && col < hi {
-                    return true;
-                }
-                i += 1;
-            }
-            false
         }
         let s = facts.stamp.surface;
         if s.terminal_id == 0
@@ -765,6 +783,9 @@ impl PetWorld {
             rows,
             cols,
         };
+        if input.display_offset == 0 {
+            self.read_body(input, pane, blanked, keep);
+        }
         let track_ground = any_selection || !overlays.is_empty();
         const PREFIX_LEN: usize = (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1);
         if self.cells.is_empty() {
@@ -886,7 +907,6 @@ impl PetWorld {
             }
             let blanked_spans = &blanked_spans_buf[..n_blanked];
             let mut scan = RowScan::new(input, frame_r);
-            let row_has_compounds = scan.has_compounds();
             let cursor_row_near = input.cursor_visible
                 && input.display_offset == 0
                 && frame_r.abs_diff(input.cursor_row) <= 1;
@@ -930,58 +950,16 @@ impl PetWorld {
                     sel_c1 = sel_c1.max(local_c);
                 }
                 let cursor = cursor_row_near && frame_c.abs_diff(input.cursor_col) <= 1;
-                let decorated =
-                    cell.underline != UnderlineStyle::None || cell.strikethrough || cell.overline;
-                let compound = row_has_compounds
-                    && !glass_blank
-                    && (scan.cluster(frame_c).is_some() || scan.combining(frame_c).is_some());
-                let line = scan.line_size(frame_c);
-                let glyph = cell.ch != ' ' || cell.wide || decorated || compound;
-                let speck = glyph
-                    && !cell.wide
-                    && !decorated
-                    && !compound
-                    && is_single_braille_dot(cell.ch)
-                    && c > 0
-                    && c + 1 < cols
-                    && row_glyphs[c - 1] == Some(PetGlyph::Blank)
-                    && {
-                        let column = frame_c + 1;
-                        let neighbour = match row.get(column) {
-                            Some(n) if !span_contains(blanked_spans, local_c + 1) => n,
-                            _ => &implicit,
-                        };
-                        neighbour.ch == ' '
-                            && !neighbour.wide
-                            && neighbour.underline == UnderlineStyle::None
-                            && !neighbour.strikethrough
-                            && !neighbour.overline
-                            && (scan.is_uniform_single_width()
-                                || input.line_size_run_at(frame_r, column).0
-                                    == LineSize::SingleWidth)
-                            && (!row_has_compounds
-                                || (input.cluster_at(frame_r, column).is_none()
-                                    && input.combining_at(frame_r, column).is_none()))
-                    };
-                row_glyphs[c] = if line == LineSize::SingleWidth {
-                    Some(if !glyph {
-                        PetGlyph::Blank
-                    } else if speck {
-                        PetGlyph::Speck
-                    } else if if cell.wide {
-                        c > 0 && row_glyphs[c - 1] == Some(PetGlyph::Letter)
-                    } else if cell.ch.is_ascii() {
-                        cell.ch.is_ascii_alphanumeric()
-                    } else {
-                        cell.ch.is_alphanumeric()
-                    } {
-                        PetGlyph::Letter
-                    } else {
-                        PetGlyph::Substantive
-                    })
-                } else {
-                    None
-                };
+                let read = read_glyph(
+                    &mut scan,
+                    (input, row.as_slice(), &implicit),
+                    cell,
+                    (c, cols, frame_c),
+                    (glass_blank, span_contains(blanked_spans, local_c + 1)),
+                    if c > 0 { row_glyphs[c - 1] } else { None },
+                );
+                let (glyph, speck, line) = (read.glyph, read.speck, read.line);
+                row_glyphs[c] = read.class;
                 let lasting = line != LineSize::SingleWidth
                     || span_contains(spans, local_c)
                     || scan.image(frame_c).is_some();
@@ -1175,6 +1153,109 @@ impl PetWorld {
         self.cells.as_slice()[r * MAX_WORLD_COLS + c]
     }
 
+    /// The window about the body ([`Self::observe_with_exclusions_near`]): on a pane past the
+    /// map's budget, the pane's rows the console asks for about the body (as many as
+    /// [`MAX_BODY_ROWS`]), over as many columns as the map reads about the body's centre, read
+    /// for their glyphs alone ([`Self::locomotion_ink_in_span`], [`Self::last_letter_in_span`],
+    /// [`Self::ink_row_bits`], [`Self::ink_at`], [`Self::letter_at`] and
+    /// [`Self::locomotion_ink_at`]). Where the caret's window
+    /// ([`Self::coverage`]) reads those columns, the window leaves out the rows it reads, and
+    /// reads none where it reads them all (every pane within the budget). Where it does not (a
+    /// pane past [`MAX_WORLD_COLS`]), the window reads the rows it reads too, for a span's
+    /// columns past it. No rows where the frame is scrolled into history, or where the console
+    /// asked for none ([`crate::kitty_pet::OldPath::WorldReadsTheBodysRows`]).
+    #[inline]
+    #[must_use]
+    pub const fn body_window(&self) -> PetPane {
+        self.body
+    }
+
+    /// The glyphs of the window that reads the pane row `row`'s columns `first..end` whole and
+    /// the window: the caret's where it does, else the body's where that does; the caret's
+    /// (reading part of them, or none) where neither does.
+    #[inline]
+    const fn glyphs_for(
+        &self,
+        row: usize,
+        first: usize,
+        end: usize,
+    ) -> (&[Option<PetGlyph>], PetPane) {
+        if !reads_span(self.coverage, row, first, end) && reads_span(self.body, row, first, end) {
+            (self.body_glyphs.as_slice(), self.body)
+        } else {
+            (self.glyphs.as_slice(), self.coverage)
+        }
+    }
+
+    /// Reads the glyphs of the window about the body the pane's rows `keep` ask for
+    /// (`first..end`, and the body's centre column) where the caret's window reads `coverage`
+    /// ([`body_window_about`], [`Self::body_window`]), counted with the cells it examined
+    /// ([`Self::examined_cells`]).
+    fn read_body(
+        &mut self,
+        input: &RenderInput,
+        pane: PetPane,
+        blanked: &[PetRect],
+        keep: Option<(usize, usize, usize)>,
+    ) {
+        let body = body_window_about(pane, self.coverage, keep);
+        if body.rows == 0 {
+            return;
+        }
+        let (first, col, cols) = (body.row, body.col, body.cols);
+        if self.body_glyphs.is_empty() {
+            self.body_glyphs
+                .resize(MAX_BODY_ROWS * MAX_WORLD_COLS, None);
+        }
+        let implicit = RenderCell::default();
+        let mut spans_buf = [(0, 0); MAX_REGIONS];
+        let mut r = 0;
+        while r < body.rows {
+            let local_r = first + r;
+            let frame_r = pane.row + local_r;
+            let out = &mut self.body_glyphs[r * MAX_WORLD_COLS..r * MAX_WORLD_COLS + cols];
+            let Some(row) = input.cells.get(frame_r) else {
+                out.fill(None);
+                r += 1;
+                continue;
+            };
+            let mut n_spans = 0;
+            for &rect in blanked {
+                if let Some(span) = exclusion_span(rect, local_r, pane.cols) {
+                    spans_buf[n_spans] = span;
+                    n_spans += 1;
+                }
+            }
+            let spans = &spans_buf[..n_spans];
+            let mut scan = RowScan::new(input, frame_r);
+            let mut before = None;
+            let mut c = 0;
+            while c < cols {
+                let local_c = col + c;
+                let frame_c = pane.col + local_c;
+                let glass_blank = span_contains(spans, local_c);
+                let cell = match row.get(frame_c) {
+                    Some(cell) if !glass_blank => cell,
+                    _ => &implicit,
+                };
+                let read = read_glyph(
+                    &mut scan,
+                    (input, row.as_slice(), &implicit),
+                    cell,
+                    (c, cols, frame_c),
+                    (glass_blank, span_contains(spans, local_c + 1)),
+                    before,
+                );
+                out[c] = read.class;
+                before = read.class;
+                c += 1;
+            }
+            r += 1;
+        }
+        self.examined_cells += body.rows * cols;
+        self.body = body;
+    }
+
     /// Actual glyph/decorated-cell occupancy, independent of caret/selection protection.
     #[inline]
     #[must_use]
@@ -1220,18 +1301,18 @@ impl PetWorld {
         if self.stamp.is_none() || end <= first {
             return None;
         }
-        let Some(r) = row.checked_sub(self.coverage.row) else {
+        let (glyphs, cov) = self.glyphs_for(row, first, end);
+        let Some(r) = row.checked_sub(cov.row) else {
             return None;
         };
-        let Some(c0) = first.checked_sub(self.coverage.col) else {
+        let Some(c0) = first.checked_sub(cov.col) else {
             return None;
         };
-        let c1 = end - self.coverage.col;
-        if r >= self.coverage.rows || c1 > self.coverage.cols {
+        let c1 = end - cov.col;
+        if r >= cov.rows || c1 > cov.cols {
             return None;
         }
         let row_base = r * MAX_WORLD_COLS;
-        let glyphs = self.glyphs.as_slice();
         let mut occupied = false;
         let mut c = c0;
         while c < c1 {
@@ -1258,14 +1339,15 @@ impl PetWorld {
         if self.stamp.is_none() {
             return None;
         }
-        let Some(r) = row.checked_sub(self.coverage.row) else {
+        let (glyphs, cov) = self.glyphs_for(row, first, end);
+        let Some(r) = row.checked_sub(cov.row) else {
             return None;
         };
-        if r >= self.coverage.rows {
+        if r >= cov.rows {
             return None;
         }
-        let cov_start = self.coverage.col;
-        let cov_end = cov_start.saturating_add(self.coverage.cols);
+        let cov_start = cov.col;
+        let cov_end = cov_start.saturating_add(cov.cols);
         let s0 = if first > cov_start { first } else { cov_start };
         let s1 = if end < cov_end { end } else { cov_end };
         if s1 <= s0 {
@@ -1274,7 +1356,6 @@ impl PetWorld {
         let c0 = s0 - cov_start;
         let c1 = s1 - cov_start;
         let row_base = r * MAX_WORLD_COLS;
-        let glyphs = self.glyphs.as_slice();
         let mut seen = false;
         let mut offset = c1 - c0;
         while offset > 0 {
@@ -1302,18 +1383,18 @@ impl PetWorld {
         if width > 32 {
             return None;
         }
-        let Some(r) = row.checked_sub(self.coverage.row) else {
+        let (glyphs, cov) = self.glyphs_for(row, c0, c1);
+        let Some(r) = row.checked_sub(cov.row) else {
             return None;
         };
-        let Some(mc0) = c0.checked_sub(self.coverage.col) else {
+        let Some(mc0) = c0.checked_sub(cov.col) else {
             return None;
         };
         let mc1 = mc0 + width;
-        if r >= self.coverage.rows || mc1 > self.coverage.cols {
+        if r >= cov.rows || mc1 > cov.cols {
             return None;
         }
         let row_base = r * MAX_WORLD_COLS;
-        let glyphs = self.glyphs.as_slice();
         let mut row_bits = 0u32;
         let mut dc = 0;
         while dc < width {
@@ -1333,16 +1414,17 @@ impl PetWorld {
         if self.stamp.is_none() {
             return None;
         }
-        let Some(r) = row.checked_sub(self.coverage.row) else {
+        let (glyphs, cov) = self.glyphs_for(row, col, col.saturating_add(1));
+        let Some(r) = row.checked_sub(cov.row) else {
             return None;
         };
-        let Some(c) = col.checked_sub(self.coverage.col) else {
+        let Some(c) = col.checked_sub(cov.col) else {
             return None;
         };
-        if r >= self.coverage.rows || c >= self.coverage.cols {
+        if r >= cov.rows || c >= cov.cols {
             return None;
         }
-        self.glyphs.as_slice()[r * MAX_WORLD_COLS + c]
+        glyphs[r * MAX_WORLD_COLS + c]
     }
 
     /// Certify all cells touched by the rectangle and a margin on every side.
@@ -2514,10 +2596,15 @@ impl PetFill {
 /// scratch a host wrote into is never taken as a fill. Beside the fill, the
 /// key holds everything else a reading reads: the caret, the scroll fences,
 /// the size, the theme, the selections, the facts, the pane, the host's
-/// reserve, and the held centre where it can move the coverage window.
+/// reserve, the held centre where it can move the coverage window, and the
+/// window about the body ([`PetWorld::body_window`]) where it is read.
 #[derive(Debug)]
 pub(crate) struct PetReading {
     key: Option<ReadingKey>,
+    /// The caret's window the reading read ([`PetWorld::coverage`]): where the key's other
+    /// fields are the same, the one a reading now reads, so the window about the body it reads
+    /// is read off it ([`body_window_about`]).
+    coverage: PetPane,
     selection: TextSelection,
     selections: Vec<aterm_core::render::PaneSelection>,
     protected: Vec<PetRect>,
@@ -2552,6 +2639,9 @@ struct ReadingKey {
     facts: PetWorldFacts,
     pane: PetPane,
     held_center: Option<(u32, u32)>,
+    /// The window about the body read ([`PetWorld::body_window`]): the rows about the body the
+    /// console asks for move the reading only where they are read.
+    body: PetPane,
 }
 
 impl ReadingKey {
@@ -2561,7 +2651,7 @@ impl ReadingKey {
         fill: PetFill,
         facts: &PetWorldFacts,
         pane: PetPane,
-        held_center: Option<(f32, f32)>,
+        (held_center, body): (Option<(f32, f32)>, PetPane),
     ) -> Option<Self> {
         if matches!(fill, PetFill::Unconsumed)
             || input.terminal_id == 0
@@ -2603,6 +2693,7 @@ impl ReadingKey {
             facts: *facts,
             pane,
             held_center,
+            body,
         })
     }
 }
@@ -2636,6 +2727,7 @@ impl PetReading {
     pub(crate) const fn new() -> Self {
         Self {
             key: None,
+            coverage: PetPane::EMPTY,
             selection: TextSelection::new(),
             selections: Vec::new(),
             protected: Vec::new(),
@@ -2655,7 +2747,7 @@ impl PetReading {
         facts: &PetWorldFacts,
         pane: PetPane,
         reserve: PetReserve<'_>,
-        held_center: Option<(f32, f32)>,
+        (held_center, keep): PetCentre,
     ) -> bool {
         let Some(kept) = &self.key else {
             return false;
@@ -2677,7 +2769,12 @@ impl PetReading {
         {
             return false;
         }
-        let Some(mut now) = ReadingKey::of(input, fill, facts, pane, held_center) else {
+        let body = if input.display_offset == 0 {
+            body_window_about(pane, self.coverage, keep)
+        } else {
+            PetPane::EMPTY
+        };
+        let Some(mut now) = ReadingKey::of(input, fill, facts, pane, (held_center, body)) else {
             return false;
         };
         now.extract_gen = expected_gen;
@@ -2690,7 +2787,9 @@ impl PetReading {
     }
 
     /// Remember what a reading just taken was taken from (nothing, for an
-    /// unconsumed fill or a scratch a host wrote into).
+    /// unconsumed fill or a scratch a host wrote into): the held centre, and the
+    /// caret's window and the window about the body it read
+    /// ([`PetWorld::coverage`], [`PetWorld::body_window`]).
     #[inline]
     pub(crate) fn note(
         &mut self,
@@ -2699,9 +2798,11 @@ impl PetReading {
         pane: PetPane,
         reserve: PetReserve<'_>,
         held_center: Option<(f32, f32)>,
+        (coverage, body): (PetPane, PetPane),
     ) {
         self.kept = false;
-        self.key = ReadingKey::of(input, fill, facts, pane, held_center);
+        self.key = ReadingKey::of(input, fill, facts, pane, (held_center, body));
+        self.coverage = coverage;
         if self.key.is_some() {
             self.selection.clone_from(&input.selection);
             self.selections.clone_from(&input.selections);
@@ -3027,6 +3128,167 @@ impl<'a> RowScan<'a> {
 const fn is_single_braille_dot(ch: char) -> bool {
     let code = ch as u32;
     code >= 0x2800 && code <= 0x28ff && (code - 0x2800).count_ones() == 1
+}
+
+/// What the map reads of a frame's cell ([`read_glyph`]).
+#[derive(Clone, Copy)]
+struct GlyphRead {
+    /// Whether it holds a glyph: a character, a wide one, a decoration or a compound.
+    glyph: bool,
+    /// Whether that glyph is a lone braille dot between blanks.
+    speck: bool,
+    /// The line size of its row there.
+    line: LineSize,
+    /// What it holds ([`PetGlyph`]); `None` on a line drawn other than single-width.
+    class: Option<PetGlyph>,
+}
+
+/// What the map reads of the frame's cell `cell` (the frame's `row` that `scan` reads, at its
+/// column `frame_c`), the window's column `c` of `cols`: `implicit` stands in for a cell the
+/// frame does not hold or the host blanks, `glass_blank` and `next_blank` say whether the host
+/// blanks this cell and the next ([`PetReserve::blanked`]), and `before` is what the window read
+/// of the cell before it.
+#[inline]
+fn read_glyph(
+    scan: &mut RowScan<'_>,
+    (input, row, implicit): (&RenderInput, &[RenderCell], &RenderCell),
+    cell: &RenderCell,
+    (c, cols, frame_c): (usize, usize, usize),
+    (glass_blank, next_blank): (bool, bool),
+    before: Option<PetGlyph>,
+) -> GlyphRead {
+    let frame_r = scan.row;
+    let row_has_compounds = scan.has_compounds();
+    let decorated = cell.underline != UnderlineStyle::None || cell.strikethrough || cell.overline;
+    let compound = row_has_compounds
+        && !glass_blank
+        && (scan.cluster(frame_c).is_some() || scan.combining(frame_c).is_some());
+    let line = scan.line_size(frame_c);
+    let glyph = cell.ch != ' ' || cell.wide || decorated || compound;
+    let speck = glyph
+        && !cell.wide
+        && !decorated
+        && !compound
+        && is_single_braille_dot(cell.ch)
+        && c > 0
+        && c + 1 < cols
+        && before == Some(PetGlyph::Blank)
+        && {
+            let column = frame_c + 1;
+            let neighbour = match row.get(column) {
+                Some(n) if !next_blank => n,
+                _ => implicit,
+            };
+            neighbour.ch == ' '
+                && !neighbour.wide
+                && neighbour.underline == UnderlineStyle::None
+                && !neighbour.strikethrough
+                && !neighbour.overline
+                && (scan.is_uniform_single_width()
+                    || input.line_size_run_at(frame_r, column).0 == LineSize::SingleWidth)
+                && (!row_has_compounds
+                    || (input.cluster_at(frame_r, column).is_none()
+                        && input.combining_at(frame_r, column).is_none()))
+        };
+    let class = if line == LineSize::SingleWidth {
+        Some(if !glyph {
+            PetGlyph::Blank
+        } else if speck {
+            PetGlyph::Speck
+        } else if if cell.wide {
+            c > 0 && before == Some(PetGlyph::Letter)
+        } else if cell.ch.is_ascii() {
+            cell.ch.is_ascii_alphanumeric()
+        } else {
+            cell.ch.is_alphanumeric()
+        } {
+            PetGlyph::Letter
+        } else {
+            PetGlyph::Substantive
+        })
+    } else {
+        None
+    };
+    GlyphRead {
+        glyph,
+        speck,
+        line,
+        class,
+    }
+}
+
+/// Whether a column `col` lies in one of `spans` (`lo..hi`).
+#[inline]
+const fn span_contains(spans: &[(usize, usize)], col: usize) -> bool {
+    let mut i = 0;
+    while i < spans.len() {
+        let (lo, hi) = spans[i];
+        if lo <= col && col < hi {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The window about the body ([`PetWorld::body_window`]) a pane past the map's budget reads
+/// where the caret's window reads `coverage`: the pane's rows `keep` asks for (`first..end`, as
+/// many as [`MAX_BODY_ROWS`] from the first) over as many columns as the map reads
+/// ([`MAX_WORLD_COLS`]) about its centre column, kept on the pane. Where `coverage` reads those
+/// columns, the rows it reads at either end of the window are left out, and none are read where
+/// it reads them all; past the budget's rows it reads more rows than the window has, so those
+/// are every row it reads. Where it does not read those columns (a pane past
+/// [`MAX_WORLD_COLS`]), every row is kept, so a span past its columns is read whole by one
+/// window. `None` asks for none.
+#[inline]
+const fn body_window_about(
+    pane: PetPane,
+    coverage: PetPane,
+    keep: Option<(usize, usize, usize)>,
+) -> PetPane {
+    let Some((first, end, mid)) = keep else {
+        return PetPane::EMPTY;
+    };
+    let mut first = if first < pane.rows { first } else { pane.rows };
+    let mut end = if end < pane.rows { end } else { pane.rows };
+    if end > first.saturating_add(MAX_BODY_ROWS) {
+        end = first + MAX_BODY_ROWS;
+    }
+    let cols = if pane.cols < MAX_WORLD_COLS {
+        pane.cols
+    } else {
+        MAX_WORLD_COLS
+    };
+    let col = mid.saturating_sub(cols / 2);
+    let col = if col < pane.cols - cols {
+        col
+    } else {
+        pane.cols - cols
+    };
+    if col >= coverage.col && col + cols <= coverage.col + coverage.cols {
+        let (top, foot) = (coverage.row, coverage.row + coverage.rows);
+        if first >= top && first < foot {
+            first = if foot < end { foot } else { end };
+        }
+        if end > top && end <= foot {
+            end = if top > first { top } else { first };
+        }
+    }
+    if end <= first {
+        return PetPane::EMPTY;
+    }
+    PetPane {
+        row: first,
+        col,
+        rows: end - first,
+        cols,
+    }
+}
+
+/// Whether the window `w` reads the pane row `row`'s columns `first..end`, every one of them.
+#[inline]
+const fn reads_span(w: PetPane, row: usize, first: usize, end: usize) -> bool {
+    row >= w.row && row < w.row + w.rows && first >= w.col && end <= w.col + w.cols
 }
 
 /// The pane-local columns `[lo, hi)` of row `row` whose cells overlap
@@ -4079,6 +4341,155 @@ mod tests {
         );
     }
 
+    /// THE WINDOW ABOUT THE BODY READS ITS ROWS, PAST THE MAP'S COLUMNS ([`PetWorld::body_window`]):
+    /// on a pane 100 rows by 300 columns, the caret at its top left (the caret's window rows
+    /// 0..64 and columns 0..256), the console asks for rows 70..90 about a body centred on
+    /// column 290. The window reads [`MAX_BODY_ROWS`] of them from the first (70..82), over
+    /// [`MAX_WORLD_COLS`] columns about that column kept on the pane (44..300), and the map counts
+    /// its cells with the caret's window's: a letter at row 75 in the pane's last column, past
+    /// the caret's window's columns, is read there, and one at row 75 in column 44, its first;
+    /// one in column 43, before it, one at row 69, before its first row, and one at row 85, past
+    /// its last, are read by neither window. Asked for no rows, the window reads none, and
+    /// neither does row 75. Asked for rows the caret's window reads (rows 10..20 there), or on a
+    /// pane within the map's budget (60 rows by 80 columns, asked for rows 40..52), it reads
+    /// none either, and the map examines the caret's window's cells alone. Of rows the caret's
+    /// window reads in part, the window leaves out those it reads where it reads the window's
+    /// columns: about column 100 (columns 0..256, the caret's window's), rows 58..70 read rows
+    /// 64..70; about column 290 (columns 44..300, past it) rows 60..70 read all ten, so a
+    /// letter at row 62 in the pane's last column is read. On a pane 100 rows by 72 columns,
+    /// the caret at row 45 (the caret's window rows 12..76), rows 9..18 read rows 9..12, and rows
+    /// 70..82 read rows 76..82.
+    #[test]
+    fn the_window_about_the_body_reads_its_rows_past_the_maps_columns() {
+        let mut term = Terminal::new(100, 300);
+        term.process(
+            b"\x1b[70;300Hx\x1b[76;300Hx\x1b[86;300Hx\x1b[76;45Hy\x1b[76;44Hy\x1b[63;300Hz\x1b[1;1H",
+        );
+        let (input, facts) = snapshot(&mut term);
+        let pane = PetPane::full(&input);
+        let mut world = PetWorld::default();
+        let read = |world: &mut PetWorld, keep| {
+            assert!(world.observe_with_exclusions_near(
+                &input,
+                &facts,
+                pane,
+                PetReserve::protected(&[]),
+                (None, keep),
+            ));
+        };
+        read(&mut world, Some((70, 90, 290)));
+        assert_eq!(
+            world.coverage(),
+            PetPane {
+                row: 0,
+                col: 0,
+                rows: MAX_WORLD_ROWS,
+                cols: MAX_WORLD_COLS
+            }
+        );
+        assert_eq!(
+            world.body_window(),
+            PetPane {
+                row: 70,
+                col: 44,
+                rows: MAX_BODY_ROWS,
+                cols: MAX_WORLD_COLS
+            }
+        );
+        assert_eq!(
+            world.examined_cells(),
+            (MAX_WORLD_ROWS + MAX_BODY_ROWS) * MAX_WORLD_COLS
+        );
+        assert_eq!(world.locomotion_ink_in_span(75, 290, 300), Some(true));
+        assert_eq!(world.letter_at(75, 299), Some(true));
+        assert_eq!(world.last_letter_in_span(75, 44, 300), Some(Some(299)));
+        assert_eq!(world.ink_row_bits(75, 280, 300), Some(1 << 19));
+        assert_eq!(world.locomotion_ink_in_span(75, 44, 45), Some(true));
+        assert_eq!(world.locomotion_ink_in_span(75, 45, 299), Some(false));
+        assert_eq!(world.locomotion_ink_in_span(75, 43, 44), None);
+        assert_eq!(world.letter_at(75, 43), None);
+        assert_eq!(world.locomotion_ink_in_span(69, 299, 300), None);
+        assert_eq!(world.locomotion_ink_in_span(85, 299, 300), None);
+        read(&mut world, None);
+        assert_eq!(world.body_window().rows, 0);
+        assert_eq!(world.locomotion_ink_in_span(75, 290, 300), None);
+        assert_eq!(world.examined_cells(), MAX_WORLD_ROWS * MAX_WORLD_COLS);
+        read(&mut world, Some((10, 20, 40)));
+        assert_eq!(world.body_window().rows, 0);
+        assert_eq!(world.examined_cells(), MAX_WORLD_ROWS * MAX_WORLD_COLS);
+        read(&mut world, Some((58, 70, 100)));
+        assert_eq!(
+            world.body_window(),
+            PetPane {
+                row: MAX_WORLD_ROWS,
+                col: 0,
+                rows: 70 - MAX_WORLD_ROWS,
+                cols: MAX_WORLD_COLS
+            }
+        );
+        assert_eq!(world.examined_cells(), 70 * MAX_WORLD_COLS);
+        read(&mut world, Some((60, 70, 290)));
+        assert_eq!(
+            world.body_window(),
+            PetPane {
+                row: 60,
+                col: 44,
+                rows: 10,
+                cols: MAX_WORLD_COLS
+            }
+        );
+        assert_eq!(
+            world.examined_cells(),
+            (MAX_WORLD_ROWS + 10) * MAX_WORLD_COLS
+        );
+        assert_eq!(world.letter_at(62, 299), Some(true));
+        assert_eq!(world.locomotion_ink_in_span(62, 250, 300), Some(true));
+
+        let mut term = Terminal::new(100, 72);
+        term.process(b"\x1b[45;58H");
+        let (input, facts) = snapshot(&mut term);
+        let pane = PetPane::full(&input);
+        for (keep, rows) in [((9, 18, 30), 9..12), ((70, 82, 30), 76..82)] {
+            assert!(world.observe_with_exclusions_near(
+                &input,
+                &facts,
+                pane,
+                PetReserve::protected(&[]),
+                (None, Some(keep)),
+            ));
+            assert_eq!(
+                (world.coverage().row, world.coverage().rows),
+                (12, MAX_WORLD_ROWS)
+            );
+            assert_eq!(
+                world.body_window(),
+                PetPane {
+                    row: rows.start,
+                    col: 0,
+                    rows: rows.len(),
+                    cols: 72
+                },
+                "rows {keep:?}"
+            );
+            assert_eq!(world.examined_cells(), (MAX_WORLD_ROWS + rows.len()) * 72);
+        }
+
+        let mut term = Terminal::new(60, 80);
+        term.process(b"\x1b[46;41Hx\x1b[1;1H");
+        let (input, facts) = snapshot(&mut term);
+        let pane = PetPane::full(&input);
+        assert!(world.observe_with_exclusions_near(
+            &input,
+            &facts,
+            pane,
+            PetReserve::protected(&[]),
+            (None, Some((40, 52, 40))),
+        ));
+        assert_eq!(world.body_window().rows, 0);
+        assert_eq!(world.examined_cells(), 60 * 80);
+        assert_eq!(world.letter_at(45, 40), Some(true));
+    }
+
     #[test]
     fn stale_frame_and_nonfinite_geometry_fail_closed() {
         let mut term = Terminal::new(10, 40);
@@ -4810,10 +5221,19 @@ mod tests {
         const fn consumed(i: &RenderInput) -> (&RenderInput, PetFill) {
             (i, PetFill::Consumed)
         }
+        // A reading noted with no window read: the windows a world reads move the reading only
+        // through the window about the body, which none of these asks for.
+        const UNREAD: (PetPane, PetPane) = (PetPane::EMPTY, PetPane::EMPTY);
         let mut reading = PetReading::new();
-        reading.note(consumed(&input), &facts, pane, reserve, None);
+        reading.note(consumed(&input), &facts, pane, reserve, None, UNREAD);
         assert!(
-            reading.holds(consumed(&input), &facts, pane, reserve, Some((3.0, 4.0))),
+            reading.holds(
+                consumed(&input),
+                &facts,
+                pane,
+                reserve,
+                (Some((3.0, 4.0)), None)
+            ),
             "the same screen is the same reading (a centre moves no window of a pane in budget)"
         );
         type Edit = fn(&mut RenderInput, &mut PetWorldFacts);
@@ -4868,7 +5288,13 @@ mod tests {
             let (mut changed, mut changed_facts) = (input.clone(), facts);
             edit(&mut changed, &mut changed_facts);
             assert!(
-                !reading.holds(consumed(&changed), &changed_facts, pane, reserve, None),
+                !reading.holds(
+                    consumed(&changed),
+                    &changed_facts,
+                    pane,
+                    reserve,
+                    (None, None)
+                ),
                 "{what} moves the reading"
             );
         }
@@ -4877,7 +5303,7 @@ mod tests {
             ..pane
         };
         assert!(
-            !reading.holds(consumed(&input), &facts, narrower, reserve, None),
+            !reading.holds(consumed(&input), &facts, narrower, reserve, (None, None)),
             "the pane moves the reading"
         );
         let other = [PetRect::new(1.0, 2.0, 1.0, 4.0)];
@@ -4912,12 +5338,18 @@ mod tests {
             ),
         ] {
             assert!(
-                !reading.holds(consumed(&input), &facts, pane, moved, None),
+                !reading.holds(consumed(&input), &facts, pane, moved, (None, None)),
                 "the host's {what} move the reading"
             );
         }
         assert!(
-            !reading.holds((&input, PetFill::Unconsumed), &facts, pane, reserve, None),
+            !reading.holds(
+                (&input, PetFill::Unconsumed),
+                &facts,
+                pane,
+                reserve,
+                (None, None)
+            ),
             "an unconsumed fill is always read"
         );
         let retained = |prior| PetFill::Retained { prior };
@@ -4929,7 +5361,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                None
+                (None, None)
             ),
             "a fill that re-extracted no row of the cells read keeps the reading"
         );
@@ -4939,12 +5371,12 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                None
+                (None, None)
             ),
             "a fill that re-extracted no row of other cells moves the reading"
         );
         let mut kept = PetReading::new();
-        kept.note(consumed(&input), &facts, pane, reserve, None);
+        kept.note(consumed(&input), &facts, pane, reserve, None, UNREAD);
         kept.keep(&refilled);
         let mut next = refilled.clone();
         next.extract_gen += 1;
@@ -4954,7 +5386,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                None
+                (None, None)
             ),
             "a kept reading is named by the fill that kept it"
         );
@@ -4964,7 +5396,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                None
+                (None, None)
             ),
             "a kept reading is no longer named by the fill it was taken from"
         );
@@ -4976,7 +5408,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                None
+                (None, None)
             ),
             "a retained scratch a host wrote into is read"
         );
@@ -5005,20 +5437,83 @@ mod tests {
         }
         let mut host_wrote = input.clone();
         host_wrote.snapshot_seq += 1;
-        reading.note(consumed(&host_wrote), &facts, pane, reserve, None);
+        reading.note(consumed(&host_wrote), &facts, pane, reserve, None, UNREAD);
         assert!(
-            !reading.holds(consumed(&host_wrote), &facts, pane, reserve, None),
+            !reading.holds(consumed(&host_wrote), &facts, pane, reserve, (None, None)),
             "a scratch a host wrote into is never kept"
         );
 
         let mut tall = Terminal::new(70, 80);
         let (input, facts) = snapshot(&mut tall);
         let pane = PetPane::full(&input);
-        reading.note(consumed(&input), &facts, pane, reserve, Some((30.0, 4.0)));
-        assert!(reading.holds(consumed(&input), &facts, pane, reserve, Some((30.0, 4.0))));
+        reading.note(
+            consumed(&input),
+            &facts,
+            pane,
+            reserve,
+            Some((30.0, 4.0)),
+            UNREAD,
+        );
+        assert!(reading.holds(
+            consumed(&input),
+            &facts,
+            pane,
+            reserve,
+            (Some((30.0, 4.0)), None)
+        ));
         assert!(
-            !reading.holds(consumed(&input), &facts, pane, reserve, Some((31.0, 4.0))),
+            !reading.holds(
+                consumed(&input),
+                &facts,
+                pane,
+                reserve,
+                (Some((31.0, 4.0)), None)
+            ),
             "past the budget, the held centre moves the window"
+        );
+
+        // Past the budget, the window about the body moves the reading where it is read, and
+        // only there ([`PetWorld::body_window`]). On a pane 100 rows tall with the caret at its
+        // top (the caret's window reads rows 0..64), rows 70..80 asked for are read, so rows
+        // 71..81 move the reading; rows 10..20, which the caret's window reads, are not, so rows
+        // 11..21 leave it as it is, and rows 60..70, whose rows 64..70 are read, move it.
+        let mut tall = Terminal::new(100, 80);
+        let (input, facts) = snapshot(&mut tall);
+        let pane = PetPane::full(&input);
+        let none = PetReserve::default();
+        let mut world = PetWorld::default();
+        let mut read = |reading: &mut PetReading, keep| {
+            assert!(world.observe_with_exclusions_near(&input, &facts, pane, none, (None, keep)));
+            let windows = (world.coverage(), world.body_window());
+            reading.note(consumed(&input), &facts, pane, none, None, windows);
+            world.body_window()
+        };
+        let asks = |rows: (usize, usize)| (None, Some((rows.0, rows.1, 40)));
+        assert_eq!(
+            read(&mut reading, Some((70, 80, 40))),
+            PetPane {
+                row: 70,
+                col: 0,
+                rows: 10,
+                cols: 80
+            }
+        );
+        assert!(
+            reading.holds(consumed(&input), &facts, pane, none, asks((70, 80))),
+            "the same window about the body is the same reading"
+        );
+        assert!(
+            !reading.holds(consumed(&input), &facts, pane, none, asks((71, 81))),
+            "past the budget, a window about the body that is read moves the reading"
+        );
+        assert_eq!(read(&mut reading, Some((10, 20, 40))).rows, 0);
+        assert!(
+            reading.holds(consumed(&input), &facts, pane, none, asks((11, 21))),
+            "rows the caret's window reads move no reading"
+        );
+        assert!(
+            !reading.holds(consumed(&input), &facts, pane, none, asks((60, 70))),
+            "rows past the caret's window move it"
         );
     }
 }

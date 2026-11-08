@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 
 use aterm_agent::harness::account_series::{self, SeriesRow};
 use aterm_agent::harness::accounts::{self, Mode};
-use aterm_agent::harness::outlook::{self, Glance, Outlook};
+use aterm_agent::harness::outlook::{self, Figure, Outlook, Refusal};
+use aterm_agent::harness::quota_view::QuotaView;
 
 /// How often the inputs' stamps are looked at between replays (as the roster's,
 /// `claude_footer::ROSTER_RECHECK`).
@@ -212,6 +213,8 @@ pub(crate) struct OutlookMemo {
     outlook: Option<Arc<Outlook>>,
     /// Each label's plan as this process last noted it ([`Self::note_plan`]).
     planned: BTreeMap<String, account_series::PlanSaid>,
+    /// The quota views [`Self::quota`] last built, and what it built them of.
+    views: Option<(ViewsOf, QuotaViews)>,
     /// Replays run, for the tests that hold it to once a minute.
     #[cfg(test)]
     pub(crate) replays: usize,
@@ -339,19 +342,68 @@ impl OutlookMemo {
         self.planned.insert(label.to_owned(), said);
     }
 
-    /// The footer's [`Glance`] for the pane whose row is `label`: `used_x10` its own week's
-    /// figure, `movable` whether the harness can move its tab ([`Outlook::glance`]).
-    pub(crate) fn glance(
+    /// The quota views of the pane whose account is `tab` ([`Outlook::quota`]): as replayed,
+    /// and with observations only ([`Outlook::observations_only`]) for a pane whose progress,
+    /// read after the resolver, refuses its forecasts (`FooterFacts::quota_view`); the second
+    /// `None` where it says what the first does. `own` is the footer's own figure of the week,
+    /// `movable` whether the harness can move its tab. Built once per replay and input, so a
+    /// resolver pass between replays builds none.
+    pub(crate) fn quota(
         &mut self,
         (instant, now): (Instant, i64),
         roster: Option<&accounts::Roster>,
-        label: &str,
-        used_x10: Option<u32>,
+        tab: &str,
+        own: Option<Figure>,
         movable: bool,
-    ) -> Option<Glance> {
-        self.at(instant, now, roster, false)?
-            .glance(label, used_x10, movable)
+    ) -> Option<QuotaViews> {
+        self.at(instant, now, roster, false)?;
+        let outlook = self.outlook.clone()?;
+        if let Some((of, views)) = &self.views
+            && Arc::ptr_eq(&of.outlook, &outlook)
+            && of.tab == tab
+            && of.own == own
+            && of.movable == movable
+        {
+            return Some(views.clone());
+        }
+        let view = outlook.quota(tab, own, movable);
+        // The observed view's words never name the refusal (it has no carrier, so no tail
+        // says it): either refusal builds the same view.
+        let observed = outlook
+            .observations_only(Refusal::SessionPaused)
+            .quota(tab, own, movable);
+        let views = QuotaViews {
+            observed: (observed != view).then_some(observed),
+            view,
+        };
+        self.views = Some((
+            ViewsOf {
+                outlook,
+                tab: tab.to_owned(),
+                own,
+                movable,
+            },
+            views.clone(),
+        ));
+        Some(views)
     }
+}
+
+/// A pane's quota views ([`OutlookMemo::quota`]).
+#[derive(Clone, Debug)]
+pub(crate) struct QuotaViews {
+    /// As replayed.
+    pub(crate) view: QuotaView,
+    /// With observations only, where that differs.
+    pub(crate) observed: Option<QuotaView>,
+}
+
+/// What [`OutlookMemo::quota`]'s views were built of: the replay (by identity) and the inputs.
+struct ViewsOf {
+    outlook: Arc<Outlook>,
+    tab: String,
+    own: Option<Figure>,
+    movable: bool,
 }
 
 /// The store's state, enrolment and renewals for `roster` (read only).

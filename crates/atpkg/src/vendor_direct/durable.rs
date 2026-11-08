@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::lock::Flock;
 
-const LOCK_WAIT: Duration = Duration::from_secs(5);
+const LOCK_WAIT: Duration = Duration::from_secs(60);
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -92,11 +92,33 @@ fn again_while_refused<T>(mut op: impl FnMut() -> io::Result<T>) -> io::Result<T
 /// # Errors
 /// The lock could not be created or was not granted within [`LOCK_WAIT`].
 pub(super) fn lock_for_update(path: &Path) -> io::Result<Flock> {
+    lock_for_update_after(path, Duration::ZERO)
+}
+
+fn lock_for_update_after(path: &Path, elapsed: Duration) -> io::Result<Flock> {
+    lock_for_update_with(path, elapsed, Flock::lock_within)
+}
+
+fn lock_for_update_with(
+    path: &Path,
+    elapsed: Duration,
+    acquire: impl FnOnce(std::fs::File, Duration, &Path) -> io::Result<Flock>,
+) -> io::Result<Flock> {
     let name = file_name(path)?;
     let mut lock = String::from(name);
     lock.push_str(".lock");
     let lock = path.with_file_name(lock);
-    Flock::lock_within(open_lock_file(&lock)?, LOCK_WAIT, &lock)
+    let file = open_lock_file(&lock)?;
+    let left = LOCK_WAIT
+        .checked_sub(elapsed)
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "vendor update lock hang detector expired",
+            )
+        })?;
+    acquire(file, left, &lock)
 }
 
 /// Open (creating `0600`, never truncating: a lock file is a rendezvous, not data) the lock file at
@@ -188,6 +210,40 @@ mod tests {
 
     fn dir(label: &str) -> crate::testdir::Dir {
         crate::testdir::dir(&format!("atpkg-vendor-durable-{label}-"))
+    }
+
+    #[test]
+    fn digest_update_waits_for_a_scheduled_native_lock_holder() {
+        let d = dir("scheduled-lock");
+        let dest = d.join("x.toml");
+        std::fs::write(&dest, b"unchanged").unwrap();
+        let mut previous = Some(lock_for_update(&dest).unwrap());
+        let held = lock_for_update_with(&dest, Duration::from_secs(6), |file, left, lock| {
+            assert!(
+                matches!(
+                    Flock::try_lock(file.try_clone().unwrap()),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ),
+                "CONTROL: the native predecessor still owns the rendezvous"
+            );
+            drop(previous.take());
+            Flock::lock_within(file, left, lock)
+        })
+        .expect("a scheduled native holder may finish before the hang detector");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"unchanged");
+        let late = lock_for_update_after(&dest, Duration::from_secs(61))
+            .err()
+            .expect("expired");
+        assert_eq!(late.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            matches!(
+                Flock::try_lock(open_lock_file(&d.join("x.toml.lock")).unwrap()),
+                Err(std::fs::TryLockError::WouldBlock)
+            ),
+            "the exhausted wait preserves the actual native holder"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"unchanged");
+        drop(held);
     }
 
     #[test]
@@ -373,14 +429,9 @@ mod tests {
         let d = dir("lock-held");
         let dest = d.join("x.toml");
         let _held = lock_for_update(&dest).unwrap();
-        let lock = d.join("x.toml.lock");
-        let err = Flock::lock_within(
-            open_lock_file(&lock).unwrap(),
-            Duration::from_millis(120),
-            &lock,
-        )
-        .err()
-        .expect("held");
+        let err = lock_for_update_after(&dest, Duration::from_secs(61))
+            .err()
+            .expect("held");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
 

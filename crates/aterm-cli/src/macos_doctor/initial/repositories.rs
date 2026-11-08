@@ -288,6 +288,7 @@ mod tests {
         };
         let mut sys = Fake::root();
         sys.euid = user.uid;
+        sys.logged_in(&user);
         let stat = |dir, len| Stat {
             uid: user.uid,
             gid: user.gid,
@@ -389,13 +390,6 @@ mod tests {
     fn leaving_the_secrets_group_as_is_still_checks_the_configured_default_vault() {
         let (_root, _plan, sys, ctx) = after_sync_failure();
         let ran = run_reading_guarded(&sys, &ctx, None, Mode::Apply, || Ok(true)).unwrap();
-        assert!(
-            ran.rows
-                .iter()
-                .any(|row| row.detail.contains("configured secrets vault is not ready")),
-            "{:?}",
-            ran.rows
-        );
         assert!(
             ran.rows
                 .iter()

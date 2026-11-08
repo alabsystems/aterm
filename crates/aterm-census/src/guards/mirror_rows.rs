@@ -58,7 +58,7 @@ fn mirror_rows(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         line,
         detail,
     };
-    let rows = match read(tree, REGISTRY).map(|t| mirror::parse(&t)) {
+    let rows = match tree.text(REGISTRY).map(|t| mirror::parse(&t)) {
         Some(Ok(rows)) => rows,
         Some(Err(why)) => {
             out.push(finding(REGISTRY, 0, why));
@@ -73,7 +73,7 @@ fn mirror_rows(tree: &Tree<'_>, out: &mut Vec<Finding>) {
             continue;
         };
         let specs_path = format!("{package}/SPECS.md");
-        let Some(specs) = read(tree, &specs_path).map(Cow::into_owned) else {
+        let Some(specs) = tree.text(&specs_path).map(Cow::into_owned) else {
             continue;
         };
         let clauses = mirror::clauses(&specs);
@@ -278,7 +278,8 @@ fn reading_cached<'t>(
             continue;
         }
         let parsed = parsed_files.entry(item.file.as_str()).or_insert_with(|| {
-            read(tree, &item.file).map(|src| mirror::item::ParsedFile::of(&src))
+            tree.text(&item.file)
+                .map(|src| mirror::item::ParsedFile::of(&src))
         });
         let res = match parsed {
             Some(p) => {
@@ -315,19 +316,6 @@ fn reading_cached<'t>(
         clause_digest: clause.digest(),
         clause_line: Some(clause.line),
     })
-}
-
-/// `rel`'s text: from the corpus when it holds the file, else from the tree.
-fn read<'t>(tree: &'t Tree<'_>, rel: &str) -> Option<Cow<'t, str>> {
-    if let Some(file) = tree.corpus.get(rel) {
-        return Some(Cow::Borrowed(file.raw.as_str()));
-    }
-    if let Some(script) = tree.corpus.scripts.iter().find(|s| s.rel == rel) {
-        return Some(Cow::Borrowed(script.raw.as_str()));
-    }
-    crate::tree::read_to_string(&tree.root.join(rel))
-        .ok()
-        .map(Cow::Owned)
 }
 
 #[cfg(test)]

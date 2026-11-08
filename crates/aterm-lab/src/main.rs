@@ -544,9 +544,10 @@ usage: targo --unverified lab <command> [tag] [args]
   kimi [tag] [-e K=V]... [--no-wait] [-- kimi args]
                                  launch Kimi Code in tab 1 with a scratch HOME and KIMI_CODE_HOME whose config.toml names
                                  one openai-type provider at the stub's Chat Completions routes and the lab's fake key
-  outlook-captures --out DIR [--aterm ATERM] [--tag NAME] [--scenes ABCDEFGH] [--look day|night|both] [--scale 1|2|both]
+  outlook-captures --out DIR [--aterm ATERM] [--tag NAME] [--scenes ABCDEFGHIJK] [--look day|night|both] [--scale 1|2|both]
                                  the accounts outlook's footer at three widths and Accounts card at 60 and 44 cells, one
-                                 headless instance per scene, look and scale, seeded with synthetic identities only
+                                 headless instance per scene, look and scale, seeded with synthetic identities only; I, J
+                                 and K: line E's quota row over the fixture's usage-tap statusLine, under Cruise
   outlook-perf --main ATERM --out DIR [--aterm ATERM] [--pairs N]
                                  the outlook against another build on scene A: paired typing and idle takes, and the
                                  resolver's own read and replay cost

@@ -105,7 +105,8 @@ fn host() {
         world.owner.tick();
         match aterm_uds::kept_out(|| listener.accept()) {
             Ok((stream, _)) => {
-                let end = Instant::now() + Duration::from_secs(8);
+                let end =
+                    crate::runtime::control_deadline(Instant::now() - Duration::from_secs(11));
                 let peer = match wire::local_peer(&stream) {
                     Ok(peer) => peer,
                     Err(error) if error.kind() == io::ErrorKind::NotConnected => continue,
@@ -160,7 +161,7 @@ fn host() {
 
 fn client() {
     let path = PathBuf::from(std::env::var_os(STORE).unwrap());
-    let until = Instant::now() + Duration::from_secs(8);
+    let until = Instant::now() + HANG;
     let selected = ReadStore::open_at(&path)
         .unwrap()
         .connect_ancestor(until)

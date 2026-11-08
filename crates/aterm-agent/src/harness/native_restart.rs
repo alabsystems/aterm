@@ -6,8 +6,8 @@
 
 use super::contract::Scope;
 use super::native_act::{
-    self, AskedUpgradeIntent, Binding, Constructor, Decision, Image, ImagePhase, NativePlan,
-    Prepare, Process, Reply, Request,
+    self, AskedIntent, AskedUpgradeIntent, Binding, Constructor, Decision, Image, ImagePhase,
+    NativePlan, Prepare, Process, Reply, Request,
 };
 use super::upgrade_drive::{self, Client, Opts, St, Terminated, Typed};
 
@@ -119,7 +119,7 @@ fn legacy_before_prepare(opts: &Opts, client: &mut Client, st: &St) -> Result<bo
         project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
     )
 )]
-fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
+pub(super) fn terminal_reply(st: &mut St, reply: &Reply) -> Option<Recovery> {
     // A terminal no-grant hold cannot be revived by a later receipt or host epoch.
     if st.native_retired_unissued {
         return Some(Recovery::Held);
@@ -277,9 +277,9 @@ pub(super) fn begin(
             .native_completed_prepare
             .as_deref()
             .ok_or("native-asked-predecessor-unproven")?;
-        Some(AskedUpgradeIntent {
+        Some(AskedIntent::Upgrade(AskedUpgradeIntent {
             predecessor: previous.id.clone(),
-        })
+        }))
     } else {
         None
     };
@@ -295,7 +295,99 @@ pub(super) fn begin(
         None,
         None,
         asked.as_ref(),
+        None,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn begin_relaunch(
+    opts: &Opts,
+    client: &mut Client,
+    st: &mut St,
+    session: &str,
+    duty: Scope,
+    target: &std::path::Path,
+    command: Option<&super::relaunch::PlannedCommand>,
+    rollback: Option<&super::relaunch::PlannedCommand>,
+    checked: Option<(
+        &super::relaunch::CheckedSource,
+        &dyn super::relaunch::RelaunchAuthorizer,
+    )>,
+) -> Result<Recovery, &'static str> {
+    if !coordinated(st) {
+        return begin(opts, client, st, session, duty, target, command, rollback);
+    }
+    if checked.is_none() {
+        return Err("native-checked-source-unavailable");
+    }
+    if command.is_some_and(|command| {
+        matches!(
+            command.account_intent.as_ref(),
+            Some(super::accounts_pool::ExecutionIntent::Token { .. })
+        )
+    }) {
+        return Err("native-checked-token-route");
+    }
+    if st.native_completed_prepare.is_none() {
+        return Err("native-asked-predecessor-unproven");
+    }
+    begin_plan(
+        opts, client, st, session, duty, target, command, rollback, None, None, None, checked,
+    )
+}
+
+pub(super) fn authorize_relaunch(
+    st: &St,
+    source: &super::relaunch::CheckedSource,
+    authorizer: &dyn super::relaunch::RelaunchAuthorizer,
+) -> Result<Box<dyn Send>, &'static str> {
+    let request = retained_prepare(st)?;
+    let checked = source
+        .checked(&request)
+        .ok_or("native-checked-source-changed")?;
+    authorizer.authorize(&checked)
+}
+
+pub(super) enum RelaunchObservation {
+    Terminal(Recovery),
+    Signalled,
+    Pending,
+}
+
+/// Observe exact saved work before asking for any fresh source authorization.
+pub(super) fn observe_relaunch(
+    opts: &Opts,
+    session: &str,
+    client: &mut Client,
+    tab: &str,
+    st: &mut St,
+) -> RelaunchObservation {
+    if retained_prepare(st).is_err() {
+        return RelaunchObservation::Pending;
+    }
+    if st.native.is_none() {
+        // Without a scoped producer permit this cannot admit a missing AskedRelaunch.
+        // An accepted lost-ACK operation instead returns its existing exact binding.
+        match recover(opts, session, client, tab, st) {
+            Ok(Recovery::Admitted) => {}
+            Ok(outcome) => return RelaunchObservation::Terminal(outcome),
+            Err(_) => return RelaunchObservation::Pending,
+        }
+    }
+    let Some(binding) = &st.native else {
+        return RelaunchObservation::Pending;
+    };
+    let Ok(reply) = native_act::exchange(client, tab, &Request::Query(binding.clone())) else {
+        return RelaunchObservation::Pending;
+    };
+    if let Some(outcome) = terminal_reply(st, &reply) {
+        return RelaunchObservation::Terminal(outcome);
+    }
+    if reply == Reply::Signalled {
+        RelaunchObservation::Signalled
+    } else {
+        RelaunchObservation::Pending
+    }
 }
 
 pub(super) fn begin_crash(
@@ -332,6 +424,7 @@ pub(super) fn begin_crash(
         None,
         observed,
         cold,
+        None,
         None,
     )
 }
@@ -417,6 +510,7 @@ pub(super) fn begin_completed_rollback(
         Some((observed.registration, observed.binding)),
         None,
         None,
+        None,
     )
 }
 
@@ -470,19 +564,33 @@ fn begin_plan(
         super::native_observe::ObservationBinding,
     )>,
     cold: Option<&super::native_act::ColdIntent>,
-    asked: Option<&AskedUpgradeIntent>,
+    asked: Option<&AskedIntent>,
+    checked: Option<(
+        &super::relaunch::CheckedSource,
+        &dyn super::relaunch::RelaunchAuthorizer,
+    )>,
 ) -> Result<Recovery, &'static str> {
     if st.native_retired_unissued {
         return Ok(Recovery::Held);
     }
     // CLI/operator constructors preserve their independent legacy authority. Only the real
     // private host opts contain this token; holder/as=person words never select this branch.
-    if asked.is_some() {
-        if duty != Scope::Upgrade || cold.is_some() || observed.is_some() || opts.token.is_none() {
+    if asked.is_some() || checked.is_some() {
+        let constructor = if checked.is_some() {
+            Constructor::AskedRelaunch
+        } else {
+            Constructor::AskedUpgrade
+        };
+        let expected_duty = if checked.is_some() {
+            Scope::Relaunch
+        } else {
+            Scope::Upgrade
+        };
+        if duty != expected_duty || cold.is_some() || observed.is_some() || opts.token.is_none() {
             return Err("native-asked-upgrade-unqualified");
         }
         if !matches!(native_act::exchange(client, &st.tab, &Request::Constructors),
-            Ok(Reply::Constructors(enabled)) if enabled.contains(&Constructor::AskedUpgrade))
+            Ok(Reply::Constructors(enabled)) if enabled.contains(&constructor))
         {
             return Err("native-asked-constructor-disabled");
         }
@@ -534,7 +642,7 @@ fn begin_plan(
         let target = Image::at(target).ok_or("native-target")?;
         let forward = command
             .and_then(|command| {
-                if asked.is_some() {
+                if asked.is_some() || checked.is_some() {
                     command.capture_native()
                 } else {
                     command.capture()
@@ -572,8 +680,8 @@ fn begin_plan(
         let deadline_us = native_act::monotonic_us()
             .and_then(|now| now.checked_add(120_000_000))
             .ok_or("native-clock")?;
-        let request = Request::prepare(Prepare {
-            asked_upgrade: asked.cloned(),
+        let mut prepare = Prepare {
+            asked: asked.cloned(),
             id: native_act::operation_id().map_err(|_| "native-entropy")?,
             host_epoch,
             holder: upgrade_drive::hand_name(),
@@ -591,11 +699,34 @@ fn begin_plan(
                 cold: cold.cloned().map(Box::new),
                 rollback: rollback.map(Box::new),
             },
-        });
+        };
+        if let Some((source, _)) = checked {
+            if !source.agrees(&prepare) {
+                return Err("native-checked-source-changed");
+            }
+            let predecessor = st
+                .native_completed_prepare
+                .as_ref()
+                .ok_or("native-asked-predecessor-unproven")?
+                .id
+                .clone();
+            prepare.asked = Some(AskedIntent::Relaunch(native_act::AskedRelaunchIntent {
+                predecessor,
+                ask: source.ask().to_owned(),
+            }));
+        }
+        let request = Request::prepare(prepare);
         st.native_prepare = request.encode().ok_or("native-plan")?;
         st.native_noexec_prepare = None;
         st.native_coordination = true;
     }
+    let _checked_authorization = if let Some((source, host)) = checked {
+        // The producer can authorize only a recipe whose actual durability barrier succeeded.
+        upgrade_drive::save_checked(opts, session, st).map_err(|_| "native-unsaved")?;
+        Some(authorize_relaunch(st, source, host)?)
+    } else {
+        None
+    };
     let tab = st.tab.clone();
     let recovered = recover(opts, session, client, &tab, st)?;
     if recovered == Recovery::Completed {

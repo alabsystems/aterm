@@ -188,7 +188,7 @@ const PROOF_DEADLINE: Duration = Duration::from_secs(60);
 /// A minute hang detector for the local broker launchd or systemd started to answer.
 const BIND_DEADLINE: Duration = Duration::from_secs(60);
 
-const ARM_DEADLINE: Duration = Duration::from_secs(5);
+const ARM_DEADLINE: Duration = Duration::from_secs(60);
 
 #[cfg(not(test))]
 const IO_TIMEOUT: Duration = Duration::from_secs(8);
@@ -4894,6 +4894,20 @@ fn ask_instance(pid: u32, sock: String) -> Result<Instance, Option<String>> {
     })
 }
 
+fn wait_for_arm_state(
+    mut read: impl FnMut() -> (String, String),
+    started: Instant,
+    mut pause: impl FnMut(Duration),
+) -> (String, String) {
+    loop {
+        let (state, reason) = read();
+        if state == "connected" || reason == "state-locked" || started.elapsed() > ARM_DEADLINE {
+            return (state, reason);
+        }
+        pause(Duration::from_millis(50));
+    }
+}
+
 fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance>) {
     let ours = fabric::serve_flags(argv);
     let our_program = fabric::bridge_program(argv);
@@ -4982,20 +4996,20 @@ fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance
             }
         }
         let started = Instant::now();
-        let (state, reason) = loop {
-            let header = ctl
-                .request("fabric status")
-                .ok()
-                .map(|r| r.header().to_string())
-                .unwrap_or_default();
-            let state = kv(&header, "state").unwrap_or("-").to_string();
-            let reason = kv(&header, "reason").unwrap_or("-").to_string();
-            if state == "connected" || reason == "state-locked" || started.elapsed() > ARM_DEADLINE
-            {
-                break (state, reason);
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
+        let (state, reason) = wait_for_arm_state(
+            || {
+                let header = ctl
+                    .request("fabric status")
+                    .ok()
+                    .map(|r| r.header().to_string())
+                    .unwrap_or_default();
+                let state = kv(&header, "state").unwrap_or("-").to_string();
+                let reason = kv(&header, "reason").unwrap_or("-").to_string();
+                (state, reason)
+            },
+            started,
+            std::thread::sleep,
+        );
         if state == "connected" {
             out.ok(
                 "instance",
@@ -7117,6 +7131,47 @@ pub fn doctor(retire_ghosts: bool, yes: bool) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_armed_supervisor_can_be_scheduled_after_the_old_observation_budget() {
+        let mut reads = 0;
+        let (state, _) = wait_for_arm_state(
+            || {
+                reads += 1;
+                if reads == 1 {
+                    ("absent".to_owned(), "-".to_owned())
+                } else {
+                    ("connected".to_owned(), "-".to_owned())
+                }
+            },
+            Instant::now() - Duration::from_secs(6),
+            |_| {},
+        );
+        assert_eq!(state, "connected");
+        assert_eq!(reads, 2);
+
+        let mut reads = 0;
+        let (state, _) = wait_for_arm_state(
+            || {
+                reads += 1;
+                ("absent".to_owned(), "-".to_owned())
+            },
+            Instant::now() - Duration::from_secs(61),
+            |_| panic!("the hang detector is exhausted"),
+        );
+        assert_eq!(state, "absent");
+        assert_eq!(reads, 1);
+
+        let (state, reason) = wait_for_arm_state(
+            || ("stalled".to_owned(), "state-locked".to_owned()),
+            Instant::now(),
+            |_| panic!("a state-locked bridge is already observed"),
+        );
+        assert_eq!(
+            (state.as_str(), reason.as_str()),
+            ("stalled", "state-locked")
+        );
+    }
 
     /// A [`Found`] of a root under a path nothing holds, its broker (pid 4242) at the root's own
     /// socket, kept by `service`'s job (which runs it), an update having replaced its build

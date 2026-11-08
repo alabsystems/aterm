@@ -5335,6 +5335,15 @@ pub struct Offer {
     pub by: String,
 }
 
+impl Offer {
+    /// Whether `other` is the same offer: its kind, count and use-by instant, whenever and
+    /// wherever either was seen.
+    #[must_use]
+    pub fn says(&self, other: &Offer) -> bool {
+        (self.kind, self.left, self.use_by) == (other.kind, other.left, other.use_by)
+    }
+}
+
 /// Newest observation of whether usage credits are carrying an account (`InUse` or `Off`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Credits {
@@ -13288,6 +13297,8 @@ pub enum Recorded {
         /// The account the session runs on ([`Me::label`]).
         account: String,
         events: usize,
+        /// A model's week this call put on record at its wall ([`WeekWalled`]).
+        walled: Option<WeekWalled>,
     },
     /// What a session's screen said is on record for the stats alone ([`Account::weeks_said`]):
     /// nothing a decision reads moved, so no look at the accounts follows it.
@@ -13295,6 +13306,8 @@ pub enum Recorded {
         /// The account the session runs on ([`Me::label`]).
         account: String,
         events: usize,
+        /// A model's week this call put on record at its wall ([`WeekWalled`]).
+        walled: Option<WeekWalled>,
     },
     /// Everything this call would write is on record.
     Unchanged,
@@ -13303,6 +13316,24 @@ pub enum Recorded {
 }
 
 impl Recorded {
+    /// The account and the model's week whose wall this call put on record, where it put one.
+    #[must_use]
+    pub fn walled(&self) -> Option<(&str, &WeekWalled)> {
+        match self {
+            Recorded::Usage {
+                account,
+                walled: Some(walled),
+                ..
+            }
+            | Recorded::Stats {
+                account,
+                walled: Some(walled),
+                ..
+            } => Some((account, walled)),
+            _ => None,
+        }
+    }
+
     /// Returns whether the recorder failed because `accounts.lock` remained held.
     #[must_use]
     pub fn lock_held(&self) -> bool {
@@ -13461,6 +13492,21 @@ pub struct WeekRead {
     pub wall: bool,
 }
 
+/// A model's week whose wall a session's screen said, as [`record_usage`] put it on record for
+/// the stats alone ([`Account::weeks_said`]): what the readings series' `wall` event row says
+/// once the transaction commits (`account_series::EventSaid::wall`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeekWalled {
+    /// The week's bucket id ([`week_bucket`]).
+    pub bucket: &'static str,
+    /// The wall's reset, where its notice named one.
+    pub reset: Option<i64>,
+    /// When the screen said it.
+    pub at: i64,
+    /// The machine whose state recorded it ([`State::machine`]), whose series takes the row.
+    pub by: String,
+}
+
 /// Combined screen usage observations (`credits`, `warning` and `week`) passed to
 /// [`record_usage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13497,7 +13543,7 @@ pub fn record_usage(
     }
     let at = said.at.min(now);
     let sid = one_line(sid, WORD_MAX);
-    let (mut decided, mut stats) = (false, false);
+    let (mut decided, mut stats, mut walled) = (false, false, None);
     let done = store.observe_usage_within(store.ladder, now, captured, who, |state| {
         let by = state.machine.clone();
         let Some(record) = account_mut(state, account) else {
@@ -13512,8 +13558,18 @@ pub fn record_usage(
             events.extend(note_warning(record, account, warning, at, now));
         }
         decided = *record != before;
+        walled = None;
         if let Some(week) = said.week {
-            events.extend(note_week(record, account, week, at, &by, now));
+            let moved = note_week(record, account, week, at, &by, now);
+            if week.wall && moved.is_some() {
+                walled = Some(WeekWalled {
+                    bucket: week.bucket,
+                    reset: week.reset,
+                    at,
+                    by: by.clone(),
+                });
+            }
+            events.extend(moved);
         }
         stats = record.weeks_said != before.weeks_said;
         Ok(events
@@ -13526,10 +13582,12 @@ pub fn record_usage(
         Ok(events) if decided => Recorded::Usage {
             account: account.to_string(),
             events: events.len(),
+            walled,
         },
         Ok(events) if stats => Recorded::Stats {
             account: account.to_string(),
             events: events.len(),
+            walled,
         },
         Ok(_) => Recorded::Unchanged,
     }

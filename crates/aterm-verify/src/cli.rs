@@ -459,6 +459,9 @@ Sets:
            its tree half (--tree): {tree}
            its bundle half (--bundle): {bundle}
 
+Read existing observations without running checks:
+  verify status --events <path> [--json]
+
 Checks:
 {checks}
 

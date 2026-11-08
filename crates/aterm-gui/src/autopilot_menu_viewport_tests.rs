@@ -50,7 +50,7 @@ fn fixture(cols: u16, disabled: usize) -> (App, WindowId, u64) {
     let mut facts = probe::facts();
     facts.subscription = Some(aterm_agent::harness::profile::SubscriptionDisplay {
         email: Some("pool-00@example.test".into()),
-        weekly: Some("weekly 42% left".into()),
+        weekly: Some("weekly 58% used".into()),
         label: Some("pool-00".into()),
         ..Default::default()
     });

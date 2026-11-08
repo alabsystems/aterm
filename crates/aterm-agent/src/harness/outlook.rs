@@ -23,7 +23,7 @@
 //! ends and time words: a stop never ends at the horizon or at a wall the worst case invented,
 //! and a forecast instant is said to a grain its lead time can bear.
 //!
-//! The renderers ([`Outlook::glance`], [`Outlook::card_rows`], [`Outlook::text`],
+//! The renderers ([`Outlook::quota`], [`Outlook::card_rows`], [`Outlook::text`],
 //! [`Outlook::json`]) paint the one model, so the footer, the card and the CLI tell one story.
 //!
 //! The outlook is a leaf: nothing in the supervisor, the advice or the tap imports it; it has no
@@ -2572,8 +2572,8 @@ pub fn renewals_of(roster: &Roster, logins: &accounts::Logins) -> BTreeMap<Strin
 }
 
 /// Each roster row's series on `machine` under `harness_state` as the outlook reads it at `now`
-/// ([`account_series::outlook_view`], what the card's [`account_series::Tail`] holds), rows with
-/// none left out ([`Inputs::series`]).
+/// ([`account_series::outlook_view`], what the card's [`account_series::Tail`] holds), each cut
+/// as it is read, rows with none left out ([`Inputs::series`]).
 #[must_use]
 pub fn series_of(
     harness_state: &std::path::Path,
@@ -2597,6 +2597,26 @@ pub fn series_of(
         .collect()
 }
 
+/// `series`, rows of each row's series that hold at least its outlook view (a report's,
+/// [`account_series::report_view`]), as the outlook reads them at `now`
+/// ([`account_series::outlook_view`]), rows with none left out.
+#[must_use]
+pub fn series_view(
+    series: &BTreeMap<String, Vec<SeriesRow>>,
+    now: i64,
+) -> BTreeMap<String, Vec<SeriesRow>> {
+    series
+        .iter()
+        .map(|(label, rows)| {
+            (
+                label.clone(),
+                account_series::outlook_view(rows.clone(), now),
+            )
+        })
+        .filter(|(_, rows)| !rows.is_empty())
+        .collect()
+}
+
 /// The mode the outlook replays under for `policy`: `[harness] accounts` where the harness runs
 /// Claude Code, else [`Mode::Off`], since nothing then rotates its accounts. The window's switch
 /// also folds `[harness] headless` in a headless instance (`harness_host`), which a report run
@@ -2610,16 +2630,17 @@ pub fn replay_mode(policy: &crate::supervise::SupervisorConfig) -> Mode {
     }
 }
 
-/// The outlook `aterm harness accounts` reports: the series and the renewals read from
-/// `harness_state` and `logins` beside the state the report read, nothing written.
+/// The outlook `aterm harness accounts` reports: `series`, what the report read once of each
+/// row's series ([`account_series::report_view`]), in the outlook's view ([`series_view`]), and
+/// the renewals read from `logins` beside the state the report read, nothing written.
 #[must_use]
 pub fn for_report(
-    harness_state: &std::path::Path,
+    series: &BTreeMap<String, Vec<SeriesRow>>,
     (roster, state, logins, enrolled): (&Roster, &State, &accounts::Logins, &BTreeSet<String>),
     (mode, credits): (Mode, bool),
     (now, offset): (i64, fn(i64) -> i64),
 ) -> Outlook {
-    let series = series_of(harness_state, roster, &state.machine, now);
+    let series = series_view(series, now);
     let renewals = renewals_of(roster, logins);
     outlook(&Inputs {
         roster,
@@ -3298,6 +3319,32 @@ pub fn long_when(t: i64, offsets: &Offsets) -> String {
     )
 }
 
+/// A span of local time with its weekday and date whatever its day, as a hover names a chart
+/// column (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.6): `Wed 4 Nov 20:00–23:00`, the
+/// end's date said again only where it falls on another local day (`Wed 4 Nov 20:00–Thu 5 Nov
+/// 00:00`).
+#[must_use]
+pub fn span_dated(from: i64, to: i64, offsets: &Offsets) -> String {
+    let dated = |t: i64| {
+        let (day, min) = local(t, offsets.at(t));
+        let (_, m, d) = aterm_types::rfc3339::civil_from_days(day);
+        let words = format!(
+            "{} {d} {} {}",
+            WEEKDAYS[usize::try_from(day.rem_euclid(7)).unwrap_or(0)],
+            MONTHS[usize::try_from(m - 1).unwrap_or(0).min(11)],
+            clock_of(min)
+        );
+        (day, min, words)
+    };
+    let (day, _, head) = dated(from);
+    let (end_day, end_min, end) = dated(to);
+    if end_day == day {
+        format!("{head}\u{2013}{}", clock_of(end_min))
+    } else {
+        format!("{head}\u{2013}{end}")
+    }
+}
+
 /// The card's short date: `22 Oct`.
 #[must_use]
 pub fn day_words(t: i64, offsets: &Offsets) -> String {
@@ -3483,7 +3530,7 @@ pub fn bar_text(cells: &[BarCell]) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The footer's glance (§2)
+// The verdict's words (§2.2)
 
 /// The verdict's words, at each rung's length (§2.2).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -3498,49 +3545,6 @@ pub struct VerdictWords {
     pub warn: bool,
     /// It stays when the rule is narrow (a stop or a wall verdict).
     pub kept_narrow: bool,
-}
-
-/// The footer's quantized parts for one pane's row ([`Outlook::glance`]): its bar cells, its
-/// reset and 5-hour words to the minute, and the verdict's words. It hashes into the footer's
-/// fingerprint, never the raw clock.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Glance {
-    /// The week's bar at 10 cells and at 5, where a figure is.
-    pub bar: Option<([BarCell; 10], [BarCell; 5])>,
-    /// The week's reset, as `♻` words say it (`Thu 09:00`); `None` while a wall stands.
-    pub reset: Option<String>,
-    /// The 5-hour part (`5h 62% left`).
-    pub five: Option<String>,
-    /// The verdict, where this pane's tab can be moved and the pace stands.
-    pub verdict: Option<VerdictWords>,
-    /// The hover title's words on the week (`58% used, ~98% by its reset at today's pace`);
-    /// none of a wall's, which the footer's `weekly out` says.
-    pub title: Option<String>,
-    /// The hover title's verdict clause (`continuous 7d: me → alt1 ~Wed 06:40`; a 5-hour stop's
-    /// `stop ~20:10–21:10 (a 5-hour limit)`).
-    pub title_verdict: Option<String>,
-    /// The spoken sentences after the week's own (`At today's pace about 98% used by then. …`).
-    pub spoken: Option<String>,
-}
-
-impl Glance {
-    /// Keep observed usage and reset information without a projected service promise.
-    #[must_use]
-    pub fn observations(&self) -> Self {
-        let mut view = self.clone();
-        if let Some((ten, five)) = view.bar.as_mut() {
-            for cell in ten.iter_mut().chain(five.iter_mut()) {
-                if *cell != BarCell::Used {
-                    *cell = BarCell::Left;
-                }
-            }
-        }
-        view.verdict = None;
-        view.title = None;
-        view.title_verdict = None;
-        view.spoken = None;
-        view
-    }
 }
 
 impl Outlook {
@@ -3801,150 +3805,6 @@ impl Outlook {
             }
             Verdict::Refused(why) => why.spoken(),
         }
-    }
-
-    /// The footer's glance for the pane whose row is `label`, with the footer's own figure of the
-    /// week (`used_x10`) where it holds one, so the bar agrees with its words. A tab the rotation
-    /// cannot move (`movable` false: another home, not a stored login, not listed) shows no
-    /// verdict, and dashes only where its row is the carrier (§2.2).
-    #[must_use]
-    pub fn glance(&self, label: &str, used_x10: Option<u32>, movable: bool) -> Option<Glance> {
-        let row = self.row(label)?;
-        let week = row.window(Window::Week)?;
-        let clock_admitted = self.as_of > 0
-            && week
-                .at
-                .is_none_or(|at| super::profile::usage_read_age(at, self.as_of).is_some());
-        let projection = week
-            .projection
-            .filter(|_| clock_admitted && self.demand.week.is_ok() && (movable || row.carrier));
-        // A wall is `out`, never an inferred 100%: no bar, no percentage.
-        let walled = week.fresh == Fresh::Walled;
-        let used = clock_admitted
-            .then(|| used_x10.or(week.used_x10))
-            .flatten()
-            .filter(|_| !walled);
-        let bar = used.map(|used| {
-            let ten = bar_cells(used, projection, 10);
-            let five = bar_cells(used, projection, 5);
-            (
-                std::array::from_fn(|i| ten[i]),
-                std::array::from_fn(|i| five[i]),
-            )
-        });
-        let reset = week
-            .reset
-            .filter(|r| clock_admitted && *r > self.as_of && week.fresh != Fresh::Walled)
-            .map(|r| self.when(r));
-        // The 5-hour part says a figure of now only: the rule gives it no age, and a 5-hour
-        // window moves too fast for an aged one to stand bare.
-        let five_now = row
-            .window(Window::Five)
-            .filter(|w| w.fresh == Fresh::Now)
-            .filter(|w| w.reset.is_some_and(|r| r > self.as_of));
-        let five = five_now
-            .and_then(|w| w.used_x10)
-            .map(|x10| format!("5h {} left", pct(1000 - x10.min(1000))));
-        let own = row.walled.as_ref().map(|w| Verdict::Walled {
-            to: w.to.clone(),
-            until: w.until,
-        });
-        let verdict_of = own.as_ref().unwrap_or(&self.verdict);
-        let verdict = movable.then(|| words_of(self, verdict_of)).flatten();
-        let title_verdict = verdict.as_ref().map(|w| {
-            // A title carries no drawing glyph: a projected stop's `╳` is said as the word. The
-            // glass never names the 5-hour window; the title says where its stop comes from.
-            let mut full = w
-                .full
-                .strip_prefix("\u{2573} ")
-                .map_or_else(|| w.full.clone(), |rest| format!("stop {rest}"));
-            if matches!(
-                verdict_of,
-                Verdict::Stop {
-                    pass: PassKind::Working,
-                    ..
-                }
-            ) {
-                full.push_str(" (a 5-hour limit)");
-            }
-            let chain = self
-                .week
-                .as_ref()
-                .filter(|_| matches!(verdict_of, Verdict::Continuous))
-                .map(|p| self.chain_words(p, true).0)
-                .filter(|c| c.contains('\u{2192}'));
-            match chain {
-                Some(chain) => format!("{full}: {chain}"),
-                None => full,
-            }
-        });
-        // A wall's week has no title words: the footer's own words say `weekly out`, and the
-        // verdict's clause says how long, so the title never repeats `out` or states a figure.
-        let mut title = String::new();
-        if let Some(used) = used {
-            title.push_str(&format!("{} used", pct(used)));
-            match projection {
-                Some(p) if p.fills_at.is_some() || p.at_reset_x10 >= 1000 => {
-                    title.push_str(", out before its reset at today's pace");
-                }
-                Some(p) => title.push_str(&format!(
-                    ", ~{}% by its reset at today's pace",
-                    whole(p.at_reset_x10)
-                )),
-                None => {}
-            }
-        }
-        if let Err(why) = self.demand.week
-            && row.carrier
-        {
-            if !title.is_empty() {
-                title.push_str("; ");
-            }
-            title.push_str(&why.words());
-        }
-        let mut spoken = String::new();
-        let week_reset = week
-            .reset
-            .filter(|r| clock_admitted && *r > self.as_of && week.fresh != Fresh::Walled);
-        if let Some(clause) = self.reset_pace_spoken(week_reset, projection) {
-            let mut chars = clause.chars();
-            if let Some(first) = chars.next() {
-                spoken.extend(first.to_uppercase());
-                spoken.push_str(chars.as_str());
-                spoken.push_str(". ");
-            }
-        }
-        if let Some(five) = five_now
-            && let (Some(x10), Some(reset)) = (five.used_x10, five.reset)
-        {
-            spoken.push_str(&format!(
-                "5-hour {}% left, resets {}. ",
-                whole(1000 - x10.min(1000)),
-                self.spoken_when(reset)
-            ));
-        }
-        if movable {
-            match own {
-                Some(v) => spoken.push_str(
-                    &Outlook {
-                        verdict: v,
-                        ..self.clone()
-                    }
-                    .verdict_spoken(),
-                ),
-                None => spoken.push_str(&self.verdict_spoken()),
-            }
-        }
-        let spoken = spoken.trim_end().to_owned();
-        Some(Glance {
-            bar,
-            reset,
-            five,
-            verdict,
-            title: (!title.is_empty()).then_some(title),
-            title_verdict,
-            spoken: (!spoken.is_empty()).then_some(spoken),
-        })
     }
 }
 

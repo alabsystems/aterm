@@ -23,6 +23,12 @@ use std::{
 };
 
 pub(crate) const VERB: &str = "__resource-host-v3";
+/// Local native control observations have a hang detector, independently of target execution.
+pub(crate) const CONTROL_HANG: Duration = Duration::from_secs(60);
+
+pub(crate) fn control_deadline(started: Instant) -> Instant {
+    started + CONTROL_HANG
+}
 const MAX_CONNECTIONS: usize = 128;
 struct Endpoint {
     program: PathBuf,
@@ -229,7 +235,7 @@ fn run(control: CtlStream, status: CtlStream) -> io::Result<()> {
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&path))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let instance = store.publish(&program, &listener)?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = control_deadline(Instant::now());
     let native = trust_resource_provenance::Store::open_at(&Store::account_path()?)?
         .pin_program(program.path(), deadline)?;
     native.validate_cached_process(
@@ -244,7 +250,7 @@ fn run(control: CtlStream, status: CtlStream) -> io::Result<()> {
             store: Some(open_store_description(&store_path)?),
         })
         .map_err(|_| refused())?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = control_deadline(Instant::now());
     write_json(
         &status,
         &aterm_json::json!({"version":3,"pid":pid,"birth":birth.0,
@@ -361,7 +367,7 @@ fn serve(
     }
 }
 fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> io::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = control_deadline(Instant::now());
     let peer = wire::local_peer(stream)?;
     let hello = read_json(stream, deadline)?;
     match hello["role"].as_str() {

@@ -34,7 +34,7 @@ fn independent_work_is_disclosed_without_changing_decision_or_forecast_authority
     let original = progress();
     let mut value = original.clone();
     value.independent_work.push(work());
-    let text = account_progress_text(&value, false);
+    let text = account_progress_text(&value);
     assert!(text.contains("Waiting") && text.contains("pool-B") && text.contains("mailbox"));
     assert!(text.contains(&crate::harness::usage::rfc3339_utc(500)));
     assert_eq!(
@@ -45,9 +45,9 @@ fn independent_work_is_disclosed_without_changing_decision_or_forecast_authority
         account_progress: Some(original.clone()),
         ..Default::default()
     };
-    before.glance = Some(crate::harness::outlook::Glance {
-        title: Some("retained primary projection".into()),
-        spoken: Some("The primary forecast is retained.".into()),
+    before.quota = Some(crate::harness::quota_view::QuotaView {
+        title: "retained primary projection".into(),
+        spoken: "The primary forecast is retained.".into(),
         ..Default::default()
     });
     let mut after = before.clone();
@@ -56,13 +56,15 @@ fn independent_work_is_disclosed_without_changing_decision_or_forecast_authority
         after.account_forecast_refusal(),
         before.account_forecast_refusal()
     );
-    assert_eq!(after.glance_view(), before.glance_view());
+    assert_eq!(after.quota_view(), before.quota_view());
     value.independent_work.clear();
     assert_eq!(value, original);
 }
 
+/// Independent pool work is said where accounts are (the card's words and the quota row's
+/// title's rotation clause, §5.1), watching or waiting, and never on the rule.
 #[test]
-fn independent_work_survives_watching_and_narrow_composer_fitting() {
+fn independent_work_is_said_where_accounts_are_and_not_on_the_rule() {
     for phase in [ProgressPhase::Waiting, ProgressPhase::Watching] {
         let mut value = progress();
         value.phase = phase;
@@ -73,26 +75,29 @@ fn independent_work_survives_watching_and_narrow_composer_fitting() {
         }
         value.independent_work.push(work());
         let facts = FooterFacts {
-            model: Some("a long model name that yields to recovery".into()),
-            path: Some("/a/long/path/that/yields/to/recovery".into()),
+            model: Some("a long model name".into()),
+            path: Some("/a/long/path".into()),
             account_progress: Some(value.clone()),
             ..Default::default()
         };
-        assert!(facts.account_progress_on_rule().is_some());
-        assert!(account_progress_text(&value, true).contains("pool-B"));
+        assert!(account_progress_text(&value).contains("pool-B"));
+        let rotation = rotation_words(&value, |at| at.to_string());
+        assert!(
+            rotation.contains("local pool sign-in: pool-B via mailbox"),
+            "{rotation}"
+        );
         for room in [60, 120] {
             let fit = fit_rule(&facts, room, None);
             assert!(fit.width(None) <= room);
             assert!(
-                fit.segments
+                !fit.segments
                     .iter()
-                    .any(|segment| segment.text.contains("pool-B")
-                        && segment.text.contains("sign-in"))
+                    .any(|segment| segment.text.contains("pool-B")),
+                "{room}: {fit:?}"
             );
         }
     }
 }
-
 #[test]
 fn a_busy_view_withdraws_current_pool_work_without_erasing_the_record() {
     let mut value = progress();
@@ -112,27 +117,4 @@ fn a_busy_view_withdraws_current_pool_work_without_erasing_the_record() {
         Some(crate::harness::outlook::Refusal::ObserverBusy)
     );
     assert_eq!(facts.account_progress, Some(value));
-}
-
-#[test]
-fn long_work_and_primary_targets_still_fit_the_narrow_recovery_row() {
-    let mut value = progress();
-    value.phase = ProgressPhase::Switching { to: "a".repeat(80) };
-    let mut work = work();
-    work.label = format!("pool-{}", "b".repeat(80));
-    value.independent_work.push(work);
-    let facts = FooterFacts {
-        account_progress: Some(value),
-        ..Default::default()
-    };
-    let fit = fit_rule(&facts, 60, None);
-    assert!(fit.width(None) <= 60);
-    assert!(
-        fit.segments
-            .iter()
-            .any(|segment| segment.text.contains("Switching")
-                && segment.text.contains("pool-")
-                && segment.text.contains("sign-in"))
-    );
-    assert!(chips_room(&facts, 60) < 60);
 }

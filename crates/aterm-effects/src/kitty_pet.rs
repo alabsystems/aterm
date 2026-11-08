@@ -1739,11 +1739,38 @@ pub enum OldPath {
     /// its take-off, its box rising back into the line it was held under
     /// ([`PetBrain::left_top`]).
     CrossingRisesIntoTheLine = 1 << 35,
+    /// A pane past the rows or the columns the console's map reads at once
+    /// ([`crate::pet_world::MAX_WORLD_ROWS`], [`crate::pet_world::MAX_WORLD_COLS`]) is read about
+    /// its caret, and about the body in a second window
+    /// ([`crate::pet_world::PetWorld::body_window`]): the rows where it was last drawn and
+    /// [`crate::pet_world::KEPT_ROWS`] over and under them, over as many columns as the map
+    /// reads about the body's centre, for their glyphs, so the laws that read the rows beside a
+    /// body (the head law's, [`PetBrain::head_target`]) read them wherever the caret leaps, for
+    /// a read one window holds whole: a span along the body's row longer than the map's columns,
+    /// or across the edge between the two windows, reads nothing (ATERM-KI-1107-3). Reverted, the map is read about the caret alone: on a pane 100 rows tall, once the caret
+    /// leapt 40, 58 or 70 rows down from a body at rest fitted between rows lettered to the
+    /// margin, the head law read nothing of the body's rows and let the fit go as it gathered to
+    /// leap, and its box met the row above's letters in 38 or 39, 43 and 12 frames of each run
+    /// from rest, and in 9 to 12 after the `steam` scene's Backspaces; on a pane 300 columns
+    /// wide, leaping five rows down to the 290th column, in 37 to 39; from the 85th row of a
+    /// pane 160 rows tall, leaping 40 and 58 rows down, in 38 or 39 and 43; and at the foot of
+    /// a pane 100 rows tall, leaping 88 rows up, in 10 standing on the prompt's row (every face,
+    /// the cat and the dog, both ways of typing, Linux arm64, 2026-11-07).
+    WorldReadsTheBodysRows = 1 << 36,
+    /// A flight re-aimed in the air keeps the box's top a held body took off with
+    /// ([`PetBrain::left_top`]) only while its way has never gone up ([`PetBrain::rebase`]).
+    /// Reverted, the top outlived a flight up turned back down: a body fitted between rows
+    /// lettered to the margin at a pane's foot leapt after a caret sent 30 rows up (a pane 40
+    /// rows tall) or 52 (64 rows tall) and back 1.2 s later, its flight was turned back down in
+    /// the air, and its box, held at its take-off top, moved 26 or 29 rows in one frame and lay
+    /// on the letters of the row under the prompt's in 63 or 73 frames of each run (every face,
+    /// the cat and the dog, Linux arm64, 2026-11-07).
+    TurnKeepsTheTakeOffTop = 1 << 37,
 }
 
 impl OldPath {
     /// Every law.
-    pub const EVERY: [Self; 36] = [
+    pub const EVERY: [Self; 38] = [
         Self::WatchFromTheLine,
         Self::FirstKeysAhead,
         Self::LookAheadAtTopSpeed,
@@ -1780,6 +1807,8 @@ impl OldPath {
         Self::MarginKeepsTheLine,
         Self::FitCentredAtTheWall,
         Self::CrossingRisesIntoTheLine,
+        Self::WorldReadsTheBodysRows,
+        Self::TurnKeepsTheTakeOffTop,
     ];
     /// Every law's bit ([`PetBrain::set_old_paths`], a test seam, so only where it is built).
     #[cfg(any(test, debug_assertions))]
@@ -1838,7 +1867,8 @@ struct Flight {
     /// its leap.
     stage: u8,
     /// Where the box's top stood (a row coordinate) as a body the head law held down or fitted
-    /// left the ground ([`PetBrain::left_top`]); `None` for a body that left whole.
+    /// left the ground ([`PetBrain::left_top`]); `None` for a body that left whole, and once the
+    /// flight's way has gone up ([`PetBrain::rebase`]).
     left_top: Option<f32>,
 }
 
@@ -5808,6 +5838,16 @@ impl PetBrain {
         false
     }
 
+    /// How far (rows) the head law draws the body down its row this frame, and the share of its
+    /// height it fits it to ([`Self::ease_head`], [`head_law`]): a test's reading of whether the
+    /// law holds the body under a row above.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn head_sink_fit(&self) -> (f32, f32) {
+        (self.sink, self.fit)
+    }
+
     /// A test's negative control ([`Self::observed_last_letter`], [`Self::clear_of_letters_above`],
     /// [`Self::arc_under_letters`], [`Self::veil_over_letters`]).
     #[cfg(any(test, debug_assertions))]
@@ -7319,7 +7359,7 @@ impl PetBrain {
                         in_time = true;
                     }
                     if in_time && early {
-                        Self::rebase(&mut f, u_now, (self.col, self.row), (Some(to_arc), aim_row));
+                        self.rebase(&mut f, u_now, (self.col, self.row), (Some(to_arc), aim_row));
                         self.pending_pounce = false;
                         self.pending_big_jump = false;
                         self.pending_wall_transit = false;
@@ -7339,7 +7379,7 @@ impl PetBrain {
                         // bound came down there and hopped after it.
                         let rest = span_eq(f.to_col - self.col, aim_row - self.row) / cap;
                         Self::retime(&mut f, rest);
-                        Self::rebase(&mut f, u_now, (self.col, self.row), (None, aim_row));
+                        self.rebase(&mut f, u_now, (self.col, self.row), (None, aim_row));
                     }
                     self.bound2 = None;
                 }
@@ -7371,7 +7411,7 @@ impl PetBrain {
                 {
                     let cap = Self::flight_cap(&f, sense.cols);
                     Self::retime(&mut f, span_eq(to - self.col, aim_row - self.row) / cap);
-                    Self::rebase(&mut f, u_now, (self.col, self.row), (Some(to), aim_row));
+                    self.rebase(&mut f, u_now, (self.col, self.row), (Some(to), aim_row));
                 }
             }
             if airborne_at_entry {
@@ -9564,8 +9604,17 @@ impl PetBrain {
     /// Rebase a flight in the air onto the landing `to` (a column, `None` to keep its own,
     /// and a row) from `at`, where the body is drawn, at the share `s` of its way
     /// ([`Self::rebased_from`]).
+    ///
+    /// THE TAKE-OFF TOP GOES WITH A WAY UP. The box's top a body the head law held took off
+    /// with ([`Self::left_top`]) keeps a crossing down off that row under it: the frame draws
+    /// the box no higher than that top ([`Self::sunk`]). A body flying up comes to stand over
+    /// its take-off row, so a way up, before this re-aim or after it, drops the top: kept, a
+    /// flight up turned back down in the air drew the box at its take-off top, tens of rows
+    /// under the body in one frame and over the row under the one it left. Reverted by
+    /// [`OldPath::TurnKeepsTheTakeOffTop`].
     #[inline]
-    const fn rebase(f: &mut Flight, s: f32, at: (f32, f32), to: (Option<f32>, f32)) {
+    const fn rebase(&self, f: &mut Flight, s: f32, at: (f32, f32), to: (Option<f32>, f32)) {
+        let up_before = f.to_row - f.from_row <= -0.5;
         if let Some(to_col) = to.0
             && let Some(from) = Self::rebased_from(at.0, to_col, s)
         {
@@ -9575,6 +9624,11 @@ impl PetBrain {
         if let Some(from) = Self::rebased_from(at.1, to.1, s) {
             f.from_row = from;
             f.to_row = to.1;
+        }
+        if (up_before || f.to_row - f.from_row <= -0.5)
+            && !self.old_path(OldPath::TurnKeepsTheTakeOffTop)
+        {
+            f.left_top = None;
         }
     }
 

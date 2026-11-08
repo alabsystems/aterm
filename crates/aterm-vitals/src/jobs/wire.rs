@@ -443,6 +443,16 @@ impl Findings {
                 ));
             }
         }
+        for n in &self.program_check_stranded {
+            out.push(format!(
+                "finding kind=program-check-stranded pid={} exe={} for_ms={} daemon={}",
+                n.pid,
+                exe_word(&n.name),
+                n.for_ms,
+                self.program_check_daemon
+                    .map_or_else(|| "-".to_owned(), |d| d.to_string())
+            ));
+        }
         for s in &self.stopped_unstarted {
             out.push(format!(
                 "finding kind=stopped-unstarted pid={} exe={} stopped={} traced={} for_ms={}",

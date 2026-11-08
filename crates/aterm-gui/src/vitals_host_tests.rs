@@ -3876,11 +3876,12 @@ fn an_idle_host_arms_no_system_vitals_deadline_while_a_job_runs_and_reads_its_en
     );
 }
 
-/// `status`'s `program_check=` with no program held: `0` on macOS, `-` elsewhere.
+/// `status`'s `program_check=` and `program_check_stranded=` with no program held and no
+/// syspolicyd judged against: `0` and `-` on macOS, `-` twice elsewhere.
 const NONE_HELD: &str = if cfg!(target_os = "macos") {
-    "program_check=0"
+    "program_check=0 program_check_stranded=-"
 } else {
-    "program_check=-"
+    "program_check=- program_check_stranded=-"
 };
 
 /// `status` counts the programs macOS's program check holds in its session's tab, from the view
@@ -3915,13 +3916,17 @@ fn status_counts_the_programs_held_in_its_sessions_tab() {
     if cfg!(target_os = "macos") {
         let held = fields
             .strip_prefix("job=none job_quiet_ms=- program_check=1:")
+            .and_then(|rest| rest.strip_suffix(" program_check_stranded=-"))
             .unwrap_or_else(|| panic!("one program held in tab 0: {fields}"));
         assert!(
             held.parse::<u64>().is_ok_and(|ms| ms >= 1_140_000),
             "the oldest, to now: {fields}"
         );
     } else {
-        assert_eq!(fields, "job=none job_quiet_ms=- program_check=-");
+        assert_eq!(
+            fields,
+            "job=none job_quiet_ms=- program_check=- program_check_stranded=-"
+        );
     }
 }
 
@@ -6387,6 +6392,7 @@ fn a_program_first_named_as_not_started_is_recorded_once() {
         tab: None,
         job: None,
         started_ms: None,
+        stranded: false,
     };
     let x86 = row(7010, "x86tool", StartWait::Translating);
     let nfs = row(7011, "nfsprog", StartWait::NotStarted);
@@ -6460,6 +6466,128 @@ fn a_program_first_named_as_not_started_is_recorded_once() {
             .iter()
             .all(|e| !e.key.starts_with("program-check")),
         "a record only"
+    );
+}
+
+/// A STRANDED ROW IS RECORDED ONCE WHILE IT STANDS (leftover §5.1, §6.5): its first verdict is one
+/// `program-check.stranded` record naming the syspolicyd running now, the next view's none, and a
+/// row that leaves and comes back is named again. A held row that is not stranded is never named,
+/// nor is any row of a view that names no syspolicyd; the record is no Entry and no Now, and past
+/// the detail cap its last line stays.
+#[test]
+fn a_stranded_row_is_recorded_once_while_it_stands() {
+    use crate::message_reporters as mr;
+    use aterm_vitals::jobs::{HeldProc, JobTick, Jobs, Named, StartWait};
+    static BOARD: JobsBoard = JobsBoard::new();
+    let row = |pid, name: &str, stranded| HeldProc {
+        pid,
+        exec: u64::from(pid),
+        exec_version: Some(u64::from(pid)),
+        name: name.into(),
+        wait: StartWait::ProgramCheck,
+        stranded,
+        ..HeldProc::default()
+    };
+    let band = row(11271, "band-dd34e7089f8bb855", true);
+    let gh = row(7020, "gh", false);
+    let mut engine = Jobs::new();
+    let mut seq = 0;
+    let mut adopt = |app: &mut crate::App, held: &[HeldProc], daemon| {
+        seq += 1;
+        let at_ms = seq * 2_000;
+        let view = engine.absorb(&JobTick {
+            at_ms,
+            read_ms: at_ms,
+            self_uid: Some(501),
+            held: held.to_vec(),
+            program_check_daemon: daemon,
+            ..JobTick::default()
+        });
+        app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+            seq,
+            jobs: Some(Arc::new(view)),
+            ..Snapshot::default()
+        }));
+        app.on_vitals_wake();
+    };
+    let records = |app: &crate::App| -> Vec<(String, Vec<String>)> {
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.key.as_deref() == Some(mr::STRANDED_KEY))
+            .map(|r| (r.title.clone(), r.detail.clone()))
+            .collect()
+    };
+    let named_band = (
+        "macOS's program check stranded 1 program".to_owned(),
+        vec![
+            "pid 11271 band-dd34e7089f8bb855: held since before the syspolicyd running now (pid \
+             11291) started, so its check went to a syspolicyd that is no longer running"
+                .to_owned(),
+            "aterm leaves it as it is (whether a held program ends on a signal is unmeasured); \
+             new programs start, so stop what started it and run it again"
+                .to_owned(),
+        ],
+    );
+    let mut app = crate::App::headless_for_test();
+    app.vitals.board = &BOARD;
+    let both = [band.clone(), gh.clone()];
+    adopt(&mut app, &both, Some(11291));
+    assert_eq!(
+        records(&app),
+        std::slice::from_ref(&named_band),
+        "its first verdict"
+    );
+    adopt(&mut app, &both, Some(11291));
+    assert_eq!(
+        records(&app),
+        std::slice::from_ref(&named_band),
+        "the next view names none"
+    );
+    adopt(&mut app, std::slice::from_ref(&gh), Some(11291));
+    adopt(&mut app, &both, Some(11291));
+    assert_eq!(
+        records(&app),
+        [named_band.clone(), named_band.clone()],
+        "a row that left and came back is named again"
+    );
+    let mut app = crate::App::headless_for_test();
+    app.vitals.board = &BOARD;
+    adopt(&mut app, std::slice::from_ref(&gh), Some(11291));
+    adopt(&mut app, &both, None);
+    assert_eq!(
+        records(&app),
+        [],
+        "CONTROL: a held row that is not stranded, and a view that names no syspolicyd"
+    );
+    assert!(
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .all(|e| !e.key.starts_with("program-check")),
+        "a record only"
+    );
+    let many: Vec<Named> = (0..30)
+        .map(|i| Named {
+            pid: 20_000 + i,
+            exec_version: None,
+            name: "band".into(),
+            tab: None,
+            job: None,
+            for_ms: 0,
+        })
+        .collect();
+    let message = mr::stranded_record(&many.iter().collect::<Vec<_>>(), 11291);
+    assert_eq!(message.title, "macOS's program check stranded 30 programs");
+    assert_eq!(message.detail.len(), aterm_messages::DETAIL_LINES_CAP);
+    assert!(
+        message
+            .detail
+            .last()
+            .is_some_and(|l| l.starts_with("aterm leaves them as they are")),
+        "{:?}",
+        message.detail.last()
     );
 }
 

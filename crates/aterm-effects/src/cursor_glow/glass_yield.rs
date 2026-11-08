@@ -4302,14 +4302,19 @@ mod tests {
         );
     }
 
-    /// The caps of a word in `ink` (`r;g;b`) on Default Light under a grey glass at each alpha from
+    /// The caps of `wow` in `ink` (`r;g;b`) on Default Light under a grey glass at each alpha from
     /// 1 to 60, which darkens the page by it, on the strict path at 24 px.
     fn grey_glass_caps(ink: &str) -> Vec<u8> {
+        grey_glass_word_caps("wow", ink)
+    }
+
+    /// [`grey_glass_caps`] of `word`.
+    fn grey_glass_word_caps(word: &str, ink: &str) -> Vec<u8> {
         let mut renderer =
             aterm_render::Renderer::from_system(24.0, aterm_render::Theme::default())
                 .expect("the bundled face");
         let (cw, ch) = renderer.cell_size();
-        let text = format!("\x1b[38;2;{ink}mwow\x1b[39m");
+        let text = format!("\x1b[38;2;{ink}m{word}\x1b[39m");
         (1..=60_u8)
             .map(|alpha| {
                 let mut input = page(text.as_bytes());
@@ -4337,19 +4342,62 @@ mod tests {
     /// lowered its full ink to that level's share, and the coloured line's `w` read 4.40 of its
     /// own 4.50. Its full ink reads under AA's level in hand, so it takes no glass that lowers it.
     /// Negative control ([`with_least_level_bar`]): every level at its dimmest level's bar, the
-    /// word takes a wash.
+    /// word takes a wash. The word is the face's [`uncored_word`]: a glyph whose core holds its
+    /// word from every glass holds it under the control too, which could not bite through it.
     #[test]
     fn each_solid_level_of_an_app_ink_keeps_the_bar_of_its_own_reading() {
-        let caps = grey_glass_caps("180;63;180");
+        let word = uncored_word("180;63;180");
+        let caps = grey_glass_word_caps(word, "180;63;180");
         assert!(
             caps.iter().all(|&k| k == 0),
-            "#b43fb4 under a grey glass takes {caps:?}"
+            "`{word}` in #b43fb4 under a grey glass takes {caps:?}"
         );
-        let least = with_least_level_bar(|| grey_glass_caps("180;63;180"));
+        let least = with_least_level_bar(|| grey_glass_word_caps(word, "180;63;180"));
         assert!(
             least.iter().any(|&k| k > 0),
-            "control: at its dimmest level's bar #b43fb4 takes no wash ({least:?})"
+            "control: at its dimmest level's bar `{word}` in #b43fb4 takes no wash ({least:?})"
         );
+    }
+
+    /// The first of `wow` and `xxx` in `ink` (`r;g;b`) on Default Light at 24 px no glyph of which
+    /// holds the word from every glass by its core alone: a core whose letter bar lies over its
+    /// own reading, as one reading AA as the judges read it and under AA's level in hand does,
+    /// keeps the word whole whatever its solid levels' bars. Under macOS's SF Mono, where
+    /// amendment 65's control was measured, #b43fb4's is `wow`: that control's caps, [255, 255,
+    /// 255, 223, 178, 148, ...], were `wow`'s, and a core holding it would have left them 0.
+    /// Under Linux's bundled JetBrains Mono (14 x 28 px cells) `o`'s core (coverage 253) reads
+    /// 4.4976, `x`'s (248) 4.32, and the word is `xxx`, whose caps under the control are those
+    /// (Linux arm64, 2026-11-07).
+    fn uncored_word(ink: &str) -> &'static str {
+        use crate::rainbow_kitty::prism_glass::colour::{contrast, luminance};
+        let mut renderer =
+            aterm_render::Renderer::from_system(24.0, aterm_render::Theme::default())
+                .expect("the bundled face");
+        let (cw, ch) = renderer.cell_size();
+        let rgb = ink
+            .split(';')
+            .map(|c| c.parse::<u32>().expect("a channel"))
+            .fold(0, |rgb, c| rgb << 8 | c);
+        ["wow", "xxx"]
+            .into_iter()
+            .find(|word| {
+                let input = page(format!("\x1b[38;2;{ink}m{word}\x1b[39m").as_bytes());
+                let glyphs = renderer.glyph_ink_for(&input);
+                let frame = glyphs
+                    .for_frame(&input, (cw, ch))
+                    .expect("the frame's glyph evidence");
+                let corrected = frame.corrected();
+                (0..word.len()).all(|col| {
+                    let (_, coverage) = frame.coverage(0, col).expect("the glyph's raster");
+                    let core = coverage
+                        .core_level(luminance(rgb) as f32, luminance(BG) as f32, corrected)
+                        .expect("an inked glyph");
+                    let read =
+                        contrast(aterm_render::blend_text(BG, rgb, BG, core, corrected), BG) as f32;
+                    crate::cursor_glow::letter_bar(read, false) <= read
+                })
+            })
+            .expect("a word no core holds")
     }
 
     /// After-land round 3: a letter the judges read at AA keeps AA. They give a reading to two

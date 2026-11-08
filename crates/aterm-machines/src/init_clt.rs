@@ -2211,51 +2211,69 @@ mod tests {
     /// even when the automatic sudo was proven never started afterward.
     #[test]
     fn an_explicit_attempt_survives_an_older_automatic_no_start_result() {
-        const CHILD: &str = "ATERM_CLT_EXPLICIT_ATTEMPT_TEST_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
-            cmd.args([
-                "--exact",
-                "init_clt::tests::an_explicit_attempt_survives_an_older_automatic_no_start_result",
-                "--nocapture",
-            ])
-            .env(CHILD, "1");
-            let output = aterm_uds::deadline::output_until(
-                &mut cmd,
-                std::time::Instant::now() + std::time::Duration::from_secs(60),
-            )
-            .expect("explicit-attempt regression must finish before the hang detector");
-            assert!(
-                output.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        use std::sync::atomic::{AtomicBool, Ordering};
+        if !aterm_uds::test_binary::isolated_lifecycle(
+            "init_clt::tests::an_explicit_attempt_survives_an_older_automatic_no_start_result",
+        ) {
             return;
         }
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let sys = console();
-        let first = AtomicBool::new(true);
-        sys.tty_model(move |sys, _| {
-            if first.swap(false, Ordering::SeqCst) {
-                // B is another process: record its explicit attempt while A owns this
-                // process's terminal. Nesting B's fake tty here deadlocks that same mutex.
-                assert!(
-                    !aterm_types::clt_mark::explicit(sys.clt_mark(), Path::new(MARK), BUILD)
-                        .unwrap()
-                );
-                None
-            } else {
-                Some(Ran::exit(1, ""))
+        let sys = Arc::new(console());
+        let automatic_entered = Arc::new(AtomicBool::new(false));
+        let explicit_ran = Arc::new(AtomicBool::new(false));
+        sys.tty_model({
+            let automatic_entered = Arc::clone(&automatic_entered);
+            move |_, _| {
+                if automatic_entered.swap(true, Ordering::SeqCst) {
+                    Some(Ran::exit(1, ""))
+                } else {
+                    None // A's real unscripted Spawn failure, after its claim.
+                }
             }
         });
-        assert_eq!(
-            run(&sys, &decided(crate::init::Decider::Aterm), Mode::Apply).outcome,
-            Outcome::Failed
-        );
+        let item = CommandLineTools::new(
+            Box::new({
+                let (sys, automatic_entered, explicit_ran) = (
+                    Arc::clone(&sys),
+                    Arc::clone(&automatic_entered),
+                    Arc::clone(&explicit_ran),
+                );
+                move |probe| {
+                    // `ended` reads back after A released the terminal, before it releases its
+                    // no-start claim. B must acquire the real terminal here, never recursively
+                    // from A's terminal-command callback, which still owns that mutex.
+                    if automatic_entered.load(Ordering::SeqCst)
+                        && !explicit_ran.swap(true, Ordering::SeqCst)
+                    {
+                        let person = decided(crate::init::Decider::Person);
+                        assert_eq!(run(&sys, &person, Mode::Apply).outcome, Outcome::Failed);
+                    }
+                    if probe.read_file(std::path::Path::new(CC)).is_ok() {
+                        Found::Present(CC.into())
+                    } else {
+                        Found::Missing("no developer directory".into())
+                    }
+                }
+            }),
+            ATERM.into(),
+        )
+        .saying(Arc::new(|_: &str| {}));
+        let automatic = crate::init::Decider::Aterm
+            .compose(
+                crate::init::Base {
+                    clt: Some(item),
+                    ..crate::init::Base::none()
+                },
+                || {
+                    Unbidden::new(Some(PathBuf::from(MARK)), BUILD.to_owned(), || {
+                        crate::init::Holds::NONE
+                    })
+                },
+            )
+            .clt
+            .expect("base.clt");
+        assert_eq!(run(&sys, &automatic, Mode::Apply).outcome, Outcome::Failed);
+        assert!(explicit_ran.load(Ordering::SeqCst));
         assert!(marked(&sys));
-        let person = decided(crate::init::Decider::Person);
-        assert_eq!(run(&sys, &person, Mode::Apply).outcome, Outcome::Failed);
         assert_eq!(
             run(&sys, &decided(crate::init::Decider::Aterm), Mode::Apply).outcome,
             Outcome::Deferred

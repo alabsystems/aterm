@@ -30,6 +30,13 @@ use crate::supervise::limit::one_line;
 use crate::supervise::policy::turn_end::RestartClaim;
 use crate::supervise::policy::turn_end::TurnEndReading;
 pub use crate::supervise::policy::turn_end::{Restart, RestartAsk};
+#[path = "relaunch_checked.rs"]
+mod checked;
+pub(super) use checked::CheckedSource;
+pub use checked::{CheckedRelaunch, CheckedRelaunchStep, RelaunchAuthorizer};
+#[cfg(all(unix, any(test, debug_assertions)))]
+#[path = "relaunch_checked_fixture.rs"]
+pub mod checked_fixture;
 use crate::supervise::screen::HumanInput;
 
 #[cfg(all(test, unix))]
@@ -420,7 +427,7 @@ pub(super) fn plan_native_upgrade(
     if !cfg!(unix) {
         return Err(NoPlan::Wait("native-platform"));
     }
-    plan_with_selection(opts, launch, shell, t, None, true)
+    plan_with_selection(opts, launch, shell, t, None, true, &Live)
 }
 
 fn plan_with_cold(
@@ -430,7 +437,7 @@ fn plan_with_cold(
     t: &[super::upgrade_drive::ProcRow],
     cold: Option<super::native_act::ColdIntent>,
 ) -> Result<Plan, NoPlan> {
-    plan_with_selection(opts, launch, shell, t, cold, false)
+    plan_with_selection(opts, launch, shell, t, cold, false, &Live)
 }
 
 fn plan_with_selection(
@@ -440,6 +447,7 @@ fn plan_with_selection(
     t: &[super::upgrade_drive::ProcRow],
     cold: Option<super::native_act::ColdIntent>,
     native_upgrade: bool,
+    kernel: &dyn Kernel,
 ) -> Result<Plan, NoPlan> {
     if shell == NO_SHELL {
         return Err(NoPlan::Refused {
@@ -448,7 +456,7 @@ fn plan_with_selection(
             detail: NO_SHELL_DETAIL.to_string(),
         });
     }
-    let Some(dialect) = shell_dialect(shell, t) else {
+    let Some(dialect) = kernel.shell_dialect(shell, t) else {
         return Err(NoPlan::Wait("shell-dialect"));
     };
     let heal = atpkg::hooks::hook_file(&opts.home, dialect.hook_ext()).map(|(p, _)| p);
@@ -4595,6 +4603,27 @@ pub fn restart_here(opts: &Opts, why: &Restart, ask: &RestartAsk) -> Restarted {
     restart_from(opts, why, ask, snapshot(opts))
 }
 
+/// A built-in host's restart through its private exact-session authorization hook.
+/// The hook receives proof only after the real source safety checks and durable recipe.
+#[must_use]
+pub fn restart_here_authorized(
+    opts: &Opts,
+    why: &Restart,
+    ask: &RestartAsk,
+    authorizer: &dyn RelaunchAuthorizer,
+) -> Restarted {
+    restart_as_authorized(
+        opts,
+        why,
+        ask,
+        &accounts::Roster::default(),
+        snapshot(opts),
+        None,
+        &Live,
+        Some(authorizer),
+    )
+}
+
 /// [`restart_here`] for a host that keeps the owner's roster of Claude Code accounts.
 #[must_use]
 pub fn restart_under(
@@ -5141,6 +5170,20 @@ pub(super) fn restart_as(
     selected: Option<&AccountRestart>,
     k: &dyn Kernel,
 ) -> Restarted {
+    restart_as_authorized(opts, why, ask, roster, snap, selected, k, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restart_as_authorized(
+    opts: &Opts,
+    why: &Restart,
+    ask: &RestartAsk,
+    roster: &accounts::Roster,
+    snap: Result<Snapshot, &'static str>,
+    selected: Option<&AccountRestart>,
+    k: &dyn Kernel,
+    authorizer: Option<&dyn RelaunchAuthorizer>,
+) -> Restarted {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
     let r = Report {
         pid: 0,
@@ -5165,7 +5208,9 @@ pub(super) fn restart_as(
         Err(why) => return Restarted::unread(said(r, format!("busy:{why}"))),
     };
     let mut met = Met::Unread;
-    let report = restart_locked(opts, why, ask, snap, selected, k, r, target, &mut met);
+    let report = restart_locked(
+        opts, why, ask, snap, selected, k, r, target, &mut met, authorizer,
+    );
     let claim = claim_of(opts, why, ask, &report, met);
     Restarted { report, claim }
 }
@@ -5184,6 +5229,7 @@ fn restart_locked(
     mut r: Report,
     target: Option<String>,
     met: &mut Met,
+    authorizer: Option<&dyn RelaunchAuthorizer>,
 ) -> Report {
     let tab = r.tab.clone();
     let snap = match snap {
@@ -5232,6 +5278,20 @@ fn restart_locked(
         }
         if selected.is_some_and(|s| !s.is_current()) {
             return said(r, "wait:account-changed");
+        }
+        if let Some(authorizer) = authorizer
+            && let Some(report) = retry_checked_relaunch(
+                opts,
+                (why, ask),
+                (&snap, &records, &sf),
+                selected,
+                k,
+                (r.clone(), st.clone()),
+                authorizer,
+            )
+        {
+            *met = Met::Carried;
+            return report;
         }
         let supersedes = supersedes(why, ask, &st, &sf, &session, k);
         let native = st.native.is_some() || !st.native_prepare.is_empty();
@@ -5343,7 +5403,7 @@ fn restart_locked(
                 homedir: homedir.as_deref(),
                 ..launch
             };
-            plan(opts, &launch, snap.shell, &t)
+            plan_with_selection(opts, &launch, snap.shell, &t, None, false, k)
         });
     let Plan {
         shell,
@@ -5376,24 +5436,20 @@ fn restart_locked(
         return said(r, "wait:held");
     };
     let aborted: Option<Report> = 'signal: {
-        let again = records.session_file(snap.pid);
-        let still = again.is_some_and(|a| {
-            a.session_id == session
-                && a.status == "idle"
-                && k.process_start(snap.pid).as_deref() == Some(squash(&a.proc_start).as_str())
-        }) && foreground_shell(k.job(snap.pid)) == Ok(shell)
-            && k.terminal(snap.pid)
-                .as_ref()
-                .is_some_and(|(p, name)| owned_by_aterm((*p, name.as_str())))
-            && screen(&mut c, &tab).is_some_and(|scr| at_rest_for(why, &mut c, &tab, &scr))
-            && k.restart_background(snap.pid).is_empty()
-            && !held(&mut c, &tab, opts.human_grace_s);
-        if !still {
-            break 'signal Some(said(r.clone(), "wait:changed"));
-        }
-        if let Err(why) = records.unique_owner(&sf) {
-            break 'signal Some(said(r.clone(), format!("wait:{why}")));
-        }
+        let checked_step = (authorizer.is_some() && super::native_restart::coordinated(&st))
+            .then_some(CheckedRelaunchStep::Prepare);
+        let checked_human = match restart_source_current(
+            opts,
+            (why, checked_step),
+            (&snap, &records, &sf),
+            shell,
+            selected,
+            k,
+            &mut c,
+        ) {
+            Ok(seq) => seq,
+            Err(why) => break 'signal Some(said(r.clone(), format!("wait:{why}"))),
+        };
         let Ok(pid) = i32::try_from(snap.pid) else {
             break 'signal Some(said(r.clone(), "wait:pid"));
         };
@@ -5418,18 +5474,52 @@ fn restart_locked(
             break 'signal Some(said(r.clone(), "wait:claim-unwritten"));
         }
         super::upgrade_drive::note_moved_writes(opts, &snap, &session, &sf.cwd);
-        let admission = super::native_restart::begin(
-            opts,
-            &mut c,
-            &mut st,
-            &session,
-            super::contract::Scope::Relaunch,
-            PlannedCommand::expects(command.as_ref(), std::path::Path::new(&snap.program)),
-            command.as_ref(),
-            None,
-        );
+        let checked = authorizer
+            .filter(|_| super::native_restart::coordinated(&st))
+            .and_then(|host| {
+                checked_human
+                    .and_then(|seq| {
+                        CheckedSource::new(
+                            why,
+                            ask,
+                            &snap,
+                            seq,
+                            CheckedRelaunchStep::Prepare,
+                            &session,
+                        )
+                    })
+                    .map(|source| (source, host))
+            });
+        let admission = if authorizer.is_some() {
+            super::native_restart::begin_relaunch(
+                opts,
+                &mut c,
+                &mut st,
+                &session,
+                super::contract::Scope::Relaunch,
+                PlannedCommand::expects(command.as_ref(), std::path::Path::new(&snap.program)),
+                command.as_ref(),
+                None,
+                checked.as_ref().map(|(source, host)| (source, *host)),
+            )
+        } else {
+            super::native_restart::begin(
+                opts,
+                &mut c,
+                &mut st,
+                &session,
+                super::contract::Scope::Relaunch,
+                PlannedCommand::expects(command.as_ref(), std::path::Path::new(&snap.program)),
+                command.as_ref(),
+                None,
+            )
+        };
         if matches!(admission, Ok(super::native_restart::Recovery::Completed)) {
             break 'signal Some(said(r.clone(), "wait:native-completed"));
+        }
+        if matches!(admission, Ok(super::native_restart::Recovery::Cancelled)) {
+            let _ = super::native_record::restore_inactive(opts, &session, &mut st, prior.as_ref());
+            break 'signal Some(said(r.clone(), "wait:native-cancelled-before-mutation"));
         }
         if matches!(admission, Ok(super::native_restart::Recovery::Retired)) {
             break 'signal Some(said(r.clone(), "failed:native-cohort-retired"));
@@ -5465,14 +5555,20 @@ fn restart_locked(
             }
             break 'signal Some(said(r.clone(), format!("wait:{why}")));
         }
-        if st.native.is_some()
-            && (selected.is_some_and(|s| !s.is_current())
-                || foreground_shell(k.job(snap.pid)) != Ok(shell)
-                || !screen(&mut c, &tab).is_some_and(|scr| at_rest_for(why, &mut c, &tab, &scr))
-                || !k.restart_background(snap.pid).is_empty()
-                || held(&mut c, &tab, opts.human_grace_s)
-                || records.unique_owner(&sf).is_err())
-        {
+        let signal_check = if st.native.is_some() {
+            restart_source_current(
+                opts,
+                (why, checked.as_ref().map(|_| CheckedRelaunchStep::Signal)),
+                (&snap, &records, &sf),
+                shell,
+                selected,
+                k,
+                &mut c,
+            )
+        } else {
+            Ok(None)
+        };
+        if signal_check.is_err() {
             if super::native_restart::abort(opts, &session, &mut c, &tab, &mut st) {
                 let _ =
                     super::native_record::restore_inactive(opts, &session, &mut st, prior.as_ref());
@@ -5487,6 +5583,36 @@ fn restart_locked(
             }
             break 'signal Some(said(r.clone(), "wait:changed-after-native-admission"));
         }
+        let _signal_authorization = if let Some((_, host)) = checked.as_ref() {
+            let source = signal_check.ok().flatten().and_then(|seq| {
+                CheckedSource::new(why, ask, &snap, seq, CheckedRelaunchStep::Signal, &session)
+            });
+            let Some(source) = source else {
+                cancel_checked_before_effect(
+                    opts,
+                    &session,
+                    &tab,
+                    &mut c,
+                    (&mut st, prior.as_ref()),
+                );
+                break 'signal Some(said(r.clone(), "wait:native-checked-source-changed"));
+            };
+            match super::native_restart::authorize_relaunch(&st, &source, *host) {
+                Ok(guard) => Some(guard),
+                Err(why) => {
+                    cancel_checked_before_effect(
+                        opts,
+                        &session,
+                        &tab,
+                        &mut c,
+                        (&mut st, prior.as_ref()),
+                    );
+                    break 'signal Some(said(r.clone(), format!("wait:{why}")));
+                }
+            }
+        } else {
+            None
+        };
         let signal = if let Some(binding) = st.native.as_ref() {
             super::native_restart::signal(&mut c, &tab, binding)
         } else {
@@ -5496,7 +5622,17 @@ fn restart_locked(
             Terminated::Sent => None,
             Terminated::Refused(no) => {
                 if st.native.is_some() {
-                    save(opts, &session, &st);
+                    if checked.is_some() {
+                        cancel_checked_before_effect(
+                            opts,
+                            &session,
+                            &tab,
+                            &mut c,
+                            (&mut st, prior.as_ref()),
+                        );
+                    } else {
+                        save(opts, &session, &st);
+                    }
                     break 'signal Some(said(r.clone(), format!("wait:signal-{no}")));
                 }
                 if super::native_restart::coordinated(&st) {
@@ -5594,6 +5730,236 @@ fn at_rest_for(why: &Restart, c: &mut Client, tab: &str, scr: &Screen) -> bool {
                     &scr.rows,
                     scr.cursor.map(|(_, col)| col),
                 )))
+}
+
+/// The actual source checks shared by initial admission, exact replay and first Signal.
+/// Memory overrides agent-own-work alone; every source still protects draft/background work.
+fn restart_source_current(
+    opts: &Opts,
+    purpose: (&Restart, Option<CheckedRelaunchStep>),
+    source: (&Snapshot, &Records, &SessionFile),
+    shell: u32,
+    selected: Option<&AccountRestart>,
+    k: &dyn Kernel,
+    client: &mut Client,
+) -> Result<Option<u64>, &'static str> {
+    let (why, checked_step) = purpose;
+    let (snap, records, original) = source;
+    let human = if checked_step.is_some() {
+        Some(
+            super::upgrade_drive::status_line(client, &snap.tab)
+                .and_then(|status| super::native_restart::human_seq(&status))
+                .ok_or("native-person-unread")?,
+        )
+    } else {
+        None
+    };
+    if !asked_of(why, snap) {
+        return Err("changed");
+    }
+    if selected.is_some_and(|account| !account.is_current()) {
+        return Err("account-changed");
+    }
+    if !records.session_file(snap.pid).is_some_and(|now| {
+        let actual_start = k.process_start(snap.pid);
+        now.session_id == original.session_id
+            && now.status == "idle"
+            && actual_start.as_deref() == Some(squash(&now.proc_start).as_str())
+            && actual_start.as_deref() == Some(squash(&snap.start).as_str())
+    }) || foreground_shell(k.job(snap.pid)) != Ok(shell)
+        || !k
+            .terminal(snap.pid)
+            .as_ref()
+            .is_some_and(|(pid, name)| owned_by_aterm((*pid, name.as_str())))
+        || !screen(client, &snap.tab).is_some_and(|scr| at_rest_for(why, client, &snap.tab, &scr))
+        || !k.restart_background(snap.pid).is_empty()
+        || held(client, &snap.tab, opts.human_grace_s)
+    {
+        return Err("changed");
+    }
+    records.unique_owner(original)?;
+    if let Some(seq) = human
+        && super::upgrade_drive::status_line(client, &snap.tab)
+            .and_then(|status| super::native_restart::human_seq(&status))
+            != Some(seq)
+    {
+        return Err("native-person-changed");
+    }
+    Ok(human)
+}
+
+/// A changed observation is only a veto. The actual server must prove and acknowledge
+/// no effect before a later fresh request can replace the retained recipe.
+fn cancel_checked_before_effect(
+    opts: &Opts,
+    session: &str,
+    tab: &str,
+    client: &mut Client,
+    state: (&mut St, Option<&St>),
+) {
+    let (st, prior) = state;
+    if super::native_restart::abort(opts, session, client, tab, st) {
+        let _ = super::native_record::restore_inactive(opts, session, st, prior);
+    } else {
+        save(opts, session, st);
+    }
+}
+
+/// Only the actual original producer can reauthorize the exact saved recipe before Signal.
+/// Generic carry remains observation/reconciliation; it never mints a source authorization.
+fn retry_checked_relaunch(
+    opts: &Opts,
+    purpose: (&Restart, &RestartAsk),
+    source: (&Snapshot, &Records, &SessionFile),
+    selected: Option<&AccountRestart>,
+    k: &dyn Kernel,
+    run: (Report, St),
+    authorizer: &dyn RelaunchAuthorizer,
+) -> Option<Report> {
+    use super::native_act::{AskedIntent, NativePlan};
+    use super::native_restart::{self, Recovery};
+    let (why, ask) = purpose;
+    let (snap, _, file) = source;
+    let (r, mut st) = run;
+    let request = native_restart::retained_prepare(&st).ok()?;
+    let Some(AskedIntent::Relaunch(intent)) = &request.asked else {
+        return None;
+    };
+    let NativePlan::Restart { process, shell, .. } = &request.plan else {
+        return None;
+    };
+    if intent.ask != ask.word()
+        || !its_own(why, ask, &st)
+        || process.pid != snap.pid
+        || squash(&native_restart::vendor_start(process)) != squash(&snap.start)
+    {
+        // A replacement or completed run is observed by carry, never ended as the old source.
+        return None;
+    }
+    let session = &file.session_id;
+    let tab = st.tab.clone();
+    let Ok(mut client) = connect(opts, &tab) else {
+        return Some(said(r, "wait:no-socket"));
+    };
+    match native_restart::observe_relaunch(opts, session, &mut client, &tab, &mut st) {
+        native_restart::RelaunchObservation::Signalled => {
+            save(opts, session, &st);
+            return Some(carry_in_flight(opts, r, st, session, &tab));
+        }
+        native_restart::RelaunchObservation::Terminal(Recovery::Completed) => {
+            save(opts, session, &st);
+            return Some(carry_in_flight(opts, r, st, session, &tab));
+        }
+        native_restart::RelaunchObservation::Terminal(Recovery::Cancelled) => {
+            st.stop("native-cancelled-before-mutation", now_s());
+            save(opts, session, &st);
+            return Some(said(r, "wait:native-cancelled-before-mutation"));
+        }
+        native_restart::RelaunchObservation::Terminal(Recovery::Retired | Recovery::Held) => {
+            save(opts, session, &st);
+            return Some(said(r, native_restart::WAIT_RETIRED_UNISSUED));
+        }
+        native_restart::RelaunchObservation::Terminal(Recovery::Legacy | Recovery::Admitted)
+        | native_restart::RelaunchObservation::Pending => {}
+    }
+    let held_report = r.clone();
+    let result = super::upgrade_drive::under_hand(&mut client, &tab, None, |client| {
+        let stopped = |report| Err(Box::new(report));
+        let seq = match restart_source_current(
+            opts,
+            (why, Some(CheckedRelaunchStep::Prepare)),
+            source,
+            shell.pid,
+            selected,
+            k,
+            client,
+        ) {
+            Ok(Some(seq)) => seq,
+            _ => return stopped(said(r, "wait:changed")),
+        };
+        let Some(checked) =
+            CheckedSource::new(why, ask, snap, seq, CheckedRelaunchStep::Prepare, session)
+        else {
+            return stopped(said(r, "wait:native-checked-source-changed"));
+        };
+        if save_checked(opts, session, &st).is_err() {
+            return stopped(said(r, "wait:native-unsaved"));
+        }
+        let prepare_guard = match native_restart::authorize_relaunch(&st, &checked, authorizer) {
+            Ok(guard) => guard,
+            Err(why) => return stopped(said(r, format!("wait:{why}"))),
+        };
+        let recovered = native_restart::recover(opts, session, client, &tab, &mut st);
+        drop(prepare_guard);
+        match recovered {
+            Ok(Recovery::Admitted) => {}
+            Ok(Recovery::Completed) => {
+                save(opts, session, &st);
+                return stopped(said(r, "wait:native-completed"));
+            }
+            Ok(Recovery::Cancelled) => {
+                st.stop("native-cancelled-before-mutation", now_s());
+                save(opts, session, &st);
+                return stopped(said(r, "wait:native-cancelled-before-mutation"));
+            }
+            Ok(Recovery::Retired | Recovery::Held) => {
+                save(opts, session, &st);
+                return stopped(said(r, native_restart::WAIT_RETIRED_UNISSUED));
+            }
+            Ok(Recovery::Legacy) | Err(_) => {
+                save(opts, session, &st);
+                return stopped(said(r, "wait:native-recovery"));
+            }
+        }
+        let seq = match restart_source_current(
+            opts,
+            (why, Some(CheckedRelaunchStep::Signal)),
+            source,
+            shell.pid,
+            selected,
+            k,
+            client,
+        ) {
+            Ok(Some(seq)) => seq,
+            _ => {
+                cancel_checked_before_effect(opts, session, &tab, client, (&mut st, None));
+                return stopped(said(r, "wait:changed-after-native-admission"));
+            }
+        };
+        let Some(checked) =
+            CheckedSource::new(why, ask, snap, seq, CheckedRelaunchStep::Signal, session)
+        else {
+            cancel_checked_before_effect(opts, session, &tab, client, (&mut st, None));
+            return stopped(said(r, "wait:native-checked-source-changed"));
+        };
+        let signal_guard = match native_restart::authorize_relaunch(&st, &checked, authorizer) {
+            Ok(guard) => guard,
+            Err(why) => {
+                cancel_checked_before_effect(opts, session, &tab, client, (&mut st, None));
+                return stopped(said(r, format!("wait:{why}")));
+            }
+        };
+        let Some(binding) = &st.native else {
+            return stopped(said(r, "wait:native-recovery"));
+        };
+        let signalled = native_restart::signal(client, &tab, binding);
+        drop(signal_guard);
+        match signalled {
+            Terminated::Sent => {
+                save(opts, session, &st);
+                Ok((r, st))
+            }
+            Terminated::Refused(_) | Terminated::Failed => {
+                cancel_checked_before_effect(opts, session, &tab, client, (&mut st, None));
+                stopped(said(r, "wait:native-signal-unknown"))
+            }
+        }
+    });
+    match result {
+        Some(Ok((report, st))) => Some(carry_in_flight(opts, report, st, session, &tab)),
+        Some(Err(report)) => Some(*report),
+        None => Some(said(held_report, "wait:held")),
+    }
 }
 
 /// WHETHER THE RESTART `why` IS MADE OVER THE AGENT'S OWN WORK ITS SCREEN NAMES RUNNING

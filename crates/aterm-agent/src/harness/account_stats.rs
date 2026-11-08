@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use aterm_json::{Map, Value};
 use aterm_phase::ResetKind;
 
+use super::account_series::{self, Moved, SeriesRow, Since};
 use super::accounts::{
     self, Account, Credits, Offer, SESSION_LIMIT, SESSION_WINDOW_S, SOURCE_SAMPLE, WEEK_LIMIT,
     WEEK_WINDOW_S, WeekSaid, WindowFig, WindowSaid, merge_fig,
@@ -268,6 +269,9 @@ pub struct Win {
     pub void_at: Option<i64>,
     /// Why it says nothing now.
     pub missing: Option<Missing>,
+    /// How far its figure moved over the asked span, where the readings series says
+    /// ([`with_since`], [`account_series::since_of`]).
+    pub since: Option<Since>,
 }
 
 impl Win {
@@ -555,6 +559,7 @@ pub fn view(look: &Look<'_>) -> View {
             missing,
             fig: f,
             void_at: None,
+            since: None,
         });
     }
     let mut weeks = vec![
@@ -603,6 +608,7 @@ pub fn view(look: &Look<'_>) -> View {
             missing: state_of(&f, cache_missing()),
             fig: f,
             void_at,
+            since: None,
         });
     }
     let tenths = windows
@@ -610,6 +616,28 @@ pub fn view(look: &Look<'_>) -> View {
         .filter_map(|w| w.fig.as_ref())
         .any(|f| f.pct_x10 % 10 != 0);
     View { windows, tenths }
+}
+
+/// Fills each window's [`Win::since`] from `rows`, the label's readings series, for the account
+/// its record's `keys` name: how far its current figure moved over the last `span_s` before
+/// `now` ([`account_series::since_of`]). The one filler, so `accounts stats` and the accounts
+/// report say one `since`. A caller whose record is another account's passes no rows.
+pub fn with_since(
+    view: &mut View,
+    (rows, keys): (&[SeriesRow], account_series::Keys<'_>),
+    span_s: i64,
+    now: i64,
+) {
+    for win in &mut view.windows {
+        win.since = account_series::since_of(
+            rows,
+            keys,
+            (win.id, win.length_s),
+            win.current(now),
+            span_s,
+            now,
+        );
+    }
 }
 
 /// The two windows the accounts state holds of `account`.
@@ -730,7 +758,7 @@ const DASH: &str = "\u{2014}";
 const DOT: &str = " \u{b7} ";
 
 /// A span of seconds as the text says it: `40s`, `12m`, `1h25m`, `3d4h`.
-fn span(s: i64) -> String {
+pub(super) fn span(s: i64) -> String {
     let s = s.max(0);
     match s {
         0..60 => format!("{s}s"),
@@ -752,7 +780,7 @@ const MONTHS: [&str; 12] = [
 ];
 
 /// The local day of `t` (`tz_s` from UTC) as `Sun Oct 18`.
-fn day_of(t: i64, tz_s: i64) -> String {
+pub(super) fn day_of(t: i64, tz_s: i64) -> String {
     let day = t.saturating_add(tz_s).div_euclid(86_400);
     let (_, month, d) = aterm_types::rfc3339::civil_from_days(day);
     let weekday = WEEKDAYS
@@ -767,14 +795,14 @@ fn day_of(t: i64, tz_s: i64) -> String {
 }
 
 /// The local time of day of `t` as `18:05`.
-fn hm(t: i64, tz_s: i64) -> String {
+pub(super) fn hm(t: i64, tz_s: i64) -> String {
     let secs = t.saturating_add(tz_s).rem_euclid(86_400);
     format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60)
 }
 
 /// An instant on the local clock: `18:05` on the local day of `now`, else
 /// `Sun Oct 18 20:50`.
-fn clock_local(t: i64, now: i64, tz_at: &dyn Fn(i64) -> i64) -> String {
+pub(super) fn clock_local(t: i64, now: i64, tz_at: &dyn Fn(i64) -> i64) -> String {
     let (t_tz, now_tz) = (tz_at(t), tz_at(now));
     let same =
         t.saturating_add(t_tz).div_euclid(86_400) == now.saturating_add(now_tz).div_euclid(86_400);
@@ -908,6 +936,26 @@ fn fable_plan_text(p: &Profile, tz_at: &dyn Fn(i64) -> i64) -> String {
     }
 }
 
+/// A span the way `since` names it: whole hours up to a day as hours (`24h`, `3h`), else as
+/// [`span`] says it (`7d`, `3h12m`).
+pub(super) fn since_span(s: i64) -> String {
+    if s > 0 && s <= 86_400 && s % 3600 == 0 {
+        format!("{}h", s / 3600)
+    } else {
+        span(s)
+    }
+}
+
+/// A window's `since` as its row says it: `+18 since 24h`, `new window since 13:00` or `reset
+/// used since 13:00`.
+fn since_text(since: &Since, now: i64, tz_at: &dyn Fn(i64) -> i64) -> String {
+    match since.moved {
+        Moved::Rose(points) => format!("+{points} since {}", since_span(since.span_s)),
+        Moved::NewWindow(at) => format!("new window since {}", clock_local(at, now, tz_at)),
+        Moved::ResetUsed(at) => format!("reset used since {}", clock_local(at, now, tz_at)),
+    }
+}
+
 /// One window's row.
 fn window_row(
     look: &Look<'_>,
@@ -946,6 +994,9 @@ fn window_row(
         }
         None => format!("{DASH}  {}", missing_text(win, look, tz_at)),
     };
+    if let Some(since) = &win.since {
+        let _ = write!(row, "{DOT}{}", since_text(since, now, tz_at));
+    }
     if win.id == Bucket::Fable.id()
         && let Some(p) = p
     {
@@ -1192,6 +1243,22 @@ fn reason(missing: Missing) -> Value {
     Value::Object(o)
 }
 
+/// A window's `since` as `--json` carries it: `{span_s, used_pct, new_window(+), reset_used(+)}`,
+/// one of the last three set.
+fn since_value(since: &Since) -> Value {
+    let mut o = Map::new();
+    o.insert("span_s".to_owned(), Value::from(since.span_s));
+    let (rose, new_window, reset_used) = match since.moved {
+        Moved::Rose(points) => (Some(points), None, None),
+        Moved::NewWindow(at) => (None, Some(at), None),
+        Moved::ResetUsed(at) => (None, None, Some(at)),
+    };
+    o.insert("used_pct".to_owned(), Value::from(rose));
+    put_time(&mut o, "new_window", new_window);
+    put_time(&mut o, "reset_used", reset_used);
+    Value::Object(o)
+}
+
 /// One window as `--json` carries it.
 #[must_use]
 pub fn window_value(win: &Win, now: i64) -> Value {
@@ -1232,7 +1299,10 @@ pub fn window_value(win: &Win, now: i64) -> Value {
     );
     o.insert("by".to_owned(), Value::from(f.map(|f| f.by.clone())));
     o.insert("cached".to_owned(), Value::from(false));
-    o.insert("since".to_owned(), Value::Null);
+    o.insert(
+        "since".to_owned(),
+        win.since.as_ref().map_or(Value::Null, since_value),
+    );
     o.insert(
         "missing".to_owned(),
         win.missing.map_or(Value::Null, reason),

@@ -1762,6 +1762,164 @@ fn a_fable_wall_that_named_no_reset_has_the_rolling_weeks_dollars() {
     );
 }
 
+/// A series row of `main`'s readings at `at`: the five-hour window's `(pct_x10, reset)` and the
+/// week's.
+fn series_fig(at: i64, five: Option<(u32, i64)>, week: Option<(u32, i64)>) -> SeriesRow {
+    let fig = |(pct_x10, reset): (u32, i64)| account_series::Fig {
+        pct_x10,
+        reset,
+        at,
+        src: accounts::SOURCE_TAP.to_owned(),
+        epoch: None,
+    };
+    SeriesRow {
+        t: at,
+        by: MACHINE.to_owned(),
+        said: account_series::Said::Fig {
+            five_hour: five.map(fig),
+            seven_day: week.map(fig),
+            ac: None,
+            key: None,
+        },
+    }
+}
+
+/// `main`'s view at five-hour `five` and week `week` read a minute ago, its `since` filled from
+/// `rows` over `span_s`: the view, its text and its JSON.
+fn since_view(five: u32, week: u32, rows: &[SeriesRow], span_s: i64) -> (View, String, Value) {
+    let state = tapped(five, week, NOW - MIN);
+    let p = profile(None);
+    let l = look(state.accounts.get("main"), &p, Tap::On);
+    let mut v = view(&l);
+    with_since(&mut v, (rows, account_series::Keys::default()), span_s, NOW);
+    let shown = text(&l, &v);
+    let d = aterm_json::from_str(&json(&l, &v, "0.105.0")).expect("one JSON document");
+    (v, shown, d)
+}
+
+/// SINCE SAYS THE RISE, A NEW WINDOW OR A RESET USED. Against a day of readings, the week rose
+/// from 53% a day ago to 71% now (+18, not +31 from the older reading before it), and the
+/// five-hour window a day ago is one that has since ended, so a new one began at its reset less
+/// five hours; a week that refilled says the reset used and when; a series younger than the
+/// span says its own age, and one whose newest reading before the span's start is older than a
+/// reading heartbeat says the span it did compare (25h, 2d), never a rise over a longer gap put
+/// inside 24h; a figure that fell by less than a refill rose by nothing, never a negative
+/// number; and the window with no figure has no `since`. Text and JSON say the same.
+/// Negative control: taking the baseline as the newest figure (`max_by_key` over every `fig`
+/// in `since_of`, ignoring `now − span_s`) compares now with now, gives `+0 since 24h`, and the
+/// first assertion fails.
+#[test]
+fn since_says_the_rise_a_new_window_or_a_reset_used() {
+    let five_reset = NOW + 85 * MIN;
+    let rows = [
+        series_fig(
+            NOW - 30 * HOUR,
+            Some((200, NOW - 20 * HOUR)),
+            Some((400, WEEK_END)),
+        ),
+        series_fig(
+            NOW - 24 * HOUR,
+            Some((500, NOW - 20 * HOUR)),
+            Some((530, WEEK_END)),
+        ),
+        series_fig(
+            NOW - 2 * HOUR,
+            Some((300, five_reset)),
+            Some((700, WEEK_END)),
+        ),
+        series_fig(NOW - MIN, Some((380, five_reset)), Some((710, WEEK_END))),
+    ];
+    let (v, shown, d) = since_view(380, 710, &rows, DAY);
+    assert_eq!(
+        win(&v, "seven_day").since,
+        Some(Since {
+            span_s: DAY,
+            moved: Moved::Rose(18)
+        })
+    );
+    assert_eq!(
+        win(&v, "five_hour").since,
+        Some(Since {
+            span_s: DAY,
+            moved: Moved::NewWindow(five_reset - 5 * HOUR)
+        })
+    );
+    assert_eq!(win(&v, Bucket::Fable.id()).since, None);
+    let row = |id: &str| {
+        shown
+            .lines()
+            .find(|l| l.trim_start().starts_with(id))
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(row("week").ends_with(" \u{b7} +18 since 24h"), "{shown}");
+    assert!(
+        row("5h").ends_with(" \u{b7} new window since 13:05"),
+        "{shown}"
+    );
+    let windows = &d["accounts"][0]["windows"];
+    assert_eq!(
+        windows[1]["since"],
+        json!({"span_s": DAY, "used_pct": 18, "new_window": null, "new_window_rfc3339": null,
+               "reset_used": null, "reset_used_rfc3339": null})
+    );
+    assert_eq!(windows[0]["since"]["used_pct"], Value::Null);
+    assert_eq!(
+        windows[0]["since"]["new_window"],
+        Value::from(five_reset - 5 * HOUR)
+    );
+    assert_eq!(
+        windows[0]["since"]["new_window_rfc3339"],
+        Value::from("2026-10-15T13:05:00Z")
+    );
+    assert_eq!(windows[2]["since"], Value::Null);
+
+    let refilled = [
+        series_fig(NOW - 25 * HOUR, None, Some((900, WEEK_END))),
+        series_fig(NOW - 10 * HOUR, None, Some((100, WEEK_END))),
+    ];
+    let (v, shown, d) = since_view(380, 150, &refilled, DAY);
+    assert_eq!(
+        win(&v, "seven_day").since,
+        Some(Since {
+            span_s: 25 * HOUR,
+            moved: Moved::ResetUsed(NOW - 10 * HOUR)
+        }),
+        "the baseline an hour before the span's start says the span it covers"
+    );
+    assert!(
+        shown.contains(" \u{b7} reset used since 06:40\n"),
+        "{shown}"
+    );
+    assert_eq!(
+        d["accounts"][0]["windows"][1]["since"]["reset_used"],
+        Value::from(NOW - 10 * HOUR)
+    );
+    assert_eq!(win(&v, "five_hour").since, None, "no five-hour rows");
+
+    let young = [series_fig(NOW - 3 * HOUR, None, Some((660, WEEK_END)))];
+    let (v, shown, _) = since_view(380, 710, &young, DAY);
+    assert_eq!(
+        win(&v, "seven_day").since,
+        Some(Since {
+            span_s: 3 * HOUR,
+            moved: Moved::Rose(5)
+        })
+    );
+    assert!(shown.contains(" \u{b7} +5 since 3h\n"), "{shown}");
+
+    let fell = [series_fig(NOW - 2 * DAY, None, Some((715, WEEK_END)))];
+    let (v, shown, _) = since_view(380, 710, &fell, DAY);
+    assert_eq!(
+        win(&v, "seven_day").since,
+        Some(Since {
+            span_s: 2 * DAY,
+            moved: Moved::Rose(0)
+        })
+    );
+    assert!(shown.contains(" \u{b7} +0 since 2d\n"), "{shown}");
+}
+
 /// Thursday, November 12, 2026, at the hour and minute of [`NOW`] (UTC).
 const NOV_12: i64 = NOW + 28 * DAY;
 

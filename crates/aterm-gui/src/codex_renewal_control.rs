@@ -392,7 +392,7 @@ fn make_prepare(
         ..rollback.clone()
     };
     Some(Prepare {
-        asked_upgrade: None,
+        asked: None,
         id: id.into(),
         host_epoch: host_epoch()?.into(),
         holder: crate::harness_host::holder(),
@@ -1413,7 +1413,7 @@ mod tests {
             .supervisor_authority(crate::metrics::now_us())
             .revision();
         let prepare = Prepare {
-            asked_upgrade: None,
+            asked: None,
             id: "ab".repeat(16),
             host_epoch: host_epoch().unwrap().into(),
             holder: crate::harness_host::holder(),

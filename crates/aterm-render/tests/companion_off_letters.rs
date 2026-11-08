@@ -1411,6 +1411,272 @@ fn a_body_held_in_its_row_is_drawn_no_taller_than_its_fit() {
     }
 }
 
+/// A leap of the caret far from the body on a pane past the rows or the columns the console's
+/// map reads at once ([`a_body_far_from_the_caret_reads_its_own_rows`]): what it is; the pane,
+/// rows by columns; whether it comes after the `steam` scene's typing and Backspaces, or from
+/// rest, typing no key; where the caret rests on the prompt's row and where it leaps to (rows
+/// and columns, counted from 1); and how many frames, at the fewest, the negative control's box
+/// meets the letters the head law keeps it off ([`kept_off`]) at the window and as the gallery
+/// types (from rest: the first).
+type FarLeap = (
+    &'static str,
+    (u16, u16),
+    bool,
+    (u16, u16),
+    (u16, u16),
+    [usize; 2],
+);
+
+/// The leaps far from the body, each control's floor two thirds of the fewest frames it was
+/// measured at on Linux arm64, 2026-11-07, under Linux's bundled JetBrains Mono (13 x 29 px
+/// cells): 38 and 43 from rest; 9 at the window and 11 as the gallery types after the
+/// Backspaces on the tall pane, 37 and 39 on the wide one; 38 from rest on a 160-row pane's
+/// 85th row; and 10 at a 100-row pane's foot, 88 rows up, standing on the prompt's row.
+const FAR_LEAPS: [FarLeap; 6] = [
+    (
+        "40j from rest",
+        (100, 72),
+        false,
+        (5, 58),
+        (45, 58),
+        [25, 0],
+    ),
+    (
+        "58j from rest",
+        (100, 72),
+        false,
+        (5, 58),
+        (63, 58),
+        [28, 0],
+    ),
+    (
+        "40j after the Backspaces",
+        (100, 72),
+        true,
+        (5, 15),
+        (45, 15),
+        [6, 7],
+    ),
+    (
+        "5j to the 290th column after the Backspaces",
+        (14, 300),
+        true,
+        (5, 15),
+        (10, 290),
+        [24, 26],
+    ),
+    (
+        "40j from rest on a 160-row pane's 85th row",
+        (160, 72),
+        false,
+        (85, 58),
+        (125, 58),
+        [25, 0],
+    ),
+    (
+        "88k from rest at a 100-row pane's foot",
+        (100, 72),
+        false,
+        (98, 58),
+        (10, 58),
+        [6, 0],
+    ),
+];
+
+/// The frames from `from` ms in which `leap`'s box meets glyphs the head law keeps the body off
+/// (cells `ch` px tall): the row's beside the prompt's that its leaps do not cross (the row
+/// above's for a leap down, the row under's for one up), and for a leap up, the row above's
+/// while the box's foot stands on the prompt's row, before the flight crosses it.
+fn kept_off(judged: &[Judged], from: u64, leap: FarLeap, ch: i32) -> usize {
+    let prompt = usize::from(leap.3.0) - 1;
+    if leap.4.0 > leap.3.0 {
+        return boxes_on_glyphs(judged, from, prompt - 1..=prompt - 1);
+    }
+    let ground = (prompt as i32 + 1) * ch;
+    judged
+        .iter()
+        .filter(|j| {
+            j.ms >= from
+                && j.coat.box_cells.iter().any(|c| {
+                    c.0 == prompt + 1
+                        || (c.0 == prompt - 1 && j.coat.pet.is_some_and(|p| p.3 >= ground))
+                })
+        })
+        .count()
+}
+
+/// `leap` on the alternate screen, its prompt on its seat's row and the rows over and under
+/// that one lettered to the margin, or blank, keys driven as `drive` says, the laws in `old` reverted: from rest the caret goes to its seat 300
+/// ms after the page and leaps there and back twice, 1.2 s apart, the coats read to 3 s after
+/// the last; after the Backspaces it leaps 300 ms after the last, back 1.2 s later, and there
+/// and back again 1.2 s apart, the coats read to 1.6 s after the last. And the replay's cell
+/// height.
+fn far_from_the_caret(
+    style: &str,
+    look: Look,
+    (leap, lettered): (FarLeap, bool),
+    old: &[OldPath],
+    drive: Drive,
+) -> (Vec<Judged>, i32) {
+    let (_, (rows, cols), typed_first, from, to, _) = leap;
+    let mut r = Replay::gridded(style, look, TrailColor::Automatic, rows, cols);
+    r.coat = true;
+    r.keys_unnoted = drive != Drive::Console;
+    r.fx.set_sparkle_enabled(true);
+    for &law in old {
+        r.fx.set_pet_old_path(law, true);
+    }
+    let ch = r.cell.1 as i32;
+    let row: String = if lettered {
+        "the quick brown fox jumps over the lazy dog "
+            .repeat(usize::from(cols))
+            .chars()
+            .take(usize::from(cols))
+            .collect()
+    } else {
+        String::new()
+    };
+    let at = |(r, c): (u16, u16)| format!("\x1b[{r};{c}H").into_bytes();
+    let page = format!(
+        "\x1b[?1049h\x1b[2J\x1b[{}H{row}\x1b[{}H{row}\x1b[{}H$ ",
+        from.0 - 1,
+        from.0 + 1,
+        from.0
+    );
+    let mut ev = vec![(0, Ev::Out(page.into_bytes()))];
+    let tail = if typed_first {
+        ev.extend(typed(TYPING_TEXT, TYPING_FROM, 60));
+        let erase_from = TYPING_FROM + 60 * TYPING_TEXT.len() as u64 + 300;
+        ev.extend((0..12u64).map(|k| {
+            (
+                erase_from + 50 * k,
+                Ev::Key('\u{7f}', b"\x08 \x08".to_vec()),
+            )
+        }));
+        let last = erase_from + 50 * 11;
+        for (k, seat) in [to, from, to, from].into_iter().enumerate() {
+            ev.push((last + 300 + 1_200 * k as u64, Ev::Out(at(seat))));
+        }
+        1_600
+    } else {
+        for (k, seat) in [from, to, from, to, from].into_iter().enumerate() {
+            ev.push((300 + 1_200 * k as u64, Ev::Out(at(seat))));
+        }
+        3_000
+    };
+    (r.run(&ev, tail), ch)
+}
+
+/// A BODY FAR FROM THE CARET READS ITS OWN ROWS ([`OldPath::WorldReadsTheBodysRows`]): a pane
+/// past the rows or the columns the console's map reads at once is read about its caret, and
+/// about the body in a second window, so the head law reads the rows over and under a body
+/// wherever the caret leaps. On the alternate screen between rows lettered to the margin
+/// ([`FAR_LEAPS`]), the program moves the caret far from the body and back, twice: 40 and 58
+/// rows down on a pane 100 rows tall from rest at the prompt's 58th column, 40 rows down after
+/// the Backspaces at its 15th, five rows down to the 290th column on a pane 300 columns wide
+/// after the Backspaces, 40 rows down from rest on the 85th row of a pane 160 rows tall, and 88
+/// rows up from rest at the foot of a pane 100 rows tall. The body gathers to leap where it
+/// rests fitted to its row, far from the caret. From 600 ms, the cat on dark and the dog on
+/// Solarized Dark, keys typed at the window and, after the Backspaces, as the gallery types
+/// them: no frame's drawn box meets a cell holding a glyph that the head law keeps it off
+/// ([`kept_off`]), by a pixel or more, and none moves more than three rows from the frame
+/// before (measured at most 1.9). On a blank page the same leaps find none, and no frame draws
+/// the body down its row or fits it. Negative control ([`OldPath::WorldReadsTheBodysRows`]
+/// reverted alone, the cat on dark): read about the caret alone, the head law lets the fit go as
+/// the body gathers to leap, and its box meets those glyphs in each leap's floor of frames or
+/// more (measured 38, 43, 9 and 11, 37 and 39, 38, and 10). In every leap the body follows the
+/// caret away from the prompt's rows in 60 frames or more (91 to 308), and between the lettered
+/// rows the head law holds it, drawn down or fitted, in 100 or more (153 to 374). The effects'
+/// own `a_body_far_from_the_caret_reads_its_own_rows_on_every_face` judges these leaps and
+/// others, and the control, on 13 x 29, 14 x 26 and 11 x 28 px cells.
+#[test]
+fn a_body_far_from_the_caret_reads_its_own_rows() {
+    let from = 600;
+    let mut runs = Vec::new();
+    for leap in FAR_LEAPS {
+        let drives: &[Drive] = if leap.2 {
+            &[Drive::Console, Drive::Ctl]
+        } else {
+            &[Drive::Console]
+        };
+        for &drive in drives {
+            for (style, look) in [("rainbow kitty pet", DARK), ("rainbow dog", SOLARIZED_DARK)] {
+                runs.push((leap, style, look, drive, true, false));
+                runs.push((leap, style, look, drive, false, false));
+            }
+            runs.push((leap, "rainbow kitty pet", DARK, drive, true, true));
+        }
+    }
+    let seen = aterm_spec::check::each(&runs, |&(leap, style, look, drive, lettered, control)| {
+        let old: &[OldPath] = if control {
+            &[OldPath::WorldReadsTheBodysRows]
+        } else {
+            &[]
+        };
+        let (judged, ch) = far_from_the_caret(style, look, (leap, lettered), old, drive);
+        let prompt = i32::from(leap.3.0) - 1;
+        let away = judged
+            .iter()
+            .filter(|j| {
+                j.ms >= from
+                    && j.coat
+                        .pet
+                        .is_some_and(|p| p.3 <= (prompt - 1) * ch || p.3 > (prompt + 2) * ch)
+            })
+            .count();
+        let held = judged
+            .iter()
+            .filter(|j| {
+                j.ms >= from
+                    && j.coat
+                        .sink_fit
+                        .is_some_and(|(sink, fit)| sink > 0.0 || fit < 1.0)
+            })
+            .count();
+        let step = judged
+            .windows(2)
+            .filter(|w| w[1].ms >= from)
+            .filter_map(|w| Some((w[1].coat.pet?.2 - w[0].coat.pet?.2).abs()))
+            .max()
+            .unwrap_or(0);
+        (away, held, kept_off(&judged, from, leap, ch), step, ch)
+    });
+    for (&(leap, style, look, drive, lettered, control), &(away, held, met, step, ch)) in
+        runs.iter().zip(&seen)
+    {
+        let (name, look) = (leap.0, look.name);
+        assert!(
+            away >= 60,
+            "fixture: {style} on {look} ({name}, {drive:?}) follows the caret ({away} frames)"
+        );
+        assert!(
+            !lettered || held >= 100,
+            "fixture: {style} on {look} ({name}, {drive:?}) is fitted under the lettered rows \
+             ({held} frames)"
+        );
+        if control {
+            let bites = leap.5[usize::from(drive == Drive::Ctl)];
+            assert!(
+                met >= bites,
+                "negative control ({name}, {drive:?}): read about the caret alone, the box met \
+                 the glyphs it is kept off in {met} frames"
+            );
+        } else {
+            assert_eq!(
+                (met, if lettered { 0 } else { held }),
+                (0, 0),
+                "{style} on {look} ({name}, {drive:?}, lettered {lettered}): frames whose box \
+                 meets the glyphs it is kept off, frames drawn down or fitted on a blank page"
+            );
+            assert!(
+                step <= 3 * ch,
+                "{style} on {look} ({name}, {drive:?}, lettered {lettered}): a box moved {step} \
+                 px in a frame"
+            );
+        }
+    }
+}
+
 /// A FULL-SCREEN PROGRAM'S ROWS UNDER ITS LINE ARE ITS OWN ([`OldPath::FullScreenKeepsItsRow`]):
 /// in the `steam` scene on the alternate screen ([`Steam::FullScreen`]) the cat keeps its line's
 /// row. Seated three rows under the prompt at rest and while the hand wrote, it flew up across

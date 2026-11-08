@@ -11484,6 +11484,11 @@ mod reset {
     include!("reset_loop_tests.rs");
 }
 
+mod usage_capture {
+    use super::*;
+    include!("usage_capture_tests.rs");
+}
+
 mod stall_hold {
     use super::*;
     include!("stall_tests.rs");

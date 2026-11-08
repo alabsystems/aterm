@@ -24,7 +24,7 @@ use std::ops::Range;
 use super::accounts::{self, Class};
 use super::outlook::{
     self, Basis, Figure, Knot, Offsets, Outlook, Pass, PassKind, Read, RowOutlook, Stop, StopEnd,
-    Verdict, Window, round_down, round_up, spoken_when, when,
+    Verdict, Window, round_down, round_up, span_dated, spoken_when, when,
 };
 
 const DAY: i64 = 86_400;
@@ -48,6 +48,8 @@ pub const NO_FIGURE: &str = "no week figure yet";
 pub const NO_FIGURE_FULL: &str = "no week figure yet \u{b7} Claude reports it with its next reply";
 /// The name of a login the roster cannot name (§2.5).
 pub const THIS_LOGIN: &str = "this login";
+/// The title's last words: what a click on the row does (§2.6).
+pub const CLICK: &str = "click: accounts";
 
 /// `▕` (U+2595): the now cell, between the measured past and the projected future.
 pub const NOW_MARK: char = '\u{2595}';
@@ -303,8 +305,8 @@ impl QuotaLine {
     }
 
     fn put(&mut self, text: &str, role: Role, bold: bool) {
-        let bold = bold || role == Role::Warn;
-        self.cells.extend(text.chars().map(|c| (c, role, bold)));
+        self.cells
+            .extend(text.chars().map(|c| (c, role, bold || heavy(c, role))));
     }
 
     fn gap(&mut self) {
@@ -355,18 +357,23 @@ pub struct Piece {
     pub text: String,
     /// Their ink.
     pub role: Role,
-    /// Bold (a warn piece always is).
+    /// Bold (a warn piece and the reset mark always are: [`heavy`]).
     pub bold: bool,
 }
 
 impl Piece {
     fn new(text: impl Into<String>, role: Role) -> Piece {
-        Piece {
-            text: text.into(),
-            role,
-            bold: role == Role::Warn,
-        }
+        let text = text.into();
+        let bold = text.chars().any(|c| heavy(c, role));
+        Piece { text, role, bold }
     }
+}
+
+/// Whether a glyph of the glass is laid bold whatever its phrase says: every warn glyph, and
+/// `↺`, whose font glyph has so little ink at 1x that, laid regular, the milestone §1.3 inks
+/// `lit` reads fainter than the quiet `·` beside it.
+fn heavy(c: char, role: Role) -> bool {
+    role == Role::Warn || c == RESET_MARK
 }
 
 /// The lead forms of §2.4.
@@ -416,15 +423,18 @@ pub fn level(x10: u16) -> u8 {
     }
 }
 
-/// A name cut to [`NAME_CELLS`] cells, its last an ellipsis.
+/// A name cut to at most [`NAME_CELLS`] cells, its last an ellipsis, between whole grapheme
+/// clusters: an accent stays on its letter and a joined emoji goes whole or not at all.
 #[must_use]
 pub fn cut(name: &str) -> String {
-    if name.chars().count() <= NAME_CELLS {
+    if aterm_grapheme::str_grid_columns(name) <= NAME_CELLS {
         return name.to_owned();
     }
-    let mut out: String = name.chars().take(NAME_CELLS - 1).collect();
-    out.push('\u{2026}');
-    out
+    aterm_grapheme::grid_graphemes(name)
+        .take_while(|cluster| cluster.end_col < NAME_CELLS)
+        .map(|cluster| cluster.text)
+        .chain(std::iter::once("\u{2026}"))
+        .collect()
 }
 
 /// Whole percent, half up, at most 99: a curve under 100 is never said `100%`.
@@ -1468,7 +1478,7 @@ impl Outlook {
         if !view.folded.is_empty() {
             parts.push(format!("+{} more", view.folded.len()));
         }
-        parts.push("click: accounts".to_owned());
+        parts.push(CLICK.to_owned());
         parts.join(SEP)
     }
 
@@ -1661,6 +1671,61 @@ fn whole_spoken(x10: u16) -> u16 {
 }
 
 impl QuotaView {
+    /// Case (b) of the glass design (§1) as a pane's view, built by hand for other crates' tests
+    /// of what the window draws from a view: `main` at 63% of its week, its reset Sat 10:00
+    /// (`~98%` by then), a gap projected from ~Thu 12 Nov 05:00 to its next reset, Sat 14 Nov
+    /// 10:00; no chart. The outlook's own tests build views from replays ([`Outlook::quota`]).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn sample() -> QuotaView {
+        QuotaView {
+            named: vec![Named {
+                label: "main".into(),
+                this_tab: true,
+                carrier: true,
+                figure: Figure::Exact(630),
+                reset: None,
+                plan: Some("Max 20x".into()),
+            }],
+            tail: Tail {
+                own: Some(Own {
+                    by_reset: Some(98),
+                    reset: "Sat 10:00".into(),
+                }),
+                verdict: Some(Phrase {
+                    full: format!("{GAP_MARK} ~Thu 12 Nov 05:00\u{2013}Sat 14 Nov 10:00"),
+                    short: format!("{GAP_MARK} ~Thu 12 Nov 05:00"),
+                    ink: Role::Warn,
+                    kept: true,
+                }),
+            },
+            title: format!(
+                "main{SEP}Max 20x{SEP}63% of its week used, read now{SEP}~98% by its reset Sat \
+                 10:00{SEP}next week out ~Thu 12 Nov 05:00 until its reset Sat 14 Nov 10:00{SEP}\
+                 {CLICK}"
+            ),
+            spoken: "Accounts. main, this tab, 63 percent of its week used, resets Saturday \
+                     10:00. Every account out from about Thursday 12 November 05:00 until main's \
+                     reset Saturday 14 November 10:00."
+                .into(),
+            ..QuotaView::default()
+        }
+    }
+
+    /// The hover title with `clause` said last before the click's words (the rotation's,
+    /// `footer::rotation_words`, §5.1); the title alone where there is none.
+    #[must_use]
+    pub fn title_with(&self, clause: Option<&str>) -> String {
+        let Some(clause) = clause.filter(|c| !c.is_empty()) else {
+            return self.title.clone();
+        };
+        match self.title.strip_suffix(CLICK) {
+            Some(head) => format!("{head}{clause}{SEP}{CLICK}"),
+            None if self.title.is_empty() => clause.to_owned(),
+            None => format!("{}{SEP}{clause}", self.title),
+        }
+    }
+
     /// This tab's named account.
     #[must_use]
     pub fn tab(&self) -> Option<&Named> {
@@ -1715,7 +1780,7 @@ impl QuotaView {
                 out.cells.extend(
                     chart
                         .iter()
-                        .map(|c| (c.glyph(), c.role(), c.role() == Role::Warn)),
+                        .map(|c| (c.glyph(), c.role(), heavy(c.glyph(), c.role()))),
                 );
                 out.chart = from..out.cells.len();
                 out.per_day = per_day;
@@ -1796,6 +1861,180 @@ impl QuotaView {
                 false,
             );
         }
+    }
+
+    /// What the pointer on cell `cell` of the chart laid at `per_day` cells a day names (§2.6),
+    /// in local time by `offsets`: a past cell its span and the reading it holds (`Wed 4 Nov
+    /// 20:00–23:00 · main 50% (read on this Mac)`); a future level its span and the drawn
+    /// account's projected fill (`~Tue 10 Nov 14:00–17:00 · main ~45% (projected)`); a `→` the
+    /// hand-off (`~Fri 08:00 · the work moves from main (98%) to alt1`; `(out)` for a fill the
+    /// projection reaches, never 100%; a move where a wall lifts at a named account's reset said
+    /// at that reset exactly, `Sat 10:00 · the work moves to main`), and a name after it the
+    /// same; a `╳` its stop (`~Sat 03:00–Sat 10:00 · every account out until main's reset`); a
+    /// `$` its span on credits; a `↺` the reset; `┄` that nothing is projected there. `None` for
+    /// the now cell, which holds no time, and past the chart's end: the row's own title stands.
+    #[must_use]
+    pub fn column_title(&self, per_day: u8, cell: usize, offsets: &Offsets) -> Option<String> {
+        let chart = &self.chart;
+        let (a, b) = chart.span_of(per_day, cell)?;
+        let mut cells = Vec::new();
+        chart.cells(per_day, &mut cells);
+        let k = usize::from(per_day);
+        let s = DAY / i64::from(per_day);
+        let now = chart.now;
+        let tab = self.tab().map_or(THIS_LOGIN, |n| n.label.as_str());
+        let span = span_dated(a, b, offsets);
+        let about = |t: i64| format!("~{}", when(round_down(t, now, offsets), now, offsets));
+        if cell < k {
+            return Some(match cells.get(cell)? {
+                Cell::Read(_) => {
+                    let i = chart.past.partition_point(|r| r.t <= b);
+                    let r = chart.past.get(i.checked_sub(1)?)?;
+                    format!(
+                        "{span}{SEP}{} {}% (read on this Mac)",
+                        cut(tab),
+                        whole_spoken(r.x10)
+                    )
+                }
+                Cell::Reset => format!("{span}{SEP}{}'s week reset", cut(tab)),
+                _ => format!("{span}{SEP}no reading on this Mac"),
+            });
+        }
+        let j = cell - k - 1;
+        // Whose week reset `t` is, among the named accounts.
+        let reset_of = |t: i64| {
+            self.named
+                .iter()
+                .find(|n| n.reset.is_some_and(|r| (t - r).rem_euclid(WEEK) == 0))
+                .map(|n| cut(&n.label))
+        };
+        let run_at = |t: i64| {
+            chart
+                .runs
+                .iter()
+                .rev()
+                .find(|r| r.from < t && t <= r.to)
+                .or_else(|| chart.runs.iter().rev().find(|r| r.from < t))
+        };
+        let words = match cells.get(cell)? {
+            Cell::Gap | Cell::Credits => {
+                let credits = matches!(cells[cell], Cell::Credits);
+                let &(from, to, _) = chart
+                    .stops
+                    .iter()
+                    .filter(|(_, _, c)| *c == credits)
+                    .find(|(from, to, _)| (to.min(&b) - from.max(&a)) * 2 >= s)
+                    .or_else(|| {
+                        chart
+                            .stops
+                            .iter()
+                            .filter(|(_, _, c)| *c == credits)
+                            .find(|(from, to, _)| *to > a && *from < b)
+                    })?;
+                if credits {
+                    format!(
+                        "{}\u{2013}~{}{SEP}the work runs on usage credits",
+                        about(from),
+                        when(round_up(to, now, offsets), now, offsets)
+                    )
+                } else if to >= now + 7 * DAY {
+                    format!("from {}{SEP}every account out", about(from))
+                } else if let Some(label) = reset_of(to) {
+                    format!(
+                        "{}\u{2013}{}{SEP}every account out until {label}'s reset",
+                        about(from),
+                        when(to, now, offsets)
+                    )
+                } else {
+                    format!(
+                        "{}\u{2013}~{}{SEP}every account out",
+                        about(from),
+                        when(round_up(to, now, offsets), now, offsets)
+                    )
+                }
+            }
+            Cell::Handoff | Cell::Name(_) => {
+                let arrow = (0..=j)
+                    .rev()
+                    .find(|&i| matches!(cells[k + 1 + i], Cell::Handoff))?;
+                // The hand-off it draws: the last whose own cell is the arrow's, or one a gap
+                // moved there.
+                let (t, mark) = chart
+                    .marks
+                    .iter()
+                    .filter(|(_, m)| matches!(m, Mark::Handoff(_) | Mark::Lean(_)))
+                    .rfind(|(t, _)| {
+                        future_index(now, s, cells.len() - k - 1, *t).is_some_and(|at| {
+                            at <= arrow
+                                && (at..arrow).all(|i| matches!(cells[k + 1 + i], Cell::Gap))
+                        })
+                    })?;
+                match mark {
+                    Mark::Handoff(to) => {
+                        let from = chart.runs.iter().find(|r| r.to == *t && &r.label != to);
+                        // A projected fill is never said as 100% (§2.1): one that reaches it is
+                        // `out`, as a level's title says. A move at a vendor reset is said
+                        // exactly, as the vendor says it (§2.3); any other is a forecast.
+                        let pct = from
+                            .and_then(|r| r.at(*t))
+                            .map(|x| match x {
+                                1000.. => " (out)".to_owned(),
+                                x => format!(" ({}%)", whole_under_full(x)),
+                            })
+                            .unwrap_or_default();
+                        // The work resumes where a wall lifts, `RESET_GRACE_S` after the reset
+                        // it waited for; the glass says that reset (§2.3).
+                        let reset = self.named.iter().find_map(|n| {
+                            let late = (*t - n.reset?).rem_euclid(WEEK);
+                            (late <= accounts::RESET_GRACE_S).then_some(*t - late)
+                        });
+                        let at = reset.map_or_else(|| about(*t), |r| when(r, now, offsets));
+                        match from {
+                            Some(from) => format!(
+                                "{at}{SEP}the work moves from {}{pct} to {}",
+                                cut(&from.label),
+                                cut(to)
+                            ),
+                            None => format!("{at}{SEP}the work moves to {}", cut(to)),
+                        }
+                    }
+                    Mark::Lean(to) => format!(
+                        "{}{SEP}the work moves to {}, which aterm has not read",
+                        about(*t),
+                        cut(to)
+                    ),
+                    Mark::Reset => return None,
+                }
+            }
+            Cell::Reset => {
+                let t = chart
+                    .marks
+                    .iter()
+                    .find(|(t, m)| matches!(m, Mark::Reset) && (a..b).contains(t))
+                    .map_or(a, |(t, _)| *t);
+                let label = reset_of(t)
+                    .or_else(|| run_at(t + 1).map(|r| cut(&r.label)))
+                    .unwrap_or_else(|| cut(tab));
+                format!("{}{SEP}{label}'s week resets", when(t, now, offsets))
+            }
+            Cell::Ahead(_) => {
+                let run = run_at(b)?;
+                match run.at(b.min(run.to)) {
+                    Some(x10) if x10 >= 1000 => {
+                        format!("~{span}{SEP}{} out (projected)", cut(&run.label))
+                    }
+                    Some(x10) => format!(
+                        "~{span}{SEP}{} ~{}% (projected)",
+                        cut(&run.label),
+                        whole_under_full(x10)
+                    ),
+                    None => format!("~{span}{SEP}not projected"),
+                }
+            }
+            Cell::Unknown => format!("~{span}{SEP}not projected"),
+            Cell::Blank | Cell::Now | Cell::Read(_) => format!("~{span}{SEP}nothing projected"),
+        };
+        Some(words)
     }
 
     /// Line D's words-only unit (§1.2), for a pane whose line E is not the glass's: its forms,

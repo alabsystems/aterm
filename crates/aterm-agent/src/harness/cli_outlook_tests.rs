@@ -307,3 +307,61 @@ fn the_report_replays_under_the_windows_mode() {
         assert_eq!(card_outlook(&env).mode.as_str(), mode, "{toml}: the card's");
     }
 }
+
+/// The `since` of the window `id` in a `windows` array of `--json`.
+fn since_in(windows: &Value, id: &str) -> Value {
+    windows
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|w| w["id"] == Value::from(id))
+        .map_or(Value::Null, |w| w["since"].clone())
+}
+
+/// STATS AND THE ACCOUNTS REPORT GIVE ONE SINCE. On the seed, `me`'s week read 42% a day ago and
+/// 58% now: `accounts stats --json` run on `me`'s home says it rose 16 points over 24h, and the
+/// `--json` accounts report says exactly that `since` under `me`'s row, the windows with no
+/// series saying none in both. Negative control: the report's `since` left null (its
+/// `with_since` call in `accounts_json` removed) differs from the stats one, and the second
+/// assertion fails.
+#[test]
+fn stats_and_the_accounts_report_give_one_since() {
+    let tmp = tmp_dir("accounts-since");
+    let mut env = env_at(&tmp);
+    seeded(&tmp, &env);
+    let home = tmp.path().join("logins").join("me");
+    env.claude_profile = Some(home.join(".claude.json"));
+    env.claude_dir = Some(home);
+    let (code, stats, err) = acc_quiet(
+        AccountsCmd::Stats {
+            json: true,
+            since_s: D,
+        },
+        &env,
+    );
+    assert_eq!(code, format!("{:?}", ExitCode::SUCCESS), "{err}");
+    let stats: Value = aterm_json::from_str(stats.trim()).expect("the stats are JSON");
+    let account = &stats["accounts"][0];
+    assert_eq!(account["label"], Value::from("me"));
+    let week = since_in(&account["windows"], "seven_day");
+    assert_eq!(
+        week,
+        aterm_json::json!({"span_s": D, "used_pct": 16, "new_window": null,
+                           "new_window_rfc3339": null, "reset_used": null,
+                           "reset_used_rfc3339": null}),
+        "{stats}"
+    );
+    let (_, report, _) = acc_quiet(AccountsCmd::Report { json: true }, &env);
+    let report: Value = aterm_json::from_str(report.trim()).expect("the report is JSON");
+    let row = report["accounts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|a| a["label"] == Value::from("me"))
+        .expect("me's row");
+    assert_eq!(since_in(&row["windows"], "seven_day"), week, "{report}");
+    for id in ["five_hour", profile::Bucket::Fable.id()] {
+        assert_eq!(since_in(&account["windows"], id), Value::Null, "{id}");
+        assert_eq!(since_in(&row["windows"], id), Value::Null, "{id}");
+    }
+}

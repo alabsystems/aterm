@@ -437,7 +437,7 @@ fn cancellation_slots_are_bounded_and_never_evict_an_unexpired_no_future_receipt
     assert_eq!(
         Reply::parse(&run(&ctx, &facts, cancel(first), auxiliary())),
         Some(cancel_receipt(Prepare {
-            asked_upgrade: None,
+            asked: None,
             id: "00".repeat(16),
             ..original.clone()
         }))

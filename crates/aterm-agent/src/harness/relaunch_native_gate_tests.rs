@@ -363,7 +363,7 @@ fn retirement_discovered_during_abort_is_saved_before_any_further_observation() 
     let mut st = state(true);
     st.line = command.legacy_line().unwrap();
     st.native_prepare = Request::prepare(Prepare {
-        asked_upgrade: None,
+        asked: None,
         id: "ab".repeat(16),
         host_epoch: "ef".repeat(16),
         holder: super::super::upgrade_drive::hand_name(),
@@ -1327,7 +1327,7 @@ fn a_native_act_is_this_hosts_only_by_its_epoch() {
         "nothing stamped is never asked"
     )));
     st.native_completed_prepare = Some(Box::new(super::super::native_act::Prepare {
-        asked_upgrade: None,
+        asked: None,
         id: "12".repeat(16),
         host_epoch: "34".repeat(16),
         holder: "fixture@1".into(),

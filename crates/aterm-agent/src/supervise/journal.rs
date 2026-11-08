@@ -117,10 +117,10 @@ pub const CAPTURED: &str = "CAPTURED";
 
 /// The rows of a screen the loop kept, as its journal line says them: `CAPTURED seq=<n> <what>
 /// program=<name> version=<v|-> grid=<cols>x<rows>|- first=<n> masked=<n> rows=<JSON array>`,
-/// each row as the read gave it ([`Self::of_screen`]: every e-mail address masked), its trailing
-/// blanks cut; `first` is the grid row of the first, so the rows above it (the transcript over a
-/// box) are none of the record's. A record, never a badge or an ask; the `rows=` array, top to
-/// bottom, is a phase fixture's rows.
+/// each row as the read gave it ([`Self::of_screen`]: every e-mail address and the composer's draft
+/// masked), its trailing blanks cut; `first` is the grid row of the first, so the rows above it
+/// (the transcript over a box) are none of the record's. A record, never a badge or an ask; the
+/// `rows=` array, top to bottom, is a phase fixture's rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capture {
     /// The read's `seq=`.
@@ -190,6 +190,25 @@ pub fn mask_addresses(rows: &[String]) -> (Vec<String>, usize) {
     )
 }
 
+/// `rows` with the letters and digits of the composer's draft masked (`x`): the rows between the
+/// composer's two rules ([`aterm_phase::phase::composer_rules`]), their other characters (the `❯`,
+/// blanks, punctuation) kept. What the person typed and has not sent is none of a record's; the
+/// rows under the composer (its mode and status rows, a footer notice) are kept as drawn, since a
+/// reader reads a footer notice against them.
+#[must_use]
+pub fn mask_draft(rows: &[String]) -> Vec<String> {
+    let mut rows = rows.to_vec();
+    if let Some((top, bottom)) = aterm_phase::phase::composer_rules(&rows) {
+        for row in rows.get_mut(top + 1..bottom).unwrap_or_default() {
+            *row = row
+                .chars()
+                .map(|c| if c.is_alphanumeric() { 'x' } else { c })
+                .collect();
+        }
+    }
+    rows
+}
+
 /// A character an address's host may hold.
 fn host_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '.' || c == '-'
@@ -216,8 +235,8 @@ fn address_spans(text: &[char], name_char: impl Fn(char) -> bool) -> Vec<(usize,
 }
 
 impl Capture {
-    /// A capture of `rows`, the grid's from row `first`, with every e-mail address masked
-    /// ([`mask_addresses`]).
+    /// A capture of `rows`, the grid's from row `first`, with every e-mail address
+    /// ([`mask_addresses`]) and the composer's draft ([`mask_draft`]) masked.
     #[must_use]
     pub fn of_screen(
         seq: u64,
@@ -229,6 +248,7 @@ impl Capture {
         rows: &[String],
     ) -> Self {
         let (rows, masked) = mask_addresses(rows);
+        let rows = mask_draft(&rows);
         Self {
             seq,
             what,

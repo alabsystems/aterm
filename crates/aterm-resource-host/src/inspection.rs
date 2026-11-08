@@ -6,11 +6,7 @@
 use aterm_ctl::resource_admission_transport as wire;
 use aterm_json::Value;
 use aterm_types::resource_inspection::{BirthKind, Cpu, Inspection, Manifest, Memory, Subject};
-use std::{
-    io,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{io, path::Path, time::Instant};
 use trust_resource_provenance::{Host, Store as ProvenanceStore};
 
 const MAX_REPLY: usize = 16 * 1024;
@@ -28,8 +24,12 @@ pub fn lookup(session: &str) -> io::Result<Value> {
     lookup_at(&ProvenanceStore::account_path()?, session)
 }
 fn lookup_at(root: &Path, session: &str) -> io::Result<Value> {
+    lookup_started(root, session, Instant::now())
+}
+
+fn lookup_started(root: &Path, session: &str, started: Instant) -> io::Result<Value> {
     canonical_session(session)?;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = crate::runtime::control_deadline(started);
     let host = ProvenanceStore::open_at(root)?.connect_ancestor(deadline)?;
     query(&host, session, deadline)
 }

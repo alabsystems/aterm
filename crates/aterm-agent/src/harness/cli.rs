@@ -107,7 +107,12 @@ USAGE:
                                                  shared accounts, preferred machines, pending rows
     aterm harness accounts import <label> --cli kimi [--region <r>]
                                                  import a pending source row for sign-in
-    aterm harness accounts stats [--json]        5h/week/Fable windows, plan, credits, \u{2248}$, and active sessions
+    aterm harness accounts stats [--since 24h] [--json]
+                                                 5h/week/Fable windows, plan, credits, \u{2248}$, how far
+                                                 each window moved since 24h, and active sessions
+    aterm harness accounts history [<label|key>] [--since 30d] [--rows] [--json]
+                                                 each account's days from this Mac's readings, with
+                                                 its ledger and journal lines
     aterm harness accounts refresh --cli kimi [--json]
                                                  read fresh Kimi /usage in a temporary tab
     aterm harness accounts add <label> [--pool] [--email <e>] [--browser <b>]
@@ -166,6 +171,9 @@ OPTIONS:
     --now               upgrade <sid>: move at first pause (still requires idle, empty draft,
                         no box/hold/child, and no keystroke in the last 20 s)
     --defer <dur>       upgrade <sid>: hold for <dur> (90s, 30m, 6h, 2d; max 30d)
+    --since <span>      accounts stats: the span each window's rise is read over (1m..90d, default
+                        24h); accounts history: the days shown (1d..400d, default 30d)
+    --rows              accounts history: also print the stored readings rows inside the span
     --skip              upgrade <sid>: stay on the running build until a newer target lands
     --cli <id>          accounts, ledger accounts: the CLI's pool (`claude`, the default; `codex`,
                         `grok`, `kimi`; `all` for the report and `accounts table` alone)
@@ -416,8 +424,8 @@ restart in place, a restore); where the relaunch line would not fit the terminal
 with it, the line goes without it and a `tap-dropped` ledger row says so. The window's
 footer shows the tab's week from the tap, from Claude Code's own `/usage` cache, or from the
 accounts store (another tapped session on the same login), whichever is newer:
-`weekly <p>% left` up to 15 minutes old, `weekly <p>% left \u{b7} 40m ago` up to an hour, then
-nothing. Without a figure the footer shows no week; the account's hover title and the
+`weekly <p>% used` up to 15 minutes old, the lower bound `weekly \u{2265}<p>% used` up to an
+hour, then nothing. Without a figure the footer shows no week; the account's hover title and the
 Accounts menu say why, and never ask you to act:
 `weekly \u{2013} \u{b7} until relaunch` (a relaunch aterm offers now would add the tap),
 `weekly \u{2013} \u{b7} untapped` (no relaunch line can carry it, or none is offered, or the line
@@ -658,9 +666,28 @@ VERBS:
     `env` block or `apiKeyHelper`), with the token in use here and, for `--auto`, the account's
     claim this Mac's; anything else runs exactly as typed, its reason word journaled
     (`token-fallback`) where the account has a token. It writes nothing and takes no lock.
-  - `accounts stats [--json]`
+  - `accounts stats [--since 24h] [--json]`
     Reads 5h, week, and Fable windows, plan, credits, 8-day list-price spend (\u{2248}$), login
     state, and running sessions for the current home (`--json` is schema 1 `account-stats`).
+    Each window also says how far it moved over `--since` (1m to 90d, default 24h), read off
+    this Mac's readings series: `+18 since 24h`, `new window since 13:00` or `reset used since
+    13:00`, never a negative number; where the series holds no reading near the span's start,
+    the span it did compare (`+5 since 3h`, `+30 since 2d1h`). It never compares two accounts.
+    Another CLI's pool keeps no series and takes no `--since`.
+  - `accounts history [<label|key>] [--since 30d] [--rows] [--json]`
+    One account's days, named by its row label, lab label or key (`ac-…` or `c-…`, never an
+    address), or every roster row's in roster order: one line a local day from this Mac's
+    readings series (the week's first and last figure and its reset, how many five-hour windows
+    closed and how many of them read full, the day's highest five-hour figure, and each limit
+    reset used or sign-in of another account), with that day's ledger rows and every Mac's
+    journal lines beneath, never a ledger row's free text. Only this account's readings count: a
+    row renamed here keeps its old series, found by its key, and a label given to another
+    account shows none of the one before. `--since` takes 1d to 400d (default 30d); `--rows`
+    adds the account's stored rows inside the span exactly as stored; `--json` is
+    `account-history` schema 1. Another CLI's pool keeps no series: its history prints its
+    ledger and journal lines alone (`series: false`). It stores nothing of its own (no compaction
+    runs, no derived row is kept); like every accounts read, it first completes an accounts
+    publication that was cut short.
   - `accounts sync [alab | <source>] [--machine <mN>] [--json]`
     Synchronizes this machine's `accounts.toml`. The default source is the lab registry
     (`alab`) wherever the lab names this Mac, ahead of every other default: its rows are the
@@ -713,8 +740,9 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     kimi.com); a Codex or Grok row may name `flow` (`browser` or `device`).
     A Claude or Codex row may name `identity_email`, the email its provider must report,
     separately from the `email` used for signing in. Alias relationships are explicit.
-  - `accounts list|add|adopt-default|use|stats --cli <id>` take the forms above, with
-    `--region` and `--flow` on `add` and `adopt-default`; `serve` is Claude Code's alone in
+  - `accounts list|add|adopt-default|use|stats|history --cli <id>` take the forms above, with
+    `--region` and `--flow` on `add` and `adopt-default` and without `--since` and `--rows`,
+    which read Claude Code's readings series; `serve` is Claude Code's alone in
     this build, and its dashboard shows every pool. `stats --cli <id>` lists each row's
     condition, login and usage as last read, with its age (no row is read for the report: a
     Codex row is read from OpenAI's usage API only when a launch is about to start on it), and `stats --cli codex` reads the default home's newest rollouts' 5h and
@@ -1371,13 +1399,19 @@ pub enum AccountsCmd {
     },
     /// `accounts use --auto`: end the pin.
     Auto,
-    /// `accounts history <label|account> [--json]`: the account's history across Macs, this Mac's
-    /// ledger rows and every Mac's journal events about it ([`super::alab_seen::history`]).
+    /// `accounts history [<label|key>] [--since <span>] [--rows] [--json]`: one account's days
+    /// from this Mac's readings series beside its ledger rows and every Mac's journal events
+    /// about it, or every roster row's in roster order ([`history::run`]).
     History {
-        /// A row label, a lab label or legacy label, or an account key; never an address.
-        name: String,
+        /// A row label, a lab label or legacy label, a lab key (`ac-…`) or an account key
+        /// (`c-…`); never an address. `None`: every roster row.
+        name: Option<String>,
         /// The JSON form.
         json: bool,
+        /// `--since`: how many seconds of days it shows ([`HISTORY_SINCE`]).
+        since_s: i64,
+        /// `--rows`: the stored series rows inside the span too, exactly as stored.
+        rows: bool,
     },
     /// `accounts token <label|email> [--replace | --remove]`: make, store and record a Claude Code
     /// setup-token for one account in one step, or remove it from the vault
@@ -1389,10 +1423,12 @@ pub enum AccountsCmd {
         /// A bare run, `--replace` or `--remove`.
         mode: TokenMode,
     },
-    /// `accounts stats [--json]`: what this machine has of the Claude Code account of the home the environment names ([`super::account_stats`]).
+    /// `accounts stats [--since <span>] [--json]`: what this machine has of the Claude Code account of the home the environment names ([`super::account_stats`]).
     Stats {
         /// The JSON form.
         json: bool,
+        /// `--since`: the span each window's `since` is read over, seconds ([`STATS_SINCE`]).
+        since_s: i64,
     },
     /// `accounts refresh --cli kimi [--json]`: read a fresh `/usage` panel in a temporary tab.
     Refresh {
@@ -1419,7 +1455,7 @@ pub enum AccountsCmd {
     },
 }
 
-/// `accounts … --cli <id>` for a pool other than Claude Code's ([`Cli`]): the report (`list`), `add`, `adopt-default`, `login`, `renew`, `use`, `stats` and `sync` ([`super::accounts_sync::run_cli_accounts_sync`]). Serving is Claude Code's alone in this build, refused by name; its dashboard shows every pool.
+/// `accounts … --cli <id>` for a pool other than Claude Code's ([`Cli`]): the report (`list`), `add`, `adopt-default`, `login`, `renew`, `use`, `stats`, `history` and `sync` ([`super::accounts_sync::run_cli_accounts_sync`]). Serving is Claude Code's alone in this build, refused by name; its dashboard shows every pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountsOf {
     /// The pool.
@@ -1805,6 +1841,8 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     let mut pool: Option<String> = None;
     let mut region: Option<String> = None;
     let mut flow: Option<String> = None;
+    let mut since: Option<String> = None;
+    let mut rows = false;
     let mut owner: Vec<OwnerAsk> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1827,6 +1865,11 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             "--wait" => wait = true,
             "--replace" => replace = true,
             "--remove" => remove = true,
+            "--rows" => rows = true,
+            "--since" => {
+                since = Some(value(i, "--since")?);
+                i += 1;
+            }
             "--email" => {
                 email = Some(value(i, "--email")?);
                 i += 1;
@@ -2150,16 +2193,28 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
             }
         },
         "accounts" => {
+            let series_flags = since.is_some() || rows;
             let form = match &rest[1..] {
                 [] | ["list"] => AccountsCmd::Report { json },
                 ["table"] => AccountsCmd::Table { json },
                 ["import", label] => AccountsCmd::Import {
                     label: (*label).to_string(),
                 },
-                ["stats"] => AccountsCmd::Stats { json },
-                ["history", name] => AccountsCmd::History {
-                    name: (*name).to_string(),
+                ["stats"] => AccountsCmd::Stats {
                     json,
+                    since_s: span_or(since.take(), STATS_SINCE)?,
+                },
+                ["history"] => AccountsCmd::History {
+                    name: None,
+                    json,
+                    since_s: span_or(since.take(), HISTORY_SINCE)?,
+                    rows: std::mem::take(&mut rows),
+                },
+                ["history", name] => AccountsCmd::History {
+                    name: Some((*name).to_string()),
+                    json,
+                    since_s: span_or(since.take(), HISTORY_SINCE)?,
+                    rows: std::mem::take(&mut rows),
                 },
                 ["refresh"] => AccountsCmd::Refresh { json },
                 ["token", name] => AccountsCmd::Token {
@@ -2265,7 +2320,8 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 },
                 other => {
                     return Err(format!(
-                        "accounts takes nothing (or `list`), `table`, `import <label>`, `stats`, \
+                        "accounts takes nothing (or `list`), `table`, `import <label>`, `stats \
+                         [--since <span>]`, `history [<label|key>] [--since <span>] [--rows]`, \
                          `refresh`, `sync [<source>] [--machine <mN>]`, `serve [<source>] \
                          [--bind <addr:port>] [--machine <mN>]`, `add <label> \
                          [--pool] [--email <e>] [--browser <b>]`, `adopt-default <label> \
@@ -2289,12 +2345,25 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
                 return Err(
                     "--json is the report's form (`aterm harness accounts --json`), \
                      `accounts table --json`, `accounts stats --json`, `accounts history \
-                     <label> --json`, `accounts refresh --cli kimi --json`, and `accounts sync \
-                     --json`: the other forms print lines"
+                     [<label|key>] --json`, `accounts refresh --cli kimi --json`, and `accounts \
+                     sync --json`: the other forms print lines"
                         .to_string(),
                 );
             }
-            accounts_of(form, pool.take(), region.take(), flow.take())?
+            let series_asked = series_flags
+                && matches!(
+                    form,
+                    AccountsCmd::Stats { .. } | AccountsCmd::History { .. }
+                );
+            let cmd = accounts_of(form, pool.take(), region.take(), flow.take())?;
+            if series_asked && matches!(cmd, Cmd::AccountsOf(_)) {
+                return Err(
+                    "--since and --rows read Claude Code's readings series: another CLI's pool \
+                     keeps none, so its `accounts stats` and `accounts history` take neither"
+                        .to_string(),
+                );
+            }
+            cmd
         }
         other => return Err(format!("unknown subcommand {other:?}")),
     };
@@ -2303,6 +2372,12 @@ pub fn parse(args: &[String]) -> Result<(Cmd, Overrides), String> {
     }
     if replace || remove {
         return Err("--replace and --remove belong to `accounts token <label|email>`".to_string());
+    }
+    if since.is_some() {
+        return Err("--since belongs to `accounts stats` and `accounts history`".to_string());
+    }
+    if rows {
+        return Err("--rows belongs to `accounts history`".to_string());
     }
     if !owner.is_empty() && !matches!(cmd, Cmd::UpgradeOwner { .. }) {
         return Err("--status, --now, --defer and --skip belong to `upgrade`".to_string());
@@ -2963,9 +3038,8 @@ fn accounts_of(
     };
     if let Some(verb) = verb {
         return Err(format!(
-            "accounts {verb} is Claude Code's alone in this build: {}'s pool takes `list`, \
-             `add`, `adopt-default`, `login`, `browser`, `renew`, `use`, `stats` and `sync` \
-             (Claude Code's dashboard shows every pool)",
+            "accounts {verb} is Claude Code's alone in this build: {}'s pool takes \
+             {OTHER_POOL_VERBS} (Claude Code's dashboard shows every pool)",
             cli.connector().product
         ));
     }
@@ -2976,11 +3050,37 @@ fn accounts_of(
     }))
 }
 
+/// The verbs another CLI's pool takes in this build ([`accounts_of`], [`run_accounts_of`]), as
+/// its refusals name them.
+const OTHER_POOL_VERBS: &str = "`list`, `add`, `adopt-default`, `login`, `browser`, `renew`, \
+                                `use`, `stats`, `history` and `sync`";
+
 /// The longest `--defer`: a month.
 pub const UPGRADE_MAX_DEFER_S: u64 = 30 * 86_400;
 
-/// `--defer`'s value: a count with a unit — `90s`, `30m`, `6h`, `2d` — or bare seconds; more than zero and at most [`UPGRADE_MAX_DEFER_S`].
-pub fn parse_defer(v: &str) -> Result<u64, String> {
+/// `accounts stats --since`'s bounds and default, seconds: a minute to 90 days, a day unless
+/// named.
+pub const STATS_SINCE: (u64, u64, u64) = (60, 90 * 86_400, 86_400);
+
+/// `accounts history --since`'s bounds and default, seconds: a day to 400 days (the series' daily
+/// tier), 30 days unless named.
+pub const HISTORY_SINCE: (u64, u64, u64) = (86_400, 400 * 86_400, 30 * 86_400);
+
+/// The span the accounts report's `--json` reads each window's `since` over: `accounts stats`'
+/// default ([`STATS_SINCE`]), so the two say one thing.
+const REPORT_SINCE_S: i64 = STATS_SINCE.2 as i64;
+
+/// The keys `account`'s record holds, which tell its series rows from another account's
+/// ([`super::account_series::Keys`]).
+fn record_keys(account: &accounts::Account) -> super::account_series::Keys<'_> {
+    super::account_series::Keys {
+        ac: account.pk.as_deref(),
+        key: account.key,
+    }
+}
+
+/// A span's seconds: a count with a unit — `90s`, `30m`, `6h`, `2d` — or bare seconds.
+fn span_secs(v: &str) -> Option<u64> {
     let (digits, unit) = match v.find(|c: char| !c.is_ascii_digit()) {
         Some(at) => v.split_at(at),
         None => (v, "s"),
@@ -2992,18 +3092,43 @@ pub fn parse_defer(v: &str) -> Result<u64, String> {
         "d" => 86_400,
         _ => 0,
     };
-    let secs = digits
+    digits
         .parse::<u64>()
         .ok()
         .filter(|_| scale > 0)
         .and_then(|n| n.checked_mul(scale))
-        .ok_or_else(|| format!("--defer wants a span like 90s, 30m, 6h or 2d, not {v:?}"))?;
-    if secs == 0 || secs > UPGRADE_MAX_DEFER_S {
+}
+
+/// A span flag's value ([`span_secs`]), at least `min` and at most `max` seconds; the refusal
+/// names `flag` and the bounds (`1s..30d`).
+pub fn parse_span(flag: &str, v: &str, min: u64, max: u64) -> Result<u64, String> {
+    let secs = span_secs(v)
+        .ok_or_else(|| format!("{flag} wants a span like 90s, 30m, 6h or 2d, not {v:?}"))?;
+    if secs < min || secs > max {
+        let word = |s: u64| super::account_stats::span(i64::try_from(s).unwrap_or(i64::MAX));
         return Err(format!(
-            "--defer {v} is outside 1s..30d: longer is `--skip`, or the `[harness] upgrade` switch"
+            "{flag} {v} is outside {}..{}",
+            word(min),
+            word(max)
         ));
     }
     Ok(secs)
+}
+
+/// `--since`'s value for a form whose bounds and default are `(min, max, default)`, the default
+/// where none was named.
+fn span_or(v: Option<String>, (min, max, default): (u64, u64, u64)) -> Result<i64, String> {
+    let secs = v.map_or(Ok(default), |v| parse_span("--since", &v, min, max))?;
+    Ok(i64::try_from(secs).unwrap_or(i64::MAX))
+}
+
+/// `--defer`'s value ([`parse_span`]): more than zero and at most [`UPGRADE_MAX_DEFER_S`]; a longer
+/// one is pointed at `--skip`.
+pub fn parse_defer(v: &str) -> Result<u64, String> {
+    parse_span("--defer", v, 1, UPGRADE_MAX_DEFER_S).map_err(|why| match span_secs(v) {
+        Some(_) => format!("{why}: longer is `--skip`, or the `[harness] upgrade` switch"),
+        None => why,
+    })
 }
 
 /// How many directory entries the transcript search looks at: a fence against a project directory that holds something other than one file per session.
@@ -11646,11 +11771,12 @@ fn accounts_json(
     raw_roster: &Roster,
     (state, logins): (&accounts::State, &accounts::Logins),
     enrolled: &BTreeSet<String>,
-    (by, policy, judged, outlook): (
+    (by, policy, judged, outlook, series): (
         HeldBy,
         &SupervisorConfig,
         &Rotation,
         Option<&super::outlook::Outlook>,
+        &BTreeMap<String, Vec<super::account_series::SeriesRow>>,
     ),
     now: i64,
 ) -> String {
@@ -11881,7 +12007,17 @@ fn accounts_json(
             m.insert("active".to_owned(), Value::from(mark.is_some()));
             m.insert("pinned".to_owned(), Value::from(mark == Some("pinned")));
             let sample = account.sample.as_ref();
-            let windows = by.windows(&account, state, now);
+            let mut windows = by.windows(&account, state, now);
+            // `accounts stats`' own `since`, over its default span: one filler, one answer.
+            super::account_stats::with_since(
+                &mut windows,
+                (
+                    series.get(&row.label).map_or(&[], Vec::as_slice),
+                    record_keys(&account),
+                ),
+                REPORT_SINCE_S,
+                now,
+            );
             let session = current_account_window(&windows, accounts::SESSION_LIMIT, now);
             let week = current_account_window(&windows, accounts::WEEK_LIMIT, now);
             m.insert(
@@ -12108,67 +12244,8 @@ fn token_report(env: &Env, host: &dyn AccountsHost) -> super::accounts_token_vie
     }
 }
 
-/// `accounts history <name> [--json]` ([`super::alab_seen::history`]): this Mac's ledger rows and
-/// every Mac's journal events about one account, oldest first. The name is a row label, a lab
-/// label or legacy label, or an account key; an address is refused. Nothing calls a provider.
-fn run_accounts_history(
-    cli: Cli,
-    env: &Env,
-    name: &str,
-    json: bool,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> ExitCode {
-    let refuse = |err: &mut dyn Write, why: &str| {
-        let _ = writeln!(err, "aterm harness accounts history: {why}");
-        ExitCode::FAILURE
-    };
-    if name.contains('@') {
-        return refuse(
-            err,
-            "an account is named by its label or key, never its address",
-        );
-    }
-    let (Some(path), Some(store)) = (env.accounts_roster_for(cli), env.accounts_store_for(cli))
-    else {
-        return refuse(err, &no_home_for(cli));
-    };
-    let records = match store.read_account_records(Some(&path), env.now) {
-        Ok(records) => records,
-        Err(_) => return refuse(err, "the account records could not be read consistently"),
-    };
-    let lab = super::alab_roster::current();
-    let Some(asked) = super::alab_seen::resolve(cli, name, &records.roster, lab.as_deref()) else {
-        return refuse(err, "no row, lab label or account key goes by that name");
-    };
-    let ledger = store.tail(accounts::LEDGER_KEEP_ROWS).unwrap_or_default();
-    let seen = super::alab_seen::current(true);
-    let journal = seen
-        .as_deref()
-        .zip(asked.pk.as_deref())
-        .and_then(|(seen, pk)| seen.accounts.get(pk));
-    let lines = super::alab_seen::history(&asked, &ledger, journal);
-    if json {
-        let value = aterm_json::json!({
-            "label": asked.label,
-            "ac": asked.pk,
-            "journal": seen.is_some(),
-            "lines": lines,
-        });
-        let _ = writeln!(out, "{value}");
-    } else {
-        if seen.is_none() {
-            let _ = writeln!(
-                out,
-                "(this Mac's ledger only: no lab journal is read in this process)"
-            );
-        }
-        for line in &lines {
-            let _ = writeln!(out, "{line}");
-        }
-    }
-    ExitCode::SUCCESS
-}
+#[path = "cli_history.rs"]
+mod history;
 
 /// The rows, admitted state and login presence used to format an account report.
 /// A dashboard can reuse this observation without reading account records again.
@@ -12472,11 +12549,35 @@ fn write_accounts_report_snapshot(
         super::accounts_sync::fleet_origin(env.home.as_deref(), env.config.as_deref(), path)
     });
     let (policy, rotation) = rotation_beside(cli, env, path);
+    // Each row's readings series, read once and cut as it is read to what the outlook's pace and
+    // each window's `since` read, so no whole series is held. Claude Code's alone: its footer
+    // writes the `plan` rows, and its files are named by label, which another CLI's roster may
+    // share.
+    let series: BTreeMap<String, Vec<super::account_series::SeriesRow>> = if cli == Cli::Claude {
+        roster
+            .rows
+            .iter()
+            .map(|r| {
+                let rows = super::account_series::read(&env.state, &r.label, &state.machine);
+                let account = state.account(&r.label);
+                let view = super::account_series::report_view(
+                    rows,
+                    record_keys(&account),
+                    REPORT_SINCE_S,
+                    env.now,
+                );
+                (r.label.clone(), view)
+            })
+            .filter(|(_, rows)| !rows.is_empty())
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     // The outlook speaks for Claude Code's pool alone (§13 of the outlook's design): the
     // other pools keep today's rows. It replays under the policy the report states.
     let outlook = (cli == Cli::Claude && !own && !roster.rows.is_empty()).then(|| {
         super::outlook::for_report(
-            &env.state,
+            &series,
             (&roster, &state, &logins, &enrolled),
             (super::outlook::replay_mode(&policy), policy.usage_credits),
             (
@@ -12496,7 +12597,7 @@ fn write_accounts_report_snapshot(
                 &raw_roster,
                 read,
                 &enrolled,
-                (by, &policy, &rotation, outlook.as_ref()),
+                (by, &policy, &rotation, outlook.as_ref(), &series),
                 env.now
             )
         )
@@ -18417,10 +18518,20 @@ pub fn run_accounts(
             run_accounts_use((Cli::Claude, host), env, Some(label), out, err)
         }
         AccountsCmd::Auto => run_accounts_use((Cli::Claude, host), env, None, out, err),
-        AccountsCmd::Stats { json } => run_accounts_stats(env, *json, out),
-        AccountsCmd::History { name, json } => {
-            run_accounts_history(Cli::Claude, env, name, *json, out, err)
-        }
+        AccountsCmd::Stats { json, since_s } => run_accounts_stats(env, *json, *since_s, out),
+        AccountsCmd::History {
+            name,
+            json,
+            since_s,
+            rows,
+        } => history::run(
+            Cli::Claude,
+            env,
+            (name.as_deref(), *json, *since_s, *rows),
+            report_clock(REPORT_LOCAL_CLOCK.load(std::sync::atomic::Ordering::Relaxed)),
+            out,
+            err,
+        ),
         AccountsCmd::Refresh { .. } => {
             let _ = writeln!(err, "aterm harness accounts refresh: use --cli kimi");
             ExitCode::from(2)
@@ -18668,7 +18779,7 @@ pub fn run_accounts_of(
         }
         AccountsCmd::Use { label } => run_accounts_use((cli, host), env, Some(label), out, err),
         AccountsCmd::Auto => run_accounts_use((cli, host), env, None, out, err),
-        AccountsCmd::Stats { json } => {
+        AccountsCmd::Stats { json, .. } => {
             let program = host.launch_program(cli);
             run_accounts_stats_of(
                 (cli, Launch::of(program.as_deref(), host)),
@@ -18678,9 +18789,19 @@ pub fn run_accounts_of(
                 err,
             )
         }
-        AccountsCmd::History { name, json } => {
-            run_accounts_history(cli, env, name, *json, out, err)
-        }
+        AccountsCmd::History {
+            name,
+            json,
+            since_s,
+            rows,
+        } => history::run(
+            cli,
+            env,
+            (name.as_deref(), *json, *since_s, *rows),
+            report_clock(REPORT_LOCAL_CLOCK.load(std::sync::atomic::Ordering::Relaxed)),
+            out,
+            err,
+        ),
         AccountsCmd::Refresh { json } => run_kimi_refresh(env, *json, out, err),
         AccountsCmd::Renew { labels, due, on } => {
             run_accounts_renew_for(cli, env, host, (labels, *due, on.as_deref()), out, err)
@@ -18701,8 +18822,7 @@ pub fn run_accounts_of(
         AccountsCmd::Serve { .. } | AccountsCmd::Token { .. } => {
             let _ = writeln!(
                 err,
-                "aterm harness accounts: {}'s pool takes `list`, `add`, `adopt-default`, \
-                 `login`, `browser`, `renew`, `use`, `stats` and `sync` in this build",
+                "aterm harness accounts: {}'s pool takes {OTHER_POOL_VERBS} in this build",
                 cli.connector().product
             );
             ExitCode::from(1)
@@ -19036,7 +19156,7 @@ fn run_accounts_stats_of(
     ExitCode::SUCCESS
 }
 
-fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
+fn run_accounts_stats(env: &Env, json: bool, since_s: i64, out: &mut dyn Write) -> ExitCode {
     use super::account_stats::{self, Look, SpendLook};
     use super::spend;
     let read = env
@@ -19135,7 +19255,17 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
         login,
         sessions,
     };
-    let view = account_stats::view(&look);
+    let mut view = account_stats::view(&look);
+    // How far each window moved, read off the label's series on this Mac. Where the label's
+    // record is another account's than the one signed in, its series is that other account's,
+    // so none is read.
+    let record = state.account(&label);
+    let series = if record.of_another(key) {
+        Vec::new()
+    } else {
+        super::account_series::read(&env.state, &label, &state.machine)
+    };
+    account_stats::with_since(&mut view, (&series, record_keys(&record)), since_s, env.now);
     let live_clock = REPORT_LOCAL_CLOCK.load(std::sync::atomic::Ordering::Relaxed);
     let live_tz = |t: i64| limit::local_offset_at(t).unwrap_or(env.tz_s);
     let fixed_tz = |_: i64| env.tz_s;
@@ -19890,8 +20020,17 @@ pub fn main_entry(argv: Vec<OsString>) -> ExitCode {
     if matches!(cmd, Cmd::Disk { .. }) || stats {
         env.claude_running = Some(disk::discover::running_claude_census(env.home.as_deref()));
     }
-    // The report's outlook says its instants on the local clock, as the footer and the card do.
-    if stats || matches!(cmd, Cmd::Accounts(AccountsCmd::Report { .. })) {
+    // The report's outlook says its instants on the local clock, as the footer and the card do,
+    // and a history its days.
+    let history = matches!(
+        cmd,
+        Cmd::Accounts(AccountsCmd::History { .. })
+            | Cmd::AccountsOf(AccountsOf {
+                form: AccountsCmd::History { .. },
+                ..
+            })
+    );
+    if stats || history || matches!(cmd, Cmd::Accounts(AccountsCmd::Report { .. })) {
         env.tz_s = limit::tz_offset_s();
         REPORT_LOCAL_CLOCK.store(true, std::sync::atomic::Ordering::Relaxed);
     }

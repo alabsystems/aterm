@@ -48,7 +48,7 @@ pub use announcement::{
 };
 pub use autocompact::{Offer, OfferFocus};
 pub use command::{CLAUDE_EXIT_WORDS, DraftCommand, draft_command};
-pub use credits::{ModelWeek, WeekModel};
+pub use credits::{ModelWeek, UsageSighting, WeekModel, usage_sighting};
 pub use harness_version::{
     CliHarness, HarnessVersion, cli_build_later, cli_version_build, cli_version_core,
     cli_version_later, cli_version_offered,

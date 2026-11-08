@@ -6,6 +6,7 @@
 use super::{Github, auth_id, auth_ready, get};
 use crate::checkout::{Origin, Stands, git, github_origin as origin_matches};
 use crate::github_pages::Page;
+use crate::init_observe::{LastReading, Reading};
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
 use crate::port::{Cmd, FileId, Scratch, Secret, System};
@@ -42,6 +43,7 @@ pub(super) fn item(user: &User, config: &Github, recorded: Vec<PathBuf>) -> Box<
         },
         recorded,
         hooks: std::sync::Mutex::new(Vec::new()),
+        reading: LastReading::default(),
     })
 }
 
@@ -52,16 +54,20 @@ struct Repositories {
     /// What the last apply's clones made of their hook installers ([`Cloned::hooks`]), which
     /// the read-back's row says.
     hooks: std::sync::Mutex<Vec<String>>,
+    reading: LastReading,
 }
 
 struct Scan {
+    /// Every selected repository, including a destination that must stay untouched.
     all: usize,
     missing: Vec<Repo>,
     existing: Vec<(Repo, PathBuf, Stands)>,
     dependencies: Vec<(Repo, PathBuf)>,
     recorded: usize,
-    /// The listed repositories left untouched ([`Inventory::notes`], [`Partition::notes`]).
+    /// Repositories excluded by the inventory's folder-selection policy.
     notes: Vec<String>,
+    /// Selected destinations that remain unfinished while preserving their existing contents.
+    blocked: Vec<String>,
 }
 
 const NAMED: usize = 4;
@@ -76,6 +82,7 @@ impl Scan {
 
     fn kept(&self) -> Option<String> {
         let mut kept = self.notes.clone();
+        kept.extend(self.blocked.iter().cloned());
         kept.extend(
             self.existing
                 .iter()
@@ -115,6 +122,7 @@ impl Item for Repositories {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         let read = (|| -> Probe {
+            self.reading.set(None);
             if matches!(super::settings_managed(sys, &self.user), Ok(false)) {
                 return Probe::NotApplicable {
                     why: "repository setup is disabled in init.toml".into(),
@@ -137,27 +145,40 @@ impl Item for Repositories {
             },
             Ok(Some(token)) => token,
         };
-            match self.scan(sys, &token) {
-                Err(why) => Probe::Unusable { why },
-                Ok(scan)
-                    if scan.missing.is_empty()
-                        && scan.dependencies.is_empty()
-                        && scan.moving() == 0 =>
-                {
-                    let mut now = format!("{} matching worktrees present", scan.all);
-                    if scan.recorded > 0 {
-                        now.push_str(&format!(
-                            "; {} recorded in [develop], which the develop items align",
-                            scan.recorded
-                        ));
-                    }
-                    match scan.kept() {
-                        Some(kept) => now.push_str(&format!("; left as they are: {kept}")),
-                        None => now.push_str("; the others up to date with GitHub"),
-                    }
-                    Probe::Ok { now }
+            let scan = match self.scan(sys, &token) {
+                Err(why) => return Probe::Unusable { why },
+                Ok(scan) => scan,
+            };
+            let present = scan.existing.len() + scan.recorded;
+            self.reading.set(Some(Reading::Repositories {
+                present,
+                count: scan.all,
+                signed_in: true,
+            }));
+            if scan.missing.is_empty() && scan.dependencies.is_empty() && scan.moving() == 0 {
+                if let Some(why) = named(&scan.blocked) {
+                    return Probe::Person {
+                        step: "github.repositories".into(),
+                        how: format!(
+                            "{present} of {} repositories ready; preserved destinations block completion: {why}",
+                            scan.all,
+                        ),
+                    };
                 }
-                Ok(scan) => Probe::Change {
+                let mut now = format!("{} matching worktrees present", scan.all);
+                if scan.recorded > 0 {
+                    now.push_str(&format!(
+                        "; {} recorded in [develop], which the develop items align",
+                        scan.recorded
+                    ));
+                }
+                match scan.kept() {
+                    Some(kept) => now.push_str(&format!("; left as they are: {kept}")),
+                    None => now.push_str("; the others up to date with GitHub"),
+                }
+                Probe::Ok { now }
+            } else {
+                Probe::Change {
                     from: format!(
                         "{} of {} repositories missing from ~{}; {} clean worktree(s) behind GitHub{}",
                         scan.missing.len(),
@@ -176,10 +197,14 @@ impl Item for Repositories {
                     to: "clone missing repositories with full history; fast-forward each clean \
                      worktree that is behind; preserve every other worktree"
                         .into(),
-                },
+                }
             }
         })();
         with_hooks(read, &hooks)
+    }
+
+    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
+        self.reading.detail()
     }
 
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
@@ -305,12 +330,13 @@ impl Repositories {
             aligned.push((repo, path, stands));
         }
         Ok(Scan {
-            all: listed.repositories.len() - notes.len(),
+            all: listed.repositories.len(),
             missing,
             existing: aligned,
             dependencies,
             recorded,
-            notes: listed.notes.into_iter().chain(notes).collect(),
+            notes: listed.notes,
+            blocked: notes,
         })
     }
 }
@@ -2599,6 +2625,7 @@ pub(super) mod tests {
                 config: config.clone(),
                 recorded: Vec::new(),
                 hooks: std::sync::Mutex::new(Vec::new()),
+                reading: LastReading::default(),
             }
             .scan(&sys, &token())
             .unwrap();
@@ -2726,8 +2753,8 @@ pub(super) mod tests {
             && !call.contains("reset")));
     }
 
-    /// A file, a link or another origin's worktree where a repository goes is left as it is,
-    /// one note each, and the stage is done without it.
+    /// A file, a link or another origin's worktree where a selected repository goes is left as
+    /// it is. The repository remains in the desired count and the stage stays unfinished.
     #[test]
     fn occupied_symlink_and_mismatched_origins_are_left_as_notes_and_never_fetched() {
         for kind in 0..3 {
@@ -2768,10 +2795,22 @@ pub(super) mod tests {
                 &mut NoJournal,
             )
             .remove(0);
-            assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
-            let now = row.to.unwrap();
-            assert!(now.contains("left as they are: ~/one"), "{now}");
-            assert!(!now.contains("private-token"), "{now}");
+            assert_eq!(row.outcome, Outcome::Person, "{row:?}");
+            assert_eq!(
+                crate::init_observe::Reading::of(&row),
+                Some(crate::init_observe::Reading::Repositories {
+                    present: 0,
+                    count: 1,
+                    signed_in: true,
+                }),
+            );
+            let why = &row
+                .explain
+                .as_ref()
+                .expect("the preserved destination is explained")
+                .why;
+            assert!(why.contains("~/one"), "{why}");
+            assert!(!why.contains("private-token"), "{why}");
             assert!(sys.calls().iter().all(|call| !call.contains("scratch")
                 && !call.contains(" clone ")
                 && !call.contains("rename")

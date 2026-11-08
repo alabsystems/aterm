@@ -20,6 +20,9 @@ pub(crate) struct Board {
     /// When the last look read [`Self::last`], on [`now_ms`]'s clock: `None` once a later look
     /// read nothing or found no `syspolicyd` running.
     read_ms: Option<u64>,
+    /// The daemon the looks have read since none or another ran, and when the first of them read
+    /// it, on [`now_ms`]'s clock, which stops while the Mac sleeps.
+    seen: Option<(Daemon, u64)>,
     /// Whether the window has been notified that the check is not stuck.
     told_unstuck: bool,
     /// `(workers, limit)` reported at the stuck edge and repeated while stuck.
@@ -33,6 +36,7 @@ impl Board {
             judge: Judge::new(),
             last: None,
             read_ms: None,
+            seen: None,
             told_unstuck: false,
             told_stuck: None,
         }
@@ -121,11 +125,15 @@ pub(crate) fn step(board: &mut Board, at_ms: u64, look: Look) -> Option<HostNote
         Look::Read(reading) => {
             board.last = Some(reading);
             board.read_ms = Some(at_ms);
+            if board.seen.is_none_or(|(d, _)| d != reading.daemon) {
+                board.seen = Some((reading.daemon, at_ms));
+            }
             board.judge.absorb(at_ms, Some(&reading))
         }
         Look::NoneRunning => {
             board.last = None;
             board.read_ms = None;
+            board.seen = None;
             board.judge.absorb_none_running()
         }
         Look::Unread => {
@@ -337,13 +345,17 @@ fn fields(b: &Board, now_ms: u64, wall_us: u64) -> String {
     )
 }
 
-/// The `syspolicyd` a fresh look read: the daemon and whether its pool read full.
+/// The `syspolicyd` a fresh look read: the daemon, whether its pool read full, and how long the
+/// looks have read it awake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RunningCheck {
     /// The daemon the look read.
     pub(crate) daemon: Daemon,
     /// Whether its pool read full ([`Reading::full`]).
     pub(crate) pool_full: bool,
+    /// How long since the first look that read it, ms on a clock that stops while the Mac
+    /// sleeps: a lower bound of its awake age, where its start (a wall clock) counts a sleep.
+    pub(crate) awake_ms: u64,
 }
 
 /// The check `b`'s last look read, while that look read it and is at most two looks old at
@@ -353,17 +365,18 @@ fn check_of(b: &Board, now_ms: u64) -> Option<RunningCheck> {
     if u128::from(now_ms.saturating_sub(read_ms)) > 2 * every().as_millis() {
         return None;
     }
-    b.last.map(|r| RunningCheck {
+    let r = b.last?;
+    Some(RunningCheck {
         daemon: r.daemon,
         pool_full: r.full(),
+        awake_ms: b
+            .seen
+            .filter(|(d, _)| *d == r.daemon)
+            .map_or(0, |(_, since)| now_ms.saturating_sub(since)),
     })
 }
 
 /// [`check_of`] the process-wide board now.
-#[expect(
-    dead_code,
-    reason = "the jobs pass's stranded judge is its reader, and it is not wired yet"
-)]
 pub(crate) fn last_read() -> Option<RunningCheck> {
     check_of(
         &BOARD.lock().unwrap_or_else(PoisonError::into_inner),
@@ -576,19 +589,28 @@ mod tests {
     }
 
     /// The stranded judge gets the board only while its last look read a daemon, at most two
-    /// looks (two `DISK_TICK`s, 120 s) ago.
+    /// looks (two `DISK_TICK`s, 120 s) ago, with how long the looks have read that daemon on a
+    /// clock that stops while the Mac sleeps: from the first look that read it, which a look that
+    /// reads nothing keeps and one that finds none running, or another daemon, starts over.
     #[test]
     fn the_stranded_judge_reads_the_board_only_while_its_last_look_read_it() {
         let mut b = Board::default();
         assert_eq!(check_of(&b, 0), None, "nothing read");
         let at = 5 * MIN;
         step(&mut b, at, reading(6, false));
-        let answering = Some(RunningCheck {
-            daemon: D,
-            pool_full: false,
-        });
-        assert_eq!(check_of(&b, at), answering);
-        assert_eq!(check_of(&b, at + 120_000), answering, "two looks old");
+        let answering = |awake_ms| {
+            Some(RunningCheck {
+                daemon: D,
+                pool_full: false,
+                awake_ms,
+            })
+        };
+        assert_eq!(check_of(&b, at), answering(0));
+        assert_eq!(
+            check_of(&b, at + 120_000),
+            answering(120_000),
+            "two looks old"
+        );
         assert_eq!(check_of(&b, at + 120_001), None, "older than two looks");
         step(&mut b, at + MIN, Look::Unread);
         assert_eq!(check_of(&b, at + MIN), None, "the last look read nothing");
@@ -603,11 +625,36 @@ mod tests {
             Some(RunningCheck {
                 daemon: D,
                 pool_full: true,
+                awake_ms: 2 * MIN,
             }),
-            "the full stand-in reads full"
+            "the full stand-in reads full, the daemon read awake since the first look, a look \
+             that read nothing between"
         );
         step(&mut b, at + 3 * MIN, Look::NoneRunning);
         assert_eq!(check_of(&b, at + 3 * MIN), None, "none running");
+        step(&mut b, at + 4 * MIN, reading(6, false));
+        step(&mut b, at + 5 * MIN, reading(6, false));
+        assert_eq!(
+            check_of(&b, at + 5 * MIN + 120_000),
+            Some(RunningCheck {
+                daemon: D,
+                pool_full: false,
+                awake_ms: MIN + 120_000,
+            }),
+            "each look that reads it moves the read time on, and one after none ran reads it \
+             from that look"
+        );
+        let again = Daemon {
+            pid: 11291,
+            start_s: D.start_s + 3_600,
+            start_us: 0,
+        };
+        step(&mut b, at + 6 * MIN, on(again, 6, false));
+        assert_eq!(
+            check_of(&b, at + 7 * MIN).map(|c| (c.daemon.pid, c.awake_ms)),
+            Some((11291, MIN)),
+            "CONTROL: another daemon is read awake from its own first look"
+        );
     }
 
     /// The `full` stand-in drives a healthy reading to stuck, and `live` clears it.

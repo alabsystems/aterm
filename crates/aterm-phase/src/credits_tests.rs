@@ -454,3 +454,271 @@ fn no_unmeasured_name_and_no_programs_words_read_as_a_models_week() {
         );
     }
 }
+
+/// The recorder's clock as these tests stand it in: it places every reset a notice names.
+fn places_any(reset: &str) -> bool {
+    !reset.is_empty()
+}
+
+/// The Fable consent box the approval policy's own tests draw (aterm-agent
+/// `policy::approval_tests`' `a_credits_consent_is_taken_only_under_usage_credits`): the reset
+/// confirmation's head rows, a rule among them, over the box's body.
+fn consent_box() -> Vec<String> {
+    let mut rows: Vec<String> = screen(crate::reset::fixtures::CONFIRM)[..3].to_vec();
+    rows.extend(
+        [
+            "   You've reached your Fable limit",
+            "",
+            "   You've used your included Fable usage for this week. Continuing on Fable 5.1 uses",
+            "   usage credits — you have $12.00 in credits.",
+            "   https://support.claude.com/en/articles/12429409-extra-usage-for-paid-claude-plans",
+            "",
+            "   ❯ Switch to Opus 5.5 and continue",
+            "     Continue with Fable 5.1",
+            "",
+            "   Enter to confirm · Esc to cancel",
+        ]
+        .map(str::to_string),
+    );
+    rows
+}
+
+/// Each usage form no reader here reads is sighted for a capture: a `You've used …` warning of a
+/// limit no reader names (the measured Fable warning, renamed Opus), the consent box naming usage
+/// credits, and a model's wall no reader names (the measured Fable wall, renamed Opus). Each
+/// sighting's top is the form's own first row and its key its own text, so the rows from the top
+/// sight the same form with the same key. NEGATIVE CONTROL: the box with its credits words taken
+/// out is no sighting.
+#[test]
+fn usage_sighting_takes_each_unread_usage_form() {
+    let rows = screen(FABLE_WARNING_2_1_301);
+    let at = row_of(&rows, "You've used 85%");
+    let opus = with_row(
+        rows.clone(),
+        at,
+        &rows[at].replace("Fable limit", "Opus limit"),
+    );
+    let seen = usage_sighting(&opus, places_any).expect("the Opus warning");
+    assert_eq!(
+        (seen.what, seen.top, seen.key.as_str()),
+        (
+            "usage-warning-unread",
+            at,
+            "You've used 85% of your Opus limit · resets Oct 19 at 11:36pm (America/Los_Angeles)"
+        )
+    );
+    assert_eq!(model_week(&opus), None, "no reader reads it");
+    assert_eq!(usage_warning(&opus), None, "no reader reads it");
+
+    let boxed = consent_box();
+    let seen = usage_sighting(&boxed, places_any).expect("the consent box");
+    assert_eq!((seen.what, seen.top), ("usage-consent", 2));
+    assert!(boxed[seen.top].starts_with('▔'), "the rule over the box");
+    assert!(
+        seen.key.starts_with("You've reached your Fable limit")
+            && seen.key.ends_with("Enter to confirm · Esc to cancel"),
+        "{}",
+        seen.key
+    );
+    assert_eq!(
+        usage_sighting(&boxed[seen.top..], places_any).map(|s| s.key),
+        Some(seen.key)
+    );
+    let plain: Vec<String> = boxed
+        .iter()
+        .map(|r| {
+            r.replace("usage credits", "your plan")
+                .replace("extra-usage", "plans")
+        })
+        .collect();
+    assert_ne!(plain, boxed);
+    assert_eq!(
+        usage_sighting(&plain, places_any),
+        None,
+        "the control: no credits named"
+    );
+
+    let walled = screen(WALL_FABLE_RESET_2_1_301);
+    let wall = row_of(&walled, "You've hit your Fable limit");
+    let footer = row_of(&walled, "You've used 85%");
+    let opus_wall = with_row(
+        with_row(
+            walled.clone(),
+            wall,
+            &walled[wall].replace("Fable limit", "Opus limit"),
+        ),
+        footer,
+        "",
+    );
+    let seen = usage_sighting(&opus_wall, places_any).expect("the Opus wall");
+    assert_eq!((seen.what, seen.top), ("usage-wall-unread", wall));
+    assert!(
+        seen.key
+            .starts_with("You've hit your Opus limit · resets 1:36am"),
+        "{}",
+        seen.key
+    );
+    assert_eq!(model_week(&opus_wall), None, "no reader reads it");
+}
+
+/// NEGATIVE CONTROLS: every form a reader reads is no sighting: the measured Fable warning, the
+/// Fable walls with a reset, with none and in their usage-credits form, the Sonnet wall, S5's
+/// weekly warning and its credits notices; and neither is the usage-limit dialog, whose `Add
+/// funds to continue with usage credits` row is the reset program's, the `/usage` panel, which
+/// names usage credits in its own tab, nor a tool's output quoting an Opus wall.
+#[test]
+fn usage_sighting_leaves_every_read_form_alone() {
+    let measured = screen(IDLE_AFTER_LIMIT_AND_MODEL_SWITCH);
+    let model = row_of(&measured, "❯ /model");
+    let credits_wall: Vec<String> = measured[..model]
+        .iter()
+        .chain(&measured[model + 2..])
+        .cloned()
+        .collect();
+    assert!(model_week(&credits_wall).is_some(), "read");
+    for (name, rows) in [
+        ("the Fable warning", screen(FABLE_WARNING_2_1_301)),
+        ("the Fable wall", screen(WALL_FABLE_RESET_2_1_301)),
+        (
+            "the Fable wall, no reset",
+            screen(WALL_FABLE_NO_RESET_2_1_301),
+        ),
+        ("the usage-credits wall", credits_wall),
+        (
+            "the Sonnet wall",
+            screen(WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300),
+        ),
+        ("the weekly warning", screen(USAGE_WARNING_WEEKLY_2_1_300)),
+        ("credits started", screen(CREDITS_STARTED_2_1_300)),
+        ("credits in use", screen(CREDITS_IN_USE_2_1_300)),
+        (
+            "the limit dialog",
+            screen(crate::prompt::fixtures::LIMIT_DIALOG_NO_RESET_ROWS_2_1_301),
+        ),
+        (
+            "the /usage panel",
+            screen(crate::prompt::fixtures::USAGE_SETTLED),
+        ),
+        (
+            "the slash menu",
+            screen(crate::prompt::fixtures::USAGE_MENU_INLINE_2_1_301),
+        ),
+    ] {
+        assert_eq!(usage_sighting(&rows, places_any), None, "{name}");
+    }
+    let dialog = screen(crate::prompt::fixtures::LIMIT_DIALOG_NO_RESET_ROWS_2_1_301);
+    assert!(
+        dialog.iter().any(|r| names(r)) && crate::reset_sighting(&dialog).is_some(),
+        "the control: the dialog names usage credits, and it is the reset program's"
+    );
+    let walled = screen(WALL_FABLE_RESET_2_1_301);
+    let wall = row_of(&walled, "You've hit your Fable limit");
+    let footer = row_of(&walled, "You've used 85%");
+    let quiet = with_row(walled.clone(), footer, "");
+    let quoted = with_row(
+        with_row(quiet, wall - 1, "⏺ Bash(cat notes.txt)"),
+        wall,
+        "  ⎿  You've hit your Opus limit · resets 1:36am (America/Los_Angeles)",
+    );
+    assert_eq!(
+        usage_sighting(&quoted, places_any),
+        None,
+        "a tool's output quoting it"
+    );
+}
+
+/// A tool's box is the agent's, never the account's: a Bash box whose command and an Edit box
+/// whose diff quote the credits words ([`WORDS`]) name usage credits, and neither is a
+/// `usage-consent` sighting; the policy reads a credits consent only in a box of Claude Code's
+/// own ([`PromptKind::Other`]). NEGATIVE CONTROL: the consent box, which is one, is sighted.
+#[test]
+fn a_tool_box_quoting_the_credits_words_is_no_usage_sighting() {
+    use crate::prompt::fixtures::{BOX_BASH_2_1_287, BOX_EDIT};
+    let bash = screen(BOX_BASH_2_1_287);
+    let command = row_of(&bash, " rm -rf ./lab-doomed");
+    let bash = with_row(bash, command, r#" git grep -n "usage credit""#);
+    let edit = screen(BOX_EDIT);
+    let (minus, plus) = (row_of(&edit, " 1 -seed"), row_of(&edit, " 1 +sprout"));
+    let edit = with_row(
+        with_row(edit, minus, " 1 -pub const WORDS: &[&str] = &[];"),
+        plus,
+        r#" 1 +pub const WORDS: &[&str] = &["usage credit", "extra usage"];"#,
+    );
+    for (name, rows, kind) in [
+        ("the Bash box", &bash, PromptKind::Bash),
+        ("the Edit box", &edit, PromptKind::Edit),
+    ] {
+        let p = crate::prompt::parse_prompt_v2(rows).expect(name);
+        assert_eq!(p.kind, kind, "{name}");
+        assert!(box_names(&p, rows), "{name}: the box quotes the words");
+        assert_eq!(usage_sighting(rows, places_any), None, "{name}");
+    }
+    assert_eq!(
+        usage_sighting(&consent_box(), places_any).map(|s| s.what),
+        Some("usage-consent"),
+        "the control"
+    );
+}
+
+/// A box drawn right under a transcript row, no rule or blank between, is kept from its own first
+/// row: the row over it is the conversation's, in neither the sighting's key nor its top.
+/// NEGATIVE CONTROL: under its rule, the box is kept from the rule.
+#[test]
+fn a_consent_box_under_a_transcript_row_keeps_none_of_it() {
+    let ruled = consent_box();
+    let rule = row_of(&ruled, "▔▔▔▔");
+    let under = with_row(ruled.clone(), rule, "Notes from the review are in the plan");
+    let p = crate::prompt::parse_prompt_v2(&under).expect("the box");
+    assert_eq!((p.kind, p.span.0), (PromptKind::Other, rule + 1));
+    let seen = usage_sighting(&under, places_any).expect("the consent box");
+    assert_eq!((seen.what, seen.top), ("usage-consent", rule + 1));
+    assert!(!seen.key.contains("Notes"), "{}", seen.key);
+    assert_eq!(
+        usage_sighting(&ruled, places_any).map(|s| s.top),
+        Some(rule),
+        "the control"
+    );
+}
+
+/// A model's week is recorded only with its reset placed (or, at its wall, none named), so a Fable
+/// warning whose reset clause no reader reads, and a Fable warning or wall whose reset the
+/// recorder's clock does not place, are sighted as unread. NEGATIVE CONTROLS: the measured Fable
+/// warning and wall under a clock that places them, the Fable wall that names no reset (recorded
+/// with none, Q11) and S5's weekly warning (recorded whatever its reset says) under a clock that
+/// places nothing are none.
+#[test]
+fn a_model_week_the_recorder_cannot_place_is_sighted_unread() {
+    let places_none = |_: &str| false;
+    let rows = screen(FABLE_WARNING_2_1_301);
+    let at = row_of(&rows, "You've used 85%");
+    let width = rows[at].chars().count();
+    let reworded = rows[at].trim().replace("resets Oct 19", "refills Oct 19");
+    let reworded = with_row(rows.clone(), at, &format!("{reworded:>width$}"));
+    let seen = usage_sighting(&reworded, places_any).expect("the reworded warning");
+    assert_eq!(
+        (seen.what, seen.top, seen.key.as_str()),
+        (
+            "usage-warning-unread",
+            at,
+            "You've used 85% of your Fable limit · refills Oct 19 at 11:36pm (America/Los_Angeles)"
+        )
+    );
+    assert_eq!(usage_sighting(&rows, places_any), None, "the control");
+    assert_eq!(
+        usage_sighting(&rows, places_none).map(|s| (s.what, s.top)),
+        Some(("usage-warning-unread", at))
+    );
+    let walled = screen(WALL_FABLE_RESET_2_1_301);
+    let wall = row_of(&walled, "You've hit your Fable limit");
+    assert_eq!(usage_sighting(&walled, places_any), None, "the control");
+    assert_eq!(
+        usage_sighting(&walled, places_none).map(|s| (s.what, s.top)),
+        Some(("usage-wall-unread", wall))
+    );
+    for (name, text) in [
+        ("the Fable wall, no reset", WALL_FABLE_NO_RESET_2_1_301),
+        ("the weekly warning", USAGE_WARNING_WEEKLY_2_1_300),
+    ] {
+        assert_eq!(usage_sighting(&screen(text), places_none), None, "{name}");
+    }
+}

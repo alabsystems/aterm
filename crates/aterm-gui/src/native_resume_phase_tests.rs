@@ -106,7 +106,7 @@ fn rollback_latch_survives_three_children_expiring_before_their_first_resume() {
     let mut previous = world.original.clone();
     for id in ["e2", "e3", "e4"] {
         let request = Prepare {
-            asked_upgrade: None,
+            asked: None,
             id: id.repeat(16),
             revision: world
                 .handle

@@ -56,6 +56,118 @@ impl EventLog {
     }
 }
 
+/// One dev-set run: its exit code, each finished check's row, its wall seconds, and what its
+/// last event says it finished.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Judged {
+    /// The run's exit code ([`crate::exit`]).
+    pub code: i32,
+    /// Each check the run finished, in the order it finished them.
+    pub checks: Vec<CheckRow>,
+    /// The run's wall seconds.
+    pub secs: u64,
+    /// The run's own `run-finished` event ([`crate::report::run_event`]); `None` where none was read.
+    pub finished: Option<Finished>,
+}
+
+impl Judged {
+    /// Whether its rows are the run's whole record: its `run-finished` event names its exit code
+    /// and exactly the checks its rows name, each with its word. A line the events file lost
+    /// leaves a check the event names with no row, or the event itself missing.
+    #[must_use]
+    pub fn whole(&self) -> bool {
+        let mut rows: Vec<(&str, &str)> = self
+            .checks
+            .iter()
+            .map(|row| (row.check.as_str(), row.word.as_str()))
+            .collect();
+        rows.sort_unstable();
+        self.finished.as_ref().is_some_and(|finished| {
+            let mut named: Vec<(&str, &str)> = finished
+                .checks
+                .iter()
+                .map(|(check, word)| (check.as_str(), word.as_str()))
+                .collect();
+            named.sort_unstable();
+            finished.code == self.code && named == rows
+        })
+    }
+}
+
+/// What a run's `run-finished` event states: its exit code and each check it finished, with its
+/// outcome word.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Finished {
+    /// The run's exit code.
+    pub code: i32,
+    /// Each check and its word.
+    pub checks: Vec<(String, String)>,
+}
+
+impl Finished {
+    /// What a `verify-event: {…}` line states, when it is a `run-finished` event.
+    #[must_use]
+    pub fn of_event(line: &str) -> Option<Self> {
+        let value: aterm_json::Value =
+            aterm_json::from_str(line.strip_prefix("verify-event: ")?).ok()?;
+        if value.get("event")?.as_str()? != "run-finished" {
+            return None;
+        }
+        let checks = value
+            .get("checks")?
+            .as_array()?
+            .iter()
+            .map(|c| {
+                Some((
+                    c.get("check")?.as_str()?.to_owned(),
+                    c.get("outcome")?.as_str()?.to_owned(),
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            code: i32::try_from(value.get("code")?.as_i64()?).ok()?,
+            checks,
+        })
+    }
+}
+
+/// One finished check, as its `check-finished` event states it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckRow {
+    /// The check's name.
+    pub check: String,
+    /// Its outcome word: `ok`, `skip`, `FAIL` or `NOT RUN`.
+    pub word: String,
+    /// The ids of the findings the event carries (at most `report::FINDINGS_SHOWN`).
+    pub findings: Vec<String>,
+    /// How many findings the check had.
+    pub findings_total: usize,
+}
+
+impl CheckRow {
+    /// The row a `verify-event: {…}` line states, when it is a `check-finished` event.
+    #[must_use]
+    pub fn of_event(line: &str) -> Option<Self> {
+        let json = line.strip_prefix("verify-event: ")?;
+        let value: aterm_json::Value = aterm_json::from_str(json).ok()?;
+        if value.get("event")?.as_str()? != "check-finished" {
+            return None;
+        }
+        let findings = value
+            .get("findings")?
+            .as_array()?
+            .iter()
+            .map(|f| f.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self {
+            check: value.get("check")?.as_str()?.to_owned(),
+            word: value.get("outcome")?.as_str()?.to_owned(),
+            findings,
+            findings_total: usize::try_from(value.get("findings_total")?.as_u64()?).ok()?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -45,6 +45,9 @@ mod live_version;
 #[path = "cli_outlook_tests.rs"]
 mod outlook_report;
 
+#[path = "cli_history_tests.rs"]
+mod history_report;
+
 #[path = "cli_upgrade_policy_tests.rs"]
 mod upgrade_policy;
 
@@ -557,11 +560,17 @@ fn the_grammar_parses_what_the_help_text_advertises() {
         ),
         (
             "accounts stats",
-            Cmd::Accounts(AccountsCmd::Stats { json: false }),
+            Cmd::Accounts(AccountsCmd::Stats {
+                json: false,
+                since_s: STATS_DAY,
+            }),
         ),
         (
             "accounts stats --json",
-            Cmd::Accounts(AccountsCmd::Stats { json: true }),
+            Cmd::Accounts(AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            }),
         ),
         (
             "accounts refresh --cli kimi --json",
@@ -10147,6 +10156,108 @@ fn stats_profile() -> String {
     .expect("compose")
 }
 
+/// `accounts stats`' default `--since` ([`STATS_SINCE`]).
+const STATS_DAY: i64 = 86_400;
+
+/// STATS' `--since` TAKES A SPAN AND REFUSES THE OTHERS. `accounts stats` reads a day unless
+/// named, takes a minute to 90 days in the span grammar `--defer` takes, and refuses zero, under a
+/// minute, past 90 days, a word, another CLI's pool (whose pool keeps no series), and any verb
+/// but `stats` and `history`; `history` takes a day to 400 days, 30 days unless named, and alone
+/// takes `--rows`. Negative control: an unbounded span parser (`parse_span` with its bounds
+/// check removed) admits `--since 0` and `--since 91d`, and the first refusal fails.
+#[test]
+fn stats_since_takes_a_span_and_refuses_others() {
+    let stats = |line: &str| match parsed(line) {
+        Ok(Cmd::Accounts(AccountsCmd::Stats { json, since_s })) => Ok((json, since_s)),
+        other => Err(format!("{other:?}")),
+    };
+    for (bad, why) in [
+        ("accounts stats --since 0", "--since 0 is outside 1m..90d"),
+        (
+            "accounts stats --since 91d",
+            "--since 91d is outside 1m..90d",
+        ),
+        (
+            "accounts stats --since 30s",
+            "--since 30s is outside 1m..90d",
+        ),
+        (
+            "accounts stats --since soon",
+            "--since wants a span like 90s, 30m, 6h or 2d",
+        ),
+        (
+            "accounts stats --since 3h --cli codex",
+            "another CLI's pool keeps none",
+        ),
+        (
+            "accounts stats --rows",
+            "--rows belongs to `accounts history`",
+        ),
+        (
+            "accounts --since 3h",
+            "--since belongs to `accounts stats` and `accounts history`",
+        ),
+        ("accounts table --since 3h", "--since belongs to"),
+        ("limits --since 3h", "--since belongs to"),
+        (
+            "accounts history --since 12h",
+            "--since 12h is outside 1d..400d",
+        ),
+        (
+            "accounts history --since 401d",
+            "--since 401d is outside 1d..400d",
+        ),
+        (
+            "accounts history --cli codex --rows",
+            "another CLI's pool keeps none",
+        ),
+    ] {
+        let refused = parsed(bad).expect_err(bad);
+        assert!(refused.contains(why), "{bad}: {refused}");
+    }
+    assert_eq!(stats("accounts stats"), Ok((false, 86_400)));
+    assert_eq!(stats("accounts stats --since 3h"), Ok((false, 10_800)));
+    assert_eq!(stats("accounts stats --since 1m --json"), Ok((true, 60)));
+    assert_eq!(
+        stats("accounts stats --since 90d"),
+        Ok((false, 90 * 86_400))
+    );
+    assert_eq!(
+        parsed("accounts history"),
+        Ok(Cmd::Accounts(AccountsCmd::History {
+            name: None,
+            json: false,
+            since_s: 30 * 86_400,
+            rows: false,
+        }))
+    );
+    assert_eq!(
+        parsed("accounts history work --since 7d --rows --json"),
+        Ok(Cmd::Accounts(AccountsCmd::History {
+            name: Some("work".into()),
+            json: true,
+            since_s: 7 * 86_400,
+            rows: true,
+        }))
+    );
+    assert!(matches!(
+        parsed("accounts history --cli codex"),
+        Ok(Cmd::AccountsOf(AccountsOf {
+            cli: Cli::Codex,
+            form: AccountsCmd::History { name: None, .. },
+            ..
+        }))
+    ));
+    assert_eq!(
+        parse_defer("31d").expect_err("past a month"),
+        "--defer 31d is outside 1s..30d: longer is `--skip`, or the `[harness] upgrade` switch"
+    );
+    assert_eq!(
+        parse_defer("0").expect_err("zero"),
+        "--defer 0 is outside 1s..30d: longer is `--skip`, or the `[harness] upgrade` switch"
+    );
+}
+
 fn stats_env(tmp: &Tmp, dir: PathBuf, profile: PathBuf) -> Env {
     let mut env = env_at(tmp);
     env.claude_dir = Some(dir);
@@ -10162,7 +10273,13 @@ fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
     std::fs::write(home.join(".claude.json"), stats_profile()).expect("profile");
     let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
 
-    let (code, out, err) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+    let (code, out, err) = acc_quiet(
+        AccountsCmd::Stats {
+            json: true,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
     assert_eq!(code, format!("{:?}", ExitCode::SUCCESS), "{err}");
     let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
     assert_eq!(doc["schema"], Value::from(1u64));
@@ -10186,7 +10303,13 @@ fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
     assert_eq!(account["fable"]["hint"], Value::from(true));
     assert_eq!(doc["missing"], Value::Array(Vec::new()));
 
-    let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
+    let (_, text, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: false,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
     assert!(
         text.contains("main \u{b7} claude \u{b7} Max 5x \u{b7} credits on\n"),
         "{text}"
@@ -10226,7 +10349,13 @@ fn accounts_stats_names_a_missing_profile_and_labels_another_home_by_key() {
     let tmp = tmp_dir("stats-missing");
     let home = tmp.path().join("home");
     let env = stats_env(&tmp, home.join(".claude"), home.join(".claude.json"));
-    let (code, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+    let (code, out, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: true,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
     assert_eq!(code, format!("{:?}", ExitCode::SUCCESS));
     let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
     let account = &doc["accounts"][0];
@@ -10237,7 +10366,13 @@ fn accounts_stats_names_a_missing_profile_and_labels_another_home_by_key() {
         (&Value::Null, &Value::Null)
     );
     assert_eq!(doc["missing"][0]["what"], Value::from("profile"));
-    let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
+    let (_, text, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: false,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
     assert!(
         text.contains(
             "main \u{b7} claude \u{b7} plan \u{2014} (no-profile) \u{b7} credits \u{2014}\n"
@@ -10249,7 +10384,13 @@ fn accounts_stats_names_a_missing_profile_and_labels_another_home_by_key() {
     std::fs::create_dir_all(&other).expect("dir");
     std::fs::write(other.join(".claude.json"), stats_profile()).expect("profile");
     let env = stats_env(&tmp, other.clone(), other.join(".claude.json"));
-    let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+    let (_, out, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: true,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
     let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
     let short = super::profile::AccountKey::claude(STATS_UUID)
         .expect("key")
@@ -10268,7 +10409,13 @@ fn accounts_stats_reads_the_profile_claude_code_keeps_for_the_home_it_names() {
     std::fs::create_dir_all(&own).expect("home");
     let config = own.to_string_lossy().into_owned();
     let stats = |env: &Env| {
-        let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let (_, out, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            },
+            env,
+        );
         let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
         doc["accounts"][0].clone()
     };
@@ -10325,7 +10472,13 @@ fn accounts_stats_reads_the_file_claude_code_reads_for_the_home() {
     std::fs::write(&legacy, stats_profile()).expect("legacy profile");
     let mut env = stats_env(&tmp, records.clone(), home.join(".claude.json"));
     let stats = |env: &Env| {
-        let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let (_, out, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            },
+            env,
+        );
         let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
         let account = &doc["accounts"][0];
         (account["label"].clone(), account["plan"]["word"].clone())
@@ -10363,7 +10516,13 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
     let fresh = tmp.path().join("accounts").join("fresh");
     std::fs::create_dir_all(&fresh).expect("dir");
     let label = |env: &Env| {
-        let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let (_, out, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            },
+            env,
+        );
         let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
         doc["accounts"][0]["label"].clone()
     };
@@ -10386,7 +10545,13 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
 
     std::fs::write(&path, roster(&[("work", Some(work.as_path()))])).expect("write");
     assert_eq!(label(&env), Value::from("work"));
-    let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
+    let (_, text, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: false,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
     assert!(
         text.contains("work \u{b7} claude \u{b7} Max 5x \u{b7} credits on\n"),
         "{text}"
@@ -10456,7 +10621,13 @@ fn accounts_stats_recovers_before_choosing_its_label_and_state() {
     std::fs::rename(&witness, witness.with_extension("obstruction")).unwrap();
     std::fs::rename(&retained, &witness).unwrap();
 
-    let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+    let (_, out, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: true,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
     let doc: Value = aterm_json::from_str(out.trim()).unwrap();
     assert_eq!(doc["accounts"][0]["label"], Value::from("work"), "{out}");
     assert!(!out.contains("state-unread"), "{out}");
@@ -10493,7 +10664,13 @@ fn accounts_stats_refuses_all_account_metadata_when_any_record_is_unreadable() {
             _ => unreachable!(),
         };
         std::fs::write(&path, "{").unwrap();
-        let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+        let (_, out, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            },
+            &env,
+        );
         let doc: Value = aterm_json::from_str(out.trim()).unwrap();
         assert!(
             doc["missing"]
@@ -10525,7 +10702,13 @@ fn accounts_stats_names_a_home_it_could_not_resolve() {
     env.claude_config_unusable = Some("rel/claude".to_owned());
     env.claude_profile = claude_profile_of(env.home.as_deref(), Some("rel/claude"), None);
     assert_eq!(env.claude_profile, None);
-    let (code, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+    let (code, out, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: true,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
     assert_eq!(code, format!("{:?}", ExitCode::SUCCESS));
     let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
     assert_eq!(
@@ -10533,7 +10716,13 @@ fn accounts_stats_names_a_home_it_could_not_resolve() {
         Value::from("no-home")
     );
     assert_eq!(doc["missing"][0]["reason"], Value::from("no-home"));
-    let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
+    let (_, text, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: false,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
     assert!(
         text.contains(
             "home \u{b7} claude \u{b7} plan \u{2014} (no-home) \u{b7} credits \u{2014}\n"
@@ -10543,7 +10732,13 @@ fn accounts_stats_names_a_home_it_could_not_resolve() {
 
     let other = tmp.path().join("srv-claude-c");
     let env = stats_env(&tmp, other.clone(), other.join(".claude.json"));
-    let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
+    let (_, text, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: false,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
     assert!(
         text.contains(
             "home \u{b7} claude \u{b7} plan \u{2014} (no-profile) \u{b7} credits \u{2014}\n"
@@ -10615,7 +10810,13 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
         dirs: Vec::new(),
     }));
     let stats = |env: &Env| -> Value {
-        let (code, out, err) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let (code, out, err) = acc_quiet(
+            AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            },
+            env,
+        );
         assert_eq!(code, format!("{:?}", ExitCode::SUCCESS), "{err}");
         aterm_json::from_str(out.trim()).expect("one JSON document")
     };
@@ -10640,7 +10841,13 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
         id,
         "the same machine, run again"
     );
-    let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
+    let (_, text, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: false,
+            since_s: STATS_DAY,
+        },
+        &env,
+    );
     assert!(
         text.contains("  5h     42.5% used \u{b7} 57.5% left \u{b7} resets 01:25 (in 1h25m)   as of 1m (tap, here)\n"),
         "{text}"
@@ -10692,7 +10899,13 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
             "{windows}"
         );
     }
-    let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &off);
+    let (_, text, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: false,
+            since_s: STATS_DAY,
+        },
+        &off,
+    );
     assert!(text.contains("usage_tap = true turns it on"), "{text}");
     for config in [
         "[harness]\nenabled = false\n",
@@ -10709,7 +10922,13 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
             Value::from("usage-tap-off"),
             "{config}"
         );
-        let (_, text, _) = acc_quiet(AccountsCmd::Stats { json: false }, &off);
+        let (_, text, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: false,
+                since_s: STATS_DAY,
+            },
+            &off,
+        );
         assert!(
             text.contains("usage_tap off (the harness is off for Claude Code)")
                 && !text.contains("usage_tap = true turns it on"),
@@ -10808,7 +11027,13 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
         assert_eq!(code, exit(0), "{err}");
         let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, env);
         let doc: Value = aterm_json::from_str(json.trim()).expect("one JSON document");
-        let (_, stats, _) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let (_, stats, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            },
+            env,
+        );
         let stats: Value = aterm_json::from_str(stats.trim()).expect("one JSON document");
         (
             out,
@@ -11025,7 +11250,13 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
                 .expect("held identity");
             signed_in(observed);
             let stored = std::fs::read(store.state_file()).expect("state before stats");
-            let (code, json, err) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+            let (code, json, err) = acc_quiet(
+                AccountsCmd::Stats {
+                    json: true,
+                    since_s: STATS_DAY,
+                },
+                &env,
+            );
             assert_eq!(code, exit(0), "{err}");
             let doc: Value = aterm_json::from_str(json.trim()).expect("stats JSON");
             let row = &doc["accounts"][0];
@@ -11039,7 +11270,13 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
                     "{doc}"
                 );
             }
-            let (code, text, err) = acc_quiet(AccountsCmd::Stats { json: false }, &env);
+            let (code, text, err) = acc_quiet(
+                AccountsCmd::Stats {
+                    json: false,
+                    since_s: STATS_DAY,
+                },
+                &env,
+            );
             assert_eq!(code, exit(0), "{err}");
             assert!(
                 text.contains(&format!("login: here {expected}, renew by ")),
@@ -11095,7 +11332,13 @@ fn a_window_the_tap_never_records_says_so() {
     .expect("config");
     let roster = env.accounts_roster().expect("a roster path");
     let reason = |env: &Env| {
-        let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let (_, out, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            },
+            env,
+        );
         let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
         doc["accounts"][0]["windows"][0]["missing"]["reason"].clone()
     };
@@ -11135,7 +11378,13 @@ fn a_window_the_tap_never_records_says_so() {
     );
     std::fs::write(&roster, format!("{one}\n{work_row}")).expect("roster");
     let at_work = stats_env(&tmp, work.clone(), work.join(".claude.json"));
-    let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, &at_work);
+    let (_, out, _) = acc_quiet(
+        AccountsCmd::Stats {
+            json: true,
+            since_s: STATS_DAY,
+        },
+        &at_work,
+    );
     let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
     assert_eq!(doc["accounts"][0]["label"], Value::from("work"), "{doc}");
     assert_eq!(
@@ -11236,7 +11485,13 @@ fn under_several_accounts_the_default_homes_profile_keys_no_row() {
     let docs = |env: &Env| {
         let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, env);
         let report: Value = aterm_json::from_str(json.trim()).expect("one JSON document");
-        let (_, stats, _) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let (_, stats, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            },
+            env,
+        );
         let stats: Value = aterm_json::from_str(stats.trim()).expect("one JSON document");
         (report, stats)
     };
@@ -11324,7 +11579,13 @@ fn a_claude_code_on_no_stored_login_suppresses_the_capacity() {
             }],
             dirs: Vec::new(),
         }));
-        let (_, out, _) = acc_quiet(AccountsCmd::Stats { json: true }, &env);
+        let (_, out, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            },
+            &env,
+        );
         let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
         doc["accounts"][0]["spend"]["windows"][0]["suppressed"].clone()
     };
@@ -11348,7 +11609,13 @@ fn an_unkeyed_records_row_carries_the_key_stats_names() {
     let keys = |env: &Env| {
         let (_, json, _) = acc_quiet(AccountsCmd::Report { json: true }, env);
         let report: Value = aterm_json::from_str(json.trim()).expect("one JSON document");
-        let (_, stats, _) = acc_quiet(AccountsCmd::Stats { json: true }, env);
+        let (_, stats, _) = acc_quiet(
+            AccountsCmd::Stats {
+                json: true,
+                since_s: STATS_DAY,
+            },
+            env,
+        );
         let stats: Value = aterm_json::from_str(stats.trim()).expect("one JSON document");
         (
             report["accounts"][0]["key"].clone(),

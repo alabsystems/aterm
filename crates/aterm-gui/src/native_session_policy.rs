@@ -105,10 +105,13 @@ impl SessionPolicy {
             return fixture.constructors.enabled(kind);
         }
         // ColdRestart requires built-in Relaunch authority and owned-helper resolution.
-        // AskedUpgrade independently requires the settled predecessor and current Upgrade
-        // authority; advertising either constructor supplies neither admission proof.
-        matches!(kind, Constructor::ColdRestart | Constructor::AskedUpgrade)
-            && cold_restart_qualified()
+        // Asked constructors independently require settlement and current duty authority;
+        // AskedRelaunch additionally needs the checked producer's scoped authorization.
+        // Discovery supplies none of those admission proofs.
+        matches!(
+            kind,
+            Constructor::ColdRestart | Constructor::AskedUpgrade | Constructor::AskedRelaunch
+        ) && cold_restart_qualified()
     }
 
     /// Qualification gate for the sealed same-account service. Generic native
@@ -274,6 +277,7 @@ impl FixtureConstructors {
             Constructor::PrivateRestart => 2,
             Constructor::ColdRestart => 4,
             Constructor::AskedUpgrade => 8,
+            Constructor::AskedRelaunch => 16,
         }
     }
 

@@ -3431,6 +3431,42 @@ fn an_immutable_leaf_is_neither_planned_nor_asked_for_on_linux() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn unproducible_stage_ordinals_do_not_retire_live_workspace_caches() {
+    for suffix in [
+        "4294967296",
+        "18446744073709551615",
+        "9999999999999999999999999",
+    ] {
+        let f = Fixture::new("build-cache-stage-ordinal");
+        let root = cache_root(&f.home);
+        let workspace = f.home.join(format!("{DOOMED}-{suffix}"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").unwrap();
+        let leaf = lay(&root, &workspace, 2 * DAY);
+        let artifact = leaf.join("debug/deps/x");
+        let before = std::fs::read(&artifact).unwrap();
+        let stage = leaf
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(stage_name(OsStr::new(DOOMED), u32::MAX - 1));
+        std::fs::create_dir(&stage).unwrap();
+        std::fs::write(stage.join("retired"), b"completed removal stage").unwrap();
+
+        let removed = reclaim(&root, Some(f.home.as_path()), SystemTime::now());
+
+        assert_eq!(std::fs::read(&artifact).unwrap(), before);
+        assert_eq!(removed, std::slice::from_ref(&stage));
+        assert!(
+            !stage.exists(),
+            "a producer-valid stranded stage is still retired"
+        );
+    }
+}
+
 /// EVERY STAGE NAME IS READ AS A STAGE, AND NOTHING ELSE IS: `.cargo-build.removing` and
 /// `.cargo-build.removing-<n>` (n from 1, no leading zero) are stages, planned and finished once
 /// each and never looked into for a workspace, while `-0`, `-01`, `-x`, a bare `-` and other

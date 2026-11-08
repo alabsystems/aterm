@@ -2,12 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! The deck's units as the planner measures them (`docs/DESIGN-stats-deck-units-2026-11-04.md`
-//! §2.4 and §4, A1; `docs/DESIGN-stats-deck-resources-2026-11-04.md` §3.1 and §3.5, A2): each of
-//! block A's rows has a ladder of forms, widest first, and each form a width at a scale.
+//! §2.4 and §4, A1; `docs/DESIGN-stats-deck-resources-2026-11-04.md` §3.1 and §3.5, A2;
+//! `docs/DESIGN-stats-deck-instruments-2026-11-06.md` §4, §5 and §7, A4): each row that draws
+//! units has a ladder of forms, widest first, and each form a width at a scale. Block A's GPU,
+//! Memory, Disk and Heat rows draw them, and block B's Network and Processes rows; the CPU row
+//! draws none, because the Cores row is its unit view (A4 §7).
 //!
 //! The planner counts widths at 1× ([`PLAN_SCALE`]), where a device px is a point, so the
-//! hairlines (a wall, a rim, a seam) cost the most and a form fits its column at every scale
-//! above. The tiles inside each form, and their paint, are A1's steps R5 and R6.
+//! hairlines (a wall, a rim, a seam) and the tiles of a half point cost the most, and a form fits
+//! its column at every scale above. The tiles inside each form, and their paint, are A4's step N5.
 
 use aterm_vitals::Snapshot;
 use aterm_vitals::units::DISK_UNITS;
@@ -15,18 +18,8 @@ use aterm_vitals::units::DISK_UNITS;
 /// The scale the planner measures forms at: 1×, where hairlines cost the most (A1 §2.4).
 pub(crate) const PLAN_SCALE: f64 = 1.0;
 
-/// A Super (`hw.perflevel0`) core's tile, pt (A1 §4.1); the tile of a machine with one cluster.
-const FIRST_CLUSTER_TILE: f64 = 3.0;
-/// Every other cluster's core tile, pt: core types are told apart by width (A1 ruling 4).
-const LATER_CLUSTER_TILE: f64 = 2.0;
 /// Between two tiles of a row's run, pt.
 const TILE_GAP: f64 = 1.0;
-/// Between two CPU clusters, pt.
-const CLUSTER_GAP: f64 = 2.0;
-/// The CPU's Cluster form's tile, one a cluster, pt.
-const CLUSTER_TILE: f64 = 3.0;
-/// The CPU's queue tile past its wall, pt.
-const QUEUE_TILE: f64 = 3.0;
 /// Clear each side of a wall's hairline, pt (A1 §4.0).
 const WALL_CLEAR: f64 = 1.0;
 /// A GPU compartment, pt: rows of up to [`GPU_ROW`] (A1 §4.2).
@@ -56,14 +49,41 @@ const MEMORY_TILES: u64 = 16;
 const SWAP_COLUMN: f64 = 4.0;
 /// Between two device tiles, pt (A1 §4.4).
 const DISK_GAP: f64 = 1.0;
+/// The thermal-pressure ladder, pt (A4 §4): one column of four steps lit from the foot.
+const LADDER: f64 = 3.0;
+/// From the ladder to the first clock tile, and from the last watt tile to the work-per-joule
+/// tile, pt: the chain's three groups read apart.
+const CHAIN_GAP: f64 = 2.0;
+/// The first CPU kind's clock tile (the Super cores', or a CPU of one kind's), pt.
+const FIRST_CLOCK: f64 = 3.0;
+/// The other kind's clock tile (the Efficiency cores'), pt: kinds are told apart by width, as
+/// the Cores row's clusters were in A1 §4.1.
+const LATER_CLOCK: f64 = 2.0;
+/// The most clock tiles: the coalition split names the Super cores' cycles and the rest's
+/// (A4 §4), and CPU Stats, which names each cluster, is read only on demand.
+const CLOCKS_MAX: u8 = 2;
+/// A watt tile (CPU, GPU, Neural Engine), pt.
+const WATT_TILE: f64 = 3.0;
+/// The most watt tiles: CPU, GPU and Neural Engine.
+const WATTS_MAX: u8 = 3;
+/// The work-per-joule tile, pt.
+const WORK_TILE: f64 = 3.0;
+/// A link's interface tile, pt (A4 §5.1).
+const LINK_TILE: f64 = 3.0;
+/// The interface tiles the Network form keeps the place of: the busiest four links that are up.
+/// Links come and go with the machine's place, so the form keeps all four's place whether or not
+/// they draw, as Disk keeps its second device's (A1 §2.4's as-built note), and no link moves a
+/// column.
+pub(crate) const LINK_TILES: u64 = 4;
+/// The Processes flow tile, starts over exits at its seam, pt (A4 §6.3).
+const FLOW_TILE: f64 = 5.0;
+/// The unreaped pile's column, and the stuck column's, pt: 5 device px at 2×, so 3 at 1×.
+const PILE_TILE: f64 = 2.5;
 
-/// What the units' widths read of the machine: what it has, which changes seldom or never, not
-/// the readings its tiles draw.
+/// What the planner's measures read of the machine: what it has, which changes seldom or never,
+/// not the readings its tiles draw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct UnitFacts<'a> {
-    /// Logical cores per CPU cluster, fastest first (`hw.perflevel0` first); empty where the CPU
-    /// is unread. A cluster of no cores draws nothing.
-    pub(crate) clusters: &'a [usize],
+pub(crate) struct UnitFacts {
     /// The GPU, where its row reads one; without it the row draws no units, and no Neural
     /// Engine tile stands alone (A2 §3.1).
     pub(crate) gpu: Option<Gpu>,
@@ -75,85 +95,14 @@ pub(crate) struct UnitFacts<'a> {
     /// reading draws, as a wall keeps its space (A1 §4.0), and a front-tab change moves no
     /// column (A1 §2.4).
     pub(crate) disk: bool,
-}
-
-/// What the host's reading gives the units' widths, owned so a deck keeps it beside its plan
-/// ([`Self::facts`] lends the [`UnitFacts`] the planner reads): the cores per cluster in the
-/// reading's cluster order (`hw.perflevel0` first) or, with no cluster read, every core in one;
-/// the GPU's core count, and the Neural Engine tile where its reader's self-check held
-/// (`Snapshot::ane` read, A2 §3.1); memory's total; and whether this platform's block reader
-/// reads devices (macOS and Linux, A1 §4.4). Each changes seldom or never: none is a reading the
-/// units draw. A1's step R5 plans both deck forms from these facts in its laws; step R6 plans the
-/// painted deck with them as it paints the units.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct HostFacts {
-    clusters: Vec<usize>,
-    gpu: Option<Gpu>,
-    memory: Option<u64>,
-    disk: bool,
-}
-
-// Outside tests only `of` and `facts` reach the struct, and neither reaches the other, so each
-// carries its own expectation: once R6 calls one, that one goes unfulfilled and fails the lint,
-// where one expectation on the impl would stay fulfilled while the other is dead. The struct
-// carries none: rustc 1.96 and earlier (the cells lint on rustup's unpinned `stable`, which can be
-// one) count what an expected-dead item names as live, so an expectation on the struct as well
-// goes unfulfilled there (`docs/measured/main-reds-2026-10-20.md` §1.1).
-impl HostFacts {
-    /// What `snap` reads of the machine.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "A1 step R6 builds the painted deck's facts from the host's reading"
-        )
-    )]
-    pub(crate) fn of(snap: &Snapshot) -> Self {
-        let clusters = snap
-            .cpu
-            .as_ref()
-            .map(|cpu| {
-                cpu.clusters
-                    .iter()
-                    .map(|c| c.cores.len())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|counts| counts.iter().any(|&n| n > 0))
-            .or_else(|| snap.total_cores().map(|n| vec![n]))
-            .unwrap_or_default();
-        Self {
-            clusters,
-            gpu: snap.gpu.as_ref().map(|gpu| Gpu {
-                cores: gpu.cores.map(u32::from),
-                neural_engine: matches!(snap.ane, Some(Ok(_))),
-            }),
-            memory: snap
-                .mem
-                .as_ref()
-                .map(|mem| mem.sample.total)
-                .filter(|&total| total > 0),
-            // The block reader's platforms (`aterm_sysprobe::blockio`): elsewhere the Disk row
-            // draws no units.
-            disk: cfg!(any(target_os = "macos", target_os = "linux")),
-        }
-    }
-
-    /// The facts the planner reads.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "A1 step R6 plans the painted deck with the host's facts"
-        )
-    )]
-    pub(crate) fn facts(&self) -> UnitFacts<'_> {
-        UnitFacts {
-            clusters: &self.clusters,
-            gpu: self.gpu,
-            memory: self.memory,
-            disk: self.disk,
-        }
-    }
+    /// The heat chain's readers (A4 §4), where any runs; without them the Heat row draws no
+    /// units and says it has no heat reading.
+    pub(crate) heat: Option<Heat>,
+    /// Whether the network row reads its links here (A4 §5.1): its reader runs on this platform
+    /// (macOS's `NET_RT_IFLIST2`, Linux's `/proc/net/dev`), not which links are up.
+    pub(crate) network: bool,
+    /// Whether the processes row reads its flow, pile and stuck columns here (A4 §5.3).
+    pub(crate) processes: bool,
 }
 
 /// The GPU's facts.
@@ -166,27 +115,69 @@ pub(crate) struct Gpu {
     pub(crate) neural_engine: bool,
 }
 
-/// Block A's rows, the ones that draw units (A1 §2.1); block B draws none (A1 ruling 15).
+/// Which links of the heat chain have a reader here (A4 §4's units, left to right): a unit with
+/// no reader is absent and keeps no width (A3's rule). A unit whose reader fails its self-check
+/// (M-COAL) still reads, hollow, and keeps its width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Heat {
+    /// The pressure ladder: macOS's documented thermal-pressure level, or Linux's heuristic
+    /// level in machine ink (A3).
+    pub(crate) ladder: bool,
+    /// The clock tiles, one a CPU kind the coalition split names: the Super cores' and the
+    /// rest's on Apple silicon, one on a CPU of one kind, none where no clock is derived. More
+    /// than [`CLOCKS_MAX`] draw that many.
+    pub(crate) clocks: u8,
+    /// The watt tiles past the wall: CPU, GPU and Neural Engine, each where read. More than
+    /// [`WATTS_MAX`] draw that many.
+    pub(crate) watts: u8,
+    /// The work-per-joule tile: instructions and energy both read.
+    pub(crate) work: bool,
+}
+
+/// The rows that draw units (A1 §2.1, A4 §5), in the order of a units column's forms
+/// ([`Forms`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum UnitRow {
-    Cpu,
     Gpu,
     Memory,
     Disk,
+    Heat,
+    Network,
+    Processes,
 }
 
-impl UnitRow {
-    /// Block A's rows, top to bottom.
-    pub(crate) const ALL: [Self; 4] = [Self::Cpu, Self::Gpu, Self::Memory, Self::Disk];
+/// Each [`UnitRow`]'s form in a table's units column, in [`UnitRow::ALL`]'s order; `None` draws
+/// no units on that row, or the row is not the table's.
+pub(crate) type Forms = [Option<Form>; UnitRow::ALL.len()];
 
-    /// Its forms, widest first (A1 §4.1–§4.4): the row takes the first that its facts draw and
-    /// that fits. None grows past [`Form::Column`] (A1 ruling 17).
+impl UnitRow {
+    /// Every row that draws units, block A's top to bottom, then block B's.
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Gpu,
+        Self::Memory,
+        Self::Disk,
+        Self::Heat,
+        Self::Network,
+        Self::Processes,
+    ];
+    /// Folded block A's rows that draw units, top to bottom: the CPU row draws none (A4 §7).
+    pub(crate) const BLOCK_A: [Self; 4] = [Self::Gpu, Self::Memory, Self::Disk, Self::Heat];
+    /// Folded block B's rows that draw units, top to bottom (A4 §5): Latency's TCP waits tile
+    /// lands with F8's Latency row.
+    pub(crate) const BLOCK_B: [Self; 2] = [Self::Network, Self::Processes];
+
+    /// Its place in [`Forms`].
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Its forms, widest first (A1 §4.2–§4.4, A4 §4, §5): the row takes the first that its
+    /// facts draw and that fits. None grows past [`Form::Column`] (A1 ruling 17).
     pub(crate) const fn ladder(self) -> &'static [Form] {
         match self {
-            Self::Cpu => &[Form::Column, Form::Stack, Form::Cluster],
             Self::Gpu => &[Form::Column, Form::Undivided],
             Self::Memory => &[Form::Column, Form::Half],
-            Self::Disk => &[Form::Column],
+            Self::Disk | Self::Heat | Self::Network | Self::Processes => &[Form::Column],
         }
     }
 }
@@ -194,13 +185,10 @@ impl UnitRow {
 /// How a row draws its units.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Form {
-    /// A tile per unit of capacity: a core, a GPU core's compartment, a memory tile in the
-    /// waffle, a device.
+    /// A tile per unit of capacity or mechanism: a GPU core's compartment, a memory tile in the
+    /// waffle, a device, each link of the heat chain, a link's interface tile, the processes'
+    /// flow, pile and stuck columns.
     Column,
-    /// CPU: each cluster's cores in two half-height rows, core k in column ⌊k/2⌋.
-    Stack,
-    /// CPU: one tile per cluster, at its mean.
-    Cluster,
     /// GPU: one tank with no compartments.
     Undivided,
     /// Memory: the waffle at twice the tile, at most eight of them.
@@ -222,6 +210,11 @@ fn hairline(scale: f64) -> f64 {
     1.0 / scale
 }
 
+/// `pt` in whole device px at `scale`, rounded up, pt: a tile of a half point is 3 px at 1×.
+fn whole_px(pt: f64, scale: f64) -> f64 {
+    (pt * scale).ceil() / scale
+}
+
 /// A wall past a row's units, pt (A1 §4.0): a device px in `words2` with a point clear each
 /// side, 3 pt at 1× and 2.5 at 2×.
 fn wall(scale: f64) -> f64 {
@@ -237,23 +230,98 @@ fn run(n: u64, each: f64, gap: f64) -> f64 {
     n * each + (n - 1.0) * gap
 }
 
+/// Two groups of a form beside each other, a wall between them where both stand, pt.
+fn walled(left: f64, right: f64, scale: f64) -> f64 {
+    if left > 0.0 && right > 0.0 {
+        left + wall(scale) + right
+    } else {
+        left + right
+    }
+}
+
 /// The units' height in whole device px at `scale` for a cell `cell` pt tall: 17 at 2× and 9 at
 /// 1× in Folded's 8.5 pt cell (A1 §2.2).
 fn units_px(cell: f64, scale: f64) -> f64 {
     (cell * scale).ceil()
 }
 
-impl UnitFacts<'static> {
+impl UnitFacts {
     /// No facts: a deck that draws no units.
     pub(crate) const NONE: Self = Self {
-        clusters: &[],
         gpu: None,
         memory: None,
         disk: false,
+        heat: None,
+        network: false,
+        processes: false,
     };
-}
 
-impl UnitFacts<'_> {
+    /// What `snap` and this platform's readers give the units' widths: the GPU's core count,
+    /// and the Neural Engine tile where its reader's self-check held (`Snapshot::ane` read, A2
+    /// §3.1); memory's total; the block reader's platforms (macOS and Linux, A1 §4.4); the heat
+    /// chain's readers (A4 §4: on macOS the pressure level, a clock a CPU kind the coalition
+    /// split names, the CPU's watts and the GPU's and the Neural Engine's where read, and the
+    /// work per joule; on Linux the heuristic level alone; on Windows none); and the network and
+    /// processes rows, whose readers run on macOS and Linux. Each changes
+    /// seldom or never: none is a reading the units draw. A4's step N5 plans the painted deck
+    /// with these as it paints the units; its step N2 builds the heat readers they name.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "A4 step N5 plans the painted deck with the host's facts"
+        )
+    )]
+    pub(crate) fn of(snap: &Snapshot) -> Self {
+        let kinds = snap
+            .cpu
+            .as_ref()
+            .map_or(0, |cpu| {
+                cpu.clusters.iter().filter(|c| !c.cores.is_empty()).count()
+            })
+            .max(usize::from(snap.total_cores().is_some_and(|n| n > 0)));
+        let neural_engine = matches!(snap.ane, Some(Ok(_)));
+        let gpu = snap.gpu.as_ref().map(|gpu| Gpu {
+            cores: gpu.cores.map(u32::from),
+            neural_engine,
+        });
+        let heat = if cfg!(target_os = "macos") {
+            Some(Heat {
+                ladder: true,
+                clocks: u8::try_from(kinds).unwrap_or(u8::MAX).min(CLOCKS_MAX),
+                watts: 1 + u8::from(gpu.is_some()) + u8::from(neural_engine),
+                work: true,
+            })
+        } else if cfg!(target_os = "linux") {
+            // No watt tile: sysprobe's NVML binding reads no power and nothing reads RAPL (A3
+            // rejects it: root-only, package scope), so A4 §4's Linux watts have no reader. The
+            // step that brings an NVML power reading into the Snapshot plans the GPU's tile here.
+            Some(Heat {
+                ladder: true,
+                clocks: 0,
+                watts: 0,
+                work: false,
+            })
+        } else {
+            None
+        };
+        // The block, link and process readers' platforms (`aterm_sysprobe::blockio`, `iflist`,
+        // the sweep): elsewhere those rows draw no units.
+        let readers = cfg!(any(target_os = "macos", target_os = "linux"));
+        Self {
+            gpu,
+            memory: snap
+                .mem
+                .as_ref()
+                .map(|mem| mem.sample.total)
+                .filter(|&total| total > 0),
+            disk: readers,
+            heat,
+            network: readers,
+            processes: readers,
+        }
+    }
+
     /// How wide `row` draws `form` at `scale` in a cell `cell` pt tall, pt; `None` where its
     /// facts give that form nothing to draw, or the form is not on the row's ladder. A wall and
     /// what stands past it keep their space whether or not they draw (A1 §4.0).
@@ -262,60 +330,44 @@ impl UnitFacts<'_> {
             return None;
         }
         match row {
-            UnitRow::Cpu => self.cpu_width(form, scale),
             UnitRow::Gpu => self.gpu_width(form, scale, cell),
             UnitRow::Memory => self.memory_width(form, scale),
             UnitRow::Disk => self.disk_width(scale, cell),
+            UnitRow::Heat => self.heat_width(scale),
+            UnitRow::Network => self.network.then(|| run(LINK_TILES, LINK_TILE, TILE_GAP)),
+            UnitRow::Processes => self.processes.then(|| {
+                let pile = whole_px(PILE_TILE, scale);
+                walled(FLOW_TILE, pile + TILE_GAP + pile, scale)
+            }),
         }
     }
 
-    /// Each row's form for a column at most `cap` pt wide at [`PLAN_SCALE`]: the first of its
-    /// ladder that its facts draw within `cap`, else `None`.
-    pub(crate) fn forms_within(&self, cap: f64, cell: f64) -> [Option<Form>; 4] {
-        UnitRow::ALL.map(|row| {
-            row.ladder().iter().copied().find(|&form| {
+    /// Each of `rows`' forms for a column at most `cap` pt wide at [`PLAN_SCALE`]: the first of
+    /// its ladder that its facts draw within `cap`, else `None`, as every row not in `rows`.
+    pub(crate) fn forms_within(&self, cap: f64, cell: f64, rows: &[UnitRow]) -> Forms {
+        let mut forms = [None; UnitRow::ALL.len()];
+        for &row in rows {
+            forms[row.index()] = row.ladder().iter().copied().find(|&form| {
                 self.width(row, form, PLAN_SCALE, cell)
                     .is_some_and(|w| w <= cap)
-            })
-        })
+            });
+        }
+        forms
     }
 
-    /// Whether any row's facts draw any form at all.
-    pub(crate) fn draw_any(&self, cell: f64) -> bool {
-        self.forms_within(f64::INFINITY, cell)
+    /// Whether any of `rows`' facts draw any form at all.
+    pub(crate) fn draw_any(&self, cell: f64, rows: &[UnitRow]) -> bool {
+        self.forms_within(f64::INFINITY, cell, rows)
             .iter()
             .any(Option::is_some)
     }
 
-    /// The CPU (A1 §4.1): its clusters' tiles, fastest first, then the wall and the queue tile.
-    fn cpu_width(&self, form: Form, scale: f64) -> Option<f64> {
-        let counts = || self.clusters.iter().filter(|&&n| n > 0).map(|&n| n as u64);
-        let k = counts().count();
-        if k == 0 {
-            return None;
-        }
-        // The first cluster's tiles are the wider: core types are told apart by width.
-        let tile = |i: usize| {
-            if i == 0 {
-                FIRST_CLUSTER_TILE
-            } else {
-                LATER_CLUSTER_TILE
-            }
-        };
-        let clusters: f64 = match form {
-            Form::Column => counts()
-                .enumerate()
-                .map(|(i, n)| run(n, tile(i), TILE_GAP))
-                .sum(),
-            Form::Stack => counts()
-                .enumerate()
-                .map(|(i, n)| run(n.div_ceil(2), tile(i), TILE_GAP))
-                .sum(),
-            Form::Cluster => k as f64 * CLUSTER_TILE,
-            Form::Undivided | Form::Half => return None,
-        };
-        let gaps = (k - 1) as f64 * CLUSTER_GAP;
-        Some(clusters + gaps + wall(scale) + QUEUE_TILE)
+    /// The widest of `forms` at [`PLAN_SCALE`], pt; 0 where none draws.
+    pub(crate) fn widest(&self, forms: &Forms, cell: f64) -> f64 {
+        UnitRow::ALL
+            .into_iter()
+            .filter_map(|row| self.width(row, forms[row.index()]?, PLAN_SCALE, cell))
+            .fold(0.0, f64::max)
     }
 
     /// The GPU (A1 §4.2, A2 §3.1): the tank, and the Neural Engine tile and its clear left of it
@@ -343,7 +395,7 @@ impl UnitFacts<'_> {
                 cols * compartment + (cols + 1.0) * hairline(scale)
             }
             Form::Undivided => UNDIVIDED,
-            Form::Stack | Form::Cluster | Form::Half => return None,
+            Form::Half => return None,
         };
         let tile = if gpu.neural_engine {
             NEURAL_ENGINE_TILE + NEURAL_ENGINE_CLEAR
@@ -360,7 +412,7 @@ impl UnitFacts<'_> {
         let tiles = match form {
             Form::Column => tiles,
             Form::Half => self.memory?.div_ceil(2 * unit),
-            Form::Stack | Form::Cluster | Form::Undivided => return None,
+            Form::Undivided => return None,
         };
         Some(run(tiles.div_ceil(2), MEMORY_TILE, TILE_GAP) + wall(scale) + SWAP_COLUMN)
     }
@@ -370,6 +422,30 @@ impl UnitFacts<'_> {
     fn disk_width(&self, scale: f64, cell: f64) -> Option<f64> {
         let tile = units_px(cell, scale) / scale;
         self.disk.then(|| run(DISK_UNITS as u64, tile, DISK_GAP))
+    }
+
+    /// Heat (A4 §4), read left to right as the thermal control chain: the pressure ladder, the
+    /// clock tiles (the first kind's wider), a wall, the watt tiles and the work-per-joule tile.
+    /// Each stands where its reader runs; the wall stands where something stands each side of it.
+    fn heat_width(&self, scale: f64) -> Option<f64> {
+        let heat = self.heat?;
+        let clocks = match heat.clocks.min(CLOCKS_MAX) {
+            0 => 0.0,
+            1 => FIRST_CLOCK,
+            _ => FIRST_CLOCK + TILE_GAP + LATER_CLOCK,
+        };
+        let ladder = if heat.ladder { LADDER } else { 0.0 };
+        let watts = run(u64::from(heat.watts.min(WATTS_MAX)), WATT_TILE, TILE_GAP);
+        let work = if heat.work { WORK_TILE } else { 0.0 };
+        let apart = |a: f64, b: f64| {
+            if a > 0.0 && b > 0.0 {
+                a + CHAIN_GAP + b
+            } else {
+                a + b
+            }
+        };
+        let w = walled(apart(ladder, clocks), apart(watts, work), scale);
+        (w > 0.0).then_some(w)
     }
 }
 
@@ -381,55 +457,54 @@ mod tests {
     /// The Folded cell, pt.
     const CELL: f64 = 8.5;
 
-    /// This Mac (A1 §1.3): 4 Super and 6 Efficiency cores, a 10-core GPU with a Neural Engine,
-    /// 32 GiB and a disk reader.
-    fn this_mac() -> UnitFacts<'static> {
+    /// This Mac (A1 §1.3, A4 §4): a 10-core GPU with a Neural Engine, 32 GiB, a disk reader, the
+    /// whole heat chain with its Super and Efficiency clocks, and the network and processes rows.
+    fn this_mac() -> UnitFacts {
         UnitFacts {
-            clusters: &[4, 6],
             gpu: Some(Gpu {
                 cores: Some(10),
                 neural_engine: true,
             }),
             memory: Some(32 * GIB),
             disk: true,
+            heat: Some(Heat {
+                ladder: true,
+                clocks: 2,
+                watts: 3,
+                work: true,
+            }),
+            network: true,
+            processes: true,
         }
     }
 
-    fn at(facts: &UnitFacts<'_>, row: UnitRow, form: Form) -> [Option<f64>; 2] {
+    fn at(facts: &UnitFacts, row: UnitRow, form: Form) -> [Option<f64>; 2] {
         [1.0, 2.0].map(|s| facts.width(row, form, s, CELL))
     }
 
-    /// The forms measure what A1 §2.4, §4.1–§4.4 and A2 §3.1 say: this Mac at 1× (CPU 40, GPU
-    /// 31 and 36 with the Neural Engine, Memory 46, Disk 19 for two devices' place) and at 2× (a
-    /// hairline is half a point there), a 12 + 4 core Max's Stack at 36, an Ultra's Cluster at
-    /// 14, the tank's rows at 16 and 40 cores, and the undivided tank over 40 or with no count.
+    /// The forms measure what A1 §2.4, §4.2–§4.4, A2 §3.1 and A4 §4 and §5 say: this Mac at 1×
+    /// (GPU 31 and 36 with the Neural Engine, Memory 46, Disk 19 for two devices' place, Heat 30,
+    /// Network 15 for four links' place, Processes 15) and at 2× (a hairline is half a point
+    /// there, and a half-point tile is 5 px, not 3), the tank's rows at 16 and 40 cores, the
+    /// undivided tank over 40 or with no count, and the heat chain without each reader.
     #[test]
     fn the_forms_measure_what_the_design_says() {
-        use Form::{Cluster, Column, Half, Stack, Undivided};
-        use UnitRow::{Cpu, Disk, Memory};
+        use Form::{Column, Half, Undivided};
+        use UnitRow::{Disk, Heat as HeatRow, Memory, Network, Processes};
         let mac = this_mac();
-        assert_eq!(at(&mac, Cpu, Column), [Some(40.0), Some(39.5)]);
-        assert_eq!(at(&mac, Cpu, Stack), [Some(23.0), Some(22.5)]);
-        assert_eq!(at(&mac, Cpu, Cluster), [Some(14.0), Some(13.5)]);
         assert_eq!(at(&mac, UnitRow::Gpu, Column), [Some(36.0), Some(30.5)]);
         assert_eq!(at(&mac, UnitRow::Gpu, Undivided), [Some(13.0), Some(13.0)]);
         assert_eq!(at(&mac, Memory, Column), [Some(46.0), Some(45.5)]);
         assert_eq!(at(&mac, Memory, Half), [Some(26.0), Some(25.5)]);
         // Two square tiles a point apart: 9 + 1 + 9 px at 1×, 17 + 2 + 17 at 2× (A1 §4.4).
         assert_eq!(at(&mac, Disk, Column), [Some(19.0), Some(18.0)]);
-
-        let max = UnitFacts {
-            clusters: &[12, 4],
-            ..mac
-        };
-        assert_eq!(at(&max, Cpu, Column), [Some(66.0), Some(65.5)]);
-        assert_eq!(at(&max, Cpu, Stack), [Some(36.0), Some(35.5)]);
-        let ultra = UnitFacts {
-            clusters: &[24, 8],
-            ..mac
-        };
-        assert_eq!(at(&ultra, Cpu, Stack), [Some(66.0), Some(65.5)]);
-        assert_eq!(at(&ultra, Cpu, Cluster), [Some(14.0), Some(13.5)]);
+        // The ladder 3, 2, the Super clock 3, 1, the Efficiency clock 2, the wall, three watt
+        // tiles of 3 a point apart, 2, the work per joule 3 (A4 §4).
+        assert_eq!(at(&mac, HeatRow, Column), [Some(30.0), Some(29.5)]);
+        // Four 3 pt tiles a point apart, whichever links are up (A4 §5.1).
+        assert_eq!(at(&mac, Network, Column), [Some(15.0), Some(15.0)]);
+        // The flow tile 5, the wall, the pile and the stuck column a point apart (A4 §6.3).
+        assert_eq!(at(&mac, Processes, Column), [Some(15.0), Some(13.5)]);
 
         let tank = |cores: Option<u32>| UnitFacts {
             gpu: Some(Gpu {
@@ -462,43 +537,80 @@ mod tests {
             );
         }
 
-        // Where no reader runs, the Disk row draws no units.
+        // The heat chain keeps no width for a unit with no reader: an Intel Mac's one clock, a
+        // Mac with no Neural Engine, Linux's ladder alone, the watts alone (no wall), and none.
+        let heat = |ladder, clocks, watts, work| UnitFacts {
+            heat: Some(Heat {
+                ladder,
+                clocks,
+                watts,
+                work,
+            }),
+            ..mac
+        };
+        for (facts, want) in [
+            (heat(true, 1, 2, true), [Some(23.0), Some(22.5)]),
+            (heat(true, 2, 2, true), [Some(26.0), Some(25.5)]),
+            (heat(true, 0, 0, false), [Some(3.0), Some(3.0)]),
+            (heat(false, 0, 3, false), [Some(11.0), Some(11.0)]),
+            (heat(false, 2, 0, false), [Some(6.0), Some(6.0)]),
+            (heat(true, 7, 9, true), [Some(30.0), Some(29.5)]),
+            (heat(false, 0, 0, false), [None; 2]),
+        ] {
+            assert_eq!(at(&facts, HeatRow, Column), want, "{:?}", facts.heat);
+        }
+
+        // Where no reader runs, a row draws no units.
         let diskless = UnitFacts { disk: false, ..mac };
         assert_eq!(at(&diskless, Disk, Column), [None; 2]);
+        let bare = UnitFacts {
+            heat: None,
+            network: false,
+            processes: false,
+            ..mac
+        };
+        for row in [HeatRow, Network, Processes] {
+            assert_eq!(at(&bare, row, Column), [None; 2], "{row:?}");
+        }
 
         // Unread, a row draws nothing, and no form off its ladder draws.
         let none = UnitFacts::NONE;
         for row in UnitRow::ALL {
-            for form in [Column, Stack, Cluster, Undivided, Half] {
+            for form in [Column, Undivided, Half] {
                 assert_eq!(none.width(row, form, 1.0, CELL), None, "{row:?} {form:?}");
                 if !row.ladder().contains(&form) {
                     assert_eq!(mac.width(row, form, 1.0, CELL), None, "{row:?} {form:?}");
                 }
             }
         }
-        assert!(!none.draw_any(CELL) && mac.draw_any(CELL));
+        for rows in [&UnitRow::BLOCK_A[..], &UnitRow::BLOCK_B, &UnitRow::ALL] {
+            assert!(!none.draw_any(CELL, rows) && mac.draw_any(CELL, rows));
+        }
         let gpuless = UnitFacts { gpu: None, ..mac };
         assert_eq!(at(&gpuless, UnitRow::Gpu, Undivided), [None; 2]);
+        // A table's forms name its own rows alone.
+        let a = mac.forms_within(f64::INFINITY, CELL, &UnitRow::BLOCK_A);
+        let b = mac.forms_within(f64::INFINITY, CELL, &UnitRow::BLOCK_B);
+        for row in UnitRow::ALL {
+            let ours = UnitRow::BLOCK_A.contains(&row);
+            assert_eq!(a[row.index()].is_some(), ours, "{row:?}");
+            assert_eq!(b[row.index()].is_some(), !ours, "{row:?}");
+        }
+        assert_eq!((mac.widest(&a, CELL), mac.widest(&b, CELL)), (46.0, 15.0));
     }
 
-    /// A1 §2.4's choice, before the planner: for every machine shape (1 to 128 cores in one to
-    /// four clusters, GPUs of no count and 0 to 80 cores with and without the Neural Engine, 1
-    /// to 512 GiB, a disk reader or none), as the cap grows no row's form steps down its ladder,
-    /// every form taken is within the cap at 1× and no wider at 2×, and a row takes nothing
-    /// only where no form of its ladder fits. CONTROL: each form of each ladder is taken
-    /// somewhere in the sweep.
+    /// A1 §2.4's choice, before the planner: for every machine shape (GPUs of no count and 0 to
+    /// 80 cores with and without the Neural Engine, 1 to 512 GiB, a disk reader or none, every
+    /// heat chain, and the network and processes rows read or not), as the cap grows no row's
+    /// form steps down its ladder, every form taken is within the cap at 1× and no wider at 2×,
+    /// and a row takes nothing only where no form of its ladder fits. CONTROL: each form of each
+    /// ladder is taken somewhere in the sweep.
     #[test]
     fn a_wider_cap_never_takes_a_smaller_form() {
         let rank = |row: UnitRow, form: Option<Form>| {
             form.and_then(|f| row.ladder().iter().position(|&g| g == f))
                 .unwrap_or(row.ladder().len())
         };
-        let mut shapes: Vec<Vec<usize>> = Vec::new();
-        for n in 1..=128_usize {
-            for k in 1..=4_usize.min(n) {
-                shapes.push((0..k).map(|i| n / k + usize::from(i < n % k)).collect());
-            }
-        }
         let gpus = (0..=80)
             .map(Some)
             .chain([None])
@@ -511,11 +623,11 @@ mod tests {
             .map(Some)
             .chain([None]);
         let mut taken = std::collections::HashSet::new();
-        let mut check = |facts: UnitFacts<'_>| {
-            let mut last = [usize::MAX; 4];
+        let mut check = |facts: UnitFacts| {
+            let mut last = [usize::MAX; UnitRow::ALL.len()];
             for cap in 0..=140 {
                 let cap = f64::from(cap);
-                let forms = facts.forms_within(cap, CELL);
+                let forms = facts.forms_within(cap, CELL, &UnitRow::ALL);
                 for (i, (row, form)) in UnitRow::ALL.into_iter().zip(forms).enumerate() {
                     let r = rank(row, form);
                     assert!(
@@ -542,12 +654,6 @@ mod tests {
             }
         };
         let mac = this_mac();
-        for clusters in &shapes {
-            check(UnitFacts {
-                clusters,
-                ..UnitFacts::NONE
-            });
-        }
         for gpu in gpus {
             check(UnitFacts {
                 gpu,
@@ -560,8 +666,34 @@ mod tests {
                 ..UnitFacts::NONE
             });
         }
+        for ladder in [false, true] {
+            for clocks in 0..=3 {
+                for watts in 0..=4 {
+                    for work in [false, true] {
+                        check(UnitFacts {
+                            heat: Some(Heat {
+                                ladder,
+                                clocks,
+                                watts,
+                                work,
+                            }),
+                            ..UnitFacts::NONE
+                        });
+                    }
+                }
+            }
+        }
         for disk in [false, true] {
-            check(UnitFacts { disk, ..mac });
+            for network in [false, true] {
+                for processes in [false, true] {
+                    check(UnitFacts {
+                        disk,
+                        network,
+                        processes,
+                        ..mac
+                    });
+                }
+            }
         }
         for row in UnitRow::ALL {
             for &form in row.ladder() {
@@ -608,65 +740,100 @@ mod tests {
         }
     }
 
-    /// The host's reading supplies every fact the units plan reads (A1 step R5): the deck's
-    /// three-reading snapshot of this Mac reads its 4 + 6 cores, its 10-core GPU and 32 GiB,
-    /// the Neural Engine tile only once its reader reads, and the disk row on macOS and Linux;
-    /// planned from them, both deck forms lay the units column the laws plan for this Mac at
-    /// 1039 pt. A machine with no cluster read draws every core in one, and an empty snapshot
-    /// gives the planner nothing to draw.
+    /// The host's reading supplies every fact the units plan reads (A1 step R5, A4 step N4): the
+    /// deck's three-reading snapshot of this Mac reads its 10-core GPU and 32 GiB, the Neural
+    /// Engine tile only once its reader reads, the disk, network and processes rows on macOS
+    /// and Linux, and on macOS the heat chain with a clock for
+    /// each of its two CPU kinds and a watt tile for the CPU, the GPU and, once it reads, the
+    /// Neural Engine; planned from them, both deck forms lay the units columns the laws plan for
+    /// this Mac at 1039 pt. A CPU of one kind derives one clock, and an empty snapshot gives the
+    /// planner only the platform's readers.
     #[test]
     fn the_hosts_reading_supplies_the_facts_the_units_plan_reads() {
         use crate::stats_plan::{plan_folded_with, plan_full_with};
         let mut snap = crate::stats_deck::tests::snapshot();
         let disk = cfg!(any(target_os = "macos", target_os = "linux"));
-        let read = HostFacts::of(&snap);
+        let heat = |clocks, watts| {
+            if cfg!(target_os = "macos") {
+                Some(Heat {
+                    ladder: true,
+                    clocks,
+                    watts,
+                    work: true,
+                })
+            } else if cfg!(target_os = "linux") {
+                Some(Heat {
+                    ladder: true,
+                    clocks: 0,
+                    watts: 0,
+                    work: false,
+                })
+            } else {
+                None
+            }
+        };
         let want = UnitFacts {
             gpu: Some(Gpu {
                 cores: Some(10),
                 neural_engine: false,
             }),
             disk,
+            heat: heat(2, 2),
+            network: disk,
+            processes: disk,
             ..this_mac()
         };
-        assert_eq!(read.facts(), want);
+        assert_eq!(UnitFacts::of(&snap), want);
         snap.ane = Some(Ok(aterm_vitals::AneSample {
             cores: 16,
             powered: false,
         }));
-        let read = HostFacts::of(&snap);
-        assert_eq!(read.facts(), UnitFacts { disk, ..this_mac() });
-
-        let m = crate::deck_face::FaceMetrics::helvetica_neue();
-        let folded = plan_folded_with(1039.0, &m, &read.facts()).blocks[0].units;
-        let full = plan_full_with(1039.0, &m, &read.facts()).units;
-        assert_eq!(folded.map(|u| u.at.w), Some(46.0));
-        let column = Some(Form::Column);
+        let read = UnitFacts::of(&snap);
         assert_eq!(
-            full.map(|u| u.forms),
-            Some([column, column, column, disk.then_some(Form::Column)]),
-            "{full:?}"
-        );
-
-        if let Some(cpu) = snap.cpu.as_mut() {
-            cpu.clusters.clear();
-        }
-        assert_eq!(HostFacts::of(&snap).facts().clusters, &[10]);
-        let empty = HostFacts::of(&Snapshot::default());
-        assert_eq!(
-            empty.facts(),
+            read,
             UnitFacts {
                 disk,
+                heat: heat(2, 3),
+                network: disk,
+                processes: disk,
+                ..this_mac()
+            }
+        );
+
+        let m = crate::deck_face::FaceMetrics::helvetica_neue();
+        let folded = plan_folded_with(1039.0, &m, &read).blocks;
+        let full = plan_full_with(1039.0, &m, &read).units;
+        assert_eq!(
+            folded.map(|block| block.units.map(|u| u.at.w)),
+            [Some(46.0), disk.then_some(15.0)]
+        );
+        let column = Some(Form::Column);
+        let mut forms = [column; UnitRow::ALL.len()];
+        for row in [UnitRow::Disk, UnitRow::Network, UnitRow::Processes] {
+            forms[row.index()] = disk.then_some(Form::Column);
+        }
+        if read.heat.is_none() {
+            forms[UnitRow::Heat.index()] = None;
+        }
+        assert_eq!(full.map(|u| u.forms), Some(forms), "{full:?}");
+
+        if let Some(cpu) = snap.cpu.as_mut() {
+            cpu.clusters.truncate(1);
+        }
+        assert_eq!(UnitFacts::of(&snap).heat, heat(1, 3));
+        let empty = UnitFacts::of(&Snapshot::default());
+        assert_eq!(
+            empty,
+            UnitFacts {
+                disk,
+                heat: heat(0, 1),
+                network: disk,
+                processes: disk,
                 ..UnitFacts::NONE
             }
         );
-        let disk_alone = empty.facts().draw_any(CELL);
-        assert_eq!(disk_alone, disk);
-        assert!(
-            !UnitFacts {
-                disk: false,
-                ..empty.facts()
-            }
-            .draw_any(CELL)
-        );
+        let alone = empty.draw_any(CELL, &UnitRow::ALL);
+        assert_eq!(alone, disk || empty.heat.is_some());
+        assert!(!UnitFacts::NONE.draw_any(CELL, &UnitRow::ALL));
     }
 }

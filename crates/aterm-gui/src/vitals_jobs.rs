@@ -31,13 +31,16 @@ use aterm_vitals::jobs::{
 use aterm_vitals::left::{LeftRow, LeftView};
 use aterm_vitals::model::TabRoot;
 
+use crate::program_check_watch::RunningCheck;
+
 /// The engine's fast cadence, also the floor between passes, so a 2 Hz lens does not double the
 /// detailed reads.
 const FAST_MS: u64 = 2_000;
 
-/// The readers the pass asks of this user's processes outside every job, and the held stand-in
-/// (`KERNEL` live, `INERT` in unit tests). None reads a process's arguments or environment, which
-/// can hang on a program held mid-start (leftover M29).
+/// The readers the pass asks of this user's processes outside every job, the held stand-in, the
+/// stuck check's board and the wall clock (`KERNEL` live, `INERT` in unit tests). None reads a
+/// process's arguments or environment, which can hang on a program held mid-start (leftover
+/// M29).
 #[derive(Clone, Copy)]
 pub(crate) struct HeldReaders {
     /// What a process's start reads, its age taken at the pass's clock (µs since the epoch), one
@@ -53,6 +56,14 @@ pub(crate) struct HeldReaders {
     /// The pid a development build stands in as held
     /// ([`crate::program_check_watch::held_stand_in`]).
     pub(crate) stand_in: fn() -> Option<u32>,
+    /// The syspolicyd the stuck check's last look read, while that look is fresh
+    /// ([`crate::program_check_watch::last_read`]): what the stranded judge reads ([`strand`]).
+    pub(crate) check: fn() -> Option<RunningCheck>,
+    /// How many held programs of this user, every process read, forked at or after a time
+    /// ([`aterm_uds::process::held_since`]): asked only when a row would first be stranded.
+    pub(crate) backlog: fn(u64) -> Option<usize>,
+    /// The wall clock, µs since the epoch ([`probe::now_us`]), read once a pass.
+    pub(crate) now_us: fn() -> u64,
 }
 
 impl HeldReaders {
@@ -77,15 +88,21 @@ impl HeldReaders {
                 .map(str::to_owned)
         },
         stand_in: crate::program_check_watch::held_stand_in,
+        check: crate::program_check_watch::last_read,
+        backlog: aterm_uds::process::held_since,
+        now_us: probe::now_us,
     };
 
-    /// The inert arm: nothing outside a job is read, and nothing stands in.
+    /// The inert arm: nothing outside a job is read, nothing stands in, and no check is read.
     pub(crate) const INERT: Self = Self {
         start: |_, _, _| None,
         exec: |_| None,
         coalition: |_| None,
         exe_name: |_| None,
         stand_in: || None,
+        check: || None,
+        backlog: |_| None,
+        now_us: probe::now_us,
     };
 }
 
@@ -262,6 +279,8 @@ pub(crate) struct JobsPass {
     jobs: Jobs,
     reader: JobsReader,
     held: HeldReaders,
+    /// Each pid the passes have read unrun, by its run ([`date`]).
+    unrun: Unrun,
     fronts: Fronts,
     process_limit: Option<u64>,
     /// When the next pass is due, host ms (`None`: at the next reading).
@@ -287,6 +306,7 @@ impl JobsPass {
             } else {
                 HeldReaders::KERNEL
             },
+            unrun: Unrun::new(),
             fronts: Fronts::new(if cfg!(test) {
                 FrontReaders::INERT
             } else {
@@ -386,7 +406,7 @@ impl JobsPass {
         // Each age is the probe's as its reading starts.
         let probe_ms = read_ms();
         // One wall clock for every start the pass reads, so each fork time is its age before it.
-        let now_us = probe::now_us();
+        let now_us = (readers.now_us)();
         let read = self.reader.read_all_at(&reqs, now_us);
         let roots: BTreeSet<u32> = tabs.iter().map(|t| t.shell_pid).collect();
         let fronts = &mut self.fronts;
@@ -396,7 +416,7 @@ impl JobsPass {
         let read_ms = clock();
         let mounts = OnceCell::new();
         let ours = OnceCell::new();
-        let mut held = held_list(
+        let (mut held, young) = held_list(
             readings,
             &read,
             self_uid,
@@ -410,7 +430,16 @@ impl JobsPass {
             },
             readers.exe_name,
         );
-        name_tied(&mut held, &self.ties);
+        name_tied(held.iter_mut().map(|h| &mut h.row), &self.ties);
+        let mut unrun = date(&mut held, &young, &self.unrun, now_us);
+        let (program_check_daemon, program_check_judged) =
+            strand(&mut held, (readers.check)(), now_us, readers.backlog);
+        for h in &held {
+            if let (Some(by), Some(run)) = (h.stranded_by, unrun.get_mut(&h.row.pid)) {
+                run.stranded_by = Some(by);
+            }
+        }
+        self.unrun = unrun;
         let lanes = self.reader.lanes();
         // The statuses of watched calls' leaders read since the last pass, each at its own moment
         // on this pass's clock: read after the sweep, so a leader it no longer lists has left its
@@ -435,7 +464,9 @@ impl JobsPass {
                 pipe_flags: lanes.pipe_flags.is_on(),
             },
             process_limit: self.process_limit,
-            held,
+            held: held.into_iter().map(|h| h.row).collect(),
+            program_check_daemon,
+            program_check_judged,
             grant_ms: grant.grant_ms,
             exits,
         };
@@ -452,12 +483,51 @@ impl JobsPass {
 /// Names each program that has not started by the leftover pass's tie of it
 /// ([`JobsPass::tie_held`]): the tie's tab, and an agent's call where it was born after that tab's
 /// agent started; the engine prefers a job's own tab and kind, where the program has a job.
-fn name_tied(held: &mut [HeldProc], ties: &BTreeMap<u32, aterm_vitals::left::Tie>) {
+fn name_tied<'a>(
+    held: impl IntoIterator<Item = &'a mut HeldProc>,
+    ties: &BTreeMap<u32, aterm_vitals::left::Tie>,
+) {
     for h in held {
         let tie = ties.get(&h.pid);
         h.tab = tie.map(|t| t.key);
         h.job = tie.filter(|t| t.after_agent).map(|_| JobKind::AgentCall);
     }
+}
+
+/// A program of this user that has not started, as one pass reads it ([`held_list`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Held {
+    /// The engine's row; [`strand`] sets its `stranded`.
+    pub(crate) row: HeldProc,
+    /// What its start read; `None` for the stand-in, read held unasked, which is never stranded.
+    pub(crate) facts: Option<StartFacts>,
+    /// Its CPU as this pass read it, ns; `None` where unread.
+    pub(crate) cpu_ns: Option<u64>,
+    /// A time its exec had come by, µs since the epoch ([`date`]); `None` until dated.
+    pub(crate) sent_by_us: Option<u64>,
+    /// The syspolicyd that was running when a pass judged it stranded, kept while the passes
+    /// read it unrun ([`date`], [`strand`]).
+    pub(crate) stranded_by: Option<u32>,
+}
+
+/// A row of this user a pass read unrun, neither stopped nor traced, that it does not list held:
+/// younger than [`probe::PROGRAM_CHECK_AGE_MS`], or of an age unread. [`date`] dates it all the
+/// same, so a check sent before a syspolicyd started dates from the first pass that read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Unlisted {
+    /// Its pid.
+    pub(crate) pid: u32,
+    /// Its pid version, bound to a fresh read that found it still unrun ([`bound_version`]).
+    pub(crate) exec: u64,
+    /// Its CPU as this pass read it, ns.
+    pub(crate) cpu_ns: u64,
+}
+
+/// Whether a start that reads `f` stands unrun in a way a check can hold: its one thread never
+/// ran ([`StartFacts::lone_zero`]), and it reads neither stopped nor traced, since a program
+/// stopped at its start may send its check only once it is let go.
+const fn unrun(f: &StartFacts) -> bool {
+    f.lone_zero && !f.stopped && !f.traced
 }
 
 /// This user's programs that have not started, members of a job or not: each member of `members`
@@ -469,9 +539,13 @@ fn name_tied(held: &mut [HeldProc], ties: &BTreeMap<u32, aterm_vitals::left::Tie
 /// reading, else `exe_name`, else its short name), is aterm's when it is a member or `in_aterm`
 /// (aterm's coalition) says so, and forked its start facts' age before `now_us`, the clock the
 /// members' reading and `start` took those ages at ([`fork_ms`]): a member's own reading's facts,
-/// else the first `start` read's (the stand-in outside every job, read held unasked, has none). An actual exec version is bound to a fresh `start` read of each
-/// listed row between equal versions; the stand-in supplies its own held reading. `exe_name` is
-/// asked only of listed rows outside every job.
+/// else the first `start` read's (the stand-in outside every job, read held unasked, has none).
+/// An actual exec version is bound to a fresh `start` read of each listed row between equal
+/// versions; the stand-in supplies its own held reading. Each listed row keeps those facts (none
+/// for the stand-in) and its CPU (a member's counters, else the sweep's), undated. Beside them,
+/// each such member or row its facts read [`unrun`] that is not listed, whose CPU was read and
+/// whose pid version binds to a fresh `start` read that finds it still unrun ([`Unlisted`]).
+/// `exe_name` is asked only of listed rows outside every job.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn held_list(
     sweep: &[ProcessReading],
@@ -483,30 +557,56 @@ pub(crate) fn held_list(
     exec: impl Fn(u32) -> Option<u64>,
     in_aterm: impl Fn(u32) -> bool,
     exe_name: impl Fn(u32) -> Option<String>,
-) -> Vec<HeldProc> {
+) -> (Vec<Held>, Vec<Unlisted>) {
     let Some(uid) = self_uid else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
+    };
+    let mut young = Vec::new();
+    let mut unlisted = |pid: u32,
+                        facts: Option<&StartFacts>,
+                        cpu_ns: Option<u64>,
+                        start: &mut dyn FnMut(u32) -> Option<StartFacts>| {
+        let Some(cpu_ns) = cpu_ns.filter(|_| facts.is_some_and(unrun)) else {
+            return;
+        };
+        if let Some(version) = bound_version(
+            exec(pid),
+            || start(pid).as_ref().is_some_and(unrun),
+            || exec(pid),
+        ) {
+            young.push(Unlisted {
+                pid,
+                exec: version,
+                cpu_ns,
+            });
+        }
     };
     let read: BTreeSet<u32> = members.iter().map(|m| m.pid).collect();
-    let mut held: Vec<HeldProc> = members
-        .iter()
-        .filter(|m| m.uid == Some(uid))
-        .filter_map(|m| {
-            let wait = start_wait(member_start(m, stand_in)?)?;
-            let version = exec(m.pid);
-            let exec_version = version_at_wait(
-                version,
-                wait,
-                || {
-                    if stand_in == Some(m.pid) {
-                        Some(StartWait::ProgramCheck)
-                    } else {
-                        start(m.pid).and_then(|f| start_wait(probe::judge_start(&f)))
-                    }
-                },
-                || exec(m.pid),
-            );
-            Some(HeldProc {
+    let mut held: Vec<Held> = Vec::new();
+    for m in members.iter().filter(|m| m.uid == Some(uid)) {
+        let Some(at) = member_start(m, stand_in) else {
+            continue;
+        };
+        let cpu_ns = m.counters.map(|c| c.cpu_ns);
+        let Some(wait) = start_wait(at) else {
+            unlisted(m.pid, m.start_facts.as_ref(), cpu_ns, &mut start);
+            continue;
+        };
+        let version = exec(m.pid);
+        let exec_version = version_at_wait(
+            version,
+            wait,
+            || {
+                if stand_in == Some(m.pid) {
+                    Some(StartWait::ProgramCheck)
+                } else {
+                    start(m.pid).and_then(|f| start_wait(probe::judge_start(&f)))
+                }
+            },
+            || exec(m.pid),
+        );
+        held.push(Held {
+            row: HeldProc {
                 pid: m.pid,
                 exec: version.or(m.start).unwrap_or(0),
                 exec_version,
@@ -516,9 +616,14 @@ pub(crate) fn held_list(
                 tab: None,
                 job: None,
                 started_ms: m.start_facts.as_ref().and_then(|f| fork_ms(f, now_us)),
-            })
-        })
-        .collect();
+                stranded: false,
+            },
+            facts: m.start_facts.filter(|_| stand_in != Some(m.pid)),
+            cpu_ns,
+            sent_by_us: None,
+            stranded_by: None,
+        });
+    }
     for p in sweep.iter().filter(|p| {
         p.uid == Some(uid)
             && p.state != probe::RunState::Zombie
@@ -531,21 +636,25 @@ pub(crate) fn held_list(
             let facts = start(p.pid);
             (facts.as_ref().map(probe::judge_start), facts)
         };
-        if let Some(wait) = at.and_then(start_wait) {
-            let version = exec(p.pid);
-            let exec_version = version_at_wait(
-                version,
-                wait,
-                || {
-                    if stand_in == Some(p.pid) {
-                        Some(StartWait::ProgramCheck)
-                    } else {
-                        start(p.pid).and_then(|f| start_wait(probe::judge_start(&f)))
-                    }
-                },
-                || exec(p.pid),
-            );
-            held.push(HeldProc {
+        let Some(wait) = at.and_then(start_wait) else {
+            unlisted(p.pid, facts.as_ref(), p.cpu_ns, &mut start);
+            continue;
+        };
+        let version = exec(p.pid);
+        let exec_version = version_at_wait(
+            version,
+            wait,
+            || {
+                if stand_in == Some(p.pid) {
+                    Some(StartWait::ProgramCheck)
+                } else {
+                    start(p.pid).and_then(|f| start_wait(probe::judge_start(&f)))
+                }
+            },
+            || exec(p.pid),
+        );
+        held.push(Held {
+            row: HeldProc {
                 pid: p.pid,
                 exec: version.or(p.start).unwrap_or(0),
                 exec_version,
@@ -555,10 +664,147 @@ pub(crate) fn held_list(
                 tab: None,
                 job: None,
                 started_ms: facts.as_ref().and_then(|f| fork_ms(f, now_us)),
-            });
+                stranded: false,
+            },
+            facts,
+            cpu_ns: p.cpu_ns,
+            sent_by_us: None,
+            stranded_by: None,
+        });
+    }
+    (held, young)
+}
+
+/// What the passes have read of one pid unrun ([`date`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Run {
+    /// The pid version every pass of the run read it as ([`HeldProc::exec_version`], an
+    /// [`Unlisted::exec`]).
+    exec: u64,
+    /// The CPU, ns, every pass of the run read it at.
+    cpu: u64,
+    /// The first such pass's wall clock, µs since the epoch.
+    since_us: u64,
+    /// The syspolicyd that was running when a pass of the run judged it stranded ([`strand`]).
+    stranded_by: Option<u32>,
+}
+
+/// Each pid the passes have read unrun, by its run ([`Run`]).
+type Unrun = BTreeMap<u32, Run>;
+
+/// Dates each of `held` whose start read [`unrun`], with its CPU and its actual pid version
+/// ([`HeldProc::exec_version`]) read, as verify's watch dates a stage child's members: its
+/// [`Held::sent_by_us`] is `was`'s time for it when the pass before also read it unrun as the
+/// same version at the same CPU, else `now_us`, and its [`Held::stranded_by`] that run's. Each of
+/// `young`, read unrun but not yet held, is dated the same way, so a row is dated from the first
+/// pass that read it unrun, held or not. A row that ran, went unread, read stopped or traced, or
+/// reads another version or CPU starts over, since it may have exec'd again; its fork dates
+/// nothing, since an exec in the same pid keeps it. Returns the runs the next pass reads as `was`.
+fn date(held: &mut [Held], young: &[Unlisted], was: &Unrun, now_us: u64) -> Unrun {
+    let mut runs = Unrun::new();
+    let mut run = |pid: u32, exec: u64, cpu: u64| -> Run {
+        let run = match was.get(&pid) {
+            Some(r) if r.exec == exec && r.cpu == cpu => *r,
+            _ => Run {
+                exec,
+                cpu,
+                since_us: now_us,
+                stranded_by: None,
+            },
+        };
+        runs.insert(pid, run);
+        run
+    };
+    for h in held {
+        let (Some(facts), Some(cpu), Some(exec)) = (h.facts, h.cpu_ns, h.row.exec_version) else {
+            continue;
+        };
+        if !unrun(&facts) {
+            continue;
+        }
+        let r = run(h.row.pid, exec, cpu);
+        h.sent_by_us = Some(r.since_us);
+        h.stranded_by = r.stranded_by;
+    }
+    for y in young {
+        run(y.pid, y.exec, y.cpu_ns);
+    }
+    runs
+}
+
+/// The stranded judge over one pass's `held` at `now_us` (leftover §5.1). A row a pass of its run
+/// judged stranded stays so ([`Held::stranded_by`]): where its check went does not change with
+/// what a later pass reads. Against `check`, the stuck check's fresh look, while its pool reads
+/// not full, each other row is [`probe::stranded`] by what its start read and its date ([`date`])
+/// against that daemon's start, its age read on the awake clock (the lesser of its wall-clock age
+/// and [`RunningCheck::awake_ms`], so a sleep counts for nothing) and the backlog being how many
+/// of `held` are held and forked at or after that start
+/// ([`aterm_uds::process::held_since_among`]); a row that would be is only once `backlog`, every
+/// held process of this user so forked, reads 0, which is asked only then. Returns the
+/// syspolicyd the verdicts stand against ([`aterm_vitals::jobs::JobTick::program_check_daemon`]:
+/// the one the look read, else the one a kept row was judged under) and whether every row the
+/// check holds was judged ([`aterm_vitals::jobs::JobTick::program_check_judged`]): the look's
+/// pool reads not full, and each is stranded or forked at or after that start, its check the
+/// running one's. Any other may be stranded or in the running one's line, and nothing read tells
+/// which. Nothing it reads feeds a signal: the host ends no held program.
+fn strand(
+    held: &mut [Held],
+    check: Option<RunningCheck>,
+    now_us: u64,
+    backlog: impl FnOnce(u64) -> Option<usize>,
+) -> (Option<u32>, bool) {
+    for h in held.iter_mut() {
+        h.row.stranded = h.stranded_by.is_some();
+    }
+    let alone = check.filter(|c| !c.pool_full);
+    if let Some(c) = alone {
+        let start = c.daemon.started_us();
+        let up_us = now_us
+            .saturating_sub(start)
+            .min(c.awake_ms.saturating_mul(1_000));
+        let pids: Vec<u32> = held.iter().map(|h| h.row.pid).collect();
+        let facts: BTreeMap<u32, StartFacts> = held
+            .iter()
+            .filter_map(|h| Some((h.row.pid, h.facts?)))
+            .collect();
+        let own =
+            aterm_uds::process::held_since_among(&pids, |pid| facts.get(&pid).copied(), start);
+        let fresh: Vec<usize> = (0..held.len())
+            .filter(|&i| {
+                let h = &held[i];
+                !h.row.stranded
+                    && h.facts.is_some_and(|f| {
+                        probe::stranded(
+                            &f,
+                            h.sent_by_us,
+                            start,
+                            start.saturating_add(up_us),
+                            Some(false),
+                            Some(own),
+                        )
+                    })
+            })
+            .collect();
+        if !fresh.is_empty() && backlog(start) == Some(0) {
+            for i in fresh {
+                held[i].row.stranded = true;
+                held[i].stranded_by = Some(c.daemon.pid);
+            }
         }
     }
-    held
+    let judged = |h: &Held| {
+        h.row.wait != StartWait::ProgramCheck
+            || h.row.stranded
+            || alone.is_some_and(|c| {
+                h.facts
+                    .and_then(|f| f.start_us)
+                    .is_some_and(|fork| fork >= c.daemon.started_us())
+            })
+    };
+    let by = check
+        .map(|c| c.daemon.pid)
+        .or_else(|| held.iter().find_map(|h| h.stranded_by));
+    (by, alone.is_some() && held.iter().all(judged))
 }
 
 /// When a process whose start reads `facts`, its age taken at `now_us` (µs since the epoch),
@@ -575,8 +821,19 @@ fn version_at_wait(
     current_wait: impl FnOnce() -> Option<StartWait>,
     after: impl FnOnce() -> Option<u64>,
 ) -> Option<u64> {
+    bound_version(before, || current_wait() == Some(wait), after)
+}
+
+/// The version read `before` when a fresh read between it and a second version read `after`
+/// still `holds` and that second read equals it; `None` otherwise ([`version_at_wait`], an
+/// [`Unlisted`] row's version).
+fn bound_version(
+    before: Option<u64>,
+    holds: impl FnOnce() -> bool,
+    after: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
     let version = before?;
-    (current_wait() == Some(wait) && after() == Some(version)).then_some(version)
+    (holds() && after() == Some(version)).then_some(version)
 }
 
 /// What keeps a process that stands `at` its start from starting, as the engine names it; `None`
@@ -655,26 +912,42 @@ pub(crate) fn holds_a_wait(view: &JobsView) -> bool {
         || f.program_check_episode.is_some()
 }
 
-/// `privacy`'s `program_check=` from `view`, `age` old: how many of this user's programs macOS's
-/// program check holds (a lower bound, aterm's and others'), and the longest held to now in ms (its
-/// first sighting's age plus the view's); `None` when the view, read with the leftover view `left`,
-/// does not speak for now ([`speaks_for_now`]).
+/// `privacy`'s count of this user's programs at macOS's program check ([`program_check_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeldCount {
+    /// How many it holds: a lower bound, aterm's and others'.
+    pub(crate) held: u32,
+    /// The longest held to now, ms: its first sighting's age plus the view's.
+    pub(crate) oldest_ms: u64,
+    /// How many of them are stranded ([`aterm_vitals::jobs::Findings::program_check_stranded`]);
+    /// `None` with none named while the view did not judge every held row
+    /// ([`aterm_vitals::jobs::Findings::program_check_judged`]).
+    pub(crate) stranded: Option<u32>,
+}
+
+/// `privacy`'s `program_check=` from `view`, `age` old ([`HeldCount`]); `None` when the view, read
+/// with the leftover view `left`, does not speak for now ([`speaks_for_now`]).
 pub(crate) fn program_check_of(
     view: &JobsView,
     left: Option<&LeftView>,
     age: Duration,
     reader: bool,
-) -> Option<(u32, u64)> {
+) -> Option<HeldCount> {
     if !speaks_for_now(view, left, age, reader) {
         return None;
     }
-    let held = &view.findings.program_check;
-    let oldest = held.iter().map(|n| n.for_ms).max().unwrap_or(0);
+    let f = &view.findings;
+    let oldest = f.program_check.iter().map(|n| n.for_ms).max().unwrap_or(0);
     let age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
-    Some((
-        u32::try_from(held.len()).unwrap_or(u32::MAX),
-        oldest.saturating_add(age_ms),
-    ))
+    let count = |list: &[aterm_vitals::jobs::Named]| u32::try_from(list.len()).unwrap_or(u32::MAX);
+    Some(HeldCount {
+        held: count(&f.program_check),
+        oldest_ms: oldest.saturating_add(age_ms),
+        stranded: f.program_check_daemon.and_then(|_| {
+            let n = count(&f.program_check_stranded);
+            (n > 0 || f.program_check_judged).then_some(n)
+        }),
+    })
 }
 
 /// The view last posted, its tabs' session ids, and when it was first posted.
@@ -2351,7 +2624,7 @@ pub(crate) mod tests {
         .concat();
         let asked = RefCell::new(Vec::new());
         let versions = RefCell::new(Vec::new());
-        let held = held_list(
+        let (held, young) = held_list(
             &sweep,
             &members,
             Some(ME),
@@ -2395,6 +2668,7 @@ pub(crate) mod tests {
         );
         let got: Vec<(u32, u64, &str, bool, StartWait)> = held
             .iter()
+            .map(|h| &h.row)
             .map(|h| (h.pid, h.exec, h.name.as_str(), h.aterm, h.wait))
             .collect();
         assert_eq!(
@@ -2435,7 +2709,8 @@ pub(crate) mod tests {
             "each named by its executable where one reads, never by p_comm's 16 bytes, with what \
              keeps it; the stand-in's 30 ms row counted"
         );
-        assert!(held.iter().all(|h| h.exec_version == Some(h.exec)));
+        assert!(held.iter().all(|h| h.row.exec_version == Some(h.row.exec)));
+        assert_eq!(young, [], "none read unrun but unlisted");
         assert!(
             held_list(
                 &sweep,
@@ -2448,6 +2723,7 @@ pub(crate) mod tests {
                 |_| true,
                 |_| None,
             )
+            .0
             .is_empty(),
             "no user read, nothing counted"
         );
@@ -2473,7 +2749,7 @@ pub(crate) mod tests {
         };
         let read = |before, fresh, after| {
             let version = Cell::new(before);
-            let rows = held_list(
+            let (rows, _) = held_list(
                 &[],
                 std::slice::from_ref(&member),
                 Some(501),
@@ -2488,7 +2764,7 @@ pub(crate) mod tests {
                 |_| None,
             );
             assert_eq!(rows.len(), 1, "the cached descriptive held row remains");
-            rows[0].exec_version
+            rows[0].row.exec_version
         };
         assert_eq!(read(Some(17), AtStart::Held, Some(17)), Some(17));
         assert_eq!(read(Some(17), AtStart::Held, Some(18)), None);
@@ -2524,7 +2800,7 @@ pub(crate) mod tests {
             start_facts: Some(held_for(90_000)),
             ..ProcFacts::default()
         };
-        let held = held_list(
+        let (held, _) = held_list(
             &[row(10), row(20), row(30)],
             std::slice::from_ref(&member),
             Some(ME),
@@ -2535,7 +2811,8 @@ pub(crate) mod tests {
             |_| true,
             |_| None,
         );
-        let forks: Vec<(u32, Option<u64>)> = held.iter().map(|h| (h.pid, h.started_ms)).collect();
+        let forks: Vec<(u32, Option<u64>)> =
+            held.iter().map(|h| (h.row.pid, h.row.started_ms)).collect();
         assert_eq!(
             forks,
             [
@@ -2573,6 +2850,7 @@ pub(crate) mod tests {
             coalition: |pid| Some(if pid == 23 { 8 } else { 7 }),
             exe_name: |pid| (pid == 20).then(|| "codex-command-runner".to_owned()),
             stand_in: || Some(10),
+            ..HeldReaders::INERT
         };
         let view = pass
             .tick(
@@ -2616,6 +2894,506 @@ pub(crate) mod tests {
             view.findings.program_check_aterm,
             (2, 0),
             "aterm's: the two in this process's coalition, not 23 in another"
+        );
+    }
+
+    /// THE PASS NAMES STRANDED ONLY A HELD PROGRAM OLDER THAN A DAEMON THAT ANSWERS ALONE (leftover
+    /// §5.1): with the syspolicyd running now started at T, up the bound awake, its pool not full,
+    /// a member and a sweep row seen unrun since T − 8 s read stranded by the facts `held_list`
+    /// kept, once every held program of this user reads no backlog. None does beside a held row
+    /// forked at T or after (a backlog), nor with the daemon a µs short of the bound by the wall
+    /// clock or the awake one; a full pool or no fresh look judges nothing; a row seen unrun only
+    /// from T, a translating row, an undated one and the stand-in are never stranded. Every row is
+    /// judged only while each is stranded or forked since T, and a row a pass judged stranded
+    /// stays so whatever this one reads.
+    #[test]
+    fn the_pass_names_stranded_only_a_held_program_older_than_a_daemon_that_answers_alone() {
+        use aterm_vitals::program_check::Daemon;
+        const ME: u32 = 501;
+        const SEC: u64 = 1_000_000;
+        const T: u64 = 1_791_000_000 * SEC;
+        const AWAKE_MS: u64 = probe::STRANDED_AFTER_US / 1_000;
+        let daemon = Daemon {
+            pid: 11291,
+            start_s: T / SEC,
+            start_us: 0,
+        };
+        let up = T + probe::STRANDED_AFTER_US;
+        let awake = |pool_full, awake_ms| {
+            Some(RunningCheck {
+                daemon,
+                pool_full,
+                awake_ms,
+            })
+        };
+        let check = |pool_full| awake(pool_full, AWAKE_MS);
+        let forked = |at, fork_us| StartFacts {
+            start_us: Some(fork_us),
+            ..judged(at)
+        };
+        let row = |pid| ProcessReading {
+            pid,
+            uid: Some(ME),
+            cpu_ns: Some(2_000_000),
+            name: format!("p{pid}"),
+            ..ProcessReading::default()
+        };
+        let member = ProcFacts {
+            pid: 10,
+            uid: Some(ME),
+            name: "band".into(),
+            start_facts: Some(forked(AtStart::Held, T - 8 * SEC)),
+            ..ProcFacts::default()
+        };
+        let (rows, young) = held_list(
+            &[row(20), row(30)],
+            std::slice::from_ref(&member),
+            Some(ME),
+            Some(30),
+            T,
+            |_| Some(forked(AtStart::Held, T - 8 * SEC)),
+            |pid| Some(u64::from(pid)),
+            |_| false,
+            |_| None,
+        );
+        assert_eq!(young, [], "none read unrun but unlisted");
+        assert_eq!(
+            rows.iter()
+                .map(|h| (h.row.pid, h.facts))
+                .collect::<Vec<_>>(),
+            [
+                (10, member.start_facts),
+                (20, member.start_facts),
+                (30, None)
+            ],
+            "the member's own reading, the sweep row's read, none for the stand-in"
+        );
+        let alone: Vec<Held> = rows
+            .into_iter()
+            .map(|h| Held {
+                sent_by_us: Some(T - 8 * SEC),
+                ..h
+            })
+            .collect();
+        let verdict_by = |mut rows: Vec<Held>, check, now_us, backlog: Option<usize>| {
+            let (by, every) = strand(&mut rows, check, now_us, |since| {
+                assert_eq!(since, T, "the backlog since the daemon's start");
+                backlog
+            });
+            let stranded: Vec<u32> = rows
+                .iter()
+                .filter(|h| h.row.stranded)
+                .map(|h| h.row.pid)
+                .collect();
+            (by, every, stranded)
+        };
+        let verdict = |rows, check, now_us| verdict_by(rows, check, now_us, Some(0));
+        assert_eq!(
+            verdict(alone.clone(), check(false), up),
+            (Some(11291), false, vec![10, 20]),
+            "held since before the daemon running now, which answers alone; never the stand-in, \
+             which no read judges"
+        );
+        let held_row = |pid, at, fork_us, sent_by_us| {
+            let facts = forked(at, fork_us);
+            Held {
+                row: HeldProc {
+                    pid,
+                    exec: u64::from(pid),
+                    exec_version: Some(u64::from(pid)),
+                    name: format!("p{pid}"),
+                    wait: start_wait(probe::judge_start(&facts)).expect("not started"),
+                    ..HeldProc::default()
+                },
+                facts: Some(facts),
+                cpu_ns: Some(2_000_000),
+                sent_by_us: Some(sent_by_us),
+                stranded_by: None,
+            }
+        };
+        let beside = |pid, at, fork_us, sent_by_us| {
+            let mut rows = alone.clone();
+            rows.push(held_row(pid, at, fork_us, sent_by_us));
+            rows
+        };
+        let traced = AtStart::StoppedUnstarted {
+            stopped: false,
+            traced: true,
+        };
+        for (case, rows, want) in [
+            (
+                "a held row forked at T + 1 µs, a slow first exec the daemon running now has yet \
+                 to answer, is its backlog, and no verdict stands for the rows before T",
+                beside(40, AtStart::Held, T + 1, T + 1),
+                (Some(11291), false, vec![]),
+            ),
+            (
+                "a held row forked at T is its backlog",
+                beside(41, AtStart::Held, T, T),
+                (Some(11291), false, vec![]),
+            ),
+            (
+                "CONTROL: a row forked before T but seen unrun only from T on may have exec'd \
+                 since, so it is not stranded, and the others still are",
+                beside(42, AtStart::Held, T - 8 * SEC, T),
+                (Some(11291), false, vec![10, 20]),
+            ),
+            (
+                "CONTROL: a translating row forked since T is never stranded nor a backlog",
+                beside(43, AtStart::Translating, T + SEC, T + SEC),
+                (Some(11291), false, vec![10, 20]),
+            ),
+            (
+                "CONTROL: a traced unstarted row forked since T is never stranded nor a backlog",
+                beside(46, traced, T + SEC, T + SEC),
+                (Some(11291), false, vec![10, 20]),
+            ),
+            (
+                "CONTROL: rows all forked since T, one translating and one traced, are all judged, \
+                 none stranded",
+                vec![
+                    held_row(44, AtStart::Held, T + SEC, T + SEC),
+                    held_row(45, AtStart::Translating, T - 8 * SEC, T - 8 * SEC),
+                    held_row(47, traced, T - 8 * SEC, T - 8 * SEC),
+                ],
+                (Some(11291), true, vec![]),
+            ),
+        ] {
+            assert_eq!(verdict(rows, check(false), up), want, "{case}");
+        }
+        assert_eq!(
+            verdict(alone.clone(), check(false), up - 1),
+            (Some(11291), false, vec![]),
+            "the daemon a µs short of the bound on a first exec gives no verdict"
+        );
+        assert_eq!(
+            verdict(alone.clone(), awake(false, AWAKE_MS - 1), up + 3_600 * SEC),
+            (Some(11291), false, vec![]),
+            "an hour up by the wall clock but a ms short of the bound awake: a sleep counts for \
+             nothing"
+        );
+        for (backlog, want) in [(Some(1), vec![]), (None, vec![]), (Some(0), vec![10, 20])] {
+            assert_eq!(
+                verdict_by(alone.clone(), check(false), up, backlog),
+                (Some(11291), false, want),
+                "a held program of this user the pass does not list ({backlog:?}) is a backlog too"
+            );
+        }
+        assert_eq!(
+            verdict(alone.clone(), check(true), up),
+            (Some(11291), false, vec![]),
+            "CONTROL: a full pool judges nothing"
+        );
+        assert_eq!(
+            verdict(alone.clone(), None, up),
+            (None, false, vec![]),
+            "CONTROL: no fresh look judges nothing"
+        );
+        let undated: Vec<Held> = alone
+            .iter()
+            .cloned()
+            .map(|h| Held {
+                sent_by_us: None,
+                ..h
+            })
+            .collect();
+        assert_eq!(
+            verdict(undated, check(false), up),
+            (Some(11291), false, vec![]),
+            "an undated row is not judged"
+        );
+        let kept: Vec<Held> = alone
+            .iter()
+            .cloned()
+            .map(|h| Held {
+                stranded_by: h.facts.map(|_| 690),
+                ..h
+            })
+            .collect();
+        let mut later = kept.clone();
+        later.push(held_row(40, AtStart::Held, T + 1, T + 1));
+        for (case, rows, check, want) in [
+            ("no fresh look", kept.clone(), None, Some(690)),
+            ("a full pool", kept.clone(), check(true), Some(11291)),
+            ("a backlog", later, check(false), Some(11291)),
+        ] {
+            assert_eq!(
+                verdict(rows, check, up),
+                (want, false, vec![10, 20]),
+                "a row a pass judged stranded stays so beside {case}, against the daemon read now \
+                 or else the one it was judged under"
+            );
+        }
+    }
+
+    /// THE PASS HANDS THE ENGINE THE DAEMON IT JUDGED AGAINST: a held row its passes read unrun at
+    /// one CPU since before the syspolicyd the stuck check reads now started, once that daemon is
+    /// up the bound, is the engine's stranded row and privacy's count, with the daemon's pid. A row
+    /// first read after that start, and one whose CPU moved between the passes, start over and are
+    /// only held; with no check read (the inert arm's) the same rows are held and none is judged.
+    #[test]
+    fn the_pass_hands_the_engine_the_daemon_it_judged_against() {
+        use aterm_vitals::jobs::Named;
+        use aterm_vitals::program_check::Daemon;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        const ME: u32 = 501;
+        const SEC: u64 = 1_000_000;
+        const T: u64 = 1_791_000_000 * SEC;
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        let row = |pid, cpu_ns| ProcessReading {
+            pid,
+            uid: Some(ME),
+            cpu_ns: Some(cpu_ns),
+            name: format!("p{pid}"),
+            ..ProcessReading::default()
+        };
+        let readers = HeldReaders {
+            start: |_, _, _| {
+                Some(StartFacts {
+                    start_us: Some(T - 30 * SEC),
+                    ..judged(AtStart::Held)
+                })
+            },
+            exec: |pid| Some(u64::from(pid)),
+            check: || {
+                let (pid, started) = if NOW.load(Ordering::SeqCst) < T {
+                    (690, T - 3_600 * SEC)
+                } else {
+                    (11291, T)
+                };
+                Some(RunningCheck {
+                    daemon: Daemon {
+                        pid,
+                        start_s: started / SEC,
+                        start_us: 0,
+                    },
+                    pool_full: false,
+                    awake_ms: u64::MAX,
+                })
+            },
+            backlog: |_| Some(0),
+            now_us: || NOW.load(Ordering::SeqCst),
+            ..HeldReaders::INERT
+        };
+        let run = |readers: HeldReaders| {
+            let mut pass = JobsPass::new();
+            pass.held = readers;
+            NOW.store(T - 8 * SEC, Ordering::SeqCst);
+            let first = [row(10, 400_000_000), row(20, 2_000_000), row(22, 2_000_000)];
+            let _ = pass.tick(
+                10_000,
+                || 10_000,
+                Some(&first),
+                &[],
+                &[],
+                &[],
+                &GrantFacts::default(),
+                10,
+                false,
+                true,
+            );
+            NOW.store(T + probe::STRANDED_AFTER_US, Ordering::SeqCst);
+            let then = [
+                row(10, 400_000_000),
+                row(20, 2_000_000),
+                row(21, 2_000_000),
+                row(22, 3_000_000),
+            ];
+            pass.tick(
+                12_000,
+                || 12_000,
+                Some(&then),
+                &[],
+                &[],
+                &[],
+                &GrantFacts::default(),
+                10,
+                false,
+                true,
+            )
+            .expect("a view")
+        };
+        let pids = |list: &[Named]| list.iter().map(|n| n.pid).collect::<Vec<_>>();
+        let view = run(readers);
+        let f = &view.findings;
+        assert_eq!(pids(&f.program_check), [20, 21, 22], "every one held");
+        assert_eq!(
+            pids(&f.program_check_stranded),
+            [20],
+            "only the row read unrun at one CPU since before the daemon started"
+        );
+        assert_eq!(
+            f.program_check_daemon,
+            Some(11291),
+            "the daemon judged against"
+        );
+        assert_eq!(
+            program_check_of(&view, None, Duration::ZERO, false).map(|c| c.stranded),
+            Some(Some(1))
+        );
+        let inert = run(HeldReaders {
+            check: HeldReaders::INERT.check,
+            ..readers
+        });
+        let f = &inert.findings;
+        assert_eq!(pids(&f.program_check), [20, 21, 22], "CONTROL: still held");
+        assert_eq!(
+            (pids(&f.program_check_stranded), f.program_check_daemon),
+            (vec![], None),
+            "CONTROL: no check read judges nothing"
+        );
+        assert_eq!(
+            program_check_of(&inert, None, Duration::ZERO, false).map(|c| c.stranded),
+            Some(None)
+        );
+    }
+
+    /// A PASS DATES A ROW FROM ITS FIRST UNRUN READ AND KEEPS ITS VERDICT: a row read unrun at
+    /// T − 1 s, before the syspolicyd running now started at T, still younger than the held bar, is
+    /// dated then, so it reads stranded once the daemon is up the bound; the verdict stands beside
+    /// a backlog and through a pass with no fresh look. A row whose CPU moved, a young row whose
+    /// thread ran, and a young row that read stopped start over.
+    #[test]
+    fn a_pass_dates_a_row_from_its_first_unrun_read_and_keeps_its_verdict() {
+        use aterm_vitals::program_check::Daemon;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        const ME: u32 = 501;
+        const SEC: u64 = 1_000_000;
+        const T: u64 = 1_791_000_000 * SEC;
+        static NOW: AtomicU64 = AtomicU64::new(0);
+        static LOOK: AtomicBool = AtomicBool::new(true);
+        let row = |pid, cpu_ns| ProcessReading {
+            pid,
+            uid: Some(ME),
+            cpu_ns: Some(cpu_ns),
+            name: format!("p{pid}"),
+            ..ProcessReading::default()
+        };
+        let mut pass = JobsPass::new();
+        pass.held = HeldReaders {
+            start: |pid, now_us, _| {
+                let fork = match pid {
+                    50..=52 => T - 6 * SEC,
+                    60 => T + 300 * SEC,
+                    _ => T - 30 * SEC,
+                };
+                let before = NOW.load(Ordering::SeqCst) < T;
+                Some(StartFacts {
+                    lone_zero: pid != 51 || !before,
+                    stopped: pid == 52 && before,
+                    local: Some(true),
+                    age_ms: Some(now_us.saturating_sub(fork) / 1_000),
+                    start_us: Some(fork),
+                    ..StartFacts::default()
+                })
+            },
+            exec: |pid| Some(u64::from(pid)),
+            check: || {
+                let now = NOW.load(Ordering::SeqCst);
+                let (pid, started) = if now < T {
+                    (690, T - 3_600 * SEC)
+                } else {
+                    (11291, T)
+                };
+                LOOK.load(Ordering::SeqCst).then_some(RunningCheck {
+                    daemon: Daemon {
+                        pid,
+                        start_s: started / SEC,
+                        start_us: 0,
+                    },
+                    pool_full: false,
+                    awake_ms: now.saturating_sub(started) / 1_000,
+                })
+            },
+            backlog: |_| Some(0),
+            now_us: || NOW.load(Ordering::SeqCst),
+            ..HeldReaders::INERT
+        };
+        let mut tick = |at_ms, now_us, rows: &[ProcessReading]| {
+            NOW.store(now_us, Ordering::SeqCst);
+            let view = pass
+                .tick(
+                    at_ms,
+                    || at_ms,
+                    Some(rows),
+                    &[],
+                    &[],
+                    &[],
+                    &GrantFacts::default(),
+                    10,
+                    false,
+                    true,
+                )
+                .expect("a view");
+            let f = &view.findings;
+            (
+                f.program_check.iter().map(|n| n.pid).collect::<Vec<_>>(),
+                f.program_check_stranded
+                    .iter()
+                    .map(|n| n.pid)
+                    .collect::<Vec<_>>(),
+                f.program_check_daemon,
+                f.program_check_judged,
+            )
+        };
+        let cpu = 2_000_000;
+        let me = row(10, 400_000_000);
+        let first = [
+            me.clone(),
+            row(20, cpu),
+            row(22, cpu),
+            row(50, cpu),
+            row(51, cpu),
+            row(52, cpu),
+        ];
+        assert_eq!(
+            tick(10_000, T - SEC, &first),
+            (vec![20, 22], vec![], Some(690), true),
+            "50, 51 and 52 are five seconds old, under the held bar; 20 and 22 forked since 690 \
+             started are judged, none stranded"
+        );
+        let up = T + probe::STRANDED_AFTER_US;
+        assert_eq!(
+            tick(12_000, up, &first),
+            (
+                vec![20, 22, 50, 51, 52],
+                vec![20, 22, 50],
+                Some(11291),
+                false
+            ),
+            "50 read unrun before it was held, from T − 1 s; CONTROL: 51's thread ran at its \
+             first read and 52 read stopped, so each dates from its second, after T"
+        );
+        let backlog = [
+            me,
+            row(20, cpu),
+            row(22, cpu + 1),
+            row(50, cpu),
+            row(51, cpu),
+            row(52, cpu),
+            row(60, cpu),
+        ];
+        assert_eq!(
+            tick(14_000, up + 2 * SEC, &backlog),
+            (
+                vec![20, 22, 50, 51, 52, 60],
+                vec![20, 50],
+                Some(11291),
+                false
+            ),
+            "kept beside 60, a backlog forked at T + 5 m; CONTROL: 22's CPU moved, so its run \
+             starts over and its verdict goes"
+        );
+        LOOK.store(false, Ordering::SeqCst);
+        assert_eq!(
+            tick(16_000, up + 4 * SEC, &backlog),
+            (
+                vec![20, 22, 50, 51, 52, 60],
+                vec![20, 50],
+                Some(11291),
+                false
+            ),
+            "kept with no fresh look, against the daemon it was judged under"
         );
     }
 
@@ -3262,14 +4040,15 @@ pub(crate) mod tests {
             "privacy's count pulls past the minute"
         );
         assert_eq!(
-            program_check_of(&parked, None, late, true),
+            program_check_of(&parked, None, late, true).map(|c| (c.held, c.oldest_ms)),
             Some((0, 61_000)),
             "none held, read on edges"
         );
     }
 
-    /// Privacy's count: every held program of this user, aterm's and others', and the longest held
-    /// to now; nothing from a view that does not speak for now.
+    /// Privacy's count: every held program of this user, aterm's and others', the longest held to
+    /// now, and how many are stranded: a count whenever one is named, `0` only when the view judged
+    /// every held row, none otherwise; nothing from a view that does not speak for now.
     #[test]
     fn privacys_count_is_every_held_program_and_the_longest_wait_to_now() {
         use aterm_vitals::jobs::{Findings, Named};
@@ -3291,12 +4070,20 @@ pub(crate) mod tests {
         };
         assert_eq!(
             program_check_of(&view, None, Duration::from_millis(1_500), false),
-            Some((2, 35_941_500)),
-            "both held, the oldest plus the view's age"
+            Some(HeldCount {
+                held: 2,
+                oldest_ms: 35_941_500,
+                stranded: None
+            }),
+            "both held, the oldest plus the view's age, none judged stranded or not"
         );
         assert_eq!(
             program_check_of(&JobsView::default(), None, Duration::ZERO, false),
-            Some((0, 0)),
+            Some(HeldCount {
+                held: 0,
+                oldest_ms: 0,
+                stranded: None
+            }),
             "none held"
         );
         assert_eq!(
@@ -3304,6 +4091,28 @@ pub(crate) mod tests {
             None,
             "a view that does not speak for now"
         );
+        let judged = |stranded: Vec<Named>, every| JobsView {
+            findings: Findings {
+                program_check_stranded: stranded,
+                program_check_daemon: Some(11291),
+                program_check_judged: every,
+                ..view.findings.clone()
+            },
+            ..JobsView::default()
+        };
+        for (stranded, every, want) in [
+            (vec![named(25311, 35_940_000)], false, Some(1)),
+            (Vec::new(), true, Some(0)),
+            (Vec::new(), false, None),
+        ] {
+            assert_eq!(
+                program_check_of(&judged(stranded, every), None, Duration::ZERO, false)
+                    .map(|c| c.stranded),
+                Some(want),
+                "a view counts its stranded rows, and none only when it judged every row \
+                 ({every})"
+            );
+        }
     }
 
     /// THE BOARD'S HELD PROGRAMS ARE THIS SESSION'S CALLS' AND THEIR ORPHANS': of the view's held

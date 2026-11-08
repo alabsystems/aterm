@@ -31,20 +31,40 @@ pub(super) struct SettledBinding {
 #[derive(Clone, Debug)]
 pub(super) struct Qualification {
     request: Prepare,
+    pub(super) producer: Option<Arc<relaunch_permit::Permit>>,
+    pub(super) signal: Option<Arc<relaunch_permit::Permit>>,
 }
 
 impl Qualification {
     pub(super) fn admits(&self, request: &Prepare) -> bool {
+        self.matches_request(request)
+            && (!matches!(request.asked, Some(AskedIntent::Relaunch(_)))
+                || self
+                    .producer
+                    .as_ref()
+                    .is_some_and(|permit| permit.matches(request)))
+    }
+
+    pub(super) fn matches_request(&self, request: &Prepare) -> bool {
         self.request == *request && shape(request)
+    }
+
+    pub(super) fn consume_first_signal(&mut self) -> bool {
+        self.signal
+            .take()
+            .is_some_and(|permit| permit.consume_signal(&self.request))
     }
 }
 
 pub(super) fn shape(request: &Prepare) -> bool {
-    request.duty == Scope::Upgrade
-        && request
-            .asked_upgrade
-            .as_ref()
-            .is_some_and(|asked| aterm_codec::hex::is_lower(&asked.predecessor, 32))
+    matches!(
+        (&request.asked, request.duty),
+        (Some(AskedIntent::Upgrade(_)), Scope::Upgrade)
+            | (Some(AskedIntent::Relaunch(_)), Scope::Relaunch)
+    ) && request
+        .asked
+        .as_ref()
+        .is_some_and(|asked| aterm_codec::hex::is_lower(asked.predecessor(), 32))
         && matches!(
             request.plan,
             NativePlan::Restart {
@@ -53,19 +73,23 @@ pub(super) fn shape(request: &Prepare) -> bool {
                 ..
             }
         )
+        && (!matches!(request.asked, Some(AskedIntent::Relaunch(_)))
+            || matches!(&request.plan, NativePlan::Restart { forward, .. }
+                if forward.settles.is_none() && !matches!(forward.account_intent.as_deref(), Some(aterm_agent::harness::accounts_pool::ExecutionIntent::Token { .. }))))
 }
 
 impl Operations {
     /// Called only at accepted publication, after actual authority/custody checks.
     pub(super) fn admitted_binding(&mut self, op: &Operation) {
+        relaunch_permit::superseded(self, Some(&op.request));
         let request = &op.request;
         let previous = std::mem::take(&mut self.asked_binding);
         let prior = match previous {
             CurrentBinding::Settled(settled)
-                if request.asked_upgrade.as_ref().is_some_and(|asked| {
+                if request.asked.as_ref().is_some_and(|asked| {
                     shape(request)
                         && op.authority.asked_matches(request)
-                        && asked.predecessor == settled.binding.id
+                        && asked.predecessor() == settled.binding.id
                 }) =>
             {
                 Some(settled)
@@ -128,14 +152,18 @@ impl Operations {
             return Err("settlement-drain");
         }
         if !matches!(op.request.plan, NativePlan::Restart { cold: Some(_), .. })
-            && op.request.asked_upgrade.is_none()
+            && op.request.asked.is_none()
         {
             return Err("settlement-constructor");
         }
         if decision == Decision::ProvenNotCommittedRollbackSafe {
             // A rollback-safe result after any accepted effect is not a retry grant.
-            if op.request.asked_upgrade.is_none()
-                || !op.authority.asked_matches(&op.request)
+            if op.request.asked.is_none()
+                || op
+                    .authority
+                    .asked
+                    .as_ref()
+                    .is_none_or(|qualification| !qualification.matches_request(&op.request))
                 || op.signal_sent
                 || op.resume_sent
                 || op.resume_attempt.is_some()
@@ -215,14 +243,11 @@ impl Operations {
         let CurrentBinding::Settled(settled) = &self.asked_binding else {
             return Err("qualification-no-settled-binding");
         };
-        let asked = request
-            .asked_upgrade
-            .as_ref()
-            .ok_or("qualification-no-intent")?;
+        let asked = request.asked.as_ref().ok_or("qualification-no-intent")?;
         let NativePlan::Restart { process, shell, .. } = &request.plan else {
             return Err("qualification-plan");
         };
-        if asked.predecessor != settled.binding.id {
+        if asked.predecessor() != settled.binding.id {
             return Err("qualification-predecessor");
         }
         if request.host_epoch != settled.host_epoch {
@@ -264,8 +289,15 @@ impl Operations {
         if self.account_lineages.pins(&settled.binding.id) {
             return Err("qualification-account-lineage");
         }
+        let producer = if matches!(request.asked, Some(AskedIntent::Relaunch(_))) {
+            Some(relaunch_permit::pending(self, request).ok_or("qualification-checked-producer")?)
+        } else {
+            None
+        };
         Ok(Qualification {
             request: request.clone(),
+            producer,
+            signal: None,
         })
     }
 }

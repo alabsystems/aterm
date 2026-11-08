@@ -10,8 +10,6 @@
 //! so a stray `<<<<<<<`, `|||||||`, `=======` or `>>>>>>>` line left behind after resolving a
 //! merge can land unseen and ship verbatim in release notes.
 
-use std::borrow::Cow;
-
 use super::{Finding, Rule, Tree};
 
 pub(super) const CONFLICT_MARKER: Rule = Rule {
@@ -34,21 +32,6 @@ fn skip_path(rel: &str) -> bool {
     }
     rel.rsplit_once('.')
         .is_some_and(|(_, ext)| BINARY_EXTS.iter().any(|b| ext.eq_ignore_ascii_case(b)))
-}
-
-fn text<'t>(tree: &'t Tree<'_>, rel: &str) -> Option<Cow<'t, str>> {
-    if let Some(file) = tree.corpus.get(rel) {
-        return Some(Cow::Borrowed(file.raw.as_str()));
-    }
-    if let Some((_, raw)) = tree.corpus.manifests.iter().find(|(p, _)| p == rel) {
-        return Some(Cow::Borrowed(raw.as_str()));
-    }
-    if let Some(script) = tree.corpus.scripts.iter().find(|s| s.rel == rel) {
-        return Some(Cow::Borrowed(script.raw.as_str()));
-    }
-    crate::tree::read_to_string(&tree.root.join(rel))
-        .ok()
-        .map(Cow::Owned)
 }
 
 fn fence_open(raw: &str) -> Option<(u8, usize)> {
@@ -98,7 +81,7 @@ fn conflict_marker(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         if skip_path(rel) {
             continue;
         }
-        let Some(body) = text(tree, rel) else {
+        let Some(body) = tree.text(rel) else {
             continue;
         };
         if !["<<<<<<<", "|||||||", "=======", ">>>>>>>"]

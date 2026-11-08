@@ -16,7 +16,7 @@ use crate::wall::{ApiCause, Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 15, "0.15");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 16, "0.16");
 
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 
@@ -2061,7 +2061,7 @@ pub fn usage_card_weekly_for_model(
         .find(|(g, _, _)| matches_group(g))
         .or_else(|| parsed_rows.into_iter().next())?;
     Some(crate::muse::UsageCardWeekly {
-        text: format!("weekly {left}% left"),
+        text: format!("weekly {}% used", 100 - left),
         reset,
     })
 }

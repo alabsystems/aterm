@@ -1189,6 +1189,12 @@ pub struct SubscriptionDisplay {
     /// only a read that happened is spent. Muse Code's and `agy`'s footers; the owner's no-polling
     /// rule ([`super::provider_read`]).
     pub usage_read: bool,
+    /// This process's newest usage-tap reading says Claude Code shows the tap's own row under
+    /// the composer ([`super::tap::Reading::claimable`]): the second of the quota row's three
+    /// claim conditions (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.2), read with the
+    /// reading's figure so the frame does no IO. `false` with no reading, one naming the owner's
+    /// row, or one written before the `row` key.
+    pub tap_own: bool,
 }
 
 /// One weekly figure, whichever source read it (Claude Code's `/usage` cache, this process's usage
@@ -1204,32 +1210,24 @@ pub struct WeeklyFigure {
 }
 
 impl WeeklyFigure {
-    /// The one age rule of every weekly source, the footer's words at `now`: `weekly N% left`
-    /// while the figure is at most [`USAGE_CURRENT_S`] old (or stamped at most
-    /// [`USAGE_SKEW_S`] ahead), `weekly N% left · Mm ago` up to [`USAGE_SHOWN_S`], and nothing
-    /// for an older figure, one from further in the future, or one whose window has reset.
+    /// The one age rule of every weekly source, its words at `now`: `weekly 63% used` while the
+    /// figure is at most [`USAGE_CURRENT_S`] old (or stamped at most [`USAGE_SKEW_S`] ahead),
+    /// the lower bound `weekly ≥63% used` up to [`USAGE_SHOWN_S`] (use only rises within a
+    /// window), and nothing for an older figure, one from further in the future, or one whose
+    /// window has reset. The share is [`super::outlook::Figure`]'s, so these words and the
+    /// glass's agree (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §3.2: no `% left`).
     #[must_use]
     pub fn words(&self, now: i64) -> Option<String> {
-        let age = usage_read_age(self.at, now)
-            .filter(|age| *age <= USAGE_SHOWN_S)?
-            .max(0);
-        if self.resets_at <= now {
-            return None;
+        usage_read_age(self.at, now).filter(|age| *age <= USAGE_SHOWN_S)?;
+        match super::outlook::Figure::of_weekly(self, now) {
+            figure @ (super::outlook::Figure::Exact(_) | super::outlook::Figure::AtLeast(_)) => {
+                Some(format!("weekly {} used", figure.words()))
+            }
+            super::outlook::Figure::Out | super::outlook::Figure::Unread => None,
         }
-        let left = 1000_u32.saturating_sub(self.used_x10.min(1000));
-        let left = if left.is_multiple_of(10) {
-            format!("{}", left / 10)
-        } else {
-            format!("{}.{}", left / 10, left % 10)
-        };
-        Some(if age <= USAGE_CURRENT_S {
-            format!("weekly {left}% left")
-        } else {
-            format!("weekly {left}% left \u{b7} {}m ago", age / 60)
-        })
     }
 
-    /// Whether [`Self::words`] says it at `now` with no age.
+    /// Whether [`Self::words`] says it at `now` as an exact figure, not a bound.
     #[must_use]
     pub fn current(&self, now: i64) -> bool {
         self.words(now).is_some() && now.saturating_sub(self.at) <= USAGE_CURRENT_S
@@ -1306,19 +1304,17 @@ impl WeeklyGap {
     }
 }
 
-/// The footer's narrow form of the weekly words [`WeeklyFigure::words`] said, for a rule too
-/// narrow for them beside the account: an aged figure without its ` left` and ` ago` but with
-/// its `weekly` (`weekly 61.5% \u{b7} 59m`), since the rule draws the week behind the account
-/// unit's `\u{b7}` and no mark of its own names it; `None` for words that are already their
-/// narrowest (a current figure, a wall's [`WEEKLY_OUT`]).
+/// The figure alone of weekly words ([`WeeklyFigure::words`], [`WEEKLY_OUT`], a screen's
+/// `weekly 22% used`): `63%`, `≥63%` or `out`, for line D's words-only unit where no outlook
+/// serves (`footer::account_unit`); `None` for words that carry no figure (a [`WeeklyGap`]'s).
 #[must_use]
-pub fn narrow_weekly(words: &str) -> Option<String> {
-    let (share, age) = words
-        .strip_prefix("weekly ")
-        .and_then(|rest| rest.strip_suffix(" ago"))
-        .and_then(|aged| aged.split_once(" left \u{b7} "))
-        .filter(|(share, _)| share.ends_with('%'))?;
-    Some(format!("weekly {share} \u{b7} {age}"))
+pub fn weekly_figure_words(words: &str) -> Option<&str> {
+    let rest = words.strip_prefix("weekly ")?;
+    if rest == "out" {
+        return Some(rest);
+    }
+    rest.strip_suffix(" used")
+        .filter(|share| share.ends_with('%'))
 }
 
 /// One reset occurrence, placed when the card is first observed.
@@ -3036,6 +3032,7 @@ impl Selected {
             weekly_reset: None,
             account: self.profile.key,
             usage_read: false,
+            tap_own: false,
         }
     }
 

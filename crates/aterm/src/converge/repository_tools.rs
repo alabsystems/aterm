@@ -6,6 +6,7 @@
 
 use aterm_converge::{Class, Explain, Item, Layer, Probe, Remedy, Requires, StoodAside};
 use aterm_machines::init::BaseLock;
+use aterm_machines::init_github::RepositorySelection;
 use aterm_machines::init_toolset::Toolset;
 use aterm_machines::items::{Ctx, Item as MachineItem};
 use aterm_machines::port::{Live, System};
@@ -20,6 +21,7 @@ struct Admission {
     ctx: Ctx,
     current: Current,
     continuing: Current,
+    credential: Option<RepositorySelection>,
 }
 
 enum Scope {
@@ -119,6 +121,11 @@ fn packages_in(
 }
 
 fn current_scope(sys: &dyn System, ctx: &Ctx, paths: &Paths) -> Result<(), Gate> {
+    intent_scope(sys, ctx, paths)?;
+    packages()
+}
+
+fn intent_scope(sys: &dyn System, ctx: &Ctx, paths: &Paths) -> Result<(), Gate> {
     check_scope(
         sys,
         ctx,
@@ -126,8 +133,7 @@ fn current_scope(sys: &dyn System, ctx: &Ctx, paths: &Paths) -> Result<(), Gate>
         super::vault_held(),
         &super::setup_holds(),
         aterm_secrets::swarm::enabled_in_home(&paths.home).map_err(|why| why.to_string()),
-    )?;
-    packages()
+    )
 }
 
 fn check_scope(
@@ -162,27 +168,62 @@ fn check_scope(
 fn capture(sys: &dyn System) -> Result<Scope, String> {
     let ctx = super::repository_context(sys)?;
     let paths = Paths::live().map_err(|why| why.to_string())?;
-    match current_scope(sys, &ctx, &paths) {
+    match intent_scope(sys, &ctx, &paths) {
         Ok(()) => {}
         Err(Gate::Off(why)) => return Ok(Scope::Off(why)),
         Err(Gate::Unread(why)) => return Ok(Scope::Waiting(why)),
     }
     let expected = ctx.clone();
     let selected = paths.clone();
+    let intent_context = ctx.clone();
+    let intent_paths = paths.clone();
     admit(
+        sys,
         ctx,
         paths,
+        Box::new(move || {
+            intent_scope(&Live::new(), &intent_context, &intent_paths).map_err(Gate::why)
+        }),
         Box::new(move || current_scope(&Live::new(), &expected, &selected).map_err(Gate::why)),
     )
 }
 
-fn admit(ctx: Ctx, paths: Paths, policy: Current) -> Result<Scope, String> {
-    policy()?;
+fn admit(
+    sys: &dyn System,
+    ctx: Ctx,
+    paths: Paths,
+    intent: Current,
+    policy: Current,
+) -> Result<Scope, String> {
+    intent()?;
     let Some(config) = super::vault_config(&paths)? else {
         return Ok(Scope::Off(
             "no private repository vault is configured".into(),
         ));
     };
+    let Some(selection) = RepositorySelection::capture(sys, &ctx)? else {
+        return Ok(Scope::Waiting(super::REPOSITORIES_SYNCING.into()));
+    };
+    if selection.count() == 0 {
+        selection.ensure_current(sys)?;
+        intent()?;
+        return Ok(Scope::Off(
+            "the private inventory selects no repositories".into(),
+        ));
+    }
+    if selection.needs_credential(sys)? {
+        let policy: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::from(intent);
+        let current = Arc::clone(&policy);
+        return Ok(Scope::Admitted(Box::new(Admission {
+            ctx,
+            current: Box::new(move || current()),
+            continuing: Box::new(move || policy()),
+            credential: Some(selection),
+        })));
+    }
+    if let Err(why) = policy() {
+        return Ok(Scope::Off(why));
+    }
     let Some(ready) = client::with_materialization_ready_for_entries(
         &paths,
         &config,
@@ -200,6 +241,7 @@ fn admit(ctx: Ctx, paths: Paths, policy: Current) -> Result<Scope, String> {
     let continuing_paths = paths.clone();
     Ok(Scope::Admitted(Box::new(Admission {
         ctx,
+        credential: None,
         current: Box::new(move || {
             policy()?;
             if !ready
@@ -256,6 +298,22 @@ impl Item for Prerequisites {
         if let Err(why) = (ready.current)() {
             return Self::waiting(why);
         }
+        if let Some(selection) = &ready.credential {
+            return match selection.needs_credential(self.sys.as_ref()) {
+                Ok(true) => Probe::Change {
+                    from: selection.waiting(),
+                    to: "record the development credential need before preparing repository tools"
+                        .into(),
+                },
+                Ok(false) => {
+                    *admitted = None;
+                    Self::waiting(
+                        "credential inputs arrived; repository tools await a paired capture".into(),
+                    )
+                }
+                Err(why) => Self::waiting(why),
+            };
+        }
         // The actual capability check starts no Git child while the vault is
         // locked. Its result cannot outlive source or package-policy admission.
         let usable =
@@ -288,6 +346,12 @@ impl Item for Prerequisites {
         let ready = admitted
             .as_ref()
             .ok_or("repository tools have no admitted source")?;
+        if let Some(selection) = &ready.credential {
+            let _ = selection.request_credential(self.sys.as_ref(), ready.current.as_ref())?;
+            *self.aside.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(StoodAside::Waiting(selection.waiting()));
+            return Ok(());
+        }
         let result = self.toolset.apply_with_guards(
             self.sys.as_ref(),
             ready.current.as_ref(),
@@ -392,6 +456,17 @@ mod tests {
             admin: false,
         };
         sys.logged_in(&who);
+        sys.stat_of(
+            home,
+            aterm_machines::port::Stat {
+                uid: who.uid,
+                gid: who.gid,
+                mode: 0o700,
+                dir: true,
+                symlink: false,
+                len: 0,
+            },
+        );
         inventory(&sys, home, Some(&[]));
         let ctx = super::super::repository_context(&sys).unwrap();
         let sys = Arc::new(sys);
@@ -462,6 +537,7 @@ mod tests {
                 ctx: ctx.clone(),
                 current: Box::new(move || current()),
                 continuing: Box::new(move || continuing()),
+                credential: None,
             })))
         });
         let item = Prerequisites::new(sys.clone(), tools, capture);
@@ -566,7 +642,18 @@ mod tests {
             let original = item.capture;
             let scoped = paths.clone();
             item.capture = Box::new(move |sys| match original(sys)? {
-                Scope::Admitted(ready) => admit(ready.ctx, scoped.clone(), ready.current),
+                Scope::Admitted(ready) => {
+                    let policy: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
+                        Arc::from(ready.current);
+                    let intent = Arc::clone(&policy);
+                    admit(
+                        sys,
+                        ready.ctx,
+                        scoped.clone(),
+                        Box::new(move || intent()),
+                        Box::new(move || policy()),
+                    )
+                }
                 other => Ok(other),
             });
             let calls = Arc::clone(&choices);
@@ -620,7 +707,8 @@ mod tests {
                     left_for_next_pass: |_| Vec::new(),
                 },
             ).default_selected("git");
-            assert!(matches!(item.probe(), Probe::Change { .. }));
+            let probe = item.probe();
+            assert!(matches!(probe, Probe::Change { .. }), "{change}: {probe:?}");
             let result = item.apply();
             assert_eq!(
                 *choices.calls.lock().unwrap(),
@@ -642,6 +730,91 @@ mod tests {
                 );
             }
         }
+
+        // The real inventory can precede its credential. A package refusal must not
+        // swallow that independent intent, and recording it starts no package or Git child.
+        let root = aterm_tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let paths = Paths::for_home(&home);
+        let source = root.path().join("inventory.secrets");
+        let payload = String::from_utf8(inventory_bytes(Some(&[]))).unwrap();
+        aterm_uds::atomic_file::write(
+            &source,
+            format!("github-repositories.json={payload}\n").as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        client::join(
+            &paths,
+            &client::JoinOptions {
+                source: source.to_string_lossy().into_owned(),
+                host: Some("fixture".into()),
+                interactive: false,
+                wait: std::time::Duration::ZERO,
+                confirm: &|_| false,
+                password: client::JoinPassword::Given(None),
+                fetched: None,
+                requested: &|| {},
+                say: &|_| {},
+            },
+        )
+        .unwrap();
+        let (sys, choices, mut item) = fixture_at(home.to_str().unwrap());
+        sys.stat_of(
+            home.to_str().unwrap(),
+            aterm_machines::port::Stat {
+                uid: 501,
+                gid: 20,
+                mode: 0o700,
+                dir: true,
+                symlink: false,
+                len: 0,
+            },
+        );
+        sys.simulate(|_, command| panic!("credential intent started {}", command.display()));
+        let ctx = super::super::repository_context(sys.as_ref()).unwrap();
+        let checked_sys = Arc::clone(&sys);
+        let checked_choices = Arc::clone(&choices);
+        let checked_paths = paths.clone();
+        let expected = ctx.clone();
+        let intent: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
+            check_scope(
+                checked_sys.as_ref(),
+                &expected,
+                &checked_paths,
+                None,
+                &checked_choices.holds.lock().unwrap(),
+                Ok(true),
+            )
+            .map_err(Gate::why)
+        });
+        let capture_paths = paths.clone();
+        item.capture = Box::new(move |system| {
+            let current = Arc::clone(&intent);
+            admit(
+                system,
+                ctx.clone(),
+                capture_paths.clone(),
+                Box::new(move || current()),
+                Box::new(|| Err("package installation is off".into())),
+            )
+        });
+        assert!(matches!(item.probe(), Probe::Change { .. }));
+        assert!(aterm_secrets::need::peek(&paths).unwrap().is_empty());
+        assert!(
+            item.apply().is_err(),
+            "this private fixture grants no credential-release policy"
+        );
+        assert_eq!(aterm_secrets::need::peek(&paths).unwrap().len(), 1);
+        assert!(choices.calls.lock().unwrap().is_empty());
+        choices
+            .holds
+            .lock()
+            .unwrap()
+            .off
+            .set(Setting::Repositories, true);
+        assert!(matches!(item.probe(), Probe::Deferred { .. }));
+        assert_eq!(aterm_secrets::need::peek(&paths).unwrap().len(), 1);
     }
 
     #[test]

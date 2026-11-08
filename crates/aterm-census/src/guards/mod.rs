@@ -5,6 +5,7 @@
 //! The source guards: rules a type, a visibility or a clippy lint cannot express, each a small
 //! function over one shared, lexed corpus.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -18,6 +19,7 @@ mod aos_step;
 mod bridge_fx;
 mod build_path;
 mod captures;
+mod changelog_repeat;
 mod closure_anchor;
 mod conflict_marker;
 mod debug_seam;
@@ -132,6 +134,7 @@ pub const GUARDS: &[Rule] = &[
     generated::GENERATED_SEAL,
     identity_read::IDENTITY_READ,
     conflict_marker::CONFLICT_MARKER,
+    changelog_repeat::CHANGELOG_REPEAT,
     mirror_rows::MIRROR_ROWS,
     unmounted_test::UNMOUNTED_TEST,
     release_test_state::RELEASE_TEST_STATE,
@@ -295,6 +298,25 @@ pub(crate) fn run_guard_census(root: &Path) -> CensusOutcome {
 pub(crate) struct Tree<'a> {
     pub(crate) root: &'a Path,
     pub(crate) corpus: &'a Corpus,
+}
+
+impl<'a> Tree<'a> {
+    /// The text at root-relative `rel`: the corpus's copy when it holds the file (as source, a
+    /// manifest or a script), else the checkout's; `None` when the checkout's cannot be read.
+    pub(crate) fn text(&self, rel: &str) -> Option<Cow<'a, str>> {
+        if let Some(file) = self.corpus.get(rel) {
+            return Some(Cow::Borrowed(file.raw.as_str()));
+        }
+        if let Some((_, raw)) = self.corpus.manifests.iter().find(|(p, _)| p == rel) {
+            return Some(Cow::Borrowed(raw.as_str()));
+        }
+        if let Some(script) = self.corpus.scripts.iter().find(|s| s.rel == rel) {
+            return Some(Cow::Borrowed(script.raw.as_str()));
+        }
+        crate::tree::read_to_string(&self.root.join(rel))
+            .ok()
+            .map(Cow::Owned)
+    }
 }
 
 /// The source the guards read, each file lexed at most once.

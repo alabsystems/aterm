@@ -1439,15 +1439,12 @@ pub fn usage_text_at(facts: &UsageFacts, grain: UsageGrain) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
-/// The limit wall's segment text (after its `⧗` mark, which says "limit").
+/// The limit wall's segment text after its `⧗` mark, which says "limit": until when the
+/// account is out (`until 3pm`), and no window name, since line D says no 5-hour figure
+/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.1).
 #[must_use]
 pub fn wall_text(wall: &Wall) -> String {
-    format!(
-        "{} {} {}",
-        wall.label,
-        super::footer::RESET_MARK,
-        wall.resets
-    )
+    format!("until {}", wall.resets)
 }
 
 #[cfg(test)]

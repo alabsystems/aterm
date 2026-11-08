@@ -430,6 +430,9 @@ pub struct Judged {
 pub struct Coat {
     /// The pet's drawn box, frame px `(x0, x1, y0, y1)`.
     pub pet: Option<(i32, i32, i32, i32)>,
+    /// How far (rows) the head law draws the body down its row and the share of its height it
+    /// fits it to (`EffectsPipeline::companion_head_sink_fit`), when it is drawn.
+    pub sink_fit: Option<(f32, f32)>,
     /// The letters' ink pixels (a clean frame's pixels off the page in a cell that holds a
     /// glyph) the body covers, and the cells they lie in `(row, col, px)`.
     pub ink_px: usize,
@@ -822,6 +825,7 @@ impl Replay {
                 .companion_hit_rect()
                 .map(|(x0, x1, y0, y1)| (x0 + px, x1 + px, y0 + py, y1 + py));
             coat.pet = pet;
+            coat.sink_fit = pet.map(|_| self.fx.companion_head_sink_fit());
             coat.icons = self
                 .fx
                 .word_icon_boxes()
@@ -1660,6 +1664,12 @@ const BAR_SCENES: [Scene; 8] = [
 /// through CoreText, Windows through the hinted coverage fill without Linux's subpixel modes, so
 /// the controls' margins there are unmeasured.
 const JETBRAINS_MONO: &[u8] = include_bytes!("../assets/bundled/JetBrainsMono-Regular.ttf");
+/// The size [`a_dim_letter_keeps_its_own_reading`]'s ring control replays at where the window's
+/// face does not lay the gallery's row at [`GALLERY_PX`] ([`lays_the_gallery_row`]): at 19 px
+/// Linux's bundled JetBrains Mono lays 11 x 25 px cells, on which Fire's wrapped line on the dim
+/// grey, read by its grounds' luminance, leaves a dim letter under 97% of its own reading (Linux
+/// arm64, 2026-11-07); at the size that lays the gallery's row no line of [`BAR_SCENES`] does.
+const RING_CONTROL_PX: f32 = 19.0;
 /// The underlined lines [`a_dim_letter_keeps_its_own_reading`] judges besides [`BAR_SCENES`]: the
 /// stroke in the typed row's foot band at the bare prompt and over the `context` page's
 /// selected row.
@@ -2139,22 +2149,26 @@ struct OwnShare {
 /// the stroke, its rails parted round the row's descenders alone, on both dim looks: the
 /// rainbow kitty pet's `h` at 1.08:1.
 ///
-/// Negative controls: read by its solid ink against the least and greatest luminance of its
-/// grounds (`set_letter_guard_ring(false)` and `set_letter_guard_channels(false)`, the guard
-/// before round 27), Fire's wrapped line on the dim grey where the window's face lays the
-/// gallery's row ([`lays_the_gallery_row`]), and Laser's Enter on Solarized Dark where it lays
-/// another, keeps a dim letter under 97% of its own reading, where the ring's channel medians
-/// read the light round a stroke apart from its grounds' luminance: Fire's `c` at 94.9% and
-/// Lumen's `o` on its Enter at the bottom at 96.2% under macOS's SF Mono (round 27 named the
-/// nyan rainbow's `p` on Solarized Dark's wrapped line at 96.6%, which, with a letter at AA kept
-/// at AA, no longer falls under 97% with the ring off: after-land round 3); Laser's `w` at 96.4%
-/// under Linux's bundled JetBrains Mono at 20 px (the nyan rainbow's line 98.7% there; Linux
-/// arm64, 2026-11-06, measured before after-land round 3 joined main). Read by their rings, the
-/// controls' replays keep the law at that size too, and Laser and the nyan rainbow each read by
-/// its solid ink against each channel's least and greatest ground (99.2%, 99.8%). At
-/// 22 px that face's 13 x 29 px cells leave the ring no load: read by its grounds' luminance,
-/// every dim letter of every replay kept 98.3% of its own or more. Windows' bundled Iosevka
-/// Term SemiBold replays the scene its cell picks, unmeasured on Windows. The underlined
+/// Negative controls: read by its solid ink against the least and greatest luminance of its grounds
+/// (`set_letter_guard_ring(false)` and `set_letter_guard_channels(false)`, the guard before round
+/// 27), Fire's wrapped line on the dim grey keeps a dim letter under 97% of its own reading, where
+/// the ring's channel medians read the light round a stroke apart from its grounds' luminance: at
+/// the gallery's size where the window's face lays the gallery's row there
+/// ([`lays_the_gallery_row`]), Fire's `c` at 94.9% and Lumen's `o` on its Enter at the bottom at
+/// 96.2% under macOS's SF Mono (round 27 named the nyan rainbow's `p` on Solarized Dark's wrapped
+/// line at 96.6%, which, with a letter at AA kept at AA, no longer falls under 97% with the ring
+/// off: after-land round 3); and at [`RING_CONTROL_PX`] where it does not. Under Linux's bundled
+/// JetBrains Mono at the size that lays the gallery's row (20 px, 12 x 26 px cells) Laser's `w` on
+/// Solarized Dark's Enter read 96.4% before after-land round 3 joined main; now no line of
+/// [`BAR_SCENES`] on either dim look reads a dim letter under 97% there by its grounds' luminance
+/// (the least, Lumen's `o` on the dim grey's Enter, 98.25%). At 19 px (11 x 25 px cells) Fire's
+/// wrapped line on the dim grey reads `o` at 96.4% of its own 4.577, the ring off alone 96.4% and
+/// the channels' luminance alone 98.5% (Linux arm64, 2026-11-07). Read by their rings, Fire's and
+/// the nyan rainbow's replays keep the law at that size too. At 22 px that face's 13 x 29 px cells
+/// leave the ring no load: read by its grounds' luminance, every dim letter of every line of
+/// [`BAR_SCENES`] keeps 98.2% of its own or more (the least, Laser's `w` on Solarized Dark's Enter,
+/// 98.28%, Linux arm64, 2026-11-07). Windows' bundled Iosevka Term SemiBold replays the scene at
+/// [`RING_CONTROL_PX`], unmeasured on Windows. The underlined
 /// line's, on Solarized Dark in [`JETBRAINS_MONO`] at the gallery's size on every OS: read by its
 /// grounds' luminance (`set_letter_guard_channels(false)`), the underline cat's line keeps `h` at
 /// 90.5% of its own reading; the rails parted round no underline's stroke
@@ -2336,17 +2350,19 @@ fn a_dim_letter_keeps_its_own_reading() {
         "dim letters under 97% of their own reading:\n{}",
         fell.join("\n")
     );
-    // The ring's control on the gallery's row: Fire's wrapped line on the dim grey where the face
-    // lays it at the gallery's size (macOS's measured cell), Laser's Enter where it lays it at
-    // another size (Linux's). The nyan rainbow's wrapped line, round 27's control, is read by its
-    // ring at that size too.
+    // The ring's control: Fire's wrapped line on the dim grey, at the gallery's size where the
+    // face lays the gallery's row there (macOS's measured cell), and at RING_CONTROL_PX where it
+    // does not (Linux's measured cell). The nyan rainbow's wrapped line, round 27's control, is
+    // read by its ring at that size too.
     let fire = ("fire", DIM_GREY, Scene::Wrapped);
     let nyan = ("nyan rainbow", SOLARIZED_DARK, Scene::Wrapped);
-    let laser = ("laser", SOLARIZED_DARK, Scene::EnterBottom);
-    let px = gallery_row_px();
-    let glow_edge = if lays_the_gallery_row() { fire } else { laser };
+    let px = if lays_the_gallery_row() {
+        GALLERY_PX
+    } else {
+        RING_CONTROL_PX
+    };
     if px != GALLERY_PX {
-        let ringed = sweep(&[fire, nyan, laser], Knobs { px, ..SHIPPED });
+        let ringed = sweep(&[fire, nyan], Knobs { px, ..SHIPPED });
         let failed: Vec<String> = ringed
             .iter()
             .filter(|(v, _)| v.under > 0)
@@ -2366,9 +2382,9 @@ fn a_dim_letter_keeps_its_own_reading() {
         ..SHIPPED
     };
     assert!(
-        !under(&sweep(&[glow_edge], luminance)).is_empty(),
-        "control: read by its grounds' luminance at {px} px, {glow_edge:?} still keeps 97% of \
-         every dim letter's own reading"
+        !under(&sweep(&[fire], luminance)).is_empty(),
+        "control: read by its grounds' luminance at {px} px, {fire:?} still keeps 97% of every \
+         dim letter's own reading"
     );
     // The underlined lines' controls, in the face and cell they were measured in: a letter read
     // by its solid ink against its grounds' least and greatest luminance, and the rails parting

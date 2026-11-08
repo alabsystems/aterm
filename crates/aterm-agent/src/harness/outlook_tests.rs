@@ -7,14 +7,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
-use crate::harness::account_series::{Fig, PlanSaid, Said, SeriesRow};
-use crate::harness::accounts::{Class, Mode, Roster, Row, SessionRow, State, TapRead, WindowRead};
+use crate::harness::account_series::{Fig, Said, SeriesRow};
+use crate::harness::accounts::{Class, Mode, State};
+pub(crate) use crate::harness::quota_scenes::{
+    D, Fx, H, MACHINE, MIN, NOW, SAT7, SAT14, T5, case_b, utc,
+};
 
-/// Sun 25 Oct 2026 19:30, UTC (the words below are said at offset 0).
-pub(crate) const NOW: i64 = 1_792_956_600;
-pub(crate) const MIN: i64 = 60;
-pub(crate) const H: i64 = 3600;
-pub(crate) const D: i64 = 86_400;
 /// Thu 29 Oct 09:00: `me`'s week resets.
 const THU9: i64 = NOW + 307_800;
 /// Fri 30 Oct 14:00: `alt1`'s week resets.
@@ -23,170 +21,6 @@ const FRI14: i64 = NOW + 412_200;
 const THU22: i64 = NOW - 289_800;
 /// Sat 31 Oct 08:00: `pool1`'s week resets.
 pub(crate) const SAT8: i64 = NOW + 477_000;
-const MACHINE: &str = "0a0b";
-
-/// The clock the words below are said on.
-pub(crate) fn utc() -> Offsets {
-    Offsets::fixed(0)
-}
-
-/// A synthetic roster, state and series (the quota view's tests build on it too).
-pub(crate) struct Fx {
-    pub(crate) roster: Roster,
-    pub(crate) state: State,
-    pub(crate) enrolled: BTreeSet<String>,
-    pub(crate) series: BTreeMap<String, Vec<SeriesRow>>,
-    pub(crate) renewals: BTreeMap<String, String>,
-    pub(crate) mode: Mode,
-    pub(crate) credits: bool,
-    pub(crate) now: i64,
-    /// The local clock's offset at each instant.
-    pub(crate) offset: fn(i64) -> i64,
-}
-
-impl Fx {
-    /// The first row is the default login; the others have their own login, enrolled.
-    pub(crate) fn new(rows: &[(&str, Class)]) -> Fx {
-        let roster = Roster {
-            rows: rows
-                .iter()
-                .enumerate()
-                .map(|(i, (label, class))| Row {
-                    label: (*label).to_owned(),
-                    class: *class,
-                    dir: (i > 0).then(|| format!("/logins/{label}")),
-                    ..Row::default()
-                })
-                .collect(),
-        };
-        let enrolled = rows.iter().map(|(l, _)| (*l).to_owned()).collect();
-        Fx {
-            roster,
-            state: State {
-                machine: MACHINE.into(),
-                active: rows.first().map(|(l, _)| (*l).to_owned()),
-                proven: true,
-                ..State::default()
-            },
-            enrolled,
-            series: BTreeMap::new(),
-            renewals: BTreeMap::new(),
-            mode: Mode::Early,
-            credits: false,
-            now: NOW,
-            offset: |_| 0,
-        }
-    }
-
-    /// The tap's reading of `label` at `at`, through the store's own writer, and its series row.
-    pub(crate) fn read(
-        &mut self,
-        label: &str,
-        five: Option<(u32, i64)>,
-        week: Option<(u32, i64)>,
-        at: i64,
-    ) {
-        let window = |w: Option<(u32, i64)>| {
-            w.map(|(pct_x10, reset)| WindowRead {
-                pct_x10,
-                reset,
-                refilled: None,
-            })
-        };
-        let read = TapRead {
-            five_hour: window(five),
-            seven_day: window(week),
-            at,
-            seen_before: true,
-            born: None,
-            key: None,
-        };
-        let _ = accounts::note_reading_held(&mut self.state, label, &read, at);
-        self.fig(label, at, five, week);
-    }
-
-    /// A series `fig` row of `label` at `t`.
-    pub(crate) fn fig(
-        &mut self,
-        label: &str,
-        t: i64,
-        five: Option<(u32, i64)>,
-        week: Option<(u32, i64)>,
-    ) {
-        let fig = |w: Option<(u32, i64)>| {
-            w.map(|(pct_x10, reset)| Fig {
-                pct_x10,
-                reset,
-                at: t,
-                src: "tap".into(),
-                epoch: None,
-            })
-        };
-        let rows = self.series.entry(label.to_owned()).or_default();
-        rows.push(SeriesRow {
-            t,
-            by: MACHINE.into(),
-            said: Said::Fig {
-                five_hour: fig(five),
-                seven_day: fig(week),
-                ac: None,
-                key: None,
-            },
-        });
-        rows.sort_by_key(|r| r.t);
-    }
-
-    pub(crate) fn plan(&mut self, label: &str, word: &str, tier: Option<&str>, t: i64) {
-        let rows = self.series.entry(label.to_owned()).or_default();
-        rows.push(SeriesRow {
-            t,
-            by: MACHINE.into(),
-            said: Said::Plan(PlanSaid {
-                word: word.into(),
-                tier: tier.map(str::to_owned),
-                src: "profile".into(),
-            }),
-        });
-        rows.sort_by_key(|r| r.t);
-    }
-
-    pub(crate) fn ran(&mut self, label: &str, at: i64) {
-        self.state
-            .accounts
-            .entry(label.to_owned())
-            .or_default()
-            .ran_at = Some(at);
-    }
-
-    pub(crate) fn session(&mut self, sid: &str, label: &str, at: i64) {
-        self.state.sessions.insert(
-            sid.into(),
-            SessionRow {
-                account: label.into(),
-                at,
-                held: None,
-            },
-        );
-    }
-
-    fn inputs(&self) -> Inputs<'_> {
-        Inputs {
-            roster: &self.roster,
-            state: &self.state,
-            enrolled: &self.enrolled,
-            series: &self.series,
-            renewals: &self.renewals,
-            mode: self.mode,
-            credits: self.credits,
-            now: self.now,
-            offset: self.offset,
-        }
-    }
-
-    pub(crate) fn outlook(&self) -> Outlook {
-        outlook(&self.inputs())
-    }
-}
 
 /// `me` at 58% of a Max 20x week, 16 points of it a day for the last 24 h, its 5h at 38% since
 /// 17:00 (15.2 points an hour).
@@ -619,10 +453,6 @@ fn quota_clock_admission_survives_the_codec_without_current_claims() {
             assert_eq!(week.used_x10, None);
             assert_eq!(week.projection, None);
             assert_eq!(out.demand.week, Err(Refusal::Skew));
-            for supplied in [None, Some(580)] {
-                let glance = out.glance("me", supplied, true).unwrap();
-                assert!(glance.bar.is_none() && glance.reset.is_none() && glance.five.is_none());
-            }
             for width in [44, 60] {
                 let cards = out.card_rows(Some("me"), width, None);
                 assert!(
@@ -674,11 +504,6 @@ fn access_classes_cannot_admit_a_rejected_quota_clock() {
         assert_eq!((week.at, week.reset), (Some(NOW + 120), Some(THU9)));
         assert_eq!(week.used_x10, None);
         assert!(out.reset_words(week).is_empty());
-        for supplied in [None, Some(580)] {
-            let glance = out.glance("me", supplied, false).unwrap();
-            assert!(glance.bar.is_none() && glance.reset.is_none() && glance.five.is_none());
-            assert!(glance.title.is_none() && glance.spoken.is_none());
-        }
         let five = row.window(Window::Five).unwrap();
         let mut without_source = five.clone();
         without_source.at = None;
@@ -840,10 +665,11 @@ fn replay_clock_sanitation_preserves_walls_access_and_refill_cuts() {
         out.rows[0].window(Window::Week).unwrap().fresh,
         Fresh::Walled
     );
-    let glance = out.glance("me", None, true).unwrap();
-    // A wall is `out`: no bar of an inferred 100%.
-    assert!(glance.bar.is_none());
-    assert_eq!(glance, out.glance("me", Some(0), true).unwrap());
+    // A wall is `out`, whatever the footer's own reading says: never an inferred 100%.
+    for own in [None, Some(Figure::Exact(0))] {
+        let view = out.quota("me", own, true);
+        assert_eq!(view.tab().map(|n| n.figure), Some(Figure::Out), "{own:?}");
+    }
     assert_eq!(fx.state, before);
 }
 
@@ -2111,11 +1937,8 @@ fn spoken_words_carry_no_glyph_and_name_the_chain() {
             }
         }
         for label in ["me", "alt1"] {
-            let g = out.glance(label, None, true).expect("a glance");
-            for s in [&g.title, &g.title_verdict, &g.spoken]
-                .into_iter()
-                .flatten()
-            {
+            let view = out.quota(label, None, true);
+            for s in [&view.title, &view.spoken] {
                 assert!(!boxy(s), "{name}: {s}");
             }
         }
@@ -2405,25 +2228,6 @@ fn an_unseen_carrier_tier_counts_every_row_alike() {
     }
 }
 
-/// AN AGED 5-HOUR FIGURE IS NOT SAID BARE: the rule's 5-hour part carries no age, so a reading
-/// forty minutes old leaves it out (the week, which says its age, stays). Negative control: a
-/// figure "as of" shown as the 5-hour part says a 40-minute-old figure as now.
-#[test]
-fn an_aged_five_hour_figure_is_not_said_bare() {
-    let mut fx = scenario_a();
-    let fresh = fx.outlook().glance("me", Some(580), true).unwrap();
-    assert_eq!(fresh.five.as_deref(), Some("5h 62% left"), "CONTROL");
-    fx.state.accounts.remove("me");
-    fx.read(
-        "me",
-        Some((380, NOW + 150 * MIN)),
-        Some((580, THU9)),
-        NOW - 40 * MIN,
-    );
-    let g = fx.outlook().glance("me", Some(580), true).unwrap();
-    assert_eq!(g.five, None);
-}
-
 /// A LEAN'S STOP ENDS ON ITS OWN WORDS: in C the worst case stops to `me`'s reset, the vendor's
 /// instant, said exactly, as a stop's end is, and the stop is a projected gap: `╳`, never the
 /// wall's `⧗`. Negative controls: the end said as a forecast instant (`~`, rounded down) says
@@ -2498,11 +2302,8 @@ fn every_assumption_is_said_on_the_card_and_in_the_text() {
 /// A STOP'S WORDS LEAD WITH ITS MARK: every warn form (full, short and shortest) of every
 /// projected stop in B and D (the week's and the 5-hour one alike) begins with `╳`, the gap,
 /// and a wall standing now with `⧗`, its one meaning (glass design §4.3). The words never name
-/// the 5-hour window, so the hover title says where D's stop comes from (`(a 5-hour limit)`, as
-/// its spoken `A 5-hour stop` does) and B's says no such thing (§2.3). Negative controls: a
-/// short form without the mark fails it; the projected stop marked `⧗` (the words before the
-/// glass design) fails the first loop; a title made from the words alone (the slice before this
-/// fix) says `stop ~20:10–21:10` for D and fails the title.
+/// the 5-hour window (§2.3). Negative controls: a short form without the mark fails it; the
+/// projected stop marked `⧗` (the words before the glass design) fails the first loop.
 #[test]
 fn a_stops_words_lead_with_its_mark() {
     let forms = |words: &VerdictWords| -> Vec<String> {
@@ -2516,10 +2317,7 @@ fn a_stops_words_lead_with_its_mark() {
         .cloned()
         .collect()
     };
-    for (fx, title) in [
-        (scenario_b(), "stop ~Wed 22:00\u{2013}Thu 09:00"),
-        (scenario_d(), "stop ~20:10\u{2013}21:10 (a 5-hour limit)"),
-    ] {
+    for fx in [scenario_b(), scenario_d()] {
         let out = fx.outlook();
         let words = out.verdict_words().expect("a stop");
         assert!(words.warn);
@@ -2527,17 +2325,6 @@ fn a_stops_words_lead_with_its_mark() {
             assert!(form.starts_with("\u{2573} "), "{form}");
             assert!(!form.contains("5h") && !form.contains("stop"), "{form}");
         }
-        let glance = out.glance("me", None, true).expect("me's glance");
-        assert_eq!(glance.title_verdict.as_deref(), Some(title));
-        assert_eq!(
-            glance
-                .spoken
-                .as_deref()
-                .is_some_and(|s| s.contains("A 5-hour stop")),
-            title.contains("5-hour"),
-            "{:?}",
-            glance.spoken
-        );
     }
     let mut walled = Fx::new(&[("me", Class::Preferred)]);
     walled.read("me", None, Some((1000, THU9)), NOW);
@@ -2562,14 +2349,11 @@ fn a_stops_words_lead_with_its_mark() {
     }
 }
 
-/// THE GLANCE SAYS ITS RESET ALOUD: the spoken glance and the card's bar say the week's reset and
-/// where today's pace leaves it, in one clause. Negative control: a clause without its reset
-/// says only the pace.
+/// THE CARD SAYS ITS RESET ALOUD: the card's bar says the week's reset and where today's pace
+/// leaves it, in one clause. Negative control: a clause without its reset says only the pace.
 #[test]
-fn the_glance_says_its_reset_aloud() {
+fn the_card_says_its_reset_aloud() {
     let out = scenario_a().outlook();
-    let g = out.glance("me", Some(580), true).unwrap();
-    let spoken = g.spoken.expect("spoken");
     let reset = out.spoken_when(THU9);
     let clause = out
         .reset_pace_spoken(
@@ -2578,10 +2362,6 @@ fn the_glance_says_its_reset_aloud() {
         )
         .expect("a clause");
     assert!(clause.contains(&format!("resets {reset}")), "{clause}");
-    assert!(
-        spoken.to_lowercase().starts_with(&clause.to_lowercase()),
-        "{spoken}"
-    );
     let card_spoken: Vec<String> = out
         .card_rows(Some("me"), 60, None)
         .iter()
@@ -2610,35 +2390,17 @@ fn a_reset_past_a_daylight_change_is_said_on_its_own_clock() {
     let out = fx.outlook();
     assert_eq!(out.offsets.at(PST_FROM - 1), -7 * H);
     assert_eq!(out.offsets.at(PST_FROM), -8 * H);
-    let g = out.glance("me", Some(580), true).unwrap();
-    assert_eq!(g.reset.as_deref(), Some("Sun 1 Nov 10:30"));
+    let view = out.quota("me", Some(Figure::Exact(580)), true);
+    assert_eq!(
+        view.tail.own.as_ref().map(|own| own.reset.as_str()),
+        Some("Sun 1 Nov 10:30")
+    );
     assert_eq!(when(reset, NOW, &Offsets::fixed(-7 * H)), "Sun 1 Nov 11:30");
 }
 
 // ---------------------------------------------------------------------------------------------
-// Projection truth (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §3, slice S1)
-
-/// Thu 5 Nov 2026 17:00, UTC: the glass design's now (its §1).
-pub(crate) const T5: i64 = NOW + 941_400;
-/// Sat 7 Nov 10:00: case (b)'s week resets.
-pub(crate) const SAT7: i64 = T5 + 41 * H;
-/// Sat 14 Nov 10:00: the week after.
-pub(crate) const SAT14: i64 = SAT7 + 7 * D;
-
-/// The glass design's case (b): one Max 20x account at 63% of its week at Thu 17:00, its reset
-/// Sat 10:00, read here from 42% a day before (50% by 23:00, flat overnight): 21% a day.
-pub(crate) fn case_b() -> Fx {
-    let mut fx = Fx::new(&[("main", Class::Preferred)]);
-    fx.now = T5;
-    fx.plan("main", "max", Some("20x"), T5 - H);
-    for (t, x10) in [(T5 - 24 * H, 420), (T5 - 18 * H, 500), (T5 - 10 * H, 500)] {
-        fx.fig("main", t, None, Some((x10, SAT7)));
-    }
-    fx.read("main", None, Some((630, SAT7)), T5);
-    fx.ran("main", T5);
-    fx.session("s-main", "main", T5);
-    fx
-}
+// Projection truth (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §3, slice S1), on the
+// design's case (b) and its now ([`crate::harness::quota_scenes`])
 
 /// Two Max 20x rows under `wall` mode at 50% of a week a day: `alt1` carries at 90% (its week
 /// resets in 29 h), `main` read now at 30% (its week resets in 41 h).
@@ -3009,11 +2771,9 @@ fn when_adds_the_date_from_a_week() {
 }
 
 /// A WALL SAYS OUT, NEVER 100: a standing wall's week is `Figure::Out` (`out`; `out until its
-/// reset` aloud), and the glance draws no bar and gives the week no title words (the footer's
-/// own `weekly out` says it, so the account hover never reads `weekly out (out)`), with no
-/// percentage anywhere, though the last reading said 97%; its verdict clause says how long.
-/// Negative controls: the glance's wall-as-1000 path (before this slice) draws a full bar
-/// titled `100% used`; a wall titled `out` (the slice before this fix) fails the title.
+/// reset` aloud) whatever the footer's own reading says, and the quota view's phrase says how
+/// long with no percentage, though the last reading said 97%. Negative control: the retired
+/// glance's wall-as-1000 path said `100% used`.
 #[test]
 fn a_wall_says_out_never_100() {
     let mut fx = Fx::new(&[("me", Class::Preferred)]);
@@ -3033,13 +2793,13 @@ fn a_wall_says_out_never_100() {
     assert_eq!(figure, Figure::Out);
     assert_eq!(figure.words(), "out");
     assert_eq!(figure.spoken(), "out until its reset");
-    let g = out.glance("me", Some(970), true).expect("a glance");
-    assert_eq!(g.bar, None);
-    assert_eq!(g.title, None);
-    let clause = g.title_verdict.expect("the wall's clause");
+    let view = out.quota("me", Some(Figure::Exact(970)), true);
+    assert_eq!(view.tab().map(|n| n.figure), Some(Figure::Out));
+    let phrase = view.tail.verdict.as_ref().expect("the wall's phrase");
     assert!(
-        clause.starts_with('\u{29d7}') && !clause.contains('%'),
-        "{clause}"
+        phrase.full.starts_with('\u{29d7}') && !phrase.full.contains('%'),
+        "{}",
+        phrase.full
     );
 }
 

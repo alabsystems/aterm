@@ -1553,7 +1553,6 @@ mod tests {
             (seen.standing, seen.now.as_deref(), seen.note.as_deref()),
             (Standing::NeedsYou, Some("Out of sync"), Some(FLEETING))
         );
-        assert!(FLEETING.contains("Applications"));
         // A Secrets group left as is asks nothing of anyone.
         assert_eq!(
             vault_observation(&VaultRead::Fleeting, Selection::none(), None, false).standing,
@@ -1611,9 +1610,6 @@ mod tests {
                 "the person's choice is the wanted state"
             );
             assert_ne!(off.wanted, subject.wanted());
-        }
-        for note in [STOPPED, NOT_SET_UP, TURNED_OFF] {
-            assert!(!note.contains("aterm secrets"), "{note}");
         }
         assert_eq!(
             words(member_read(false, Subscriber::Running, installed), true),

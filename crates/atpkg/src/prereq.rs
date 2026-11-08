@@ -253,7 +253,8 @@ pub struct CcCache {
     /// The file that keeps it ([`crate::probe_cache`]).
     pub file: PathBuf,
     /// The receipt the Command Line Tools install writes: an install, an update or a removal
-    /// changes its time and retires the verdict.
+    /// changes its identity or contents and retires the verdict. An unread receipt cannot
+    /// supply a cache key.
     pub receipt: PathBuf,
 }
 
@@ -309,7 +310,7 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
 /// What a `Ready` verdict for `located` depends on, read without spawning: the compiler as it is
 /// now ([`crate::probe_cache::identity`]), the active developer directory (`DEVELOPER_DIR`,
 /// else `xcode-select`'s link, else Xcode or the standalone tools), the identity of its `clang`,
-/// the Command Line Tools receipt's time, the SDK a build would fall back to and the `PATH`
+/// the Command Line Tools receipt's identity and digest, the SDK a build would fall back to and the `PATH`
 /// the build sees, its minimum macOS deployment target, and the inherited environment's digest
 /// when project configuration is inherited. `None` when the compiler cannot
 /// be read or an explicit SDK or developer directory is used: changes within its SDK have
@@ -329,11 +330,7 @@ fn cc_key(
         Located::Shim(cc) => ("shim", cc),
     };
     let developer_dir = host.developer_dir();
-    let receipt = std::fs::metadata(&cache.receipt)
-        .and_then(|meta| meta.modified())
-        .ok()
-        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or_else(|| "no receipt".to_owned(), |at| at.as_nanos().to_string());
+    let receipt = receipt_key(&cache.receipt)?;
     let sdk = std::fs::canonicalize(developer_dir.join("SDKs/MacOSX.sdk"))
         .map_or_else(|_| "no sdk".to_owned(), |sdk| sdk.display().to_string());
     // The compiler the developer directory holds, where `locate` looks for it: an Xcode
@@ -362,6 +359,35 @@ fn cc_key(
         Some(host.inherit_environment.to_string()),
         compiler_environment_key(host.inherit_environment),
     ])
+}
+
+/// Read a bounded regular receipt through one held file. Only absence supplies a missing
+/// receipt fact; unread, linked, nonregular and oversized receipts disable caching.
+fn receipt_key(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    const CAP: u64 = 64 * 1024;
+    let (file, metadata) = match aterm_uds::regular_file::open(path) {
+        Ok(opened) => opened,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some("receipt-v1 absent".to_owned());
+        }
+        Err(_) => return None,
+    };
+    if metadata.len() > CAP {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    file.take(CAP + 1).read_to_end(&mut bytes).ok()?;
+    if u64::try_from(bytes.len()).ok()? > CAP {
+        return None;
+    }
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update(&bytes);
+    Some(format!(
+        "receipt-v1 {} {}",
+        crate::probe_cache::metadata_identity(path, &metadata)?,
+        aterm_codec::hex::encode_lower(&digest.finalize())
+    ))
 }
 
 /// Include arbitrary compiler configuration without persisting environment names or values.
@@ -1223,8 +1249,8 @@ mod tests {
 
     /// A `Ready` verdict is kept under what it depends on: a probe with the same key spawns
     /// nothing (the compiler is never asked again), and a changed Command Line Tools receipt
-    /// probes again. NEGATIVE CONTROL: the receipt's new time re-runs the compiler; with no
-    /// cache every probe runs it.
+    /// probes again, including replacement and in-place edits preserving the old timestamp.
+    /// An unread or oversized receipt cannot supply a kept success.
     #[test]
     fn a_kept_cc_verdict_spawns_nothing_until_the_receipt_changes() {
         let root = scratch("kept");
@@ -1253,16 +1279,54 @@ mod tests {
         assert_eq!(runs(), 2, "asked its version, then built the probe");
         assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
         assert_eq!(runs(), 2, "the same key ran the compiler again");
+        let fresh = |why: &str| {
+            let before = runs();
+            assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+            assert_eq!(runs(), before + 2, "{why}");
+        };
+        let modified = std::fs::metadata(&receipt).unwrap().modified().unwrap();
+        let replacement = root.join("replacement-receipt");
+        std::fs::write(&replacement, "2").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        std::fs::rename(&replacement, &receipt).unwrap();
+        assert_eq!(
+            std::fs::metadata(&receipt).unwrap().modified().unwrap(),
+            modified
+        );
+        fresh("a replaced receipt kept its old timestamp and verdict");
+        std::fs::write(&receipt, "3").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&receipt)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fresh("an in-place receipt edit kept its old timestamp and verdict");
         std::fs::File::options()
             .write(true)
             .open(&receipt)
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(86_400))
             .unwrap();
-        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
-        assert_eq!(runs(), 4, "a changed receipt left the old verdict standing");
+        fresh("a changed receipt left the old verdict standing");
+        let before = runs();
         assert_eq!(probe_cached(path, &host, None), ready);
-        assert_eq!(runs(), 6, "no cache: the compiler is asked");
+        assert_eq!(runs(), before + 2, "no cache: the compiler is asked");
+        std::fs::remove_file(&receipt).unwrap();
+        std::os::unix::fs::symlink("missing-receipt-target", &receipt).unwrap();
+        for _ in 0..2 {
+            fresh("an unread receipt cannot retain a success");
+        }
+        std::fs::remove_file(&receipt).unwrap();
+        std::fs::write(&receipt, vec![0; 64 * 1024 + 1]).unwrap();
+        for _ in 0..2 {
+            fresh("an oversized receipt cannot retain a success");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1532,6 +1596,9 @@ mod tests {
         )
         .unwrap();
         old_keys.push(current.replacen("fresh-executable-link-v5", "fresh-executable-link-v4", 1));
+        // The old receipt reader also called an unread receipt absent. Retire that fact
+        // even if the receipt really is absent now and all other inputs still match.
+        old_keys.push(current.replacen("receipt-v1 absent", "no receipt", 1));
         for (epoch, old_key) in old_keys.into_iter().enumerate() {
             crate::probe_cache::put(&cache.file, &old_key, &cc.to_string_lossy());
             for calls in [2, 4] {

@@ -129,6 +129,8 @@ pub(crate) struct Inert {
     steward_standby_server: Mutex<StewardStandbyServerRead>,
     shared: Mutex<SharedRead>,
     requests: Mutex<RequestsRead>,
+    /// Observe the actual need ledger when the publisher runs, where a test supplies one.
+    pass_requests: Option<Box<dyn Fn() -> Result<String, String> + Sync>>,
     /// What a founding of the vault's Commons ends in ([`Ports::found_commons`]).
     founded: Mutex<Result<SharedDone, String>>,
     /// What `sync.shared-data` reads once a founding is done.
@@ -244,6 +246,7 @@ impl Inert {
             requests: Mutex::new(RequestsRead::Idle(
                 "this Mac is not a Commons Writer, and holds no needs".to_owned(),
             )),
+            pass_requests: None,
             founded: Mutex::new(Ok(SharedDone::Done("founded, approving m2".to_owned()))),
             shared_after: Mutex::new(SharedRead::Visible("control record here".to_owned())),
             shared_fails: Mutex::new(None),
@@ -481,7 +484,9 @@ impl Ports for Inert {
     }
     fn pass_requests(&self) -> Result<String, String> {
         self.applied("requests");
-        Ok("0 posted".to_owned())
+        self.pass_requests
+            .as_ref()
+            .map_or_else(|| Ok("0 posted".to_owned()), |pass| pass())
     }
     fn found_commons(&self) -> Result<SharedDone, String> {
         self.applied("commons");
@@ -803,6 +808,96 @@ fn the_requests_pass_runs_only_where_the_table_is_reached_and_never_in_a_plan() 
             .count(),
         0
     );
+
+    #[cfg(unix)]
+    {
+        use aterm_secrets::{client::Paths, need};
+        use owed_clone::Hooked;
+
+        // A later local producer may raise its first need while still failing its own work.
+        // The one publisher must read that durable row in this pass, without claiming that
+        // observing it posts to a real Commons table or completes repository acquisition.
+        for (mode, swarm, held) in [
+            (Mode::Plan, true, None),
+            (Mode::Apply, false, None),
+            (Mode::Apply, true, Some("setup is held")),
+            (Mode::Apply, true, None),
+        ] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let paths = Paths::for_home(scratch.path());
+            let raised = Mutex::new(None);
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let clone = || {
+                let row = need::raise(
+                    &paths,
+                    need::Want::Gh(need::GhProfile::Dev),
+                    need::Purpose::AghDev,
+                )
+                .map_err(|why| why.to_string())?;
+                assert!(!row.state.ended(), "a cold need remains unfinished");
+                *raised.lock().unwrap() = Some(row.id);
+                Err("repository acquisition still waits for its credential".into())
+            };
+            let mut inner = Inert::new(scratch.path());
+            *inner.swarm.lock().unwrap() = Ok(swarm);
+            *inner.requests.lock().unwrap() =
+                RequestsRead::Due("read the local need ledger".into());
+            let reading = paths.clone();
+            let capture = Arc::clone(&observed);
+            inner.pass_requests = Some(Box::new(move || {
+                let rows = need::peek(&reading).map_err(|why| why.to_string())?;
+                capture
+                    .lock()
+                    .unwrap()
+                    .extend(rows.iter().map(|row| row.id));
+                Ok(format!("{} local needs observed", rows.len()))
+            }));
+            let ports = Hooked {
+                inner,
+                held: &|| held.map(str::to_owned),
+                owed: &|| {
+                    Ok(crate::init::OwedClone::Due(
+                        "repository credential needed".into(),
+                    ))
+                },
+                clone: &clone,
+                forget: &|| Ok(()),
+            };
+            let pass = ran(converge(
+                &ports,
+                Trigger::Subscriber,
+                mode,
+                aterm_secrets::converge::RepositoryWork::Repair,
+                &mut |_| {},
+            ));
+            if mode == Mode::Apply && swarm && held.is_none() {
+                let id = raised.lock().unwrap().expect("the later producer ran");
+                assert_eq!(need::peek(&paths).unwrap()[0].id, id, "the need is durable");
+                assert_eq!(row(&pass.rows, CLONE).outcome, Outcome::Failed);
+                assert!(
+                    !pass.complete(),
+                    "the publisher cannot complete the producer"
+                );
+                assert_eq!(
+                    *observed.lock().unwrap(),
+                    [id],
+                    "the same pass's publisher missed the newly raised need"
+                );
+                assert_eq!(row(&pass.rows, REQUESTS).outcome, Outcome::Changed);
+            } else {
+                assert!(
+                    raised.lock().unwrap().is_none(),
+                    "the producer must not run"
+                );
+                assert!(
+                    need::peek(&paths).unwrap().is_empty(),
+                    "no durable need was raised"
+                );
+                assert!(observed.lock().unwrap().is_empty());
+                assert!(!ports.inner.applies().contains(&"requests"));
+            }
+        }
+    }
 }
 
 /// A pass after one that converged applies nothing: every kind reads right, and the base layer

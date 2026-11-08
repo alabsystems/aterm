@@ -414,6 +414,12 @@ pub struct HeldProc {
     pub job: Option<JobKind>,
     /// When it forked, unix ms; `None` where unread.
     pub started_ms: Option<u64>,
+    /// Its check went to a syspolicyd that is no longer running: held since before the one
+    /// running now started, which answers alone (`aterm_sysprobe::jobs::stranded`). The host
+    /// judges it only against [`JobTick::program_check_daemon`], and keeps the verdict while it
+    /// reads the row unrun as the same exec at the same CPU. No part of the held key: a row that
+    /// turns stranded keeps its held time.
+    pub stranded: bool,
 }
 
 /// One OSC 133 command block of a tab.
@@ -673,6 +679,14 @@ pub struct JobTick {
     /// aterm's user's processes that have not started: held at macOS's program check,
     /// translated by Rosetta, on a volume not proven local, or stopped or traced.
     pub held: Vec<HeldProc>,
+    /// The syspolicyd [`HeldProc::stranded`] was judged against, by pid: the one the stuck
+    /// check's board read lately, else the one a kept verdict was judged under; `None` with
+    /// neither, when no row is named stranded.
+    pub program_check_daemon: Option<u32>,
+    /// Whether every held row was judged against it: its pool read not full, and each row the
+    /// check holds is stranded or forked since its start, its check the running one's. `false`
+    /// while one may be stranded and nothing read tells.
+    pub program_check_judged: bool,
     /// When aterm's Developer Tools grant took effect, unix ms, while the host reads aterm granted:
     /// from then on macOS checks no new program aterm starts (the leftover-processes design's
     /// M13). `None` when not granted or not known.
@@ -1315,6 +1329,14 @@ pub struct Findings {
     /// while no reading named a tab adopted). One means the grant did not take; one started
     /// before it may still wait.
     pub program_check_after_grant: u32,
+    /// Of [`Findings::program_check`], the ones stranded ([`HeldProc::stranded`]), each as its
+    /// row there; empty while [`Findings::program_check_daemon`] is `None`.
+    pub program_check_stranded: Vec<Named>,
+    /// The syspolicyd they were judged against ([`JobTick::program_check_daemon`]).
+    pub program_check_daemon: Option<u32>,
+    /// Whether every held row was judged against it ([`JobTick::program_check_judged`]), so
+    /// none but those named is stranded.
+    pub program_check_judged: bool,
     /// The backed-up episode this reading is in.
     pub program_check_episode: Option<HeldEpisode>,
     /// The episode that closed at this reading (set on that one view only).

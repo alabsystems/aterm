@@ -71,6 +71,25 @@ fn current(path: &std::path::Path, file: &File, before: &std::fs::Metadata) -> i
     }
     Ok(())
 }
+
+fn retain_sdk_lease(
+    layout: &atpkg::store::Layout,
+    directory: &std::path::Path,
+    started: Instant,
+) -> io::Result<atpkg::lease::Lease> {
+    let remaining = native_inputs::deadline(started)
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))?;
+    match atpkg::lease::hold_for(
+        &layout.prefix,
+        directory,
+        "native metadata service and retained members",
+        remaining,
+    ) {
+        Ok(atpkg::lease::Hold::Held(lease)) => Ok(lease),
+        _ => Err(refused("original SDK GC lease unavailable")),
+    }
+}
 impl Keeper {
     pub(super) fn execution(&self) -> &std::path::Path {
         &self.execution
@@ -230,15 +249,7 @@ impl Keeper {
             .ok_or_else(|| refused("SDK ready record unavailable"))?;
         let (program, program_before) = open(program_path)?;
         let (ready, ready_before) = open(&ready_path)?;
-        let lease = match atpkg::lease::hold_for(
-            &layout.prefix,
-            directory,
-            "native metadata service and retained members",
-            Duration::from_secs(2),
-        ) {
-            Ok(atpkg::lease::Hold::Held(lease)) => lease,
-            _ => return Err(refused("original SDK GC lease unavailable")),
-        };
+        let lease = retain_sdk_lease(layout, directory, Instant::now())?;
         current(program_path, &program, &program_before)?;
         current(&ready_path, &ready, &ready_before)?;
         let deadline = native_inputs::deadline(started);

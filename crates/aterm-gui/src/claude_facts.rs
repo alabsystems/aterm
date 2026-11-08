@@ -5,8 +5,9 @@
 
 use std::path::Path;
 
-use aterm_agent::harness::account_progress::ProgressPhase;
-use aterm_agent::harness::footer::{FactKind, FactMask, FooterFacts};
+use aterm_agent::harness::footer::{self, FactKind, FactMask, FooterFacts};
+use aterm_agent::harness::outlook;
+use aterm_agent::harness::quota_view::QuotaView;
 use aterm_agent::harness::session_usage::{self, UsageFacts};
 
 use crate::claude_lights::Fact;
@@ -93,13 +94,34 @@ fn usage_pair(usage: &UsageFacts) -> (u64, u64) {
         })
 }
 
-/// A transient profile miss may retain an old glance. Like the visible account
-/// unit, its disclosure uses those parts only while the profile remains present.
-fn account_glance(
-    facts: &FooterFacts,
-) -> Option<std::borrow::Cow<'_, aterm_agent::harness::outlook::Glance>> {
+/// The pane's quota view while its profile is present: a transient profile miss may keep an old
+/// view, and like line D's unit its words are said only while the profile is.
+fn account_view(facts: &FooterFacts) -> Option<&QuotaView> {
     facts.subscription.as_ref()?;
-    facts.glance_view()
+    facts.quota_view()
+}
+
+/// The rotation's words (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.1), the account's
+/// title's and speech's last clause, its next check on the glass's local clock (`spoken`: as a
+/// screen reader says it), in UTC where the local zone does not read; `None` with no progress
+/// read.
+fn rotation_clause(facts: &FooterFacts, spoken: bool) -> Option<String> {
+    let progress = facts.account_progress_view()?;
+    let now = aterm_time::unix_secs()
+        .and_then(|n| i64::try_from(n).ok())
+        .unwrap_or(0);
+    let offsets = outlook::Offsets::read_around(now, crate::presence::local_offset_at);
+    Some(footer::rotation_words(&progress, |at| match &offsets {
+        Some(o) if spoken => outlook::spoken_when(at, now, o),
+        Some(o) => outlook::when(at, now, o),
+        None => aterm_agent::harness::usage::rfc3339_utc(at),
+    }))
+}
+
+/// The limit wall line D's `⧗` says, in words: `limit until 3pm`.
+fn wall_clause(facts: &FooterFacts) -> Option<String> {
+    let wall = facts.usage.as_ref()?.wall.as_ref()?;
+    Some(format!("limit {}", session_usage::wall_text(wall)))
 }
 
 /// What a fact's title says, whole and short, hovered or selected (design §10.6.14).
@@ -174,79 +196,51 @@ pub(crate) fn fact_title(facts: &FooterFacts, cwd: Option<&Path>, fact: Fact) ->
             (whole, "click: graph".to_owned())
         }
         Fact::Account => {
-            let progress = facts.account_progress_view();
-            // A watch adds inventory beside the account's own readings. Limits and
-            // active or unconfirmed recovery keep the existing recovery-only disclosure.
-            if let Some(progress) = progress.as_deref()
-                && (progress.phase != ProgressPhase::Watching
-                    || progress.wall.is_some()
-                    || !progress.independent_work.is_empty())
-            {
-                return (
-                    format!(
-                        "{} · click: accounts",
-                        aterm_agent::harness::footer::account_progress_text(progress, false)
-                    ),
-                    "click: accounts".into(),
-                );
-            }
-            let mut parts: Vec<std::borrow::Cow<'_, str>> = Vec::new();
-            let glance_view = account_glance(facts);
-            let glance = glance_view.as_deref();
-            if let Some(sub) = facts.subscription.as_ref() {
-                if let Some(email) = sub.email.as_deref() {
-                    parts.push(email.into());
+            // The wall, the quota row's title (§2.6) or the account's own words, then the
+            // rotation's words last before the click's (§5.1).
+            let mut clauses: Vec<String> = Vec::new();
+            let sub = facts.subscription.as_ref();
+            let gap = sub
+                .filter(|sub| sub.weekly.is_none())
+                .and_then(|sub| sub.weekly_gap)
+                .map(|gap| gap.words().to_owned());
+            clauses.extend(gap);
+            clauses.extend(rotation_clause(facts, false));
+            let clause = (!clauses.is_empty()).then(|| clauses.join(" \u{b7} "));
+            let title = match account_view(facts) {
+                Some(view) => view.title_with(clause.as_deref()),
+                None => {
+                    // Line D's unit's name, never the email (§2.5): the title is painted in
+                    // line D's lights block, on the glass.
+                    let mut parts: Vec<&str> = Vec::new();
+                    parts.extend(footer::unit_name(facts));
+                    if let Some(sub) = sub {
+                        parts.extend(sub.plan.as_deref());
+                        parts.extend(sub.weekly.as_deref());
+                    }
+                    let lead = if parts.is_empty() {
+                        "\u{2386} accounts".to_owned()
+                    } else {
+                        format!("\u{2386} {}", parts.join(" \u{b7} "))
+                    };
+                    [Some(lead), clause, Some(QUOTA_CLICK.to_owned())]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" \u{b7} ")
                 }
-                if let Some(plan) = sub.plan.as_deref() {
-                    parts.push(plan.into());
-                }
-                if let Some(weekly) = sub
-                    .weekly
-                    .as_deref()
-                    .or_else(|| sub.weekly_gap.map(|gap| gap.words()))
-                {
-                    // The outlook's words on the week, its reset, the 5 hours and the verdict
-                    // (`docs/DESIGN-accounts-outlook-2026-10-25.md` §2.5).
-                    parts.push(match glance.and_then(|g| g.title.as_deref()) {
-                        Some(more) => format!("{weekly} ({more})").into(),
-                        None => weekly.into(),
-                    });
-                }
-            }
-            if let Some(g) = glance {
-                parts.extend(
-                    g.reset.as_deref().map(|r| {
-                        format!("{} {r}", aterm_agent::harness::footer::RESET_MARK).into()
-                    }),
-                );
-                parts.extend(g.five.as_deref().map(Into::into));
-                parts.extend(g.title_verdict.as_deref().map(Into::into));
-            }
-            if parts.is_empty()
-                && let Some(acct) = facts.account.as_deref()
-            {
-                parts.push(acct.into());
-            }
-            let summary = if let Some(progress) = progress.as_deref() {
-                let inventory =
-                    aterm_agent::harness::footer::account_progress_text(progress, false);
-                if parts.is_empty() {
-                    inventory
-                } else {
-                    format!("{inventory} · {}", parts.join(" · "))
-                }
-            } else if parts.is_empty() {
-                "⎆ accounts".to_owned()
-            } else {
-                format!("⎆ {}", parts.join(" · "))
             };
-            (
-                format!("{summary} · click: accounts"),
-                "click: accounts".to_owned(),
-            )
+            let title = match wall_clause(facts) {
+                Some(wall) => format!("{wall} \u{b7} {title}"),
+                None => title,
+            };
+            (title, QUOTA_CLICK.to_owned())
         }
     }
 }
+
+/// What a click on the account does, its title's last words.
+const QUOTA_CLICK: &str = aterm_agent::harness::quota_view::CLICK;
 
 /// The top-effort key's title.
 #[must_use]
@@ -388,66 +382,49 @@ pub(crate) fn fact_spoken_of(
             )
         }
         Fact::Account => {
-            let progress = facts.account_progress_view();
-            if let Some(progress) = progress.as_deref()
-                && (progress.phase != ProgressPhase::Watching
-                    || progress.wall.is_some()
-                    || !progress.independent_work.is_empty())
-            {
-                return (
-                    format!(
-                        "Account: {}",
-                        aterm_agent::harness::footer::account_progress_text(progress, false)
-                    ),
-                    "Activate for account recovery details.".into(),
-                );
-            }
-            let mut parts: Vec<&str> = Vec::new();
-            let weekly = facts.subscription.as_ref().and_then(|sub| {
-                sub.weekly
-                    .as_deref()
-                    .map(|words| words.replace(" \u{b7} ", ", "))
-                    .or_else(|| sub.weekly_gap.map(|gap| gap.spoken().to_owned()))
-            });
-            if let Some(sub) = facts.subscription.as_ref() {
-                if let Some(email) = sub.email.as_deref() {
-                    parts.push(email);
+            // The quota row's sentences (§2.6) or the account's own words, the wall first and
+            // the rotation's words last (§5.1).
+            let words = match account_view(facts) {
+                Some(view) => view
+                    .spoken
+                    .strip_prefix("Accounts. ")
+                    .unwrap_or(&view.spoken)
+                    .trim_end_matches('.')
+                    .to_owned(),
+                None => {
+                    // As the title says it: line D's unit's name, never the email (§2.5).
+                    let mut parts: Vec<String> = Vec::new();
+                    parts.extend(footer::unit_name(facts).map(str::to_owned));
+                    if let Some(sub) = facts.subscription.as_ref() {
+                        parts.extend(sub.plan.clone());
+                        parts.extend(
+                            sub.weekly
+                                .as_deref()
+                                .map(|words| words.replace('\u{2265}', "at least "))
+                                .or_else(|| sub.weekly_gap.map(|gap| gap.spoken().to_owned())),
+                        );
+                    }
+                    parts.join(", ")
                 }
-                if let Some(plan) = sub.plan.as_deref() {
-                    parts.push(plan);
-                }
-                if let Some(weekly) = weekly.as_deref() {
-                    parts.push(weekly);
-                }
-            }
-            if parts.is_empty()
-                && let Some(acct) = facts.account.as_deref()
-            {
-                parts.push(acct);
-            }
-            let words = parts.join(", ");
-            // The outlook's sentences follow the week's own words (§2.5).
-            let glance = account_glance(facts);
-            let more = glance
-                .as_deref()
-                .and_then(|g| g.spoken.as_deref())
-                .map_or_else(String::new, |more| {
-                    format!(". {}", more.trim_end_matches('.'))
-                });
-            if let Some(progress) = progress.as_deref() {
-                let inventory =
-                    aterm_agent::harness::footer::account_progress_text(progress, false);
-                let separator = if words.is_empty() { "" } else { ". " };
-                (
-                    format!("{name}: {inventory}{separator}{words}{more}"),
-                    "Activate for account recovery details.".into(),
-                )
+            };
+            let mut sentences: Vec<String> = Vec::new();
+            sentences.extend(wall_clause(facts).map(|wall| format!("Usage {wall}")));
+            sentences.extend((!words.is_empty()).then_some(words));
+            sentences.extend(rotation_clause(facts, true).map(|rotation| {
+                let mut chars = rotation.chars();
+                chars.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().chain(chars).collect()
+                })
+            }));
+            let description = if facts.account_progress_view().is_some() {
+                "Activate for account recovery details."
             } else {
-                (
-                    format!("{name}: {words}{more}"),
-                    "Activate for the accounts menu.".to_owned(),
-                )
-            }
+                "Activate for the accounts menu."
+            };
+            (
+                format!("{name}: {}", sentences.join(". ")),
+                description.to_owned(),
+            )
         }
         Fact::TopEffort => top_spoken(facts.top_effort.unwrap_or(false)),
     };

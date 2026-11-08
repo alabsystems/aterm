@@ -26,6 +26,9 @@ mod readiness;
 pub(crate) mod table;
 
 const HANG: Duration = Duration::from_secs(60);
+// Use the lab's existing 2 GiB functional-window budget. These state/data checks
+// reserve memory and window custody without making a latency or throughput claim.
+const WINDOW_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const USAGE: &str = "commons-startup <aterm> <new-output-directory> [--log-backed] [--suppressed | --observe SECONDS | --peer-cycle [--peer-details] | --local-follower]";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +154,7 @@ impl Drop for Node {
     }
 }
 
-fn stop_hosts(node: Node, window: &mut Instance, out: &Path, name: &str) -> Result<(), Fail> {
+fn stop_hosts(node: Node, mut window: Instance, out: &Path, name: &str) -> Result<(), Fail> {
     let node_pid = node.0.id();
     let window_pid = window.aterm_pid();
     let window = window.stop();
@@ -191,14 +194,14 @@ fn start_window(
         reroute: false,
     };
     let mut instance = if suppressed {
-        Instance::start(world, launch)
+        Instance::start_functional(world, launch, WINDOW_MEMORY_BYTES)
     } else {
-        Instance::start_ordinary(world, launch)
+        Instance::start_ordinary_functional(world, launch, WINDOW_MEMORY_BYTES)
     }
     .map_err(fail)?;
     instance.await_socket(BOOT)?;
     println!(
-        "commons-startup window_keeper={} window_pid={:?} socket={} suppressed={suppressed}",
+        "commons-startup window_keeper={} window_pid={:?} socket={} suppressed={suppressed} admission=functional reserved_memory_bytes={WINDOW_MEMORY_BYTES} timing_qualified=false",
         instance.pid,
         instance.aterm_pid(),
         instance.sock.display(),
@@ -536,7 +539,7 @@ pub fn cmd(args: &[String]) -> Res {
     application.received(&paths[0], &configs[0], &rows, &out, "table-reverse.json")?;
     let (reverse, reverse_value) = publish(&paths[1], 2, "reverse")?;
     received(&paths[0], reverse, "reverse", &reverse_value, &out)?;
-    stop_hosts(node, &mut window, &out, "before-offline-cleanup.json")?;
+    stop_hosts(node, window, &out, "before-offline-cleanup.json")?;
 
     let (after_restart, after_restart_value) = publish(&paths[0], 3, "after-restart")?;
     let (generic_after_restart, value) = application.write(&paths[0], "after-restart")?;
@@ -582,7 +585,7 @@ pub fn cmd(args: &[String]) -> Res {
     conflict.received(&paths[0], &out, "conflict-source-final.json")?;
     conflict.received(&paths[1], &out, "conflict-recipient-final.json")?;
     image(&window, &out, "restarted.png")?;
-    let (node, mut window, peer_cycle) = if matches!(mode, Mode::PeerCycle { .. }) {
+    let (node, window, peer_cycle) = if matches!(mode, Mode::PeerCycle { .. }) {
         peer_cycle::Cycle {
             source: &source,
             recipient: &restarted,
@@ -653,7 +656,7 @@ pub fn cmd(args: &[String]) -> Res {
         "repair_driven_by_lab": false,
     });
     save(&out, "application-result.json", &result)?;
-    let stopped = stop_hosts(node, &mut window, &out, "final-cleanup.json");
+    let stopped = stop_hosts(node, window, &out, "final-cleanup.json");
     result
         .as_object_mut()
         .expect("result is an object")

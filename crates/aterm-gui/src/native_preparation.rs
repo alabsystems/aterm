@@ -529,9 +529,15 @@ pub(super) fn finish_preparation(
         .map_or(Ok(None), |account| account.admit(kernel));
     let preflight = account_guard.is_ok() && renewal.as_ref().is_none_or(|seal| seal.preflight());
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let mut table = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let mut op = operation.lock().unwrap_or_else(|p| p.into_inner());
     if matches!(op.phase, Phase::Completed(_)) {
         drop(op);
+        drop(table);
         drop(meta);
         drop(account_guard);
         return completed_reply(operation);
@@ -543,6 +549,16 @@ pub(super) fn finish_preparation(
     {
         let completion = abandon_preparation(&mut op, kernel);
         drop(op);
+        drop(table);
+        drop(meta);
+        drop(account_guard);
+        kernel.completion_sealed();
+        return finish(ctx, operation, completion);
+    }
+    if !relaunch_permit::finish_admission(&mut table, &op) {
+        let completion = abandon_preparation(&mut op, kernel);
+        drop(op);
+        drop(table);
         drop(meta);
         drop(account_guard);
         kernel.completion_sealed();

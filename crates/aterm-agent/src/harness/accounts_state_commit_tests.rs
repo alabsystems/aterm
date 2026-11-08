@@ -146,6 +146,7 @@ fn commit(store: &Store, operation: i64) -> Recorded {
         Ok(events) => Recorded::Usage {
             account: "main".into(),
             events: events.len(),
+            walled: None,
         },
     }
 }

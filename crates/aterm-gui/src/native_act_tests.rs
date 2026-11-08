@@ -943,7 +943,7 @@ fn caller() -> SupervisorInputCaller {
 
 fn plan(ctx: &crate::SessionCtx, facts: &Facts) -> Prepare {
     Prepare {
-        asked_upgrade: None,
+        asked: None,
         id: "ab".repeat(16),
         host_epoch: host_epoch().unwrap().to_string(),
         holder: "grok-alab@4242".into(),
@@ -1292,7 +1292,7 @@ fn native_queue_input_drain_transition_and_lost_ack_conform_to_model() {
             &ctx,
             &facts,
             Request::prepare(Prepare {
-                asked_upgrade: None,
+                asked: None,
                 host_epoch: "00".repeat(16),
                 ..request.clone()
             }),

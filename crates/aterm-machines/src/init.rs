@@ -2028,6 +2028,33 @@ fn owed_clone_with(
         None
     };
     let inputs = inputs.or(owned.as_ref());
+    if let Some(inputs) = inputs.filter(|inputs| inputs.local_blocker().is_none())
+        && let Err(why) = inputs.validate_selection(sys, &ctx)
+    {
+        return Ok(OwedClone::Waiting(why));
+    }
+    if inputs.is_none_or(|inputs| inputs.local_blocker().is_some()) {
+        match crate::init_github::RepositorySelection::capture(sys, &ctx) {
+            Ok(Some(selection)) => {
+                if let Some(inputs) = inputs
+                    && let Err(why) = inputs.validate_selection(sys, &ctx)
+                {
+                    return Ok(OwedClone::Waiting(why));
+                }
+                if selection.count() == 0 {
+                    selection.ensure_current(sys)?;
+                    return Ok(OwedClone::Nothing(
+                        "the private inventory selects no repositories".into(),
+                    ));
+                }
+                if selection.needs_credential(sys)? {
+                    return Ok(OwedClone::Waiting(selection.waiting()));
+                }
+            }
+            Err(why) => return Ok(OwedClone::Waiting(why)),
+            _ => {}
+        }
+    }
     if let Some(inputs) = inputs.filter(|inputs| inputs.selects_no_repositories()) {
         return Ok(if inputs.is_current_now(sys)? {
             OwedClone::Nothing("the private inventory selects no repositories".into())
@@ -2149,6 +2176,44 @@ fn automatic_clone(
     let Ok(ctx) = repository_context(sys) else {
         return Ok(nothing());
     };
+    let owned = if inputs.is_none() && crate::init_github::uses_vault_inventory(sys, &ctx)? {
+        Some(crate::init_github::InitialRepositoryInputs::capture_ready(
+            sys, &ctx,
+        )?)
+    } else {
+        None
+    };
+    let inputs = inputs.or(owned.as_ref());
+    if let Some(inputs) = inputs.filter(|inputs| inputs.local_blocker().is_none())
+        && let Err(why) = inputs.validate_selection(sys, &ctx)
+    {
+        return Ok(OwedClone::Waiting(why));
+    }
+    if inputs.is_none_or(|inputs| inputs.local_blocker().is_some()) {
+        match crate::init_github::RepositorySelection::capture(sys, &ctx) {
+            Ok(Some(selection)) => {
+                if let Some(inputs) = inputs
+                    && let Err(why) = inputs.validate_selection(sys, &ctx)
+                {
+                    return Ok(OwedClone::Waiting(why));
+                }
+                if now.holds(Setting::Repositories) {
+                    return Ok(OwedClone::Held(now.why(Setting::Repositories)));
+                }
+                if selection.count() == 0 {
+                    selection.ensure_current(sys)?;
+                    return Ok(OwedClone::Nothing(
+                        "the private inventory selects no repositories".into(),
+                    ));
+                }
+                if selection.needs_credential(sys)? {
+                    return Ok(OwedClone::Waiting(selection.waiting()));
+                }
+            }
+            Err(why) => return Ok(OwedClone::Waiting(why)),
+            Ok(None) => {}
+        }
+    }
     let token = Path::new(&ctx.users[0].home).join(crate::init_github::TOKEN_FILE);
     if sys
         .stat(&token)
@@ -2181,7 +2246,13 @@ fn automatic_clone(
             "the private inventory selects no repositories".into(),
         )),
         Ok(Some((present, total))) if present == total => {
-            Ok(OwedClone::Verified { present, total })
+            if crate::init_github::RepositorySelection::acknowledgment_due(sys, &ctx.users[0])? {
+                Ok(OwedClone::Due(
+                    "confirm the delivered repository credential locally".into(),
+                ))
+            } else {
+                Ok(OwedClone::Verified { present, total })
+            }
         }
         Ok(Some((present, total))) => Ok(OwedClone::Due(format!(
             "{present}/{total} repositories from the private vault are present; fleet setup clones the rest"

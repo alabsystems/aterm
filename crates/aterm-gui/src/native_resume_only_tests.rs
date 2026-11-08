@@ -256,7 +256,7 @@ fn world_with_signal(local: u64, retired: bool, signal: bool) -> World {
 
 fn publish(world: &World, id: &str) -> (recovery::Receipt, recovery::Attempt, Prepare) {
     let request = Prepare {
-        asked_upgrade: None,
+        asked: None,
         id: id.repeat(16),
         revision: world
             .handle

@@ -36,7 +36,7 @@ fn fixture() -> (aterm_tempfile::TempDir, Paths, Prepare, Binding) {
         image: image(u64::from(pid)),
     };
     let prepare = Prepare {
-        asked_upgrade: None,
+        asked: None,
         id: "ab".repeat(16),
         host_epoch: "cd".repeat(16),
         holder: "claude-code@900".into(),

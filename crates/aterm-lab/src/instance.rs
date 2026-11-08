@@ -648,10 +648,15 @@ mod window_admission_tests {
     fn functional_window_rejects_headless_and_zero_before_starting() {
         let world = World::new(CONFIG_OFF).unwrap();
         for (headless, bytes) in [(true, 1024), (false, 0)] {
-            let why = Instance::start_functional(&world, launch(&world, headless), bytes)
-                .err()
-                .expect("invalid functional request refused before spawn");
-            assert!(why.contains("started nothing"), "{why}");
+            for start in [
+                Instance::start_functional,
+                Instance::start_ordinary_functional,
+            ] {
+                let why = start(&world, launch(&world, headless), bytes)
+                    .err()
+                    .expect("invalid functional request refused before spawn");
+                assert!(why.contains("started nothing"), "{why}");
+            }
             assert!(!world.dir.join("aterm.log").exists());
         }
     }
@@ -857,19 +862,41 @@ impl Instance {
     /// A headless launch, mismatched private roots,
     /// or any failure named by [`Self::start_in`].
     pub fn start_ordinary(world: &World, l: Launch) -> Result<Instance, String> {
+        Self::start_ordinary_with(world, l, WindowWork::Timing)
+    }
+
+    /// Start an ordinary app-band window with a nonzero memory reservation and
+    /// the shared window lane, without a quiet-machine wait or timing qualification.
+    /// The private roots and default control socket are those of [`Self::start_ordinary`].
+    /// # Errors
+    /// A headless launch, zero reservation, unavailable resources, or a failure
+    /// named by [`Self::start_ordinary`]. No child starts when admission fails.
+    pub fn start_ordinary_functional(
+        world: &World,
+        l: Launch,
+        memory_bytes: u64,
+    ) -> Result<Instance, String> {
+        if l.headless || memory_bytes == 0 {
+            return Err("functional window needs a window and a nonzero memory reservation; it started nothing".into());
+        }
+        Self::start_ordinary_with(
+            world,
+            l,
+            WindowWork::Functional {
+                memory_bytes,
+                retain: false,
+            },
+        )
+    }
+
+    fn start_ordinary_with(world: &World, l: Launch, work: WindowWork) -> Result<Instance, String> {
         if l.headless || !ordinary_roots_match(world, &l.env) {
             return Err("ordinary instance needs a window and its private home, config and runtime directories".into());
         }
         // Empty means the ordinary per-instance socket, rather than an explicit
         // socket that would suppress Commons startup in the executable.
-        let mut instance = Self::start_in_on_socket(
-            world,
-            l,
-            Band::App,
-            Path::new(""),
-            WindowWork::Timing,
-            |_| Ok(()),
-        )?;
+        let mut instance =
+            Self::start_in_on_socket(world, l, Band::App, Path::new(""), work, |_| Ok(()))?;
         instance.sock = world
             .run
             .join("aterm")
@@ -2840,6 +2867,23 @@ mod world_tests {
                 world.dir.join("elsewhere").display().to_string(),
             ));
             assert!(!ordinary_roots_match(&world, &overridden), "{name}");
+            let why = Instance::start_ordinary_functional(
+                &world,
+                Launch {
+                    aterm: world.dir.join("must-not-start"),
+                    headless: false,
+                    args: Vec::new(),
+                    env: overridden,
+                    cwd: world.home.clone(),
+                    sandbox: None,
+                    reroute: false,
+                },
+                1024,
+            )
+            .err()
+            .expect("foreign roots refused before admission or spawn");
+            assert!(why.contains("private home, config and runtime"), "{why}");
+            assert!(!world.dir.join("aterm.log").exists());
         }
     }
 

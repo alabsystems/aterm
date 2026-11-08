@@ -154,6 +154,8 @@ pub(crate) struct SpliceLists {
     /// Claude's mode rows rewritten to its jobs ([`collect_mode_row`]).
     mode_rows: Vec<RowWrite>,
     mode_cells: Vec<RenderCell>,
+    /// The quota rows this frame lays on line E ([`quota::QuotaWrite`]).
+    quota_rows: Vec<quota::QuotaWrite>,
     /// The composer top rules' compositions ([`ComposedTop`]).
     tops: Vec<TopWrite>,
     /// The top-effort key's targets each top rule would put on the glass ([`TopHit`]).
@@ -211,6 +213,7 @@ impl SpliceLists {
         self.agy_edits.clear();
         self.mode_rows.clear();
         self.mode_cells.clear();
+        self.quota_rows.clear();
         self.tops.clear();
         self.top_hits.clear();
         self.top_seen.clear();
@@ -278,6 +281,9 @@ pub(crate) struct PaneTextCache {
     marks: MarkContents,
     /// The top rules' ⬆️ ring contents, shared by the leaves ([`RingContents`]).
     rings: RingContents,
+    /// Each live session's grace on line E ([`quota::Grace`]), by session: it outlives the leaf's
+    /// footer, which a tab switch, a scroll back or a closed split replaces.
+    graces: HashMap<u64, quota::Grace>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,8 +645,14 @@ impl PaneTextCache {
     }
 
     /// A pane that no longer shows a Claude footer must not keep its old transcript resident just
-    /// because another pane still has one.
-    fn retain_active(&mut self, active: impl Fn(usize) -> bool, card: impl Fn(usize) -> bool) {
+    /// because another pane still has one; a session gone (`live` false) keeps no grace.
+    fn retain_active(
+        &mut self,
+        active: impl Fn(usize) -> bool,
+        card: impl Fn(usize) -> bool,
+        live: impl Fn(u64) -> bool,
+    ) {
+        self.graces.retain(|&session, _| live(session));
         for (index, cached) in self.panes.iter_mut().enumerate() {
             if !active(index) && !card(index) {
                 *cached = None;
@@ -1201,6 +1213,13 @@ impl PaneTextCache {
         self.footers.get_mut(leaf_index)
     }
 
+    /// The cells of leaf `leaf_index`'s composed quota row ([`quota::QuotaRow::cells`]).
+    fn quota_cells(&self, leaf_index: usize) -> &[RenderCell] {
+        self.footers
+            .get(leaf_index)
+            .map_or(&[], |f| f.quota.cells())
+    }
+
     /// The cells of leaf `leaf_index`'s composed rule ([`PaneFooter::compose`]).
     fn composed(&self, leaf_index: usize) -> &[RenderCell] {
         self.footers
@@ -1372,6 +1391,14 @@ struct PaneFooter {
     shown: FooterFacts,
     /// Bumped on every change of `shown`.
     shown_gen: u64,
+    /// Bumped on every change of the facts `shown` is made of, not on [`Self::line_e`]'s: the
+    /// quota row's view is laid once per generation ([`quota::QuotaRow`]).
+    view_gen: u64,
+    /// Line E is the glass's, or a grace keeps line D's unit back ([`Self::note_line_e`]):
+    /// `shown`'s [`FooterFacts::line_e`]. The grace is the session's ([`PaneTextCache::graces`]).
+    line_e: bool,
+    /// Line E as the frames before composed it.
+    quota: quota::QuotaRow,
     /// The repaint key's term for `from` ([`fingerprint`], [`Self::fingerprint_of`]).
     fp: u64,
     /// `footer::chips_room` of `shown` at `room` cells.
@@ -1496,9 +1523,11 @@ impl PaneFooter {
         let mut shown = facts.filled_from(card);
         with_usage_switch(&mut shown, usage);
         shown.off = off;
+        shown.line_e = self.line_e;
         let model_changed = shown.model != self.shown.model;
         self.shown = shown;
         self.shown_gen += 1;
+        self.view_gen += 1;
         self.fp = fingerprint(Some(facts), card, usage, off);
         self.from = Some((facts.clone(), card.cloned(), usage, off));
         model_changed
@@ -2775,23 +2804,18 @@ impl RosterMemo {
         self.roster.as_ref()
     }
 
-    /// The footer's outlook glance for the pane whose row is `label` at wall second `now`
-    /// ([`crate::accounts_outlook::OutlookMemo::glance`]), over the roster [`Self::at`] gives.
-    fn glance(
+    /// The quota views of the pane whose account is `tab` at wall second `now`
+    /// ([`crate::accounts_outlook::OutlookMemo::quota`]), over the roster [`Self::at`] gives.
+    fn quota(
         &mut self,
         (instant, now): (std::time::Instant, i64),
         load: impl FnOnce() -> Option<accounts::Roster>,
-        label: &str,
-        (used_x10, movable): (Option<u32>, bool),
-    ) -> Option<aterm_agent::harness::outlook::Glance> {
+        tab: &str,
+        (own, movable): (Option<aterm_agent::harness::outlook::Figure>, bool),
+    ) -> Option<crate::accounts_outlook::QuotaViews> {
         self.at(instant, load);
-        self.outlook.glance(
-            (instant, now),
-            self.roster.as_ref(),
-            label,
-            used_x10,
-            movable,
-        )
+        self.outlook
+            .quota((instant, now), self.roster.as_ref(), tab, own, movable)
     }
 }
 
@@ -3364,7 +3388,9 @@ fn resolve_facts_at_with_cwd(
                 plan: None,
                 context: prev_ctx,
                 goal,
-                glance: None,
+                quota: None,
+                quota_observed: None,
+                line_e: false,
             });
         }
     }
@@ -3436,27 +3462,24 @@ fn resolve_facts_at_with_cwd(
         }
         facts.subscription = subscription.clone();
         facts.plan = plan;
-        // The outlook's quantized parts for this pane's row (its bar, its reset and the
-        // verdict's words; `docs/DESIGN-accounts-outlook-2026-10-25.md` §2): replayed on this
-        // thread at most once a minute, hashed into the fingerprint, never the raw clock. Only
-        // under the label the account gate passed (`sub.label`): a pane whose gate refused says
-        // no row's figures, as its weekly says none.
-        facts.glance = subscription.as_ref().and_then(|sub| {
+        // The quota view of this pane's account (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+        // §2, §5.1), built of the outlook this thread replays at most once a minute, hashed
+        // into the fingerprint, never the raw clock. Only under the label the account gate
+        // passed (`sub.label`): a pane whose gate refused says no row's figures, as its weekly
+        // says none. Its own figure is the weekly's: a wall's `out`, never an inferred 100%.
+        let views = subscription.as_ref().and_then(|sub| {
             let label = sub.label.clone()?;
-            let walled = facts
-                .usage
-                .as_ref()
-                .and_then(|u| u.wall.as_ref())
-                .is_some_and(|w| w.label == "7d");
-            let used = sub
-                .weekly_figure
-                .map(|f| f.used_x10)
-                .or(walled.then_some(1000));
-            let glance = roster.glance(
+            let own = if sub.weekly.as_deref() == Some(WEEKLY_OUT) {
+                Some(aterm_agent::harness::outlook::Figure::Out)
+            } else {
+                sub.weekly_figure
+                    .map(|f| aterm_agent::harness::outlook::Figure::of_weekly(&f, clock.now))
+            };
+            let views = roster.quota(
                 (std::time::Instant::now(), clock.now),
                 asks.roster,
                 &label,
-                (used, identity.route.on_account()),
+                (own, identity.route.on_account()),
             );
             // The tier this process's gated profile read named, as its row's `plan` row (§4.2).
             if gated.is_some()
@@ -3464,8 +3487,10 @@ fn resolve_facts_at_with_cwd(
             {
                 roster.outlook.note_plan(&label, title, clock.now);
             }
-            glance
+            views
         });
+        (facts.quota, facts.quota_observed) =
+            views.map_or((None, None), |views| (Some(views.view), views.observed));
     }
     let denied = facts.as_ref().and_then(|f| f.repo_read_denied.clone());
     let excerpts = facts
@@ -3594,10 +3619,14 @@ fn weekly_into(
     let tapped = tap::carried_by(&identity.argv);
     sub.label = gated.and_then(|_| own_label(identity, roster, asks));
     let seat = gated.map(|_| (asks.tap.seat)());
-    let reading = gated
+    let tap = gated
         .zip(seat.as_ref())
         .and_then(|(tab, seat)| tab.filter(|_| tapped).zip(seat.dir.as_deref()))
-        .and_then(|(tab, dir)| own_tap_figure(identity, tab, dir));
+        .and_then(|(tab, dir)| own_tap_reading(identity, tab, dir));
+    // Which row Claude shows for the newest run (the quota row's claim, glass design §5.2), read
+    // here beside the figure so the frame reads no file.
+    sub.tap_own = tap.as_ref().is_some_and(tap::Reading::claimable);
+    let reading = tap.and_then(|reading| own_tap_figure(identity, reading));
     let own = gated.and_then(|_| WeeklyFigure::newer(shown(sub.weekly_figure), shown(reading)));
     let walled = facts
         .usage
@@ -3654,15 +3683,20 @@ fn weekly_into(
     });
 }
 
-/// This process's own usage-tap figure: the week of the reading its tap wrote for tab `tab` in
-/// `dir` since the process started ([`tap::Reading::read`]), whatever its age, for its own login
-/// in the default home only. A reading names no account, so after a `/login` to another account
-/// the week the process last held reads as the new account's until a reply brings the new one's.
-fn own_tap_figure(identity: &Identity, tab: &str, dir: &std::path::Path) -> Option<WeeklyFigure> {
+/// The newest reading this process's usage tap wrote for tab `tab` in `dir` since the process
+/// started ([`tap::Reading::read`]), whatever its age.
+fn own_tap_reading(identity: &Identity, tab: &str, dir: &std::path::Path) -> Option<tap::Reading> {
     let pid = u32::try_from(identity.pid).ok()?;
     let started = i64::try_from(identity.started?).ok()?;
+    tap::Reading::read(dir, tab, pid, started).map(|(reading, _)| reading)
+}
+
+/// This process's own usage-tap figure: the week of its tap's `reading` ([`own_tap_reading`]),
+/// for its own login in the default home only. A reading names no account, so after a `/login`
+/// to another account the week the process last held reads as the new account's until a reply
+/// brings the new one's.
+fn own_tap_figure(identity: &Identity, reading: tap::Reading) -> Option<WeeklyFigure> {
     let login = identity.login.as_ref().filter(|login| login.default_home)?;
-    let (reading, _) = tap::Reading::read(dir, tab, pid, started)?;
     let said = |value: Option<String>| value.filter(|value| !value.is_empty());
     if said(reading.home).is_some() || said(reading.login) != login.login {
         return None;
@@ -3934,7 +3968,9 @@ pub(crate) fn fingerprint(
         context,
         // The leaf's own goal term carries it, for every program ([`goal_term`]).
         goal: _,
-        glance,
+        quota,
+        quota_observed,
+        line_e,
     } = facts;
     let version = version
         .as_deref()
@@ -3955,7 +3991,7 @@ pub(crate) fn fingerprint(
     account_progress.hash(&mut h);
     account_progress_busy.hash(&mut h);
     context.hash(&mut h);
-    glance.hash(&mut h);
+    (quota, quota_observed, line_e).hash(&mut h);
     if usage {
         usage_facts.hash(&mut h);
     } else {
@@ -4046,8 +4082,9 @@ impl RuleAt {
 
 /// The cells aterm writes into `room` cells of the rule for one pane, in the glass's tokens
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §4.1): a fact's mark in the mark ink of its
-/// column, a value and a quiet word in theirs, the account unit's bar in the mark ink and the
-/// track ink, a projected stop's words in the warn ink. Under a palette the rule's own `─` (its
+/// column, a value and a quiet word in theirs; the account unit by its pieces' tones, its name
+/// and `↺` in the lit ink, its `·` in the quiet ink, its figures and times in the value ink and a
+/// projected gap's words in the warn ink. Under a palette the rule's own `─` (its
 /// lead, the run between the chips and the facts, and its close) wear the arc of their columns,
 /// so the whole run is written; with none, the run between stays Claude's. A run with no room
 /// (`footer::RULE_LEAD + 1` cells or fewer) takes no cells either way: the arc's lead and close
@@ -4114,7 +4151,6 @@ fn compose_rule_spans(
             fg: rgb_of(fg),
             ..cell
         };
-        let track = quiet(glass.track());
         let warn = quiet(glass.warn());
         let set = footer::set_facts(&fit.segments);
         // The facts are laid against the run's close, at pane column `at.end - 1`: their cell
@@ -4129,39 +4165,27 @@ fn compose_rule_spans(
                 .copied()
         });
         let lit_cells = lit_span.map(|span| usize::from(span.cells.0)..usize::from(span.cells.1));
-        // Every `·` of the account unit, its weekly words' own among them, reads as a join.
-        let unit = spans
-            .iter()
-            .flatten()
-            .find(|span| span.kind == FactKind::Account)
-            .map(|span| usize::from(span.cells.0)..usize::from(span.cells.1));
         let mut lit_inks: Vec<(isize, [u8; 3])> = Vec::new();
         facts = vec![blank; set.cells + 2];
         for glyph in &set.glyphs {
             let lit = lit_cells.as_ref().is_some_and(|c| c.contains(&glyph.cell));
-            let joins = glyph.ch == footer::JOIN_MARK
-                && unit.as_ref().is_some_and(|c| c.contains(&glyph.cell));
             let t = at.t(fact_col(1 + glyph.cell));
-            let ink = match (
-                glyph.mark || glyph.ch == footer::RESET_MARK || joins,
-                glyph.quiet,
-                lit,
-            ) {
-                // The bar keeps its inks lit or not: the underline sits under its stroke.
-                _ if glyph.meter => {
-                    if matches!(glyph.ch, '\u{2500}' | '\u{2504}') {
-                        track
-                    } else {
-                        quiet(glass.mark(t))
-                    }
+            // Line D's inks (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2): marks in
+            // the field's hue, values in the value ink, the account unit's name and `↺` lit,
+            // its `·` quiet, a projected gap's words warn. A hovered fact lifts each ink (the
+            // lit name to the field's letter ink, as its mark) but a warning's.
+            let ink = match (glyph.mark, glyph.quiet, lit, glyph.tone) {
+                (true, _, false, _) => quiet(glass.mark(t)),
+                (true, _, true, _) => quiet(glass.letter(t)),
+                (false, true, false, _) | (false, false, false, footer::Tone::Quiet) => stub,
+                (false, true, true, _) | (false, false, true, footer::Tone::Quiet) => {
+                    lifted(stub, glass.value())
                 }
-                (false, false, false) if glyph.warn => warn,
-                (true, _, false) => quiet(glass.mark(t)),
-                (true, _, true) => quiet(glass.letter(t)),
-                (false, true, false) => stub,
-                (false, true, true) => lifted(stub, glass.value()),
-                (false, false, false) => value,
-                (false, false, true) => lifted(value, glass.lit()),
+                (false, false, _, footer::Tone::Warn) => warn,
+                (false, false, false, footer::Tone::Lit) => quiet(glass.lit()),
+                (false, false, true, footer::Tone::Lit) => quiet(glass.letter(t)),
+                (false, false, false, footer::Tone::Value) => value,
+                (false, false, true, footer::Tone::Value) => lifted(value, glass.lit()),
             };
             let cell = RenderCell {
                 ch: glyph.ch,
@@ -4767,6 +4791,7 @@ impl App {
         let mut claude = false;
         let usage = self.config.claude_footer_usage();
         let claims = crate::autopilot::ClaimClock::default();
+        let now = std::time::SystemTime::now();
         for (index, leaf) in plan.leaves.iter().enumerate() {
             let Some(session) = self
                 .view_store
@@ -4801,6 +4826,13 @@ impl App {
                     .fingerprint_of(session, f, timeline.claude_card(), usage, off)
             });
             let leaf = kept.unwrap_or_else(|| fingerprint(facts, card, usage, off));
+            // Line E's claim, and a grace that still keeps line D's unit back: its lapse redraws.
+            let line_e = ws
+                .claude_footer_texts
+                .borrow()
+                .graces
+                .get(&session)
+                .map_or(0, |g| g.term(now));
             let shows = facts.is_some();
             let (agent, group) = (
                 crate::harness_host::agent_of(timeline.agent()),
@@ -4856,6 +4888,7 @@ impl App {
             } ^ gate.rotate_left(11);
             fp = fp.rotate_left(7)
                 ^ leaf
+                ^ line_e.rotate_left(13)
                 ^ harness.rotate_left(29)
                 ^ key.rotate_left(41)
                 ^ goal.rotate_left(19)
@@ -5861,6 +5894,61 @@ impl App {
                         );
                     }
                 }
+                // Line E, the quota row (glass design §5.2): claimed while the row under the
+                // bottom rule is the tap's own and a rung of the view fits it, laid where its
+                // cells are plain. Until a claim, and for the grace after the last, line D gives
+                // up its account unit; agy's, a CLI's with no line E and a harness switched off
+                // never claim, and line D keeps the unit.
+                let claimable = matches!(agent, None | Some(aterm_phase::Program::Claude))
+                    && !crate::autopilot::HarnessSwitch::of(view)
+                        .is_some_and(crate::autopilot::HarnessSwitch::is_off);
+                let rows = texts
+                    .panes
+                    .get(leaf_index)
+                    .and_then(Option::as_ref)
+                    .map(|cached| cached.rows.clone());
+                let claim = match read.zip(rows.as_deref()) {
+                    Some((r, rows)) if claimable => {
+                        texts.footers[leaf_index].claim_quota_row(&quota::RowAt {
+                            scratch: &ws.input_scratch,
+                            rows,
+                            region,
+                            rule: r.rule,
+                            chrome_owned: self.chrome_owns_terminal_row(wid, row_off + r.rule + 1),
+                        })
+                    }
+                    _ => quota::Claim::Not,
+                };
+                let (line_e, wake) = texts.graces.entry(session).or_default().note(
+                    || clock().read_at,
+                    claimable.then_some(claim != quota::Claim::Not),
+                );
+                let footer = &mut texts.footers[leaf_index];
+                footer.note_line_e(line_e);
+                if let Some(left) = wake {
+                    crate::claude_lights::wake_after(session, left);
+                }
+                if let (quota::Claim::Laid(span), Some(r)) = (claim, read) {
+                    let rule_fg = rule
+                        .as_ref()
+                        .map_or_else(|| mix(blank.bg, blank.fg, 0.35), |(_, _, _, rc)| rc.fg);
+                    let glass = GlassInks::of(
+                        border,
+                        pack_rgb(blank.bg),
+                        pack_rgb(blank.fg),
+                        pack_rgb(rule_fg),
+                    );
+                    let lit = ws.claude_lights.lit_fact(session) == Some(FactKind::Account);
+                    lists.quota_rows.extend(footer.compose_quota_row(
+                        session,
+                        leaf_index,
+                        span,
+                        (region, strip + row_off + r.rule + 1),
+                        (glass, blank, lit),
+                        cell,
+                        pane_grid_px(cell, pane),
+                    ));
+                }
                 lists.seen.push(SeenPane {
                     leaf_index,
                     session,
@@ -5888,6 +5976,7 @@ impl App {
             ws.claude_footer_texts.borrow_mut().retain_active(
                 |index| seen.iter().any(|pane| pane.leaf_index == index),
                 |index| cards.iter().any(|card| card.reads(index)),
+                |session| self.pool.get(session).is_some(),
             );
         }
         for pane in lists.seen.drain(..) {
@@ -5911,6 +6000,7 @@ impl App {
             && !lines
             && lists.agy_edits.is_empty()
             && lists.mode_rows.is_empty()
+            && lists.quota_rows.is_empty()
             && lists.tops.is_empty()
             && lists.top_hits.is_empty()
             && lists.border_toggles.is_empty()
@@ -6086,6 +6176,14 @@ impl App {
                 .mode_rows
                 .iter()
                 .map(|e| (e.frame_row, e.col, &mode_cells[e.cells.clone()], e.ground));
+            let quota_rows = lists.quota_rows.iter().map(|q| {
+                (
+                    q.frame_row,
+                    q.col,
+                    texts.quota_cells(q.leaf_index),
+                    q.ground,
+                )
+            });
             write_edits(
                 claude_footer_undo,
                 input_scratch,
@@ -6093,8 +6191,17 @@ impl App {
                     .chain(rules)
                     .chain(tops)
                     .chain(agy)
-                    .chain(mode_rows),
+                    .chain(mode_rows)
+                    .chain(quota_rows),
             );
+            // Line E's midnights show only over the row the write laid.
+            for q in &lists.quota_rows {
+                if claude_footer_undo.took(q.frame_row, q.col)
+                    && let Some(layer) = &q.ticks
+                {
+                    claude_card.paint_layer(input_scratch, layer.clone());
+                }
+            }
             for e in &lists.mode_rows {
                 if claude_footer_undo.took(e.frame_row, e.col) {
                     claude_footer_undo.glass.push(e.shift);
@@ -6164,6 +6271,12 @@ impl App {
                         r.col_off + words,
                         r.painted.len() - words,
                     );
+                } else if let Some(q) = lists.quota_rows.iter().find(|q| (q.frame_row, q.col) == at)
+                {
+                    // Line E: the row's cells are painted, the tap's words past them blanked.
+                    let line = q.line.min(r.painted.len());
+                    pet_chrome.note_painted(r.frame_row, r.col_off, &r.painted[..line]);
+                    pet_chrome.note_blanked(r.frame_row, r.col_off + line, r.painted.len() - line);
                 } else {
                     pet_chrome.note_painted(r.frame_row, r.col_off, &r.painted);
                 }
@@ -6184,6 +6297,25 @@ impl App {
                         session: f.session,
                         fact: f.fact,
                         restores: f.restores,
+                        part: None,
+                    });
+                }
+            }
+            // Line E is the account, in three parts (glass design §2.6).
+            for q in lists
+                .quota_rows
+                .iter()
+                .filter(|q| took((q.frame_row, q.col)))
+            {
+                for (cols, part) in q.parts() {
+                    claude_lights.fact_hits.push(crate::claude_lights::FactHit {
+                        frame_row: q.frame_row,
+                        term_row: q.term_row,
+                        cols,
+                        session: q.session,
+                        fact: crate::claude_lights::Fact::Account,
+                        restores: FactMask::default(),
+                        part: Some(part),
                     });
                 }
             }
@@ -6214,6 +6346,7 @@ impl App {
                         session: h.session,
                         fact: crate::claude_lights::Fact::TopEffort,
                         restores: FactMask::default(),
+                        part: None,
                     });
                 }
             }
@@ -10904,6 +11037,10 @@ pub(crate) fn read_glass(row: &[RenderCell]) -> String {
 #[path = "claude_footer_layout_scene.rs"]
 pub(crate) mod layout_scene;
 
+/// Line E, the quota row (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §5.3).
+#[path = "claude_footer_quota.rs"]
+pub(crate) mod quota;
+
 /// Benchmark and cost-test fixture for a single-pane footer pass.
 #[cfg(any(test, feature = "bench-support"))]
 #[path = "claude_footer_probe.rs"]
@@ -11695,7 +11832,7 @@ mod tests {
         let changed = cache.rows(0, 8, &scratch, full);
         assert_eq!(&changed[0], "zbcd");
         assert!(!Arc::ptr_eq(&other_session, &changed));
-        cache.retain_active(|index| index == 1, |_| false);
+        cache.retain_active(|index| index == 1, |_| false, |_| true);
         assert!(cache.panes[0].is_none());
         assert!(cache.panes[1].is_some());
         cache.trim(1);
@@ -12001,8 +12138,11 @@ mod tests {
         let glass = rule_glass(None, rule, blank);
         let fit = footer::RuleFit {
             segments: vec![
-                footer::Segment::plain(footer::ACCOUNT_MARK, "owner@example.com"),
-                footer::Segment::joined(footer::WEEKLY_MARK, "weekly 29% left"),
+                footer::Segment {
+                    tone: footer::Tone::Lit,
+                    ..footer::Segment::plain(footer::ACCOUNT_MARK, "main")
+                },
+                footer::Segment::attached(footer::ACCOUNT_MARK, "71%"),
                 footer::Segment {
                     split: Some("Opus 5.5 ".len()),
                     ..footer::Segment::plain(footer::MODEL_MARK, "Opus 5.5 xhigh")
@@ -12056,7 +12196,12 @@ mod tests {
                 };
                 let left = c as f32 + f32::from(nudge) * step;
                 drawn.push((left, left + cols, cell.fg));
-                assert_ne!(cell.fg, rest.cells[c].fg, "{kind:?}: cell {c} is lifted");
+                // A lit-toned word (the account's name) already wears the lit ink at rest; with
+                // no palette the hovered letter ink is that same ink, so it stays.
+                assert!(
+                    cell.fg != rest.cells[c].fg || rest.cells[c].fg == rgb_of(glass.lit()),
+                    "{kind:?}: cell {c} is lifted"
+                );
             }
             let left = drawn.iter().map(|d| d.0).fold(f32::MAX, f32::min);
             let right = drawn.iter().map(|d| d.1).fold(f32::MIN, f32::max);
@@ -12096,13 +12241,15 @@ mod tests {
         }
     }
 
-    /// THE ACCOUNT, ITS PLAN AND ITS WEEK READ AS ONE UNIT ON THE GLASS, `⎆ <email> · <plan> ·
-    /// <week>`, every `·` of it in the marks' ink of its column (the week's own too), and the next
-    /// fact the facts' gap away; lit, every glyph of it is lifted under one underline and the next
-    /// fact stays as at rest.
+    /// THE ACCOUNT UNIT READS AND LIGHTS AS ONE (glass design §1.2): line D's words-only unit, the
+    /// fallback shown while line E is not the quota row (`quota::tests` hold the row's own),
+    /// `⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 05:00`, reads with one blank between its parts and
+    /// the facts' gap before the next fact; at rest `⎆` takes the marks' ink of its column, the
+    /// name and `↺` the lit ink, the figure and time the values', each `·` the quiet ink, the gap
+    /// the warn ink. Lit, every glyph but the warning's is lifted, under one underline, and the
+    /// next fact stays as at rest. Negative control: the figure's ink differs from the name's.
     #[test]
     fn the_account_unit_reads_and_lights_as_one() {
-        use aterm_agent::harness::profile::SubscriptionDisplay;
         use aterm_core::terminal::UnderlineStyle;
         let blank = cell(' ', [200, 200, 200]);
         let rule = cell('\u{2500}', [60, 60, 60]);
@@ -12114,14 +12261,10 @@ mod tests {
                 blank,
             ),
         );
-        let week = "weekly 61.5% left \u{b7} 59m ago";
         let facts = FooterFacts {
-            subscription: Some(SubscriptionDisplay {
-                email: Some("owner@example.com".into()),
-                plan: Some("Max 20x".into()),
-                weekly: Some(week.into()),
-                ..Default::default()
-            }),
+            account: Some("main".into()),
+            subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay::default()),
+            quota: Some(aterm_agent::harness::quota_view::QuotaView::sample()),
             ..facts()
         };
         let room = 120;
@@ -12130,10 +12273,8 @@ mod tests {
         let rest = compose_rule_spans(&fit, None, rule, blank, (&plain, place), room, None);
         assert_eq!(
             text_of(&rest.cells),
-            format!(
-                " \u{2386} owner \u{b7} {week}   \
-                 \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main "
-            )
+            " \u{2386} main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 05:00   \
+             \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main "
         );
         let unit = rest
             .spans
@@ -12153,30 +12294,35 @@ mod tests {
         );
         let at = rest.facts_at + 1;
         let own = at + usize::from(unit.cells.0)..at + usize::from(unit.cells.1);
-        // Under the arc a mark wears the marks' ink of its column ([`GlassInks::mark`]).
         let arc = compose_rule_spans(&fit, None, rule, blank, (&cruise, place), room, None);
         let arc_at = arc.facts_at + 1;
         let arc_own = arc_at + usize::from(unit.cells.0)..arc_at + usize::from(unit.cells.1);
-        let mark_ink = |c: usize| rgb_of(cruise.mark(place.t(c)));
+        let first = |ch: char| {
+            arc_own
+                .clone()
+                .find(|&c| arc.cells[c].ch == ch)
+                .unwrap_or_else(|| panic!("{ch:?} in the unit"))
+        };
         assert_eq!(arc.cells[arc_own.start].ch, footer::ACCOUNT_MARK);
-        assert_eq!(arc.cells[arc_own.start].fg, mark_ink(arc_own.start));
-        let joins: Vec<usize> = arc_own
-            .clone()
-            .filter(|&c| arc.cells[c].ch == footer::JOIN_MARK)
-            .collect();
-        assert_eq!(joins.len(), 2, "the join and the week's own");
-        assert!(
-            joins.iter().all(|&c| arc.cells[c].fg == mark_ink(c)),
-            "every join in the marks' ink of its column"
+        assert_eq!(
+            arc.cells[arc_own.start].fg,
+            rgb_of(cruise.mark(place.t(arc_own.start))),
+            "the mark in the marks' ink of its column"
         );
-        let word = arc_own
-            .clone()
-            .find(|&c| arc.cells[c].ch == 'w')
-            .expect("the week's word");
+        for (ch, ink, what) in [
+            ('m', cruise.lit(), "the name"),
+            ('\u{21ba}', cruise.lit(), "the reset"),
+            ('6', cruise.value(), "the figure"),
+            ('S', cruise.value(), "the time"),
+            ('\u{b7}', cruise.quiet(), "the join"),
+            ('\u{2573}', cruise.warn(), "the gap"),
+        ] {
+            assert_eq!(arc.cells[first(ch)].fg, rgb_of(ink), "{what}");
+        }
         assert_ne!(
-            arc.cells[word].fg,
-            mark_ink(word),
-            "CONTROL: a word is in the values' ink"
+            arc.cells[first('6')].fg,
+            arc.cells[first('m')].fg,
+            "NEGATIVE CONTROL: the figure's ink is not the name's"
         );
         let lit = compose_rule_spans(
             &fit,
@@ -12187,11 +12333,17 @@ mod tests {
             room,
             Some(FactKind::Account),
         );
+        let warned = own
+            .clone()
+            .find(|&c| rest.cells[c].ch == '\u{2573}')
+            .expect("the gap");
         for (c, cell) in lit.cells.iter().enumerate() {
             if own.contains(&c) {
-                if cell.ch != ' ' {
-                    assert_ne!(
-                        cell.fg, rest.cells[c].fg,
+                if cell.ch != ' ' && c < warned {
+                    // The name and `↺` wear the lit ink at rest, which with no palette is the
+                    // hovered letter ink: they stay; every other glyph lifts.
+                    assert!(
+                        cell.fg != rest.cells[c].fg || rest.cells[c].fg == rgb_of(plain.lit()),
                         "cell {c} ({:?}) is lifted",
                         cell.ch
                     );
@@ -12227,73 +12379,6 @@ mod tests {
             "the model is not lit"
         );
     }
-
-    #[test]
-    fn the_rule_names_the_account_between_the_model_and_the_path() {
-        let blank = cell(' ', [200, 200, 200]);
-        let rule = cell('\u{2500}', [60, 60, 60]);
-        let listed = FooterFacts {
-            account: Some("work-2".into()),
-            ..facts()
-        };
-        let paint = |facts: &FooterFacts, room: usize| {
-            let fit = footer::fit_rule(facts, room, None);
-            compose_rule(&fit, None, rule, blank, None, room).0
-        };
-        let plain = " \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main ";
-        let named =
-            " \u{25C6} Opus 5.5 xhigh   \u{2386} work-2   \u{2302} ~/aterm   \u{2387} main ";
-        let cells = paint(&listed, 76);
-        assert_eq!(text_of(&cells), named);
-        let at = cells
-            .iter()
-            .position(|c| c.ch == footer::ACCOUNT_MARK)
-            .expect("the account's mark");
-        assert_eq!(
-            unplaced(cells[at]),
-            unplaced(RenderCell {
-                ch: footer::ACCOUNT_MARK,
-                ..cells[1]
-            }),
-            "the mark takes the marks' ink"
-        );
-        let w = at
-            + cells[at..]
-                .iter()
-                .position(|c| c.ch == 'w')
-                .expect("the label");
-        let o = cells.iter().position(|c| c.ch == 'O').expect("the model");
-        assert_eq!(
-            unplaced(cells[w]),
-            unplaced(RenderCell {
-                ch: 'w',
-                ..cells[o]
-            }),
-            "the label takes the values' ink"
-        );
-        assert_eq!(text_of(&paint(&facts(), 76)), plain);
-
-        let (mut app, wid, session) = glass(80);
-        let rows = claude_rows("footer-bypass-idle", 80);
-        let bottom = aterm_phase::phase::composer_bottom(&rows).expect("the composer");
-        feed_rows(&app, session, &rows);
-        let shown = |app: &mut App, facts: FooterFacts| {
-            publish(app, session, facts);
-            frame(app, wid);
-            text_of(&app.windows[&wid].input_scratch.cells[strip(app, wid) + bottom])
-        };
-        let glass = shown(&mut app, listed);
-        assert!(
-            glass.ends_with(&format!("\u{2500}{named}\u{2500}")),
-            "{glass:?}"
-        );
-        let glass = shown(&mut app, facts());
-        assert!(
-            glass.ends_with(&format!("\u{2500}{plain}\u{2500}")),
-            "{glass:?}"
-        );
-    }
-
     #[test]
     fn wide_names_take_two_cells() {
         let wide = FooterFacts {
@@ -12340,33 +12425,30 @@ mod tests {
         }
     }
 
-    /// THE WALL AND USAGE MARKS TAKE THE MARKS' INK: `⧗`, `♻` and `Σ` are drawn as `◆` is, in
-    /// the glass's marks ink of their own column ([`GlassInks::mark`]), under Cruise on a dark
-    /// ground. CONTROL: the marks stand at different columns and their inks differ, so the
-    /// column, not one fixed ink, decides.
+    /// THE WALL AND USAGE MARKS TAKE THE MARKS' INK: `⧗` and `Σ` are drawn as `◆` is, in the
+    /// glass's marks ink of their own column ([`GlassInks::mark`]), under Cruise on a dark ground,
+    /// and the wall says until when alone (`⧗ until 3pm`, no window name). CONTROL: the marks stand
+    /// at different columns and their inks differ, so the column, not one fixed ink, decides.
     #[test]
     fn the_wall_and_usage_marks_take_the_marks_ink() {
         let blank = cell(' ', [200, 200, 200]);
         let rule = cell('\u{2500}', [60, 60, 60]);
-        let mut facts = facts_with_usage();
-        // This explicit recovery observation supplies the reset glyph for the ink check.
-        let mut progress = aterm_agent::harness::account_progress::AccountProgress::unknown(100);
-        progress.wall = facts
-            .usage
-            .as_ref()
-            .and_then(|usage| usage.wall.as_ref())
-            .map(aterm_agent::harness::session_usage::wall_text);
-        facts.account_progress = Some(progress);
+        let facts = facts_with_usage();
         let room = footer::segments_width(&footer::segments(&facts)) + 4;
         let fit = footer::fit_rule(&facts, room, None);
         let palette = Some(aterm_effects::harness_card::CardPalette::Cruise);
         let cells = compose_rule(&fit, None, rule, blank, palette, room).0;
+        let text = text_of(&cells);
+        assert!(
+            text.contains(" \u{29D7} until 3pm   \u{25C6}") && !text.contains("5h"),
+            "the wall leads, until when alone: {text:?}"
+        );
         let (glass, at) = (rule_glass(palette, rule, blank), rule_at_room(room));
         let col = |mark: char| cells.iter().position(|c| c.ch == mark).unwrap();
         let model = unplaced(cells[col('\u{25C6}')]);
         assert_eq!(model.fg, rgb_of(glass.mark(at.t(col('\u{25C6}')))), "`◆`");
         let mut inks = vec![model.fg];
-        for mark in ['\u{29D7}', footer::RESET_MARK, '\u{03A3}'] {
+        for mark in ['\u{29D7}', '\u{03A3}'] {
             let c = col(mark);
             assert_eq!(
                 unplaced(cells[c]),
@@ -12382,7 +12464,6 @@ mod tests {
         inks.dedup();
         assert!(inks.len() > 1, "CONTROL: one ink at every column");
     }
-
     #[test]
     fn the_offset_cache_keeps_answers_and_asks_again_after_a_failure() {
         let mut answers = Vec::new();
@@ -12826,7 +12907,7 @@ mod tests {
             .clone()
             .unwrap();
         assert_eq!(display.email.as_deref(), Some("selected@example.test"));
-        assert_eq!(display.weekly.as_deref(), Some("weekly 29% left"));
+        assert_eq!(display.weekly.as_deref(), Some("weekly 71% used"));
         assert_eq!(AUTH_READS.get(), 1);
 
         for registry_present in [true, false] {
@@ -13037,7 +13118,7 @@ mod tests {
         };
         let (first, plan, _) = refresh();
         assert_eq!(first.email.as_deref(), Some("first@example.com"));
-        assert_eq!(first.weekly.as_deref(), Some("weekly 29% left"));
+        assert_eq!(first.weekly.as_deref(), Some("weekly 71% used"));
         assert_eq!(
             plan,
             Some((Bucket::SevenDay, 710)),
@@ -13131,7 +13212,7 @@ mod tests {
                     subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
                         email: Some("first@example.test".into()),
                         plan: Some("Muse Code Max Usage".into()),
-                        weekly: Some("weekly 29% left".into()),
+                        weekly: Some("weekly 71% used".into()),
                         ..Default::default()
                     },),
                     ..FooterFacts::default()
@@ -13187,7 +13268,7 @@ mod tests {
         let first = refresh(&mut identity, &mut tail, &mut fold, &mut memo, RESET - 1);
         assert_eq!(first.email.as_deref(), Some("first@example.test"));
         assert_eq!(first.plan.as_deref(), Some("Muse Code Max Usage"));
-        assert_eq!(first.weekly.as_deref(), Some("weekly 29% left"));
+        assert_eq!(first.weekly.as_deref(), Some("weekly 71% used"));
         let clock = footer::ReadClock {
             read_at: std::time::UNIX_EPOCH,
             now: RESET - 1,
@@ -13206,7 +13287,7 @@ mod tests {
             assert!(held.set_claude_footer(PID, None, Some(facts)));
         }
         let before = refresh(&mut identity, &mut tail, &mut fold, &mut memo, RESET - 1);
-        assert_eq!(before.weekly.as_deref(), Some("weekly 29% left"));
+        assert_eq!(before.weekly.as_deref(), Some("weekly 71% used"));
         assert_eq!(before.weekly_reset.as_ref(), Some(&reset));
         let expired = refresh(&mut identity, &mut tail, &mut fold, &mut memo, RESET);
         assert_eq!(expired.email.as_deref(), Some("first@example.test"));
@@ -13226,7 +13307,7 @@ mod tests {
             let mut held = timeline.lock().unwrap();
             let mut facts = held.claude_footer().cloned().unwrap();
             let sub = facts.subscription.as_mut().unwrap();
-            sub.weekly = Some("weekly 29% left".into());
+            sub.weekly = Some("weekly 71% used".into());
             sub.weekly_reset = Some(relative.clone());
             assert!(held.set_claude_footer(PID, None, Some(facts)));
         }
@@ -13237,7 +13318,7 @@ mod tests {
             &mut memo,
             relative_at - 1,
         );
-        assert_eq!(before.weekly.as_deref(), Some("weekly 29% left"));
+        assert_eq!(before.weekly.as_deref(), Some("weekly 71% used"));
         let expired = refresh(&mut identity, &mut tail, &mut fold, &mut memo, relative_at);
         assert_eq!(
             (expired.weekly, expired.weekly_reset),
@@ -13252,7 +13333,7 @@ mod tests {
             let mut held = timeline.lock().unwrap();
             let mut facts = held.claude_footer().cloned().unwrap();
             let sub = facts.subscription.as_mut().unwrap();
-            sub.weekly = Some("weekly 29% left".into());
+            sub.weekly = Some("weekly 71% used".into());
             sub.weekly_reset = Some(unknown.clone());
             assert!(held.set_claude_footer(PID, None, Some(facts)));
         }
@@ -13263,7 +13344,7 @@ mod tests {
             &mut memo,
             relative_at + 60,
         );
-        assert_eq!(kept.weekly.as_deref(), Some("weekly 29% left"));
+        assert_eq!(kept.weekly.as_deref(), Some("weekly 71% used"));
         assert_eq!(kept.weekly_reset, Some(unknown));
         write_auth("second@example.test");
         let second = refresh(
@@ -13417,7 +13498,7 @@ mod tests {
         let display = refresh(asks);
         assert_eq!(display.email.as_deref(), Some("auth@example.com"));
         assert_eq!(display.plan.as_deref(), Some("Max 5x"));
-        assert_eq!(display.weekly.as_deref(), Some("weekly 29% left"));
+        assert_eq!(display.weekly.as_deref(), Some("weekly 71% used"));
         assert_eq!(refresh(asks), display);
         assert_eq!(CHECKS.get(), 2);
 
@@ -13547,7 +13628,7 @@ mod tests {
                 (found, display)
             };
             let (found, display) = refresh(601);
-            assert_eq!(display.weekly.as_deref(), Some("weekly 29% left"));
+            assert_eq!(display.weekly.as_deref(), Some("weekly 71% used"));
             assert!(found.timed, "weekly without a wall still needs the clock");
 
             let asked = std::time::Instant::now();
@@ -13594,8 +13675,8 @@ mod tests {
                     display
                         .weekly
                         .as_deref()
-                        .is_some_and(|words| words.ends_with(" ago") == aged),
-                    "past fifteen minutes, with its age: {elapsed} {:?}",
+                        .is_some_and(|words| words.contains('\u{2265}') == aged),
+                    "past fifteen minutes, a lower bound: {elapsed} {:?}",
                     display.weekly
                 );
             }
@@ -14002,10 +14083,11 @@ mod tests {
         let blank = cell(' ', [0, 0, 0]);
         let rule = cell('\u{2500}', [60, 60, 60]);
         let facts = FooterFacts {
+            account: Some("jose\u{0301}👩‍💻".into()),
             subscription: Some(aterm_agent::harness::profile::SubscriptionDisplay {
                 email: Some("jose\u{0301}👩‍💻@example.com".into()),
                 plan: Some("Pro".into()),
-                weekly: Some("weekly 29% left".into()),
+                weekly: Some("weekly 71% used".into()),
                 ..Default::default()
             }),
             ..FooterFacts::default()
@@ -16445,6 +16527,15 @@ mod tests {
                 .find(|f| f.session == session)
                 .and_then(|f| f.shown().subscription.as_ref()?.plan.clone())
         };
+        let email_of = |app: &App| {
+            app.windows[&wid]
+                .claude_footer_texts
+                .borrow()
+                .footers
+                .iter()
+                .find(|f| f.session == session)
+                .and_then(|f| f.shown().subscription.as_ref()?.email.clone())
+        };
         const RESET: i64 = 1_792_947_600;
         let now = std::cell::Cell::new(RESET - 1);
         let clock_reads = std::cell::Cell::new(0usize);
@@ -16518,7 +16609,9 @@ mod tests {
         let strip = strip(&app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
         assert!(
-            bottom.contains("\u{2386} redacted-user ") && !bottom.contains("weekly"),
+            bottom.contains("\u{2386} this login")
+                && !bottom.contains("71%")
+                && email_of(&app).as_deref() == Some("redacted-user@example.test"),
             "CONTROL: no card shown yet: {bottom:?}"
         );
 
@@ -16545,9 +16638,8 @@ mod tests {
         );
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("\u{2386} redacted-user ")
+            bottom.contains("\u{2386} this login 71%")
                 && !bottom.contains("Muse Code Max Usage")
-                && bottom.contains("weekly 29% left")
                 && !bottom.contains("unavailable"),
             "the usage card populates its weekly beside the account: {bottom:?}"
         );
@@ -16573,7 +16665,8 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[account_only_bottom]);
         assert!(
-            bottom.contains("\u{2386} redacted-user ")
+            bottom.contains("\u{2386} this login")
+                && email_of(&app).as_deref() == Some("redacted-user@example.test")
                 && plan_of(&app).as_deref() != Some("Muse Code Max Usage"),
             "a named status card cannot borrow another card's plan: {bottom:?}"
         );
@@ -16583,7 +16676,7 @@ mod tests {
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
             plan_of(&app).as_deref() == Some("Muse Code Max Usage")
-                && bottom.contains("weekly 29% left"),
+                && bottom.contains("\u{2386} this login 71%"),
             "usage-only bootstrap remains available before any switch: {bottom:?}"
         );
         let already_read = clock_reads.get();
@@ -16639,9 +16732,7 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("\u{2386} redacted-user ")
-                && !bottom.contains("weekly")
-                && !bottom.contains("weekly 29% left"),
+            bottom.contains("\u{2386} this login") && !bottom.contains("71%"),
             "an unchanged expired card cannot graft its quota again: {bottom:?}"
         );
         assert_eq!(
@@ -16655,7 +16746,7 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("weekly 29% left"),
+            bottom.contains("\u{2386} this login 71%"),
             "a new window is admitted: {bottom:?}"
         );
         {
@@ -16681,10 +16772,10 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("\u{2386} second ")
-                && !bottom.contains("weekly")
+            bottom.contains("\u{2386} this login")
+                && email_of(&app).as_deref() == Some("second@example.test")
                 && plan_of(&app).as_deref() != Some("Muse Code Max Usage")
-                && !bottom.contains("weekly 29% left"),
+                && !bottom.contains("71%"),
             "anonymous old usage cannot be attributed to the new login: {bottom:?}"
         );
         app.windows
@@ -16700,10 +16791,10 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[strip + 9]);
         assert!(
-            bottom.contains("\u{2386} second ")
-                && !bottom.contains("weekly")
+            bottom.contains("\u{2386} this login")
+                && email_of(&app).as_deref() == Some("second@example.test")
                 && plan_of(&app).as_deref() != Some("Muse Code Max Usage")
-                && !bottom.contains("weekly 29% left"),
+                && !bottom.contains("71%"),
             "a new pane/text generation cannot reattribute the old card: {bottom:?}"
         );
         let stale = vec![
@@ -16730,10 +16821,10 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[stale_bottom_row]);
         assert!(
-            bottom.contains("\u{2386} second ")
-                && !bottom.contains("weekly")
+            bottom.contains("\u{2386} this login")
+                && email_of(&app).as_deref() == Some("second@example.test")
                 && !bottom.contains("redacted-user")
-                && !bottom.contains("weekly 29% left"),
+                && !bottom.contains("71%"),
             "the previous account's cards stay historical after a switch: {bottom:?}"
         );
         let mut current = stale.clone();
@@ -16747,11 +16838,11 @@ mod tests {
         frame(&mut app, wid);
         let bottom = text_of(&app.windows[&wid].input_scratch.cells[stale_bottom_row]);
         assert!(
-            bottom.contains("\u{2386} second ")
+            bottom.contains("\u{2386} this login")
+                && email_of(&app).as_deref() == Some("second@example.test")
                 && plan_of(&app).as_deref() == Some("Muse Code Pro")
-                && !bottom.contains("weekly")
                 && plan_of(&app).as_deref() != Some("Muse Code Max Usage")
-                && !bottom.contains("weekly 29% left"),
+                && !bottom.contains("71%"),
             "only the matching status card's own fields are attributable: {bottom:?}"
         );
         {
@@ -17208,7 +17299,8 @@ mod tests {
             );
             if prog == "agy" {
                 assert!(
-                    bottom_on.contains("\u{2386} redacted-user ")
+                    bottom_on.contains("\u{2386} this login")
+                        && !bottom_on.contains("redacted-user")
                         && !bottom_on.contains("Google AI Ultra"),
                     "agy: the launch card's account populates the standardized footer, its plan the hover: {bottom_on:?}"
                 );
@@ -18438,7 +18530,7 @@ mod tests {
                 .into(),
         ];
         let reading = aterm_phase::agy::usage_card_weekly(&rows).expect("agy /usage weekly");
-        assert_eq!(reading.text, "weekly 78% left");
+        assert_eq!(reading.text, "weekly 22% used");
         assert_eq!(reading.reset.as_deref(), Some("2026-10-29 09:31 PDT"));
 
         let mut scratch = RenderInput::empty();
@@ -18458,25 +18550,25 @@ mod tests {
         for (model, words, reset) in [
             (
                 Some("Gemini 3.1 Pro"),
-                "weekly 78% left",
+                "weekly 22% used",
                 "2026-10-29 09:31 PDT",
             ),
             (
                 Some("Claude Opus 4.6"),
-                "weekly 100% left",
+                "weekly 0% used",
                 "2026-10-31 00:51 PDT",
             ),
             (
                 Some("Gemini 3.1 Pro"),
-                "weekly 78% left",
+                "weekly 22% used",
                 "2026-10-29 09:31 PDT",
             ),
             (
                 Some("Claude Opus 4.6"),
-                "weekly 100% left",
+                "weekly 0% used",
                 "2026-10-31 00:51 PDT",
             ),
-            (None, "weekly 78% left", "2026-10-29 09:31 PDT"),
+            (None, "weekly 22% used", "2026-10-29 09:31 PDT"),
         ] {
             cache.note_facts(
                 0,
@@ -18516,7 +18608,7 @@ mod tests {
         };
         let (weekly, reset) =
             muse_weekly_observation((&reading.text, reading.reset.as_deref()), None, &before);
-        assert_eq!(weekly, Some("weekly 78% left"));
+        assert_eq!(weekly, Some("weekly 22% used"));
         assert_eq!(reset, Some(("2026-10-29 09:31 PDT", Some(reset_unix))));
 
         let after = || footer::ReadClock {
@@ -18728,7 +18820,7 @@ mod tests {
         let mut first_facts = resumed_shown.clone();
         first_facts.subscription = Some(aterm_agent::harness::profile::SubscriptionDisplay {
             email: Some("dev@example.com".to_owned()),
-            weekly: Some("weekly 78% left".to_owned()),
+            weekly: Some("weekly 22% used".to_owned()),
             weekly_figure: None,
             ..Default::default()
         });
@@ -18765,7 +18857,7 @@ mod tests {
             switch_tl
                 .claude_footer()
                 .and_then(|f| f.subscription.as_ref()?.weekly.as_deref()),
-            Some("weekly 91% left"),
+            Some("weekly 9% used"),
             "live WeeklyFigure for the new agy account is preserved after switch"
         );
         PROC_FILES.with(|files| files.borrow_mut().clear());

@@ -2604,9 +2604,9 @@ pub struct Session<'a, C: Ctl> {
     reset_passed: Option<String>,
     reset_again: u8,
     reset_fallback: Option<Decision>,
-    /// The `what` and key of each sighting of the reset program this loop kept a capture of
-    /// ([`Session::reset_capture`]), at most `RESET_CAPTURES` of each `what`.
-    reset_captured: Vec<(String, String)>,
+    /// The `what` and key of each sighting this loop kept a capture of
+    /// ([`Session::screen_capture`]), at most `CAPTURES_EACH` of each `what`.
+    captured: Vec<(String, String)>,
     decided_on: Option<super::policy::box_facts::BoxFacts>,
     focus_key_tried: bool,
     halted: bool,
@@ -2930,7 +2930,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             reset_passed: None,
             reset_again: 0,
             reset_fallback: None,
-            reset_captured: Vec::new(),
+            captured: Vec::new(),
             decided_on: None,
             focus_key_tried: false,
             halted: false,
@@ -5613,7 +5613,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         if self.stopped() {
             return Ok(Some(End::Quit));
         }
-        self.reset_capture(&turn.screen, opts, review);
+        self.screen_capture(&turn.screen, opts, review);
         let off = self.autopilot(opts) == Autopilot::Off;
         if review.unattended()
             && !turn.timed_out
@@ -8955,6 +8955,8 @@ pub use answer::{
 mod approval_loop;
 #[path = "beside.rs"]
 mod beside;
+#[path = "capture_loop.rs"]
+mod capture_loop;
 #[cfg(test)]
 pub(crate) use approval_loop::reask_pause;
 /// Re-exports whole-box approval decision evaluation for tape explanation.

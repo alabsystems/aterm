@@ -71,7 +71,17 @@ fn account_usage_of(
     read: &UsageRead<'_>,
     now: i64,
 ) -> &'static str {
-    super::account_usage_of(store, &usage_fixture(store, roster, now), sid, read, now)
+    let state = store
+        .dir
+        .parent()
+        .expect("the harness state over the store");
+    super::account_usage_of(
+        (state, store),
+        &usage_fixture(store, roster, now),
+        sid,
+        read,
+        now,
+    )
 }
 
 #[path = "harness_host_agent_gate_tests.rs"]
@@ -13596,6 +13606,144 @@ fn every_takeable_kinds_spent_line_is_a_reset_used() {
     assert_eq!(rows.first().map(|r| r.0), Some("reset-kept"), "{rows:?}");
 }
 
+/// The `event` rows of `label`'s series on this world's machine.
+fn series_events(a: &Accts, label: &str) -> Vec<account_series::EventSaid> {
+    let machine = a.state().machine;
+    account_series::read(&a.state_root(), label, &machine)
+        .into_iter()
+        .filter_map(|row| match row.said {
+            account_series::Said::Event(event) => Some(event),
+            _ => None,
+        })
+        .collect()
+}
+
+/// THE READINGS SERIES TAKES A LIMIT-RESET OFFER ONCE PER MOVE, once the store committed it
+/// (docs/DESIGN-account-stats-2026-10-15.md §5): a reset's end that puts on record an offer the
+/// account did not hold, or held with another count, appends one `grant-seen` row of its kind and
+/// count, in closed words and numbers; one that puts on record the offer the account already
+/// holds appends none.
+#[test]
+fn a_reset_offer_first_seen_or_changed_is_one_grant_seen_row() {
+    use aterm_phase::ResetKind;
+    let sid = "s-reset-series";
+    const TOLD: i64 = ACCT_NOW + 20;
+    let entered = ResetEnd {
+        entered: true,
+        kept: None,
+        offer: Some(ResetOffer {
+            kind: ResetKind::Session,
+            left: 2,
+            use_by: None,
+        }),
+        last: false,
+    };
+    let events = |held: Option<u32>| {
+        let a = Accts::new();
+        let _agent = walled(&a, sid, ACCT_TALK_A, LONG_WALL);
+        let idle = a.worker(sid, &resetting());
+        assert!(matches!(
+            idle.reset_take(&reset_ask(None)),
+            ResetWord::Take(_)
+        ));
+        if let Some(left) = held {
+            edited(&a, |state| {
+                let main = state.accounts.get_mut("main").expect("the claim's record");
+                main.offer = Some(accounts::Offer {
+                    kind: Some(ResetKind::Session),
+                    left,
+                    use_by: None,
+                    at: ACCT_NOW - 10,
+                    by: "lab".to_string(),
+                });
+            });
+            assert_eq!(a.state().account("main").offer.map(|o| o.left), Some(left));
+        }
+        a.now.store(TOLD, Ordering::SeqCst);
+        a.dialog_said(ACCT_TALK_A, ACCT_NOW + 15, SESSION_SPENT);
+        assert!(matches!(
+            idle.reset_told(&entered),
+            ResetOutcome::Spent { .. }
+        ));
+        let offer = a.state().account("main").offer.clone();
+        assert_eq!(
+            offer.map(|o| (o.kind, o.left)),
+            Some((Some(ResetKind::Session), 1))
+        );
+        series_events(&a, "main")
+    };
+    let first = events(None);
+    assert_eq!(
+        first
+            .iter()
+            .map(|e| (e.e.as_str(), e.kind.as_deref(), e.n, e.use_by, e.w.clone()))
+            .collect::<Vec<_>>(),
+        [("grant-seen", Some("session"), Some(1), None, None)],
+        "{first:?}"
+    );
+    assert!(first[0].at.is_some());
+    assert_eq!(events(Some(2)).len(), 1, "the count changed");
+    assert_eq!(events(Some(1)), [], "the offer the account holds");
+}
+
+/// THE READINGS SERIES TAKES A MODEL'S WALL ONCE PER MOVE: the usage recorder that puts the Fable
+/// week on record at its wall appends one `wall` row of its bucket, and the same wall read again
+/// appends none. NEGATIVE CONTROL: a Fable warning, which moves the week but is no wall, appends
+/// none.
+#[test]
+fn a_models_wall_is_one_wall_row_per_move() {
+    let a = Accts::new();
+    let store = a.store();
+    let roster = accounts::Roster::own();
+    let env = vec!["HOME=/Users//someone".to_string()];
+    let started = a.clock() - 120;
+    let read = |week: aterm_phase::ModelWeek, answer: i64, now: i64| {
+        let seen = UsageSeen {
+            credits: None,
+            warning: None,
+            week: Some(week),
+        };
+        let settled = || true;
+        let answered = |by: i64| Some(answer).filter(|at| *at <= by);
+        let said = |at: i64| usage_said(&seen, at, 0);
+        let read = UsageRead {
+            env: &env,
+            started: Some(started),
+            settled: &settled,
+            answered: &answered,
+            said: &said,
+        };
+        account_usage_of(&store, &roster, "s-live", &read, now)
+    };
+    let fable = |pct: u8, wall: bool| aterm_phase::ModelWeek {
+        model: aterm_phase::WeekModel::Fable,
+        pct,
+        reset: (!wall).then(|| "11:36pm".to_string()),
+        wall,
+    };
+    let own = aterm_agent::harness::cli::ACCOUNTS_OWN_LABEL;
+    let now = a.clock();
+    assert_eq!(read(fable(85, false), now - 90, now), "stats");
+    assert_eq!(series_events(&a, own), [], "a warning is no wall");
+    assert_eq!(read(fable(100, true), now - 60, now), "stats");
+    assert_eq!(read(fable(100, true), now - 30, now + 60), "stats");
+    let walls = series_events(&a, own);
+    assert_eq!(
+        walls
+            .iter()
+            .map(|e| (e.e.as_str(), e.w.as_deref(), e.at, e.reset, e.n))
+            .collect::<Vec<_>>(),
+        [(
+            "wall",
+            Some(accounts::week_bucket(aterm_phase::WeekModel::Fable)),
+            Some(now - 60),
+            None,
+            None
+        )],
+        "one row for the move, none for the wall read again"
+    );
+}
+
 #[test]
 fn a_limit_resets_outcome_is_the_transcripts_line_since_the_claim() {
     use aterm_agent::supervise::policy::KeepWhy;
@@ -17075,7 +17223,7 @@ fn the_usage_recorder_reads_the_roster_through_this_machines_logins() {
             answered: &answered,
             said: &said,
         };
-        super::account_usage_of(&store, roster, sid, &read, now)
+        super::account_usage_of((&a.state_root(), &store), roster, sid, &read, now)
     };
     assert_eq!(read(&file, &renewed, "s-new", now - 60), "not-listed");
     let roster = usage_roster(Some(&path), &store, (false, true), now).expect("bound");

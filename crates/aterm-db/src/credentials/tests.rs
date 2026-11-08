@@ -589,6 +589,29 @@ fn the_schema_is_closed_and_a_retry_identity_is_its_records() {
     assert!(!named(vec!["m3; rm".into()]), "a host is a machine name");
 }
 
+/// A `Retired` record takes whatever evidence and note it is handed, a person's note typed on the
+/// vault's admin Mac included: each control character is a space and each field is held to its
+/// cap, so the closed schema never refuses it.
+#[test]
+fn a_retired_record_holds_no_control_character_whatever_it_is_handed() {
+    let long = "x".repeat(MAX_NOTE + 9);
+    let record = retired_record(
+        &[7; 16],
+        Reason::Declined,
+        "a person\non the admin",
+        &format!("no\tnotary\n{long}"),
+    );
+    assert!(check(&record).is_ok(), "{record:?}");
+    let field = |name: &str| record.body.get(name).and_then(Value::as_str).unwrap();
+    assert_eq!(field("evidence"), "a person on the admin");
+    assert!(
+        field("note").starts_with("no notary x"),
+        "{}",
+        field("note")
+    );
+    assert_eq!(field("note").chars().count(), MAX_NOTE);
+}
+
 /// What a requester takes off its own request's thread beside the custodian's first decision:
 /// a `NeedsPerson` on an ask it made standing in for a silent custodian replaces that ask, a
 /// window decision whose unanswered members have each swept since restates as every member's
@@ -877,6 +900,170 @@ fn a_want_nobody_holds_goes_to_a_person_and_a_decline_retires_it_in_the_lab() {
         Some(Reason::Declined)
     );
     assert!(need::exceptions(&need::list(&lab.paths[1]).unwrap()).is_empty());
+}
+
+/// A request awaiting a person whose requester is gone, or cannot decline it there, is declined
+/// on the vault's admin Mac by the id `need ls --all` prints: one attested `declined` that keeps
+/// the person's note, which the requester takes in, its ask taken down. On the admin Mac its own
+/// request takes its table id too, and a want key its ledger names only in an ended row still
+/// reaches another Mac's request.
+/// NEGATIVE CONTROL: a member that is not the admin, and the admin while its custody does not
+/// open, refuse and say why; an open request no custodian handed to a person, and a published
+/// one, are not declined.
+#[test]
+fn a_request_awaiting_a_person_is_declined_on_the_vaults_admin_mac() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    for paths in &lab.paths {
+        need::test_alab_policy(paths);
+    }
+    let (custodian, requester) = (&lab.paths[0], &lab.paths[1]);
+    let mailbox = Want::parse("mailbox:m29").unwrap();
+    need::raise(requester, Want::Notary, Purpose::ReleaseNotary).unwrap();
+    need::raise(requester, mailbox.clone(), Purpose::ByHand).unwrap();
+    need::raise(custodian, mailbox.clone(), Purpose::HarnessSignIn).unwrap();
+    let now = 1_000_000_000;
+    assert_eq!(pass_at(requester, now).unwrap().posted, 2);
+    assert_eq!(pass_at(custodian, now).unwrap().posted, 1);
+    repair_commons(&lab, 3);
+    let threads = pass_at(custodian, now).unwrap().threads;
+    let id_of = |want: &Want, purpose| {
+        threads
+            .iter()
+            .find(|t| t.want == *want && t.purpose == purpose)
+            .unwrap()
+            .id
+    };
+    let id = id_of(&Want::Notary, Purpose::ReleaseNotary);
+    let theirs = id_of(&mailbox, Purpose::ByHand);
+    let own = id_of(&mailbox, Purpose::HarnessSignIn);
+    pass_at(requester, now).unwrap();
+    repair_commons(&lab, 3);
+    let asked = custodian_pass_at(custodian, now).unwrap().unwrap();
+    assert_eq!(asked.asked.len(), 3, "{asked:?}");
+    repair_commons(&lab, 3);
+    for paths in [requester, custodian] {
+        pass_at(paths, now).unwrap();
+        for need in need::list(paths).unwrap() {
+            assert_eq!(need.state, State::AwaitingPerson, "{}", need.line);
+        }
+    }
+    let retire = |paths: &Paths, selector: &str| {
+        let words = [
+            "retire",
+            selector,
+            "--declined",
+            "--note",
+            "no notary\nhere",
+        ];
+        cli::run(paths, &words.map(str::to_owned))
+    };
+    let live = |paths: &Paths, id: &[u8; 16]| {
+        let pass = pass_at(paths, now).unwrap();
+        pass.threads
+            .into_iter()
+            .find(|t| t.id == *id)
+            .unwrap()
+            .retired
+    };
+    let (refused, _) = retire(requester, &hex::encode_lower(&id)).unwrap_err();
+    assert!(
+        refused.contains("no need on this Mac")
+            && refused.contains("opens the vault's admin custody, which it cannot now ("),
+        "{refused}"
+    );
+    assert_eq!(
+        live(requester, &id),
+        None,
+        "a member that is not the admin writes nothing"
+    );
+    let cache = custodian.dir.join("vault");
+    let aside = custodian.dir.join("vault.aside");
+    std::fs::rename(&cache, &aside).unwrap();
+    let (shut, _) = retire(custodian, &hex::encode_lower(&id)).unwrap_err();
+    std::fs::rename(&aside, &cache).unwrap();
+    assert!(
+        shut.contains("which it cannot now (no cached admin vault)"),
+        "the admin Mac says why its custody is shut: {shut}"
+    );
+    let mine = retire(custodian, &hex::encode_lower(&own)).unwrap();
+    assert!(
+        mine.contains("mailbox:m29  retired  harness.sign-in"),
+        "its own request by its table id: {mine}"
+    );
+    let by_key = retire(custodian, "mailbox:m29").unwrap();
+    assert!(
+        by_key.contains("mailbox:m29  retired declined  by-hand"),
+        "another Mac's, past an ended row of its own: {by_key}"
+    );
+    let text = retire(custodian, &hex::encode_lower(&id)).unwrap();
+    assert!(text.contains("notary  retired declined"), "{text}");
+    repair_commons(&lab, 3);
+    assert_eq!(pass_at(requester, now).unwrap().decided, 2);
+    let needs = need::list(requester).unwrap();
+    let declined = needs.iter().find(|need| need.want == Want::Notary).unwrap();
+    assert_eq!(declined.state, State::Retired, "{}", declined.line);
+    assert!(
+        declined
+            .line
+            .starts_with("declined on the vault's admin Mac"),
+        "{}",
+        declined.line
+    );
+    assert_eq!(
+        declined
+            .retired
+            .as_ref()
+            .map(|r| (r.reason, r.note.as_str())),
+        Some((Reason::Declined, "no notary here"))
+    );
+    assert!(need::exceptions(&needs).is_empty(), "the asks are down");
+    let seen = live(requester, &id).map(|(retired, attested)| (retired.reason, attested));
+    assert_eq!(
+        seen,
+        Some((Reason::Declined, true)),
+        "the requester's replica reads it"
+    );
+    assert!(live(requester, &theirs).is_some());
+    need::raise(requester, Want::Notary, Purpose::ByHand).unwrap();
+    assert_eq!(pass_at(requester, now).unwrap().posted, 1);
+    let open = pass_at(requester, now)
+        .unwrap()
+        .threads
+        .into_iter()
+        .find(|t| t.want == Want::Notary && !t.ended())
+        .unwrap()
+        .id;
+    repair_commons(&lab, 3);
+    let (refused, _) = retire(custodian, &hex::encode_lower(&open)).unwrap_err();
+    assert!(refused.contains("awaits a person"), "{refused}");
+    assert_eq!(
+        live(custodian, &open),
+        None,
+        "an open request is not declined"
+    );
+    // Handed to a person, then published once the vault holds it: a decline by its want key
+    // passes it by.
+    let handed = custodian_pass_at(custodian, now).unwrap().unwrap();
+    assert_eq!(handed.asked, [open], "{handed:?}");
+    let admin = client::admin_open(custodian).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Hosts(vec!["m1".into()]),
+        aterm_secrets::need::catalog::NOTARY_ENTRY,
+        b"apple",
+    )
+    .unwrap();
+    client::admin_publish(custodian, &admin, &doc).unwrap();
+    client::sync(custodian, None).unwrap();
+    let given = custodian_pass_at(custodian, now).unwrap().unwrap();
+    assert_eq!(given.published.len(), 1, "{given:?}");
+    let (passed, _) = retire(custodian, "notary").unwrap_err();
+    assert!(passed.contains("awaits a person"), "{passed}");
+    assert_eq!(
+        live(custodian, &open),
+        None,
+        "a published request is not declined"
+    );
 }
 
 /// A mailbox's TOTP travels only with its password: a vault that holds the TOTP alone copies

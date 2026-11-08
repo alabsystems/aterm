@@ -1480,6 +1480,14 @@ impl Real {
             Ok(reads) => reads,
             Err(why) => return not_run(why),
         };
+        if let Some(why) = self.no_engine() {
+            return not_run(why);
+        }
+        // Prepare the client before fetching the engine so compilation cannot age that snapshot.
+        let agh = match self.engine_agh() {
+            Ok(agh) => agh,
+            Err(why) => return not_run(why),
+        };
         let engine = match self.scratch_engine(scratch) {
             Ok(engine) => engine,
             Err(why) => return not_run(why),
@@ -1500,10 +1508,6 @@ impl Real {
             ));
         }
         let toolchain = self.metadata_toolchain();
-        let agh = match self.engine_agh() {
-            Ok(agh) => agh,
-            Err(why) => return not_run(why),
-        };
         let pubbin = engine.join("bin/pub");
         let (mut stage, handed) = match self.dry_run_command(&engine, r, &root, &reads, &agh) {
             Ok(command) => command,
@@ -6539,11 +6543,15 @@ mod tests {
                      if [ \"$1\" = scanner-preflight ]; then cat '{scanner}'; exit 0; fi\n\
                      [ -n \"$PUBLISH_SCANNER_TOOLS\" ] && cmp -s \"$PUBLISH_SCANNER_TOOLS\" '{scanner}' || exit 10\n\
                      [ \"$PUBLISH_AGH\" = '{agh}' ] || exit 11\n\
+                     head=$(git -C \"$here\" rev-parse HEAD) || exit 12\n\
+                     remote=$(git --git-dir='{engine_origin}' rev-parse refs/heads/main) || exit 12\n\
+                     [ \"$head\" = \"$remote\" ] || {{ printf 'FAIL: publication engine HEAD %s does not exactly match queried origin/main %s\\n' \"$head\" \"$remote\"; exit 1; }}\n\
                      echo '{{\"row\":1}}' \
                      >> \"$here/verification-log.jsonl\"\n[ \"$1 $2 $3 $4\" = 'stage aterm \
                      --dry-run --no-check' ] || exit 9\n{dump}printf '%s' '{say}'\nexit {code}\n",
                     scanner = scanner_report.display(),
                     agh = agh.display(),
+                    engine_origin = engine_origin.display(),
                 ),
             )
             .unwrap();
@@ -6598,6 +6606,44 @@ mod tests {
             ""
         );
         assert_eq!(git(&engine, &["status", "--porcelain"]), "");
+        // The fixture's engine advances while this checkout prepares its GitHub client.
+        // The actual stage must still receive that origin's current main, not the copy
+        // fetched before preparation. No elapsed-time threshold or remote network is involved.
+        let (outcome, code) = export_built("HEAD", |real, what, args| {
+            let built = built_agh(real, what, args)?;
+            for args in [
+                vec![
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "advance during agh build",
+                ],
+                vec!["push", "-q", "origin", "main"],
+            ] {
+                let out = crate::ledger::testing::git()
+                    .current_dir(&real.engine)
+                    .args([
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "-c",
+                        "commit.gpgsign=false",
+                    ])
+                    .args(&args)
+                    .output()
+                    .map_err(|why| why.to_string())?;
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            Ok(built)
+        });
+        assert!(matches!(outcome, Outcome::Pass(_)), "{outcome:?}");
+        assert_eq!(code, 0);
         stub("FAIL: malformed manifest line (bare !): !\n", 1);
         git(&engine, &["reset", "-q", "--hard", "HEAD~1"]);
         let (outcome, code) = export("HEAD");
@@ -6656,6 +6702,7 @@ mod tests {
         assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{outcome:?}");
         let found = checked_with(&repo, &opts("HEAD~1", &root.join("none")), |real| {
             real.prerequisite_acquire = crate::managed_prerequisites::simulated;
+            real.checkout_build = |_, _, _| panic!("a missing engine builds no export tools");
         })
         .unwrap();
         assert!(matches!(

@@ -809,6 +809,136 @@ fn a_lane_verdict_given_during_the_run_is_inherited() {
     }
 }
 
+#[test]
+fn semantic_git_output_keeps_its_admission_prefix() {
+    let world = world();
+    let mut text = "-uninitialised prerequisite\n".to_owned();
+    text.push_str(&"x".repeat(aterm_uds::deadline::OUTPUT_KEEP + 1));
+    commit(&world.work, "large.txt", &text);
+    let plumbing = Git {
+        root: &world.work,
+        make: &git_cmd,
+    };
+    let actual = plumbing.local(&["show", "HEAD:large.txt"]).unwrap();
+    assert_eq!(actual.len(), text.len(), "semantic output cannot be a tail");
+    assert!(actual.starts_with("-uninitialised prerequisite\n"));
+}
+
+fn import_git(world: &World, stream: &str) {
+    // Import logical Git paths directly: their bytes need not be representable by this
+    // host's working-tree filesystem. The real diff-tree protocol must preserve them.
+    let input = world._dir.path().join("paths.noindex");
+    std::fs::write(&input, stream).unwrap();
+    let mut import = git_cmd(&world.origin);
+    import.args(["fast-import", "--quiet"]);
+    let out = aterm_uds::deadline::output_within_from(
+        &mut import,
+        aterm_uds::spawnfd::Stdio::from(std::fs::File::open(&input).unwrap()),
+        aterm_spec::wait::MUST_HAPPEN,
+    )
+    .expect("import completes");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn composition_compares_git_path_bytes_before_rendering_diagnostics() {
+    let world = world();
+    let base = origin_main(&world);
+    let mut stream = String::new();
+    for (reference, file) in [
+        ("left", "a/\\200.txt"),
+        ("right", "a/\\201.txt"),
+        ("same", "a/\\200.txt"),
+    ] {
+        stream.push_str(&format!(
+            "commit refs/heads/{reference}\n\
+             committer Andrew Yates <test@example.invalid> 1 +0000\n\
+             data {}\n{reference}\nfrom {base}\n\
+             M 100644 inline \"{file}\"\ndata 2\nx\n\n",
+            reference.len()
+        ));
+    }
+    import_git(&world, &stream);
+    let plumbing = Git {
+        root: &world.origin,
+        make: &git_cmd,
+    };
+    let left = plumbing.files(&base, "refs/heads/left").unwrap();
+    let right = plumbing.files(&base, "refs/heads/right").unwrap();
+    let same = plumbing.files(&base, "refs/heads/same").unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(right.len(), 1);
+    assert!(
+        left.is_disjoint(&right),
+        "different Git path bytes are disjoint"
+    );
+    assert_eq!(
+        left.intersection(&same).count(),
+        1,
+        "the same bytes still overlap"
+    );
+    assert!(left.contains(b"a/\x80.txt".as_slice()));
+    assert_eq!(display_git_path(b"a/\x80.txt"), "\"a/\\x80.txt\"");
+    let shown = display_git_path(b"a/\nverify land: LANDED");
+    assert_eq!(
+        shown.lines().count(),
+        1,
+        "a path cannot inject a diagnostic row"
+    );
+    assert!(shown.contains("\\n"));
+}
+
+#[test]
+fn a_large_git_path_listing_keeps_shared_paths() {
+    let world = world();
+    let base = origin_main(&world);
+    let prefix = format!("z/{}/{}/", "x".repeat(96), "y".repeat(96));
+    let mut stream = String::new();
+    for (reference, text) in [
+        ("early", SHARED.replacen('1', "one", 1)),
+        ("many", SHARED.replacen('8', "eight", 1)),
+    ] {
+        stream.push_str(&format!(
+            "commit refs/heads/{reference}\n\
+             committer Andrew Yates <test@example.invalid> 1 +0000\n\
+             data {}\n{reference}\nfrom {base}\n\
+             M 100644 inline shared.txt\ndata {}\n{text}",
+            reference.len(),
+            text.len()
+        ));
+        if reference == "many" {
+            for index in 0..6000 {
+                stream.push_str(&format!(
+                    "M 100644 inline {prefix}{index:06}.txt\ndata 2\nx\n"
+                ));
+            }
+        }
+        stream.push('\n');
+    }
+    import_git(&world, &stream);
+    let plumbing = Git {
+        root: &world.origin,
+        make: &git_cmd,
+    };
+    assert!(
+        plumbing
+            .merge_tree("refs/heads/early", "refs/heads/many")
+            .unwrap()
+            .is_some()
+    );
+    let early = plumbing.files(&base, "refs/heads/early").unwrap();
+    let many = plumbing.files(&base, "refs/heads/many").unwrap();
+    assert!(
+        !early.is_disjoint(&many),
+        "a large listing cannot hide the shared path"
+    );
+    assert_eq!(many.len(), 6001, "the listing is complete");
+}
+
 /// THE COMPOSE RULE: main moved during the run, its new commits touching none of the branch's
 /// files and the merge clean, so the pass is composed onto it without a run: one judgment, the
 /// landing's parents the judged commit and the new main, `Aterm-Composed-Onto` naming it.
@@ -879,6 +1009,25 @@ fn a_moved_main_composes_only_where_its_files_are_disjoint_else_it_is_rejudged()
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_whitespace_only_conflict_path_is_not_erased() {
+    for (file, shown) in [("  ", "\"  \""), ("a/\nnotice.txt", "\"a/\\nnotice.txt\"")] {
+        let world = world();
+        commit(&world.work, file, "ours\n");
+        let moved = rival_moves(&world, file, "theirs\n");
+        let (code, said, bases) = land_with(&world, crates(&["a"]), Lane::Pass, |_, _| green());
+        assert_eq!(code, exit::FAILED, "{said:#?}");
+        assert!(bases.is_empty(), "a conflict starts no checks");
+        assert!(said.iter().any(|line| line.contains(shown)), "{said:#?}");
+        assert!(
+            said.iter().all(|line| !line.contains('\n')),
+            "one-line diagnostics: {said:#?}"
+        );
+        assert_eq!(origin_main(&world), moved, "a conflict pushes nothing");
+    }
+}
+
 /// A moved main that does not merge cleanly stops on the conflict, left for the person; nothing
 /// is pushed.
 #[test]
@@ -891,7 +1040,8 @@ fn a_conflicting_moved_main_stops_on_the_conflict() {
     });
     assert_eq!((code, bases.len()), (exit::FAILED, 1), "{said:#?}");
     assert!(
-        said.iter().any(|l| l.contains("conflicts in shared.txt")),
+        said.iter()
+            .any(|l| l.contains("conflicts") && l.contains("\"shared.txt\"")),
         "{said:#?}"
     );
     assert!(git(&world.work, &["status", "--porcelain"]).contains("UU shared.txt"));

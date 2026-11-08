@@ -21,9 +21,9 @@ use crate::stats_gauge::{self as gauge, Gauge, GaugeInks};
 use crate::stats_live::{self as live, DeckLive, LiveLayer};
 use crate::stats_paint::{Bar, Hit, Instrument, Painter, Rect, StatsMark, WellMark, panel};
 use crate::stats_plan::{
-    self as plan, BOX_GAP, BlockKind, BlockPlan, Cluster, Col, CoresAt, CoresMode, DeckForm,
-    DeckSizePref, FOLD_GAUGE_R, FoldedGauge, FullKind, FullPlan, HeaderPlan, HeaderText, KeyItem,
-    Label, Meter, Rows, StateLabel, Strip,
+    self as plan, BOX_GAP, BlockKind, BlockPlan, Cluster, Col, CoresMode, DeckForm, DeckRows,
+    DeckSizePref, FOLD_GAUGE_R, FoldedGauge, FullKind, FullPlan, GaugeSlot, HeaderPlan, HeaderText,
+    KeyItem, Label, Meter, Rows, StateLabel, Strip,
 };
 use crate::stats_skyline::{self as skyline, BoxValue, Skyline};
 use crate::stats_steam as steam;
@@ -35,12 +35,9 @@ use crate::widget::{DrawPrim, TextFace, TextWeight, rgba, text_prim};
 const SLOT_TOP: f64 = 4.0;
 const SLOT_FOOT: f64 = 6.0;
 
-/// The Folded deck's height in points (124 device px at 2×, 62 at 1×): two blocks of four rows.
-pub(crate) const FOLDED_PT: f64 = 62.0;
-
-/// The Full table's height in points, before what it adds to the Folded height is rounded up
-/// to whole terminal cells.
-pub(crate) const FULL_TABLE_PT: f64 = 100.0;
+/// The Folded deck's height in points (124 device px at 2×, 62 at 1×): two blocks of the rows it
+/// paints ([`DeckRows::PAINTED`]), four each until A4's step N5 paints five (73.5 pt).
+pub(crate) const FOLDED_PT: f64 = DeckRows::PAINTED.folded_pt();
 
 /// Which form the stats bars take (`[sys] stats_bars`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,7 +111,7 @@ pub(crate) fn deck_px(form: StatsBars, deck: DeckForm, scale: f64, cell_px: usiz
     let folded = (FOLDED_PT * scale).round() as usize;
     match deck {
         DeckForm::Folded => folded,
-        DeckForm::Full => folded + crate::stats_plan::full_delta_px(scale, cell_px),
+        DeckForm::Full => folded + DeckRows::PAINTED.full_delta_px(scale, cell_px),
     }
 }
 
@@ -2808,39 +2805,37 @@ impl<'a> Deck<'a> {
             .collect();
         let last = rows.top(DECK_RESOURCES.len() as u32 - 1) + rows.cell;
         let mut cores_row_hit = None;
-        match plan.cores {
-            CoresAt::Block { at, divider } => {
-                self.gauge(at, &rows, words);
-                let w = (0.5 * self.s).round().max(1.0) as f32;
-                let (y0, y1) = (self.px(SLOT_TOP), self.px(self.h_pt - SLOT_FOOT));
-                let grid = self.inks.grid;
-                self.rect((self.px(divider), y0, w, y1 - y0), 0.0, grid);
-                if !words.reading {
-                    let rect = self.px_rect(at.x, 0.0, at.end(), self.h_pt - 6.0);
-                    self.hits_first.push(Hit::cores(rect));
-                }
+        if let Some(GaugeSlot { at, divider }) = plan.gauge {
+            self.gauge(at, &rows, words);
+            let w = (0.5 * self.s).round().max(1.0) as f32;
+            let (y0, y1) = (self.px(SLOT_TOP), self.px(self.h_pt - SLOT_FOOT));
+            let grid = self.inks.grid;
+            self.rect((self.px(divider), y0, w, y1 - y0), 0.0, grid);
+            if !words.reading {
+                let rect = self.px_rect(at.x, 0.0, at.end(), self.h_pt - 6.0);
+                self.hits_first.push(Hit::cores(rect));
             }
-            CoresAt::Row(room) => {
-                let r = DECK_RESOURCES.len() as u32;
-                let top = rows.top(r);
-                let ink = self.inks.words;
-                self.text(
-                    plan.name.x,
-                    top + rows.baseline,
-                    CORES_NAME.into(),
-                    rows.name_pt,
-                    true,
-                    ink,
-                    Some((plan.name.x, plan.name.end())),
-                );
-                let mode = plan
-                    .cores_mode(&words.clusters(), self.m)
-                    .unwrap_or(CoresMode::CountOnly);
-                self.cores_row(room, top, rows.cell, mode, SMALL_PT, words);
-                if !words.reading {
-                    let (y0, y1) = t.band(r);
-                    cores_row_hit = Some(self.px_rect(plan.name.x, y0, room.end(), y1));
-                }
+        }
+        if let Some(room) = plan.cores {
+            let r = DECK_RESOURCES.len() as u32;
+            let top = rows.top(r);
+            let ink = self.inks.words;
+            self.text(
+                plan.name.x,
+                top + rows.baseline,
+                CORES_NAME.into(),
+                rows.name_pt,
+                true,
+                ink,
+                Some((plan.name.x, plan.name.end())),
+            );
+            let mode = plan
+                .cores_mode(&words.clusters(), self.m)
+                .unwrap_or(CoresMode::CountOnly);
+            self.cores_row(room, top, rows.cell, mode, SMALL_PT, words);
+            if !words.reading {
+                let (y0, y1) = t.band(r);
+                cores_row_hit = Some(self.px_rect(plan.name.x, y0, room.end(), y1));
             }
         }
         if let Some(bar) = plan.meter.bar {

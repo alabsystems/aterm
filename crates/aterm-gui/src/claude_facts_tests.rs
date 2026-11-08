@@ -230,7 +230,12 @@ fn a_reader_hears_each_fact_in_words() {
 
 /// AN ACCOUNT WITH NO WEEKLY FIGURE says why in its title, in the footer's own words
 /// (`profile::WeeklyGap::words`), and to a reader in full (`WeeklyGap::spoken`, no glyph); a
-/// figure, where there is one, says the week instead, its age after a comma.
+/// figure, where there is one, says the week instead, a lower bound read `at least`. A pane with
+/// no quota view (agy, Muse Code, a roster not read) names the account as line D's unit does,
+/// `this login` for a login the roster cannot name, its roster label where it has one, and never
+/// its email (design §2.5: the title is painted in line D's lights block, on the glass).
+/// NEGATIVE CONTROL: the profile does name the email, which the title said before (`⎆
+/// owner@example.com · Max 20x · …`).
 #[test]
 fn an_account_with_no_weekly_figure_names_why_in_its_title_and_to_a_reader() {
     use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyGap};
@@ -250,45 +255,71 @@ fn an_account_with_no_weekly_figure_names_why_in_its_title_and_to_a_reader() {
             fact_spoken_of(facts, None, Fact::Account, FactMask::default()).0,
         )
     };
+    assert_eq!(
+        with(None).subscription.and_then(|sub| sub.email).as_deref(),
+        Some("owner@example.com"),
+        "NEGATIVE CONTROL: the profile names the email"
+    );
     let (title, spoken) = said(&with(None));
     assert!(
-        title.contains("weekly \u{2013} \u{b7} until relaunch"),
+        title.starts_with("\u{2386} this login \u{b7} Max 20x \u{b7} ")
+            && title.contains("weekly \u{2013} \u{b7} until relaunch"),
         "{title}"
     );
     assert_eq!(
         spoken,
-        "Account: owner@example.com, Max 20x, weekly figure unknown until aterm next relaunches this Claude Code"
+        "Account: this login, Max 20x, weekly figure unknown until aterm next relaunches this Claude Code"
     );
-    let (title, spoken) = said(&with(Some("weekly 62% left")));
+    let (title, spoken) = said(&with(Some("weekly 38% used")));
     assert!(
-        title.contains("weekly 62% left") && !title.contains("until relaunch"),
+        title.contains("weekly 38% used") && !title.contains("until relaunch"),
         "{title}"
     );
+    assert_eq!(spoken, "Account: this login, Max 20x, weekly 38% used");
+    let (title, spoken) = said(&with(Some("weekly \u{2265}38% used")));
+    assert!(title.contains("weekly \u{2265}38% used"), "{title}");
     assert_eq!(
         spoken,
-        "Account: owner@example.com, Max 20x, weekly 62% left"
+        "Account: this login, Max 20x, weekly at least 38% used"
     );
-    let (title, spoken) = said(&with(Some("weekly 62% left \u{b7} 40m ago")));
-    assert!(title.contains("weekly 62% left \u{b7} 40m ago"), "{title}");
-    assert_eq!(
-        spoken,
-        "Account: owner@example.com, Max 20x, weekly 62% left, 40m ago"
+    let labelled = FooterFacts {
+        account: Some("main".into()),
+        ..with(Some("weekly 38% used"))
+    };
+    let (title, spoken) = said(&labelled);
+    assert!(
+        title.starts_with("\u{2386} main \u{b7} Max 20x \u{b7} weekly 38% used"),
+        "{title}"
     );
+    assert_eq!(spoken, "Account: main, Max 20x, weekly 38% used");
+    for facts in [with(None), with(Some("weekly 38% used")), labelled] {
+        let (title, spoken) = said(&facts);
+        for words in [&title, &spoken] {
+            assert!(!words.contains("owner@example.com"), "{words}");
+            assert!(!words.contains("owner"), "no local part: {words}");
+        }
+    }
 }
 
+/// A WATCHING ROTATION IS SAID LAST, where accounts are (design §5.1): the account's title and
+/// speech say the observed week, or why there is none, then the rotation's words, and line D's
+/// unit is the same with or without them. Negative control: the rotation said first (the
+/// pre-S5 recovery lead) fails the order.
 #[test]
-fn a_watching_inventory_keeps_the_observed_week_or_its_missing_reading_reason() {
+fn a_watching_rotation_follows_the_observed_week_or_its_missing_reading_reason() {
     use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
-    use aterm_agent::harness::footer::{WEEKLY_MARK, account_progress_text, segments};
+    use aterm_agent::harness::footer::{account_unit, rotation_words};
     use aterm_agent::harness::profile::{SubscriptionDisplay, WeeklyGap};
 
     for (known, eligible) in [(Some(2), Some(1)), (Some(2), None), (None, None)] {
-        for weekly in [Some("weekly 62% left"), None] {
+        for weekly in [Some("weekly 38% used"), None] {
             let mut progress = AccountProgress::unknown(100);
             progress.phase = ProgressPhase::Watching;
             progress.known = known;
             progress.eligible = eligible;
-            let inventory = account_progress_text(&progress, false);
+            // No check is due, so the words read no clock.
+            let rotation = rotation_words(&progress, |_| String::new());
+            let spoken_rotation = format!("R{}", &rotation[1..]);
             let facts = FooterFacts {
                 subscription: Some(SubscriptionDisplay {
                     email: Some("owner@example.test".into()),
@@ -305,24 +336,43 @@ fn a_watching_inventory_keeps_the_observed_week_or_its_missing_reading_reason() 
             without_progress.account_progress = None;
             let title = fact_title(&facts, None, Fact::Account).0;
             let spoken = fact_spoken_of(&facts, None, Fact::Account, FactMask::default()).0;
-            for (said, observation) in [
-                (&title, weekly.unwrap_or(WeeklyGap::Untapped.words())),
-                (&spoken, weekly.unwrap_or(WeeklyGap::Untapped.spoken())),
+            for (said, rotation, observation) in [
+                (
+                    &title,
+                    &rotation,
+                    weekly.unwrap_or(WeeklyGap::Untapped.words()),
+                ),
+                (
+                    &spoken,
+                    &spoken_rotation,
+                    weekly.unwrap_or(WeeklyGap::Untapped.spoken()),
+                ),
             ] {
-                let recovery_at = said.find(&inventory).expect("recovery inventory retained");
+                let rotation_at = said.find(rotation.as_str()).expect("the rotation's words");
                 let quota_at = said
                     .find(observation)
                     .expect("observed quota or reason retained");
-                assert!(recovery_at < quota_at, "recovery leads: {said}");
-                assert!(said.contains("owner@example.test"));
+                assert!(quota_at < rotation_at, "the rotation is said last: {said}");
+                assert!(
+                    !said.contains("owner@example.test") && said.contains("this login"),
+                    "line D's unit's name, never the email: {said}"
+                );
             }
-            let week = |facts: &FooterFacts| {
-                segments(facts)
-                    .into_iter()
-                    .find(|segment| segment.mark == WEEKLY_MARK)
-            };
-            assert_eq!(week(&facts), week(&without_progress));
-            assert_eq!(week(&facts).is_some(), weekly.is_some());
+            assert!(
+                title.ends_with(&format!("{rotation} \u{b7} click: accounts")),
+                "the rotation is the last clause before the click's: {title}"
+            );
+            assert_eq!(
+                account_unit(&facts),
+                account_unit(&without_progress),
+                "line D says no rotation"
+            );
+            assert_eq!(
+                account_unit(&facts)
+                    .first()
+                    .is_some_and(|form| form.iter().any(|segment| segment.text == "38%")),
+                weekly.is_some()
+            );
             assert_eq!(
                 facts, before,
                 "disclosures read the same retained observation"
@@ -331,13 +381,29 @@ fn a_watching_inventory_keeps_the_observed_week_or_its_missing_reading_reason() 
     }
 }
 
+/// A view whose title and speech say `words`, as the resolver's projected (`quota`) or
+/// observed (`quota_observed`) view does.
+fn view_saying(words: &str) -> aterm_agent::harness::quota_view::QuotaView {
+    use aterm_agent::harness::quota_view::{CLICK, QuotaView};
+    QuotaView {
+        title: format!("main \u{b7} {words} \u{b7} {CLICK}"),
+        spoken: format!("Accounts. main, {words}."),
+        ..QuotaView::sample()
+    }
+}
+
+/// EVERY RECOVERY PHASE SAYS THE OBSERVATION, THEN THE ROTATION (design §5.1): whatever the
+/// phase, a busy read or a transcript wall, the account's title and speech say the quota view's
+/// words (its observations alone while the recovery refuses forecasts) and end with the
+/// rotation's; a transcript wall leads them. Negative control: a recovery that refuses
+/// forecasts handed the projected view says the synthetic movement.
 #[test]
-fn recovery_work_limits_and_busy_reads_keep_their_existing_disclosure_priority() {
+fn every_recovery_phase_says_the_observation_then_the_rotation() {
     use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
-    use aterm_agent::harness::outlook::Glance;
     use aterm_agent::harness::profile::SubscriptionDisplay;
     use aterm_agent::harness::session_usage::Wall;
 
+    let (future, observed) = ("synthetic future movement", "38% of its week used");
     for (phase, busy, transcript_wall) in [
         (ProgressPhase::Unknown, false, false),
         (ProgressPhase::Waiting, false, false),
@@ -364,7 +430,7 @@ fn recovery_work_limits_and_busy_reads_keep_their_existing_disclosure_priority()
         let facts = FooterFacts {
             subscription: Some(SubscriptionDisplay {
                 email: Some("owner@example.test".into()),
-                weekly: Some("weekly 62% left".into()),
+                weekly: Some("weekly 38% used".into()),
                 ..Default::default()
             }),
             account_progress: Some(progress),
@@ -376,11 +442,8 @@ fn recovery_work_limits_and_busy_reads_keep_their_existing_disclosure_priority()
                 }),
                 ..Default::default()
             }),
-            glance: Some(Glance {
-                title_verdict: Some("synthetic future movement".into()),
-                spoken: Some("synthetic future movement".into()),
-                ..Default::default()
-            }),
+            quota: Some(view_saying(future)),
+            quota_observed: Some(view_saying(observed)),
             ..facts()
         };
         let view = facts.account_progress_view().expect("recovery observation");
@@ -393,32 +456,51 @@ fn recovery_work_limits_and_busy_reads_keep_their_existing_disclosure_priority()
             assert_eq!(view.phase, ProgressPhase::Waiting);
             assert!(view.wall.is_some());
         }
-        let mut recovery_only = facts.clone();
-        recovery_only.subscription = None;
-        recovery_only.glance = None;
-        recovery_only.account = None;
-        assert_eq!(
-            fact_title(&facts, None, Fact::Account),
-            fact_title(&recovery_only, None, Fact::Account),
+        let refused = facts.account_forecast_refusal().is_some();
+        let what = format!(
             "{:?}, busy={busy}, transcript_wall={transcript_wall}",
-            view.phase,
+            view.phase
+        );
+        let title = fact_title(&facts, None, Fact::Account).0;
+        let spoken = fact_spoken_of(&facts, None, Fact::Account, FactMask::default()).0;
+        assert_eq!(
+            title.starts_with("limit until Thu 09:00 \u{b7} "),
+            transcript_wall,
+            "{what}: {title}"
         );
         assert_eq!(
-            fact_spoken_of(&facts, None, Fact::Account, FactMask::default()),
-            fact_spoken_of(&recovery_only, None, Fact::Account, FactMask::default()),
-            "{:?}, busy={busy}, transcript_wall={transcript_wall}",
-            view.phase,
+            spoken.starts_with("Account: Usage limit until Thu 09:00. "),
+            transcript_wall,
+            "{what}: {spoken}"
+        );
+        for (said, rotation) in [(&title, "rotation: "), (&spoken, "Rotation: ")] {
+            let shown = if refused { observed } else { future };
+            let unshown = if refused { future } else { observed };
+            let quota_at = said.find(shown).unwrap_or_else(|| panic!("{what}: {said}"));
+            let rotation_at = said
+                .find(rotation)
+                .unwrap_or_else(|| panic!("{what}: {said}"));
+            assert!(quota_at < rotation_at, "{what}: the rotation last: {said}");
+            assert!(!said.contains(unshown), "{what}: {said}");
+        }
+        assert!(
+            title.ends_with(" \u{b7} click: accounts"),
+            "{what}: {title}"
         );
     }
 }
 
+/// A PANE WITH NO PROFILE SAYS ITS ROSTER LABEL ALONE: while the profile is present the
+/// account's words are its quota view's, its movement unsaid while the recovery is paused; a
+/// transient profile miss keeps the view as history and says none of it, nor the email, under
+/// the label the pane last named. Negative control: the view read without the profile check
+/// (`facts.quota_view()`) says the old movement.
 #[test]
-fn watching_disclosures_use_the_panes_glance_without_inventing_a_profile() {
+fn watching_disclosures_use_the_panes_quota_view_without_inventing_a_profile() {
     use aterm_agent::harness::account_progress::{AccountProgress, ProgressPhase};
-    use aterm_agent::harness::outlook::Glance;
     use aterm_agent::harness::profile::SubscriptionDisplay;
 
-    let future = "synthetic future movement";
+    let (future, observed) = ("synthetic future movement", "38% of its week used");
     for paused in [false, true] {
         let mut progress = AccountProgress::unknown(100);
         progress.phase = ProgressPhase::Watching;
@@ -427,29 +509,24 @@ fn watching_disclosures_use_the_panes_glance_without_inventing_a_profile() {
         let mut facts = FooterFacts {
             subscription: Some(SubscriptionDisplay {
                 email: Some("owner@example.test".into()),
-                weekly: Some("weekly 62% left".into()),
+                weekly: Some("weekly 38% used".into()),
                 ..Default::default()
             }),
             account_progress: Some(progress),
-            glance: Some(Glance {
-                reset: Some("Thu 09:00".into()),
-                five: Some("5h 62% left".into()),
-                title_verdict: Some(future.into()),
-                spoken: Some(future.into()),
-                ..Default::default()
-            }),
+            quota: Some(view_saying(&format!("{observed} \u{b7} {future}"))),
+            quota_observed: Some(view_saying(observed)),
             ..facts()
         };
         for said in [
             fact_title(&facts, None, Fact::Account).0,
             fact_spoken_of(&facts, None, Fact::Account, FactMask::default()).0,
         ] {
-            assert!(said.contains("weekly 62% left"), "{said}");
+            assert!(said.contains(observed), "{said}");
             assert_eq!(said.contains(future), !paused, "{said}");
         }
         facts.subscription = None;
         facts.account = Some("retained-login".into());
-        let retained_glance = facts.glance.clone();
+        let retained = (facts.quota.clone(), facts.quota_observed.clone());
         for with_progress in [true, false] {
             if !with_progress {
                 facts.account_progress = None;
@@ -459,19 +536,20 @@ fn watching_disclosures_use_the_panes_glance_without_inventing_a_profile() {
                 fact_spoken_of(&facts, None, Fact::Account, FactMask::default()).0,
             ] {
                 assert!(said.contains("retained-login"), "{said}");
-                for absent in [
-                    "owner@example.test",
-                    "weekly 62% left",
-                    "Thu 09:00",
-                    "5h 62% left",
-                    future,
-                ] {
+                for absent in ["owner@example.test", "weekly 38% used", observed, future] {
                     assert!(!said.contains(absent), "{said}");
                 }
             }
             assert_eq!(
-                facts.glance, retained_glance,
+                (facts.quota.clone(), facts.quota_observed.clone()),
+                retained,
                 "raw history remains retained"
+            );
+            assert!(
+                facts
+                    .quota_view()
+                    .is_some_and(|view| view.title.contains(observed)),
+                "CONTROL: the retained view still says its words"
             );
         }
     }

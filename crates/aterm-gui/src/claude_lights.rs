@@ -732,7 +732,9 @@ pub(crate) enum Fact {
     Context,
     /// `Σ 6m33s ↑20M ↓82k`.
     Usage,
-    /// `⎆ sol-m27@example.test · max 20x · weekly 61% left`, one unit.
+    /// The account: line E's quota row, in three parts ([`RowPart`]), or where line E is not the
+    /// glass's, line D's fallback unit (`⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 05:00`), one
+    /// unit.
     Account,
 }
 
@@ -909,6 +911,21 @@ pub(crate) struct FactHit {
     pub(crate) fact: Fact,
     /// What a click on it shows again.
     pub(crate) restores: FactMask,
+    /// Which part of line E's quota row it is (`crate::claude_footer::quota`); `None` for a fact
+    /// of a rule.
+    pub(crate) part: Option<RowPart>,
+}
+
+/// A part of line E's quota row (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.6): the
+/// row is one [`Fact::Account`] in three hits, whose chart names the column under the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RowPart {
+    /// The named accounts and their figures.
+    Lead,
+    /// The chart, laid at this many cells a day; its first cell is the hit's first column.
+    Chart(u8),
+    /// The tail's phrases.
+    Tail,
 }
 
 /// Where a rule's title slot landed.
@@ -1027,6 +1044,9 @@ pub(crate) struct WindowLights {
     cursor_owed: bool,
     /// The facts on the glass.
     pub(crate) fact_hits: Vec<FactHit>,
+    /// The quota row's chart column the pointer rests on: its session, the chart's cells a day
+    /// and the cell ([`RowPart::Chart`]), whose span the account's title names (§2.6).
+    pub(crate) quota_column: Option<(u64, u8, usize)>,
     /// The fact titles someone reads here (hovered or selected).
     fact_readings: Vec<FactReading>,
     /// The agents panel's titles.
@@ -1372,7 +1392,7 @@ impl WindowLights {
         }
         self.fact_hits.len().hash(&mut h);
         for f in &self.fact_hits {
-            (f.frame_row, f.term_row, f.cols, f.session, f.fact).hash(&mut h);
+            (f.frame_row, f.term_row, f.cols, f.session, f.fact, f.part).hash(&mut h);
         }
         self.mark_hits.len().hash(&mut h);
         for m in &self.mark_hits {
@@ -1416,6 +1436,7 @@ impl WindowLights {
         }
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.hover.hash(&mut h);
+        self.quota_column.hash(&mut h);
         self.selected.hash(&mut h);
         active.sort_by_key(|(id, _)| **id);
         for (id, s) in active {
@@ -1491,6 +1512,16 @@ impl WindowLights {
             self.fact_readings
                 .retain(|r| reading.contains(&Some((r.session, Target::Fact(r.fact)))));
         }
+    }
+
+    /// The whole title someone reads of `session`'s `fact` here, as
+    /// [`App::note_fact_readings`] last built it.
+    #[cfg(test)]
+    pub(crate) fn fact_reading(&self, session: u64, fact: Fact) -> Option<&str> {
+        self.fact_readings
+            .iter()
+            .find(|r| r.session == session && r.fact == fact)
+            .map(|r| r.whole.as_str())
     }
 
     /// The fact the pointer or the keyboard is on in `session`'s rule, the keyboard's first.
@@ -4071,6 +4102,7 @@ impl App {
                 | ws.claude_lights.switch_hover.take().is_some()
                 | ws.claude_lights.part_hover.take().is_some()
                 | ws.claude_lights.mark_hover.take().is_some()
+                | ws.claude_lights.quota_column.take().is_some()
                 | ws.claude_lights.glass_hover_px.take().is_some())
         {
             redraw(ws);
@@ -4198,6 +4230,9 @@ impl App {
             at.and_then(|(session, glass)| matches!(glass, GlassAt::Switch(_)).then_some(session));
         let part = at.and_then(|(session, glass)| Some((session, part_of(glass)?)));
         let mark = at.and_then(|(session, glass)| (glass == GlassAt::Mark).then_some(session));
+        let column = over
+            .filter(|(_, t)| *t == Target::Fact(Fact::Account))
+            .and_then(|_| self.quota_column_at(wid, x, y));
         let Some(ws) = self.windows.get_mut(&wid) else {
             return OverChips::No;
         };
@@ -4210,8 +4245,10 @@ impl App {
             || ws.claude_lights.switch_hover != switch
             || ws.claude_lights.part_hover != part
             || ws.claude_lights.mark_hover != mark
+            || ws.claude_lights.quota_column != column
         {
             ws.claude_lights.hover = over;
+            ws.claude_lights.quota_column = column;
             ws.claude_lights.switch_hover = switch;
             ws.claude_lights.part_hover = part;
             ws.claude_lights.mark_hover = mark;
@@ -4277,7 +4314,25 @@ impl App {
             .map(|m| (m.session, GlassAt::Mark))
     }
 
-    /// Build again every fact title someone reads in window `wid` (hovered or selected).
+    /// The quota row's chart column under window pixel `(x, y)` ([`RowPart::Chart`]): its
+    /// session, the chart's cells a day and the cell.
+    fn quota_column_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, u8, usize)> {
+        let (row, col) = self.glass_cell_at(wid, x, y)?;
+        self.windows
+            .get(&wid)?
+            .claude_lights
+            .fact_hits
+            .iter()
+            .find(|h| h.frame_row == row && (h.cols.0..h.cols.1).contains(&col))
+            .and_then(|h| match h.part {
+                Some(RowPart::Chart(per_day)) => Some((h.session, per_day, col - h.cols.0)),
+                _ => None,
+            })
+    }
+
+    /// Build again every fact title someone reads in window `wid` (hovered or selected). The
+    /// pointer on a column of the quota row's chart reads that column's title
+    /// ([`App::quota_column_title`]), the row's own where the column names no time.
     pub(crate) fn note_fact_readings(&mut self, wid: WindowId) {
         let Some(ws) = self.windows.get(&wid) else {
             return;
@@ -4287,9 +4342,20 @@ impl App {
             .flatten()
             .filter_map(|(session, t)| Some((session, t.fact()?)))
             .collect();
+        let (hover, column) = (ws.claude_lights.hover, ws.claude_lights.quota_column);
         let built: Vec<(u64, Fact, (String, String))> = focus
             .into_iter()
-            .map(|(session, fact)| (session, fact, self.fact_title(session, fact)))
+            .map(|(session, fact)| {
+                let (whole, short) = self.fact_title(session, fact);
+                let whole = column
+                    .filter(|&(s, ..)| {
+                        s == session && hover == Some((session, Target::Fact(Fact::Account)))
+                    })
+                    .filter(|_| fact == Fact::Account)
+                    .and_then(|(_, per_day, cell)| self.quota_column_title(session, per_day, cell))
+                    .unwrap_or(whole);
+                (session, fact, (whole, short))
+            })
             .collect();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -5521,6 +5587,32 @@ impl App {
                 continue;
             };
             if self.chrome_owns_terminal_row(wid, hit.term_row) {
+                continue;
+            }
+            // Line E is one chip over its parts, the row's words its name (glass design §2.6).
+            if hit.part.is_some() {
+                let parts = ws.claude_lights.fact_hits.iter().filter(|h| {
+                    h.part.is_some() && h.session == hit.session && h.frame_row == hit.frame_row
+                });
+                if parts.clone().any(|h| h.cols.0 < hit.cols.0) {
+                    continue;
+                }
+                let end = parts.map(|h| h.cols.1).max().unwrap_or(hit.cols.1);
+                let (_, description) = self.fact_spoken(hit.session, hit.fact, hit.restores);
+                let label = self
+                    .shown_facts(hit.session)
+                    .and_then(|(facts, _)| Some(facts.quota_view()?.spoken.clone()))
+                    .unwrap_or_default();
+                chips.push(GridChip {
+                    session: hit.session,
+                    chip: HarnessChip::of_fact(hit.fact),
+                    label,
+                    description: (!description.is_empty()).then_some(description),
+                    toggled: None,
+                    row,
+                    col: hit.cols.0,
+                    width: end.saturating_sub(hit.cols.0),
+                });
                 continue;
             }
             let (mut label, description) = self.fact_spoken(hit.session, hit.fact, hit.restores);

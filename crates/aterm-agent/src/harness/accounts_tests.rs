@@ -7356,6 +7356,7 @@ fn credits_are_an_episode_and_its_line_is_once_a_day() {
     let first = Recorded::Usage {
         account: OWN.to_string(),
         events: 1,
+        walled: None,
     };
     assert_eq!(record(on_credits(NOW, Some(until)), NOW + 5), first);
     assert_eq!(noted(NOW + 5), [OWN]);
@@ -7371,6 +7372,7 @@ fn credits_are_an_episode_and_its_line_is_once_a_day() {
         Recorded::Usage {
             account: OWN.to_string(),
             events: 0,
+            walled: None,
         },
         "its newest answer"
     );
@@ -7435,12 +7437,14 @@ fn an_older_credits_notice_cannot_extend_the_newest_episode() {
     let update = Recorded::Usage {
         account: OWN.to_string(),
         events: 0,
+        walled: None,
     };
     assert_eq!(
         record("s-new", NOW, Some(NOW + HOUR), NOW),
         Recorded::Usage {
             account: OWN.to_string(),
             events: 1,
+            walled: None,
         }
     );
     assert_eq!(record("s-new", NOW + MIN, None, NOW + MIN), update);
@@ -10503,6 +10507,7 @@ fn weeks_said_keeps_the_newest_read_and_one_warned_row_per_move() {
         Recorded::Stats {
             account: OWN.to_string(),
             events: 1,
+            walled: None,
         }
     );
     assert_eq!(
@@ -10510,6 +10515,7 @@ fn weeks_said_keeps_the_newest_read_and_one_warned_row_per_move() {
         Recorded::Stats {
             account: OWN.to_string(),
             events: 0,
+            walled: None,
         },
         "the same figure said again: its newer instant, no row"
     );
@@ -10547,6 +10553,41 @@ fn weeks_said_keeps_the_newest_read_and_one_warned_row_per_move() {
         rows_of(&store, Kind::Warned),
         ["fable week 85%", "fable wall", "sonnet wall"]
     );
+}
+
+/// The usage recorder names the model's week it put on record at its wall once per move, for the
+/// readings series' `wall` row: a wall the week did not hold names it, with its bucket, its reset,
+/// when the screen said it and the machine; the same wall read again, and a warning, name none; a
+/// wall with another reset names it again.
+#[test]
+fn weeks_said_names_each_wall_move_once() {
+    use aterm_phase::WeekModel;
+    let r = own_row();
+    let dir = tmp("weeks-said-walled");
+    let store = Store::at(dir.path());
+    let now = NOW + 3 * HOUR;
+    let walled = |at: i64, week: WeekRead| {
+        record_usage(&store, &r, "s-1", &stored(), &week_said_at(at, week), now)
+            .walled()
+            .map(|(account, w)| (account.to_owned(), w.clone()))
+    };
+    let fable =
+        |pct: u32, reset: i64, wall: bool| week_read(WeekModel::Fable, pct, Some(reset), wall);
+    assert_eq!(walled(NOW, fable(85, NOW + DAY, false)), None, "a warning");
+    let first = walled(NOW + 60, fable(100, NOW + DAY, true)).expect("the wall");
+    assert_eq!(first.0, OWN);
+    assert_eq!(
+        (first.1.bucket, first.1.reset, first.1.at),
+        (FABLE, Some(NOW + DAY), NOW + 60)
+    );
+    assert_eq!(first.1.by, held(&store, OWN, now).weeks_said[FABLE].by);
+    assert_eq!(
+        walled(NOW + 120, fable(100, NOW + DAY, true)),
+        None,
+        "the same wall read again"
+    );
+    let later = walled(NOW + 180, fable(100, NOW + 2 * DAY, true)).expect("another wall");
+    assert_eq!(later.1.reset, Some(NOW + 2 * DAY));
 }
 
 #[test]

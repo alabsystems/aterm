@@ -1922,7 +1922,7 @@ fn the_path_shows_home_as_a_tilde() {
 }
 
 #[test]
-fn the_account_stands_after_the_model_and_before_the_path() {
+fn the_account_stands_after_the_wall_and_before_the_model() {
     use crate::harness::session_usage::{ModelTokens, UsageFacts, Wall};
     let plain = FooterFacts {
         model: Some("Opus 5.5".into()),
@@ -1956,30 +1956,33 @@ fn the_account_stands_after_the_model_and_before_the_path() {
         marks(&facts),
         [
             WALL_MARK,
-            MODEL_MARK,
             ACCOUNT_MARK,
+            MODEL_MARK,
             PATH_MARK,
             BRANCH_MARK,
             USAGE_MARK
         ]
     );
     assert_eq!(
-        segments(&facts)[2],
-        Segment::plain(ACCOUNT_MARK, "work-2"),
-        "the label, whole"
+        segments(&facts)[1],
+        Segment {
+            tone: Tone::Lit,
+            ..Segment::plain(ACCOUNT_MARK, "work-2")
+        },
+        "the label, whole, lit"
     );
+    assert_eq!(segments(&facts)[0].text, "until 3pm", "no window name");
     let bare = FooterFacts {
         model: Some("Opus 5.5".into()),
         account: Some("work-2".into()),
         ..FooterFacts::default()
     };
-    assert_eq!(marks(&bare), [MODEL_MARK, ACCOUNT_MARK]);
+    assert_eq!(marks(&bare), [ACCOUNT_MARK, MODEL_MARK]);
     assert_eq!(
         marks(&plain),
         [WALL_MARK, MODEL_MARK, PATH_MARK, BRANCH_MARK, USAGE_MARK]
     );
 }
-
 /// End to end over a temp Claude directory: the fold reads the transcript
 /// this process's sessions file names, only what was appended, sums
 /// subagents and withholds tokens until caught up.
@@ -2555,7 +2558,7 @@ fn the_limit_wall_is_read_from_the_transcripts_row() {
     let day0 = two_pm - 14 * 3600;
     let mut cache = FooterCache::default();
     let wall = wall_at(&claude, &mut cache, two_pm + 60).expect("standing transcript limit");
-    assert!(wall.contains("5h; provider reset: 3pm"));
+    assert_eq!(wall, "until 3pm", "the wall alone, no window name");
     assert!(
         !wall.contains("UTC"),
         "the vendor's reset, its zone left off"
@@ -2929,14 +2932,22 @@ fn native_footer_text_preserves_combining_and_joined_graphemes_when_set_and_elid
             assert!(at.cell >= emoji.cell + emoji.cols);
         }
     }
-    for (email, expected) in [
-        ("123456e\u{0301}x@example.com", "123456e\u{0301}…"),
-        ("12345👩‍💻x@example.com", "12345👩‍💻…"),
+    // The unit's label is cut whole clusters at a time (negative control: a cut by chars splits
+    // the accent from its letter and the emoji's joiner from its second half).
+    for (label, expected, cells) in [
+        ("1234567890e\u{0301}xyz", "1234567890e\u{0301}…", 12),
+        ("123456789👩‍💻xyz", "123456789👩‍💻…", 12),
+        ("1234567890👩‍💻x", "1234567890…", 11),
+        ("使用者使用者使用者", "使用者使用…", 11),
     ] {
-        let mut account = [Segment::plain(ACCOUNT_MARK, email)];
-        assert!(shorten_subscription_account(&mut account, 8));
-        assert_eq!(account[0].text, expected);
-        assert_eq!(text_width(&account[0].text), 8);
+        let facts = FooterFacts {
+            account: Some(label.into()),
+            ..FooterFacts::default()
+        };
+        let unit = account_unit(&facts);
+        let name = &unit.last().expect("a unit")[0];
+        assert_eq!(name.text, expected, "{label:?}");
+        assert_eq!(text_width(&name.text), cells, "{label:?}");
     }
 }
 
@@ -3224,111 +3235,15 @@ fn narrow_rule_tokens() -> FooterFacts {
     }
 }
 
+/// The unit outlasts the workspace's details without overflow, and a profile that says no value
+/// puts no unit on the rule.
 #[test]
-fn an_unblocked_account_costs_only_the_tokens() {
-    let plain = narrow_rule_tokens();
-    let named = |label: &str, facts: &FooterFacts| FooterFacts {
-        account: Some(label.into()),
-        ..facts.clone()
-    };
-    let facts = named("work-2", &plain);
-    let walk = walk_down(&facts);
-    let fewer = walk
-        .iter()
-        .find(|rung| rung.len() < walk[0].len())
-        .expect("a narrower rung");
-    assert_eq!(fewer.as_slice(), &walk[0][..walk[0].len() - 1], "{fewer:?}");
-    let bare = narrow_rule_facts();
-
-    let strip = |segments: &[Segment], marks: &[char]| -> Vec<Segment> {
-        segments
-            .iter()
-            .filter(|s| !marks.contains(&s.mark))
-            .cloned()
-            .collect()
-    };
-    for label in ["a", "work-2", "a-label-of-twenty-six-cells"] {
-        for unnamed in [&plain, &bare] {
-            let facts = named(label, unnamed);
-            let mut shown = 0;
-            for room in 0..=160 {
-                let fit = fit_rule(&facts, room, None);
-                let base = fit_rule(unnamed, room, None);
-                let kept = strip(&base.segments, &[USAGE_MARK]);
-                match fit.segments.iter().find(|s| s.mark == ACCOUNT_MARK) {
-                    Some(s) => {
-                        assert_eq!(s.text, label, "{room}: {fit:?}");
-                        assert_eq!(
-                            strip(&fit.segments, &[USAGE_MARK, ACCOUNT_MARK]),
-                            kept,
-                            "{label} {room}: it took the tokens' room alone"
-                        );
-                        shown += 1;
-                    }
-                    None => {
-                        assert_eq!(fit, base, "{label} {room}");
-                        if let Some(at) = kept.iter().position(|s| s.mark == MODEL_MARK) {
-                            let mut with = kept.clone();
-                            with.insert(at + 1, Segment::plain(ACCOUNT_MARK, label));
-                            let with = RuleFit {
-                                segments: with,
-                                ..fit.clone()
-                            };
-                            assert!(with.width(None) > room, "{label} {room}: {fit:?}");
-                        }
-                    }
-                }
-            }
-            assert!(shown > 0, "{label}: a wide rule shows it");
-        }
-    }
-
-    let unnamed_of = |walk: &[Vec<String>]| -> Vec<Vec<String>> {
-        walk.iter()
-            .filter(|rung| !rung.iter().any(|s| s.starts_with(ACCOUNT_MARK)))
-            .cloned()
-            .collect()
-    };
-    let pinned = walk_down(&plain);
-    // When the account no longer fits, its room can show the full runtime row again.
-    let mut rest = pinned.iter();
-    for rung in unnamed_of(&walk) {
-        assert!(rest.any(|r| *r == rung), "{rung:?} out of order: {walk:?}");
-    }
-    assert_eq!(
-        unnamed_of(&walk_down(&named("work-2", &bare))),
-        walk_down(&bare)
-    );
-}
-
-#[test]
-fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() {
-    let facts = FooterFacts {
-        subscription: Some(super::super::profile::SubscriptionDisplay {
-            email: Some("owner@example.com".into()),
-            plan: Some("Max 5x".into()),
-            weekly: Some("weekly 29% left".into()),
-            ..Default::default()
-        }),
-        ..narrow_rule_facts()
-    };
-    let whole = segments(&facts);
-    assert!(
-        !whole.iter().any(|s| s.text.contains("Max 5x")),
-        "the plan is not on the rule at rest: {whole:?}"
-    );
+fn the_unit_outlasts_workspace_details_without_overflow() {
+    let facts = unit_facts();
     let short = fit_rule(&facts, 45, None);
     assert!(
-        short
-            .segments
-            .iter()
-            .any(|s| s.mark == ACCOUNT_MARK && s.text == "owner")
-    );
-    assert!(
-        short
-            .segments
-            .iter()
-            .any(|s| s.mark == WEEKLY_MARK && s.text == "weekly 29% left")
+        unit_text(&short.segments).is_some_and(|unit| unit.starts_with("main 63%")),
+        "{short:?}"
     );
     assert!(
         !short
@@ -3346,378 +3261,418 @@ fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() 
     };
     let shown = segments(&missing);
     assert!(
-        !shown
-            .iter()
-            .any(|s| matches!(s.mark, ACCOUNT_MARK | WEEKLY_MARK)),
+        !shown.iter().any(|s| s.mark == ACCOUNT_MARK),
         "a value the rule does not know is not shown: {shown:?}"
     );
 }
+/// Case (b) of the glass design (§1): `main` at 63% of its week, its reset Sat 10:00, a gap
+/// projected from ~Thu 12 Nov 04:00, as the pane's quota view (`outlook::tests::case_b`).
+fn case_b_view() -> super::super::quota_view::QuotaView {
+    crate::harness::outlook::tests::case_b()
+        .outlook()
+        .quota("main", None, true)
+}
 
-/// A WEEKLY FIGURE THE FOOTER HAS NOT GOT IS NOT ON THE RULE: whatever the reason (the tap off,
-/// no reply yet, none told) the rule shows the account and no `weekly –` or `weekly
-/// unavailable`; the reason is the account's hover title's, the Accounts menu's and a screen
-/// reader's. A standing 7d wall says `weekly out`, never a percentage, and a real figure, aged
-/// or not, stays beside the account and the controls on an 80-column pane, in its narrow form
-/// (`weekly 61.5% · 59m`) where the controls take the room. Negative control: the wall's
-/// inferred `weekly 0% left` (before the glass design) fails it.
+/// A pane on case (b)'s account, its profile read (an email and a plan the rule never says), its
+/// quota view and that view with observations only, line E not claimed.
+fn unit_facts() -> FooterFacts {
+    use super::super::profile::SubscriptionDisplay;
+    let out = crate::harness::outlook::tests::case_b().outlook();
+    FooterFacts {
+        account: Some("main".into()),
+        subscription: Some(SubscriptionDisplay {
+            email: Some("owner@example.com".into()),
+            plan: Some("Max 20x".into()),
+            weekly: Some("weekly 63% used".into()),
+            label: Some("main".into()),
+            ..Default::default()
+        }),
+        quota: Some(case_b_view()),
+        quota_observed: Some(
+            out.observations_only(super::super::outlook::Refusal::SessionPaused)
+                .quota("main", None, true),
+        ),
+        ..narrow_rule_facts()
+    }
+}
+
+/// The account unit `rung` carries, as it reads after its `⎆`: its parts' words one blank
+/// apart; `None` without one.
+fn unit_text(rung: &[Segment]) -> Option<String> {
+    let words: Vec<&str> = rung
+        .iter()
+        .filter(|s| s.mark == ACCOUNT_MARK)
+        .map(|s| s.text.as_str())
+        .collect();
+    (!words.is_empty()).then(|| words.join(" "))
+}
+
+/// LINE D'S FALLBACK UNIT READS NAME, FIGURE, THEN ITS MILESTONES (glass design §1.2): where line
+/// E is not the glass's, one `⎆` leads the roster label, then the week's figure, `↺` and its
+/// reset, and the verdict, each part attached to the one before and each `·` quiet; the name and
+/// `↺` are lit, the figure and the time values, the gap warn. The unit stands after the wall and
+/// before the model as one fact's span. Negative control: the retired unit's words (the email's
+/// name, the plan, `weekly … left`) are nowhere on the rule.
 #[test]
-fn a_missing_weekly_figure_is_not_on_the_rule() {
-    use super::super::profile::{SubscriptionDisplay, WeeklyGap};
-    use super::super::tap::Refusal;
-    let with = |gap: Option<WeeklyGap>, weekly: Option<&str>| FooterFacts {
+fn the_fallback_unit_reads_name_figure_then_milestones() {
+    let facts = unit_facts();
+    let shown = segments(&facts);
+    let unit: Vec<(&str, bool, Tone)> = shown
+        .iter()
+        .filter(|s| s.mark == ACCOUNT_MARK)
+        .map(|s| (s.text.as_str(), s.attached, s.tone))
+        .collect();
+    assert_eq!(
+        unit,
+        [
+            ("main", false, Tone::Lit),
+            ("63%", true, Tone::Value),
+            ("\u{b7}", true, Tone::Quiet),
+            ("\u{21ba}", true, Tone::Lit),
+            ("Sat 10:00", true, Tone::Value),
+            ("\u{b7}", true, Tone::Quiet),
+            ("\u{2573} ~Thu 12 Nov 04:00", true, Tone::Warn),
+        ]
+    );
+    let marks: Vec<char> = shown.iter().map(|s| s.mark).collect();
+    assert_eq!(
+        marks[..unit.len() + 1],
+        [[ACCOUNT_MARK; 7].as_slice(), &[MODEL_MARK]].concat(),
+        "the unit leads, the model follows: {marks:?}"
+    );
+    let set = set_facts(&shown);
+    assert_eq!(
+        fact_spans(&set, &shown)
+            .iter()
+            .flatten()
+            .filter(|span| span.kind == FactKind::Account)
+            .count(),
+        1,
+        "one span"
+    );
+    let words: Vec<&str> = shown.iter().map(|s| s.text.as_str()).collect();
+    for gone in ["owner", "Max 20x", "weekly", "left"] {
+        assert!(
+            !words.iter().any(|w| w.contains(gone)),
+            "NEGATIVE CONTROL: {gone}: {words:?}"
+        );
+    }
+    let walled = FooterFacts {
+        usage: narrow_rule_walled().usage,
+        ..facts
+    };
+    let marks: Vec<char> = segments(&walled).iter().map(|s| s.mark).collect();
+    assert_eq!(marks[..2], [WALL_MARK, ACCOUNT_MARK], "the wall leads");
+}
+
+/// THE FALLBACK UNIT NARROWS AFTER THE FACTS (§1.2): walking a rule down, the branch, the path
+/// and the model give way while the unit stays whole; then the unit takes its forms in order
+/// (name, figure, `↺`, verdict; name, figure, verdict; name and figure; name), each whole, never
+/// wider than the room. Negative control: the widest rule shows the model beside the whole
+/// unit, so a fact does give way before the unit shortens.
+#[test]
+fn the_fallback_unit_narrows_after_the_facts() {
+    let facts = unit_facts();
+    let forms: Vec<String> = account_unit(&facts)
+        .iter()
+        .filter_map(|form| unit_text(form))
+        .collect();
+    assert_eq!(
+        forms,
+        [
+            "main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 04:00",
+            "main 63% \u{b7} \u{2573} ~Thu 12 Nov 04:00",
+            "main 63%",
+            "main",
+        ]
+    );
+    let full = segments_width(&segments(&facts)) + 2;
+    let mut seen: Vec<String> = Vec::new();
+    for room in (0..=full).rev() {
+        let fit = fit_rule(&facts, room, None);
+        assert!(fit.width(None) <= room, "{room}: {fit:?}");
+        let Some(unit) = unit_text(&fit.segments) else {
+            assert!(
+                fit.segments.is_empty(),
+                "{room}: the unit goes last: {fit:?}"
+            );
+            continue;
+        };
+        assert!(forms.contains(&unit), "{room}: never cut: {unit:?}");
+        if fit.segments.iter().any(|s| s.mark != ACCOUNT_MARK) {
+            assert_eq!(
+                unit, forms[0],
+                "{room}: a fact beside a narrowed unit: {fit:?}"
+            );
+        }
+        if seen.last() != Some(&unit) {
+            seen.push(unit);
+        }
+    }
+    assert_eq!(seen, forms, "every form, widest first");
+    assert!(
+        fit_rule(&facts, full, None)
+            .segments
+            .iter()
+            .any(|s| s.mark == MODEL_MARK),
+        "NEGATIVE CONTROL: the model stands beside the whole unit"
+    );
+}
+
+/// THE FALLBACK UNIT NAMES THE ROSTER LABEL (§2.5): a pane with no quota view (agy, Muse Code, a
+/// roster not read yet) says its roster label, cut as the glass cuts one, and its profile's own
+/// figure (exact, a lower bound, a wall's `out`); a login the roster cannot name (one with a
+/// figure, or one the profile names by email) reads `this login`; a label with no figure stands
+/// alone. With a view the name is the view's own. Negative control: the email the profile names
+/// is on no rung.
+#[test]
+fn the_fallback_unit_names_the_roster_label() {
+    use super::super::profile::{SubscriptionDisplay, WEEKLY_OUT};
+    let with = |account: Option<&str>, weekly: Option<&str>| FooterFacts {
+        account: account.map(str::to_owned),
         subscription: Some(SubscriptionDisplay {
             email: Some("owner@example.com".into()),
             plan: Some("Max 20x".into()),
             weekly: weekly.map(str::to_owned),
-            weekly_gap: gap,
             ..Default::default()
         }),
         ..narrow_rule_facts()
     };
-    let weekly = |facts: &FooterFacts| {
-        segments(facts)
-            .into_iter()
-            .find(|s| s.mark == WEEKLY_MARK)
-            .map(|s| s.text)
-    };
-    for gap in [
-        Some(WeeklyGap::TapOff),
-        Some(WeeklyGap::Unoffered(Refusal::Home)),
-        Some(WeeklyGap::Untapped),
-        Some(WeeklyGap::Unrestarted),
-        Some(WeeklyGap::NoReply),
-        Some(WeeklyGap::Stale),
-        None,
+    let widest = |facts: &FooterFacts| account_unit(facts).first().and_then(|f| unit_text(f));
+    let long = "a-long-account-label-0123456789";
+    for (account, weekly, said) in [
+        (Some("work-2"), Some("weekly 38% used"), Some("work-2 38%")),
+        (
+            Some("work-2"),
+            Some("weekly \u{2265}38% used"),
+            Some("work-2 \u{2265}38%"),
+        ),
+        (Some("work-2"), Some(WEEKLY_OUT), Some("work-2 out")),
+        (None, Some("weekly 22% used"), Some("this login 22%")),
+        (Some("work-2"), None, Some("work-2")),
+        (None, None, Some("this login")),
     ] {
-        let facts = with(gap, None);
-        assert_eq!(weekly(&facts), None, "{gap:?}");
-        let (account, _) = unit_of(&segments(&facts)).expect("the account stays");
-        assert_eq!(account, "owner", "{gap:?}");
-        for room in 0..=180 {
-            let fit = fit_rule(&facts, room, None);
-            assert!(fit.width(None) <= room, "{room}: {fit:?}");
-            assert!(
-                !fit.segments.iter().any(|s| s.text.starts_with("weekly")),
-                "{room}: {fit:?}"
-            );
-        }
-    }
-    let walled = FooterFacts {
-        subscription: with(Some(WeeklyGap::NoReply), None).subscription,
-        ..narrow_rule_walled()
-    };
-    assert_eq!(
-        weekly(&walled).as_deref(),
-        Some(super::super::profile::WEEKLY_OUT)
-    );
-    let facts = with(None, Some(AGED_WEEK));
-    let room = rule_room(&(0..80));
-    let words = weekly(&facts).expect("a weekly segment");
-    let mut pair = [
-        Segment::plain(ACCOUNT_MARK, "owner"),
-        Segment::joined(WEEKLY_MARK, AGED_NARROW),
-    ];
-    shorten_subscription_account(&mut pair, 8);
-    let reserved = rule_width(&pair, TitleFit::None, false, None);
-    assert_eq!(
-        chips_room(&facts, room),
-        room - (reserved + RULE_SEP + 2),
-        "{words}: the controls get the room its narrow form frees"
-    );
-    for chips in [1, 3, 6, chips_room(&facts, room)] {
-        let lights = Some(LightsWidth {
-            chips,
-            title: 50,
-            lean: [0; LEAN_FORMS],
-            short: 20,
-            reason: true,
-        });
-        let fit = fit_rule(&facts, room, lights);
-        assert!(fit.width(lights) <= room, "{chips}: {fit:?}");
-        assert!(fit.chips, "{chips}: controls stay available");
-        assert!(
-            fit.segments
-                .iter()
-                .any(|s| s.mark == WEEKLY_MARK && (s.text == words || s.text == AGED_NARROW)),
-            "{chips}: {words} stays: {fit:?}"
+        assert_eq!(
+            widest(&with(account, weekly)).as_deref(),
+            said,
+            "{account:?} {weekly:?}"
         );
     }
-    let floor = rule_width(&pair, TitleFit::None, false, None);
-    for room in 0..=180 {
-        let fit = fit_rule(&facts, room, None);
-        assert!(fit.width(None) <= room, "{room}: {fit:?}");
-        if room >= floor {
-            assert!(
-                fit.segments
-                    .iter()
-                    .any(|s| s.mark == WEEKLY_MARK && (s.text == words || s.text == AGED_NARROW)),
-                "{room}: the narrowest unit holds the week: {fit:?}"
-            );
-        }
-    }
-}
-
-/// AN AGED WEEK KEEPS ITS NAME ON THE NARROWEST RUNG: the rule draws the week behind the unit's
-/// `·`, with no mark of its own, so its narrow form keeps `weekly` and drops `left` and `ago`
-/// (`weekly 61.5% · 59m`); at no width, with the controls or without, does the figure stand
-/// beside the account as a bare share.
-#[test]
-fn an_aged_week_keeps_its_name_on_the_narrowest_rung() {
-    let aged = FooterFacts {
-        subscription: Some(super::super::profile::SubscriptionDisplay {
-            weekly: Some(AGED_WEEK.into()),
-            weekly_gap: None,
-            ..unit_facts(Some("owner@example.com"))
-                .subscription
-                .expect("a subscription")
-        }),
-        ..narrow_rule_facts()
+    assert_eq!(
+        widest(&with(Some(long), Some("weekly 38% used"))),
+        Some(format!("{} 38%", super::super::quota_view::cut(long)))
+    );
+    let viewed = FooterFacts {
+        account: Some("work-2".into()),
+        ..unit_facts()
     };
-    let week = |rung: &[Segment]| {
-        rung.iter()
-            .find(|s| s.mark == WEEKLY_MARK)
-            .map(|s| s.text.clone())
-    };
-    let narrowest = plain_ladder(&aged)
-        .iter()
-        .rev()
-        .find_map(|rung| week(rung))
-        .expect("a rung with the week");
-    assert_eq!(narrowest, AGED_NARROW);
-    let controls = Some(LightsWidth {
-        chips: 3,
-        title: 50,
-        lean: [0; LEAN_FORMS],
-        short: 20,
-        reason: true,
-    });
-    let mut shown = Vec::new();
-    for room in 0..=180 {
-        for lights in [None, controls] {
-            let fit = fit_rule(&aged, room, lights);
-            assert!(fit.width(lights) <= room, "{room}: {fit:?}");
-            let Some(text) = week(&fit.segments) else {
-                continue;
-            };
-            assert!(
-                text.starts_with("weekly "),
-                "{room}: the week reads as a bare share: {fit:?}"
-            );
-            if !shown.contains(&text) {
-                shown.push(text);
-            }
-        }
-    }
     assert!(
-        shown.contains(&narrowest) && shown.len() > 1,
-        "the whole and the narrow forms both show: {shown:?}"
+        widest(&viewed).is_some_and(|unit| unit.starts_with("main 63%")),
+        "the view names its own row"
     );
-}
-
-/// A week the last reply read an hour ago, whole and in its narrow form.
-const AGED_WEEK: &str = "weekly 61.5% left \u{b7} 59m ago";
-const AGED_NARROW: &str = "weekly 61.5% \u{b7} 59m";
-
-fn unit_facts(email: Option<&str>) -> FooterFacts {
-    use super::super::profile::SubscriptionDisplay;
-    FooterFacts {
-        subscription: Some(SubscriptionDisplay {
-            email: email.map(str::to_owned),
-            plan: Some("Max 20x".into()),
-            weekly: Some(AGED_WEEK.into()),
-            ..Default::default()
-        }),
-        ..narrow_rule_facts()
-    }
-}
-
-/// The account unit as one rung shows it: the account's text, the week's.
-fn unit_of(rung: &[Segment]) -> Option<(String, Option<String>)> {
-    let text = |mark: char| rung.iter().find(|s| s.mark == mark).map(|s| s.text.clone());
-    Some((text(ACCOUNT_MARK)?, text(WEEKLY_MARK)))
-}
-
-/// Whether every part of `rung`'s account unit follows the account or another part of it; with
-/// no account (no email told) the parts stand apart.
-fn unit_whole(rung: &[Segment]) -> bool {
-    let headed = rung.iter().any(|s| s.mark == ACCOUNT_MARK);
-    rung.iter().enumerate().all(|(at, s)| {
-        let part = headed && s.mark == WEEKLY_MARK;
-        part == s.joined
-            && (!part
-                || at
-                    .checked_sub(1)
-                    .and_then(|before| rung.get(before))
-                    .is_some_and(|b| b.mark == ACCOUNT_MARK || b.joined))
-    })
-}
-
-/// THE ACCOUNT AND ITS WEEK ARE ONE UNIT: one `⎆`, then the weekly words behind a `·` one pitch
-/// on (`⎆ owner · weekly 61.5% left · 59m ago`), and the next fact the usual gap away; the
-/// plan is not on the rule at rest, `◷` is not drawn, and the unit is one fact's span.
-#[test]
-fn the_account_and_week_are_one_unit() {
-    let facts = unit_facts(Some("owner@example.com"));
-    let segs = segments(&facts);
-    assert_eq!(
-        segs[..3]
-            .iter()
-            .map(|s| (s.mark, s.text.as_str(), s.joined))
-            .collect::<Vec<_>>(),
-        [
-            (ACCOUNT_MARK, "owner", false),
-            (WEEKLY_MARK, AGED_WEEK, true),
-            (MODEL_MARK, "Opus 5.5 xhigh", false),
-        ]
-    );
-    let set = set_facts(&segs);
-    let marks: String = set.glyphs.iter().filter(|g| g.mark).map(|g| g.ch).collect();
-    assert_eq!(
-        marks,
-        format!("{ACCOUNT_MARK}{JOIN_MARK}{MODEL_MARK}{PATH_MARK}{BRANCH_MARK}")
-    );
-    assert!(
-        !set.glyphs.iter().any(|g| g.ch == WEEKLY_MARK),
-        "the parts' own marks only name them"
-    );
-    let spans = fact_spans(&set, &segs);
-    let kinds: Vec<FactKind> = spans.iter().flatten().map(|s| s.kind).collect();
-    assert_eq!(
-        kinds,
-        [
-            FactKind::Account,
-            FactKind::Model,
-            FactKind::Effort,
-            FactKind::Path,
-            FactKind::Branch
-        ]
-    );
-    let unit = spans[0].expect("the unit's span");
-    let read: String = set
-        .glyphs
-        .iter()
-        .filter(|g| (usize::from(unit.cells.0)..usize::from(unit.cells.1)).contains(&g.cell))
-        .map(|g| g.ch)
-        .collect();
-    assert_eq!(
-        read,
-        format!("\u{2386}owner\u{b7}{}", AGED_WEEK.replace(' ', "")),
-        "one span from the account's mark to the week's last word"
-    );
-    assert_eq!(unit.cells.0, 0);
-    assert!(unit.restores.is_empty());
-    // Where each glyph is drawn, in cells: its cell, half its width, and its nudge.
-    let centre = |g: &SetGlyph| {
-        g.cell as f32 + g.cols as f32 / 2.0 + f32::from(g.nudge) / f32::from(NUDGES_PER_CELL)
-    };
-    let at = |pick: &dyn Fn(&(usize, &SetGlyph)) -> bool| {
-        set.glyphs
-            .iter()
-            .enumerate()
-            .find(|g| pick(g))
-            .map(|(i, _)| i)
-            .expect("the glyph")
-    };
-    let first_join = at(&|(_, g)| g.mark && g.ch == JOIN_MARK);
-    let model = at(&|(_, g)| g.mark && g.ch == MODEL_MARK);
-    let between = |i: usize| centre(&set.glyphs[i]) - centre(&set.glyphs[i - 1]);
-    // `m·`: half a glyph, the join's pitch, half a glyph; `b◆`: the same around the gap.
-    let (joined, gapped) = (between(first_join), between(model));
-    assert!(
-        ((joined / gapped) - (1.0 + JOIN_GAP) / (1.0 + GAP)).abs() < 0.05,
-        "a joined part sits {joined} cells on, the next fact {gapped}"
-    );
-    assert!(
-        (between(first_join + 1) - joined).abs() < 0.1,
-        "the join sits as far from the week as from the name"
-    );
-    let plain: Vec<Segment> = segs
-        .iter()
-        .map(|s| Segment {
-            joined: false,
-            ..s.clone()
-        })
-        .collect();
-    assert!(
-        segments_width(&plain) > segments_width(&segs),
-        "CONTROL: apart, the parts take the facts' gap"
-    );
-}
-
-/// THE UNIT NARROWS AS ONE, WIDEST FIRST, once the other facts have given way: whole (the
-/// email's name alone), the name cut to 8 cells, the weekly words narrowed. No rung joins the
-/// week on without the account before it.
-#[test]
-fn the_account_unit_narrows_as_one_widest_first() {
-    let facts = unit_facts(Some("pat.owner93@example.com"));
-    let week = AGED_WEEK;
-    let unit = |account: &str, weekly: &str| (account.to_owned(), Some(weekly.to_owned()));
-    let full = segments_width(&segments(&facts)) + 2;
-    let mut seen = Vec::new();
-    for room in (0..=full).rev() {
-        let fit = fit_rule(&facts, room, None);
-        assert!(fit.width(None) <= room, "{room}: {fit:?}");
-        assert!(
-            unit_whole(&fit.segments),
-            "{room}: the unit splits: {fit:?}"
-        );
-        let Some(shown) = unit_of(&fit.segments) else {
-            assert!(fit.segments.is_empty(), "{room}: {fit:?}");
-            continue;
-        };
-        if shown != unit("pat.owner93", week) {
-            assert!(
-                fit.segments
-                    .iter()
-                    .all(|s| matches!(s.mark, ACCOUNT_MARK | WEEKLY_MARK)),
-                "{room}: the other facts give way first: {fit:?}"
-            );
-        }
-        if seen.last() != Some(&shown) {
-            seen.push(shown);
-        }
-    }
-    assert_eq!(
-        seen,
-        [
-            unit("pat.owner93", week),
-            unit("pat.own\u{2026}", week),
-            unit("pat.own\u{2026}", AGED_NARROW),
-        ]
-    );
-    for facts in [
-        facts.clone(),
-        unit_facts(None),
-        FooterFacts {
-            subscription: facts.subscription.clone(),
-            ..narrow_rule_walled()
-        },
-    ] {
+    for facts in [with(Some("work-2"), Some("weekly 38% used")), unit_facts()] {
         for rung in plain_ladder(&facts) {
-            assert!(unit_whole(&rung), "{rung:?}");
+            assert!(
+                !rung.iter().any(|s| s.text.contains("owner")),
+                "NEGATIVE CONTROL: {rung:?}"
+            );
         }
     }
-    let ladder = plain_ladder(&facts);
-    let at = |shown: &(String, Option<String>)| {
-        ladder
-            .iter()
-            .position(|rung| unit_of(rung).as_ref() == Some(shown))
-            .expect("the rung")
+}
+
+/// THE RULE CARRIES NO ACCOUNT WHILE THE ROW DOES (§1.2, §5.2): with line E the glass's quota row
+/// ([`FooterFacts::line_e`]) no rung of line D at any room has a `⎆`, the rule is the one a pane
+/// with no account lays, and the chips' budget reserves nothing for one; the quota row lays the
+/// account's name and figure. Negative control: the same facts with line E unclaimed carry the
+/// unit.
+#[test]
+fn the_rule_carries_no_account_while_the_row_does() {
+    let claimed = FooterFacts {
+        line_e: true,
+        ..unit_facts()
     };
+    // A signed-out subscription: the controls outlast the model on both rules.
+    let unnamed = FooterFacts {
+        account: None,
+        subscription: Some(super::super::profile::SubscriptionDisplay::default()),
+        quota: None,
+        quota_observed: None,
+        line_e: false,
+        ..claimed.clone()
+    };
+    assert!(account_unit(&unnamed).is_empty());
+    let view = claimed.quota_view().expect("the pane's view");
+    let mut row = super::super::quota_view::QuotaLine::default();
+    assert!(view.lay(100, &mut row), "the row lays at 100");
+    assert!(row.text().contains("main 63%"), "{:?}", row.text());
+    let full = segments_width(&segments(&unit_facts())) + 2;
+    for room in 0..=full {
+        let fit = fit_rule(&claimed, room, None);
+        assert!(
+            !fit.segments.iter().any(|s| s.mark == ACCOUNT_MARK),
+            "{room}: {fit:?}"
+        );
+        assert_eq!(
+            fit.segments,
+            fit_rule(&unnamed, room, None).segments,
+            "{room}"
+        );
+    }
+    for room in [40, 80, 120] {
+        assert_eq!(
+            chips_room(&claimed, room),
+            chips_room(&unnamed, room),
+            "{room}"
+        );
+    }
     assert!(
-        ladder[..=at(&unit("pat.owner93", week))]
+        segments(&unit_facts())
             .iter()
-            .any(|rung| rung.iter().any(|s| s.mark == MODEL_MARK)),
-        "CONTROL: the model stood beside the whole unit"
+            .any(|s| s.mark == ACCOUNT_MARK),
+        "NEGATIVE CONTROL: unclaimed, the unit is on the rule"
     );
 }
 
-/// A REASON NEVER TAKES THE ROOM OF THE EMAIL'S NAME OR THE WEEK: where a title makes facts give
-/// way, the name and the week stay whole.
+/// LINE D CARRIES A WALL AND NO ROTATION WORDS (§5.1): under a paused recovery (Autopilot Off)
+/// with no limit standing, line D has no `⧗` segment and none of the recovery's words at any
+/// room, while the quota row's title names the rotation as its last clause before the click; a
+/// walled account still shows `⧗ until …` on line D, with no window name. NEGATIVE CONTROL, run:
+/// the slot as `fact_segments` filled it before S5 (`⧗` and `account_progress_text`'s words,
+/// `Recovery paused · … · Next unknown`), set beside the unit as a rung, fails the very
+/// predicate the room loop holds every rung to.
 #[test]
-fn a_reason_never_takes_the_name_or_the_week() {
-    let facts = unit_facts(Some("pat.owner93@example.com"));
-    let week = AGED_WEEK;
+fn line_d_carries_a_wall_and_no_rotation_words() {
+    use super::super::account_progress::{
+        AccountProgress, ProgressPhase, SESSION_AUTOPILOT_OFF_FINDING,
+    };
+    let mut progress = AccountProgress::unknown(100);
+    progress.phase = ProgressPhase::Paused;
+    progress.known = Some(2);
+    progress.eligible = Some(1);
+    progress.next_at = Some(1_800_000_000);
+    progress.details.push(SESSION_AUTOPILOT_OFF_FINDING.into());
+    let paused = FooterFacts {
+        account_progress: Some(progress.clone()),
+        ..unit_facts()
+    };
+    // The card keeps the recovery's words, its finding's excerpt among them.
+    let card = account_progress_text(&progress);
+    assert!(
+        card.contains("Recovery paused") && card.contains("Session Autopilot is off"),
+        "{card}"
+    );
+    // What line D may not carry under the pause: a `⧗` segment, or any of the recovery's words.
+    let carries_rotation = |segments: &[Segment]| {
+        segments.iter().any(|s| {
+            s.mark == WALL_MARK
+                || [
+                    "Recovery",
+                    "paused",
+                    "eligible",
+                    "Eligibility",
+                    "Inventory",
+                    "Next",
+                    SESSION_AUTOPILOT_OFF_FINDING,
+                ]
+                .iter()
+                .any(|words| s.text.contains(words))
+        })
+    };
+    let mut before_s5 = vec![Segment::plain(WALL_MARK, card.clone())];
+    before_s5.extend(account_unit(&paused).into_iter().next().expect("the unit"));
+    assert!(
+        carries_rotation(&before_s5),
+        "NEGATIVE CONTROL: the pre-S5 slot fails the predicate: {before_s5:?}"
+    );
+    // Each half of the predicate catches on its own: the recovery's words under the unit's
+    // mark (no `⧗`), and a `⧗` with none of the words.
+    let words_only = [Segment::plain(ACCOUNT_MARK, card.clone())];
+    assert!(
+        carries_rotation(&words_only),
+        "NEGATIVE CONTROL: the recovery's words under another mark fail the predicate"
+    );
+    let wall_only = [Segment::plain(WALL_MARK, "main")];
+    assert!(
+        carries_rotation(&wall_only),
+        "NEGATIVE CONTROL: a `⧗` with no recovery words fails the predicate"
+    );
+    for room in 0..=200 {
+        let fit = fit_rule(&paused, room, None);
+        assert!(!carries_rotation(&fit.segments), "{room}: {fit:?}");
+    }
+    let rotation = rotation_words(&progress, |at| format!("at {at}"));
+    assert!(
+        rotation.starts_with("rotation: ") && rotation.contains("1 eligible of 2"),
+        "{rotation}"
+    );
+    assert!(rotation.contains("next check at 1800000000"), "{rotation}");
+    let title = paused
+        .quota_view()
+        .expect("the pane's view")
+        .title_with(Some(&rotation));
+    assert!(
+        title.ends_with(&format!(
+            "{rotation} \u{b7} {}",
+            super::super::quota_view::CLICK
+        )),
+        "{title}"
+    );
+    let walled = FooterFacts {
+        usage: narrow_rule_walled().usage,
+        ..paused
+    };
+    let wall: Vec<String> = segments(&walled)
+        .iter()
+        .filter(|s| s.mark == WALL_MARK)
+        .map(|s| s.text.clone())
+        .collect();
+    assert_eq!(wall, ["until Oct 1 at 9am"]);
+}
+
+/// A PAUSED RECOVERY KEEPS LINE D'S UNIT TO OBSERVATIONS: under a pause or a busy observer the
+/// unit is the observations-only view's (no projected gap, no verdict), the pane's own figure
+/// and reset kept; with the pause lifted the projected view returns. Negative control: a
+/// `quota_view` that ignores the refusal keeps the `╳` under the pause.
+#[test]
+fn a_paused_recovery_keeps_the_unit_to_observations() {
+    use super::super::account_progress::{AccountProgress, ProgressPhase};
+    let mut facts = unit_facts();
+    let widest = |facts: &FooterFacts| account_unit(facts).first().and_then(|f| unit_text(f));
+    let projected = widest(&facts).expect("the unit");
+    assert!(projected.contains('\u{2573}'), "{projected}");
+    assert!(
+        facts
+            .quota
+            .as_ref()
+            .and_then(|v| v.fallback().first().cloned())
+            .is_some_and(|form| form.iter().any(|p| p.text.contains('\u{2573}'))),
+        "NEGATIVE CONTROL: the projected view keeps its gap"
+    );
+    for (phase, busy) in [
+        (ProgressPhase::Paused, false),
+        (ProgressPhase::Waiting, true),
+    ] {
+        let mut progress = AccountProgress::unknown(100);
+        progress.phase = phase.clone();
+        facts.account_progress = Some(progress);
+        facts.account_progress_busy = busy;
+        assert!(facts.account_forecast_refusal().is_some(), "{phase:?}");
+        let observed = widest(&facts).expect("the unit");
+        assert!(!observed.contains('\u{2573}'), "{phase:?}: {observed}");
+        assert!(
+            observed.starts_with("main 63%") && observed.contains("\u{21ba} Sat 10:00"),
+            "{phase:?}: {observed}"
+        );
+    }
+    facts.account_progress = None;
+    facts.account_progress_busy = false;
+    assert_eq!(widest(&facts), Some(projected));
+}
+/// A REASON NEVER TAKES THE UNIT'S ROOM: where a title makes facts give way, the unit stays as
+/// the rule without the title shows it. Negative control: a reason took some fact's room.
+#[test]
+fn a_reason_never_takes_the_units_room() {
+    let facts = unit_facts();
     let reason = Some(LightsWidth {
         chips: 6,
         title: 50,
@@ -3735,67 +3690,32 @@ fn a_reason_never_takes_the_name_or_the_week() {
     for room in (0..=240).rev() {
         let fit = fit_rule(&facts, room, reason);
         assert!(fit.width(reason) <= room, "{room}: {fit:?}");
-        assert!(unit_whole(&fit.segments), "{room}: {fit:?}");
-        if fit.title == TitleFit::None || fit.segments == fit_rule(&facts, room, untitled).segments
-        {
+        let bare = fit_rule(&facts, room, untitled);
+        if fit.title == TitleFit::None || fit.segments == bare.segments {
             continue;
         }
-        let (account, weekly) = unit_of(&fit.segments).expect("the unit beside a reason");
-        assert_eq!(account, "pat.owner93", "{room}: {fit:?}");
-        assert_eq!(weekly.as_deref(), Some(week), "{room}: {fit:?}");
+        assert_eq!(
+            unit_text(&fit.segments),
+            unit_text(&bare.segments),
+            "{room}: {fit:?}"
+        );
         took = true;
     }
-    assert!(took, "CONTROL: a reason took some fact's room");
+    assert!(took, "NEGATIVE CONTROL: a reason took some fact's room");
 }
-
-/// THE ACCOUNT SHOWS ITS EMAIL'S NAME ALONE: the text before the last `@`, where there is text on
-/// both sides of it (`owner@example.com` reads `owner`; a bare `@example.com`, a dangling
-/// `owner@` or a name with no `@` reads as told); and an account with no email is not on the
-/// rule at any width.
-#[test]
-fn the_account_shows_its_emails_name_alone() {
-    let shown = |email: &str| {
-        segments(&unit_facts(Some(email)))
-            .into_iter()
-            .find(|s| s.mark == ACCOUNT_MARK)
-            .map(|s| s.text)
-    };
-    for (email, name) in [
-        ("owner@example.com", "owner"),
-        ("a@b@example.com", "a@b"),
-        ("@example.com", "@example.com"),
-        ("owner@", "owner@"),
-        ("owner", "owner"),
-    ] {
-        assert_eq!(shown(email).as_deref(), Some(name), "{email}");
-    }
-    let missing = unit_facts(None);
-    let full = segments_width(&segments(&missing)) + 2;
-    for room in (0..=full).rev() {
-        let fit = fit_rule(&missing, room, None);
-        assert_eq!(unit_of(&fit.segments), None, "{room}: {fit:?}");
-    }
-    assert!(
-        fit_rule(&unit_facts(Some("owner")), full + 16, None)
-            .segments
-            .iter()
-            .any(|s| s.mark == ACCOUNT_MARK && s.text == "owner"),
-        "CONTROL: an email is shown where it fits"
-    );
-}
-
 #[test]
 fn subscription_chip_budget_keeps_account_and_weekly_beside_real_gui_faces() {
-    for email in ["owner@example.com", "使用者與工作帳號在公司@example.com"] {
-        let facts = FooterFacts {
-            subscription: Some(super::super::profile::SubscriptionDisplay {
-                email: Some(email.into()),
-                plan: Some("Max 5x".into()),
-                weekly: Some("weekly 29% left".into()),
-                ..Default::default()
-            }),
-            ..narrow_rule_facts()
-        };
+    let wide = FooterFacts {
+        account: Some("a-long-account-label-0123456789".into()),
+        subscription: Some(super::super::profile::SubscriptionDisplay {
+            email: Some("owner@example.com".into()),
+            plan: Some("Max 5x".into()),
+            weekly: Some("weekly 71% used".into()),
+            ..Default::default()
+        }),
+        ..narrow_rule_facts()
+    };
+    for (facts, figure) in [(unit_facts(), "63%"), (wide, "71%")] {
         for columns in [80, 100, 120] {
             let room = rule_room(&(0..columns));
             let budget = chips_room(&facts, room);
@@ -3812,30 +3732,18 @@ fn subscription_chip_budget_keeps_account_and_weekly_beside_real_gui_faces() {
                     let fit = fit_rule(&facts, room, lights);
                     assert!(fit.width(lights) <= room, "{columns}/{chips}: {fit:?}");
                     assert!(fit.chips, "{columns}/{chips}: controls stay available");
+                    let unit = unit_text(&fit.segments);
                     assert!(
-                        fit.segments.iter().any(|s| s.mark == ACCOUNT_MARK),
-                        "{columns}/{chips}: selected account remains visible: {fit:?}"
+                        unit.as_deref()
+                            .and_then(|u| u.split(' ').nth(1))
+                            .is_some_and(|f| f == figure),
+                        "{columns}/{chips}: the account and its week stay: {fit:?}"
                     );
-                    assert!(
-                        fit.segments
-                            .iter()
-                            .any(|s| s.mark == WEEKLY_MARK && s.text == "weekly 29% left"),
-                        "{columns}/{chips}: weekly quota remains visible: {fit:?}"
-                    );
-                    if chips == budget {
-                        let account = fit
-                            .segments
-                            .iter()
-                            .find(|s| s.mark == ACCOUNT_MARK)
-                            .unwrap();
-                        assert!(text_width(&account.text) <= 8, "{fit:?}");
-                    }
                 }
             }
         }
     }
 }
-
 #[test]
 fn subscription_keeps_a_standing_limit_and_controls_before_secondary_facts() {
     let facts = FooterFacts {
@@ -3891,77 +3799,6 @@ fn subscription_control_glyph_outlasts_the_model_when_essentials_cannot_fit() {
         assert!(fit.chips, "{room}/{chips}: model must not hide controls");
         assert!(fit.segments.is_empty());
         assert!(fit.width(lights) <= room);
-    }
-}
-
-#[test]
-fn a_reason_takes_the_accounts_room() {
-    let plain = narrow_rule_tokens();
-    let facts = FooterFacts {
-        account: Some("work-2".into()),
-        ..plain.clone()
-    };
-    let whole = segments(&facts);
-    let top: Vec<Segment> = whole
-        .iter()
-        .filter(|s| s.mark == WALL_MARK || s.mark == MODEL_MARK)
-        .cloned()
-        .collect();
-    assert_eq!(top.len(), 1);
-    let account = whole.iter().find(|s| s.mark == ACCOUNT_MARK).unwrap();
-    let named = |fit: &RuleFit| fit.segments.iter().any(|s| s.mark == ACCOUNT_MARK);
-    let with_account = |fit: &RuleFit| {
-        let mut fit = fit.clone();
-        let at = fit.segments.iter().position(|s| s.mark == MODEL_MARK);
-        fit.segments
-            .insert(at.expect("the model") + 1, account.clone());
-        fit
-    };
-    let reason = Some(LightsWidth {
-        chips: 13,
-        title: 50,
-        lean: [0; LEAN_FORMS],
-        short: 35,
-        reason: true,
-    });
-    let (mut beside, mut instead): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
-    for room in (0..=240).rev() {
-        let fit = fit_rule(&facts, room, reason);
-        assert!(fit.width(reason) <= room, "{room}: {fit:?}");
-        if fit.title == TitleFit::None {
-            continue;
-        }
-        assert!(
-            top.iter().all(|s| fit.segments.contains(s)),
-            "{room}: a reason never takes the wall's or the model's room: {fit:?}"
-        );
-        if named(&fit) {
-            beside.push(room);
-        } else {
-            assert_eq!(fit.title, TitleFit::Short, "{room}: {fit:?}");
-            assert!(
-                with_account(&fit).width(reason) > room,
-                "{room}: only where the two do not fit together: {fit:?}"
-            );
-            instead.push(room);
-        }
-    }
-    assert!(!instead.is_empty(), "the reason takes the account's room");
-    assert!(
-        instead.iter().max() < beside.iter().max(),
-        "a wide rule shows both: {instead:?} {beside:?}"
-    );
-    let hover = reason.map(|l| LightsWidth { reason: false, ..l });
-    for room in 0..=240 {
-        let fit = fit_rule(&facts, room, hover);
-        assert!(
-            fit.title == TitleFit::None || fit.segments == whole,
-            "{room}: {fit:?}"
-        );
-    }
-    for &room in &instead {
-        let fit = fit_rule(&plain, room, reason);
-        assert_ne!(fit.title, TitleFit::None, "{room}: {fit:?}");
     }
 }
 
@@ -5699,9 +5536,9 @@ fn fact_spans_split_model_and_effort_by_their_glyphs() {
     assert_eq!(
         kinds,
         [
+            FactKind::Account,
             FactKind::Model,
             FactKind::Effort,
-            FactKind::Account,
             FactKind::Path,
             FactKind::Branch,
             FactKind::Usage
@@ -5874,7 +5711,7 @@ fn the_context_fact_is_a_span_its_stub_restores_and_it_goes_first() {
 }
 
 #[test]
-fn recovery_and_account_spans_keep_every_optional_fact_clickable() {
+fn account_spans_keep_every_optional_fact_clickable() {
     let facts = FooterFacts {
         account: Some("work".into()),
         account_progress: Some(super::super::account_progress::AccountProgress::unknown(
@@ -5886,7 +5723,7 @@ fn recovery_and_account_spans_keep_every_optional_fact_clickable() {
     let segments = segments(&facts);
     let spans = fact_spans(&set_facts(&segments), &segments);
     let kinds: Vec<_> = spans.into_iter().flatten().map(|span| span.kind).collect();
-    assert_eq!(kinds.len(), 8);
+    assert_eq!(kinds.len(), 7, "{kinds:?}");
     for kind in [
         FactKind::Model,
         FactKind::Effort,
@@ -5902,11 +5739,11 @@ fn recovery_and_account_spans_keep_every_optional_fact_clickable() {
             .iter()
             .filter(|kind| **kind == FactKind::Account)
             .count(),
-        2
+        1,
+        "the unit alone: the recovery is not on the rule"
     );
     assert_eq!(kinds.last(), Some(&FactKind::Usage));
 }
-
 #[test]
 fn a_hidden_fact_reads_off_in_rule_gray_and_gives_way_first() {
     let shown = |facts: &FooterFacts| -> Vec<String> {
@@ -6320,7 +6157,6 @@ fn the_effort_split_survives_clusters_and_marks() {
             text: text.clone(),
             split: Some(head.len()),
             quiet: (true, false),
-            joined: false,
             ..Segment::default()
         }]);
         let spelled = |pick: &dyn Fn(&SetGlyph) -> bool| -> String {
@@ -6379,8 +6215,10 @@ fn agents_panel_under_reads_agy_active_subagents_and_skips_background_tasks() {
         }
     );
 }
+/// The Accounts card's recovery words follow the next check and the phase, and none of them is
+/// on the rule at any room (§5.1).
 #[test]
-fn account_progress_survives_optional_facts_and_its_wall_opens_accounts() {
+fn account_progress_words_follow_the_check_and_stay_off_the_rule() {
     use super::super::account_progress::{AccountProgress, ProgressPhase};
     let mut progress = AccountProgress::unknown(100);
     progress.phase = ProgressPhase::Waiting;
@@ -6394,43 +6232,21 @@ fn account_progress_survives_optional_facts_and_its_wall_opens_accounts() {
         account_progress: Some(progress.clone()),
         ..Default::default()
     };
-    let narrow = super::account_progress_text(&progress, true);
-    let minimum = super::rule_width(
-        &[Segment::plain(WALL_MARK, &narrow)],
-        TitleFit::None,
-        false,
-        None,
-    );
-    for room in [minimum, minimum + 8, 160] {
+    for room in [20, 60, 160] {
         let fit = fit_rule(&facts, room, None);
         assert!(fit.width(None) <= room);
-        assert!(fit.segments.iter().any(|s| s.mark == WALL_MARK));
-        if room == minimum {
-            assert!(fit.segments.iter().all(|s| s.mark == WALL_MARK));
-        }
-        let set = set_facts(&fit.segments);
         assert!(
-            fact_spans(&set, &fit.segments)
+            !fit.segments
                 .iter()
-                .flatten()
-                .any(|s| s.kind == FactKind::Account)
+                .any(|s| s.mark == WALL_MARK || s.text.contains("sign-in")),
+            "{room}: {fit:?}"
         );
     }
-    let crowded = LightsWidth {
-        chips: minimum,
-        title: minimum,
-        lean: [minimum; LEAN_FORMS],
-        short: minimum,
-        reason: true,
-    };
-    let fit = fit_rule(&facts, minimum, Some(crowded));
-    assert!(fit.width(Some(crowded)) <= minimum);
-    assert!(fit.segments.iter().any(|segment| segment.mark == WALL_MARK));
     let mut later = progress.clone();
     later.next_at = Some(160);
     assert_ne!(
-        super::account_progress_text(&progress, true),
-        super::account_progress_text(&later, true)
+        super::account_progress_text(&progress),
+        super::account_progress_text(&later)
     );
     later.phase = ProgressPhase::Switching {
         to: "alternate".into(),
@@ -6440,9 +6256,8 @@ fn account_progress_survives_optional_facts_and_its_wall_opens_accounts() {
         super::account_progress_phase(&later)
     );
 }
-
 #[test]
-fn compact_recovery_retains_its_blocker_before_the_retry_timestamp() {
+fn the_cards_recovery_words_keep_their_blocker_and_retry_time() {
     use super::super::account_progress::{AccountProgress, ProgressPhase};
     let mut progress = AccountProgress::unknown(1_793_040_000);
     progress.phase = ProgressPhase::Waiting;
@@ -6451,35 +6266,21 @@ fn compact_recovery_retains_its_blocker_before_the_retry_timestamp() {
     progress.next_at = Some(1_793_040_160);
     let blocker = "current: sign-in needed";
     progress.details.push(blocker.into());
-    let mut facts = FooterFacts {
+    let next = super::super::usage::rfc3339_utc(progress.next_at.unwrap());
+    let card = account_progress_text(&progress);
+    assert!(card.contains(blocker) && card.contains(&next), "{card}");
+    let facts = FooterFacts {
         account_progress: Some(progress.clone()),
         ..Default::default()
     };
-    for room in [40, 60] {
+    for room in [30, 60, 160] {
         let fit = fit_rule(&facts, room, None);
-        assert!(fit.width(None) <= room);
         assert!(
-            fit.segments
-                .iter()
-                .any(|s| s.mark == WALL_MARK && s.text.contains(blocker))
+            !fit.segments.iter().any(|s| s.text.contains(blocker)),
+            "{room}: the blocker is the card's, not the rule's: {fit:?}"
         );
     }
-    facts.account_progress.as_mut().unwrap().wall = Some("weekly".into());
-    let fit = fit_rule(&facts, 60, None);
-    assert!(fit.width(None) <= 60);
-    assert!(fit.segments.iter().any(|s| s.text.contains(blocker)));
-    let wide = fit_rule(&facts, 160, None);
-    let next = super::super::usage::rfc3339_utc(progress.next_at.unwrap());
-    assert!(wide.segments.iter().any(|s| s.text.contains(&next)));
-    let tiny = fit_rule(&facts, 30, None);
-    assert!(tiny.width(None) <= 30);
-    assert!(tiny.segments.iter().any(|s| s.mark == WALL_MARK));
-    assert_eq!(
-        facts.account_progress.as_ref().unwrap().next_at,
-        progress.next_at
-    );
 }
-
 #[test]
 fn a_transcript_limit_without_recovery_observations_has_an_ephemeral_unknown_view() {
     use super::super::account_progress::ProgressPhase;
@@ -6514,7 +6315,7 @@ fn a_transcript_limit_without_recovery_observations_has_an_ephemeral_unknown_vie
     assert!(limit.contains("7d"));
     assert!(limit.contains(reset));
     assert!(limit.contains("provider reset"));
-    let full = account_progress_text(&view, false);
+    let full = account_progress_text(&view);
     assert!(full.contains(reset));
     assert!(full.contains("Inventory unknown"));
     assert!(full.contains("Eligibility unknown"));
@@ -6522,14 +6323,20 @@ fn a_transcript_limit_without_recovery_observations_has_an_ephemeral_unknown_vie
     assert!(!full.contains(&format!("Next {reset}")));
     assert_eq!(facts, before, "the display does not create an observation");
     assert!(facts.account_progress.is_none());
+    let wall: Vec<String> = segments(&facts)
+        .iter()
+        .filter(|s| s.mark == WALL_MARK)
+        .map(|s| s.text.clone())
+        .collect();
     assert_eq!(
-        facts.account_progress_on_rule().as_deref(),
-        Some(view.as_ref())
+        wall,
+        [format!("until {reset}")],
+        "the rule says the wall alone"
     );
 }
 
 #[test]
-fn an_unobserved_recovery_stays_unknown_on_tight_rules_and_keeps_its_reset_in_disclosure() {
+fn an_unobserved_recovery_keeps_its_reset_in_disclosure_and_the_rule_its_wall() {
     let reset = "Nov 4 at 6:02am";
     let facts = FooterFacts {
         usage: Some(super::super::session_usage::UsageFacts {
@@ -6539,38 +6346,42 @@ fn an_unobserved_recovery_stays_unknown_on_tight_rules_and_keeps_its_reset_in_di
             }),
             ..Default::default()
         }),
-        model: Some("a model that yields to recovery visibility".into()),
+        model: Some("a model that yields to the wall".into()),
         path: Some("/a/long/path/that/yields".into()),
         ..Default::default()
     };
-    for room in [40, 60, 256] {
+    for room in [30, 60, 256] {
         let fit = fit_rule(&facts, room, None);
         assert!(fit.width(None) <= room);
-        let recovery = fit
+        let wall = fit
             .segments
             .iter()
             .find(|s| s.mark == WALL_MARK)
-            .expect("limit and recovery");
-        assert!(recovery.text.contains("Limit reached"));
-        assert!(recovery.text.contains("State unknown"));
-        assert!(!recovery.text.contains("Rotation off"));
-        assert!(!recovery.text.contains(&format!("Next {reset}")));
-        if room == 256 {
-            assert!(recovery.text.contains(reset));
-            assert!(recovery.text.contains("provider reset"));
-            assert!(recovery.text.contains(UNOBSERVED_RECOVERY_FINDING));
-        }
+            .expect("the wall");
+        assert_eq!(wall.text, format!("until {reset}"));
         let set = set_facts(&fit.segments);
         assert!(
             fact_spans(&set, &fit.segments)
                 .iter()
                 .flatten()
-                .any(|span| span.kind == FactKind::Account)
+                .any(|span| span.kind == FactKind::Account),
+            "the wall opens the accounts"
         );
     }
+    let view = facts.account_progress_view().expect("the unobserved view");
+    let card = account_progress_text(&view);
+    for words in [
+        "Limit reached",
+        "State unknown",
+        reset,
+        "provider reset",
+        UNOBSERVED_RECOVERY_FINDING,
+    ] {
+        assert!(card.contains(words), "{words}: {card}");
+    }
+    assert!(!card.contains(&format!("Next {reset}")));
     assert!(facts.account_progress.is_none());
 }
-
 #[test]
 fn a_paused_recovery_keeps_the_provider_wall_without_becoming_a_wait() {
     use super::super::account_progress::{
@@ -6670,8 +6481,10 @@ fn unavailable_recovery_withdraws_current_claims_without_rewriting_the_decision(
     assert!(unread.wall.as_ref().unwrap().contains("tomorrow"));
 }
 
+/// A wall outlasts the controls until no rung with the wall fits: with or without a recovery
+/// observation, a person can act on a wall (§5.1).
 #[test]
-fn recovery_outlasts_chips_until_no_recovery_form_fits() {
+fn a_wall_outlasts_chips_until_no_wall_fits() {
     use super::super::account_progress::{AccountProgress, ProgressPhase};
     let mut observed = AccountProgress::unknown(100);
     observed.phase = ProgressPhase::Waiting;
@@ -6708,7 +6521,7 @@ fn recovery_outlasts_chips_until_no_recovery_form_fits() {
         let fit = fit_rule(&facts, 40, Some(cramped));
         assert!(
             !fit.chips,
-            "recovery fits alone and takes priority over controls alone"
+            "the wall fits alone and takes priority over the controls"
         );
         assert!(fit.segments.iter().any(|s| s.mark == WALL_MARK));
         assert!(fit.width(Some(cramped)) <= 40);
@@ -6719,46 +6532,24 @@ fn recovery_outlasts_chips_until_no_recovery_form_fits() {
         assert!(fit.width(Some(tiny)) <= 256);
     }
 }
-
 #[test]
-fn the_advertised_chip_budget_agrees_with_the_shortest_recovery_that_fits() {
-    use super::super::account_progress::{AccountProgress, ProgressPhase};
-    let mut cases = vec![narrow_rule_walled()];
-    for phase in [
-        ProgressPhase::Unknown,
-        ProgressPhase::Watching,
-        ProgressPhase::Disabled,
-        ProgressPhase::Limited,
-        ProgressPhase::Waiting,
-        ProgressPhase::Probing,
-        ProgressPhase::Ready,
-        ProgressPhase::Switching {
-            to: "替代👩‍💻-a-long-alternate-account-name".into(),
+fn the_advertised_chip_budget_agrees_with_the_shortest_wall_that_fits() {
+    let walled = narrow_rule_walled();
+    let cases = vec![
+        walled.clone(),
+        FooterFacts {
+            account: Some("a-long-account-label-0123456789".into()),
+            subscription: Some(super::super::profile::SubscriptionDisplay {
+                weekly: Some(super::super::profile::WEEKLY_OUT.into()),
+                ..Default::default()
+            }),
+            ..walled.clone()
         },
-        ProgressPhase::Verifying {
-            to: "a-long-alternate-account-name".into(),
+        FooterFacts {
+            usage: walled.usage.clone(),
+            ..unit_facts()
         },
-        ProgressPhase::SigningIn {
-            label: "替代👩‍💻-a-long-account-name".into(),
-            route: Some("browser".into()),
-        },
-    ] {
-        let mut observed = AccountProgress::unknown(100);
-        observed.known = Some(3);
-        observed.eligible = Some(1);
-        if !matches!(phase, ProgressPhase::Watching | ProgressPhase::Unknown) {
-            observed.wall = Some("7d".into());
-        }
-        observed.phase = phase;
-        observed.details.push(
-            "A long observed recovery finding that must yield before the recovery phase".into(),
-        );
-        observed.next_at = Some(1_800_000_000);
-        cases.push(FooterFacts {
-            account_progress: Some(observed),
-            ..narrow_rule_tokens()
-        });
-    }
+    ];
     let mut controls_alone = 0;
     let mut recovery_alone = 0;
     let mut together = 0;
@@ -6773,7 +6564,7 @@ fn the_advertised_chip_budget_agrees_with_the_shortest_recovery_that_fits() {
                     .iter()
                     .any(|segment| segment.mark == WALL_MARK)
             })
-            .expect("every recovery phase has a form that fits");
+            .expect("every wall has a rung that fits");
         assert_eq!(chips_room(&facts, minimum), 0);
         for room in (0..=96).chain([120, 160, 256]) {
             let budget = chips_room(&facts, room);
@@ -6826,53 +6617,19 @@ fn the_advertised_chip_budget_agrees_with_the_shortest_recovery_that_fits() {
                     assert!(fit.segments.iter().any(|segment| segment.mark == WALL_MARK));
                     together += 1;
                 } else {
+                    // Below the wall's floor the ladder goes on without the wall, beside the
+                    // controls it never displaces.
                     assert!(
-                        fit.segments.is_empty(),
-                        "controls alone only below the recovery floor"
+                        !fit.segments.iter().any(|segment| segment.mark == WALL_MARK),
+                        "no wall below its floor: {fit:?}"
                     );
-                    controls_alone += 1;
+                    controls_alone += usize::from(fit.segments.is_empty());
                 }
             }
         }
         assert_eq!(facts, before, "budgeting never changes the observation");
     }
     assert!(controls_alone > 0 && recovery_alone > 0 && together > 0 && between > 0);
-}
-
-#[test]
-fn recovery_ladders_keep_a_joined_weekly_with_its_account() {
-    use super::super::account_progress::{AccountProgress, ProgressPhase};
-    let mut observed = AccountProgress::unknown(100);
-    observed.phase = ProgressPhase::Waiting;
-    observed.wall = Some("7d".into());
-    for progress in [None, Some(observed)] {
-        for email in [None, Some("owner@example.com")] {
-            let facts = FooterFacts {
-                subscription: Some(super::super::profile::SubscriptionDisplay {
-                    email: email.map(str::to_owned),
-                    weekly: Some(super::super::profile::WEEKLY_OUT.into()),
-                    ..Default::default()
-                }),
-                account_progress: progress.clone(),
-                ..narrow_rule_walled()
-            };
-            let full = segments(&facts);
-            assert!(unit_whole(&full));
-            assert!(plain_ladder(&facts).iter().all(|rung| unit_whole(rung)));
-            if email.is_some() {
-                // The old account-only removal left a joined weekly without its lead.
-                let mut orphan = full;
-                orphan.retain(|segment| segment.mark != ACCOUNT_MARK);
-                assert!(!unit_whole(&orphan));
-            } else {
-                assert!(
-                    full.iter()
-                        .any(|segment| segment.mark == WEEKLY_MARK && !segment.joined)
-                );
-            }
-            assert_eq!(facts.account_progress, progress);
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -6908,7 +6665,6 @@ fn clearing_a_typed_transcript_wall_removes_its_unobserved_recovery_view() {
         };
         assert!(cleared.usage.as_ref().unwrap().wall.is_none());
         assert!(cleared.account_progress_view().is_none());
-        assert!(cleared.account_progress_on_rule().is_none());
         assert!(cleared.account_progress.is_none());
     }
     std::fs::remove_dir_all(root).unwrap();
@@ -6939,7 +6695,6 @@ fn quoted_limit_text_without_a_typed_notice_cannot_create_recovery_evidence() {
         assert!(usage.input_total() > 0);
         assert!(usage.wall.is_none());
         assert!(facts.account_progress_view().is_none());
-        assert!(facts.account_progress_on_rule().is_none());
         assert!(facts.account_progress.is_none());
     }
     std::fs::remove_dir_all(root).unwrap();
@@ -6968,20 +6723,16 @@ fn a_transcript_limit_survives_an_older_idle_account_observation() {
         assert_eq!(view.phase, ProgressPhase::Waiting);
         assert_eq!(view.wall.as_deref(), Some("7d"));
         assert_eq!((view.known, view.eligible), (Some(2), Some(1)));
-        let narrow = account_progress_text(&view, true);
-        let room = super::rule_width(
-            &[Segment::plain(WALL_MARK, &narrow)],
-            TitleFit::None,
-            false,
-            None,
-        );
-        for width in [room, 200] {
+        assert!(account_progress_text(&view).contains("Limit reached"));
+        for width in [24, 200] {
             let fit = fit_rule(&facts, width, None);
-            assert!(
-                fit.segments
-                    .iter()
-                    .any(|s| s.mark == WALL_MARK && s.text.contains("Limit reached"))
-            );
+            let wall: Vec<&str> = fit
+                .segments
+                .iter()
+                .filter(|s| s.mark == WALL_MARK)
+                .map(|s| s.text.as_str())
+                .collect();
+            assert_eq!(wall, ["until tomorrow"], "{width}: the wall alone");
         }
         // The reconciled view does not rewrite the supervisor's observation.
         assert_eq!(facts.account_progress.as_ref(), Some(&progress));
@@ -7020,21 +6771,19 @@ fn healthy_account_inventory_does_not_present_a_pending_recovery_event() {
     progress.phase = ProgressPhase::Watching;
     progress.eligible = Some(1);
     progress.known = Some(2);
-    let idle = account_progress_text(&progress, false);
+    let idle = account_progress_text(&progress);
     progress.next_at = Some(160);
-    assert_eq!(idle, account_progress_text(&progress, false));
-    assert_eq!(idle, account_progress_text(&progress, true));
+    assert_eq!(idle, account_progress_text(&progress));
     progress.wall = Some("weekly".into());
-    assert_ne!(idle, account_progress_text(&progress, false));
+    assert_ne!(idle, account_progress_text(&progress));
 }
 
-/// AN ACCOUNT WATCH THAT KNOWS NOTHING IS NOT ON THE RULE: after a relaunch the account
-/// observation is a watch with no limit and no inventory, which the person at the tab can do
-/// nothing with, so the rule lays no `⧗` for it at any width and its other facts stand; the
-/// observation stays on the facts for the hover and the Accounts menu. CONTROL: a watch that
-/// knows its inventory, or a limit, is on the rule.
+/// NO ACCOUNT OBSERVATION IS ON THE RULE (§5.1): a watch that knows nothing, one that knows its
+/// inventory, and one that records a limit all leave the rule its facts and lay no `⧗`; the
+/// observation stays on the facts for the hover and the Accounts card. Negative control: a
+/// transcript wall is on the rule.
 #[test]
-fn an_account_watch_that_knows_nothing_is_not_on_the_rule() {
+fn no_account_observation_is_on_the_rule() {
     use super::super::account_progress::{AccountProgress, ProgressPhase};
     let mut progress = AccountProgress::unknown(100);
     progress.phase = ProgressPhase::Watching;
@@ -7051,30 +6800,28 @@ fn an_account_watch_that_knows_nothing_is_not_on_the_rule() {
             .map(|s| s.mark)
             .collect()
     };
-    for room in [40, 80, 200] {
-        let on = marks(&facts, room);
-        assert!(!on.contains(&WALL_MARK), "{room}: {on:?}");
-        assert!(on.contains(&MODEL_MARK), "{room}: the model stands: {on:?}");
+    for known in [None, Some(2)] {
+        for wall in [None, Some("weekly")] {
+            progress.known = known;
+            progress.wall = wall.map(str::to_owned);
+            facts.account_progress = Some(progress.clone());
+            for room in [40, 80, 200] {
+                let on = marks(&facts, room);
+                assert!(!on.contains(&WALL_MARK), "{room}: {on:?}");
+                assert!(on.contains(&MODEL_MARK), "{room}: the model stands: {on:?}");
+            }
+            assert!(
+                facts.account_progress_view().is_some(),
+                "kept for the hover and the card"
+            );
+        }
     }
-    assert!(
-        facts.account_progress_view().is_some(),
-        "kept for the hover and the menu"
-    );
-    progress.known = Some(2);
-    facts.account_progress = Some(progress.clone());
+    facts.usage = narrow_rule_walled().usage;
     assert!(
         marks(&facts, 200).contains(&WALL_MARK),
-        "CONTROL: an inventory is on the rule"
-    );
-    progress.known = None;
-    progress.wall = Some("weekly".into());
-    facts.account_progress = Some(progress);
-    assert!(
-        marks(&facts, 200).contains(&WALL_MARK),
-        "CONTROL: a limit is on the rule"
+        "NEGATIVE CONTROL: a transcript wall is on the rule"
     );
 }
-
 #[test]
 fn recovery_event_time_does_not_depend_on_the_observation_age() {
     use super::super::account_progress::{AccountProgress, ProgressPhase};
@@ -7083,14 +6830,8 @@ fn recovery_event_time_does_not_depend_on_the_observation_age() {
     first.next_at = Some(1_793_040_600);
     let mut later = first.clone();
     later.observed_at += 300;
-    for narrow in [false, true] {
-        let event = account_progress_text(&first, narrow);
-        assert_eq!(event, account_progress_text(&later, narrow));
-        later.next_at = None;
-        assert_ne!(event, account_progress_text(&later, narrow));
-        later.next_at = first.next_at;
-    }
+    let event = account_progress_text(&first);
+    assert_eq!(event, account_progress_text(&later));
+    later.next_at = None;
+    assert_ne!(event, account_progress_text(&later));
 }
-
-#[path = "footer_outlook_tests.rs"]
-mod outlook_unit;

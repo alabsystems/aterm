@@ -123,7 +123,7 @@ pub(crate) struct AccountMenuRow {
     pub(crate) enabled: bool,
 }
 
-/// Format a weekly availability string with a 5-cell meter bar.
+/// Format weekly words with a 5-cell meter bar of the share left (`▰▱▱▱▱  weekly 73% used`).
 #[must_use]
 pub(crate) fn weekly_meter_bar(text: &str) -> String {
     let Some(pct) = weekly_pct(text) else {
@@ -143,18 +143,19 @@ pub(crate) fn weekly_meter_bar(text: &str) -> String {
     bar
 }
 
-/// The whole percent weekly words name (`weekly 73% left`, `weekly 61.5% left · 16m ago`: 61),
-/// tenths cut as [`whole_left`] cuts them.
+/// The whole percent left of the share weekly words say used (`weekly 27% used`: 73; a bound,
+/// `weekly ≥27% used`, gives the most that can be left: 73), as [`whole_left`] says it; `None`
+/// for words with no figure (a wall's `weekly out`, a gap's).
 fn weekly_pct(text: &str) -> Option<u32> {
-    let n = text.split_whitespace().find_map(|w| w.strip_suffix('%'))?;
-    let (whole, tenths) = n.split_once('.').unwrap_or((n, ""));
-    let whole = whole
+    let used = aterm_agent::harness::profile::weekly_figure_words(text)?
+        .trim_start_matches('\u{2265}')
+        .strip_suffix('%')?;
+    let used = used
         .bytes()
         .all(|b| b.is_ascii_digit())
-        .then(|| whole.parse::<u32>().ok())
+        .then(|| used.parse::<u32>().ok())
         .flatten()?;
-    let tenths = tenths.bytes().any(|b| (b'1'..=b'9').contains(&b));
-    Some(whole_left(whole.saturating_mul(10) + u32::from(tenths)))
+    Some(whole_left(1000u32.saturating_sub(used.min(100) * 10)))
 }
 
 /// The whole percent left of `left_x10` tenths, the footer's tenths cut, but never to the `0`
@@ -357,7 +358,8 @@ pub(crate) struct FactMenuFacts {
     pub(crate) context: Option<String>,
     /// The active subscription summary (`sol-m27@example.test · max 20x`).
     pub(crate) subscription: Option<String>,
-    /// The weekly meter line (`▰▰▰▰▱  weekly 61% left`; a wall's `weekly out`, no meter).
+    /// The weekly meter line (`▰▰▰▰▱  weekly 39% used`, its bar the share left; a wall's
+    /// `weekly out`, no meter).
     pub(crate) weekly_meter: Option<String>,
     /// Why the footer has no weekly figure, where it says ([`weekly_gap_why`]).
     pub(crate) weekly_gap: Option<WeeklyGap>,
@@ -768,7 +770,7 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 summary.details.clear();
                 summary.independent_work.clear();
                 summary.next_at = summary.next_at.filter(|at| *at > 0);
-                let summary = aterm_agent::harness::footer::account_progress_text(&summary, false);
+                let summary = aterm_agent::harness::footer::account_progress_text(&summary);
                 out.push(MenuRow::note(if progress.independent_work.is_empty() {
                     summary
                 } else {
@@ -838,17 +840,12 @@ pub(crate) fn rows(fact: Fact, facts: &FactMenuFacts) -> Vec<MenuRow> {
                 .as_ref()
                 .filter(|_| facts.outlook.is_none())
             {
-                out.push(MenuRow::note(format!(
-                    "{}  {meter}",
-                    aterm_agent::harness::footer::WEEKLY_MARK
-                )));
+                // The week's line leads with no mark of its own: `◷` left the glass (§4.2), and
+                // the card's rows are S6's to redraw.
+                out.push(MenuRow::note(format!("   {meter}")));
             } else if let Some(gap) = facts.weekly_gap {
                 out.push(MenuRow::note_spoken(
-                    format!(
-                        "{}  {}",
-                        aterm_agent::harness::footer::WEEKLY_MARK,
-                        gap.words()
-                    ),
+                    format!("   {}", gap.words()),
                     gap.spoken(),
                 ));
                 // The why is prose wrapped to the card: a reader hears it whole,
