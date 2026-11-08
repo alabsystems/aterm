@@ -95,6 +95,13 @@ pub const EPOCHS_MAX: usize = 4;
 /// The most bytes one row may take.
 pub const ROW_MAX: usize = 512;
 
+/// The most five-hour windows one stored `day` row names by anchor ([`DayFive::anchors`]): one
+/// window ends at most every five hours where no limit reset was used and no other login took
+/// the home, so a day holds five, and six name one to spare. A row names the oldest of them
+/// that fit its line under [`ROW_MAX`] ([`SeriesRow::line`]): six fit a row of every count and
+/// figure at its widest and ten-digit instants.
+pub const DAY_ANCHORS_MAX: usize = 6;
+
 /// How long a writer waits for [`LOCK_FILE`] before it drops its row (an `event` or `plan` row
 /// waits in this process's outbox for the next append to the file).
 pub const LOCK_WAIT: Duration = Duration::from_millis(50);
@@ -207,7 +214,7 @@ pub struct Close {
 }
 
 /// One local day's five-hour windows ([`Day::five_hour`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DayFive {
     /// Windows closed that day.
     pub closed: u32,
@@ -216,6 +223,12 @@ pub struct DayFive {
     pub peak: u32,
     /// Windows closed that day that read full.
     pub walled: u32,
+    /// The windows closed that day by anchor (each one's reset), oldest first, each with whether
+    /// it read full. A stored row names at most [`DAY_ANCHORS_MAX`] of them, the oldest that fit
+    /// its line, so a stored row of a busier day names fewer than [`Self::closed`], as does a row
+    /// written before rows named them. It lets two files' rows of one day count a window both
+    /// closed once after their closes are gone.
+    pub anchors: Vec<(i64, bool)>,
 }
 
 /// One local day's week ([`Day::seven_day`]).
@@ -541,9 +554,23 @@ impl SeriesRow {
         }
     }
 
-    /// The row as one line of its file, at most [`ROW_MAX`] bytes; `None` past that.
+    /// The row as one line of its file, at most [`ROW_MAX`] bytes; `None` past that. A `day` row
+    /// names the oldest of its five-hour anchors that fit, at most [`DAY_ANCHORS_MAX`], and
+    /// keeps its counts: a window it counts but does not name is counted all the same.
     #[must_use]
     pub fn line(&self) -> Option<String> {
+        let named = match &self.said {
+            Said::Day(Day {
+                five_hour: Some(five),
+                ..
+            }) => five.anchors.len().min(DAY_ANCHORS_MAX),
+            _ => 0,
+        };
+        (0..=named).rev().find_map(|n| self.line_naming(n))
+    }
+
+    /// [`Self::line`] with a `day` row's oldest `named` anchors.
+    fn line_naming(&self, named: usize) -> Option<String> {
         let mut o = Map::new();
         o.insert("v".into(), Value::from(SCHEMA));
         o.insert("t".into(), Value::from(self.t));
@@ -609,11 +636,27 @@ impl SeriesRow {
                 o.insert("span_s".into(), Value::from(d.span_s));
                 o.insert("tz_s".into(), Value::from(d.tz_s));
                 let mut w = Map::new();
-                if let Some(five) = d.five_hour {
+                if let Some(five) = &d.five_hour {
                     let mut f = Map::new();
                     f.insert("closed".into(), Value::from(five.closed));
                     f.insert("peak".into(), Value::from(five.peak));
                     f.insert("walled".into(), Value::from(five.walled));
+                    let anchors = &five.anchors[..named.min(five.anchors.len())];
+                    let resets = |full: bool| {
+                        Value::Array(
+                            anchors
+                                .iter()
+                                .filter(|(_, walled)| *walled || !full)
+                                .map(|(reset, _)| Value::from(*reset))
+                                .collect(),
+                        )
+                    };
+                    if !anchors.is_empty() {
+                        f.insert("anchors".into(), resets(false));
+                    }
+                    if anchors.iter().any(|(_, walled)| *walled) {
+                        f.insert("full".into(), resets(true));
+                    }
                     w.insert(accounts::SESSION_LIMIT.into(), Value::Object(f));
                 }
                 if let Some(week) = d.seven_day {
@@ -726,6 +769,26 @@ impl SeriesRow {
             "day" => {
                 let w = o.get("w").and_then(Value::as_object)?;
                 let count = |f: &Map, key: &str| u32::try_from(f.get(key)?.as_u64()?).ok();
+                // The anchors and the ones that read full; an absent list names none, and so do
+                // lists that are not of instants, which leave the day's counts standing.
+                let anchors = |f: &Map| {
+                    let list = |key: &str| match f.get(key) {
+                        None => Some(Vec::new()),
+                        Some(v) => v
+                            .as_array()?
+                            .iter()
+                            .take(DAY_ANCHORS_MAX)
+                            .map(Value::as_i64)
+                            .collect::<Option<Vec<i64>>>(),
+                    };
+                    let (Some(resets), Some(full)) = (list("anchors"), list("full")) else {
+                        return Vec::new();
+                    };
+                    resets
+                        .into_iter()
+                        .map(|reset| (reset, full.contains(&reset)))
+                        .collect()
+                };
                 let five_hour = w
                     .get(accounts::SESSION_LIMIT)
                     .and_then(Value::as_object)
@@ -734,6 +797,7 @@ impl SeriesRow {
                             closed: count(f, "closed")?,
                             peak: pct(f.get("peak"))?,
                             walled: count(f, "walled")?,
+                            anchors: anchors(f),
                         })
                     });
                 let seven_day = w
@@ -1618,6 +1682,7 @@ struct DayAcc<'a> {
     five_close_peak: Option<u32>,
     five_closed: u32,
     five_walled: u32,
+    five_anchors: BTreeMap<i64, bool>,
     five_any: bool,
     week_first: Option<(i64, u32, i64)>,
     week_last: Option<(i64, u32, i64)>,
@@ -1658,12 +1723,13 @@ impl<'a> DayAcc<'a> {
 /// One `day` row for each local day under `tz_at` that overlaps `[from, to)` and holds a
 /// reading or a close, each from all of that day's rows taken in time order whatever order they
 /// come in: the readings recorded (`fig` and `beat` rows, a beat repeating the figures and keys
-/// of the last `fig` row before it), the five-hour windows closed, their peak and how many read
-/// full, and the week's first and last figures, its reset and whether it closed (a day that read
-/// no weekly figure takes its last weekly close's end). A day's `t` is its local midnight, its
-/// `span_s` its length (23 or 25 hours across a daylight-saving change) and its `tz_s` the
-/// zone's offset then. The one definition of a day: compaction writes these, and a history reads
-/// them for the days it holds rows of.
+/// of the last `fig` row before it), the five-hour windows closed, their peak, how many read full
+/// and each one's anchor (every one: a stored row names the oldest that fit,
+/// [`SeriesRow::line`]), and the week's first and last figures, its reset and whether it closed
+/// (a day that read no weekly figure takes its last weekly close's end). A day's `t` is its
+/// local midnight, its `span_s` its length (23 or 25 hours across a daylight-saving change) and
+/// its `tz_s` the zone's offset then. The one definition of a day: compaction writes these, and
+/// a history reads them for the days it holds rows of.
 #[must_use]
 pub fn day_summaries(
     rows: &[SeriesRow],
@@ -1716,6 +1782,7 @@ pub fn day_summaries(
                 acc.five_any = true;
                 acc.five_closed = acc.five_closed.saturating_add(1);
                 acc.five_walled = acc.five_walled.saturating_add(u32::from(c.walled));
+                *acc.five_anchors.entry(c.reset).or_default() |= c.walled;
                 acc.five_close_peak = Some(acc.five_close_peak.map_or(c.peak, |p| p.max(c.peak)));
                 acc.keyed(row.t, &row.by, c.ac.as_ref(), c.key);
             }
@@ -1741,6 +1808,11 @@ pub fn day_summaries(
                         closed: acc.five_closed,
                         peak: acc.five_fig_peak.or(acc.five_close_peak).unwrap_or(0),
                         walled: acc.five_walled,
+                        anchors: acc
+                            .five_anchors
+                            .iter()
+                            .map(|(reset, walled)| (*reset, *walled))
+                            .collect(),
                     }),
                     seven_day: acc
                         .week_last
@@ -1854,6 +1926,53 @@ fn after_parting(rows: &[SeriesRow], keys: Keys<'_>, now: i64) -> (Option<usize>
         }
         None => (None, order),
     }
+}
+
+/// THE NEWEST INSTANT THE SERIES ROWS `rows` SAW THE HOME TAKEN OVER BY THE ACCOUNT `keys` NAMES
+/// FROM ANOTHER, at `now`: an `another-account` event's instant (the transaction that recorded
+/// another account's sign-in), or, after a row that carries another account's keys
+/// ([`Keys::others`]: a reading, a close or a day, which a label given to another account leaves
+/// with no event), the first row of the account's own keys ([`Keys::names`]) after what that row
+/// speaks for (a reading's instant, a close's last reading, a day's end), and `now` where none
+/// came after it: until then who held the home is not known. `None` where no row parts two
+/// accounts. Rows go by `t`, a tie in the order given. The account backfill books no wall from
+/// before it (`super::account_backfill::book`), as [`since_of`] takes no baseline from before a
+/// parting ([`after_parting`]).
+#[must_use]
+pub fn taken_over<'a>(
+    rows: impl IntoIterator<Item = &'a SeriesRow>,
+    keys: Keys<'_>,
+    now: i64,
+) -> Option<i64> {
+    let mut rows: Vec<&SeriesRow> = rows.into_iter().filter(|row| row.t <= now).collect();
+    rows.sort_by_key(|row| row.t);
+    let mut taken: Option<i64> = None;
+    // The last instant another account's rows speak for, until a row of the account's own.
+    let mut theirs: Option<i64> = None;
+    for row in rows {
+        if let Said::Event(e) = &row.said {
+            if e.e == EventWord::AnotherAccount {
+                taken = taken.max(Some(e.at.unwrap_or(row.t)));
+                theirs = None;
+            }
+            continue;
+        }
+        let Some(carried) = row.keys() else {
+            continue;
+        };
+        if keys.others(carried) {
+            let through = match &row.said {
+                Said::Close(c) => c.last.max(c.first),
+                Said::Day(d) => row.t.saturating_add(d.span_s).saturating_sub(1),
+                Said::Fig { .. } | Said::Beat | Said::Plan(_) | Said::Event(_) => row.t,
+            };
+            theirs = theirs.max(Some(through));
+        } else if keys.names(carried) && theirs.is_some_and(|through| row.t > through) {
+            taken = taken.max(Some(row.t));
+            theirs = None;
+        }
+    }
+    if theirs.is_some() { Some(now) } else { taken }
 }
 
 /// How far `window`'s figure `current` moved over the last `span_s` before `now`, read against

@@ -249,8 +249,6 @@ pub struct Live {
     pub started_at: Instant,
     /// Bumped by every restate.
     pub revision: u32,
-    /// The current action list's version.
-    action_revision: Option<u64>,
     /// Duplicate posts folded into it.
     pub repeats: u32,
     /// When the row reached the glass, where its hold anchors; `None` while queued.
@@ -319,7 +317,6 @@ impl Live {
             posted_at: now,
             started_at: now,
             revision: 0,
-            action_revision: Some(0),
             repeats: 1,
             on_glass_since: None,
             fold_at: None,
@@ -342,12 +339,6 @@ impl Live {
             logged_mark: (msg.severity, msg.glyph),
             msg,
         }
-    }
-
-    /// The action-list revision to capture with this row's id before queuing an action.
-    #[must_use]
-    pub const fn action_revision(&self) -> Option<u64> {
-        self.action_revision
     }
 
     /// `true` while not on glass.
@@ -1213,9 +1204,6 @@ impl MessageCenter {
             row.motion_since = Some(now);
         }
         let eta_moved = row.track.eta(now) != eta_before;
-        if row.msg.actions != before.actions {
-            row.action_revision = row.action_revision.and_then(|rev| rev.checked_add(1));
-        }
         let changed = row.msg != before || was_carried || eta_moved;
         if changed {
             row.revision = row.revision.wrapping_add(1);
@@ -1404,20 +1392,6 @@ impl MessageCenter {
             self.rebalance(now);
         }
         Some(intent)
-    }
-
-    /// Perform an action only while the id and action-list revision captured by its caller stand.
-    pub fn act_at_revision(
-        &mut self,
-        id: MessageId,
-        revision: u64,
-        action: ActionIndex,
-        now: Instant,
-    ) -> Option<Intent> {
-        if self.live(id)?.action_revision() != Some(revision) {
-            return None;
-        }
-        self.act(id, action, now)
     }
 
     /// Reveal the rows whose grace is over, show the load words that have lasted, retire what is
@@ -4594,85 +4568,6 @@ mod tests {
             LogState::Retired(Retired::Folded)
         );
         assert!(c.live(id).unwrap().seen);
-
-        let original = c.live(id).unwrap().action_revision().unwrap();
-        let changed = Intent::OpenSettings {
-            route: "/packages".into(),
-        };
-        assert!(c.restate(
-            id,
-            Restatement {
-                actions: Some(vec![changed.clone()]),
-                ..Restatement::default()
-            },
-            now + ms(5)
-        ));
-        let replacement = c.live(id).unwrap().action_revision().unwrap();
-        assert_ne!(replacement, original);
-        let before = c.log().pending_lines().count();
-        assert_eq!(
-            c.act_at_revision(id, original, ActionIndex(0), now + ms(6)),
-            None
-        );
-        assert_eq!(
-            c.log().pending_lines().count(),
-            before,
-            "refusal writes nothing"
-        );
-        assert_eq!(
-            c.act_at_revision(id, replacement, ActionIndex(0), now + ms(7)),
-            Some(changed)
-        );
-        assert!(c.restate(
-            id,
-            Restatement {
-                actions: Some(vec![Intent::OpenSystemPane {
-                    pane: "full-disk-access".into()
-                }]),
-                ..Restatement::default()
-            },
-            now + ms(8)
-        ));
-        assert_eq!(
-            c.act_at_revision(id, original, ActionIndex(0), now + ms(9)),
-            None
-        );
-        let current = c.live(id).unwrap().action_revision().unwrap();
-        assert_eq!(
-            c.act_at_revision(held, current, ActionIndex(0), now),
-            None,
-            "retired id"
-        );
-        assert!(c.restate(
-            id,
-            Restatement {
-                title: Some("File access still needs attention".into()),
-                ..Restatement::default()
-            },
-            now + ms(10)
-        ));
-        assert_eq!(c.live(id).unwrap().action_revision(), Some(current));
-        assert!(
-            c.act_at_revision(id, current, ActionIndex(0), now + ms(11))
-                .is_some()
-        );
-        c.live
-            .iter_mut()
-            .find(|l| l.id == id)
-            .unwrap()
-            .action_revision = Some(u64::MAX);
-        assert!(c.restate(
-            id,
-            Restatement {
-                actions: Some(vec![Intent::NewWindow]),
-                ..Restatement::default()
-            },
-            now + ms(12)
-        ));
-        assert_eq!(c.live(id).unwrap().action_revision(), None);
-        let before = c.log().pending_lines().count();
-        assert_eq!(c.act_at_revision(id, u64::MAX, ActionIndex(0), now), None);
-        assert_eq!(c.log().pending_lines().count(), before);
     }
 
     fn busy(title: &str) -> Message {

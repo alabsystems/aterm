@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use agh_fake::{FakeGithub, Fault, Match, RepoSpec};
+use aterm_types::MutexExt;
 
 use super::{Answered, Call, CallBody, Github, GithubBuilder};
 use crate::config::{self, Dirs};
@@ -692,7 +693,9 @@ fn a_send_waits_for_another_send_s_binding() {
     let first = send("first");
     until("the first binding's GET /user", &|| !fake.seen().is_empty());
     let second = send("second");
-    until("the second send to wait", &|| gh.bindings().waiting == 1);
+    until("the second send to wait", &|| {
+        gh.inner.bound.lock_or_recover().waiting == 1
+    });
     fake.end_hangs();
     for _ in 0..2 {
         let (name, result) = finished.recv_timeout(HANG).expect("a send ended");

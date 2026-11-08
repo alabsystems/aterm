@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aterm_uds::spawnfd::command;
+use aterm_uds::spawnfd::{Stdio, command};
 
 use super::cat::{Term, inner_argv, order, run_in};
 use super::{
@@ -200,6 +200,39 @@ pub(crate) fn pinned_checkout(pin: &RepoPin) -> Result<PathBuf, Halt> {
     Ok(vte_dir)
 }
 
+/// Build the pinned upstream control without starting either terminal under comparison.
+/// Cargo supplies its executable path, including when a build-directory override is active.
+pub(crate) fn build_vtebench(vte_dir: &Path) -> Result<PathBuf, Halt> {
+    let driver = crate::perf::driver::cargo_driver()?;
+    let build_args = [
+        "--release",
+        "--locked",
+        "--target-dir",
+        "target",
+        "--message-format=json-render-diagnostics",
+    ];
+    eprintln!("  building pinned vtebench in {}", vte_dir.display());
+    let built = driver
+        .command("build")
+        .args(build_args)
+        .current_dir(vte_dir)
+        .stderr(Stdio::inherit())
+        .output()
+        .map_err(|e| format!("could not build vtebench: {e}"))?;
+    if !built.status.success() {
+        return Err(Halt::Fail(format!(
+            "the vtebench build exited {}",
+            built.status
+        )));
+    }
+    crate::perf::bench_build::built_executable(
+        &String::from_utf8_lossy(&built.stdout),
+        "vtebench",
+        "bin",
+    )
+    .map_err(Halt::Fail)
+}
+
 fn run_inner(args: &Args) -> Result<String, Halt> {
     let trials = args.trials.unwrap_or(3);
     let (cols, grid_rows) = (args.columns.unwrap_or(120), args.rows.unwrap_or(40));
@@ -212,18 +245,7 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
     let arena = arena_dir()?;
     let pin = &pins.harness.vtebench;
     let vte_dir = pinned_checkout(pin)?;
-    let driver = crate::perf::driver::cargo_driver()?;
-    let build_args = ["--release", "--locked", "--target-dir", "target"];
-    let built = driver
-        .command("build")
-        .args(build_args)
-        .current_dir(&vte_dir)
-        .status()
-        .map_err(|e| format!("could not build vtebench: {e}"))?;
-    if !built.success() {
-        return Err(Halt::Fail(format!("the vtebench build exited {built}")));
-    }
-    let vtebench = vte_dir.join("target/release/vtebench");
+    let vtebench = build_vtebench(&vte_dir)?;
     let vte_sha = sha256_file(&vtebench)?;
     let bench_dir = arena.join(format!("vtebench-{}-benchmarks", pin.commit));
     let trimmed = trimmed_benchmarks(&vte_dir.join("benchmarks"), &bench_dir)?;

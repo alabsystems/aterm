@@ -538,9 +538,7 @@ impl DialerCode {
 
     const fn in_line(&self) -> Duration {
         match &self.rule {
-            DialerCodeRule::Stated(_) | DialerCodeRule::CodeAt(_) => {
-                aterm_keeper::identity::PEER_CHECK_HANG
-            }
+            DialerCodeRule::Stated(_) | DialerCodeRule::CodeAt(_) => aterm_uds::peer::CHECK_HANG,
             #[cfg(all(test, target_vendor = "apple"))]
             DialerCodeRule::Scripted { in_line, .. } => *in_line,
         }

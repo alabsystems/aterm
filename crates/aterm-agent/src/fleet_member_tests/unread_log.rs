@@ -64,6 +64,52 @@ fn relabel(registry: &aterm_db::alab::Registry, mac: &str, label: &str) {
 }
 
 #[test]
+fn a_registry_label_waits_for_its_local_writer() {
+    let lab = Lab::new("registry-label-writer");
+    label_this_mac(&lab, "m42");
+    let target = registry_target_started(
+        &lab.places,
+        "m42",
+        std::time::Instant::now() - std::time::Duration::from_secs(16),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(target.transport, own_node().node());
+    let principal = member::node_principal(own_node().key());
+    assert_eq!(target.node, principal);
+
+    let held = client::test_hold_state_lock(&lab.paths).unwrap();
+    assert!(
+        registry_target_started(
+            &lab.places,
+            "m42",
+            std::time::Instant::now() - std::time::Duration::from_secs(61),
+        )
+        .is_err()
+    );
+    drop(held);
+    assert_eq!(
+        registry_target(&lab.places, "m42")
+            .unwrap()
+            .unwrap()
+            .transport,
+        own_node().node()
+    );
+    assert_eq!(
+        registry_target_started(
+            &lab.places,
+            &principal,
+            std::time::Instant::now() - std::time::Duration::from_secs(61),
+        )
+        .unwrap()
+        .unwrap()
+        .transport,
+        own_node().node(),
+        "an explicit node needs no registry but retains membership validation"
+    );
+}
+
+#[test]
 fn registry_labels_override_a_stale_local_name_and_resolve_both_node_ids() {
     let lab = Lab::new("registry-label-authority");
     let own = own_node();
@@ -528,8 +574,8 @@ impl Lab {
             Some(vec![self.m9.node().to_owned()]),
             "{when}"
         );
-        let (denied, log) = denied_and_log(&self.places);
-        assert!(denied.is_some() && log.is_some(), "{when}: both read");
+        let (_, log) = denied_and_log(&self.places).expect("both reads succeed");
+        assert!(log.is_some(), "{when}: the log reads");
         let census = self.census().unwrap();
         let rows: Vec<&str> = census
             .fleet_book
@@ -565,9 +611,8 @@ impl Lab {
             );
         }
         assert_eq!(driving(&self.places), None, "{when}");
-        assert_eq!(
-            denied_and_log(&self.places),
-            (None, None),
+        assert!(
+            denied_and_log(&self.places).is_err(),
             "{when}: read whole or not at all"
         );
         let cached = crate::fleet_census::read_cached_census(&self.places.state)
@@ -1328,9 +1373,9 @@ fn after_a_move_to_another_vault_no_mac_of_the_vault_left_drives_by_its_grants()
             id.node()
         );
     }
-    let (denied, log) = denied_and_log(&lab.places);
+    let (_, log) = denied_and_log(&lab.places).expect("denial state reads");
     assert!(
-        denied.is_some() && log.is_some(),
+        log.is_some(),
         "PRECONDITION: the deny list and the log of the vault joined read"
     );
 

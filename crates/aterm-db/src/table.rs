@@ -695,18 +695,25 @@ impl<'a> Session<'a> {
             None => selected.range::<Digest, _>(..),
         };
         let head = after.into_iter().flat_map(|after| selected.range(..=after));
-        let mut next = None;
+        let ids: Vec<Digest> = tail.chain(head).take(limit).copied().collect();
+        let next = ids.last().copied();
+        let unknown: Vec<Digest> = ids
+            .into_iter()
+            .filter(|id| !self.history.borrow().contains_key(id))
+            .collect();
+        // One batch: a log-backed session leases the log's history once, for the ids the log
+        // answers and the handoffs it opens; a fallback to the control journal still checks the
+        // membership for each id.
+        let answers = self
+            .bootstrap
+            .historicals(&self.journal, &self.access, &unknown);
         let mut needed = Vec::new();
-        for id in tail.chain(head).take(limit) {
-            next = Some(*id);
-            if self.history.borrow().contains_key(id) {
-                continue;
-            }
-            match self.bootstrap.historical(&self.journal, &self.access, *id) {
+        for (id, answer) in unknown.into_iter().zip(answers) {
+            match answer {
                 Ok(history) => {
-                    self.history.borrow_mut().insert(*id, history);
+                    self.history.borrow_mut().insert(id, history);
                 }
-                Err(_) => needed.push(*id),
+                Err(_) => needed.push(id),
             }
         }
         Ok((needed, next))

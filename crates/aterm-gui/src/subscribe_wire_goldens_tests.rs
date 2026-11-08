@@ -27,7 +27,10 @@ fn events_text(plant: bool) -> String {
                 .timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .record_title(&format!("t{i}"))
+                .record_title(
+                    &format!("t{i}"),
+                    crate::session_log::observed::TitleStands::Own
+                )
         );
     }
     let reply = crate::control::meta_line_for_test(

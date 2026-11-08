@@ -257,6 +257,8 @@ pub struct ReleaseOptions {
     pub bump: bool,
     /// `--commit <rev>`: start a line at this commit of origin/main.
     pub commit: Option<String>,
+    /// Explicitly retire an unpublished fleet line in favour of `commit`.
+    pub supersede: bool,
     /// `--fix <commit>…`: carry these landed, non-merge main commits onto this clone's
     /// unpublished line as hops ([`crate::line`]).
     pub fix: Vec<String>,
@@ -317,6 +319,9 @@ impl ReleaseOptions {
         let mut out = Vec::with_capacity(args.len());
         let mut args = args.into_iter().peekable();
         while let Some(arg) = args.next() {
+            if arg.to_str() == Some("--supersede") {
+                continue;
+            }
             if arg.to_str() == Some("--fix") {
                 while args.next_if(|a| a.to_str().is_some_and(is_value)).is_some() {}
                 continue;
@@ -794,7 +799,7 @@ pub struct EngineRows {
 /// The publication engine as a PREPARED release's visible half finds it, against the engine that staged R ([`Backend::engine_now`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EngineNow {
-    /// At its origin/main, with the code that staged (its two ledgers aside: the audit log and `mappings.json`, which every stage and every publish append to).
+    /// At its origin/main, with the code that staged: what moved since is only its records (the ledger, the audit log, handoff records, which every stage and publish append to), its Rust port or its prose, which the engine's own stage guard sets aside too (`engine_code_drift`).
     Same(String),
     /// At its origin/main, and its code moved since it staged R.
     Moved(String),
@@ -905,7 +910,7 @@ pub enum Branch {
 
 impl Branch {
     /// Every branch, in the order the graph starts them.
-    pub const ALL: [Branch; 3] = [Branch::Tree, Branch::Build, Branch::Export];
+    pub const ALL: [Branch; 3] = [Branch::Build, Branch::Tree, Branch::Export];
 
     /// Its name on the transcript and in its log's file name (`04-qualify-<name>.log`).
     #[must_use]
@@ -1202,10 +1207,9 @@ pub trait Branches: Sync {
     fn interrupted(&self) -> bool;
     /// The log a branch's child writes.
     fn branch_log(&self, branch: Branch) -> PathBuf;
-    /// Return once the tree branch holds an admitted memory claim, or `ended` says it ended
-    /// (or was stopped), or [`TREE_HEAD_START`] after the call: the tree, the longest chain,
-    /// takes the machine's memory first, and the build then claims beside it (Q7).
-    fn tree_admitted(&self, ended: &dyn Fn() -> bool);
+    /// Return once both release slices hold memory, or `ended` says the build ended.
+    /// The measured critical path gets memory before the tree's moldable compile.
+    fn build_admitted(&self, ended: &dyn Fn() -> bool);
     /// The export check of R: `pub stage` to the staging tier (`Remote`) or without its push
     /// (`Local`); its push begun is [`BranchStop::push`].
     fn export(
@@ -1260,11 +1264,6 @@ pub struct BuildWork {
     pub fixtures: bool,
 }
 
-/// How long the build waits for the tree branch's first admitted memory claim before it claims
-/// anyway ([`Branches::tree_admitted`]): a tree that claims nothing soon (a short resume, or
-/// `aterm-verify`'s own compile) keeps the build waiting no longer.
-pub const TREE_HEAD_START: std::time::Duration = std::time::Duration::from_secs(300);
-
 /// Everything the release asks of the world — git, the engine, the records, the children, the clock, the owner's aterm.
 pub trait Backend {
     fn now(&mut self) -> u64;
@@ -1284,8 +1283,17 @@ pub trait Backend {
         Ok(line.clone())
     }
     /// Read the existing version line before judging a freshly selected main tip.
-    fn fleet_existing(&mut self, _version: &str) -> Result<Option<crate::line::Line>, String> {
+    fn fleet_existing(&mut self, _version: &str) -> Result<Option<crate::line::Line>, Refusal> {
         Ok(None)
+    }
+    fn fleet_supersession(
+        &mut self,
+        _version: &str,
+    ) -> Result<Option<crate::line::Supersession>, Refusal> {
+        Ok(None)
+    }
+    fn supersede_line(&mut self, _line: &crate::line::Line) -> Result<String, String> {
+        Err("supersession is unavailable".into())
     }
     /// Record a step boundary and detect an adopted lease before starting more work.
     fn fleet_boundary(&mut self, _line: &crate::line::Line, _step: Step) -> Result<(), String> {
@@ -1933,6 +1941,20 @@ impl Run<'_> {
         let now = self.b.now();
         let at = self.b.hms(now);
         let log = self.b.log_path(step);
+        // A refusal before the step starts a child still owns a step log. Keep its native
+        // diagnostic there before naming the path, rather than leaving the detail only in the
+        // run transcript. Opening unconditionally also creates an empty log for a refusal with
+        // no detail.
+        let log_result = (|| -> std::io::Result<()> {
+            if let Some(parent) = log.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut file = crate::durable::open_append(&log, true)?;
+            for line in &r.detail {
+                std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes())?;
+            }
+            Ok(())
+        })();
         let word = if r.could_not_run {
             "COULD NOT RUN"
         } else {
@@ -1948,6 +1970,12 @@ impl Run<'_> {
         ));
         for line in &r.detail {
             self.b.say(&format!("        | {line}"));
+        }
+        if let Err(error) = log_result {
+            self.b.say(&format!(
+                "        | cannot write the named refusal log {}: {error}",
+                log.display()
+            ));
         }
         let why = if r.could_not_run {
             format!("COULD NOT RUN — {}", r.why)
@@ -2876,6 +2904,7 @@ impl Run<'_> {
             };
             if let Some(j) = unfinished
                 && j.commit != r
+                && !self.opts.supersede
             {
                 self.refuse_published(j, "--commit")?;
                 let line = j.line();
@@ -2979,13 +3008,24 @@ impl Run<'_> {
             cand.version = self.b.version_at(&cand.commit).unwrap_or_default();
         }
         if public_version(&cand.version).is_some()
-            && let Err(why) = crate::line_claim::follow(self.b, &mut cand, &mut self.journal)
+            && (!self.opts.supersede || continued)
+            && let Err(refusal) = crate::line_claim::follow(self.b, &mut cand, &mut self.journal)
         {
-            return self
-                .refuse_hard(Refusal::new(why, "retry the fleet line read").could_not_run());
+            return self.refuse_hard(refusal);
         }
         self.cand = Some(cand.clone());
         let (r, v) = (cand.commit.clone(), cand.version.clone());
+        if self.opts.supersede && !continued {
+            if self.version_used(&v, &tip) {
+                return self.refuse_hard(Refusal::new(
+                    format!("v{v} has public release state and cannot be superseded"),
+                    "finish the existing release",
+                ));
+            }
+            if let Some(j) = unfinished {
+                self.refuse_published(j, "--supersede")?;
+            }
+        }
         if public_version(&v).is_none() {
             let remedy = format!("release the next MINOR: {}", self.start_remedy("--bump"));
             return self.refuse_hard(Refusal::new(
@@ -3295,6 +3335,27 @@ impl Run<'_> {
                 }
                 Err(r) => {
                     self.refuse(r)?;
+                }
+            }
+        }
+        let superseding =
+            self.opts.supersede && !self.claim.as_ref().is_some_and(|claim| claim.continued);
+        if superseding {
+            let line = crate::line::Line::start(&cand.version, &cand.commit, self.t_start);
+            match self.b.supersede_line(&line) {
+                Ok(note) => {
+                    self.say(&note);
+                    self.journal = None;
+                }
+                Err(why) => {
+                    let code = if why.starts_with("CUTTING ELSEWHERE:") {
+                        4
+                    } else {
+                        2
+                    };
+                    self.say(&why);
+                    self.last = why;
+                    return Err(Halt::Said(code));
                 }
             }
         }
@@ -5615,8 +5676,8 @@ fn branch_event(br: &dyn Branches, branch: Branch, phase: &str, at: u64, seconds
     br.say(&format!("release-event: {event}"));
 }
 
-/// Run step 4's graph on `br`: the tree first; the build once the tree holds an admitted memory
-/// claim ([`Branches::tree_admitted`]), the export as the build starts, each in a thread of its
+/// Run step 4's graph on `br`: the build first; the tree once both slices hold memory
+/// ([`Branches::build_admitted`]), then the export, each in a thread of its
 /// own; the ledger's memory claims decide what runs together, and every branch draws from the
 /// one pool [`Backend::qualify_begin`] made. A branch's red stops the other branches at once,
 /// except a proven test-execution red retains an already running build for the next hop
@@ -5634,7 +5695,7 @@ fn run_graph(
     let first = BranchStop::default();
     let stops: [BranchStop; 3] = [first.beside(), first.beside(), first.beside()];
     let stop_of = |b: Branch| &stops[b as usize];
-    // The tree ended or a red came, told once the receiver fired every stop that end fires, so
+    // The build ended or a red came, told once the receiver fired every stop that end fires, so
     // a branch the starter starts after it sees them.
     let settled = AtomicBool::new(false);
     let red = AtomicBool::new(false);
@@ -5646,19 +5707,6 @@ fn run_graph(
         let starter = tx.clone();
         s.spawn(move || {
             let stop_of = |b: Branch| &stops[b as usize];
-            if let Some(run) = &plan.tree {
-                start_branch(
-                    s,
-                    br,
-                    &starter,
-                    Branch::Tree,
-                    stop_of(Branch::Tree),
-                    move |stop| Note::Tree(br.verify(c, p, run, None, stop)),
-                );
-                if plan.build.is_some() || plan.export.is_some() {
-                    br.tree_admitted(&|| settled.load(Ordering::SeqCst));
-                }
-            }
             if let (Some(work), Some(reserved)) = (plan.build, reserved) {
                 start_branch(
                     s,
@@ -5667,6 +5715,19 @@ fn run_graph(
                     Branch::Build,
                     stop_of(Branch::Build),
                     move |stop| Note::Built(br.build(c, reserved, p, work, stop)),
+                );
+                if work.bundle {
+                    br.build_admitted(&|| settled.load(Ordering::SeqCst));
+                }
+            }
+            if let Some(run) = &plan.tree {
+                start_branch(
+                    s,
+                    br,
+                    &starter,
+                    Branch::Tree,
+                    stop_of(Branch::Tree),
+                    move |stop| Note::Tree(br.verify(c, p, run, None, stop)),
                 );
             }
             if let Some(target) = plan.export {
@@ -5768,7 +5829,7 @@ fn run_graph(
                         }
                     ));
                 }
-                if branch == Branch::Tree || ended == Ended::Red {
+                if branch == Branch::Build || ended == Ended::Red {
                     settled.store(true, Ordering::SeqCst);
                 }
             });

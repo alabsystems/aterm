@@ -288,7 +288,7 @@ fn a_record_retires_recorded() {
 }
 
 #[test]
-fn no_excerpt_rows_lay_out_and_speak_without_detail0() {
+fn no_excerpt_rows_lay_out_without_detail0() {
     let now = t0();
     let mut c = fresh(now);
     let id = c
@@ -303,7 +303,6 @@ fn no_excerpt_rows_lay_out_and_speak_without_detail0() {
     c.commit_rows(now, 3);
     let p = present(&c, 160);
     assert_eq!(p.rows[0].detail, None, "the title alone");
-    assert_eq!(p.rows[0].spoken(""), "aterm crashed last time");
     assert_eq!(
         c.live(id).unwrap().msg.detail,
         vec!["crash log at /x/crash.log".to_string()],
@@ -1250,7 +1249,6 @@ fn a_hidden_estimate_leaves_the_eta_slot_blank() {
 fn all_but_title(row: &crate::glass::RowLayout) -> crate::glass::RowLayout {
     let mut row = row.clone();
     row.title.1.clear();
-    row.full_title.clear();
     row
 }
 
@@ -1349,7 +1347,6 @@ fn the_complete_echo_says_the_finished_form_without_a_reflow() {
             if cols >= 120 && finished.len() <= title.len() {
                 assert_eq!(words, finished, "{title}@{cols}: whole on a wide row");
             }
-            assert_eq!(echo.full_title, finished, "{title}@{cols}: spoken whole");
             let rec = c.log().get(id).unwrap();
             let logged = crate::words::done_form(finished).unwrap_or_else(|| finished.to_string());
             assert_eq!(rec.title, logged, "the record states the outcome");

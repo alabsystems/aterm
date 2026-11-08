@@ -56,7 +56,7 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
         ctx.timeline
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .record_title(title(plant))
+            .record_title(title(plant), crate::session_log::observed::TitleStands::Own)
     );
     let reply = crate::control::meta_line_for_test(
         &store,

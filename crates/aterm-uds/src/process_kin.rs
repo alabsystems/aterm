@@ -947,7 +947,8 @@ mod tests {
 
     /// A child's four markers are read off the kernel's copy of its exec environment between two
     /// identity reads, and nothing once it has exited (unreaped or reaped) or for pid 1. Its
-    /// serial reads the same twice and is gone once it is reaped. Apple's unique serial differs
+    /// working directory is the one it was started in ([`crate::holders::cwd_of`]), and none once
+    /// it is reaped. Its serial reads the same twice and is gone once it is reaped. Apple's unique serial differs
     /// from this process's; Linux's start tick is no earlier and may equal its parent's tick.
     /// A platform with no marker reader (any but macOS, Linux and Android) or no serial reader
     /// (any but Apple's and Linux) reads none. The child is this test binary run in place: macOS
@@ -959,7 +960,12 @@ mod tests {
         use super::super::{ProcessPresence, process_presence};
         let me = i32::try_from(std::process::id()).expect("pid");
         let run = format!("{me}-1");
+        let dir = aterm_tempfile::Builder::new()
+            .prefix("marked-child-")
+            .tempdir()
+            .expect("temp dir");
         let mut child = crate::spawnfd::command(std::env::current_exe().expect("the test binary"))
+            .current_dir(dir.path())
             .args([
                 "--exact",
                 "process::kin::tests::a_marked_child_stand_in",
@@ -980,6 +986,7 @@ mod tests {
         crate::deadline::prints(&mut child, MARKED_CHILD_RUNS, HANG);
         let pid = i32::try_from(child.id()).expect("pid");
         let read = read_process_markers(pid);
+        let cwd = crate::holders::cwd_of(child.id());
         let (serial, again) = (process_serial(pid), process_serial(pid));
         drop(child.stdin.take());
         let deadline = std::time::Instant::now() + HANG;
@@ -993,6 +1000,11 @@ mod tests {
         let unreaped = read_process_markers(pid);
         let _ = child.wait();
         if cfg!(any(target_vendor = "apple", target_os = "linux")) {
+            assert_eq!(
+                cwd,
+                Some(std::fs::canonicalize(dir.path()).expect("canonical")),
+                "the child's working directory"
+            );
             assert!(serial.is_some() && serial == again, "{serial:?} {again:?}");
             let parent = process_serial(me).expect("this process's serial");
             if cfg!(target_vendor = "apple") {
@@ -1005,6 +1017,7 @@ mod tests {
             }
             assert_eq!(process_serial(pid), None, "a reaped child's serial");
         } else {
+            assert_eq!(cwd, None, "no directory reader here");
             assert_eq!(serial, None, "no serial reader here");
         }
         if !cfg!(any(
@@ -1028,6 +1041,11 @@ mod tests {
         );
         assert_eq!(unreaped, None, "an exited child its parent has not reaped");
         assert_eq!(read_process_markers(pid), None, "a reaped child");
+        assert_eq!(
+            crate::holders::cwd_of(child.id()),
+            None,
+            "a reaped child's directory"
+        );
         assert_eq!(read_process_markers(1), None, "launchd's or init's");
     }
 

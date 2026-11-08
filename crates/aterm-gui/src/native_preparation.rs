@@ -342,6 +342,22 @@ pub(super) fn authority_current(
         && op.clock.remaining(op.request.deadline_us).is_some()
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeUnadmittedPrepare",
+        action = "Record",
+        project = "aterm_gui::native_act::tests::unadmitted::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeUnadmittedPrepare",
+        action = "Start",
+        project = "aterm_gui::native_act::tests::unadmitted::Host::probe"
+    )
+)]
 pub(super) fn finish_preparation(
     ctx: &crate::SessionCtx,
     master: i32,

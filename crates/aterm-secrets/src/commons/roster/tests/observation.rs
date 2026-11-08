@@ -248,7 +248,9 @@ fn warm_historical_access_requires_available_epoch_and_wrap_records() {
             reads.fault.set(Some((required, fault)));
             reads.failed_reads.set(0);
             assert!(access.is_current(&vault.journal));
-            let observed = access.historical_from_history(&identity, basis, &history);
+            let observed = history
+                .lease_complete()
+                .and_then(|lease| access.historical_from_lease(&identity, basis, &lease));
             let failed = observed.is_err();
             let called = Cell::new(false);
             if let Ok(Some(past)) = observed {
@@ -266,7 +268,7 @@ fn warm_historical_access_requires_available_epoch_and_wrap_records() {
             reads.fault.set(None);
             assert_eq!(history.lease_complete().unwrap().generation(), generation);
             let recovered = access
-                .historical_from_history(&identity, basis, &history)
+                .historical_from_lease(&identity, basis, &history.lease_complete().unwrap())
                 .unwrap()
                 .unwrap();
             assert_eq!(recovered.with_key(&vault.journal, |key| *key).unwrap(), key);
@@ -313,7 +315,7 @@ fn a_pending_epoch_cannot_hit_cached_historical_absence() {
     let generation = absent.lease_complete().unwrap().generation();
     assert!(
         access
-            .historical_from_history(&identity, *epoch.id(), &absent)
+            .historical_from_lease(&identity, *epoch.id(), &absent.lease_complete().unwrap())
             .unwrap()
             .is_none()
     );
@@ -322,8 +324,47 @@ fn a_pending_epoch_cannot_hit_cached_historical_absence() {
     assert_eq!(pending.lease_complete().unwrap().generation(), generation);
     assert!(
         access
-            .historical_from_history(&identity, *epoch.id(), &pending)
+            .historical_from_lease(&identity, *epoch.id(), &pending.lease_complete().unwrap())
             .is_err()
     );
     assert!(log.get(parent.id()).is_none(), "the parent has not arrived");
+}
+
+/// A batch answers each basis as it alone would, in order: one the log opens, and one it does not
+/// hold, which falls back to the control journal and to a handoff, and fails.
+///
+/// NEGATIVE CONTROL: `Bootstrap::historicals` answering in reverse order fails it.
+#[test]
+fn a_batch_of_historical_bases_answers_each_as_it_alone_would() {
+    let vault = Vault::new();
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    let bases = [*access.basis(), [7; 32]];
+    let opened = |answer: &Result<Historical>| {
+        answer
+            .as_ref()
+            .map(|past| {
+                let key = past.with_key(&vault.journal, |key| *key).unwrap();
+                (*past.source(), past.generation(), key)
+            })
+            .map_err(Clone::clone)
+    };
+    let alone: Vec<_> = bases
+        .iter()
+        .map(|basis| opened(&vault.bootstrap.historical(&vault.journal, &access, *basis)))
+        .collect();
+    assert!(alone[0].is_ok(), "CONTROL: the vault opens its own epoch");
+    assert!(alone[1].is_err(), "CONTROL: nothing holds the other");
+    let batch: Vec<_> = vault
+        .bootstrap
+        .historicals(&vault.journal, &access, &bases)
+        .iter()
+        .map(opened)
+        .collect();
+    assert_eq!(batch, alone);
+    assert!(
+        vault
+            .bootstrap
+            .historicals(&vault.journal, &access, &[])
+            .is_empty()
+    );
 }

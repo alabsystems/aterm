@@ -102,7 +102,9 @@ pub fn measure(rig: &Rig, row: &PaintRow) -> Result<PaintReport, CouldNotRun> {
         late_max_us,
         sampling_hole_us: u64::try_from(take.scan.driven.sampling_hole_us).unwrap_or(0),
         nominal_dt_us: u64::try_from(take.scan.driven.nominal_dt_us).unwrap_or(0),
-        all_composed_frames: take.scan.driven.all_composed_frames,
+        all_composed_frames: take.scan.all_composed_frames
+            && (take.driven_ms.is_none() || take.scan.driven.all_composed_frames),
+        require_composed_frames: row.capture.is_video(),
         wall_us,
         budget_us: BUDGET_SECS * 1_000_000,
         late_threshold_us: DEFAULT_LATE_THRESHOLD_US,

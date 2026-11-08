@@ -734,6 +734,17 @@ fn source_read_child() {
 }
 
 fn controller_scope_child() {
+    // The subject is how the controller passes on the signals this helper is sent. A process
+    // started with a signal ignored keeps it ignored across exec, and the controller's front
+    // deliberately honours an inherited SIG_IGN (`build_admit_front::install`), as bash cannot
+    // trap one either. A test binary started as a shell's background job (a release cut launched
+    // with `&`, 2026-11-08) has SIGINT and SIGQUIT ignored, so give this helper, and through it
+    // the fixture's bash, the default dispositions it exercises.
+    for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+        // SAFETY: a standard signal number and `SIG_DFL` install no handler code; the call only
+        // sets this helper process's disposition, before its controller arms its own handlers.
+        assert_ne!(unsafe { libc::signal(sig, libc::SIG_DFL) }, libc::SIG_ERR);
+    }
     let repo = PathBuf::from(std::env::var_os("ATPKG_PROJECT_TEST_SOURCE").expect("source"));
     let prefix = PathBuf::from(std::env::var_os("ATPKG_PROJECT_TEST_PREFIX").expect("prefix"));
     let scope = PathBuf::from(std::env::var_os("ATPKG_PROJECT_TEST_SCOPE").expect("scope"));
@@ -806,12 +817,12 @@ exit 0
 #[test]
 fn native_controller_keeps_sdk_lease_through_background_work_and_late_signals() {
     use std::time::{Duration, Instant};
-    fn until(mut predicate: impl FnMut() -> bool) {
+    fn until(what: &str, mut predicate: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(60);
         while !predicate() {
             assert!(
                 Instant::now() < deadline,
-                "native fixture reaches its required state"
+                "native fixture reaches its required state: {what}"
             );
             // A bounded fixture wait for native lifecycle state, not a latency budget.
             std::thread::sleep(Duration::from_millis(10));
@@ -863,7 +874,9 @@ fn native_controller_keeps_sdk_lease_through_background_work_and_late_signals() 
             ));
         let mut child = command.spawn().expect("owned helper");
         let release = Release(scope.clone());
-        until(|| scope.join("root-ready").is_file() && scope.join("worker-ready").is_file());
+        until("root and worker ready", || {
+            scope.join("root-ready").is_file() && scope.join("worker-ready").is_file()
+        });
         if before {
             // SAFETY: this still-unreaped native handle pins this exact helper pid.
             assert!(child.owns_unreaped());
@@ -872,7 +885,9 @@ fn native_controller_keeps_sdk_lease_through_background_work_and_late_signals() 
                 0
             );
         }
-        until(|| scope.join("settling").is_file());
+        until("the controller saw the root end", || {
+            scope.join("settling").is_file()
+        });
         assert!(
             child.try_wait().expect("owned status").is_none(),
             "root exit is not controller completion"
@@ -894,11 +909,13 @@ fn native_controller_keeps_sdk_lease_through_background_work_and_late_signals() 
             );
         }
         if signal != 0 {
-            until(|| scope.join("signal-observed").is_file());
+            until("the controller saw the signal", || {
+                scope.join("signal-observed").is_file()
+            });
         }
         drop(release);
         let mut status = None;
-        until(|| {
+        until("the helper exited", || {
             status = child.try_wait().expect("helper wait");
             status.is_some()
         });

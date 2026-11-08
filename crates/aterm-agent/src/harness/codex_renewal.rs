@@ -299,7 +299,7 @@ pub fn with_successor_writer<T>(
 /// Compare and commit the exact prepared selection while native account and
 /// auth locks remain held. Concurrent commits of one receipt have one winner.
 pub fn commit_receipt(env: &Env, expected: &Receipt) -> Result<Option<Receipt>, &'static str> {
-    if expected.phase != Phase::Ready {
+    if expected.phase != Phase::Ready || expected.revoked || !expected.has_no_execution_evidence() {
         return Err("not-ready");
     }
     with_selected(env, expected, |next| {
@@ -330,14 +330,30 @@ pub fn retire_pool_record(env: &Env, receipt: &Receipt) -> Result<Option<bool>, 
 }
 
 /// Retire a native reservation that never issued Go. The caller must prove
-/// that the source image still owns the operation and no successor ran.
+/// that its execution gate is closed and no successor ran. The retained
+/// metadata must also contain no execution evidence.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeTerminalEvidence",
+        action = "NextCase",
+        reason = "The fixture supplies every combination of retained execution witnesses"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeTerminalEvidence",
+        action = "Apply",
+        project = "aterm_agent::harness::accounts_pool::tests::quota_proposals::canary_ownership::terminal_evidence::transition"
+    )
+)]
 pub fn cancel_unexecuted_rotation(
     env: &Env,
     receipt: &Receipt,
     target: &str,
 ) -> Result<Option<Receipt>, &'static str> {
-    if receipt.launch_attempted
-        || receipt.accepted_turn.is_some()
+    if !receipt.has_no_execution_evidence()
         || !matches!(receipt.phase, Phase::Ready | Phase::Retired)
     {
         return Err("rotation-already-executed");
@@ -534,6 +550,19 @@ pub struct Receipt {
 }
 
 impl Receipt {
+    /// Whether every execution witness is absent from this receipt.
+    /// This is a metadata check, not proof that native execution never ran;
+    /// callers still need the execution gate's closure and provenance.
+    #[must_use]
+    pub fn has_no_execution_evidence(&self) -> bool {
+        !self.launch_attempted
+            && self.accepted_turn.is_none()
+            && self.current_attempt.is_none()
+            && self.candidate.is_none()
+            && self.successor_pid.is_none()
+            && self.successor_birth.is_none()
+    }
+
     pub fn target_identity(&self) -> Option<&Identity> {
         match (self.intent.purpose, &self.destination) {
             (Purpose::Login, None) => Some(&self.intent.identity),
@@ -638,7 +667,7 @@ impl Receipt {
     }
 
     pub fn may_replace(&self) -> bool {
-        self.phase == Phase::Retired && !self.launch_attempted && !self.revoked
+        self.phase == Phase::Retired && self.has_no_execution_evidence() && !self.revoked
     }
 
     /// Close an unlaunched Ready receipt before deriving a distinct preparation
@@ -647,12 +676,7 @@ impl Receipt {
     pub fn retire_stale_ready(&mut self, revision: u64, human_seq: u64, now_ms: u64) -> bool {
         if self.phase != Phase::Ready
             || self.revoked
-            || self.current_attempt.is_some()
-            || self.launch_attempted
-            || self.candidate.is_some()
-            || self.accepted_turn.is_some()
-            || self.successor_pid.is_some()
-            || self.successor_birth.is_some()
+            || !self.has_no_execution_evidence()
             || (self.claim_revision == revision
                 && self.human_seq == human_seq
                 && now_ms < self.expires_ms)
@@ -664,7 +688,7 @@ impl Receipt {
     }
 
     pub fn reset_before_signal(&mut self, now_ms: u64) -> bool {
-        if self.phase != Phase::Committing || self.launch_attempted {
+        if self.phase != Phase::Committing || self.revoked || !self.has_no_execution_evidence() {
             return false;
         }
         self.phase = if now_ms < self.expires_ms {

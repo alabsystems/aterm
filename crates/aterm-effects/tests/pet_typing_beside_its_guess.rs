@@ -11,7 +11,7 @@ use aterm_core::terminal::{ClockReading, Terminal};
 use aterm_effects::companion::{CompanionOwner, GlowOwnership, PetFacts};
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::host::{FrameGeom, HostFrameInput, TerminalFacts};
-use aterm_effects::kitty_pet::{PetAction, PetFrame, PetInputKind};
+use aterm_effects::kitty_pet::{OldPath, PetAction, PetFrame, PetInputKind};
 use aterm_effects::pet_world::{PetFill, PetPane, PetRect, PetReserve, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
 use aterm_lexicon::Lexicon;
@@ -4170,4 +4170,148 @@ fn the_cat_rests_by_the_words_the_footer_shows() {
         "the cat rested over the words aterm lays on the mode row ((take, ms a frame, chrome \
          lag, words), ((first ms, body's left edge, row), ms in all)): {over:?}"
     );
+}
+
+/// The long insert as recorded, replayed with `knobs` and the laws in `old` reverted, to the
+/// arrow keys (8.39 s): `(the flights from its first chunk on, the ms of presents the cat stood,
+/// sat or crouched with letters of the screen under its body (between its tiles' borders) from
+/// 2.1 s on)`.
+fn long_insert_writing(knobs: Knobs, old: &[OldPath]) -> (Vec<Flown>, u64) {
+    const TILE_BORDER: f32 = 0.30;
+    const ARROWS_MS: u64 = 8_390;
+    let mut h = Host::new(&TAKES[3], knobs);
+    for &law in old {
+        h.owner.set_pet_old_path(law, true);
+    }
+    let mut events = long_insert_as_recorded();
+    events.sort_by_key(|(ms, _)| *ms);
+    let (rows, cols) = (h.rows, h.cols);
+    let mut on_letters = 0u64;
+    let mut seen = 0;
+    for (ms, ev) in events {
+        h.run_to(ms);
+        let input = h.term.cell_frame(usize::from(rows), usize::from(cols));
+        for s in &h.shots[seen..] {
+            if !(2_100..ARROWS_MS).contains(&s.ms) || s.frame.action == PetAction::Leap {
+                continue;
+            }
+            let Some((x0, x1, y0, y1)) = s.frame.body_px(CW, CH, cols, rows) else {
+                continue;
+            };
+            let border = (TILE_BORDER * f32::from(CW)).round() as i32;
+            let (x0, x1) = (x0 + border, x1 - border);
+            let (cw, ch) = (i32::from(CW), i32::from(CH));
+            let lettered = (y0.div_euclid(ch).max(0)
+                ..=((y1 - 1).div_euclid(ch)).min(i32::from(rows) - 1))
+                .any(|row| {
+                    (x0.div_euclid(cw).max(0)..=((x1 - 1).div_euclid(cw)).min(i32::from(cols) - 1))
+                        .any(|col| {
+                            input.cells[row as usize]
+                                .get(col as usize)
+                                .is_some_and(|c| c.ch.is_alphanumeric())
+                        })
+                });
+            if lettered {
+                on_letters += knobs.frame_ms;
+            }
+        }
+        seen = h.shots.len();
+        match ev {
+            _ if ms >= ARROWS_MS => break,
+            Rec::In(b) => h.key(&b),
+            Rec::Out(b) => h.feed(&b),
+        }
+    }
+    let flights = flights_of(&h.shots)
+        .into_iter()
+        .filter(|f| (2_100..ARROWS_MS).contains(&f.0))
+        .collect();
+    (flights, on_letters)
+}
+
+/// r29 K9-3, A PROGRAM WRITING A PROMPT IN CHUNKS MOVES THE CAT ONCE OFF ITS WAY, AND ONCE HOME.
+/// The long insert's dictation writes Claude Code's composer full in 40-letter chunks 127 to
+/// 147 ms apart from 2.17 s to 6.73 s (as a harness types a prompt into it), the composer growing
+/// a row up at each line. Plain, the cat by the placeholder's end is in the writing's way: once
+/// the chunks run on it goes across the composer's bottom rule to the footer, the one trip off
+/// the writing, watches from there, and goes home under the caret once the writing has
+/// settled. With the harness it rests on top of the harness's line, off the writing: the host
+/// carries it up the composer's growth, and its one trip is home. Either way no more than
+/// those flights from the first chunk to the arrow keys at 8.39 s, at 120 and 60 Hz, and no
+/// more than 0.2 s of presents with the composer's letters under the cat on the ground (the
+/// first chunk's, until the next shows the writing goes on).
+///
+/// NEGATIVE CONTROLS, each alone (as on main 7f638f26d0, windowed: two to five flights a
+/// dictation, the cat sitting on the new letters in 22 of 123 samples): stepped off the letters
+/// along its row ([`OldPath::WritingEvictsAlongItsRow`]), plain, the cat hopped along the line
+/// into the next chunk's way and sat on its letters; and hopped off the obstruction the
+/// composer's growth laid under it ([`OldPath::CarriedBodyHopsOff`]), with the harness, it
+/// leapt a row up the harness's line at each line the writing grew the composer by; and read
+/// as at rest after 0.15 s whatever the chunks' pace
+/// ([`OldPath::SettleIgnoresTheRhythm`]), the caret between two chunks a frame late looked
+/// rested, the stream watch stood down and the cat went for the chunk's end on the line, plain
+/// and with the harness: three flights, and the harness's cat on the letters.
+#[test]
+fn a_program_writing_a_prompt_in_chunks_moves_the_cat_once_off_its_way() {
+    let harness = Knobs {
+        chips: true,
+        brand: true,
+        ..Knobs::SHIPPED
+    };
+    let mut runs = Vec::new();
+    for frame_ms in [8u64, 16] {
+        runs.push((
+            "plain",
+            Knobs {
+                frame_ms,
+                ..Knobs::SHIPPED
+            },
+            2usize,
+        ));
+        runs.push((
+            "harness",
+            Knobs {
+                frame_ms,
+                ..harness
+            },
+            1,
+        ));
+    }
+    let faults = |old: &'static [OldPath]| -> Vec<String> {
+        crate::common::par_map(&runs, |&(label, knobs, most)| {
+            let (flights, on_letters) = long_insert_writing(knobs, old);
+            (flights.len() > most || on_letters > 200).then(|| {
+                format!(
+                    "{label} at {} ms a frame: {on_letters} ms on letters, flights (ms, caret, \
+                     landing, caret): {:?}",
+                    knobs.frame_ms,
+                    flights
+                        .iter()
+                        .map(|f| (f.0, f.1, (f.2.col, f.2.row), f.3))
+                        .collect::<Vec<_>>()
+                )
+            })
+        })
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+    let now = faults(&[]);
+    assert!(now.is_empty(), "{}", now.join("\n"));
+    for (law, labels) in [
+        (&[OldPath::WritingEvictsAlongItsRow][..], &["plain"][..]),
+        (&[OldPath::CarriedBodyHopsOff][..], &["harness"][..]),
+        (
+            &[OldPath::SettleIgnoresTheRhythm][..],
+            &["plain", "harness"][..],
+        ),
+    ] {
+        let old = faults(law);
+        for label in labels {
+            assert!(
+                old.iter().filter(|f| f.starts_with(label)).count() == 2,
+                "negative control ({law:?}): the {label} dictation kept to its trips: {old:?}"
+            );
+        }
+    }
 }

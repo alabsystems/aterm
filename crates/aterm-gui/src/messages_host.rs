@@ -696,9 +696,7 @@ impl App {
     /// Settles expired rows, updates band geometry, persists log lines, and schedules repaints.
     pub(crate) fn sync_messages(&mut self) {
         let now = Instant::now();
-        if !self.settle_messages(now) {
-            self.refresh_band_hover();
-        }
+        self.settle_messages(now);
         self.publish_native_messages_state_if_due(now);
         self.request_redraw_all_windows();
     }
@@ -718,11 +716,7 @@ impl App {
         let (lines, wire) =
             drive::drain_and_pace(&mut self.messages, &mut self.wire_gate, now, persist);
         self.append_message_lines(&lines);
-        let changed = step.glass_changed || committed || wire || strip;
-        if changed {
-            self.refresh_band_hover();
-        }
-        changed
+        step.glass_changed || committed || wire || strip
     }
 
     fn persist_messages(&mut self) {
@@ -1332,16 +1326,6 @@ impl App {
     /// Projects the current message center state into a [`MessagesState`] for Settings ▸ Messages.
     pub(crate) fn messages_state(&self) -> MessagesState {
         MessagesState::of(&self.messages, &PageDesk::of(self))
-    }
-}
-
-impl App {
-    /// Handles a click on the body of band row `id` in window `wid` by opening its details.
-    pub(crate) fn press_message_body(&mut self, wid: WindowId, id: MessageId) {
-        if self.messages.live(id).is_none() {
-            return;
-        }
-        let _ = self.perform_intent(wid, id, Intent::Details);
     }
 }
 

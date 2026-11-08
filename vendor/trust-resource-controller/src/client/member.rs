@@ -80,6 +80,10 @@ pub struct ProxyChild {
 fn invalid() -> io::Error {
     io::ErrorKind::InvalidData.into()
 }
+fn lifecycle_deadline(started: Instant) -> Instant {
+    // This bounds one transport observation, not the target's execution.
+    started + std::time::Duration::from_secs(60)
+}
 /// Explicit descriptor actions are a compiler capability, not a request flag.
 /// STOCK EXCEPTION: a stock compiler cannot launch members through this API.
 fn require_member_inheritance() -> io::Result<()> {
@@ -419,7 +423,7 @@ impl ProxyChild {
     /// Host timeout starts at actual target GO, never during admission wait.
     pub fn wait(&mut self) -> Status {
         loop {
-            if let Some(status) = self.try_wait(Instant::now() + std::time::Duration::from_secs(8))
+            if let Some(status) = self.try_wait(lifecycle_deadline(Instant::now()))
             {
                 return status;
             }
@@ -587,6 +591,17 @@ impl ProxyChild {
 mod helper_tests {
     use super::*;
     #[test]
+    fn lifecycle_wait_reads_an_original_native_frame_after_scheduling_delay() {
+        let (receiver, sender) = UnixStream::pair().unwrap();
+        let mut receiver = Channel::new(receiver).unwrap();
+        let mut sender = Channel::new(sender).unwrap();
+        let deadline = lifecycle_deadline(Instant::now() - std::time::Duration::from_secs(9));
+        sender.send(b"original lifecycle frame", crate::fixture_deadline(Instant::now())).unwrap();
+        assert_eq!(receiver.receive(deadline).unwrap(), b"original lifecycle frame");
+        sender.send(b"expired frame", crate::fixture_deadline(Instant::now())).unwrap();
+        assert!(receiver.receive(lifecycle_deadline(Instant::now() - std::time::Duration::from_secs(61))).is_err());
+    }
+    #[test]
     fn owning_helper_exit_rechecks_frames_that_arrived_after_initial_readiness() {
         let (control, sender) = UnixStream::pair().unwrap();
         let (proof, _proof_sender) = UnixStream::pair().unwrap();
@@ -599,7 +614,7 @@ mod helper_tests {
         // treating that wait result as evidence that the lifecycle was lost.
         let mut child = Command::new("/usr/bin/true").spawn().unwrap();
         let mut sender = Channel::new(sender).unwrap();
-        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = crate::fixture_deadline(Instant::now());
         sender.send(b"original queued frame", deadline).unwrap();
         assert!(child.wait().unwrap().success());
         after_helper_exit(&control, &proof, false).unwrap();

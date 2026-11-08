@@ -1439,6 +1439,12 @@ pub struct Log {
     /// ([`Restored`]): `hold` lets it go with the evaluation. Clones share it until one holds a
     /// record.
     restored: Arc<OnceLock<Restored>>,
+    /// What a pull names of the held records ([`store::Advertised`]): their heads deepest first
+    /// and their `?have=` ids. Deriving them takes each record's depth and a walk of the log, and
+    /// a quiet repair round asks for both on each side of each exchange: on a log of 9,605
+    /// records, 16% of such a round (2026-11-08). `hold` lets it go; clones share it until one
+    /// holds a record.
+    advertised: Arc<OnceLock<store::Advertised>>,
 }
 
 /// The Macs a log let back in after a removal, named as a roster names them: canonical `m<N>`
@@ -1527,6 +1533,7 @@ impl Log {
             weighing: Arc::default(),
             epochs: Arc::default(),
             restored: Arc::default(),
+            advertised: Arc::default(),
         })
     }
 
@@ -1568,6 +1575,21 @@ impl Log {
         self.held
             .get(target)
             .is_some_and(|&t| self.reach.in_past_of(t, &self.indexes(from)))
+    }
+
+    /// Every `previous` head lies in the complete causal prefix of these held `heads`.
+    /// Missing heads are unknown, never evidence of inclusion.
+    #[cfg(unix)]
+    pub(crate) fn prefix_covers(&self, heads: &[RecordId], previous: &[RecordId]) -> bool {
+        if heads.is_empty() || heads.iter().any(|head| !self.held.contains_key(head)) {
+            return false;
+        }
+        let closure = self.reach.closure(self.indexes(heads));
+        previous.iter().all(|head| {
+            self.held
+                .get(head)
+                .is_some_and(|&at| (closure[at / 64] >> (at % 64)) & 1 == 1)
+        })
     }
 
     /// The held `Remove` records that are the held record `from` or lie in its causal past, in
@@ -2227,6 +2249,7 @@ impl Log {
         self.membership = Arc::default();
         self.effective = Arc::default();
         self.restored = Arc::default();
+        self.advertised = Arc::default();
         #[cfg(test)]
         let carried = eval::MUTANT.get() == Some(eval::Mutant::CarryAcross(record.kind()));
         #[cfg(not(test))]

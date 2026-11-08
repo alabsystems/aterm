@@ -236,6 +236,12 @@ impl<'a> ReceiptWriter<'a> {
         receipt: &Receipt,
         target: &str,
     ) -> Result<(), &'static str> {
+        if receipt.phase != Phase::Retired
+            || !receipt.revoked
+            || !receipt.has_no_execution_evidence()
+        {
+            return Err("rotation-already-executed");
+        }
         let binding = super::super::codex_rotation::receipt_binding(receipt)?;
         self.acknowledge(receipt)?;
         let store = self
@@ -302,10 +308,26 @@ impl<'a> ReceiptWriter<'a> {
     /// Retire pool deduplication only after the matching root is durably
     /// consumed, or retired without ever attempting native execution. A crash
     /// between terminal publication and cleanup is retried by the next reader.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "NativeTerminalEvidence",
+            action = "Retirement",
+            reason = "The fixture selects terminal deduplication retirement instead of live cancellation"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeTerminalEvidence",
+            action = "Apply",
+            project = "aterm_agent::harness::accounts_pool::tests::quota_proposals::canary_ownership::terminal_evidence::transition"
+        )
+    )]
     pub fn retire_pool_record(&self, expected: &Receipt) -> Result<bool, &'static str> {
         let terminal = (expected.phase == Phase::Consumed
             && expected.accepted_turn.as_deref() == Some(expected.intent.wall.as_str()))
-            || (expected.phase == Phase::Retired && !expected.launch_attempted);
+            || (expected.phase == Phase::Retired && expected.has_no_execution_evidence());
         self.retire_terminal_pool_record(expected, terminal)
     }
 

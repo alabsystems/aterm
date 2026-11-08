@@ -5906,7 +5906,7 @@ mod parked_secrets_route_tests {
         };
         let sys = Fake::root();
         sys.logged_in(&user);
-        sys.file(aterm_machines::items::github::CLT_GIT, b"old native Git");
+        sys.executable(aterm_machines::items::github::CLT_GIT, b"old native Git");
         let read = || {
             initial_setup_park_mark_reading(
                 Some(root.path()),
@@ -10691,7 +10691,7 @@ mod tests {
         const TOKEN: &str = "inert_repository_tools_token";
         sys.stat_of(&user.home, stat(true, 0));
         if tools {
-            sys.file(aterm_machines::items::github::CLT_GIT, b"inert git");
+            sys.executable(aterm_machines::items::github::CLT_GIT, b"inert git");
         }
         if token {
             let token = format!("{}/.secrets/gh_access_token", user.home);
@@ -10757,9 +10757,11 @@ mod tests {
         for change in [
             "inventory",
             "credential-route",
+            "launcher-permission",
             "profile-path",
             "inventory-during-accounts",
             "credential-route-during-accounts",
+            "launcher-permission-during-accounts",
             "unchanged",
             "stopped",
         ] {
@@ -10796,7 +10798,7 @@ mod tests {
             sys.file(&inventory, &before)
                 .stat_of(&inventory, stat(false, before.len() as u64));
             let launcher = format!("{home}/.local/bin/aterm");
-            sys.file(&launcher, b"launcher");
+            sys.executable(&launcher, b"launcher");
             sys.stat_of(&format!("{home}/before"), stat(true, 0));
             // The new inventory's destination contains personal work, so readback must
             // reopen the stage while apply preserves the file without cloning over it.
@@ -10883,6 +10885,17 @@ mod tests {
                     let (sys, _) = host.native_repositories.as_ref().unwrap();
                     sys.file(&launcher, b"badexec!");
                 }
+                "launcher-permission" => {
+                    let (sys, _) = host.native_repositories.as_ref().unwrap();
+                    let before = sys.stat(Path::new(&launcher)).unwrap();
+                    sys.stat_of(
+                        &launcher,
+                        Stat {
+                            mode: 0o600,
+                            ..before
+                        },
+                    );
+                }
                 "profile-path" => {
                     let (sys, _) = host.native_repositories.as_ref().unwrap();
                     let bytes = custom(&new_source);
@@ -10909,6 +10922,20 @@ mod tests {
                         sys.file(&launcher, b"badexec!");
                     }));
                 }
+                "launcher-permission-during-accounts" => {
+                    let launcher = launcher.clone();
+                    host.accounts_end = Some(Box::new(move |host| {
+                        let (sys, _) = host.native_repositories.as_ref().unwrap();
+                        let before = sys.stat(Path::new(&launcher)).unwrap();
+                        sys.stat_of(
+                            &launcher,
+                            Stat {
+                                mode: 0o600,
+                                ..before
+                            },
+                        );
+                    }));
+                }
                 "stopped" => request_stop_at(root.path(), revision).unwrap(),
                 "unchanged" => {}
                 _ => unreachable!(),
@@ -10916,7 +10943,10 @@ mod tests {
             let after_park = parked(&host);
             assert_eq!(
                 after_park.facts_changed_since(&before_park),
-                matches!(change, "inventory" | "credential-route" | "profile-path"),
+                matches!(
+                    change,
+                    "inventory" | "credential-route" | "launcher-permission" | "profile-path"
+                ),
                 "{change}: actual local input changes must wake the still-pending run"
             );
             if after_park.facts_changed_since(&before_park) {
@@ -10979,12 +11009,24 @@ mod tests {
                     assert_ne!(next, SetupNext::Done, "{change}");
                 }
             }
-            if change.ends_with("during-accounts") {
+            if change.ends_with("during-accounts") || change == "launcher-permission" {
                 assert_ne!(saved.done & Stage::Accounts.bit(), 0);
                 let (sys, _) = host.native_repositories.as_ref().unwrap();
-                sys.file(&inventory, &before)
-                    .stat_of(&inventory, stat(false, before.len() as u64));
-                sys.file(&launcher, b"launcher");
+                if change.starts_with("launcher-permission") {
+                    assert_eq!(sys.read_file(Path::new(&launcher)).unwrap(), b"launcher");
+                    let damaged = sys.stat(Path::new(&launcher)).unwrap();
+                    sys.stat_of(
+                        &launcher,
+                        Stat {
+                            mode: 0o755,
+                            ..damaged
+                        },
+                    );
+                } else {
+                    sys.file(&inventory, &before)
+                        .stat_of(&inventory, stat(false, before.len() as u64));
+                    sys.executable(&launcher, b"launcher");
+                }
                 host.calls.clear();
                 let repaired = execute_initial_for_revision(
                     &mut host,
@@ -11044,8 +11086,8 @@ mod tests {
         };
         const TOKEN: &str = "inert_repository_recovery_token";
         sys.stat_of(&user.home, stat(true, 0));
-        sys.file(aterm_machines::items::github::CLT_GIT, b"inert git");
-        sys.file(&format!("{}/.local/bin/aterm", user.home), b"launcher");
+        sys.executable(aterm_machines::items::github::CLT_GIT, b"inert git");
+        sys.executable(&format!("{}/.local/bin/aterm", user.home), b"launcher");
         let token = format!("{}/.secrets/gh_access_token", user.home);
         sys.file(&token, TOKEN.as_bytes())
             .stat_of(&token, stat(false, TOKEN.len() as u64));
@@ -15785,9 +15827,6 @@ mod tests {
                     && row
                         .detail
                         .starts_with(&format!("this aterm runs from {}", image.display()))
-                    && row
-                        .detail
-                        .contains("move aterm to Applications and open it from there")
                     && !row.detail.contains("--program")),
                 "{rows:?}"
             );

@@ -97,6 +97,10 @@ impl Waiting {
         self.0.keys().cloned().collect()
     }
 
+    pub(in super::super) fn contains(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
     /// Whether the write of `name` settles its conflict ([`WaitingWrite::resolve`]).
     pub(in super::super) fn resolves(&self, name: &str) -> bool {
         self.0.get(name).is_some_and(|write| write.resolve)

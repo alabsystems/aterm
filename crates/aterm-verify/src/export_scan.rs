@@ -583,14 +583,39 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
             &[atpkg::prerequisite::Prerequisite::Gitleaks],
             "verify export-scan",
         )
+        .map(Scanner::Signed)
     });
 }
 
-fn run_with(
-    ctx: &Ctx,
-    r: &mut Report,
-    acquire: impl FnOnce() -> Result<atpkg::prerequisite::HeldSet, String>,
-) {
+enum Scanner {
+    Signed(atpkg::prerequisite::HeldSet),
+    // Content fixtures exercise the real pinned scanner without reopening the
+    // host's live package source inside an isolated release-test environment.
+    #[cfg(test)]
+    Fixture(std::path::PathBuf),
+}
+
+impl Scanner {
+    fn command(&self, tree: &Path, report: &Path, ignore: &Path) -> Result<Cmd, String> {
+        match self {
+            Self::Signed(held) => {
+                let tool = held
+                    .tool(atpkg::prerequisite::Prerequisite::Gitleaks)
+                    .ok_or("the operation did not acquire its scanner")?;
+                tool.validate()?;
+                let mut command = gitleaks_cmd(tool.path(), tree, report, ignore);
+                for (name, value) in tool.environment().entries() {
+                    command = command.env(name, value);
+                }
+                Ok(command)
+            }
+            #[cfg(test)]
+            Self::Fixture(path) => Ok(gitleaks_cmd(path, tree, report, ignore)),
+        }
+    }
+}
+
+fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner, String>) {
     let mut not_run = Vec::new();
     let gitleaks = match acquire() {
         Ok(held) => Some(held),
@@ -698,7 +723,7 @@ fn run_with(
 /// gitleaks over the exported `tree`, its report adjudicated: the findings that stand.
 fn gitleaks_leaks(
     ctx: &Ctx,
-    held: &atpkg::prerequisite::HeldSet,
+    scanner: &Scanner,
     work: &Path,
     tree: &Path,
 ) -> Result<Vec<Finding>, String> {
@@ -707,14 +732,7 @@ fn gitleaks_leaks(
     std::fs::write(&ignore, b"").map_err(|e| format!("{}: {e}", ignore.display()))?;
     let mut env = ctx.exec_env();
     env.child_ceiling = Some(std::time::Duration::from_secs(GITLEAKS_CEILING_S));
-    let tool = held
-        .tool(atpkg::prerequisite::Prerequisite::Gitleaks)
-        .ok_or("the operation did not acquire its scanner")?;
-    tool.validate()?;
-    let mut command = gitleaks_cmd(tool.path(), tree, &report, &ignore);
-    for (name, value) in tool.environment().entries() {
-        command = command.env(name, value);
-    }
+    let command = scanner.command(tree, &report, &ignore)?;
     let run = exec::run(&command, env);
     if let Some(e) = &run.spawn_error {
         return Err(format!("gitleaks did not start: {e}"));

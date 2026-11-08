@@ -219,6 +219,7 @@ const NOEXEC: &str = "OK native-act state=retired reason=no-exec-grant\n";
 #[cfg(test)]
 const COMMITTED: &str = "OK native-act state=committed claim=lost revision=-\n";
 const ROLLBACK_SAFE: &str = "OK native-act state=rollback-safe\n";
+const DEADLINE: &str = "ERR native operation deadline\n";
 const MAX_COMPLETED: usize = 128;
 const MAX_PREPARE_US: u64 = 120_000_000;
 
@@ -330,6 +331,14 @@ impl Operations {
             machine = "NoExecFlight",
             action = "Expire",
             reason = "The injected monotonic clock passes the closed operation deadline"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeUnadmittedPrepare",
+            action = "Reclaim",
+            project = "aterm_gui::native_act::tests::unadmitted::Host::probe"
         )
     )]
     fn reclaim(&mut self, now_us: u64) -> Vec<Arc<Mutex<Operation>>> {
@@ -492,6 +501,14 @@ impl<'a> PrepareSlot<'a> {
         Self::reserve_relation(ctx, id, now_us, crash, account, None)
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeUnadmittedPrepare",
+            action = "Reserve",
+            project = "aterm_gui::native_act::tests::unadmitted::Host::probe"
+        )
+    )]
     fn reserve_relation(
         ctx: &'a crate::SessionCtx,
         id: &str,
@@ -548,6 +565,14 @@ impl<'a> PrepareSlot<'a> {
         })
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeUnadmittedPrepare",
+            action = "Publish",
+            project = "aterm_gui::native_act::tests::unadmitted::Host::probe"
+        )
+    )]
     fn publish(&mut self, table: &mut Operations, operation: Arc<Mutex<Operation>>) -> bool {
         {
             let op = operation.lock().unwrap_or_else(|p| p.into_inner());
@@ -564,6 +589,14 @@ impl<'a> PrepareSlot<'a> {
 }
 
 impl Drop for PrepareSlot<'_> {
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeUnadmittedPrepare",
+            action = "Drop",
+            project = "aterm_gui::native_act::tests::unadmitted::Host::probe"
+        )
+    )]
     fn drop(&mut self) {
         if !self.published {
             let mut table = self
@@ -2084,6 +2117,100 @@ fn prepare(
     prepare_inner(ctx, master, request, caller, kernel, None)
 }
 
+/// The answer to a prepare whose deadline has passed: `unadmitted` when this host proves it
+/// never admitted this prepare and can admit no replay of it, and otherwise today's deadline
+/// refusal. It writes, reserves and reclaims nothing.
+///
+/// The proof is read for a plain restart from the built-in harness, on this host epoch (checked
+/// before this), with no renewal seal, account relation or asked intent:
+/// - the deadline was read on this epoch's monotonic clock, which every admission reads too,
+///   and nothing publishes once it has passed (the final check under the table lock);
+/// - admission writes the issuer record and has it acknowledged before `Phase::Started`
+///   (`finish_preparation`), and every effect requires `Started` and an unexpired deadline;
+/// - nothing leaves the table unrecorded, and the issuer journal only appends.
+///
+/// So, read after the clock, an id no table entry, reservation, seal or fence holds and no
+/// issuer record names was never started, and no later replay of this prepare can start it (a
+/// prepare naming the id with a fresh deadline is a new admission). A self-exec plan
+/// writes no issuer record, and the other relations (a renewal seal, an account continuation,
+/// an asked intent's predecessor) are not argued here, so they keep the refusal
+/// (`ATERM-KI-1107-2`). Rollback of the whole custody tree stays outside this claim, as it does
+/// for every journal read (`native_receipts`).
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeUnadmittedPrepare",
+        action = "Answer",
+        project = "aterm_gui::native_act::tests::unadmitted::Host::probe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeUnadmittedPrepare",
+        action = "Approach",
+        reason = "The injected monotonic clock brings a too-far deadline into its window"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeUnadmittedPrepare",
+        action = "Expire",
+        reason = "The injected monotonic clock passes the deadline"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeUnadmittedPrepare",
+        action = "OwnImage",
+        reason = "The caller's plan names the self-exec constructor, which writes no issuer record"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeUnadmittedPrepare",
+        action = "LostAck",
+        reason = "A committed issuer append can lose its acknowledgement without informing the writer"
+    )
+)]
+fn unadmitted_after_deadline(
+    ctx: &crate::SessionCtx,
+    request: &Prepare,
+    caller: &SupervisorInputCaller,
+    renewal: Option<&renewal::Seal>,
+    account: Option<&AccountContinuation>,
+    kernel: &dyn Kernel,
+) -> String {
+    if caller.principal != crate::control::Principal::Harness
+        || renewal.is_some()
+        || account.is_some()
+        || request.asked.is_some()
+        || !matches!(request.plan, NativePlan::Restart { .. })
+    {
+        return DEADLINE.into();
+    }
+    let held = {
+        let table = ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        table.by_id.contains_key(&request.id)
+            || table.reservations.contains_key(&request.id)
+            || table.cancelled.contains_key(&request.id)
+            || table.account_fences.contains_key(&request.id)
+            || table.renewal_seals.contains_key(&request.id)
+    };
+    if held || kernel.recorded_operation(&request.id) != Ok(false) {
+        return DEADLINE.into();
+    }
+    aterm_agent::harness::native_act::unadmitted_reply(&request.id)
+        .unwrap_or_else(|| DEADLINE.into())
+}
+
 fn prepare_inner(
     ctx: &crate::SessionCtx,
     master: i32,
@@ -2171,12 +2298,20 @@ fn prepare_inner(
     let Some(now) = clock.now_us() else {
         return DENIED.into();
     };
-    if request
-        .deadline_us
-        .checked_sub(now)
-        .is_none_or(|left| left == 0 || left > MAX_PREPARE_US)
-    {
-        return "ERR native operation deadline\n".into();
+    match request.deadline_us.checked_sub(now) {
+        // An expired deadline never admits again; a too-far one may once time passes.
+        None | Some(0) => {
+            return unadmitted_after_deadline(
+                ctx,
+                &request,
+                &caller,
+                renewal.as_ref(),
+                account.as_ref(),
+                kernel,
+            );
+        }
+        Some(left) if left > MAX_PREPARE_US => return DEADLINE.into(),
+        Some(_) => {}
     }
     if let Err(refusal) = persist_noexec_predecessor(
         ctx,
@@ -2397,7 +2532,7 @@ fn prepare_inner(
         };
     }
     if clock.remaining(request.deadline_us).is_none() {
-        return "ERR native operation deadline\n".into();
+        return DEADLINE.into();
     }
     if !kernel.constructor_enabled(request.constructor()) {
         return "ERR native constructor disabled\n".into();
@@ -2712,6 +2847,14 @@ fn own_actor_matches(actual: &Process, original: &Process) -> bool {
         && actual.session == original.session
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeUnadmittedPrepare",
+        action = "Complete",
+        project = "aterm_gui::native_act::tests::unadmitted::Host::probe"
+    )
+)]
 fn finish(
     ctx: &crate::SessionCtx,
     operation: &Arc<Mutex<Operation>>,
@@ -4095,7 +4238,7 @@ fn serve_with_publication(
     if historical_reader
         && (reply == DENIED
             || reply == "ERR native host epoch changed\n"
-            || reply == "ERR native operation deadline\n"
+            || reply == DEADLINE
             || reply == "ERR native constructor disabled\n")
         && !(matches!(saved, Request::Prepare(_))
             && request_operation(ctx, &saved).is_some_and(|op| {

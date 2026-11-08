@@ -298,7 +298,13 @@ mod tests {
             len,
         };
         sys.stat_of(home.to_str().unwrap(), stat(true, 0));
-        sys.stat_of(aterm_machines::items::github::CLT_GIT, stat(false, 1));
+        sys.stat_of(
+            aterm_machines::items::github::CLT_GIT,
+            Stat {
+                mode: 0o755,
+                ..stat(false, 1)
+            },
+        );
         // git's credential settings hold nothing of an earlier init's.
         sys.simulate(|_, command| {
             command

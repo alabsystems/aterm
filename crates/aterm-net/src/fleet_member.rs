@@ -261,24 +261,9 @@ pub const RECORD_MAX: usize = 1024;
 pub const PEERS_FILE_MAX: usize = 256 * 1024;
 
 /// How long a take of the book's lock waits for another writer, which holds it for one
-/// read-modify-write ([`write_held`]), before it refuses: in a debug build, a test's wait on its
-/// thread ([`lock_waiting`]) or [`LOCK_WAIT_SEAM`]'s replaces it.
-const LOCK_WAIT: Duration = Duration::from_secs(2);
-
-/// The dev seam that sets every take of the book's lock in a debug aterm to wait this many
-/// milliseconds in place of [`LOCK_WAIT`]: a test of the binary gives it the hang detector, as
-/// every holder there is an aterm or a test on the same machine that releases the lock, which a
-/// loaded machine can keep past [`LOCK_WAIT`]. A value that names no milliseconds (empty, `0`)
-/// leaves [`LOCK_WAIT`]; a release build never reads it.
-pub const LOCK_WAIT_SEAM: &str = "ATERM_DEBUG_FLEET_LOCK_WAIT_MS";
-
-/// The dev seam that has a debug aterm write [`LOCK_HELD_LINE`] to stderr once per take of the
-/// book's lock that finds it held, before it waits: a test of the binary starts another verb only
-/// after it, so the order the two meet the lock in is known. A release build never reads it.
-pub const LOCK_TOLD_SEAM: &str = "ATERM_DEBUG_FLEET_LOCK_TOLD";
-
-/// The line [`LOCK_TOLD_SEAM`] has a debug aterm write.
-pub const LOCK_HELD_LINE: &str = "aterm fleet: the book's lock is held; waiting for it";
+/// read-modify-write ([`write_held`]), before the hang detector refuses. A test can replace
+/// its thread's wait with [`lock_waiting`].
+const LOCK_WAIT: Duration = Duration::from_secs(60);
 
 #[cfg(any(test, debug_assertions))]
 thread_local! {
@@ -332,24 +317,11 @@ fn lock_wait() -> Duration {
     if let Some(wait) = TEST_WAIT.with_borrow(|seam| seam.as_ref().map(|(wait, _)| *wait)) {
         return wait;
     }
-    // This crate's own tests read no environment, as the loopback guard's do not.
-    #[cfg(all(debug_assertions, not(test)))]
-    if let Some(ms) = std::env::var_os(LOCK_WAIT_SEAM)
-        .and_then(|ms| {
-            let s = ms.to_str()?.trim();
-            s.bytes()
-                .all(|b| b.is_ascii_digit())
-                .then(|| s.parse::<u64>().ok())?
-        })
-        .filter(|&ms| ms > 0)
-    {
-        return Duration::from_millis(ms);
-    }
     LOCK_WAIT
 }
 
-/// The book's lock found held by a take, `first` the first time that take found it so.
-fn found_held(first: bool) {
+/// Tell the native test observers that the book's lock is held.
+fn found_held() {
     #[cfg(test)]
     if let Some(wait) = ON_LOCK_WAIT.with_borrow_mut(Option::take) {
         wait();
@@ -360,12 +332,6 @@ fn found_held(first: bool) {
             let _ = told.send(());
         }
     });
-    #[cfg(all(debug_assertions, not(test)))]
-    if first && std::env::var_os(LOCK_TOLD_SEAM).is_some() {
-        let _ = aterm_uds::stdout::stderr_line(format_args!("{LOCK_HELD_LINE}"));
-    }
-    #[cfg(not(all(debug_assertions, not(test))))]
-    let _ = first;
 }
 
 /// The places tests hold silent ([`HeldSilent`]), read by dials on every thread, each with the
@@ -687,7 +653,7 @@ fn node_identity_before_mint(
     {
         return identity_of(&node, &seed);
     }
-    let _identity = BookLock::take(dir, lock_wait())
+    let _identity = BookLock::take_default_at(dir, Instant::now())
         .map_err(|e| io::Error::new(e.kind(), lock_refused(dir, &e)))?;
     let seed = match read_node_seed(dir)? {
         Some(seed) => seed,
@@ -2366,7 +2332,7 @@ impl fmt::Display for Unwritten {
 
 impl std::error::Error for Unwritten {}
 
-/// THE WRITE RULE (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): every write of fleet state — [`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`], [`ANSWERED_FILE`], [`fleet_seed::FILE`], [`fleet_seed::CONFLICT_FILE`], [`fleet_seed::UNHELD_FILE`], [`OFF_FILE`], [`VAULT_FILE`], `fleet sync`'s two records and aterm.toml's `[fleet]` — is made in `write`, under the book's lock in `dir` and only while `dir` holds the fleet `began` names, from what `write` reads under it; a leave's is [`leave_held`]'s, and a level's [`level_held`]'s. The files are written by the [`HeldBook`] `write` is handed, and sync's records and aterm.toml's `[fleet]` beside it, by convention. The lock is taken once per call, never inside another, waited for at most two seconds ([`LOCK_WAIT`]; a debug build's test seams aside); aterm.toml's write lock, where `write` takes it, comes after it.
+/// THE WRITE RULE (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): every write of fleet state — [`KEY_FILE`], [`CODE_FILE`], [`PEERS_FILE`], [`ISSUER_BOOK_FILE`], [`ANSWERED_FILE`], [`fleet_seed::FILE`], [`fleet_seed::CONFLICT_FILE`], [`fleet_seed::UNHELD_FILE`], [`OFF_FILE`], [`VAULT_FILE`], `fleet sync`'s two records and aterm.toml's `[fleet]` — is made in `write`, under the book's lock in `dir` and only while `dir` holds the fleet `began` names, from what `write` reads under it; a leave's is [`leave_held`]'s, and a level's [`level_held`]'s. The files are written by the [`HeldBook`] `write` is handed, and sync's records and aterm.toml's `[fleet]` beside it, by convention. The lock is taken once per call, never inside another, waited for until the one-minute hang detector ([`LOCK_WAIT`]); aterm.toml's write lock, where `write` takes it, comes after it.
 /// # Errors
 /// [`Unwritten::Lock`]: another writer holds the lock past its wait, the lock cannot be
 /// taken, or a leave's directory open to others cannot be narrowed; [`Unwritten::Moved`]:
@@ -2376,8 +2342,8 @@ pub fn write_held<R>(
     began: Began<'_>,
     write: impl FnOnce(&HeldBook<'_>) -> R,
 ) -> Result<R, Unwritten> {
-    let lock =
-        BookLock::take(dir, lock_wait()).map_err(|e| Unwritten::Lock(lock_refused(dir, &e)))?;
+    let lock = BookLock::take_default_at(dir, Instant::now())
+        .map_err(|e| Unwritten::Lock(lock_refused(dir, &e)))?;
     let book = HeldBook {
         dir,
         held: Held::read(dir),
@@ -2434,7 +2400,7 @@ fn unnamed_held(dir: &Path) -> Result<(Option<u32>, Option<BookLock>), Unwritten
         },
         _ => None,
     };
-    let lock = match BookLock::take(dir, lock_wait()) {
+    let lock = match BookLock::take_default_at(dir, Instant::now()) {
         Ok(lock) => Some(lock),
         Err(e) if stops_every_edit(&e) => None,
         Err(e) => {
@@ -2544,7 +2510,7 @@ impl Leaving<'_> {
 /// Another edit holds it past the lock's wait, or it cannot be taken.
 #[cfg(any(test, debug_assertions))]
 pub fn hold_book(dir: &Path) -> Result<HeldBook<'_>, String> {
-    let lock = BookLock::take(dir, lock_wait()).map_err(|e| lock_refused(dir, &e))?;
+    let lock = BookLock::take_default_at(dir, Instant::now()).map_err(|e| lock_refused(dir, &e))?;
     Ok(HeldBook {
         dir,
         held: Held::read(dir),
@@ -4059,10 +4025,18 @@ impl Drop for ClassLift {
 }
 
 impl BookLock {
+    fn take_default_at(dir: &Path, started: Instant) -> io::Result<Self> {
+        let within = started
+            .checked_add(lock_wait())
+            .map_or(Duration::MAX, |deadline| {
+                deadline.saturating_duration_since(Instant::now())
+            });
+        Self::take(dir, within)
+    }
+
     fn take(dir: &Path, within: Duration) -> io::Result<Self> {
         #[cfg(target_os = "macos")]
         let lift = ClassLift::up();
-        let mut first = true;
         aterm_uds::private_file::PrivateLock::take_with(
             dir,
             PEERS_LOCK,
@@ -4071,7 +4045,7 @@ impl BookLock {
                 "another aterm is writing the book in {}; run this again",
                 dir.display()
             ),
-            || found_held(std::mem::take(&mut first)),
+            found_held,
         )
         .map(|held| Self {
             _held: held,
@@ -9068,15 +9042,25 @@ pub fn store_pushed_facts_with_key(
     key: Option<NodeKey>,
     payload: &str,
 ) -> io::Result<()> {
-    store_pushed_facts_using(
-        state_dir,
-        node,
-        key,
-        payload,
-        Duration::from_secs(2),
-        || {},
-        write_private,
-    )
+    store_pushed_facts_started(state_dir, node, key, payload, Instant::now(), || {})
+}
+
+const FACTS_WRITE_HANG: Duration = Duration::from_secs(60);
+
+fn store_pushed_facts_started(
+    state_dir: &Path,
+    node: &str,
+    key: Option<NodeKey>,
+    payload: &str,
+    started: Instant,
+    held: impl FnMut(),
+) -> io::Result<()> {
+    let within = started
+        .checked_add(FACTS_WRITE_HANG)
+        .map_or(Duration::MAX, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+    store_pushed_facts_using(state_dir, node, key, payload, within, held, write_private)
 }
 
 fn store_pushed_facts_using(

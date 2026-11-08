@@ -6642,7 +6642,6 @@ impl App {
                 w.request_redraw();
             }
         }
-        self.refresh_band_hover();
     }
 
     /// The `(rows, cols)` window `wid` gets for raw `size`.

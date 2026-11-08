@@ -249,10 +249,7 @@ pub(super) fn prepare(
     let drafted = (!legacy || has_draft)
         .then(|| candidate.log())
         .flatten()
-        .map(|log| log_entries::Drafted {
-            records: records.clone(),
-            heads: log.heads(),
-        });
+        .map(|log| log_entries::Drafted::from_log(records.clone(), log));
     let cost = Cost {
         before: Footprint::of(&before),
         after: Footprint::of(&candidate),

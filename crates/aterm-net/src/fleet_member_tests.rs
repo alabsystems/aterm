@@ -14,6 +14,89 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const HANG: Duration = Duration::from_secs(60);
 
 #[test]
+fn native_pushed_facts_wait_for_an_unchanged_original_writer() {
+    let state = State::new("facts-native-writer-delay");
+    let node = "33".repeat(16);
+    let before = "previous facts\n";
+    store_pushed_facts(state.dir(), &node, before).unwrap();
+    let dir = state.dir().join(SWARM_FACTS_DIR);
+    let held = pushed_facts_lock(&dir, Duration::ZERO, || {}).unwrap();
+    let mut held = Some(held);
+    let result = store_pushed_facts_started(
+        state.dir(),
+        &node,
+        None,
+        "new facts\n",
+        Instant::now() - Duration::from_secs(3),
+        move || {
+            drop(held.take());
+        },
+    );
+    result.unwrap();
+    let held = pushed_facts_lock(&dir, Duration::ZERO, || {}).unwrap();
+    assert!(
+        store_pushed_facts_started(
+            state.dir(),
+            &node,
+            None,
+            "expired replacement\n",
+            Instant::now() - Duration::from_secs(61),
+            || panic!("expired detector must not wait")
+        )
+        .is_err()
+    );
+    assert!(pushed_facts_lock(&dir, Duration::ZERO, || {}).is_err());
+    drop(held);
+    assert_eq!(
+        read_pushed_facts(state.dir()),
+        [(node, "new facts\n".to_owned())]
+    );
+}
+
+#[test]
+fn the_actual_fleet_book_waits_for_an_unchanged_native_writer() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let dir = scratch.path();
+    let held = aterm_uds::private_file::PrivateLock::take_with(
+        dir,
+        PEERS_LOCK,
+        Duration::ZERO,
+        "private book held",
+        || {},
+    )
+    .unwrap();
+    ON_LOCK_WAIT.with_borrow_mut(|hook| {
+        *hook = Some(Box::new(move || {
+            drop(held);
+        }))
+    });
+    let result = BookLock::take_default_at(dir, Instant::now() - Duration::from_secs(3));
+    ON_LOCK_WAIT.with_borrow_mut(|hook| drop(hook.take()));
+    let locked = result.unwrap();
+    assert!(book_held(dir));
+    drop(locked);
+    assert!(!book_held(dir));
+    let held = aterm_uds::private_file::PrivateLock::take_with(
+        dir,
+        PEERS_LOCK,
+        Duration::ZERO,
+        "private book held",
+        || {},
+    )
+    .unwrap();
+    assert_eq!(
+        BookLock::take_default_at(dir, Instant::now() - Duration::from_secs(61))
+            .err()
+            .unwrap()
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(book_held(dir));
+    drop(held);
+    assert!(!book_held(dir));
+}
+
+#[test]
 fn mesh_identity_and_book_migration_are_key_derived_and_idempotent() {
     let scratch = State::new("mesh-identity");
     let dir = scratch.dir().to_owned();

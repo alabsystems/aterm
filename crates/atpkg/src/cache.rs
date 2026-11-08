@@ -3,7 +3,6 @@
 
 //! Same-source index cache for fallback on transient fetch failure.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -121,19 +120,7 @@ impl IndexCache {
             let _ = crate::platform::harden_file(&self.path);
             return;
         }
-        let tmp = parent.join(format!(".index-cache.tmp-{}", std::process::id()));
-        let _ = fs::remove_file(&tmp);
-        let written = crate::platform::create_private_new(&tmp).and_then(|mut f| {
-            std::io::Write::write_all(&mut f, text.as_bytes())?;
-            crate::platform::set_mode_on(&f, 0o600)
-        });
-        if written.is_err() {
-            let _ = fs::remove_file(&tmp);
-            return;
-        }
-        if fs::rename(&tmp, &self.path).is_err() {
-            let _ = fs::remove_file(&tmp);
-        }
+        let _ = crate::metadata_io::write_private_atomic(&self.path, text.as_bytes());
     }
 
     fn ensure_parent(&self, parent: &Path) -> std::io::Result<()> {
@@ -212,6 +199,7 @@ fn decode(doc: CacheDoc) -> Option<Vec<Candidate>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -518,25 +506,24 @@ mod tests {
         let _ = fs::remove_dir_all(&parent);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn store_replaces_tmp_symlink_without_writing_target() {
-        let (_scratch, p) = tmp("tmp-symlink");
+    fn store_does_not_unlink_an_inflight_writers_staging_file() {
+        let (_scratch, p) = tmp("inflight");
         let parent = p.parent().unwrap().to_path_buf();
         fs::create_dir_all(&parent).unwrap();
-        let victim = parent.join("victim.txt");
-        fs::write(&victim, b"untouched").unwrap();
         let tmp_path = parent.join(format!(".index-cache.tmp-{}", std::process::id()));
-        std::os::unix::fs::symlink(&victim, &tmp_path).unwrap();
+        let mut inflight = crate::platform::create_private_new(&tmp_path).unwrap();
+        std::io::Write::write_all(&mut inflight, b"another writer's pending bytes").unwrap();
 
         let cache = IndexCache::new(p.clone());
         cache.store("github:o/r", &[cand("v1")]);
         assert!(cache.load("github:o/r").is_some(), "the cache is written");
         assert_eq!(
-            fs::read(&victim).unwrap(),
-            b"untouched",
-            "store must unlink .index-cache.tmp-<pid> rather than following a symlink"
+            fs::read(&tmp_path).unwrap(),
+            b"another writer's pending bytes",
+            "a writer retains its staged path until it publishes"
         );
+        drop(inflight);
         let _ = fs::remove_dir_all(&parent);
     }
 }

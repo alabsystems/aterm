@@ -163,6 +163,7 @@ fn context(now_ms: u64) -> Context {
     Context {
         policy: need::Policy::compiled(true),
         signer: Some(signer()),
+        version: None,
         network: NETWORK,
         members: [A, B, C].into_iter().collect(),
         scope: None,
@@ -258,7 +259,7 @@ fn a_posted_legacy_notary_request_is_reissued_with_its_entry_binding() {
     need::test_alab_policy(paths);
     let raised = need::raise(paths, Want::Notary, Purpose::ReleaseNotary).unwrap();
     let receipt = with_store(paths, |session, store, _scope| {
-        let mut legacy = request_record(&session.actor(), &raised);
+        let mut legacy = request_record(&session.actor(), &raised)?.record;
         legacy.body.remove("entry");
         let payload = legacy.command()?.encode()?;
         store.commit_catalog(session, &payload)
@@ -449,7 +450,7 @@ fn a_publication_needs_the_vault_signers_attestation_on_this_network() {
     feed.put(B, attested(publication(&id)));
     assert_eq!(
         feed.book(0).threads[&id].published,
-        Some(("alab".into(), 7))
+        Some(("alab".into(), RefusalClaim::LegacySequence(7)))
     );
 
     let mut refused = Feed::new();
@@ -467,8 +468,166 @@ fn a_publication_needs_the_vault_signers_attestation_on_this_network() {
     refused.put(B, attested(newer));
     assert_eq!(
         refused.book(0).threads[&id].published,
-        Some(("alab".into(), 8)),
+        Some(("alab".into(), RefusalClaim::LegacySequence(8))),
         "stale signed records cannot block a later valid publication"
+    );
+
+    // A typed request cannot shed its floor while parts are arriving, and an
+    // incomplete or stale signed decision cannot occupy the publication slot.
+    let lab = Lab::with_foundation(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let admin = client::admin_open(paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Hosts(vec!["m1".into()]),
+        "release-notary",
+        b"old-version",
+    )
+    .unwrap();
+    client::admin_publish(paths, &admin, &doc).unwrap();
+    client::seed_vault_genesis(paths, &lab._home.path().join("genesis.v2")).unwrap();
+    let admin = client::admin_cached(paths).unwrap();
+    client::admin_publish(paths, &admin, &admin.doc).unwrap();
+    let before = facts(paths, 0).unwrap().sight.unwrap().version.unwrap();
+    let legacy_floor = before.envelope_sequence().unwrap();
+    let floor = before.claim().clone();
+    assert_eq!(floor.envelope().unwrap().seq, legacy_floor);
+    assert!(floor.log().is_some());
+    let admin = client::admin_cached(paths).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Hosts(vec!["m1".into()]),
+        "release-notary",
+        b"new-version",
+    )
+    .unwrap();
+    let produced = client::admin_publish(paths, &admin, &doc).unwrap();
+    let admin = client::admin_cached(paths).unwrap();
+    let actual = facts(paths, 0).unwrap().sight.unwrap().version.unwrap();
+    assert_eq!(
+        actual.relation(&floor),
+        client::version::VersionRelation::Advanced
+    );
+    let candidate = produced.version().clone();
+    assert!(candidate.envelope().is_some() && candidate.log().is_some());
+    let mut context = context(0);
+    context.signer = Some(admin.custodian_signer().unwrap());
+    context.version = Some(actual.clone());
+    let sign = |record: custody::Attested<'_>| admin.attest_credential_record(&NETWORK, record);
+    let mut feed = Feed::new();
+    let (id, mut request) = request_body(&A, 3, "notary", "release.notary");
+    let refused = version::prepare(&id, version::Use::Refused, &floor).unwrap();
+    request.body.insert("v".into(), Value::from(2_u64));
+    request
+        .body
+        .insert("refused_version".into(), refused.manifest);
+    feed.put(A, request);
+    let project = |feed: &Feed| Book::project(feed.entries.clone(), &context);
+    assert!(project(&feed).threads[&id].version_pending);
+    for part in &refused.parts {
+        feed.put(B, part.clone());
+    }
+    assert!(project(&feed).threads[&id].version_pending);
+    for part in refused.parts {
+        feed.put(A, part);
+    }
+    assert_eq!(
+        project(&feed).threads[&id].refused,
+        Some(RefusalClaim::Authenticated(floor.clone()))
+    );
+    assert!(!project(&feed).threads[&id].version_pending);
+    let recipient = aterm_secrets::age::Identity::from_secret_bytes([4; 32]).recipient();
+    let (stale, _) = super::publication(&id, &floor, None, &recipient, None, true).unwrap();
+    for part in stale.parts {
+        feed.put(B, part);
+    }
+    feed.put(B, stale.record.attest(&sign).unwrap());
+    assert!(project(&feed).threads[&id].published.is_none());
+    let (fresh, _) = super::publication(&id, &candidate, None, &recipient, None, true).unwrap();
+    feed.put(B, fresh.record.attest(&sign).unwrap());
+    assert!(project(&feed).threads[&id].published.is_none());
+    for part in &fresh.parts {
+        feed.put(C, part.clone());
+    }
+    assert!(project(&feed).threads[&id].published.is_none());
+    for part in &fresh.parts {
+        feed.put(B, part.clone());
+    }
+    assert_eq!(
+        project(&feed).threads[&id].published,
+        Some((
+            candidate.vault().to_owned(),
+            RefusalClaim::Authenticated(candidate.clone())
+        ))
+    );
+    for part in fresh.parts {
+        feed.put(B, part);
+    }
+    assert!(project(&feed).threads[&id].published.is_some());
+
+    // An untrusted protocol floor may name only the accepted log prefix. Adding
+    // its envelope to an attested candidate does not advance that prefix, as
+    // judged by the current authenticated view of both envelope and log.
+    let same_floor = client::version::VersionClaim::new(
+        actual.claim().vault().to_owned(),
+        *actual.claim().signer(),
+        None,
+        actual.claim().log().cloned(),
+    )
+    .unwrap();
+    assert!(same_floor.envelope().is_none() && same_floor.log().is_some());
+    assert_eq!(
+        actual.relation_between(&candidate, &same_floor),
+        client::version::VersionRelation::Same
+    );
+    let mut same = Feed::new();
+    let (id, mut request) = request_body(&A, 4, "notary", "release.notary");
+    let floor_parts = version::prepare(&id, version::Use::Refused, &same_floor).unwrap();
+    request.body.insert("v".into(), Value::from(2_u64));
+    request
+        .body
+        .insert("refused_version".into(), floor_parts.manifest);
+    for part in floor_parts.parts {
+        same.put(A, part);
+    }
+    same.put(A, request);
+    let (publication, _) =
+        super::publication(&id, &candidate, None, &recipient, None, true).unwrap();
+    for part in publication.parts {
+        same.put(B, part);
+    }
+    same.put(B, publication.record.attest(&sign).unwrap());
+    assert!(project(&same).threads[&id].published.is_none());
+
+    // The same accepted view reports its genuine envelope sequence for an
+    // older scalar request, without changing typed H ordering.
+    let sequence = actual.envelope_sequence().unwrap();
+    assert!(sequence > legacy_floor);
+    assert!(version::exceeds(
+        &actual,
+        &RefusalClaim::LegacySequence(legacy_floor)
+    ));
+    assert!(!version::exceeds(
+        &actual,
+        &RefusalClaim::LegacySequence(sequence)
+    ));
+    let mut legacy = Feed::new();
+    let (id, mut request) = request_body(&A, 5, "notary", "release.notary");
+    request
+        .body
+        .insert("refused".into(), Value::from(legacy_floor));
+    legacy.put(A, request);
+    let (publication, reported) =
+        super::publication(&id, actual.claim(), Some(sequence), &recipient, None, false).unwrap();
+    assert!(publication.parts.is_empty());
+    assert_eq!(reported, RefusalClaim::LegacySequence(sequence));
+    legacy.put(B, publication.record.attest(&sign).unwrap());
+    assert_eq!(
+        project(&legacy).threads[&id].published,
+        Some((
+            actual.claim().vault().to_owned(),
+            RefusalClaim::LegacySequence(sequence)
+        ))
     );
 }
 
@@ -606,6 +765,105 @@ fn the_schema_is_closed_and_a_retry_identity_is_its_records() {
     assert!(!named(Vec::new()));
     assert!(!named(vec!["m3".into(), "m3".into()]));
     assert!(!named(vec!["m3; rm".into()]), "a host is a machine name");
+
+    use aterm_secrets::client::version::{EnvelopeVersion, LogVersion, VersionClaim};
+    let head = |n: usize| {
+        let mut id = [0; 32];
+        id[24..].copy_from_slice(&(n as u64 + 1).to_be_bytes());
+        id
+    };
+    let claim = VersionClaim::new(
+        "v".repeat(63),
+        signer(),
+        Some(EnvelopeVersion {
+            seq: 7,
+            digest: [8; 32],
+        }),
+        Some(LogVersion {
+            network: [9; 32],
+            heads: (0..aterm_secrets::membership_log::MAX_HELD_RECORDS)
+                .map(head)
+                .collect(),
+        }),
+    )
+    .unwrap();
+    let prepared = version::prepare(&key, version::Use::Refused, &claim).unwrap();
+    assert_eq!(prepared.parts.len(), version::MAX_PARTS);
+    let manifest = version::Manifest::read(&prepared.manifest).unwrap();
+    assert!(aterm_json::to_vec(&prepared.manifest).unwrap().len() < MAX_RECORD);
+    let dataset =
+        crate::crypto::Manifest::deterministic(&SEED, [3; 32], [4; 16], "credentials").unwrap();
+    let writer_seed = [6; 32];
+    let mut actor = [1; 48];
+    actor[..32].copy_from_slice(&crate::crypto::public(&writer_seed).unwrap());
+    let capability = crate::crypto::Capability::issue(&dataset, &SEED, actor).unwrap();
+    let parents: Vec<_> = (0..astream_wire::sync::MAX_PARENTS).map(head).collect();
+    for part in &prepared.parts {
+        let payload = part.command().unwrap().encode().unwrap();
+        assert_eq!(decode(&payload).unwrap(), part.command().unwrap());
+        let wire = crate::crypto::seal_at(
+            &dataset,
+            &[7; 32],
+            &writer_seed,
+            &capability,
+            crate::crypto::Causal {
+                sequence: 1,
+                previous: Some(parents[0]),
+                parents: &parents,
+            },
+            &payload,
+            1,
+        )
+        .unwrap();
+        assert!(wire.len() <= crate::crypto::MAX_OPERATION);
+        assert_eq!(
+            crate::crypto::open(&dataset, &[7; 32], &wire)
+                .unwrap()
+                .plaintext,
+            payload
+        );
+    }
+    let mut feed = Feed::new();
+    for part in &prepared.parts[1..] {
+        feed.put(A, part.clone());
+    }
+    let resolve = |feed: &Feed, actor: &Actor, usage| {
+        version::Parts::read(&feed.entries)
+            .resolve(actor, &hex::encode_lower(&key), usage, &manifest)
+            .unwrap()
+    };
+    assert!(resolve(&feed, &A, version::Use::Refused).is_none());
+    feed.put(B, prepared.parts[0].clone());
+    assert!(
+        resolve(&feed, &A, version::Use::Refused).is_none(),
+        "a foreign writer supplies no part"
+    );
+    let mut wrong = prepared.parts[0].clone();
+    wrong.body.insert(
+        "data".into(),
+        Value::from(aterm_secrets::b64::encode_padded(b"wrong public witness")),
+    );
+    feed.put(A, wrong);
+    assert!(resolve(&feed, &A, version::Use::Refused).is_none());
+    feed.put(A, prepared.parts[0].clone());
+    assert_eq!(
+        resolve(&feed, &A, version::Use::Refused),
+        Some(claim.clone())
+    );
+    feed.put(A, prepared.parts[0].clone());
+    assert_eq!(resolve(&feed, &A, version::Use::Refused), Some(claim));
+    assert!(resolve(&feed, &A, version::Use::Published).is_none());
+    assert!(
+        version::Parts::read(&feed.entries)
+            .resolve(
+                &A,
+                &hex::encode_lower(&[9; 16]),
+                version::Use::Refused,
+                &manifest
+            )
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// A `Retired` record takes whatever evidence and note it is handed, a person's note typed on the
@@ -904,10 +1162,10 @@ fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone
     assert!(later.seq > floor);
     let delivered = custodian_pass_at(&lab.paths[0], now).unwrap().unwrap();
     assert!(
-        delivered
-            .published
-            .iter()
-            .any(|(id, seq)| *id == refused_key && *seq > floor),
+        delivered.published.iter().any(|(id, version)| {
+            *id == refused_key
+                && matches!(version, client::version::RefusalClaim::LegacySequence(sequence) if *sequence > floor)
+        }),
         "{delivered:?}"
     );
     repair_commons(&lab, 3);
@@ -918,6 +1176,181 @@ fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone
     assert_eq!(delivered.state, State::Published);
     assert!(delivered.seq.is_some_and(|seq| seq > floor));
     let accepted = need::satisfied(&lab.paths[1], &Want::Notary, Purpose::ReleaseNotary)
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.state, State::Fulfilled);
+
+    // A native log handout is a supported recipient too. Its signed record history
+    // advances while its envelope sequence remains zero; no scalar is invented for it.
+    struct HeldServer(Option<aterm_secrets::server::Running>);
+    impl HeldServer {
+        fn stop(&mut self) {
+            if let Some(server) = self.0.take() {
+                server.stop();
+            }
+        }
+    }
+    impl Drop for HeldServer {
+        fn drop(&mut self) {
+            self.stop();
+        }
+    }
+    let serve = |store| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = listener.local_addr().unwrap();
+        let server = aterm_secrets::server::start(
+            listener,
+            &aterm_secrets::server::Options {
+                listen,
+                store,
+                advertise: None,
+                pins: Vec::new(),
+                hold: std::time::Duration::from_millis(10),
+                keep_awake: false,
+            },
+        )
+        .unwrap();
+        (HeldServer(Some(server)), format!("http://{listen}/v1/team"))
+    };
+    let root = aterm_tempfile::tempdir().unwrap();
+    let store = root.path().join("served");
+    let (server, url) = serve(store.clone());
+    let source = Paths::for_home(&root.path().join("m1"));
+    let created = client::create(&source, &url, None, Some("m1")).unwrap();
+    let mut logged = Lab {
+        _home: root,
+        paths: vec![source],
+        signer: created.signer,
+        source: store.join("team.vault"),
+    };
+    let mut server = server;
+    let want = Want::MailboxComponent(
+        aterm_secrets::mailbox_component::Component::for_mailbox(
+            "https://mail.example",
+            "log-recipient@example",
+            aterm_secrets::mailbox_component::Part::Password,
+        )
+        .unwrap(),
+    );
+    let entry = want.entry().unwrap();
+    let purpose = Purpose::HarnessSignIn;
+    let source = &logged.paths[0];
+    let admin = client::admin_open(source).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&m1, &entry, b"first-log-token").unwrap();
+    client::admin_publish(source, &admin, &doc).unwrap();
+    client::seed_vault_genesis(source, &logged._home.path().join("genesis.v2")).unwrap();
+    let recipient = Paths::for_home(&logged._home.path().join("log-recipient"));
+    client::machine_identity(&recipient).unwrap();
+    let device = aterm_secrets::commons::bootstrap::Device::open(&recipient)
+        .unwrap()
+        .unwrap();
+    let bootstrap = logged.bootstrap(0);
+    let trust = bootstrap.trust();
+    let request = device.request(trust.network, trust.authority).unwrap();
+    let allowed = bootstrap
+        .device()
+        .with_seed(|seed| aterm_secrets::members::Allowed::sign(request.binding(), "m2", seed))
+        .unwrap();
+    let handout = client::hand_over(
+        source,
+        &aterm_secrets::members::desk::Handing {
+            request: &request,
+            node: request.binding().recipient().0,
+            name: allowed.name(),
+            allowed: &allowed,
+            reader: aterm_secrets::members::bundle::Reader::LegacyLog,
+            restore: false,
+            node_proven: false,
+            held: None,
+        },
+    )
+    .unwrap();
+    assert!(handout.logged);
+    let bundle = aterm_secrets::members::Bundle::decode(handout.bundle.as_slice()).unwrap();
+    client::write_from_log_bundle(&recipient, &bundle).unwrap();
+    let config = client::config(&recipient).unwrap().unwrap();
+    let admitted = client::with_materialization_ready(&recipient, &config, || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted.snapshot.sequence(), 0);
+    assert!(!recipient.dir.join("vault").exists());
+    logged.paths.push(recipient);
+    for paths in &logged.paths {
+        need::test_alab_policy(paths);
+    }
+    let source = &logged.paths[0];
+    let recipient = &logged.paths[1];
+    need::raise(recipient, want.clone(), purpose).unwrap();
+    assert_eq!(pass_at(recipient, now).unwrap().posted, 1);
+    repair_commons(&logged, 3);
+    let delivered = custodian_pass_at(source, now).unwrap().unwrap();
+    assert_eq!(delivered.published.len(), 1, "{delivered:?}");
+
+    // The owned primary is unavailable; the real Commons exchange still delivers
+    // its signed records, and normal sync materializes that log-only view.
+    server.stop();
+    repair_commons(&logged, 3);
+    client::sync(recipient, None).unwrap();
+    pass_at(recipient, now).unwrap();
+    let paired = || {
+        let config = client::config(recipient).unwrap().unwrap();
+        client::with_materialization_ready_for_entries(
+            recipient,
+            &config,
+            &[entry.as_str()],
+            || Ok(()),
+        )
+        .unwrap()
+        .unwrap()
+        .snapshot
+    };
+    let first = paired();
+    assert_eq!(first.sequence(), 0);
+    assert!(!recipient.dir.join("vault").exists());
+    assert_eq!(
+        std::fs::read(recipient.home.join(".secrets").join(&entry)).unwrap(),
+        b"first-log-token"
+    );
+    let delivered = need::peek(recipient).unwrap().remove(0);
+    assert_eq!(delivered.state, State::Published);
+    let accepted = need::acknowledge_from_snapshot(recipient, &delivered, &first, || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.state, State::Fulfilled);
+    let refused =
+        need::raise_refused_from_snapshot(recipient, want, purpose, &first, || Ok(())).unwrap();
+    assert_ne!(refused.id, accepted.id);
+    pass_at(recipient, now).unwrap();
+    repair_commons(&logged, 3);
+    let unchanged = custodian_pass_at(source, now).unwrap().unwrap();
+    assert!(unchanged.published.is_empty(), "{unchanged:?}");
+
+    let admin = client::admin_cached(source).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&m2, &entry, b"newer-log-token").unwrap();
+    let (_mirror, mirror_url) = serve(logged._home.path().join("mirror"));
+    client::admin_publish_with_candidates(source, &admin, &doc, &[mirror_url]).unwrap();
+    let delivered = custodian_pass_at(source, now).unwrap().unwrap();
+    assert_eq!(delivered.published.len(), 1, "{delivered:?}");
+    assert!(matches!(
+        delivered.published[0].1,
+        client::version::RefusalClaim::Authenticated(_)
+    ));
+    repair_commons(&logged, 3);
+    client::sync(recipient, None).unwrap();
+    pass_at(recipient, now).unwrap();
+    let newer = paired();
+    assert_eq!(newer.sequence(), 0);
+    assert!(!recipient.dir.join("vault").exists());
+    assert_eq!(
+        std::fs::read(recipient.home.join(".secrets").join(&entry)).unwrap(),
+        b"newer-log-token"
+    );
+    let delivered = need::peek(recipient).unwrap().remove(0);
+    assert_eq!(delivered.id, refused.id);
+    assert_eq!(delivered.state, State::Published);
+    let accepted = need::acknowledge_from_snapshot(recipient, &delivered, &newer, || Ok(()))
         .unwrap()
         .unwrap();
     assert_eq!(accepted.state, State::Fulfilled);

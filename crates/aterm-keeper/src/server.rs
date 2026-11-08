@@ -300,7 +300,7 @@ impl Server {
             conns: BTreeMap::new(),
             dialing: Vec::new(),
             dial_checks_max: DIAL_CHECKS_MAX,
-            check_hang: crate::identity::peer_wait(crate::identity::PEER_CHECK_HANG),
+            check_hang: crate::identity::peer_wait(aterm_uds::peer::CHECK_HANG),
             custody: BTreeMap::new(),
             companions: BTreeMap::new(),
             next_companion: 1,

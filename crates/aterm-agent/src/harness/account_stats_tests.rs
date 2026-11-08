@@ -1098,6 +1098,18 @@ fn the_used_row_names_the_sessions_and_the_login() {
         d["accounts"][0]["used_by"][0]["sessions"],
         Value::from(3u64)
     );
+    let mut keys: Vec<&str> = d["accounts"][0]["used_by"][0]
+        .as_object()
+        .expect("a used_by entry")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        ["last_seen", "last_seen_rfc3339", "machine", "sessions"],
+        "an entry is this machine's census: its id, its count and when it was read"
+    );
     assert_eq!(d["accounts"][0]["login"][0]["state"], Value::from("due"));
     let unread = Look {
         sessions: Err("census-unread"),

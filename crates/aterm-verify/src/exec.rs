@@ -809,6 +809,8 @@ mod output;
 #[path = "exec_start.rs"]
 mod start;
 pub use start::{Backlog, DaemonNow, Unstarted};
+#[path = "exec_compiler_progress.rs"]
+mod compiler_progress;
 #[path = "exec_test_progress.rs"]
 mod test_progress;
 
@@ -914,12 +916,15 @@ pub(crate) struct MachineRun {
 }
 
 /// Capture compiler stdout without allowing diagnostic text to become machine evidence.
-pub(crate) fn run_machine(cmd: &Cmd, env: ExecEnv<'_>) -> MachineRun {
+pub(crate) fn run_machine(cmd: &Cmd, env: ExecEnv<'_>, progress: Option<&str>) -> MachineRun {
     let mut stdout = Err("compiler stdout was not captured".to_owned());
     let run = run_captured(
         cmd,
         env,
-        Some(&mut stdout),
+        Some(MachineCapture {
+            stdout: &mut stdout,
+            progress,
+        }),
         None,
         None,
         None,
@@ -928,10 +933,15 @@ pub(crate) fn run_machine(cmd: &Cmd, env: ExecEnv<'_>) -> MachineRun {
     MachineRun { run, stdout }
 }
 
+struct MachineCapture<'a> {
+    stdout: &'a mut Result<String, String>,
+    progress: Option<&'a str>,
+}
+
 fn run_captured(
     cmd: &Cmd,
     env: ExecEnv<'_>,
-    machine: Option<&mut Result<String, String>>,
+    machine: Option<MachineCapture<'_>>,
     hung_red: Option<&(dyn Fn() + Sync)>,
     admission: Option<&File>,
     external_stop: Option<&(dyn Fn() -> Option<String> + Sync)>,
@@ -974,7 +984,7 @@ pub(crate) fn case_observations(path: &Path, json: bool) -> test_progress::Obser
 fn run_captured_inner(
     cmd: &Cmd,
     env: ExecEnv<'_>,
-    machine: Option<&mut Result<String, String>>,
+    machine: Option<MachineCapture<'_>>,
     hung_red: Option<&(dyn Fn() + Sync)>,
     admission: Option<&File>,
     external_stop: Option<&(dyn Fn() -> Option<String> + Sync)>,
@@ -1024,6 +1034,17 @@ fn run_captured_inner(
     // A repeatable tree stage owns one combined memory/CPU claim. Its actual grant, never the
     // machine-wide request, bounds every compiler, libtest and doctest child; an explicit smaller
     // command or run ceiling remains smaller.
+    if let Some(jobs) = crate::compile_width::current() {
+        let jobs = cmd
+            .envs
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "CARGO_BUILD_JOBS")
+            .and_then(|(_, value)| crate::parse_build_jobs(Some(value.as_os_str())))
+            .map_or(jobs, |asked| jobs.min(asked));
+        c.env("CARGO_BUILD_JOBS", jobs.to_string());
+        crate::compile_width::configure(&mut c);
+    }
     if let Some(grant) = crate::current_resource_claim()
         .map(|claim| claim.cores())
         .filter(|cores| *cores > 0)
@@ -1074,6 +1095,7 @@ fn run_captured_inner(
                 &label,
                 marks,
                 FinishControls {
+                    compiler: None,
                     local_red: hung_red,
                     admission: &mut admission,
                     external_stop,
@@ -1108,6 +1130,12 @@ fn run_captured_inner(
                     return spawn_failure(cmd, &e.to_string());
                 }
             };
+            let compiler = machine
+                .as_ref()
+                .and_then(|machine| machine.progress)
+                .and_then(|stage| {
+                    compiler_progress::Progress::open(stdout_log.as_deref()?, &file2, stage).ok()
+                });
             if machine.is_some() {
                 c.stdout(file2).stderr(file);
             } else {
@@ -1121,6 +1149,7 @@ fn run_captured_inner(
                 &label,
                 marks,
                 FinishControls {
+                    compiler,
                     local_red: hung_red,
                     admission: &mut admission,
                     external_stop,
@@ -1129,9 +1158,9 @@ fn run_captured_inner(
             );
             r.output
                 .insert_str(0, logged.as_deref().unwrap_or_default());
-            if let Some(stdout) = machine {
+            if let Some(machine) = machine {
                 let path = stdout_log.expect("machine capture has a stdout file");
-                *stdout = match crate::read_captured(&path) {
+                *machine.stdout = match crate::read_captured(&path) {
                     Ok(bytes) => match String::from_utf8(bytes) {
                         Ok(text) => Ok(text),
                         Err(error) => {
@@ -2257,6 +2286,7 @@ fn discard_sample(sample: &StackSample) {
 }
 
 struct FinishControls<'a, 'lock> {
+    compiler: Option<compiler_progress::Progress>,
     local_red: Option<&'a (dyn Fn() + Sync)>,
     admission: &'a mut SpawnAdmission<'lock>,
     external_stop: Option<&'a (dyn Fn() -> Option<String> + Sync)>,
@@ -2313,6 +2343,7 @@ fn finish_inner(
 ) -> (Run, Option<String>) {
     let ObservedFinish { controls, cases } = observed;
     let FinishControls {
+        mut compiler,
         local_red,
         admission,
         external_stop,
@@ -2535,6 +2566,9 @@ fn finish_inner(
                 if let (Some(watch), Some(cases)) = (&cmd.test_cases, cases.as_mut()) {
                     observe_reaped(cases, watch, env.events, begun.elapsed());
                 }
+                if let Some(compiler) = compiler.as_mut() {
+                    compiler.poll(env.events);
+                }
                 return (used(reaped(Ok(st)), &clock), read_log(log));
             }
             Ok(None) => {}
@@ -2575,6 +2609,9 @@ fn finish_inner(
                     discard_sample(&sample);
                     if let (Some(watch), Some(cases)) = (&cmd.test_cases, cases.as_mut()) {
                         observe_reaped(cases, watch, env.events, begun.elapsed());
+                    }
+                    if let Some(compiler) = compiler.as_mut() {
+                        compiler.poll(env.events);
                     }
                     return (used(reaped(Ok(st)), &clock), read_log(log));
                 }
@@ -2727,6 +2764,11 @@ fn finish_inner(
                 used(over_ceiling(cmd, &clock, limit, &killed), &clock),
                 read_log(log),
             );
+        }
+        if !ending()
+            && let Some(compiler) = compiler.as_mut()
+        {
+            compiler.poll(env.events);
         }
         std::thread::sleep(nap);
         nap = (nap * 2).min(Duration::from_millis(25));
@@ -3814,6 +3856,46 @@ mod tests {
 
     fn env_in(dir: &Path) -> ExecEnv<'_> {
         ceiled(dir, Some(DEFAULT_CHILD_CEILING))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_moldable_compile_passes_its_admitted_width_to_cargo_and_restores_it() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let cmd = Cmd::new("/usr/bin/printenv")
+            .arg("CARGO_BUILD_JOBS")
+            .env("CARGO_BUILD_JOBS", "16");
+        let narrowed = crate::compile_width::with_jobs(Some(2), || run(&cmd, env_in(dir.path())));
+        assert!(narrowed.ok, "{}", narrowed.output);
+        assert_eq!(narrowed.output.trim(), "2");
+        let restored = run(&cmd, env_in(dir.path()));
+        assert!(restored.ok, "{}", restored.output);
+        assert_eq!(restored.output.trim(), "16");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_admission_refusal_is_environmental_but_a_compiler_error_is_not() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let mut failed = run(&Cmd::new("/usr/bin/false"), env_in(dir.path()));
+        failed.output = "aterm-verify: compiler admission: unit memory history disappeared\nerror: could not compile\n".into();
+        assert_eq!(
+            crate::compile_width::refusal(&failed, "").as_deref(),
+            Some("unit memory history disappeared")
+        );
+        // The marker is meaningful only to the compile stage, never to a failed test.
+        assert_eq!(failed.environment_failure(), None);
+        assert_eq!(
+            crate::compile_width::refusal(
+                &failed,
+                r#"{"reason":"compiler-message","message":{"level":"error"}}"#
+            ),
+            None
+        );
+        failed.output = "error: unresolved import\n".into();
+        assert_eq!(crate::compile_width::refusal(&failed, ""), None);
+        failed.output = "source: aterm-verify: compiler admission: quoted source text\n".into();
+        assert_eq!(crate::compile_width::refusal(&failed, ""), None);
     }
 
     fn ceiled(dir: &Path, child_ceiling: Option<Duration>) -> ExecEnv<'_> {
@@ -7207,6 +7289,155 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn compiler_progress_child_stand_in() {
+        let Some(dir) = std::env::var_os("ATERM_VERIFY_COMPILER_PROGRESS_CHILD") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let capture = include_str!("../tests/fixtures/targo-unit-dispatch-v1.jsonl");
+        let dispatch = capture.lines().next().unwrap();
+        let artifact = capture.lines().nth(1).unwrap();
+        println!("\nBEGIN OWNED COMPILER PAYLOAD\n{dispatch}\n{artifact}");
+        eprintln!(
+            r#"{{"reason":"compiler-artifact","target":{{"name":"stderr_only","kind":["lib"]}}}}"#
+        );
+        std::io::stdout().flush().unwrap();
+        std::fs::write(dir.join("ready"), b"ready").unwrap();
+        let until = Instant::now() + Duration::from_secs(60);
+        while !dir.join("release").exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            dir.join("release").exists(),
+            "compiler fixture was never released"
+        );
+        println!("{}", dispatch.replace("\"changed-env\"", "\"forced\""));
+        println!("exact compiler suffix\nEND OWNED COMPILER PAYLOAD");
+        if std::env::var("ATERM_VERIFY_COMPILER_PROGRESS_FAIL").as_deref() == Ok("1") {
+            panic!("owned compiler failure after its full payload");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compiler_progress_is_observed_before_owned_release_without_final_join_authority() {
+        for (step, fails) in [
+            (Some("test compile"), false),
+            (Some("test compile"), true),
+            (None, false),
+        ] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let path = dir.path().join("events");
+            let events = crate::event_log::EventLog::open(&path).unwrap();
+            let cmd = Cmd::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "exec::tests::compiler_progress_child_stand_in",
+                    "--nocapture",
+                ])
+                .env(
+                    "ATERM_VERIFY_COMPILER_PROGRESS_CHILD",
+                    dir.path().as_os_str(),
+                )
+                .env(
+                    "ATERM_VERIFY_COMPILER_PROGRESS_FAIL",
+                    if fails { "1" } else { "0" },
+                );
+            let (result, held, early) = std::thread::scope(|scope| {
+                let run = scope.spawn(|| {
+                    run_machine(
+                        &cmd,
+                        ExecEnv {
+                            events: Some(&events),
+                            ..ceiled(dir.path(), None)
+                        },
+                        step,
+                    )
+                });
+                let until = Instant::now() + Duration::from_secs(60);
+                let early = loop {
+                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    let observed = text
+                        .split_inclusive('\n')
+                        .filter_map(|line| line.strip_suffix('\n'))
+                        .filter_map(|line| line.strip_prefix("verify-event: "))
+                        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+                        .any(|event| event["event"].as_str() == Some("compile-message-observed"));
+                    if (dir.path().join("ready").exists() && (step.is_none() || observed))
+                        || Instant::now() >= until
+                    {
+                        break text;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                };
+                let held = dir.path().join("ready").exists() && !run.is_finished();
+                // All assertions happen after the exact owned child was released and joined.
+                std::fs::write(dir.path().join("release"), b"release").unwrap();
+                (run.join().unwrap(), held, early)
+            });
+            assert!(held);
+            assert_eq!(result.run.ok, !fails, "{}", result.run.output);
+            assert_eq!(result.run.code, Some(if fails { 101 } else { 0 }));
+            assert!(result.run.stopped_at.is_none());
+            let stdout = result.stdout.unwrap();
+            let capture = include_str!("../tests/fixtures/targo-unit-dispatch-v1.jsonl");
+            let dispatch = capture.lines().next().unwrap();
+            let artifact = capture.lines().nth(1).unwrap();
+            let payload = stdout
+                .split_once("BEGIN OWNED COMPILER PAYLOAD\n")
+                .unwrap()
+                .1
+                .split_once("END OWNED COMPILER PAYLOAD\n")
+                .unwrap()
+                .0;
+            assert_eq!(
+                payload,
+                format!(
+                    "{dispatch}\n{artifact}\n{}\nexact compiler suffix\n",
+                    dispatch.replace("\"changed-env\"", "\"forced\"")
+                )
+            );
+            assert!(!stdout.contains("stderr_only"));
+            assert!(result.run.output.contains("stderr_only"));
+            if step.is_some() {
+                assert!(early.contains("compile-message-observed"));
+                assert!(!early.contains("stderr_only"));
+                assert!(!early.contains("/Users/"));
+                assert!(!early.contains("compile-unit-finished"));
+                let rows: Vec<aterm_json::Value> = early
+                    .lines()
+                    .map(|line| {
+                        aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap()
+                    })
+                    .collect();
+                assert!(
+                    rows.iter()
+                        .all(|row| row["stage"].as_str() == Some("test compile")
+                            && row["provisional"].as_bool() == Some(true)
+                            && row["sample_complete"].as_bool() == Some(false))
+                );
+            } else {
+                assert!(early.is_empty());
+            }
+            let final_events = crate::report::compile_unit_events("test compile", &stdout);
+            let artifact: aterm_json::Value = final_events
+                .iter()
+                .filter_map(|line| {
+                    aterm_json::from_str::<aterm_json::Value>(line.strip_prefix("verify-event: ")?)
+                        .ok()
+                })
+                .find(|row| row["event"].as_str() == Some("compile-unit-finished"))
+                .unwrap();
+            assert!(artifact["rebuild_reason"].is_null());
+            assert_eq!(
+                artifact["rebuild_reason_status"].as_str(),
+                Some("conflicting-dispatch")
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn evidence_child_stand_in() {
         let Some(dir) = std::env::var_os("ATERM_VERIFY_EVIDENCE_CHILD") else {
             return;
@@ -7245,6 +7476,17 @@ mod tests {
             let dir = aterm_tempfile::tempdir().unwrap();
             let events_path = dir.path().join("events");
             let events = crate::event_log::EventLog::open(&events_path).unwrap();
+            let mut documentation = crate::ladder::Report::new("documentation fixture");
+            documentation.pass("complete");
+            let green = crate::report::judge(
+                crate::Check::Doc,
+                &[&documentation],
+                0.0,
+                "",
+                String::new(),
+                None,
+            );
+            events.write(&crate::report::check_event(&green, &[&documentation]));
             let mut cmd = Cmd::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -7260,7 +7502,7 @@ mod tests {
                 json: true,
                 stop_at_red: false,
             });
-            let (run, early) = std::thread::scope(|scope| {
+            let (run, (held, early_text, observed, value)) = std::thread::scope(|scope| {
                 let run = scope.spawn(|| {
                     run(
                         &cmd,
@@ -7273,24 +7515,32 @@ mod tests {
                 let until = Instant::now() + Duration::from_secs(60);
                 let early = loop {
                     let text = std::fs::read_to_string(&events_path).unwrap_or_default();
-                    if (text.contains("test-case-failed") && dir.path().join("ready").exists())
+                    let case = text
+                        .split_inclusive('\n')
+                        .filter_map(|line| line.strip_suffix('\n'))
+                        .filter_map(|line| line.strip_prefix("verify-event: "))
+                        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+                        .find(|event| {
+                            event["event"].as_str() == Some("test-case-failed")
+                                && event["case"].as_str() == Some("observed-outer")
+                        });
+                    if (case.is_some() && dir.path().join("ready").exists())
                         || Instant::now() >= until
                     {
-                        break text;
+                        let observed = crate::status::observe(&text);
+                        break (text, observed, case);
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 };
                 let held = dir.path().join("ready").exists() && !run.is_finished();
                 // Release and join before assertions, including the old stderr-only negative.
                 std::fs::write(dir.path().join("release"), b"release").unwrap();
-                (run.join().unwrap(), (held, early))
+                (run.join().unwrap(), (held, early.0, early.1, early.2))
             });
-            assert!(early.0, "child must still own its explicit wait");
-            let event = crate::libtest_json::line_event(&early.1);
+            assert!(held, "child must still own its explicit wait");
+            let event = crate::libtest_json::line_event(&early_text);
             assert!(event.is_none(), "verify events are not libtest events");
-            let value: aterm_json::Value =
-                aterm_json::from_str(early.1.trim().strip_prefix("verify-event: ").unwrap())
-                    .unwrap();
+            let value = value.expect("the actual complete case record was retained before release");
             assert_eq!(value["case"].as_str(), Some("observed-outer"));
             assert!(
                 value["output"]
@@ -7299,6 +7549,36 @@ mod tests {
                     .contains("src/owned.rs:7:9")
             );
             assert_eq!(value["halts"].as_bool(), Some(false));
+            assert_eq!(observed.checks.len(), 1);
+            assert_eq!(observed.checks[0].check, "doc");
+            assert_eq!(
+                observed.checks[0]
+                    .outcomes
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["ok"]
+            );
+            assert_eq!(observed.terminal_records, 0);
+            assert_eq!(observed.early_cases.len(), 1);
+            assert_eq!(observed.early_cases[0].test, "owned-test");
+            assert_eq!(
+                observed.early_cases[0].case.as_deref(),
+                Some("observed-outer")
+            );
+            assert_eq!(
+                observed.early_cases[0]
+                    .outcomes
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                ["FAIL"]
+            );
+            assert!(!observed.json().to_string().contains("src/owned.rs"));
+            events.write(&crate::report::run_event(&[green], crate::exit::PASS));
+            let completed = crate::status::observe(&std::fs::read_to_string(&events_path).unwrap());
+            assert_eq!(completed.early_cases, observed.early_cases);
+            assert_eq!(completed.terminal_consistency, "matching-observed-rows");
             assert!(run.ok, "observation does not change an actual zero exit");
             assert!(run.stopped_at.is_none());
             assert_eq!(

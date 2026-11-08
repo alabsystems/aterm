@@ -203,6 +203,55 @@ fn largest_alloc<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
 }
 
 #[test]
+fn ligature_slices_borrow_the_cached_parent_raster() {
+    let _counters = COUNTERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut renderer = Renderer::from_bytes(embedded_font(), 24.0, Theme::default())
+        .expect("bundled monospace font");
+    let face = aterm_font::Face::parse(embedded_font(), 0).unwrap();
+    let gid = face.glyph_index('A').unwrap().0;
+    let cell_w = renderer.cell_size().0;
+    let parent_key = renderer.ligature_key(gid, aterm_render::StyleBits::REGULAR);
+    let parent = renderer.glyph_image(parent_key);
+    let parent_bytes = parent.byte_len();
+    let expected = match parent {
+        aterm_render::GlyphImage::Mono { bytes, .. } => {
+            assert!(!bytes.is_empty());
+            assert_ne!(
+                bytes.len(),
+                cell_w * parent.height(),
+                "separate parent and tile allocation sizes"
+            );
+            aterm_render::ligature_shaping::extract_cell_slice(
+                bytes,
+                parent.width(),
+                parent.height(),
+                parent.xmin(),
+                cell_w,
+                0,
+            )
+        }
+        _ => panic!("primary A is a monochrome raster"),
+    };
+    let key = renderer.ligature_slice_key(gid, 0, aterm_render::StyleBits::REGULAR);
+    let ((), copies) = count_frames(parent_bytes, || {
+        let slice = renderer.glyph_image(key);
+        match slice {
+            aterm_render::GlyphImage::Mono { bytes, .. } => assert_eq!(bytes, &expected),
+            _ => panic!("slice is monochrome"),
+        }
+    });
+    assert_eq!(
+        copies, 0,
+        "a cold slice must not allocate a copy of its cached parent"
+    );
+    eprintln!(
+        "cold ligature slice: {parent_bytes} parent bytes, {copies} parent-sized allocations"
+    );
+}
+
+#[test]
 fn owned_snapshots_transfer_pixels_without_a_full_frame_clone() {
     let _counters = COUNTERS
         .lock()

@@ -15,9 +15,8 @@ use aterm_net::fleet::{
     FleetError, FleetOp, FleetScope, FleetSecret, KEY_FILE, NodeIdentity, NodeKey, client_handshake,
 };
 use aterm_net::fleet_member::{
-    BookRead, BookUnread, DEFAULT_PORT, Keyring, LOCK_HELD_LINE, LOCK_TOLD_SEAM, LOCK_WAIT_SEAM,
-    Registration, Target, Unregistered, Via, dial, fetch_book, read_node_identity, read_peers,
-    read_whole, register_by,
+    BookRead, BookUnread, DEFAULT_PORT, Keyring, Registration, Target, Unregistered, Via, dial,
+    fetch_book, read_node_identity, read_peers, read_whole, register_by,
 };
 
 use crate::headless_boot::{
@@ -272,10 +271,7 @@ const RETRY_MS: &str = "100";
 // ([`a_drives_deadline_is_the_worlds_seam`]). The one `--host any` read that does, past the member
 // `a_walled_codex_member_is_never_picked_by_any_host_end_to_end` stopped, dials a port that refuses
 // at once, so the survey's seam costs it nothing.
-// Every aterm here, and every verb, is given the hang detector for the book's lock too
-// ([`LOCK_WAIT_SEAM`]), not the 2 s a person's verb waits: each holder is an aterm (or this test)
-// on this machine that lets it go once its read-modify-write is made, which a loaded machine can
-// keep past those 2 s. And every aterm here gives each member its heartbeat dials the hang
+// Every aterm here gives each member its heartbeat dials the hang
 // detector ([`HEARTBEAT_WITHIN_SEAM`]), not its share of a person's 10 s round, and serves each
 // proved connection as long as its client keeps it ([`LIFETIME_SEAM`]), not the 30 s a person's
 // listener allows: each member and each client is an aterm (or this test) on this machine.
@@ -328,7 +324,6 @@ fn world_seams(cmd: &mut std::process::Command) {
         .env(ISSUER_WITHIN_SEAM, &hang)
         .env(HOLDER_SEAM, &hang)
         .env(HANDSHAKE_SEAM, &hang)
-        .env(LOCK_WAIT_SEAM, &hang)
         .env(HEARTBEAT_WITHIN_SEAM, round)
         .env(LIFETIME_SEAM, NEVER_MS);
 }
@@ -674,7 +669,6 @@ fn spawn_fleet_unset(
         .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
         .env(HANDSHAKE_SEAM, HANG.as_millis().to_string())
         .env(JOIN_WITHIN_SEAM, HANG.as_millis().to_string())
-        .env(LOCK_WAIT_SEAM, HANG.as_millis().to_string())
         .envs(env.iter().copied());
     for name in unset {
         cmd.env_remove(name);
@@ -776,7 +770,6 @@ fn ctl_spawn(
         .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
         .env(HANDSHAKE_SEAM, HANG.as_millis().to_string())
         .env(DRIVE_WITHIN_SEAM, HANG.as_millis().to_string())
-        .env(LOCK_WAIT_SEAM, HANG.as_millis().to_string())
         .envs(env.iter().copied());
     cmd.spawn().expect("spawn aterm ctl")
 }
@@ -873,71 +866,6 @@ fn the_binary_places_a_host_named_with_no_port_at_the_default_port() {
     let added = fleet_ok(&world.0, &["peers", "add", "lab-maxi"], None);
     let want = format!("aterm fleet peers: added lab-maxi:{DEFAULT_PORT} to ");
     assert!(added.starts_with(&want), "{added}");
-}
-
-/// A verb that meets the book's lock held past the 2 s a shipped aterm waits for it: under
-/// [`LOCK_WAIT_SEAM`], which every [`fleet`] call passes, the debug binary waits for the holder
-/// to let it go, and without it the binary refuses as a shipped one does. The verb without the
-/// seam is the hold's clock: it starts once the waiting verb has said it found the lock held
-/// ([`LOCK_TOLD_SEAM`]), is refused only once it has found the lock held for its whole wait, and
-/// the lock is let go only after that, by when the waiting verb has waited past those 2 s too.
-#[test]
-fn a_verb_under_the_lock_seam_waits_out_a_holder_the_shipped_wait_refuses() {
-    let world = World(headless_boot::scratch_root("afbl"));
-    // The first verb makes the private state directory the lock lives in.
-    fleet_ok(&world.0, &["peers", "add", "lab-one"], None);
-    let state = world.0.join("state");
-    let held = aterm_net::fleet_member::hold_book(&state).expect("the book's lock");
-    let mut waiting = spawn_fleet(
-        &world.0,
-        &["peers", "add", "lab-two"],
-        None,
-        &[(LOCK_TOLD_SEAM, "1")],
-    );
-    let told = crate::child_output::await_stderr_line(
-        &mut waiting,
-        |line| line == LOCK_HELD_LINE,
-        Instant::now() + HANG,
-    );
-    match told {
-        Ok(()) => {}
-        Err(crate::child_output::NoLine::Exited(out)) => {
-            panic!("the waiting verb ended before it found the lock held: {out:?}")
-        }
-        Err(crate::child_output::NoLine::Hung(said)) => {
-            panic!("the waiting verb never said it found the lock held; its stderr: {said}")
-        }
-        Err(crate::child_output::NoLine::OutputLimit { stream, captured }) => {
-            panic!("the waiting verb filled its {stream} first: {captured}")
-        }
-    }
-    let shipped = fleet_with(
-        &world.0,
-        &["peers", "add", "lab-three"],
-        None,
-        &[(LOCK_WAIT_SEAM, "")],
-    );
-    let said = String::from_utf8_lossy(&shipped.stderr);
-    assert!(
-        shipped.status.code() == Some(1) && said.contains("another aterm is writing the book"),
-        "a verb with the shipped wait refuses a lock held past it: {shipped:?}"
-    );
-    drop(held);
-    succeeded(
-        &["peers", "add", "lab-two"],
-        fleet_ended(&["peers", "add", "lab-two"], waiting),
-    );
-    let hosts: Vec<String> = read_peers(&state)
-        .expect("the book")
-        .into_iter()
-        .map(|peer| peer.host)
-        .collect();
-    assert!(
-        hosts.iter().any(|host| host == "lab-one")
-            && hosts.iter().any(|host| host == "lab-two")
-            && !hosts.iter().any(|host| host == "lab-three"),
-        "the waiting verb wrote its peer once the lock was let go, the refused one none: {hosts:?}"
-    );
 }
 
 #[test]
@@ -2535,7 +2463,6 @@ fn account_renewal_runs_over_native_fleet_with_no_ssh_or_interactive_terminal() 
         .env(aterm_net::loopback::SEAM, "1")
         .env(ISSUER_WITHIN_SEAM, HANG.as_millis().to_string())
         .env(HANDSHAKE_SEAM, HANG.as_millis().to_string())
-        .env(LOCK_WAIT_SEAM, HANG.as_millis().to_string())
         .env("PATH", issuer.tmp.join("no-programs"));
     let output = aterm_uds::deadline::output_with_input_until(
         &mut command,

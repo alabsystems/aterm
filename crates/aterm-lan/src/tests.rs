@@ -494,6 +494,128 @@ fn an_actual_stale_broker_socket_survives_scheduling_delay() {
     );
 }
 
+#[test]
+fn an_actual_socket_handoff_survives_scheduling_delay() {
+    use std::os::fd::AsFd as _;
+    for (age, error) in [
+        (31, None),
+        (31, Some(std::io::ErrorKind::InvalidData)),
+        (61, Some(std::io::ErrorKind::TimedOut)),
+    ] {
+        let (client, server) = aterm_uds::kept_out(CtlStream::pair).unwrap();
+        let (kept, _other) = aterm_uds::kept_out(CtlStream::pair).unwrap();
+        let worker = std::thread::spawn(move || {
+            crate::server::pass_socket(
+                &server,
+                &aterm_uds::lan::wire::Frame::Socket { reached: None },
+                kept.as_fd(),
+                std::time::Instant::now() - Duration::from_secs(age),
+            )
+        });
+        let mut reader = aterm_uds::lan::wire::Reader::new(1);
+        assert!(matches!(
+            reader
+                .frame(&client, Some(std::time::Instant::now() + MUST_HAPPEN))
+                .unwrap(),
+            Some(aterm_uds::lan::wire::Frame::Socket { reached: None })
+        ));
+        let received = reader.take_fd().unwrap();
+        let ack = if error == Some(std::io::ErrorKind::InvalidData) {
+            (&client).write_all(&[0xff])
+        } else {
+            aterm_uds::lan::wire::took(&client)
+        };
+        let result = worker.join().unwrap();
+        if let Some(error) = error {
+            assert_eq!(result.unwrap_err().kind(), error);
+        } else {
+            result.unwrap();
+            ack.unwrap();
+        }
+        drop(received);
+    }
+}
+
+#[test]
+fn an_admitted_native_request_survives_scheduling_delay() {
+    use aterm_uds::lan::wire::{self, Frame, Reader};
+    for (age, protocol, expected_socket) in [
+        (11, aterm_uds::lan::PROTOCOL, true),
+        (61, aterm_uds::lan::PROTOCOL, false),
+        (0, aterm_uds::lan::PROTOCOL + 1, false),
+    ] {
+        let (client, server) = aterm_uds::kept_out(CtlStream::pair).unwrap();
+        assert_eq!(
+            aterm_uds::peer::peer_uid(&server),
+            Some(aterm_uds::peer::our_uid())
+        );
+        let (send, _starts) = mpsc::channel();
+        let shared = crate::server::Shared::new(
+            Admission::SameUid,
+            Box::new(Fake(Mutex::new(send))),
+            |words| eprintln!("native request: {words}"),
+        );
+        wire::send(
+            &client,
+            &Frame::Hello {
+                protocol,
+                build: "native-request".into(),
+            },
+        )
+        .unwrap();
+        wire::send(
+            &client,
+            &Frame::Request(Request::Udp {
+                bind: "0.0.0.0:0".parse().unwrap(),
+                reuse: false,
+                groups: Vec::new(),
+                multicast_if: None,
+                ttl: None,
+            }),
+        )
+        .unwrap();
+        let worker = std::thread::spawn(move || {
+            seam_here(loopback_local(), || {
+                crate::server::connection_at(
+                    &shared,
+                    &server,
+                    std::time::Instant::now() - Duration::from_secs(age),
+                )
+            });
+        });
+        let mut reader = Reader::new(1);
+        let deadline = Some(std::time::Instant::now() + MUST_HAPPEN);
+        assert!(matches!(
+            reader.frame(&client, deadline).unwrap(),
+            Some(Frame::Hello {
+                protocol: aterm_uds::lan::PROTOCOL,
+                ..
+            })
+        ));
+        let reply = reader.frame(&client, deadline).unwrap();
+        let received = reader.take_fd();
+        let acknowledged = if received.is_some() {
+            wire::took(&client).is_ok()
+        } else {
+            false
+        };
+        drop(client);
+        worker.join().unwrap();
+        if expected_socket {
+            assert!(
+                matches!(reply, Some(Frame::Socket { reached: None })),
+                "reply={reply:?}"
+            );
+            assert!(acknowledged);
+            let socket = std::net::UdpSocket::from(received.unwrap());
+            assert!(socket.local_addr().unwrap().port() > 0);
+        } else {
+            assert!(reply.is_none() && received.is_none());
+            assert!(!acknowledged);
+        }
+    }
+}
+
 /// Every passed socket arrives with its receive side whole: the broker holds its copy until the
 /// client took it in ([`aterm_uds::lan::wire::pass`]), so bytes sent to it after the pass are read.
 #[test]

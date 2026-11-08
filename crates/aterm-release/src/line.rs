@@ -31,7 +31,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ledger::{self, GitRunner, RELEASE_COMMAND, RunOut};
+use crate::ledger::{self, GitRunner, Origin, RELEASE_COMMAND, RefWrite, RunOut};
 
 /// The paths a hop never moves: the Trust lock (decision 10), the toolchain pin until that lock
 /// replaces it, and the build-number ledger, which only a claim appends to.
@@ -106,6 +106,123 @@ impl Line {
     pub fn carried(&self, commit: &str) -> bool {
         self.hops.iter().any(|hop| hop.carries == commit)
     }
+}
+
+/// A deliberate retirement, serialized on main rather than in a clone's journal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Supersession {
+    pub previous: Line,
+    pub replacement: Line,
+    pub reason: String,
+}
+
+const SUPERSESSION: &str = "Aterm-Line-Supersession: ";
+
+/// Every publication surface must be absent; a caller's failed read is an error,
+/// never an absent surface.
+pub fn require_unpublished(surfaces: [bool; 5]) -> Result<(), String> {
+    for (present, name) in surfaces.into_iter().zip([
+        "tag",
+        "ledger line",
+        "published source",
+        "release object",
+        "staged publication",
+    ]) {
+        if present {
+            return Err(format!("the line has a {name}; cannot supersede"));
+        }
+    }
+    Ok(())
+}
+
+/// Read the newest retirement of this version in main's first-parent history.
+pub fn supersession(git: &dyn GitRunner, version: &str) -> Result<Option<Supersession>, String> {
+    let log = ledger::git_ok(
+        git,
+        &[
+            "log",
+            "origin/main",
+            "--first-parent",
+            "--format=%B%x00",
+            "--fixed-strings",
+            "--grep=Aterm-Line-Supersession: ",
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    for message in log.stdout_utf8().split('\0') {
+        for row in message.lines() {
+            if let Some(json) = row.strip_prefix(SUPERSESSION) {
+                let record: Supersession = aterm_json::from_str(json)
+                    .map_err(|e| format!("invalid line supersession on main: {e}"))?;
+                if record.replacement.version == version {
+                    return Ok(Some(record));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Record the replacement under main's compare-and-swap, preserving main's tree.
+/// The caller holds the version's fleet claim throughout this transaction.
+pub fn supersede(
+    git: &dyn GitRunner,
+    origin: &dyn Origin,
+    record: &Supersession,
+) -> Result<String, String> {
+    let line = &record.replacement;
+    for _ in 0..MAX_RECORD_ATTEMPTS {
+        let tip = origin.refresh_main()?;
+        verify(git, line).map_err(|e| e.to_string())?;
+        if line.version != record.previous.version
+            || line.base == record.previous.base
+            || !line.hops.is_empty()
+            || !is_ancestor(git, record.previous.head(), &line.base).map_err(|e| e.to_string())?
+        {
+            return Err("supersession requires a newer main base of the same version".into());
+        }
+        if let Some(current) = supersession(git, &line.version)? {
+            if current == *record {
+                return Ok(tip);
+            }
+            if current.replacement.base != record.previous.base {
+                return Err("the line was superseded again; resume the current fleet line".into());
+            }
+        }
+        let json = aterm_json::to_string(record).map_err(|e| e.to_string())?;
+        let message = format!(
+            "release line v{}: supersede {} with {}\n\n{}\n\n{SUPERSESSION}{json}\n",
+            line.version,
+            record.previous.head(),
+            line.base,
+            record.reason,
+        );
+        let merge = ledger::git_ok(
+            git,
+            &[
+                "commit-tree",
+                &format!("{tip}^{{tree}}"),
+                "-p",
+                &tip,
+                "-p",
+                &line.base,
+                "-m",
+                &message,
+            ],
+        )
+        .map_err(|e| e.to_string())?
+        .stdout_utf8()
+        .trim()
+        .to_string();
+        if origin.write("refs/heads/main", Some(&tip), &merge)? == RefWrite::Written {
+            origin.refresh_main()?;
+            if supersession(git, &line.version)?.as_ref() != Some(record) {
+                return Err("supersession write was not observed on main".into());
+            }
+            return Ok(merge);
+        }
+    }
+    Err("main moved under every supersession write; retry".into())
 }
 
 /// A commit [`admit`] accepted, which [`carry`] makes a hop of.
@@ -659,20 +776,26 @@ pub fn carry(git: &dyn GitRunner, line: &Line, fixes: &[Fix]) -> Result<Vec<Hop>
 /// Put `head` into origin/main's history without changing main's bytes: fetch; when main holds
 /// `head` already, nothing; else the merge `commit-tree <tip>^{tree} -p <tip> -p <head>`
 /// ("release line v<version>: record <head> on main (main's tree unchanged)") pushed
-/// fast-forward to main. A push that lost the race to a peer ([`ledger::lost_race`], here or at
-/// the remote) is rebuilt on the new tip, up to `max` pushes in all; a push that landed is
-/// checked by a fresh fetch.
+/// to main with an exact expected-tip compare-and-swap. Only a native conflict
+/// with no side effect is rebuilt on the new tip, up to `max` writes in all;
+/// unknown transaction outcomes stop without a retry. A completed write is
+/// checked against a fresh authenticated main read.
 ///
 /// # Errors
 /// COULD NOT RUN for an origin that cannot be fetched or pushed, `max` lost races, and a pushed
 /// merge that origin/main does not hold afterwards: in each, a re-run records it.
-pub fn record(git: &dyn GitRunner, version: &str, head: &str, max: u32) -> Result<Recorded, Stop> {
+pub fn record(
+    git: &dyn GitRunner,
+    origin: &dyn Origin,
+    version: &str,
+    head: &str,
+    max: u32,
+) -> Result<Recorded, Stop> {
     let again = "run the release again, which records the line's head on the tip it finds";
     let mut attempt = 0_u32;
     loop {
         attempt += 1;
-        fetch(git)?;
-        let tip = out(git, &["rev-parse", "origin/main"])?;
+        let tip = fetch(origin)?;
         if is_ancestor(git, head, &tip)? {
             return Ok(Recorded::Already { tip });
         }
@@ -685,13 +808,18 @@ pub fn record(git: &dyn GitRunner, version: &str, head: &str, max: u32) -> Resul
             git,
             &["commit-tree", &tree, "-p", &tip, "-p", head, "-m", &message],
         )?;
-        let push = run(
-            git,
-            &["push", "origin", &format!("{merge}:refs/heads/main")],
-        )?;
-        if push.success() {
-            fetch(git)?;
-            if !is_ancestor(git, head, "origin/main")? {
+        let written = origin
+            .write("refs/heads/main", Some(&tip), &merge)
+            .map_err(|why| {
+                Stop::new(
+                    Reason::Unreachable,
+                    format!("cannot record the line's head on authenticated origin main: {why}"),
+                    "inspect the native write outcome and origin main, then run the release again",
+                )
+            })?;
+        if written == RefWrite::Written {
+            let observed = fetch(origin)?;
+            if !is_ancestor(git, head, &observed)? {
                 return Err(Stop::new(
                     Reason::Unlanded,
                     format!(
@@ -705,20 +833,10 @@ pub fn record(git: &dyn GitRunner, version: &str, head: &str, max: u32) -> Resul
             }
             return Ok(Recorded::Pushed { merge, attempt });
         }
-        let why = push.stderr_utf8().trim().to_string();
-        if !ledger::lost_race(&why) {
-            return Err(Stop::new(
-                Reason::Unreachable,
-                format!(
-                    "git push origin main failed (not a lost race, so retrying cannot help): {why}"
-                ),
-                "check the network and your git credentials, then run the release again",
-            ));
-        }
         if attempt >= max {
             return Err(Stop::new(
                 Reason::Raced,
-                format!("main moved under the record push {attempt} times; last rejection: {why}"),
+                format!("main moved under the record write {attempt} times"),
                 again,
             ));
         }
@@ -1357,16 +1475,14 @@ fn out(git: &dyn GitRunner, args: &[&str]) -> Result<String, Stop> {
         .map_err(|e| unread(e.to_string()))
 }
 
-fn fetch(git: &dyn GitRunner) -> Result<(), Stop> {
-    ledger::git_ok(git, &["fetch", "origin", "main"])
-        .map(drop)
-        .map_err(|e| {
-            Stop::new(
-                Reason::Unreachable,
-                format!("cannot reach origin to record the line's head on main: {e}"),
-                "check the network and your git credentials, then run the release again",
-            )
-        })
+fn fetch(origin: &dyn Origin) -> Result<String, Stop> {
+    origin.refresh_main().map_err(|e| {
+        Stop::new(
+            Reason::Unreachable,
+            format!("cannot reach origin to record the line's head on main: {e}"),
+            "check the network and your git credentials, then run the release again",
+        )
+    })
 }
 
 fn is_ancestor(git: &dyn GitRunner, a: &str, b: &str) -> Result<bool, Stop> {

@@ -11,10 +11,12 @@
 use crate::{Error, Result, fsx};
 use aterm_digest::Sha256;
 use aterm_dirfd::{self as fd, AtFlags, FileType, Mode, OFlags, RenameFlags};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 const DATA: &str = "current";
 const HEADER: &str = "layout";
@@ -44,8 +46,9 @@ pub(crate) struct Selected {
     witnesses: Option<Witnesses>,
 }
 
-/// What stood at a selection's pin, entry and intent: each one's kind and stamp, from one `lstat`.
-type Witnesses = [Option<(fsx::Kind, fsx::FileStamp)>; 3];
+/// What stood at a selection's pin, entry and intent: each one's kind, stamp, owner, mode and links,
+/// from one `lstat` ([`fsx::Seen`]).
+type Witnesses = [Option<fsx::Seen>; 3];
 
 impl Selected {
     pub(crate) fn path(&self) -> &Path {
@@ -64,26 +67,137 @@ impl Selected {
 
 fn selection_witnesses(entry: &Path) -> Result<Witnesses> {
     Ok([
-        fsx::kind_and_stamp_if_present(&pin_path(entry)?)?,
-        fsx::kind_and_stamp_if_present(entry)?,
-        fsx::kind_and_stamp_if_present(&intent_path(entry)?)?,
+        fsx::seen_if_present(&pin_path(entry)?)?,
+        fsx::seen_if_present(entry)?,
+        fsx::seen_if_present(&intent_path(entry)?)?,
     ])
 }
 
 /// [`data_path`], for a reader that holds the selection across its read
 /// ([`Selected::confirm`]). With no pin, no intent and a regular file or nothing at the entry, the
-/// witnesses already hold what `data_path` looks at, and the entry is what it answers.
+/// witnesses already hold what `data_path` looks at, and the entry is what it answers. A pinned
+/// layout whose files all stand as they did when a reader last resolved it answers what it did
+/// then, without being read again ([`Judgements`]).
 pub(crate) fn selected(entry: &Path) -> Result<Selected> {
-    let witnesses = selection_witnesses(entry).ok();
-    let path = match witnesses {
-        Some([None, None | Some((fsx::Kind::File, _)), None]) => entry.to_path_buf(),
-        _ => data_path(entry)?,
-    };
-    Ok(Selected {
-        entry: entry.to_path_buf(),
-        path,
-        witnesses,
-    })
+    static JUDGEMENTS: Judgements = Judgements::new();
+    JUDGEMENTS.selected(entry)
+}
+
+/// [`data_path`], as [`selected`] answers it: for a reader that only names the data file.
+pub(crate) fn reader_path(entry: &Path) -> Result<PathBuf> {
+    selected(entry).map(|selected| selected.path)
+}
+
+/// What [`data_path`] judged of a pinned layout, as it stood: the parent's identity, owner and
+/// mode ([`Context::new`]); the pin, the entry and the intent ([`Witnesses`]) and the layout's
+/// header and data file, each one's kind, stamp, owner, mode and links from one `lstat`
+/// ([`fsx::Seen`]); and the capacity the reader held ([`check_capacity`]). A file renamed over one
+/// of them or given another owner, mode or link shows another, and so does one written since, but
+/// for a rewrite in place of the same length within one tick of a coarse clock, which no writer of
+/// these files makes ([`fsx::FileStamp`]).
+#[derive(Clone, PartialEq, Eq)]
+struct Judged {
+    entry: PathBuf,
+    held: usize,
+    parent: (u64, u64, u32, u32),
+    witnesses: Witnesses,
+    files: [Option<fsx::Seen>; 2],
+}
+
+impl Judged {
+    fn of(entry: &Path, witnesses: Witnesses) -> Result<Self> {
+        let parent = std::fs::symlink_metadata(
+            entry
+                .parent()
+                .ok_or_else(|| refused("no parent directory"))?,
+        )?;
+        Ok(Self {
+            entry: entry.to_path_buf(),
+            held: crate::membership_log::RecordBudgets::current().held,
+            parent: (parent.dev(), parent.ino(), parent.uid(), parent.mode()),
+            witnesses,
+            files: [
+                fsx::seen_if_present(&entry.join(HEADER))?,
+                fsx::seen_if_present(&entry.join(DATA))?,
+            ],
+        })
+    }
+}
+
+/// The pinned layouts readers resolved lately, each as it stood ([`Judged`]). A Mac's records
+/// past [`crate::crossing::past_legacy`] sit in such a layout, and each Commons check of a quiet
+/// repair round selects them and stamps its vault memo's inputs by them
+/// (`client::Paths::records_data_file`): resolving it each time opened and read the pin, the
+/// parent, the directory, its header and its data file, 20% of such a round over a log of 9,605
+/// records (2026-11-08, `docs/measured/commons-long-log-rounds-2026-11-07.md`).
+struct Judgements(Mutex<VecDeque<Judged>>);
+
+/// The most layouts [`Judgements`] keeps: one for each records entry a process reads.
+const JUDGED: usize = 8;
+
+impl Judgements {
+    const fn new() -> Self {
+        Self(Mutex::new(VecDeque::new()))
+    }
+
+    fn selected(&self, entry: &Path) -> Result<Selected> {
+        let witnesses = selection_witnesses(entry).ok();
+        let path = match witnesses {
+            Some(
+                [
+                    None,
+                    None
+                    | Some(fsx::Seen {
+                        kind: fsx::Kind::File,
+                        ..
+                    }),
+                    None,
+                ],
+            ) => entry.to_path_buf(),
+            Some(
+                stood @ [
+                    Some(fsx::Seen {
+                        kind: fsx::Kind::File,
+                        ..
+                    }),
+                    Some(fsx::Seen {
+                        kind: fsx::Kind::Dir,
+                        ..
+                    }),
+                    _,
+                ],
+            ) => self.layout(entry, stood)?,
+            _ => data_path(entry)?,
+        };
+        Ok(Selected {
+            entry: entry.to_path_buf(),
+            path,
+            witnesses,
+        })
+    }
+
+    /// [`data_path`] of the pinned layout at `entry`, whose pin, entry and intent stood as
+    /// `witnesses` say (a prepared layout keeps its intent, which `data_path` does not read once
+    /// the pin stands), taken from the last judgement of it while its files all stand as they
+    /// did then. A judgement answers for its files only where they stood still across it.
+    fn layout(&self, entry: &Path, witnesses: Witnesses) -> Result<PathBuf> {
+        let before = Judged::of(entry, witnesses)?;
+        if self.0.lock().is_ok_and(|judged| judged.contains(&before)) {
+            return Ok(entry.join(DATA));
+        }
+        let path = data_path(entry)?;
+        let after = selection_witnesses(entry).and_then(|stood| Judged::of(entry, stood));
+        if after.is_ok_and(|after| after == before)
+            && let Ok(mut judged) = self.0.lock()
+        {
+            judged.retain(|other| other.entry != before.entry);
+            if judged.len() >= JUDGED {
+                judged.pop_front();
+            }
+            judged.push_back(before);
+        }
+        Ok(path)
+    }
 }
 
 /// Resolve existing custody without changing it. An incomplete transition is unavailable.
@@ -873,6 +987,88 @@ mod tests {
         }
     }
 
+    /// A reader resolves a pinned layout once while every file `data_path` judges stands as it
+    /// did ([`Judgements`]): another selection reads its header no more. Each change `data_path`
+    /// refuses that the selection's own witnesses do not see (the parent opened to its group, the
+    /// header rewritten in place, the data file opened to others or grown past its bound, a
+    /// smaller capacity) is refused again.
+    /// NEGATIVE CONTROLS (2026-11-08): a judgement without the parent's mode takes the layout
+    /// after the parent's change, without the header's `lstat` after the header's, without the
+    /// data file's `lstat` after either of the data file's, without the data file's stamp alone
+    /// after its growth, and without the capacity after the smaller one. APFS moves a file's
+    /// inode-change time at each `chmod`, so no change here shows a mode the stamp kept, which
+    /// [`fsx::Seen`] holds for a coarser clock.
+    #[test]
+    fn a_reader_resolves_an_unchanged_layout_once_and_a_changed_one_again() {
+        /// A change to a judged layout, the capacity its reader then holds, and what makes it.
+        struct Change {
+            what: &'static str,
+            held: usize,
+            make: fn(&Path),
+        }
+        fn mode(path: &Path, mode: u32) {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let changes = [
+            Change {
+                what: "the parent opened to its group",
+                held: 32,
+                make: |entry| mode(entry.parent().unwrap(), 0o770),
+            },
+            Change {
+                what: "the header rewritten in place",
+                held: 32,
+                make: |entry| std::fs::write(entry.join(HEADER), b"not a layout").unwrap(),
+            },
+            Change {
+                what: "the data file opened to others",
+                held: 32,
+                make: |entry| mode(&entry.join(DATA), 0o644),
+            },
+            Change {
+                what: "the data file grown past its bound",
+                held: 32,
+                make: |entry| {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(entry.join(DATA))
+                        .unwrap()
+                        .set_len(crate::membership_log::MAX_RECORDS_STREAM as u64 + 1)
+                        .unwrap();
+                },
+            },
+            Change {
+                what: "a smaller capacity",
+                held: 16,
+                make: |_| {},
+            },
+        ];
+        for Change {
+            what: change,
+            held,
+            make,
+        } in changes
+        {
+            let (_root, entry) = fixture();
+            let data = budget(32).within(|| prepare_path(&entry));
+            let judgements = Judgements::new();
+            budget(32).within(|| {
+                assert_eq!(judgements.selected(&entry).unwrap().path(), data.as_path());
+                let read = fsx::reads_of(&entry.join(HEADER));
+                assert_eq!(judgements.selected(&entry).unwrap().path(), data.as_path());
+                assert_eq!(fsx::reads_of(&entry.join(HEADER)), read, "read again");
+            });
+            make(&entry);
+            budget(held).within(|| {
+                assert!(data_path(&entry).is_err(), "{change}: data_path takes it");
+                assert!(
+                    judgements.selected(&entry).is_err(),
+                    "{change}: a reader takes it"
+                );
+            });
+        }
+    }
+
     #[test]
     fn a_stale_snapshot_never_prepares_or_raises_the_layout() {
         for fenced in [false, true] {
@@ -1142,8 +1338,8 @@ mod tests {
         assert!(!pin_path(&entry).unwrap().exists());
     }
 
-    /// NEGATIVE CONTROLS (2026-11-05): with `fsx::kind_and_stamp_if_present(entry)` replaced by
-    /// `None` in `selection_witnesses`, the entry's arm confirms the replaced entry
+    /// NEGATIVE CONTROLS (2026-11-05): with the entry's `lstat` replaced by `None` in
+    /// `selection_witnesses`, the entry's arm confirms the replaced entry
     /// (`the selection still stood`); with the intent's stamp replaced the same way, the intent's
     /// arm does.
     #[test]

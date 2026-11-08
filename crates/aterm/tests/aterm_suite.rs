@@ -106,6 +106,8 @@ mod session_bin_path;
 #[cfg(unix)]
 mod session_log_journal_live_headless;
 #[cfg(unix)]
+mod session_log_key_outcome_live_headless;
+#[cfg(unix)]
 mod session_log_prev_end_live_headless;
 #[cfg(unix)]
 mod session_log_transcript_live_headless;

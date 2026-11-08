@@ -295,11 +295,66 @@ fn depths(log: &Log) -> BTreeMap<RecordId, usize> {
     depth
 }
 
+/// What a pull names of a log's held records ([`Store::frontier`], [`Store::have`]), derived once
+/// for them: the log keeps it until it holds another record, and its clones share it.
+#[derive(Debug)]
+pub(super) struct Advertised {
+    frontier: Vec<RecordId>,
+    have: Vec<RecordId>,
+}
+
+/// What a pull names of `log`'s held records, derived once for them ([`Advertised`]).
+fn pull_names(log: &Log) -> &Advertised {
+    log.advertised.get_or_init(|| {
+        let depth = depths(log);
+        let frontier = frontier_of(log, &depth);
+        let have = have_of(log, &depth, &frontier);
+        Advertised { frontier, have }
+    })
+}
+
 /// `log`'s heads, deepest first ([`depths`]), ties by id ([`Store::frontier`]).
 fn frontier_of(log: &Log, depth: &BTreeMap<RecordId, usize>) -> Vec<RecordId> {
     let mut heads = log.heads();
     heads.sort_by(|a, b| depth.get(b).cmp(&depth.get(a)).then_with(|| a.cmp(b)));
     heads
+}
+
+/// [`Store::have`] of `log`, whose heads deepest first are `frontier` ([`frontier_of`]).
+fn have_of(log: &Log, depth: &BTreeMap<RecordId, usize>, frontier: &[RecordId]) -> Vec<RecordId> {
+    let deepest_parent = |id: &RecordId| {
+        log.get(id)?
+            .parents()
+            .iter()
+            .filter(|parent| depth.contains_key(*parent))
+            .max_by(|a, b| depth.get(*a).cmp(&depth.get(*b)).then_with(|| b.cmp(a)))
+            .copied()
+    };
+    let (mut named, mut walked) = (BTreeSet::new(), BTreeSet::new());
+    let mut out = Vec::new();
+    for &head in frontier {
+        if out.len() >= HAVE_IDS {
+            break;
+        }
+        if named.insert(head) {
+            out.push(head);
+        }
+        let (mut at, mut back, mut next) = (head, 0usize, 1usize);
+        while out.len() < HAVE_IDS
+            && walked.insert(at)
+            && let Some(parent) = deepest_parent(&at)
+        {
+            at = parent;
+            back += 1;
+            if back == next {
+                next *= 2;
+                if named.insert(at) {
+                    out.push(at);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The ids `before` keys, each after every id its map names, ties by id. When every id left
@@ -841,10 +896,9 @@ impl Store {
     /// omitted so peers still send their missing ancestors.
     #[must_use]
     pub fn frontier(&self) -> Vec<RecordId> {
-        let Some(log) = &self.log else {
-            return Vec::new();
-        };
-        frontier_of(log, &depths(log))
+        self.log
+            .as_ref()
+            .map_or_else(Vec::new, |log| pull_names(log).frontier.clone())
     }
 
     /// What a pull names in `?have=`: the [`Store::frontier`], each head followed by its
@@ -856,43 +910,9 @@ impl Store {
     /// the walks cover each record once.
     #[must_use]
     pub fn have(&self) -> Vec<RecordId> {
-        let Some(log) = &self.log else {
-            return Vec::new();
-        };
-        let depth = depths(log);
-        let deepest_parent = |id: &RecordId| {
-            log.get(id)?
-                .parents()
-                .iter()
-                .filter(|parent| depth.contains_key(*parent))
-                .max_by(|a, b| depth.get(*a).cmp(&depth.get(*b)).then_with(|| b.cmp(a)))
-                .copied()
-        };
-        let (mut named, mut walked) = (BTreeSet::new(), BTreeSet::new());
-        let mut out = Vec::new();
-        for head in frontier_of(log, &depth) {
-            if out.len() >= HAVE_IDS {
-                break;
-            }
-            if named.insert(head) {
-                out.push(head);
-            }
-            let (mut at, mut back, mut next) = (head, 0usize, 1usize);
-            while out.len() < HAVE_IDS
-                && walked.insert(at)
-                && let Some(parent) = deepest_parent(&at)
-            {
-                at = parent;
-                back += 1;
-                if back == next {
-                    next *= 2;
-                    if named.insert(at) {
-                        out.push(at);
-                    }
-                }
-            }
-        }
-        out
+        self.log
+            .as_ref()
+            .map_or_else(Vec::new, |log| pull_names(log).have.clone())
     }
 
     /// Records held here that a peer advertising causal frontier `have` lacks, in causal order
@@ -1891,6 +1911,72 @@ mod tests {
         let mut store = Store::for_vault("team").expect("store");
         store.insert_many([genesis, admit, fork.clone()].into_iter().chain(chain));
         assert_eq!(store.frontier(), vec![*deep.id(), *fork.id()]);
+    }
+
+    /// A log derives what a pull names of it once for its held records ([`Advertised`]), and its
+    /// clones share that: after each record it holds, asked first through a clone, its frontier
+    /// and `?have=` ids are those a store given the same records afresh names, and the clone,
+    /// which held nothing, names what it named. A clone taken where nothing asked since the last
+    /// record, of a store that then holds another and is asked first, names its own records.
+    /// NEGATIVE CONTROL: `Log::hold` keeping the derivation names the heads before the record it
+    /// held at the store's first ask after it; with the loop's records left out, it names the
+    /// store's records in that clone.
+    #[test]
+    fn what_a_pull_names_follows_each_record_the_log_holds() {
+        let (w1, inc1, m1, e1) = entrant(1, "m1");
+        let genesis = Record::found(&[9; 32], vec![e1], 1_000).expect("genesis");
+        let named = |records: &[Record]| {
+            let mut store = Store::for_vault("team").expect("store");
+            store.insert_many(records.iter().cloned());
+            (store.frontier(), store.have())
+        };
+        let mut records = vec![genesis.clone()];
+        let mut store = Store::for_vault("team").expect("store");
+        store.insert_many([genesis]);
+        for n in 0..6u64 {
+            let asked = store.clone();
+            let before = (asked.frontier(), asked.have());
+            assert_eq!(before, named(&records));
+            let next = store
+                .log()
+                .expect("a log")
+                .draft(
+                    &m1,
+                    1_001 + n,
+                    Body::Name {
+                        name: format!("m1-{n}"),
+                    },
+                )
+                .sign(&w1, inc1)
+                .expect("a name");
+            assert!(store.insert(next.clone()).expect("held"));
+            records.push(next);
+            assert_eq!((store.frontier(), store.have()), named(&records));
+            assert_eq!((asked.frontier(), asked.have()), before);
+        }
+        let hold = |store: &mut Store, records: &mut Vec<Record>, n: u64| {
+            let next = store
+                .log()
+                .expect("a log")
+                .draft(
+                    &m1,
+                    2_000 + n,
+                    Body::Name {
+                        name: format!("m1-later-{n}"),
+                    },
+                )
+                .sign(&w1, inc1)
+                .expect("a name");
+            assert!(store.insert(next.clone()).expect("held"));
+            records.push(next);
+        };
+        // Nothing asks after this record, so the clone shares a derivation nothing made yet.
+        hold(&mut store, &mut records, 0);
+        let unasked = store.clone();
+        let its_own = records.clone();
+        hold(&mut store, &mut records, 1);
+        assert_eq!((store.frontier(), store.have()), named(&records));
+        assert_eq!((unasked.frontier(), unasked.have()), named(&its_own));
     }
 
     #[test]

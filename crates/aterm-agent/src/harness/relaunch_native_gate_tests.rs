@@ -964,6 +964,91 @@ fn a_binding_without_its_preparation_never_bypasses_relaunch_recovery() {
 }
 
 #[test]
+fn an_unadmitted_prepare_ends_a_crash_record_and_leaves_a_completed_rollback_exiting() {
+    use super::super::native_act::{NativePlan, Request};
+    // A crash plan alone; a completed forward's own rollback; and a crash plan after that forward
+    // completed, which runs the forward's command and not its rollback.
+    for (completed, rollback) in [(false, false), (true, true), (true, false)] {
+        let world = aterm_tempfile::tempdir().unwrap();
+        let opts = options(world.path());
+        let mut st = state(true);
+        st.native = Some(super::super::native_act::Binding {
+            id: "ab".repeat(16),
+            capability: "cd".repeat(32),
+        });
+        retain_bound_preparation(&mut st);
+        // The admission reply was lost: only the exact request is kept.
+        st.native = None;
+        if completed {
+            let Some(Request::Prepare(mut prepare)) = Request::parse(&st.native_prepare) else {
+                panic!("the retained preparation")
+            };
+            let mut forward = prepare.clone();
+            forward.id = "12".repeat(16);
+            // The fixture's forward and rollback are one command; the completed forward's differs,
+            // so only its rollback marks the retained prepare as that rollback.
+            let NativePlan::Restart { forward: ran, .. } = &mut forward.plan else {
+                panic!("a restart plan")
+            };
+            ran.argv.push("--forward".into());
+            st.native_completed_prepare = Some(forward);
+            let NativePlan::Restart {
+                observation,
+                rollback: back,
+                forward: next,
+                ..
+            } = &mut prepare.plan
+            else {
+                panic!("a restart plan")
+            };
+            // The completed forward's own rollback, minted on its observed vendor's death, or a
+            // crash plan that runs that forward's command again.
+            if !rollback {
+                next.argv.push("--forward".into());
+            }
+            *back = None;
+            *observation = Some(super::super::native_observe::ObservationBinding {
+                id: "98".repeat(16),
+                host_epoch: prepare.host_epoch.clone(),
+                capability: "76".repeat(32),
+            });
+            st.native_prepare = Request::prepare(*prepare).encode().unwrap();
+        }
+        let kept = st.native_completed_prepare.clone();
+        let (mut client, worker) = endpoint_with(|line| {
+            if line.contains(" lease acquire ") || line.contains(" lease release ") {
+                "ERR busy\n".into()
+            } else if line.contains(" native-act prepare ") {
+                super::super::native_act::unadmitted_reply(&"ab".repeat(16)).unwrap()
+            } else {
+                panic!("an unadmitted prepare dispatches nothing else: {line}")
+            }
+        });
+        let result = relaunch(&opts, report(), &mut st, &mut client, SESSION, &Live);
+        assert_eq!(result.step, super::super::native_restart::WAIT_UNADMITTED);
+        assert!(st.native_prepare.is_empty() && st.native.is_none());
+        assert_eq!(st.native_completed_prepare, kept);
+        if rollback {
+            assert!(matches!(st.phase, upgrade::Phase::Exiting { .. }));
+        } else {
+            assert_eq!(st.phase, upgrade::Phase::Failed("native-unadmitted".into()));
+        }
+        let saved = load(&opts, SESSION).expect("the dropped prepare is saved");
+        assert!(saved.native_prepare.is_empty());
+        assert_eq!(saved.phase, st.phase);
+        drop(client);
+        let seen = worker.join().unwrap();
+        assert_eq!(
+            seen.iter()
+                .filter(|line| line.contains(" native-act prepare "))
+                .count(),
+            1,
+            "completed={completed} rollback={rollback}"
+        );
+    }
+}
+
+#[test]
 fn disabled_native_kind_relaunch_held_continues_legacy_exit_guard_only_when_fresh() {
     for coordinated in [false, true] {
         let world = aterm_tempfile::tempdir().unwrap();

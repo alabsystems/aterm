@@ -4268,10 +4268,15 @@ impl SessionTimeline {
     }
 
     /// The one `title-change` writer: a row iff the session log's title mark moved; returns
-    /// whether it recorded one.
-    pub(crate) fn record_title(&mut self, shown: &str) -> bool {
+    /// whether it recorded one. For a command line (`stands`) the mark, and so the row, keeps
+    /// the title's fingerprint alone ([`crate::session_log::observed::TitleStands`]).
+    pub(crate) fn record_title(
+        &mut self,
+        shown: &str,
+        stands: crate::session_log::observed::TitleStands,
+    ) -> bool {
         let at = self.slog.now();
-        if !self.slog.observe_title(shown, at) {
+        if !self.slog.observe_title(shown, stands, at) {
             return false;
         }
         self.record(TITLE_CHANGE);

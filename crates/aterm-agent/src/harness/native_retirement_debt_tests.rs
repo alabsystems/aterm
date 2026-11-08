@@ -97,14 +97,30 @@ fn reply(st: &mut St, retirement: Retirement) {
     terminal_reply(st, &Reply::Decision(Decision::Retired(retirement)));
 }
 
-fn unchanged(st: &St) -> bool {
+/// The pending record, or the one whose admission reply was lost: only its wire is kept.
+fn baseline(bound: bool) -> St {
+    let mut st = pending();
+    if !bound {
+        st.native = None;
+    }
+    st
+}
+
+fn unchanged(st: &St, bound: bool) -> bool {
     let mut copy = st.clone();
     copy.native_retired_unissued = false;
-    copy == pending()
+    copy == baseline(bound)
+}
+
+fn unadmitted_reply(st: &mut St) -> Result<Recovery, &'static str> {
+    recover_reply(st, Reply::Unadmitted("ab".repeat(16)))
 }
 
 pub(super) fn transition(state: &State, action: &str) -> State {
-    let mut st = pending();
+    let mut st = baseline(state["bound"] == 1);
+    if state["kept"] == 0 && state["observed"] == 0 && state["finished"] == 0 {
+        assert_eq!(unadmitted_reply(&mut st), Ok(Recovery::Unadmitted));
+    }
     if state["held"] == 1 {
         reply(&mut st, Retirement::NotGranted);
     } else if state["finished"] == 1 {
@@ -146,6 +162,19 @@ pub(super) fn transition(state: &State, action: &str) -> State {
         }
         "Expire" => st.stop("no-resume", 100_000),
         "Rollback" => dispatched = st.roll_back(100_000, 0),
+        "LoseAdmission" => st.native = None,
+        "Unadmitted" => {
+            let before = st.clone();
+            let outcome = unadmitted_reply(&mut st);
+            assert_eq!(
+                outcome == Ok(Recovery::Unadmitted),
+                st != before,
+                "an unadmitted answer changes the record only when it is consumed"
+            );
+            if st.native.is_some() || st.native_retired_unissued {
+                assert_eq!(st, before, "a binding or a hold keeps its record");
+            }
+        }
         _ => unreachable!("unmapped model action"),
     }
     let mut next = state.clone();
@@ -156,7 +185,9 @@ pub(super) fn transition(state: &State, action: &str) -> State {
         // hold bit. Deriving it from that bit would make NoRevival vacuous.
         i64::from(state["observed"] == 1 || action == "NotGranted"),
     );
-    next.insert("kept", i64::from(unchanged(&st)));
+    let bound = st.native.is_some();
+    next.insert("bound", i64::from(bound));
+    next.insert("kept", i64::from(unchanged(&st, bound)));
     next.insert("owed", i64::from(matches!(st.phase, Phase::Exiting { .. })));
     next.insert("dispatched", i64::from(dispatched));
     next.insert(
@@ -196,11 +227,77 @@ fn retirement_debt_model_catches_the_old_terminal_failure_path() {
     let mut bad = model.init_state();
     bad.insert("observed", 1);
     bad.insert("held", i64::from(st.native_retired_unissued));
-    bad.insert("kept", i64::from(unchanged(&st)));
+    bad.insert("kept", i64::from(unchanged(&st, true)));
     bad.insert("owed", i64::from(matches!(st.phase, Phase::Exiting { .. })));
     for invariant in ["NoRevival", "RecipeRetained", "DebtRetained"] {
         assert!(!model.check_invariant(invariant, &bad), "{invariant}");
     }
+}
+
+#[test]
+fn retirement_debt_model_catches_an_unadmitted_clear_of_a_binding_or_a_hold() {
+    let model = aterm_models_harness::native_retirement_debt_model();
+    // Negative control: the clear without its guards, on a record that holds its binding.
+    let mut st = pending();
+    st.native_prepare.clear();
+    let mut bad = model.init_state();
+    bad.insert("bound", i64::from(st.native.is_some()));
+    bad.insert("kept", i64::from(unchanged(&st, true)));
+    assert!(!model.check_invariant("BindingRetained", &bad));
+    // And on a held record whose admission reply was lost: the clear drops the hold too.
+    let mut st = baseline(false);
+    reply(&mut st, Retirement::NotGranted);
+    st.native_retired_unissued = false;
+    st.native_prepare.clear();
+    let mut bad = model.init_state();
+    bad.insert("observed", 1);
+    bad.insert("bound", 0);
+    bad.insert("held", i64::from(st.native_retired_unissued));
+    bad.insert("kept", i64::from(unchanged(&st, false)));
+    for invariant in ["NoRevival", "RecipeRetained"] {
+        assert!(!model.check_invariant(invariant, &bad), "{invariant}");
+    }
+    // The real consumer refuses both, and refuses an answer about another id.
+    let mut st = pending();
+    assert_eq!(unadmitted_reply(&mut st), Err("native-unknown"));
+    assert_eq!(st, pending());
+    let mut st = baseline(false);
+    reply(&mut st, Retirement::NotGranted);
+    let held = st.clone();
+    assert_eq!(unadmitted_reply(&mut st), Ok(Recovery::Held));
+    assert_eq!(st, held);
+    let mut st = baseline(false);
+    assert_eq!(
+        recover_reply(&mut st, Reply::Unadmitted("cd".repeat(16))),
+        Err("native-unknown")
+    );
+    assert_eq!(st, baseline(false));
+}
+
+#[test]
+fn an_unadmitted_answer_never_drops_a_terminal_record_of_the_same_id() {
+    let Request::Prepare(prepare) = Request::parse(&pending().native_prepare).unwrap() else {
+        panic!("the pending prepare")
+    };
+    for completed in [false, true] {
+        let mut st = baseline(false);
+        if completed {
+            st.native_completed_prepare = Some(prepare.clone());
+        } else {
+            st.native_noexec_prepare = Some(prepare.clone());
+        }
+        let before = st.clone();
+        assert_eq!(unadmitted_reply(&mut st), Err("native-unknown"));
+        assert_eq!(st, before);
+    }
+    let mut st = baseline(false);
+    assert_eq!(unadmitted_reply(&mut st), Ok(Recovery::Unadmitted));
+    assert!(st.native_prepare.is_empty() && st.native.is_none() && !st.native_rollback);
+    assert!(
+        st.native_coordination && st.native_completed_prepare.is_none(),
+        "nothing is recorded completed; the coordination stays"
+    );
+    assert!(matches!(st.phase, Phase::Exiting { .. }));
 }
 
 #[test]

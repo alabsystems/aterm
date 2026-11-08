@@ -1933,9 +1933,9 @@ pub const VERBS: &[VerbSpec] = &[
          drawn=\"<cells>\"|drawn=- why=<not-drawn|no-room|no-host|no-footer|switch-only> \
          spoken=\"<label>\"|spoken=- description=\"<words>\"|description=-` line per supervised \
          pane in any window (debug builds add `title=\"<the title its hover reads>\"|title=-`, \
-         then `a11y window=<id> autopilot sid=<sid>|band row=<0..2> role=<role> \
-         label=\"<words>\" description=\"<words>\"|description=-` lines: each Autopilot chip's and \
-         Messages band row's node as the window's accessibility tree is built for a screen \
+         then `a11y window=<id> autopilot sid=<sid> role=<role> label=\"<words>\" \
+         description=\"<words>\"|description=-` lines: each Autopilot chip's node as the window's \
+         accessibility tree is built for a screen \
          reader). Then `statusitem title=❯ needs=<n> stuck=<n> exceptions=<n> \
          done=<n> fleet=<off|unread|reading|failed|as_of:<unix ms>>` and, on macOS, the `❯` menu's \
          `statusmenu \"<label>\" enabled=<yes|no> [checked=<yes|no>] [tip=\"<text>\"] [indent=<n>] \
@@ -2507,10 +2507,15 @@ pub const VERBS: &[VerbSpec] = &[
          input_bytes=<n> input_wait_ms=<ms>`. `cause=@<off>|<seq>` links a turn opened within 5 s \
          to mail or a `log` record (`ERR cause` if invalid; `cause_k=mail|rec`). \
          `act=approve|deny|answer` tags the dismissed approval/question box in `log` \
-         (`out=approved|declined|answered` for harness, `out=passed by=<actor>` otherwise, \
-         `re=<box>`, rate-limited with `dropped=<n>` / `pool=shared` on `mark - input verb= \
-         by=`). `as=person` (debug / `dev-seams` only; no fence, `id=`, `act=` or `cause=` beside \
-         it) routes through the human input seam (`status human_ms=` / `human_seq=`).",
+         (`out=approved|declined|answered` for harness, `re=<box>`, rate-limited with \
+         `dropped=<n>` / `pool=shared` on `mark - input verb= by=`). Otherwise a box's close \
+         reads the key and the option the screen showed it landing on, whoever pressed it: \
+         Enter on a focused approve option or that option's digit `out=approved`, a reject \
+         option or Esc `out=declined`, a question's chosen option `out=answered`, at \
+         `conf=heuristic`; a key no option places (typed text, an unknown role, no focused \
+         option) `out=passed`; `by=<actor>` either way. `as=person` (debug / `dev-seams` only; \
+         no fence, `id=`, `act=` or `cause=` beside it) routes through the human input seam \
+         (`status human_ms=` / `human_seq=`).",
     )
     .input(
         DRIVEN
@@ -2692,8 +2697,7 @@ pub const VERBS: &[VerbSpec] = &[
          `selected=`, the Overview's item as `controls overview` does), where a person's pointer \
          selects it (`ERR item <n> is not a row the card shows` when scrolled off). `pointer \
          leave`, and `status` with no position, reply `OK at=-`. \
-         `click` (Owner-only; 10 a minute on band capsules, else `ERR busy notice: 10 presses a \
-         minute retry_ms=<ms>`) left-clicks where the pointer is. `wheel dy=<n> [dx=<n>] \
+         `click` (Owner-only) left-clicks where the pointer is. `wheel dy=<n> [dx=<n>] \
          [unit=lines|pt] [key=<ui-key>|xy=<x>,<y>]` scrolls (each `|n|<=10000`, not both 0). \
          `mods <list>` (Owner-only) holds modifiers (`cmd`/`super`, `ctrl`, `alt`/`option`, \
          `shift`, `link`, or `none`) until the next physical event (`cell <r> <c>` `link=` reads a \

@@ -212,6 +212,9 @@ pub struct Real {
     /// [`Real::engine_copy`]); in a dry run, which never makes or moves one, `engine_source` until a
     /// real run has made it.
     engine: PathBuf,
+    /// Captured once; a missing engine defers refusal until an engine operation.
+    engine_repository: Result<agh::Slug, String>,
+    engine_url: fn(&Path) -> Result<String, String>,
     /// The main of the engine's origin, fetched at step 1 ([`Backend::fetch`]): what the release
     /// judges of the engine (its ledger, its code) until it has synced its copy
     /// ([`Real::engine_text`]), which may be a release behind or not made yet; a dry run, which
@@ -243,6 +246,9 @@ pub struct Real {
     /// How a step builds a dev binary of this checkout ([`Real::build_checkout_bin`]; a test's
     /// stand-in answers cargo's JSON messages itself).
     checkout_build: CheckoutBuild,
+    /// Production uses the configured native origin. Tests route the same typed
+    /// boundary to an explicit local-bare authority, including scratch copies.
+    engine_origin: fn(&Path, &Path) -> Result<crate::github_remote::Remote, String>,
     /// The caller's [`ENGINE_AGH_ENV`], read once when the backend is made: the engine's agh
     /// when set ([`Real::engine_agh`]). A test sets it, so a cut run with `PUBLISH_AGH` does
     /// not hand the test's engine stand-in the release's agh.
@@ -346,11 +352,10 @@ impl Branches for RealBranches<'_> {
         self.real.side_log(Step::Qualify, branch.name())
     }
 
-    fn tree_admitted(&self, ended: &dyn Fn() -> bool) {
+    fn build_admitted(&self, ended: &dyn Fn() -> bool) {
         let me = std::process::id();
-        let began = std::time::Instant::now();
-        while !ended() && began.elapsed() < crate::release::TREE_HEAD_START {
-            if interrupt::caught().is_some() || tree_holds_memory(me) {
+        while !ended() {
+            if interrupt::caught().is_some() || slices_hold_memory(me) {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -453,9 +458,9 @@ impl Branches for RealBranches<'_> {
     }
 }
 
-/// Whether the user's ledger holds an admitted memory claim of `verify release` under this
-/// process `me`: the tree branch's, the only `verify` the release runs while its build waits.
-fn tree_holds_memory(me: u32) -> bool {
+/// Both slices must have their claims before the tree can compete for memory. A build
+/// that fails or serializes on a smaller machine releases the wait by ending instead.
+fn slices_hold_memory(me: u32) -> bool {
     let Some(records) = aterm_capacity::Ledger::user().and_then(|l| l.list().ok()) else {
         return false;
     };
@@ -475,9 +480,16 @@ fn tree_holds_memory(me: u32) -> bool {
         }
         false
     };
-    records.iter().any(|r| {
-        r.held.is_some() && r.need.what.starts_with("verify ") && r.need.mem > 0 && descends(r.pid)
-    })
+    ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+        .iter()
+        .all(|triple| {
+            records.iter().any(|r| {
+                r.held.is_some()
+                    && r.need.what == format!("release slice {triple}")
+                    && r.need.mem > 0
+                    && descends(r.pid)
+            })
+        })
 }
 
 struct Forwarded {
@@ -524,6 +536,7 @@ impl Real {
             |_| source.clone(),
             |cwd| crate::release::anchor(&source, &cwd),
         );
+        let engine_repository = crate::github_remote::origin_slug(&engine_source);
         let release = crate::gates::release_dir(repo);
         let copy = crate::gates::engine_copy(&release);
         let engine = if dry && !copy.join(".git").exists() {
@@ -556,6 +569,8 @@ impl Real {
             home,
             engine_source,
             engine,
+            engine_repository,
+            engine_url: engine_origin_url,
             origin_main: None,
             engine_synced: std::sync::atomic::AtomicBool::new(false),
             state,
@@ -573,6 +588,7 @@ impl Real {
             scanner_tools: None,
             scanner_probe: scanner_tools::run,
             checkout_build: Real::build_checkout_bin,
+            engine_origin: |repo, _| crate::github_remote::Remote::origin(repo),
             engine_agh_explicit: std::env::var_os(ENGINE_AGH_ENV),
             disk_claim: None,
             line_priority: None,
@@ -603,15 +619,12 @@ impl Real {
         nested_locks::paths(&out.stdout)
     }
 
-    fn remote_git(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
-        let mut cmd = command(aterm_uds::os_path!("git"));
-        cmd.arg("-C").arg(&self.repo).args(args);
-        self.output_forwarded(&mut cmd)
-    }
-
     fn engine_git(&self, args: &[&str]) -> Option<String> {
         let mut cmd = command(aterm_uds::os_path!("git"));
-        cmd.arg("-C").arg(&self.engine).args(args);
+        cmd.args(["-c", "protocol.allow=never"])
+            .arg("-C")
+            .arg(&self.engine)
+            .args(args);
         let out = self.output_forwarded(&mut cmd).ok()?;
         out.status
             .success()
@@ -621,7 +634,10 @@ impl Real {
     fn engine_git_code(&self, args: &[&str]) -> Result<(i32, std::process::Output), String> {
         let e = self.engine.display();
         let mut cmd = command(aterm_uds::os_path!("git"));
-        cmd.arg("-C").arg(&self.engine).args(args);
+        cmd.args(["-c", "protocol.allow=never"])
+            .arg("-C")
+            .arg(&self.engine)
+            .args(args);
         let out = self
             .output_forwarded(&mut cmd)
             .map_err(|err| format!("git -C {e} {}: {err}", args.join(" ")))?;
@@ -1132,6 +1148,22 @@ impl Real {
             .join(format!("{:02}-{}-{what}.log", step.number(), step.name()))
     }
 
+    fn engine_remote(&self, repo: &Path) -> Result<crate::github_remote::Remote, String> {
+        let expected = self.engine_repository.as_ref().map_err(|why| {
+            format!(
+                "the publication engine had no admitted repository when this release started: {why}"
+            )
+        })?;
+        let native = (self.engine_origin)(repo, &self.engine_source)?;
+        if native.repository() != expected {
+            return Err(
+                "the native engine repository differs from this release's captured authority"
+                    .into(),
+            );
+        }
+        Ok(native)
+    }
+
     /// Bring this release's engine to its origin's main: made first where it has none, or pointed
     /// at the origin `engine_source` names ([`Real::engine_copy`]), then fast-forwarded with the
     /// audit rows its stages appended committed and pushed ([`Real::engine_fast_forward`]).
@@ -1152,27 +1184,21 @@ impl Real {
                 "clone it there, or name one: --engine <path> (or PUBLICATION_ENGINE)",
             ));
         }
-        let mut cmd = command(aterm_uds::os_path!("git"));
-        cmd.arg("-C")
-            .arg(&self.engine_source)
-            .args(["remote", "get-url", "origin"]);
-        self.output_forwarded(&mut cmd)
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .filter(|url| !url.is_empty())
-            .ok_or_else(|| {
-                Refusal::new(
-                    format!("the publication engine {s} names no origin"),
-                    format!("git -C {s} remote add origin <the engine's repository>"),
-                )
-            })
+        (self.engine_url)(&self.engine_source).map_err(|_| {
+            Refusal::new(
+                format!("the publication engine {s} names no origin"),
+                format!("git -C {s} remote add origin <the engine's repository>"),
+            )
+        })
     }
 
     /// The main of the engine's `origin` ([`crate::gates::OriginMain`]), or why it cannot be
     /// read.
     fn read_origin_main(&self, origin: &str) -> Result<crate::gates::OriginMain, Refusal> {
-        crate::gates::OriginMain::fetch(origin, &|cmd| self.output_forwarded(cmd)).map_err(|why| {
+        crate::gates::OriginMain::fetch(origin, &|cmd| self.output_forwarded(cmd), &|at| {
+            self.engine_remote(at)
+        })
+        .map_err(|why| {
             Refusal::new(
                 format!("cannot read the publication engine's origin ({origin}): {why}"),
                 format!("check the network: git ls-remote {origin}, then {RELEASE_COMMAND} again"),
@@ -1204,6 +1230,7 @@ impl Real {
                 "check the reported native routing or source-state refusal, then re-run",
             )
             .detail([why])
+            .could_not_run()
         })?;
         self.origin_tags = origin.tags;
         self.fetch_engine_origin()?;
@@ -1248,14 +1275,16 @@ impl Real {
         let origin = self.source_origin()?;
         let git = |dir: &Path, args: &[&str]| {
             let mut cmd = command(aterm_uds::os_path!("git"));
-            cmd.arg("-C").arg(dir).args(args);
+            cmd.args(["-c", "protocol.allow=never"])
+                .args(BYTE_EXACT)
+                .arg("-C")
+                .arg(dir)
+                .args(args);
             self.output_forwarded(&mut cmd)
                 .is_ok_and(|out| out.status.success())
         };
         if self.engine.join(".git").exists()
-            && self
-                .engine_git(&["remote", "get-url", "origin"])
-                .is_none_or(|url| url.trim() != origin)
+            && !(self.engine_url)(&self.engine).is_ok_and(|url| url == origin)
         {
             // A copy of another origin: what it holds is that origin's, never this one's to
             // deliver, so it is made again from this origin, or kept where it holds anything
@@ -1322,13 +1351,13 @@ impl Real {
             let cloned = std::fs::create_dir_all(parent).is_ok()
                 && git(
                     parent,
-                    &[
-                        &["clone"],
-                        &BYTE_EXACT[..],
-                        &["--quiet", "--no-checkout", &origin, &made_s],
-                    ]
-                    .concat(),
+                    &["init", "--quiet", "--initial-branch=main", &made_s],
                 )
+                && git(&made, &["remote", "add", "origin", &origin])
+                && self
+                    .engine_remote(&made)
+                    .and_then(|native| native.refresh_main())
+                    .is_ok()
                 && git(
                     &made,
                     &[
@@ -1386,12 +1415,20 @@ impl Real {
 
     fn engine_fast_forward(&self) -> Result<(), Refusal> {
         let e = self.engine.display().to_string();
-        if self.engine_git(&["fetch", "-q", "origin"]).is_none() {
-            return Err(Refusal::new(
+        let native = self.engine_remote(&self.engine).map_err(|why| {
+            Refusal::new(
                 format!("cannot fetch the engine's origin ({e})"),
-                format!("check the network and git -C {e} remote -v"),
-            ));
-        }
+                "check the native routing or source-state refusal, then re-run",
+            )
+            .detail([why])
+        })?;
+        let tip = native.refresh_main().map_err(|why| {
+            Refusal::new(
+                format!("cannot fetch the engine's origin ({e})"),
+                "check the native routing or source-state refusal, then re-run",
+            )
+            .detail([why])
+        })?;
         if self.engine_dirty() {
             return Err(Refusal::new(
                 format!("the release's engine {e} has local changes besides its audit log"),
@@ -1429,7 +1466,7 @@ impl Real {
             .is_none_or(|out| !out.trim().is_empty());
         if ahead {
             let code: Vec<String> = self
-                .engine_git(&["diff", "--name-only", "origin/main...HEAD"])
+                .engine_git(&["diff", "--no-renames", "--name-only", "origin/main...HEAD"])
                 .map_or_else(
                     || vec!["(unread)".to_string()],
                     |out| {
@@ -1482,18 +1519,25 @@ impl Real {
             ));
         }
         if rows.is_empty() {
-            return if !ahead
-                || self
-                    .engine_git(&["push", "-q", "origin", "HEAD:main"])
-                    .is_some()
-            {
-                Ok(())
-            } else {
-                Err(Refusal::new(
+            if !ahead {
+                return Ok(());
+            }
+            let written = self.engine_commit("HEAD").and_then(|head| {
+                let head = head.ok_or("the engine has no records commit")?;
+                match native.write_ref("refs/heads/main", Some(&tip), &head)? {
+                    crate::ledger::RefWrite::Written => Ok(()),
+                    crate::ledger::RefWrite::Conflict => {
+                        Err("the engine main moved before its records could land".into())
+                    }
+                }
+            });
+            return written.map_err(|why| {
+                Refusal::new(
                     format!("could not push the records the engine {e} holds to its origin's main"),
                     format!("{RELEASE_COMMAND} again (they stay in {e} until they land)"),
-                ))
-            };
+                )
+                .detail([why])
+            });
         }
         let path = self.engine.join("verification-log.jsonl");
         let text = crate::durable::read_text(&path).unwrap_or_default();
@@ -1508,22 +1552,31 @@ impl Real {
                     "--",
                     "verification-log.jsonl",
                 ])
-                .is_some()
-            && self
-                .engine_git(&["push", "-q", "origin", "HEAD:main"])
                 .is_some();
-        if recorded {
-            Ok(())
+        let published = if recorded {
+            self.engine_commit("HEAD").and_then(|head| {
+                let head = head.ok_or("the engine has no audit commit")?;
+                match native.write_ref("refs/heads/main", Some(&tip), &head)? {
+                    crate::ledger::RefWrite::Written => Ok(()),
+                    crate::ledger::RefWrite::Conflict => {
+                        Err("the engine's main changed before the audit commit could land".into())
+                    }
+                }
+            })
         } else {
-            Err(Refusal::new(
+            Err("the local audit commit could not be recorded".into())
+        };
+        published.map_err(|why| {
+            Refusal::new(
                 "could not record the engine's audit rows (commit and push of \
                  verification-log.jsonl)",
                 format!(
                     "{RELEASE_COMMAND} again (the rows are kept in {})",
                     kept.display()
                 ),
-            ))
-        }
+            )
+            .detail([why])
+        })
     }
 
     fn engine_dirty(&self) -> bool {
@@ -1546,7 +1599,9 @@ impl Real {
             )
             .detail(ran.detail));
         }
-        crate::gates::submodules_on_declared_branch(&self.git()).map_err(|e| match e {
+        let origin = crate::publish::native_origin(&self.repo)
+            .map_err(|why| cut_refusal("submodule origin", &why.to_string()))?;
+        crate::gates::submodules_on_declared_branch(&self.git(), &origin).map_err(|e| match e {
             crate::gates::PinRefusal::Unread(why) => Refusal::new(
                 why,
                 "the fetch was retried and the pin is not in question: re-run once the network \
@@ -1674,44 +1729,46 @@ impl Real {
         let ran = |cmd: &mut Command| self.output_forwarded(cmd).is_ok_and(|o| o.status.success());
         let in_copy = |args: &[&str]| {
             let mut cmd = command(aterm_uds::os_path!("git"));
-            cmd.arg("-C").arg(&copy).args(args);
+            cmd.args(["-c", "protocol.allow=never"])
+                .arg("-C")
+                .arg(&copy)
+                .args(args);
             cmd
         };
         let mut clone = command(aterm_uds::os_path!("git"));
-        clone.arg("clone").args(BYTE_EXACT).args([
-            "--quiet",
-            "--shared",
-            "--no-checkout",
-            &e,
-            &copy_s,
-        ]);
+        clone
+            .args([
+                "-c",
+                "protocol.allow=never",
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+            ])
+            .args(BYTE_EXACT)
+            .args(["--quiet", "--shared", "--no-checkout", &e, &copy_s]);
         if !ran(&mut clone) {
             return Err(Refusal::new(
                 format!("git could not copy the engine {e} into {copy_s}"),
                 "fix what keeps it from being written, then run it again",
             ));
         }
-        if !ran(&mut in_copy(&["remote", "set-url", "origin", &origin]))
-            || !ran(&mut in_copy(&[
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "origin",
-                "refs/heads/main",
-            ]))
-        {
+        if !ran(&mut in_copy(&["remote", "set-url", "origin", &origin])) {
             return Err(Refusal::new(
-                format!("cannot fetch the main of the engine's origin ({origin})"),
-                format!("check the network: git -C {e} ls-remote origin"),
+                format!("cannot bind the scratch engine to its origin ({origin})"),
+                "read the local clone refusal, then re-run",
             ));
         }
-        if !ran(&mut in_copy(&[
-            "checkout",
-            "--quiet",
-            "-B",
-            "main",
-            "FETCH_HEAD",
-        ])) {
+        let tip = self
+            .engine_remote(&copy)
+            .and_then(|native| native.refresh_main())
+            .map_err(|why| {
+                Refusal::new(
+                    format!("cannot fetch the main of the engine's origin ({origin})"),
+                    "check the native routing or source-state refusal, then re-run",
+                )
+                .detail([why])
+            })?;
+        if !ran(&mut in_copy(&["checkout", "--quiet", "-B", "main", &tip])) {
             return Err(Refusal::new(
                 format!("git could not check the engine's origin main out in {copy_s}"),
                 "fix what keeps it from being written, then run it again",
@@ -3507,6 +3564,17 @@ fn tail(path: &Path, n: usize) -> Vec<String> {
 /// What to do about the release's own engine `e` in a state no release leaves it in: nothing
 /// but a release writes it, so whatever made the state is read (`git -C e <read>`) and kept where
 /// it is wanted before the copy goes; the next release clones it again.
+fn engine_origin_url(repo: &Path) -> Result<String, String> {
+    let out = crate::ledger::git_ok(&GitCli::new(repo), &["remote", "get-url", "origin"])
+        .map_err(|e| e.to_string())?;
+    let url = out.stdout_utf8().trim().to_string();
+    if url.is_empty() {
+        Err("engine has no origin URL".into())
+    } else {
+        Ok(url)
+    }
+}
+
 fn copy_remedy(e: &str, read: &str) -> String {
     format!(
         "nothing but a release writes it: read git -C {e} {read}, land what is wanted on the \
@@ -3519,6 +3587,19 @@ fn copy_remedy(e: &str, read: &str) -> String {
 /// `ENGINE_DATA_PLANE_PREFIXES`): its ledger, its audit log, its handoff records.
 fn engine_data_plane(path: &str) -> bool {
     matches!(path, "mappings.json" | "verification-log.jsonl") || path.starts_with("handoff/")
+}
+
+/// A changed engine path that is engine code, as the engine's own stage guard judges a move of
+/// its HEAD (`bin/pub`'s `engine_code_drift`): neither its records ([`engine_data_plane`]), its
+/// Rust port (`RUST_PORT_FILES`, `crates/`), which no `bin/pub` verb a release runs reads, nor
+/// its prose (`docs/`, a top-level `*.md`), which `bin/pub` never opens. A `*.md` anywhere else
+/// (`bin/`, `registry/`) is code. Read from `git diff --no-renames --name-only`, so a rename
+/// lists the path it left as well as the one it took.
+fn engine_code(path: &str) -> bool {
+    let port = matches!(path, "Cargo.toml" | "Cargo.lock" | "rust-toolchain.toml")
+        || path.starts_with("crates/");
+    let prose = path.starts_with("docs/") || (!path.contains('/') && path.ends_with(".md"));
+    !path.is_empty() && !engine_data_plane(path) && !port && !prose
 }
 
 /// Each kept audit row put back in time order (the pub-sync pattern).
@@ -4752,17 +4833,127 @@ impl Backend for Real {
     }
 
     fn fleet_line(&mut self, line: &Line, continued: bool) -> Result<Line, String> {
+        if let Some(claim) = &mut self.fleet_line
+            && claim.line == *line
+        {
+            claim.audit()?;
+            return Ok(line.clone());
+        }
         let claim = crate::line_claim::Claim::take(&self.repo, line, &self.logs, continued)?;
         let selected = claim.line.clone();
         self.fleet_line = Some(claim);
         Ok(selected)
     }
 
-    fn fleet_existing(&mut self, version: &str) -> Result<Option<Line>, String> {
-        let line = crate::line_claim::existing(&self.repo, version)?;
+    fn fleet_supersession(
+        &mut self,
+        version: &str,
+    ) -> Result<Option<crate::line::Supersession>, Refusal> {
+        crate::line::supersession(&self.git(), version)
+            .map_err(|e| Refusal::new(e, "retry the current line read").could_not_run())
+    }
+
+    fn supersede_line(&mut self, line: &Line) -> Result<String, String> {
+        self.fetch().map_err(|e| e.why)?;
+        let previous = crate::line_claim::existing(&self.repo, &line.version)?
+            .ok_or("no existing fleet line to supersede")?;
+        let mut claim = crate::line_claim::Claim::take(&self.repo, &previous, &self.logs, false)?;
+        // Claim acquisition may adopt a hop written after the read above.
+        let previous = claim.line.clone();
+        self.fetch().map_err(|e| e.why)?;
+        crate::line::verify(&self.git(), &previous).map_err(|e| e.to_string())?;
+        let ledger_text = self
+            .git_out(&["show", "origin/main:RELEASES.ledger"])
+            .ok_or("cannot read origin/main's release ledger")?;
+        let mappings = self
+            .engine_text("mappings.json")
+            .ok_or("cannot read the publication engine's mappings")?;
+        let _: aterm_json::Value = aterm_json::from_str(&mappings)
+            .map_err(|e| format!("invalid publication mappings: {e}"))?;
+        let tag = format!("v{}", line.version);
+        let rows = self.engine_rows(Some(previous.head()));
+        let published = rows.has
+            || rows
+                .newest
+                .as_deref()
+                .is_some_and(|sha| self.version_at(sha).as_deref() == Some(line.version.as_str()));
+        let tagged = self.origin_tag(&tag).is_some();
+        let ledger = ledger_text
+            .lines()
+            .any(|row| row.split_whitespace().nth(1) == Some(line.version.as_str()))
+            || self
+                .cut_journal()
+                .is_some_and(|cut| cut.version == line.version);
+        let published = published
+            || std::iter::once(previous.base.as_str())
+                .chain(previous.hops.iter().map(|hop| hop.commit.as_str()))
+                .any(|commit| self.engine_rows(Some(commit)).has);
+        crate::line::require_unpublished([tagged, ledger, published, false, false])?;
+        let public =
+            crate::publish::workspace_channel_slug(&self.repo).map_err(|e| e.to_string())?;
+        let released = !crate::publish::release_objects_by_tag(&public, &tag)
+            .map_err(|e| e.to_string())?
+            .is_empty();
+        crate::line::require_unpublished([false, false, false, released, false])?;
+        let config = self
+            .git_out(&["show", "origin/main:publish/config.sh"])
+            .ok_or("cannot read the staging remote declaration")?;
+        let staging = config
+            .lines()
+            .find_map(|row| {
+                row.strip_prefix("STAGING_REMOTE_DEFAULT=\"")
+                    .and_then(|value| value.strip_suffix('"'))
+            })
+            .ok_or("no staging remote declaration")?;
+        let staging =
+            crate::publish::github_slug_from_remote_url(staging).map_err(|e| e.to_string())?;
+        let staged = crate::github_remote::repository_file(&staging, "main", "Cargo.toml")?;
+        let staged = std::str::from_utf8(&staged).map_err(|e| e.to_string())?;
+        let staged_version =
+            crate::publish::workspace_version(staged).map_err(|e| e.to_string())?;
+        let numbers = |version: &str| {
+            version
+                .split('.')
+                .map(str::parse::<u64>)
+                .collect::<Result<Vec<_>, _>>()
+        };
+        let staged = numbers(&staged_version).map_err(|e| e.to_string())?
+            >= numbers(&line.version).map_err(|e| e.to_string())?;
+        crate::line::require_unpublished([false, false, false, false, staged])?;
+        claim.audit()?;
+        let record = crate::line::Supersession {
+            previous,
+            replacement: line.clone(),
+            reason: "explicit --supersede: the unpublished line cannot finish with its own tooling"
+                .into(),
+        };
+        let origin = crate::github_remote::Remote::origin(&self.repo)?;
+        let merge = crate::line::supersede(&self.git(), &origin, &record)?;
+        claim.boundary(line, "commit", &self.times())?;
+        claim.audit()?;
+        self.fleet_line = Some(claim);
+        Ok(format!(
+            "SUPERSEDED v{} line {} (base {}) with {}: {}; recorded on main at {merge}",
+            line.version,
+            record.previous.head(),
+            record.previous.base,
+            line.base,
+            record.reason
+        ))
+    }
+
+    fn fleet_existing(&mut self, version: &str) -> Result<Option<Line>, Refusal> {
+        let retry = || "retry the fleet line read";
+        let mut line = crate::line_claim::existing(&self.repo, version)
+            .map_err(|why| Refusal::new(why, retry()).could_not_run())?;
+        if line.is_some() {
+            self.fetch()?;
+            line = crate::line_claim::current(&self.git(), version, line)
+                .map_err(|why| Refusal::new(why, retry()).could_not_run())?;
+        }
         if let Some(line) = &line {
-            self.fetch().map_err(|r| r.why)?;
-            crate::line::verify(&self.git(), line).map_err(|e| e.to_string())?;
+            crate::line::verify(&self.git(), line)
+                .map_err(|error| Refusal::new(error.to_string(), retry()).could_not_run())?;
         }
         Ok(line)
     }
@@ -5127,36 +5318,37 @@ impl Backend for Real {
                 ));
             }
         }
-        let (code, out) = self.engine_git_code(&[
-            "diff",
-            "--quiet",
-            from,
-            to,
-            "--",
-            ".",
-            ":(exclude)verification-log.jsonl",
-            ":(exclude)mappings.json",
-            ":(exclude)handoff/",
-        ])?;
-        match code {
-            0 => Ok(EngineNow::Same(format!(
-                "the engine at its origin/main {} has the code that staged ({}; only its data \
-                 plane moved)",
-                short(to),
-                short(from)
-            ))),
-            1 => Ok(EngineNow::Moved(format!(
-                "the engine's code moved since it staged: {}..{} (its origin/main)",
-                short(from),
-                short(to)
-            ))),
-            _ => Err(format!(
+        let (code, out) =
+            self.engine_git_code(&["diff", "--no-renames", "--name-only", from, to])?;
+        if code != 0 {
+            return Err(format!(
                 "git -C {e} diff {}..{} exited {code}: {}",
                 short(from),
                 short(to),
                 String::from_utf8_lossy(&out.stderr).trim()
-            )),
+            ));
         }
+        let listed = String::from_utf8_lossy(&out.stdout);
+        let moved: Vec<&str> = listed.lines().filter(|p| engine_code(p)).collect();
+        if moved.is_empty() {
+            return Ok(EngineNow::Same(format!(
+                "the engine at its origin/main {} has the code that staged ({}; only its \
+                 records, Rust port or prose moved)",
+                short(to),
+                short(from)
+            )));
+        }
+        let more = moved
+            .len()
+            .checked_sub(5)
+            .filter(|n| *n > 0)
+            .map_or_else(String::new, |n| format!(" and {n} more"));
+        Ok(EngineNow::Moved(format!(
+            "the engine's code moved since it staged: {}..{} (its origin/main) changed {}{more}",
+            short(from),
+            short(to),
+            moved[..moved.len().min(5)].join(", ")
+        )))
     }
 
     fn candidate_missing(&mut self) -> Result<Option<String>, String> {
@@ -5231,10 +5423,18 @@ impl Backend for Real {
         let hops = crate::line::carry(&git, line, &fixes)?;
         let head = hops.last().map_or(line.head(), |hop| hop.commit.as_str());
         let named: Vec<&str> = fixes.iter().map(|fix| short(&fix.commit)).collect();
+        let origin = crate::publish::native_origin(&self.repo).map_err(|why| {
+            Refusal::new(
+                "cannot bind the native source origin to this workspace",
+                "restore the configured repository matching Cargo.toml before rerunning",
+            )
+            .detail([why.to_string()])
+        })?;
         // A hop is the same commit however often it is made, so naming the fixes again makes
         // these hops and records them; a bare re-run resumes the journal, which names none yet.
         let recorded = crate::line::record(
             &git,
+            &origin,
             &line.version,
             head,
             crate::line::MAX_RECORD_ATTEMPTS,
@@ -5284,6 +5484,13 @@ impl Backend for Real {
     }
 
     fn bump(&mut self, from: &str, to: &str, prover: &Prover) -> Result<String, Refusal> {
+        let origin = crate::publish::native_origin(&self.repo).map_err(|why| {
+            Refusal::new(
+                "cannot bind the native source origin to this workspace",
+                "restore the configured repository matching Cargo.toml before rerunning",
+            )
+            .detail([why.to_string()])
+        })?;
         let edit = self.engine.join("bin/pub-bump-edit");
         if !edit.is_file() {
             return Err(Refusal::new(
@@ -5391,7 +5598,7 @@ impl Backend for Real {
             // The bump opens a release window, so it also carries the harness versions the
             // window owes (`ship harness-bump`'s writes), after the version-only check above
             // judged the edit's own changes.
-            let owed = match crate::harness_versions::apply(&self.repo) {
+            let owed = match crate::harness_versions::apply(&self.repo, &origin) {
                 Ok(applied) => applied.map(|(_, owed)| owed).unwrap_or_default(),
                 Err(e) => {
                     undo(self);
@@ -5429,11 +5636,14 @@ impl Backend for Real {
                     "read the commit step's log",
                 ));
             }
-            let mut push = command(aterm_uds::os_path!("git"));
-            push.args(["push", "-q", "origin", "HEAD:main"])
-                .current_dir(&self.repo);
-            if self.logged(Step::Commit, &mut push).code == 0 {
-                return Ok(self.head());
+            let bumped = self.head();
+            match origin.write_ref("refs/heads/main", Some(&tip), &bumped) {
+                Ok(crate::ledger::RefWrite::Written) => return Ok(bumped),
+                Ok(crate::ledger::RefWrite::Conflict) => {}
+                Err(why) => return Err(Refusal::new(
+                    "the native bump write did not establish a successful claim",
+                    "inspect the reported native intent or routing refusal before rerunning; the local bump commit is retained",
+                ).detail([why])),
             }
             if attempt == 3 {
                 return Err(Refusal::new(
@@ -5441,7 +5651,13 @@ impl Backend for Real {
                     format!("{RELEASE_COMMAND} --bump again"),
                 ));
             }
-            let _ = self.remote_git(&["fetch", "-q", "origin", "main"]);
+            origin.refresh_main().map_err(|why| {
+                Refusal::new(
+                    "cannot refresh main after the bump lost its compare-and-swap",
+                    "read the native refusal before rerunning; the local bump commit is retained",
+                )
+                .detail([why])
+            })?;
             let _ = self.git().git(&["reset", "-q", "--keep", "origin/main"]);
         }
         Err(Refusal::new(
@@ -5693,6 +5909,13 @@ impl Backend for Real {
     fn commit_gates(&mut self, c: &Candidate, dry: bool) -> Vec<Refusal> {
         let mut blocks: Vec<Refusal> = Vec::new();
         let git = self.git();
+        let origin = crate::publish::native_origin(&self.repo);
+        let with_origin =
+            |check: &dyn Fn(&dyn crate::ledger::Origin) -> crate::ledger::Result<()>| match &origin
+            {
+                Ok(origin) => check(origin),
+                Err(error) => Err(crate::ledger::Error::new(error.to_string())),
+            };
         if dry && let Err(not) = crate::gates::own_cutter(&git, &c.commit) {
             self.say(&format!(
                 "        note: R's pre-claim gates asked of this cutter, not yet R's own (a real \
@@ -5708,20 +5931,26 @@ impl Backend for Real {
             ),
             (
                 "harness versions",
-                if dry && c.bump_from.is_some() {
-                    crate::gates::harness_versions_bump_writes_at(&git, commit, version)
-                } else {
-                    crate::gates::harness_versions_gate_at(&git, commit, version)
-                }
-                .map(|_| ()),
+                with_origin(&|origin| {
+                    if dry && c.bump_from.is_some() {
+                        crate::gates::harness_versions_bump_writes_at(&git, origin, commit, version)
+                    } else {
+                        crate::gates::harness_versions_gate_at(&git, origin, commit, version)
+                    }
+                    .map(|_| ())
+                }),
             ),
             (
                 "handoff fixtures",
-                crate::gates::handoff_fixture_gate_at(&git, commit, version).map(|_| ()),
+                with_origin(&|origin| {
+                    crate::gates::handoff_fixture_gate_at(&git, origin, commit, version).map(|_| ())
+                }),
             ),
             (
                 "handoff policy",
-                crate::gates::handoff_policy_gate_at(&git, commit, version).map(|_| ()),
+                with_origin(&|origin| {
+                    crate::gates::handoff_policy_gate_at(&git, origin, commit, version).map(|_| ())
+                }),
             ),
         ];
         for (name, outcome) in gates {
@@ -5774,11 +6003,15 @@ impl Backend for Real {
     fn head_gates(&mut self, c: &Candidate) -> Vec<Refusal> {
         let mut found = Vec::new();
         let git = self.git();
+        let origin = match crate::publish::native_origin(&self.repo) {
+            Ok(origin) => origin,
+            Err(error) => return vec![cut_refusal("native origin", &error.to_string())],
+        };
         let (commit, version) = (c.commit.as_str(), c.version.as_str());
-        if let Err(e) = crate::gates::handoff_fixture_gate_at(&git, commit, version) {
+        if let Err(e) = crate::gates::handoff_fixture_gate_at(&git, &origin, commit, version) {
             found.push(cut_refusal("handoff fixtures", &e.to_string()));
         }
-        if let Err(e) = crate::gates::handoff_policy_gate_at(&git, commit, version) {
+        if let Err(e) = crate::gates::handoff_policy_gate_at(&git, &origin, commit, version) {
             found.push(cut_refusal("handoff policy", &e.to_string()));
         }
         found
@@ -5799,7 +6032,8 @@ impl Backend for Real {
             )
         };
         let git = self.git();
-        let fetched = crate::ledger::git_ok(&git, &["fetch", "origin", "main"]);
+        let fetched = crate::publish::native_origin(&self.repo)
+            .and_then(|native| native.refresh_main().map_err(crate::ledger::Error::new));
         if fetched.is_ok()
             && let Ok(Some(found)) = crate::fixtures::on_commit(&git, "origin/main", &c.version)
         {
@@ -5834,9 +6068,15 @@ impl Backend for Real {
         let log = self.step_log(self.step);
         let landed = crate::fixtures::land(
             &git,
+            &crate::publish::native_origin(&self.repo).map_err(|why| {
+                Refusal::new(
+                    "cannot bind fixture landing to this workspace's native origin",
+                    "restore the configured repository matching Cargo.toml before rerunning",
+                )
+                .detail([why.to_string()])
+            })?,
             &staged,
             &pins,
-            crate::ledger::MAX_CLAIM_ATTEMPTS,
             &mut |preview| match &mut reader {
                 Ok(reader) => reader.read(&targo, preview, &pins, &mut |cmd| {
                     self.captured(self.step, prover, &log, cmd)
@@ -5892,7 +6132,14 @@ impl Backend for Real {
             source: &c.commit,
         };
         let version = c.version.clone();
-        crate::ledger::reserve(&self.git(), &plan, &|source, main| {
+        let origin = crate::publish::native_origin(&self.repo).map_err(|why| {
+            Refusal::new(
+                "cannot bind the native source origin to this workspace",
+                "restore the configured repository matching Cargo.toml before rerunning",
+            )
+            .detail([why.to_string()])
+        })?;
+        crate::ledger::reserve(&self.git(), &origin, &plan, &|source, main| {
             crate::changelog::claim_changelogs(source, main, &version, &date)
         })
         .map(|r| Reservation {
@@ -6403,20 +6650,13 @@ pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
     };
     #[cfg(not(unix))]
     let inherited_line = None;
-    let retired_deps = if matches!(
+    // Retirement is cleanup: `retire` keeps a target it cannot certify clear, so one it could not
+    // retire is stated once Real exists and the release goes on.
+    let retirement = matches!(
         crate::cutter::running_stamp(),
         Ok(crate::cutter::Stamp::Proved(_))
-    ) {
-        match crate::release_target::retire(repo) {
-            Ok(entries) => Some(entries),
-            Err(why) => {
-                eprintln!("release target retirement: {why}");
-                return 2;
-            }
-        }
-    } else {
-        None
-    };
+    )
+    .then(|| crate::release_target::retire(repo));
     interrupt::install();
     let line = if !opts.dry_run && inherited_line.is_none() {
         match aterm_capacity::admit(
@@ -6446,18 +6686,25 @@ pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
             return 2;
         }
     };
-    if let Some(entries) = retired_deps {
-        real.say(&format!(
-            "release: retired the legacy in-tree target; deps entries remaining: {entries}"
-        ));
-        real.say(&format!(
-            "release-event: {}",
-            aterm_json::json!({
-                "schema": 1,
-                "event": "target-retired",
-                "deps_entries": entries,
-            })
-        ));
+    match retirement {
+        Some(Ok(entries)) => {
+            real.say(&format!(
+                "release: retired the legacy in-tree target; deps entries remaining: {entries}"
+            ));
+            real.say(&format!(
+                "release-event: {}",
+                aterm_json::json!({
+                    "schema": 1,
+                    "event": "target-retired",
+                    "deps_entries": entries,
+                })
+            ));
+        }
+        Some(Err(why)) => real.say(&format!(
+            "release: kept the legacy in-tree target ({why}); the release goes on, and a later \
+             cut retires it"
+        )),
+        None => {}
     }
     real.line_priority = line;
     real.argv = opts.exec_args(std::env::args_os().skip(1).collect());
@@ -6528,10 +6775,15 @@ fn checked_with(
     let git = GitCli::new(repo);
     let (cut, export, wasm32) = opts.sections();
     let found = if cut {
+        let native = crate::publish::native_origin(repo);
+        let origin = native
+            .as_ref()
+            .map(|origin| origin as &dyn crate::ledger::Origin)
+            .map_err(|error| crate::ledger::Error::new(error.to_string()));
         if opts.source {
-            crate::gates::precheck_source(&git, rev)
+            crate::gates::precheck_source(&git, origin, rev)
         } else {
-            crate::gates::precheck(&git, rev)
+            crate::gates::precheck(&git, origin, rev)
         }
     } else {
         Precheck::of(&git, rev)
@@ -6664,6 +6916,244 @@ mod engine_tests;
 
 #[cfg(test)]
 mod tests {
+    pub(super) fn bind_native_engine_fixture(repo: &Path, bare: &Path) {
+        let git = GitCli::new(repo);
+        crate::ledger::git_ok(
+            &git,
+            &["config", "remote.fixture.url", bare.to_str().unwrap()],
+        )
+        .unwrap();
+        crate::ledger::git_ok(
+            &git,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://github.com/fixture/app.git",
+            ],
+        )
+        .unwrap();
+    }
+
+    fn native_engine_fixture(
+        repo: &Path,
+        authority: &Path,
+    ) -> Result<crate::github_remote::Remote, String> {
+        crate::github_remote::engine_fixture(repo, authority)
+    }
+
+    pub(super) fn fixture_engine_url(repo: &Path) -> Result<String, String> {
+        let configured = engine_origin_url(repo)?;
+        if !crate::publish::github_slug_from_remote_url(&configured)
+            .is_ok_and(|slug| slug == "fixture/app")
+        {
+            return Ok(configured);
+        }
+        crate::ledger::git_ok(
+            &GitCli::new(repo),
+            &["config", "--get", "remote.fixture.url"],
+        )
+        .map(|out| out.stdout_utf8().trim().to_string())
+        .or_else(|_| engine_origin_url(repo))
+    }
+
+    /// The native writer may canonicalize transport to SSH. Only the fixture repository
+    /// maps to the local bare; a different origin keeps its identity even with stale metadata.
+    #[test]
+    fn fixture_engine_origin_survives_transport_normalization_but_not_retargeting() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let repo = root.path().join("engine");
+        let bare = root.path().join("engine.git");
+        crate::ledger::testing::init(&repo, &[]);
+        std::fs::create_dir(&bare).unwrap();
+        bind_native_engine_fixture(&repo, &bare);
+        let git = GitCli::new(&repo);
+        crate::ledger::git_ok(
+            &git,
+            &[
+                "config",
+                "url.git@github.com:fixture/app.git.insteadOf",
+                "https://github.com/fixture/app.git",
+            ],
+        )
+        .unwrap();
+        for url in [
+            "https://github.com/fixture/app.git",
+            "git@github.com:fixture/app.git",
+            "ssh://git@github.com/fixture/app.git",
+        ] {
+            crate::ledger::git_ok(&git, &["remote", "set-url", "origin", url]).unwrap();
+            if url == "https://github.com/fixture/app.git" {
+                assert_eq!(
+                    engine_origin_url(&repo).unwrap(),
+                    "git@github.com:fixture/app.git"
+                );
+            }
+            assert_eq!(
+                fixture_engine_url(&repo).unwrap(),
+                bare.display().to_string()
+            );
+        }
+        let other = "git@github.com:another/app.git";
+        crate::ledger::git_ok(&git, &["remote", "set-url", "origin", other]).unwrap();
+        let resolved = fixture_engine_url(&repo).unwrap();
+        assert_eq!(
+            crate::publish::github_slug_from_remote_url(&resolved).unwrap(),
+            "another/app"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn engine_audit_rows_use_the_native_expected_main_and_reject_retargeting() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let engine = root.path().join("engine");
+        let bare = root.path().join("engine.git");
+        crate::ledger::testing::init(
+            &engine,
+            &[
+                ("user.name", "fixture"),
+                ("user.email", "fixture@example.invalid"),
+                ("commit.gpgsign", "false"),
+            ],
+        );
+        let git = GitCli::new(&engine);
+        std::fs::write(engine.join("verification-log.jsonl"), "").unwrap();
+        crate::ledger::git_ok(&git, &["add", "verification-log.jsonl"]).unwrap();
+        crate::ledger::git_ok(&git, &["commit", "-qm", "initial audit"]).unwrap();
+        crate::ledger::git_ok(
+            &GitCli::new(root.path()),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                engine.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        bind_native_engine_fixture(&engine, &bare);
+        let mut real = Real::new(&engine, Some(&engine), true, false).unwrap();
+        real.engine_origin = native_engine_fixture;
+        std::fs::write(engine.join("verification-log.jsonl"), "{\"row\":1}\n").unwrap();
+        real.engine_fast_forward().unwrap();
+        let remote = GitCli::new(&bare);
+        assert_eq!(
+            crate::ledger::git_ok(&remote, &["show", "refs/heads/main:verification-log.jsonl"])
+                .unwrap()
+                .stdout_utf8(),
+            "{\"row\":1}\n"
+        );
+        assert_eq!(real.engine_git(&["status", "--porcelain"]).unwrap(), "");
+        let before = crate::ledger::rev_parse(&remote, "refs/heads/main").unwrap();
+        crate::ledger::git_ok(
+            &git,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://github.com/foreign/app.git",
+            ],
+        )
+        .unwrap();
+        std::fs::write(
+            engine.join("verification-log.jsonl"),
+            "{\"row\":1}\n{\"row\":2}\n",
+        )
+        .unwrap();
+        assert!(real.engine_fast_forward().is_err());
+        assert_eq!(
+            crate::ledger::rev_parse(&remote, "refs/heads/main").unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read_to_string(engine.join("verification-log.jsonl")).unwrap(),
+            "{\"row\":1}\n{\"row\":2}\n"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_valid_retargeted_engine_adapter_cannot_replace_the_captured_authority() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let engine = root.path().join("engine");
+        let bare = root.path().join("engine.git");
+        crate::ledger::testing::init(
+            &engine,
+            &[
+                ("user.name", "fixture"),
+                ("user.email", "fixture@example.invalid"),
+                ("commit.gpgsign", "false"),
+            ],
+        );
+        let git = GitCli::new(&engine);
+        std::fs::write(engine.join("verification-log.jsonl"), "").unwrap();
+        crate::ledger::git_ok(&git, &["add", "verification-log.jsonl"]).unwrap();
+        crate::ledger::git_ok(&git, &["commit", "-qm", "initial audit"]).unwrap();
+        crate::ledger::git_ok(
+            &GitCli::new(root.path()),
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                engine.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        bind_native_engine_fixture(&engine, &bare);
+        crate::ledger::git_ok(
+            &git,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://github.com/earlier/engine.git",
+            ],
+        )
+        .unwrap();
+        let mut real = Real::new(&engine, Some(&engine), true, false).unwrap();
+        // This new native adapter is itself valid and permitted. The common
+        // production binding must still reject its different captured slug.
+        crate::ledger::git_ok(
+            &git,
+            &[
+                "config",
+                "remote.origin.url",
+                "https://github.com/fixture/app.git",
+            ],
+        )
+        .unwrap();
+        real.engine_origin = native_engine_fixture;
+        assert!(
+            native_engine_fixture(&engine, &engine)
+                .unwrap()
+                .repository()
+                .eq_full_name("fixture/app")
+        );
+        let remote = GitCli::new(&bare);
+        let before = crate::ledger::rev_parse(&remote, "refs/heads/main").unwrap();
+        std::fs::write(engine.join("verification-log.jsonl"), "{\"row\":1}\n").unwrap();
+        let error = real.engine_fast_forward().unwrap_err();
+        assert!(format!("{error:?}").contains("captured authority"));
+        assert_eq!(
+            crate::ledger::rev_parse(&remote, "refs/heads/main").unwrap(),
+            before
+        );
+        assert_eq!(
+            git.git(&[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/remotes/origin/main"
+            ])
+            .unwrap()
+            .status,
+            1,
+            "refused before the native main refresh records its snapshot"
+        );
+        assert_eq!(
+            std::fs::read_to_string(engine.join("verification-log.jsonl")).unwrap(),
+            "{\"row\":1}\n"
+        );
+    }
+
     /// THE QUALIFY POOL GOES ONLY TO THE BRANCH CHILDREN THAT ADOPT IT: with step 4's pool made
     /// (one claim of every core, a quarter of them the export's), `ship build` is handed the whole
     /// pool and the tree's verify the pool less the export's share, each as
@@ -7486,7 +7976,16 @@ mod tests {
             std::fs::write(engine.join("verification-log.jsonl"), "").unwrap();
             git(&engine, &["add", "-A"]);
             git(&engine, &["commit", "-q", "-m", "stub"]);
-            git(&engine, &["push", "-q", "--force", "origin", "main"]);
+            git(
+                &engine,
+                &[
+                    "push",
+                    "-q",
+                    "--force",
+                    engine_origin.to_str().unwrap(),
+                    "main",
+                ],
+            );
         };
         std::fs::write(
             repo.join("Cargo.toml"),
@@ -7504,7 +8003,9 @@ mod tests {
             ..CheckOptions::default()
         };
         let export_built = |commit: &str, build: CheckoutBuild| {
+            bind_native_engine_fixture(&engine, &engine_origin);
             let found = checked_with(&repo, &opts(commit, &engine), |real| {
+                real.engine_origin = native_engine_fixture;
                 real.prerequisite_acquire = crate::managed_prerequisites::simulated;
                 real.checkout_build = build;
                 // This test builds the checkout's agh, whatever PUBLISH_AGH its caller set.
@@ -7544,7 +8045,7 @@ mod tests {
                     "-m",
                     "advance during agh build",
                 ],
-                vec!["push", "-q", "origin", "main"],
+                vec!["push", "-q", "fixture", "main"],
             ] {
                 let out = crate::ledger::testing::git()
                     .current_dir(&real.engine)
@@ -8009,7 +8510,9 @@ mod tests {
                 assert_eq!(read("vendor/sub/s.sh"), "#!/bin/sh\n", "{}", tree.display());
             }
         };
-        let real = Real::new(&repo, Some(&repo), true, false).unwrap();
+        bind_native_engine_fixture(&repo, &root.join("aterm.git"));
+        let mut real = Real::new(&repo, Some(&repo), true, false).unwrap();
+        real.engine_origin = native_engine_fixture;
         let scratch = Scratch {
             dir: root.join("scratch"),
             cache: root.join("cache"),
@@ -8023,17 +8526,39 @@ mod tests {
         fs::create_dir_all(&archive).unwrap();
         assert!(real.archive_into(&r, &archive));
         lf(&archive, "one\n", true);
+        // The engine segment above uses its explicit native fixture. The
+        // placement segment exercises the existing local-file route; keep its
+        // authority local rather than accidentally selecting network Git.
+        run_crlf_git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                root.join("aterm.git").to_str().unwrap(),
+            ],
+        );
         let place = |commit: &str| {
             let source = crate::gates::PublishedSource {
                 commit: commit.to_string(),
                 verified_at: "2026-10-21T00:00:00+00:00".to_string(),
             };
-            crate::gates::place_published(&GitCli::new(&repo), &repo, &source).unwrap()
+            let git = GitCli::new(&repo);
+            let origin = crate::gates::fixture_origin::FixtureOrigin(&git);
+            crate::gates::place_published(&git, &origin, &repo, &source).unwrap()
         };
         lf(&place(&r).tree, "one\n", true);
         write_crlf_fixture_file(&repo.join("notes.txt"), "one\ntwo\n");
         run_crlf_git(&repo, &["commit", "-q", "-am", "two"]);
-        run_crlf_git(&repo, &["push", "-q", "origin", "main"]);
+        run_crlf_git(
+            &repo,
+            &[
+                "push",
+                "-q",
+                root.join("aterm.git").to_str().unwrap(),
+                "main",
+            ],
+        );
         let source = run_crlf_git(&repo, &["rev-parse", "HEAD"]);
         let moved = place(&source);
         assert!(moved.moved);
@@ -8049,8 +8574,10 @@ mod tests {
             crate::changelog::claim_changelogs(source, main, "0.26.0", "2026-10-21")
         };
         let cut = GitCli::new(&moved.tree);
-        let reserved = crate::ledger::reserve(&cut, &plan, &rolls).unwrap();
-        crate::ledger::claim(&cut, &moved.tree, &plan, &reserved, &rolls).unwrap();
+        bind_native_engine_fixture(&moved.tree, &root.join("aterm.git"));
+        let native = native_engine_fixture(&moved.tree, &moved.tree).unwrap();
+        let reserved = crate::ledger::reserve(&cut, &native, &plan, &rolls).unwrap();
+        crate::ledger::claim(&cut, &native, &moved.tree, &plan, &reserved, &rolls).unwrap();
         let rolled = fs::read_to_string(moved.tree.join("CHANGELOG.md")).unwrap();
         assert!(
             rolled.contains("## [0.26.0]") && !rolled.contains('\r'),
@@ -8580,9 +9107,12 @@ mod tests {
         engine_git
             .git(&["remote", "add", "origin", &origin.display().to_string()])
             .unwrap();
+        bind_native_engine_fixture(&engine, &origin);
         // A real run's backend (a dry one makes no engine to stage from), its logs its own.
         let backend = |engine: &Path, logs: &str| {
             let mut real = Real::new(&repo, Some(engine), false, false).unwrap();
+            real.engine_origin = native_engine_fixture;
+            real.engine_url = fixture_engine_url;
             real.logs = dir.path().join(logs);
             std::fs::create_dir_all(&real.logs).unwrap();
             real

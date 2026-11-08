@@ -103,7 +103,7 @@ impl Helper {
         for path in Self::locations(sys, user)? {
             let target = sys.canonicalize(&path).and_then(|target| {
                 let stat = sys.stat(&target)?;
-                if stat.dir {
+                if stat.dir || stat.symlink || stat.len == 0 || stat.mode & 0o111 == 0 {
                     return Err(std::io::ErrorKind::InvalidInput.into());
                 }
                 Ok(target)
@@ -120,7 +120,7 @@ impl Helper {
     pub(crate) fn unavailable(sys: &dyn System, user: &User) -> String {
         match Self::locations(sys, user) {
             Ok(paths) => format!(
-                "aterm's GitHub helper has no regular installed command at {}; repair its installation",
+                "aterm's GitHub helper has no nonempty executable installed command at {}; repair its installation",
                 paths
                     .iter()
                     .map(|path| path.display().to_string())
@@ -135,7 +135,7 @@ impl Helper {
     }
 
     /// The helper over the vault's `~/.secrets/gh_access_token`; `None` while `user` has no
-    /// installed command or it is a link to nothing.
+    /// nonempty executable installed command.
     pub(crate) fn vault(sys: &dyn System, user: &User) -> Option<Self> {
         Self::run(sys, user, String::new())
     }
@@ -285,7 +285,7 @@ impl Git {
 
     /// Whether the git this runs is installed.
     pub(crate) fn installed(&self, sys: &dyn System) -> bool {
-        sys.stat(&self.program).is_ok_and(|stat| !stat.dir)
+        crate::items::github::git_executable_target(sys, &self.program).is_some()
     }
 
     /// A git run as `user` (this process's own account for `None`) that can never prompt.
@@ -424,20 +424,24 @@ impl Git {
     /// earlier file names is left in the list of a host whose helper key the block names. A
     /// section of someone else's, in that file or a later one, keeps what it names, and every
     /// other setting (`[user]`, `[url …]`) stays. The caller journals [`KeychainBlock::revert`]
-    /// first. `git config --unset-all` exits 5 with empty output when a key is already absent.
+    /// first. Recheck caller admission before every mutating command; an already started
+    /// command may finish. `git config --unset-all` exits 5 with empty output when a key is
+    /// already absent.
     ///
     /// # Errors
-    /// A `git config` run did not complete or failed (output withheld): the files may then hold
-    /// part of the change, which the revert puts back.
+    /// Admission was withdrawn, or a `git config` run did not complete or failed (output
+    /// withheld): the files may then hold part of the change, which the revert puts back.
     pub(crate) fn replace_keychain_block(
         &self,
         sys: &dyn System,
         user: &User,
         block: &KeychainBlock,
         helper: &Helper,
+        admit: &dyn Fn() -> Result<(), String>,
     ) -> Result<(), String> {
         for replacement in &block.replacements {
             let config = |args: &[&str], absent_ok: bool| -> Result<(), String> {
+                admit()?;
                 let ran = sys
                     .run_complete_stdout(
                         &self
@@ -1072,7 +1076,7 @@ pub(crate) mod script {
 
     /// `user`'s launcher in place on `sys`, so aterm's helper ([`Helper::vault`]) is there.
     pub(crate) fn launcher(sys: &Fake, user: &User) {
-        sys.file(
+        sys.executable(
             &aterm_types::installed_command::legacy(Path::new(&user.home))[0].to_string_lossy(),
             b"launcher",
         );
@@ -1897,7 +1901,7 @@ mod tests {
         let who = alice();
         let mac = || {
             let sys = Fake::default();
-            sys.file(crate::items::github::CLT_GIT, b"git");
+            sys.executable(crate::items::github::CLT_GIT, b"git");
             sys
         };
         let work = "/Users//alice/work.inc";
@@ -2125,7 +2129,7 @@ mod tests {
                 len: bytes.len() as u64,
             },
         );
-        sys.file(declared.to_str().unwrap(), b"declared command");
+        sys.executable(declared.to_str().unwrap(), b"declared command");
         let helper = Helper::vault(&sys, &who).unwrap();
         script::hands_back(&sys, &who, &helper, TOKEN);
         assert!(
@@ -2176,7 +2180,7 @@ mod tests {
         );
         let mut dir = who.clone();
         dir.home = "/Users//alice/a dir".into();
-        sys.file("/Users//alice/a dir/.local/bin/aterm", b"launcher");
+        sys.executable("/Users//alice/a dir/.local/bin/aterm", b"launcher");
         assert_eq!(
             Helper::vault(&sys, &dir).unwrap().value(),
             "!'/Users//alice/a dir/.local/bin/aterm' secrets git-credential"
@@ -2184,7 +2188,7 @@ mod tests {
         let custom = PathBuf::from("/custom store/aterm");
         let custom_bin = "/custom bin/aterm";
         sys.link(custom_bin, custom.to_str().unwrap());
-        sys.file(custom.to_str().unwrap(), b"installed command");
+        sys.executable(custom.to_str().unwrap(), b"installed command");
         let record = aterm_types::installed_command::path(Path::new(&who.home));
         let bytes = aterm_types::installed_command::Selection::new(custom)
             .unwrap()
@@ -2208,9 +2212,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn helper_requires_a_nonempty_executable_launcher() {
+        let who = alice();
+        let launcher = aterm_types::installed_command::legacy(Path::new(&who.home))[0].clone();
+        let launcher = launcher.to_str().unwrap();
+        for executable in [false, true] {
+            for bytes in [b"".as_slice(), b"launcher".as_slice()] {
+                let sys = Fake::default();
+                if executable {
+                    sys.executable(launcher, bytes);
+                } else {
+                    sys.file(launcher, bytes);
+                }
+                let admitted = executable && !bytes.is_empty();
+                assert_eq!(Helper::vault(&sys, &who).is_some(), admitted);
+                assert_eq!(
+                    Helper::token_file(&sys, &who, "alice", Path::new("/token"), None).is_some(),
+                    admitted
+                );
+            }
+        }
+        let sys = Fake::default();
+        sys.link(launcher, launcher);
+        assert!(Helper::vault(&sys, &who).is_none());
+        assert!(sys.calls().is_empty(), "admission starts no command");
+    }
+
     /// The launcher is a link into the installed app, so the file behind it decides. Negative
-    /// controls: a link to nothing and a link to a folder are no launcher; a plain file, as a test
-    /// seeds, and a link to the app's binary are.
+    /// controls: a link to nothing and a link to a folder are no launcher; an executable file
+    /// and a link to the app's executable binary are.
     #[test]
     fn a_launcher_link_to_nothing_is_no_launcher() {
         let who = alice();
@@ -2220,7 +2251,7 @@ mod tests {
         let sys = Fake::default();
         sys.link(launcher, app);
         assert_eq!(Helper::vault(&sys, &who), None, "the app moved away");
-        sys.file(app, b"aterm");
+        sys.executable(app, b"aterm");
         assert!(Helper::vault(&sys, &who).is_some(), "the app is there");
 
         let sys = Fake::default();
@@ -2243,7 +2274,7 @@ mod tests {
         assert!(Helper::vault(&sys, &who).is_some(), "a plain file");
 
         let sys = Fake::root();
-        sys.file(store.to_str().unwrap(), b"legacy store command");
+        sys.executable(store.to_str().unwrap(), b"legacy store command");
         assert!(
             Helper::vault(&sys, &who)
                 .unwrap()
@@ -2273,7 +2304,7 @@ mod tests {
             None,
             "declared missing target does not fall back"
         );
-        sys.file(declared.to_str().unwrap(), b"repaired command");
+        sys.executable(declared.to_str().unwrap(), b"repaired command");
         assert!(
             Helper::vault(&sys, &who)
                 .unwrap()
@@ -2296,6 +2327,7 @@ mod tests {
             declared.to_str().unwrap(),
             crate::port::Stat {
                 dir: false,
+                mode: 0o755,
                 ..policy
             },
         );
@@ -2582,7 +2614,7 @@ mod tests {
             (vec![HELPER, USERNAME, USE_PATH], vec![HELPER, GIST_HELPER])
         );
         let revert = found.revert().to_owned();
-        git.replace_keychain_block(&live, &who, &found, &ours)
+        git.replace_keychain_block(&live, &who, &found, &ours, &|| Ok(()))
             .unwrap();
         let after = std::fs::read_to_string(&gitconfig).unwrap();
         assert!(
@@ -2707,7 +2739,7 @@ mod tests {
             keys(&found),
             (vec![HELPER, USERNAME, USE_PATH], vec![HELPER, GIST_HELPER])
         );
-        git.replace_keychain_block(&live, &who, &found, &ours)
+        git.replace_keychain_block(&live, &who, &found, &ours, &|| Ok(()))
             .unwrap();
         let after = text(&xdg);
         assert!(
@@ -2741,7 +2773,7 @@ mod tests {
             .unwrap();
         let both = block().expect("a block in each file");
         assert_eq!(both.replacements.len(), 2, "{both:?}");
-        git.replace_keychain_block(&live, &who, &both, &ours)
+        git.replace_keychain_block(&live, &who, &both, &ours, &|| Ok(()))
             .unwrap();
         assert!(!text(&xdg).contains(OSXKEYCHAIN), "{}", text(&xdg));
         assert!(
@@ -2762,7 +2794,7 @@ mod tests {
             .unwrap();
         let beside = block().expect("the block in ~/.gitconfig");
         assert_eq!(only(&beside).file, gitconfig);
-        git.replace_keychain_block(&live, &who, &beside, &ours)
+        git.replace_keychain_block(&live, &who, &beside, &ours, &|| Ok(()))
             .unwrap();
         assert_eq!(text(&xdg), vault);
         assert!(
@@ -2820,7 +2852,7 @@ mod tests {
             1,
             "the settings read alone: no helper ran"
         );
-        git.replace_keychain_block(&live, &who, &found, &ours)
+        git.replace_keychain_block(&live, &who, &found, &ours, &|| Ok(()))
             .unwrap();
         let after = std::fs::read_to_string(&gitconfig).unwrap();
         assert!(!after.contains("auth git-credential"), "{after}");

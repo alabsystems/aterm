@@ -8,7 +8,7 @@ use std::time::Duration;
 const ACTOR: &str = "ATERM_PRODUCER_PROOF_FIXTURE";
 const SOURCE: &str = "ATERM_PRODUCER_PROOF_SOURCE";
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(30)
+    crate::fixture_deadline(Instant::now())
 }
 
 #[test]
@@ -83,9 +83,7 @@ fn cached_helper_parent_challenge_and_stale_wrong_answer_refusals() {
             Err(e) => panic!("accept: {e}"),
         }
     };
-    channel
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .unwrap();
+    channel.set_read_timeout(Some(crate::FIXTURE_HANG)).unwrap();
     let peer = aterm_ctl::resource_admission_transport::local_peer(&channel).unwrap();
     assert_eq!(peer.pid, helper.0.id());
     let mut marker = [0; 1];
@@ -143,7 +141,7 @@ fn cached_helper_parent_challenge_and_stale_wrong_answer_refusals() {
                 .send(&challenge.answer().unwrap(), deadline())
                 .unwrap();
         }
-        retained.recv_timeout(Duration::from_secs(30)).unwrap();
+        retained.recv_timeout(crate::FIXTURE_HANG).unwrap();
     });
     assert!(
         TransportProof::authenticate(

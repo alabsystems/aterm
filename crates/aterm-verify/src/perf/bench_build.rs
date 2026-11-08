@@ -244,6 +244,17 @@ pub(crate) struct Targo<'a> {
 }
 
 impl<'a> Targo<'a> {
+    /// Keep a fixture's intermediates separate from the executable being measured.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn with_build_dir(mut self, path: &Path) -> Result<Self, String> {
+        let path = path.to_str().ok_or("fixture build path is not UTF-8")?;
+        self.build_dir = Some(format!(
+            "build.build-dir={}",
+            aterm_toml::Value::String(path.to_owned())
+        ));
+        Ok(self)
+    }
+
     pub(crate) fn new(driver: &'a CargoDriver) -> Self {
         Targo {
             driver,
@@ -366,6 +377,38 @@ fn set_bench_environment(command: &mut Command, env: &str, words: &str, output: 
 
 /// Cargo's exact executable artifact, matched by both target name and target kind.
 pub(crate) fn built_executable(messages: &str, name: &str, kind: &str) -> Result<PathBuf, String> {
+    built_executable_checked(messages, name, kind, |_| Ok(()))
+}
+
+/// A normal debug executable whose compiler profile enables the checkout's lab identity.
+/// Test harnesses and missing or disabled debug assertions cannot supply that fixture.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn built_debug_app(messages: &str, name: &str) -> Result<PathBuf, String> {
+    built_executable_checked(messages, name, "bin", |message| {
+        let profile = message.get("profile");
+        if profile
+            .and_then(|p| p.get("debug_assertions"))
+            .and_then(aterm_json::Value::as_bool)
+            != Some(true)
+            || profile
+                .and_then(|p| p.get("test"))
+                .and_then(aterm_json::Value::as_bool)
+                != Some(false)
+        {
+            return Err(format!(
+                "`{name}` lab fixture requires a normal executable with debug assertions enabled"
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn built_executable_checked(
+    messages: &str,
+    name: &str,
+    kind: &str,
+    accept: impl Fn(&aterm_json::Value) -> Result<(), String>,
+) -> Result<PathBuf, String> {
     let mut selected: Option<PathBuf> = None;
     for line in messages.lines() {
         let Ok(wire) = aterm_json::from_str::<crate::compiler_message::UnitMessage>(line) else {
@@ -374,7 +417,7 @@ pub(crate) fn built_executable(messages: &str, name: &str, kind: &str) -> Result
         let message = match wire {
             crate::compiler_message::UnitMessage::Unit(value) => value,
             crate::compiler_message::UnitMessage::Other => continue,
-            crate::compiler_message::UnitMessage::Ambiguous(_) => {
+            crate::compiler_message::UnitMessage::Ambiguous { .. } => {
                 return Err("compiler reported ambiguous message fields".into());
             }
         };
@@ -395,6 +438,7 @@ pub(crate) fn built_executable(messages: &str, name: &str, kind: &str) -> Result
             == Some(name);
         let bin = kinds.contains(&kind);
         if named && bin {
+            accept(&message)?;
             if selected
                 .as_ref()
                 .is_some_and(|prior| prior.as_os_str() != std::ffi::OsStr::new(path))
@@ -551,6 +595,35 @@ impl Provenance<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lab_app_requires_positive_debug_profile_evidence_and_no_test_harness() {
+        let artifact = |profile: &str| {
+            format!(
+                "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"aterm\",\"kind\":[\"bin\"]}},\"executable\":\"/fixture/aterm\",\"profile\":{profile}}}"
+            )
+        };
+        let valid = artifact(r#"{"debug_assertions":true,"test":false}"#);
+        assert_eq!(
+            built_debug_app(&valid, "aterm").unwrap(),
+            PathBuf::from("/fixture/aterm")
+        );
+        for profile in [
+            r#"{"debug_assertions":false,"test":false}"#,
+            r#"{"debug_assertions":true,"test":true}"#,
+            r#"{"debug_assertions":true}"#,
+            r#"{"test":false}"#,
+            r#"{"debug_assertions":"true","test":false}"#,
+            r#"{"debug_assertions":false,"debug_assertions":true,"test":false}"#,
+        ] {
+            assert!(
+                built_debug_app(&artifact(profile), "aterm").is_err(),
+                "{profile}"
+            );
+        }
+        let release = artifact(r#"{"debug_assertions":false,"test":false}"#);
+        assert!(built_executable(&release, "aterm", "bin").is_ok());
+    }
 
     #[test]
     fn the_built_aterm_is_the_binary_cargo_reports() {

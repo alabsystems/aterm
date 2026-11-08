@@ -1,6 +1,8 @@
 seq v=1 rig=screen program=claude build=2.1.0
 # T1: `aterm ctl key act=approve` from a control client: the box closes by
-# the client, but `passed`: only a proven author's act decides it.
+# the client, but `passed`: only a proven author's act decides it. What the
+# client's key chose on the screen (E8, `e8-ctl-enter-approves-by-ctl.seq`)
+# would; this input carries no key the screen placed.
 see busy
 half
 see prompt bash:not-read-only

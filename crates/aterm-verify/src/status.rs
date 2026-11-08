@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Read observed check completions, partitioning exact per-event invocation identities.
+//! Read check completions and incomplete case metadata by exact per-event invocation identities.
 //! Legacy records remain unattributed; captured source facts never prove the checkout.
 //! This reader grants no check, resource-retirement or land verdict.
 
@@ -24,6 +24,16 @@ pub struct ObservedCheck {
     pub occurrences: usize,
 }
 
+/// Incomplete case evidence, keyed by the full reported test and optional case names.
+/// Names may already have been clipped by the producer; they are not process identities.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedCase {
+    pub test: String,
+    pub case: Option<String>,
+    pub outcomes: BTreeSet<String>,
+    pub occurrences: usize,
+}
+
 /// One diagnostic invocation's observed rows, not a qualification or checkout proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {
@@ -42,6 +52,8 @@ pub struct Observed {
     pub unattributed: Option<Box<Observed>>,
     /// Every successfully parsed finished check, ordered by check name.
     pub checks: Vec<ObservedCheck>,
+    /// Supported failed-case observations, independently of finished checks and terminals.
+    pub early_cases: Vec<ObservedCase>,
     /// Number of complete parsed terminal records in the file.
     pub terminal_records: usize,
     /// Whether one terminal list matches all observed rows; not run attribution.
@@ -71,6 +83,7 @@ fn record_value(line: &str) -> Option<aterm_json::Value> {
 
 fn observe_one(text: &str) -> Observed {
     let mut checks = BTreeMap::<String, ObservedCheck>::new();
+    let mut cases = BTreeMap::<(String, Option<String>), ObservedCase>::new();
     let mut rows = Vec::new();
     let mut terminals = Vec::new();
     let mut malformed = 0;
@@ -87,6 +100,24 @@ fn observe_one(text: &str) -> Observed {
             continue;
         };
         match value["event"].as_str() {
+            Some("test-case-failed") => {
+                let Some((test, case, word)) = failed_case_metadata(&value) else {
+                    // Previously unprojected events cannot alter check/terminal consistency
+                    // merely because their case metadata is unsupported.
+                    unprojected += 1;
+                    continue;
+                };
+                let observed = cases
+                    .entry((test.clone(), case.clone()))
+                    .or_insert_with(|| ObservedCase {
+                        test,
+                        case,
+                        outcomes: BTreeSet::new(),
+                        occurrences: 0,
+                    });
+                observed.outcomes.insert(word);
+                observed.occurrences += 1;
+            }
             Some("check-finished") => {
                 let Some(row) = CheckRow::of_event(line)
                     .filter(|row| !row.check.is_empty() && outcome(&row.word))
@@ -143,12 +174,32 @@ fn observe_one(text: &str) -> Observed {
         invocations: Vec::new(),
         unattributed: None,
         checks: checks.into_values().collect(),
+        early_cases: cases.into_values().collect(),
         terminal_records: terminals.len(),
         terminal_consistency,
         malformed_complete_records: malformed,
         unprojected_records: unprojected,
         trailing_partial,
     }
+}
+
+fn failed_case_metadata(value: &aterm_json::Value) -> Option<(String, Option<String>, String)> {
+    if value["binary_completed"].as_bool() != Some(false)
+        || value["sample_complete"].as_bool() != Some(false)
+    {
+        return None;
+    }
+    let test = value["test"].as_str().filter(|test| !test.is_empty())?;
+    let word = value["outcome"]
+        .as_str()
+        .filter(|word| matches!(*word, "FAIL" | "NOT RUN"))?;
+    let case = value.get("case")?;
+    let case = if case.is_null() {
+        None
+    } else {
+        Some(case.as_str()?.to_owned())
+    };
+    Some((test.to_owned(), case, word.to_owned()))
 }
 
 /// Read exact event identities without inferring them from file order, checkout or headers.
@@ -208,6 +259,17 @@ impl Observed {
                 "check": check.check, "outcomes": check.outcomes.iter().map(String::as_str).collect::<Vec<_>>(),
                 "occurrences": check.occurrences, "conflict": check.outcomes.len() > 1,
             })).collect::<Vec<_>>(),
+            "case_observations_complete": false,
+            "early_cases": self.early_cases.iter().map(|case| {
+                let test = crate::report::clip_json(&case.test, crate::report::EVENT_ROW_BYTES);
+                let name = case.case.as_ref().map(|name| crate::report::clip_json(name, crate::report::EVENT_ROW_BYTES));
+                aterm_json::json!({
+                    "test_truncated":test != case.test, "case_truncated":name != case.case,
+                    "test":test, "case":name,
+                    "outcomes":case.outcomes.iter().map(String::as_str).collect::<Vec<_>>(),
+                    "occurrences":case.occurrences, "conflict":case.outcomes.len() > 1,
+                })
+            }).collect::<Vec<_>>(),
             "terminal_records": self.terminal_records,
             "terminal_consistency": self.terminal_consistency,
             "malformed_complete_records": self.malformed_complete_records,
@@ -259,6 +321,7 @@ impl Observed {
                 }
             ));
         }
+        self.render_cases(&mut out, "");
         out.push_str(&format!("Terminal records: {}; consistency: {}.\nMalformed complete records: {}; unprojected events: {}; trailing partial: {}.\n",
             self.terminal_records, self.terminal_consistency, self.malformed_complete_records,
             self.unprojected_records, self.trailing_partial));
@@ -287,8 +350,52 @@ impl Observed {
                     check.occurrences
                 ));
             }
+            run.observed.render_cases(&mut out, "  ");
         }
         out
+    }
+
+    fn render_cases(&self, out: &mut String, prefix: &str) {
+        if self.early_cases.is_empty() {
+            return;
+        }
+        out.push_str(&format!(
+            "{prefix}Early case observations (incomplete; not check completions):\n"
+        ));
+        for case in &self.early_cases {
+            let test = crate::report::clip_json(&case.test, crate::report::EVENT_ROW_BYTES);
+            let name = case
+                .case
+                .as_ref()
+                .map(|name| crate::report::clip_json(name, crate::report::EVENT_ROW_BYTES));
+            out.push_str(&format!(
+                "{prefix}  test={} case={}: {} ({} observations{}{}{})\n",
+                aterm_json::Value::String(test.clone()),
+                name.clone()
+                    .map_or(aterm_json::Value::Null, aterm_json::Value::String),
+                case.outcomes
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                case.occurrences,
+                if case.outcomes.len() > 1 {
+                    "; conflict"
+                } else {
+                    ""
+                },
+                if test != case.test {
+                    "; test name truncated"
+                } else {
+                    ""
+                },
+                if name != case.case {
+                    "; case name truncated"
+                } else {
+                    ""
+                }
+            ));
+        }
     }
 }
 
@@ -309,7 +416,7 @@ fn arguments(args: &[String]) -> Option<(PathBuf, bool)> {
 /// Exit zero means the file was inspected, regardless of the checks' observed outcomes.
 #[must_use]
 pub fn run(args: &[String], cwd: &Path) -> i32 {
-    const USAGE: &str = "usage: verify status --events <path> [--json]\nRead observed finished checks, invocation groups and captured source observations; no landing verdict.\nExit: 0 inspected, 2 usage, 3 file unavailable.\n";
+    const USAGE: &str = "usage: verify status --events <path> [--json]\nRead recorded check completions, incomplete case observations, invocation groups and captured source observations; no landing verdict.\nExit: 0 inspected, 2 usage, 3 file unavailable.\n";
     if matches!(args, [help] if help == "--help" || help == "-h") {
         print!("{USAGE}");
         return crate::exit::PASS;
@@ -338,6 +445,240 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
 mod tests {
     use super::*;
     use crate::{Check, Outcome};
+
+    const FAILED_CASE: &str = r#"verify-event: {"schema":1,"event":"test-case-failed","outcome":"FAIL","test":"-p fixture --lib","case":"t::a","binary_completed":false,"sample_complete":false}"#;
+
+    #[test]
+    fn case_observations_keep_repeats_conflicts_and_null_or_empty_reported_names() {
+        let mut refused: aterm_json::Value =
+            aterm_json::from_str(FAILED_CASE.strip_prefix("verify-event: ").unwrap()).unwrap();
+        refused.as_object_mut().unwrap().insert(
+            "outcome".into(),
+            aterm_json::Value::String("NOT RUN".into()),
+        );
+        let mut unnamed = refused.clone();
+        unnamed
+            .as_object_mut()
+            .unwrap()
+            .insert("case".into(), aterm_json::Value::Null);
+        let mut empty = refused.clone();
+        empty
+            .as_object_mut()
+            .unwrap()
+            .insert("case".into(), aterm_json::Value::String(String::new()));
+        let observed = observe(&format!(
+            "{FAILED_CASE}\n{FAILED_CASE}\nverify-event: {refused}\nverify-event: {unnamed}\nverify-event: {empty}\n"
+        ));
+        assert_eq!(observed.early_cases.len(), 3);
+        let named = observed
+            .early_cases
+            .iter()
+            .find(|case| case.case.as_deref() == Some("t::a"))
+            .unwrap();
+        assert_eq!(named.occurrences, 3);
+        assert_eq!(
+            named
+                .outcomes
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["FAIL", "NOT RUN"]
+        );
+        assert!(observed.early_cases.iter().any(|case| case.case.is_none()));
+        assert!(
+            observed
+                .early_cases
+                .iter()
+                .any(|case| case.case.as_deref() == Some(""))
+        );
+        assert!(observed.checks.is_empty());
+        assert_eq!(observed.terminal_records, 0);
+        assert_eq!(
+            observed.json()["case_observations_complete"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn unsupported_case_metadata_and_running_observations_leave_terminal_consistency_unchanged() {
+        let complete = format!(
+            "{}{}",
+            event(Check::Doc),
+            crate::report::run_event(&[result(Check::Doc, Outcome::Ok)], crate::exit::PASS)
+        );
+        let baseline = observe(&complete);
+        for (key, value) in [
+            ("test", aterm_json::Value::Null),
+            ("test", aterm_json::Value::String(String::new())),
+            ("case", aterm_json::json!(3)),
+            ("outcome", aterm_json::Value::String("RUNNING".into())),
+            ("binary_completed", aterm_json::json!(true)),
+            ("sample_complete", aterm_json::Value::Null),
+            (
+                "event",
+                aterm_json::Value::String("test-case-running-long".into()),
+            ),
+        ] {
+            let mut value_of_event: aterm_json::Value =
+                aterm_json::from_str(FAILED_CASE.strip_prefix("verify-event: ").unwrap()).unwrap();
+            value_of_event
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), value);
+            let observed = observe(&format!("{complete}verify-event: {value_of_event}\n"));
+            assert!(observed.early_cases.is_empty());
+            assert_eq!(observed.checks, baseline.checks);
+            assert_eq!(observed.terminal_consistency, baseline.terminal_consistency);
+            assert_eq!(
+                observed.malformed_complete_records,
+                baseline.malformed_complete_records
+            );
+            assert_eq!(
+                observed.unprojected_records,
+                baseline.unprojected_records + 1
+            );
+        }
+        for missing in ["test", "case", "binary_completed", "sample_complete"] {
+            let mut value: aterm_json::Value =
+                aterm_json::from_str(FAILED_CASE.strip_prefix("verify-event: ").unwrap()).unwrap();
+            value.as_object_mut().unwrap().remove(missing);
+            let observed = observe(&format!("{complete}verify-event: {value}\n"));
+            assert!(observed.early_cases.is_empty());
+            assert_eq!(observed.checks, baseline.checks);
+            assert_eq!(observed.terminal_consistency, baseline.terminal_consistency);
+            assert_eq!(
+                observed.malformed_complete_records,
+                baseline.malformed_complete_records
+            );
+            assert_eq!(
+                observed.unprojected_records,
+                baseline.unprojected_records + 1
+            );
+        }
+    }
+
+    #[test]
+    fn case_metadata_obeys_complete_record_bounds_and_exact_invocation_groups() {
+        let first = writer(None);
+        let second = writer(None);
+        let bound = first.prepare(FAILED_CASE);
+        let observed = observe(&format!(
+            "{bound}{}{FAILED_CASE}\n",
+            second.prepare(FAILED_CASE)
+        ));
+        assert_eq!(observed.invocations.len(), 2);
+        assert!(
+            observed
+                .invocations
+                .iter()
+                .all(|group| group.observed.early_cases[0].occurrences == 1)
+        );
+        assert_eq!(
+            observed.unattributed.as_ref().unwrap().early_cases[0].occurrences,
+            1
+        );
+        let crlf = format!("{}\r\n", bound.trim_end_matches('\n'));
+        assert_eq!(observe(&crlf).invocations[0].observed.early_cases.len(), 1);
+        let partial = observe(bound.trim_end_matches('\n'));
+        assert!(partial.early_cases.is_empty());
+        assert!(partial.invocations.is_empty());
+        assert!(partial.trailing_partial);
+        let mut large: aterm_json::Value =
+            aterm_json::from_str(bound.trim().strip_prefix("verify-event: ").unwrap()).unwrap();
+        large.as_object_mut().unwrap().insert(
+            "padding".into(),
+            aterm_json::Value::String("x".repeat(MAX_RECORD_BYTES + 1)),
+        );
+        let oversized = observe(&format!("verify-event: {large}\n"));
+        assert!(oversized.early_cases.is_empty());
+        assert!(oversized.invocations.is_empty());
+        assert_eq!(oversized.malformed_complete_records, 1);
+        let other_source = writer(Some("b".repeat(40))).prepare(FAILED_CASE);
+        let mut conflict: aterm_json::Value =
+            aterm_json::from_str(other_source.trim().strip_prefix("verify-event: ").unwrap())
+                .unwrap();
+        let id = first.id().unwrap().to_owned();
+        conflict
+            .as_object_mut()
+            .unwrap()
+            .get_mut("invocation")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("id".into(), aterm_json::Value::String(id));
+        let conflicted = observe(&format!("{bound}verify-event: {conflict}\n"));
+        assert_eq!(conflicted.invocations.len(), 1);
+        assert!(conflicted.invocations[0].source_conflict);
+        assert!(conflicted.invocations[0].source_observation.is_none());
+        assert_eq!(
+            conflicted.invocations[0].observed.early_cases[0].occurrences,
+            2
+        );
+    }
+
+    #[test]
+    fn clipped_case_presentation_never_merges_full_keys_or_exposes_assertion_fields() {
+        let prefix = "\n\u{1b}\\\"界".repeat(150);
+        let mut text = String::new();
+        for suffix in ["first", "second"] {
+            let mut value: aterm_json::Value =
+                aterm_json::from_str(FAILED_CASE.strip_prefix("verify-event: ").unwrap()).unwrap();
+            let object = value.as_object_mut().unwrap();
+            object.insert(
+                "test".into(),
+                aterm_json::Value::String(format!("{prefix}{suffix}")),
+            );
+            object.insert(
+                "case".into(),
+                aterm_json::Value::String(format!("{prefix}{suffix}")),
+            );
+            for field in ["output", "source_path", "detail", "rerun"] {
+                object.insert(
+                    field.into(),
+                    aterm_json::Value::String(format!("PRIVATE-{field}-SENTINEL")),
+                );
+            }
+            text.push_str(&format!("verify-event: {value}\n"));
+        }
+        let observed = observe(&text);
+        assert_eq!(observed.early_cases.len(), 2);
+        assert!(
+            observed
+                .early_cases
+                .iter()
+                .all(|case| case.occurrences == 1)
+        );
+        let json = observed.json();
+        let cases = json["early_cases"].as_array().unwrap();
+        assert_eq!(cases[0]["test"], cases[1]["test"]);
+        assert!(
+            cases
+                .iter()
+                .all(|case| case["test_truncated"].as_bool() == Some(true))
+        );
+        assert!(
+            cases
+                .iter()
+                .all(|case| case["case_truncated"].as_bool() == Some(true))
+        );
+        assert!(
+            cases
+                .iter()
+                .all(|case| case["test"].to_string().len() <= crate::report::EVENT_ROW_BYTES + 2)
+        );
+        assert!(
+            cases
+                .iter()
+                .all(|case| case["case"].to_string().len() <= crate::report::EVENT_ROW_BYTES + 2)
+        );
+        let rendered = observed.render();
+        assert!(!rendered.contains('\u{1b}'));
+        for field in ["output", "source_path", "detail", "rerun"] {
+            let sentinel = format!("PRIVATE-{field}-SENTINEL");
+            assert!(!json.to_string().contains(&sentinel));
+            assert!(!rendered.contains(&sentinel));
+        }
+    }
 
     fn writer(head: Option<String>) -> crate::event_log::EventLog {
         let ctx = crate::Ctx::new(

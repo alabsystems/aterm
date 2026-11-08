@@ -644,10 +644,10 @@ pub fn held_by(holds: &crate::init::Holds) -> Option<String> {
     }
 }
 
-/// The person's own ways to install the tools, which a run aterm decided names where it asks no
-/// password by itself: System State's card, or an `aterm init` they type, each asking once.
-pub const PERSONS_STEP: &str = "press Install Command Line Tools\u{2026} on System State, or run \
-                                `aterm init --only base.clt` in a terminal";
+/// The person's explicit retry routes when setup asks no password by itself. The terminal
+/// route also covers owed root steps after the tools are installed.
+pub const PERSONS_STEP: &str = "run `aterm init --only base.clt` in a terminal, or use \
+                                Install Command Line Tools\u{2026} in System State when shown";
 
 /// Why a run aterm decided asks no password where this build asked by itself already: its tab,
 /// or an earlier run aterm decided ([`aterm_types::clt_mark`]).

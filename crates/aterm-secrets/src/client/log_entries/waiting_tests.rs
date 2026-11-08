@@ -831,6 +831,16 @@ fn in_flight(race: bool, held: bool) -> InFlight {
         vec!["shared".to_owned()],
         "CONTROL: the view shows v2 waiting"
     );
+    assert!(
+        admin
+            .version_for_requester(&lab.recipients[0], &["shared"])
+            .is_err()
+    );
+    assert!(
+        admin
+            .version_for_requester(&lab.recipients[0], &[crate::commons::ENTRY])
+            .is_ok()
+    );
     let mut doc = admin.doc.clone();
     set(&mut doc, "shared", b"v3");
     CUT_AFTER_STORE.with(|cell| cell.set(true));
@@ -888,6 +898,11 @@ fn a_waiting_write_a_pending_set_rewrites_waits_for_that_set() {
         "the person's own newer edit is never read as overtaken"
     );
     assert!(!log_entries::waiting_file(m22).exists(), "nothing waits");
+    let settled = admin_open(m22).expect("the ordinary sync settled the waiting write");
+    let version = settled
+        .version_for_requester(&run.lab.recipients[0], &["shared"])
+        .expect("the ordinary vault pass covered this entry");
+    assert!(version.claim().log().is_some());
     for paths in &run.lab.all[..4] {
         assert_eq!(reads(paths, true, "shared"), Some(b"v3".to_vec()));
     }

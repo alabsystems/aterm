@@ -1052,11 +1052,6 @@ fn ask<'a>(now: i64, reading: Option<Reading>) -> Ask<'a> {
         on_credits: false,
         attribution: Attribution::Assumed,
         api_key_seen: false,
-        machines: Machines {
-            reported: 1,
-            used: 1,
-            silent: 0,
-        },
         now,
     }
 }
@@ -1210,9 +1205,6 @@ fn each_empty_figure_says_why() {
     assert_eq!(why(&old), (None, Some(Why::Stale)));
     old.newest = Some(tap(300, now - FIVE_H / 10));
     assert_eq!(why(&old), (None, None), "at a tenth exactly");
-    let mut silent = ask(now, r(250));
-    silent.machines.silent = 1;
-    assert_eq!(why(&silent), (None, Some(Why::Stale)));
     let mut shared = ask(now, r(250));
     shared.attribution = Attribution::Unattributed { share: 0.02 };
     assert_eq!(why(&shared).0, Some(Why::Unattributed));

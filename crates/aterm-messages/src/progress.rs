@@ -403,33 +403,6 @@ pub(crate) fn eta_word_change(remaining: Duration) -> Option<Duration> {
     Some(Duration::from_millis(r - below * 1000))
 }
 
-/// Format `eta` for screen-reader announcement.
-#[must_use]
-pub fn eta_spoken(eta: Eta) -> Option<String> {
-    match eta {
-        Eta::Hidden => None,
-        Eta::Stalled => Some("stalled".to_string()),
-        Eta::Remaining(r) => {
-            let s = secs_up(r);
-            if s < 5 {
-                // The paint's `<5 s left`, never "about 5 seconds".
-                return Some("less than 5 seconds left".to_string());
-            }
-            let (n, unit) = if s <= 55 {
-                (5 * s.max(1).div_ceil(5), "second")
-            } else if s < 3570 {
-                (((s + 30) / 60).max(1), "minute")
-            } else if s <= 86_400 {
-                ((s + 1800) / 3600, "hour")
-            } else {
-                return None;
-            };
-            let plural = if n == 1 { "" } else { "s" };
-            Some(format!("about {n} {unit}{plural} left"))
-        }
-    }
-}
-
 /// Format elapsed busy time `e` once it reaches [`ELAPSED_AFTER`].
 #[must_use]
 pub(crate) fn elapsed_words(e: Duration, short: bool) -> Option<String> {
@@ -471,33 +444,6 @@ pub(crate) fn elapsed_word_change(e: Duration) -> Option<Duration> {
         3_600_000
     };
     Some(Duration::from_millis(step - e_ms % step))
-}
-
-/// Format elapsed time `e` for screen-reader announcement (`None` below [`ELAPSED_AFTER`]).
-#[must_use]
-pub fn elapsed_spoken(e: Duration) -> Option<String> {
-    if e < ELAPSED_AFTER {
-        return None;
-    }
-    clock_spoken(e)
-}
-
-/// Format elapsed time `e` for screen-reader announcement without [`ELAPSED_AFTER`] floor.
-#[must_use]
-pub fn clock_spoken(e: Duration) -> Option<String> {
-    let s = e.as_secs();
-    if s == 0 {
-        return None;
-    }
-    let (n, unit) = if s < 60 {
-        (s, "second")
-    } else if s < 3600 {
-        (s / 60, "minute")
-    } else {
-        (s / 3600, "hour")
-    };
-    let plural = if n == 1 { "" } else { "s" };
-    Some(format!("running for {n} {unit}{plural}"))
 }
 
 /// Whether a person is actively waiting on an operation.
@@ -718,7 +664,6 @@ mod tests {
                 );
             }
         }
-        assert_eq!(eta_spoken(Eta::Hidden), None);
     }
 
     /// Every 10 ms over two hours, the words hold until the change and
@@ -976,7 +921,5 @@ mod tests {
         );
         assert_eq!(elapsed_word_change(Duration::from_secs(999 * 3600)), None);
         assert_eq!(elapsed_word_change(Duration::from_secs(1000 * 3600)), None);
-        assert_eq!(elapsed_spoken(Duration::from_secs(3)), None);
-        assert_eq!(clock_spoken(Duration::from_millis(900)), None);
     }
 }

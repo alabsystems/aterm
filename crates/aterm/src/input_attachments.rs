@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Activate accepted keyboard defaults when this login gets a new HID service.
+//! Keep accepted keyboard defaults across service arrival and effective mapping drift.
 
 use aterm_cli::macos_doctor::{InputServiceSet, InputSetupScope};
+use aterm_machines::init::{KeyboardAttachmentActivation, KeyboardAttachmentReceipt};
+use aterm_machines::port::KeyboardServiceObservation;
 use aterm_secrets::converge::{Last, RunnerRetry};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,8 +15,8 @@ use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct Keeper {
-    settled: Option<(u64, Vec<u64>)>,
-    attempted: Option<(u64, Vec<u64>)>,
+    settled: Option<(u64, KeyboardAttachmentReceipt)>,
+    attempted: Option<(u64, Vec<KeyboardServiceObservation>)>,
     retry: RunnerRetry,
 }
 
@@ -22,7 +24,19 @@ struct Keeper {
 struct Inputs {
     keeper: Keeper,
     pending: Option<(u64, InputServiceSet)>,
-    seen: Option<(InputSetupScope, Option<InputServiceSet>)>,
+    seen: Option<Sample>,
+}
+
+struct Sample {
+    scope: InputSetupScope,
+    services: Option<InputServiceSet>,
+    mappings: Option<SampleMappings>,
+}
+
+#[derive(PartialEq, Eq)]
+enum SampleMappings {
+    Observed(Vec<KeyboardServiceObservation>),
+    Verified(KeyboardAttachmentReceipt),
 }
 
 /// Mutable task ownership outlives a failed sampling thread. Only observations are
@@ -207,12 +221,13 @@ impl Inputs {
         now_ms: u64,
         scope: impl FnOnce() -> Result<InputSetupScope, String>,
         services: impl FnOnce() -> Result<Vec<u64>, String>,
-        activate: impl FnOnce(u64, &[u64]) -> Result<Option<bool>, String>,
+        observations: impl FnOnce() -> Result<Vec<KeyboardServiceObservation>, String>,
+        activate: impl FnOnce(u64, &[u64]) -> Result<Option<KeyboardAttachmentActivation>, String>,
         pending_changed: &dyn Fn(),
         invalidated: &dyn Fn(),
     ) -> Result<bool, String> {
         if !at_console {
-            self.observe(InputSetupScope::Inactive, None, invalidated);
+            self.observe(InputSetupScope::Inactive, None, None, invalidated);
             self.keeper = Keeper::default();
             self.pending = None;
             return Ok(false);
@@ -222,28 +237,53 @@ impl Inputs {
             invalidated();
         })?;
         if scope == InputSetupScope::Inactive {
-            self.observe(scope, None, invalidated);
+            self.observe(scope, None, None, invalidated);
             self.keeper = Keeper::default();
             self.pending = None;
             return Ok(false);
         }
-        let services = services().and_then(InputServiceSet::new).inspect_err(|_| {
-            self.seen = None;
-            invalidated();
-        })?;
-        // The sample is already paid for. Retire the previous fact before an
-        // activation can fail or before a pending stage can be resumed.
-        self.observe(scope, Some(services.clone()), invalidated);
         match scope {
             InputSetupScope::Inactive => {
                 unreachable!("inactive scope returned before the hardware sample")
             }
             InputSetupScope::Applied(revision) => {
+                let mut observed = observations().inspect_err(|_| {
+                    self.seen = None;
+                    invalidated();
+                })?;
+                observed.sort_unstable_by_key(KeyboardServiceObservation::registry);
+                let services = InputServiceSet::new(
+                    observed
+                        .iter()
+                        .map(KeyboardServiceObservation::registry)
+                        .collect(),
+                )
+                .inspect_err(|_| {
+                    self.seen = None;
+                    invalidated();
+                })?;
+                // Retire changed live facts even if the profile lock defers their repair.
+                self.observe(scope, Some(services), Some(observed.clone()), invalidated);
                 self.pending = None;
-                self.keeper
-                    .round(now_ms, Some(revision), || Ok(services.into_vec()), activate)
+                let result = self
+                    .keeper
+                    .round(now_ms, Some(revision), || Ok(observed), activate);
+                if matches!(result, Ok(true))
+                    && let Some((_, receipt)) = &self.keeper.settled
+                    && let Some(seen) = &mut self.seen
+                {
+                    // Our own write is not later drift. A reset back to its before-image
+                    // must still invalidate the successful pass's newer readback.
+                    seen.mappings = Some(SampleMappings::Verified(receipt.clone()));
+                }
+                result
             }
             InputSetupScope::Pending(revision) => {
+                let services = services().and_then(InputServiceSet::new).inspect_err(|_| {
+                    self.seen = None;
+                    invalidated();
+                })?;
+                self.observe(scope, Some(services.clone()), None, invalidated);
                 self.keeper = Keeper::default();
                 let current = (revision, services);
                 if self.pending.as_ref() != Some(&current) {
@@ -262,13 +302,32 @@ impl Inputs {
         &mut self,
         scope: InputSetupScope,
         services: Option<InputServiceSet>,
+        observations: Option<Vec<KeyboardServiceObservation>>,
         invalidated: &dyn Fn(),
     ) {
-        let current = (scope, services);
-        if self.seen.as_ref() != Some(&current) {
-            let completed = self.seen.as_ref().is_some_and(|(before, ids)| {
-                matches!((before, scope), (InputSetupScope::Pending(a), InputSetupScope::Applied(b)) if *a == b)
-                    && ids == &current.1
+        let current = Sample {
+            scope,
+            services,
+            mappings: observations.map(SampleMappings::Observed),
+        };
+        let unchanged = self.seen.as_ref().is_some_and(|before| {
+            before.scope == current.scope
+                && before.services == current.services
+                && match (&before.mappings, &current.mappings) {
+                    (
+                        Some(SampleMappings::Verified(receipt)),
+                        Some(SampleMappings::Observed(rows)),
+                    ) => rows
+                        .iter()
+                        .all(|row| row.unread().is_none() && receipt.matches(row)),
+                    (before, current) => before == current,
+                }
+        });
+        if !unchanged {
+            let completed = self.seen.as_ref().is_some_and(|before| {
+                matches!((before.scope, scope), (InputSetupScope::Pending(a), InputSetupScope::Applied(b)) if a == b)
+                    && before.services == current.services
+                    && matches!(&current.mappings, Some(SampleMappings::Observed(rows)) if rows.iter().all(|row| row.unread().is_none()))
             });
             // The owned pass just supplied the full cohort. Recording its
             // completion with the same identities is no new hardware/source.
@@ -329,8 +388,8 @@ impl Keeper {
         sys: &dyn aterm_machines::port::System,
         now_ms: u64,
         revision: impl FnOnce() -> Result<Option<u64>, String>,
-        services: impl FnOnce() -> Result<Vec<u64>, String>,
-        activate: impl FnOnce(u64, &[u64]) -> Result<Option<bool>, String>,
+        services: impl FnOnce() -> Result<Vec<KeyboardServiceObservation>, String>,
+        activate: impl FnOnce(u64, &[u64]) -> Result<Option<KeyboardAttachmentActivation>, String>,
     ) -> Result<bool, String> {
         self.round_with_console(
             sys.euid() != 0 && !aterm_machines::console::remote(sys),
@@ -347,8 +406,8 @@ impl Keeper {
         at_console: bool,
         now_ms: u64,
         revision: impl FnOnce() -> Result<Option<u64>, String>,
-        services: impl FnOnce() -> Result<Vec<u64>, String>,
-        activate: impl FnOnce(u64, &[u64]) -> Result<Option<bool>, String>,
+        services: impl FnOnce() -> Result<Vec<KeyboardServiceObservation>, String>,
+        activate: impl FnOnce(u64, &[u64]) -> Result<Option<KeyboardAttachmentActivation>, String>,
     ) -> Result<bool, String> {
         if !at_console {
             *self = Self::default();
@@ -361,25 +420,38 @@ impl Keeper {
         &mut self,
         now_ms: u64,
         revision: Option<u64>,
-        services: impl FnOnce() -> Result<Vec<u64>, String>,
-        activate: impl FnOnce(u64, &[u64]) -> Result<Option<bool>, String>,
+        services: impl FnOnce() -> Result<Vec<KeyboardServiceObservation>, String>,
+        activate: impl FnOnce(u64, &[u64]) -> Result<Option<KeyboardAttachmentActivation>, String>,
     ) -> Result<bool, String> {
         let Some(revision) = revision else {
             *self = Self::default();
             return Ok(false);
         };
-        let services = InputServiceSet::new(services()?)?.into_vec();
-        let current = (revision, services);
-        if self.settled.as_ref() == Some(&current) {
-            return Ok(false);
-        }
-        let is_new = |id: &u64| {
-            self.settled
-                .as_ref()
-                .is_none_or(|(before, ids)| *before != revision || ids.binary_search(id).is_err())
-        };
-        if !current.1.iter().any(&is_new) {
-            self.settled = Some(current);
+        let mut observed = services()?;
+        observed.sort_unstable_by_key(KeyboardServiceObservation::registry);
+        let registries = InputServiceSet::new(
+            observed
+                .iter()
+                .map(KeyboardServiceObservation::registry)
+                .collect(),
+        )?
+        .into_vec();
+        let current = (revision, observed);
+        let changed: Vec<_> = current
+            .1
+            .iter()
+            .filter(|observation| {
+                self.settled.as_ref().is_none_or(|(before, receipt)| {
+                    *before != revision || !receipt.matches(observation)
+                })
+            })
+            .map(KeyboardServiceObservation::registry)
+            .collect();
+        if changed.is_empty() {
+            if let Some((_, receipt)) = &mut self.settled {
+                receipt.retain(&registries);
+            }
+            self.attempted = None;
             return Ok(false);
         }
         if self.attempted.as_ref() != Some(&current) {
@@ -391,27 +463,29 @@ impl Keeper {
         {
             return Ok(false);
         }
-        let new: Vec<_> = current.1.iter().copied().filter(is_new).collect();
         self.retry.started();
-        let result = activate(revision, &new);
+        let result = activate(revision, &changed);
         self.retry.reaped(
             match &result {
-                Ok(Some(true)) => Last::Ended,
+                Ok(Some(KeyboardAttachmentActivation::Verified(_))) => Last::Ended,
                 Ok(None) => Last::Held,
-                Ok(Some(false)) => Last::Unfinished,
+                Ok(Some(KeyboardAttachmentActivation::Unfinished)) => Last::Unfinished,
                 Err(_) => Last::Failed,
             },
             now_ms,
         );
-        if matches!(result, Ok(Some(true))) {
-            if self.attempted.as_ref() != Some(&current) {
-                self.attempted = Some(current.clone());
+        self.attempted = Some(current);
+        if let Ok(Some(KeyboardAttachmentActivation::Verified(mut verified))) = result {
+            if let Some((before, receipt)) = &mut self.settled
+                && *before == revision
+            {
+                receipt.merge(verified);
+                receipt.retain(&registries);
+            } else {
+                verified.retain(&registries);
+                self.settled = Some((revision, verified));
             }
-            self.settled = Some(current);
             return Ok(true);
-        }
-        if self.attempted.as_ref() != Some(&current) {
-            self.attempted = Some(current);
         }
         result.map(|_| false)
     }
@@ -537,6 +611,9 @@ fn spawn_worker(
             let _ = aterm_log::wait_for_logger(super::EARLY_LOG_WAIT);
             let sys = aterm_machines::port::Live::new();
             while !stop.load(Ordering::Acquire) {
+                if matches!(notifications.pending, PendingOwner::Window(_)) {
+                    super::maintain_observation_dispatch();
+                }
                 let mut actor = actor.lock().unwrap_or_else(PoisonError::into_inner);
                 let Actor {
                     inputs,
@@ -574,6 +651,7 @@ fn spawn_worker(
                     now,
                     || scope.clone(),
                     || sys.keyboard_service_ids(),
+                    || sys.keyboard_service_observations(),
                     |revision, ids| {
                         let (result, retired) = activate_observing(|changing| {
                             aterm_cli::macos_doctor::activate_input_attachments(
@@ -655,6 +733,93 @@ fn spawn_worker_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_machines::port::System as _;
+
+    fn keyboard_dump(registries: &[u64], native: &[(i64, i64)]) -> String {
+        let pairs = native
+            .iter()
+            .map(|(source, destination)| {
+                format!("<dict><key>Src</key><integer>{source}</integer><key>Dst</key><integer>{destination}</integer></dict>")
+            })
+            .collect::<String>();
+        let services = registries
+            .iter()
+            .map(|registry| {
+                format!(
+                    "<dict><key>IORegistryEntryID</key><integer>{registry}</integer>\
+                     <key>PrimaryUsagePage</key><integer>1</integer>\
+                     <key>PrimaryUsage</key><integer>6</integer>\
+                     <key>ServiceFilterDebug</key><array><dict><key>plugin</key><dict>\
+                     <key>Class</key><string>IOHIDKeyboardFilter</string>\
+                     <key>HIDKeyboardModifierMappingPairs</key><array>{pairs}</array>\
+                     <key>UserKeyMapping</key><array/>\
+                     <key>FnFunctionUsageMap</key><array/>\
+                     <key>FnKeyboardUsageMap</key><array/>\
+                     <key>NumLockKeyboardUsageMap</key><array/>\
+                     </dict></dict></array></dict>"
+                )
+            })
+            .collect::<String>();
+        format!(
+            "<plist version=\"1.0\"><dict><key>ServiceRecords</key><array>{services}</array></dict></plist>"
+        )
+    }
+
+    /// Reuse the real Fake input ports for logical keeper cases. Receipts still come
+    /// from the ordinary final probe; no success flag can manufacture their state.
+    fn mapped_keyboard_system(registries: &[u64]) -> aterm_machines::port::Fake {
+        use aterm_machines::items::keyboard::{CAPS_LOCK, LEFT_CONTROL};
+        use aterm_machines::port::Ran;
+        let mut sys = aterm_cli::macos_doctor::InitialSetupAdmissionStopTest::keyboard_system(true);
+        sys.keyboard_services = Some(Ok(registries.to_vec()));
+        let mut census = format!(
+            "Services:\n{:<12}{:<12}{:<16}{:<24}Built-In\n",
+            "VendorID", "ProductID", "RegistryID", "Product"
+        );
+        let mut properties = String::from("RegistryID Key Value\n");
+        for id in registries {
+            census.push_str(&format!(
+                "{:<12}{:<12}{:<16}{:<24}0\n",
+                "0xfffe",
+                "0xa9",
+                format!("0x{id:x}"),
+                "Fixture keyboard"
+            ));
+            properties.push_str(&format!("{id:x} UserKeyMapping (null)\n"));
+        }
+        census.push_str("\nDevices:\n");
+        let dump = keyboard_dump(registries, &[(CAPS_LOCK, LEFT_CONTROL)]);
+        sys.simulate(move |_, cmd| {
+            let args: Vec<_> = cmd.args.iter().filter_map(|arg| arg.to_str()).collect();
+            match cmd.program.file_name().and_then(|name| name.to_str()) {
+                Some("hidutil") if args.first() == Some(&"list") => Some(Ran::ok(&census)),
+                Some("hidutil") if args.first() == Some(&"property") => Some(Ran::ok(&properties)),
+                Some("hidutil") if args.first() == Some(&"dump") => Some(Ran::ok(&dump)),
+                Some("defaults") => Some(Ran::ok(&aterm_machines::plist::document(
+                    &aterm_machines::model::PValue::Dict(Vec::new()),
+                ))),
+                _ => None,
+            }
+        });
+        sys
+    }
+
+    fn observations(registries: &[u64]) -> Result<Vec<KeyboardServiceObservation>, String> {
+        mapped_keyboard_system(registries).keyboard_service_observations()
+    }
+
+    fn verified(registries: &[u64]) -> Result<Option<KeyboardAttachmentActivation>, String> {
+        let sys = mapped_keyboard_system(registries);
+        let result = aterm_machines::init::activate_keyboard_attachments(
+            &sys,
+            registries,
+            &|_| false,
+            &|| true,
+            &|| panic!("the modeled mapping is already in place"),
+        )?;
+        assert!(sys.keyboard_changes().is_empty());
+        Ok(Some(result))
+    }
 
     fn native_pending_caps(
         root: &std::path::Path,
@@ -754,6 +919,7 @@ mod tests {
                                 FIRST_RETRY_MS,
                                 || input_setup_scope_at(&root),
                                 || Ok(vec![41]),
+                                || panic!("pending input reads only service identities"),
                                 |_, _| panic!("pending input has no setter authority"),
                                 &|| {},
                                 &|| {},
@@ -893,7 +1059,6 @@ mod tests {
         use aterm_cli::macos_doctor::{
             InitialSetupAdmissionStopTest, SetupNext, input_setup_scope_at,
         };
-        use aterm_machines::port::System as _;
         use std::sync::atomic::Ordering;
 
         let positive = aterm_tempfile::tempdir().unwrap();
@@ -940,6 +1105,7 @@ mod tests {
                                 InitialSetupAdmissionStopTest::keyboard_system(attached)
                                     .keyboard_service_ids()
                             },
+                            || panic!("pending input reads only service identities"),
                             |_, _| panic!("a pending pass has no attachment-setter authority"),
                             &hand_off,
                             &|| {},
@@ -996,6 +1162,7 @@ mod tests {
                     0,
                     || input_setup_scope_at(dir.path()),
                     || panic!("Stop withholds the pending hardware read"),
+                    || panic!("Stop withholds the mapping read"),
                     |_, _| panic!("Stop withholds activation"),
                     &stopped_handoff,
                     &|| {},
@@ -1129,6 +1296,7 @@ mod tests {
                 0,
                 scope,
                 || Ok(ids),
+                || panic!("pending observation reads only service identities"),
                 |_, _| panic!("pending observation has no setter authority"),
                 &changed,
                 &invalidate,
@@ -1199,7 +1367,8 @@ mod tests {
                     true,
                     0,
                     scope,
-                    || Ok(vec![41, 42]),
+                    || panic!("applied scope uses one passive mapping observation"),
+                    || no_op.keyboard_service_observations(),
                     |_, ids| aterm_machines::init::activate_keyboard_attachments(
                         &no_op,
                         ids,
@@ -1230,6 +1399,7 @@ mod tests {
                     0,
                     || panic!("another console reads no setup scope"),
                     || panic!("another console reads no hardware"),
+                    || panic!("another console reads no mappings"),
                     |_, _| panic!("another console activates nothing"),
                     &changed,
                     &invalidate,
@@ -1245,6 +1415,7 @@ mod tests {
                     0,
                     scope,
                     || panic!("Stop withdraws even pending hardware observation"),
+                    || panic!("Stop withdraws mapping observation"),
                     |_, _| panic!("Stop withdraws activation"),
                     &changed,
                     &invalidate,
@@ -1261,6 +1432,7 @@ mod tests {
                     0,
                     || Ok(InputSetupScope::Applied(revision)),
                     || Ok(vec![41]),
+                    || observations(&[41]),
                     |_, _| {
                         assert_eq!(
                             invalidations.get(),
@@ -1281,6 +1453,7 @@ mod tests {
                     1,
                     || Err("injected source read failure".into()),
                     || panic!("no hardware read after source refusal"),
+                    || panic!("no mapping read after source refusal"),
                     |_, _| panic!("no activation after source refusal"),
                     &changed,
                     &invalidate,
@@ -1452,12 +1625,12 @@ mod tests {
                         },
                         || {
                             reads.set((reads.get().0, reads.get().1 + 1));
-                            Ok(ids.clone())
+                            observations(&ids)
                         },
                         |revision, new| {
                             assert_eq!(revision, 7);
                             activated.borrow_mut().push(new.to_vec());
-                            Ok(Some(true))
+                            verified(new)
                         },
                     )
                     .unwrap(),
@@ -1503,11 +1676,11 @@ mod tests {
                     .round(
                         0,
                         Some(7),
-                        || Ok(ids),
+                        || observations(&ids),
                         |revision, new| {
                             assert_eq!(revision, 7);
                             assert_eq!(new, expected);
-                            Ok(Some(true))
+                            verified(new)
                         }
                     )
                     .unwrap()
@@ -1515,12 +1688,22 @@ mod tests {
         }
         assert!(
             !keeper
-                .round(0, Some(7), || Ok(vec![1]), |_, _| panic!("removal only"))
+                .round(
+                    0,
+                    Some(7),
+                    || observations(&[1]),
+                    |_, _| panic!("removal only")
+                )
                 .unwrap()
         );
         assert!(
             !keeper
-                .round(0, Some(7), || Ok(vec![1]), |_, _| panic!("unchanged"))
+                .round(
+                    0,
+                    Some(7),
+                    || observations(&[1]),
+                    |_, _| panic!("unchanged")
+                )
                 .unwrap()
         );
         assert!(
@@ -1538,10 +1721,10 @@ mod tests {
                 .round(
                     0,
                     Some(8),
-                    || Ok(vec![1]),
+                    || observations(&[1]),
                     |revision, ids| {
                         assert_eq!((revision, ids), (8, &[1][..]));
-                        Ok(Some(true))
+                        verified(ids)
                     }
                 )
                 .unwrap()
@@ -1553,7 +1736,7 @@ mod tests {
         let mut keeper = Keeper::default();
         assert!(
             !keeper
-                .round(0, Some(7), || Ok(vec![1]), |_, _| Ok(None))
+                .round(0, Some(7), || observations(&[1]), |_, _| Ok(None))
                 .unwrap()
         );
         assert!(
@@ -1561,14 +1744,19 @@ mod tests {
                 .round(
                     4999,
                     Some(7),
-                    || Ok(vec![1]),
+                    || observations(&[1]),
                     |_, _| panic!("lock retry paced")
                 )
                 .unwrap()
         );
         assert!(
             !keeper
-                .round(5000, Some(7), || Ok(vec![1]), |_, _| Ok(Some(false)))
+                .round(
+                    5000,
+                    Some(7),
+                    || observations(&[1]),
+                    |_, _| Ok(Some(KeyboardAttachmentActivation::Unfinished))
+                )
                 .unwrap()
         );
         assert!(
@@ -1576,14 +1764,19 @@ mod tests {
                 .round(
                     9999,
                     Some(7),
-                    || Ok(vec![1]),
+                    || observations(&[1]),
                     |_, _| panic!("unfinished retry paced")
                 )
                 .unwrap()
         );
         assert!(
             keeper
-                .round(10000, Some(7), || Ok(vec![1]), |_, _| Ok(Some(true)))
+                .round(
+                    10000,
+                    Some(7),
+                    || observations(&[1]),
+                    |_, ids| verified(ids)
+                )
                 .unwrap()
         );
         assert!(
@@ -1591,7 +1784,7 @@ mod tests {
                 .round(
                     10001,
                     Some(7),
-                    || Ok(vec![1]),
+                    || observations(&[1]),
                     |_, _| panic!("success stops")
                 )
                 .unwrap()
@@ -1601,10 +1794,10 @@ mod tests {
                 .round(
                     10001,
                     Some(7),
-                    || Ok(vec![1, 2]),
+                    || observations(&[1, 2]),
                     |_, ids| {
                         assert_eq!(ids, [2]);
-                        Ok(Some(true))
+                        verified(ids)
                     }
                 )
                 .unwrap()
@@ -1614,7 +1807,7 @@ mod tests {
                 .round(
                     10002,
                     Some(7),
-                    || Ok(vec![1, 2, 2]),
+                    || observations(&[1, 2, 2]),
                     |_, _| panic!("duplicate identity")
                 )
                 .is_err()
@@ -1624,33 +1817,11 @@ mod tests {
     #[test]
     fn an_unseen_model_retries_the_same_native_service_and_applies_when_its_census_recovers() {
         use aterm_machines::items::keyboard::{CAPS_LOCK, LEFT_CONTROL};
-        use aterm_machines::port::{Fake, Ran, Stat};
+        use aterm_machines::port::{Cmd, Fake, Ran, Stat};
         use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         const REGISTRY: u64 = 41;
-        fn dump(native: &[(i64, i64)]) -> String {
-            let pairs = native
-                .iter()
-                .map(|(source, destination)| {
-                    format!("<dict><key>Src</key><integer>{source}</integer><key>Dst</key><integer>{destination}</integer></dict>")
-                })
-                .collect::<String>();
-            format!(
-                "<plist version=\"1.0\"><dict><key>ServiceRecords</key><array><dict>\
-                 <key>IORegistryEntryID</key><integer>{REGISTRY}</integer>\
-                 <key>PrimaryUsagePage</key><integer>1</integer>\
-                 <key>PrimaryUsage</key><integer>6</integer>\
-                 <key>ServiceFilterDebug</key><array><dict><key>plugin</key><dict>\
-                 <key>Class</key><string>IOHIDKeyboardFilter</string>\
-                 <key>HIDKeyboardModifierMappingPairs</key><array>{pairs}</array>\
-                 <key>UserKeyMapping</key><array/>\
-                 <key>FnFunctionUsageMap</key><array/>\
-                 <key>FnKeyboardUsageMap</key><array/>\
-                 <key>NumLockKeyboardUsageMap</key><array/>\
-                 </dict></dict></array></dict></array></dict></plist>"
-            )
-        }
 
         let who = aterm_machines::model::User {
             name: "alice".into(),
@@ -1663,6 +1834,7 @@ mod tests {
         let mut sys = Fake::root();
         sys.euid = who.uid;
         sys.logged_in(&who);
+        sys.keyboard_services = Some(Ok(vec![REGISTRY]));
         sys.stat_of(
             "/dev/console",
             Stat {
@@ -1691,6 +1863,8 @@ mod tests {
         );
         let available = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&available);
+        let written_before_reset = Arc::new(AtomicUsize::new(0));
+        let forgotten = Arc::clone(&written_before_reset);
         sys.simulate(move |sys, cmd| {
             let args: Vec<_> = cmd.args.iter().filter_map(|arg| arg.to_str()).collect();
             match cmd.program.file_name().and_then(|name| name.to_str()) {
@@ -1714,13 +1888,18 @@ mod tests {
                     )))
                 }
                 Some("hidutil") if args.first() == Some(&"dump") => {
-                    let native = sys
+                    let changes: Vec<_> = sys
                         .keyboard_changes()
                         .into_iter()
-                        .find(|change| change.registry == REGISTRY)
+                        .filter(|change| change.registry == REGISTRY)
+                        .collect();
+                    let native = changes
+                        .into_iter()
+                        .skip(forgotten.load(Ordering::SeqCst))
+                        .next_back()
                         .and_then(|change| change.native)
                         .unwrap_or_default();
-                    Some(Ran::ok(&dump(&native)))
+                    Some(Ran::ok(&keyboard_dump(&[REGISTRY], &native)))
                 }
                 Some("defaults") => Some(Ran::ok(&aterm_machines::plist::document(
                     &aterm_machines::model::PValue::Dict(Vec::new()),
@@ -1729,6 +1908,7 @@ mod tests {
             }
         });
         let invalidations = std::cell::Cell::new(0);
+        let writes_before = std::cell::Cell::new(0);
         let activate = |revision, ids: &[u64]| {
             assert_eq!(revision, 7);
             aterm_machines::init::activate_keyboard_attachments(
@@ -1737,9 +1917,10 @@ mod tests {
                 &|_| false,
                 &|| true,
                 &|| {
-                    assert!(
-                        sys.keyboard_changes().is_empty(),
-                        "retire before the first real native setter"
+                    assert_eq!(
+                        sys.keyboard_changes().len(),
+                        writes_before.get(),
+                        "retire before the next real native setter"
                     );
                     invalidations.set(invalidations.get() + 1);
                 },
@@ -1749,7 +1930,7 @@ mod tests {
         let mut keeper = Keeper::default();
         assert!(
             !keeper
-                .round(0, Some(7), || Ok(vec![REGISTRY]), activate)
+                .round(0, Some(7), || sys.keyboard_service_observations(), activate)
                 .unwrap()
         );
         assert!(sys.keyboard_changes().is_empty());
@@ -1764,14 +1945,19 @@ mod tests {
                 .round(
                     4999,
                     Some(7),
-                    || Ok(vec![REGISTRY]),
+                    || sys.keyboard_service_observations(),
                     |_, _| panic!("unfinished retry remains paced")
                 )
                 .unwrap()
         );
         assert!(
             keeper
-                .round(5000, Some(7), || Ok(vec![REGISTRY]), activate)
+                .round(
+                    5000,
+                    Some(7),
+                    || sys.keyboard_service_observations(),
+                    activate
+                )
                 .unwrap()
         );
         let changed = sys.keyboard_changes();
@@ -1795,12 +1981,12 @@ mod tests {
                 .round(
                     5001,
                     Some(7),
-                    || Ok(vec![REGISTRY]),
+                    || sys.keyboard_service_observations(),
                     |_, _| panic!("verified cohort settles")
                 )
                 .unwrap()
         );
-        assert!(
+        assert!(matches!(
             aterm_machines::init::activate_keyboard_attachments(
                 &sys,
                 &[REGISTRY],
@@ -1808,8 +1994,102 @@ mod tests {
                 &|| true,
                 &|| panic!("a real no-op must retain an existing valid observation"),
             )
-            .unwrap()
-        );
+            .unwrap(),
+            KeyboardAttachmentActivation::Verified(_)
+        ));
         assert_eq!(sys.keyboard_changes().len(), 1);
+
+        // The same live service loses its map after a successfully verified activation.
+        // Neither its registry identity nor the accepted setup revision changes.
+        written_before_reset.store(changed.len(), Ordering::SeqCst);
+        writes_before.set(changed.len());
+        let reset = sys
+            .run_complete_stdout(&Cmd::new("hidutil").args(["dump", "services", "-f", "xml"]))
+            .unwrap();
+        assert!(reset.success());
+        assert_eq!(reset.out(), keyboard_dump(&[REGISTRY], &[]));
+        assert_eq!(sys.keyboard_changes().len(), 1, "no reset-time setter");
+        assert!(
+            keeper
+                .round(
+                    5002,
+                    Some(7),
+                    || sys.keyboard_service_observations(),
+                    activate
+                )
+                .unwrap(),
+            "an unchanged service identity must not hide a lost effective mapping"
+        );
+        let repaired = sys.keyboard_changes();
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[1].registry, REGISTRY);
+        assert_eq!(repaired[1].native, Some(vec![(CAPS_LOCK, LEFT_CONTROL)]));
+        assert_eq!(invalidations.get(), 3);
+        let paid = sys.calls().len();
+        assert!(
+            !keeper
+                .round(
+                    5003,
+                    Some(7),
+                    || sys.keyboard_service_observations(),
+                    |_, _| panic!("the verified repaired state needs no further activation")
+                )
+                .unwrap()
+        );
+        assert_eq!(sys.keyboard_changes().len(), 2);
+        assert!(
+            sys.calls()[paid..]
+                .iter()
+                .all(|call| call == "keyboard-service-ids")
+        );
+
+        let mut inputs = Inputs::default();
+        let positive_readback = std::cell::Cell::new(false);
+        let invalidate = || positive_readback.set(false);
+        let round = |inputs: &mut Inputs, now, held| {
+            inputs.round(
+                true,
+                now,
+                || Ok(InputSetupScope::Applied(7)),
+                || panic!("accepted inputs read one native mapping sample"),
+                || sys.keyboard_service_observations(),
+                |revision, ids| {
+                    if held {
+                        Ok(None)
+                    } else {
+                        activate(revision, ids)
+                    }
+                },
+                &|| panic!("accepted inputs are not a pending stage"),
+                &invalidate,
+            )
+        };
+        assert!(round(&mut inputs, 6000, false).unwrap());
+        assert_eq!(
+            sys.keyboard_changes().len(),
+            2,
+            "the initial receipt is a no-op"
+        );
+        written_before_reset.store(2, Ordering::SeqCst);
+        writes_before.set(2);
+        assert!(round(&mut inputs, 6001, false).unwrap());
+        assert_eq!(sys.keyboard_changes().len(), 3);
+        positive_readback.set(true);
+        assert!(!round(&mut inputs, 6002, false).unwrap());
+        assert!(
+            positive_readback.get(),
+            "our verified write is not new drift"
+        );
+        written_before_reset.store(3, Ordering::SeqCst);
+        assert!(!round(&mut inputs, 6003, true).unwrap());
+        assert!(
+            !positive_readback.get(),
+            "a reset to the old before-image retires the newer fact even while repair is held"
+        );
+        assert_eq!(
+            sys.keyboard_changes().len(),
+            3,
+            "held repair writes nothing"
+        );
     }
 }

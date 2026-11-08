@@ -118,6 +118,77 @@ fn the_number_is_the_heads_plus_one_and_everything_unnamed_is_carried() {
 }
 
 #[test]
+fn adding_the_serial_helper_preserves_unlisted_programs_pins_and_target_overlays() {
+    let mut b = with_overlay(
+        base(
+            115,
+            &[("ay", 14248), ("atpkg-keys", 82150), ("future-helper", 99)],
+        ),
+        AARCH64_APPLE_DARWIN.as_str(),
+        &[("ay", 14249), ("future-helper", 100)],
+    );
+    b.channel.min_build = 4;
+    b.channel
+        .min_build_by_program
+        .insert("atpkg-keys".into(), 82100);
+    b.channel.yanked = vec!["ay@3".into()];
+    let mut keys = block("aterm", None);
+    keys.unavailable_hint =
+        Some("The managed release-signing helper is published for ARM macOS only".into());
+    b.programs.insert("atpkg-keys".into(), keys);
+    let mut future = block("future-repo", None);
+    future.unavailable_hint = Some("retained target policy".into());
+    b.programs.insert("future-helper".into(), future);
+    let (p, _) = ok(&b, &delta(&["--pin", "trust-resource-controller=123"]));
+    let mut expected_pin = b.channel.pin.clone();
+    expected_pin.insert("trust-resource-controller".into(), 123);
+    assert_eq!(p.channel.pin, expected_pin);
+    assert_eq!(p.channel.pin_by_target, b.channel.pin_by_target);
+    assert_eq!(p.channel.min_build, b.channel.min_build);
+    assert_eq!(
+        p.channel.min_build_by_program,
+        b.channel.min_build_by_program
+    );
+    assert_eq!(p.channel.yanked, b.channel.yanked);
+    for (name, old) in &b.programs {
+        let (_, kept) = p
+            .programs
+            .iter()
+            .find(|(n, _)| n == name)
+            .expect("retained program");
+        assert_eq!(
+            (
+                &kept.repo,
+                &kept.policy,
+                &kept.coherence_group,
+                &kept.system,
+                &kept.unavailable_hint,
+                &kept.requires
+            ),
+            (
+                &old.repo,
+                &old.policy,
+                &old.coherence_group,
+                &old.system,
+                &old.unavailable_hint,
+                &old.requires
+            ),
+            "{name}",
+        );
+    }
+    assert_eq!(p.programs.len(), b.programs.len() + 1);
+    let (_, helper) = p
+        .programs
+        .iter()
+        .find(|(n, _)| n == "trust-resource-controller")
+        .expect("new helper");
+    assert_eq!(helper.repo, "trust");
+    assert!(helper.coherence_group.is_none());
+    assert_eq!(p.added, [("trust-resource-controller".into(), 123)]);
+    assert!(p.moved.is_empty() && p.retired.is_empty());
+}
+
+#[test]
 fn a_pin_moves_up_never_down_and_an_equal_build_is_a_carry() {
     let b = base(21, &[("ay", 5), ("nn", 108)]);
     let err = refused(&b, &delta(&["--pin", "ay=4"]));

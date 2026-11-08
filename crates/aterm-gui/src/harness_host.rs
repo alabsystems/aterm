@@ -203,9 +203,16 @@ pub(crate) struct Switches {
     pool_controls: AtomicU16,
     /// The host says nothing of the accounts as a whole.
     mute: AtomicBool,
-    /// `[harness] limit_reset` as the window last parsed it, and `false` with `[harness] enabled = false`.
+    /// `[harness] limit_reset` as the window last parsed it (`SupervisorConfig::limit_reset_on`),
+    /// `false` where the policy supervises nothing here ([`would_supervise`]), as for the other
+    /// account switches: a worker still running when the person turns Claude Code's harness off
+    /// claims no reset from then on, since its claim reads the switch again under the store's lock,
+    /// where the claim commits ([`WorkerIdle::reset_claimed`]).
     limit_reset: AtomicBool,
-    /// `[harness] usage_tap` under the master switch, for this host's workers.
+    /// `[harness] usage_tap` for this host's workers (`SupervisorConfig::usage_tap_on`), `false`
+    /// where the policy supervises nothing here ([`would_supervise`]). It gates a wall's timing
+    /// ([`WorkerIdle::tap_window`]), the session log's mark and the silent tap's note; what a
+    /// process launched with the tap reports is recorded with it off too ([`WorkerIdle::tap_step`]).
     usage_tap: AtomicBool,
     /// `[harness] usage_notes`, `false` where Claude Code is not supervised here (as for the other account switches).
     usage_notes: AtomicBool,
@@ -380,9 +387,9 @@ impl Switches {
             Ordering::SeqCst,
         );
         self.limit_reset
-            .store(cfg.enabled && cfg.limit_reset, Ordering::SeqCst);
+            .store(supervises && cfg.limit_reset_on(), Ordering::SeqCst);
         self.usage_tap
-            .store(cfg.enabled && cfg.usage_tap, Ordering::SeqCst);
+            .store(supervises && cfg.usage_tap_on(), Ordering::SeqCst);
         USAGE_TAP.store(cfg.usage_tap_on(), Ordering::SeqCst);
         self.usage_notes
             .store(accounts_on && cfg.usage_notes, Ordering::SeqCst);
@@ -1648,7 +1655,8 @@ use aterm_agent::supervise::ProbeNo as NoProbe;
 /// Why a limit reset was not claimed ([`WorkerIdle::reset_claimed`]), each by its own word for the log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoReset {
-    /// `[harness] limit_reset`, read live, is off (or the whole policy).
+    /// `[harness] limit_reset`, read live, is off (or the whole policy, or Claude Code's switch,
+    /// or this instance supervises nothing).
     Off,
     /// The agent is no Claude Code, the host has no seat, or nothing of the agent's process could be read.
     Unread,
@@ -5225,8 +5233,12 @@ struct TapNoted {
     at: i64,
 }
 
-/// What a tap reading's store transaction left of the label, read under `accounts.lock` for the
-/// readings series ([`account_series::note_committed`]) once the transaction commits.
+/// What a tap reading's store transaction committed of the reading, read under `accounts.lock`
+/// for the readings series ([`account_series::note_committed`]) once the transaction commits:
+/// the record's figures as the reading left them, and the keys of the record the journal then
+/// filed them under (`journal::learn`, after the edit): the label's, its lab key the one the same
+/// transaction learned, or, where the label's row now names another account, the record the
+/// observations were handed off to under the key it had ([`accounts::State::forgotten`]).
 #[derive(Debug)]
 struct SeriesTake {
     machine: String,
@@ -5235,6 +5247,15 @@ struct SeriesTake {
     ac: Option<String>,
     key: Option<profile::AccountKey>,
     now: i64,
+}
+
+/// A tap reading's record as the store transaction's edit left it ([`SeriesTake`]).
+#[derive(Debug, Default)]
+struct TapFolded {
+    five_hour: Option<accounts::WindowFig>,
+    seven_day: Option<accounts::WindowFig>,
+    /// Its lab key before the journal learned the rows' keys.
+    pk: Option<String>,
 }
 
 /// Where a usage tap's reading is taken ([`WorkerIdle::tap_step`]).
@@ -7223,37 +7244,61 @@ impl WorkerIdle {
         };
         let mut held_back = false;
         let mut low_or_limited = false;
-        let mut series = None;
         let mut verify = None;
-        let noted = self.usage_observed(&seat, &captured, &look.who, |state, now| {
-            // Under `accounts.lock`, before this reading is folded into the row: so the basis a
-            // token's verification compares with is the stored login's, never the token's own.
-            if let Some(standing) = token.as_ref() {
-                verify = token_served(&seat, standing, &label, state, &read, now);
-            }
-            let (events, held) = accounts::note_reading_held(state, &label, &read, now);
-            held_back = held;
-            low_or_limited = !events.is_empty()
-                && state
-                    .accounts
-                    .get(&label)
-                    .is_some_and(|a| a.low(now) || a.limited_until(now).is_some());
-            let record = state.accounts.get(&label);
-            let windows = record.map(|a| &a.windows);
-            series = Some(SeriesTake {
-                machine: state.machine.clone(),
-                five_hour: windows
-                    .and_then(|w| w.get(accounts::SESSION_LIMIT))
-                    .cloned(),
-                seven_day: windows.and_then(|w| w.get(accounts::WEEK_LIMIT)).cloned(),
-                ac: record.and_then(|a| a.pk.clone()),
-                key: record.and_then(|a| a.key),
-                now,
-            });
-            Ok(events)
-        });
+        // The record's figures once the reading was folded in, and its lab key then.
+        let folded: std::cell::Cell<Option<TapFolded>> = std::cell::Cell::new(None);
+        let noted = self.usage_observed(
+            &seat,
+            &captured,
+            &look.who,
+            |state, now| {
+                // Under `accounts.lock`, before this reading is folded into the row: so the basis
+                // a token's verification compares with is the stored login's, never the token's
+                // own.
+                if let Some(standing) = token.as_ref() {
+                    verify = token_served(&seat, standing, &label, state, &read, now);
+                }
+                let (events, held) = accounts::note_reading_held(state, &label, &read, now);
+                held_back = held;
+                let record = state.accounts.get(&label);
+                low_or_limited = !events.is_empty()
+                    && record.is_some_and(|a| a.low(now) || a.limited_until(now).is_some());
+                let window = |w: &str| record.and_then(|a| a.windows.get(w)).cloned();
+                folded.set(Some(TapFolded {
+                    five_hour: window(accounts::SESSION_LIMIT),
+                    seven_day: window(accounts::WEEK_LIMIT),
+                    pk: record.and_then(|a| a.pk.clone()),
+                }));
+                Ok(events)
+            },
+            // After the journal learned the rows' keys: the figures stay the ones the reading
+            // left (not one the journal gave back from a forgotten record), under the keys of
+            // the record the journal filed them in.
+            |state, now| {
+                let folded = folded.take().unwrap_or_default();
+                let record = state.accounts.get(&label);
+                let (ac, key) = match folded.pk {
+                    Some(was) if record.and_then(|a| a.pk.as_deref()) != Some(was.as_str()) => {
+                        let key = state.forgotten.get(&was).and_then(|a| a.key);
+                        (Some(was), key)
+                    }
+                    _ => (
+                        record.and_then(|a| a.pk.clone()),
+                        record.and_then(|a| a.key),
+                    ),
+                };
+                SeriesTake {
+                    machine: state.machine.clone(),
+                    five_hour: folded.five_hour,
+                    seven_day: folded.seven_day,
+                    ac,
+                    key,
+                    now,
+                }
+            },
+        );
         match noted {
-            Ok(events) => {
+            Ok((events, take)) => {
                 if let Some(verify) = verify {
                     token_verify(&seat, verify);
                 }
@@ -7262,22 +7307,20 @@ impl WorkerIdle {
                 }
                 // The readings series takes what the store just committed, under its own lock
                 // (docs/DESIGN-account-stats-2026-10-15.md §5).
-                if let Some(take) = series {
-                    let _ = account_series::note_committed(
-                        &seat.state,
-                        &label,
-                        &take.machine,
-                        &account_series::Committed {
-                            five_hour: take.five_hour.as_ref(),
-                            seven_day: take.seven_day.as_ref(),
-                            events: &events,
-                            held_back,
-                            ac: take.ac.as_deref(),
-                            key: take.key,
-                        },
-                        take.now,
-                    );
-                }
+                let _ = account_series::note_committed(
+                    &seat.state,
+                    &label,
+                    &take.machine,
+                    &account_series::Committed {
+                        five_hour: take.five_hour.as_ref(),
+                        seven_day: take.seven_day.as_ref(),
+                        events: &events,
+                        held_back,
+                        ac: take.ac.as_deref(),
+                        key: take.key,
+                    },
+                    take.now,
+                );
                 if !held_back {
                     self.tap
                         .lock()
@@ -7363,12 +7406,18 @@ impl WorkerIdle {
             let label = look
                 .judged(captured.roster())
                 .expect("tap account was attributed");
-            let _ = self.usage_observed(seat, &captured, &look.who, |_, now| {
-                Ok(vec![
-                    accounts::Event::new(now, accounts::Kind::NoTap, label)
-                        .because("a served turn left no reading"),
-                ])
-            });
+            let _ = self.usage_observed(
+                seat,
+                &captured,
+                &look.who,
+                |_, now| {
+                    Ok(vec![
+                        accounts::Event::new(now, accounts::Kind::NoTap, label)
+                            .because("a served turn left no reading"),
+                    ])
+                },
+                |_, _| (),
+            );
         }
         if self.switches.usage_tap.load(Ordering::SeqCst) {
             (self.hooks.note)(HostNote::UsageTap {
@@ -8938,18 +8987,25 @@ impl WorkerIdle {
         }
     }
 
-    /// Publish tap usage only while its source and the host's writer context agree.
-    fn usage_observed(
+    /// Publish tap usage only while its source and the host's writer context agree; `seen`
+    /// reads the state the edit leaves with the keys the same transaction learns
+    /// ([`accounts::Store::observe_usage_within`]).
+    fn usage_observed<T>(
         &self,
         seat: &AccountSeat,
         captured: &accounts::UsageRoster,
         who: &accounts::ProcessLogin,
         edit: impl FnOnce(&mut accounts::State, i64) -> Result<Vec<accounts::Event>, String>,
-    ) -> Result<Vec<accounts::Event>, String> {
+        seen: impl FnOnce(&accounts::State, i64) -> T,
+    ) -> Result<(Vec<accounts::Event>, T), String> {
         self.reset_flush(seat);
         let current = current_account_seat(&self.hooks, seat)?;
-        seat.claude_store()
-            .observe_usage_within(seat.ladder, current.now, captured, who, |state| {
+        seat.claude_store().observe_usage_within(
+            seat.ladder,
+            current.now,
+            captured,
+            who,
+            |state| {
                 Ok(edit(state, current.now)?
                     .into_iter()
                     .map(|event| match event.sid {
@@ -8957,7 +9013,9 @@ impl WorkerIdle {
                         None => event.with_sid(&self.sid),
                     })
                     .collect())
-            })
+            },
+            |state| seen(state, current.now),
+        )
     }
 
     /// An account-wide observation, retaining attribution across credential renewal.
@@ -9253,6 +9311,12 @@ impl WorkerIdle {
                 refused = Some(why);
                 Err(why.as_str().to_string())
             };
+            // Read again under the lock the claim commits under: a switch turned off while this
+            // ask read the agent or waited on the lock spends no attempt the cut transport would
+            // then refuse to enter.
+            if !self.switches.reset_on() {
+                return no(NoReset::Off);
+            }
             let cleared = state
                 .accounts
                 .get(&label)

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! One complete, bounded Cargo-lock inventory for every cache removal route.
+//! Complete Cargo-lock inventories: budgeted surveys and unbudgeted one-time retirement.
 
 use std::path::Path;
 
@@ -14,7 +14,36 @@ const ENTRIES: usize = 1_000_000;
 const LOCKS: usize = 1024;
 
 pub(super) fn scan(root: &Path) -> std::io::Result<Seen> {
-    scan_with(root, ENTRIES, DEPTH)
+    #[cfg(test)]
+    let entries = SURVEY_ENTRIES.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let entries = ENTRIES;
+    scan_with(root, entries, DEPTH)
+}
+
+#[cfg(test)]
+thread_local! {
+    static SURVEY_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(ENTRIES) };
+}
+
+/// Inject a small real survey budget on this test thread. Replacing retirement's scan
+/// with the ordinary survey must then fail on the very same fixture, without a million files.
+#[cfg(all(test, unix))]
+pub(super) fn with_entry_budget<T>(entries: usize, run: impl FnOnce() -> T) -> T {
+    struct Reset(usize);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SURVEY_ENTRIES.with(|budget| budget.set(self.0));
+        }
+    }
+    let _reset = Reset(SURVEY_ENTRIES.with(|budget| budget.replace(entries)));
+    run()
+}
+
+/// Retirement is a one-time migration, not a cache survey. Certify the whole tree even
+/// when its artifact count exceeds the survey budget; never accept a lock-free prefix.
+pub(super) fn retiring(root: &Path) -> std::io::Result<Seen> {
+    scan_limits(root, usize::MAX, usize::MAX, usize::MAX)
 }
 
 fn uncertain() -> std::io::Error {
@@ -29,7 +58,7 @@ fn is_lock(name: &std::ffi::OsStr) -> bool {
 }
 
 #[cfg(unix)]
-fn scan_with(root: &Path, mut left: usize, depth: usize) -> std::io::Result<Seen> {
+fn scan_limits(root: &Path, mut left: usize, depth: usize, locks: usize) -> std::io::Result<Seen> {
     use aterm_dirfd::{self as fd, Mode, OFlags};
     let flags =
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
@@ -38,7 +67,7 @@ fn scan_with(root: &Path, mut left: usize, depth: usize) -> std::io::Result<Seen
         newest: metadata(&root_fd)?.modified()?,
         locks: Vec::new(),
     };
-    walk(root_fd, root, &mut left, depth, &mut seen)?;
+    walk(root_fd, root, &mut left, depth, locks, &mut seen)?;
     seen.locks.sort();
     Ok(seen)
 }
@@ -67,6 +96,7 @@ fn walk(
     path: &Path,
     left: &mut usize,
     depth: usize,
+    locks: usize,
     seen: &mut Seen,
 ) -> std::io::Result<()> {
     use aterm_dirfd::{self as fd, AtFlags, FileType, Mode, OFlags};
@@ -85,7 +115,7 @@ fn walk(
         let name = std::ffi::OsStr::from_bytes(name.to_bytes());
         let child_path = path.join(name);
         if is_lock(name) {
-            if seen.locks.len() >= LOCKS {
+            if seen.locks.len() >= locks {
                 return Err(uncertain());
             }
             // Include nonregular lock names too: hold() must refuse them, not miss them.
@@ -111,7 +141,7 @@ fn walk(
             {
                 return Err(uncertain());
             }
-            walk(child, &child_path, left, next_depth, seen)?;
+            walk(child, &child_path, left, next_depth, locks, seen)?;
             let after = fd::fstatat(&listing, name, AtFlags::SYMLINK_NOFOLLOW)?;
             if (after.st_dev, after.st_ino) != (held.st_dev, held.st_ino) {
                 return Err(uncertain());
@@ -125,8 +155,14 @@ fn walk(
 }
 
 #[cfg(not(unix))]
-fn scan_with(root: &Path, mut left: usize, depth: usize) -> std::io::Result<Seen> {
-    fn walk(path: &Path, left: &mut usize, depth: usize, seen: &mut Seen) -> std::io::Result<()> {
+fn scan_limits(root: &Path, mut left: usize, depth: usize, locks: usize) -> std::io::Result<Seen> {
+    fn walk(
+        path: &Path,
+        left: &mut usize,
+        depth: usize,
+        locks: usize,
+        seen: &mut Seen,
+    ) -> std::io::Result<()> {
         let before = std::fs::symlink_metadata(path)?;
         if !before.is_dir() {
             return Err(uncertain());
@@ -137,7 +173,7 @@ fn scan_with(root: &Path, mut left: usize, depth: usize) -> std::io::Result<Seen
             let entry = entry?;
             *left = left.checked_sub(1).ok_or_else(uncertain)?;
             if is_lock(&entry.file_name()) {
-                if seen.locks.len() >= LOCKS {
+                if seen.locks.len() >= locks {
                     return Err(uncertain());
                 }
                 seen.locks.push(entry.path());
@@ -146,6 +182,7 @@ fn scan_with(root: &Path, mut left: usize, depth: usize) -> std::io::Result<Seen
                     &entry.path(),
                     left,
                     depth.checked_sub(1).ok_or_else(uncertain)?,
+                    locks,
                     seen,
                 )?;
             }
@@ -159,9 +196,13 @@ fn scan_with(root: &Path, mut left: usize, depth: usize) -> std::io::Result<Seen
         newest: std::fs::symlink_metadata(root)?.modified()?,
         locks: Vec::new(),
     };
-    walk(root, &mut left, depth, &mut seen)?;
+    walk(root, &mut left, depth, locks, &mut seen)?;
     seen.locks.sort();
     Ok(seen)
+}
+
+pub(super) fn scan_with(root: &Path, entries: usize, depth: usize) -> std::io::Result<Seen> {
+    scan_limits(root, entries, depth, LOCKS)
 }
 
 #[cfg(all(test, unix))]

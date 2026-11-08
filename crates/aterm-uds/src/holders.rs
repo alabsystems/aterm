@@ -910,47 +910,62 @@ impl Drop for TableCheck {
 /// calls, again when it outgrew that room.
 #[cfg(target_vendor = "apple")]
 fn unix_stream_table() -> io::Result<Vec<u8>> {
-    let name = aterm_sysprobe::jobs::darwin::UNIX_STREAM_TABLE;
-    for _ in 0..4 {
-        let mut len: libc::size_t = 0;
-        // SAFETY: a size query: no buffer, and `len` a live `size_t` the call writes.
-        let sized = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                std::ptr::null_mut(),
-                &raw mut len,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if sized != 0 {
-            return Err(io::Error::last_os_error());
+    unix_stream_table_with(unix_stream_table_once, std::time::Instant::now())
+}
+
+#[cfg(target_vendor = "apple")]
+fn unix_stream_table_with(
+    mut read: impl FnMut() -> io::Result<Vec<u8>>,
+    started: std::time::Instant,
+) -> io::Result<Vec<u8>> {
+    let deadline = started + SCAN_DEADLINE;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
         }
-        let mut table = vec![0u8; len + len / 4 + 4096];
-        let mut got: libc::size_t = table.len();
-        // SAFETY: `table` is `got` writable bytes; the call writes at most `got` of them and sets
-        // `got` to the count it wrote.
-        let read = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                table.as_mut_ptr().cast(),
-                &raw mut got,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if read == 0 {
-            table.truncate(got);
-            return Ok(table);
-        }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ENOMEM) {
-            return Err(err);
+        match read() {
+            Ok(table) => return Ok(table),
+            Err(error) if error.raw_os_error() == Some(libc::ENOMEM) => {}
+            Err(error) => return Err(error),
         }
     }
-    Err(io::Error::other(
-        "the unix-domain stream table outgrew each read's room",
-    ))
+}
+
+#[cfg(target_vendor = "apple")]
+fn unix_stream_table_once() -> io::Result<Vec<u8>> {
+    let name = aterm_sysprobe::jobs::darwin::UNIX_STREAM_TABLE;
+    let mut len: libc::size_t = 0;
+    // SAFETY: a size query: no buffer, and `len` a live `size_t` the call writes.
+    let sized = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if sized != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut table = vec![0u8; len + len / 4 + 4096];
+    let mut got: libc::size_t = table.len();
+    // SAFETY: `table` is `got` writable bytes; the call writes at most `got` of them and sets
+    // `got` to the count it wrote.
+    let read = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            table.as_mut_ptr().cast(),
+            &raw mut got,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read == 0 {
+        table.truncate(got);
+        return Ok(table);
+    }
+    Err(io::Error::last_os_error())
 }
 
 /// One walk of this uid's processes except `skip`.
@@ -1964,7 +1979,7 @@ pub use paths::a_force_detached_volume_is_no_working_directory;
 #[cfg(all(windows, any(test, debug_assertions)))]
 pub use paths::scan_path_users_of_within;
 pub use paths::{
-    Exe, PathScan, PathUse, exe_of, open_files, scan_path_users, scan_path_users_of,
+    Exe, PathScan, PathUse, cwd_of, exe_of, open_files, scan_path_users, scan_path_users_of,
     write_open_files,
 };
 
@@ -3972,5 +3987,52 @@ mod tests {
             "{}",
             path.display()
         );
+    }
+
+    #[test]
+    fn actual_unix_stream_inventory_survives_unrelated_capacity_churn() {
+        let check = super::TableCheck::bind().unwrap();
+        let mut calls = 0;
+        let table = super::unix_stream_table_with(
+            || {
+                calls += 1;
+                if calls <= 4 {
+                    Err(std::io::Error::from_raw_os_error(libc::ENOMEM))
+                } else {
+                    super::unix_stream_table_once()
+                }
+            },
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert!(calls >= 5);
+        let rows = aterm_sysprobe::jobs::darwin::unix_listeners(&table).unwrap();
+        assert!(rows.iter().any(|row| row.pid == std::process::id()
+            && row.path == check.path.as_os_str().as_encoded_bytes()));
+        let mut called = false;
+        assert_eq!(
+            super::unix_stream_table_with(
+                || {
+                    called = true;
+                    Ok(Vec::new())
+                },
+                std::time::Instant::now() - std::time::Duration::from_secs(61)
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        assert!(!called);
+        let mut failures = 0;
+        let error = super::unix_stream_table_with(
+            || {
+                failures += 1;
+                Err(std::io::Error::from_raw_os_error(libc::EACCES))
+            },
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(failures, 1);
     }
 }

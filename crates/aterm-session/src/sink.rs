@@ -34,6 +34,40 @@ pub struct InputEpoch(u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DrivenInput(u64);
 
+/// One look at whether a sink's program has read the input driven into it
+/// ([`SinkWriter::input_look`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputLook {
+    /// Which sink, and how much input was driven into it by the look.
+    pub mark: InputMark,
+    /// Every byte of every driven write reserved before the look was read by the program or
+    /// dropped: none was still on its way, in the sink's spill or in the slave's input queue,
+    /// and the slave reads input byte by byte (not canonical), so the queue counts every byte
+    /// its program can read. False wherever any of that is unknown.
+    pub read: bool,
+}
+
+/// Which sink an [`InputLook`] looked at and how much input had been driven into it: it moves at
+/// each driven write's reservation, and two sinks of one process never share one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputMark {
+    sink: u64,
+    driven: u64,
+}
+
+impl InputLook {
+    /// A look that found input `read` or not, after `driven` driven writes into sink `sink`, for
+    /// another crate's tests of what reads looks.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub const fn for_testing(sink: u64, driven: u64, read: bool) -> Self {
+        Self {
+            mark: InputMark { sink, driven },
+            read,
+        }
+    }
+}
+
 /// A watch on one sink's [`DrivenInput`] that holds no descriptor ([`SinkWriter::driven_input_watch`]).
 #[derive(Clone, Debug)]
 pub struct DrivenInputWatch(Arc<AtomicU64>);
@@ -532,6 +566,24 @@ impl std::fmt::Debug for ReplyBudget {
 
 static OWNED_MASTERS: AtomicUsize = AtomicUsize::new(0);
 
+/// The last sink serial handed out ([`InputMark`]).
+static SINK_SERIALS: AtomicU64 = AtomicU64::new(0);
+
+fn next_sink_serial() -> u64 {
+    SINK_SERIALS.fetch_add(1, Ordering::Relaxed)
+}
+
+/// A driven write's reservation until its bytes are placed: in the kernel, in the spill, or
+/// dropped ([`SinkWriter::input_look`]). Dropping it counts the write placed.
+#[must_use = "a reservation counts its write placed when it drops"]
+struct Placing<'a>(&'a AtomicU64);
+
+impl Drop for Placing<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// The number of PTY masters owned by live sinks in this process.
 #[must_use]
 pub fn owned_masters_open() -> usize {
@@ -563,6 +615,10 @@ pub struct SinkWriter {
     _owned: Option<CountedMaster<aterm_pty::OwnedMaster>>,
     ordered_egress_pending: AtomicUsize,
     driven_input: Arc<AtomicU64>,
+    /// Driven writes whose bytes are placed ([`Placing`]); never ahead of `driven_input`.
+    driven_placed: AtomicU64,
+    /// This sink among the process's ([`InputMark`]).
+    serial: u64,
     shared: Arc<Shared>,
 }
 
@@ -706,6 +762,8 @@ impl SinkWriter {
             _owned: None,
             ordered_egress_pending: AtomicUsize::new(0),
             driven_input: Arc::new(AtomicU64::new(0)),
+            driven_placed: AtomicU64::new(0),
+            serial: next_sink_serial(),
             shared: Arc::new(Shared::new()),
         }
     }
@@ -744,6 +802,8 @@ impl SinkWriter {
             _owned: Some(CountedMaster::new(master)),
             ordered_egress_pending: AtomicUsize::new(0),
             driven_input: Arc::new(AtomicU64::new(0)),
+            driven_placed: AtomicU64::new(0),
+            serial: next_sink_serial(),
             shared: Arc::new(Shared::new()),
         }
     }
@@ -783,6 +843,8 @@ impl SinkWriter {
             _owned: Some(CountedMaster::new(master)),
             ordered_egress_pending: AtomicUsize::new(0),
             driven_input: Arc::new(AtomicU64::new(0)),
+            driven_placed: AtomicU64::new(0),
+            serial: next_sink_serial(),
             shared: Arc::new(Shared::new()),
         }
     }
@@ -1203,9 +1265,32 @@ impl SinkWriter {
         DrivenInputWatch(Arc::clone(&self.driven_input))
     }
 
-    fn reserve_input_attempt(&self) {
+    /// Whether this sink's program has read every byte driven into it, as of this look. Read
+    /// in this order, so that a write reserved before the count is read is either seen unplaced
+    /// or, once placed, seen in the spill or the queue until its program reads it: the placed
+    /// count, the driven count, the spill, then the slave's queue
+    /// ([`Self::unread_input`]) and its mode. A reply ([`Self::write_reply`]) moves no count,
+    /// but its bytes while unread make the look unread too.
+    #[must_use]
+    pub fn input_look(&self) -> InputLook {
+        let placed = self.driven_placed.load(Ordering::Acquire);
+        let driven = self.driven_input.load(Ordering::Acquire);
+        let spilled = self.shared.try_spill_len();
+        let queued = self.unread_input();
+        let raw = self.tty_echo().is_some_and(|echo| !echo.canonical);
+        InputLook {
+            mark: InputMark {
+                sink: self.serial,
+                driven,
+            },
+            read: placed == driven && spilled == Some(0) && queued == Some(0) && raw,
+        }
+    }
+
+    fn reserve_input_attempt(&self) -> Placing<'_> {
         self.driven_input.fetch_add(1, Ordering::AcqRel);
         self.reserve_attempt();
+        Placing(&self.driven_placed)
     }
 
     fn reserve_attempt(&self) {
@@ -1232,7 +1317,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return (ImmediateWrite::Full, None);
         }
-        self.reserve_input_attempt();
+        let _placing = self.reserve_input_attempt();
         let (outcome, receipt) =
             self.try_write_frame_immediate_reserved(bytes, ShortWrite::InDoubt, false);
         (outcome, receipt.order())
@@ -1247,7 +1332,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return (ImmediateWrite::Full, None);
         }
-        self.reserve_input_attempt();
+        let _placing = self.reserve_input_attempt();
         let (outcome, receipt) =
             self.try_write_frame_immediate_reserved(bytes, ShortWrite::Queue, false);
         (outcome, receipt.order())
@@ -1263,7 +1348,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return (ImmediateWrite::Full, WriteReceipt::new(0, None));
         }
-        self.reserve_input_attempt();
+        let _placing = self.reserve_input_attempt();
         self.try_write_frame_immediate_reserved(bytes, ShortWrite::Queue, true)
     }
 
@@ -1388,7 +1473,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return (ImmediateWrite::Full, None);
         }
-        self.reserve_input_attempt();
+        let _placing = self.reserve_input_attempt();
         (ImmediateWrite::BusyZero, None)
     }
 
@@ -1414,7 +1499,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return Ok(WriteReceipt::new(0, None));
         }
-        self.reserve_input_attempt();
+        let _placing = self.reserve_input_attempt();
         self.write_frame_after_reserve(bytes, None, Landing::Driven, false)
     }
 
@@ -1423,7 +1508,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return Ok(WriteReceipt::new(0, None));
         }
-        self.reserve_input_attempt();
+        let _placing = self.reserve_input_attempt();
         self.write_frame_after_reserve(bytes, None, Landing::Driven, true)
     }
 
@@ -1460,7 +1545,7 @@ impl SinkWriter {
             .state
             .store(BulkState::Writing as u8, Ordering::Release);
         let since = self.shared.discard_epoch();
-        self.reserve_input_attempt();
+        let _placing = self.reserve_input_attempt();
         let result = self.write_frame_after_reserve(bytes, Some(meter), Landing::Driven, tracked);
         let sent = meter.sent.load(Ordering::Relaxed);
         meter.finish(match &result {
@@ -1668,7 +1753,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return Ok(WriteReceipt::new(0, None));
         }
-        self.reserve_input_attempt();
+        let _placing = self.reserve_input_attempt();
         self.write_frame_nonparking_after_reserve(bytes, Landing::Driven)
     }
 
@@ -1714,7 +1799,7 @@ impl SinkWriter {
         if bytes.is_empty() {
             return Ok(WriteReceipt::new(0, None));
         }
-        self.reserve_input_attempt();
+        let _placing = self.reserve_input_attempt();
         self.write_frame_unparked(bytes, WhenFull::Refuse, Landing::Driven)
     }
 

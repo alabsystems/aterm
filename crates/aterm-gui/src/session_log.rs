@@ -652,6 +652,8 @@ pub(crate) struct SessionLog {
     ask: Option<AskedEnd>,
     /// The runs that left the front for the shell before the open command's D, at most [`LEFT_FRONT_MAX`].
     left_front: Vec<LeftFront>,
+    /// The frame the next key lands on (fix E8, [`Self::note_frame`]).
+    keys: keys::KeyWitness,
     /// Where the session's tab took its place, as its `tab act=open` said ([`tab::TabPlace`]).
     tab: Option<tab::TabPlace>,
     /// What the tab spent, for its close's totals ([`tab::TabSpend`]).
@@ -663,6 +665,8 @@ pub(crate) struct SessionLog {
 pub(crate) struct PersonGesture {
     pub(crate) burst: Option<u64>,
     pub(crate) reaches: bool,
+    /// The gesture's key class (fix E8): what it chose on the frame it landed on.
+    pub(crate) key: KeyClass,
 }
 
 /// A session ring's bounds: [`Limits::SESSION`], or, in a development build only, `ATERM_SLOG_RING=<records>,<bytes>` (`aterm_types::dev_seam!`, `None` in a release build), read once: the bus mirror's world tests reach an eviction in a handful of commands with it.
@@ -743,6 +747,7 @@ impl SessionLog {
             front_pgid: 0,
             ask: None,
             left_front: Vec::new(),
+            keys: keys::KeyWitness::default(),
             tab: None,
             spend: tab::TabSpend::default(),
         }
@@ -858,6 +863,35 @@ impl SessionLog {
         self.reached_seen = c.reached;
         self.marked_through = c.seq;
         self.person = Some(count);
+    }
+
+    /// THE SCREEN'S COUNT, bound when the store registers the session: the PTY reader's feeds
+    /// that moved the screen, read when an input reaches the program (fix E8,
+    /// [`keys::KeyWitness`]).
+    pub(crate) fn bind_screen(&mut self, moves: std::sync::Arc<crate::vitals_host::ScreenMoves>) {
+        self.keys.bind(moves);
+    }
+
+    /// THE FRAME A KEY LANDS ON (fix E8): an agent read of the screen at `moves` (the screen's
+    /// count as the reader saw it, under the term lock) showed a box or question whose choosing
+    /// keys choose `keys` (`None`: it showed none). It stands for a key pressed later only once
+    /// the screen it saw moved after the last input.
+    pub(crate) const fn note_frame(&mut self, keys: Option<FrameKeys>, moves: u64) {
+        self.keys.read(keys, moves);
+    }
+
+    /// THE SAME FRAME, READ AGAIN (fix E8): an agent read of the screen at `moves` found the zone
+    /// the last noted read classified unchanged, so the sweep classified nothing: the frame
+    /// [`Self::note_frame`] noted stands at `moves`, and a screen that moved after it no longer
+    /// voids it.
+    pub(crate) fn note_same_frame(&mut self, moves: u64) {
+        self.keys.reread(moves);
+    }
+
+    /// The frame a control input admitted now lands on, for its acceptance
+    /// ([`Self::ctl_accepted`]).
+    pub(crate) fn key_frame(&self) -> KeyFrame {
+        self.keys.at_admission()
     }
 
     /// RECONCILE THE PERSON: when the count moved past what this log last delivered, a person's key found the timeline held (`note_person`'s `try_lock`): it is delivered now, before the entry that called this reaches the tracker or writes mail, so it binds the step open now (T1) and stands between mail and the turn after it.
@@ -2156,11 +2190,13 @@ impl SessionLog {
     /// A person's hands were on the session: the tracker attributes a turn that opens within 5 s to them (a run a waiting name opens later too, [`Typed`]).
     pub(crate) fn person_input(&mut self, own: Option<PersonGesture>, at: Stamp) {
         let own_reaches = own.is_some_and(|g| g.reaches);
+        let own_key = own.filter(|g| g.reaches).map(|g| g.key);
         let Some(p) = self.person.as_ref() else {
             if let Some(g) = own {
+                let chose = own_key.and_then(|k| self.keys.chose(k));
                 self.deliver_person(
                     true,
-                    g.reaches,
+                    (g.reaches, chose),
                     (g.burst.is_some(), false),
                     own_reaches,
                     0,
@@ -2172,6 +2208,11 @@ impl SessionLog {
         let c = p.counts();
         let fresh = c.seq > self.person_seen;
         let reached = c.reached > self.reached_seen;
+        // The key's frame is the program's state before it only when it is the one reached
+        // gesture this delivery brings: one held behind it landed on that frame first (fix E8).
+        let chose = own_key
+            .filter(|_| c.reached == self.reached_seen + 1)
+            .and_then(|k| self.keys.chose(k));
         let burst = own
             .and_then(|g| g.burst)
             .is_some_and(|n| n > self.marked_through);
@@ -2180,7 +2221,7 @@ impl SessionLog {
         self.reached_seen = self.reached_seen.max(c.reached);
         self.deliver_person(
             fresh,
-            reached,
+            (reached, chose),
             (burst, unmarked_burst),
             own_reaches,
             c.seq,
@@ -2194,13 +2235,15 @@ impl SessionLog {
         let c = self.person.as_ref().map(|p| p.counts()).unwrap_or_default();
         self.person_seen = self.person_seen.max(c.seq);
         self.reached_seen = self.reached_seen.max(c.reached);
-        self.deliver_person(true, true, (burst, false), true, c.seq, at);
+        self.deliver_person(true, (true, None), (burst, false), true, c.seq, at);
     }
 
+    /// `reached`: whether a gesture it delivers reached the program, and what the screen showed
+    /// the delivered gesture's key choose (fix E8).
     fn deliver_person(
         &mut self,
         fresh: bool,
-        reached: bool,
+        (reached, chose): (bool, Option<aterm_slog::Chose>),
         (burst, unmarked_burst): (bool, bool),
         own_reaches: bool,
         seq: u64,
@@ -2214,13 +2257,16 @@ impl SessionLog {
             self.arrivals += 1;
             self.typed.input = Some((self.arrivals, Actor::Human, None, at));
         }
+        if reached {
+            self.keys.reached();
+        }
         let Self { log, agent, .. } = self;
         if let Some(a) = agent.as_mut() {
             if fresh {
                 a.tracker.note_input(Actor::Human, at);
             }
             if reached {
-                let _ = a.tracker.person(log, at);
+                let _ = a.tracker.person(log, chose, at);
             }
         }
         let after_mail = reached && self.log.fold().in_since_human();
@@ -3178,6 +3224,9 @@ pub(crate) fn render_brief_all(parts: &[BriefPart], budget: usize) -> String {
 #[path = "session_log_mark.rs"]
 mod mark;
 
+#[path = "session_log_keys.rs"]
+pub(crate) mod keys;
+pub(crate) use keys::{FrameKeys, KeyClass, KeyFrame};
 #[path = "session_log_tab.rs"]
 mod tab;
 pub(crate) use tab::{TabClose, TabPlace, TreeSpent};

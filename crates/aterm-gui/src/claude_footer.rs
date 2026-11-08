@@ -145,8 +145,9 @@ struct AgyRowEdit {
 pub(crate) struct SpliceLists {
     panes: Vec<FooterPane>,
     seen: Vec<SeenPane>,
-    /// Panes whose composer is on the glass with no plain rule glyph to write into.
-    bare: Vec<u64>,
+    /// Panes whose composer is on the glass with no plain rule glyph to write into
+    /// (`(session, term_row)`).
+    bare: Vec<(u64, usize)>,
     /// The rules' compositions, written as [`rule_edits`].
     rules: Vec<RuleWrite>,
     /// agy's glass-only transcript markdown edits.
@@ -5711,7 +5712,7 @@ impl App {
                 if let Some((top, bottom)) = readings.reach.and_then(|r| r.rules())
                     && check.disowns(top, bottom + 1)
                 {
-                    lists.bare.push(session);
+                    lists.bare.push((session, row_off + bottom));
                     lists.seen.push(SeenPane {
                         leaf_index,
                         session,
@@ -5740,8 +5741,10 @@ impl App {
                     )?;
                     Some((frame_row, row_off + r, run, rule))
                 });
-                if on_glass.is_some() && rule.is_none() {
-                    lists.bare.push(session);
+                if let Some(r) = on_glass
+                    && rule.is_none()
+                {
+                    lists.bare.push((session, row_off + r));
                 }
                 let harness_on = view.wears_glass(supervised).is_some() && !agy_switch_off;
                 // Claude's running jobs, which the ⬆️'s words name for a move held by them.
@@ -5987,8 +5990,8 @@ impl App {
                 ws.claude_lights.note_switch_face(pane.session, pane.switch);
             }
         }
-        for session in lists.bare.drain(..) {
-            self.note_claude_footer_row(wid, session, 0);
+        for (session, term_row) in lists.bare.drain(..) {
+            self.note_claude_footer_row(wid, session, term_row, 0);
         }
         self.compose_claude_cards(wid, cards);
         self.compose_claude_panels(wid, &mut lists.panels);
@@ -6015,7 +6018,7 @@ impl App {
             }) else {
                 continue;
             };
-            self.note_claude_footer_row(wid, pane.session, chips_room);
+            self.note_claude_footer_row(wid, pane.session, pane.term_row, chips_room);
             self.note_claude_team(wid, pane.session);
             let glass = GlassInks::of(
                 pane.palette,

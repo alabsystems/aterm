@@ -302,6 +302,30 @@ pub fn exe_of(_pid: u32) -> Exe {
     Exe::Unnamed
 }
 
+/// The working directory of `pid`, as the kernel answers it: none for a process gone, another
+/// user's, or a directory with no path.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+pub fn cwd_of(pid: u32) -> Option<PathBuf> {
+    mac::cwd(i32::try_from(pid).ok()?).ok().flatten()
+}
+
+/// See the macOS twin: `/proc/<pid>/cwd`'s target.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn cwd_of(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd"))
+        .ok()
+        .filter(|p| p.is_absolute())
+}
+
+/// See the macOS twin: no reader here, so none is named.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+#[must_use]
+pub fn cwd_of(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
 #[cfg(target_vendor = "apple")]
 mod mac {
     use super::super::{Failed, clear_errno, ffi, list_fds};

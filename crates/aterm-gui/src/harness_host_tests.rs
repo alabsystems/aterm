@@ -12955,6 +12955,99 @@ fn reset_rows(a: &Accts) -> Vec<(&'static str, String)> {
         .collect()
 }
 
+/// Claude Code's own switch (`[harness.claude] enabled = false`) holds the limit reset off as the
+/// master switch does (`SupervisorConfig::limit_reset_on`): a worker still running when the
+/// person turns it off claims nothing, makes nothing and reads nothing of the agent, with a roster
+/// or with none (the one row `main`). NEGATIVE CONTROL: the same worker, the switch on again,
+/// takes the reset.
+#[test]
+fn claude_codes_own_switch_off_claims_no_limit_reset() {
+    let sid = "s-reset-1";
+    let ask = reset_ask(None);
+    let mut claude_off = resetting();
+    claude_off.set("claude.enabled", "false").unwrap();
+    for listed in [true, false] {
+        let a = Accts::new();
+        walled(&a, sid, ACCT_TALK_A, LONG_WALL);
+        if !listed {
+            std::fs::remove_file(a.roster_path()).unwrap();
+        }
+        let live = a.worker(sid, &resetting());
+        live.switches.set(&claude_off, false);
+        assert_eq!(
+            live.reset_claimed(&ask, &mut None),
+            Err(NoReset::Off),
+            "listed: {listed}"
+        );
+        assert_eq!(live.reset_take(&ask), ResetWord::No(ResetNo::Off));
+        assert_eq!(live.reset_told(&reset_end()), ResetOutcome::Unread);
+        assert_eq!(a.said(), Vec::<String>::new(), "nothing of the agent read");
+        assert!(!a.state_root().exists(), "nothing made, no lock to hold");
+        live.switches.set(&resetting(), false);
+        assert_eq!(
+            live.reset_take(&ask),
+            ResetWord::Take(reset_go(LONG_WALL, true)),
+            "listed: {listed}"
+        );
+    }
+}
+
+/// Claude Code's switch turned off while a claim is under way, past its first read of the switch:
+/// the claim reads it again under the store's lock, where it commits, and claims nothing, so the
+/// wall's one attempt is not spent on a row the cut transport would refuse to enter. NEGATIVE
+/// CONTROL: the switch on again, the same worker takes the reset, its attempt still unspent.
+#[test]
+fn a_switch_turned_off_while_the_claim_is_under_way_spends_no_attempt() {
+    let sid = "s-reset-1";
+    let ask = reset_ask(None);
+    let mut claude_off = resetting();
+    claude_off.set("claude.enabled", "false").unwrap();
+    let a = Accts::new();
+    walled(&a, sid, ACCT_TALK_A, LONG_WALL);
+    let live = a.worker(sid, &resetting());
+    let switches = Arc::clone(&live.switches);
+    // The ask's context is the first read of the seat; the claim's commit is the second.
+    a.at_seat_read(2, move |_| switches.set(&claude_off, false));
+    assert_eq!(live.reset_claimed(&ask, &mut None), Err(NoReset::Off));
+    assert!(
+        a.at_read.lock().unwrap().is_none(),
+        "the window was reached"
+    );
+    assert_eq!(a.state().reset, None, "no claim");
+    assert_eq!(a.ledger_len(), 0, "nothing recorded");
+    live.switches.set(&resetting(), false);
+    assert_eq!(
+        live.reset_take(&ask),
+        ResetWord::Take(reset_go(LONG_WALL, true))
+    );
+    assert_eq!(a.ledger(), ["wall"]);
+}
+
+/// A headless instance under `[harness] headless = false` supervises nothing here, and its host's
+/// limit reset and usage tap read off with its other account switches. CONTROLS: the same keys
+/// read on in a window, and in a headless instance that supervises.
+#[test]
+fn an_instance_that_supervises_nothing_holds_its_limit_reset_and_tap_off() {
+    let read = |cfg: &SupervisorConfig, headless: bool| {
+        let s = Switches::default();
+        s.set(cfg, headless);
+        (s.reset_on(), s.usage_tap.load(Ordering::SeqCst))
+    };
+    let mut never = resetting();
+    never.set("headless", "false").unwrap();
+    assert_eq!(
+        read(&never, true),
+        (false, false),
+        "headless, never to supervise"
+    );
+    assert_eq!(read(&never, false), (true, true), "a window supervises");
+    assert_eq!(
+        read(&resetting(), true),
+        (true, true),
+        "headless, supervising"
+    );
+}
+
 #[test]
 fn a_limit_reset_is_claimed_once_per_wall_and_only_with_its_key_on() {
     let (sid, other_sid) = ("s-reset-1", "s-reset-2");
@@ -33727,17 +33820,37 @@ impl TapWorld {
 
     /// [`Self::tap`] from a process whose Claude home variable is `home` (`None`: unset).
     fn tap_in(&self, api_ms: u64, pct: u32, login: Option<&str>, home: Option<&str>) {
+        let reset = self.born + 4 * 3600;
+        self.tap_text(
+            &format!(
+                r#"{{"cost":{{"total_api_duration_ms":{api_ms}}},"rate_limits":{{"five_hour":{{"used_percentage":{pct},"resets_at":{reset}}},"seven_day":{{"used_percentage":30,"resets_at":{}}}}}}}"#,
+                reset + 86_400
+            ),
+            login,
+            home,
+        );
+    }
+
+    /// [`Self::tap`] of a reading that names its five-hour window alone.
+    fn tap_five_hour(&self, api_ms: u64, pct: u32) {
+        let reset = self.born + 4 * 3600;
+        self.tap_text(
+            &format!(
+                r#"{{"cost":{{"total_api_duration_ms":{api_ms}}},"rate_limits":{{"five_hour":{{"used_percentage":{pct},"resets_at":{reset}}}}}}}"#
+            ),
+            None,
+            None,
+        );
+    }
+
+    /// The status line `stdin` read by the tap, now.
+    fn tap_text(&self, stdin: &str, login: Option<&str>, home: Option<&str>) {
         let vars = tap::TapVars {
             sid: Some(TAP_SID.to_string()),
             pid: Some(TAP_PID.to_string()),
             login: login.map(str::to_owned),
             home: home.map(str::to_owned),
         };
-        let reset = self.born + 4 * 3600;
-        let stdin = format!(
-            r#"{{"cost":{{"total_api_duration_ms":{api_ms}}},"rate_limits":{{"five_hour":{{"used_percentage":{pct},"resets_at":{reset}}},"seven_day":{{"used_percentage":30,"resets_at":{}}}}}}}"#,
-            reset + 86_400
-        );
         let mut out = Vec::new();
         let _ = tap::run(
             &mut stdin.as_bytes(),
@@ -34360,6 +34473,195 @@ fn a_recorded_tap_readings_series_row_carries_the_records_lab_key() {
     );
 }
 
+/// A tap reading's series row carries the lab key its own store transaction learns. The row
+/// `main` names its login's email, so the journal keys the record (`journal::learn`, which runs
+/// after the transaction's edit) in the transaction that folds the first reading: that
+/// reading's `fig` row carries the lab key the record now holds. Negative control: the series'
+/// keys read inside the edit, before the journal learned them (as they were), write the first
+/// `fig` row with no `ac`.
+#[cfg(unix)]
+#[test]
+fn a_tap_readings_series_row_carries_the_lab_key_its_transaction_learns() {
+    const AC: &str = "ac-fedcba9876543210";
+    fn keyer(_realm: &str, _email: &str) -> Option<String> {
+        Some(AC.to_owned())
+    }
+    let w = TapWorld::new();
+    std::fs::write(
+        w.roster_path(),
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"person@example.com\"\n",
+    )
+    .expect("roster");
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    w.tap(10, 42, None);
+    let step = aterm_agent::harness::journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+    assert_eq!(step, Some("reading recorded"));
+    let (state, _) = accounts::Store::at(&w.state())
+        .load(w.clock())
+        .expect("the store");
+    assert_eq!(
+        state.accounts.get("main").and_then(|a| a.pk.as_deref()),
+        Some(AC),
+        "PRECONDITION: the reading's transaction keyed the record"
+    );
+    let rows = account_series::read(&w.state(), "main", &state.machine);
+    assert!(
+        matches!(
+            rows.as_slice(),
+            [account_series::SeriesRow {
+                said: account_series::Said::Fig {
+                    five_hour: Some(five),
+                    ac: Some(ac),
+                    ..
+                },
+                ..
+            }] if ac == AC && five.pct_x10 == 420
+        ),
+        "{rows:?}"
+    );
+}
+
+/// A TAP READING WHOSE RECORD THE JOURNAL HANDS OFF KEEPS ITS SERIES ROW, UNDER THE KEY IT IS
+/// FILED BY. The row `main` names `old@`, keyed `ac-…01`, and its first reading is written under
+/// that key; the row is then edited to name `new@`. The next reading's transaction folds it into
+/// the record, and the journal, learning that the row now names another account, files the
+/// record's observations, this reading's among them, under the key the record had
+/// (`State::forgotten`): the reading's `fig` row carries its figures and that key. Negative
+/// control: the series' figures read once the journal learned (the label's record, which the
+/// hand-off emptied) leave the reading out, and the last assertion fails.
+#[cfg(unix)]
+#[test]
+fn a_tap_reading_the_journal_hands_off_keeps_its_series_row_under_the_key_it_is_filed_by() {
+    const OLD: &str = "ac-0000000000000001";
+    const NEW: &str = "ac-0000000000000002";
+    fn keyer(_realm: &str, email: &str) -> Option<String> {
+        Some(if email.starts_with("old@") { OLD } else { NEW }.to_owned())
+    }
+    let w = TapWorld::new();
+    let roster = |email: &str| {
+        std::fs::write(
+            w.roster_path(),
+            format!("[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"{email}\"\n"),
+        )
+        .expect("roster");
+    };
+    roster("old@example.com");
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    let step = || aterm_agent::harness::journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+    w.tap(10, 42, None);
+    assert_eq!(step(), Some("reading recorded"));
+    roster("new@example.com");
+    w.later(10);
+    w.tap(30, 50, None);
+    assert_eq!(step(), Some("reading recorded"));
+    let (state, _) = accounts::Store::at(&w.state())
+        .load(w.clock())
+        .expect("the store");
+    assert_eq!(
+        state.accounts.get("main").and_then(|a| a.pk.as_deref()),
+        Some(NEW),
+        "PRECONDITION: the row's record is keyed as the account the row names now"
+    );
+    assert_eq!(
+        state
+            .forgotten
+            .get(OLD)
+            .and_then(|a| a.windows.get(accounts::SESSION_LIMIT))
+            .map(|f| f.pct_x10),
+        Some(500),
+        "PRECONDITION: the store filed the reading under the key the record had"
+    );
+    let rows = account_series::read(&w.state(), "main", &state.machine);
+    let figs: Vec<(u32, Option<&str>)> = rows
+        .iter()
+        .filter_map(|row| match &row.said {
+            account_series::Said::Fig {
+                five_hour: Some(five),
+                ac,
+                ..
+            } => Some((five.pct_x10, ac.as_deref())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(figs, [(420, Some(OLD)), (500, Some(OLD))], "{rows:?}");
+}
+
+/// A TAP READING'S SERIES ROW TAKES NO FIGURE THE JOURNAL GIVES BACK FROM A FORGOTTEN RECORD. The
+/// row `main` names an account this Mac forgot (`State::forgotten`, its week read at 77% two days
+/// ago) and has no record yet; the first reading names its five-hour window alone. Its
+/// transaction folds it into a new record, and the journal then gives the record the forgotten
+/// week back: the reading's `fig` row carries its five-hour figure and the account's lab key, and
+/// no week. Negative control: the series' figures read once the journal learned (the record with
+/// the week given back) write the forgotten week at its old `at`, and the last assertion fails.
+#[cfg(unix)]
+#[test]
+fn a_tap_readings_series_row_takes_no_figure_the_journal_gives_back() {
+    const AC: &str = "ac-0000000000000003";
+    fn keyer(_realm: &str, _email: &str) -> Option<String> {
+        Some(AC.to_owned())
+    }
+    let w = TapWorld::new();
+    std::fs::write(
+        w.roster_path(),
+        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\nemail = \"person@example.com\"\n",
+    )
+    .expect("roster");
+    let read_at = w.clock() - 2 * 86_400;
+    accounts::Store::at(&w.state())
+        .transact(w.clock(), &mut None, |state| {
+            let mut forgot = accounts::Account {
+                pk: Some(AC.into()),
+                ..accounts::Account::default()
+            };
+            forgot.windows.insert(
+                accounts::WEEK_LIMIT.into(),
+                accounts::WindowFig {
+                    pct_x10: 770,
+                    reset: w.clock() + 3 * 86_400,
+                    at: read_at,
+                    by: state.machine.clone(),
+                    source: accounts::SOURCE_TAP.into(),
+                    epoch_at: None,
+                },
+            );
+            state.forgotten.insert(AC.into(), forgot);
+            Ok(Vec::new())
+        })
+        .expect("the forgotten record");
+    let idle = w.worker(&tap_on(), tapped_argv(), true);
+    w.tap_five_hour(10, 42);
+    let step = aterm_agent::harness::journal::with_keyer(keyer, || idle.tap_step(TapAt::Point));
+    assert_eq!(step, Some("reading recorded"));
+    let (state, _) = accounts::Store::at(&w.state())
+        .load(w.clock())
+        .expect("the store");
+    assert_eq!(
+        state
+            .accounts
+            .get("main")
+            .and_then(|a| a.windows.get(accounts::WEEK_LIMIT))
+            .map(|f| f.at),
+        Some(read_at),
+        "PRECONDITION: the journal gave the record the forgotten week back"
+    );
+    let rows = account_series::read(&w.state(), "main", &state.machine);
+    assert!(
+        matches!(
+            rows.as_slice(),
+            [account_series::SeriesRow {
+                said: account_series::Said::Fig {
+                    five_hour: Some(five),
+                    seven_day: None,
+                    ac: Some(ac),
+                    ..
+                },
+                ..
+            }] if ac == AC && five.pct_x10 == 420
+        ),
+        "{rows:?}"
+    );
+}
+
 /// A tapped session's fresh reading is recorded for the machine's own login (`main`, with no
 /// roster), and only news is written.
 #[cfg(unix)]
@@ -34711,8 +35013,9 @@ fn a_fresh_reading_not_taken_is_tried_again() {
 }
 
 /// The reading that times a wall is the tab's own process's newest, stamped when the tap wrote it,
-/// and recorded nowhere. Negative controls answer nothing: the switch off, no tap on the argv, a
-/// Codex, a file older than the process.
+/// and recorded nowhere. Negative controls answer nothing: the switch off, Claude Code's own
+/// switch off (`[harness.claude] enabled = false`), no tap on the argv, a Codex, a file older than
+/// the process.
 #[cfg(unix)]
 #[test]
 fn a_tapped_processs_own_reading_times_its_wall_under_the_switch() {
@@ -34758,6 +35061,14 @@ fn a_tapped_processs_own_reading_times_its_wall_under_the_switch() {
         off.tap_window(UsageWindow::FiveHour),
         None,
         "the switch off"
+    );
+    let mut claude_off = tap_on();
+    claude_off.set("claude.enabled", "false").expect("a switch");
+    assert_eq!(
+        w.worker(&claude_off, tapped_argv(), true)
+            .tap_window(UsageWindow::FiveHour),
+        None,
+        "Claude Code's own switch off"
     );
     let bare = w.worker(&tap_on(), vec!["claude".to_string()], true);
     assert_eq!(

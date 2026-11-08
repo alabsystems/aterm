@@ -490,8 +490,8 @@ mod tests {
             Box::new(move |args, _, _| {
                 called.calls.lock().unwrap().push(args.join(" "));
                 if args.first().is_some_and(|verb| verb == "update") {
-                    landing.file(aterm_machines::items::github::CLT_GIT, b"fixture Git");
-                    landing.file(aterm_machines::items::github::SYSTEM_GIT, b"fixture Git");
+                    landing.executable(aterm_machines::items::github::CLT_GIT, b"fixture Git");
+                    landing.executable(aterm_machines::items::github::SYSTEM_GIT, b"fixture Git");
                 }
                 Ok(Ran::ok(""))
             }),
@@ -909,7 +909,7 @@ mod tests {
             aterm_machines::items::github::CLT_GIT,
             aterm_machines::items::github::SYSTEM_GIT,
         ] {
-            sys.file(path, b"old native Git");
+            sys.executable(path, b"old native Git");
         }
         sys.simulate(|_, command| {
             command

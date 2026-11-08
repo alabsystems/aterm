@@ -12,7 +12,7 @@ use std::process::Output;
 use crate::fixtures::{self, Answers, Landed, Pins};
 use crate::gates::{HANDOFF_FIXTURE_GUARD, HANDOFF_FIXTURE_ROOT};
 use crate::ledger::testing::Git;
-use crate::ledger::{GitRunner, RunOut};
+use crate::ledger::{GitRunner, Origin as OriginTransport, RefWrite, RunOut};
 
 const GUARD: &str = "// the guard\nconst PINNED_DESKS: &[(&str, &str)] = &[\n    (\"v0.5.0\", \"history\"),\n];\n\nconst REQUIRED_DESKS: &[(&str, &str)] = &[\n    (\"v0.5.0\", \"history\"),\n];\n";
 
@@ -116,6 +116,21 @@ impl Origin {
             .unwrap()
             .stdout
     }
+}
+
+/// The actual native adapter uses only this owned bare repository. Fixture
+/// actors retain their separate local Git setup route; the algorithm gets no
+/// raw transport through its GitRunner.
+fn native(o: &Origin) -> crate::github_remote::Remote {
+    git(
+        &o.work,
+        &[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ],
+    );
+    crate::github_remote::claim_fixture(&o.work, &o.dir.path().join("origin.git"))
 }
 
 fn artifact(root: &Path, binary: &Path) -> String {
@@ -396,7 +411,8 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
         .trim()
         .to_string();
 
-    let landed = fixtures::land(&work, &staged, &pins(7), 5, &mut reader(&staged)).unwrap();
+    let landed =
+        fixtures::land(&work, &native(&o), &staged, &pins(7), &mut reader(&staged)).unwrap();
     let Landed::Pushed {
         commit,
         attempt,
@@ -433,7 +449,7 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
         ),
         "{guard}"
     );
-    git(&o.work, &["fetch", "-q", "origin", "main"]);
+    native(&o).refresh_main().unwrap();
     assert_eq!(
         git(&o.work, &["rev-parse", "origin/main"]).trim(),
         commit.as_str()
@@ -462,9 +478,10 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
         Some(vec!["history".to_string(), "twelve-panes".to_string()])
     );
 
-    let again = fixtures::land(&work, &staged, &pins(7), 5, &mut reader(&staged)).unwrap();
+    let again =
+        fixtures::land(&work, &native(&o), &staged, &pins(7), &mut reader(&staged)).unwrap();
     assert!(matches!(again, Landed::Already { .. }), "{again:?}");
-    git(&o.work, &["fetch", "-q", "origin", "main"]);
+    native(&o).refresh_main().unwrap();
     assert_eq!(
         git(&o.work, &["rev-parse", "origin/main"]).trim(),
         commit.as_str()
@@ -473,9 +490,12 @@ fn a_landing_commits_the_staging_and_its_rows_on_main_once() {
 
 struct Raced<'a> {
     inner: Git,
-    rival: &'a Path,
-    fired: Cell<bool>,
+    remote: crate::github_remote::Remote,
+    rival: Option<&'a Path>,
+    remaining: Cell<u32>,
     pushes: RefCell<Vec<String>>,
+    refreshes: Cell<u32>,
+    lose_reply: bool,
     path: &'static str,
 }
 
@@ -501,34 +521,40 @@ fn main_reader_answers_replace_line_answers_and_a_named_red_still_lands() {
         "negative control: main and line must answer differently"
     );
     let mut reads = 0;
-    let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |preview| {
-        reads += 1;
-        assert_eq!(
-            git(
-                &o.work,
-                &[
-                    "show",
-                    &format!("{preview}:{HANDOFF_FIXTURE_ROOT}/v0.6.0/history/parent.toml")
-                ]
-            )
-            .as_bytes(),
-            fs::read(staged.dir.join("history/parent.toml")).unwrap()
-        );
-        assert_eq!(
-            git(
-                &o.work,
-                &[
-                    "show",
-                    &format!("{preview}:{}", fixtures::SHIPPED_STATE_CORPUS)
-                ]
-            ),
-            corpus()
-        );
-        fixtures::Reading {
-            answers: Ok(main.clone()),
-            checks: "FAIL: restore_claude_auth_tests::new_route".into(),
-        }
-    })
+    let landed = fixtures::land(
+        &Git::new(&o.work),
+        &native(&o),
+        &staged,
+        &pins(7),
+        &mut |preview| {
+            reads += 1;
+            assert_eq!(
+                git(
+                    &o.work,
+                    &[
+                        "show",
+                        &format!("{preview}:{HANDOFF_FIXTURE_ROOT}/v0.6.0/history/parent.toml")
+                    ]
+                )
+                .as_bytes(),
+                fs::read(staged.dir.join("history/parent.toml")).unwrap()
+            );
+            assert_eq!(
+                git(
+                    &o.work,
+                    &[
+                        "show",
+                        &format!("{preview}:{}", fixtures::SHIPPED_STATE_CORPUS)
+                    ]
+                ),
+                corpus()
+            );
+            fixtures::Reading {
+                answers: Ok(main.clone()),
+                checks: "FAIL: restore_claude_auth_tests::new_route".into(),
+            }
+        },
+    )
     .unwrap();
     assert_eq!(reads, 1, "a FAIL is never re-rolled");
     assert_eq!(o.on_main(fixtures::SHIPPED_STATE_CORPUS), main.as_bytes());
@@ -556,12 +582,16 @@ fn an_unavailable_main_reader_never_falls_back_to_the_line_reader() {
         &mut generator(&["history"], &runs),
     )
     .unwrap();
-    let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |_| {
-        fixtures::Reading {
+    let landed = fixtures::land(
+        &Git::new(&o.work),
+        &native(&o),
+        &staged,
+        &pins(7),
+        &mut |_| fixtures::Reading {
             answers: Err("main compile failed".into()),
             checks: "COULD NOT RUN: main compile failed".into(),
-        }
-    })
+        },
+    )
     .unwrap();
     assert_eq!(
         o.on_main(fixtures::SHIPPED_STATE_CORPUS),
@@ -601,7 +631,7 @@ fn main_reader_field_hold_names_a_stale_row_and_lands_the_facts() {
         let fields = "[meta]\nwritten = []\n";
         fs::write(staged.dir.join("fields.toml"), fields).unwrap();
         let (mut compiles, mut holds, mut consumers) = (0, 0, 0);
-        let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |preview| {
+        let landed = fixtures::land(&Git::new(&o.work), &native(&o), &staged, &pins(7), &mut |preview| {
             fixtures::MainReader::new(&o.work).unwrap().read(&targo(), preview, &pins(7), &mut |cmd| {
                 let tree = cmd.get_current_dir().unwrap();
                 let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
@@ -680,7 +710,7 @@ fn main_reader_records_then_checks_the_splice_without_blessing_old_answers() {
         let mut calls = 0;
         let rendered = staged_answers(&["history"]).replace("fnv1a64:6", "fnv1a64:MAIN");
         let expected = rendered.clone();
-        let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |preview| {
+        let landed = fixtures::land(&Git::new(&o.work), &native(&o), &staged, &pins(7), &mut |preview| {
             fixtures::MainReader::new(&o.work).unwrap().read(&targo(), preview, &pins(7), &mut |cmd| {
                 if let Some(out) = field_hold_pass(cmd) { return Ok(out); }
                 calls += 1;
@@ -848,164 +878,6 @@ fn measure_main_fixture_reader() {
     assert!(reading.checks.starts_with("PASS"), "{}", reading.checks);
 }
 
-/// Real reader, local bare origin, one competing commit per take. Reopening the
-/// reader on each callback models the old unconditional retry without a product flag.
-#[test]
-#[ignore = "ABBA measurement of real GUI compilation and desk readers against a scratch remote"]
-fn measure_raced_fixture_landing() {
-    let version = std::env::var("ATERM_MEASURE_SHIPPED_VERSION").unwrap();
-    let repo = aterm_tempfile::manifest_dir()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let found = fixtures::on_commit(&Git::new(&repo), "HEAD", &version)
-        .unwrap()
-        .unwrap();
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let root = scratch.path();
-    git(
-        root,
-        &[
-            "clone",
-            "-q",
-            "--shared",
-            "--bare",
-            repo.to_str().unwrap(),
-            "origin.git",
-        ],
-    );
-    git(
-        &root.join("origin.git"),
-        &["symbolic-ref", "HEAD", "refs/heads/main"],
-    );
-    crate::ledger::testing::config(&root.join("origin.git"), &[]);
-    git(
-        root,
-        &["clone", "-q", "--shared", repo.to_str().unwrap(), "work"],
-    );
-    let work = root.join("work");
-    identity(&work);
-    git(
-        &work,
-        &[
-            "remote",
-            "set-url",
-            "origin",
-            root.join("origin.git").to_str().unwrap(),
-        ],
-    );
-    git(&work, &["checkout", "-q", "-B", "main"]);
-    let tag = format!("v{version}");
-    git(
-        &work,
-        &["rm", "-qr", &format!("{HANDOFF_FIXTURE_ROOT}/{tag}")],
-    );
-    let guard = fs::read_to_string(work.join(HANDOFF_FIXTURE_GUARD)).unwrap();
-    fs::write(
-        work.join(HANDOFF_FIXTURE_GUARD),
-        guard
-            .lines()
-            .filter(|line| !line.contains(&format!("(\"{tag}\",")))
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n",
-    )
-    .unwrap();
-    let corpus = fs::read_to_string(work.join(fixtures::SHIPPED_STATE_CORPUS)).unwrap();
-    fs::write(
-        work.join(fixtures::SHIPPED_STATE_CORPUS),
-        corpus
-            .lines()
-            .filter(|line| !line.starts_with(&format!("{tag}/")))
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n",
-    )
-    .unwrap();
-    git(&work, &["add", "-A"]);
-    git(
-        &work,
-        &["commit", "-qm", "scratch base without measured release"],
-    );
-    let base = git(&work, &["rev-parse", "HEAD"]).trim().to_string();
-    git(&work, &["push", "-q", "-u", "origin", "main"]);
-    git(root, &["clone", "-q", "origin.git", "rival"]);
-    let rival = root.join("rival");
-    identity(&rival);
-    let staged = fixtures::Staged {
-        dir: repo.join(HANDOFF_FIXTURE_ROOT).join(&tag),
-        desks: found.desks,
-        rendezvous: repo
-            .join(HANDOFF_FIXTURE_ROOT)
-            .join(&tag)
-            .join("rendezvous.toml")
-            .is_file(),
-        answers: root.join("unused-line-answers"),
-        fresh: false,
-    };
-    let pins = Pins {
-        version,
-        build: 1,
-        commit: git(&repo, &["rev-parse", "HEAD"]).trim().to_string(),
-    };
-    for reuse in [false, true, true, false] {
-        git(
-            &root.join("origin.git"),
-            &["update-ref", "refs/heads/main", &base],
-        );
-        git(&rival, &["checkout", "-q", "-B", "main", &base]);
-        let raced = Raced {
-            inner: Git::new(&work),
-            rival: &rival,
-            fired: Cell::new(false),
-            pushes: RefCell::new(Vec::new()),
-            path: "crates/aterm-release/src/main.rs",
-        };
-        let mut persistent = reuse.then(|| fixtures::MainReader::new(&work).unwrap());
-        let start = std::time::Instant::now();
-        let mut compiles = 0;
-        let mut records = 0;
-        let landed = fixtures::land(&raced, &staged, &pins, 5, &mut |preview| {
-            let mut reopened;
-            let reader = if let Some(reader) = persistent.as_mut() {
-                reader
-            } else {
-                reopened = fixtures::MainReader::new(&work).unwrap();
-                &mut reopened
-            };
-            let reading = reader.read(&targo(), preview, &pins, &mut |cmd| {
-                if cmd.get_args().any(|a| a == "--no-run") {
-                    compiles += 1;
-                }
-                if cmd.get_args().any(|a| a == "--ignored") {
-                    records += 1;
-                }
-                cmd.output()
-            });
-            println!("reuse={reuse} reader: {}", reading.checks);
-            reading
-        })
-        .unwrap();
-        println!(
-            "REAL SCRATCH RACE reuse={reuse} wall={:.3}s compiles={compiles} records={records}: {}",
-            start.elapsed().as_secs_f64(),
-            landed.words(&pins)
-        );
-        assert_eq!(raced.pushes.borrow().len(), 2);
-        assert_eq!(compiles, if reuse { 1 } else { 2 });
-        assert_eq!(records, compiles);
-        assert!(matches!(
-            landed,
-            Landed::Pushed {
-                answers: Answers::Recorded(_),
-                ..
-            }
-        ));
-    }
-}
-
 #[test]
 fn main_reader_reopens_warm_but_never_reuses_previous_answers_or_tree() {
     let o = Origin::new();
@@ -1104,42 +976,48 @@ fn an_unproven_main_recorder_is_held_before_another_compile() {
     )
     .unwrap();
     let mut calls = 0;
-    let landed = fixtures::land(&Git::new(&o.work), &staged, &pins(7), 5, &mut |preview| {
-        let mut reader = fixtures::MainReader::new(&o.work).unwrap();
-        let first = reader.read(&targo(), preview, &pins(7), &mut |cmd| {
-            calls += 1;
-            Ok(if calls == 1 {
-                Output {
-                    status: exit(0),
-                    stdout: artifact(
-                        cmd.get_current_dir().unwrap(),
-                        &o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"),
-                    )
-                    .into_bytes(),
-                    stderr: Vec::new(),
-                }
-            } else {
-                assert_eq!(calls, 2);
-                Output {
-                    status: std::process::ExitStatus::from_raw(9),
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                }
-            })
-        });
-        assert!(first.answers.is_err());
-        drop(reader);
-        let mut reader = fixtures::MainReader::new(&o.work).unwrap();
-        let held = reader.read(&targo(), preview, &pins(7), &mut |_| {
-            panic!("must not replace an unproven executable")
-        });
-        assert!(
-            held.checks.contains("never showed it ran"),
-            "{}",
-            held.checks
-        );
-        held
-    })
+    let landed = fixtures::land(
+        &Git::new(&o.work),
+        &native(&o),
+        &staged,
+        &pins(7),
+        &mut |preview| {
+            let mut reader = fixtures::MainReader::new(&o.work).unwrap();
+            let first = reader.read(&targo(), preview, &pins(7), &mut |cmd| {
+                calls += 1;
+                Ok(if calls == 1 {
+                    Output {
+                        status: exit(0),
+                        stdout: artifact(
+                            cmd.get_current_dir().unwrap(),
+                            &o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"),
+                        )
+                        .into_bytes(),
+                        stderr: Vec::new(),
+                    }
+                } else {
+                    assert_eq!(calls, 2);
+                    Output {
+                        status: std::process::ExitStatus::from_raw(9),
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    }
+                })
+            });
+            assert!(first.answers.is_err());
+            drop(reader);
+            let mut reader = fixtures::MainReader::new(&o.work).unwrap();
+            let held = reader.read(&targo(), preview, &pins(7), &mut |_| {
+                panic!("must not replace an unproven executable")
+            });
+            assert!(
+                held.checks.contains("never showed it ran"),
+                "{}",
+                held.checks
+            );
+            held
+        },
+    )
     .unwrap();
     assert_eq!(calls, 2);
     assert!(matches!(
@@ -1157,14 +1035,12 @@ fn an_unproven_main_recorder_is_held_before_another_compile() {
 
 impl GitRunner for Raced<'_> {
     fn git(&self, args: &[&str]) -> crate::ledger::Result<RunOut> {
-        if args.first() == Some(&"push") {
-            self.pushes.borrow_mut().push(args.join(" "));
-            if !self.fired.replace(true) {
-                fs::write(self.rival.join(self.path), "aterm, moved\n").unwrap();
-                git(self.rival, &["commit", "-q", "-am", "a peer's change"]);
-                git(self.rival, &["push", "-q", "origin", "main"]);
-            }
-        }
+        assert!(
+            !args
+                .iter()
+                .any(|word| matches!(*word, "fetch" | "push" | "ls-remote")),
+            "fixture landing must use typed Origin: {args:?}"
+        );
         self.inner.git(args)
     }
 
@@ -1173,199 +1049,231 @@ impl GitRunner for Raced<'_> {
     }
 }
 
-#[test]
-fn a_landing_that_loses_the_race_lands_on_the_winners_tip() {
-    let o = Origin::new();
-    let runs = Cell::new(0);
-    let mut run = generator(&["history"], &runs);
-    let staged = fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).unwrap();
-    let raced = Raced {
-        inner: Git::new(&o.work),
-        rival: &o.rival,
-        fired: Cell::new(false),
-        pushes: RefCell::new(Vec::new()),
-        path: "README.md",
-    };
-    let mut read_tips = Vec::new();
-    let mut source_paths = Vec::new();
-    let mut reader = fixtures::MainReader::new(&o.work).unwrap();
-    let landed = fixtures::land(&raced, &staged, &pins(7), 5, &mut |preview| {
-        let seen = git(&o.work, &["show", &format!("{preview}:README.md")]);
-        read_tips.push(seen.clone());
-        let answers = staged_answers(&["history"]).replace("fnv1a64:6", seen.trim());
-        let reading = reader.read(&targo(), preview, &pins(7), &mut |cmd| {
-            if let Some(out) = field_hold_pass(cmd) {
-                return Ok(out);
-            }
-            let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
-            let stdout = if args.iter().any(|a| a == "--no-run") {
-                let source = cmd.get_current_dir().unwrap();
-                assert_eq!(
-                    fs::read_to_string(source.join("README.md")).unwrap(),
-                    seen,
-                    "the compiler must see the winner's checked-out source"
-                );
-                source_paths.push(source.to_path_buf());
-                artifact(
-                    source,
-                    &o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"),
-                )
-            } else if args.iter().any(|a| a == "--ignored") {
-                fs::write(env_of(cmd, fixtures::ANSWERS_OUT).unwrap(), &answers).unwrap();
-                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
-                    .into()
-            } else {
-                "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
-                    .into()
-            };
-            Ok(Output {
-                status: exit(0),
-                stdout: stdout.into_bytes(),
-                stderr: Vec::new(),
-            })
-        });
-        assert!(reading.checks.starts_with("PASS"), "{}", reading.checks);
-        reading
-    })
-    .unwrap();
-    assert_eq!(read_tips, ["aterm\n", "aterm, moved\n"]);
-    assert_eq!(source_paths.len(), 2);
-    assert_eq!(
-        source_paths[0], source_paths[1],
-        "a lost race must keep the source path"
-    );
-    drop(reader);
-    assert!(
-        source_paths[0].exists(),
-        "the landing retains its reader worktree for the next cut"
-    );
-    assert_eq!(
-        o.on_main(fixtures::SHIPPED_STATE_CORPUS),
-        staged_answers(&["history"])
-            .replace("fnv1a64:6", "aterm, moved")
-            .as_bytes()
-    );
-    assert!(
-        matches!(landed, Landed::Pushed { attempt: 2, .. }),
-        "{landed:?}"
-    );
-    assert_eq!(raced.pushes.borrow().len(), 2);
-    assert_eq!(
-        o.on_main("README.md"),
-        b"aterm, moved\n",
-        "the peer's change kept"
-    );
-    assert!(
-        String::from_utf8(o.on_main(HANDOFF_FIXTURE_GUARD))
-            .unwrap()
-            .contains("(\"v0.6.0\", \"history\"),")
-    );
+impl OriginTransport for Raced<'_> {
+    fn refresh_main(&self) -> Result<String, String> {
+        self.refreshes.set(self.refreshes.get() + 1);
+        self.remote.refresh_main()
+    }
+    fn write(
+        &self,
+        reference: &str,
+        before: Option<&str>,
+        after: &str,
+    ) -> Result<RefWrite, String> {
+        self.pushes
+            .borrow_mut()
+            .push(format!("{reference} {before:?} {after}"));
+        if self.remaining.get() > 0
+            && let Some(rival) = self.rival
+        {
+            let left = self.remaining.get();
+            self.remaining.set(left - 1);
+            let path = rival.join(self.path);
+            let old = fs::read_to_string(&path).unwrap();
+            fs::write(path, format!("// peer move {left}\n{old}")).unwrap();
+            git(rival, &["commit", "-q", "-am", "a peer's change"]);
+            git(rival, &["push", "-q", "origin", "main"]);
+        }
+        let outcome = OriginTransport::write(&self.remote, reference, before, after)?;
+        if self.lose_reply {
+            assert_eq!(
+                outcome,
+                RefWrite::Written,
+                "the native fixture really writes before losing its reply"
+            );
+            return Err("outcome unknown; side_effect=unknown; [rejected] non-fast-forward".into());
+        }
+        Ok(outcome)
+    }
+    fn get(&self, _: &str) -> Result<Option<String>, String> {
+        Err("fixture landing only refreshes main".into())
+    }
+    fn import(&self, _: &str) -> Result<(), String> {
+        Err("main refresh imports its exact source".into())
+    }
+    fn peel(&self, _: &str) -> Result<Option<String>, String> {
+        Err("fixture landing reads no tags".into())
+    }
+    fn tag_object(&self, _: &str) -> Result<Vec<u8>, String> {
+        Err("fixture landing reads no tags".into())
+    }
+    fn delete(&self, _: &str, _: &str) -> Result<RefWrite, String> {
+        Err("fixture landing deletes no refs".into())
+    }
+    fn control_transaction(
+        &self,
+        _: crate::ledger::ControlRefTransaction,
+    ) -> Result<RefWrite, String> {
+        Err("fixture landing changes no controls".into())
+    }
 }
 
 #[test]
-fn a_race_reuses_only_cargo_unrelated_inputs_and_never_hides_a_red() {
-    for changes_reader in [false, true] {
+fn fixture_races_compose_unrelated_moves_and_recheck_overlapping_files() {
+    for (path, moves, expected_reads) in [("README.md", 8, 1), (HANDOFF_FIXTURE_GUARD, 1, 2)] {
         let o = Origin::new();
-        fs::write(
-            o.rival.join("Cargo.toml"),
-            "metadata supplied by command seam\n",
-        )
-        .unwrap();
-        for package in ["helper", "other"] {
-            let source = o.rival.join(format!("crates/{package}/src/lib.rs"));
-            fs::create_dir_all(source.parent().unwrap()).unwrap();
-            fs::write(source, "initial\n").unwrap();
-        }
-        git(&o.rival, &["add", "-A"]);
-        git(&o.rival, &["commit", "-qm", "reader and unrelated package"]);
-        git(&o.rival, &["push", "-q", "origin", "main"]);
-        git(&o.work, &["fetch", "-q", "origin", "main"]);
-        let runs = Cell::new(0);
         let staged = fixtures::stage(
             &targo(),
             &o.work,
             &o.stage_root(),
             &pins(7),
-            &mut generator(&["history"], &runs),
+            &mut generator(&["history"], &Cell::new(0)),
         )
         .unwrap();
         let raced = Raced {
             inner: Git::new(&o.work),
-            rival: &o.rival,
-            fired: Cell::new(false),
+            remote: native(&o),
+            rival: Some(&o.rival),
+            remaining: Cell::new(moves),
             pushes: RefCell::new(Vec::new()),
-            path: if changes_reader {
-                "crates/helper/src/lib.rs"
-            } else {
-                "crates/other/src/lib.rs"
-            },
+            refreshes: Cell::new(0),
+            lose_reply: false,
+            path,
         };
-        let mut reader = fixtures::MainReader::new(&o.work).unwrap();
-        let mut records = 0;
-        let mut compiles = 0;
-        let started = std::time::Instant::now();
-        let landed = fixtures::land(&raced, &staged, &pins(7), 5, &mut |preview| {
-            reader.read(&targo(), preview, &pins(7), &mut |cmd| {
-                if let Some(out) = field_hold_pass(cmd) { return Ok(out); }
-                let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
-                let tree = cmd.get_current_dir().unwrap();
-                let mut status = exit(0);
-                let stdout = if args.iter().any(|a| a == "metadata") {
-                    aterm_json::json!({
-                        "packages":[
-                            {"name":"aterm-gui","id":"gui","manifest_path":tree.join("crates/aterm-gui/Cargo.toml")},
-                            {"name":"helper","id":"helper","manifest_path":tree.join("crates/helper/Cargo.toml")},
-                            {"name":"other","id":"other","manifest_path":tree.join("crates/other/Cargo.toml")}
-                        ],
-                        "resolve":{"nodes":[
-                            {"id":"gui","dependencies":["helper"]},
-                            {"id":"helper","dependencies":[]},
-                            {"id":"other","dependencies":[]}
-                        ]}
-                    }).to_string()
-                } else if args.iter().any(|a| a == "--no-run") {
-                    compiles += 1;
-                    artifact(tree, &o.work.join("target/debug/deps/aterm_gui-0123456789abcdef"))
-                } else if args.iter().any(|a| a == "--ignored") {
-                    records += 1;
-                    let source = fs::read_to_string(tree.join("crates/helper/src/lib.rs")).unwrap();
-                    fs::write(env_of(cmd, fixtures::ANSWERS_OUT).unwrap(), staged_answers(&["history"]).replace("fnv1a64:6", source.trim())).unwrap();
-                    "test result: ok. 1 passed; 0 failed; 0 ignored\n".into()
-                } else if records == 1 {
-                    status = exit(101);
-                    "test restore::tests::real_red ... FAILED\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\n".into()
-                } else {
-                    "test result: ok. 2 passed; 0 failed; 0 ignored\n".into()
-                };
-                Ok(Output {status, stdout: stdout.into_bytes(), stderr: Vec::new()})
-            })
-        }).unwrap();
+        let mut reads = 0;
+        let start = std::time::Instant::now();
+        let result = fixtures::land(&raced, &raced, &staged, &pins(7), &mut |preview| {
+            reads += 1;
+            assert!(
+                git(
+                    &o.work,
+                    &["show", &format!("{preview}:{HANDOFF_FIXTURE_GUARD}")]
+                )
+                .contains("v0.6.0")
+            );
+            if reads > 1 {
+                assert!(
+                    git(&o.work, &["show", &format!("{preview}:{path}")]).contains("peer move")
+                );
+            }
+            let mut reading = reader(&staged)(preview);
+            reading.checks = "FAIL: retained reader verdict".into();
+            reading
+        });
         println!(
-            "scratch-remote race reader_changed={changes_reader}: {:.3}s, {compiles} compiles, {records} recordings",
-            started.elapsed().as_secs_f64()
+            "fixture race path={path} moves={moves} reads={reads} writes={} wall={:.3}s result={result:?}",
+            raced.pushes.borrow().len(),
+            start.elapsed().as_secs_f64()
         );
-        assert_eq!(records, if changes_reader { 2 } else { 1 });
-        assert_eq!(compiles, records);
-        assert_eq!(raced.pushes.borrow().len(), 2);
+        let landed = result.unwrap();
+        assert_eq!(reads, expected_reads);
+        assert_eq!(raced.pushes.borrow().len(), moves as usize + 1);
+        assert_eq!(raced.remaining.get(), 0);
         assert!(
             landed
                 .words(&pins(7))
-                .contains("FAIL: restore::tests::real_red")
+                .contains("FAIL: retained reader verdict")
+        );
+        assert!(matches!(landed, Landed::Pushed { attempt, .. } if attempt == expected_reads));
+        assert!(
+            String::from_utf8(o.on_main(path))
+                .unwrap()
+                .contains("peer move")
         );
         assert_eq!(
-            o.on_main(fixtures::SHIPPED_STATE_CORPUS),
-            staged_answers(&["history"])
-                .replace(
-                    "fnv1a64:6",
-                    if changes_reader {
-                        "aterm, moved"
-                    } else {
-                        "initial"
-                    }
-                )
-                .as_bytes()
+            o.on_main(&format!(
+                "{HANDOFF_FIXTURE_ROOT}/v0.6.0/history/parent.toml"
+            )),
+            fs::read(staged.dir.join("history/parent.toml")).unwrap()
         );
+        if expected_reads == 1 {
+            let message = git(&o.work, &["show", "-s", "--format=%B", "origin/main"]);
+            assert!(message.contains("Fixture-Reader-Checked:"));
+            assert!(message.contains("Fixture-Composed-Onto:"));
+        }
     }
+}
+
+#[test]
+fn a_fixture_merge_conflict_stops_without_overwriting_the_winner() {
+    let o = Origin::new();
+    let staged = fixtures::stage(
+        &targo(),
+        &o.work,
+        &o.stage_root(),
+        &pins(7),
+        &mut generator(&["history"], &Cell::new(0)),
+    )
+    .unwrap();
+    let remote = native(&o);
+    let mut reads = 0;
+    let result = fixtures::land(
+        &Git::new(&o.work),
+        &remote,
+        &staged,
+        &pins(7),
+        &mut |preview| {
+            reads += 1;
+            let path = o.rival.join(HANDOFF_FIXTURE_GUARD);
+            fs::write(
+                path,
+                GUARD.replace(
+                    "    (\"v0.5.0\", \"history\"),",
+                    "    (\"v0.5.0\", \"other\"),",
+                ),
+            )
+            .unwrap();
+            git(&o.rival, &["commit", "-qam", "conflicting fixture rows"]);
+            git(&o.rival, &["push", "-q", "origin", "main"]);
+            reader(&staged)(preview)
+        },
+    );
+    assert!(result.unwrap_err().to_string().contains("merge-tree"));
+    assert_eq!(reads, 1);
+    assert!(
+        !String::from_utf8(o.on_main(HANDOFF_FIXTURE_GUARD))
+            .unwrap()
+            .contains("v0.6.0")
+    );
+}
+
+#[test]
+fn an_unknown_fixture_write_never_retries_or_rereads_as_a_conflict() {
+    let o = Origin::new();
+    let runs = Cell::new(0);
+    let staged = fixtures::stage(
+        &targo(),
+        &o.work,
+        &o.stage_root(),
+        &pins(7),
+        &mut generator(&["history"], &runs),
+    )
+    .unwrap();
+    let answers = fs::read(&staged.answers).unwrap();
+    let unknown = Raced {
+        inner: Git::new(&o.work),
+        remote: native(&o),
+        rival: None,
+        remaining: Cell::new(1),
+        pushes: RefCell::new(Vec::new()),
+        refreshes: Cell::new(0),
+        lose_reply: true,
+        path: "README.md",
+    };
+    // The fixture performs the real native write and withholds only the caller's
+    // reply. Adapter journal persistence is qualified separately; this control
+    // establishes the landing algorithm's treatment of an uncertain result.
+    let error =
+        fixtures::land(&unknown, &unknown, &staged, &pins(7), &mut reader(&staged)).unwrap_err();
+    assert!(error.to_string().contains("outcome unknown"), "{error}");
+    assert_eq!(unknown.pushes.borrow().len(), 1);
+    assert_eq!(
+        unknown.refreshes.get(),
+        1,
+        "no retry or post-write read can reinterpret unknown"
+    );
+    assert_eq!(
+        o.on_main(&format!(
+            "{HANDOFF_FIXTURE_ROOT}/v0.6.0/history/parent.toml"
+        )),
+        fs::read(staged.dir.join("history/parent.toml")).unwrap(),
+        "the withheld native write really landed"
+    );
+    assert_eq!(
+        fs::read(&staged.answers).unwrap(),
+        answers,
+        "staging remains unchanged"
+    );
 }
 
 #[test]
@@ -1395,9 +1303,9 @@ fn a_fixture_directory_on_main_the_gate_refuses_is_never_overwritten() {
     let staged = fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).unwrap();
     fixtures::land(
         &Git::new(&o.work),
+        &native(&o),
         &staged,
         &pins(7),
-        5,
         &mut reader(&staged),
     )
     .unwrap_err();
@@ -1457,9 +1365,9 @@ fn a_landing_whose_corpus_cannot_take_the_answers_lands_the_desks_and_says_so() 
     let staged = fixtures::stage(&targo(), &o.work, &o.stage_root(), &pins(7), &mut run).unwrap();
     let landed = fixtures::land(
         &Git::new(&o.work),
+        &native(&o),
         &staged,
         &pins(7),
-        5,
         &mut reader(&staged),
     )
     .unwrap();

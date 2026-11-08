@@ -119,13 +119,22 @@ pub const MIN_REMAINING_WINDOW_SECS: i64 = 6 * 60 * 60;
 pub(crate) fn channel_roster_document(
     slug: &str,
 ) -> std::result::Result<Option<(u64, Vec<u8>)>, String> {
-    let url = |asset: &str| format!("https://github.com/{slug}/releases/latest/download/{asset}");
-    let bytes = match anonymous_fetch(&url(aterm_update_core::roster::ROSTER_ASSET), 65_536) {
+    let bytes = match latest_asset(
+        &anonymous_fetch,
+        slug,
+        aterm_update_core::roster::ROSTER_ASSET,
+        65_536,
+    ) {
         Ok(b) => b,
-        Err(e) if e.contains("returned error: 404") => return Ok(None),
+        Err(e) if is_absent(&e) => return Ok(None),
         Err(e) => return Err(e),
     };
-    let sig = anonymous_fetch(&url(aterm_update_core::roster::ROSTER_SIG_ASSET), 4_096)?;
+    let sig = latest_asset(
+        &anonymous_fetch,
+        slug,
+        aterm_update_core::roster::ROSTER_SIG_ASSET,
+        4_096,
+    )?;
     let verified = verify_roster(aterm_update_core::pins::PAPER_MASTER_PUBKEYS, bytes, &sig)
         .map_err(|e| {
             format!("the channel roster did not verify under the committed paper master ({e:?})")
@@ -158,23 +167,104 @@ pub(crate) fn roster_lineage_agrees(
     }
 }
 
+/// A web-route answer that means the asset is absent, never a failed route.
+fn is_absent(error: &str) -> bool {
+    error.contains("returned error: 404")
+}
+
+/// One anonymous download of `url`, at most `cap` bytes, sending `accept` as its Accept header.
+type Fetch<'a> = dyn Fn(&str, usize, Option<&str>) -> std::result::Result<Vec<u8>, String> + 'a;
+
+/// The channel's latest release asset `asset`, read anonymously.
+///
+/// GitHub's web route (`releases/latest/download/NAME`, which redirects through
+/// `releases/download/TAG/NAME`) answered 504 to about one request in eight, for over an hour,
+/// while its API asset route served the same bytes (m3, 2026-11-08, the 0.175.0 cut: four
+/// refused runs). So a web route that fails any way but 404 reads the API route; a 404 is the
+/// asset's absence and asks nothing more. The bytes are judged by the caller exactly as before
+/// (the roster by its signature), so the route changes nothing about what is accepted.
+///
+/// # Errors
+/// The web route's 404 unchanged, or both routes' failures, the web route's first.
+fn latest_asset(
+    fetch: &Fetch<'_>,
+    slug: &str,
+    asset: &str,
+    cap: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    let web = format!("https://github.com/{slug}/releases/latest/download/{asset}");
+    let web_error = match fetch(&web, cap, None) {
+        Ok(bytes) => return Ok(bytes),
+        Err(error) if is_absent(&error) => return Err(error),
+        Err(error) => error,
+    };
+    api_asset(fetch, slug, asset, cap)
+        .map_err(|api_error| format!("{web_error}; the API route too: {api_error}"))
+}
+
+/// `asset` of `slug`'s latest release through the REST API: the release's asset list, then the
+/// asset by its id as an octet stream (GitHub redirects that to the same storage).
+fn api_asset(
+    fetch: &Fetch<'_>,
+    slug: &str,
+    asset: &str,
+    cap: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    #[derive(serde::Deserialize)]
+    struct Release {
+        assets: Vec<Asset>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Asset {
+        name: String,
+        id: u64,
+    }
+    let listing = fetch(
+        &format!("https://api.github.com/repos/{slug}/releases/latest"),
+        4 << 20,
+        Some("application/vnd.github+json"),
+    )?;
+    let release: Release = aterm_json::from_slice(&listing)
+        .map_err(|e| format!("{slug}'s latest release listing is not the API's JSON ({e})"))?;
+    let id = release
+        .assets
+        .iter()
+        .find(|a| a.name == asset)
+        .map(|a| a.id)
+        .ok_or_else(|| format!("{slug}'s latest release lists no asset {asset}"))?;
+    fetch(
+        &format!("https://api.github.com/repos/{slug}/releases/assets/{id}"),
+        cap,
+        Some("application/octet-stream"),
+    )
+}
+
 /// One bounded anonymous download, under the client's own roster limits (64 KiB body, 4 KiB
 /// signature): a floor read never accepts more than the fleet would.
-fn anonymous_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
+fn anonymous_fetch(
+    url: &str,
+    cap: usize,
+    accept: Option<&str>,
+) -> std::result::Result<Vec<u8>, String> {
     let cap_s = cap.to_string();
-    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("curl"))
-        .args([
-            "-fsSL",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--max-time",
-            "60",
-            "--max-filesize",
-            &cap_s,
-            url,
-        ])
+    let accept = accept.map(|media| format!("Accept: {media}"));
+    let mut command = aterm_uds::spawnfd::command(aterm_uds::os_path!("curl"));
+    command.args([
+        "-fsSL",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--max-time",
+        "60",
+        "--max-filesize",
+        &cap_s,
+    ]);
+    if let Some(header) = &accept {
+        command.args(["-H", header]);
+    }
+    let out = command
+        .arg(url)
         .output()
         .map_err(|e| format!("failed to run curl: {e}"))?;
     if !out.status.success() {
@@ -326,6 +416,78 @@ pub fn attribute(manifest: &mut Manifest, who: &Attribution) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fetch that answers from `routes` (URL prefix → answer) and records each URL asked.
+    fn routed<'a>(
+        routes: &'a [(&'a str, std::result::Result<&'a [u8], &'a str>)],
+        asked: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl Fn(&str, usize, Option<&str>) -> std::result::Result<Vec<u8>, String> + 'a {
+        move |url, _cap, _accept| {
+            asked.borrow_mut().push(url.to_owned());
+            let (_, answer) = routes
+                .iter()
+                .find(|(prefix, _)| url.starts_with(prefix))
+                .unwrap_or_else(|| panic!("no route for {url}"));
+            answer.map(<[u8]>::to_vec).map_err(str::to_owned)
+        }
+    }
+
+    const WEB: &str = "https://github.com/o/r/releases/latest/download/roster";
+    const LIST: &str = "https://api.github.com/repos/o/r/releases/latest";
+    const ASSET: &str = "https://api.github.com/repos/o/r/releases/assets/7";
+    const LISTING: &[u8] = br#"{"assets":[{"name":"other","id":3},{"name":"roster","id":7}]}"#;
+
+    #[test]
+    fn a_web_route_504_reads_the_same_asset_through_the_api_route() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let fetch = routed(
+            &[
+                (WEB, Err("curl: (56) The requested URL returned error: 504")),
+                (LIST, Ok(LISTING)),
+                (ASSET, Ok(b"bytes")),
+            ],
+            &asked,
+        );
+        assert_eq!(
+            latest_asset(&fetch, "o/r", "roster", 64),
+            Ok(b"bytes".to_vec())
+        );
+        assert_eq!(*asked.borrow(), [WEB, LIST, ASSET]);
+    }
+
+    /// NEGATIVE CONTROL: a 404 is the asset's absence, so the API route is never asked and the
+    /// caller still reads "absent".
+    #[test]
+    fn a_web_route_404_is_absence_and_asks_nothing_more() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let fetch = routed(
+            &[(WEB, Err("curl: (22) The requested URL returned error: 404"))],
+            &asked,
+        );
+        let error = latest_asset(&fetch, "o/r", "roster", 64).unwrap_err();
+        assert!(is_absent(&error), "{error}");
+        assert_eq!(*asked.borrow(), [WEB]);
+    }
+
+    #[test]
+    fn both_routes_failing_names_both() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let fetch = routed(
+            &[
+                (WEB, Err("curl: (56) The requested URL returned error: 504")),
+                (LIST, Ok(br#"{"assets":[{"name":"other","id":3}]}"#)),
+            ],
+            &asked,
+        );
+        let error = latest_asset(&fetch, "o/r", "roster", 64).unwrap_err();
+        assert!(error.contains("error: 504"), "{error}");
+        assert!(error.contains("the API route too"), "{error}");
+        assert!(error.contains("lists no asset roster"), "{error}");
+        assert!(
+            !is_absent(&error),
+            "a failed route must never read as absence: {error}"
+        );
+    }
     /// Standard padded Base64 — the shipped encoder (`aterm_codec::base64`).
     fn b64(raw: &[u8]) -> String {
         aterm_codec::base64::encode(raw).expect("test key material is far below MAX_INPUT_LEN")

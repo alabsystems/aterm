@@ -1059,6 +1059,16 @@ fn check_signed_tree(
     exposes: &[String],
     verify: VerifyOne<'_>,
 ) -> Result<(), StageError> {
+    check_signed_tree_with_clock(tree, signer, exposes, verify, std::time::Instant::now)
+}
+
+fn check_signed_tree_with_clock(
+    tree: &Path,
+    signer: &str,
+    exposes: &[String],
+    verify: VerifyOne<'_>,
+    now: impl Fn() -> std::time::Instant,
+) -> Result<(), StageError> {
     use aterm_update_core::codesign::{CodesignError, VERIFY_TIMEOUT, verify_timeout_for};
     let found = crate::macho::find_macho(tree)?;
     if found.is_empty() {
@@ -1102,13 +1112,13 @@ fn check_signed_tree(
             std::time::Duration::ZERO,
             std::time::Duration::saturating_add,
         );
-    let far_future = || std::time::Instant::now() + std::time::Duration::from_secs(365 * 86_400);
-    let budget = std::time::Instant::now()
+    let far_future = || now() + std::time::Duration::from_secs(365 * 86_400);
+    let budget = now()
         .checked_add(DEVELOPER_ID_BUDGET.saturating_add(extra))
         .unwrap_or_else(far_future);
     for path in &found {
         let deadline = budget.min(
-            std::time::Instant::now()
+            now()
                 .checked_add(allowance(path))
                 .unwrap_or_else(far_future),
         );
@@ -4678,6 +4688,7 @@ image-alias     : /tmp/stage/bar.dmg
     fn the_gate_gives_each_macho_a_deadline_scaled_by_its_size() {
         use aterm_update_core::codesign::{VERIFY_TIMEOUT, verify_timeout_for};
         let exposes = vec![String::from("codex")];
+        let started = std::time::Instant::now();
         let deadline_for = |len: Option<u64>| {
             let one = tmp("devid-deadline");
             lay(&one, "bin/codex", &thin_macho(), 0o755);
@@ -4691,30 +4702,24 @@ image-alias     : /tmp/stage/bar.dmg
             }
             let given = std::cell::Cell::new(None);
             let answer = |_: &Path, deadline: std::time::Instant| {
-                given.set(Some(
-                    deadline.saturating_duration_since(std::time::Instant::now()),
-                ));
+                given.set(Some(deadline));
                 Ok(())
             };
-            check_developer_id(&one, "2DC432GLL2", &exposes, &answer).unwrap();
+            check_signed_tree_with_clock(
+                &one,
+                "Developer ID team 2DC432GLL2",
+                &exposes,
+                &answer,
+                || started,
+            )
+            .unwrap();
             given.get().unwrap()
         };
         let big: u64 = 238_223_808;
-        let slack = std::time::Duration::from_secs(5);
         let large = deadline_for(Some(big));
-        assert!(
-            large + slack >= verify_timeout_for(big) && large <= verify_timeout_for(big),
-            "a 238 MB Mach-O gets its size-scaled deadline: {large:?}"
-        );
-        assert!(
-            large > VERIFY_TIMEOUT + slack,
-            "past the 30 s floor: {large:?}"
-        );
+        assert_eq!(large, started + verify_timeout_for(big));
         let small = deadline_for(None);
-        assert!(
-            small <= VERIFY_TIMEOUT && small + slack >= VERIFY_TIMEOUT,
-            "a small Mach-O keeps the 30 s floor: {small:?}"
-        );
+        assert_eq!(small, started + VERIFY_TIMEOUT);
     }
 
     #[cfg(unix)]

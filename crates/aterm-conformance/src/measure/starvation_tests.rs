@@ -15,6 +15,7 @@ fn healthy() -> SchedInputs {
         sampling_hole_us: 18_400,
         nominal_dt_us: 18_300,
         all_composed_frames: false,
+        require_composed_frames: false,
         wall_us: 5_400_000,
         budget_us: 60_000_000,
         late_threshold_us: DEFAULT_LATE_THRESHOLD_US,
@@ -118,6 +119,24 @@ fn a_complete_composition_history_needs_no_periodic_sampling_but_still_needs_its
         })
         .evidence(),
         Evidence::Unproved
+    );
+}
+
+#[test]
+fn full_video_cannot_qualify_from_regular_sampling_when_its_frame_account_is_incomplete() {
+    let incomplete = SchedInputs {
+        require_composed_frames: true,
+        ..healthy()
+    };
+    assert_eq!(classify(&incomplete), Starvation::IncompleteCapture);
+    assert_eq!(classify(&incomplete).evidence(), Evidence::Unproved);
+    assert_eq!(
+        classify(&SchedInputs {
+            all_composed_frames: true,
+            ..incomplete
+        })
+        .evidence(),
+        Evidence::Sound
     );
 }
 

@@ -1426,12 +1426,6 @@ impl App {
             cell_h: ch as f64,
             strip_y: frame_y + strip_y as f64,
             strip_h: (strip_rows * ch) as f64,
-            bars_y: frame_y + (strip_y + strip_rows * ch) as f64,
-            bar_h: if self.message_band_rows == 0 {
-                0.0
-            } else {
-                ch as f64
-            },
         })
     }
 
@@ -1732,137 +1726,15 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return Vec::new();
         };
-        let mut out: Vec<GridMessage> = Vec::new();
-
-        let presentation = if self.message_band_rows > 0 {
-            Some(self.band_presentation(usize::from(ws.cols)))
-        } else {
-            None
-        };
-        for (row, layout) in presentation
-            .iter()
-            .flat_map(|p| p.rows.iter())
-            .take(usize::from(self.message_band_rows))
-            .enumerate()
-        {
-            let bar_row = row;
-            let capsules: Vec<crate::a11y_tree::BandCapsule> = layout
-                .capsules
-                .iter()
-                .filter(|c| !c.full_label.is_empty())
-                .map(|c| crate::a11y_tree::BandCapsule {
-                    label: c.full_label,
-                    col: c.col,
-                    width: c.width,
-                    index: crate::a11y_tree::capsule_index(c.action),
-                })
-                .collect();
-            match layout.kind {
-                aterm_messages::RowKind::Message(id) => {
-                    let Some(live) = self.messages.live(id) else {
-                        continue;
-                    };
-                    let Some(message) = ChromeMessage::band_row(row) else {
-                        continue;
-                    };
-                    let now = std::time::Instant::now();
-                    let busy = live.activity() == 2;
-                    let ran = now.saturating_duration_since(live.started_at);
-                    let time_words = if busy || layout.elapsed.is_some() {
-                        aterm_messages::progress::elapsed_spoken(ran)
-                    } else {
-                        aterm_messages::progress::eta_spoken(live.track.eta(now))
-                    };
-                    let stats = live
-                        .msg
-                        .meter
-                        .as_ref()
-                        .map(|m| m.stats.trim().to_string())
-                        .filter(|s| !s.is_empty());
-                    let labels = layout
-                        .capsules
-                        .iter()
-                        .map(|c| c.full_label)
-                        .collect::<Vec<_>>()
-                        .join(" \u{00b7} ");
-                    let detail = [
-                        time_words,
-                        layout.load.map(|(_, words)| words.to_string()),
-                        stats,
-                        Some(labels).filter(|l| !l.is_empty()),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                    let detail0 = if live.msg.excerpt {
-                        live.msg.detail.first().map_or("", String::as_str)
-                    } else {
-                        ""
-                    };
-                    out.push(GridMessage {
-                        message,
-                        context: live.action_revision().map(|revision| {
-                            aterm_a11y::model::ActionContext::message(id.raw(), revision)
-                        }),
-                        text: layout.spoken(detail0),
-                        detail: Some(detail),
-                        busy,
-                        progress: live
-                            .msg
-                            .meter
-                            .as_ref()
-                            .and_then(|m| m.fill_permille)
-                            .map(|f| f32::from(f) / 1000.0),
-                        alarm: matches!(
-                            live.msg.severity,
-                            aterm_messages::Severity::Warn | aterm_messages::Severity::Error
-                        ) || live.msg.is_ask()
-                            || live
-                                .msg
-                                .actions
-                                .iter()
-                                .any(aterm_messages::Intent::is_consequential),
-                        activates: true,
-                        bar_row: Some(bar_row),
-                        capsules,
-                    });
-                }
-                aterm_messages::RowKind::Echo(_) => {}
-                aterm_messages::RowKind::Overflow { .. } => {
-                    out.push(GridMessage {
-                        message: ChromeMessage::BandOverflow,
-                        context: Some(aterm_a11y::model::ActionContext::message_log()),
-                        text: layout.full_title.clone(),
-                        detail: None,
-                        busy: false,
-                        progress: None,
-                        alarm: false,
-                        activates: true,
-                        bar_row: Some(bar_row),
-                        capsules: Vec::new(),
-                    });
-                }
-            }
-        }
-
-        out.extend(self.grid_a11y_questions(wid));
-
+        let mut out = self.grid_a11y_questions(wid);
         if let Some(caption) = ws.shown_caption.as_ref().filter(|caption| {
             self.front_terminal(wid)
                 .is_some_and(|front| front.session == caption.session)
         }) {
             out.push(GridMessage {
                 message: ChromeMessage::LinkCaption,
-                context: None,
                 text: caption.words.clone(),
                 detail: None,
-                busy: false,
-                progress: None,
-                alarm: false,
-                activates: false,
-                bar_row: None,
-                capsules: Vec::new(),
             });
         }
         out
@@ -1877,28 +1749,14 @@ impl App {
         if let Some(pending) = self.paste_banner.as_ref().filter(|p| p.wid == wid) {
             out.push(GridMessage {
                 message: ChromeMessage::PasteConfirm,
-                context: None,
                 text: crate::paste_banner::question(pending.text()),
                 detail: Some(crate::paste_banner::announcement_detail(pending.text())),
-                busy: false,
-                progress: None,
-                alarm: false,
-                activates: false,
-                bar_row: None,
-                capsules: Vec::new(),
             });
         } else if let Some(pending) = self.close_band(wid) {
             out.push(GridMessage {
                 message: ChromeMessage::CloseConfirm,
-                context: None,
                 text: crate::close_confirm::question(&pending.prompt),
                 detail: Some(crate::close_confirm::announcement_detail(&pending.prompt)),
-                busy: false,
-                progress: None,
-                alarm: false,
-                activates: false,
-                bar_row: None,
-                capsules: Vec::new(),
             });
         }
         out
@@ -1910,104 +1768,6 @@ impl App {
     fn grid_a11y_menu(&self, wid: crate::WindowId) -> Option<crate::a11y_tree::GridMenu> {
         self.tab_grid_menu(wid)
             .or_else(|| self.autopilot_grid_menu(wid))
-    }
-
-    /// A screen reader activated one of window `wid`'s chrome messages.
-    #[cfg(a11y_tree)]
-    fn activate_a11y_message(
-        &mut self,
-        wid: crate::WindowId,
-        message: crate::a11y_tree::ChromeMessage,
-        context: Option<aterm_a11y::model::ActionContext>,
-    ) {
-        use crate::a11y_tree::ChromeMessage;
-        match message {
-            ChromeMessage::BandRow0 | ChromeMessage::BandRow1 | ChromeMessage::BandRow2 => {
-                if let Some(id) =
-                    self.committed_a11y_message(wid, message.band_row_index(), context)
-                {
-                    self.press_message_body(wid, id);
-                }
-            }
-            ChromeMessage::BandCapsule { row, index } => {
-                let Some(id) = self.committed_a11y_message(wid, Some(usize::from(row)), context)
-                else {
-                    return;
-                };
-                let action = crate::a11y_tree::capsule_action(index);
-                if action.is_details() {
-                    self.press_message_body(wid, id);
-                    return;
-                }
-                let Some(context) = context else {
-                    return;
-                };
-                let intent = self.messages.act_at_revision(
-                    id,
-                    context.generation(),
-                    action,
-                    std::time::Instant::now(),
-                );
-                self.sync_messages();
-                if let Some(intent) = intent {
-                    let _ = self.perform_intent(wid, id, intent);
-                }
-            }
-            ChromeMessage::BandOverflow => {
-                if context != Some(aterm_a11y::model::ActionContext::message_log()) {
-                    return;
-                }
-                let cols = self.windows.get(&wid).map(|ws| usize::from(ws.cols));
-                let overflow = cols.is_some_and(|cols| {
-                    self.band_presentation(cols)
-                        .rows
-                        .iter()
-                        .take(usize::from(self.message_band_rows))
-                        .any(|row| matches!(row.kind, aterm_messages::RowKind::Overflow { .. }))
-                });
-                if overflow {
-                    let _ = self.open_messages_entry(wid, None);
-                }
-            }
-            ChromeMessage::PasteConfirm
-            | ChromeMessage::CloseConfirm
-            | ChromeMessage::LinkCaption => {}
-        }
-    }
-
-    /// A committed row still has the id and action authorization captured by
-    /// the publisher.
-    #[cfg(a11y_tree)]
-    fn committed_a11y_message(
-        &self,
-        wid: crate::WindowId,
-        row: Option<usize>,
-        context: Option<aterm_a11y::model::ActionContext>,
-    ) -> Option<aterm_messages::MessageId> {
-        let id = self.committed_band_message(wid, row)?;
-        let revision = self.messages.live(id)?.action_revision()?;
-        let expected = aterm_a11y::model::ActionContext::message(id.raw(), revision);
-        (context == Some(expected)).then_some(id)
-    }
-
-    /// The message on committed band row `row` of window `wid` now, or `None` when the
-    /// row is not committed, is the overflow link, or holds no message: the live
-    /// re-check every a11y activate makes.
-    #[cfg(a11y_tree)]
-    fn committed_band_message(
-        &self,
-        wid: crate::WindowId,
-        row: Option<usize>,
-    ) -> Option<aterm_messages::MessageId> {
-        let row = row?;
-        if row >= usize::from(self.message_band_rows) {
-            return None;
-        }
-        let cols = usize::from(self.windows.get(&wid)?.cols);
-        match self.band_presentation(cols).rows.get(row)?.kind {
-            aterm_messages::RowKind::Message(id) => self.messages.live(id).map(|l| l.id),
-            aterm_messages::RowKind::Echo(_) | aterm_messages::RowKind::Overflow { .. } => None,
-        }
     }
 
     /// Handle an event from a window's native accessibility adapter.
@@ -2125,14 +1885,6 @@ impl App {
                     _ => return,
                 };
                 let _ = self.rewind_step(session, crate::rewind::StepBy::Slice(delta), None);
-                return;
-            }
-            if req.action == aterm_a11y::model::Action::Click
-                && let Some(message) = crate::a11y_tree::ChromeMessage::from_node(req.target_node)
-            {
-                if req.target_tree == aterm_a11y::model::TreeId::ROOT {
-                    self.activate_a11y_message(wid, message, req.context);
-                }
                 return;
             }
             self.on_native_accessibility_action(wid, req);

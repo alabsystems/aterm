@@ -12,8 +12,8 @@
 //! stdout and stderr piped, the caller's controlling terminal inherited) from a child whose
 //! controlling terminal is a fresh PTY at the grid, as vtebench's is when it runs inside a
 //! terminal; the scripts are the arena's copy, stock but for the tty lookup the `vte` lane trims
-//! ([`super::arena::vte::trimmed_benchmarks`]). Where the `vte` lane has built the pinned
-//! vtebench, the same child runs it once and the lane holds every captured payload to the bytes
+//! ([`super::arena::vte::trimmed_benchmarks`]). The lane builds the pinned upstream control;
+//! the same child runs it once and the lane holds every captured payload to the bytes
 //! vtebench itself wrote ([`cross_check`]).
 //!
 //! What that capture shows on macOS: the scripts' `tput cols` and `tput lines` read the size of
@@ -41,7 +41,7 @@ use aterm_uds::spawnfd::{Command, Stdio, command};
 
 use super::LaneRun;
 use super::arena::cat::{CORPUS_MB, Corpus, corpus_file, inner_argv};
-use super::arena::vte::{benchmark_dirs, pinned_checkout, trimmed_benchmarks};
+use super::arena::vte::{benchmark_dirs, build_vtebench, pinned_checkout, trimmed_benchmarks};
 use super::arena::{Halt, Scratch, arena_dir, pins};
 use super::floors::{FloorLane, judge_keyed, measure_cycle_example_with, number};
 
@@ -159,36 +159,24 @@ fn measure() -> Result<aterm_json::Value, Halt> {
     let pins = pins()?;
     let pin = &pins.harness.vtebench;
     let vte_dir = pinned_checkout(pin)?;
+    let vtebench = build_vtebench(&vte_dir)?;
     let scratch = Scratch::new("vte-engine")?;
     let benchmarks = scratch.path().join("benchmarks");
     trimmed_benchmarks(&vte_dir.join("benchmarks"), &benchmarks)?;
-    let built = vte_dir.join("target/release/vtebench");
-    let vtebench = built.is_file().then_some(built.as_path());
     let part = scratch.path().join("payloads");
-    capture(&benchmarks, &part, vtebench)?;
+    capture(&benchmarks, &part, &vtebench)?;
     let names = payload_names(&part)?;
-    match vtebench {
-        Some(bin) => {
-            let stream_path = part.join(STREAM);
-            let stream = crate::read_regular(&stream_path)
-                .map_err(|e| format!("{}: {e}", stream_path.display()))?;
-            cross_check(&stream, &read_payloads(&part, &names)?)?;
-            std::fs::remove_file(&stream_path)
-                .map_err(|e| format!("{}: {e}", stream_path.display()))?;
-            eprintln!(
-                "  payloads: {} benchmarks, each the bytes {} wrote at {COLS}x{ROWS} \
+    let stream_path = part.join(STREAM);
+    let stream =
+        crate::read_regular(&stream_path).map_err(|e| format!("{}: {e}", stream_path.display()))?;
+    cross_check(&stream, &read_payloads(&part, &names)?)?;
+    std::fs::remove_file(&stream_path).map_err(|e| format!("{}: {e}", stream_path.display()))?;
+    eprintln!(
+        "  payloads: {} benchmarks, each the bytes {} wrote at {COLS}x{ROWS} \
                  (cross-checked)",
-                names.len(),
-                bin.display()
-            );
-        }
-        None => eprintln!(
-            "  payloads: {} benchmarks from the pinned scripts at {COLS}x{ROWS}; NOT cross-checked \
-             against vtebench's own stream (no build at {}: `verify perf vte` builds it)",
-            names.len(),
-            built.display()
-        ),
-    }
+        names.len(),
+        vtebench.display()
+    );
     let captured = read_payloads(&part, &names)?;
     for line in describe(&captured) {
         eprintln!("  {line}");
@@ -282,13 +270,18 @@ fn open_pty(rows: u16, cols: u16) -> Result<(OwnedFd, OwnedFd), String> {
 }
 
 /// Capture the payloads of `benchmarks` into `out` from a child in a session of its own whose
-/// controlling terminal is a fresh PTY at the grid ([`capture_here`]), and, given `vtebench`,
+/// controlling terminal is a fresh PTY at the grid ([`capture_here`]), and
 /// vtebench's own stream beside them.
-fn capture(benchmarks: &Path, out: &Path, vtebench: Option<&Path>) -> Result<(), String> {
+fn capture(benchmarks: &Path, out: &Path, vtebench: &Path) -> Result<(), String> {
     let (master, slave) = open_pty(ROWS, COLS)?;
     let (rows, cols) = (ROWS.to_string(), COLS.to_string());
-    let mut args = vec![benchmarks, out, Path::new(&rows), Path::new(&cols)];
-    args.extend(vtebench);
+    let args = [
+        benchmarks,
+        out,
+        Path::new(&rows),
+        Path::new(&cols),
+        vtebench,
+    ];
     let argv = inner_argv(CAPTURE_VERB, &args)?;
     let mut cmd = command(&argv[0]);
     cmd.args(&argv[1..])
@@ -423,10 +416,10 @@ fn describe(payloads: &[Payload]) -> Vec<String> {
         .collect()
 }
 
-/// `aterm-verify --arena-inner vte-capture <benchmarks> <out> <rows> <cols> [<vtebench>]`, the
+/// `aterm-verify --arena-inner vte-capture <benchmarks> <out> <rows> <cols> <vtebench>`, the
 /// capture child: a session leader whose stdin is the lane's PTY.
 pub(crate) fn capture_main(args: &[&str]) -> ExitCode {
-    let [benchmarks, out, rows, cols, rest @ ..] = args else {
+    let [benchmarks, out, rows, cols, bin] = args else {
         return capture_usage();
     };
     if !rows.bytes().all(|b| b.is_ascii_digit()) || !cols.bytes().all(|b| b.is_ascii_digit()) {
@@ -435,16 +428,11 @@ pub(crate) fn capture_main(args: &[&str]) -> ExitCode {
     let (Ok(rows), Ok(cols)) = (rows.parse::<u16>(), cols.parse::<u16>()) else {
         return capture_usage();
     };
-    let vtebench = match rest {
-        [] => None,
-        [bin] => Some(Path::new(bin)),
-        _ => return capture_usage(),
-    };
     match capture_here(
         Path::new(benchmarks),
         Path::new(out),
         (rows, cols),
-        vtebench,
+        Path::new(bin),
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -457,19 +445,19 @@ pub(crate) fn capture_main(args: &[&str]) -> ExitCode {
 fn capture_usage() -> ExitCode {
     eprintln!(
         "usage: aterm-verify --arena-inner {CAPTURE_VERB} <benchmarks> <out> <rows> <cols> \
-         [<vtebench>]\n(the `vte-engine` lane's capture child; not for direct use)"
+         <vtebench>\n(the `vte-engine` lane's capture child; not for direct use)"
     );
     ExitCode::from(2)
 }
 
 /// Take stdin, the lane's PTY, as this session's controlling terminal, hold it to the grid, then
-/// write each benchmark's payload into `out` ([`capture_scripts`]) and, given `vtebench`, its own
+/// write each benchmark's payload into `out` ([`capture_scripts`]) and vtebench's own
 /// stream as [`STREAM`].
 fn capture_here(
     benchmarks: &Path,
     out: &Path,
     (rows, cols): (u16, u16),
-    vtebench: Option<&Path>,
+    vtebench: &Path,
 ) -> Result<(), String> {
     // SAFETY: fd 0 is this process's stdin; TIOCSCTTY takes an int (0: never steal a terminal
     // another session holds) and reads no memory.
@@ -500,7 +488,8 @@ fn capture_here(
     }
     std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
     capture_scripts(benchmarks, out)?;
-    if let Some(bin) = vtebench {
+    {
+        let bin = vtebench;
         let stream_path = out.join(STREAM);
         let stream = crate::create_stdio_file(&stream_path)
             .map_err(|e| format!("{}: {e}", stream_path.display()))?;

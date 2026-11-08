@@ -757,10 +757,28 @@ pub fn read(
     heard: Option<(&super::Spool, u64)>,
     now: u64,
 ) -> crate::Result<Option<Seen>> {
+    read_started(paths, heard, now, std::time::Instant::now())
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn native_journal_seen_waits_for_unchanged_custody() {
+    let read = crate::admission::with_delayed_custody(|paths, started| {
+        read_started(paths, None, 1_728_000_600, started)
+    });
+    assert!(read.unwrap().is_some());
+}
+
+fn read_started(
+    paths: &aterm_secrets::client::Paths,
+    heard: Option<(&super::Spool, u64)>,
+    now: u64,
+    started: std::time::Instant,
+) -> crate::Result<Option<Seen>> {
     use crate::{catalog::Directory, table::Session};
     use aterm_secrets::commons::bootstrap::Bootstrap;
     let selected = crate::generation::selected(paths)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = crate::admission::deadline_at(started);
     let Ok((bootstrap, journal)) = Bootstrap::required_with_journal_until(&selected, deadline)
     else {
         return Ok(None);

@@ -3,7 +3,14 @@
 
 //! Connected Unix-domain socket peer credentials ([`peer_uid`](crate::peer::peer_uid) and [`peer_audit_token`](crate::peer::peer_audit_token)).
 
+use std::time::Duration;
+
 use crate::CtlStream;
+
+/// How long a peer's code check may take, at least: `trustd`'s judgment of the process across a
+/// socket (`aterm_keeper::identity::Identity::check`). A server that checks its peer before it
+/// answers answers up to this much later, so its client's wait for that answer covers it too.
+pub const CHECK_HANG: Duration = Duration::from_secs(60);
 
 /// Return the connected peer's effective uid via `getpeereid(2)`, or `None` on failure.
 #[cfg(target_vendor = "apple")]

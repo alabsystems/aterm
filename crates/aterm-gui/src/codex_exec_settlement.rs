@@ -348,12 +348,7 @@ fn settle(
     };
     if never_granted
         && observed.phase == codex_renewal::Phase::Retired
-        && !observed.launch_attempted
-        && observed.accepted_turn.is_none()
-        && observed.current_attempt.is_none()
-        && observed.candidate.is_none()
-        && observed.successor_pid.is_none()
-        && observed.successor_birth.is_none()
+        && observed.has_no_execution_evidence()
     {
         // The preceding cancellation closed admission under the live gate.
         // This second writer rechecks exact bytes before releasing a reservation.

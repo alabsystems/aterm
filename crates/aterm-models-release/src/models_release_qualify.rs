@@ -33,8 +33,8 @@
 //! # Actions
 //! Plan (phase 0): `SkipTree` (sets `tree_rec` 2), `SkipBuild`, `SkipExport`, then `Plan` (to 1).
 //! `TreeMoves` (any time) is the environment: R's tree or the seal moved.
-//! Qualify (phase 1): `StartTree`; `StartBuild` once the tree is running, ended or skipped;
-//! `StartExport` once the build is; none after a red. `TreeAcquire`/`BuildAcquire`/
+//! Qualify (phase 1): `StartBuild`; `StartTree` once the build is running, ended or skipped;
+//! `StartExport` once the tree is; none after a red. `TreeAcquire`/`BuildAcquire`/
 //! `ExportAcquire` take a token while the branch runs and the pool has one; `TreeRelease`/
 //! `BuildRelease`/`ExportRelease` give one back. `TreePass`, `TreeRed`, `TreeCouldNotRun` and
 //! `StopTree` (on a red) end the tree, writing its records only on a held tree; `BuildPass`,
@@ -51,10 +51,10 @@
 //! `Buggy == k` enables the one action written for dial k, and each breaks the law after it:
 //! 1 `BundleBeforeTreeEnds` (`BundleAfterBuildAndTree`), 2 `TreeWritesOnAMovedTree`
 //! (`RecordsOnlyOfAHeldTree`), 3 `ExportPushesAfterARed` (`NoPushAfterARed`),
-//! 4 `BuildStartsAfterARed` (`NoStartAfterARed`), 5 `ExportAcquiresPastThePool`
+//! 4 `TreeStartsAfterARed` (`NoStartAfterARed`), 5 `ExportAcquiresPastThePool`
 //! (`ChargesWithinThePool`), 6 `PublishBeforeReady` (`NothingPublicBeforeReady`),
 //! 7 `CutBeforeReady` (`CutHoldsEveryRecord`), 8 `ReadyOnVerdicts` (`ReadyHoldsEveryRecord`),
-//! 9 `BuildStartsBeforeTheTree` (`StartsInOrder`), 10 `StopOnACouldNotRun` (`StopOnlyOnARed`),
+//! 9 `TreeStartsBeforeTheBuild` (`StartsInOrder`), 10 `StopOnACouldNotRun` (`StopOnlyOnARed`),
 //! 11 `StopAPushInFlight` (`PushInFlightFinishes`), 12 `RefuseBeforeTheBranchesEnd`
 //! (`NoBranchOutlivesTheStep`), 13 `PassOnACouldNotRun` (`QualifyPassesOnlyOnEveryPass`),
 //! 14 `BuildEndsHoldingTokens` (`NoTokenOutlivesItsBranch`), 15 `StopKeptBuild`
@@ -107,13 +107,13 @@ pub fn release_qualify_model() -> Model {
                 held = if tree <= 1 { 0 } else { held };
             }
 
-            action StartTree when (phase == 1 && tree == 0 && red == 0) {
+            action StartTree when (phase == 1 && tree == 0 && red == 0 && build > 0) {
                 tree = 1;
             }
-            action StartBuild when (phase == 1 && build == 0 && red == 0 && tree > 0) {
+            action StartBuild when (phase == 1 && build == 0 && red == 0) {
                 build = 1;
             }
-            action StartExport when (phase == 1 && export == 0 && red == 0 && build > 0) {
+            action StartExport when (phase == 1 && export == 0 && red == 0 && build > 0 && tree > 0) {
                 export = 1;
             }
 
@@ -276,10 +276,10 @@ pub fn release_qualify_model() -> Model {
                 pushed = 1;
                 pushed_after_red = 1;
             }
-            action BuildStartsAfterARed when (
-                Buggy == 4 && phase == 1 && build == 0 && red == 1 && tree > 0
+            action TreeStartsAfterARed when (
+                Buggy == 4 && phase == 1 && tree == 0 && red == 1 && build > 0
             ) {
-                build = 1;
+                tree = 1;
                 started_after_red = 1;
             }
             action ExportAcquiresPastThePool when (Buggy == 5 && export == 1 && S > export_cpu) {
@@ -297,10 +297,10 @@ pub fn release_qualify_model() -> Model {
                 phase = 3;
                 ready = 1;
             }
-            action BuildStartsBeforeTheTree when (
+            action TreeStartsBeforeTheBuild when (
                 Buggy == 9 && phase == 1 && build == 0 && red == 0 && tree == 0
             ) {
-                build = 1;
+                tree = 1;
             }
             action StopOnACouldNotRun when (
                 Buggy == 10 && build == 1 && red == 0 && (tree == 4 || export == 4)
@@ -345,7 +345,8 @@ pub fn release_qualify_model() -> Model {
                 (tree_cpu == 0 || tree == 1) && (build_cpu == 0 || build == 1) &&
                     (export_cpu == 0 || export == 1 || export == 7);
             invariant StartsInOrder:
-                (build == 0 || build == 6 || tree > 0) && (export == 0 || export == 6 || build > 0);
+                (tree == 0 || tree == 6 || build > 0)
+                    && (export == 0 || export == 6 || (build > 0 && tree > 0));
             invariant StopOnlyOnARed:
                 red == 1 ||
                     ((tree <= 4 || tree == 6) && (build <= 4 || build == 6) &&

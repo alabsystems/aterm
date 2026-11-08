@@ -24,7 +24,7 @@ pub struct Args {
     /// `--fail-fast`: the run's first proven red ends it, as it ends a release; a bare run keeps
     /// its whole sweep.
     pub fail_fast: bool,
-    /// Repeatable tree sample: yield at stage boundaries to foreground waiters.
+    /// Repeatable tree sample: overlapping resources queue behind Ordinary work; Release can end it.
     pub background: bool,
     /// `list`: print the table of checks and run nothing.
     pub list: bool,

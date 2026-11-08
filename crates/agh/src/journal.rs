@@ -8,8 +8,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 #[cfg(unix)]
 use std::sync::atomic::Ordering;
@@ -17,6 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aterm_json::{Map, Value};
+#[cfg(unix)]
+use aterm_types::MutexExt;
 
 use crate::config::Dirs;
 use crate::error::{Error, Kind, Result, Sub};
@@ -41,8 +41,8 @@ pub const JOURNAL_MAX: u64 = 64 << 20;
 /// retract every intent it holds open, and a discovery rerun cannot use the reserve up.
 /// Moving a journal aside with an intent open would drop the open-intent rule for its key.
 pub const JOURNAL_RESERVE: u64 = 1 << 20;
-/// How long `append` waits for the lock: 10 s (design §6.8).
-pub const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// The one-minute hang detector while `append` waits for journal custody.
+pub const LOCK_WAIT: Duration = Duration::from_secs(60);
 /// How long an intent may stay open before it becomes a need (`needs::raise`): 6 h. That is
 /// longer than the longest lane between a create and its discovery (a 20-asset upload at
 /// 12 KB/s), and short enough to be seen the same day.
@@ -375,8 +375,6 @@ pub struct Journal {
     slug: Slug,
     /// The effect seam: the clock, and under a tape the journal door.
     fx: Arc<Fx>,
-    /// How long `append` waits for the lock.
-    lock_wait: Duration,
     /// The directories, for the stale need; `None` when taped.
     dirs: Option<Dirs>,
     /// Whether an append through this value has made the owner directory durable: a run that
@@ -417,7 +415,6 @@ impl Journal {
                 path,
                 slug: slug.clone(),
                 fx: fx.clone(),
-                lock_wait: LOCK_WAIT,
                 dirs: Some(dirs.clone()),
                 dir_synced: AtomicBool::new(false),
                 taped: None,
@@ -443,7 +440,6 @@ impl Journal {
             path: PathBuf::new(),
             slug: slug.clone(),
             fx: fx.clone(),
-            lock_wait: LOCK_WAIT,
             dirs: None,
             dir_synced: AtomicBool::new(false),
             taped: Some(Mutex::new(Vec::new())),
@@ -504,7 +500,7 @@ impl Journal {
         if let Some(taped) = &self.taped {
             #[cfg(unix)]
             {
-                return Ok((lock(taped).clone(), JournalEnd::Clean));
+                return Ok((taped.lock_or_recover().clone(), JournalEnd::Clean));
             }
             #[cfg(not(unix))]
             {
@@ -568,14 +564,6 @@ impl Journal {
         retracted.map(|_| ())
     }
 
-    /// Tests: the same journal with another lock wait.
-    #[cfg(any(test, debug_assertions))]
-    #[must_use]
-    pub fn with_lock_wait_for_tests(mut self, wait: Duration) -> Journal {
-        self.lock_wait = wait;
-        self
-    }
-
     /// The lowercased slug, as refusals and needs name the repository.
     fn repo(&self) -> String {
         self.slug.key()
@@ -614,7 +602,7 @@ impl Journal {
         taped: &Mutex<Vec<(u64, JournalRecord)>>,
         build: impl FnOnce(&[(u64, JournalRecord)], u64) -> Result<JournalRecord>,
     ) -> Result<u64> {
-        let mut records = lock(taped);
+        let mut records = taped.lock_or_recover();
         let step = u64::try_from(records.len())
             .map_err(|_| Error::local("the taped journal holds more records than a step counts"))?;
         let record = build(&records, step)?;
@@ -661,7 +649,7 @@ impl Journal {
     /// Off unix a file journal is never made (`Journal::open` is `write::unix_only()`).
     #[cfg(not(unix))]
     fn read_file(&self) -> Result<(Vec<(u64, JournalRecord)>, JournalEnd)> {
-        let _ = (self.lock_wait, &self.dirs, &self.dir_synced);
+        let _ = (&self.dirs, &self.dir_synced);
         Err(crate::write::unix_only())
     }
 
@@ -743,7 +731,7 @@ impl Journal {
         &self,
         build: impl FnOnce(&[(u64, JournalRecord)], u64) -> Result<JournalRecord>,
     ) -> Result<u64> {
-        let _ = (build, self.lock_wait, &self.dirs, &self.dir_synced);
+        let _ = (build, &self.dirs, &self.dir_synced);
         Err(crate::write::unix_only())
     }
 
@@ -767,6 +755,16 @@ impl Journal {
     /// runs while it still holds the scan, and the lock with it.
     #[cfg(unix)]
     fn scan(&self, create: bool) -> Result<Option<Scan>> {
+        self.scan_after(create, Duration::ZERO, || {})
+    }
+
+    #[cfg(unix)]
+    fn scan_after(
+        &self,
+        create: bool,
+        elapsed: Duration,
+        held: impl FnMut(),
+    ) -> Result<Option<Scan>> {
         use std::io::Read as _;
 
         let owner_dir = self
@@ -781,11 +779,12 @@ impl Journal {
             .unwrap_or_default()
             .to_string();
         let lock_name = format!("{name}.lock");
-        let held = aterm_uds::private_file::PrivateLock::take(
+        let held = aterm_uds::private_file::PrivateLock::take_with(
             &owner_dir,
             &lock_name,
-            self.lock_wait,
+            LOCK_WAIT.saturating_sub(elapsed),
             "busy",
+            held,
         );
         let lock = held.map_err(|e| {
             if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -1146,12 +1145,6 @@ const RECORD_MAX: usize = 4096;
 /// A frame's bytes before its body: the frame header and the step header.
 #[cfg(unix)]
 const FRAME_OVERHEAD: usize = astream_wire::frame::HEADER_SIZE + astream_wire::steps::STEP_HEADER;
-
-/// The lock of a taped journal's records; a poisoned lock still holds whole records.
-#[cfg(unix)]
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Whether nothing is at `path` (`symlink_metadata`'s `NotFound`).
 #[cfg(unix)]

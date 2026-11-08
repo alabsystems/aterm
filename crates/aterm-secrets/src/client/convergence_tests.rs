@@ -866,6 +866,14 @@ fn enrollment_after_twenty_rotations_wraps_the_admission_epochs_and_history_come
         .expect("m10 opens the old epoch through the handoff")
         .with_key(&journal, |key| *key)
         .unwrap();
+    // A batch opens it through the same handoff under the history the batch leased once.
+    let batch: Vec<_> = b10
+        .historicals(&journal, &access, &[old, [7; 32]])
+        .into_iter()
+        .map(|answer| answer.and_then(|past| past.with_key(&journal, |key| *key)))
+        .collect();
+    assert_eq!(batch[0], Ok(key), "the batch opens the handoff's epoch");
+    assert!(batch[1].is_err(), "CONTROL: nothing holds the other");
     drop(journal);
     let expected = log_of(&macs.m22)
         .unwrap_commons_epoch(&old, &identity22)

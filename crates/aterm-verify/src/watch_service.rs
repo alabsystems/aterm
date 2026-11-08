@@ -20,7 +20,7 @@ fn xml(value: &str) -> String {
 }
 
 fn manifest(exe: &Path, root: &Path, home: &Path, path: &str, interval: u64) -> String {
-    // Capacity owns Background rank and foreground cancellation. The checks must
+    // Capacity owns Background rank and Release cancellation. The checks must
     // exercise default/boosted QoS, which Standard/Background launchd jobs cap.
     let exe = xml(&exe.to_string_lossy());
     let root = xml(&root.to_string_lossy());

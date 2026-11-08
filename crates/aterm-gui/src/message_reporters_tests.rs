@@ -3827,10 +3827,12 @@ fn every_tab_notices_step_stands_on_the_band() {
         ),
         ..Exception::of_notice(&notice::LOGIN_CANCELLED, None, None, "x")
     };
-    let row = band_row(resume_ask("s-1", &spot, &long), BAND_WIDE);
+    let msg = resume_ask("s-1", &spot, &long);
+    let title = msg.title.clone();
+    let row = band_row(msg, BAND_WIDE);
     assert!(
         row.detail.as_ref().map(|(_, d)| d.as_str()) != Some(long.action.as_str())
-            || row.title.1 != row.full_title,
+            || row.title.1 != title,
         "the control: {row:?}"
     );
     let last = Exception {

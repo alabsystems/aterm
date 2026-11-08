@@ -12285,8 +12285,7 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
         "unexpected drive refusal: {drive_refused:?}"
     );
     let parsed_code = JoinCode::parse(&code).expect("parse code");
-    let (denied, log) = denied_and_log(&member.places);
-    let denied = denied.expect("this member's deny list reads");
+    let (denied, log) = denied_and_log(&member.places).expect("this member's denial state reads");
     let dials = join_places(
         &member.places,
         &Opts::default(),
@@ -12319,12 +12318,12 @@ fn roster_identities_and_names_this_machine_bind_node_keys_and_enforce_deny_list
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(mode)).unwrap();
     };
     set(0o644);
-    let (unread, _) = denied_and_log(&member.places);
+    let unread = denied_and_log(&member.places);
     let grant = drive_grants(&member.places, &[peer_id.node().to_owned()], None);
     let drive = drive_fleet_in(&member.places, peer_id.node(), HANG);
     let joined = join(&member.places, &sync_here(), &code);
     set(0o600);
-    assert_eq!(unread, None, "an unreadable deny list is no list");
+    assert!(unread.is_err(), "an unreadable deny list is no list");
     assert!(
         grant.is_err_and(|why| failure_words(why).contains(DENY_LIST_UNREAD)),
         "no grant names a node while the deny list is unread"

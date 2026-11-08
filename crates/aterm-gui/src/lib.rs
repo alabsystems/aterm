@@ -825,6 +825,7 @@ mod input_hint;
 mod input_stall;
 mod keybinding;
 mod keymap;
+mod kimi_record;
 mod kitty_log;
 mod label_enum;
 mod launch_kitty;
@@ -17626,7 +17627,7 @@ impl App {
             self.session_chrome_retry.remove(&session);
             return true;
         };
-        let Some((live_epoch, live_title, live_cwd, untitled, timeline)) =
+        let Some((live_epoch, live_title, live_cwd, untitled, stands, timeline)) =
             s.term.try_lock().ok().map(|t| {
                 use crate::cwd_native::ReportedCwd as _;
                 (
@@ -17634,6 +17635,7 @@ impl App {
                     t.title().to_string(),
                     t.native_working_directory().map(|cwd| cwd.into_owned()),
                     crate::app_take_over::untitled_by_its_program(&t),
+                    crate::session_status::title_stands(&t),
                     s.ctx.timeline.clone(),
                 )
             })
@@ -17669,7 +17671,7 @@ impl App {
             let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
             let cwd_moved = timeline.record_cwd_change(live_cwd.as_deref());
             let shown = crate::tab_label::informative(&live_title).to_string();
-            let _ = timeline.record_title(&shown);
+            let _ = timeline.record_title(&shown, stands);
             let _ = timeline.slog_take_wake();
             cwd_moved
         };

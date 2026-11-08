@@ -1085,7 +1085,8 @@ fn status(
         .map(PathBuf::from)
         .unwrap_or_else(|| copy.home.join("auth.json"));
     let abandoned_before_launch = same_native_host(&receipt)
-        && !receipt.launch_attempted
+        && !receipt.revoked
+        && receipt.has_no_execution_evidence()
         && matches!(receipt.phase, Phase::Ready | Phase::Committing)
         && Process::observe(receipt.old_pid).is_none_or(|old| old.birth != receipt.old_birth)
         && current_auth == receipt.old_auth
@@ -1160,7 +1161,8 @@ fn status(
         return acknowledged_receipt_reply(env, &receipt);
     }
     if receipt.phase == Phase::Committing
-        && !receipt.launch_attempted
+        && !receipt.revoked
+        && receipt.has_no_execution_evidence()
         && now_ms() >= receipt.expires_ms
     {
         let Ok(Some(_guard)) = store.acquire_bounded() else {

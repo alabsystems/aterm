@@ -107,6 +107,7 @@ impl PetBrain {
             f.flag("chrome_hop", self.chrome_hop);
             f.flag("wrap_back", self.wrap_back);
             f.opt("wrap_ahead", self.wrap_ahead, wrap_ahead_words);
+            f.u16_opt("unseated", self.unseated);
             f.opt("writing_wrap", self.writing_wrap, |f, v| f.f64("v", v));
             f.flag("launch_running", self.launch_running);
             f.flag("launch_brisk", self.launch_brisk);
@@ -346,6 +347,10 @@ impl PetBrain {
             f.f64("stream_last", self.stream_last);
             f.opt("jump_at", self.jump_at, |f, v| f.f64("v", v));
             f.opt("burst_from", self.burst_from, |f, v| f.f64("v", v));
+            f.f32("jump_gap", self.jump_gap);
+            f.opt("written_through", self.written_through, |f, v| {
+                f.f64("v", v)
+            });
             f.flag("lone_along", self.lone_along);
             f.opt("paste_hold", self.paste_hold, |f, v| f.f64("v", v));
             f.flag("coil_waited", self.coil_waited);
@@ -681,7 +686,7 @@ mod tests {
         use super::super::PetMoteKind;
         let t0 = Instant::now();
         let base = words(&PetBrain::new(), t0);
-        let cases: [Case; 35] = [
+        let cases: [Case; 36] = [
             ("the surface", |p, _| p.surface = Some((7, true))),
             ("a held stand", |p, _| {
                 p.held_stash[1] = Some(HeldStand {
@@ -694,6 +699,7 @@ mod tests {
             ("the wrap ahead", |p, _| {
                 p.wrap_ahead = Some(WrapAhead::Rest(4.0, 2.0));
             }),
+            ("the wall that holds no seat", |p, _| p.unseated = Some(13)),
             ("the room cheer's air", |p, _| {
                 p.room_cheer_air = Some(CheerAir::Compact);
             }),

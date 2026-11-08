@@ -3,11 +3,14 @@
 
 //! Deadlines for blocking in-process calls and child processes.
 
+#[cfg(any(unix, windows))]
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write as _};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::Output;
 
 use crate::spawnfd::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -84,10 +87,11 @@ mod complete;
 #[cfg(unix)]
 mod custody;
 pub use complete::{
-    CompleteOutputError, MAX_COMPLETE_LISTING_BYTES, MAX_COMPLETE_STDOUT_BYTES,
-    output_until_complete_listing, output_until_complete_stdout, output_until_complete_stdout_from,
-    output_until_complete_stdout_from_observed, output_until_complete_stdout_from_unless,
-    output_until_complete_stdout_observed, output_until_complete_stdout_with_limit,
+    CompleteOutputError, CompleteProgressError, MAX_COMPLETE_LISTING_BYTES,
+    MAX_COMPLETE_STDOUT_BYTES, output_until_complete_listing, output_until_complete_stdout,
+    output_until_complete_stdout_from, output_until_complete_stdout_from_observed,
+    output_until_complete_stdout_from_unless, output_until_complete_stdout_observed,
+    output_until_complete_stdout_with_limit, output_while_process_progressing_complete_stdout,
     output_within_complete_listing, output_within_complete_stdout_records,
     output_within_complete_stdout_records_from,
 };
@@ -520,6 +524,48 @@ impl std::fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
+/// Why a process-progress-bounded child did not produce an output.
+#[derive(Debug)]
+pub enum ProgressError {
+    /// Ordinary spawn, capture or wait failure.
+    Run(RunError),
+    /// One whole evidence window passed without captured bytes or descendant CPU/I/O progress.
+    Stalled {
+        /// The inactivity evidence window.
+        window: Duration,
+        /// The operation the caller was waiting for, without secret argv or environment values.
+        waiting_on: String,
+    },
+}
+
+impl std::fmt::Display for ProgressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Run(error) => std::fmt::Display::fmt(error, f),
+            Self::Stalled { window, waiting_on } => write!(
+                f,
+                "produced no stdout/stderr bytes and its descendant tree made no CPU or I/O \
+                 progress for {window:?} while waiting on {waiting_on}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProgressError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Run(error) => Some(error),
+            Self::Stalled { .. } => None,
+        }
+    }
+}
+
+impl From<RunError> for ProgressError {
+    fn from(error: RunError) -> Self {
+        Self::Run(error)
+    }
+}
+
 const POLL_MIN: Duration = Duration::from_millis(1);
 const POLL_MAX: Duration = Duration::from_millis(25);
 const MAX_WITHIN: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
@@ -810,6 +856,167 @@ fn deadline_now() -> Instant {
 }
 
 const PROGRESS_TICK: Duration = Duration::from_millis(100);
+/// The m16 descendant-progress detector's cadence: frequent enough inside a one-minute evidence
+/// window without turning a network operation into a continuous process-table sweep.
+const PROCESS_PROGRESS_TICK: Duration = Duration::from_millis(500);
+
+/// More descendants than this make a process-tree reading incomplete. Ordinary Git and local
+/// metadata children stay many orders below it.
+#[cfg(any(unix, windows))]
+const PROCESS_PROGRESS_TREE_CAP: usize = 4_096;
+
+/// One identity-bracketed member of a complete descendant-tree progress reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ProcessProgressMember {
+    pid: u32,
+    start: u64,
+    /// Own CPU plus CPU of descendants this member already reaped.
+    cpu_ns: u64,
+    /// Storage I/O where the platform supplies both counters.
+    io_bytes: Option<u64>,
+}
+
+/// Select `root` and every current descendant from one complete process-table sweep. Missing
+/// identity, CPU, reaped-child CPU, truncation or ambiguous pids prove no lack of progress.
+#[cfg(any(unix, windows))]
+fn process_progress_tree(root: u32) -> Option<Vec<ProcessProgressMember>> {
+    let sweep = aterm_sysprobe::processes()?;
+    if sweep.truncated {
+        return None;
+    }
+    let mut by_pid = BTreeMap::new();
+    let mut children: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+    for process in &sweep.procs {
+        if by_pid.insert(process.pid, process).is_some() {
+            return None;
+        }
+        children.entry(process.ppid).or_default().push(process.pid);
+    }
+    if !by_pid.contains_key(&root) {
+        return None;
+    }
+    let mut open = VecDeque::from([root]);
+    let mut seen = BTreeSet::new();
+    let mut members = Vec::new();
+    while let Some(pid) = open.pop_front() {
+        if !seen.insert(pid) || members.len() >= PROCESS_PROGRESS_TREE_CAP {
+            return None;
+        }
+        let process = by_pid.get(&pid)?;
+        members.push(ProcessProgressMember {
+            pid,
+            start: process.start?,
+            cpu_ns: process.cpu_ns?.saturating_add(process.child_cpu_ns?),
+            io_bytes: process
+                .disk_read
+                .zip(process.disk_written)
+                .map(|(read, written)| read.saturating_add(written)),
+        });
+        if let Some(next) = children.get(&pid) {
+            open.extend(next.iter().copied());
+        }
+    }
+    members.sort_unstable();
+    Some(members)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_progress_tree(_root: u32) -> Option<Vec<ProcessProgressMember>> {
+    None
+}
+
+/// Monotone generation of CPU or I/O progress over comparable complete descendant-tree reads.
+#[derive(Debug, Default)]
+struct ProcessProgressProbe {
+    seen: Vec<ProcessProgressMember>,
+    generation: u64,
+    observed: bool,
+}
+
+impl ProcessProgressProbe {
+    fn read(&mut self, root: u32) -> Option<u64> {
+        let now = process_progress_tree(root)?;
+        if !self.observed {
+            self.seen = now;
+            self.observed = true;
+            return Some(self.generation);
+        }
+        let identities_match = self.seen.len() == now.len()
+            && self
+                .seen
+                .iter()
+                .zip(&now)
+                .all(|(before, after)| (before.pid, before.start) == (after.pid, after.start));
+        let counters = identities_match.then(|| {
+            self.seen
+                .iter()
+                .zip(&now)
+                .try_fold(false, |grew, (before, after)| -> Option<bool> {
+                    if before.cpu_ns > after.cpu_ns {
+                        return None;
+                    }
+                    let io_grew = match (before.io_bytes, after.io_bytes) {
+                        (None, None) => false,
+                        (Some(before), Some(after)) if before <= after => before < after,
+                        _ => return None,
+                    };
+                    Some(grew || before.cpu_ns < after.cpu_ns || io_grew)
+                })
+        });
+        self.seen = now;
+        let Some(Some(grew)) = counters else {
+            return None;
+        };
+        if grew {
+            self.generation = self.generation.saturating_add(1);
+        }
+        Some(self.generation)
+    }
+}
+
+/// Evidence window over captured bytes and a complete descendant-tree progress generation.
+/// An unread or incomparable tree disarms the window until another complete baseline exists.
+#[derive(Clone, Copy, Debug)]
+struct ProgressWindow {
+    window: Duration,
+    last: Instant,
+    bytes: u64,
+    work: u64,
+    armed: bool,
+}
+
+impl ProgressWindow {
+    fn new(window: Duration, now: Instant) -> Self {
+        Self {
+            window,
+            last: now,
+            bytes: 0,
+            work: 0,
+            armed: false,
+        }
+    }
+
+    fn remaining(&mut self, now: Instant, bytes: u64, work: Option<u64>) -> Duration {
+        let tick = PROCESS_PROGRESS_TICK
+            .min(self.window / 4)
+            .max(Duration::from_millis(1));
+        let Some(work) = work else {
+            self.armed = false;
+            self.last = now;
+            self.bytes = bytes;
+            return tick;
+        };
+        if !self.armed || self.bytes != bytes || self.work != work {
+            self.armed = true;
+            self.last = now;
+            self.bytes = bytes;
+            self.work = work;
+        }
+        self.window
+            .saturating_sub(now.saturating_duration_since(self.last))
+            .min(tick)
+    }
+}
 
 /// Runs `cmd` while `progress()` keeps advancing at least once every `window`.
 ///
@@ -834,7 +1041,7 @@ pub fn output_while_progressing_until(
     deadline: Instant,
     progress: &mut dyn FnMut() -> u64,
 ) -> Result<Output, RunError> {
-    if Instant::now() >= deadline {
+    if deadline_now() >= deadline {
         return Err(RunError::TimedOut);
     }
     progressing_until(cmd, window, Some(deadline), progress)
@@ -853,7 +1060,7 @@ fn progressing_until(
         Stdio::null(),
         &mut || {
             let reading = progress();
-            let now = Instant::now();
+            let now = deadline_now();
             let since = match last {
                 Some((seen, since)) if seen == reading => since,
                 _ => {
@@ -870,6 +1077,69 @@ fn progressing_until(
     )
 }
 
+/// Runs `cmd` with closed stdin while captured output bytes or a complete descendant-tree
+/// CPU/I/O generation advances at least once every `window`. An unread or incomparable process
+/// observation disarms the inactivity window instead of turning missing evidence into zero.
+/// That includes platforms whose process reader cannot supply cumulative reaped-child CPU
+/// (currently Windows); release cuts use macOS's complete reading.
+///
+/// # Errors
+/// Spawn, capture or wait failures, or [`ProgressError::Stalled`] after one whole evidence
+/// window.
+pub fn output_while_process_progressing(
+    cmd: &mut Command,
+    window: Duration,
+    waiting_on: impl Into<String>,
+) -> Result<Output, ProgressError> {
+    output_from_while_process_progressing(cmd, Stdio::null(), window, waiting_on)
+}
+
+/// As [`output_while_process_progressing`], with explicit owned `stdin`.
+///
+/// # Errors
+/// The same errors as [`output_while_process_progressing`].
+pub fn output_from_while_process_progressing(
+    cmd: &mut Command,
+    stdin: Stdio,
+    window: Duration,
+    waiting_on: impl Into<String>,
+) -> Result<Output, ProgressError> {
+    let waiting_on = waiting_on.into();
+    let mut probe = ProcessProgressProbe::default();
+    let mut now = deadline_now;
+    output_from_while_process_progressing_with(
+        cmd,
+        stdin,
+        window,
+        waiting_on,
+        &mut now,
+        &mut |pid| probe.read(pid),
+    )
+}
+
+fn output_from_while_process_progressing_with(
+    cmd: &mut Command,
+    stdin: Stdio,
+    window: Duration,
+    waiting_on: String,
+    now: &mut dyn FnMut() -> Instant,
+    work: &mut dyn FnMut(u32) -> Option<u64>,
+) -> Result<Output, ProgressError> {
+    let mut progress = ProgressWindow::new(window, now());
+    let mut left = |pid, bytes| progress.remaining(now(), bytes, work(pid));
+    let (child, pipes, group) = started(cmd, stdin)?;
+    drained_owned(
+        child,
+        pipes,
+        group,
+        &mut left,
+        &mut settle_child,
+        true,
+        None,
+    )?
+    .map_err(|_| ProgressError::Stalled { window, waiting_on })
+}
+
 /// `cmd` run with `stdin` in a process group of its own (on Unix), its output drained, until it
 /// ends or `left()` reads zero; then `overrun` ends it (for `output_until` and
 /// `output_while_progressing`, [`settle_child`]: it and its group killed, and it reaped).
@@ -881,7 +1151,8 @@ fn output_by(
     stopped: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<Output, RunError> {
     let (child, pipes, group) = started(cmd, stdin)?;
-    drained_owned(child, pipes, group, left, overrun, true, stopped)?
+    let mut unobserved = |_, _| left();
+    drained_owned(child, pipes, group, &mut unobserved, overrun, true, stopped)?
         .map_err(|_| RunError::TimedOut)
 }
 
@@ -986,7 +1257,7 @@ fn drained_owned<C: Waited>(
     child: C,
     pipes: Pipes,
     group: Option<u32>,
-    left: &mut dyn FnMut() -> Duration,
+    left: &mut dyn FnMut(u32, u64) -> Duration,
     overrun: &mut dyn FnMut(&mut C),
     settle_on_unwind: bool,
     mut stopped: Option<&mut dyn FnMut() -> bool>,
@@ -1025,6 +1296,12 @@ fn drained_owned<C: Waited>(
         }
     };
     let mut exit = ExitWait::on_pid(child.pid());
+    let captured = |stdout: &Option<Drain>, stderr: &Option<Drain>| {
+        stdout
+            .as_ref()
+            .map_or(0, Drain::bytes)
+            .saturating_add(stderr.as_ref().map_or(0, Drain::bytes))
+    };
     let status = loop {
         match child.poll_exit() {
             Ok(Some(status)) => break status,
@@ -1032,7 +1309,7 @@ fn drained_owned<C: Waited>(
                 let remaining = if stopped.as_mut().is_some_and(|stop| stop()) {
                     Duration::ZERO
                 } else {
-                    left()
+                    left(child.pid(), captured(&stdout, &stderr))
                 };
                 if remaining.is_zero() {
                     overrun(child);
@@ -1057,7 +1334,10 @@ fn drained_owned<C: Waited>(
     };
     let grace = Grace {
         by: saturating_after(Instant::now(), DRAIN_GRACE),
-        until: saturating_after(Instant::now(), left()),
+        until: saturating_after(
+            Instant::now(),
+            left(child.pid(), captured(&stdout, &stderr)),
+        ),
         group,
     };
     let mut collect = |drain: Option<Drain>| {
@@ -1373,11 +1653,16 @@ impl Drop for Held {
 
 struct Drain {
     tail: Arc<Mutex<Vec<u8>>>,
+    total: Arc<AtomicU64>,
     ended: mpsc::Receiver<()>,
     pipe: Option<PipeEnd>,
 }
 
 impl Drain {
+    fn bytes(&self) -> u64 {
+        self.total.load(Ordering::Relaxed)
+    }
+
     fn collect(self, grace: &Grace) -> Vec<u8> {
         self.collect_unless(grace, &mut None)
             .expect("an unobserved capture cannot be cancelled")
@@ -1464,6 +1749,8 @@ fn drain(
     }
     let tail = Arc::new(Mutex::new(Vec::new()));
     let theirs = Arc::clone(&tail);
+    let total = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&total);
     let (tx, ended) = mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(format!("child-{which}"))
@@ -1473,6 +1760,7 @@ fn drain(
                 if n == 0 {
                     break;
                 }
+                counted.fetch_add(u64::try_from(n).unwrap_or(u64::MAX), Ordering::Relaxed);
                 let mut tail = theirs.lock().unwrap_or_else(PoisonError::into_inner);
                 tail.extend_from_slice(&chunk[..n]);
                 if tail.len() > OUTPUT_KEEP {
@@ -1482,7 +1770,12 @@ fn drain(
             }
             let _ = tx.send(());
         })?;
-    Ok(Drain { tail, ended, pipe })
+    Ok(Drain {
+        tail,
+        total,
+        ended,
+        pipe,
+    })
 }
 
 #[cfg(test)]
@@ -2537,6 +2830,125 @@ mod tests {
     /// under a second.
     #[cfg(unix)]
     const WINDOW: Duration = Duration::from_millis(300);
+
+    /// Injected clock and probe generations: byte and descendant-work progress keep an
+    /// operation alive beyond the former two-minute wall budget. Mutating either generation
+    /// comparison away makes one of the later observations read as stalled.
+    #[test]
+    fn process_progress_outlives_a_wall_budget_while_evidence_advances() {
+        let start = Instant::now();
+        let window = Duration::from_secs(60);
+        let mut progress = super::ProgressWindow::new(window, start);
+        assert!(!progress.remaining(start, 0, Some(0)).is_zero());
+        assert!(
+            !progress
+                .remaining(start + Duration::from_secs(61), 1, Some(0))
+                .is_zero()
+        );
+        assert!(
+            !progress
+                .remaining(start + Duration::from_secs(122), 1, Some(1))
+                .is_zero()
+        );
+        assert!(
+            !progress
+                .remaining(start + Duration::from_secs(183), 2, Some(1))
+                .is_zero(),
+            "progressing work is not a two-minute latency budget"
+        );
+    }
+
+    /// Negative control: a complete probe whose bytes and descendant-work generation stay flat
+    /// reaches zero at exactly one injected evidence window, without a production-minute sleep.
+    #[test]
+    fn process_progress_stalls_after_one_whole_quiet_window() {
+        let start = Instant::now();
+        let window = Duration::from_secs(60);
+        let mut progress = super::ProgressWindow::new(window, start);
+        assert!(!progress.remaining(start, 7, Some(11)).is_zero());
+        assert!(
+            !progress
+                .remaining(start + window - Duration::from_nanos(1), 7, Some(11))
+                .is_zero()
+        );
+        assert!(progress.remaining(start + window, 7, Some(11)).is_zero());
+    }
+
+    /// The collector uses the same injected clock/probe evidence to end and reap a stalled
+    /// process group, and preserves the caller's safe operation label. NEGATIVE CONTROL: a
+    /// collector that only returns the finding without `settle_child` leaves the sleep alive.
+    #[cfg(unix)]
+    #[test]
+    fn stalled_process_progress_is_named_and_the_owned_group_ends() {
+        let dir = scratch("process-progress-stalled");
+        let pid_file = dir.join("pid");
+        let mut cmd = sh("echo $$ > \"$0\"; exec sleep 600", &[&pid_file]);
+        let start = Instant::now();
+        let mut reads = 0u32;
+        let mut now = || {
+            let at = start + Duration::from_secs(u64::from(reads) * 61);
+            reads = reads.saturating_add(1);
+            at
+        };
+        let proof = pid_file.clone();
+        let mut probe = move |_| proof.is_file().then_some(0);
+        let result = super::output_from_while_process_progressing_with(
+            &mut cmd,
+            crate::spawnfd::Stdio::null(),
+            Duration::from_secs(60),
+            "git fetch origin/main".to_owned(),
+            &mut now,
+            &mut probe,
+        );
+        let child = pid_in(&pid_file).expect("the stalled child wrote its pid");
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = result.expect_err("flat injected progress must stall");
+        assert!(
+            matches!(
+                &error,
+                super::ProgressError::Stalled {
+                    window,
+                    ..
+                } if *window == Duration::from_secs(60)
+            ),
+            "{error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("waiting on git fetch origin/main"),
+            "{error}"
+        );
+        assert!(
+            !crate::process::pid_alive(child),
+            "stalled child {child} outlived the progress collector"
+        );
+    }
+
+    /// An unread or incomparable descendant-tree probe is missing evidence, never zero work: it
+    /// disarms the old window and a later complete observation establishes a new baseline.
+    #[test]
+    fn unread_process_progress_disarms_and_rebaselines_the_window() {
+        let start = Instant::now();
+        let window = Duration::from_secs(60);
+        let mut progress = super::ProgressWindow::new(window, start);
+        assert!(!progress.remaining(start, 0, Some(0)).is_zero());
+        assert!(
+            !progress
+                .remaining(start + Duration::from_secs(600), 0, None)
+                .is_zero()
+        );
+        assert!(
+            !progress
+                .remaining(start + Duration::from_secs(1_200), 0, Some(0))
+                .is_zero()
+        );
+        assert!(
+            progress
+                .remaining(start + Duration::from_secs(1_260), 0, Some(0))
+                .is_zero()
+        );
+    }
 
     /// A child that keeps making progress outlives its window and answers: the probe's
     /// reading moves every quarter window, and after three windows the probe drops the flag

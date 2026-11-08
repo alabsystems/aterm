@@ -506,7 +506,7 @@ mod tests {
         let checkout = format!("{}/code", user.home);
         sys.stat_of(&checkout, directory);
         file(&helper, b"helper one");
-        file(aterm_machines::items::github::CLT_GIT, b"git one");
+        sys.executable(aterm_machines::items::github::CLT_GIT, b"git one");
         let private_reads = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&private_reads);
         sys.on_owned_read(move |_, path| {

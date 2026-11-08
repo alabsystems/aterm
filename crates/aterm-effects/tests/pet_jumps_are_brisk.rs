@@ -213,6 +213,20 @@ fn entered(above: usize, command: &str, output: &str) -> (Vec<(u64, Ev)>, u64) {
     (ev, t)
 }
 
+/// [`entered`] with the output's last line written before its newline, and the newline and the
+/// new prompt `late` ms after it: a command that prints its line and then ends (a `printf`, a
+/// slow first line of `git status`), the caret resting at the line's end in between.
+fn entered_late(above: usize, command: &str, line: &str, late: u64) -> (Vec<(u64, Ev)>, u64) {
+    let mut ev = vec![(300, Ev::Out(page(above)))];
+    let mut t = 2_000;
+    type_text(&mut ev, &mut t, command, 400);
+    t += 350;
+    ev.push((t, Ev::Key(PetInputKind::Submit)));
+    ev.push((t + 5, Ev::Out(format!("\r\n{line}").into_bytes())));
+    ev.push((t + 5 + late, Ev::Out(format!("\r\n{PROMPT}").into_bytes())));
+    (ev, t)
+}
+
 /// A line typed at a prompt under `above` lines, then cleared back to the prompt by zsh's
 /// Ctrl+U 1.2 s later; the Ctrl+U's time with the events.
 fn cleared(above: usize, cols: u16) -> (Vec<(u64, Ev)>, u64) {
@@ -305,37 +319,56 @@ fn every_flight_after_a_caret_jump_is_one_brisk_bound() {
 
 /// r25 K8-3, AN ENTER AFTER A SHORT COMMAND COSTS ONE FLIGHT: a short command whose output is
 /// one long line (`ls` of a long name, `pwd` deep in a tree, `git status`'s first line) puts the
-/// new prompt under letters, and the seat the cat rests on past the line's end. The cat near the
-/// prompt waits in its coil for the new prompt to come to rest and goes once, to that seat.
-/// Hopped at once to the stand beside the prompt, it came down there and flew on to the seat
-/// 0.8 to 1.2 s later (two flights), and after `pwd` printing 70 columns on 80 to a further one
-/// (three). Negative control ([`OldPath::BoundLeavesUnrested`]): it leaves at once.
+/// new prompt under letters, the cat's stand drawn down or fitted beside it. The cat near the
+/// prompt goes once, to where it rests by it, whether the line and the prompt come together or
+/// the prompt 100 ms after the line (the caret resting at the line's end between): its coil
+/// waits for the caret to come to rest, so the bound leaves for where it settles.
+///
+/// The cat comes down within 8 cells of the prompt's caret.
+///
+/// Negative control ([`OldPath::SunkStandSlides`], r29 K9-2): the stand drawn down by the prompt
+/// slid along its row to the seat past the line's end, and the bound came down there, 48 cells
+/// past the prompt (and where the bound came down by the prompt first, a second went on to it).
 #[test]
 fn an_enter_after_a_short_command_s_long_line_costs_one_flight() {
-    let line = |n: usize| -> String {
-        let mut s: String = "abcdefghij ".chars().cycle().take(n).collect();
-        s.push_str("\r\n");
-        s
-    };
+    let line = |n: usize| -> String { "abcdefghij ".chars().cycle().take(n).collect() };
     for (cols, rows) in [(80u16, 24u16), (102, 29)] {
         for (command, out) in [("ls", 60usize), ("pwd", 70), ("git status", 45)] {
-            let (events, at) = entered(usize::from(rows) - 4, command, &line(out));
-            let mut host = Host::new(rows, cols, &[]);
-            host.run(events, 4_000);
-            let flights = flights(&host.shots, at);
-            assert_eq!(
-                flights.len(),
-                1,
-                "{cols}x{rows} `{command}` printing {out} columns: one flight, not {flights:?}"
-            );
+            for late in [None, Some(100u64)] {
+                let (events, at) = match late {
+                    None => entered(
+                        usize::from(rows) - 4,
+                        command,
+                        &format!("{}\r\n", line(out)),
+                    ),
+                    Some(late) => entered_late(usize::from(rows) - 4, command, &line(out), late),
+                };
+                let mut host = Host::new(rows, cols, &[]);
+                host.run(events, 4_000);
+                let flights = flights(&host.shots, at);
+                assert_eq!(
+                    flights.len(),
+                    1,
+                    "{cols}x{rows} `{command}` printing {out} columns, the prompt {late:?} ms \
+                     after: one flight, not {flights:?}"
+                );
+                let off = flights[0].landing.0 - PROMPT.len() as f32;
+                assert!(
+                    off.abs() <= 8.0,
+                    "{cols}x{rows} `{command}` printing {out} columns, the prompt {late:?} ms \
+                     after: the cat came down {off:.1} cells from the prompt's caret"
+                );
+            }
         }
     }
-    let (events, at) = entered(20, "ls", &line(60));
-    let mut old = Host::new(24, 80, &[OldPath::BoundLeavesUnrested]);
+    let (events, at) = entered(20, "ls", &format!("{}\r\n", line(60)));
+    let mut old = Host::new(24, 80, &[OldPath::SunkStandSlides]);
     old.run(events, 4_000);
     let flights = flights(&old.shots, at);
     assert!(
-        flights.len() >= 2,
-        "negative control: leaving at once, the cat still flew once ({flights:?})"
+        flights
+            .last()
+            .is_some_and(|f| f.landing.0 - PROMPT.len() as f32 > 30.0),
+        "negative control: the cat came down by the prompt ({flights:?})"
     );
 }

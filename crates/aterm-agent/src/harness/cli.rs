@@ -668,7 +668,7 @@ VERBS:
     (`token-fallback`) where the account has a token. It writes nothing and takes no lock.
   - `accounts stats [--since 24h] [--json]`
     Reads 5h, week, and Fable windows, plan, credits, 8-day list-price spend (\u{2248}$), login
-    state, and running sessions for the current home (`--json` is schema 1 `account-stats`).
+    state, and running sessions for the current home (`--json` is schema 2 `account-stats`).
     Each window also says how far it moved over `--since` (1m to 90d, default 24h), read off
     this Mac's readings series: `+18 since 24h`, `new window since 13:00` or `reset used since
     13:00`, never a negative number; where the series holds no reading near the span's start,
@@ -11748,7 +11748,7 @@ fn put_time(o: &mut Map, key: &str, t: Option<i64>) {
 
 fn accounts_json_head(path: Option<&Path>, now: i64) -> Map {
     let mut o = Map::new();
-    o.insert("schema".to_owned(), Value::from(1u64));
+    o.insert("schema".to_owned(), Value::from(2u64));
     o.insert("kind".to_owned(), Value::from("accounts".to_owned()));
     put_time(&mut o, "as_of", Some(now));
     o.insert(

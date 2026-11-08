@@ -72,6 +72,301 @@ fn the_sweep_marks_what_the_engine_says_once() {
     }
 }
 
+/// The node of the newest `cmd` run `got` opened.
+fn opened_cmd(got: &[String]) -> String {
+    let open = got
+        .iter()
+        .rev()
+        .find(|l| l.contains(" open r") && l.contains(" cmd "))
+        .unwrap_or_else(|| panic!("a cmd run opened: {got:?}"));
+    open.split(' ').nth(2).expect("a node").to_string()
+}
+
+/// One OSC 9 notification, one BEL and one inbound mail into `app`'s front session `sid`, the
+/// engine's two read by a sweep at `at`, the mail delivered as the bridge delivers it.
+fn notify_bell_and_mail(
+    app: &mut App,
+    term: &std::sync::Mutex<aterm_core::terminal::Terminal>,
+    sid: &str,
+    off: u64,
+    at: Instant,
+) {
+    crate::term_lock(term).process(b"\x1b]9;QZP7NOTEBODY\x07\x07");
+    app.observe_session_statuses(at);
+    let store = app.store.clone();
+    let wake = |s: &aterm_session::SessionId| crate::control::wake_sid_watchers(&store, s);
+    let line = format!("{sid} off={off} from=h-a kind=task trust=human text=QZP7MAILBODY");
+    let ok = crate::fabric::cmd_deliver_waking(&app.store, &line, &wake);
+    assert!(ok.starts_with("OK "), "{ok}");
+}
+
+/// A NOTIFICATION, A BELL AND A MAIL MARK WHAT RUNS NOW (unit J1-1, SMOKE-1c; §2.1, §2.6):
+/// through the sweep's engine read and the fabric's delivery, with a `cmd` run open each marks
+/// that run, and the run's close counts the mail (`mail=1`, §2.3); at the prompt, with no run
+/// open, each marks the session. Their bodies are never kept. NEGATIVE CONTROL: the writers
+/// pinned to `-` (as before the unit) put all three on the session and the close counts none.
+#[test]
+fn a_notification_a_bell_and_a_mail_mark_the_open_run() {
+    for in_command in [true, false] {
+        let mut app = App::headless_for_test();
+        let front = app.front_terminal(WindowId(0)).expect("a front terminal");
+        let (session, term) = (front.session, std::sync::Arc::clone(&front.term));
+        let ctx = std::sync::Arc::clone(&app.pool.get(session).expect("pooled").ctx);
+        let sid = ctx.self_id.as_str().to_string();
+        let t0 = Instant::now();
+        if in_command {
+            crate::term_lock(&term)
+                .process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\read\r\n\x1b]133;C\x1b\\");
+        }
+        app.observe_session_statuses(t0);
+        let node = if in_command {
+            opened_cmd(&lines_of(&ctx.timeline))
+        } else {
+            "-".to_string()
+        };
+        notify_bell_and_mail(&mut app, &term, &sid, 7, t0 + Duration::from_secs(1));
+        let got = lines_of(&ctx.timeline);
+        for kind in [" notify n=1 ", " bell n=1 ", " mail dir=in kind=task "] {
+            assert_eq!(
+                having(&got, &format!(" mark {node}{kind}")).len(),
+                1,
+                "in a command: {in_command}; {kind} on {node}: {got:?}"
+            );
+        }
+        if in_command {
+            crate::term_lock(&term).process(b"\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\\x1b]133;B\x1b\\");
+            app.observe_session_statuses(t0 + Duration::from_secs(2));
+            let got = lines_of(&ctx.timeline);
+            let close = having(&got, &format!(" close {node} cmd "));
+            assert!(
+                close.len() == 1 && close[0].contains(" mail=1 "),
+                "the run's close counts its mail: {got:?}"
+            );
+        }
+        let content = content_lines(&ctx.timeline);
+        assert!(
+            content.iter().all(|l| !l.contains("QZP7")),
+            "no body kept: {content:?}"
+        );
+    }
+}
+
+/// A new tab the status sweep visited at `t0` and owes no look again: its session, its terminal
+/// and its timeline.
+fn swept_tab(
+    app: &mut App,
+    t0: Instant,
+) -> (
+    u64,
+    std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>,
+    std::sync::Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
+) {
+    let wid = WindowId(0);
+    app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+    let session = app.focused_session_id(wid).expect("the new tab, active");
+    let (term, timeline) = {
+        let s = app.pool.get(session).expect("pooled");
+        (
+            std::sync::Arc::clone(&s.term),
+            std::sync::Arc::clone(&s.ctx.timeline),
+        )
+    };
+    app.observe_session_statuses(t0);
+    assert!(
+        !app.session_status.due(session, t0),
+        "the sweep visited and is not due again"
+    );
+    (session, term, timeline)
+}
+
+/// `aterm ctl @<sid> close` of `session`, through the real close path.
+fn ctl_close(app: &mut App, session: u64) {
+    let progress = {
+        let _closing = crate::session_store::CloseAttribution::enter(
+            crate::session_store::ExitReason::CtlClose,
+            crate::session_store::ExitActor::Unknown,
+        );
+        app.close_confirm = crate::app_window::CloseConfirm::WireRefuseBusy;
+        app.close_session_by_id(session)
+    };
+    assert!(
+        matches!(progress, Ok(crate::app_tabs::CloseProgress::Retired)),
+        "{progress:?}"
+    );
+}
+
+/// A COMMAND THAT ENDS JUST BEFORE ITS SESSION CLOSES IS LOGGED (unit J1-1, SMOKE-3c; §2.4,
+/// §5): the sweep visits the tab at `t0` and is not due again, its command runs and ends, and
+/// `ctl close` closes it through the real close path. The close's last visit writes the run's
+/// open and close, from the block's stamps, before the session's close, and counts no loss.
+/// NEGATIVE CONTROL: the close path without its last visit (as before the unit) logs neither.
+#[test]
+fn a_command_that_ends_just_before_its_session_closes_is_logged() {
+    let mut app = App::headless_for_test();
+    let (session, term, timeline) = swept_tab(&mut app, Instant::now());
+    crate::term_lock(&term).process(
+        b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\printf QZP7WORD2\r\n\x1b]133;C\x1b\\QZP7WORD2\
+          \x1b]133;D;0\x1b\\\x1b]133;A\x1b\\\x1b]133;B\x1b\\",
+    );
+    let before = lines_of(&timeline);
+    assert!(
+        having(&before, " cmd ").is_empty(),
+        "no visit read it: {before:?}"
+    );
+    ctl_close(&mut app, session);
+    let got = lines_of(&timeline);
+    let at = |needle: &str| {
+        got.iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle}: {got:?}"))
+    };
+    let (open, close, end) = (
+        at(" open r1 cmd "),
+        at(" close r1 cmd out=ok "),
+        at(" close - "),
+    );
+    assert!(open < close && close < end, "{got:?}");
+    assert!(
+        having(&got, " gap ").is_empty() && !got[end].contains(" lost="),
+        "nothing lost: {got:?}"
+    );
+}
+
+/// THE CLOSE'S LAST VISIT SAYS WHAT THE ENGINE SAID SINCE THE SWEEP (unit J1-1 review, SMOKE-3c):
+/// a notification and a bell that come after the sweep's visit, the tab then closed at once by
+/// `ctl close`, are marked before the session's close, their bodies never kept. NEGATIVE
+/// CONTROL: a last visit that reads only the blocks (no `observe_engine`) marks neither.
+#[test]
+fn the_closes_last_visit_marks_a_notification_and_a_bell_since_the_sweep() {
+    let mut app = App::headless_for_test();
+    let (session, term, timeline) = swept_tab(&mut app, Instant::now());
+    crate::term_lock(&term).process(b"\x1b]9;QZP7NOTEBODY\x07\x07");
+    ctl_close(&mut app, session);
+    let got = lines_of(&timeline);
+    let at = |needle: &str| {
+        got.iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle}: {got:?}"))
+    };
+    let end = at(" close - ");
+    assert!(
+        at(" mark - notify n=1 ") < end && at(" mark - bell n=1 ") < end,
+        "{got:?}"
+    );
+    let content = content_lines(&timeline);
+    assert!(
+        content.iter().all(|l| !l.contains("QZP7")),
+        "no body kept: {content:?}"
+    );
+}
+
+/// THE CLOSE'S LAST VISIT READS ON PAST ITS CAP (unit J1-1 review, SMOKE-3c): the sweep visits
+/// the tab, more commands than one block read takes ([`crate::session_status::BLOCK_READ_MAX`])
+/// run and end, and `ctl close` closes the tab before the sweep is due. Each is a run, opened and
+/// closed before the session's close, with no `gap` and no `lost=`. NEGATIVE CONTROL: a last
+/// visit that stops after one read logs the cap's worth and loses the rest.
+#[test]
+fn the_closes_last_visit_reads_on_past_its_cap() {
+    let prompt = b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\";
+    let n = crate::session_status::BLOCK_READ_MAX + 8;
+    let mut app = App::headless_for_test();
+    let (session, term, timeline) = swept_tab(&mut app, Instant::now());
+    let mut burst = prompt.to_vec();
+    for i in 0..n {
+        burst.extend_from_slice(
+            format!("true {i}\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\").as_bytes(),
+        );
+        burst.extend_from_slice(prompt);
+    }
+    crate::term_lock(&term).process(&burst);
+    ctl_close(&mut app, session);
+    let got = lines_of(&timeline);
+    let end = got
+        .iter()
+        .position(|l| l.contains(" close - "))
+        .unwrap_or_else(|| panic!("the session closed: {got:?}"));
+    let runs = |op: &str| {
+        got[..end]
+            .iter()
+            .filter(|l| l.contains(op) && l.contains(" cmd "))
+            .count()
+    };
+    assert_eq!(
+        (runs(" open r"), runs(" close r")),
+        (n, n),
+        "every command is a run: {got:?}"
+    );
+    assert!(
+        having(&got, " gap ").is_empty() && !got[end].contains(" lost="),
+        "nothing lost: {got:?}"
+    );
+}
+
+/// A MAIL THAT COMES DURING AN AGENT'S TURN COUNTS IN THE TURN'S CLOSE (unit J1-1 review,
+/// SMOKE-1c; §2.1, §2.3): delivered as the bridge delivers it, while Claude Code's turn is open
+/// under its run, the mail marks the turn (the deepest open node), and the turn's close says
+/// `mail=1`. NEGATIVE CONTROL: a mail put on the front run marks the run alone, and the turn's
+/// close counts none.
+#[test]
+fn a_mail_during_an_agents_turn_counts_in_the_turns_close() {
+    let h = crate::session_store::test_handle(3);
+    let hand = super::super::tests::hand_clock(&h.ctx.timeline);
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(h.clone());
+    {
+        let mut g = h.ctx.timeline.lock().unwrap();
+        let now = g.slog().now();
+        g.slog_mut().open_session(None, None, now);
+        g.note_root_group(100);
+    }
+    with_claude(&h.ctx.timeline);
+    let verdict = |word: &'static str, seq: u64| {
+        h.ctx.timeline.lock().unwrap().publish_agent(
+            word,
+            None,
+            None,
+            Some(aterm_phase::Program::Claude),
+            stamp(seq),
+        );
+    };
+    hand.set(1_000);
+    verdict("busy", 1);
+    let got = lines_of(&h.ctx.timeline);
+    let turn = got
+        .iter()
+        .find(|l| l.contains(" open t1 turn "))
+        .unwrap_or_else(|| panic!("a turn opened: {got:?}"));
+    assert!(turn.contains(" par=r1 "), "{turn}");
+    hand.set(1_500);
+    let wake = |s: &aterm_session::SessionId| crate::control::wake_sid_watchers(&store, s);
+    let line = format!(
+        "{} off=9 from=h-a kind=task trust=human text=QZP7MAILBODY",
+        h.ctx.self_id.as_str()
+    );
+    let ok = crate::fabric::cmd_deliver_waking(&store, &line, &wake);
+    assert!(ok.starts_with("OK "), "{ok}");
+    hand.set(2_000);
+    verdict("idle", 2);
+    hand.set(10_000);
+    let _ = h.ctx.timeline.lock().unwrap().slog_tick();
+    let got = lines_of(&h.ctx.timeline);
+    assert_eq!(
+        having(&got, " mark t1 mail dir=in kind=task ").len(),
+        1,
+        "the mail marks the turn: {got:?}"
+    );
+    let close = having(&got, " close t1 turn ");
+    assert!(
+        close.len() == 1 && close[0].contains(" mail=1 "),
+        "the turn's close counts its mail: {got:?}"
+    );
+    let content = content_lines(&h.ctx.timeline);
+    assert!(
+        content.iter().all(|l| !l.contains("QZP7")),
+        "no body kept: {content:?}"
+    );
+}
+
 #[test]
 fn a_status_transition_is_one_typed_mark() {
     let mut app = App::headless_for_test();
@@ -496,6 +791,202 @@ fn the_drift_flush_marks_the_cwd_and_the_title_when_they_move() {
     assert!(!cwd[1].contains(" cwd="), "{cwd:?}");
 }
 
+type TermArc = std::sync::Arc<std::sync::Mutex<aterm_core::terminal::Terminal>>;
+type TimelineArc = std::sync::Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>;
+
+/// The title marks of `timeline`'s log, at `tier`.
+fn title_marks(
+    timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+    tier: aterm_slog::Tier,
+) -> Vec<String> {
+    let g = timeline.lock().unwrap();
+    g.slog()
+        .log()
+        .window()
+        .filter(|r| r.k == aterm_slog::Kind::Title)
+        .map(|r| aterm_slog::encode(r, tier).expect("fits"))
+        .collect()
+}
+
+/// A new headless app's front tab at its prompt, the shell's title `~/QZP7DIRA` flushed at `t0`
+/// and kept as text at tier C.
+fn at_a_titled_prompt(t0: Instant) -> (App, u64, TermArc, TimelineArc) {
+    let mut app = App::headless_for_test();
+    let front = app.front_terminal(WindowId(0)).expect("a front terminal");
+    let (session, term) = (front.session, std::sync::Arc::clone(&front.term));
+    let timeline = std::sync::Arc::clone(&app.pool.get(session).expect("pooled").ctx.timeline);
+    crate::term_lock(&term).process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\\x1b]0;~/QZP7DIRA\x07");
+    assert!(app.flush_title_drift(session, t0), "uncontended");
+    let marks = title_marks(&timeline, aterm_slog::Tier::Content);
+    assert!(
+        marks.len() == 1 && marks[0].contains(" title=") && marks[0].contains("QZP7DIRA"),
+        "the prompt's title keeps its text: {marks:?}"
+    );
+    (app, session, term, timeline)
+}
+
+/// The newest title mark is the command `line`'s, the `n`th: at tier C it is `title_fp=<16 hex>`
+/// alone, below C it says nothing of the title, `sentinel` (a word of the line past its first) is
+/// nowhere in the log at any tier, and the timeline's row says `title=- title_fp=`.
+fn assert_fingerprinted(
+    timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+    line: &str,
+    sentinel: &str,
+    n: usize,
+) {
+    let content = title_marks(timeline, aterm_slog::Tier::Content);
+    assert_eq!(content.len(), n, "{content:?}");
+    let fp = format!(" title_fp={:016x} ", super::title_fp(line));
+    assert!(
+        content[n - 1].contains(&fp) && !content[n - 1].contains(" title="),
+        "the fingerprint alone: {content:?}"
+    );
+    let host = title_marks(timeline, aterm_slog::Tier::Host);
+    assert!(
+        !host[n - 1].contains("fp=") && host[n - 1].contains(" mark - title src=engine "),
+        "below C the mark says only that the title moved: {host:?}"
+    );
+    for l in content_lines(timeline) {
+        assert!(!l.contains(sentinel), "the command line is kept: {l}");
+    }
+    let rows: Vec<String> = timeline
+        .lock()
+        .unwrap()
+        .since(None)
+        .filter(|e| e.kind == crate::session_timeline::TITLE_CHANGE)
+        .map(|e| e.payload.to_string())
+        .collect();
+    assert_eq!(
+        rows.last().map(String::as_str),
+        Some(format!("title=- title_fp={:016x}", super::title_fp(line)).as_str()),
+        "{rows:?}"
+    );
+}
+
+/// THE COMMAND LINE SET AS THE TITLE IS ITS FINGERPRINT ALONE (unit J1-1, SMOKE-1e; §3.6):
+/// through the drift flush, the title aterm's zsh preexec sets after it announces the line
+/// (633;E) and before C, which it writes after every user preexec hook, is marked
+/// `mark - title title_fp=<16 hex>` at tier C, nothing of it below C, and no word of the line
+/// anywhere in the log. The run the sweep opens on C marks nothing more, and the next prompt's
+/// title keeps its text. NEGATIVE CONTROLS: an `observe_title` that keeps the text, a title
+/// judged a command's only once C is read, and a fingerprint in the wire-tier `fp=`, each fail it.
+#[test]
+fn a_command_line_set_as_the_title_is_its_fingerprint_alone() {
+    let t0 = Instant::now();
+    let (mut app, session, term, timeline) = at_a_titled_prompt(t0);
+    crate::term_lock(&term)
+        .process(b"\x1b]633;E;printf\\x20QZP7WORD1\x1b\\\x1b]0;printf QZP7WORD1\x07");
+    assert!(app.flush_title_drift(session, t0 + Duration::from_secs(1)));
+    assert_fingerprinted(&timeline, "printf QZP7WORD1", "QZP7WORD1", 2);
+    crate::term_lock(&term).process(b"\x1b]133;C\x1b\\");
+    app.observe_session_statuses(t0 + Duration::from_secs(1));
+    let node = opened_cmd(&lines_of(&timeline));
+    assert!(
+        timeline
+            .lock()
+            .unwrap()
+            .slog()
+            .log()
+            .is_open(aterm_slog::Node::parse(&node).expect("a node id")),
+        "a cmd run is open: {node}"
+    );
+    assert!(app.flush_title_drift(session, t0 + Duration::from_secs(2)));
+    assert_fingerprinted(&timeline, "printf QZP7WORD1", "QZP7WORD1", 2);
+    crate::term_lock(&term)
+        .process(b"\x1b]133;D;0\x1b\\\x1b]0;~/QZP7DIRB\x07\x1b]133;A\x1b\\\x1b]133;B\x1b\\");
+    assert!(app.flush_title_drift(session, t0 + Duration::from_secs(3)));
+    let back = title_marks(&timeline, aterm_slog::Tier::Content);
+    assert!(
+        back.len() == 3 && back[2].contains(" title=") && back[2].contains("QZP7DIRB"),
+        "at the prompt again: {back:?}"
+    );
+}
+
+/// A COMMAND LINE TITLE READ AFTER ITS COMMAND ENDED IS STILL ITS FINGERPRINT (unit J1-1 review,
+/// SMOKE-1e): a quick command's E, title, C and D are all read before the first flush, which so
+/// finds the block complete with the line still the title (zsh and bash write D before the
+/// user's precmd hooks and set the directory only after them): the mark is the line's
+/// fingerprint. So is a line still the title once the next prompt opened (a prompt that sets no
+/// title), judged against the block just archived. NEGATIVE CONTROLS: a title judged by the
+/// block's state (a command's only while it is announced or executes) keeps the first line; one
+/// judged against the current block alone keeps the second.
+#[test]
+fn a_command_line_title_read_after_its_command_ended_is_its_fingerprint() {
+    let t0 = Instant::now();
+    let (mut app, session, term, timeline) = at_a_titled_prompt(t0);
+    crate::term_lock(&term).process(
+        b"\x1b]633;E;printf\\x20QZP7WORD3\x1b\\\x1b]0;printf QZP7WORD3\x07\
+          \x1b]133;C\x1b\\\x1b]133;D;0\x1b\\",
+    );
+    assert!(app.flush_title_drift(session, t0 + Duration::from_secs(1)));
+    assert_fingerprinted(&timeline, "printf QZP7WORD3", "QZP7WORD3", 2);
+    crate::term_lock(&term).process(b"\x1b]0;~/QZP7DIRB\x07\x1b]133;A\x1b\\\x1b]133;B\x1b\\");
+    assert!(app.flush_title_drift(session, t0 + Duration::from_secs(2)));
+    let back = title_marks(&timeline, aterm_slog::Tier::Content);
+    assert!(
+        back.len() == 3 && back[2].contains(" title=") && back[2].contains("QZP7DIRB"),
+        "the next prompt's title keeps its text: {back:?}"
+    );
+    crate::term_lock(&term).process(
+        b"\x1b]633;E;printf\\x20QZP7WORD4\x1b\\\x1b]0;printf QZP7WORD4\x07\
+          \x1b]133;C\x1b\\\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\\x1b]133;B\x1b\\",
+    );
+    assert!(app.flush_title_drift(session, t0 + Duration::from_secs(3)));
+    assert_fingerprinted(&timeline, "printf QZP7WORD4", "QZP7WORD4", 4);
+}
+
+/// A PROGRAM'S OWN TITLE WHILE ITS COMMAND RUNS KEEPS ITS WORDS (unit J1-1 review, SMOKE-1e;
+/// §3.6 "Why C exists"): the integration's title for `claude` is the line's fingerprint, and the
+/// summary Claude Code then writes as the title while it runs is kept as text at tier C, as it
+/// was before the unit. NEGATIVE CONTROL: a title judged a command's whenever a command executes
+/// fingerprints the summary.
+#[test]
+fn a_programs_own_title_while_its_command_runs_keeps_its_words() {
+    let t0 = Instant::now();
+    let (mut app, session, term, timeline) = at_a_titled_prompt(t0);
+    crate::term_lock(&term).process(b"\x1b]633;E;claude\x1b\\\x1b]0;claude\x07\x1b]133;C\x1b\\");
+    assert!(app.flush_title_drift(session, t0 + Duration::from_secs(1)));
+    assert_fingerprinted(&timeline, "claude", "QZP7SUMMARY", 2);
+    crate::term_lock(&term).process("\x1b]0;\u{2733} QZP7SUMMARY\x07".as_bytes());
+    assert!(app.flush_title_drift(session, t0 + Duration::from_secs(2)));
+    let marks = title_marks(&timeline, aterm_slog::Tier::Content);
+    assert!(
+        marks.len() == 3 && marks[2].contains(" title=") && marks[2].contains("QZP7SUMMARY"),
+        "the agent's summary keeps its words at C: {marks:?}"
+    );
+}
+
+/// WHAT A COMMAND LINE TITLE IS ([`crate::session_status::title_is_line`]): the line as aterm's
+/// integrations set it, control characters dropped, or cut after 255 characters and ended by an
+/// ellipsis (`…`, or `...`), a byte-counting cut ending in U+FFFD; never a first word alone, a
+/// directory, a program's own words or a cut the line does not start with. NEGATIVE CONTROL: a
+/// match that takes the whole line alone misses every cut.
+#[test]
+fn a_title_is_the_command_line_as_an_integration_sets_it() {
+    use crate::session_status::title_is_line;
+    let line = format!("printf {}", "QZP7WORD5 ".repeat(40));
+    let cut: String = line.chars().take(255).collect();
+    let short: String = line.chars().take(254).collect();
+    let cases: [(String, &str, bool); 12] = [
+        ("printf QZP7WORD1".into(), "printf QZP7WORD1", true),
+        ("printfQZP7WORD1".into(), "printf\tQZP7\u{1}WORD1", true),
+        ("printf QZP7WORD1".into(), "printf QZP7\u{202E}WORD1", true),
+        (format!("{cut}\u{2026}"), line.as_str(), true),
+        (format!("{cut}..."), line.as_str(), true),
+        (format!("{short}\u{FFFD}\u{2026}"), line.as_str(), true),
+        ("printf".into(), "printf QZP7WORD1", false),
+        ("\u{2733} QZP7SUMMARY".into(), "claude", false),
+        ("~/QZP7DIRA".into(), "printf QZP7WORD1", false),
+        ("printf QZP7WORDX\u{2026}".into(), "printf QZP7WORD1", false),
+        ("\u{2026}".into(), "printf", false),
+        (String::new(), "printf", false),
+    ];
+    for (title, line, is) in &cases {
+        assert_eq!(title_is_line(title, line), *is, "{title:?} as {line:?}");
+    }
+    assert!(!title_is_line("printf", ""), "no line, no command title");
+}
+
 #[test]
 fn the_cwd_and_the_title_cross_an_update_as_fingerprints() {
     let (tl, _hand) = opened();
@@ -504,7 +995,11 @@ fn the_cwd_and_the_title_cross_an_update_as_fingerprints() {
         let at = g.slog().now();
         g.slog_mut()
             .observe_cwd(Some("/aterm-p3b/SENTINEL-DIR"), at);
-        g.slog_mut().observe_title("SENTINEL-TITLE", at);
+        g.slog_mut().observe_title(
+            "SENTINEL-TITLE",
+            crate::session_log::observed::TitleStands::Own,
+            at,
+        );
         g.slog().observed.carry_tokens()
     };
     assert!(
@@ -526,18 +1021,27 @@ fn the_cwd_and_the_title_cross_an_update_as_fingerprints() {
     let at = n.slog().now();
     n.slog_mut()
         .observe_cwd(Some("/aterm-p3b/SENTINEL-DIR"), at);
-    n.slog_mut().observe_title("SENTINEL-TITLE", at);
+    n.slog_mut().observe_title(
+        "SENTINEL-TITLE",
+        crate::session_log::observed::TitleStands::Own,
+        at,
+    );
     let got = lines(n.slog().log());
     assert!(
         having(&got, " mark - cwd ").is_empty() && having(&got, " mark - title ").is_empty(),
         "{got:?}"
     );
-    n.slog_mut().observe_title("\u{280b} SENTINEL-TITLE", at);
+    n.slog_mut().observe_title(
+        "\u{280b} SENTINEL-TITLE",
+        crate::session_log::observed::TitleStands::Own,
+        at,
+    );
     assert_eq!(having(&lines(n.slog().log()), " mark - title ").len(), 1);
     let (fresh, _hand) = opened();
     let mut f = fresh.lock().unwrap();
     let at = f.slog().now();
-    f.slog_mut().observe_title("", at);
+    f.slog_mut()
+        .observe_title("", crate::session_log::observed::TitleStands::Own, at);
     assert!(having(&lines(f.slog().log()), " mark - title ").is_empty());
 }
 

@@ -6,6 +6,11 @@
 //! Production serving must run in an independent custodian process so GUI
 //! handoff cannot discard original unreaped-child control.
 
+#[cfg(all(test, unix))]
+mod fixture_wait;
+#[cfg(all(test, unix))]
+use fixture_wait::{HANG as FIXTURE_HANG, deadline as fixture_deadline};
+
 #[cfg(unix)]
 mod actor;
 #[cfg(unix)]

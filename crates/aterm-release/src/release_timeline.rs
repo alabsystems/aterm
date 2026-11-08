@@ -55,6 +55,33 @@ struct ChildRow {
     peak_bytes: Option<u64>,
 }
 
+impl QualifyRow {
+    /// Whether the child ended within this row's linked window. `None` means its log is linked but
+    /// the times cannot exclude ownership; it must not let another row claim the child.
+    fn contains_child(&self, child: &ChildRow) -> Option<bool> {
+        let linked = self
+            .log
+            .as_deref()
+            .and_then(|log| log.strip_suffix(".log"))
+            .is_some_and(|stem| {
+                child.log.strip_prefix(stem).is_some_and(|rest| {
+                    rest == ".log" || (rest.starts_with('-') && rest.ends_with(".log"))
+                })
+            });
+        if !linked {
+            return Some(false);
+        }
+        let at = child.ended_at_unix_ms?;
+        let from = self.started_at_unix_s?.checked_mul(1000)?;
+        let to = self.ended_at_unix_s?.checked_mul(1000)?.checked_add(999)?;
+        if from > to {
+            None
+        } else {
+            Some((from..=to).contains(&at))
+        }
+    }
+}
+
 #[derive(Default)]
 struct ChildTotals {
     cpu_s: Option<f64>,
@@ -348,42 +375,36 @@ impl Timeline {
             .filter(|_| row.started_at_unix_s.is_some());
     }
 
-    /// The qualify branches' rows, each with the CPU and peak of the children that ended in its
-    /// log or a side log of it (`<stem>-*.log`) while it ran: a second round's branch, in the
-    /// same log, is booked only its own.
+    /// Qualify rows keep only child contributions with one possible owner by log and time.
+    /// Producer seconds include the whole second, so overlapping rounds and uncertain linked
+    /// windows cannot establish ownership. These observed contributions are not a child census.
     fn qualify_rows(&self) -> Vec<aterm_json::Value> {
+        let mut totals: Vec<ChildTotals> = (0..self.qualify.len())
+            .map(|_| ChildTotals::default())
+            .collect();
+        for child in &self.children {
+            let mut candidates = self
+                .qualify
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.contains_child(child) != Some(false));
+            let Some((index, row)) = candidates.next() else {
+                continue;
+            };
+            if candidates.next().is_some() || row.contains_child(child) != Some(true) {
+                continue;
+            }
+            let total = &mut totals[index];
+            total.children += 1;
+            add_f(&mut total.cpu_s, child.cpu_s);
+            if let Some(peak) = child.peak_bytes {
+                total.peak_bytes = Some(total.peak_bytes.map_or(peak, |old| old.max(peak)));
+            }
+        }
         self.qualify
             .iter()
-            .map(|row| {
-                let mut totals = ChildTotals::default();
-                let window = row
-                    .started_at_unix_s
-                    .zip(row.ended_at_unix_s)
-                    .map(|(s, e)| {
-                        (
-                            s.saturating_mul(1000),
-                            e.saturating_mul(1000).saturating_add(999),
-                        )
-                    });
-                let stem = row.log.as_deref().and_then(|l| l.strip_suffix(".log"));
-                for child in &self.children {
-                    let in_log = stem.is_some_and(|stem| {
-                        child.log.strip_prefix(stem).is_some_and(|rest| {
-                            rest == ".log" || (rest.starts_with('-') && rest.ends_with(".log"))
-                        })
-                    });
-                    let in_window = window
-                        .zip(child.ended_at_unix_ms)
-                        .is_some_and(|((from, to), at)| (from..=to).contains(&at));
-                    if !(in_log && in_window) {
-                        continue;
-                    }
-                    totals.children += 1;
-                    add_f(&mut totals.cpu_s, child.cpu_s);
-                    if let Some(peak) = child.peak_bytes {
-                        totals.peak_bytes = Some(totals.peak_bytes.map_or(peak, |p| p.max(peak)));
-                    }
-                }
+            .zip(totals)
+            .map(|(row, totals)| {
                 aterm_json::json!({
                     "branch": row.branch, "log": row.log, "outcome": row.outcome,
                     "started_at_unix_s": row.started_at_unix_s,
@@ -711,12 +732,16 @@ impl Timeline {
 mod tests {
     use super::*;
 
-    fn timeline_of(logs: &[(&str, &str)]) -> aterm_json::Value {
+    fn read_timeline(logs: &[(&str, &str)]) -> Timeline {
         let dir = aterm_tempfile::tempdir().unwrap();
         for (name, text) in logs {
             std::fs::write(dir.path().join(name), text).unwrap();
         }
-        Timeline::of_logs(dir.path()).unwrap().value()
+        Timeline::of_logs(dir.path()).unwrap()
+    }
+
+    fn timeline_of(logs: &[(&str, &str)]) -> aterm_json::Value {
+        read_timeline(logs).value()
     }
 
     fn stage(step: &str, outcome: &str, at: u64, waiting: u64, execution: u64) -> String {
@@ -906,6 +931,138 @@ mod tests {
             row["cpu_s"].is_null(),
             "no record is null, never 0: {never}"
         );
+    }
+
+    fn qualify_event(branch: &str, phase: &str, log: Option<&str>, at: Option<u64>) -> String {
+        format!(
+            "release-event: {}\n",
+            aterm_json::json!({
+                "schema":1, "event":"qualify-branch", "branch":branch,
+                "phase":phase, "log":log, "at_unix_s":at,
+            })
+        )
+    }
+
+    fn qualify_child(cpu: f64, at: Option<u64>) -> String {
+        format!(
+            "release-event: {}\n",
+            aterm_json::json!({
+                "schema":1, "event":"step-child-finished", "step":"qualify",
+                "ended_at_unix_ms":at, "child_cpu":{"observed_s":cpu}, "peak_bytes":1234,
+            })
+        )
+    }
+
+    #[test]
+    fn same_second_rounds_leave_shared_children_unassigned_and_keep_unique_contributions() {
+        let transcript = [
+            qualify_event("build", "started", Some("04-build.log"), Some(1000)),
+            qualify_event("build", "passed", Some("04-build.log"), Some(1010)),
+            qualify_event("build", "started", Some("04-build.log"), Some(1010)),
+            qualify_event("build", "passed", Some("04-build.log"), Some(1020)),
+        ]
+        .concat();
+        let shared = qualify_child(17.0, Some(1_010_500));
+        let ambiguous =
+            read_timeline(&[("transcript.log", &transcript), ("04-build.log", &shared)]);
+        assert_eq!(ambiguous.children.len(), 1);
+        let ambiguous = ambiguous.value();
+        for row in ambiguous["qualify"].as_array().unwrap() {
+            assert!(row["cpu_s"].is_null());
+            assert!(row["peak_bytes"].is_null());
+            assert_eq!(row["children"].as_u64(), Some(0));
+            assert_eq!(row["outcome"].as_str(), Some("passed"));
+        }
+        let children = [
+            qualify_child(2.0, Some(1_009_500)),
+            shared,
+            qualify_child(3.0, Some(1_011_500)),
+        ]
+        .concat();
+        let timeline =
+            read_timeline(&[("transcript.log", &transcript), ("04-build.log", &children)]);
+        assert_eq!(timeline.children.len(), 3);
+        let value = timeline.value();
+        let rows = value["qualify"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["cpu_s"].as_f64(), Some(2.0));
+        assert_eq!(rows[1]["cpu_s"].as_f64(), Some(3.0));
+        assert!(rows.iter().all(|row| row["children"].as_u64() == Some(1)));
+    }
+
+    #[test]
+    fn nested_log_stems_do_not_duplicate_children_and_prefix_neighbors_are_not_linked() {
+        let transcript = [
+            qualify_event("outer", "started", Some("04-build.log"), Some(1000)),
+            qualify_event(
+                "inner",
+                "started",
+                Some("04-build-fixtures.log"),
+                Some(1000),
+            ),
+            qualify_event("outer", "passed", Some("04-build.log"), Some(1010)),
+            qualify_event("inner", "passed", Some("04-build-fixtures.log"), Some(1010)),
+        ]
+        .concat();
+        let own = qualify_child(2.0, Some(1_005_000));
+        let shared = qualify_child(17.0, Some(1_005_000));
+        let unrelated = qualify_child(99.0, Some(1_005_000));
+        let timeline = read_timeline(&[
+            ("transcript.log", &transcript),
+            ("04-build.log", &own),
+            ("04-build-fixtures.log", &shared),
+            ("04-buildish.log", &unrelated),
+        ]);
+        assert_eq!(timeline.children.len(), 3);
+        let value = timeline.value();
+        let rows = value["qualify"].as_array().unwrap();
+        assert_eq!(rows[0]["cpu_s"].as_f64(), Some(2.0));
+        assert_eq!(rows[0]["children"].as_u64(), Some(1));
+        assert!(rows[1]["cpu_s"].is_null());
+        assert_eq!(rows[1]["children"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn uncertain_linked_windows_and_child_times_cannot_establish_unique_ownership() {
+        for (start, end) in [
+            (None, Some(1010)),
+            (Some(1000), None),
+            (Some(1012), Some(1000)),
+            (Some(u64::MAX), Some(u64::MAX)),
+            (Some(1000), Some(u64::MAX)),
+        ] {
+            let transcript = [
+                qualify_event("known", "started", Some("04-build.log"), Some(1000)),
+                qualify_event("unknown", "started", Some("04-build.log"), start),
+                qualify_event("known", "passed", Some("04-build.log"), Some(1010)),
+                qualify_event("unknown", "passed", Some("04-build.log"), end),
+            ]
+            .concat();
+            let child = qualify_child(17.0, Some(1_005_000));
+            let timeline =
+                read_timeline(&[("transcript.log", &transcript), ("04-build.log", &child)]);
+            assert_eq!(timeline.children.len(), 1);
+            let value = timeline.value();
+            assert!(
+                value["qualify"].as_array().unwrap().iter().all(|row| {
+                    row["cpu_s"].is_null()
+                        && row["peak_bytes"].is_null()
+                        && row["children"].as_u64() == Some(0)
+                }),
+                "{value}"
+            );
+        }
+        let transcript = [
+            qualify_event("known", "started", Some("04-build.log"), Some(1000)),
+            qualify_event("known", "passed", Some("04-build.log"), Some(1010)),
+        ]
+        .concat();
+        let child = qualify_child(17.0, None);
+        let timeline = read_timeline(&[("transcript.log", &transcript), ("04-build.log", &child)]);
+        assert_eq!(timeline.children.len(), 1);
+        let value = timeline.value();
+        assert!(value["qualify"][0]["cpu_s"].is_null());
+        assert_eq!(value["qualify"][0]["children"].as_u64(), Some(0));
     }
 
     /// A RELEASE COUNTS NO FULL HASH ONLY WHERE EVERY CUTTER OF IT LOGGED ITS OWN SEAL CALL: the

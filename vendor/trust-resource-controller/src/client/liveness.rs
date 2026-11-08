@@ -61,9 +61,18 @@ impl Drop for HostLifeline {
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
+    fn receive_loss(
+        receive: &mpsc::Receiver<()>,
+        started: Instant,
+    ) -> Result<(), mpsc::RecvTimeoutError> {
+        let deadline = crate::fixture_deadline(started);
+        let remaining = deadline.checked_duration_since(Instant::now())
+            .ok_or(mpsc::RecvTimeoutError::Timeout)?;
+        receive.recv_timeout(remaining)
+    }
     #[test]
     fn actual_host_pipe_loss_is_reported_once_and_explicit_watch_drop_is_cancelled() {
         let (reader, writer) = std::io::pipe().unwrap();
@@ -73,7 +82,7 @@ mod tests {
         })
         .unwrap();
         drop(writer);
-        receive.recv_timeout(Duration::from_secs(2)).unwrap();
+        receive_loss(&receive, Instant::now() - Duration::from_secs(3)).unwrap();
         drop(watch);
         assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Disconnected)));
         let (reader, _writer) = std::io::pipe().unwrap();
@@ -85,8 +94,8 @@ mod tests {
             .unwrap(),
         );
         assert!(matches!(
-            receive.recv_timeout(Duration::from_secs(2)),
-            Err(mpsc::RecvTimeoutError::Disconnected)
+            receive.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
         ));
     }
 }

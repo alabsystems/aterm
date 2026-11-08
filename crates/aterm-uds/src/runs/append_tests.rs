@@ -16,6 +16,75 @@ fn record() -> (aterm_tempfile::TempDir, PathBuf, std::fs::File) {
     (dir, path, file)
 }
 
+struct HeldReader(std::fs::File);
+
+impl HeldReader {
+    fn on(path: &Path) -> Self {
+        let file = open_regular_write(path, true).unwrap();
+        crate::keep_out_of_children(&file).unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the native reader fixture explicitly unlocks its owned file in Drop"
+        )]
+        file.try_lock_shared().unwrap();
+        Self(file)
+    }
+}
+
+impl Drop for HeldReader {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+#[test]
+fn a_native_reader_does_not_discard_a_complete_record_write() {
+    let (dir, path, retained) = record();
+    let mut held = Some(HeldReader::on(&path));
+    let started = Instant::now() - Duration::from_secs(2);
+    let line = format!("{CLOSED}\n");
+    crate::file_lock::with_lock_wait_observer(
+        move |_| {
+            drop(held.take());
+        },
+        || {
+            write_record_with(
+                &retained,
+                line.as_bytes(),
+                record_write_deadline_at(started),
+                |mut file, bytes| file.write_all(bytes),
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        format!("{HEADER}{CLOSED}\n")
+    );
+    assert!(read_records(dir.path()).unwrap()[0].1.groups[0].closed);
+}
+
+#[test]
+fn an_expired_complete_record_write_retains_the_original_evidence() {
+    let (_dir, path, retained) = record();
+    let reader = HeldReader::on(&path);
+    let mut called = false;
+    let error = write_record_with(
+        &retained,
+        format!("{DEAD}\n").as_bytes(),
+        record_write_deadline_at(Instant::now() - Duration::from_secs(61)),
+        |mut file, bytes| {
+            called = true;
+            file.write_all(bytes)
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert!(!called);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), HEADER);
+    drop(reader);
+}
+
 #[test]
 fn retained_writer_preserves_a_line_appended_through_another_open() {
     let (dir, path, retained) = record();

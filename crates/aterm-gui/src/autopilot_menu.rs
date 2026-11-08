@@ -1255,7 +1255,7 @@ impl App {
         let frame = self.windows.get(&wid).map_or((0, 0), |ws| {
             (ws.input_scratch.cols, ws.input_scratch.cells.len())
         });
-        let top = usize::from(self.chrome_rows(wid));
+        let top = usize::from(self.chrome_rows(wid)).max(self.top_confirmation_band_rows(wid));
         fit_rows(
             rows,
             anchor,
@@ -1476,18 +1476,30 @@ impl App {
         }
     }
 
+    /// Whether the menu open in `wid` still has its focus and its anchor row uncovered by chrome.
+    pub(crate) fn autopilot_menu_anchored(&self, wid: WindowId) -> bool {
+        let Some(menu) = self.autopilot_menu.as_ref().filter(|m| m.wid == wid) else {
+            return false;
+        };
+        if self.focused_session_id(wid) != menu.focus
+            || menu.anchor.0 < self.top_confirmation_band_rows(wid)
+        {
+            return false;
+        }
+        match menu.owner {
+            MenuOwner::Autopilot => self.shows_autopilot_chip(wid, menu.session, menu.anchor),
+            MenuOwner::Fact(fact) => self.shows_fact_on_row(wid, menu.session, fact, menu.anchor.0),
+        }
+    }
+
     fn paint_autopilot_menu(&mut self, wid: WindowId) -> Option<crate::tab_menu::MenuRect> {
         let menu = self.autopilot_menu.as_ref().filter(|m| m.wid == wid)?;
-        let (session, anchor, focus, owner) = (menu.session, menu.anchor, menu.focus, menu.owner);
-        let anchored = match owner {
-            MenuOwner::Autopilot => self.shows_autopilot_chip(wid, session, anchor),
-            MenuOwner::Fact(fact) => self.shows_fact_on_row(wid, session, fact, anchor.0),
-        };
-        if self.focused_session_id(wid) != focus || !anchored {
+        let (session, anchor, owner) = (menu.session, menu.anchor, menu.owner);
+        if !self.autopilot_menu_anchored(wid) {
             self.close_autopilot_menu();
             return None;
         }
-        let top = usize::from(self.chrome_rows(wid));
+        let top = usize::from(self.chrome_rows(wid)).max(self.top_confirmation_band_rows(wid));
         let theme = self.overlay_card_theme(wid);
         // A fact card wears the glass of its session's pane: its Autopilot palette, as the
         // pane's lines do (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4).

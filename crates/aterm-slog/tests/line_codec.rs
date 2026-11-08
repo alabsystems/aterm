@@ -1414,10 +1414,11 @@ fn the_tab_mark_is_appended_local_and_its_samples_say_unavailable() {
     assert_eq!(Kind::Tab.word(), "tab");
     assert!(Kind::Tab.is_mark() && Kind::Tab.node_level().is_none());
     assert_eq!(Kind::from_word("tab"), Kind::Tab);
+    let key_at = |key: Key| FIELDS.iter().position(|(k, ..)| *k == key);
     assert_eq!(
-        FIELDS.last().map(|(k, ..)| *k),
-        Some(Key::Account),
-        "appended: every earlier key keeps its index"
+        key_at(Key::Account).map(|i| i + 1),
+        key_at(Key::TitleFp),
+        "appended: every earlier key keeps its index, the title's fingerprint after it"
     );
     assert_eq!(
         [
@@ -1721,4 +1722,44 @@ fn line_and_bus_decoders_reject_plus_prefixed_numbers() {
     );
     let b = decode_bus("v=2 t=+7 ep=+3 seq=9 ms=+4 op=open node=t1 k=turn").expect("decodes");
     assert_eq!((b.rec.t, b.ep, b.ms), (0, 0, None));
+}
+
+/// THE TITLE'S FINGERPRINT (the session log's unit J1-1, SMOKE-1e): `title_fp` is appended last,
+/// a Content-tier id, so a command line set as the title leaves RAM as nothing: tier C keeps the
+/// fingerprint, every encode below C (the journal's host encode, the bus's wire one) drops it, and
+/// an older reader skips it. NEGATIVE CONTROL: the wire-tier `fp=`, which the unit's first build
+/// wrote, survives every encode; `title_fp` planted at the wire tier fails this test.
+#[test]
+fn title_fp_is_appended_content_and_no_encode_below_c_keeps_it() {
+    assert_eq!(
+        FIELDS.last().map(|(k, ..)| *k),
+        Some(Key::TitleFp),
+        "appended: every earlier key keeps its index"
+    );
+    assert_eq!(
+        (Key::TitleFp.word(), Key::TitleFp.tier(), Key::TitleFp.cap()),
+        ("title_fp", Tier::Content, Cap::Id)
+    );
+    let title = |key: Key| {
+        let f = Fields::new().id(key, "1111111111111111").expect("an id");
+        rec(Op::Mark, Node::SESSION, Kind::Title, f)
+    };
+    let content = encode(&title(Key::TitleFp), Tier::Content).expect("fits");
+    assert!(content.contains(" title_fp=1111111111111111 "), "{content}");
+    for tier in [Tier::Wire, Tier::WireMeta, Tier::Host] {
+        let below = encode(&title(Key::TitleFp), tier).expect("fits");
+        assert!(
+            !below.contains("1111111111111111"),
+            "{tier:?} keeps it: {below}"
+        );
+        let fp = encode(&title(Key::Fp), tier).expect("fits");
+        assert!(
+            fp.contains(" fp=1111111111111111 "),
+            "CONTROL, {tier:?}: {fp}"
+        );
+    }
+    let older = content.replace(" title_fp=", " zz_title_fp=");
+    let read = decode(&older).expect("an older reader still reads it");
+    assert_eq!(read.k, Kind::Title, "{older}");
+    assert_eq!(read.f.get(Key::TitleFp), None, "skipped: {older}");
 }

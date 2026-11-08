@@ -98,12 +98,11 @@ fn five_kinds_keep_the_download_on_the_glass_at_every_width() {
             Some((0, cols)),
             "{cols}: its fill is the whole row"
         );
-        assert_eq!(p.rows[0].full_title, "Screen reader access lost", "{cols}");
+        assert_eq!(p.rows[0].title.1, "Screen reader access lost", "{cols}");
         let overflow = &p.rows[2];
         assert_eq!(overflow.kind, RowKind::Overflow { hidden: 3 }, "{cols}");
         assert!(overflow.capsules.is_empty(), "{cols}: one link, no capsule");
         assert_eq!(overflow.title.1, "3 more \u{203a}", "{cols}");
-        assert_eq!(overflow.full_title, "3 more messages", "{cols}");
         for col in [0, cols / 2, cols - 1] {
             assert_eq!(p.hit(2, col), Hit::Overflow, "{cols}/{col}");
         }
@@ -136,7 +135,7 @@ fn a_retrospective_error_ranks_with_the_warnings() {
         );
         c.commit_rows(now + ms(3), 2);
         let p = present(&c, 120);
-        assert_eq!(p.rows[0].full_title, want_top, "retrospective {retro}");
+        assert_eq!(p.rows[0].title.1, want_top, "retrospective {retro}");
     }
 }
 
@@ -163,28 +162,17 @@ fn the_overflow_row_names_a_hidden_download_and_degrades_to_a_count() {
     );
     c.commit_rows(now + ms(3), 2);
     let pins = [
-        (
-            120,
-            '+',
-            "Downloading Homebrew 20% \u{b7} 1 more \u{203a}",
-            "Downloading Homebrew 20% \u{b7} 1 more messages",
-        ),
-        (
-            80,
-            '+',
-            "Downloading Homebrew 20% \u{b7} 1 more \u{203a}",
-            "Downloading Homebrew 20% \u{b7} 1 more messages",
-        ),
-        (30, '\u{2026}', "2 more \u{203a}", "2 more messages"),
+        (120, '+', "Downloading Homebrew 20% \u{b7} 1 more \u{203a}"),
+        (80, '+', "Downloading Homebrew 20% \u{b7} 1 more \u{203a}"),
+        (30, '\u{2026}', "2 more \u{203a}"),
     ];
-    for (cols, glyph, words, spoken) in pins {
+    for (cols, glyph, words) in pins {
         let p = present(&c, cols);
         assert_eq!(p.rows.len(), 2, "{cols}");
         assert_eq!(p.rows[0].kind, RowKind::Message(first), "{cols}");
         assert_eq!(p.rows[1].kind, RowKind::Overflow { hidden: 2 }, "{cols}");
         assert_eq!(p.rows[1].glyph.1, glyph, "{cols}");
         assert_eq!(p.rows[1].title.1, words, "{cols}");
-        assert_eq!(p.rows[1].full_title, spoken, "{cols}");
         assert!(p.rows[1].capsules.is_empty(), "{cols}");
     }
     let p = present(&c, 60);
@@ -261,7 +249,7 @@ fn an_ask_keeps_its_row_over_the_reserved_progress() {
     let p = present(&c, 120);
     assert_eq!(p.rows.len(), 3);
     assert_eq!(p.rows[0].kind, RowKind::Message(ask));
-    assert_eq!(p.rows[1].full_title, "Downloading aterm v0.91.0");
+    assert_eq!(p.rows[1].title.1, "Downloading aterm v0.91.0");
     assert_eq!(p.rows[2].title.1, "2 more \u{203a}");
 }
 
@@ -409,7 +397,7 @@ fn a_carried_row_keeps_its_rank_and_its_measured_fill() {
         .expect("the crash row is carried");
     assert!(crash.msg.retrospective, "it stays a past run's record");
     let p = present(&child, 120);
-    let titles: Vec<&str> = p.rows.iter().map(|r| r.full_title.as_str()).collect();
+    let titles: Vec<&str> = p.rows.iter().map(|r| r.title.1.as_str()).collect();
     let pos = |t: &str| titles.iter().position(|x| *x == t).unwrap();
     assert!(
         pos("Misspelled setting") < pos("aterm crashed last time"),

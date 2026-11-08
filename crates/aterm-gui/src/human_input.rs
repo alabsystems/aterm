@@ -667,6 +667,44 @@ pub(crate) const fn is_person_gesture(ev: &InputEvent) -> bool {
     }
 }
 
+impl crate::session_log::KeyClass {
+    /// The class of `ev`, a person's gesture or a control verb's event (fix E8): a plain press of
+    /// Enter, Escape or a digit `1`-`9` (Caps or Num Lock aside), one character of text, or the
+    /// bytes [`Self::of_bytes`] places; anything else is [`Self::Other`]. It lives on the input
+    /// side, so the session log takes a key's class and never names an event (census
+    /// `slog-inert`).
+    pub(crate) fn of_event(ev: &InputEvent) -> Self {
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+        match ev {
+            InputEvent::Key {
+                key,
+                mods,
+                event_type: KeyEventType::Press,
+                ..
+            } if mods
+                .difference(Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK)
+                .is_empty() =>
+            {
+                match key {
+                    Key::Named(NamedKey::Enter) => Self::Enter,
+                    Key::Named(NamedKey::Escape) => Self::Esc,
+                    Key::Character(c) => Self::of_char(*c),
+                    _ => Self::Other,
+                }
+            }
+            InputEvent::Text(t) => {
+                let mut chars = t.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Self::of_char(c),
+                    _ => Self::Other,
+                }
+            }
+            InputEvent::KeySequence(b) => Self::of_bytes(b),
+            _ => Self::Other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

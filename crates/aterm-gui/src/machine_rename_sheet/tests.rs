@@ -298,26 +298,6 @@ fn a_number_that_holds_no_claim_is_claimed_only_when_typed() {
     );
 }
 
-/// A nickname another Mac carries too is said beside a nickname alone and beside a number, and
-/// leaves Rename available: two Macs may share one.
-#[test]
-fn a_shared_nickname_is_said_and_refuses_nothing() {
-    let (_root, preview) = preview();
-    let otter = Nickname::parse("Otter").expect("a nickname");
-    let held = Held::of_read(&preview);
-    let snapshot = Snapshot::read(preview.with_taken_for_test(vec![otter]));
-    for number in [left("m7"), typed("m87")] {
-        let said = line(&snapshot, &held, &number, &typed("otter"));
-        assert!(said.renames, "{said:?}");
-        assert!(
-            said.text.ends_with(" Another Mac is called otter too."),
-            "{said:?}"
-        );
-    }
-    let alone = line(&snapshot, &held, &typed("m87"), &typed("Kestrel"));
-    assert_eq!(alone.text, "m87 is free.");
-}
-
 /// Before the read lands a typed field is asked for as typed, since a change pressed before may
 /// still move the name the window shows; once it lands, typed text that equals it keeps it.
 #[test]

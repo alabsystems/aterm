@@ -438,7 +438,7 @@ fn a_body_that_is_no_record_is_a_fault() {
 fn a_held_lock_is_busy_after_the_wait() {
     let root = scratch();
     let fx = fx();
-    let journal = journal(root.path(), &fx).with_lock_wait_for_tests(Duration::ZERO);
+    let journal = journal(root.path(), &fx);
     begin(&journal, draft(WriteOp::ReleaseCreate, "v1"));
     let before = bytes(&journal);
     let owner_dir = journal
@@ -458,7 +458,10 @@ fn a_held_lock_is_busy_after_the_wait() {
             "busy",
         )
         .expect("the test's lock");
-        let e = journal.append(&record).expect_err("busy");
+        let e = journal
+            .scan_after(true, Duration::from_secs(61), || {})
+            .err()
+            .expect("busy");
         assert_eq!(e.exit(), 3);
         assert_eq!(e.sub, Sub::Local);
         assert!(e.why.contains(&journal.path().display().to_string()));
@@ -479,8 +482,7 @@ fn two_appenders_take_turns() {
             let fx = fx.clone();
             let done = done.clone();
             std::thread::spawn(move || {
-                // The lock wait is the hang detector's, never a latency budget (plan §1).
-                let journal = journal(&root, &fx).with_lock_wait_for_tests(HANG);
+                let journal = journal(&root, &fx);
                 for i in 0..50 {
                     begin(
                         &journal,
@@ -506,6 +508,45 @@ fn two_appenders_take_turns() {
     let ids: std::collections::BTreeSet<IntentId> =
         intents(&journal).into_iter().map(|i| i.id).collect();
     assert_eq!(ids.len(), 100);
+}
+
+#[test]
+fn a_required_journal_append_waits_for_a_scheduled_holder() {
+    let root = scratch();
+    let fx = fx();
+    let journal = journal(root.path(), &fx);
+    begin(&journal, draft(WriteOp::ReleaseCreate, "v1"));
+    let owner_dir = journal.path().parent().unwrap();
+    let mut guard = Some(
+        aterm_uds::private_file::PrivateLock::take(
+            owner_dir,
+            "app.steps.lock",
+            Duration::ZERO,
+            "busy",
+        )
+        .unwrap(),
+    );
+    let result = journal.scan_after(true, Duration::from_secs(11), || drop(guard.take()));
+    drop(guard);
+    let mut scan = result
+        .expect("the required journal scan completed")
+        .expect("the journal exists");
+    let record = JournalRecord::Retracted {
+        intent: IntentId::parse("0-000000000000").unwrap(),
+        at_secs: SIM_START,
+    };
+    assert_eq!(
+        journal.append_locked(&mut scan, |_, _| Ok(record)).unwrap(),
+        1
+    );
+    drop(scan);
+    let (records, end) = journal.read_file().unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(
+        matches!(&records[1].1, JournalRecord::Retracted { intent, at_secs }
+        if intent == &IntentId::parse("0-000000000000").unwrap() && *at_secs == SIM_START)
+    );
+    assert!(matches!(end, JournalEnd::Clean));
 }
 
 #[test]

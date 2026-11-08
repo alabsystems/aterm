@@ -69,7 +69,7 @@ fn check_failed(e: CheckError) -> io::Error {
 
 /// Minimum wait for a HELLO's answer from the keeper.
 #[cfg(not(test))]
-pub const WELCOME_WAIT: Duration = crate::identity::PEER_CHECK_HANG.saturating_add(FRAME_BUDGET);
+pub const WELCOME_WAIT: Duration = aterm_uds::peer::CHECK_HANG.saturating_add(FRAME_BUDGET);
 /// Unit tests: the hang detector, since every keeper these tests dial answers a HELLO.
 #[cfg(test)]
 pub const WELCOME_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;

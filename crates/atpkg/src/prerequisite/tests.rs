@@ -12,6 +12,106 @@ use crate::sig::testkit;
 const TRIPLE: &str = "aarch64-apple-darwin";
 
 #[test]
+fn persistent_manifest_bytes_avoid_fetches_but_recheck_each_admission() {
+    let mut fixture = Fixture::new(Prerequisite::Gitleaks);
+    fixture.cache_source = Some("fixture:one".into());
+    drop(
+        fixture
+            .session(TRIPLE)
+            .unwrap()
+            .acquire(fixture.want)
+            .unwrap(),
+    );
+    fixture.manifest_unavailable.set(true);
+    drop(
+        fixture
+            .session(TRIPLE)
+            .unwrap()
+            .acquire(fixture.want)
+            .unwrap(),
+    );
+    assert_eq!(fixture.manifest_reads.get(), 1);
+    assert_eq!(fixture.index_reads.get(), 2);
+
+    std::fs::write(fixture.executable(), b"changed after cache population").unwrap();
+    assert!(
+        fixture
+            .session(TRIPLE)
+            .unwrap()
+            .acquire(fixture.want)
+            .is_err()
+    );
+    assert_eq!(fixture.manifest_reads.get(), 1);
+}
+
+#[test]
+fn persistent_manifest_cache_never_supplies_authority() {
+    for fault in [
+        "source",
+        "signature",
+        "identity",
+        "yank",
+        "rotation",
+        "corrupt",
+    ] {
+        let mut fixture = Fixture::new(Prerequisite::Gitleaks);
+        fixture.cache_source = Some("fixture:one".into());
+        drop(
+            fixture
+                .session(TRIPLE)
+                .unwrap()
+                .acquire(fixture.want)
+                .unwrap(),
+        );
+        let layout = fixture.layout.clone();
+        let cache = manifest_cache::Cache::new(&layout);
+        match fault {
+            "source" => fixture.cache_source = Some("fixture:two".into()),
+            "signature" => cache.store(
+                "fixture:one",
+                "gitleaks",
+                7,
+                &(fixture.package.as_bytes().to_vec(), vec![0; 64]),
+            ),
+            "identity" => {
+                fixture.change_package("program=\"gitleaks\"", "program=\"other\"");
+                cache.store(
+                    "fixture:one",
+                    "gitleaks",
+                    7,
+                    &(
+                        fixture.package.as_bytes().to_vec(),
+                        fixture.signature.clone(),
+                    ),
+                );
+            }
+            "yank" => fixture.index.push_str("yanked=[\"gitleaks@7\"]\n"),
+            "rotation" => fixture.index_seed = testkit::OUTSIDER_SEED,
+            "corrupt" => std::fs::write(
+                fixture.layout.prefix.join("prerequisite-manifests.toml"),
+                b"invalid",
+            )
+            .unwrap(),
+            _ => unreachable!(),
+        }
+        fixture.manifest_unavailable.set(true);
+        assert!(
+            fixture
+                .session(TRIPLE)
+                .unwrap()
+                .acquire(fixture.want)
+                .is_err(),
+            "{fault}"
+        );
+        assert_eq!(
+            fixture.manifest_reads.get(),
+            if fault == "yank" { 1 } else { 2 },
+            "{fault}"
+        );
+    }
+}
+
+#[test]
 fn named_controller_retains_its_world_through_background_work_and_cancellation() {
     if !crate::testdir::isolated_lifecycle(
         "prerequisite::tests::named_controller_retains_its_world_through_background_work_and_cancellation",
@@ -343,6 +443,9 @@ struct Fixture {
     after_first: Option<(Vec<u8>, Vec<u8>)>,
     archive: Option<Vec<u8>>,
     downloads: Cell<usize>,
+    cache_source: Option<String>,
+    manifest_unavailable: Cell<bool>,
+    index_seed: [u8; 32],
 }
 
 fn fixture_version(want: Prerequisite) -> &'static str {
@@ -393,6 +496,9 @@ impl Fixture {
             after_first: None,
             archive: None,
             downloads: Cell::new(0),
+            cache_source: None,
+            manifest_unavailable: Cell::new(false),
+            index_seed: testkit::MACHINE_SEED,
         }
     }
 
@@ -452,13 +558,20 @@ impl Fixture {
 }
 
 impl Fetcher for Fixture {
+    fn package_source_id(&self, _: &str, _: &str) -> Option<String> {
+        self.cache_source.clone()
+    }
+
     fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
         self.index_reads.set(self.index_reads.get() + 1);
-        let (roster_bytes, roster_sig) = testkit::published_roster();
+        let mut roster = testkit::roster();
+        roster.machines[0].pubkey = testkit::pubkey_b64(&self.index_seed);
+        let roster_bytes = roster.to_toml().unwrap().into_bytes();
+        let roster_sig = testkit::sign(&testkit::MASTER_SEED, &roster_bytes);
         Ok(vec![Candidate {
             label: "fixture41".into(),
             index_bytes: self.index.as_bytes().to_vec(),
-            sig: testkit::sign(&testkit::MACHINE_SEED, self.index.as_bytes()),
+            sig: testkit::sign(&self.index_seed, self.index.as_bytes()),
             roster_bytes,
             roster_sig,
         }])
@@ -475,6 +588,9 @@ impl Fetcher for Fixture {
             (self.want.program(), self.want.program(), 7)
         );
         self.manifest_reads.set(self.manifest_reads.get() + 1);
+        if self.manifest_unavailable.get() {
+            return Err("fixture offline".into());
+        }
         if self.manifest_reads.get() > 1
             && let Some(pair) = &self.after_first
         {

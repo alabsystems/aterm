@@ -657,8 +657,6 @@ pub struct ActionContext {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ActionDomain {
     Native,
-    Message,
-    MessageLog,
     Tab,
 }
 
@@ -680,28 +678,6 @@ impl ActionContext {
         }
     }
 
-    /// A message's exact id and checked action-list revision, captured together.
-    #[inline]
-    pub const fn message(owner: u64, generation: u64) -> Self {
-        Self {
-            domain: ActionDomain::Message,
-            owner,
-            generation,
-            review_revision: 0,
-        }
-    }
-
-    /// The message log's link, which does not authorize any individual row's action.
-    #[inline]
-    pub const fn message_log() -> Self {
-        Self {
-            domain: ActionDomain::MessageLog,
-            owner: 0,
-            generation: 0,
-            review_revision: 0,
-        }
-    }
-
     /// A tab's stable identity, independent of its current position in the strip.
     #[inline]
     pub const fn tab(owner: u64) -> Self {
@@ -711,18 +687,6 @@ impl ActionContext {
             generation: 0,
             review_revision: 0,
         }
-    }
-
-    /// Stable owner identity, without truncation or hashing.
-    #[inline]
-    pub const fn owner(self) -> u64 {
-        self.owner
-    }
-
-    /// Native lifecycle generation or message action-list revision.
-    #[inline]
-    pub const fn generation(self) -> u64 {
-        self.generation
     }
 }
 
@@ -762,13 +726,13 @@ mod action_context_tests {
     #[test]
     fn native_review_identity_preserves_lifecycle_and_never_aliases_other_contexts() {
         let review = ActionContext::native_review(u64::MAX, u64::MAX, 9);
-        assert_eq!(review.owner(), u64::MAX);
-        assert_eq!(review.generation(), u64::MAX);
+        let narrow = u64::from(u32::MAX);
         assert_eq!(review, ActionContext::native_review(u64::MAX, u64::MAX, 9));
+        assert_ne!(review, ActionContext::native_review(narrow, u64::MAX, 9));
+        assert_ne!(review, ActionContext::native_review(u64::MAX, narrow, 9));
         assert_ne!(review, ActionContext::new(u64::MAX, u64::MAX));
         assert_ne!(review, ActionContext::native_review(u64::MAX, u64::MAX, 10));
         assert_ne!(review, ActionContext::native_review(u64::MAX, 1, 9));
-        assert_ne!(review, ActionContext::message(u64::MAX, u64::MAX));
         assert_ne!(review, ActionContext::tab(u64::MAX));
     }
 }

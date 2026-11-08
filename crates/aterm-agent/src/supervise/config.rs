@@ -849,7 +849,7 @@ impl SupervisorConfig {
         self.on_for(agent) && self.logins
     }
 
-    /// Whether the usage tap ([`Self::usage_tap`]) is on for Claude Code, the one reading every surface shares: the relaunch lines a pass arms it on (the window's lane, `aterm harness upgrade`), the footer's reason for a missing week, and `accounts stats`' tap.
+    /// Whether the usage tap ([`Self::usage_tap`]) is on for Claude Code, the one reading every surface shares: the relaunch lines a pass arms it on (the window's lane, `aterm harness upgrade`), the window's host's own uses of a reading (a wall's timing, the session log's mark, the silent tap's note; what a process launched with the tap reports is recorded with it off too), the footer's reason for a missing week, and `accounts stats`' tap.
     #[must_use]
     pub fn usage_tap_on(&self) -> bool {
         self.on_for(Program::Claude) && self.usage_tap
@@ -857,7 +857,8 @@ impl SupervisorConfig {
 
     /// Whether the limit reset ([`Self::limit_reset`]) is on for Claude Code: the one program
     /// that records a limit-reset offer (`accounts::note_offer`), which `aterm harness accounts`'
-    /// rotation and `accounts stats`' `resets` both read.
+    /// rotation and `accounts stats`' `resets` both read, and the switch the window's host claims
+    /// a reset under, so Claude Code switched off claims none.
     #[must_use]
     pub fn limit_reset_on(&self) -> bool {
         self.on_for(Program::Claude) && self.limit_reset

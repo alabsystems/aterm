@@ -203,14 +203,15 @@ fn the_outgoing_set_is_never_drawn_cut() {
     let first_line = |app: &App| needs_lines(app).first().cloned().unwrap_or_default();
     tell(&mut app, &sid, &[NEED_A, NEED_B], ENTRY_AB);
     land(&mut app, &ctx, Some(ENTRY_AB));
-    let whole = needs_lines(&app);
     tell(&mut app, &sid, &[NEED_B], ENTRY_B);
     app.refresh_presence_session(0);
-    assert_eq!(
-        needs_lines(&app),
-        whole,
-        "the standing entry keeps its words"
+    let standing = needs_lines(&app);
+    assert_eq!(standing.len(), 2, "{standing:#?}");
+    assert!(
+        standing[0].contains("grant Screen Recording"),
+        "{standing:#?}"
     );
+    assert!(one_in(&standing[1], NEED_B), "{standing:#?}");
     assert_eq!(
         hover(&app).first(),
         Some(&format!("Needs you: {NEED_A}")),

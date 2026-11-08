@@ -19,13 +19,89 @@ const SUSTAINED_TEST: &str =
 const CATALOG_TEST: &str = "replica::tests::compatibility::a_quiet_catalog_pair_reports_its_cpu";
 const SUSTAINED_CATALOG_TEST: &str =
     "replica::tests::compatibility::a_sustained_quiet_catalog_pair_reports_its_cpu";
+const LONG_LOG_TEST: &str =
+    "replica::tests::compatibility::a_quiet_pair_over_a_long_log_reports_its_cpu";
+const SUSTAINED_LONG_LOG_TEST: &str =
+    "replica::tests::compatibility::a_sustained_quiet_pair_over_a_long_log_reports_its_cpu";
+const LATE_JOINER_TEST: &str =
+    "replica::tests::compatibility::a_quiet_late_joiner_over_a_long_log_reports_its_cpu";
+const SUSTAINED_LATE_JOINER_TEST: &str =
+    "replica::tests::compatibility::a_sustained_quiet_late_joiner_over_a_long_log_reports_its_cpu";
 const PREFIX: &str = "COMMONS-QUIET ";
 
-pub(crate) fn run(json_out: Option<&Path>, sustained: bool, catalog: bool) -> LaneRun {
-    outcome(measure(json_out, sustained, catalog))
+/// What the measured rounds repair: one explicit table (the default), the catalog's tables
+/// (`--catalog`), one explicit table over a long vault history (`--long-log`), or the same where
+/// the second Mac was admitted after that history and opens it through handoffs
+/// (`--late-joiner`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Workload {
+    Explicit,
+    Catalog,
+    LongLog,
+    LateJoiner,
 }
 
-fn measure(json_out: Option<&Path>, sustained: bool, catalog: bool) -> Result<String, Halt> {
+impl Workload {
+    fn of(catalog: bool, long_log: bool, late_joiner: bool) -> Result<Self, Halt> {
+        match (catalog, long_log, late_joiner) {
+            (false, false, false) => Ok(Self::Explicit),
+            (true, false, false) => Ok(Self::Catalog),
+            (false, true, false) => Ok(Self::LongLog),
+            (false, false, true) => Ok(Self::LateJoiner),
+            _ => Err(Halt::Fail(
+                "--catalog, --long-log and --late-joiner each name a workload; measure one at a time"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Its name in the fixture's report and in this lane's.
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Catalog => "catalog",
+            Self::LongLog => "long-log",
+            Self::LateJoiner => "late-joiner",
+        }
+    }
+
+    /// How many tables each of its rounds visits.
+    const fn tables(self) -> u64 {
+        match self {
+            Self::Catalog => 2,
+            Self::Explicit | Self::LongLog | Self::LateJoiner => 1,
+        }
+    }
+
+    /// The ignored fixture test that measures it.
+    const fn test(self, sustained: bool) -> &'static str {
+        match (self, sustained) {
+            (Self::Explicit, false) => TEST,
+            (Self::Explicit, true) => SUSTAINED_TEST,
+            (Self::Catalog, false) => CATALOG_TEST,
+            (Self::Catalog, true) => SUSTAINED_CATALOG_TEST,
+            (Self::LongLog, false) => LONG_LOG_TEST,
+            (Self::LongLog, true) => SUSTAINED_LONG_LOG_TEST,
+            (Self::LateJoiner, false) => LATE_JOINER_TEST,
+            (Self::LateJoiner, true) => SUSTAINED_LATE_JOINER_TEST,
+        }
+    }
+}
+
+pub(crate) fn run(
+    json_out: Option<&Path>,
+    sustained: bool,
+    catalog: bool,
+    long_log: bool,
+    late_joiner: bool,
+) -> LaneRun {
+    outcome(
+        Workload::of(catalog, long_log, late_joiner)
+            .and_then(|workload| measure(json_out, sustained, workload)),
+    )
+}
+
+fn measure(json_out: Option<&Path>, sustained: bool, workload: Workload) -> Result<String, Halt> {
     let driver = cargo_driver()
         .map_err(|why| Halt::skip(why, "run it with the pinned toolchain's targo"))?;
     let root = workspace_root();
@@ -70,12 +146,7 @@ fn measure(json_out: Option<&Path>, sustained: bool, catalog: bool) -> Result<St
     }
     let executable =
         bench_build::built_executable(&String::from_utf8_lossy(&built.stdout), "aterm_db", "lib")?;
-    let test = match (catalog, sustained) {
-        (false, false) => TEST,
-        (false, true) => SUSTAINED_TEST,
-        (true, false) => CATALOG_TEST,
-        (true, true) => SUSTAINED_CATALOG_TEST,
-    };
+    let test = workload.test(sustained);
     let mut run = command(executable);
     targo.environment(&mut run);
     // Every measurement is ignored in a plain run; `--exact` keeps this to the one named.
@@ -108,14 +179,14 @@ fn measure(json_out: Option<&Path>, sustained: bool, catalog: bool) -> Result<St
             lines.into_iter().rev().collect::<Vec<_>>().join("\n")
         )));
     }
-    let workload = if catalog { "catalog" } else { "explicit" };
     let measurement = parse_report(&text, workload)?;
     let cpu_ns = measurement["per_round_cpu_ns"]
         .as_u64()
         .expect("validated CPU");
     let summary = format!(
-        "{:.3} ms mean process CPU per {workload} quiet round, both peers, over {} rounds (opt-test)",
+        "{:.3} ms mean process CPU per {} quiet round, both peers, over {} rounds (opt-test)",
         cpu_ns as f64 / 1_000_000.0,
+        workload.word(),
         measurement["rounds"].as_u64().expect("validated rounds")
     );
     let head = git(&["rev-parse", "HEAD"])?;
@@ -127,7 +198,7 @@ fn measure(json_out: Option<&Path>, sustained: bool, catalog: bool) -> Result<St
         "dirty_paths": dirty.lines().count(),
         "profile": "opt-test",
         "sustained": sustained,
-        "workload": workload,
+        "workload": workload.word(),
         "build": build,
         "build_plan": plan.summary(),
         "rustflags": bench_build::flags::describe(&flags),
@@ -162,7 +233,7 @@ fn git(args: &[&str]) -> Result<String, Halt> {
     })
 }
 
-fn parse_report(text: &str, workload: &str) -> Result<Value, String> {
+fn parse_report(text: &str, workload: Workload) -> Result<Value, String> {
     let mut reports = text.lines().filter_map(|line| line.strip_prefix(PREFIX));
     let raw = reports
         .next()
@@ -180,8 +251,8 @@ fn parse_report(text: &str, workload: &str) -> Result<Value, String> {
     if number("schema")? != 1 || number("moved_records")? != 0 {
         return Err("Commons measurement is not a quiet-round schema 1 report".into());
     }
-    if report.get("workload").and_then(Value::as_str) != Some(workload)
-        || number("tables")? != if workload == "catalog" { 2 } else { 1 }
+    if report.get("workload").and_then(Value::as_str) != Some(workload.word())
+        || number("tables")? != workload.tables()
     {
         return Err("Commons measurement has another workload or table count".into());
     }
@@ -209,10 +280,12 @@ mod tests {
     #[test]
     fn measurement_requires_one_complete_consistent_quiet_report() {
         let valid = format!("{PREFIX}{}", report());
-        assert!(parse_report(&valid, "explicit").is_ok());
-        assert!(parse_report(&valid, "catalog").is_err());
-        assert!(parse_report("running 0 tests", "explicit").is_err());
-        assert!(parse_report(&format!("{valid}\n{valid}"), "explicit").is_err());
+        assert!(parse_report(&valid, Workload::Explicit).is_ok());
+        assert!(parse_report(&valid, Workload::Catalog).is_err());
+        assert!(parse_report(&valid, Workload::LongLog).is_err());
+        assert!(parse_report(&valid, Workload::LateJoiner).is_err());
+        assert!(parse_report("running 0 tests", Workload::Explicit).is_err());
+        assert!(parse_report(&format!("{valid}\n{valid}"), Workload::Explicit).is_err());
         for (key, value) in [
             ("schema", 2),
             ("rounds", 0),
@@ -226,18 +299,56 @@ mod tests {
                 .unwrap()
                 .insert(key.into(), json!(value));
             assert!(
-                parse_report(&format!("{PREFIX}{invalid}"), "explicit").is_err(),
+                parse_report(&format!("{PREFIX}{invalid}"), Workload::Explicit).is_err(),
                 "{key}"
             );
         }
         let mut missing = report();
         missing.as_object_mut().unwrap().remove("clock_read_cpu_ns");
-        assert!(parse_report(&format!("{PREFIX}{missing}"), "explicit").is_err());
+        assert!(parse_report(&format!("{PREFIX}{missing}"), Workload::Explicit).is_err());
         let mut catalog = report();
         let fields = catalog.as_object_mut().unwrap();
         fields.insert("workload".into(), json!("catalog"));
         fields.insert("tables".into(), json!(2));
-        assert!(parse_report(&format!("{PREFIX}{catalog}"), "catalog").is_ok());
-        assert!(parse_report(&format!("{PREFIX}{catalog}"), "explicit").is_err());
+        assert!(parse_report(&format!("{PREFIX}{catalog}"), Workload::Catalog).is_ok());
+        assert!(parse_report(&format!("{PREFIX}{catalog}"), Workload::Explicit).is_err());
+        let mut long = report();
+        long.as_object_mut()
+            .unwrap()
+            .insert("workload".into(), json!("long-log"));
+        assert!(parse_report(&format!("{PREFIX}{long}"), Workload::LongLog).is_ok());
+        assert!(parse_report(&format!("{PREFIX}{long}"), Workload::Explicit).is_err());
+        let mut late = report();
+        late.as_object_mut()
+            .unwrap()
+            .insert("workload".into(), json!("late-joiner"));
+        assert!(parse_report(&format!("{PREFIX}{late}"), Workload::LateJoiner).is_ok());
+        assert!(parse_report(&format!("{PREFIX}{late}"), Workload::LongLog).is_err());
+    }
+
+    /// Each set of flags names one workload and its fixture test, or is refused.
+    #[test]
+    fn the_flags_name_one_workload_and_its_test() {
+        assert_eq!(
+            Workload::of(false, false, false).unwrap(),
+            Workload::Explicit
+        );
+        assert_eq!(Workload::of(true, false, false).unwrap(), Workload::Catalog);
+        assert_eq!(Workload::of(false, true, false).unwrap(), Workload::LongLog);
+        assert_eq!(
+            Workload::of(false, false, true).unwrap(),
+            Workload::LateJoiner
+        );
+        for both in [
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            assert!(Workload::of(both.0, both.1, both.2).is_err(), "{both:?}");
+        }
+        assert_eq!(Workload::LongLog.test(false), LONG_LOG_TEST);
+        assert_eq!(Workload::LongLog.test(true), SUSTAINED_LONG_LOG_TEST);
+        assert_eq!(Workload::LateJoiner.test(false), LATE_JOINER_TEST);
+        assert_eq!(Workload::LateJoiner.test(true), SUSTAINED_LATE_JOINER_TEST);
     }
 }

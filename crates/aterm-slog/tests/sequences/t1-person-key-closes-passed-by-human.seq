@@ -1,6 +1,9 @@
 seq v=1 rig=screen program=claude build=2.1.0
 # T1: a person's key on the open box: it binds the box at once and the
-# close is the person's, `passed` (a key says nothing of what it meant).
+# close is the person's, `passed`: a key alone says nothing of what it meant.
+# E8 refines T1 with the option the screen showed the key landing on (the
+# `e8-*` files); this key carries none (no `key=`: typed text, no focused
+# option, a screen the box no longer shows), so the close stays `passed`.
 see busy
 half
 see prompt edit

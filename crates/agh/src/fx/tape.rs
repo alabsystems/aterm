@@ -1355,10 +1355,11 @@ mod tests {
         let body = sidecar_dir(&path).join(&stored.hex);
         assert!(body.exists());
         // The tape's handle made read-only: the next append fails to write, as on a full disk.
+        let read_only = std::fs::File::open(&path).expect("the tape, read-only");
         sink.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .file = std::fs::File::open(&path).expect("the tape, read-only");
+            .file = read_only;
         sink.append(&EffectRecord::Clock(1));
         let refused = sink.finish().expect_err("a write error");
         assert_eq!(refused.sub, Sub::Local);

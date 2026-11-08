@@ -13,10 +13,14 @@ use aterm_uds::{CtlStream, ready};
 use std::{
     io,
     os::fd::{AsFd, OwnedFd},
-    time::{Duration, Instant},
+    time::Instant,
 };
 use trust_resource_controller::{GnuTransport, Request};
 use trust_resource_provenance::Store;
+
+fn submission_deadline(started: Instant) -> Instant {
+    crate::runtime::control_deadline(started)
+}
 
 pub(crate) struct NativeBackend {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -121,7 +125,7 @@ impl Backend for NativeBackend {
         delegated: Delegations,
         accounted: bool,
     ) -> Result<RemoteChild, SubmitError> {
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let deadline = submission_deadline(Instant::now());
         let (events, host_events) =
             aterm_uds::kept_out(CtlStream::pair).map_err(SubmitError::NotSubmitted)?;
         let binding = Binding {
@@ -234,5 +238,40 @@ impl Backend for NativeBackend {
                 child: Box::new(child),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn native_proxy_submission_reads_its_original_frame_after_scheduling_delay() {
+        let (sender, receiver) = aterm_uds::kept_out(CtlStream::pair).unwrap();
+        let deadline = submission_deadline(Instant::now() - Duration::from_secs(9));
+        transport::write_frame(
+            &sender,
+            subgroup::READY,
+            crate::runtime::control_deadline(Instant::now()),
+        )
+        .unwrap();
+        assert_eq!(
+            transport::read_frame(&receiver, deadline).unwrap(),
+            subgroup::READY
+        );
+        transport::write_frame(
+            &sender,
+            subgroup::READY,
+            crate::runtime::control_deadline(Instant::now()),
+        )
+        .unwrap();
+        assert!(
+            transport::read_frame(
+                &receiver,
+                submission_deadline(Instant::now() - Duration::from_secs(61))
+            )
+            .is_err()
+        );
     }
 }

@@ -30,7 +30,7 @@ use crate::wall::{Placement, Wall, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 17, "0.17");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 18, "0.18");
 
 /// The usage limit is spent: the server's quota words 2.3.3's patterns matched, and its code
 /// (lowercase).
@@ -580,7 +580,9 @@ impl Shell {
 /// sequence can redraw any row, that one too (measured: a command ending `ESC[1A ESC[2K` blanked
 /// the row over its own). Only Kimi's own patterns draw that row, so a command they miss
 /// (`git push`, `mv`, a write) can be redrawn as a read with none, which no reading of the
-/// screen sees: the verdict is on the command as drawn. No wrap shows what it stood on ([`Shell::spellings`]): a
+/// screen sees: the verdict here is on the command as drawn, and aterm-gui's presence judges a
+/// read-only one again against the command Kimi wrote to its own session record
+/// (`docs/DESIGN-kimi-wire-verdict-2026-11-07.md`). No wrap shows what it stood on ([`Shell::spellings`]): a
 /// run of spaces that reaches it is dropped there whole (`wrapSingleLine`), so the row over it
 /// may have had room for the next word (measured on 2.5.2, `cat README.md`, 130 spaces and
 /// `;git push --force`); a word wider than the box is cut with none (`breakLongWord`; measured,
@@ -954,6 +956,14 @@ pub mod fixtures {
     /// `cat README.md` under its `Dangerous: recursive delete` row (MEASURED).
     pub const BOX_SHELL_BACKSPACED_252: &str =
         include_str!("fixtures/kimi-2.5.2-box-shell-backspaced.txt");
+    /// Kimi Code 2.5.2 asking to run `cat README.md`, described `Show the readme`, the box
+    /// whose record line is aterm-agent's `kimi-2.5.2-request.jsonl` (MEASURED).
+    pub const BOX_SHELL_READ_252: &str = include_str!("fixtures/kimi-2.5.2-box-shell-read.txt");
+    /// Kimi Code 2.5.2 asking to run `git push --force` redrawn by backspaces as
+    /// `cat README.md`, the row [`BOX_SHELL_READ_252`] draws, with no danger named: the box whose
+    /// record line is aterm-agent's `kimi-2.5.2-request-backspaced.jsonl` (MEASURED).
+    pub const BOX_SHELL_BACKSPACED_PUSH_252: &str =
+        include_str!("fixtures/kimi-2.5.2-box-shell-backspaced-push.txt");
     /// Kimi Code 2.5.2 under `tui_mode = "fullscreen"` asking to run a two-line command, with a
     /// description, whose body fits the panel's dock (MEASURED).
     pub const FULLSCREEN_BOX_SHELL_252: &str =

@@ -13,11 +13,7 @@ use aterm_secrets::{
     client::{self, Paths},
     fsx,
 };
-use std::{
-    collections::BTreeMap,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeMap, path::Path, time::Instant};
 
 pub(crate) fn run(command: &str, options: BTreeMap<&str, &str>) -> Result<Value> {
     run_with(command, options, || {
@@ -68,7 +64,7 @@ fn run_with(
         "accounts-billing-prepare" => {
             let account = decode_hex(take(&mut options, "--account")?)?;
             empty(&options)?;
-            prepare_at(account, paths()?, Instant::now() + Duration::from_secs(2))
+            prepare_started(account, paths()?, Instant::now())
         }
         _ => Err(Error::new("unknown account billing command")),
     }
@@ -100,6 +96,10 @@ fn describe(policy: &Policy, kind: &str) -> Value {
             })
         }).collect::<Vec<_>>()
     })
+}
+
+pub(super) fn prepare_started(account: Digest, paths: Paths, started: Instant) -> Result<Value> {
+    prepare_at(account, paths, crate::admission::deadline_at(started))
 }
 
 pub(super) fn prepare_at(account: Digest, paths: Paths, deadline: Instant) -> Result<Value> {

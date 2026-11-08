@@ -15,6 +15,54 @@ fn row(pad: &str) -> String {
 }
 
 #[test]
+fn optional_progress_batches_keep_individual_stamps_and_skip_busy_external_sink() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let external = dir.path().join("external");
+    let mut events = EventLog::open(&external).unwrap();
+    let mut log = crate::run_log::open(None, dir.path(), dir.path(), events.id()).unwrap();
+    events.retain(log.take_events().unwrap());
+    let raw: Vec<_> = (0..16).map(|i| row(&i.to_string())).collect();
+    emit_progress_batch(Some(&events), &[]);
+    assert_eq!(std::fs::read_to_string(&external).unwrap(), "");
+    emit_progress_batch(Some(&events), &raw);
+    let first = std::fs::read_to_string(&external).unwrap();
+    assert_eq!(first.lines().count(), 16);
+    for line in first.lines() {
+        let value: aterm_json::Value =
+            aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
+        assert_eq!(value["invocation"]["id"].as_str(), events.id());
+    }
+    let holder = EventLog::open(&external)
+        .unwrap()
+        .sinks
+        .into_inner()
+        .unwrap()
+        .external
+        .unwrap();
+    aterm_uds::file_lock::lock_exclusive_until(&holder, Instant::now(), "busy").unwrap();
+    emit_progress_batch(Some(&events), &raw);
+    holder.unlock().unwrap();
+    assert_eq!(std::fs::read_to_string(&external).unwrap(), first);
+    let companion = crate::run_log::events_path(&log.path);
+    assert_eq!(
+        std::fs::read_to_string(&companion).unwrap(),
+        format!("{}{first}{first}", crate::run_log::PRIVATE_EVENTS_HEADER)
+    );
+    let holder = aterm_uds::regular_file::open(&companion).unwrap().0;
+    aterm_uds::file_lock::lock_exclusive_until(&holder, Instant::now(), "busy").unwrap();
+    emit_progress_batch(Some(&events), &raw);
+    holder.unlock().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&external).unwrap(),
+        format!("{first}{first}")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&companion).unwrap(),
+        format!("{}{first}{first}", crate::run_log::PRIVATE_EVENTS_HEADER)
+    );
+}
+
+#[test]
 fn independent_handles_and_hardlink_aliases_lock_the_actual_append_file() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let path = dir.path().join("events");

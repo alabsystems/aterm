@@ -1400,7 +1400,8 @@ fn machine_id_among(names: impl IntoIterator<Item = String>) -> Option<String> {
         .find_map(|name| normalize_machine_id(&name))
 }
 
-fn read_default_profile_email(env: &Env) -> Option<String> {
+/// The address the profile of the home `env` names is signed in as.
+pub(crate) fn read_default_profile_email(env: &Env) -> Option<String> {
     let path = env.claude_profile.as_deref().map(|own| {
         super::profile::effective(own, env.claude_dir().as_deref(), env.claude_custom_oauth)
     })?;
@@ -3934,7 +3935,7 @@ static TRANSCRIPT_SCANS: TranscriptScans = std::sync::Mutex::new(BTreeMap::new()
 
 /// The email of a transcript `line` that is Claude Code's `session_context` attachment
 /// (`attachment.context.userEmail`), its first word holding an `@`.
-fn session_context_email(line: &str) -> Option<String> {
+pub(crate) fn session_context_email(line: &str) -> Option<String> {
     if !line.contains("\"session_context\"") || !line.contains("\"userEmail\"") {
         return None;
     }

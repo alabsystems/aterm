@@ -8396,8 +8396,12 @@ pub(crate) fn clt_which_line(
     }
 }
 
+fn clt_install_host() -> crate::prereq::CcHost {
+    crate::prereq::CcHost::waited_on()
+}
+
 fn cmd_install_clt() -> ExitCode {
-    let host = crate::prereq::CcHost::this_machine();
+    let host = clt_install_host();
     let path = std::env::var_os("PATH");
     let verdict = crate::prereq::probe_with(path.as_deref(), &host);
     let exe = std::env::current_exe().ok();

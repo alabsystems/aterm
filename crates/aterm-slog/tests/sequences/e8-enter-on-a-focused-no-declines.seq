@@ -1,0 +1,18 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# E8: Enter is not "yes". On the box the vendor defaults to `No` (`❯ No`
+# focused above `Yes`), Enter chooses the focused option, whose role rejects:
+# the close is `declined`, by whoever pressed it. A closer that read the key
+# alone (Enter = approve) fails this file.
+see busy
+half
+see prompt tool fixture=claude-2.1.282-box-tool-default-no
+expect open p1 approval par=t1 box=tool @500
+person key=enter chose=decline
+see busy
+expect close p1 approval out=declined by=human conf=heuristic
+see prompt tool fixture=claude-2.1.282-box-tool-default-no
+expect open p2 approval par=t1 box=tool
+admit ctl key=enter chose=decline
+accept
+see busy
+expect close p2 approval out=declined by=ctl conf=heuristic

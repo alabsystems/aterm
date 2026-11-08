@@ -1429,7 +1429,7 @@ pub enum Why {
     Low,
     /// The window is spent: nothing is left to estimate.
     AtLimit,
-    /// The newest reading is older than a tenth of its window, or a machine that used the account in it did not answer.
+    /// The newest reading is older than a tenth of its window.
     Stale,
     /// More than [`SHARE_MAX`] of a token class has no price.
     Unpriced,
@@ -1484,17 +1484,6 @@ impl Attribution {
     }
 }
 
-/// The machines behind a figure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Machines {
-    /// Machines whose spend is summed.
-    pub reported: u32,
-    /// Machines that used the account in the window.
-    pub used: u32,
-    /// Of those, the ones that did not answer.
-    pub silent: u32,
-}
-
 /// What one window's figure is asked from.
 #[derive(Debug, Clone, Copy)]
 pub struct Ask<'a> {
@@ -1518,8 +1507,6 @@ pub struct Ask<'a> {
     pub attribution: Attribution,
     /// A process on an API key, Bedrock or Vertex used the home.
     pub api_key_seen: bool,
-    /// The machines behind it.
-    pub machines: Machines,
     /// The caller's clock.
     pub now: i64,
 }
@@ -1652,7 +1639,7 @@ fn left(ask: &Ask<'_>, capacity: Capacity, from: i64) -> Result<Left, Why> {
         return Err(Why::AtLimit);
     }
     let age_s = ask.now.saturating_sub(newest.at).max(0);
-    if age_s > ask.length_s / 10 || ask.machines.silent > 0 {
+    if age_s > ask.length_s / 10 {
         return Err(Why::Stale);
     }
     let (used, _) = newest.point(ask.tenths_seen);

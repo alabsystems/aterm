@@ -83,7 +83,7 @@ fn retained_bound_refusal_waits_actual_output_and_event_eof_and_rechecks_the_ori
     let request = request();
     request.validate_request().unwrap();
     let (mut streams, mut peer, mut stdout, mut stderr) = streams();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = crate::fixture_deadline(Instant::now() - Duration::from_secs(11));
     let frame = refusal(&request);
     peer.send(&MetadataEvent::Status(frame.clone()).encode().unwrap(), deadline).unwrap();
     stdout.write_all(b"actual refused stdout\0\xff").unwrap();
@@ -130,7 +130,7 @@ fn retained_bound_refusal_waits_actual_output_and_event_eof_and_rechecks_the_ori
 fn wrong_binding_contradictory_status_or_failed_observer_never_supplies_known_refusal() {
     let request = request();
     let (mut streams, mut peer, stdout, stderr) = streams();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = crate::fixture_deadline(Instant::now());
     peer.send(&MetadataEvent::Status(refusal(&request)).encode().unwrap(), deadline).unwrap();
     drop((peer, stdout, stderr));
     settle(&mut streams, &request, deadline);
@@ -159,7 +159,7 @@ fn wrong_binding_contradictory_status_or_failed_observer_never_supplies_known_re
 fn trailing_protocol_error_after_refused_is_never_a_positive_refusal() {
     let request = request();
     let (mut streams, mut peer, stdout, stderr) = streams();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = crate::fixture_deadline(Instant::now());
     let encoded = MetadataEvent::Status(refusal(&request)).encode().unwrap();
     peer.send(&encoded, deadline).unwrap();
     peer.send(&encoded, deadline).unwrap();

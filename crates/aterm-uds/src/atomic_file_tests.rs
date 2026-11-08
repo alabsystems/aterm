@@ -7,6 +7,34 @@ use super::*;
 use crate::atomic_file::read_bounded_stream;
 use std::os::unix::fs::PermissionsExt as _;
 
+#[test]
+fn native_config_writer_waits_for_an_unchanged_original_holder() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let target = scratch.path().join("aterm.toml");
+    let held = ConfigWriteLock::take_within(&target, Duration::ZERO, || {}).unwrap();
+    let mut held = Some(held);
+    let result = ConfigWriteLock::take_default_at(
+        &target,
+        Instant::now() - Duration::from_secs(3),
+        move || drop(held.take()),
+    );
+    assert!(result.is_ok(), "{:?}", result.err());
+    drop(result);
+    let held = ConfigWriteLock::take_within(&target, Duration::ZERO, || {}).unwrap();
+    let expired =
+        ConfigWriteLock::take_default_at(&target, Instant::now() - Duration::from_secs(61), || {
+            panic!("expired detector must not wait")
+        });
+    assert_eq!(
+        expired.err().unwrap().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(ConfigWriteLock::take_within(&target, Duration::ZERO, || {}).is_err());
+    drop(held);
+    let config = ConfigFile::open(&target).unwrap();
+    assert!(config.lock().is_ok());
+}
+
 /// A scratch directory of this test's own, removed on drop.
 struct Scratch(PathBuf);
 

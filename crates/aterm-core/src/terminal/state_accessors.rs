@@ -175,7 +175,7 @@ impl Terminal {
         self.bell_total
     }
 
-    /// The monotonic count of desktop notifications the program asked for (OSC 9, a final OSC 99 chunk, OSC 777 `notify`), whether or not notifications are allowed: the session log counts them (`mark - notify n=`), never their text.
+    /// The monotonic count of desktop notifications the program asked for (OSC 9, a final OSC 99 chunk, OSC 777 `notify`), whether or not notifications are allowed: the session log counts them (`mark <node> notify n=`, on the deepest open node), never their text.
     #[inline]
     #[must_use]
     pub const fn notify_total(&self) -> u64 {

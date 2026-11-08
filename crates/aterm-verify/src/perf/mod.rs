@@ -392,7 +392,8 @@ impl Lane {
             }
             Lane::CliStart => {
                 "macOS, targo (release builds of aterm, unless --binary names one, and of \
-                 aterm-start-controls; a build of aterm-lab for ctl-status's headless instance)"
+                 aterm-start-controls; test-profile builds of aterm-lab and the current debug \
+                 aterm for ctl-status's headless fixture)"
             }
             Lane::FabricCounts => {
                 "unix, targo (builds aterm and its fabric_bench bench in the test profile, as \
@@ -893,6 +894,20 @@ const OPTIONS: &[OptSpec] = &[
         help: "measure catalog-discovered application tables instead of one explicit table",
     },
     OptSpec {
+        flag: "--long-log",
+        value: None,
+        lanes: &[Lane::CommonsQuiet],
+        help: "measure the explicit table over a long vault history (1,200 rotations of the \
+               vault's key, 9,605 records) instead of a short one",
+    },
+    OptSpec {
+        flag: "--late-joiner",
+        value: None,
+        lanes: &[Lane::CommonsQuiet],
+        help: "measure --long-log's history where the second Mac was admitted after it and opens \
+               each older epoch through a handoff",
+    },
+    OptSpec {
         flag: "--sustained",
         value: None,
         lanes: &[Lane::CommonsQuiet],
@@ -1022,6 +1037,16 @@ pub(crate) fn parse(args: &[String]) -> Result<Cli, String> {
         && !(cli.options.contains_key("--baseline") && cli.options.contains_key("--candidate"))
     {
         return Err("`compare` needs --baseline PATH and --candidate PATH".to_string());
+    }
+    let workloads: Vec<&str> = ["--catalog", "--long-log", "--late-joiner"]
+        .into_iter()
+        .filter(|flag| cli.options.contains_key(flag))
+        .collect();
+    if workloads.len() > 1 {
+        return Err(format!(
+            "{} each name a commons-quiet workload; measure one at a time",
+            workloads.join(" and ")
+        ));
     }
     if cli.options.contains_key("--json-out") {
         let writers: Vec<&str> = cli
@@ -1340,6 +1365,8 @@ fn main(args: &[String]) -> ExitCode {
                 cli.options.get("--json-out").map(Path::new),
                 cli.options.contains_key("--sustained"),
                 cli.options.contains_key("--catalog"),
+                cli.options.contains_key("--long-log"),
+                cli.options.contains_key("--late-joiner"),
             ),
             #[cfg(not(unix))]
             Lane::CommonsQuiet => LaneRun::skip(
@@ -1680,6 +1707,14 @@ mod tests {
         assert!(catalog.options.contains_key("--catalog"));
         assert!(catalog.options.contains_key("--sustained"));
         assert!(parse(&args("aos --catalog")).is_err());
+        let long = parse(&args("commons-quiet --long-log --sustained")).unwrap();
+        assert!(long.options.contains_key("--long-log"));
+        assert!(parse(&args("aos --long-log")).is_err());
+        assert!(parse(&args("commons-quiet --catalog --long-log")).is_err());
+        assert!(parse(&args("commons-quiet --long-log --late-joiner")).is_err());
+        let late = parse(&args("commons-quiet --late-joiner --sustained")).unwrap();
+        assert!(late.options.contains_key("--late-joiner"));
+        assert!(parse(&args("aos --late-joiner")).is_err());
     }
 
     #[test]

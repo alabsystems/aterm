@@ -21,6 +21,7 @@ pub mod custody;
 mod ledger;
 pub mod transfer;
 
+pub use crate::client::version::RefusalClaim;
 pub use catalog::{Class, GhProfile, Purpose, Want};
 pub use ledger::{
     FILE as LEDGER, absorb, acknowledge_from_snapshot, list, peek, raise, raise_refused,
@@ -336,8 +337,8 @@ pub struct Need {
     pub updated: u64,
     /// How many times this want was raised for this purpose (the model's `raises`).
     pub raises: u32,
-    /// The vault seq whose value the consumer refused, if any.
-    pub refused: Option<u64>,
+    /// The actual authenticated source version refused, or an explicit legacy scalar floor.
+    pub refused: Option<RefusalClaim>,
     /// The consumer's word that it still needs the want (the model's `need`).
     pub needed: bool,
     /// Whether a `NEEDS YOU` is up for it (the model's `you`).
@@ -377,7 +378,7 @@ impl Need {
     }
 }
 
-/// What this Mac's applied vault version shows of a want's entries (§9.4): names only.
+/// What this Mac's applied vault version shows: entry names and authenticated public history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sight {
     /// The vault's name.
@@ -395,6 +396,8 @@ pub struct Sight {
     pub hidden: bool,
     /// Entry names in lockers this Mac opens.
     pub held: BTreeSet<String>,
+    /// The actual accepted source view, captured beside these names before any table lock.
+    pub version: Option<crate::client::version::AuthenticatedVersion>,
 }
 
 /// Where Commons stands for this Mac.
@@ -454,6 +457,46 @@ pub struct Facts {
 }
 
 impl Facts {
+    /// Strict source progress is retry eligibility, never consumer/provider acceptance.
+    pub fn after_refusal(&self, refused: Option<&RefusalClaim>) -> bool {
+        match refused {
+            None => true,
+            Some(RefusalClaim::LegacySequence(floor)) => self.sight.as_ref().is_some_and(|s| {
+                s.version.as_ref().map_or(s.seq > *floor, |version| {
+                    version.envelope_sequence().is_some_and(|seq| seq > *floor)
+                })
+            }),
+            Some(RefusalClaim::Authenticated(floor)) => self
+                .sight
+                .as_ref()
+                .and_then(|s| s.version.as_ref())
+                .is_some_and(|v| {
+                    v.relation(floor) == crate::client::version::VersionRelation::Advanced
+                }),
+        }
+    }
+
+    fn publication_after(&self, version: &RefusalClaim, refused: Option<&RefusalClaim>) -> bool {
+        match (version, refused) {
+            (_, None) => true,
+            (RefusalClaim::LegacySequence(next), Some(RefusalClaim::LegacySequence(floor))) => {
+                next > floor
+            }
+            (RefusalClaim::Authenticated(next), Some(RefusalClaim::LegacySequence(floor))) => {
+                next.envelope().is_some_and(|e| e.seq > *floor)
+            }
+            (RefusalClaim::Authenticated(next), Some(RefusalClaim::Authenticated(floor))) => self
+                .sight
+                .as_ref()
+                .and_then(|s| s.version.as_ref())
+                .is_some_and(|v| {
+                    v.relation_between(next, floor)
+                        == crate::client::version::VersionRelation::Advanced
+                }),
+            _ => false,
+        }
+    }
+
     fn hidden(&self) -> bool {
         self.sight.as_ref().is_none_or(|sight| sight.hidden)
     }
@@ -536,7 +579,7 @@ fn hand_route(want: &Want, host: &str) -> Option<String> {
 }
 
 /// The line a need still in the ledger shows: the one party it waits on.
-fn local_line(want: &Want, facts: &Facts, refused: Option<u64>) -> String {
+fn local_line(want: &Want, facts: &Facts, refused: Option<&RefusalClaim>) -> String {
     let host = facts.sight.as_ref().map(|sight| sight.host.as_str());
     let vault = facts.sight.as_ref().map(|sight| sight.vault.as_str());
     let founding = match facts.commons {
@@ -568,9 +611,10 @@ fn local_line(want: &Want, facts: &Facts, refused: Option<u64>) -> String {
             "the vault gives this Mac {} at seq {}, and its consumer still finds none: it raises again with refused = {}",
             entry_words(want),
             facts.sight.as_ref().map_or(0, |sight| sight.seq),
-            refused
-                .or(facts.sight.as_ref().map(|sight| sight.seq))
-                .unwrap_or(0)
+            refused.map_or_else(
+                || format!("seq {}", facts.sight.as_ref().map_or(0, |s| s.seq)),
+                ToString::to_string
+            )
         ),
         Class::VaultOnly if facts.hidden() => format!(
             "{founding}; this Mac cannot open every locker of its vault version, so it cannot show that no Mac holds {}",
@@ -1047,12 +1091,7 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
             let guard = need.state == State::AwaitingPerson
                 && facts.holds(&need.want)
                 && facts.policy.allows(&need.want)
-                && need.refused.is_none_or(|refused| {
-                    facts
-                        .sight
-                        .as_ref()
-                        .is_some_and(|sight| sight.seq > refused)
-                });
+                && facts.after_refusal(need.refused.as_ref());
             guard.then(|| {
                 let seq = facts.sight.as_ref().map_or(0, |sight| sight.seq);
                 Need {
@@ -1185,7 +1224,7 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
                     custodian_silent: false,
                     late_offer: false,
                     record: None,
-                    line: local_line(&need.want, facts, need.refused),
+                    line: local_line(&need.want, facts, need.refused.as_ref()),
                     seq: facts.sight.as_ref().map(|sight| sight.seq),
                     updated: now,
                     ..need.clone()
@@ -1220,7 +1259,7 @@ pub fn act(need: &Need, facts: &Facts, act: &Act) -> Option<Need> {
             let wait = local_wait(&need.want, facts);
             Need {
                 wait,
-                line: local_line(&need.want, facts, need.refused),
+                line: local_line(&need.want, facts, need.refused.as_ref()),
                 seq: facts.sight.as_ref().map(|sight| sight.seq),
                 ..need.clone()
             }
@@ -1240,7 +1279,7 @@ pub enum Decision {
     /// The custodian copied it into this Mac's own host section at vault `seq` (§8.1).
     Published {
         /// The vault version that carries it.
-        seq: u64,
+        version: RefusalClaim,
     },
     /// Every Mac allowed to give it swept and none holds it, or the want window ended before
     /// the members it names answered, and a person can make it.
@@ -1343,8 +1382,8 @@ pub fn decided(need: &Need, facts: &Facts, decision: &Decision) -> Option<Need> 
                 }
             })
         }
-        Decision::Published { seq } => (facts.policy.allows(&need.want)
-            && need.refused.is_none_or(|refused| *seq > refused))
+        Decision::Published { version } => (facts.policy.allows(&need.want)
+            && facts.publication_after(version, need.refused.as_ref()))
         .then(|| Need {
             state: State::Published,
             wait: Wait::Requester,
@@ -1353,10 +1392,10 @@ pub fn decided(need: &Need, facts: &Facts, decision: &Decision) -> Option<Need> 
             got: true,
             got_authorized: true,
             line: format!(
-                "published: the vault admin's aterm put {} in this Mac's own section at seq {seq}; this Mac's next sync applies it and its consumer's check fulfils it",
+                "published: the vault admin's aterm put {} in this Mac's own section at {version}; this Mac's next sync applies it and its consumer's check fulfils it",
                 entry_words(&need.want)
             ),
-            seq: Some(*seq),
+            seq: version.sequence(),
             updated: now,
             ..need.clone()
         }),
@@ -1436,7 +1475,7 @@ pub fn silent(need: &Need, facts: &Facts) -> Option<Need> {
     if let Some(sight) = facts.sight.as_ref()
         && facts.holds(&need.want)
         && facts.policy.allows(&need.want)
-        && need.refused.is_none_or(|refused| sight.seq > refused)
+        && facts.after_refusal(need.refused.as_ref())
     {
         return Some(Need {
             state: State::Published,

@@ -7,13 +7,15 @@
 use aterm_core::terminal::RenderCell;
 #[cfg(test)]
 use aterm_core::terminal::UnderlineStyle;
+use aterm_messages::Links;
 #[cfg(test)]
 use aterm_messages::ink;
 #[cfg(test)]
 use aterm_messages::text::char_width;
-use aterm_messages::{ActionIndex, Hit, Links, Presentation};
 #[cfg(test)]
-use aterm_messages::{BandMotion, CapsuleRole, FineTone, RowKind, RowLayout, Severity};
+use aterm_messages::{
+    BandMotion, CapsuleRole, FineTone, Presentation, RowKind, RowLayout, Severity,
+};
 #[cfg(test)]
 use aterm_render::Theme;
 
@@ -23,7 +25,9 @@ use crate::chrome_band::BandColors;
 use crate::chrome_band::{self};
 use crate::{App, WindowId};
 
-pub(crate) use aterm_messages::paint::{Geometry as BandGeometry, Hover as BandHover, HoverTarget};
+#[cfg(test)]
+pub(crate) use aterm_messages::paint::HoverTarget;
+pub(crate) use aterm_messages::paint::{Geometry as BandGeometry, Hover as BandHover};
 
 pub(crate) use aterm_messages::ink::RowRaster;
 #[cfg(test)]
@@ -37,15 +41,6 @@ pub(crate) use aterm_messages::palette::lin;
 #[cfg(test)]
 pub(crate) fn cell_width(s: &str) -> usize {
     char_width(s)
-}
-
-/// Where a window pixel landed on the band rows between the strip and the grid.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct BandTarget {
-    /// 0 = the topmost band row.
-    pub(crate) row: usize,
-    /// The cell column, 0 = the window's first cell.
-    pub(crate) col: usize,
 }
 
 /// One empty band row, in the same colours a painted row uses (the tests' probe of the renderer's own pad, `aterm_render::band::blank_band_row`).
@@ -84,7 +79,6 @@ pub(crate) fn assert_completes_in_place(msg: &aterm_messages::Message, finished:
         let mut r = r.clone();
         r.kind = RowKind::Overflow { hidden: 0 };
         r.title.1.clear();
-        r.full_title.clear();
         r.stats = None;
         r.load = None;
         r.pct = None;
@@ -202,33 +196,6 @@ pub(crate) fn row_inks(c: &BandColors, l: &RowLayout, hc: bool) -> (MeterInks, O
     ink::inks_for(c, fill, l.track.is_some(), hc)
 }
 
-/// The band row and column for a frame pixel, given the geometry — the pure
-/// half of [`App::band_hit_at`].
-fn band_target_for_pixel(
-    gx: usize,
-    gy: usize,
-    frame: BandGeometry,
-    ch: usize,
-    top: usize,
-    strip_rows: usize,
-    band_rows: usize,
-) -> Option<BandTarget> {
-    if band_rows == 0 {
-        return None;
-    }
-    let ch = ch.max(1);
-    let gy = gy.checked_sub(top)?;
-    let strip_px = strip_rows * ch;
-    let band_px = band_rows * ch;
-    if gy < strip_px || gy >= strip_px + band_px {
-        return None;
-    }
-    Some(BandTarget {
-        row: (gy - strip_px) / ch,
-        col: frame.cell_at(gx),
-    })
-}
-
 #[cfg(test)]
 thread_local! {
     /// How many band layouts this test thread has built (each reads the home once).
@@ -272,135 +239,6 @@ impl App {
             win_w,
             cells_x,
             cell_w: cw.max(1),
-        }
-    }
-
-    /// The band's layout at `cols`.
-    pub(crate) fn band_presentation(&self, cols: usize) -> Presentation {
-        (self.band_lay)(cols).presentation(&self.messages)
-    }
-
-    /// If window pixel `(x, y)` lands on one of window `wid`'s band rows between the strip and the grid, which, and at which cell column.
-    pub(crate) fn band_hit_at(&self, wid: WindowId, x: f64, y: f64) -> Option<BandTarget> {
-        let (fx, fy) = self.window_to_frame(wid, x, y);
-        let (cw, ch) = self.win_cell_size(wid);
-        let pad = self.win_pad(wid);
-        let cols = self.windows.get(&wid).map_or(0, |ws| usize::from(ws.cols));
-        let frame = BandGeometry {
-            win_w: cols
-                .saturating_mul(cw)
-                .saturating_add(pad.saturating_mul(2)),
-            cells_x: pad,
-            cell_w: cw,
-        };
-        band_target_for_pixel(
-            fx as usize,
-            fy as usize,
-            frame,
-            ch,
-            self.win_pad_top(wid) + self.win_head(wid),
-            usize::from(self.tab_strip_rows),
-            usize::from(self.message_band_rows),
-        )
-    }
-
-    /// What a press at `target` in window `wid` lands on, through the width
-    /// law at this window's width — the same layout the painter drew.
-    fn band_hit(&self, wid: WindowId, target: BandTarget) -> Hit {
-        let BandTarget { row, col } = target;
-        let Some(cols) = self.windows.get(&wid).map(|ws| usize::from(ws.cols)) else {
-            return Hit::Nothing;
-        };
-        self.band_presentation(cols).hit(row, col)
-    }
-
-    /// A press on window `wid`'s band rows between the strip and the grid (design §3.4).
-    pub(crate) fn press_band(&mut self, wid: WindowId, target: BandTarget) {
-        match self.band_hit(wid, target) {
-            Hit::Capsule(id, k) => {
-                let intent = self.messages.act(id, k, std::time::Instant::now());
-                self.sync_messages();
-                if let Some(intent) = intent {
-                    let _ = self.perform_intent(wid, id, intent);
-                }
-            }
-            Hit::Details(id) | Hit::Body(id) => self.press_message_body(wid, id),
-            Hit::Overflow => {
-                let _ = self.open_messages_entry(wid, None);
-            }
-            Hit::Nothing => {}
-        }
-    }
-
-    /// Whether a press at `target` would do something.
-    pub(crate) fn band_press_acts(&self, wid: WindowId, target: BandTarget) -> bool {
-        matches!(
-            self.band_hit(wid, target),
-            Hit::Capsule(..) | Hit::Details(_) | Hit::Body(_) | Hit::Overflow
-        )
-    }
-
-    /// The chip to light for a pointer at `target`.
-    pub(crate) fn band_hover_for(&self, wid: WindowId, target: BandTarget) -> Option<BandHover> {
-        let row = target.row;
-        let row = u8::try_from(row).ok()?;
-        let target = match self.band_hit(wid, target) {
-            Hit::Capsule(_, k) => HoverTarget::Capsule(k),
-            Hit::Details(_) => HoverTarget::Capsule(ActionIndex::DETAILS),
-            Hit::Body(_) | Hit::Overflow => HoverTarget::Body,
-            Hit::Nothing => return None,
-        };
-        Some(BandHover { row, target })
-    }
-
-    /// Update the hovered band chip on `CursorMoved`, clearing it when the pointer leaves the band.
-    pub(crate) fn track_band_hover(&mut self, wid: WindowId, x: f64, y: f64) {
-        let hover = self
-            .band_hit_at(wid, x, y)
-            .and_then(|target| self.band_hover_for(wid, target));
-        self.set_band_hover(wid, hover);
-    }
-
-    /// The lit chip follows the layout under a still pointer.
-    pub(crate) fn refresh_band_hover(&mut self) {
-        let wids: Vec<WindowId> = self.windows.keys().copied().collect();
-        for wid in wids {
-            let Some(ws) = self.windows.get(&wid) else {
-                continue;
-            };
-            let (was, known, (x, y)) =
-                (ws.band_hover, ws.pointer_position_known, ws.last_cursor_px);
-            let hover = if known {
-                self.band_hit_at(wid, x, y)
-                    .and_then(|target| self.band_hover_for(wid, target))
-            } else {
-                None
-            };
-            if hover == was {
-                continue;
-            }
-            if known && self.active_native_view(wid).is_some() {
-                self.on_cursor_moved(wid, x, y);
-                continue;
-            }
-            self.set_band_hover(wid, hover);
-            if known {
-                self.update_hover_cursor(wid);
-            }
-        }
-    }
-
-    /// Write the band hover, requesting a redraw only on a change.
-    pub(crate) fn set_band_hover(&mut self, wid: WindowId, hover: Option<BandHover>) {
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return;
-        };
-        if ws.band_hover == hover {
-            return;
-        }
-        ws.band_hover = hover;
-        if let Some(window) = &ws.os_window {
-            window.request_redraw();
         }
     }
 }
@@ -682,43 +520,6 @@ mod tests {
                 assert_eq!(lit[0][first.col].ch, '[', "{name}: brackets stay");
             });
         }
-    }
-
-    /// The pixel → row/column map: the band rows under the strip, the column
-    /// from the cell lattice; off the band rows is `None`.
-    #[test]
-    fn band_target_for_pixel_maps_the_chrome_rows_in_order() {
-        let (pad, top) = (4, 10);
-        let lattice = |cw| BandGeometry {
-            win_w: 80 * cw + 2 * pad,
-            cells_x: pad,
-            cell_w: cw,
-        };
-        let cell = lattice(8);
-        let hit = |gx, gy| band_target_for_pixel(gx, gy, cell, 16, top, 1, 2);
-        assert_eq!(hit(40, top + 5), None, "the strip is not the band");
-        assert_eq!(
-            hit(40, top + 16),
-            Some(BandTarget {
-                row: 0,
-                col: (40 - pad) / 8
-            })
-        );
-        assert_eq!(hit(4, top + 47), Some(BandTarget { row: 1, col: 0 }));
-        assert_eq!(hit(40, top + 48), None, "the grid starts below the band");
-        assert_eq!(hit(40, 3), None, "above the lattice");
-        assert_eq!(
-            band_target_for_pixel(40, top + 20, cell, 16, top, 1, 0),
-            None
-        );
-        assert_eq!(
-            band_target_for_pixel(0, top, cell, 16, top, 0, 1),
-            Some(BandTarget { row: 0, col: 0 })
-        );
-        assert_eq!(
-            band_target_for_pixel(0, top, lattice(0), 0, top, 0, 1),
-            Some(BandTarget { row: 0, col: 0 })
-        );
     }
 
     /// One frame of `center`'s motion over `p` at `at` in `look`, painted on

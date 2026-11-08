@@ -7873,7 +7873,13 @@ fn timeline_records_lifecycle_in_order() {
     let store = session_store::new_store();
     let h = registered_session(3, -1, b"");
     store.write().unwrap().register(h.clone()); // -> spawned
-    assert!(h.ctx.timeline.lock().unwrap().record_title("vim"));
+    assert!(
+        h.ctx
+            .timeline
+            .lock()
+            .unwrap()
+            .record_title("vim", crate::session_log::observed::TitleStands::Own)
+    );
     let (_, changed) = cmd_meta(&h.term, &store, 3, &h.ctx, "set title build agent");
     assert!(changed); // -> meta-change
     store

@@ -42,5 +42,10 @@ pub use channel::Channel;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, feature = "channel", any(target_os = "linux", target_os = "macos")))]
+fn fixture_deadline(started: std::time::Instant) -> std::time::Instant {
+    started + std::time::Duration::from_secs(60)
+}
+
 #[cfg(all(feature = "client", any(target_os = "linux", target_os = "macos")))]
 pub mod client;

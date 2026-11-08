@@ -1006,8 +1006,8 @@ enum TitleAt {
 pub(crate) struct WindowLights {
     /// One per painted cell of every drawn chip.
     hits: Vec<LightHit>,
-    /// The sessions whose composer rule this frame found on the glass (chip or none).
-    footers: Vec<(u64, usize)>,
+    /// The sessions whose composer rule this frame found on the glass (`(session, term_row, room)`).
+    footers: Vec<(u64, usize, usize)>,
     hover: Option<(u64, Target)>,
     selected: Option<(u64, Target)>,
     /// A frame has been painted since the selection last moved.
@@ -1040,6 +1040,10 @@ pub(crate) struct WindowLights {
     /// Where the last paint laid what a pointer hit-tests ([`WindowLights::places`]) and the
     /// hover it was laid under ([`App::settle_glass_hover`]).
     laid: Option<(u64, GlassHover)>,
+    /// The digest of pre-footer `ws.chrome_rows` at the last [`App::settle_glass_hover`].
+    chrome_rows_laid: u64,
+    /// A paste or close confirmation band covered the top rows since the last footer settle.
+    band_covered: bool,
     /// A paint after a re-grid moved the hover under a still pointer ([`App::settle_glass_hover`]).
     cursor_owed: bool,
     /// The facts on the glass.
@@ -1372,6 +1376,20 @@ impl WindowLights {
         )
     }
 
+    /// A digest of the pre-footer chrome bands (`ws.chrome_rows`), `0` when none are open.
+    fn chrome_rows_digest(chrome_rows: &[std::ops::Range<usize>]) -> u64 {
+        use std::hash::{Hash, Hasher};
+        if chrome_rows.is_empty() {
+            return 0;
+        }
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        chrome_rows.len().hash(&mut h);
+        for band in chrome_rows {
+            band.hash(&mut h);
+        }
+        h.finish() | 1
+    }
+
     /// A digest of where the last paint laid what a pointer hit-tests ([`App::claude_glass_at`]):
     /// the chips' cells, the switches with their labels and arrows, the facts and the lockups.
     fn places(&self) -> u64 {
@@ -1630,6 +1648,20 @@ impl WindowLights {
     const fn select(&mut self, selected: Option<(u64, Target)>) {
         self.selected = selected;
         self.selection_painted = false;
+    }
+
+    /// Whether the keyboard selection's target is off the glass or on a row `covered` owns.
+    fn selection_stale(&self, covered: impl Fn(usize) -> bool) -> bool {
+        let Some((session, target)) = self.selected else {
+            return false;
+        };
+        match target {
+            Target::Chip(_) if !self.selection_painted => !self
+                .footers
+                .iter()
+                .any(|(s, term_row, room)| *s == session && *room > 0 && !covered(*term_row)),
+            _ => !self.shows_uncovered(session, target, covered),
+        }
     }
 
     /// Let `session`'s turning state go once `face` has reached the side it was turning toward.
@@ -4019,12 +4051,22 @@ impl App {
         }
     }
 
-    /// `session`'s composer rule is on the glass this frame (chip or none, facts or none).
-    pub(crate) fn note_claude_footer_row(&mut self, wid: WindowId, session: u64, room: usize) {
+    /// `session`'s composer rule is on the glass at `term_row` this frame (chip or none, facts or none).
+    pub(crate) fn note_claude_footer_row(
+        &mut self,
+        wid: WindowId,
+        session: u64,
+        term_row: usize,
+        room: usize,
+    ) {
         if let Some(ws) = self.windows.get_mut(&wid)
-            && !ws.claude_lights.footers.iter().any(|(s, _)| *s == session)
+            && !ws
+                .claude_lights
+                .footers
+                .iter()
+                .any(|(s, _, _)| *s == session)
         {
-            ws.claude_lights.footers.push((session, room));
+            ws.claude_lights.footers.push((session, term_row, room));
         }
     }
 
@@ -4125,34 +4167,75 @@ impl App {
         wid: WindowId,
         grid: Option<crate::app_mouse::GlassGrid>,
     ) {
+        let band_active = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid)
+            || self.close_band(wid).is_some();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
         let regridded = std::mem::replace(&mut ws.claude_lights.drawn_at, grid) != grid;
+        let chrome = WindowLights::chrome_rows_digest(&ws.chrome_rows);
+        let chrome_changed =
+            std::mem::replace(&mut ws.claude_lights.chrome_rows_laid, chrome) != chrome;
+        let uncovered =
+            !band_active && std::mem::replace(&mut ws.claude_lights.band_covered, false);
         let lights = &mut ws.claude_lights;
         let was = lights.glass_hover();
         let laid = (lights.places(), was);
         // Glass laid elsewhere under the same hover moved under a still pointer (a re-laid rule,
-        // a newly drawn ⬆️): track it again. A paint under a hover that changed since the last
-        // paint (a motion's, or a track's here) only records its places, so glass a hover
-        // itself re-lays never moves the hover again.
-        let moved = lights
-            .laid
-            .replace(laid)
-            .is_some_and(|(places, hover)| hover == was && places != laid.0);
-        if (regridded || moved) && ws.pointer_position_known {
+        // a newly drawn ⬆️, a changed chrome band): track it again. A paint under a hover that
+        // changed since the last paint (a motion's, or a track's here) only records its places,
+        // so glass a hover itself re-lays never moves the hover again.
+        let prev = lights.laid.replace(laid);
+        let places_changed = prev.is_none_or(|(places, _)| places != laid.0);
+        let moved = prev.is_some_and(|(places, hover)| hover == was && places != laid.0);
+        if (regridded || moved || chrome_changed || uncovered)
+            && ws.pointer_position_known
+            && !ws.selecting
+        {
             let (x, y) = ws.last_cursor_px;
             let _ = self.track_claude_light_hover(wid, x, y);
             if let Some(ws) = self.windows.get_mut(&wid) {
                 let lights = &mut ws.claude_lights;
                 lights.cursor_owed |= lights.glass_hover() != was;
             }
+            self.evict_stale_glass_selection(wid);
+        } else if regridded || places_changed || chrome_changed {
+            self.evict_stale_glass_hover(wid);
         }
-        self.evict_stale_glass_hover(wid);
+    }
+
+    /// Record that a paste or close confirmation band covered the top rows in `wid`.
+    pub(crate) fn note_band_covered(&mut self, wid: WindowId) {
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.claude_lights.band_covered = true;
+        }
+    }
+
+    /// Clear any keyboard selection in `wid` whose target moved away or was covered by a chrome band.
+    fn evict_stale_glass_selection(&mut self, wid: WindowId) {
+        let mut had_fact = false;
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            let chrome_rows = &ws.chrome_rows;
+            if ws
+                .claude_lights
+                .selection_stale(|row| chrome_rows.iter().any(|band| band.contains(&row)))
+            {
+                had_fact = ws
+                    .claude_lights
+                    .selected
+                    .is_some_and(|(_, t)| t.fact().is_some());
+                ws.claude_lights.select(None);
+                redraw(ws);
+            }
+        }
+        if had_fact {
+            self.note_fact_readings(wid);
+        }
     }
 
     /// Clear any glass hover in `wid` whose target moved away or was covered by a chrome band.
     pub(crate) fn evict_stale_glass_hover(&mut self, wid: WindowId) {
+        self.evict_stale_glass_selection(wid);
         let Some(lights) = self.windows.get(&wid).map(|ws| &ws.claude_lights) else {
             return;
         };
@@ -5279,10 +5362,13 @@ impl App {
             .claude_lights
             .footers
             .iter()
-            .find(|(id, _)| *id == session)
-            .map(|(_, room)| *room);
+            .find(|(id, term_row, _)| {
+                *id == session && !ws.chrome_rows.iter().any(|band| band.contains(term_row))
+            })
+            .map(|(_, _, room)| *room);
         let stale = ws.claude_lights.selected.is_some_and(|(id, target)| {
             id != session
+                || (matches!(target, Target::Chip(_)) && room.is_none())
                 || ((ws.claude_lights.selection_painted || !matches!(target, Target::Chip(_)))
                     && !ws.claude_lights.shows_uncovered(id, target, |row| {
                         ws.chrome_rows.iter().any(|band| band.contains(&row))
@@ -7324,7 +7410,11 @@ mod gesture_tests {
                 };
                 assert_eq!(chips, want, "{mode:?} hosted={hosted}");
                 assert_eq!(
-                    lights.footers.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+                    lights
+                        .footers
+                        .iter()
+                        .map(|(s, _, _)| *s)
+                        .collect::<Vec<_>>(),
                     vec![session],
                     "{mode:?}"
                 );

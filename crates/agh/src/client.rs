@@ -5,8 +5,10 @@
 
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
+
+use aterm_types::MutexExt;
 
 use crate::classify;
 use crate::config::Dirs;
@@ -459,7 +461,7 @@ struct Binder<'a> {
 
 impl Drop for Binder<'_> {
     fn drop(&mut self) {
-        let mut held = self.gh.bindings();
+        let mut held = self.gh.inner.bound.lock_or_recover();
         if self.bound {
             held.profiles.insert(self.profile.to_string(), true);
         } else {
@@ -895,7 +897,7 @@ impl Github {
         if spent.requests == 0 {
             return;
         }
-        let mut meter = self.lock_meter();
+        let mut meter = self.inner.meter.lock_or_recover();
         meter.requests = meter.requests.saturating_add(spent.requests);
         for (identity, count) in &spent.rest_requests {
             let entry = meter.rest_requests.entry(identity.clone()).or_default();
@@ -1281,6 +1283,14 @@ impl Github {
     ///
     /// As `git::run`.
     pub fn run_git(&self, run: &GitRun) -> Result<GitOut> {
+        if matches!(
+            run.op,
+            crate::git::GitOp::PushControl { dry_run: false, .. }
+        ) {
+            return Err(Error::usage(
+                "a control transaction requires the journaled refs resource boundary",
+            ));
+        }
         crate::git::run(self, run)
     }
 
@@ -1323,7 +1333,9 @@ impl Github {
                 .map(|v| v.intent.id),
         );
         let id = intents.begin(&draft)?;
-        let result = self.run_git(run);
+        // This private entry is reached only after the durable intent begins.
+        // Public run_git refuses unjournaled mutable control transactions.
+        let result = crate::git::run(self, run);
         let settled = match &result {
             Ok(_) => Settled::Created {
                 id: 0,
@@ -1390,7 +1402,7 @@ impl Github {
     /// Record a `--notify` post's receipt value in the meter: `notify::settled` calls it, and
     /// `Receipt::metered` prints it as the note `notify={value}`.
     pub(crate) fn note_notify(&self, value: String) {
-        self.lock_meter().notify = Some(value);
+        self.inner.meter.lock_or_recover().notify = Some(value);
     }
 
     /// The directories `GithubBuilder::journal` set, if any.
@@ -2020,7 +2032,7 @@ impl Github {
             }
             Decision::Anonymous { why } => {
                 if why != AnonymousWhy::Asked {
-                    self.lock_meter().fell_to_anonymous = true;
+                    self.inner.meter.lock_or_recover().fell_to_anonymous = true;
                 }
                 Ok((
                     Decided {
@@ -2109,7 +2121,7 @@ impl Github {
         if !matches!(row.source, Source::Inline(_)) {
             return Ok(());
         }
-        let mut held = self.bindings();
+        let mut held = self.inner.bound.lock_or_recover();
         loop {
             match held.profiles.get(profile) {
                 Some(true) => return Ok(()),
@@ -2161,14 +2173,6 @@ impl Github {
             format!("the token of {profile} is {got}'s, and {profile} names {expected}"),
         )
         .with_sub(Sub::LoginMismatch { expected, got }))
-    }
-
-    /// The login bindings, held.
-    fn bindings(&self) -> MutexGuard<'_, Bindings> {
-        self.inner
-            .bound
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Pacing (design §7.4): a write attempt begins at least 1 s of `fx.mono()` after this
@@ -2234,7 +2238,7 @@ impl Github {
         let (body, digest) = write_body(call, &mut file, self.taped())?;
         let request = prepared.write_request(permit, body, digest.as_deref());
         {
-            let mut meter = self.lock_meter();
+            let mut meter = self.inner.meter.lock_or_recover();
             meter.requests = meter.requests.saturating_add(1);
             meter.as_ = Some(prepared.as_.clone());
             if matches!(prepared.origin, OriginRole::Api | OriginRole::Uploads) {
@@ -2274,7 +2278,7 @@ impl Github {
         };
         let rate = RateSnapshot::from_headers(&response.headers);
         if let Some(snapshot) = &rate {
-            self.lock_meter().rate = Some(snapshot.clone());
+            self.inner.meter.lock_or_recover().rate = Some(snapshot.clone());
             if booked {
                 self.inner.rate_book.record(key, snapshot);
             }
@@ -2312,13 +2316,6 @@ impl Github {
             rate,
         };
         Err(self.finish_error(error, call, &prepared.as_, Some(exchange)))
-    }
-
-    fn lock_meter(&self) -> std::sync::MutexGuard<'_, Meter> {
-        self.inner
-            .meter
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn prepare(&self, call: &Call, decided: &Decided, reading: Reading) -> Prepared {
@@ -2387,7 +2384,7 @@ impl Github {
     fn send(&self, prepared: &Prepared) -> Result<std::result::Result<WireResponse, WireError>> {
         self.check_anonymous_api(prepared)?;
         {
-            let mut meter = self.lock_meter();
+            let mut meter = self.inner.meter.lock_or_recover();
             meter.requests = meter.requests.saturating_add(1);
             meter.as_ = Some(prepared.as_.clone());
             if matches!(prepared.origin, OriginRole::Api | OriginRole::Uploads) {
@@ -2473,7 +2470,7 @@ impl Github {
                 Ok(mut response) => {
                     let rate = RateSnapshot::from_headers(&response.headers);
                     if let Some(snapshot) = &rate {
-                        self.lock_meter().rate = Some(snapshot.clone());
+                        self.inner.meter.lock_or_recover().rate = Some(snapshot.clone());
                         if booked {
                             self.inner.rate_book.record(key, snapshot);
                         }
@@ -2678,7 +2675,11 @@ impl Github {
             .saturating_add(failed.requests)
             .saturating_add(looked.requests);
         got.moved = Some((old, new));
-        self.lock_meter().moved.clone_from(&got.moved);
+        self.inner
+            .meter
+            .lock_or_recover()
+            .moved
+            .clone_from(&got.moved);
         Ok(got)
     }
 
@@ -2714,7 +2715,7 @@ impl Github {
             }
         };
         {
-            let mut meter = self.lock_meter();
+            let mut meter = self.inner.meter.lock_or_recover();
             meter.requests = meter.requests.saturating_add(1);
             meter.hopped = true;
         }

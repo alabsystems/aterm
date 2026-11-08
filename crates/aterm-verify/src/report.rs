@@ -111,6 +111,71 @@ fn unit_dispatch(value: &aterm_json::Value) -> Option<UnitDispatch<'_>> {
     })
 }
 
+/// One complete compiler message observed, without whole-output joins or completion evidence.
+pub(crate) fn provisional_compile_event(stage: &str, line: &str) -> Option<String> {
+    let UnitMessage::Unit(value) = aterm_json::from_str::<UnitMessage>(line).ok()? else {
+        return None;
+    };
+    let reason = value.get("reason")?.as_str()?;
+    let (kind, mode, compile_kind, target_name, target_kinds) = match reason {
+        "compilation-unit-dispatched" => {
+            let dispatch = unit_dispatch(&value)?;
+            (
+                "dispatch",
+                Some(dispatch.mode),
+                Some(dispatch.kind),
+                None,
+                None,
+            )
+        }
+        "compiler-artifact" => {
+            let target = value.get("target")?;
+            let name = target.get("name")?.as_str()?;
+            if name.is_empty()
+                || name.len() > 256
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            {
+                return None;
+            }
+            let kinds = crate::compiler_message::artifact_target_kinds(&value).ok()?;
+            if kinds.is_empty()
+                || kinds.len() > 16
+                || kinds.iter().any(|kind| {
+                    !matches!(
+                        *kind,
+                        "lib"
+                            | "rlib"
+                            | "dylib"
+                            | "cdylib"
+                            | "staticlib"
+                            | "proc-macro"
+                            | "bin"
+                            | "example"
+                            | "test"
+                            | "bench"
+                            | "custom-build"
+                    )
+                })
+            {
+                return None;
+            }
+            ("artifact", None, None, Some(name), Some(kinds))
+        }
+        _ => return None,
+    };
+    Some(format!(
+        "verify-event: {}",
+        aterm_json::json!({
+            "schema":1, "event":"compile-message-observed", "stage":stage,
+            "provisional":true, "sample_complete":false, "message_kind":kind,
+            "compile_mode":mode, "compile_kind":compile_kind,
+            "target_name":target_name, "target_kinds":target_kinds,
+        })
+    ))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct UnitContext<'a> {
     mode: Option<&'a str>,
@@ -210,7 +275,7 @@ pub fn compile_unit_events(stage: &str, output: &str) -> Vec<String> {
     for message in &messages {
         let UnitMessage::Unit(value) = message else {
             dispatches.push(None);
-            if let UnitMessage::Ambiguous(identities) = message {
+            if let UnitMessage::Ambiguous { identities, .. } = message {
                 for identity in identities {
                     units.entry(identity).or_default().ambiguous = true;
                 }
@@ -762,6 +827,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn provisional_messages_expose_only_strict_bounded_metadata() {
+        let capture = include_str!("../tests/fixtures/targo-unit-dispatch-v1.jsonl");
+        let dispatch = capture.lines().next().unwrap();
+        let artifact = capture.lines().nth(1).unwrap();
+        for line in [dispatch, artifact] {
+            let wire = provisional_compile_event("test compile", line).unwrap();
+            let value: aterm_json::Value =
+                aterm_json::from_str(wire.strip_prefix("verify-event: ").unwrap()).unwrap();
+            assert_eq!(value["provisional"].as_bool(), Some(true));
+            assert_eq!(value["sample_complete"].as_bool(), Some(false));
+            for key in [
+                "fresh",
+                "dirty_reason",
+                "producer_unit_sha256",
+                "manifest_path",
+                "package_id",
+                "executable",
+                "artifact_reported",
+            ] {
+                assert!(value.get(key).is_none(), "{key}");
+            }
+            assert!(!wire.contains("/Users/"));
+        }
+        for wire in [
+            dispatch.replace("\"build\"", "\"unknown-mode\""),
+            dispatch.replace("\"host\"", "\"unknown-kind\""),
+            dispatch.replace("\"changed-env\"", "\"unknown-cause\""),
+            dispatch.replace("\"reason\":", "\"extra\":true,\"reason\":"),
+            dispatch.replace("\"fresh\":false,", ""),
+            dispatch.replace(
+                "3585558e13bc333691c3e05830d0ce2175baa184bf4ff01aa9f76465b5784241",
+                "invalid",
+            ),
+            dispatch.replace("\"reason\":", "\"reason\":\"build-finished\",\"reason\":"),
+            artifact.replace(
+                "\"name\":\"dispatch_serialization_probe\"",
+                "\"name\":\"/private/path\"",
+            ),
+            artifact.replace("\"kind\":[\"lib\"]", "\"kind\":[\"unrecognized\"]"),
+            artifact.replace("\"target\":{", "\"target\":{\"name\":\"duplicate\","),
+            artifact.replace("\"features\":[]", "\"features\":[{\"x\":1,\"x\":2}]"),
+        ] {
+            assert!(provisional_compile_event("test compile", &wire).is_none());
+        }
+    }
+
+    #[test]
     fn duplicate_wire_fields_cannot_establish_a_unit_cause_or_artifact_match() {
         let capture = include_str!("../tests/fixtures/targo-unit-dispatch-v1.jsonl");
         let dispatch = capture.lines().next().unwrap();
@@ -908,6 +1020,52 @@ mod tests {
                 .iter()
                 .any(|event| event.contains("\"rebuild_reason\":\"changed-env\""))
         );
+    }
+
+    #[test]
+    fn decoded_ambiguous_artifact_kind_preserves_every_identity_taint() {
+        let x = "a".repeat(64);
+        let y = "b".repeat(64);
+        let z = "c".repeat(64);
+        let ambiguous = format!(
+            r#"{{"re\u0061son":"compiler-\u0061rtifact","trust_unit_identity_sha256":"{x}","trust_unit_identity_sha256":"{y}"}}"#
+        );
+        let output = [
+            producer_dispatch(&x).to_string(),
+            producer_artifact(&x).to_string(),
+            producer_dispatch(&y).to_string(),
+            producer_artifact(&y).to_string(),
+            producer_dispatch(&z).to_string(),
+            producer_artifact(&z).to_string(),
+            ambiguous,
+        ]
+        .join("\n");
+        let events: Vec<aterm_json::Value> =
+            compile_unit_events("escaped ambiguous artifact", &output)
+                .iter()
+                .map(|line| {
+                    aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap()
+                })
+                .collect();
+        for identity in [&x, &y, &z] {
+            let event = events
+                .iter()
+                .find(|event| {
+                    event["event"].as_str() == Some("compile-unit-finished")
+                        && event["producer_unit_sha256"].as_str() == Some(identity.as_str())
+                })
+                .unwrap();
+            if identity == &z {
+                assert_eq!(event["rebuild_reason"].as_str(), Some("changed-file"));
+            } else {
+                assert!(event["rebuild_reason"].is_null());
+                assert_eq!(
+                    event["rebuild_reason_status"].as_str(),
+                    Some("ambiguous-message")
+                );
+            }
+        }
+        assert_eq!(crate::compile_account::read(&output).units.unknown, 1);
     }
 
     fn producer_artifact(identity: &str) -> aterm_json::Value {

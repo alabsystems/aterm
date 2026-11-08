@@ -21,10 +21,24 @@ struct Region {
 fn mac_with(
     pid: u32,
     dirs: &[PathBuf],
-    mut read: impl FnMut(u64) -> Result<Option<Region>, Failed>,
+    read: impl FnMut(u64) -> Result<Option<Region>, Failed>,
 ) -> Result<Option<PathUse>, Failed> {
+    mac_started(pid, dirs, read, std::time::Instant::now())
+}
+
+#[cfg(target_vendor = "apple")]
+fn mac_started(
+    pid: u32,
+    dirs: &[PathBuf],
+    mut read: impl FnMut(u64) -> Result<Option<Region>, Failed>,
+    started: std::time::Instant,
+) -> Result<Option<PathUse>, Failed> {
+    let deadline = started + super::super::SCAN_DEADLINE;
     let mut at = 0;
-    for _ in 0..65_536 {
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(Failed::Other);
+        }
         let Some(region) = read(at)? else {
             return Ok(None);
         };
@@ -44,7 +58,6 @@ fn mac_with(
         }
         at = next;
     }
-    Err(Failed::Other)
 }
 
 #[cfg(target_vendor = "apple")]
@@ -89,23 +102,26 @@ fn mac_region(buf: &[u8]) -> Result<Region, Failed> {
 #[cfg(target_vendor = "apple")]
 pub(super) fn mac_uses(pid: u32, dirs: &[PathBuf]) -> Result<Option<PathUse>, Failed> {
     let n = i32::try_from(pid).map_err(|_| Failed::Other)?;
-    mac_with(pid, dirs, |at| {
-        crate::progress::tick();
-        let mut buf = [0u8; ffi::REGION_SIZE];
-        clear_errno();
-        // SAFETY: `buf` is writable for the SDK-checked record size passed to libproc.
-        let got = unsafe {
-            ffi::proc_pidinfo(
-                n,
-                ffi::PROC_PIDREGIONPATHINFO,
-                at,
-                buf.as_mut_ptr().cast(),
-                i32::try_from(buf.len()).map_err(|_| Failed::Other)?,
-            )
-        };
-        let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-        mac_answer(got, error, &buf)
-    })
+    mac_with(pid, dirs, |at| read_mac_region(n, at))
+}
+
+#[cfg(target_vendor = "apple")]
+fn read_mac_region(n: i32, at: u64) -> Result<Option<Region>, Failed> {
+    crate::progress::tick();
+    let mut buf = [0u8; ffi::REGION_SIZE];
+    clear_errno();
+    // SAFETY: `buf` is writable for the SDK-checked record size passed to libproc.
+    let got = unsafe {
+        ffi::proc_pidinfo(
+            n,
+            ffi::PROC_PIDREGIONPATHINFO,
+            at,
+            buf.as_mut_ptr().cast(),
+            i32::try_from(buf.len()).map_err(|_| Failed::Other)?,
+        )
+    };
+    let error = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    mac_answer(got, error, &buf)
 }
 
 #[cfg(target_vendor = "apple")]
@@ -439,6 +455,43 @@ mod mac_tests {
     use super::*;
 
     #[test]
+    fn actual_native_mapping_walk_survives_a_large_unrelated_prefix() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let pid = std::process::id();
+        let native = i32::try_from(pid).unwrap();
+        let mut calls = 0;
+        let found = mac_with(pid, &[scratch.path().to_owned()], |at| {
+            calls += 1;
+            if calls <= 65_536 {
+                Ok(Some(Region {
+                    address: at,
+                    len: 1,
+                    path: None,
+                }))
+            } else {
+                read_mac_region(native, at)
+            }
+        })
+        .unwrap();
+        assert!(found.is_none());
+        assert!(calls > 65_536);
+        let mut called = false;
+        assert!(
+            mac_started(
+                pid,
+                &[scratch.path().to_owned()],
+                |_| {
+                    called = true;
+                    Ok(None)
+                },
+                std::time::Instant::now() - std::time::Duration::from_secs(61)
+            )
+            .is_err()
+        );
+        assert!(!called);
+    }
+
+    #[test]
     fn short_truncated_and_unnamed_file_regions_are_unknown() {
         let mut buf = [0u8; ffi::REGION_SIZE];
         buf[ffi::REGION_ADDRESS..ffi::REGION_ADDRESS + 8].copy_from_slice(&4096u64.to_ne_bytes());
@@ -502,11 +555,16 @@ mod mac_tests {
             .is_err()
         );
         assert!(
-            mac_with(7, &dirs, |at| Ok(Some(Region {
-                address: at,
-                len: 1,
-                path: None
-            })))
+            mac_started(
+                7,
+                &dirs,
+                |at| Ok(Some(Region {
+                    address: at,
+                    len: 1,
+                    path: None
+                })),
+                std::time::Instant::now() - std::time::Duration::from_secs(61)
+            )
             .is_err()
         );
         assert!(mac_with(7, &dirs, |_| Ok(None)).unwrap().is_none());

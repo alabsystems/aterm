@@ -6,7 +6,6 @@ use std::{
     fs::File,
     io::{Seek, SeekFrom},
     os::fd::{AsRawFd, FromRawFd},
-    time::Duration,
 };
 use trust_resource_controller::{
     Channel, CommandSpec, Delegations as WireDelegations, JobBinding, ProducerChallenge, Role,
@@ -14,7 +13,7 @@ use trust_resource_controller::{
 const ACTOR: &str = "ATERM_PROXY_INTAKE_FIXTURE";
 const MODE: &str = "ATERM_PROXY_INTAKE_MODE";
 fn deadline() -> Instant {
-    Instant::now() + Duration::from_secs(30)
+    crate::fixture_deadline(Instant::now())
 }
 fn request() -> Request {
     Request {
@@ -161,7 +160,7 @@ fn cached_helper_intake_success_deny_wrong_challenge_and_truncated_bundle() {
                 channel
                     .send(&challenge.answer().unwrap(), deadline())
                     .unwrap();
-                held.recv_timeout(Duration::from_secs(30)).unwrap();
+                held.recv_timeout(crate::FIXTURE_HANG).unwrap();
             }))
         } else {
             None

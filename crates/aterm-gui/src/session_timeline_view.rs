@@ -325,12 +325,13 @@ fn project_mark(r: &Rec) -> Option<(&'static str, String)> {
         }
         Kind::Human if f.get_word(Key::Why) == Some("mail") => return None,
         Kind::Human => (crate::session_timeline::HUMAN, String::new()),
+        // A command line set as the title is its fingerprint alone (unit J1-1, SMOKE-1e).
         Kind::Title => (
             crate::session_timeline::TITLE_CHANGE,
-            format!(
-                "title={}",
-                crate::control::pct_encode(f.get_str(Key::Title).unwrap_or(""))
-            ),
+            match (f.get_str(Key::Title), f.get(Key::TitleFp)) {
+                (None, Some(_)) => format!("title=- title_fp={}", text(f, Key::TitleFp)),
+                (title, _) => format!("title={}", crate::control::pct_encode(title.unwrap_or(""))),
+            },
         ),
         Kind::Cwd => (
             crate::session_timeline::CWD_CHANGE,

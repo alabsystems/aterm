@@ -15,6 +15,7 @@
 #[cfg(unix)]
 mod common;
 
+mod compile_wrapper;
 mod conformance_end_by_proof;
 mod conformance_test_dispatch;
 mod gate_contract;

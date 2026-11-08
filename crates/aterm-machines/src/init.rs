@@ -3511,6 +3511,17 @@ pub fn run_workstation_selected(
     prepare_workstation_selected(sys, group, selected)?.run(sys, mode)
 }
 
+pub use crate::init_preferences::KeyboardAttachmentReceipt;
+
+/// Whether the requested service cohort reached an actual final probe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeyboardAttachmentActivation {
+    /// A service or its current setup authority remains unverified.
+    Unfinished,
+    /// Complete final probe states, including explicit unowned choices and held services.
+    Verified(KeyboardAttachmentReceipt),
+}
+
 /// Activate accepted Caps defaults on the new HID services only. The caller holds the setup
 /// profile lock and checks its exact-run Stop before each item, including this process's Stop.
 /// A requested service absent from the model or mapping census stays retryable; each one must
@@ -3526,7 +3537,7 @@ pub fn activate_keyboard_attachments(
     kept: &dyn Fn(&str) -> bool,
     continues: &dyn Fn() -> bool,
     invalidate: &dyn Fn(),
-) -> Result<bool, String> {
+) -> Result<KeyboardAttachmentActivation, String> {
     struct BeforeChange<'a> {
         inner: &'a mut dyn Journal,
         invalidate: &'a dyn Fn(),
@@ -3577,9 +3588,10 @@ pub fn activate_keyboard_attachments(
         };
         let mut ready = true;
         let mut covered = crate::facts::KeyboardCoverage::default();
+        let mut receipt = KeyboardAttachmentReceipt::empty();
         for item in &items {
             if !continues() {
-                return Ok(false);
+                return Ok(KeyboardAttachmentActivation::Unfinished);
             }
             if kept(&item.id()) {
                 let observed = item.inspect_kept(sys)?;
@@ -3589,6 +3601,7 @@ pub fn activate_keyboard_attachments(
                 {
                     invalidate_once();
                 }
+                receipt.merge(item.kept_receipt(&observed));
                 covered.include(observed);
                 continue;
             }
@@ -3621,10 +3634,19 @@ pub fn activate_keyboard_attachments(
                 )
             });
             covered.include(item.observed_services());
+            if let Some(verified) = item.verified() {
+                receipt.merge(verified);
+            } else {
+                ready = false;
+            }
         }
-        Ok(ready && covered.covers(registries))
+        Ok(if ready && covered.covers(registries) && continues() {
+            KeyboardAttachmentActivation::Verified(receipt)
+        } else {
+            KeyboardAttachmentActivation::Unfinished
+        })
     })();
-    if !matches!(result, Ok(true)) {
+    if !matches!(result, Ok(KeyboardAttachmentActivation::Verified(_))) {
         invalidate_once();
     }
     result
@@ -8885,9 +8907,12 @@ mod tests {
         let sys = alice_at(501);
         let invalidated = std::cell::Cell::new(0);
         assert!(
-            !activate_keyboard_attachments(&sys, &[41], &|_| false, &|| true, &|| invalidated
-                .set(invalidated.get() + 1))
-            .unwrap(),
+            matches!(
+                activate_keyboard_attachments(&sys, &[41], &|_| false, &|| true, &|| invalidated
+                    .set(invalidated.get() + 1))
+                .unwrap(),
+                KeyboardAttachmentActivation::Unfinished
+            ),
             "a native service missing from the separate model census remains retryable"
         );
         assert_eq!(
@@ -8923,8 +8948,10 @@ mod tests {
         );
         assert_eq!(sys.keyboard_service_ids().unwrap(), [41]);
         assert!(
-            !activate_keyboard_attachments(&sys, &[41], &|_| false, &|| true, &|| {})
-                .unwrap_or(false),
+            !matches!(
+                activate_keyboard_attachments(&sys, &[41], &|_| false, &|| true, &|| {}),
+                Ok(KeyboardAttachmentActivation::Verified(_))
+            ),
             "attachment activation still owes the service absent from the model census"
         );
 
@@ -9173,11 +9200,12 @@ mod tests {
             Ran::ok("RegistryID Key Value\n29 UserKeyMapping (null)\n"),
         );
         let invalidated = std::cell::Cell::new(0);
-        assert!(
+        assert!(matches!(
             activate_keyboard_attachments(&sys, &[41], &|_| true, &|| true, &|| invalidated
                 .set(invalidated.get() + 1))
-            .unwrap()
-        );
+            .unwrap(),
+            KeyboardAttachmentActivation::Verified(_)
+        ));
         assert_eq!(
             invalidated.get(),
             1,
@@ -9185,9 +9213,13 @@ mod tests {
         );
         invalidated.set(0);
         assert!(
-            !activate_keyboard_attachments(&sys, &[41, 42], &|_| true, &|| true, &|| invalidated
-                .set(invalidated.get() + 1))
-            .unwrap(),
+            matches!(
+                activate_keyboard_attachments(&sys, &[41, 42], &|_| true, &|| true, &|| {
+                    invalidated.set(invalidated.get() + 1)
+                })
+                .unwrap(),
+                KeyboardAttachmentActivation::Unfinished
+            ),
             "an observed held model cannot cover an unseen requested service"
         );
         assert_eq!(invalidated.get(), 1, "kept and uncertain coverage coalesce");

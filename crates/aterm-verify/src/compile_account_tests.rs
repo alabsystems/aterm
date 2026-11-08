@@ -56,6 +56,39 @@ fn units_are_fresh_compiled_or_unknown_and_never_guessed() {
     assert_eq!(read("").units, Units::default());
 }
 
+/// JSON spelling and unrelated values cannot decide whether an ambiguous message names an
+/// artifact. Every decoded top-level artifact reason counts once as unknown, in either order.
+#[test]
+fn ambiguous_units_use_decoded_top_level_reasons() {
+    for wire in [
+        r#"{"reason":"compiler-\u0061rtifact","fresh":false,"fresh":true}"#,
+        r#"{"re\u0061son":"compiler-artifact","fresh":false,"fresh":true}"#,
+        r#"{"reason":"compilation-unit-dispatched","reason":"compiler-artifact"}"#,
+        r#"{"reason":"compiler-artifact","reason":"compilation-unit-dispatched"}"#,
+        r#"{"reason":"build-finished","re\u0061son":"compiler-\u0061rtifact"}"#,
+    ] {
+        let artifacts = read(wire);
+        assert_eq!(
+            artifacts.units,
+            Units {
+                unknown: 1,
+                ..Units::default()
+            },
+            "{wire}"
+        );
+        assert!(artifacts.written.is_empty());
+    }
+    for wire in [
+        r#"{"reason":"compilation-unit-dispatched","note":"compiler-artifact","mode":"build","mode":"check"}"#,
+        r#"{"reason":"compilation-unit-dispatched","note":{"reason":"compiler-artifact","x":1,"x":2}}"#,
+        r#"{"reason":"compilation-unit-dispatched","reason":"build-finished","note":"compiler-artifact"}"#,
+    ] {
+        let artifacts = read(wire);
+        assert_eq!(artifacts.units, Units::default(), "{wire}");
+        assert!(artifacts.written.is_empty());
+    }
+}
+
 /// A call's output bytes are the regular files each artifact it did not report fresh names, one
 /// metadata read each: a path named twice, and a hard link of a file already counted (an uplifted
 /// binary beside its `deps/` copy), count once; a directory (`.dSYM`), a symlink and a file that is

@@ -263,6 +263,65 @@ fn billing_command_observes_only_public_binding_metadata_and_does_not_enroll_or_
 }
 
 #[test]
+#[cfg(unix)]
+fn native_billing_preparation_waits_for_unchanged_custody() {
+    let f = Fixture::new(1);
+    let reference = f.policy("example-v1").reference([41; 32]).unwrap();
+    f.issue(31, 0, reference, vec![]);
+    let expected =
+        super::super::command::prepare_at([31; 32], f.lab.paths[0].clone(), deadline()).unwrap();
+    let held = aterm_uds::private_file::PrivateLock::take_with(
+        &f.lab.paths[0].dir,
+        "commons.lock",
+        Duration::ZERO,
+        "private custody held",
+        || {},
+    )
+    .unwrap();
+    let mut held = Some(held);
+    let result = aterm_uds::file_lock::with_lock_wait_observer(
+        move |_| {
+            if let Some(held) = held.take() {
+                drop(held);
+            }
+        },
+        || {
+            super::super::command::prepare_started(
+                [31; 32],
+                f.lab.paths[0].clone(),
+                Instant::now() - Duration::from_secs(3),
+            )
+        },
+    );
+    assert_eq!(result.unwrap(), expected);
+    let held = aterm_uds::private_file::PrivateLock::take_with(
+        &f.lab.paths[0].dir,
+        "commons.lock",
+        Duration::ZERO,
+        "private custody held",
+        || {},
+    )
+    .unwrap();
+    assert!(
+        super::super::command::prepare_started(
+            [31; 32],
+            f.lab.paths[0].clone(),
+            Instant::now() - Duration::from_secs(61)
+        )
+        .is_err()
+    );
+    drop(held);
+    assert!(
+        f.source(31, 0)
+            .prepare_until(deadline())
+            .unwrap()
+            .resources()
+            .snapshot()
+            .is_err()
+    );
+}
+
+#[test]
 fn root_pinned_aliases_share_fixed_offline_capacity_and_sync_later() {
     let f = Fixture::new(2);
     let reference = f.policy("example-v1").reference([41; 32]).unwrap();

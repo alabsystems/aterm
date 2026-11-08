@@ -169,6 +169,9 @@ impl World {
     /// A real run's backend named the shared checkout (`dry`: a dry run's), its logs its own.
     fn real(&self, dry: bool) -> Real {
         let mut real = Real::new(&self.repo, Some(&self.shared), dry, false).unwrap();
+        real.engine_repository = Ok(agh::Slug::parse("fixture/app").unwrap());
+        real.engine_origin = crate::github_remote::engine_fixture;
+        real.engine_url = tests::fixture_engine_url;
         real.prerequisite_acquire = crate::managed_prerequisites::simulated;
         real.scanner_probe = |_| Ok(scanner_tools::test_output());
         real.logs = self.root.join(format!("logs-{}", u8::from(dry)));
@@ -202,9 +205,10 @@ impl World {
              git -C '{peer}' add -A\n\
              git -C '{peer}' -c commit.gpgsign=false commit -q -m 'peer engine code'\n\
              git -C '{peer}' push -q origin HEAD:main\n\
-             git -C {checkout} fetch -q origin\n\
+             git -C {checkout} fetch -q '{origin}' refs/heads/main:refs/remotes/origin/main\n\
              git -C {checkout} merge -q --ff-only origin/main\n",
             peer = self.peer.display(),
+            origin = self.origin.display(),
         )
     }
 
@@ -274,6 +278,7 @@ fn a_second_writer_moving_the_shared_engine_mid_stage_leaves_the_stage_unaffecte
 
     // NEGATIVE CONTROL: the release's engine as the checkout it was named.
     w.mid_stage(&w.lands_and_aligns("pub-ledger", &format!("'{}'", w.shared.display())));
+    tests::bind_native_engine_fixture(&w.shared, &w.origin);
     real.engine = w.shared.clone();
     let ran = Backend::stage(&mut real, &w.candidate, &w.prover, StageTarget::Remote).unwrap();
     let log = w.log(&real);
@@ -311,9 +316,10 @@ fn the_releases_own_engine_still_refuses_code_moving_its_head_mid_stage() {
          printf '{{\"mappings\":{{\"other\":{{}}}}}}\\n' > '{peer}/mappings.json'\n\
          git -C '{peer}' -c commit.gpgsign=false commit -q -am 'feat(ledger): other'\n\
          git -C '{peer}' push -q origin HEAD:main\n\
-         git -C \"$1\" fetch -q origin\n\
+         git -C \"$1\" fetch -q '{origin}' refs/heads/main:refs/remotes/origin/main\n\
          git -C \"$1\" merge -q --ff-only origin/main\n",
-        peer = w.peer.display()
+        peer = w.peer.display(),
+        origin = w.origin.display()
     ));
     let ran = Backend::stage(&mut real, &w.candidate, &w.prover, StageTarget::Remote).unwrap();
     let log = w.log(&real);
@@ -359,7 +365,7 @@ fn step_two_makes_the_releases_engine_from_its_origin_and_never_writes_the_named
         "origin/main"
     );
     assert_eq!(
-        git_in(&copy, &["remote", "get-url", "origin"]),
+        tests::fixture_engine_url(&copy).unwrap(),
         w.origin.display().to_string()
     );
     assert_eq!(git_in(&copy, &["config", "user.name"]), SHARED_NAME);
@@ -392,7 +398,7 @@ fn step_two_makes_the_releases_engine_from_its_origin_and_never_writes_the_named
     );
     real.engine_sync().unwrap();
     assert_eq!(
-        git_in(&copy, &["remote", "get-url", "origin"]),
+        tests::fixture_engine_url(&copy).unwrap(),
         mirror.display().to_string()
     );
     assert_eq!(
@@ -411,7 +417,7 @@ fn step_two_makes_the_releases_engine_from_its_origin_and_never_writes_the_named
     // Holding nothing the mirror lacks, the copy is made again from the origin named now.
     real.engine_sync().unwrap();
     assert_eq!(
-        git_in(&copy, &["remote", "get-url", "origin"]),
+        tests::fixture_engine_url(&copy).unwrap(),
         w.origin.display().to_string()
     );
     assert_eq!(git_in(&copy, &["rev-parse", "HEAD"]), w.origin_main());
@@ -649,6 +655,8 @@ fn every_child_of_a_real_run_is_handed_the_releases_engine() {
     // The re-run as R's own cutter: named the copy, it runs it in place, from its own origin.
     w.peer_lands_code("pub-again");
     let mut again = Real::new(&w.repo, Some(&copy), false, false).unwrap();
+    again.engine_origin = crate::github_remote::engine_fixture;
+    again.engine_url = tests::fixture_engine_url;
     again.logs = w.root.join("logs-again");
     std::fs::create_dir_all(&again.logs).unwrap();
     assert_eq!((&again.engine, &again.engine_source), (&copy, &copy));
@@ -656,7 +664,7 @@ fn every_child_of_a_real_run_is_handed_the_releases_engine() {
     again.engine_sync().unwrap();
     assert_eq!(git_in(&copy, &["rev-parse", "HEAD"]), w.origin_main());
     assert_eq!(
-        git_in(&copy, &["remote", "get-url", "origin"]),
+        tests::fixture_engine_url(&copy).unwrap(),
         w.origin.display().to_string()
     );
 }
@@ -726,7 +734,7 @@ fn a_copy_of_another_origin_is_made_again_and_never_delivered_to_this_one() {
     point(&w.origin);
     real.engine_sync().unwrap();
     assert_eq!(
-        git_in(&copy, &["remote", "get-url", "origin"]),
+        tests::fixture_engine_url(&copy).unwrap(),
         w.origin.display().to_string()
     );
     assert_eq!(git_in(&copy, &["rev-parse", "HEAD"]), origin_was);
@@ -797,4 +805,140 @@ fn step_one_counts_the_rows_the_releases_engine_holds_unpushed() {
     next.engine_sync().unwrap();
     assert!(next.engine_rows(Some(&r)).has);
     assert!(git_in(&w.origin, &["show", "main:mappings.json"]).contains(&r));
+}
+
+/// The peer lands `path` holding `text` on the engine's origin.
+fn peer_lands(w: &World, path: &str, text: &str) {
+    git_in(&w.peer, &["pull", "-q", "--ff-only"]);
+    let file = w.peer.join(path);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, text).unwrap();
+    git_in(&w.peer, &["add", "-A"]);
+    git_in(&w.peer, &["commit", "-q", "-m", &format!("land {path}")]);
+    git_in(&w.peer, &["push", "-q", "origin", "HEAD:main"]);
+}
+
+/// The peer renames `from` to `to` on the engine's origin.
+fn peer_renames(w: &World, from: &str, to: &str) {
+    git_in(&w.peer, &["pull", "-q", "--ff-only"]);
+    std::fs::create_dir_all(w.peer.join(to).parent().unwrap()).unwrap();
+    git_in(&w.peer, &["mv", from, to]);
+    git_in(
+        &w.peer,
+        &["commit", "-q", "-m", &format!("move {from} to {to}")],
+    );
+    git_in(&w.peer, &["push", "-q", "origin", "HEAD:main"]);
+}
+
+/// THE ENGINE'S CODE IS WHAT ITS OWN STAGE GUARD CALLS CODE (`bin/pub`'s `engine_code_drift`):
+/// records, the Rust port and the engine's prose are not; every other path is, a `*.md` under
+/// `bin/` included. NEGATIVE CONTROL: the release's rule before named only the records, so
+/// `docs/`, a top-level `*.md` and `crates/` were code.
+#[test]
+fn engine_code_is_what_the_engines_own_stage_guard_calls_code() {
+    for path in [
+        "mappings.json",
+        "verification-log.jsonl",
+        "handoff/v1/x.toml",
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "crates/pubx/src/main.rs",
+        "docs/RUNBOOK.md",
+        "docs/measured/x.txt",
+        "README.md",
+        "AGENTS.md",
+        "",
+    ] {
+        assert!(!engine_code(path), "{path} is not engine code");
+    }
+    for path in [
+        "bin/pub",
+        "bin/pub_ledger.py",
+        "bin/NOTES.md",
+        "registry/repos.toml",
+        "registry/README.md",
+        "keys/registry.toml",
+        "baseline/forbidden-content.txt",
+        "pins.json",
+        "tests/test_pub.py",
+        "README.txt",
+    ] {
+        assert!(engine_code(path), "{path} is engine code");
+    }
+}
+
+/// A RESUMED RELEASE RESTAGES ONLY WHEN THE ENGINE'S CODE MOVED: the engine's main took prose
+/// (`docs/`, a top-level `*.md`) and its Rust port since the release staged, as 101 of its 438
+/// commits in the week to 2026-11-07 did, and the engine that staged is still the one that
+/// promotes (`Same`). NEGATIVE CONTROL: the rule before (only records set aside) called that
+/// `Moved` and threw the stage away. A move of `bin/` is `Moved`, naming the path; so is a
+/// rename of engine code into `docs/`, which a diff with rename detection lists only at the path
+/// it took (NEGATIVE CONTROL: without `--no-renames`, `Same`).
+#[test]
+fn a_resume_restages_only_for_a_move_of_the_engines_code() {
+    let w = World::new();
+    let mut real = w.real(false);
+    real.engine_sync().unwrap();
+    let staged = w.origin_main();
+    peer_lands(&w, "docs/notes.md", "# notes\n");
+    peer_lands(&w, "NOTES.md", "# top-level notes\n");
+    peer_lands(&w, "crates/pubx/src/main.rs", "fn main() {}\n");
+    peer_lands(&w, "Cargo.toml", "[workspace]\n");
+    real.engine_sync().unwrap();
+    assert_eq!(git_in(&w.copy(), &["rev-parse", "HEAD"]), w.origin_main());
+    match Backend::engine_now(&mut real, &staged).unwrap() {
+        EngineNow::Same(note) => assert!(note.contains("records, Rust port or prose"), "{note}"),
+        other => panic!("only prose and the port moved: {other:?}"),
+    }
+
+    peer_lands(&w, "bin/pub-tool", "# engine code\n");
+    real.engine_sync().unwrap();
+    match Backend::engine_now(&mut real, &staged).unwrap() {
+        EngineNow::Moved(why) => {
+            assert!(why.contains("bin/pub-tool"), "{why}");
+            assert!(!why.contains("docs/notes.md"), "prose is not named: {why}");
+        }
+        other => panic!("engine code moved: {other:?}"),
+    }
+
+    let staged = w.origin_main();
+    peer_renames(&w, "bin/pub-tool", "docs/pub-tool");
+    real.engine_sync().unwrap();
+    match Backend::engine_now(&mut real, &staged).unwrap() {
+        EngineNow::Moved(why) => assert!(why.contains("bin/pub-tool"), "{why}"),
+        other => panic!("engine code left bin/: {other:?}"),
+    }
+}
+
+/// A COMMIT THE RELEASE'S ENGINE HOLDS THAT RENAMES ENGINE CODE INTO ITS RECORDS IS KEPT, NOT
+/// DELIVERED: the sync lists both paths of a rename, so `bin/pub-tool` moved to `handoff/` is
+/// refused as code and the origin is untouched. NEGATIVE CONTROL: a listing with rename
+/// detection names only `handoff/pub-tool`, a record, and the sync pushed the commit that
+/// deleted engine code from the origin's main.
+#[test]
+fn a_held_rename_of_engine_code_into_the_records_is_never_delivered() {
+    let w = World::new();
+    peer_lands(&w, "bin/pub-tool", "# engine code\n");
+    let real = w.real(false);
+    real.engine_sync().unwrap();
+    let copy = w.copy();
+    std::fs::create_dir_all(copy.join("handoff")).unwrap();
+    git_in(&copy, &["mv", "bin/pub-tool", "handoff/pub-tool"]);
+    git_in(&copy, &["commit", "-q", "-m", "chore(audit): not a record"]);
+    let held = git_in(&copy, &["rev-parse", "HEAD"]);
+    let origin_was = w.origin_main();
+    let refused = real.engine_sync().unwrap_err();
+    assert!(
+        refused
+            .why
+            .contains("change more than its records (bin/pub-tool)"),
+        "{refused:?}"
+    );
+    assert_eq!(w.origin_main(), origin_was, "nothing was delivered");
+    assert_eq!(
+        git_in(&copy, &["rev-parse", "HEAD"]),
+        held,
+        "the commit is kept"
+    );
 }

@@ -293,7 +293,7 @@ fn a_rule_with_no_run_names_no_room() {
         lights
             .footers
             .iter()
-            .any(|(s, room)| *s == session && *room == 0),
+            .any(|(s, _, room)| *s == session && *room == 0),
         "the rule is on the glass with no room: {:?}",
         lights.footers
     );
@@ -487,11 +487,21 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
     );
     let mut lights = WindowLights::default();
     lights.border_toggles.push(switch(Program::Agy, off, 3));
-    lights.footers.push((3, 0));
+    lights.footers.push((3, 9, 0));
     assert_eq!(
         lights.drawn_chip(3, 0, |_| false),
         Drawn::NoRoom,
         "a rule found with no room"
+    );
+    assert_eq!(
+        lights.drawn_chip(3, 0, |row| row == 9),
+        Drawn::SwitchOnly,
+        "a rule a band covers leaves the uncovered top switch"
+    );
+    assert_eq!(
+        lights.drawn_chip(3, 0, |_| true),
+        Drawn::NoRule,
+        "a band covering both rule and switch"
     );
 }
 

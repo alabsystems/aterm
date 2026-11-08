@@ -131,7 +131,7 @@ pub(crate) fn empty_tree() -> TreeUpdate {
     }
 }
 
-/// Physical-pixel geometry of the visible grid, tab strip, and status bars within the client area.
+/// Physical-pixel geometry of the visible grid and tab strip within the client area.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct GridGeometry {
     /// Left edge of column 0, physical px from the client area's left edge.
@@ -146,10 +146,6 @@ pub(crate) struct GridGeometry {
     pub(crate) strip_y: f64,
     /// Height of the strip band in physical px (`0.0` when hidden).
     pub(crate) strip_h: f64,
-    /// Top edge of the status bar band in physical px.
-    pub(crate) bars_y: f64,
-    /// Height of one status bar row in physical px.
-    pub(crate) bar_h: f64,
 }
 
 /// Published tab entry for the in-grid tab strip.
@@ -221,100 +217,30 @@ pub(crate) struct GridFind {
     pub(crate) status: String,
 }
 
-/// Transient chrome message or status band row, published as a live region but for the link
-/// caption, which is published silent.
+/// Transient chrome message, published as a live region but for the link caption, which is
+/// published silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChromeMessage {
     /// Multi-line paste confirmation band ([`crate::paste_banner`]).
     PasteConfirm,
     /// Close/quit confirmation band ([`crate::close_confirm`]).
     CloseConfirm,
-    /// Top row of the message band (`crate::message_band`).
-    BandRow0,
-    /// The band's second row.
-    BandRow1,
-    /// The band's third row.
-    BandRow2,
-    /// Message band overflow link (`N more messages`).
-    BandOverflow,
     /// The caption naming a hovered link's destination ([`crate::link_target`]).
     LinkCaption,
-    /// Action capsule button within a message band row.
-    BandCapsule {
-        /// The band row, 0 = topmost.
-        row: u8,
-        /// Capsule slot index ([`capsule_index`] / [`capsule_action`]).
-        index: u8,
-    },
-}
-
-/// Capsule slot index for the implicit `Details ›` action.
-pub(crate) const CAPSULE_DETAILS: u8 = 2;
-const CAPSULES_PER_ROW: u64 = 4;
-const CAPSULE_BASE: u64 = 16;
-
-/// Map an [`aterm_messages::ActionIndex`] to its band capsule slot index.
-pub(crate) const fn capsule_index(action: aterm_messages::ActionIndex) -> u8 {
-    if action.is_details() {
-        CAPSULE_DETAILS
-    } else {
-        action.0
-    }
-}
-
-/// The inverse of [`capsule_index`].
-pub(crate) const fn capsule_action(index: u8) -> aterm_messages::ActionIndex {
-    if index == CAPSULE_DETAILS {
-        aterm_messages::ActionIndex::DETAILS
-    } else {
-        aterm_messages::ActionIndex(index)
-    }
 }
 
 impl ChromeMessage {
-    /// Row-level messages in top-down publish order.
-    pub(crate) const ORDER: [Self; 7] = [
-        Self::BandRow0,
-        Self::BandRow1,
-        Self::BandRow2,
-        Self::BandOverflow,
-        Self::PasteConfirm,
-        Self::CloseConfirm,
-        Self::LinkCaption,
-    ];
+    /// The messages in publish order.
+    pub(crate) const ORDER: [Self; 3] = [Self::PasteConfirm, Self::CloseConfirm, Self::LinkCaption];
 
-    /// Band row variant for `row` (`0..3`).
-    pub(crate) const fn band_row(row: usize) -> Option<Self> {
-        match row {
-            0 => Some(Self::BandRow0),
-            1 => Some(Self::BandRow1),
-            2 => Some(Self::BandRow2),
-            _ => None,
-        }
-    }
-
-    /// Band row index (`0..3`) for row variants.
-    pub(crate) const fn band_row_index(self) -> Option<usize> {
-        match self {
-            Self::BandRow0 => Some(0),
-            Self::BandRow1 => Some(1),
-            Self::BandRow2 => Some(2),
-            _ => None,
-        }
-    }
-
+    /// Its id's offset from `MESSAGE_BASE`. Slots 0, 2 to 7 and 16 to 27 belonged to surfaces that
+    /// are gone (the message band's rows, its overflow link and its capsules among them) and are
+    /// given to no other surface.
     const fn slot(self) -> u64 {
         match self {
             Self::PasteConfirm => 1,
-            Self::BandRow0 => 3,
-            Self::BandRow1 => 4,
-            Self::BandRow2 => 6,
-            Self::BandOverflow => 7,
             Self::CloseConfirm => 8,
             Self::LinkCaption => 9,
-            Self::BandCapsule { row, index } => {
-                CAPSULE_BASE + (row as u64) * CAPSULES_PER_ROW + index as u64
-            }
         }
     }
 
@@ -322,65 +248,20 @@ impl ChromeMessage {
         NodeId(MESSAGE_BASE + self.slot())
     }
 
-    /// Decode `node` to its [`ChromeMessage`], if any.
-    pub(crate) fn from_node(node: NodeId) -> Option<Self> {
-        let slot = node.0.checked_sub(MESSAGE_BASE)?;
-        if let Some(offset) = slot.checked_sub(CAPSULE_BASE) {
-            let (row, index) = (offset / CAPSULES_PER_ROW, offset % CAPSULES_PER_ROW);
-            if row < 3 && index <= u64::from(CAPSULE_DETAILS) {
-                return Some(Self::BandCapsule {
-                    row: row as u8,
-                    index: index as u8,
-                });
-            }
-            return None;
-        }
-        Self::ORDER.into_iter().find(|m| m.slot() == slot)
-    }
-
     const fn politeness(self) -> Live {
         match self {
             Self::PasteConfirm | Self::CloseConfirm => Live::Assertive,
-            Self::BandRow0
-            | Self::BandRow1
-            | Self::BandRow2
-            | Self::BandOverflow
-            | Self::BandCapsule { .. } => Live::Polite,
             // A pointer resting where links scroll past would speak every one of them.
             Self::LinkCaption => Live::Off,
         }
     }
 
-    const fn role(self, metered: bool, alarm: bool) -> Role {
+    const fn role(self) -> Role {
         match self {
             Self::PasteConfirm | Self::CloseConfirm => Role::AlertDialog,
-            Self::BandRow0 | Self::BandRow1 | Self::BandRow2 => {
-                if alarm {
-                    Role::Alert
-                } else if metered {
-                    Role::ProgressIndicator
-                } else {
-                    Role::Status
-                }
-            }
-            Self::BandOverflow => Role::Link,
             Self::LinkCaption => Role::Label,
-            Self::BandCapsule { .. } => Role::Button,
         }
     }
-}
-
-/// Action capsule button child of a message band row.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BandCapsule {
-    /// Full accessible label.
-    pub(crate) label: &'static str,
-    /// The first cell of the chip.
-    pub(crate) col: usize,
-    /// Its cells.
-    pub(crate) width: usize,
-    /// Its slot within the row ([`capsule_index`]).
-    pub(crate) index: u8,
 }
 
 /// Frame state for one [`ChromeMessage`] (`text` is spoken; `detail` is description).
@@ -388,24 +269,10 @@ pub(crate) struct BandCapsule {
 pub(crate) struct GridMessage {
     /// Message surface kind.
     pub(crate) message: ChromeMessage,
-    /// The owner and action-list revision published with this row and its capsules.
-    pub(crate) context: Option<ActionContext>,
     /// Spoken sentence.
     pub(crate) text: String,
     /// Secondary detail exposed as description.
     pub(crate) detail: Option<String>,
-    /// Determinate progress in `0..=1`, when the band draws a meter.
-    pub(crate) progress: Option<f32>,
-    /// Whether indeterminate work is in flight.
-    pub(crate) busy: bool,
-    /// Whether the row is a warning, error, or question (`Role::Alert`).
-    pub(crate) alarm: bool,
-    /// Whether the message supports `Action::Click`.
-    pub(crate) activates: bool,
-    /// Reserved status bar row index (`0` = topmost), if bounded.
-    pub(crate) bar_row: Option<usize>,
-    /// Action capsules in this row.
-    pub(crate) capsules: Vec<BandCapsule>,
 }
 
 /// Target published for a Claude Code composer rule chip or fact.
@@ -1212,75 +1079,14 @@ fn push_rename_field(nodes: &mut Vec<(NodeId, Node)>, rename: &GridRename) {
     );
 }
 
-fn push_message(
-    nodes: &mut Vec<(NodeId, Node)>,
-    message: &GridMessage,
-    geom: Option<GridGeometry>,
-    cols: usize,
-) -> NodeId {
+fn push_message(nodes: &mut Vec<(NodeId, Node)>, message: &GridMessage) -> NodeId {
     let id = message.message.node_id();
-    let metered = message.progress.is_some() || message.busy;
-    let mut node = Node::new(message.message.role(metered, message.alarm));
+    let mut node = Node::new(message.message.role());
     node.set_label(message.text.clone());
     node.set_value(message.text.clone());
     node.set_live(message.message.politeness());
-    if let Some(context) = message.context {
-        node.set_action_context(context);
-    }
     if let Some(detail) = &message.detail {
         node.set_description(detail.clone());
-    }
-    let row_rect = message.bar_row.and_then(|row| {
-        let g = geom?;
-        (g.bar_h > 0.0).then(|| {
-            let y0 = g.bars_y + row as f64 * g.bar_h;
-            (g, y0)
-        })
-    });
-    if let Some((g, y0)) = row_rect {
-        node.set_bounds(Rect {
-            x0: g.origin_x,
-            y0,
-            x1: g.origin_x + cols as f64 * g.cell_w,
-            y1: y0 + g.bar_h,
-        });
-    }
-    if let Some(band_row) = message.message.band_row_index() {
-        let mut children = Vec::with_capacity(message.capsules.len());
-        for cap in &message.capsules {
-            let kind = ChromeMessage::BandCapsule {
-                row: band_row as u8,
-                index: cap.index,
-            };
-            let mut button = Node::new(Role::Button);
-            button.set_label(cap.label.to_string());
-            if let Some((g, y0)) = row_rect {
-                button.set_bounds(Rect {
-                    x0: g.origin_x + cap.col as f64 * g.cell_w,
-                    y0,
-                    x1: g.origin_x + (cap.col + cap.width) as f64 * g.cell_w,
-                    y1: y0 + g.bar_h,
-                });
-            }
-            if let Some(context) = message.context {
-                button.set_action_context(context);
-                button.add_action(Action::Click);
-            }
-            let child = kind.node_id();
-            nodes.push((child, button));
-            children.push(child);
-        }
-        if !children.is_empty() {
-            node.set_children(children);
-        }
-    }
-    if let Some(fill) = message.progress {
-        node.set_min_numeric_value(0.0);
-        node.set_max_numeric_value(1.0);
-        node.set_numeric_value(f64::from(fill.clamp(0.0, 1.0)));
-    }
-    if message.activates && message.context.is_some() {
-        node.add_action(Action::Click);
     }
     nodes.push((id, node));
     id
@@ -1373,7 +1179,7 @@ fn push_chrome(
         .iter()
         .filter_map(|kind| frame.messages.iter().find(|m| m.message == *kind))
     {
-        root_children.push(push_message(nodes, message, geom, cols));
+        root_children.push(push_message(nodes, message));
     }
 
     if let Some(find) = frame.find {
@@ -1507,9 +1313,8 @@ pub(crate) fn grid_tree(
 /// THE HARNESS'S NODES AS A SCREEN READER IS HANDED THEM (`aterm ctl chrome`'s `a11y` lines, a
 /// development build's): of `update`, window `window`'s tree as [`grid_tree`] builds it for the
 /// adapter, each Autopilot chip's node (`a11y window=<id> autopilot sid=<sid> role=<role>
-/// label="…" description="…"|-`, its session named by `sid_of`) and each Messages band row's
-/// (`a11y window=<id> band row=<0..2> role=<role> label="…" description="…"|-`), in the tree's
-/// order. Every other node is left out.
+/// label="…" description="…"|-`, its session named by `sid_of`), in the tree's order. Every other
+/// node is left out.
 #[cfg(any(test, debug_assertions))]
 pub(crate) fn harness_node_lines(
     window: u64,
@@ -1530,16 +1335,12 @@ pub(crate) fn harness_node_lines(
         .nodes
         .iter()
         .filter_map(|(id, node)| {
-            if let Some((session, HarnessChip::Autopilot)) = chip_for(*id) {
-                let sid = sid_of(session).unwrap_or_else(|| "-".to_string());
-                return Some(format!(
-                    "a11y window={window} autopilot sid={sid} {}",
-                    said(node)
-                ));
-            }
-            let row = ChromeMessage::from_node(*id)?.band_row_index()?;
+            let (session, HarnessChip::Autopilot) = chip_for(*id)? else {
+                return None;
+            };
+            let sid = sid_of(session).unwrap_or_else(|| "-".to_string());
             Some(format!(
-                "a11y window={window} band row={row} {}",
+                "a11y window={window} autopilot sid={sid} {}",
                 said(node)
             ))
         })
@@ -1573,99 +1374,7 @@ mod tests {
         cell_h: 18.0,
         strip_y: 12.0,
         strip_h: 18.0,
-        bars_y: 30.0,
-        bar_h: 18.0,
     };
-
-    #[test]
-    fn a_status_band_is_published_where_it_is_painted() {
-        let snap = live_grid(2, 20, b"hi", Some((0, 2)));
-        let bars = vec![
-            GridMessage {
-                bar_row: Some(0),
-                capsules: vec![BandCapsule {
-                    label: "Packages",
-                    col: 10,
-                    width: 6,
-                    index: 0,
-                }],
-                ..message(
-                    ChromeMessage::BandRow0,
-                    "Installing ALab tools \u{00b7} extracting",
-                )
-            },
-            GridMessage {
-                bar_row: Some(1),
-                ..message(
-                    ChromeMessage::BandRow1,
-                    "Updating to aterm v0.62.0 \u{00b7} downloading",
-                )
-            },
-        ];
-        fn frame(messages: &[GridMessage]) -> GridFrame<'_> {
-            GridFrame {
-                messages,
-                ..GridFrame::default()
-            }
-        }
-        let update = grid_tree(&snap, Some(GEOM), &frame(&bars));
-
-        for (index, band) in bars.iter().enumerate() {
-            let published = node(&update, band.message.node_id());
-            assert_eq!(published.label(), Some(band.text.as_str()));
-            let bounds = published
-                .bounds()
-                .expect("a published band carries the row it reserved");
-            assert_eq!(bounds.y0, GEOM.bars_y + index as f64 * GEOM.bar_h);
-            assert_eq!(bounds.y1, bounds.y0 + GEOM.bar_h);
-            assert_eq!(bounds.x0, GEOM.origin_x);
-            assert_eq!(bounds.x1, GEOM.origin_x + 20.0 * GEOM.cell_w);
-        }
-        let capsule = ChromeMessage::BandCapsule { row: 0, index: 0 };
-        let button = node(&update, capsule.node_id());
-        assert_eq!(button.role(), Role::Button);
-        assert_eq!(button.label(), Some("Packages"));
-        assert!(button.supports_action(Action::Click));
-        assert_eq!(button.action_context(), bars[0].context);
-        assert_eq!(
-            node(&update, bars[0].message.node_id()).action_context(),
-            bars[0].context
-        );
-        let mut unbound = bars.clone();
-        unbound[0].context = None;
-        let unbound = grid_tree(&snap, Some(GEOM), &frame(&unbound));
-        assert!(!node(&unbound, capsule.node_id()).supports_action(Action::Click));
-        let b = button.bounds().expect("a capsule has its cells");
-        assert_eq!(b.x0, GEOM.origin_x + 10.0 * GEOM.cell_w);
-        assert_eq!(b.x1, GEOM.origin_x + 16.0 * GEOM.cell_w);
-        assert_eq!(b.y0, GEOM.bars_y);
-        assert_eq!(
-            node(&update, bars[0].message.node_id()).children(),
-            [capsule.node_id()]
-        );
-        assert_eq!(ChromeMessage::from_node(capsule.node_id()), Some(capsule));
-        let floating = grid_tree(
-            &snap,
-            Some(GEOM),
-            &frame(&[message(ChromeMessage::PasteConfirm, "Paste 3 lines?")]),
-        );
-        assert_eq!(
-            node(&floating, ChromeMessage::PasteConfirm.node_id()).bounds(),
-            None
-        );
-
-        let children = node(&update, ROOT).children();
-        let bar_ids: Vec<NodeId> = bars.iter().map(|b| b.message.node_id()).collect();
-        assert_eq!(&children[..bars.len()], &bar_ids[..]);
-        assert_eq!(children.last().copied(), Some(GRID));
-
-        let without = grid_tree(&snap, Some(GEOM), &GridFrame::default());
-        assert_eq!(
-            without.nodes.len() + bars.len() + 1,
-            update.nodes.len(),
-            "a hidden row publishes no node at all (the capsule is the +1)"
-        );
-    }
 
     #[test]
     fn grid_tree_publishes_the_terminal_grid() {
@@ -1958,11 +1667,7 @@ mod tests {
             None
         );
         assert_eq!(tab_action_index(&request, |_| None), None, "closed tab");
-        for context in [
-            None,
-            Some(ActionContext::new(tabs[1].id, 0)),
-            Some(ActionContext::message(tabs[1].id, 0)),
-        ] {
+        for context in [None, Some(ActionContext::new(tabs[1].id, 0))] {
             request.context = context;
             assert_eq!(
                 tab_action_index(&request, lookup),
@@ -2160,19 +1865,7 @@ mod tests {
             caret: 6,
             status: String::new(),
         };
-        let band = GridMessage {
-            message: ChromeMessage::BandRow0,
-            context: None,
-            text: "Toolchain ready".into(),
-            detail: None,
-            progress: None,
-            busy: false,
-            alarm: false,
-            activates: false,
-            bar_row: Some(0),
-            capsules: Vec::new(),
-        };
-        let messages = [band];
+        let messages = [message(ChromeMessage::LinkCaption, "alab.systems")];
         let mut update = native_composite(&[native], Some(native));
         let window_root = update.tree.as_ref().unwrap().root;
         let quiet = GridFrame {
@@ -2180,10 +1873,13 @@ mod tests {
             ..GridFrame::default()
         };
         splice_chrome(&mut update, Some(GEOM), &quiet, 20).expect("no collision");
-        let band_id = ChromeMessage::BandRow0.node_id();
-        assert_eq!(node(&update, window_root).children(), [band_id, native]);
-        assert_eq!(node(&update, band_id).label(), Some("Toolchain ready"));
-        assert_eq!(update.focus, native, "a band never takes a control's focus");
+        let caption = ChromeMessage::LinkCaption.node_id();
+        assert_eq!(node(&update, window_root).children(), [caption, native]);
+        assert_eq!(node(&update, caption).label(), Some("alab.systems"));
+        assert_eq!(
+            update.focus, native,
+            "a message never takes a control's focus"
+        );
 
         let mut update = native_composite(&[native], Some(native));
         let finding = GridFrame {
@@ -2194,7 +1890,7 @@ mod tests {
         splice_chrome(&mut update, Some(GEOM), &finding, 20).expect("no collision");
         assert_eq!(
             node(&update, window_root).children(),
-            [band_id, FIND, native]
+            [caption, FIND, native]
         );
         assert_eq!(update.focus, FIND, "an open find field owns the keyboard");
 
@@ -2372,21 +2068,8 @@ mod tests {
     fn message(message: ChromeMessage, text: &str) -> GridMessage {
         GridMessage {
             message,
-            context: match message {
-                ChromeMessage::BandRow0 | ChromeMessage::BandRow1 | ChromeMessage::BandRow2 => {
-                    Some(ActionContext::message(7, 0))
-                }
-                ChromeMessage::BandOverflow => Some(ActionContext::message_log()),
-                _ => None,
-            },
             text: text.to_string(),
             detail: None,
-            progress: None,
-            busy: false,
-            alarm: false,
-            activates: false,
-            bar_row: None,
-            capsules: Vec::new(),
         }
     }
 
@@ -2395,6 +2078,7 @@ mod tests {
         let snap = live_grid(2, 20, b"hi", None);
         let messages: Vec<GridMessage> = ChromeMessage::ORDER
             .iter()
+            .rev()
             .map(|kind| message(*kind, &format!("{kind:?} speaks")))
             .collect();
         let update = grid_tree(
@@ -2405,6 +2089,22 @@ mod tests {
                 ..GridFrame::default()
             },
         );
+        let without = grid_tree(&snap, None, &GridFrame::default());
+        assert_eq!(
+            update.nodes.len(),
+            without.nodes.len() + ChromeMessage::ORDER.len(),
+            "each message adds exactly its own node"
+        );
+        assert_eq!(
+            node(&update, ROOT).children(),
+            [
+                ChromeMessage::PasteConfirm.node_id(),
+                ChromeMessage::CloseConfirm.node_id(),
+                ChromeMessage::LinkCaption.node_id(),
+                GRID,
+            ],
+            "the messages in ORDER, whatever order the frame lists them in, then the grid"
+        );
         for kind in ChromeMessage::ORDER {
             let node = node(&update, NodeId(MESSAGE_BASE + kind.slot()));
             let spoken = format!("{kind:?} speaks");
@@ -2412,95 +2112,6 @@ mod tests {
             assert_eq!(node.value(), Some(spoken.as_str()), "{kind:?} value");
             assert_eq!(node.live(), Some(kind.politeness()), "{kind:?} politeness");
         }
-    }
-
-    #[test]
-    fn a_status_band_keeps_its_volatile_figures_out_of_the_announcement() {
-        let snap = live_grid(2, 20, b"hi", None);
-        let at = |done: &str, fill: f32| GridMessage {
-            message: ChromeMessage::BandRow0,
-            context: Some(ActionContext::message(7, 0)),
-            text: "Updating to aterm v0.48.0 \u{00b7} downloading".to_string(),
-            detail: Some(format!("{done} / 1.2 GB")),
-            progress: Some(fill),
-            busy: false,
-            alarm: false,
-            activates: true,
-            bar_row: Some(0),
-            capsules: Vec::new(),
-        };
-        let id = NodeId(MESSAGE_BASE + ChromeMessage::BandRow0.slot());
-        let tree = |m: &[GridMessage]| {
-            grid_tree(
-                &snap,
-                None,
-                &GridFrame {
-                    messages: m,
-                    ..GridFrame::default()
-                },
-            )
-        };
-        let early = tree(&[at("120 MB", 0.25)]);
-        let later = tree(&[at("900 MB", 0.75)]);
-        let (early, later) = (node(&early, id), node(&later, id));
-        assert_eq!(
-            early.label(),
-            later.label(),
-            "the spoken sentence does not move with the byte counter"
-        );
-        assert_eq!(early.value(), later.value());
-        assert_eq!(early.description(), Some("120 MB / 1.2 GB"));
-        assert_eq!(later.description(), Some("900 MB / 1.2 GB"));
-        assert_eq!(early.role(), Role::ProgressIndicator, "a real meter");
-        assert_eq!(early.numeric_value(), Some(0.25));
-        assert_eq!(later.numeric_value(), Some(0.75));
-        assert_eq!(early.min_numeric_value(), Some(0.0));
-        assert_eq!(early.max_numeric_value(), Some(1.0));
-
-        let flat = tree(&[message(
-            ChromeMessage::BandRow1,
-            "Installing ALab tools \u{00b7} starting\u{2026}",
-        )]);
-        let flat = node(&flat, NodeId(MESSAGE_BASE + ChromeMessage::BandRow1.slot()));
-        assert_eq!(flat.role(), Role::Status);
-        assert_eq!(flat.numeric_value(), None);
-        let warn = tree(&[GridMessage {
-            alarm: true,
-            ..message(ChromeMessage::BandRow2, "Couldn't install aterm v0.48.0")
-        }]);
-        assert_eq!(
-            node(&warn, NodeId(MESSAGE_BASE + ChromeMessage::BandRow2.slot())).role(),
-            Role::Alert
-        );
-    }
-
-    #[test]
-    fn an_indeterminate_row_is_a_busy_progress_indicator() {
-        let snap = live_grid(2, 20, b"hi", None);
-        let id = NodeId(MESSAGE_BASE + ChromeMessage::BandRow0.slot());
-        let tree = |m: &[GridMessage]| {
-            grid_tree(
-                &snap,
-                None,
-                &GridFrame {
-                    messages: m,
-                    ..GridFrame::default()
-                },
-            )
-        };
-        let busy = tree(&[GridMessage {
-            busy: true,
-            ..message(ChromeMessage::BandRow0, "Installing ALab toolchain")
-        }]);
-        let busy = node(&busy, id);
-        assert_eq!(busy.role(), Role::ProgressIndicator);
-        assert_eq!(busy.numeric_value(), None, "indeterminate: no value");
-        let alarm = tree(&[GridMessage {
-            busy: true,
-            alarm: true,
-            ..message(ChromeMessage::BandRow0, "Update did not apply")
-        }]);
-        assert_eq!(node(&alarm, id).role(), Role::Alert);
     }
 
     #[test]
@@ -2537,70 +2148,33 @@ mod tests {
         assert_eq!(update.focus, GRID, "Enter still reaches the terminal");
     }
 
+    /// A message's id is a function of its kind alone, one slot each, never read as a tab, a chip
+    /// or a menu row, and never a slot a surface that is gone held: the notice (0), the config
+    /// warning (2), the message band's rows (3, 4, 6) and overflow link (7), the presence status
+    /// (5), and the band's capsules (16 to 27, four slots a row).
     #[test]
-    fn message_ids_round_trip_are_stable_and_are_never_read_as_a_tab() {
+    fn message_ids_are_stable_and_never_reuse_a_retired_slot_or_read_as_a_tab() {
         let snap = live_grid(2, 20, b"hi", None);
+        let retired: Vec<u64> = [0, 2, 3, 4, 5, 6, 7].into_iter().chain(16..=27).collect();
+        let mut slots = std::collections::HashSet::new();
         for kind in ChromeMessage::ORDER {
-            let id = NodeId(MESSAGE_BASE + kind.slot());
-            assert_eq!(ChromeMessage::from_node(id), Some(kind));
-            assert_eq!(tab_index_for(id), None, "{kind:?} is not a tab");
-        }
-        for (retired, what) in [
-            (0, "retired Notice slot"),
-            (2, "retired ConfigWarning slot"),
-            (5, "retired PresenceStatus slot"),
-        ] {
-            assert_eq!(
-                ChromeMessage::from_node(NodeId(MESSAGE_BASE + retired)),
-                None,
-                "{what}"
-            );
+            let id = kind.node_id();
+            assert_eq!(id, NodeId(MESSAGE_BASE + kind.slot()), "{kind:?}");
+            assert!(slots.insert(kind.slot()), "{kind:?}: a slot of its own");
             assert!(
-                ChromeMessage::ORDER.iter().all(|m| m.slot() != retired),
-                "no row is published at the {what}"
+                !retired.contains(&kind.slot()),
+                "{kind:?} is published at a retired slot"
             );
+            assert_eq!(tab_index_for(id), None, "{kind:?} is not a tab");
+            assert_eq!(chip_for(id), None, "{kind:?} is not a chip");
+            assert_eq!(menu_item_for(id), None, "{kind:?} is not a menu row");
         }
-        for row in 0..3u8 {
-            for index in 0..=CAPSULE_DETAILS {
-                let kind = ChromeMessage::BandCapsule { row, index };
-                assert_eq!(ChromeMessage::from_node(kind.node_id()), Some(kind));
-                assert_eq!(tab_index_for(kind.node_id()), None);
-            }
-            assert_eq!(
-                ChromeMessage::from_node(NodeId(
-                    MESSAGE_BASE + CAPSULE_BASE + u64::from(row) * CAPSULES_PER_ROW + 3
-                )),
-                None,
-                "the spare capsule slot is unassigned"
-            );
-        }
-        assert_eq!(
-            ChromeMessage::from_node(NodeId(MESSAGE_BASE + CAPSULE_BASE + 3 * CAPSULES_PER_ROW)),
-            None,
-            "no fourth band row"
-        );
-        assert_eq!(
-            capsule_action(CAPSULE_DETAILS),
-            aterm_messages::ActionIndex::DETAILS
-        );
-        assert_eq!(capsule_index(aterm_messages::ActionIndex(1)), 1);
-        assert_eq!(
-            ChromeMessage::from_node(NodeId(MESSAGE_BASE + ChromeMessage::BandRow2.slot())),
-            Some(ChromeMessage::BandRow2),
-            "the band's slot round-trips"
-        );
-        assert_eq!(
-            ChromeMessage::from_node(NodeId(MESSAGE_BASE + 99)),
-            None,
-            "an unassigned slot decodes to nothing rather than the nearest surface"
-        );
-        assert_eq!(ChromeMessage::from_node(ROOT), None);
 
         let first = grid_tree(
             &snap,
             None,
             &GridFrame {
-                messages: &[message(ChromeMessage::BandRow0, "one")],
+                messages: &[message(ChromeMessage::PasteConfirm, "one")],
                 ..GridFrame::default()
             },
         );
@@ -2608,14 +2182,14 @@ mod tests {
             &snap,
             None,
             &GridFrame {
-                messages: &[message(ChromeMessage::BandRow0, "two")],
+                messages: &[message(ChromeMessage::PasteConfirm, "two")],
                 ..GridFrame::default()
             },
         );
         let id_of = |u: &TreeUpdate| {
             u.nodes
                 .iter()
-                .find(|(_, n)| n.role() == Role::Status)
+                .find(|(_, n)| n.role() == Role::AlertDialog)
                 .map(|(id, _)| *id)
                 .unwrap()
         };
@@ -2703,7 +2277,6 @@ mod tests {
             );
             assert_eq!(chip_for(*id), Some((chip.session, chip.chip)));
             assert_eq!(tab_index_for(*id), None);
-            assert_eq!(ChromeMessage::from_node(*id), None);
             let menu = chip.chip == HarnessChip::Autopilot;
             assert_eq!(
                 n.has_popup(),
@@ -2726,11 +2299,11 @@ mod tests {
         assert!(bare.nodes.iter().all(|(id, _)| chip_for(*id).is_none()));
     }
 
-    /// `chrome`'s `a11y` lines read the built tree's Autopilot chip and band row nodes, each its
-    /// role, label and description as the adapter is handed them, and nothing else: a Team chip, a
-    /// band's capsule and overflow, and the grid itself are left out.
+    /// `chrome`'s `a11y` lines read the built tree's Autopilot chip node, its role, label and
+    /// description as the adapter is handed them, and nothing else: a Team chip, a chrome message
+    /// and the grid itself are left out.
     #[test]
-    fn the_harness_node_lines_read_the_autopilot_chip_and_the_band_rows_off_the_built_tree() {
+    fn the_harness_node_lines_read_the_autopilot_chip_off_the_built_tree() {
         let snap = live_grid(3, 60, b"hi", Some((0, 2)));
         let chip = |chip, label: &str, description: Option<&str>| GridChip {
             session: 4,
@@ -2754,24 +2327,10 @@ mod tests {
                 Some("Goes to its manager."),
             ),
         ];
-        let messages = [
-            GridMessage {
-                alarm: true,
-                bar_row: Some(0),
-                detail: Some("Under Land it answered twice".to_string()),
-                capsules: vec![BandCapsule {
-                    label: "Show tab 3",
-                    col: 40,
-                    width: 10,
-                    index: 0,
-                }],
-                ..message(
-                    ChromeMessage::BandRow0,
-                    "aterm stopped typing in tab 3 \u{00b7} Open the tab",
-                )
-            },
-            message(ChromeMessage::BandOverflow, "2 more messages"),
-        ];
+        let messages = [GridMessage {
+            detail: Some("Paste 3 lines into the terminal".to_string()),
+            ..message(ChromeMessage::PasteConfirm, "Paste 3 lines?")
+        }];
         let update = grid_tree(
             &snap,
             Some(GEOM),
@@ -2787,8 +2346,6 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "a11y window=2 band row=0 role=Alert label=\"aterm stopped typing in tab 3 \u{00b7} \
-                 Open the tab\" description=\"Under Land it answered twice\"",
                 "a11y window=2 autopilot sid=s-4 role=Button label=\"Autopilot: land.\" \
                  description=\"Stopped typing: the same reply twice, with no work.\"",
             ]
@@ -3021,7 +2578,6 @@ mod tests {
             assert_eq!(menu_item_for(*id), Some((menu.epoch, i)));
             assert!(id.0 > MENU_BASE && id.0 < CHIP_BASE, "{id:?}");
             assert_eq!(chip_for(*id), None);
-            assert_eq!(ChromeMessage::from_node(*id), None);
             assert_eq!(tab_index_for(*id), None);
             assert_eq!(n.label(), Some(want.label.as_str()));
             assert!(spoken(&want.label), "{}", want.label);

@@ -85,7 +85,7 @@ pub enum GitOp {
         /// Read without a credential or fallback identity.
         anonymous: bool,
     },
-    /// `git ls-remote --refs <url> [<ref>]`.
+    /// `git ls-remote --refs <url> [<ref>]`; exact HEAD includes that pseudoref.
     LsRemote {
         /// One ref, or every one.
         reference: Option<String>,
@@ -113,6 +113,16 @@ pub enum GitOp {
         /// Run the same checks and Git's dry run without changing remote refs.
         dry_run: bool,
     },
+    /// The exact release lease/fence protocol. Actual mutation is admitted only
+    /// through its journaled resource boundary, never a direct `run_git` call.
+    PushControl {
+        /// Caller-owned source repository, screened and read without changes.
+        dir: PathBuf,
+        /// Validated canonical control names and expected old/new identities.
+        transaction: crate::git::ControlRefTransaction,
+        /// Validate the same transaction without changing remote refs.
+        dry_run: bool,
+    },
 }
 
 /// One isolated git run on one repository.
@@ -125,8 +135,12 @@ pub struct GitRun {
     pub op: GitOp,
     /// How the destination was named: a release-tier owner needs `Named::Literal`.
     pub named: Named,
-    /// The run's bound (`GIT_BUDGET` by default).
+    /// The run's wall bound (`GIT_BUDGET` by default), and the upper lifetime supplied to a
+    /// credential grant. [`Self::progress_window`] replaces it only as the execution bound.
     pub budget: Duration,
+    /// An inactivity window for native progress. When set, child execution is bounded by
+    /// output and descendant CPU/I/O progress instead of [`Self::budget`]'s wall clock.
+    pub progress_window: Option<Duration>,
 }
 
 impl GitRun {
@@ -158,6 +172,22 @@ impl GitRun {
             },
         )
     }
+
+    pub(crate) fn push_control(
+        slug: &Slug,
+        dir: &Path,
+        transaction: crate::git::ControlRefTransaction,
+        dry_run: bool,
+    ) -> GitRun {
+        GitRun::of(
+            slug,
+            GitOp::PushControl {
+                dir: dir.into(),
+                transaction,
+                dry_run,
+            },
+        )
+    }
     /// `op` on `slug`, `Named::Default`, bounded by `GIT_BUDGET`.
     fn of(slug: &Slug, op: GitOp) -> GitRun {
         GitRun {
@@ -165,6 +195,7 @@ impl GitRun {
             op,
             named: Named::Default,
             budget: GIT_BUDGET,
+            progress_window: None,
         }
     }
 
@@ -302,6 +333,14 @@ impl GitRun {
     #[must_use]
     pub fn with_budget(mut self, budget: Duration) -> GitRun {
         self.budget = budget;
+        self
+    }
+
+    /// The same run with a native-progress inactivity bound instead of a wall-clock execution
+    /// bound. The ordinary budget remains the lifetime of any short-lived credential grant.
+    #[must_use]
+    pub fn with_progress_window(mut self, window: Duration) -> GitRun {
+        self.progress_window = Some(window);
         self
     }
 
@@ -620,6 +659,7 @@ mod unix {
                 }
                 Ok(())
             }
+            GitOp::PushControl { .. } => Ok(()),
             GitOp::CheckLocal { .. }
             | GitOp::Fetch { .. }
             | GitOp::FetchBatch { .. }
@@ -743,12 +783,30 @@ mod unix {
         work: Option<PathBuf>,
         /// `{scratch}/scratch.git`, the leased delete's empty repository.
         scratch_git: Option<PathBuf>,
-        /// The run's bound.
+        /// The run's wall bound, used only when `progress_window` is absent.
         budget: std::time::Duration,
+        /// A native-progress inactivity window in place of the wall-clock execution bound.
+        progress_window: Option<std::time::Duration>,
         /// Whether the run only reads, so its main child killed at its bound changed nothing.
         /// The children the runner makes for itself (a fetch's config read, a leased delete's
         /// scratch `init`) send nothing whatever this says: `unsent` lowers their errors.
         reads: bool,
+    }
+
+    /// A credential-free name for the canonical native operation, narrowed to its internal
+    /// step when one is present. Timing policy is intentionally absent from canonical tape
+    /// bytes, but those bytes are the safe vocabulary for a diagnostic too.
+    pub(super) fn waiting_on(canonical: &[u8]) -> String {
+        let Ok(text) = std::str::from_utf8(canonical) else {
+            return "native git operation".to_owned();
+        };
+        let mut lines = text.lines();
+        let first = lines
+            .next()
+            .filter(|line| line.starts_with("git "))
+            .unwrap_or("native git operation");
+        let step = lines.find_map(|line| line.strip_prefix("step "));
+        step.map_or_else(|| first.to_owned(), |step| format!("{first}, step {step}"))
     }
 
     /// A child's error that sent nothing (the runner's own config read or scratch `init`,
@@ -789,6 +847,9 @@ mod unix {
             config_query: Option<ConfigQuery>,
         ) -> Result<ChildOut> {
             let mut spec = ChildSpec::new(&self.git).budget(self.budget);
+            if let Some(window) = self.progress_window {
+                spec = spec.progressing(window, waiting_on(canonical));
+            }
             if let Some(input) = input {
                 spec = match config_query {
                     Some(query) => spec.config_input(input, query),
@@ -889,7 +950,8 @@ mod unix {
         | GitOp::FetchMain { dir, .. }
         | GitOp::FetchRef { dir, .. }
         | GitOp::FetchBatch { dir, .. }
-        | GitOp::PushRefs { dir, .. }) = op
+        | GitOp::PushRefs { dir, .. }
+        | GitOp::PushControl { dir, .. }) = op
         else {
             return Ok(root.as_os_str().to_os_string());
         };
@@ -997,7 +1059,7 @@ mod unix {
             | GitOp::FetchRef { .. }
             | GitOp::FetchBatch { .. } => "fetch",
             GitOp::LsRemote { .. } => "ls-remote",
-            GitOp::PushDelete { .. } | GitOp::PushRefs { .. } => "push",
+            GitOp::PushDelete { .. } | GitOp::PushRefs { .. } | GitOp::PushControl { .. } => "push",
         }
     }
 
@@ -1143,9 +1205,9 @@ mod unix {
     /// both, because `push --porcelain` reports a refused lease on stdout. `sent` is true only
     /// for the exit of the leased delete's own `git push`: an exit no phrase names there (a
     /// hung-up remote, an HTTP error, a signal agh did not send) may follow a delete GitHub
-    /// applied, so it is could_not_run with `SideEffect::Unknown`, never read as not sent. A
-    /// porcelain line `!` with `[rejected]` or `[remote rejected]` (GitHub's protected branch
-    /// or ruleset) is a refusal no retry changes: Refused, nothing written.
+    /// applied, so it is could_not_run with `SideEffect::Unknown`, never read as not sent.
+    /// Policy and unknown porcelain rejection reasons are Refused. Known receive
+    /// infrastructure failures are CouldNotRun with an unknown side effect.
     pub(super) fn failed(
         op: &GitOp,
         out: &ChildOut,
@@ -1193,7 +1255,16 @@ mod unix {
                 needed: "workflow".to_string(),
             }))
         } else if let Some(line) = rejected(op, &stdout) {
-            Error::refused(format!("GitHub refused the push: {line}"))
+            if server_rejection(&line) {
+                Error::could_not_run(format!("GitHub receive side failed: {line}"))
+                    .with_side_effect(if sent {
+                        SideEffect::Unknown
+                    } else {
+                        SideEffect::None
+                    })
+            } else {
+                Error::refused(format!("GitHub refused the push: {line}"))
+            }
         } else {
             let code = out
                 .code
@@ -1203,7 +1274,9 @@ mod unix {
             if sent
                 && matches!(
                     op,
-                    GitOp::PushDelete { .. } | GitOp::PushRefs { dry_run: false, .. }
+                    GitOp::PushDelete { .. }
+                        | GitOp::PushRefs { dry_run: false, .. }
+                        | GitOp::PushControl { dry_run: false, .. }
                 )
             {
                 error.with_side_effect(SideEffect::Unknown)
@@ -1214,22 +1287,73 @@ mod unix {
         error.with_repo(slug.to_string())
     }
 
-    /// A leased delete's porcelain line (stdout, already redacted) that GitHub or git refused
-    /// for good: it starts `!` and names `[rejected]` or `[remote rejected]`, and is not the
-    /// lease's `stale info`, which is Conflict.
+    /// An authentication error from Git names the routed identity that supplied its helper
+    /// credential. Git knows only that a helper answer failed; the route decision is the
+    /// authoritative identity and must survive the child boundary in the diagnostic.
+    fn name_routed_authentication(mut error: Error, profile: Option<&str>) -> Error {
+        if error.kind == Kind::Unauthenticated
+            && let Some(profile) = profile
+        {
+            error.why = format!(
+                "routed identity {profile} failed authentication: {}",
+                error.why
+            );
+        }
+        error
+    }
+
+    /// A push's concrete porcelain rejection (stdout, already redacted), excluding
+    /// the lease's `stale info`, which is Conflict.
     fn rejected(op: &GitOp, stdout: &str) -> Option<String> {
-        if !matches!(op, GitOp::PushDelete { .. } | GitOp::PushRefs { .. }) {
+        if !matches!(
+            op,
+            GitOp::PushDelete { .. } | GitOp::PushRefs { .. } | GitOp::PushControl { .. }
+        ) {
             return None;
         }
-        stdout
+        let lines: Vec<_> = stdout
             .lines()
             .map(str::trim)
-            .find(|line| {
+            .filter(|line| {
                 line.starts_with('!')
                     && (line.contains("[rejected]") || line.contains("[remote rejected]"))
                     && !line.contains("stale info")
             })
+            .collect();
+        // Atomic pushes report a generic failure on otherwise valid sibling
+        // refs. Preserve a concrete policy refusal even if a server failure
+        // appears first, and use the concrete server reason over a sibling.
+        lines
+            .iter()
+            .copied()
+            .find(|line| {
+                !server_rejection(line)
+                    && !line.ends_with("[remote rejected] (atomic push failure)")
+            })
+            .or_else(|| lines.iter().copied().find(|line| server_rejection(line)))
+            .or_else(|| lines.first().copied())
             .map(str::to_string)
+    }
+
+    /// Exact receive-pack infrastructure reasons; unknown and policy reasons
+    /// remain refusals. `atomic push failure` alone is ambiguous (another row
+    /// can have failed policy), so it is deliberately absent.
+    fn server_rejection(line: &str) -> bool {
+        let Some(reason) = line
+            .split_once("[remote rejected] (")
+            .and_then(|(_, reason)| reason.strip_suffix(')'))
+        else {
+            return false;
+        };
+        matches!(
+            reason,
+            "failed"
+                | "failed to update ref"
+                | "failed to update refs"
+                | "transaction failed to start"
+                | "atomic transaction failed"
+                | "unable to migrate objects to permanent storage"
+        )
     }
 
     /// Refused: git's credential helper, which routes again from agh's directories, would not
@@ -1281,7 +1405,10 @@ mod unix {
         check_op(run)?;
         let slug = &run.slug;
         let router = gh.router();
-        let push = matches!(run.op, GitOp::PushDelete { .. } | GitOp::PushRefs { .. });
+        let push = matches!(
+            run.op,
+            GitOp::PushDelete { .. } | GitOp::PushRefs { .. } | GitOp::PushControl { .. }
+        );
         let anonymous = matches!(
             run.op,
             GitOp::LsRemote {
@@ -1350,9 +1477,12 @@ mod unix {
                 work: None,
                 scratch_git: None,
                 budget: run.budget,
+                progress_window: run.progress_window,
                 reads: !push,
             };
-            return finish(&children, run, &remote, profile, None);
+            let routed = profile.clone();
+            return finish(&children, run, &remote, profile, None)
+                .map_err(|error| name_routed_authentication(error, routed.as_deref()));
         }
         let dirs = match (needs_grant, gh.dirs()) {
             (false, _) => None,
@@ -1420,10 +1550,13 @@ mod unix {
                 || matches!(run.op, GitOp::FetchRef { .. } | GitOp::FetchBatch { .. }))
             .then(|| root.join("scratch.git")),
             budget: run.budget,
+            progress_window: run.progress_window,
             reads: !push,
         };
         let nonce = guard.as_ref().map(|g| g.grant.nonce.clone());
-        let result = finish(&children, run, &remote, profile, nonce);
+        let routed = profile.clone();
+        let result = finish(&children, run, &remote, profile, nonce)
+            .map_err(|error| name_routed_authentication(error, routed.as_deref()));
         drop(guard);
         drop(scratch);
         result
@@ -1582,6 +1715,63 @@ mod unix {
         Ok(())
     }
 
+    /// `rev-parse` of the caller `dir`: its absolute common directory, then whether it is
+    /// shallow, one line each ([`source_view`] reads the answer).
+    fn source_view_args(dir: &Path) -> Vec<OsString> {
+        vec![
+            os("-C"),
+            dir.as_os_str().to_os_string(),
+            os("rev-parse"),
+            os("--path-format=absolute"),
+            os("--git-common-dir"),
+            os("--is-shallow-repository"),
+        ]
+    }
+
+    /// The caller's common directory and whether it is shallow, from [`source_view_args`]'s
+    /// answer. A common directory holding a newline or a carriage return, or one that is not
+    /// absolute, fails the run.
+    fn source_view(stdout: &[u8]) -> Result<(&str, bool)> {
+        std::str::from_utf8(stdout)
+            .ok()
+            .and_then(|text| text.strip_suffix('\n'))
+            .and_then(|text| text.split_once('\n'))
+            .filter(|(common, _)| !common.contains('\r') && Path::new(common).is_absolute())
+            .and_then(|(common, shallow)| match shallow {
+                "false" => Some((common, false)),
+                "true" => Some((common, true)),
+                _ => None,
+            })
+            .ok_or_else(|| Error::local("git returned an invalid common directory"))
+    }
+
+    /// Lend a fetch's private scratch the caller's object directory, read-only, and nothing
+    /// else: with it in `objects/info/alternates`, the network fetch offers the caller's ref
+    /// tips as haves and receives only objects the caller lacks, instead of the whole history
+    /// on every run. A source named by a raw object ID whose closure the caller already holds
+    /// needs no transfer, and git then fills the scratch ref without asking the remote; a
+    /// source named by a ref is always resolved by the remote. The credentialed fetch still
+    /// runs in the scratch under the environment the runner built (an inherited
+    /// `GIT_ALTERNATE_OBJECT_DIRECTORIES` never reaches it), with the scratch's own fresh
+    /// config (so no caller `core.alternateRefsCommand` or `core.alternateRefsPrefixes`) and
+    /// hooks off; git lists the borrowed tips with a `for-each-ref` that reads the caller's
+    /// screened config, as the fetch's import and update already do, and sends nothing. What
+    /// each fetch checks of the fetched object IDs, its import and its no-deref update still
+    /// decide what is accepted, and the caller gains no alternates file. A shallow caller's
+    /// tips do not stand for complete history, so its scratch starts cold. `common` is what
+    /// [`source_view`] admitted: an absolute path begins with '/', never with the '"' or '#'
+    /// git's alternates parser reads specially, and holds no line break.
+    fn lend_objects(scratch: Option<&Path>, common: &str, shallow: bool) -> Result<()> {
+        let Some(scratch) = scratch.filter(|_| !shallow) else {
+            return Ok(());
+        };
+        std::fs::write(
+            scratch.join("objects/info/alternates"),
+            format!("{common}/objects\n"),
+        )
+        .map_err(|e| Error::local(format!("private object view: {e}")))
+    }
+
     /// Fetch into private scratch first, then import objects with no destination
     /// ref. Only the final no-deref update can change the caller's cache ref.
     fn fetch_exact(
@@ -1608,22 +1798,8 @@ mod unix {
             }
             Ok(out)
         };
-        let common = step(
-            "common-dir",
-            vec![
-                os("-C"),
-                dir.as_os_str().to_os_string(),
-                os("rev-parse"),
-                os("--path-format=absolute"),
-                os("--git-common-dir"),
-            ],
-            None,
-        )?;
-        let common = std::str::from_utf8(&common.stdout)
-            .ok()
-            .and_then(|text| text.strip_suffix('\n'))
-            .filter(|text| !text.contains(['\n', '\r']) && Path::new(text).is_absolute())
-            .ok_or_else(|| Error::local("git returned an invalid common directory"))?;
+        let view = step("common-dir", source_view_args(&dir), None)?;
+        let (common, shallow) = source_view(&view.stdout)?;
         let check_parents =
             || -> Result<()> {
                 let answer =
@@ -1648,6 +1824,7 @@ mod unix {
             init.push(path.as_os_str().to_os_string());
         }
         step("init", init, None)?;
+        lend_objects(scratch, common, shallow)?;
         step(
             "fetch",
             vec![
@@ -1743,23 +1920,8 @@ mod unix {
             }
             Ok(out)
         };
-        let common = step(
-            "common-dir",
-            vec![
-                os("-C"),
-                dir.as_os_str().to_os_string(),
-                os("rev-parse"),
-                os("--path-format=absolute"),
-                os("--git-common-dir"),
-            ],
-            None,
-            None,
-        )?;
-        let common = std::str::from_utf8(&common.stdout)
-            .ok()
-            .and_then(|text| text.strip_suffix('\n'))
-            .filter(|text| !text.contains(['\n', '\r']) && Path::new(text).is_absolute())
-            .ok_or_else(|| Error::local("git returned an invalid common directory"))?;
+        let view = step("common-dir", source_view_args(&dir), None, None)?;
+        let (common, shallow) = source_view(&view.stdout)?;
         let check_parents = || -> Result<()> {
             let answer =
                 children
@@ -1838,6 +2000,7 @@ mod unix {
             init.push(path.as_os_str().to_os_string());
         }
         step("init", init, None, None)?;
+        lend_objects(scratch, common, shallow)?;
         let mut fetch_input = String::new();
         for (index, row) in batch.rows().iter().enumerate() {
             let _ = writeln!(fetch_input, "+{}:refs/agh/batch/{index}", row.source);
@@ -1943,6 +2106,75 @@ mod unix {
         )
     }
 
+    enum NativeRefBatch<'a> {
+        Ordinary(&'a crate::github::refs::AtomicRefBatch),
+        Control {
+            transaction: &'a crate::git::ControlRefTransaction,
+            updates: Vec<crate::github::refs::RefUpdate>,
+        },
+    }
+
+    impl NativeRefBatch<'_> {
+        fn updates(&self) -> &[crate::github::refs::RefUpdate] {
+            match self {
+                Self::Ordinary(batch) => batch.updates(),
+                Self::Control { updates, .. } => updates,
+            }
+        }
+
+        fn control(&self) -> Option<&crate::git::ControlRefTransaction> {
+            match self {
+                Self::Ordinary(_) => None,
+                Self::Control { transaction, .. } => Some(transaction),
+            }
+        }
+
+        fn source_roots(&self) -> Vec<&str> {
+            match self {
+                Self::Ordinary(batch) => batch
+                    .updates()
+                    .iter()
+                    .map(|row| row.after.as_str())
+                    .collect(),
+                Self::Control {
+                    transaction,
+                    updates,
+                } => std::iter::once(transaction.owner_commit())
+                    .chain(
+                        updates
+                            .iter()
+                            .flat_map(|row| [row.before.as_str(), row.after.as_str()]),
+                    )
+                    .filter(|oid| !oid.bytes().all(|byte| byte == b'0'))
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect(),
+            }
+        }
+
+        fn guard_refs(&self) -> Vec<&str> {
+            if let Some(control) = self.control() {
+                let changes = control.changes();
+                // Safe failed-session cleanup owns only its exact token. Its
+                // lease may already be absent or belong to a later publisher.
+                if changes.len() == 1
+                    && changes[0].reference == crate::git::PUBLISHER_FENCE_REF
+                    && changes[0].after.is_none()
+                {
+                    return vec![crate::git::PUBLISHER_FENCE_REF];
+                }
+                return vec![
+                    crate::git::PUBLISHER_FENCE_REF,
+                    crate::git::RELEASE_LEASE_REF,
+                ];
+            }
+            self.updates()
+                .iter()
+                .map(|row| row.reference.as_str())
+                .collect()
+        }
+    }
+
     /// Import exact source objects into a private repository, validate all old
     /// values and ancestry, then perform one atomic push with explicit leases.
     /// The caller owns its source repository throughout the config screen and
@@ -1953,6 +2185,55 @@ mod unix {
         remote: &Remote,
         dir: &Path,
         batch: &crate::github::refs::AtomicRefBatch,
+        dry_run: bool,
+    ) -> Result<ChildOut> {
+        push_native_refs(
+            children,
+            run,
+            remote,
+            dir,
+            NativeRefBatch::Ordinary(batch),
+            dry_run,
+        )
+    }
+
+    fn push_control(
+        children: &Children<'_>,
+        run: &GitRun,
+        remote: &Remote,
+        dir: &Path,
+        transaction: &crate::git::ControlRefTransaction,
+        dry_run: bool,
+    ) -> Result<ChildOut> {
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+        let updates = transaction
+            .changes()
+            .iter()
+            .map(|row| crate::github::refs::RefUpdate {
+                reference: row.reference.clone(),
+                before: row.before.clone().unwrap_or_else(|| ZERO.into()),
+                after: row.after.clone().unwrap_or_else(|| ZERO.into()),
+            })
+            .collect();
+        push_native_refs(
+            children,
+            run,
+            remote,
+            dir,
+            NativeRefBatch::Control {
+                transaction,
+                updates,
+            },
+            dry_run,
+        )
+    }
+
+    fn push_native_refs(
+        children: &Children<'_>,
+        run: &GitRun,
+        remote: &Remote,
+        dir: &Path,
+        batch: NativeRefBatch<'_>,
         dry_run: bool,
     ) -> Result<ChildOut> {
         use std::collections::{BTreeMap, BTreeSet};
@@ -1992,6 +2273,38 @@ mod unix {
             }
             Ok(out)
         };
+        if batch.control().is_some() {
+            let origin = checked(
+                "control-source-origin",
+                vec![
+                    os("-C"),
+                    dir.as_os_str().to_owned(),
+                    os("remote"),
+                    os("get-url"),
+                    os("origin"),
+                ],
+                None,
+            )?;
+            let url = std::str::from_utf8(&origin.stdout)
+                .ok()
+                .and_then(|value| value.strip_suffix('\n'))
+                .filter(|value| !value.contains(['\n', '\r']))
+                .ok_or_else(|| Error::refused("control source origin has unsupported framing"))?;
+            let slug = run.slug.to_string();
+            let admitted = [
+                format!("https://github.com/{slug}"),
+                format!("git@github.com:{slug}"),
+                format!("ssh://git@github.com/{slug}"),
+                format!("git@gh-{}:{slug}", run.slug.owner()),
+            ];
+            if !admitted.iter().any(|base| {
+                url.eq_ignore_ascii_case(base) || url.eq_ignore_ascii_case(&format!("{base}.git"))
+            }) {
+                return Err(Error::refused(
+                    "control transaction source origin names another repository",
+                ));
+            }
+        }
         let scratch = children.scratch_git.as_deref();
         let mut init = vec![os("init"), os("--quiet"), os("--bare"), os("--template=")];
         if let Some(path) = scratch {
@@ -2023,15 +2336,15 @@ mod unix {
             os("--recurse-submodules=no"),
             dir.as_os_str().to_owned(),
         ];
-        for (i, u) in batch.updates().iter().enumerate() {
-            import.push(os(format!("{}:refs/agh/source/{i}", u.after)));
+        for (i, oid) in batch.source_roots().iter().enumerate() {
+            import.push(os(format!("{oid}:refs/agh/source/{i}")));
         }
         let incremental = batch.updates().iter().any(|u| u.before != ZERO);
         if !incremental {
             checked("objects", import, scratch)?;
         }
         let mut list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
-        list.extend(batch.updates().iter().map(|u| os(&u.reference)));
+        list.extend(batch.guard_refs().iter().map(|reference| os(*reference)));
         let listed = checked("remote", list, scratch)?;
         let text = std::str::from_utf8(&listed.stdout)
             .map_err(|_| Error::protocol("git returned non-UTF-8 refs"))?;
@@ -2041,7 +2354,7 @@ mod unix {
                 .split_once('\t')
                 .ok_or_else(|| Error::protocol("git returned malformed refs"))?;
             if !crate::path::is_sha(oid)
-                || !batch.updates().iter().any(|u| u.reference == reference)
+                || !batch.guard_refs().contains(&reference)
                 || found.insert(reference, oid).is_some()
             {
                 return Err(Error::protocol("git returned unexpected or duplicate refs"));
@@ -2055,6 +2368,12 @@ mod unix {
                 )
                 .with_repo(run.slug.to_string()));
             }
+        }
+        if let Some(control) = batch.control() {
+            control.check_before(
+                found.get(crate::git::RELEASE_LEASE_REF).copied(),
+                found.get(crate::git::PUBLISHER_FENCE_REF).copied(),
+            )?;
         }
         // Only a freshly observed remote BEFORE can exclude an old object
         // closure. Source refs, grafts, replacement objects and accelerator
@@ -2083,12 +2402,18 @@ mod unix {
             }
             let mut metadata_roots = String::new();
             for u in batch.updates() {
-                metadata_roots.push_str(&u.after);
-                metadata_roots.push('\n');
+                if u.after != ZERO {
+                    metadata_roots.push_str(&u.after);
+                    metadata_roots.push('\n');
+                }
                 if u.before != ZERO {
                     metadata_roots.push_str(&u.before);
                     metadata_roots.push('\n');
                 }
+            }
+            if let Some(control) = batch.control() {
+                metadata_roots.push_str(control.owner_commit());
+                metadata_roots.push('\n');
             }
             let prefix = scratch
                 .map_or_else(|| PathBuf::from("scratch.git"), Path::to_path_buf)
@@ -2149,7 +2474,7 @@ mod unix {
                 os("--no-reflogs"),
                 os("--no-progress"),
             ];
-            args.extend(batch.updates().iter().map(|u| os(&u.after)));
+            args.extend(batch.source_roots().iter().map(|oid| os(*oid)));
             // Connectivity-only does not hash every tree. The full metadata
             // pack above independently verifies all commit/tree/tag bytes and
             // their original index IDs before any old closure is excluded.
@@ -2174,67 +2499,102 @@ mod unix {
             commit_facts.insert(oid.to_owned(), commit);
             Ok(commit)
         };
-        let mut ancestor_pairs = BTreeSet::new();
-        for (i, u) in batch.updates().iter().enumerate() {
-            let after_is_commit = is_commit(&format!("kind-{i}"), &u.after)?;
-            if u.reference.starts_with("refs/heads/") && !after_is_commit {
-                return Err(Error::refused("a branch must point directly at a commit"));
+        if let Some(control) = batch.control() {
+            if !is_commit("control-owner-kind", control.owner_commit())? {
+                return Err(Error::refused("the control owner must be a source commit"));
             }
-            if u.before == ZERO {
-                continue;
-            }
-            if u.reference.starts_with("refs/tags/") {
-                return Err(Error::refused("an existing tag is immutable"));
-            }
-            // Every mutable namespace advances through commit ancestry; an
-            // existing non-commit custom ref is immutable as well.
-            if !after_is_commit {
-                return Err(Error::refused(
-                    "an existing ref can advance only to a descendant commit",
-                ));
-            }
-            if !is_commit(&format!("before-kind-{i}"), &u.before)? {
-                return Err(Error::refused("an existing non-commit ref is immutable"));
-            }
-            let pair = (u.before.as_str(), u.after.as_str());
-            if ancestor_pairs.contains(&pair) {
-                continue;
-            }
-            let ancestry = step(
-                &format!("ancestry-{i}"),
-                vec![
-                    os("-c"),
-                    os("core.commitGraph=false"),
-                    os("merge-base"),
-                    os("--is-ancestor"),
-                    os(&u.before),
-                    os(&u.after),
-                ],
-                scratch,
-            )?;
-            match ancestry.code {
-                Some(0) => {
-                    ancestor_pairs.insert(pair);
-                }
-                Some(1) => {
+            let tokens: BTreeSet<_> = control
+                .changes()
+                .iter()
+                .filter(|row| row.reference == crate::git::PUBLISHER_FENCE_REF)
+                .flat_map(|row| row.before.iter().chain(&row.after))
+                .collect();
+            for (index, token) in tokens.iter().enumerate() {
+                let kind = checked(
+                    &format!("control-token-kind-{index}"),
+                    vec![os("cat-file"), os("-t"), os(token.as_str())],
+                    scratch,
+                )?;
+                if kind.stdout != b"tag\n" {
                     return Err(Error::refused(
-                        "native push refuses a non-fast-forward update",
+                        "a publisher control token must be annotated",
                     ));
                 }
-                _ => {
-                    return Err(failed(
-                        &run.op,
-                        &ancestry,
-                        children.gh.redactor(),
-                        &run.slug,
-                        false,
+                let body = checked(
+                    &format!("control-token-body-{index}"),
+                    vec![os("cat-file"), os("tag"), os(token.as_str())],
+                    scratch,
+                )?;
+                if body.stdout_may_be_truncated() {
+                    return Err(Error::refused(
+                        "publisher control token exceeds bounded object admission",
                     ));
+                }
+                control.check_fence_header(&body.stdout)?;
+            }
+        } else {
+            let mut ancestor_pairs = BTreeSet::new();
+            for (i, u) in batch.updates().iter().enumerate() {
+                let after_is_commit = is_commit(&format!("kind-{i}"), &u.after)?;
+                if u.reference.starts_with("refs/heads/") && !after_is_commit {
+                    return Err(Error::refused("a branch must point directly at a commit"));
+                }
+                if u.before == ZERO {
+                    continue;
+                }
+                if u.reference.starts_with("refs/tags/") {
+                    return Err(Error::refused("an existing tag is immutable"));
+                }
+                // Every mutable namespace advances through commit ancestry; an
+                // existing non-commit custom ref is immutable as well.
+                if !after_is_commit {
+                    return Err(Error::refused(
+                        "an existing ref can advance only to a descendant commit",
+                    ));
+                }
+                if !is_commit(&format!("before-kind-{i}"), &u.before)? {
+                    return Err(Error::refused("an existing non-commit ref is immutable"));
+                }
+                let pair = (u.before.as_str(), u.after.as_str());
+                if ancestor_pairs.contains(&pair) {
+                    continue;
+                }
+                let ancestry = step(
+                    &format!("ancestry-{i}"),
+                    vec![
+                        os("-c"),
+                        os("core.commitGraph=false"),
+                        os("merge-base"),
+                        os("--is-ancestor"),
+                        os(&u.before),
+                        os(&u.after),
+                    ],
+                    scratch,
+                )?;
+                match ancestry.code {
+                    Some(0) => {
+                        ancestor_pairs.insert(pair);
+                    }
+                    Some(1) => {
+                        return Err(Error::refused(
+                            "native push refuses a non-fast-forward update",
+                        ));
+                    }
+                    _ => {
+                        return Err(failed(
+                            &run.op,
+                            &ancestry,
+                            children.gh.redactor(),
+                            &run.slug,
+                            false,
+                        ));
+                    }
                 }
             }
         }
-        if incremental {
+        if incremental && batch.updates().iter().any(|row| row.after != ZERO) {
             let mut roots = String::new();
-            for u in batch.updates() {
+            for u in batch.updates().iter().filter(|row| row.after != ZERO) {
                 roots.push_str(&u.after);
                 roots.push('\n');
             }
@@ -2346,7 +2706,7 @@ mod unix {
             }
         }
         let mut final_list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
-        final_list.extend(batch.updates().iter().map(|u| os(&u.reference)));
+        final_list.extend(batch.guard_refs().iter().map(|reference| os(*reference)));
         if checked("remote-final", final_list, scratch)?.stdout != listed.stdout {
             return Err(Error::new(
                 Kind::Conflict,
@@ -2374,24 +2734,100 @@ mod unix {
             args.push(os(format!("--force-with-lease={}:{before}", u.reference)));
         }
         args.push(os(remote.url()));
-        args.extend(
-            batch
+        args.extend(batch.updates().iter().map(|u| {
+            if u.after == ZERO {
+                os(format!(":{}", u.reference))
+            } else {
+                os(format!("{}:{}", u.after, u.reference))
+            }
+        }));
+        let started = children.gh.fx().mono()?;
+        let mut pause = std::time::Duration::from_secs(1);
+        let out = loop {
+            let out = children
+                .git(&args, scratch, &canonical)
+                .map_err(|e| if dry_run { unsent(e) } else { e })?;
+            if out.code == Some(0) {
+                break out;
+            }
+            let error = failed(&run.op, &out, children.gh.redactor(), &run.slug, !dry_run);
+            if dry_run
+                || error.kind != Kind::CouldNotRun
+                || error.side_effect != SideEffect::Unknown
+            {
+                return Err(error);
+            }
+            // A receive failure says nothing about whether the CAS committed.
+            // Read all guarded refs, including the control refs we do not change.
+            let mut list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
+            list.extend(batch.guard_refs().iter().map(|reference| os(*reference)));
+            let read = checked("remote-recover", list, scratch).map_err(|read| {
+                Error::could_not_run(format!(
+                    "{}; remote re-read failed: {}",
+                    error.why, read.why
+                ))
+                .with_side_effect(SideEffect::Unknown)
+            })?;
+            if read.stdout_may_be_truncated() {
+                return Err(Error::protocol(
+                    "remote recovery refs exceed the complete output bound",
+                )
+                .with_side_effect(SideEffect::Unknown));
+            }
+            let text = std::str::from_utf8(&read.stdout).map_err(|_| {
+                Error::protocol("git returned non-UTF-8 refs").with_side_effect(SideEffect::Unknown)
+            })?;
+            let mut observed = BTreeMap::new();
+            for line in text.lines() {
+                let (oid, reference) = line.split_once('\t').ok_or_else(|| {
+                    Error::protocol("git returned malformed refs")
+                        .with_side_effect(SideEffect::Unknown)
+                })?;
+                if !crate::path::is_sha(oid)
+                    || !batch.guard_refs().contains(&reference)
+                    || observed.insert(reference, oid).is_some()
+                {
+                    return Err(Error::protocol("git returned unexpected or duplicate refs")
+                        .with_side_effect(SideEffect::Unknown));
+                }
+            }
+            if batch
                 .updates()
                 .iter()
-                .map(|u| os(format!("{}:{}", u.after, u.reference))),
-        );
-        let out = children
-            .git(&args, scratch, &canonical)
-            .map_err(|e| if dry_run { unsent(e) } else { e })?;
-        if out.code != Some(0) {
-            return Err(failed(
-                &run.op,
-                &out,
-                children.gh.redactor(),
-                &run.slug,
-                !dry_run,
-            ));
-        }
+                .all(|u| observed.get(u.reference.as_str()).copied().unwrap_or(ZERO) == u.after)
+            {
+                return Ok(ChildOut {
+                    code: Some(0),
+                    stdout: b"remote re-read confirmed all requested refs\n".to_vec(),
+                    stderr: Vec::new(),
+                });
+            }
+            if observed != found {
+                let partial = batch.updates().iter().any(|u| {
+                    observed.get(u.reference.as_str()).copied().unwrap_or(ZERO) == u.after
+                });
+                return Err(Error::new(
+                    Kind::Conflict,
+                    "remote refs changed after an uncertain push",
+                )
+                .with_side_effect(if partial {
+                    SideEffect::Unknown
+                } else {
+                    SideEffect::None
+                }));
+            }
+            // No ref progress: use elapsed patience, never an attempt count.
+            // Repeated healthy reads of BEFORE are not progress and cannot
+            // keep a broken receive service alive forever.
+            if children.gh.fx().mono()?.saturating_sub(started) >= run.budget {
+                return Err(
+                    Error::could_not_run(format!("no remote ref progress: {}", error.why))
+                        .with_side_effect(SideEffect::None),
+                );
+            }
+            children.gh.fx().sleep(pause)?;
+            pause = (pause * 2).min(std::time::Duration::from_secs(30));
+        };
         // Git omits a lease when its advertisement already equals AFTER. That
         // can race our earlier read even when BEFORE != AFTER in every input.
         // Other rows may have landed, so never call that a complete CAS success.
@@ -2407,13 +2843,25 @@ mod unix {
             let Some((source, reference)) = spec.split_once(':') else {
                 continue;
             };
-            if !matches!(flag, " " | "*")
-                || !batch
-                    .updates()
-                    .iter()
-                    .any(|u| u.reference == reference && u.after == source)
-                || !acknowledged.insert(reference)
-            {
+            let matches = batch.updates().iter().any(|update| {
+                if update.reference != reference {
+                    return false;
+                }
+                if batch.control().is_none() {
+                    return matches!(flag, " " | "*") && update.after == source;
+                }
+                if update.after == ZERO {
+                    return flag == "-" && matches!(source, "" | "(delete)");
+                }
+                let acknowledged = if update.before == ZERO {
+                    flag == "*"
+                } else {
+                    // Only the validated annotated control token can rotate.
+                    update.reference == crate::git::PUBLISHER_FENCE_REF && matches!(flag, " " | "+")
+                };
+                acknowledged && update.after == source
+            });
+            if !matches || !acknowledged.insert(reference) {
                 return Err(Error::new(Kind::OutcomeUnknown, "native push did not acknowledge every explicit lease; concurrent changes or partial effects are possible")
                     .with_side_effect(if dry_run { SideEffect::None } else { SideEffect::Unknown }).with_repo(run.slug.to_string()));
             }
@@ -2540,6 +2988,19 @@ mod unix {
                     grant,
                 });
             }
+            GitOp::PushControl {
+                dir,
+                transaction,
+                dry_run,
+            } => {
+                let out = push_control(children, run, remote, dir, transaction, *dry_run)?;
+                return Ok(GitOut {
+                    stdout: kept(&out.stdout, redactor),
+                    stderr: kept(&out.stderr, redactor),
+                    as_: profile,
+                    grant,
+                });
+            }
             GitOp::FetchBatch { dir, batch, .. } => {
                 let out = fetch_batch(children, run, remote, dir, batch)?;
                 return Ok(GitOut {
@@ -2554,7 +3015,7 @@ mod unix {
                 anonymous,
             } => {
                 let mut args = vec![os("ls-remote")];
-                if !anonymous {
+                if !anonymous && reference.as_deref() != Some("HEAD") {
                     args.push(os("--refs"));
                 }
                 args.push(url);
@@ -2586,10 +3047,77 @@ mod unix {
             }
         };
         let canonical = crate::fx::canon::git_request(run);
-        let out = children.git(&args, cwd, &canonical)?;
-        if out.code != Some(0) {
-            return Err(failed(&run.op, &out, redactor, slug, true));
-        }
+        let started = children.gh.fx().mono()?;
+        let mut pause = std::time::Duration::from_secs(1);
+        let out = loop {
+            let out = children.git(&args, cwd, &canonical)?;
+            if out.code == Some(0) {
+                break out;
+            }
+            let error = failed(&run.op, &out, redactor, slug, true);
+            let GitOp::PushDelete { reference, expect } = &run.op else {
+                return Err(error);
+            };
+            if error.kind != Kind::CouldNotRun || error.side_effect != SideEffect::Unknown {
+                return Err(error);
+            }
+            let read_key = [canonical.as_slice(), b"\nstep delete-recover"].concat();
+            let read = children
+                .git(
+                    &[
+                        os("ls-remote"),
+                        os("--refs"),
+                        os(remote.url()),
+                        os(reference),
+                    ],
+                    cwd,
+                    &read_key,
+                )
+                .map_err(|read| {
+                    Error::could_not_run(format!(
+                        "{}; remote re-read failed: {}",
+                        error.why, read.why
+                    ))
+                    .with_side_effect(SideEffect::Unknown)
+                })?;
+            if read.code != Some(0) {
+                return Err(Error::could_not_run(format!(
+                    "{}; remote re-read failed: {}",
+                    error.why,
+                    kept(&read.stderr, redactor)
+                ))
+                .with_side_effect(SideEffect::Unknown));
+            }
+            if read.stdout_may_be_truncated() {
+                return Err(Error::protocol(
+                    "remote recovery refs exceed the complete output bound",
+                )
+                .with_side_effect(SideEffect::Unknown));
+            }
+            if read.stdout.is_empty() {
+                break ChildOut {
+                    code: Some(0),
+                    stdout: b"remote re-read confirmed ref absence\n".to_vec(),
+                    stderr: Vec::new(),
+                };
+            }
+            let expected = format!("{expect}\t{reference}\n");
+            if read.stdout != expected.as_bytes() {
+                return Err(Error::new(
+                    Kind::Conflict,
+                    "remote ref changed after an uncertain delete",
+                )
+                .with_side_effect(SideEffect::None));
+            }
+            if children.gh.fx().mono()?.saturating_sub(started) >= run.budget {
+                return Err(
+                    Error::could_not_run(format!("no remote ref progress: {}", error.why))
+                        .with_side_effect(SideEffect::None),
+                );
+            }
+            children.gh.fx().sleep(pause)?;
+            pause = (pause * 2).min(std::time::Duration::from_secs(30));
+        };
         if matches!(
             run.op,
             GitOp::LsRemote {
@@ -2676,6 +3204,26 @@ mod unix {
 
 #[cfg(all(test, unix))]
 mod tests {
+    /// A stall report names the credential-free operation and its exact internal phase, without
+    /// copying ref rows or raw argv into the diagnostic.
+    #[test]
+    fn progress_wait_name_is_the_canonical_operation_and_step() {
+        assert_eq!(
+            super::unix::waiting_on(
+                b"git fetch-batch fixture/app\nsource 0123\ninto refs/agh/x\nstep fetch"
+            ),
+            "git fetch-batch fixture/app, step fetch"
+        );
+        assert_eq!(
+            super::unix::waiting_on(b"git ls-remote fixture/app\nref refs/heads/main"),
+            "git ls-remote fixture/app"
+        );
+        assert_eq!(
+            super::unix::waiting_on(b"not canonical"),
+            "native git operation"
+        );
+    }
+
     #[test]
     fn cutter_helper_uses_only_its_explicit_agh_dispatch() {
         let helper = super::HelperCommand::for_executable("/owned/aterm-release".into()).unwrap();
@@ -2815,6 +3363,57 @@ mod tests {
             error.why
         );
         assert!(error.why.contains("refs/tags/v1"), "{}", error.why);
+        for (reason, transient) in [
+            ("failed", true),
+            ("failed to update ref", true),
+            ("failed to update refs", true),
+            ("transaction failed to start", true),
+            ("atomic transaction failed", true),
+            ("unable to migrate objects to permanent storage", true),
+            ("protected branch hook declined", false),
+            ("pre-receive hook declined", false),
+            ("hook declined", false),
+            ("protected", false),
+            ("permission denied", false),
+            ("repository rule violations found", false),
+            ("unrecognized failure", false),
+            ("atomic push failure", false),
+        ] {
+            let mut out = ruled.clone();
+            out.stdout = format!("!\t:refs/tags/v1\t[remote rejected] ({reason})\n").into_bytes();
+            let error = super::unix::failed(&push, &out, &redactor, &slug, true);
+            assert_eq!(
+                (error.kind, error.side_effect),
+                if transient {
+                    (Kind::CouldNotRun, SideEffect::Unknown)
+                } else {
+                    (Kind::Refused, SideEffect::None)
+                },
+                "{reason}"
+            );
+            assert!(error.why.contains(reason));
+        }
+        for (other, expected) in [
+            ("atomic push failure", Kind::CouldNotRun),
+            ("protected branch hook declined", Kind::Refused),
+        ] {
+            let mut out = ruled.clone();
+            out.stdout =
+                format!("!\t:a\t[remote rejected] ({other})\n!\t:b\t[remote rejected] (failed)\n")
+                    .into_bytes();
+            assert_eq!(
+                super::unix::failed(&push, &out, &redactor, &slug, true).kind,
+                expected
+            );
+            // Reordering rows must preserve a concrete policy refusal.
+            out.stdout =
+                format!("!\t:b\t[remote rejected] (failed)\n!\t:a\t[remote rejected] ({other})\n")
+                    .into_bytes();
+            assert_eq!(
+                super::unix::failed(&push, &out, &redactor, &slug, true).kind,
+                expected
+            );
+        }
         let stale = ChildOut {
             code: Some(1),
             stdout: b"!\t(delete):refs/tags/v1\t[rejected] (stale info)\n".to_vec(),

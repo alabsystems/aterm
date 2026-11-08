@@ -87,6 +87,8 @@ pub enum Starvation {
     NoTake,
     /// The sampler took no ticks.
     NoSamples,
+    /// A full offscreen video did not establish a complete composition history.
+    IncompleteCapture,
     /// The driver was descheduled past the floor.
     Descheduled {
         late_max_us: u64,
@@ -141,7 +143,7 @@ impl Starvation {
     #[must_use]
     pub const fn label(&self) -> Starved {
         match self {
-            Self::NoTake | Self::NoSamples => Starved::Unknown,
+            Self::NoTake | Self::NoSamples | Self::IncompleteCapture => Starved::Unknown,
             Self::Descheduled { .. } | Self::CadenceBlown { .. } | Self::BudgetPressure { .. } => {
                 Starved::Yes
             }
@@ -168,6 +170,9 @@ impl std::fmt::Display for Starvation {
                  recorder",
             ),
             Self::NoSamples => f.write_str("no scheduling samples were taken"),
+            Self::IncompleteCapture => f.write_str(
+                "the full offscreen recording did not account for every composition in the driven window: not evidence about continuity"
+            ),
             Self::Descheduled {
                 late_max_us,
                 threshold_us,
@@ -225,6 +230,9 @@ pub struct SchedInputs {
     /// The offscreen recorder and scan account for every composition. A render interval then
     /// holds the last known image, instead of hiding an unknown periodically sampled image.
     pub all_composed_frames: bool,
+    /// Full offscreen video must account for every composition, rather than fall back to an
+    /// assumption that periodic samples happened not to miss an image.
+    pub require_composed_frames: bool,
     pub wall_us: u64,
     pub budget_us: u64,
     pub late_threshold_us: u64,
@@ -248,6 +256,9 @@ pub const fn classify(i: &SchedInputs) -> Starvation {
             threshold_us: i.late_threshold_us,
             qos: i.qos,
         };
+    }
+    if i.require_composed_frames && !i.all_composed_frames {
+        return Starvation::IncompleteCapture;
     }
     if !i.all_composed_frames
         && i.nominal_dt_us > 0

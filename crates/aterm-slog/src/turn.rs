@@ -107,6 +107,57 @@ impl ActWord {
     }
 }
 
+/// What a key chose on the approval box or question it was pressed on, as the screen showed it
+/// (fix E8, finding E2E-8): the host reads it from the key's class and the box's options as the
+/// phase reader read them on the last frame before the key, whoever pressed it. A key alone says
+/// nothing (T1); the focused option, or the option a digit numbers, is the evidence. Evidence, not
+/// a witness of what the program did: a close it decides is `conf=heuristic`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Chose {
+    /// An approve-role option of an approval box.
+    Approve,
+    /// A reject-role option, or Esc where the box or question says Esc rejects it.
+    Decline,
+    /// An answer of a question.
+    Answer,
+}
+
+impl Chose {
+    /// Every choice, in word order.
+    pub const ALL: [Chose; 3] = [Chose::Approve, Chose::Decline, Chose::Answer];
+
+    /// Its word (a `.seq` file's `chose=`).
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Chose::Approve => "approve",
+            Chose::Decline => "decline",
+            Chose::Answer => "answer",
+        }
+    }
+
+    /// The choice a word names, or `None`.
+    #[must_use]
+    pub fn from_word(w: &str) -> Option<Chose> {
+        Chose::ALL.into_iter().find(|c| c.word() == w)
+    }
+
+    /// The outcome it gives a step of `what` that the key dismissed: `approved` on an approval,
+    /// `declined` on an approval or a question, `answered` on a question; `None` where it does not
+    /// fit the step (an approve on a question, an answer on an approval).
+    #[must_use]
+    pub const fn out_for(self, what: ScreenStep) -> Option<StepOut> {
+        match (self, what) {
+            (Chose::Approve, ScreenStep::Approval(_)) => Some(StepOut::Approved),
+            (Chose::Decline, ScreenStep::Approval(_) | ScreenStep::Question) => {
+                Some(StepOut::Declined)
+            }
+            (Chose::Answer, ScreenStep::Question) => Some(StepOut::Answered),
+            _ => None,
+        }
+    }
+}
+
 /// Whether an input accepted at `accepted` is recent enough at a step's close at `close` to be the input that dismissed it ([`STEP_ACT_MS`]).
 #[must_use]
 pub const fn dismisses(accepted: Stamp, close: Stamp) -> bool {
@@ -127,6 +178,7 @@ pub struct Admission {
     at: Stamp,
     opens: u64,
     closes: u64,
+    chose: Option<Chose>,
 }
 
 impl Admission {
@@ -140,6 +192,21 @@ impl Admission {
     #[must_use]
     pub const fn at(&self) -> Stamp {
         self.at
+    }
+
+    /// The admission of an input whose key the screen showed choosing `chose` on the step open
+    /// at it (fix E8): the host's reading of the frame the key lands on. It counts only for the
+    /// step open at the admission ([`TurnTracker::accept`]); a lead's step opened after the frame.
+    #[must_use]
+    pub const fn choosing(mut self, chose: Option<Chose>) -> Admission {
+        self.chose = chose;
+        self
+    }
+
+    /// What the screen showed its key choose ([`Self::choosing`]).
+    #[must_use]
+    pub const fn chose(&self) -> Option<Chose> {
+        self.chose
     }
 }
 
@@ -156,11 +223,16 @@ pub enum Binding {
     Unbound,
 }
 
+/// The input bound to an approval or question step, as [`AttributionView::bound`] shows it: the
+/// step, its author, its act, what the screen showed its key choose (fix E8) and when it was
+/// accepted.
+pub type BoundInput = (Node, Actor, Option<ActWord>, Option<Chose>, Stamp);
+
 /// What the tracker holds of the inputs bound to its steps, for a conformance projection or a debugger.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttributionView {
-    /// The latest input bound to the open approval or question step: the step, its author, its act and when it was accepted.
-    pub bound: Option<(Node, Actor, Option<ActWord>, Stamp)>,
+    /// The latest input bound to the open approval or question step ([`BoundInput`]).
+    pub bound: Option<BoundInput>,
     /// An accepted input waiting on the lead.
     pub lead: Option<(Actor, Option<ActWord>, Stamp, Stamp, u64, u64)>,
     /// Approval and question steps opened so far.
@@ -410,6 +482,9 @@ struct Bound {
     node: Node,
     by: Actor,
     act: Option<ActWord>,
+    /// What the screen showed its key choose on the step (fix E8): `None` for a lead's input,
+    /// whose frame showed no step.
+    chose: Option<Chose>,
     accepted: Stamp,
 }
 
@@ -1364,7 +1439,10 @@ impl TurnTracker {
             let (by, out, orphan) = if gone {
                 (Actor::Nobody, StepOut::Gone, None)
             } else {
-                self.attribution_of(&c.held, at)
+                // The close keeps the claim's confidence, the lowest there is: what a key's
+                // frame chose (heuristic, fix E8) never raises it.
+                let (by, out, _, orphan) = self.attribution_of(&c.held, at);
+                (by, out, orphan)
             };
             let f = orphan
                 .and_then(|a| Fields::new().word(Key::Act, a.word()).ok())
@@ -1454,10 +1532,11 @@ impl TurnTracker {
             at,
             opens: self.opens,
             closes: self.closes,
+            chose: None,
         }
     }
 
-    /// THE ACCEPTANCE of an input admitted as `adm` (its bytes written), from `by` with its `act=`, at `at`.
+    /// THE ACCEPTANCE of an input admitted as `adm` (its bytes written), from `by` with its `act=`, at `at`. What the screen showed its key choose ([`Admission::choosing`]) binds with it only to the step open at its admission.
     pub fn accept(
         &mut self,
         log: &Log,
@@ -1472,7 +1551,7 @@ impl TurnTracker {
         }
         if let Some(node) = adm.step {
             if self.decision().is_some_and(|h| h.node == node) {
-                self.bind_input(node, by, act, at);
+                self.bind_input(node, by, act, adm.chose, at);
                 return Binding::Step(node);
             }
             return Binding::Late(node);
@@ -1495,7 +1574,7 @@ impl TurnTracker {
             Some(1) => match self.decision() {
                 Some(h) if h.opened.is_some_and(|o| within_lead(adm.at, o)) => {
                     let node = h.node;
-                    self.bind_input(node, by, act, at);
+                    self.bind_input(node, by, act, None, at);
                     Binding::Step(node)
                 }
                 _ => Binding::Unbound,
@@ -1504,13 +1583,13 @@ impl TurnTracker {
         }
     }
 
-    /// A PERSON's input at `at` (delivery).
-    pub fn person(&mut self, log: &Log, at: Stamp) -> Binding {
+    /// A PERSON's input at `at` (delivery), whose key the screen showed choosing `chose` on the step open now (fix E8; `None`: a key the host could not place, or no key).
+    pub fn person(&mut self, log: &Log, chose: Option<Chose>, at: Stamp) -> Binding {
         self.resync(log);
         match self.decision() {
             Some(h) => {
                 let node = h.node;
-                self.bind_input(node, Actor::Human, None, at);
+                self.bind_input(node, Actor::Human, None, chose, at);
                 Binding::Step(node)
             }
             _ => {
@@ -1531,7 +1610,9 @@ impl TurnTracker {
     #[must_use]
     pub fn attribution(&self) -> AttributionView {
         AttributionView {
-            bound: self.bound.map(|b| (b.node, b.by, b.act, b.accepted)),
+            bound: self
+                .bound
+                .map(|b| (b.node, b.by, b.act, b.chose, b.accepted)),
             lead: self
                 .lead
                 .map(|l| (l.by, l.act, l.admitted, l.accepted, l.opens, l.closes)),
@@ -1931,28 +2012,43 @@ impl TurnTracker {
         }
     }
 
-    const fn bind_input(&mut self, node: Node, by: Actor, act: Option<ActWord>, at: Stamp) {
+    const fn bind_input(
+        &mut self,
+        node: Node,
+        by: Actor,
+        act: Option<ActWord>,
+        chose: Option<Chose>,
+        at: Stamp,
+    ) {
         self.bound = Some(Bound {
             node,
             by,
             act,
+            chose,
             accepted: at,
         });
         self.lead = None;
     }
 
-    fn attribution_of(&self, h: &Held, at: Stamp) -> (Actor, StepOut, Option<ActWord>) {
+    /// Who closed the open step `h` at `at`, how, and the act of an input that dismissed nothing
+    /// (written on the close as `act=`). THE OUTCOME (T1, refined by fix E8): a proven author's
+    /// act decides it; else what the screen showed the dismissing input's key choose, whoever
+    /// pressed it, at `conf=heuristic` (the screen is evidence, not a witness); else `passed`.
+    fn attribution_of(&self, h: &Held, at: Stamp) -> (Actor, StepOut, Conf, Option<ActWord>) {
         match self.bound.filter(|b| b.node == h.node) {
-            Some(b) if dismisses(b.accepted, at) => (
-                b.by,
-                b.act
+            Some(b) if dismisses(b.accepted, at) => {
+                let acted = b
+                    .act
                     .and_then(|a| a.out_for(h.what))
-                    .filter(|_| b.by.is_proven())
-                    .unwrap_or(StepOut::Passed),
-                None,
-            ),
-            Some(b) => (Actor::Nobody, StepOut::Passed, b.act),
-            None => (Actor::Nobody, StepOut::Passed, None),
+                    .filter(|_| b.by.is_proven());
+                match (acted, b.chose.and_then(|c| c.out_for(h.what))) {
+                    (Some(out), _) => (b.by, out, Conf::Strong, None),
+                    (None, Some(out)) => (b.by, out, Conf::Heuristic, None),
+                    (None, None) => (b.by, StepOut::Passed, Conf::Strong, None),
+                }
+            }
+            Some(b) => (Actor::Nobody, StepOut::Passed, Conf::Strong, b.act),
+            None => (Actor::Nobody, StepOut::Passed, Conf::Strong, None),
         }
     }
 
@@ -2151,7 +2247,7 @@ impl TurnTracker {
             && l.closes == self.closes
             && within_lead(l.admitted, at)
         {
-            self.bind_input(node, l.by, l.act, l.accepted);
+            self.bind_input(node, l.by, l.act, None, l.accepted);
         }
         self.opens += 1;
     }
@@ -2162,27 +2258,28 @@ impl TurnTracker {
 
     /// [`Self::close_step`], `declined` when the screen reported the interrupt at the verdict that
     /// closes it (an approval box the person stopped the turn under): a close no act decided is
-    /// then `out=declined`, by whoever's input is attributed, and an act's own word stands.
+    /// then `out=declined`, by whoever's input is attributed, and an act's own word stands. The
+    /// report is the screen's own, after the key: it stands over what the key's frame showed.
     fn close_step_as(&mut self, log: &mut Log, out: StepOut, declined: bool, at: Stamp) {
         if let Some(h) = self.step.as_ref()
             && log.is_open(h.node)
         {
-            let (by, out, orphan) = if out == StepOut::Passed && binds(h.what) {
+            let (by, out, conf, orphan) = if out == StepOut::Passed && binds(h.what) {
                 self.attribution_of(h, at)
             } else {
-                (Actor::Nobody, out, None)
+                (Actor::Nobody, out, Conf::Strong, None)
             };
-            let out = if declined && out == StepOut::Passed {
-                StepOut::Declined
+            let (out, conf) = if declined && (out == StepOut::Passed || conf == Conf::Heuristic) {
+                (StepOut::Declined, Conf::Strong)
             } else {
-                out
+                (out, conf)
             };
             let f = orphan
                 .and_then(|a| Fields::new().word(Key::Act, a.word()).ok())
                 .unwrap_or_default();
             let _ = log.close(
                 h.node,
-                Close::new(Out::Step(out), Src::Screen, Conf::Strong)
+                Close::new(Out::Step(out), Src::Screen, conf)
                     .by(by)
                     .fields(f),
                 at,

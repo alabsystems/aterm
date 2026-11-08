@@ -4,6 +4,7 @@
 //! Attachment activation belongs to the exact accepted Caps setting, beyond stage completion.
 
 use super::*;
+use aterm_machines::init::KeyboardAttachmentActivation;
 
 /// Current Caps authority, or a pending setting whose hardware facts may wake its worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +121,7 @@ pub(super) fn revision_at(root: &Path) -> Result<Option<u64>, String> {
     ))
 }
 
-/// Activate only newly attached services under their original accepted Caps setting. The
+/// Activate new or changed services under their original accepted Caps setting. The
 /// profile lock orders the operation against choices and Restore, while both the durable and
 /// this process's immediate Stop are checked before each whole item.
 /// `invalidate` retires an earlier whole-Caps reading before a mutation or on uncertain
@@ -133,7 +134,7 @@ pub fn activate_input_attachments(
     registries: &[u64],
     stopped: impl Fn(u64) -> bool,
     invalidate: &dyn Fn(),
-) -> Result<Option<bool>, String> {
+) -> Result<Option<KeyboardAttachmentActivation>, String> {
     let invalidated = std::cell::Cell::new(false);
     let invalidate_once = || {
         if !invalidated.replace(true) {
@@ -159,19 +160,22 @@ pub fn activate_input_attachments(
             },
         )
     })();
-    if matches!(result, Err(_) | Ok(Some(false))) {
+    if matches!(
+        result,
+        Err(_) | Ok(Some(KeyboardAttachmentActivation::Unfinished))
+    ) {
         invalidate_once();
     }
     result
 }
 
-fn activate_at(
+fn activate_at<T>(
     root: &Path,
     expected: u64,
     stopped: &dyn Fn(u64) -> bool,
     invalidate: &dyn Fn(),
-    work: impl FnOnce(&kept::Kept, &dyn Fn() -> bool) -> Result<bool, String>,
-) -> Result<Option<bool>, String> {
+    work: impl FnOnce(&kept::Kept, &dyn Fn() -> bool) -> Result<T, String>,
+) -> Result<Option<T>, String> {
     let Some(_lock) = HeldLock::try_take(root)? else {
         return Ok(None);
     };
@@ -244,14 +248,14 @@ mod tests {
             "an unrelated pending preference must not suspend accepted keyboard attachments"
         );
         assert_eq!(
-            activate_at(root, current, &|_| false, &|| {}, |_, continues| Ok(
+            activate_at::<bool>(root, current, &|_| false, &|| {}, |_, continues| Ok(
                 continues()
             ))
             .unwrap(),
             Some(true)
         );
         assert_eq!(
-            activate_at(root, original, &|_| false, &|| {}, |_, _| panic!(
+            activate_at::<bool>(root, original, &|_| false, &|| {}, |_, _| panic!(
                 "old revision"
             ))
             .unwrap(),
@@ -523,7 +527,7 @@ mod tests {
                 "{caps:?}: Caps completion cannot be borrowed from the unfinished Dock"
             );
             assert_eq!(
-                activate_at(root, current, &|_| false, &|| {}, |_, continues| Ok(
+                activate_at::<bool>(root, current, &|_| false, &|| {}, |_, continues| Ok(
                     continues()
                 ))
                 .unwrap(),
@@ -532,14 +536,14 @@ mod tests {
             if enrolled {
                 let before = observation_at(root).unwrap();
                 assert_eq!(
-                    activate_at(root, current + 1, &|_| false, &|| {}, |_, _| panic!(
+                    activate_at::<bool>(root, current + 1, &|_| false, &|| {}, |_, _| panic!(
                         "other revision"
                     ))
                     .unwrap(),
                     None
                 );
                 assert_eq!(
-                    activate_at(root, current, &|_| true, &|| {}, |_, _| panic!(
+                    activate_at::<bool>(root, current, &|_| true, &|| {}, |_, _| panic!(
                         "immediate Stop"
                     ))
                     .unwrap(),
@@ -643,7 +647,7 @@ mod tests {
             );
             assert_eq!(revision_at(root).unwrap(), None);
             assert_eq!(
-                activate_at(root, current, &|_| false, &|| {}, |_, _| panic!(
+                activate_at::<bool>(root, current, &|_| false, &|| {}, |_, _| panic!(
                     "Caps is restored"
                 ))
                 .unwrap(),
@@ -664,7 +668,7 @@ mod tests {
         let current = choose(root, &plan);
         assert_eq!(revision_at(root).unwrap(), Some(current));
         assert_eq!(
-            activate_at(root, current, &|_| true, &|| {}, |_, _| panic!(
+            activate_at::<bool>(root, current, &|_| true, &|| {}, |_, _| panic!(
                 "immediate Stop"
             ))
             .unwrap(),
@@ -714,7 +718,7 @@ mod tests {
                 "attachment authority belongs to this setting, not the unfinished stage"
             );
             assert_eq!(
-                activate_at(root, current, &|_| false, &|| {}, |_, continues| {
+                activate_at::<bool>(root, current, &|_| false, &|| {}, |_, continues| {
                     assert_eq!(applied, Setting::CapsLock, "new Caps has not applied");
                     Ok(continues())
                 })
@@ -722,7 +726,7 @@ mod tests {
                 (applied == Setting::CapsLock).then_some(true)
             );
             assert_eq!(
-                activate_at(root, original.revision, &|_| false, &|| {}, |_, _| panic!(
+                activate_at::<bool>(root, original.revision, &|_| false, &|| {}, |_, _| panic!(
                     "the old partial revision grants nothing"
                 ))
                 .unwrap(),
@@ -776,7 +780,7 @@ mod tests {
         assert!(scope::upgrade_of(&before.records, || true).is_none());
         assert_eq!(revision_at(root).unwrap(), Some(0));
         assert_eq!(
-            activate_at(root, 0, &|_| false, &|| {}, |_, go| {
+            activate_at::<bool>(root, 0, &|_| false, &|| {}, |_, go| {
                 assert!(HeldLock::try_take(root)?.is_none());
                 Ok(go())
             })
@@ -792,7 +796,7 @@ mod tests {
         let (plan, mut progress) = ready(root);
         assert_ne!(revision_at(root).unwrap(), Some(0));
         assert_eq!(
-            activate_at(root, 0, &|_| false, &|| {}, |_, _| panic!(
+            activate_at::<bool>(root, 0, &|_| false, &|| {}, |_, _| panic!(
                 "superseded legacy setting"
             ))
             .unwrap(),
@@ -827,7 +831,7 @@ mod tests {
         older(root, selected, "applied", false);
         assert_eq!(revision_at(root).unwrap(), Some(0));
         assert_eq!(
-            activate_at(root, 0, &|_| true, &|| {}, |_, _| panic!(
+            activate_at::<bool>(root, 0, &|_| true, &|| {}, |_, _| panic!(
                 "immediate legacy Stop"
             ))
             .unwrap(),
@@ -848,15 +852,17 @@ mod tests {
         let (mut plan, mut progress) = ready(root);
         assert_eq!(revision_at(root).unwrap(), Some(7));
         assert_eq!(
-            activate_at(root, 7, &|_| false, &|| {}, |_, go| Ok(go())).unwrap(),
+            activate_at::<bool>(root, 7, &|_| false, &|| {}, |_, go| Ok(go())).unwrap(),
             Some(true)
         );
         assert_eq!(
-            activate_at(root, 8, &|_| false, &|| {}, |_, _| panic!("stale revision")).unwrap(),
+            activate_at::<bool>(root, 8, &|_| false, &|| {}, |_, _| panic!("stale revision"))
+                .unwrap(),
             None
         );
         assert_eq!(
-            activate_at(root, 7, &|_| true, &|| {}, |_, _| panic!("immediate Stop")).unwrap(),
+            activate_at::<bool>(root, 7, &|_| true, &|| {}, |_, _| panic!("immediate Stop"))
+                .unwrap(),
             None
         );
         progress.admitted = false;
@@ -876,7 +882,8 @@ mod tests {
         request_stop_at(root, 7).unwrap();
         assert_eq!(revision_at(root).unwrap(), None);
         assert_eq!(
-            activate_at(root, 7, &|_| false, &|| {}, |_, _| panic!("durable Stop")).unwrap(),
+            activate_at::<bool>(root, 7, &|_| false, &|| {}, |_, _| panic!("durable Stop"))
+                .unwrap(),
             None
         );
         let restored = aterm_tempfile::tempdir().unwrap();
@@ -900,7 +907,7 @@ mod tests {
         let invalidate = || invalidated.set(invalidated.get() + 1);
         let held = HeldLock::try_take(root).unwrap().unwrap();
         assert_eq!(
-            activate_at(root, 7, &|_| false, &invalidate, |_, _| panic!(
+            activate_at::<bool>(root, 7, &|_| false, &invalidate, |_, _| panic!(
                 "a busy profile does not admit a read"
             ))
             .unwrap(),
@@ -913,7 +920,7 @@ mod tests {
         );
         drop(held);
         assert_eq!(
-            activate_at(root, 7, &|_| false, &invalidate, |_, go| {
+            activate_at::<bool>(root, 7, &|_| false, &invalidate, |_, go| {
                 assert!(HeldLock::try_take(root)?.is_none());
                 assert!(go());
                 request_stop_at(root, 7)?;

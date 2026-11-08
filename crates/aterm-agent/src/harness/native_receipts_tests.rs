@@ -480,6 +480,12 @@ pub(crate) fn issuer_transition(
         "ReopenA" => {
             assert!(put(&a, &a_binding, Event::Prepare).is_err());
         }
+        "ContainsA" => {
+            next.insert(
+                "seen_a",
+                i64::from(contains_operation_at(&paths, &a.id).unwrap()),
+            );
+        }
         _ => panic!("unknown issuer action {action}"),
     }
     let loaded = read(&paths).unwrap();
@@ -554,6 +560,23 @@ fn issuer_journal_refines_capacity_and_sticky_execution_model() {
         open(&paths, &key, five_records()).is_err(),
         "an overcommitted prefix is never adopted"
     );
+    // Negative control: a read after the whole custody tree is rolled back, the one loss the
+    // signed log cannot detect, forgets a record an earlier read found.
+    let (home, paths, a, a_binding) = fixture();
+    record_event_at_limits(&paths, &a, &a_binding, Some(Event::Prepare), five_records()).unwrap();
+    let mut forgot = model.init_state();
+    forgot.insert("a", 1);
+    forgot.insert("records", 1);
+    forgot.insert(
+        "seen_a",
+        i64::from(contains_operation_at(&paths, &a.id).unwrap()),
+    );
+    std::fs::remove_dir_all(home.path()).unwrap();
+    std::fs::create_dir_all(home.path()).unwrap();
+    assert!(!contains_operation_at(&paths, &a.id).unwrap());
+    forgot.insert("a", 0);
+    forgot.insert("records", 0);
+    assert!(!model.check_invariant("PresencePermanent", &forgot));
 }
 
 pub(crate) fn transition(

@@ -298,7 +298,7 @@ fn fixture(paths: &[&str]) -> (Fake, User, Repo, PathBuf) {
     sys.euid = 501;
     let who = user("alice", 501);
     let parent = Path::new(&who.home).join("parent");
-    sys.file(crate::items::github::CLT_GIT, b"fixture git");
+    sys.executable(crate::items::github::CLT_GIT, b"fixture git");
     sys.stat_of(&who.home, directory(&who));
     sys.stat_of(parent.to_str().unwrap(), directory(&who));
     repos::tests::script_existing(&sys, &who, &parent, "parent");

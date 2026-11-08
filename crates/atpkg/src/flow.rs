@@ -185,6 +185,11 @@ pub trait Fetcher {
     fn source_id(&self) -> String {
         "fetcher:unspecified".to_string()
     }
+    /// Stable identity of the actual package repository, including overrides.
+    /// Unidentified fetchers do not participate in persistent manifest reuse.
+    fn package_source_id(&self, _repo: &str, _program: &str) -> Option<String> {
+        None
+    }
     fn index_link_down(&self) -> bool {
         false
     }

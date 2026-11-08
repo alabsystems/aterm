@@ -17,8 +17,8 @@ mod service;
 const HELP: &str = "verify watch [--workspace DIR] [--remote NAME] [--branch BRANCH] [--once] [--interval SECONDS]\n\
 verify watch --install [--workspace DIR] [--interval SECONDS] installs a persistent macOS main lane.\n\
 Samples origin/main in a dedicated persistent clone at Background rank. Claims and verdicts\n\
-are appended to refs/aterm/judged (14 days of records). A release ends the sample; an Ordinary\n\
-waiter yields it at the next stage. --once attempts one sample. No hook, gate or publication.\n";
+are appended to refs/aterm/judged (14 days of records). A release ends the sample; Ordinary\n\
+work retains priority for overlapping resources. --once attempts one sample. No hook, gate or publication.\n";
 
 /// Re-run a Background verifier as its own cancellable process group when its launcher did not
 /// give it one. A candidate can be newer than a long-lived watch controller: the invariant
@@ -694,19 +694,41 @@ fn scrub(cmd: &mut aterm_uds::spawnfd::Command) {
     }
 }
 
-/// Used at each tree-stage boundary. Claims in this sample's private checkout belong to
-/// its own children; their internal memory waits cannot preempt their parent.
-pub(crate) fn foreground_waiting(root: &Path) -> Result<bool, String> {
+/// Whether a new sample must stay out of the lane until foreground work has entered it. Once a
+/// sample owns a judging claim, its Background stage admissions retain their place behind
+/// Ordinary work instead of discarding the judgment.
+fn foreground_waiting(root: &Path) -> Result<bool, String> {
+    pressure_waiting(root, SamplePhase::Starting)
+}
+
+/// Whether a Release or line must stop an in-flight judgment before its next stage. Ordinary
+/// work is deliberately absent: capacity gives its overlapping resource reservations priority.
+pub(crate) fn running_should_stop(root: &Path) -> Result<bool, String> {
+    pressure_waiting(root, SamplePhase::Running)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SamplePhase {
+    Starting,
+    Running,
+}
+
+fn pressure_waiting(root: &Path, phase: SamplePhase) -> Result<bool, String> {
     let ledger = aterm_capacity::Ledger::user().ok_or("no capacity ledger")?;
     let root = fs::canonicalize(root).map_err(|e| e.to_string())?;
     let rows = ledger.list().map_err(|e| e.to_string())?;
-    Ok(stage_should_yield(&root, &rows))
+    Ok(pressure_requires_stop(&root, &rows, phase))
 }
 
-fn stage_should_yield(root: &Path, rows: &[aterm_capacity::Record]) -> bool {
+fn pressure_requires_stop(
+    root: &Path,
+    rows: &[aterm_capacity::Record],
+    phase: SamplePhase,
+) -> bool {
     rows.iter().any(|r| {
         r.need.rank == aterm_capacity::Rank::Release
-            || (r.need.rank == aterm_capacity::Rank::Ordinary
+            || (phase == SamplePhase::Starting
+                && r.need.rank == aterm_capacity::Rank::Ordinary
                 && r.held.is_none()
                 && Path::new(&r.checkout) != root)
     })
@@ -858,7 +880,7 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
     let (stage2, path) = if let Some(handoff) = test_handoff {
         handoff
     } else {
-        let claim = match aterm_capacity::admit(
+        let _claim = match aterm_capacity::admit(
             aterm_capacity::Need::new("verify watch sample bootstrap"),
             aterm_capacity::Admit::Preemptible,
         ) {
@@ -866,9 +888,6 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
             Err(aterm_capacity::Error::Stopped { .. }) => return Ok(false),
             Err(why) => return Err(why.to_string()),
         };
-        if claim.should_yield().map_err(|e| e.to_string())? {
-            return Ok(false);
-        }
         let env = crate::EnvSnapshot::capture();
         let tools = crate::preflight(&env, root)?;
         let prefix = aterm_toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
@@ -926,7 +945,7 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
     } else {
         next
     };
-    if !is_test_handoff && foreground_waiting(root)? {
+    if !is_test_handoff && running_should_stop(root)? {
         return Ok(false);
     }
     if !crate::exec::group::default_interrupts_for_exec() {
@@ -1025,7 +1044,7 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
     // The zero-resource claim gives a release authority to end the whole sample group even
     // between stages. Resource ownership belongs to each stage, where memory and CPU are one
     // ordered admission.
-    let claim = match aterm_capacity::admit(
+    let _claim = match aterm_capacity::admit(
         aterm_capacity::Need::new("verify watch sample lifecycle"),
         aterm_capacity::Admit::Preemptible,
     ) {
@@ -1061,7 +1080,7 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
         ("inputs-end", &["ship", "inputs", "--recheck"]),
     ];
     for (id, args) in stages {
-        if claim.should_yield().map_err(|e| e.to_string())? {
+        if running_should_stop(root)? {
             return Ok(false);
         }
         let admitted_at = Instant::now();
@@ -1270,8 +1289,14 @@ fn row(id: &str, code: Option<i32>, text: &str) -> Row {
 fn attribute(root: &Path, commit: &str, tree: &str, rows: &mut [Row]) -> Result<(), String> {
     let until = judged::deadline();
     let head = judged::head(root, "origin", until)?;
-    let mut previous = judged::records(root, head.as_deref(), until)?;
-    previous.sort_by_key(|r| std::cmp::Reverse(r.updated));
+    let previous = judged::records(root, head.as_deref(), until)?;
+    // A late verdict for an older head must not move the attribution base backwards. Commit
+    // topology, not journal publication time, defines the last opposing verdict on this head's
+    // history. Reading the ancestry once also drops records from rewritten or unrelated refs.
+    let ancestors: BTreeSet<String> = git(root, &["rev-list", commit])?
+        .lines()
+        .map(str::to_owned)
+        .collect();
     for row in rows {
         let wanted = if row.outcome == "red" {
             "pass"
@@ -1280,21 +1305,35 @@ fn attribute(root: &Path, commit: &str, tree: &str, rows: &mut [Row]) -> Result<
         } else {
             continue;
         };
-        let Some(base) = previous.iter().find(|r| {
-            r.tree != tree
-                && r.rows
-                    .iter()
-                    .any(|old| old.id == row.id && old.outcome == wanted)
-        }) else {
-            continue;
-        };
-        let ancestry =
-            judged::command(root, &["merge-base", "--is-ancestor", &base.commit, commit])
-                .status()
-                .map_err(|e| e.to_string())?;
-        if !ancestry.success() {
+        let candidates: Vec<&Record> = previous
+            .iter()
+            .filter(|r| {
+                r.tree != tree
+                    && ancestors.contains(&r.commit)
+                    && r.rows
+                        .iter()
+                        .any(|old| old.id == row.id && old.outcome == wanted)
+            })
+            .collect();
+        if candidates.is_empty() {
             continue;
         }
+        let mut independent = vec!["merge-base", "--independent"];
+        independent.extend(candidates.iter().map(|record| record.commit.as_str()));
+        let independent = git(root, &independent)?;
+        let maxima: Vec<&str> = independent.lines().collect();
+        let [nearest] = maxima.as_slice() else {
+            // Two incomparable last verdicts (possible after rewritten histories rejoin) define
+            // no honest single range. Leave attribution empty rather than inventing one.
+            continue;
+        };
+        let Some(base) = candidates
+            .iter()
+            .copied()
+            .find(|record| record.commit == *nearest)
+        else {
+            return Err("independent attribution base was not a journal candidate".into());
+        };
         let evidence = if row.outcome == "red" {
             &*row
         } else {
@@ -2097,13 +2136,43 @@ mod tests {
                 &root,
                 "origin",
                 None,
-                &record(&base, "pass", 1),
+                &record(&base, "pass", 30),
+                judged::deadline()
+            )
+            .unwrap()
+        );
+        git(&root, &["checkout", "-b", "unrelated", &base]).unwrap();
+        let unrelated = commit("unrelated pass", "side");
+        let head = judged::head(&root, "origin", judged::deadline())
+            .unwrap()
+            .unwrap();
+        assert!(
+            judged::append(
+                &root,
+                "origin",
+                Some(&head),
+                &record(&unrelated, "pass", 100),
+                judged::deadline()
+            )
+            .unwrap()
+        );
+        git(&root, &["checkout", "main"]).unwrap();
+        let nearest_green = commit("newer green", "still good");
+        let head = judged::head(&root, "origin", judged::deadline())
+            .unwrap()
+            .unwrap();
+        assert!(
+            judged::append(
+                &root,
+                "origin",
+                Some(&head),
+                &record(&nearest_green, "pass", 20),
                 judged::deadline()
             )
             .unwrap()
         );
         let red = commit("red", "bad");
-        let mut red_record = record(&red, "red", 2);
+        let mut red_record = record(&red, "red", 40);
         let sample_result = root.join(".git/test-sample.toml");
         write_sampled_result(&root, &sample_result, red_record.rows.clone()).unwrap();
         let sampled: Sample =
@@ -2116,7 +2185,8 @@ mod tests {
         red_record.rows = sampled.rows;
         assert_eq!(
             red_record.rows[0].suspects.as_slice(),
-            std::slice::from_ref(&red)
+            std::slice::from_ref(&red),
+            "publication time and an unrelated pass cannot move the range before the nearest green"
         );
         let head = judged::head(&root, "origin", judged::deadline())
             .unwrap()
@@ -2147,7 +2217,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut passing = record(&merge, "pass", 3);
+        let mut passing = record(&merge, "pass", 50);
         attribute(&root, &passing.commit, &passing.tree, &mut passing.rows).unwrap();
         assert_eq!(
             passing.rows[0].fixed_by.as_deref(),
@@ -2155,7 +2225,7 @@ mod tests {
             "the landing merge is not a second suspect"
         );
         let extra = commit("another change", "good with another edit");
-        let mut ambiguous = record(&extra, "pass", 4);
+        let mut ambiguous = record(&extra, "pass", 60);
         attribute(
             &root,
             &ambiguous.commit,
@@ -2167,9 +2237,69 @@ mod tests {
             ambiguous.rows[0].fixed_by.is_none(),
             "two non-merge changes cannot be attributed to one fix"
         );
+
+        git(&root, &["checkout", "-b", "attribution-left", &base]).unwrap();
+        let left = commit("left green", "left good");
+        let head = judged::head(&root, "origin", judged::deadline())
+            .unwrap()
+            .unwrap();
+        assert!(
+            judged::append(
+                &root,
+                "origin",
+                Some(&head),
+                &record(&left, "pass", 70),
+                judged::deadline()
+            )
+            .unwrap()
+        );
+        git(&root, &["checkout", "-b", "attribution-right", &base]).unwrap();
+        let right = commit("right green", "right good");
+        let head = judged::head(&root, "origin", judged::deadline())
+            .unwrap()
+            .unwrap();
+        assert!(
+            judged::append(
+                &root,
+                "origin",
+                Some(&head),
+                &record(&right, "pass", 80),
+                judged::deadline()
+            )
+            .unwrap()
+        );
+        let right_tree = git(&root, &["rev-parse", &format!("{right}^{{tree}}")]).unwrap();
+        let joined = git(
+            &root,
+            &[
+                "commit-tree",
+                &right_tree,
+                "-p",
+                &left,
+                "-p",
+                &right,
+                "-m",
+                "join incomparable greens",
+            ],
+        )
+        .unwrap();
+        git(&root, &["checkout", "--detach", &joined]).unwrap();
+        let ambiguous_red = commit("red after both greens", "bad after join");
+        let mut ambiguous_red_record = record(&ambiguous_red, "red", 90);
+        attribute(
+            &root,
+            &ambiguous_red_record.commit,
+            &ambiguous_red_record.tree,
+            &mut ambiguous_red_record.rows,
+        )
+        .unwrap();
+        assert!(
+            ambiguous_red_record.rows[0].suspects.is_empty(),
+            "incomparable last-green ancestors define no honest single suspect range"
+        );
     }
     #[test]
-    fn only_foreground_waiters_outside_the_sample_and_every_release_preempt_a_stage() {
+    fn ordinary_work_delays_a_start_but_only_release_stops_a_running_sample() {
         let mut row = aterm_capacity::Record {
             accounting: aterm_capacity::Accounting::Holder,
             pid: 1,
@@ -2183,26 +2313,40 @@ mod tests {
             wrote: None,
             next_ms: None,
         };
-        assert!(!stage_should_yield(
+        assert!(!pressure_requires_stop(
             Path::new("/sample"),
-            std::slice::from_ref(&row)
+            std::slice::from_ref(&row),
+            SamplePhase::Starting,
         ));
         row.checkout = "/other".into();
-        assert!(stage_should_yield(
+        assert!(pressure_requires_stop(
             Path::new("/sample"),
-            std::slice::from_ref(&row)
+            std::slice::from_ref(&row),
+            SamplePhase::Starting,
+        ));
+        assert!(!pressure_requires_stop(
+            Path::new("/sample"),
+            std::slice::from_ref(&row),
+            SamplePhase::Running,
         ));
         row.held = Some(aterm_capacity::Held {
             admitted_ms: 1,
             cores: 0,
             alone: false,
         });
-        assert!(!stage_should_yield(
+        assert!(!pressure_requires_stop(
             Path::new("/sample"),
-            std::slice::from_ref(&row)
+            std::slice::from_ref(&row),
+            SamplePhase::Starting,
         ));
         row.need.rank = aterm_capacity::Rank::Release;
-        assert!(stage_should_yield(Path::new("/sample"), &[row]));
+        for phase in [SamplePhase::Starting, SamplePhase::Running] {
+            assert!(pressure_requires_stop(
+                Path::new("/sample"),
+                &[row.clone()],
+                phase
+            ));
+        }
     }
     #[test]
     fn the_sampled_verifier_is_built_once_then_reused_without_an_outer_slot() {

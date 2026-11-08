@@ -599,6 +599,13 @@ fn a_fact_under_a_band_is_no_target() {
             .is_some()
     );
     assert!(app.windows[&wid].hover_pointer);
+    assert!(app.open_fact_menu_at(wid, x, y));
+    assert!(app.autopilot_menu.is_some());
+    #[cfg(target_os = "macos")]
+    {
+        chord(&mut app, wid);
+        assert!(app.windows[&wid].claude_lights.selected.is_some());
+    }
     app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
         wid,
         Some(session),
@@ -610,6 +617,12 @@ fn a_fact_under_a_band_is_no_target() {
     app.refresh_glass_cursor_for_frame(wid);
     let branch = fact_hit(&app, wid, Fact::Branch);
     assert!(app.chrome_owns_terminal_row(wid, branch.term_row));
+    assert!(app.autopilot_menu.is_none());
+    #[cfg(target_os = "macos")]
+    {
+        chord(&mut app, wid);
+        assert_eq!(app.windows[&wid].claude_lights.selected, None);
+    }
     assert_eq!(app.claude_glass_at(wid, x, y), None);
     assert_eq!(app.windows[&wid].claude_lights.hover, None);
     assert_eq!(
@@ -621,6 +634,77 @@ fn a_fact_under_a_band_is_no_target() {
     assert!(!app.windows[&wid].hover_pointer);
     assert!(!app.press_visible_claude_fact(wid, session, Fact::Branch, FactMask::default()));
     assert_eq!(app.fact_mask(session), FactMask::default());
+
+    app.paste_banner = None;
+    frame(&mut app, wid);
+    app.refresh_glass_cursor_for_frame(wid);
+    assert_eq!(
+        app.windows[&wid].claude_lights.hover,
+        Some((session, Target::Fact(Fact::Branch)))
+    );
+    assert!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_reading(session, Fact::Branch)
+            .is_some()
+    );
+    assert!(app.windows[&wid].hover_pointer);
+    assert!(app.open_fact_menu_at(wid, x, y));
+    assert!(app.autopilot_menu.is_some());
+    app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
+        wid,
+        Some(session),
+        "one\ntwo\nthree\nfour\nfive".to_owned(),
+        Source::Controller,
+        PasteFraming::Gesture { bracketed: true },
+    ));
+    frame(&mut app, wid);
+    app.splice_autopilot_menu(wid);
+    assert!(app.autopilot_menu.is_none());
+    app.paste_banner = None;
+    frame(&mut app, wid);
+    app.refresh_glass_cursor_for_frame(wid);
+
+    let (plan, route) = app.active_visible_frame_layout(wid).expect("a layout");
+    #[cfg(target_os = "macos")]
+    {
+        chord(&mut app, wid);
+        assert!(app.windows[&wid].claude_lights.selected.is_some());
+    }
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .chrome_rows
+        .push(0..6);
+    #[cfg(target_os = "macos")]
+    {
+        chord(&mut app, wid);
+        assert_eq!(app.windows[&wid].claude_lights.selected, None);
+    }
+    app.splice_claude_footer(wid, &plan, route);
+    app.refresh_glass_cursor_for_frame(wid);
+    assert_eq!(app.windows[&wid].claude_lights.hover, None);
+    assert_eq!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_reading(session, Fact::Branch),
+        None
+    );
+    assert!(!app.windows[&wid].hover_pointer);
+
+    frame(&mut app, wid);
+    app.refresh_glass_cursor_for_frame(wid);
+    assert_eq!(
+        app.windows[&wid].claude_lights.hover,
+        Some((session, Target::Fact(Fact::Branch)))
+    );
+    assert!(
+        app.windows[&wid]
+            .claude_lights
+            .fact_reading(session, Fact::Branch)
+            .is_some()
+    );
+    assert!(app.windows[&wid].hover_pointer);
 }
 
 #[test]

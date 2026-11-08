@@ -72,6 +72,7 @@ fn accepted_publication_at_a_full_held_store() {
             name(&mut after_draft, &actor, &seed, incarnation),
         ],
         heads: after_draft.heads(),
+        network: Some(*after_draft.network()),
     };
     let incoming = name(&mut base, &peer, &peer_seed, peer_incarnation);
     assert_eq!(base.held_count(), LEGACY.held - 1);
@@ -393,6 +394,7 @@ fn a_path_vault_settles_each_held_version_by_its_own_answer() {
     let nothing = Drafted {
         records: Vec::new(),
         heads: Vec::new(),
+        network: None,
     };
     hold_drafted(&m22, &nothing, crashed.0, &crashed.1, &reach).unwrap();
     let refused = admin_publish(&m22, &opened, &edit(b"v4")).expect_err("not newer");
@@ -442,6 +444,7 @@ fn a_hold_goes_only_by_descent_or_the_answer_of_every_server_it_may_have_reached
     let nothing = Drafted {
         records: Vec::new(),
         heads: Vec::new(),
+        network: None,
     };
     let (a, b, c) = (
         "https://a.example/v".to_owned(),
@@ -524,6 +527,7 @@ fn a_hold_is_removed_only_under_the_state_lock() {
     let nothing = Drafted {
         records: Vec::new(),
         heads: Vec::new(),
+        network: None,
     };
     let a = vec!["https://a.example/v".to_owned()];
     let (refused, landed, older) = ((5, [1; 32]), (5, [2; 32]), (4, [3; 32]));
@@ -580,6 +584,7 @@ fn a_landed_version_whose_records_were_not_kept_settles_by_reach_alone() {
     let nothing = Drafted {
         records: Vec::new(),
         heads: Vec::new(),
+        network: None,
     };
     let (a, b) = (
         vec!["https://a.example/v".to_owned()],

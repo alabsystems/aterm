@@ -122,7 +122,8 @@ pub(crate) const PAGE: Page = Page {
                      stalls= errs= lost=`; `detail=` holds a sanitized command or wall reset).",
                 ),
                 para(
-                    "`tier=content` adds the in-memory-only `title=`, `meta field=attention \
+                    "`tier=content` adds the in-memory-only `title=` (or `title_fp=` alone for a \
+                     title that is the command line the shell announced), `meta field=attention \
                      attn_text=` (`fp=`), `reason=`, `topic_name=`, `since=`, `closer=`, \
                      `reply=`, `row_text=`.",
                 ),

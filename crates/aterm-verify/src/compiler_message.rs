@@ -9,7 +9,11 @@ use aterm_json::Value;
 pub(crate) enum UnitMessage {
     Other,
     Unit(Value),
-    Ambiguous(Vec<String>),
+    Ambiguous {
+        identities: Vec<String>,
+        /// At least one decoded top-level reason names an artifact, even if reasons conflict.
+        artifact_reason_seen: bool,
+    },
 }
 
 impl<'de> serde::Deserialize<'de> for UnitMessage {
@@ -27,10 +31,13 @@ impl<'de> serde::Deserialize<'de> for UnitMessage {
                 let mut fields = aterm_json::Map::new();
                 let mut identities = std::collections::BTreeSet::new();
                 let mut unit = false;
+                let mut artifact_reason_seen = false;
                 let mut duplicate = false;
                 while let Some((key, checked)) = input.next_entry::<String, CheckedValue>()? {
                     duplicate |= checked.duplicate;
                     let value = checked.value;
+                    artifact_reason_seen |=
+                        key == "reason" && value.as_str() == Some("compiler-artifact");
                     if key == "reason"
                         && matches!(
                             value.as_str(),
@@ -56,7 +63,10 @@ impl<'de> serde::Deserialize<'de> for UnitMessage {
                 Ok(if !unit {
                     UnitMessage::Other
                 } else if duplicate {
-                    UnitMessage::Ambiguous(identities.into_iter().collect())
+                    UnitMessage::Ambiguous {
+                        identities: identities.into_iter().collect(),
+                        artifact_reason_seen,
+                    }
                 } else {
                     UnitMessage::Unit(Value::Object(fields))
                 })

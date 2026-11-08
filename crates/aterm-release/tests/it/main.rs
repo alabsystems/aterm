@@ -214,6 +214,8 @@ mod machine_roster;
 mod plist_stamp;
 mod publisher_fence_liveness;
 mod publisher_fence_model;
+mod publisher_origin;
+mod publisher_script;
 mod push_hook;
 mod release_fixtures;
 mod release_flow;

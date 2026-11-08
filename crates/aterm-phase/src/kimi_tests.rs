@@ -308,7 +308,7 @@ fn its_footer_claims_no_other_programs_screen() {
         }
     }
     assert_eq!(
-        footer_only, 17,
+        footer_only, 19,
         "the approval, question and session-picker frames with no composer"
     );
     assert!(unclaimed > 0, "frames with nothing to tell them by stand");
@@ -377,12 +377,14 @@ const PHASES: &[(&str, Phase, bool)] = &[
     ("2.5.2-box-edit", Phase::Prompt, true),
     ("2.5.2-box-plan-forged", Phase::Prompt, true),
     ("2.5.2-box-shell-backspaced", Phase::Prompt, true),
+    ("2.5.2-box-shell-backspaced-push", Phase::Prompt, true),
     ("2.5.2-box-shell-carriage-return", Phase::Prompt, true),
     ("2.5.2-box-shell-carriage-return-mid", Phase::Prompt, true),
     ("2.5.2-box-shell-empty-line", Phase::Prompt, true),
     ("2.5.2-box-shell-long-word", Phase::Prompt, true),
     ("2.5.2-box-shell-option-shaped", Phase::Prompt, true),
     ("2.5.2-box-shell-option-shaped-cr", Phase::Prompt, true),
+    ("2.5.2-box-shell-read", Phase::Prompt, true),
     ("2.5.2-box-shell-spaced", Phase::Prompt, true),
     ("2.5.2-box-write", Phase::Prompt, true),
     ("2.5.2-fullscreen-box-plan", Phase::Prompt, true),

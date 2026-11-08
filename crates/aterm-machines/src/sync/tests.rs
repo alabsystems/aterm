@@ -3400,7 +3400,7 @@ pub(crate) mod owed_clone {
             crate::port::Ran::ok("Services:\n\nDevices:\n"),
         );
         if git {
-            sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+            sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
         }
         sys.stat_of(
             &alice.home,
@@ -3717,7 +3717,7 @@ pub(crate) mod owed_clone {
         };
         assert_eq!(asked(), 0, "no clone runs without git");
         // The tools arrive (their install); the token and init.toml are as they were.
-        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
         let second = ran(converge(
             &ports,
             Trigger::Subscriber,

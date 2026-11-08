@@ -152,7 +152,7 @@ impl World {
                     self.act_mark();
                 }
             }
-            "PersonKey" => match self.tr.person(&self.log, now) {
+            "PersonKey" => match self.tr.person(&self.log, None, now) {
                 Binding::Step(n) => self.keys.push((n, 1)),
                 other => panic!("a person's key bound {other:?}"),
             },

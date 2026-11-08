@@ -2109,22 +2109,6 @@ impl App {
                 else {
                     return Err("the pointer holds no position (move it first)".into());
                 };
-                if self.band_banner_at(wid, x, y).is_none()
-                    && self
-                        .band_hit_at(wid, x, y)
-                        .is_some_and(|target| self.band_press_acts(wid, target))
-                {
-                    // Not while parked, as `notice` refuses (`take_notice`): the band crossed
-                    // to the successor in the carry the park captured, so a press here would
-                    // be undone at Commit while its side effects stood. Refused before any
-                    // press is spent.
-                    if self.update_handoff_parked() {
-                        let line = aterm_messages::wire::switching_reply();
-                        return Err(line.strip_prefix("ERR ").unwrap_or(&line).to_string());
-                    }
-                    aterm_messages::wire::spend_press(&mut self.wire_gate, Instant::now())
-                        .map_err(|line| line.strip_prefix("ERR ").unwrap_or(&line).to_string())?;
-                }
                 for state in [ElementState::Pressed, ElementState::Released] {
                     if cfg!(target_os = "macos") {
                         self.on_cursor_moved(wid, x, y);
@@ -2481,8 +2465,8 @@ impl App {
         }
         let (ox, oy) = self.frame_origin_with(wid, geom);
         let fx = usize::from(col) * cw + cw / 2 + geom.pad;
-        // Bands count upward from the grid, preserving existing message-band
-        // positions. The top band may contain only part of a cell's height.
+        // Bands count upward from the grid, `up = 1` the row just above it.
+        // The top band may contain only part of a cell's height.
         let bottom = height.saturating_sub((up - 1).saturating_mul(ch));
         let top = height.saturating_sub(up.saturating_mul(ch));
         let fy = top + (bottom - top) / 2 + geom.pad_top;
@@ -2557,22 +2541,18 @@ impl App {
         self.strip_col_at_with(wid, self.pointer_geometry(wid), x, y)
     }
 
-    fn press_band_at(&mut self, wid: WindowId, px: f64, py: f64) -> bool {
-        // Judged against the banner's own floor (`paste_banner_tray_floor_y`, `0` = none)
-        // before the band's hit test, whether or not the band has a row under it.
-        if let Some(paste_up) = self.band_banner_at(wid, px, py) {
-            if paste_up {
-                self.answer_paste_banner(false);
-            } else {
-                self.answer_close_banner(false);
-            }
-            self.request_redraw_all_windows();
-            return true;
-        }
-        let Some(target) = self.band_hit_at(wid, px, py) else {
+    /// A left press inside a paste or close question's rows answers it (cancel), judged against
+    /// the banner's own floor (`paste_banner_tray_floor_y`, `0` = none); `false` elsewhere.
+    fn press_banner_at(&mut self, wid: WindowId, px: f64, py: f64) -> bool {
+        let Some(paste_up) = self.band_banner_at(wid, px, py) else {
             return false;
         };
-        self.press_band(wid, target);
+        if paste_up {
+            self.answer_paste_banner(false);
+        } else {
+            self.answer_close_banner(false);
+        }
+        self.request_redraw_all_windows();
         true
     }
 
@@ -2832,8 +2812,7 @@ impl App {
         let lit = ws.strip_hover.take().is_some()
             | std::mem::take(&mut ws.strip_hover_new_tab)
             | std::mem::take(&mut ws.strip_hover_version)
-            | ws.strip_hover_caption.take().is_some()
-            | ws.band_hover.take().is_some();
+            | ws.strip_hover_caption.take().is_some();
         if lit && let Some(w) = &ws.os_window {
             w.request_redraw();
         }
@@ -2888,13 +2867,11 @@ impl App {
         ws.pointer_position_known = false;
         ws.hover_grid_owned = false;
         ws.native_rehover = false;
-        let band_lit = ws.band_hover.take().is_some();
         ws.frame_edge = None;
         if ws.strip_hover.is_none()
             && !ws.strip_hover_new_tab
             && !ws.strip_hover_version
             && ws.strip_hover_caption.is_none()
-            && !band_lit
         {
             return;
         }
@@ -3204,14 +3181,6 @@ impl App {
                 self.set_hover_cursor(wid, CursorIcon::Default, false, false);
             } else {
                 self.set_hover_cursor(wid, CursorIcon::Text, false, true);
-            }
-            return Resolved(None);
-        }
-        if let Some(target) = self.band_hit_at(wid, px, py) {
-            if self.band_press_acts(wid, target) {
-                self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
-            } else {
-                self.set_hover_cursor(wid, CursorIcon::Default, false, false);
             }
             return Resolved(None);
         }
@@ -3680,7 +3649,6 @@ impl App {
         }
         let geom = self.pointer_geometry(wid);
         self.track_strip_hover(wid, geom, x, y);
-        self.track_band_hover(wid, x, y);
         let over_claude_chips = self.track_claude_light_hover(wid, x, y);
         if self.palette_claims_pointer(wid) {
             self.palette_pointer_motion(wid, x, y);
@@ -3756,13 +3724,8 @@ impl App {
                     .as_ref()
                     .map(|(view, _, key, ..)| (*view, key.clone())),
             );
-            let band_acts = self
-                .band_hit_at(wid, x, y)
-                .is_some_and(|target| self.band_press_acts(wid, target));
-            let text_cursor =
-                !over_pane_header && !band_acts && (editor_target.is_some() || text_field_hovered);
+            let text_cursor = !over_pane_header && (editor_target.is_some() || text_field_hovered);
             let pointer = over_pane_header
-                || band_acts
                 || (!text_field_hovered
                     && native_hover
                         .as_ref()
@@ -3850,15 +3813,6 @@ impl App {
                 return;
             }
             crate::claude_lights::OverChips::No => {}
-        }
-        if self.band_hit_at(wid, x, y).is_some()
-            && !self
-                .windows
-                .get(&wid)
-                .is_some_and(|ws| ws.selecting || ws.held_mouse_button.is_some())
-        {
-            self.update_hover_cursor_with(wid, geom, parked, None);
-            return;
         }
         if let Some(ws) = self.windows.get_mut(&wid)
             && pet_wake_wanted(
@@ -4986,9 +4940,8 @@ impl App {
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |window| window.last_cursor_px);
-            let on_band = self.band_banner_at(wid, px, py).is_some()
-                || self.band_hit_at(wid, px, py).is_some();
-            let in_content = !on_band && self.strip_col_at(wid, px, py).is_none();
+            let on_banner = self.band_banner_at(wid, px, py).is_some();
+            let in_content = !on_banner && self.strip_col_at(wid, px, py).is_none();
             if in_content && self.press_claude_light(wid, at) {
                 return None;
             }
@@ -5113,7 +5066,7 @@ impl App {
                     self.handle_tab_strip_click(wid, col, at);
                     return None;
                 }
-                if self.press_band_at(wid, px, py) {
+                if self.press_banner_at(wid, px, py) {
                     return None;
                 }
                 if self.inline_rename_edit(wid).is_some() {
@@ -5273,7 +5226,7 @@ impl App {
                 .windows
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-            if self.press_band_at(wid, px, py) {
+            if self.press_banner_at(wid, px, py) {
                 return None;
             }
             if self.press_claude_light(wid, at) {
@@ -5320,9 +5273,7 @@ impl App {
                     }
                     return None;
                 }
-                if self.band_banner_at(wid, px, py).is_some()
-                    || self.band_hit_at(wid, px, py).is_some()
-                {
+                if self.band_banner_at(wid, px, py).is_some() {
                     return None;
                 }
             }

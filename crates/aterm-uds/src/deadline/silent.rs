@@ -504,7 +504,7 @@ fn judged<C: super::Waited>(
         child,
         pipes,
         group,
-        &mut || by.saturating_duration_since(std::time::Instant::now()),
+        &mut |_, _| by.saturating_duration_since(std::time::Instant::now()),
         &mut |child| {
             let pid = child.pid();
             overran = Some((pid, (how.held)(pid)));

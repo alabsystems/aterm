@@ -36,13 +36,25 @@ pub struct ChildSpec {
     pub env: Vec<(OsString, OsString)>,
     /// Its working directory.
     pub cwd: Option<PathBuf>,
-    /// Its bound.
+    /// Its wall bound, used only when [`Self::progress`] is absent.
     pub budget: Duration,
+    /// A progress inactivity bound and the safe operation it is waiting on. When present,
+    /// execution has no wall-clock deadline: output or descendant CPU/I/O keeps it live.
+    pub progress: Option<ProgressBound>,
     /// Explicit owned input; never the caller's ambient stdin. Sensitive Git
     /// configuration uses `config_input`, which withholds parser stderr.
     pub(crate) input: Option<Vec<u8>>,
     #[cfg(unix)]
     config_input: Option<ConfigQuery>,
+}
+
+/// A child execution bound based on evidence of progress, not elapsed wall time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProgressBound {
+    /// The longest interval with neither output nor descendant CPU/I/O progress.
+    pub window: Duration,
+    /// A credential-free operation label for a stall diagnostic.
+    pub waiting_on: String,
 }
 
 /// Only these fixed Git parsers may consume repository configuration input.
@@ -87,6 +99,7 @@ impl fmt::Debug for ChildSpec {
             .field("env", &self.env)
             .field("cwd", &self.cwd)
             .field("budget", &self.budget)
+            .field("progress", &self.progress)
             .field("input_bytes", &self.input.as_ref().map(Vec::len))
             .finish()
     }
@@ -102,6 +115,7 @@ impl ChildSpec {
             env: Vec::new(),
             cwd: None,
             budget: DEFAULT_BUDGET,
+            progress: None,
             input: None,
             #[cfg(unix)]
             config_input: None,
@@ -133,6 +147,17 @@ impl ChildSpec {
     #[must_use]
     pub fn budget(mut self, budget: Duration) -> ChildSpec {
         self.budget = budget;
+        self
+    }
+
+    /// Use `window` as a native-progress inactivity bound, naming the safe operation
+    /// `waiting_on` if it stalls.
+    #[must_use]
+    pub fn progressing(mut self, window: Duration, waiting_on: impl Into<String>) -> ChildSpec {
+        self.progress = Some(ProgressBound {
+            window,
+            waiting_on: waiting_on.into(),
+        });
         self
     }
 
@@ -227,11 +252,11 @@ pub(crate) fn check(spec: &ChildSpec) -> Result<()> {
 /// Run `spec` to completion or its bound: `check(spec)`, then `spawnfd::command(program)`,
 /// `args`, `env_clear()` then `envs(env)`, and `current_dir(cwd)` when set, then
 /// `deadline::output_until_from(&mut cmd, input, until)`, with `until` =
-/// `Instant::now().checked_add(spec.budget)` (a budget past the clock is refused before
-/// anything spawns). `output_until_from` takes an
-/// `Instant`, not a `Duration`, so the deadline is computed here, inside `fx/`, the one place
-/// census's agh-fx clause lets agh read a clock. This runner attaches `/dev/null` unless
-/// explicit bounded ref input is attached through a private data file.
+/// `Instant::now().checked_add(spec.budget)`, or the progress collector when
+/// [`ChildSpec::progress`] is present. A wall budget past the clock is refused before anything
+/// spawns. The progress arm has no wall deadline: output or complete descendant-tree CPU/I/O
+/// advances its inactivity window. This runner attaches `/dev/null` unless explicit bounded
+/// ref input is attached through a private data file.
 /// Both paths pipe the output streams, keep the last `deadline::OUTPUT_KEEP` bytes of each, and
 /// put the child at the head of a new process group (`process_group(0)`), which its
 /// termination path targets.
@@ -262,11 +287,15 @@ pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
         ));
     }
     let program = spec.program.display();
-    let Some(until) = Instant::now().checked_add(spec.budget) else {
-        return Err(Error::local(format!(
-            "{program}'s budget {:?} is past what the clock holds",
-            spec.budget
-        )));
+    let until = if spec.progress.is_none() {
+        Some(Instant::now().checked_add(spec.budget).ok_or_else(|| {
+            Error::local(format!(
+                "{program}'s budget {:?} is past what the clock holds",
+                spec.budget
+            ))
+        })?)
+    } else {
+        None
     };
     // Keep the private input directory until the command drops its descriptor.
     let input_dir;
@@ -291,19 +320,29 @@ pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
     } else {
         spawnfd::Stdio::null()
     };
-    match deadline::output_until_from(&mut cmd, input, until) {
-        Ok(output) => {
-            let out = ChildOut {
-                code: output.status.code(),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            };
-            #[cfg(unix)]
-            let out = config_output(spec, out);
-            Ok(out)
-        }
-        Err(error) => Err(classify_failure(spec, error)),
-    }
+    let output = match &spec.progress {
+        Some(progress) => deadline::output_from_while_process_progressing(
+            &mut cmd,
+            input,
+            progress.window,
+            &progress.waiting_on,
+        )
+        .map_err(|error| classify_progress_failure(spec, error))?,
+        None => deadline::output_until_from(
+            &mut cmd,
+            input,
+            until.expect("a wall-bound child has a deadline"),
+        )
+        .map_err(|error| classify_failure(spec, error))?,
+    };
+    let out = ChildOut {
+        code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    };
+    #[cfg(unix)]
+    let out = config_output(spec, out);
+    Ok(out)
 }
 
 #[cfg(unix)]
@@ -346,14 +385,100 @@ fn classify_failure(spec: &ChildSpec, error: RunError) -> Error {
     }
 }
 
+fn classify_progress_failure(spec: &ChildSpec, error: deadline::ProgressError) -> Error {
+    match error {
+        deadline::ProgressError::Run(error) => classify_failure(spec, error),
+        stalled @ deadline::ProgressError::Stalled { .. } => {
+            Error::local(format!("{} {stalled}", spec.program.display()))
+                .with_side_effect(SideEffect::Unknown)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
     use std::time::Duration;
 
-    use super::{ChildOut, ChildSpec, RunError, ScriptedChild, classify_failure, run};
+    use super::{
+        ChildOut, ChildSpec, RunError, ScriptedChild, classify_failure, classify_progress_failure,
+        run,
+    };
     use crate::error::{Kind, SideEffect, Sub};
     use crate::fx::Fx;
+
+    #[cfg(unix)]
+    const ROUTED_ENV_CASE: &str = "AGH_ROUTED_CHILD_ENV_CASE";
+    #[cfg(unix)]
+    const ROUTED_ENV_MARKER: &str = "AGH_ROUTED_CHILD_ENV_MARKER";
+    #[cfg(unix)]
+    const ROUTED_ENV_TEST: &str =
+        "fx::child::tests::a_routed_git_child_gets_only_its_explicit_environment";
+
+    /// A child with routed Git's explicit authentication environment is actually re-executed
+    /// beneath a parent holding both ambient token variables. It sees neither, and it sees
+    /// prompting disabled. NEGATIVE CONTROL: removing `run`'s `env_clear` makes the probe
+    /// inherit the planted variables and fail.
+    #[cfg(unix)]
+    #[test]
+    fn a_routed_git_child_gets_only_its_explicit_environment() {
+        match std::env::var(ROUTED_ENV_CASE).as_deref() {
+            Ok("probe") => {
+                assert!(std::env::var_os("GH_TOKEN").is_none());
+                assert!(std::env::var_os("GITHUB_TOKEN").is_none());
+                assert_eq!(
+                    std::env::var_os("GIT_TERMINAL_PROMPT").as_deref(),
+                    Some(std::ffi::OsStr::new("0"))
+                );
+                let marker = std::env::var_os(ROUTED_ENV_MARKER).expect("the marker path");
+                std::fs::write(marker, b"exact environment").expect("write the marker");
+                return;
+            }
+            Ok("parent") => {
+                assert!(std::env::var_os("GH_TOKEN").is_some());
+                assert!(std::env::var_os("GITHUB_TOKEN").is_some());
+                let marker = std::env::var_os(ROUTED_ENV_MARKER).expect("the marker path");
+                let exe = std::env::current_exe().expect("the test binary");
+                let out = run(&ChildSpec::new(&exe)
+                    .arg("--exact")
+                    .arg(ROUTED_ENV_TEST)
+                    .arg("--test-threads=1")
+                    .arg("--nocapture")
+                    .env(ROUTED_ENV_CASE, "probe")
+                    .env(ROUTED_ENV_MARKER, marker)
+                    .env("GIT_TERMINAL_PROMPT", "0"))
+                .expect("the exact-environment probe ran");
+                assert_eq!(out.code, Some(0), "{out:?}");
+                return;
+            }
+            Err(_) => {}
+            other => panic!("unknown routed child environment case {other:?}"),
+        }
+
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let marker = root.path().join("exact-environment");
+        let mut parent = aterm_uds::spawnfd::command(
+            std::env::current_exe().expect("the test binary's own path"),
+        );
+        parent
+            .args([
+                "--exact",
+                ROUTED_ENV_TEST,
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(ROUTED_ENV_CASE, "parent")
+            .env(ROUTED_ENV_MARKER, &marker)
+            .env("GH_TOKEN", "planted-dead-token")
+            .env("GITHUB_TOKEN", "planted-dead-token");
+        let out = aterm_uds::deadline::output_within(&mut parent, Duration::from_secs(60))
+            .expect("the parent finished within the hang detector");
+        assert!(out.status.success(), "the parent failed");
+        assert_eq!(
+            std::fs::read(marker).expect("the probe's marker"),
+            b"exact environment"
+        );
+    }
 
     /// Successful dispatch permits effects even if the output reader never starts. The
     /// other collector failures keep their previous classifications and diagnostic stages.
@@ -389,6 +514,30 @@ mod tests {
                 (Kind::CouldNotRun, Sub::Local, effect)
             );
             assert_eq!(data.why, why);
+        }
+    }
+
+    /// A progress stall is a post-dispatch unknown-effect result, and its reason preserves both
+    /// the evidence window and the credential-free native operation name.
+    #[test]
+    fn progress_stall_names_its_evidence_and_wait() {
+        let spec = ChildSpec::new(Path::new("/fixture/git"));
+        let error = aterm_uds::deadline::ProgressError::Stalled {
+            window: Duration::from_secs(60),
+            waiting_on: "git fetch-batch fixture/app, step fetch".into(),
+        };
+        let data = classify_progress_failure(&spec, error).into_data();
+        assert_eq!(
+            (data.kind, data.sub, data.side_effect),
+            (Kind::CouldNotRun, Sub::Local, SideEffect::Unknown)
+        );
+        for words in [
+            "no stdout/stderr bytes",
+            "descendant tree made no CPU or I/O progress",
+            "60s",
+            "git fetch-batch fixture/app, step fetch",
+        ] {
+            assert!(data.why.contains(words), "{}", data.why);
         }
     }
 

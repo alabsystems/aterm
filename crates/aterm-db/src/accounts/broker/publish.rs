@@ -10,7 +10,7 @@ pub enum Publication {
     /// The complete requested policy is already the authenticated current one.
     AlreadyCurrent { sequence: u64 },
     /// At least one receiving store accepted the conditional envelope.
-    Published(client::Published),
+    Published(Box<client::Published>),
 }
 
 impl Broker {
@@ -160,6 +160,7 @@ impl Broker {
         )
         .map_err(|_| Error::new("broker policy cannot be encoded"))?;
         client::admin_publish_conditional_until(&paths, admin, &doc, deadline)
+            .map(Box::new)
             .map(Publication::Published)
             .map_err(crate::table::failure)
     }

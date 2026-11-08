@@ -703,7 +703,7 @@ fn discarded_source_never_launders_a_selected_fork() {
 fn recovered_replicas_exchange_live_records_without_offering_quarantined_bytes() {
     use crate::control::{Endpoint, Repair, Side};
     use aterm_net::lan::{Connection, Scope as LinkScope};
-    use std::{net::TcpListener, thread, time::Duration};
+    use std::{net::TcpListener, thread};
 
     let f = Fixture::new(false, false, false);
     f.recover();
@@ -746,7 +746,7 @@ fn recovered_replicas_exchange_live_records_without_offering_quarantined_bytes()
             });
             endpoints[0]
                 .exchange(
-                    Connection::connect(address, LinkScope::Loopback, Duration::from_secs(2))
+                    crate::replica::tests::fixture_connect(address, std::time::Instant::now())
                         .unwrap(),
                     Side::Initiator,
                     &mut ra,

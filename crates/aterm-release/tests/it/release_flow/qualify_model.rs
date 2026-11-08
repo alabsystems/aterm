@@ -198,11 +198,9 @@ fn every_qualify_run_the_release_makes_is_a_path_of_the_model() {
     let cases: [(&str, Setup, Option<Setup>); 6] = [
         ("passes", |_| {}, None),
         (
-            "tree red before the build starts",
+            "build red before the tree starts",
             |w| {
-                w.verify_outcomes.insert("test", "FAIL");
-                w.verify_code = 1;
-                w.tree_claims_late = true;
+                w.build_claims_late = true;
             },
             None,
         ),
@@ -296,8 +294,8 @@ fn the_model_refuses_the_defects_the_graph_must_not_have() {
     let start = || {
         let mut r = Replay::new();
         r.fire("Plan");
-        r.fire("StartTree");
         r.fire("StartBuild");
+        r.fire("StartTree");
         r.fire("StartExport");
         r
     };
@@ -315,9 +313,10 @@ fn the_model_refuses_the_defects_the_graph_must_not_have() {
 
     let mut r = Replay::new();
     r.fire("Plan");
-    r.fire("StartTree");
-    r.fire("TreeRed");
-    r.refuses("StartBuild");
+    r.refuses("StartTree");
+    r.fire("StartBuild");
+    r.fire("BuildRed");
+    r.refuses("StartTree");
 
     let mut r = start();
     r.fire("TreeRed");

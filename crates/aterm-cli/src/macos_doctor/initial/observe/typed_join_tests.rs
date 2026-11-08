@@ -753,8 +753,8 @@ fn github(home: &Path, token: bool) -> (aterm_machines::port::Fake, aterm_machin
         len,
     };
     sys.stat_of(&user.home, stat(true, 0));
-    sys.file(aterm_machines::items::github::CLT_GIT, b"inert git");
-    sys.file(&format!("{}/.local/bin/aterm", user.home), b"launcher");
+    sys.executable(aterm_machines::items::github::CLT_GIT, b"inert git");
+    sys.executable(&format!("{}/.local/bin/aterm", user.home), b"launcher");
     if token {
         let token = format!("{}/.secrets/gh_access_token", user.home);
         sys.file(&token, TOKEN.as_bytes())

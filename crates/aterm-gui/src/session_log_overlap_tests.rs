@@ -509,8 +509,11 @@ fn drive_title_at_its_bounds() -> Seen {
     let long = format!("vim {}end", "t\u{e9} ".repeat(80));
     during(&h.ctx.timeline, || {
         let mut g = h.ctx.timeline.lock().unwrap();
-        assert!(g.record_title(&long));
-        assert!(g.record_title("vim\u{200b} hidden"));
+        assert!(g.record_title(&long, crate::session_log::observed::TitleStands::Own));
+        assert!(g.record_title(
+            "vim\u{200b} hidden",
+            crate::session_log::observed::TitleStands::Own
+        ));
     })
 }
 
@@ -1628,7 +1631,10 @@ fn every_writer(h: &SessionHandle, store: &Store, round: u64) {
             Some(aterm_phase::Program::Claude),
             stamp(round + 1),
         );
-        assert!(g.record_title(&format!("build {round}")));
+        assert!(g.record_title(
+            &format!("build {round}"),
+            crate::session_log::observed::TitleStands::Own
+        ));
     }
     let mark = if round.is_multiple_of(2) {
         "mark working"

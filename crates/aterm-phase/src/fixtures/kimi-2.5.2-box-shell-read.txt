@@ -1,0 +1,51 @@
+# kimi 2.5.2 · MEASURED 2026-11-07, `aterm ctl text` of an `aterm-lab kimi` instance (a private headless aterm, 144x50, aterm 0.173.0, a debug build of this branch before it read Kimi's record) running the real Kimi Code, launched by path with a scratch `HOME` and `KIMI_CODE_HOME` whose `config.toml` names one `openai`-type provider at `http://127.0.0.1:<port>/v1` with a fake key (a local stub of the Chat Completions API, crates/aterm-lab), no login, in a project folder that is no git work tree, inline (no `tui.toml`) · the stub's `tool` mode asks for `Bash` `{command: "cat README.md", description: "Show the readme"}`, the first of two calls in one session (aterm-agent's `kimi-2.5.2-request.jsonl` is the line Kimi wrote to its record while this box stood) · the lab's random project dir is spelled /private/tmp/at.NCdO here
+
+ ╭────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+ │                                                                                                                                            │
+ │  ▐█▛█▛█▌  Welcome to Kimi Code!                                                                                                            │
+ │  ▐█████▌  Send /help for help information.                                                                                                 │
+ │                                                                                                                                            │
+ │  Directory: /private/tmp/at.NCdO/proj                                                                                                      │
+ │  Session:   session_562baf5b-93af-4a07-812a-adf26bdbd97d                                                                                   │
+ │  Model:     lab-model                                                                                                                      │
+ │  Version:   2.5.2                                                                                                                          │
+ │                                                                                                                                            │
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+   No session yet — one will be created on your first message.
+
+ ❯ toolstart
+
+ ● Running a command · $ cat README.md
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   ▶ Run this command?
+
+   cwd: /private/tmp/at.NCdO/proj
+   $ cat README.md
+     Show the readme
+
+   ▶ 1. Approve once
+     2. Approve for this session
+     3. Reject
+     4. Reject with feedback
+
+   ↑/↓ select · 1/2/3/4 choose · ↵ confirm
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ lab-model  …/tmp/at.NCdO/proj                         ctrl+o expand | ! to run a shell command | /compact compresses context when it gets long
+                                                                                                                         context: 1% (81/97.7k)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

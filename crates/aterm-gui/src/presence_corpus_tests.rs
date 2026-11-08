@@ -3,7 +3,9 @@
 
 //! Verifies that every `see <word> [<detail>] fixture=<name>` line in
 //! `aterm-slog`'s `.seq` corpus matches [`agent_verdict`] on the named
-//! `aterm-phase` fixture.
+//! `aterm-phase` fixture, and that every `key=<k> [chose=<c>]` an input line
+//! carries is what the frame of the `see` line before it chooses for that key
+//! (fix E8, [`crate::session_log::FrameKeys`]).
 
 use super::*;
 
@@ -169,5 +171,131 @@ fn a_corpus_line_with_the_wrong_word_fails() {
     assert!(
         wrong(&|s| s.program = "zsh".into(), bare),
         "a shell is no agent"
+    );
+}
+
+/// One input line's `key=` and `chose=` (`person …` or `admit …`), with the
+/// fixture of the `see` line before it (`None`: it named none).
+#[derive(Clone, Debug)]
+struct Keyed {
+    at: String,
+    key: String,
+    chose: Option<String>,
+    fixture: Option<String>,
+}
+
+/// The keyed input lines of one `.seq` file's text.
+fn keyed(name: &str, text: &str) -> Vec<Keyed> {
+    let mut fixture = None;
+    let mut out = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let mut l = raw.trim();
+        if let Some(rest) = l.strip_prefix("at ") {
+            l = rest.split_once(' ').map_or("", |(_, r)| r.trim());
+        }
+        let toks: Vec<&str> = l.split_whitespace().collect();
+        let field = |k: &str| {
+            toks.iter()
+                .find_map(|t| t.strip_prefix(k))
+                .map(str::to_string)
+        };
+        match toks.first() {
+            Some(&"see") => fixture = field("fixture="),
+            Some(&("person" | "admit")) => {
+                if let Some(key) = field("key=") {
+                    out.push(Keyed {
+                        at: format!("{name}:{}", i + 1),
+                        key,
+                        chose: field("chose="),
+                        fixture: fixture.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The class of a `.seq` file's `key=` word (`aterm-slog`'s
+/// `seq_replay::KEYS`).
+fn class_of(word: &str) -> Option<crate::session_log::KeyClass> {
+    use crate::session_log::KeyClass;
+    match word {
+        "enter" => Some(KeyClass::Enter),
+        "esc" => Some(KeyClass::Esc),
+        "down" | "text" => Some(KeyClass::Other),
+        d => d
+            .parse::<u8>()
+            .ok()
+            .filter(|n| (1..=9).contains(n))
+            .map(KeyClass::Digit),
+    }
+}
+
+/// What the frame of the line's fixture chooses for its key, against what
+/// the line says.
+fn check_key(k: &Keyed) -> Result<(), String> {
+    let fixture = k
+        .fixture
+        .as_deref()
+        .ok_or_else(|| format!("{}: a keyed input after a `see` with no fixture=", k.at))?;
+    let class = class_of(&k.key).ok_or_else(|| format!("{}: key={}", k.at, k.key))?;
+    let got = crate::session_log::keys::tests::frame(fixture)
+        .and_then(|f| f.chose(class))
+        .map(aterm_slog::Chose::word);
+    if got != k.chose.as_deref() {
+        return Err(format!(
+            "{}: key={} on {fixture} chooses {got:?}, the line says {:?}",
+            k.at, k.key, k.chose
+        ));
+    }
+    Ok(())
+}
+
+/// Every keyed input of the corpus chooses, on the screen its frame names,
+/// what its line says; the corpus keys each choice and an unplaced key.
+#[test]
+fn every_corpus_key_chooses_what_its_line_says() {
+    let all: Vec<Keyed> = corpus().iter().flat_map(|(n, t)| keyed(n, t)).collect();
+    let errs: Vec<String> = all.iter().filter_map(|k| check_key(k).err()).collect();
+    assert!(errs.is_empty(), "{}", errs.join("\n"));
+    let chosen: std::collections::BTreeSet<Option<&str>> =
+        all.iter().map(|k| k.chose.as_deref()).collect();
+    for c in [Some("approve"), Some("decline"), Some("answer"), None] {
+        assert!(
+            chosen.contains(&c),
+            "no corpus key chooses {c:?}: {chosen:?}"
+        );
+    }
+}
+
+/// NEGATIVE CONTROLS: a keyed line changed in each way fails.
+#[test]
+fn a_corpus_key_with_the_wrong_choice_fails() {
+    let all: Vec<Keyed> = corpus().iter().flat_map(|(n, t)| keyed(n, t)).collect();
+    let chosen = all
+        .iter()
+        .find(|k| k.chose.as_deref() == Some("approve"))
+        .expect("an approving key");
+    check_key(chosen).expect("the shipping line");
+    let wrong = |f: &dyn Fn(&mut Keyed)| {
+        let mut x = chosen.clone();
+        f(&mut x);
+        check_key(&x).is_err()
+    };
+    assert!(
+        wrong(&|k| k.chose = Some("decline".into())),
+        "another choice"
+    );
+    assert!(wrong(&|k| k.chose = None), "a choice dropped");
+    assert!(
+        wrong(&|k| k.key = "down".into()),
+        "a key that chooses nothing"
+    );
+    assert!(wrong(&|k| k.fixture = None), "no screen behind it");
+    assert!(
+        wrong(&|k| k.fixture = Some("claude-2.1.282-box-tool-default-no".into())),
+        "Enter on a focused No"
     );
 }

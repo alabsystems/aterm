@@ -477,6 +477,7 @@ pub(super) fn retire_ready(
 ) -> Result<Option<Receipt>, &'static str> {
     if receipt.intent.purpose != renewal::Purpose::WeeklyQuota
         || receipt.phase != Phase::Ready
+        || !receipt.has_no_execution_evidence()
         || receipt.sid != ctx.self_id.as_str()
         || receipt.old_pid != proof.pid
         || Process::observe(proof.pid).is_none_or(|process| process.birth != receipt.old_birth)

@@ -350,6 +350,9 @@ pub(crate) struct TurnFacts {
     pub(crate) goal: Option<bool>,
     /// A person stopped the last turn (Esc).
     pub(crate) interrupted: bool,
+    /// What each choosing key would choose on the box or question the reading publishes (fix E8,
+    /// [`crate::session_log::FrameKeys::of_prompt`]); `None` when it publishes none.
+    pub(crate) keys: Option<crate::session_log::FrameKeys>,
 }
 
 impl TurnFacts {
@@ -360,6 +363,7 @@ impl TurnFacts {
                 ctx_pct: r.context_left,
                 goal: Some(r.goal_active),
                 interrupted: r.interrupted,
+                keys: None,
             },
             aterm_phase::Program::Codex
             | aterm_phase::Program::Grok
@@ -473,20 +477,54 @@ pub(crate) fn agent_verdict(
     }
 }
 
-/// The rows a verdict classifies and the cursor on them: the live zone ([`live_zone`]), or the
-/// whole screen when the zone cuts the head off a box (a prompt read `head_off_screen`) that a
-/// taller screen may hold whole.
+/// The rows a verdict classifies: the live zone ([`live_zone`]), or the whole screen when the
+/// zone cuts the head off a box (a prompt read `head_off_screen`) that a taller screen may hold
+/// whole.
+fn prompt_rows<'a>(reader: &dyn aterm_phase::ScreenReader, whole: &'a [String]) -> &'a [String] {
+    let rows = live_zone(whole);
+    if whole.len() > rows.len() && reader.prompt(rows).is_some_and(|p| p.head_off_screen) {
+        whole
+    } else {
+        rows
+    }
+}
+
+/// [`prompt_rows`] and the cursor on them.
 fn verdict_rows<'a>(
     reader: &dyn aterm_phase::ScreenReader,
     whole: &'a [String],
     cursor: Cursor,
 ) -> (&'a [String], Cursor) {
-    let rows = live_zone(whole);
-    if whole.len() > rows.len() && reader.prompt(rows).is_some_and(|p| p.head_off_screen) {
-        (whole, cursor)
-    } else {
-        (rows, cursor.on_rows_from(whole.len() - rows.len()))
+    let rows = prompt_rows(reader, whole);
+    (rows, cursor.on_rows_from(whole.len() - rows.len()))
+}
+
+/// What the box `program`'s reader reads on `whole` draws, off the rows a verdict classifies
+/// ([`prompt_rows`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Drawn {
+    /// The read-only rule's readings of it: what [`prompt_detail`] judged.
+    pub(crate) readings: Vec<String>,
+    /// Its own rows, from its upper rule to its lower one
+    /// ([`aterm_phase::prompt::PromptV2::span`]), hashed: a footer below it or a transcript above
+    /// it repaints without moving this.
+    pub(crate) key: u64,
+}
+
+/// [`Drawn`] of the box `program`'s reader reads on `whole`.
+pub(crate) fn prompt_drawn(program: aterm_phase::Program, whole: &[String]) -> Option<Drawn> {
+    let reader = program.reader();
+    let rows = prompt_rows(reader, whole);
+    let prompt = reader.prompt(rows)?;
+    let mut key = aterm_hash::Fnv1a64::new();
+    for row in rows.get(prompt.span.0..=prompt.span.1).unwrap_or(rows) {
+        key.write(row.as_bytes());
+        key.write(b"\n");
     }
+    Some(Drawn {
+        readings: prompt.readings(),
+        key: key.finish(),
+    })
 }
 
 /// The title's run bit the agent watch keeps: whether any agent's reader reads `title` as its
@@ -667,13 +705,22 @@ pub(crate) fn classify(
             aterm_phase::Phase::Idle => AgentPhase::Idle,
         }
     };
+    // The box or question the verdict publishes is the frame a key lands on (fix E8): what each
+    // choosing key would choose on it, from the options the reader parsed.
+    let keys = match &phase {
+        AgentPhase::Prompt { .. } => r
+            .prompt
+            .as_ref()
+            .map(crate::session_log::FrameKeys::of_prompt),
+        _ => None,
+    };
     (
         AgentReading {
             phase,
             context_pct: r.context_left,
         },
         subject,
-        turn,
+        TurnFacts { keys, ..turn },
     )
 }
 
@@ -2488,6 +2535,14 @@ mod tests {
                 "bash:not-read-only",
             ),
             ("kimi", kimi::fixtures::BOX_SHELL_BACKSPACED_252, "bash"),
+            // Its screen alone passes the spoof as the honest read; Kimi's record tells them
+            // apart (`kimi_record`).
+            ("kimi", kimi::fixtures::BOX_SHELL_READ_252, "bash:read-only"),
+            (
+                "kimi",
+                kimi::fixtures::BOX_SHELL_BACKSPACED_PUSH_252,
+                "bash:read-only",
+            ),
             (
                 "kimi",
                 kimi::fixtures::BOX_SHELL_LONG_WORD_252,

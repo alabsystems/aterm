@@ -624,6 +624,133 @@ fn entry_versions_require_retained_log_facts_even_with_an_unchanged_envelope() {
     assert!(!replaced.not_before(&first));
     replaced.log_ids = None;
     assert!(!replaced.not_before(&first));
+
+    // A public frontier may redundantly name an ancestor. That changes its encoding,
+    // not the causal prefix it represents, including when checking a published candidate.
+    seed_vault_genesis(&f.paths, &f._root.path().join("version.genesis")).unwrap();
+    let held = super::super::load_records(&f.paths).unwrap();
+    let log = held.log().unwrap();
+    let cfg = config(&f.paths).unwrap().unwrap();
+    let state = load_state(&f.paths).unwrap();
+    let actual = super::super::version::AuthenticatedVersion::from_source(
+        &cfg.name,
+        cfg.signer.unwrap(),
+        cfg.followed.clone(),
+        Some(super::super::version::EnvelopeVersion {
+            seq: state.seq,
+            digest: state.digest.unwrap(),
+        }),
+        Some(log),
+    )
+    .unwrap();
+    let envelope_only = super::super::version::VersionClaim::new(
+        cfg.name.clone(),
+        cfg.signer.unwrap(),
+        actual.claim().envelope().cloned(),
+        None,
+    )
+    .unwrap();
+    use super::super::version::VersionRelation::Same;
+    assert_eq!(actual.relation(&envelope_only), Same);
+    assert!(actual.refines_for_recovery(&envelope_only));
+    assert!(!actual.refines_for_recovery(actual.claim()));
+    let mut other_envelope = envelope_only.envelope().unwrap().clone();
+    other_envelope.digest[0] ^= 1;
+    let other_envelope = super::super::version::VersionClaim::new(
+        cfg.name.clone(),
+        cfg.signer.unwrap(),
+        Some(other_envelope),
+        None,
+    )
+    .unwrap();
+    assert!(!actual.refines_for_recovery(&other_envelope));
+    let mut redundant = log.heads();
+    assert!(!redundant.contains(log.network()));
+    redundant.push(*log.network());
+    redundant.sort_unstable();
+    let redundant = super::super::version::VersionClaim::new(
+        cfg.name.clone(),
+        cfg.signer.unwrap(),
+        actual.claim().envelope().cloned(),
+        Some(super::super::version::LogVersion {
+            network: *log.network(),
+            heads: redundant,
+        }),
+    )
+    .unwrap();
+    assert_eq!(actual.relation(&redundant), Same);
+    assert_eq!(actual.relation_between(&redundant, actual.claim()), Same);
+    assert_eq!(actual.relation_between(actual.claim(), &redundant), Same);
+    let log_only = super::super::version::AuthenticatedVersion::from_source(
+        &cfg.name,
+        cfg.signer.unwrap(),
+        cfg.followed.clone(),
+        None,
+        Some(log),
+    )
+    .unwrap();
+    assert!(!log_only.refines_for_recovery(&envelope_only));
+    assert!(!actual.refines_for_recovery(log_only.claim()));
+    assert_eq!(actual.relation(log_only.claim()), Same);
+    assert_eq!(
+        log_only.relation_between(actual.claim(), log_only.claim()),
+        Same,
+        "a custodian's existing envelope does not advance the recipient's same log prefix"
+    );
+    f.publish(|doc| {
+        doc.set_entry(&Audience::Everyone, "token", b"new-log-value")
+            .unwrap();
+    });
+    let next_store = super::super::load_records(&f.paths).unwrap();
+    let next_state = load_state(&f.paths).unwrap();
+    let next = super::super::version::AuthenticatedVersion::from_source(
+        &cfg.name,
+        cfg.signer.unwrap(),
+        cfg.followed.clone(),
+        Some(super::super::version::EnvelopeVersion {
+            seq: next_state.seq,
+            digest: next_state.digest.unwrap(),
+        }),
+        next_store.log(),
+    )
+    .unwrap();
+    use super::super::version::VersionRelation::Advanced;
+    assert_eq!(next.relation(log_only.claim()), Advanced);
+    let next_log = super::super::version::AuthenticatedVersion::from_source(
+        &cfg.name,
+        cfg.signer.unwrap(),
+        cfg.followed.clone(),
+        None,
+        next_store.log(),
+    )
+    .unwrap();
+    assert_eq!(
+        next_log.relation_between(next.claim(), log_only.claim()),
+        Advanced
+    );
+    f.publish(|doc| {
+        doc.set_entry(&Audience::Everyone, "other", b"later-log-value")
+            .unwrap();
+    });
+    let latest_store = super::super::load_records(&f.paths).unwrap();
+    let latest_state = load_state(&f.paths).unwrap();
+    let latest = super::super::version::AuthenticatedVersion::from_source(
+        &cfg.name,
+        cfg.signer.unwrap(),
+        cfg.followed.clone(),
+        Some(super::super::version::EnvelopeVersion {
+            seq: latest_state.seq,
+            digest: latest_state.digest.unwrap(),
+        }),
+        latest_store.log(),
+    )
+    .unwrap();
+    assert_eq!(latest.relation(next_log.claim()), Advanced);
+    assert_eq!(
+        latest.relation_between(next.claim(), next_log.claim()),
+        Same,
+        "a newer local view cannot make an older candidate advance its own prefix"
+    );
 }
 
 pub(crate) fn version_transition(

@@ -231,9 +231,6 @@ pub struct Reading {
     /// Usage credits carry the session, by the program's own notice
     /// ([`ScreenReader::credits`]).
     pub credits: Option<crate::credits::Credits>,
-    /// The program's own warning that a usage window is filling
-    /// ([`ScreenReader::usage_warning`]), for the record.
-    pub warning: Option<crate::credits::Warning>,
 }
 
 /// A caller's veto on a row [`ScreenReader::said_lines`] would join by the pane's width:
@@ -664,7 +661,6 @@ fn compose<R: ScreenReader + ?Sized>(
         fresh: reader.fresh(rows),
         composer: reader.composer(rows),
         credits: reader.credits(rows),
-        warning: reader.usage_warning(rows),
     }
 }
 

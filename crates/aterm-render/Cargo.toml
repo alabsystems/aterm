@@ -172,6 +172,11 @@ path = "tests/heap_book.rs"
 
 # ---- release perf gates: `targo --unverified bench -p aterm-render` ----------
 [[bench]]
+name = "ligature_slice"
+path = "benches/ligature_slice.rs"
+harness = false
+
+[[bench]]
 name = "sparkle_words"
 path = "benches/sparkle_words.rs"
 harness = false

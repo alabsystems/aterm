@@ -46,6 +46,16 @@ struct Context {
     keys: BTreeSet<[u8; 32]>,
     legacy: bool,
     frontier: Frontier,
+    /// Validated committed deltas, shared by readers so historical need references need
+    /// neither another witness store nor a full frontier copied into every ledger row.
+    receipts: Vec<Arc<VersionReceipt>>,
+}
+
+#[derive(Clone)]
+struct VersionReceipt {
+    index: u64,
+    keys: Vec<[u8; 32]>,
+    delta: Option<Delta>,
 }
 
 impl Context {
@@ -335,6 +345,7 @@ impl History {
                     keys: BTreeSet::new(),
                     legacy: false,
                     frontier: Frontier::empty(network),
+                    receipts: Vec::new(),
                 },
             );
         }
@@ -347,10 +358,15 @@ impl History {
         {
             return Err(invalid());
         }
-        if let Some(delta) = delta {
-            context.frontier.apply(&delta)?;
+        if let Some(delta) = &delta {
+            context.frontier.apply(delta)?;
         }
         context.keys.extend(keys.iter().copied());
+        context.receipts.push(Arc::new(VersionReceipt {
+            index: self.1 as u64 + 1,
+            keys: keys.to_vec(),
+            delta,
+        }));
         context.legacy = false;
         self.1 += 1;
         Ok(())
@@ -978,6 +994,139 @@ pub(super) fn require_covers(reads: &Reads<'_>, config: &Config, log: &Log) -> R
         ));
     }
     Ok(())
+}
+
+/// Encode only a small locator into the existing, already committed receipt WAL. The
+/// complete public frontier stays there once, independently of the number of needs.
+pub(super) fn version_reference(
+    paths: &Paths,
+    claim: &super::version::VersionClaim,
+) -> Result<Vec<u8>> {
+    use aterm_json::{Value, json};
+    let log = if let Some(log) = claim.log() {
+        let history = read(paths)?;
+        let context = history
+            .0
+            .get(&log.network)
+            .filter(|context| context.name == claim.vault())
+            .ok_or_else(|| Error::new("the refused log version has no retained context"))?;
+        let mut frontier = Frontier::empty(log.network);
+        let mut keys = BTreeSet::new();
+        let mut found = None;
+        for receipt in &context.receipts {
+            if let Some(delta) = &receipt.delta {
+                frontier.apply(delta)?;
+            }
+            keys.extend(receipt.keys.iter().copied());
+            if keys.contains(claim.signer()) && frontier.names_heads(&log.heads) {
+                found = Some((receipt.index, frontier.digest()));
+                break;
+            }
+        }
+        let (index, digest) =
+            found.ok_or_else(|| Error::new("the refused log prefix was not retained"))?;
+        json!({"network": super::hex(&log.network), "receipt": index, "frontier": super::hex(&digest)})
+    } else {
+        Value::Null
+    };
+    let envelope = claim.envelope().map_or(
+        Value::Null,
+        |envelope| json!({"seq": envelope.seq, "digest": super::hex(&envelope.digest)}),
+    );
+    aterm_json::to_vec(&json!({
+        "claim": super::hex(&claim.id()), "vault": claim.vault(),
+        "signer": super::hex(claim.signer()), "envelope": envelope, "log": log,
+    }))
+    .map_err(|_| Error::new("cannot encode retained version reference"))
+}
+
+/// Resolve a historical prefix from validated receipt deltas. Nothing is acknowledged,
+/// repaired or written by a ledger read; a missing or changed witness remains unavailable.
+pub(super) fn resolve_version_reference(
+    paths: &Paths,
+    bytes: &[u8],
+) -> Result<super::version::VersionClaim> {
+    use super::version::{EnvelopeVersion, LogVersion, VersionClaim};
+    let invalid = || Error::new("invalid or unavailable retained version reference");
+    if bytes.len() > 1024 {
+        return Err(invalid());
+    }
+    let value: aterm_json::Value = aterm_json::from_slice(bytes).map_err(|_| invalid())?;
+    let object = value.as_object().ok_or_else(invalid)?;
+    if object.len() != 5
+        || !["claim", "vault", "signer", "envelope", "log"]
+            .iter()
+            .all(|key| object.contains_key(*key))
+    {
+        return Err(invalid());
+    }
+    let key = |value: &aterm_json::Value| -> Result<[u8; 32]> {
+        aterm_codec::hex::decode_vec(value.as_str().ok_or_else(invalid)?.as_bytes())
+            .ok_or_else(invalid)?
+            .try_into()
+            .map_err(|_| invalid())
+    };
+    let expected = key(&value["claim"])?;
+    let vault = value["vault"].as_str().ok_or_else(invalid)?;
+    let signer = key(&value["signer"])?;
+    let envelope = if value["envelope"].is_null() {
+        None
+    } else {
+        let fields = value["envelope"].as_object().ok_or_else(invalid)?;
+        if fields.len() != 2 || !fields.contains_key("seq") || !fields.contains_key("digest") {
+            return Err(invalid());
+        }
+        Some(EnvelopeVersion {
+            seq: value["envelope"]["seq"].as_u64().ok_or_else(invalid)?,
+            digest: key(&value["envelope"]["digest"])?,
+        })
+    };
+    let log = if value["log"].is_null() {
+        None
+    } else {
+        let fields = value["log"].as_object().ok_or_else(invalid)?;
+        if fields.len() != 3
+            || !["network", "receipt", "frontier"]
+                .iter()
+                .all(|key| fields.contains_key(*key))
+        {
+            return Err(invalid());
+        }
+        let network = key(&value["log"]["network"])?;
+        let index = value["log"]["receipt"].as_u64().ok_or_else(invalid)?;
+        let expected_frontier = key(&value["log"]["frontier"])?;
+        let history = read(paths)?;
+        let context = history
+            .0
+            .get(&network)
+            .filter(|context| context.name == vault)
+            .ok_or_else(invalid)?;
+        let mut frontier = Frontier::empty(network);
+        let mut keys = BTreeSet::new();
+        let mut found = false;
+        for receipt in &context.receipts {
+            if let Some(delta) = &receipt.delta {
+                frontier.apply(delta)?;
+            }
+            keys.extend(receipt.keys.iter().copied());
+            if receipt.index == index {
+                found = keys.contains(&signer) && frontier.digest() == expected_frontier;
+                break;
+            }
+        }
+        if !found {
+            return Err(invalid());
+        }
+        Some(LogVersion {
+            network,
+            heads: frontier.heads(),
+        })
+    };
+    let claim = VersionClaim::new(vault.to_owned(), signer, envelope, log)?;
+    if claim.id() != expected {
+        return Err(invalid());
+    }
+    Ok(claim)
 }
 
 #[cfg(test)]

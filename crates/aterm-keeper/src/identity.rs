@@ -13,9 +13,6 @@ use aterm_uds::CtlStream;
 /// How long the on-disk check of a copy of this build ([`Identity::admits_code_at`]) may take.
 pub const CODE_CHECK_HANG: Duration = Duration::from_secs(60);
 
-/// How long a peer's code check ([`Identity::check`]) may take, at least.
-pub const PEER_CHECK_HANG: Duration = Duration::from_secs(60);
-
 /// The floor a test set on this process's peer waits, in milliseconds (0: none set).
 #[cfg(any(test, debug_assertions))]
 static PEER_WAITS_FOR_TEST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -404,7 +401,7 @@ impl Identity {
         token: Option<aterm_uds::peer::AuditToken>,
         within: Duration,
     ) -> Result<(), CheckError> {
-        let hang = within.max(PEER_CHECK_HANG);
+        let hang = within.max(aterm_uds::peer::CHECK_HANG);
         self.begin_check(stream, token, hang)
             .wait(hang)
             .unwrap_or_else(|check| Err(CheckError::Unanswered(check.unanswered())))
@@ -417,7 +414,7 @@ impl Identity {
         stream: &CtlStream,
         token: Option<aterm_uds::peer::AuditToken>,
     ) -> PeerCheck {
-        self.begin_check(stream, token, PEER_CHECK_HANG)
+        self.begin_check(stream, token, aterm_uds::peer::CHECK_HANG)
     }
 
     fn begin_check(

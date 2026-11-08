@@ -13,7 +13,7 @@ use aterm_codec::hex;
 use aterm_json::{Map, Value};
 use aterm_secrets::{
     client::Paths,
-    need::{self, Need, Purpose, Retirement, Want},
+    need::{self, Need, Purpose, RefusalClaim, Retirement, Want},
 };
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -316,8 +316,13 @@ fn thread_row(thread: &Thread) -> String {
         format!("retired {}", retired.reason.word())
     } else if thread.fulfilled.is_some() {
         "fulfilled".to_owned()
-    } else if let Some((vault, seq)) = &thread.published {
-        format!("published {vault} seq {seq}")
+    } else if let Some((vault, version)) = &thread.published {
+        match version {
+            RefusalClaim::LegacySequence(seq) => format!("published {vault} seq {seq}"),
+            RefusalClaim::Authenticated(_) => format!("published {vault} authenticated version"),
+        }
+    } else if thread.version_pending {
+        "waits for complete version witness".to_owned()
     } else if thread.needs_person && thread.offers.is_empty() {
         format!("awaiting-person, swept by {}", thread.swept.len())
     } else if thread.needs_person {
@@ -413,7 +418,15 @@ fn observation_json(table: &Result<Observation, String>) -> Value {
                 "sweeps_complete": swept_current == required_sweeps,
                 "want_window_ended": thread.window_ended(observed.at_ms),
                 "needs_person": thread.needs_person,
-                "published_seq": thread.published.as_ref().map(|(_, seq)| *seq),
+                "published_seq": thread.published.as_ref().and_then(|(_, version)| match version {
+                    RefusalClaim::LegacySequence(seq) => Some(*seq),
+                    RefusalClaim::Authenticated(claim) => claim.envelope().map(|v| v.seq),
+                }),
+                "published_version": thread.published.as_ref().and_then(|(_, version)| match version {
+                    RefusalClaim::LegacySequence(_) => None,
+                    RefusalClaim::Authenticated(claim) => Some(hex::encode_lower(&claim.id())),
+                }),
+                "version_pending": thread.version_pending,
                 "fulfilled_seq": thread.fulfilled,
                 "retired_reason": thread.retired.as_ref().map(|(retired, _)| retired.reason.word()),
             })

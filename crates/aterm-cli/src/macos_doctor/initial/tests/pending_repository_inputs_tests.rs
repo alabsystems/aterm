@@ -32,7 +32,7 @@ fn a_parked_repository_hears_a_matching_checkout_completed_elsewhere() {
         let bytes = br#"{"schema":2,"account":"tester","repositories":[{"id":1,"name":"arrived","owner":{"login":"tester"},"full_name":"tester/arrived","private":true,"clone_url":"https://github.com/tester/arrived.git","default_branch":"main"}]}"#;
         sys.file(inventory.to_str().unwrap(), bytes)
             .stat_of(inventory.to_str().unwrap(), stat(false, bytes.len() as u64));
-        sys.file(home.join(".local/bin/aterm").to_str().unwrap(), b"launcher");
+        sys.executable(home.join(".local/bin/aterm").to_str().unwrap(), b"launcher");
         let checkout = home.join("arrived");
         let git_dir = checkout.join(".git");
         sys.stat_of(checkout.to_str().unwrap(), stat(true, 0));

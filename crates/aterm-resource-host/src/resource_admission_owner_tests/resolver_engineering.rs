@@ -184,17 +184,13 @@ fn host() {
     let source = fs::canonicalize(PathBuf::from(std::env::var_os(SDK).unwrap())).unwrap();
     let source_layout = atpkg::store::resolve_configured().unwrap();
     assert!(atpkg::lease::Subject::of_dir(&source_layout.prefix, &source.join("bin")).is_some());
-    let source_lease = match atpkg::lease::hold_for(
+    let source_lease = owner_fixture_sdk_lease(
         &source_layout.prefix,
         &source.join("bin"),
         "complete private resolver engineering SDK copy",
-        Duration::from_secs(2),
+        Instant::now(),
     )
-    .unwrap()
-    {
-        atpkg::lease::Hold::Held(lease) => lease,
-        _ => panic!("source SDK requires its original managed in-use lease"),
-    };
+    .unwrap();
     let layout = atpkg::store::Layout {
         prefix: artifacts.join("manager"),
     };
@@ -312,7 +308,7 @@ fn host() {
         }
         match aterm_uds::kept_out(|| listener.accept()) {
             Ok((stream, _)) => {
-                let end = Instant::now() + Duration::from_secs(8);
+                let end = crate::fixture_deadline(Instant::now());
                 let peer = match wire::local_peer(&stream) {
                     Ok(peer) => peer,
                     Err(error) if error.kind() == io::ErrorKind::NotConnected => continue,

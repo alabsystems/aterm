@@ -1625,6 +1625,7 @@ impl WLab {
         log_entries::Drafted {
             records: vec![direct.record.clone()],
             heads: vec![*direct.record.id()],
+            network: None,
         }
     }
 

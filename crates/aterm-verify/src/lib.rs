@@ -20,6 +20,7 @@ pub mod changed;
 pub mod checks;
 pub mod cli;
 pub mod compile_account;
+pub mod compile_width;
 mod compiler_message;
 /// The disk a run will write, claimed before it builds (`docs/DESIGN-adaptive-build-2026-10-24.md`, DISK-ADMIT).
 #[cfg(unix)]
@@ -615,7 +616,7 @@ pub struct Ctx {
     /// starts no timed callback. `None` is the caller's explicit untimed/outer-owned contract;
     /// it supplies no CPU observation or measurement qualification.
     pub quiet: Option<aterm_capacity::Admit>,
-    /// A repeatable watch sample yields before dispatching another stage.
+    /// A repeatable watch sample whose stage admissions rank behind overlapping Ordinary work.
     pub background: bool,
     /// This run's record of its stage groups ([`runs::Runs`]), when it keeps one.
     pub runs: Option<runs::Runs>,
@@ -1259,26 +1260,12 @@ fn admit_in(
             Some(why) => say(&format!("{line}; it claims {why}")),
             None => say(line),
         },
-        &|| stopping() || background_waiter_arrived(ledger, mode),
+        &stopping,
     )
 }
 
-/// Whether repeatable work reached a stage boundary after foreground work queued. A Background
-/// stage must end its admission instead of waiting while the same run retains its whole-run disk
-/// claim: the foreground disk waiter may need that claim to end before it can start. A failed
-/// ledger read supplies no authority to keep repeatable work running.
-fn background_waiter_arrived(ledger: &aterm_capacity::Ledger, mode: aterm_capacity::Admit) -> bool {
-    mode == aterm_capacity::Admit::Preemptible
-        && ledger.list().map_or(true, |rows| {
-            rows.iter().any(|row| {
-                row.need.rank == aterm_capacity::Rank::Release
-                    || (row.need.rank == aterm_capacity::Rank::Ordinary && row.held.is_none())
-            })
-        })
-}
-
-/// A whole-tree Background candidate's disk is Background too. It may finish its current stage,
-/// but cannot enter the lane ahead of foreground work and a Release may end it immediately.
+/// A whole-tree Background candidate's disk is Background too. It may finish its current stage;
+/// Ordinary work retains priority for overlapping resources, and a Release may end it immediately.
 const fn run_admit_mode(
     background: bool,
     requested: aterm_capacity::Admit,
@@ -1712,6 +1699,7 @@ fn measured(
     spec: &plan::StageSpec,
     report: &Report,
     meter: Option<&memory::Meter>,
+    compile_jobs: Option<u32>,
 ) -> Option<String> {
     let book = ctx.memory.as_ref()?;
     if !memory::metered(spec) {
@@ -1736,7 +1724,7 @@ fn measured(
     if let Some(why) = not_kept {
         return Some(format!("memory: peaked {size}, not kept: {why}"));
     }
-    let key = memory::Key::of_stage(spec, ctx);
+    let key = compile_width::record_key(memory::Key::of_stage(spec, ctx), compile_jobs);
     let mut said = match book.keep(spec, &key, peak) {
         Ok(memory::Kept::Kept | memory::Kept::Nowhere) => format!("memory: peaked {size}"),
         Ok(memory::Kept::Light) => format!(
@@ -1804,6 +1792,7 @@ pub(crate) struct ResourceClaim {
     pub(crate) claim: Arc<aterm_capacity::Claim>,
     /// What it claimed, why, and how it was admitted.
     pub(crate) said: String,
+    compile_jobs: Option<u32>,
 }
 
 impl ResourceClaim {
@@ -1887,6 +1876,9 @@ fn claim_memory(
     spec: &plan::StageSpec,
     admit: Admitter,
 ) -> Result<Option<ResourceClaim>, String> {
+    if let Some(claim) = compile_width::claim(ctx, spec, admit)? {
+        return Ok(Some(claim));
+    }
     let Some(book) = ctx.memory.as_ref() else {
         return Ok(None);
     };
@@ -1998,6 +1990,7 @@ fn claim_bytes(
             let how = admitted_how(&claim, mode);
             Ok(ResourceClaim {
                 claim: Arc::new(claim),
+                compile_jobs: None,
                 said: format!(
                     "{}: {what}{how}",
                     if cores > 0 { "resources" } else { "memory" }
@@ -2030,9 +2023,9 @@ fn claim_bytes(
 
 fn before_stage_claim(ctx: &Ctx) -> Result<(), String> {
     #[cfg(unix)]
-    if ctx.background && watch::foreground_waiting(&ctx.root)? {
+    if ctx.background && watch::running_should_stop(&ctx.root)? {
         exec::group::stop_run();
-        return Err("background sample yielded to foreground work".into());
+        return Err("a Release stopped the background sample".into());
     }
     Ok(())
 }
@@ -2084,12 +2077,18 @@ fn staged(
         }
         let _metering = memory::metering(meter.clone());
         let _covering = memory::covering(claim.as_ref().and_then(ResourceClaim::cover));
-        let begun = Instant::now();
-        let from = aterm_capacity::Live.read(None);
-        on_started();
-        let report = run_stage();
-        let to = aterm_capacity::Live.read(None);
-        Ok((report, begun, aterm_capacity::between(&from, &to), claim))
+        let jobs = claim.as_ref().and_then(|c| c.compile_jobs);
+        let (report, begun, machine) =
+            compile_width::run(ctx.pool.as_ref(), jobs, &stopping, || {
+                let begun = Instant::now();
+                let from = aterm_capacity::Live.read(None);
+                on_started();
+                let report = run_stage();
+                let to = aterm_capacity::Live.read(None);
+                (report, begun, aterm_capacity::between(&from, &to))
+            })
+            .map_err(|e| format!("compiler tokens could not be acquired: {e}"))?;
+        Ok((report, begun, machine, claim))
     };
     let ran = if takes_quiet(ctx, spec.id) {
         quietly(ctx, quiet, &spec.title, run).and_then(|(ran, admitted)| Ok((ran?, admitted)))
@@ -2105,7 +2104,13 @@ fn staged(
         machine.push_str("; ");
         machine.push_str(&said);
     }
-    if let Some(said) = measured(ctx, spec, &report, meter.as_deref()) {
+    if let Some(said) = measured(
+        ctx,
+        spec,
+        &report,
+        meter.as_deref(),
+        claim.as_ref().and_then(|c| c.compile_jobs),
+    ) {
         machine.push_str("; ");
         machine.push_str(&said);
     }
@@ -3297,41 +3302,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_foreground_waiter_ends_a_background_stage_admission() {
-        use aterm_capacity::{Admit, Fixed, Ledger, Need, Pace, Reading, Waiter};
-
-        let dir = aterm_tempfile::tempdir().expect("scratch");
-        let ledger = Ledger::at(dir.path().join("ledger"));
-        let machine = Fixed::new(Reading::of_gib(48, 40, 14));
-        let holder = aterm_capacity::admit_with(
-            &ledger,
-            &machine,
-            Need::new("ordinary holder").cores(14),
-            Admit::Wait,
-            Pace::default(),
-            &mut |_| {},
-        )
-        .expect("ordinary holder");
-        assert!(
-            !background_waiter_arrived(&ledger, Admit::Preemptible),
-            "running foreground work is not a stage-boundary request"
-        );
-
-        let waiter = Waiter::enter(
-            &ledger,
-            &machine,
-            Need::new("ordinary disk waiter").cores(14),
-        )
-        .expect("ordinary waiter");
-        assert!(background_waiter_arrived(&ledger, Admit::Preemptible));
-        assert!(
-            !background_waiter_arrived(&ledger, Admit::Wait),
-            "negative control: ordinary admission never self-cancels"
-        );
-        drop((waiter, holder));
-    }
-
     #[cfg(unix)]
     #[test]
     fn scratch_permission_changes_refuse_links_and_regular_files() {
@@ -4209,7 +4179,7 @@ mod tests {
     }
 
     #[test]
-    fn an_existing_pair_and_external_hardlink_receive_each_actual_event_once() {
+    fn a_private_companion_refuses_public_aliases_and_keeps_internal_producer_records() {
         fn stage(_: &Ctx, spec: &plan::StageSpec) -> Report {
             let mut report = Report::new(spec.title.clone());
             report.pass("ran");
@@ -4232,7 +4202,13 @@ mod tests {
         drop(previous);
         let alias = dir.path().join("external-alias.events");
         std::fs::hard_link(run_log::events_path(&path), &alias).unwrap();
-        let mut ctx = context().with_events(Some(event_log::EventLog::open(&alias).unwrap()));
+        assert!(event_log::EventLog::open(&alias).is_err());
+        assert!(event_log::EventLog::open(&run_log::events_path(&path)).is_err());
+        let human_alias = dir.path().join("external-human-alias.log");
+        std::fs::hard_link(&path, &human_alias).unwrap();
+        assert!(event_log::EventLog::open(&path).is_err());
+        assert!(event_log::EventLog::open(&human_alias).is_err());
+        let mut ctx = context();
         let mut log = open_run_log(&mut ctx, Some(&path), dir.path()).unwrap();
         assert_eq!(
             run_with(
@@ -4251,14 +4227,30 @@ mod tests {
         );
         drop(log);
         drop(ctx);
+        assert!(
+            std::fs::read(&path)
+                .unwrap()
+                .starts_with(run_log::PRIVATE_HUMAN_HEADER.as_bytes())
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            std::fs::read(&human_alias).unwrap()
+        );
+        assert!(event_log::EventLog::open(&human_alias).is_err());
         let text = std::fs::read_to_string(&alias).unwrap();
         assert_eq!(
             std::fs::read(&alias).unwrap(),
             std::fs::read(run_log::events_path(&path)).unwrap()
         );
         let observed = status::observe(&text);
+        assert!(text.starts_with(run_log::PRIVATE_EVENTS_HEADER));
+        assert_eq!(observed.malformed_complete_records, 0);
         assert_eq!(observed.invocations.len(), 1);
         assert_eq!(observed.invocations[0].observed.terminal_records, 1);
+        assert_eq!(
+            observed.invocations[0].observed.terminal_consistency,
+            "matching-observed-rows"
+        );
         assert_eq!(observed.invocations[0].observed.checks[0].occurrences, 1);
         assert_eq!(
             text.lines()
@@ -4316,9 +4308,15 @@ mod tests {
         drop(transient);
         assert!(!external.exists());
         let at = run_log::events_path(&path);
-        assert_eq!(std::fs::read(&at).unwrap(), external_bytes);
-        let text = String::from_utf8(external_bytes).unwrap();
+        let kept = std::fs::read(&at).unwrap();
+        assert_eq!(
+            kept.strip_prefix(run_log::PRIVATE_EVENTS_HEADER.as_bytes())
+                .unwrap(),
+            external_bytes
+        );
+        let text = String::from_utf8(kept).unwrap();
         let observed = status::observe(&text);
+        assert_eq!(observed.malformed_complete_records, 0);
         assert_eq!(observed.invocations.len(), 1);
         let run = &observed.invocations[0];
         assert_eq!(run.id, id);

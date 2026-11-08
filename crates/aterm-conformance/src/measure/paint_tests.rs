@@ -24,6 +24,7 @@ fn row(expect: Expect, capture: Capture, style: Style) -> PaintRow {
 fn lit_burst() -> ScanReport {
     ScanReport {
         frames: 67,
+        all_composed_frames: false,
         cell: Cell::new(7, 14).expect("cell"),
         best_ink: 2_500,
         best_hues: 11,

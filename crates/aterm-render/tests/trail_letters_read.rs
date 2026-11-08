@@ -18,7 +18,7 @@ use crate::wcag::{contrast, luma};
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ClockReading, Rgb, Terminal};
 use aterm_effects::cursor_fx::TrailColor;
-use aterm_effects::kitty_pet::PetInputKind;
+use aterm_effects::kitty_pet::{PetInputKind, art_cols, head_law};
 use aterm_effects::pipeline::EffectsPipeline;
 use aterm_render::{Renderer, Theme};
 
@@ -430,6 +430,8 @@ pub struct Judged {
 pub struct Coat {
     /// The pet's drawn box, frame px `(x0, x1, y0, y1)`.
     pub pet: Option<(i32, i32, i32, i32)>,
+    /// The alpha the frame put the pet on glass at (`0`: none drawn).
+    pub alpha: u8,
     /// How far (rows) the head law draws the body down its row and the share of its height it
     /// fits it to (`EffectsPipeline::companion_head_sink_fit`), when it is drawn.
     pub sink_fit: Option<(f32, f32)>,
@@ -599,18 +601,44 @@ pub fn lays_the_gallery_row() -> bool {
     gallery_row_px() == GALLERY_PX
 }
 
-/// The cell Linux's bundled JetBrains Mono lays at [`GALLERY_PX`], px ([`gallery_row_px`]).
-const BUNDLED_CELL: (usize, usize) = (13, 29);
-
-/// Whether the window's face lays [`BUNDLED_CELL`] at [`GALLERY_PX`]: Linux's bundled face, on
-/// which a control measured there is required as measured.
-fn lays_the_bundled_cell() -> bool {
+/// The cell the window's face lays at [`GALLERY_PX`], px: a [`Replay::new`]'s.
+pub fn gallery_cell() -> (usize, usize) {
     static CELL: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
         Renderer::from_system(GALLERY_PX, Theme::default())
             .expect("no font: build with aterm-render's default embedded-font feature")
             .cell_size()
-    }) == BUNDLED_CELL
+    })
+}
+
+/// [`Scene::LastRow`]'s columns on a `cell` (px): the burst's line (the prompt and
+/// [`BURST_TEXT`]) and, past it to the grid's end, the blank cells its companion stands in there,
+/// fitted to the row (a letter in every cell over it and no row under it,
+/// [`aterm_effects::kitty_pet::head_law`]): the fitted body's width rounded up to a cell. On the
+/// gallery's 14 x 26 px cell that body is 2.82 cells across, and the grid is the gallery window's
+/// [`COLS`], three cells past the line. Under Linux's bundled JetBrains Mono's 13 x 29 it is 3.38
+/// across (44 px, three cells 39): on the gallery's columns its box, at the grid's end, met the
+/// line's last letter by 5 to 7 px (6 in 252 of the 378 frames held at the margin), before the
+/// wall that holds no seat hid such a body (`OldPath::NoSeatHidesTheBody`; Linux arm64,
+/// 2026-11-07), so the grid takes a fourth, and the scene is one whose wall seats the body.
+pub fn last_row_cols((cw, ch): (usize, usize)) -> u16 {
+    let (_, fit) = head_law(true, true);
+    let room = (art_cols(cw as u16, ch as u16) * fit).ceil() as u16;
+    last_row_line() + room
+}
+
+/// The burst's line on [`Scene::LastRow`]'s last row, cells: the prompt and [`BURST_TEXT`].
+pub fn last_row_line() -> u16 {
+    ("$ ".len() + BURST_TEXT.len()) as u16
+}
+
+/// The cell Linux's bundled JetBrains Mono lays at [`GALLERY_PX`], px ([`gallery_row_px`]).
+const BUNDLED_CELL: (usize, usize) = (13, 29);
+
+/// Whether the window's face lays [`BUNDLED_CELL`] at [`GALLERY_PX`] ([`gallery_cell`]): Linux's
+/// bundled face, on which a control measured there is required as measured.
+pub fn lays_the_bundled_cell() -> bool {
+    gallery_cell() == BUNDLED_CELL
 }
 
 impl Replay {
@@ -843,6 +871,7 @@ impl Replay {
                 .companion_hit_rect()
                 .map(|(x0, x1, y0, y1)| (x0 + px, x1 + px, y0 + py, y1 + py));
             coat.pet = pet;
+            coat.alpha = self.fx.cursor_pet_alpha();
             coat.sink_fit = pet.map(|_| self.fx.companion_head_sink_fit());
             coat.icons = self
                 .fx
@@ -1129,6 +1158,11 @@ impl Replay {
                     self.fx.note_console_input(PetInputKind::Delete);
                     self.fx.note_keystroke();
                 }
+                (0, Ev::Key(LEFT, _)) => {
+                    // A window's Left arrow: the console's move along the line and the keystroke.
+                    self.fx.note_console_input(PetInputKind::Navigate);
+                    self.fx.note_keystroke();
+                }
                 (0, Ev::Key(c, _)) => {
                     let input = self
                         .term
@@ -1177,6 +1211,57 @@ pub const LAST_ROW_RAGGED: [&str; 4] = [
     "}",
 ];
 pub const BURST_TEXT: &str = "echo the quick brown fox jumps over the lazy dog as the kitty flies";
+/// [`LastRowThen::Gapped`]'s burst: [`BURST_TEXT`]'s length, its last words a run of fourteen
+/// spaces and two letters, so the line's last letters lie by the margin and a stand by the caret
+/// off them lies in the spaces before them.
+pub const GAPPED_TEXT: &str = "echo the quick brown fox jumps over the lazy dog as              ab";
+const _: () = assert!(GAPPED_TEXT.len() == BURST_TEXT.len());
+/// A Left arrow's key in a replay's events: the console reads it as a move along the line.
+pub const LEFT: char = '\u{2190}';
+
+/// What [`Scene::LastRowRoom`]'s line does once its burst is typed, before its Enter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LastRowThen {
+    /// It rests to the Enter.
+    Rests,
+    /// `keys` Backspaces 50 ms apart from `after` ms past the burst's last key, each echoed as a
+    /// line editor echoes one at its line's end (back a cell, erase to the end).
+    Erased { keys: u16, after: u64 },
+    /// Ten Left arrows 50 ms apart from 1.5 s past the burst's last key, each echoed back a cell.
+    Back,
+    /// The burst typed to [`PAUSED_SHORT`] keys short of its end, a 3 s pause, then the rest.
+    Paused,
+    /// 1.5 s past the burst's last key the program clears the row over the line
+    /// ([`OPEN_ROW_OVER`]), the caret kept where it stands: a seat opens beside the line.
+    Opened,
+    /// [`GAPPED_TEXT`] typed for the burst, and it rests to the Enter.
+    Gapped,
+}
+
+/// The bytes [`LastRowThen::Opened`]'s program writes: the caret saved, a row up, that row
+/// cleared, the caret restored.
+pub const OPEN_ROW_OVER: &[u8] = b"\x1b7\x1b[A\x1b[2K\x1b8";
+
+/// How many keys short of its end [`LastRowThen::Paused`]'s burst pauses.
+pub const PAUSED_SHORT: usize = 6;
+
+/// [`Scene::LastRow`]'s timeline, its line doing what `then` says: the burst's last key, the
+/// first key past it (a Backspace's, a Left arrow's), for [`LastRowThen::Paused`] the first past
+/// the pause, and for [`LastRowThen::Opened`] the row's clearing, and the Enter, 6.05 s past the
+/// burst's last key (ms).
+pub fn last_row_times(then: LastRowThen) -> (u64, Option<u64>, u64) {
+    let burst = 1_000 + 50 * (BURST_TEXT.len() as u64 - 1);
+    let (last_key, then_from) = match then {
+        LastRowThen::Rests | LastRowThen::Gapped => (burst, None),
+        LastRowThen::Erased { after, .. } => (burst, Some(burst + after)),
+        LastRowThen::Back | LastRowThen::Opened => (burst, Some(burst + 1_500)),
+        LastRowThen::Paused => {
+            let resume = 1_000 + 50 * (BURST_TEXT.len() - PAUSED_SHORT) as u64 + 3_000;
+            (resume + 50 * (PAUSED_SHORT as u64 - 1), Some(resume))
+        }
+    };
+    (last_key, then_from, last_key + 6_050)
+}
 /// [`Scene::Wrapped`]'s line: past the margin of the gallery's 72 columns from the prompt, onto a
 /// second row, where it stops at column 23.
 pub const WRAPPED_TEXT: &str =
@@ -1223,8 +1308,13 @@ pub enum Scene {
     StatusWrap,
     /// The gallery's `last-row`: the caret on the grid's last row under a page whose row over it
     /// holds a letter in every cell ([`last_row_page`]), a burst along it, an Enter whose answer
-    /// scrolls the page, and the typing line again.
+    /// scrolls the page, and the typing line again. The burst's line ends as near the grid's end
+    /// as leaves its fitted companion the room it takes ([`last_row_cols`]).
     LastRow,
+    /// [`Scene::LastRow`] on a grid as wide as leaves this many blank cells past the burst's line
+    /// (`-1`: one cell too narrow for it, so the line wraps at its last key and the page scrolls),
+    /// the line doing what the [`LastRowThen`] says before its Enter.
+    LastRowRoom(i16, LastRowThen),
     /// The gallery's `steam`: the burst between two lettered rows, then twelve Backspaces 50 ms
     /// apart and the fade.
     Steam,
@@ -1251,10 +1341,17 @@ impl Scene {
         }
     }
 
-    /// The scene's columns: `focus-wrap`'s narrow composer's, else the gallery window's [`COLS`].
+    /// The scene's columns: `focus-wrap`'s narrow composer's, `last-row`'s line and the room its
+    /// fitted companion takes past it on the window's face ([`last_row_cols`]), else the gallery
+    /// window's [`COLS`].
     pub fn cols(self) -> u16 {
         match self {
             Scene::FocusWrap | Scene::StatusWrap => FOCUS_WRAP_COLS,
+            Scene::LastRow => last_row_cols(gallery_cell()),
+            Scene::LastRowRoom(room, _) => {
+                u16::try_from(i32::from(last_row_line()) + i32::from(room))
+                    .expect("a grid as wide as the line")
+            }
             _ => COLS,
         }
     }
@@ -1402,14 +1499,14 @@ impl Scene {
                 ev.extend(typed(" state", done + 500, 60));
                 (ev, 1_500)
             }
-            Scene::LastRow => {
+            Scene::LastRow | Scene::LastRowRoom(..) => {
                 let mut page = String::from("\x1b[H\x1b[2J");
                 for over in (1..usize::from(ROWS)).rev() {
                     let text: String = if over % 2 == 1 {
                         LAST_ROW_FULL
                             .chars()
                             .cycle()
-                            .take(usize::from(COLS))
+                            .take(usize::from(self.cols()))
                             .collect()
                     } else {
                         LAST_ROW_RAGGED[over / 2 % LAST_ROW_RAGGED.len()].to_string()
@@ -1419,8 +1516,38 @@ impl Scene {
                 }
                 page.push_str("$ ");
                 let mut ev = vec![(200, Ev::Out(page.into_bytes()))];
-                ev.extend(typed(BURST_TEXT, 1_000, 50));
-                let enter = 1_000 + 50 * BURST_TEXT.len() as u64 + 6_000;
+                let then = match self {
+                    Scene::LastRowRoom(_, then) => then,
+                    _ => LastRowThen::Rests,
+                };
+                let (_, then_from, enter) = last_row_times(then);
+                match (then, then_from) {
+                    (LastRowThen::Paused, Some(resume)) => {
+                        let short = BURST_TEXT.len() - PAUSED_SHORT;
+                        ev.extend(typed(&BURST_TEXT[..short], 1_000, 50));
+                        ev.extend(typed(&BURST_TEXT[short..], resume, 50));
+                    }
+                    (LastRowThen::Erased { keys, .. }, Some(from)) => {
+                        ev.extend(typed(BURST_TEXT, 1_000, 50));
+                        ev.extend(
+                            (0..u64::from(keys)).map(|k| {
+                                (from + 50 * k, Ev::Key('\u{7f}', b"\x08\x1b[K".to_vec()))
+                            }),
+                        );
+                    }
+                    (LastRowThen::Back, Some(from)) => {
+                        ev.extend(typed(BURST_TEXT, 1_000, 50));
+                        ev.extend(
+                            (0..10u64).map(|k| (from + 50 * k, Ev::Key(LEFT, b"\x08".to_vec()))),
+                        );
+                    }
+                    (LastRowThen::Opened, Some(from)) => {
+                        ev.extend(typed(BURST_TEXT, 1_000, 50));
+                        ev.push((from, Ev::Out(OPEN_ROW_OVER.to_vec())));
+                    }
+                    (LastRowThen::Gapped, _) => ev.extend(typed(GAPPED_TEXT, 1_000, 50)),
+                    _ => ev.extend(typed(BURST_TEXT, 1_000, 50)),
+                }
                 ev.push((enter, Ev::Key('\r', b"\r\n".to_vec())));
                 ev.push((enter + 6, Ev::Out(b"Below: pqgyj [ok]\r\n$ ".to_vec())));
                 ev.extend(typed(TYPING_TEXT, enter + 470, 60));

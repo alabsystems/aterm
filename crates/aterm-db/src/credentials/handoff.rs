@@ -83,6 +83,7 @@ impl Round<'_> {
                     .get(&request)
                     .filter(|thread| {
                         !thread.ended()
+                            && !thread.version_pending
                             && thread.published.is_none()
                             && thread.offers.contains(&holder)
                             && now.saturating_sub(thread.heard_ms) < need::LAPSE_SECS * MS
@@ -159,6 +160,7 @@ impl Round<'_> {
                     let request = ids(&record.key)?;
                     if book.threads.get(&request).is_some_and(|thread| {
                         !thread.ended()
+                            && !thread.version_pending
                             && thread.published.is_none()
                             && context.policy.allows(&thread.want)
                             && thread.want.entries().first().is_none_or(|first| {
@@ -412,7 +414,7 @@ fn publish(
     }
     let mut admin = client::admin_cached(paths).map_err(crate::table::failure)?;
     let facts = facts(paths, now_ms())?;
-    let (network, recipient) = open(paths, round, |session, store, scope| {
+    let (network, recipient, floor, versioned) = open(paths, round, |session, store, scope| {
         session.writer()?;
         if let Some(contributor) = contributor {
             session.peer_writer(contributor)?;
@@ -429,17 +431,22 @@ fn publish(
             .get(&thread.id)
             .filter(|current| {
                 !current.ended()
+                    && !current.version_pending
                     && current.published.is_none()
                     && current.want == thread.want
                     && current.requester == thread.requester
                     && current.origin == thread.origin
+                    && current.operation == thread.operation
             })
             .ok_or_else(|| Error::new("credential request ended before publication"))?;
         Ok((
             scope.trust().network,
             delivery::destination(session, current)?.recipient(),
+            current.refused.clone(),
+            current.versioned,
         ))
     })?;
+    copy_source(&admin, &recipient, &thread.want, floor.as_ref())?;
     admin
         .contribute_to_requester(&recipient, &thread.want, values)
         .map_err(crate::table::failure)?;
@@ -448,26 +455,22 @@ fn publish(
     }
     let published =
         client::admin_publish(paths, &admin, &admin.doc).map_err(crate::table::failure)?;
-    let mut body = Map::new();
-    body.insert("vault".into(), Value::from(admin.config.name.clone()));
-    body.insert("seq".into(), Value::from(published.seq));
-    body.insert(
-        "recipient".into(),
-        Value::from(hex::encode_lower(&Sha256::digest(recipient.0))),
-    );
-    if let Some(contributor) = contributor {
-        body.insert(
-            "contributor".into(),
-            Value::from(hex::encode_lower(&contributor)),
-        );
-    }
-    let record = Record::new("published", &thread.id, body)
+    let (mut records, _) = publication(
+        &thread.id,
+        published.version(),
+        published.version().envelope().map(|envelope| envelope.seq),
+        &recipient,
+        contributor,
+        versioned,
+    )?;
+    records.record = records
+        .record
         .attest(&|record| admin.attest_credential_record(&network, record))?;
     open(paths, round, |session, store, scope| {
         session.writer()?;
         let log = Log::read_with(session, store, scope, decode)?;
         log.writable(session.actor())?;
-        commit(session, store, &log, &record)?;
+        records.commit(session, store, &log)?;
         Ok(())
     })?;
     Ok(published.seq)

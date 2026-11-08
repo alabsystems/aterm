@@ -147,7 +147,7 @@ impl Handoff {
                 let Some(prior) = inherited.filter(|h| h.source == source) else {
                     return Err(error);
                 };
-                prior.open_material(journal, access, identity)?
+                prior.open_material(journal, access, identity, None)?
             }
         };
         let authored_ms = aterm_time::unix_millis()
@@ -182,7 +182,20 @@ impl Handoff {
         access: &Access,
         identity: &Identity,
     ) -> Result<Historical> {
-        self.open_material(journal, access, identity)
+        self.open_material(journal, access, identity, None)
+            .map(|(past, _)| past)
+    }
+
+    /// [`Handoff::open`] under a batch's `history` ([`super::roster::Access::with_log_history`]),
+    /// which already checked the current membership and leased the log's history for it.
+    pub(super) fn open_in(
+        &self,
+        journal: &Journal,
+        access: &Access,
+        identity: &Identity,
+        history: &super::roster::LogHistory<'_>,
+    ) -> Result<Historical> {
+        self.open_material(journal, access, identity, Some(history))
             .map(|(past, _)| past)
     }
 
@@ -279,9 +292,16 @@ impl Handoff {
         journal: &Journal,
         access: &Access,
         identity: &Identity,
+        history: Option<&super::roster::LogHistory<'_>>,
     ) -> Result<(Historical, Zeroizing<[u8; 16]>)> {
+        if history.is_some_and(|history| !history.serves(access, identity)) {
+            return Err(Error::new(
+                "history handoff was read under another observation's history",
+            ));
+        }
+        // A batch's history checked the current membership when it was leased.
         if self.trust != journal.trust()
-            || !access.is_current(journal)
+            || (history.is_none() && !access.is_current(journal))
             || &self.recipient != access.local().binding()
             || self.recipient.recipient() != identity.recipient()
         {
@@ -293,9 +313,11 @@ impl Handoff {
         // roster natively. No recursive trust in another handoff is necessary.
         // Under a log-era issuance the source is a retained control node or a
         // log-era Commons epoch, which the log checks once the key is open.
-        let (issuance, journal_source) = if let Some(from_log) =
-            access.historical_from_log(journal, identity, self.issued_under)?
-        {
+        let issuance_from_log = match history {
+            Some(history) => history.historical(self.issued_under)?,
+            None => access.historical_from_log(journal, identity, self.issued_under)?,
+        };
+        let (issuance, journal_source) = if let Some(from_log) = issuance_from_log {
             let source_valid =
                 if let crate::commons::journal::State::Ready { head, .. } = journal.state() {
                     journal.selected_ancestor(self.source, head)
@@ -335,14 +357,19 @@ impl Handoff {
         let file_key: Zeroizing<[u8; 16]> = Zeroizing::new(bytes[36..52].try_into().unwrap());
         let key: &[u8; 32] = bytes[52..].try_into().unwrap();
         if !journal_source {
-            let Some(past) = access.historical_from_log_with_key(
-                journal,
-                identity,
-                self.source,
-                self.issued_under,
-                key,
-            )?
-            else {
+            let keyed = match history {
+                Some(history) => {
+                    history.historical_with_key(self.source, self.issued_under, key)?
+                }
+                None => access.historical_from_log_with_key(
+                    journal,
+                    identity,
+                    self.source,
+                    self.issued_under,
+                    key,
+                )?,
+            };
+            let Some(past) = keyed else {
                 return Err(Error::new(
                     "history source is not an ancestor of its issuance",
                 ));

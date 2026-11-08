@@ -158,8 +158,12 @@ fn with_code(doc: &Document, code: &SecretBytes) -> crate::Result<Document> {
 /// # Errors
 /// `text` is not valid TOML, or `deny_nodes` is present and not an array of strings.
 pub fn parse_denied_nodes_toml(text: &str) -> crate::Result<Vec<String>> {
-    let table: aterm_toml::Table = aterm_toml::from_str(text)
-        .map_err(|error| Error::new(format!("invalid {SWARM_ROSTER_ENTRY}: {error}")))?;
+    let table: aterm_toml::Table = aterm_toml::from_str(text).map_err(|error| {
+        Error::new(format!(
+            "invalid {SWARM_ROSTER_ENTRY}: {}",
+            error.log_words()
+        ))
+    })?;
     let Some(raw) = table.get("deny_nodes") else {
         return Ok(Vec::new());
     };
@@ -203,26 +207,91 @@ pub fn swarm_denied_nodes(paths: &Paths) -> crate::Result<Option<Vec<String>>> {
     swarm_denied_nodes_then(paths, || {})
 }
 
-/// Read the same authoritative deny list as [`swarm_denied_nodes`], waiting only for a
+/// One authoritative deny-list observation. Unavailability cannot authorize an empty list.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SwarmDenialSnapshot {
+    /// Owned deny-list contents, including an authoritative empty list.
+    Available(Vec<String>),
+    /// The actual observation could not supply an authoritative list.
+    Unavailable(SwarmDenialUnavailable),
+}
+
+impl SwarmDenialSnapshot {
+    /// A listener retains its previous verdict when the current observation is unavailable.
+    fn into_nodes(self) -> Option<Vec<String>> {
+        match self {
+            Self::Available(nodes) => Some(nodes),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+/// Why a deny-list observation was unavailable. These reasons carry no vault contents or
+/// identifiers and grant no repair, enrollment or retry authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwarmDenialUnavailable {
+    /// A writer held the state lock at the observation or bounded read's deadline.
+    WriterBusy,
+    /// The configured vault changed during this read or its bounded wait.
+    ConfigurationChanged,
+    /// The applied state marks this machine revoked.
+    Revoked,
+    /// A signed joined copy has no state observation lock.
+    MissingStateLock,
+    /// No usable reserved entry or authenticated absence was observed.
+    EntryUnavailable,
+    /// The absent-entry path could not read a local identity.
+    MissingIdentity,
+    /// The verified membership log holds this recipient out.
+    RecipientHeldOut,
+}
+
+impl std::fmt::Display for SwarmDenialUnavailable {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.write_str(match self {
+            Self::WriterBusy => "a vault writer holds the local state lock",
+            Self::ConfigurationChanged => "the configured vault changed during the read",
+            Self::Revoked => "the applied state marks this machine revoked",
+            Self::MissingStateLock => "the joined vault copy has no state observation lock",
+            Self::EntryUnavailable => {
+                "the reserved roster entry is unavailable in this applied copy"
+            }
+            Self::MissingIdentity => "the local vault identity is unavailable",
+            Self::RecipientHeldOut => "the verified membership log holds this recipient out",
+        })
+    }
+}
+
+/// Read the same authoritative deny list as [`swarm_denied_nodes`], retaining the reason for
+/// an unavailable observation instead of projecting it to a listener's `None` signal.
+///
+/// # Errors
+/// As [`swarm_denied_nodes`].
+pub fn swarm_denial_snapshot(paths: &Paths) -> crate::Result<SwarmDenialSnapshot> {
+    swarm_denial_snapshot_then(paths, || {})
+}
+
+/// Read the same authoritative deny list as [`swarm_denial_snapshot`], waiting only for a
 /// concurrent vault writer until `deadline`. Each attempt reads the current configuration and
 /// applied state afresh under the configuration that first encountered that writer. A changed
 /// or removed configuration is unavailable; an unavailable, revoked or malformed copy is never
 /// a reason to wait. The shared observation is released before returning the owned list.
 ///
 /// # Errors
-/// As [`swarm_denied_nodes`]. A writer still holding state at the deadline returns `Ok(None)`.
-pub fn swarm_denied_nodes_until(
+/// As [`swarm_denied_nodes`]. A writer still holding state at the deadline returns
+/// [`SwarmDenialUnavailable::WriterBusy`].
+pub fn swarm_denial_snapshot_until(
     paths: &Paths,
     deadline: Instant,
-) -> crate::Result<Option<Vec<String>>> {
-    swarm_denied_nodes_until_with(paths, deadline, std::thread::sleep)
+) -> crate::Result<SwarmDenialSnapshot> {
+    swarm_denial_snapshot_until_with(paths, deadline, std::thread::sleep)
 }
 
-fn swarm_denied_nodes_until_with(
+fn swarm_denial_snapshot_until_with(
     paths: &Paths,
     deadline: Instant,
     mut wait: impl FnMut(Duration),
-) -> crate::Result<Option<Vec<String>>> {
+) -> crate::Result<SwarmDenialSnapshot> {
     let mut backoff = Duration::from_millis(1);
     let mut pinned = None;
     loop {
@@ -236,7 +305,9 @@ fn swarm_denied_nodes_until_with(
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(None);
+            return Ok(SwarmDenialSnapshot::Unavailable(
+                SwarmDenialUnavailable::WriterBusy,
+            ));
         }
         wait(backoff.min(remaining));
         backoff = (backoff * 2).min(Duration::from_millis(50));
@@ -310,7 +381,7 @@ fn swarm_roster_until_with(
 }
 
 enum DeniedObservation {
-    Answer(Option<Vec<String>>),
+    Answer(SwarmDenialSnapshot),
     Busy(Option<Config>),
 }
 
@@ -368,9 +439,18 @@ fn swarm_denied_nodes_then(
     paths: &Paths,
     after_entry: impl FnOnce(),
 ) -> crate::Result<Option<Vec<String>>> {
+    Ok(swarm_denial_snapshot_then(paths, after_entry)?.into_nodes())
+}
+
+fn swarm_denial_snapshot_then(
+    paths: &Paths,
+    after_entry: impl FnOnce(),
+) -> crate::Result<SwarmDenialSnapshot> {
     match observe_denied_nodes(paths, None, after_entry)? {
         DeniedObservation::Answer(answer) => Ok(answer),
-        DeniedObservation::Busy(_) => Ok(None),
+        DeniedObservation::Busy(_) => Ok(SwarmDenialSnapshot::Unavailable(
+            SwarmDenialUnavailable::WriterBusy,
+        )),
     }
 }
 
@@ -386,7 +466,9 @@ fn observe_denied_nodes(
     if let Some(Some(expected)) = pinned
         && configured.as_ref() != Some(expected)
     {
-        return Ok(DeniedObservation::Answer(None));
+        return Ok(DeniedObservation::Answer(SwarmDenialSnapshot::Unavailable(
+            SwarmDenialUnavailable::ConfigurationChanged,
+        )));
     }
     let Some(expected) = configured else {
         if matches!(
@@ -396,10 +478,14 @@ fn observe_denied_nodes(
             busy_observed();
             return Ok(DeniedObservation::Busy(None));
         }
-        return Ok(DeniedObservation::Answer(Some(Vec::new())));
+        return Ok(DeniedObservation::Answer(SwarmDenialSnapshot::Available(
+            Vec::new(),
+        )));
     };
     if expected.signer.is_none() {
-        return Ok(DeniedObservation::Answer(Some(Vec::new())));
+        return Ok(DeniedObservation::Answer(SwarmDenialSnapshot::Available(
+            Vec::new(),
+        )));
     }
     let observation = StateLock::observe_classified(paths)?;
     if matches!(observation, StateObservation::Busy) {
@@ -414,25 +500,37 @@ fn held_denied_nodes(
     expected: &Config,
     observation: StateObservation,
     after_entry: impl FnOnce(),
-) -> crate::Result<Option<Vec<String>>> {
+) -> crate::Result<SwarmDenialSnapshot> {
     if config(paths)?.as_ref() != Some(expected) {
-        return Ok(None);
+        return Ok(SwarmDenialSnapshot::Unavailable(
+            SwarmDenialUnavailable::ConfigurationChanged,
+        ));
     }
     let state = load_state(paths)?;
     match state.membership {
-        Stored::None | Stored::Pending | Stored::Plain => return Ok(Some(Vec::new())),
-        Stored::Revoked => return Ok(None),
+        Stored::None | Stored::Pending | Stored::Plain => {
+            return Ok(SwarmDenialSnapshot::Available(Vec::new()));
+        }
+        Stored::Revoked => {
+            return Ok(SwarmDenialSnapshot::Unavailable(
+                SwarmDenialUnavailable::Revoked,
+            ));
+        }
         Stored::In => {}
     }
     // Keep the same snapshot across the entry, its absence, and the membership log. A second
     // free-lock observation cannot make an earlier unavailable entry into an absent one.
     let StateObservation::Held(_observation) = observation else {
-        return Ok(None);
+        return Ok(SwarmDenialSnapshot::Unavailable(
+            SwarmDenialUnavailable::MissingStateLock,
+        ));
     };
     let entry = entry::observe_reserved_entry(paths, expected, SWARM_ROSTER_ENTRY)?;
     after_entry();
     let Some(entry) = entry else {
-        return Ok(None);
+        return Ok(SwarmDenialSnapshot::Unavailable(
+            SwarmDenialUnavailable::EntryUnavailable,
+        ));
     };
     if let Some(entry) = entry.entry {
         let (bytes, _) = entry.into_parts();
@@ -516,10 +614,12 @@ fn held_denied_nodes(
         }
         denied.sort();
         denied.dedup();
-        return Ok(Some(denied));
+        return Ok(SwarmDenialSnapshot::Available(denied));
     }
     let Some(identity) = read_identity(paths)? else {
-        return Ok(None);
+        return Ok(SwarmDenialSnapshot::Unavailable(
+            SwarmDenialUnavailable::MissingIdentity,
+        ));
     };
     let local_log = log_entries::trusted_local_log(paths, expected)?;
     if local_log.as_ref().is_some_and(|log| {
@@ -530,7 +630,9 @@ fn held_denied_nodes(
                 &identity.recipient(),
             )
     }) {
-        return Ok(None);
+        return Ok(SwarmDenialSnapshot::Unavailable(
+            SwarmDenialUnavailable::RecipientHeldOut,
+        ));
     }
     let mut denied = Vec::new();
     if let Some(log) = &local_log {
@@ -538,7 +640,7 @@ fn held_denied_nodes(
         denied.sort();
         denied.dedup();
     }
-    Ok(Some(denied))
+    Ok(SwarmDenialSnapshot::Available(denied))
 }
 
 fn extend_denied_nodes_from_log(
@@ -624,6 +726,8 @@ fn extend_denied_nodes_from_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use SwarmDenialSnapshot::{Available, Unavailable};
+    use SwarmDenialUnavailable as Why;
 
     fn denial_fixture() -> (aterm_tempfile::TempDir, Paths) {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -648,7 +752,11 @@ mod tests {
         let mut writer = Some(StateLock::take(&paths).unwrap());
         assert_eq!(swarm_denied_nodes(&paths).unwrap(), None);
         let mut waits = 0;
-        let read = swarm_denied_nodes_until_with(
+        assert_eq!(
+            swarm_denial_snapshot(&paths).unwrap(),
+            Unavailable(Why::WriterBusy)
+        );
+        let read = swarm_denial_snapshot_until_with(
             &paths,
             Instant::now() + aterm_spec::wait::MUST_HAPPEN,
             |_| {
@@ -658,7 +766,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(waits, 1);
-        assert_eq!(read, Some(vec!["m99".to_owned()]));
+        assert_eq!(read, Available(vec!["m99".to_owned()]));
         // The returned owned list holds no reader lease across its caller's network work.
         assert!(StateLock::try_take(&paths).unwrap().is_some());
     }
@@ -712,7 +820,7 @@ mod tests {
         let next = config(&other).unwrap().unwrap();
         let mut writer = Some(StateLock::take(&paths).unwrap());
         let mut waits = 0;
-        let read = swarm_denied_nodes_until_with(
+        let read = swarm_denial_snapshot_until_with(
             &paths,
             Instant::now() + aterm_spec::wait::MUST_HAPPEN,
             |_| {
@@ -723,7 +831,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(waits, 1);
-        assert_eq!(read, None, "an old applied copy authorizes no new source");
+        assert_eq!(
+            read,
+            Unavailable(Why::ConfigurationChanged),
+            "an old applied copy authorizes no new source"
+        );
     }
 
     #[test]
@@ -735,7 +847,7 @@ mod tests {
         next_state.source_identity = Some(source_identity(&next));
         let mut writer = Some(StateLock::take(&paths).unwrap());
         let mut waits = 0;
-        let read = swarm_denied_nodes_until_with(
+        let read = swarm_denial_snapshot_until_with(
             &paths,
             Instant::now() + aterm_spec::wait::MUST_HAPPEN,
             |_| {
@@ -753,7 +865,8 @@ mod tests {
         .unwrap();
         assert_eq!(waits, 1);
         assert_eq!(
-            read, None,
+            read,
+            Unavailable(Why::ConfigurationChanged),
             "this wait belongs to the original configured source"
         );
     }
@@ -768,7 +881,7 @@ mod tests {
                 next.signer = None;
                 let mut writer = Some(StateLock::take(&paths).unwrap());
                 let mut waits = 0;
-                let read = swarm_denied_nodes_until_with(
+                let read = swarm_denial_snapshot_until_with(
                     &paths,
                     Instant::now() + aterm_spec::wait::MUST_HAPPEN,
                     |_| {
@@ -787,7 +900,13 @@ mod tests {
                 (unsigned, read)
             })
             .collect();
-        assert_eq!(outcomes, [(false, None), (true, None)]);
+        assert_eq!(
+            outcomes,
+            [
+                (false, Unavailable(Why::ConfigurationChanged)),
+                (true, Unavailable(Why::ConfigurationChanged))
+            ]
+        );
     }
 
     #[test]
@@ -796,8 +915,9 @@ mod tests {
         let original = load_state(&paths).unwrap();
         let writer = StateLock::take(&paths).unwrap();
         assert_eq!(
-            swarm_denied_nodes_until_with(&paths, Instant::now(), |_| panic!("expired")).unwrap(),
-            None
+            swarm_denial_snapshot_until_with(&paths, Instant::now(), |_| panic!("expired"))
+                .unwrap(),
+            Unavailable(Why::WriterBusy)
         );
         drop(writer);
 
@@ -806,22 +926,22 @@ mod tests {
         revoked.membership = Stored::Revoked;
         save_state(&paths, &revoked).unwrap();
         assert_eq!(
-            swarm_denied_nodes_until_with(&paths, future, |_| panic!("revoked")).unwrap(),
-            None
+            swarm_denial_snapshot_until_with(&paths, future, |_| panic!("revoked")).unwrap(),
+            Unavailable(Why::Revoked)
         );
         save_state(&paths, &original).unwrap();
         let mut partial = original.clone();
         partial.failed = true;
         save_state(&paths, &partial).unwrap();
         assert_eq!(
-            swarm_denied_nodes_until_with(&paths, future, |_| panic!("partial apply")).unwrap(),
-            None
+            swarm_denial_snapshot_until_with(&paths, future, |_| panic!("partial apply")).unwrap(),
+            Unavailable(Why::EntryUnavailable)
         );
         save_state(&paths, &original).unwrap();
         std::fs::remove_file(paths.lock_file()).unwrap();
         assert_eq!(
-            swarm_denied_nodes_until_with(&paths, future, |_| panic!("missing lock")).unwrap(),
-            None
+            swarm_denial_snapshot_until_with(&paths, future, |_| panic!("missing lock")).unwrap(),
+            Unavailable(Why::MissingStateLock)
         );
         drop(StateLock::take(&paths).unwrap());
         std::fs::set_permissions(
@@ -829,7 +949,9 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o644),
         )
         .unwrap();
-        assert!(swarm_denied_nodes_until_with(&paths, future, |_| panic!("read error")).is_err());
+        assert!(
+            swarm_denial_snapshot_until_with(&paths, future, |_| panic!("read error")).is_err()
+        );
     }
 
     #[test]
@@ -869,21 +991,37 @@ mod tests {
         let source = root.path().join("roster.vault");
         create(&paths, source.to_str().unwrap(), None, Some("m60")).unwrap();
         assert_eq!(swarm_denied_nodes(&paths).unwrap(), Some(Vec::new()));
+        assert_eq!(
+            swarm_denial_snapshot(&paths).unwrap(),
+            Available(Vec::new())
+        );
 
         let joined = load_state(&paths).unwrap();
         std::fs::remove_file(paths.lock_file()).unwrap();
         assert_eq!(swarm_denied_nodes(&paths).unwrap(), None);
+        assert_eq!(
+            swarm_denial_snapshot(&paths).unwrap(),
+            Unavailable(Why::MissingStateLock)
+        );
         let configured = config(&paths).unwrap().unwrap();
         let mut unsigned = configured.clone();
         unsigned.signer = None;
         save_config(&paths, &unsigned).unwrap();
         assert_eq!(swarm_denied_nodes(&paths).unwrap(), Some(Vec::new()));
+        assert_eq!(
+            swarm_denial_snapshot(&paths).unwrap(),
+            Available(Vec::new())
+        );
         save_config(&paths, &configured).unwrap();
         for membership in [Stored::None, Stored::Pending, Stored::Plain] {
             let mut unjoined = joined.clone();
             unjoined.membership = membership;
             save_state(&paths, &unjoined).unwrap();
             assert_eq!(swarm_denied_nodes(&paths).unwrap(), Some(Vec::new()));
+            assert_eq!(
+                swarm_denial_snapshot(&paths).unwrap(),
+                Available(Vec::new())
+            );
         }
         save_state(&paths, &joined).unwrap();
         drop(StateLock::take(&paths).unwrap());
@@ -914,6 +1052,10 @@ mod tests {
             admin_publish(&paths, &admin, &doc).unwrap();
             sync(&paths, None).unwrap();
             assert_eq!(swarm_denied_nodes(&paths).unwrap(), None);
+            assert_eq!(
+                swarm_denial_snapshot(&paths).unwrap(),
+                Unavailable(Why::EntryUnavailable)
+            );
         }
     }
 
@@ -929,6 +1071,21 @@ mod tests {
         );
         assert!(parse_denied_nodes_toml("deny_nodes = 7\n").is_err());
         assert!(parse_denied_nodes_toml("deny_nodes = [7]\n").is_err());
+    }
+
+    #[test]
+    fn parse_denied_nodes_keeps_values_out_of_errors() {
+        let private = "private-roster-value-must-not-escape";
+        let text = format!("deny_nodes = [\"{private}\" !]\n");
+        let error = parse_denied_nodes_toml(&text).unwrap_err().to_string();
+        assert!(
+            !error.contains(private),
+            "a parse diagnostic exposed a vault value"
+        );
+        assert!(
+            error.contains("line 1"),
+            "the source position was lost: {error}"
+        );
     }
 
     /// A state lock an older build left at `0644`, this user's own, is narrowed to `0600` through
@@ -1091,7 +1248,7 @@ mod tests {
         );
         let fresh_vault = root.path().join("fresh.vault");
         let mut waits = 0;
-        let after_initial = swarm_denied_nodes_until_with(
+        let after_initial = swarm_denial_snapshot_until_with(
             &fresh,
             Instant::now() + aterm_spec::wait::MUST_HAPPEN,
             |_| {
@@ -1111,7 +1268,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(waits, 1);
-        assert_eq!(after_initial, Some(vec!["aa00".to_string()]));
+        assert_eq!(after_initial, Available(vec!["aa00".to_string()]));
 
         let vault_path = root.path().join("swarm.vault");
         let admin_paths = Paths::for_home(&root.path().join("admin"));

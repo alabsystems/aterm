@@ -230,6 +230,7 @@ keys! {
     PeakMb "peak_mb" Wire Cap::Sample,
     Tokens "tokens" Wire Cap::Sample,
     Account "account" Host Cap::Text(64),
+    TitleFp "title_fp" Content Cap::Id,
 }
 
 impl Key {

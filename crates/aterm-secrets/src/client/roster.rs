@@ -1132,8 +1132,13 @@ pub fn swarm_lease_holder(paths: &Paths) -> crate::Result<Option<String>> {
     let (bytes, _) = entry.into_parts();
     let text = std::str::from_utf8(bytes.as_slice())
         .map_err(|_| Error::new(format!("{} is not UTF-8", crate::SWARM_LEASE_ENTRY)))?;
-    let table: aterm_toml::Table = aterm_toml::from_str(text)
-        .map_err(|e| Error::new(format!("invalid {}: {e}", crate::SWARM_LEASE_ENTRY)))?;
+    let table: aterm_toml::Table = aterm_toml::from_str(text).map_err(|e| {
+        Error::new(format!(
+            "invalid {}: {}",
+            crate::SWARM_LEASE_ENTRY,
+            e.log_words()
+        ))
+    })?;
     let Some(holder) = table
         .get("holder")
         .and_then(aterm_toml::Value::as_str)

@@ -414,7 +414,7 @@ fn configured_build_targets(ctx: &crate::Ctx, serial: &Cmd) -> Result<Option<Vec
     query.capture = exec::Capture::Emit;
     query.preamble = None;
     query.test_cases = None;
-    let exec::MachineRun { run, stdout } = exec::run_machine(&query, ctx.exec_env());
+    let exec::MachineRun { run, stdout } = exec::run_machine(&query, ctx.exec_env(), None);
     if !run.ok {
         if run
             .output
@@ -560,7 +560,7 @@ pub fn take_test_executables(log: &mut String) -> Result<Vec<TestExe>, String> {
                 }
                 continue;
             }
-            crate::compiler_message::UnitMessage::Ambiguous(_) => {
+            crate::compiler_message::UnitMessage::Ambiguous { .. } => {
                 bad.get_or_insert_with(|| "ambiguous compiler message fields".into());
                 continue;
             }

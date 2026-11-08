@@ -1309,10 +1309,29 @@ pub trait Launchctl {
 }
 
 /// How long one `launchctl` call may take.
-pub const LAUNCHCTL_WITHIN: Duration = Duration::from_secs(30);
+pub const LAUNCHCTL_WITHIN: Duration = Duration::from_secs(60);
 
 /// How long a reload waits for launchd to let the old job go before it loads the plist again.
-pub const BOOTOUT_SETTLE: Duration = Duration::from_secs(30);
+pub const BOOTOUT_SETTLE: Duration = Duration::from_secs(60);
+
+fn await_bootout(
+    target: &str,
+    started: Instant,
+    within: Duration,
+    mut still_held: impl FnMut() -> Result<bool, String>,
+    mut pause: impl FnMut(Duration),
+) -> Result<(), String> {
+    while still_held()? {
+        if started.elapsed() >= within {
+            return Err(format!(
+                "launchd still holds {target} {} s after its bootout; the next pass loads it",
+                within.as_secs()
+            ));
+        }
+        pause(Duration::from_millis(100));
+    }
+    Ok(())
+}
 
 fn deadline_after(d: Duration) -> Instant {
     let now = Instant::now();
@@ -1322,10 +1341,28 @@ fn deadline_after(d: Duration) -> Instant {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn run_systemctl_bounded(systemctl: &str, args: &[&str]) -> Result<std::process::Output, String> {
-    let mut command = aterm_uds::spawnfd::command(systemctl);
+    run_service_after(Path::new(systemctl), args, Duration::ZERO)
+}
+
+fn run_service_after(
+    program: &Path,
+    args: &[&str],
+    elapsed: Duration,
+) -> Result<std::process::Output, String> {
+    let remaining = LAUNCHCTL_WITHIN
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            format!(
+                "{} {}: required service command timed out",
+                program.display(),
+                args.join(" ")
+            )
+        })?;
+    let mut command = aterm_uds::spawnfd::command(program);
     command.args(args);
-    aterm_uds::deadline::output_until(&mut command, deadline_after(LAUNCHCTL_WITHIN))
-        .map_err(|e| format!("{systemctl} {}: {e}", args.join(" ")))
+    aterm_uds::deadline::output_until(&mut command, deadline_after(remaining))
+        .map_err(|e| format!("{} {}: {e}", program.display(), args.join(" ")))
 }
 
 /// `/bin/launchctl`, each call bounded by [`LAUNCHCTL_WITHIN`].
@@ -1333,10 +1370,7 @@ pub struct RealLaunchctl;
 
 impl RealLaunchctl {
     fn output(&self, args: &[&str]) -> Result<(std::process::ExitStatus, String), String> {
-        let mut cmd = aterm_uds::spawnfd::command(LAUNCHCTL);
-        cmd.args(args);
-        let out = aterm_uds::deadline::output_until(&mut cmd, deadline_after(LAUNCHCTL_WITHIN))
-            .map_err(|e| format!("{LAUNCHCTL} {}: {e}", args.join(" ")))?;
+        let out = run_service_after(Path::new(LAUNCHCTL), args, Duration::ZERO)?;
         let mut said = String::from_utf8_lossy(&out.stdout).into_owned();
         said.push_str(&String::from_utf8_lossy(&out.stderr));
         Ok((out.status, said))
@@ -1446,16 +1480,13 @@ impl Launchd<'_> {
         for (domain, _) in self.loaded()? {
             let target = format!("{domain}/{NODE_LABEL}");
             let _ = self.launchctl.run(&["bootout", &target])?;
-            let until = deadline_after(self.settle);
-            while self.launchctl.run(&["print", &target])?.0 {
-                if Instant::now() >= until {
-                    return Err(format!(
-                        "launchd still holds {target} {} s after its bootout; the next pass loads it",
-                        self.settle.as_secs()
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            await_bootout(
+                &target,
+                Instant::now(),
+                self.settle,
+                || self.launchctl.run(&["print", &target]).map(|out| out.0),
+                std::thread::sleep,
+            )?;
         }
         let unit = unit_path.to_string_lossy();
         let (ok, said) = self.launchctl.run(&["bootstrap", &wanted, &unit])?;

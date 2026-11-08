@@ -104,6 +104,7 @@ pub mod headless_fetch;
 pub mod headless_oauth;
 pub mod hold_said;
 pub mod journal;
+pub mod kimi_wire;
 pub mod land_receipt;
 pub mod lanes;
 pub mod laps;

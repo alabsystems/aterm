@@ -601,6 +601,32 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
             }
             text
         }
+        GitOp::PushControl {
+            transaction,
+            dry_run,
+            ..
+        } => {
+            let mut text = format!(
+                "git control-refs {slug}\nowner {}\ndry-run {dry_run}",
+                transaction.owner_commit()
+            );
+            for change in transaction.changes() {
+                let before = change
+                    .before
+                    .as_deref()
+                    .unwrap_or("0000000000000000000000000000000000000000");
+                let after = change
+                    .after
+                    .as_deref()
+                    .unwrap_or("0000000000000000000000000000000000000000");
+                let _ = write!(
+                    text,
+                    "\nref {}\nbefore {before}\nafter {after}",
+                    change.reference
+                );
+            }
+            text
+        }
     };
     text.into_bytes()
 }

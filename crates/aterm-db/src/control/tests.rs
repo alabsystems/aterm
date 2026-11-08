@@ -304,7 +304,7 @@ fn a_session_builds_the_same_endpoint_without_reopening_its_locked_journal() {
             .unwrap()
             .with_commons(lab.paths[n].clone(), lab.paths[n].home.join("config"))
             .unwrap();
-        let admission = Instant::now() + Duration::from_secs(2);
+        let admission = crate::admission::deadline();
         let bounded = Endpoint::from_bootstrap_until(&bootstrap, admission)
             .unwrap()
             .unwrap()
@@ -359,7 +359,7 @@ fn a_session_builds_the_same_endpoint_without_reopening_its_locked_journal() {
 fn bounded_pending_setup_preserves_enrollment_identity_and_refuses_an_enrolled_device() {
     let lab = crate::control::enrollment::tests::Lab::new(true);
     let bootstrap = lab.bootstrap(1);
-    let admission = Instant::now() + Duration::from_secs(2);
+    let admission = crate::admission::deadline();
     assert!(
         Endpoint::from_bootstrap_until(&bootstrap, admission)
             .unwrap()
@@ -378,7 +378,7 @@ fn bounded_pending_setup_preserves_enrollment_identity_and_refuses_an_enrolled_d
         Endpoint::pending_from_bootstrap_until(
             &lab.bootstrap(0),
             lab.paths[0].clone(),
-            Instant::now() + Duration::from_secs(2),
+            crate::admission::deadline(),
         )
         .is_err()
     );

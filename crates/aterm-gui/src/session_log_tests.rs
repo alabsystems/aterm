@@ -1738,7 +1738,8 @@ fn every_producer_runs_under_the_timeline_lock_alone() {
                 now,
             );
             g.record_cwd_change(Some("/a"));
-            g.slog_mut().observe_title("t", now);
+            g.slog_mut()
+                .observe_title("t", crate::session_log::observed::TitleStands::Own, now);
             let _ = g.slog_take_wake();
             let _ = g.note_harness_act("approve-all@v1", "codex-alab@1", Actor::Ctl);
             let working = crate::task_record::TaskMark::new(crate::task_record::TaskState::Working);

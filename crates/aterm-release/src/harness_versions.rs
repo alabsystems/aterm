@@ -16,7 +16,7 @@ use std::path::Path;
 
 use aterm_phase::CliHarness;
 
-use crate::ledger::{Error, GitRunner, Result, git_ok};
+use crate::ledger::{Error, GitRunner, Origin, Result, git_ok};
 
 /// The marker a harness's version line starts with, in either shape.
 const VER_LINE: &str = "pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(";
@@ -489,8 +489,15 @@ pub fn written(owed: &[Owed]) -> Vec<String> {
 /// raised; origin's tags cannot be listed, or the release's tag fetched; git cannot diff the
 /// window; or a written file cannot be read or written, a version file has no `HARNESS_VER`
 /// line, or the CHANGELOG has no `## [Unreleased]`.
-pub fn apply(root: &Path) -> Result<Option<(String, Vec<Owed>)>> {
-    let git = crate::ledger::GitCli::new(root);
+pub fn apply(root: &Path, origin: &dyn Origin) -> Result<Option<(String, Vec<Owed>)>> {
+    apply_with(root, &crate::ledger::GitCli::new(root), origin)
+}
+
+fn apply_with(
+    root: &Path,
+    git: &dyn GitRunner,
+    origin: &dyn Origin,
+) -> Result<Option<(String, Vec<Owed>)>> {
     let ledger_text = crate::durable::read_text(&root.join(crate::ledger::LEDGER_FILE))
         .map_err(|e| Error::new(format!("cannot read {}: {e}", crate::ledger::LEDGER_FILE)))?;
     let manifest = crate::durable::read_text(&root.join("Cargo.toml"))
@@ -498,20 +505,31 @@ pub fn apply(root: &Path) -> Result<Option<(String, Vec<Owed>)>> {
     let version = crate::publish::release_version_from_workspace(
         &crate::publish::workspace_version(&manifest)?,
     )?;
-    let tags = git_ok(&git, &["ls-remote", "--tags", "origin"])?.stdout_utf8();
+    let tags = origin.tag_catalog().map_err(Error::new)?;
     let Some((release, commit)) = bump_base_release(&ledger_text, &version, &tags)? else {
         return Ok(None);
     };
-    if !git
-        .git(&["cat-file", "-e", &format!("{commit}^{{commit}}")])?
-        .success()
-    {
-        git_ok(
-            &git,
-            &["fetch", "-q", "origin", "tag", &format!("v{release}")],
-        )?;
+    let present = || {
+        git.git(&["cat-file", "-e", &format!("{commit}^{{commit}}")])
+            .map(|out| out.success())
+    };
+    if !present()? {
+        let kind = git.git(&["cat-file", "-t", &commit])?;
+        if kind.success() && matches!(kind.stdout.as_slice(), b"tree\n" | b"blob\n") {
+            return Err(Error::new(format!(
+                "harness-bump: v{release}'s observed object {commit} is not an imported commit"
+            )));
+        }
+        // Keep the immutable object selected from this catalog; a fresh tag
+        // name could refer to a different baseline by the time it is fetched.
+        origin.import(&commit).map_err(Error::new)?;
+        if !present()? {
+            return Err(Error::new(format!(
+                "harness-bump: v{release}'s observed object {commit} is not an imported commit"
+            )));
+        }
     }
-    let owed = bump(root, &git, (&release, &commit))?;
+    let owed = bump(root, git, (&release, &commit))?;
     Ok(Some((release, owed)))
 }
 
@@ -520,7 +538,8 @@ pub fn apply(root: &Path) -> Result<Option<(String, Vec<Owed>)>> {
 /// # Errors
 /// As [`apply`].
 pub fn run(root: &Path) -> Result<()> {
-    let Some((release, owed)) = apply(root)? else {
+    let origin = crate::publish::native_origin(root)?;
+    let Some((release, owed)) = apply(root, &origin)? else {
         println!("harness-bump: the ledger names no earlier release; nothing is owed");
         return Ok(());
     };
@@ -915,6 +934,121 @@ fn read() {}
             updated_log.contains("`alab claude harness 0.2`")
                 && updated_log.contains("`alab muse harness 0.2`"),
             "{updated_log}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn applying_a_bump_uses_native_release_objects_and_stops_before_untrusted_writes() {
+        struct LocalOnly<'a>(&'a dyn GitRunner);
+        impl GitRunner for LocalOnly<'_> {
+            fn git(&self, args: &[&str]) -> Result<crate::ledger::RunOut> {
+                assert!(
+                    !args
+                        .iter()
+                        .any(|arg| matches!(*arg, "fetch" | "push" | "ls-remote")),
+                    "harness application must use its typed origin: {args:?}"
+                );
+                self.0.git(args)
+            }
+        }
+        let tmp = aterm_tempfile::TempDir::new().unwrap();
+        let source = tmp.path().join("source");
+        let bare = tmp.path().join("remote.git");
+        let (released, _) = history(&source, false);
+        let command = |args: &[&str]| {
+            let out = git_cmd(&source, args);
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        command(&["tag", "-a", "v0.1.0", "-m", "release", &released]);
+        command(&["init", "-q", "--bare", bare.to_str().unwrap()]);
+        command(&["push", "-q", bare.to_str().unwrap(), "refs/tags/v0.1.0"]);
+        command(&[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ]);
+        std::fs::write(source.join("Cargo.toml"), "[workspace.package]\nversion = \"0.2.0\"\nrepository = \"https://github.com/fixture/app\"\n").unwrap();
+        std::fs::write(source.join(crate::ledger::LEDGER_FILE), "1 0.1.0\n").unwrap();
+        let origin = crate::github_remote::claim_fixture(&source, &bare);
+        assert_eq!(
+            origin.get("refs/heads/main").unwrap(),
+            None,
+            "only the public release tag is needed"
+        );
+        let local = Git::new(&source);
+        let (release, owed) = apply_with(&source, &LocalOnly(&local), &origin)
+            .unwrap()
+            .unwrap();
+        assert_eq!(release, "0.1.0");
+        assert_eq!(
+            owed.iter().map(|row| row.harness).collect::<Vec<_>>(),
+            [CliHarness::ClaudeCode, CliHarness::Muse]
+        );
+        for harness in [CliHarness::ClaudeCode, CliHarness::Muse] {
+            assert_eq!(
+                declared(&std::fs::read_to_string(source.join(harness.version_file())).unwrap()),
+                Some((0, 2))
+            );
+        }
+        assert!(
+            apply_with(&source, &LocalOnly(&local), &origin)
+                .unwrap()
+                .unwrap()
+                .1
+                .is_empty(),
+            "one release window never bumps twice"
+        );
+        let paths = [
+            CliHarness::ClaudeCode.version_file(),
+            CliHarness::Muse.version_file(),
+            "CHANGELOG.md",
+        ];
+        let before = paths.map(|path| std::fs::read(source.join(path)).unwrap());
+        command(&[
+            "config",
+            "remote.origin.url",
+            "https://github.com/foreign/app.git",
+        ]);
+        assert!(apply_with(&source, &LocalOnly(&local), &origin).is_err());
+        assert_eq!(
+            before,
+            paths.map(|path| std::fs::read(source.join(path)).unwrap())
+        );
+        command(&[
+            "config",
+            "remote.origin.url",
+            "https://github.com/fixture/app.git",
+        ]);
+        let tree = command(&["rev-parse", &format!("{released}^{{tree}}")]);
+        command(&["tag", "-a", "noncommit", "-m", "not a release", &tree]);
+        command(&["push", "-q", bare.to_str().unwrap(), "refs/tags/noncommit"]);
+        let token = command(&["rev-parse", "refs/tags/noncommit"]);
+        let out = git()
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["update-ref", "refs/tags/v0.1.0", &token])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(
+            crate::gates::tag_commits(&origin.tag_catalog().unwrap()).get("v0.1.0"),
+            Some(&tree)
+        );
+        let error = apply_with(&source, &LocalOnly(&local), &origin).unwrap_err();
+        assert!(
+            error.to_string().contains("not an imported commit"),
+            "{error}"
+        );
+        assert_eq!(
+            before,
+            paths.map(|path| std::fs::read(source.join(path)).unwrap()),
+            "a noncommit baseline cannot write harness versions or notes"
         );
     }
 

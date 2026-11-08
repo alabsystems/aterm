@@ -30,7 +30,11 @@ use aterm_codec::hex;
 use aterm_digest::Sha256;
 use aterm_json::{Map, Value};
 use aterm_secrets::{
-    client::{self, Paths, custodian::Copied},
+    client::{
+        self, Paths,
+        custodian::Copied,
+        version::{AuthenticatedVersion, RefusalClaim},
+    },
     commons::bootstrap::Bootstrap,
     need::{
         self, Absorb, Decision, Need, Policy, Purpose, Reason, Retirement, State, Unanswered, Want,
@@ -44,8 +48,9 @@ mod delivery;
 pub(crate) mod handoff;
 mod source;
 mod value;
+mod version;
 
-/// A record body's canonical bytes are at most this long (§5).
+/// A normal record body's canonical bytes are at most this long (§5).
 pub const MAX_RECORD: usize = 4096;
 /// The most request ids one `Sweep` names.
 pub const MAX_COVERS: usize = 64;
@@ -60,7 +65,7 @@ const MS: u64 = 1000;
 
 /// The record kinds this build reads. A custodian's `Policy` record is step 5's: this build
 /// holds one inert, so the compiled policy stays in force until a build that reads it.
-pub const KINDS: [&str; 8] = [
+pub const KINDS: [&str; 10] = [
     "request",
     "offer",
     "sweep",
@@ -69,6 +74,8 @@ pub const KINDS: [&str; 8] = [
     "needs-person",
     "fulfilled",
     "retired",
+    "version-part",
+    "published-v2",
 ];
 
 fn descriptor(bootstrap: &Bootstrap) -> Result<Descriptor> {
@@ -119,7 +126,7 @@ impl Record {
         Ok(command_request_from(
             &self.kind,
             &self.key,
-            &canonical(&self.body)?,
+            &record_bytes(&self.kind, &self.body)?,
         ))
     }
 
@@ -127,7 +134,8 @@ impl Record {
     /// second write of the same record returns the first one's receipt rather than a twin.
     ///
     /// # Errors
-    /// The body is over [`MAX_RECORD`] bytes or cannot be encoded.
+    /// A normal body is over [`MAX_RECORD`] bytes, a public version part exceeds its
+    /// bounded operation size, or the body cannot be encoded.
     pub fn command(&self) -> Result<Command> {
         let request = self.command_request()?;
         Ok(Command::Write {
@@ -198,6 +206,14 @@ fn canonical(body: &Map) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+fn record_bytes(kind: &str, body: &Map) -> Result<Vec<u8>> {
+    if kind == version::PART_KIND {
+        version::canonical_part(body)
+    } else {
+        canonical(body)
+    }
+}
+
 fn text<'a>(body: &'a Map, field: &str, cap: usize) -> Result<&'a str> {
     body.get(field)
         .and_then(Value::as_str)
@@ -249,12 +265,18 @@ fn check(record: &Record) -> Result<Vec<u8>> {
 }
 
 fn check_parts(kind: &str, key: &str, body: &Map) -> Result<Vec<u8>> {
+    if kind == version::PART_KIND {
+        ids(key)?;
+        return version::check_part(body);
+    }
     let allowed: &[&str] = match kind {
         "request" => &[
+            "v",
             "nonce",
             "want",
             "purpose",
             "refused",
+            "refused_version",
             "supersedes",
             "entry",
             "origin",
@@ -264,6 +286,7 @@ fn check_parts(kind: &str, key: &str, body: &Map) -> Result<Vec<u8>> {
         "sweep" => &["covers"],
         "still" => &["at"],
         "published" => &["vault", "seq", "recipient", "contributor", "att"],
+        "published-v2" => &["vault", "version", "recipient", "contributor", "att"],
         "needs-person" => &["template", "unanswered", "others", "att"],
         "fulfilled" => &["seq"],
         "retired" => &["reason", "evidence", "note", "att"],
@@ -278,6 +301,17 @@ fn check_parts(kind: &str, key: &str, body: &Map) -> Result<Vec<u8>> {
     let att = || optional(body, "att", hex_field::<64>);
     match kind {
         "request" => {
+            if body.contains_key("v") && number(body, "v")? != 2 {
+                return Err(Error::new("unsupported credential request version"));
+            }
+            if let Some(value) = body.get("refused_version") {
+                if number(body, "v")? != 2 || body.contains_key("refused") {
+                    return Err(Error::new(
+                        "a request has one refused version representation",
+                    ));
+                }
+                version::Manifest::read(value)?;
+            }
             body.get("nonce")
                 .and_then(hex_field::<16>)
                 .ok_or_else(|| Error::new("a request names its ledger nonce"))?;
@@ -322,9 +356,16 @@ fn check_parts(kind: &str, key: &str, body: &Map) -> Result<Vec<u8>> {
         "still" => {
             number(body, "at")?;
         }
-        "published" => {
+        "published" | "published-v2" => {
             text(body, "vault", 64)?;
-            number(body, "seq")?;
+            if kind == "published" {
+                number(body, "seq")?;
+            } else {
+                version::Manifest::read(
+                    body.get("version")
+                        .ok_or_else(|| Error::new("publication has no version"))?,
+                )?;
+            }
             body.get("recipient")
                 .and_then(hex_field::<32>)
                 .ok_or_else(|| Error::new("published names no recipient digest"))?;
@@ -426,14 +467,17 @@ fn encode(command: &Command) -> Result<Vec<u8>> {
 }
 
 fn decode(payload: &[u8]) -> Result<Command> {
-    if payload.len() > MAX_RECORD * 2 {
+    if payload.len() > crate::crypto::MAX_BODY {
         return Err(Error::new("credential record exceeds payload limit"));
     }
     let command = Command::decode(payload)?;
     if command.encode()? != payload {
         return Err(Error::new("credential record encoding is not canonical"));
     }
-    check_command(&command)?;
+    let (kind, _, _) = check_command(&command)?;
+    if kind != version::PART_KIND && payload.len() > MAX_RECORD * 2 {
+        return Err(Error::new("credential record exceeds payload limit"));
+    }
     Ok(command)
 }
 
@@ -459,6 +503,8 @@ pub struct Context {
     pub policy: Policy,
     /// The vault signing key this Mac authenticated its applied version by.
     pub signer: Option<[u8; 32]>,
+    /// The actual applied source, captured before opening the credential table.
+    pub version: Option<AuthenticatedVersion>,
     /// The Commons network id, bound into every attestation.
     pub network: [u8; 16],
     /// Every current member's actor.
@@ -481,8 +527,12 @@ pub struct Thread {
     pub want: Want,
     /// Whose need it is.
     pub purpose: Purpose,
-    /// The vault seq whose value the consumer refused.
-    pub refused: Option<u64>,
+    /// The source whose value the consumer refused, never a secret commitment.
+    pub refused: Option<RefusalClaim>,
+    /// This request understands complete authenticated versions.
+    pub versioned: bool,
+    /// Its signed manifest is retained but its complete witness is not yet available.
+    pub version_pending: bool,
     /// The request it replaces.
     pub supersedes: Option<[u8; 16]>,
     /// The requester: the request record's signer.
@@ -502,8 +552,8 @@ pub struct Thread {
     pub offers: Vec<Actor>,
     /// Members whose sweep covered it.
     pub swept: BTreeSet<Actor>,
-    /// The custodian's publication: vault name and seq.
-    pub published: Option<(String, u64)>,
+    /// The custodian's publication: vault name and exact attested source.
+    pub published: Option<(String, RefusalClaim)>,
     /// The custodian handed it to a person.
     pub needs_person: bool,
     /// Who that decision names as not having answered, once the want window ended first.
@@ -618,6 +668,7 @@ impl Book {
     #[must_use]
     pub fn project(mut entries: Vec<Entry>, context: &Context) -> Self {
         entries.sort_unstable_by_key(|entry| entry.id);
+        let parts = version::Parts::read(&entries);
         let mut book = Self::default();
         let mut inert = |id: Digest, why: &str| book.inert.push((id, why.to_owned()));
         let mut threads: BTreeMap<[u8; 16], Thread> = BTreeMap::new();
@@ -674,13 +725,40 @@ impl Book {
                 );
                 continue;
             };
+            let (refused, version_pending) = if let Some(value) = body.get("refused_version") {
+                let resolved = version::Manifest::read(value).and_then(|manifest| {
+                    parts.resolve(
+                        &entry.actor,
+                        &entry.record.key,
+                        version::Use::Refused,
+                        &manifest,
+                    )
+                });
+                match resolved {
+                    Ok(Some(claim)) => (Some(RefusalClaim::Authenticated(claim)), false),
+                    Ok(None) => (None, true),
+                    Err(_) => {
+                        inert(entry.id, "request version witness is malformed");
+                        continue;
+                    }
+                }
+            } else {
+                (
+                    body.get("refused")
+                        .and_then(Value::as_u64)
+                        .map(RefusalClaim::LegacySequence),
+                    false,
+                )
+            };
             threads.insert(
                 id,
                 Thread {
                     id,
                     want,
                     purpose,
-                    refused: body.get("refused").and_then(Value::as_u64),
+                    refused,
+                    versioned: body.get("v").and_then(Value::as_u64) == Some(2),
+                    version_pending,
                     supersedes: body.get("supersedes").and_then(hex_field::<16>),
                     requester: entry.actor,
                     origin,
@@ -754,7 +832,7 @@ impl Book {
             let record = &entry.record;
             if !matches!(
                 record.kind.as_str(),
-                "published" | "needs-person" | "retired"
+                "published" | "published-v2" | "needs-person" | "retired"
             ) {
                 continue;
             }
@@ -769,7 +847,7 @@ impl Book {
                 continue;
             }
             match record.kind.as_str() {
-                "published" | "needs-person" if !attested => {
+                "published" | "published-v2" | "needs-person" if !attested => {
                     inert(
                         entry.id,
                         "a custodian's record whose attestation does not verify",
@@ -779,12 +857,63 @@ impl Book {
                     let vault = record.body.get("vault").and_then(Value::as_str);
                     let seq = record.body.get("seq").and_then(Value::as_u64);
                     if let Some((vault, seq)) = vault.zip(seq) {
-                        if thread.refused.is_some_and(|refused| seq <= refused) {
+                        if thread.version_pending
+                            || thread.versioned
+                            || match &thread.refused {
+                                Some(RefusalClaim::LegacySequence(floor)) => seq <= *floor,
+                                Some(RefusalClaim::Authenticated(_)) => true,
+                                None => false,
+                            }
+                        {
                             inert(entry.id, "does not exceed the requester's refused version");
                             continue;
                         }
-                        thread.published = Some((vault.to_owned(), seq));
+                        thread.published =
+                            Some((vault.to_owned(), RefusalClaim::LegacySequence(seq)));
                     }
+                }
+                "published-v2" if thread.published.is_none() => {
+                    if check(record).is_err() {
+                        inert(entry.id, "publication does not match its closed schema");
+                        continue;
+                    }
+                    let resolved = record
+                        .body
+                        .get("version")
+                        .ok_or_else(|| Error::new("missing version"))
+                        .and_then(version::Manifest::read)
+                        .and_then(|manifest| {
+                            parts.resolve(
+                                &entry.actor,
+                                &record.key,
+                                version::Use::Published,
+                                &manifest,
+                            )
+                        });
+                    let Ok(Some(candidate)) = resolved else {
+                        inert(
+                            entry.id,
+                            "publication version witness is incomplete or malformed",
+                        );
+                        continue;
+                    };
+                    if thread.version_pending
+                        || record.body.get("vault").and_then(Value::as_str)
+                            != Some(candidate.vault())
+                        || context.version.as_ref().is_none_or(|current| {
+                            !version::accepts(current, &candidate, thread.refused.as_ref())
+                        })
+                    {
+                        inert(
+                            entry.id,
+                            "publication is not an authenticated extension of the refused source",
+                        );
+                        continue;
+                    }
+                    thread.published = Some((
+                        candidate.vault().to_owned(),
+                        RefusalClaim::Authenticated(candidate),
+                    ));
                 }
                 // The first attested decision names who had not answered; a later one changes
                 // nothing.
@@ -952,6 +1081,7 @@ fn context(
     Ok(Context {
         policy: facts.policy,
         signer: facts.sight.as_ref().map(|sight| sight.signer),
+        version: facts.sight.as_ref().and_then(|sight| sight.version.clone()),
         network: scope.trust().network,
         members,
         scope: Some(scope.digest()),
@@ -1036,7 +1166,22 @@ fn commit(session: &Session<'_>, store: &mut Store, log: &Log, record: &Record) 
     crate::documents::application::append(session, store, &encode(&command)?)
 }
 
-fn request_record(me: &Actor, need: &Need) -> Record {
+struct Records {
+    record: Record,
+    parts: Vec<Record>,
+}
+
+impl Records {
+    fn commit(&self, session: &Session<'_>, store: &mut Store, log: &Log) -> Result<Receipt> {
+        for part in &self.parts {
+            commit(session, store, log, part)?;
+        }
+        commit(session, store, log, &self.record)
+    }
+}
+
+fn request_record(me: &Actor, need: &Need) -> Result<Records> {
+    let key = request_key(me, &need.id);
     let mut body = Map::new();
     body.insert("nonce".into(), Value::from(hex::encode_lower(&need.id)));
     body.insert("want".into(), Value::from(need.want.key()));
@@ -1047,20 +1192,33 @@ fn request_record(me: &Actor, need: &Need) -> Record {
             Value::from(aterm_secrets::need::catalog::NOTARY_ENTRY),
         );
     }
-    if let Some(seq) = need.refused {
-        body.insert("refused".into(), Value::from(seq));
-    }
-    Record::new("request", &request_key(me, &need.id), body)
+    let parts = match &need.refused {
+        None => Vec::new(),
+        Some(RefusalClaim::LegacySequence(seq)) => {
+            body.insert("refused".into(), Value::from(*seq));
+            Vec::new()
+        }
+        Some(RefusalClaim::Authenticated(claim)) => {
+            let prepared = version::prepare(&key, version::Use::Refused, claim)?;
+            body.insert("v".into(), Value::from(2_u64));
+            body.insert("refused_version".into(), prepared.manifest);
+            prepared.parts
+        }
+    };
+    Ok(Records {
+        record: Record::new("request", &key, body),
+        parts,
+    })
 }
 
 /// A schema successor has a deterministic nonce so a crash after either table write
 /// retries the same retirement and request, before the local ledger adopts it.
-fn successor_record(me: &Actor, need: &Need) -> Result<([u8; 16], Record)> {
-    let current = request_record(me, need);
+fn successor_record(me: &Actor, need: &Need) -> Result<([u8; 16], Records)> {
+    let current = request_record(me, need)?;
     let mut sha = Sha256::new();
     sha.update(SUCCESSOR_DOMAIN);
     sha.update(me);
-    sha.update(&canonical(&current.body)?);
+    sha.update(&canonical(&current.record.body)?);
     let digest = sha.finalize();
     let mut nonce = [0; 16];
     nonce.copy_from_slice(&digest[..16]);
@@ -1068,8 +1226,8 @@ fn successor_record(me: &Actor, need: &Need) -> Result<([u8; 16], Record)> {
         id: nonce,
         ..need.clone()
     };
-    let mut record = request_record(me, &successor);
-    record.body.insert(
+    let mut record = request_record(me, &successor)?;
+    record.record.body.insert(
         "supersedes".into(),
         Value::from(hex::encode_lower(&request_key(me, &need.id))),
     );
@@ -1120,8 +1278,13 @@ fn decision_for(
     if let Some((retirement, _)) = &thread.retired {
         return Some(Decision::Retired(retirement.clone()));
     }
-    if let Some((_, seq)) = &thread.published {
-        return Some(Decision::Published { seq: *seq });
+    if let Some((_, version)) = &thread.published {
+        return Some(Decision::Published {
+            version: version.clone(),
+        });
+    }
+    if thread.version_pending {
+        return None;
     }
     let asked = need.state == State::AwaitingPerson;
     if thread.needs_person && !asked {
@@ -1180,9 +1343,12 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
         let writer = session.writer().is_ok() && log.writable(session.actor()).is_ok();
         let mut book = Book::read(&log, &context);
         let me = session.actor();
-        let request = |record| match &origin {
-            Some(origin) => origin.bind(session, scope, record),
-            None => Ok(record),
+        let request = |mut records: Records| {
+            records.record = match &origin {
+                Some(origin) => origin.bind(session, scope, records.record)?,
+                None => records.record,
+            };
+            Ok::<_, Error>(records)
         };
         let mut report = Pass {
             writer,
@@ -1228,14 +1394,14 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
             match (need.state, thread) {
                 (State::Local, None) if writer && allowed && room => {
                     let receipt =
-                        commit(session, store, &log, &request(request_record(&me, need))?)?;
+                        request(request_record(&me, need)?)?.commit(session, store, &log)?;
                     moves.push((need.id, Absorb::Flushed(receipt.id.to_vec())));
                     report.posted += 1;
                     open += 1;
                 }
                 (State::AwaitingPerson, None) if writer && allowed && room && !need.posted => {
                     let receipt =
-                        commit(session, store, &log, &request(request_record(&me, need))?)?;
+                        request(request_record(&me, need)?)?.commit(session, store, &log)?;
                     moves.push((need.id, Absorb::Posted(receipt.id.to_vec())));
                     report.posted += 1;
                     open += 1;
@@ -1257,7 +1423,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                         ),
                     )?;
                     let (nonce, successor) = reissued.expect("computed for unplaced posted need");
-                    let receipt = commit(session, store, &log, &request(successor)?)?;
+                    let receipt = request(successor)?.commit(session, store, &log)?;
                     moves.push((
                         need.id,
                         Absorb::Reissued {
@@ -1377,6 +1543,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                     && context.members.contains(&thread.requester)
                     && !thread.ended()
                     && thread.published.is_none()
+                    && !thread.version_pending
                     && !thread.swept.contains(&me)
                     && !thread.offers.contains(&me);
                 if !unanswered || !context.policy.allows(&thread.want) {
@@ -1489,6 +1656,7 @@ pub fn give_from(
             .values()
             .filter(|thread| {
                 !thread.ended()
+                    && !thread.version_pending
                     && thread.published.is_none()
                     && context.members.contains(&thread.requester)
                     && context.policy.allows(&thread.want)
@@ -1547,8 +1715,8 @@ pub fn give_from(
 /// What a custodian's pass decided (§9.3).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Custodian {
-    /// Requests published, with the vault seq that carries each.
-    pub published: Vec<([u8; 16], u64)>,
+    /// Requests published, with the exact version that carries each.
+    pub published: Vec<([u8; 16], RefusalClaim)>,
     /// Requests handed to a person.
     pub asked: Vec<[u8; 16]>,
     /// Requests retired, and why.
@@ -1580,12 +1748,91 @@ impl Custodian {
     }
 }
 
+/// Read provenance before mutating the batch draft. Another request's copy cannot
+/// promote an unchanged refused source into an eligible version.
+struct CopySource {
+    claim: client::version::VersionClaim,
+    /// Genuine accepted envelope context, only for the existing descriptive v1 wire.
+    legacy_sequence: Option<u64>,
+}
+
+fn copy_source(
+    admin: &client::Admin,
+    recipient: &aterm_secrets::age::Recipient,
+    want: &Want,
+    floor: Option<&RefusalClaim>,
+) -> Result<CopySource> {
+    let entries = want.entries();
+    let names: Vec<_> = entries.iter().map(String::as_str).collect();
+    let version = admin
+        .version_for_requester(recipient, &names)
+        .map_err(crate::table::failure)?;
+    if floor.is_some_and(|floor| !version::exceeds(&version, floor)) {
+        return Err(Error::new(
+            "waits for a vault version after the requester's refused value",
+        ));
+    }
+    Ok(CopySource {
+        claim: version.claim().clone(),
+        legacy_sequence: version.envelope_sequence(),
+    })
+}
+
+fn publication(
+    id: &[u8; 16],
+    claim: &client::version::VersionClaim,
+    legacy_sequence: Option<u64>,
+    recipient: &aterm_secrets::age::Recipient,
+    contributor: Option<Actor>,
+    versioned: bool,
+) -> Result<(Records, RefusalClaim)> {
+    let mut body = Map::new();
+    body.insert("vault".into(), Value::from(claim.vault()));
+    body.insert(
+        "recipient".into(),
+        Value::from(hex::encode_lower(&Sha256::digest(recipient.0))),
+    );
+    if let Some(contributor) = contributor {
+        body.insert(
+            "contributor".into(),
+            Value::from(hex::encode_lower(&contributor)),
+        );
+    }
+    // V1 reports genuine accepted envelope context, not immutable entry origin.
+    // A source with no envelope context never invents seq 0. Typed delivery uses
+    // the complete data claim and ignores this context as advancement evidence.
+    let (kind, parts, version) = if let Some(sequence) = legacy_sequence.filter(|_| !versioned) {
+        body.insert("seq".into(), Value::from(sequence));
+        (
+            "published",
+            Vec::new(),
+            RefusalClaim::LegacySequence(sequence),
+        )
+    } else {
+        let prepared = version::prepare(id, version::Use::Published, claim)?;
+        body.insert("version".into(), prepared.manifest);
+        (
+            "published-v2",
+            prepared.parts,
+            RefusalClaim::Authenticated(claim.clone()),
+        )
+    };
+    Ok((
+        Records {
+            record: Record::new(kind, id, body),
+            parts,
+        },
+        version,
+    ))
+}
+
 enum Plan {
     Copy {
         id: [u8; 16],
         recipient: aterm_secrets::age::Recipient,
         want: Want,
-        refused: Option<u64>,
+        refused: Option<RefusalClaim>,
+        versioned: bool,
         offered: bool,
         offer_window_ended: bool,
         decided: bool,
@@ -1643,6 +1890,13 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 ));
                 continue;
             }
+            if thread.version_pending {
+                report.waiting.push((
+                    thread.id,
+                    "waits for the complete refused version witness".into(),
+                ));
+                continue;
+            }
             if now_ms.saturating_sub(thread.heard_ms) >= need::LAPSE_SECS * MS {
                 plans.push(Plan::Retire(
                     thread.id,
@@ -1685,7 +1939,8 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 id: thread.id,
                 recipient: binding.recipient(),
                 want: thread.want.clone(),
-                refused: thread.refused,
+                refused: thread.refused.clone(),
+                versioned: thread.versioned,
                 offered: !thread.offers.is_empty(),
                 offer_window_ended,
                 decided: swept || offer_window_ended,
@@ -1709,21 +1964,20 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 recipient,
                 want,
                 refused,
+                versioned,
                 offered,
                 offer_window_ended,
                 decided,
                 asked,
                 unanswered,
             } => {
-                // The opened published version is the copy's source. Another request in
-                // this batch must not make a refused source look new.
-                if refused.is_some_and(|seq| admin.seq() <= seq) {
-                    report.waiting.push((
-                        id,
-                        "waits for a vault version after the requester's refused value".into(),
-                    ));
-                    continue;
-                }
+                let source = match copy_source(&admin, &recipient, &want, refused.as_ref()) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        report.waiting.push((id, error.to_string()));
+                        continue;
+                    }
+                };
                 // The first entry answers the want; the others (a mailbox's TOTP) go with it
                 // where the vault holds them, and never without it. A copy the draft refuses
                 // leaves the draft as this request found it, and the request waits alone.
@@ -1757,7 +2011,7 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 }
                 changed |= wrote;
                 match first.unwrap_or(Copied::NotHeld) {
-                    Copied::Copied | Copied::AlreadyThere => copied.push((id, recipient)),
+                    Copied::Copied | Copied::AlreadyThere => copied.push((id, recipient, versioned, source)),
                     Copied::NoHost => report.waiting.push((
                         id,
                         "the vault names no machine with this Mac's recipient: a pending join, or an admin's aterm secrets approve, adds it".into(),
@@ -1805,31 +2059,30 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
     }
     // A publication that fails leaves every copy in it waiting, and nothing else: the pass's
     // other decisions need no publication and are committed all the same.
-    let seq = match (copied.is_empty(), changed) {
-        (true, _) => None,
-        (false, false) => Some(admin.seq()),
+    let published = match (copied.is_empty(), changed) {
+        (true, _) | (false, false) => None,
         (false, true) => match client::admin_publish(paths, &admin, &admin.doc) {
-            Ok(published) => Some(published.seq),
+            Ok(published) => Some(published.version().clone()),
             Err(error) => {
                 let why = format!("the vault's publication failed: {error}");
-                let failed = copied.iter().map(|(id, _)| (*id, why.clone()));
+                let failed = copied.iter().map(|(id, ..)| (*id, why.clone()));
                 report.failed.extend(failed);
+                copied.clear();
                 None
             }
         },
     };
-    if let Some(seq) = seq {
-        for (id, recipient) in copied {
-            let mut body = Map::new();
-            body.insert("vault".into(), Value::from(admin.config.name.clone()));
-            body.insert("seq".into(), Value::from(seq));
-            body.insert(
-                "recipient".into(),
-                Value::from(hex::encode_lower(&Sha256::digest(recipient.0))),
-            );
-            records.push(Record::new("published", &id, body));
-            report.published.push((id, seq));
-        }
+    let mut parts = Vec::new();
+    for (id, recipient, versioned, source) in copied {
+        let (claim, legacy_sequence) = match &published {
+            Some(claim) => (claim, claim.envelope().map(|envelope| envelope.seq)),
+            None => (&source.claim, source.legacy_sequence),
+        };
+        let (bundle, version) =
+            publication(&id, claim, legacy_sequence, &recipient, None, versioned)?;
+        parts.extend(bundle.parts);
+        records.push(bundle.record);
+        report.published.push((id, version));
     }
     if records.is_empty() {
         return Ok(Some(report));
@@ -1843,6 +2096,9 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
         session.writer()?;
         let log = Log::read_with(session, store, scope, decode)?;
         log.writable(session.actor())?;
+        for part in &parts {
+            commit(session, store, &log, part)?;
+        }
         for record in &records {
             commit(session, store, &log, record)?;
         }

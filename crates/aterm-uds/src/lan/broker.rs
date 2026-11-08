@@ -15,10 +15,11 @@ use super::{ConnectOptions, LanError, UdpOptions, Unavailable};
 use crate::CtlStream;
 
 /// How long the broker's socket may take to accept: a hang detector, as it answers at once.
-const DIAL_HANG: Duration = Duration::from_secs(10);
+const DIAL_HANG: Duration = Duration::from_secs(60);
 
-/// How long the broker may take to say its hello, or to answer past a request's own bound.
-const ANSWER_HANG: Duration = Duration::from_secs(30);
+/// How long the broker may take to say its hello past its check of this process
+/// ([`crate::peer::CHECK_HANG`]), or to answer past a request's own bound.
+const ANSWER_HANG: Duration = Duration::from_secs(60);
 
 /// What a broker said of itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,7 +74,7 @@ enum Absent {
     /// Reads [`Unavailable::NotInstalled`]: a question about the broker itself
     /// ([`super::Arrivals`]), which this process's own server cannot answer.
     #[cfg_attr(
-        not(target_os = "macos"),
+        all(not(target_os = "macos"), not(test)),
         expect(dead_code, reason = "broker arrivals are watched on macOS")
     )]
     NotInstalled,
@@ -85,7 +86,17 @@ fn open_at(
     ours: u32,
     absent: Absent,
 ) -> Result<Session, LanError> {
-    let stream = match crate::connect::until(path, Instant::now() + DIAL_HANG) {
+    open_started_at(request, path, ours, absent, Instant::now())
+}
+
+fn open_started_at(
+    request: Option<&Request>,
+    path: &Path,
+    ours: u32,
+    absent: Absent,
+    started: Instant,
+) -> Result<Session, LanError> {
+    let stream = match crate::connect::until(path, started + DIAL_HANG) {
         Ok(stream) => stream,
         // No broker: this process's own server, when the caller makes a LAN use and macOS
         // already allowed this code (`super::direct`); a broker that answers, refuses or speaks
@@ -130,6 +141,16 @@ fn exchange(
     ours: u32,
     direct: Option<String>,
 ) -> Result<Session, LanError> {
+    exchange_at(stream, request, ours, direct, Instant::now())
+}
+
+fn exchange_at(
+    stream: CtlStream,
+    request: Option<&Request>,
+    ours: u32,
+    direct: Option<String>,
+    started: Instant,
+) -> Result<Session, LanError> {
     let mut bytes = wire::encode(&Frame::Hello {
         protocol: ours,
         build: super::hello_build().to_owned(),
@@ -141,7 +162,12 @@ fn exchange(
     // then fail, and the refusal is still there to read.
     let wrote = io::Write::write_all(&mut &stream, &bytes);
     let mut reader = Reader::new(1);
-    let first = reader.frame(&stream, Some(Instant::now() + ANSWER_HANG));
+    // The broker checks this process's code before it says anything: its hello, or its
+    // `Unchecked` for a check that did not finish, can come that check's whole bound late.
+    let first = reader.frame(
+        &stream,
+        Some(started + crate::peer::CHECK_HANG + ANSWER_HANG),
+    );
     let first = match (first, wrote) {
         (Ok(Some(Frame::Refused { words })), _) => {
             return Err(Unavailable::Refused(words).into());
@@ -539,5 +565,89 @@ pub fn register(advert: &Advert) -> Result<Registration, LanError> {
             format!("the LAN broker did not register the advert within {ANSWER_HANG:?}"),
         )
         .into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hello(protocol: u32) -> Vec<u8> {
+        wire::encode(&Frame::Hello {
+            protocol,
+            build: "kernel-hello".into(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn valid_local_broker_dial_survives_scheduling_delay() {
+        let dir = aterm_tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("b.sock");
+        let ours = super::super::protocol();
+        let listener = crate::kept_out(|| crate::CtlListener::bind(&path)).unwrap();
+        let worker = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            if io::Write::write_all(&mut &stream, &hello(ours)).is_err() {
+                return false;
+            }
+            matches!(Reader::new(0).frame(&stream, Some(Instant::now() + Duration::from_secs(60))),
+                Ok(Some(Frame::Hello { protocol, .. })) if protocol == ours)
+        });
+        // A refused dial fails here with its own error, the worker left in its accept.
+        let started = Instant::now() - Duration::from_secs(11);
+        let session = open_started_at(None, &path, ours, Absent::NotInstalled, started).unwrap();
+        assert_eq!(session.broker.protocol, ours);
+        assert!(worker.join().unwrap());
+    }
+
+    #[test]
+    fn an_expired_local_broker_dial_is_refused_before_it_dials() {
+        // No broker here: a dial that looked would read it as not installed.
+        let dir = aterm_tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let path = dir.path().join("b.sock");
+        let started = Instant::now() - Duration::from_secs(61);
+        assert!(matches!(
+            open_started_at(None, &path, super::super::protocol(), Absent::NotInstalled, started),
+            Err(LanError::Io(error)) if error.kind() == io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[test]
+    fn valid_local_broker_hello_survives_its_check_and_scheduling_delay() {
+        let (client, server) = crate::kept_out(CtlStream::pair).unwrap();
+        let ours = super::super::protocol();
+        io::Write::write_all(&mut &server, &hello(ours)).unwrap();
+        let started = Instant::now() - Duration::from_secs(91);
+        let result = exchange_at(client, None, ours, None, started);
+        assert_eq!(result.unwrap().broker.protocol, ours);
+    }
+
+    #[test]
+    fn an_unfinished_broker_check_reaches_the_client_as_unchecked() {
+        let (client, server) = crate::kept_out(CtlStream::pair).unwrap();
+        let words = "trustd did not answer".to_owned();
+        let frame = wire::encode(&Frame::Unchecked {
+            words: words.clone(),
+        })
+        .unwrap();
+        io::Write::write_all(&mut &server, &frame).unwrap();
+        // The broker's check took its whole minute; its answer still reaches this process.
+        let started = Instant::now() - Duration::from_secs(61);
+        assert!(matches!(
+            exchange_at(client, None, super::super::protocol(), None, started),
+            Err(LanError::Unavailable(Unavailable::Unchecked(said))) if said == words
+        ));
+    }
+
+    #[test]
+    fn an_expired_local_broker_hello_is_still_refused() {
+        let (client, server) = crate::kept_out(CtlStream::pair).unwrap();
+        let ours = super::super::protocol();
+        io::Write::write_all(&mut &server, &hello(ours)).unwrap();
+        assert!(matches!(
+            exchange_at(client, None, ours, None, Instant::now() - Duration::from_secs(121)),
+            Err(LanError::Io(error)) if error.kind() == io::ErrorKind::TimedOut
+        ));
     }
 }

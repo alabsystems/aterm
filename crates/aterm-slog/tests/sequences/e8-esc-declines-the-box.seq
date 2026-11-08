@@ -1,0 +1,21 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# E8: Esc on a box whose footer says `Esc to cancel` chooses its cancel, which
+# rejects the call: the close is `declined` at conf=heuristic when the screen
+# reports nothing more. When the screen reports the interrupt the box was
+# stopped under (`esc-declines-the-box.seq`), that report is the program's own
+# word after the key, and the close is `declined` at conf=strong.
+see busy
+half
+see prompt bash:not-read-only fixture=claude-2.1.280-box-bash-touch
+expect open p1 approval par=t1 box=bash:not-read-only @500
+person key=esc chose=decline
+at 700 see idle
+expect close p1 approval out=declined by=human conf=heuristic @700
+at 3000 see busy
+see prompt bash:not-read-only fixture=claude-2.1.280-box-bash-touch
+expect open p2 approval par=t2 box=bash:not-read-only
+admit ctl key=esc chose=decline
+accept
+interrupted
+see idle fixture=claude-2.1.316-box-bash-declined-esc
+expect close p2 approval out=declined by=ctl conf=strong

@@ -2018,7 +2018,7 @@ impl Vault {
 
 fn fleeting_wait(exe: &Path) -> String {
     format!(
-        "this aterm runs from {}, which goes away when it quits, so it cannot keep ~/.secrets in sync; move aterm to Applications and open it from there, and setup finishes this step",
+        "this aterm runs from {}, which cannot keep sync running after it quits; open the released aterm app to install it automatically and continue setup",
         exe.display()
     )
 }
@@ -4988,17 +4988,18 @@ pub(crate) mod tests {
     /// and, where `github` gives one, her init.toml with that `[github]` table.
     fn with_git(github: Option<&[u8]>) -> Fake {
         let sys = fake();
-        sys.file(crate::items::github::CLT_GIT, b"git").stat_of(
-            "/Users//alice",
-            Stat {
-                uid: 501,
-                gid: 20,
-                mode: 0o700,
-                dir: true,
-                symlink: false,
-                len: 0,
-            },
-        );
+        sys.executable(crate::items::github::CLT_GIT, b"git")
+            .stat_of(
+                "/Users//alice",
+                Stat {
+                    uid: 501,
+                    gid: 20,
+                    mode: 0o700,
+                    dir: true,
+                    symlink: false,
+                    len: 0,
+                },
+            );
         crate::git_credential::script::unconfigured(&sys, &user("alice", 501));
         if let Some(profile) = github {
             const INIT_TOML: &str = "/Users//alice/.config/aterm/init.toml";
@@ -5578,9 +5579,6 @@ pub(crate) mod tests {
     fn a_setup_from_a_disk_image_waits_to_be_opened_from_applications() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
         let image = PathBuf::from("/Volumes/aterm/aterm.app/Contents/MacOS/aterm");
-        let moved =
-            "move aterm to Applications and open it from there, and setup finishes this step";
-        assert!(fleeting_wait(&image).contains(moved));
         assert!(!fleeting_wait(&image).contains("--program"));
 
         let ops = Scripted::new(vec![Ok(unconfigured())]);
@@ -5652,7 +5650,6 @@ pub(crate) mod tests {
         assert_eq!(rows[0].outcome, Outcome::Failed, "{rows:?}");
         let why = rows[0].why.as_deref().unwrap();
         assert!(why.contains("--program"), "{why}");
-        assert!(!why.contains(moved), "{why}");
     }
 
     #[test]

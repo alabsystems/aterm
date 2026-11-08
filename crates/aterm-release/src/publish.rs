@@ -16,7 +16,10 @@ use aterm_update_core::Manifest;
 use aterm_update_core::roster;
 use aterm_update_core::tag::TagError;
 
-use crate::ledger::{self, Error, GitCli, GitRunner, Result, RunOut, git_ok, rev_parse};
+use crate::ledger::{
+    self, ControlRefChange, ControlRefTransaction, Error, GitCli, GitRunner, Origin, RefWrite,
+    Result, RunOut, git_ok, rev_parse,
+};
 use crate::{
     artifact, buildplan, bundle, changelog, channel, dmg, gates, machines, manifest_out, sign,
     verify,
@@ -420,10 +423,10 @@ pub(crate) fn channel_token_path() -> Option<PathBuf> {
 }
 
 /// Dedicated cooperative lock for every real release cut.
-pub const RELEASE_LEASE_REF: &str = "refs/tags/aterm-release-lease";
+pub use agh::git::RELEASE_LEASE_REF;
 
 /// Per-invocation fencing token.
-pub const PUBLISHER_FENCE_REF: &str = "refs/tags/aterm-release-fence";
+pub use agh::git::PUBLISHER_FENCE_REF;
 
 /// Mandatory acknowledgement for the one recovery operation whose safety has an external, operator-established precondition.
 pub const RECOVERY_STOPPED_PROCESS_FLAG: &str = "--old-publisher-stopped";
@@ -521,87 +524,80 @@ pub fn acquire_lease_action(
     }
 }
 
-/// Read the exact lightweight lock ref. Multiple/malformed answers fail closed.
-pub fn release_lease_owner(git: &dyn GitRunner) -> Result<Option<String>> {
-    let out = git_ok(git, &["ls-remote", "origin", RELEASE_LEASE_REF])?;
-    let text = out.stdout_utf8();
-    let mut rows = text.lines();
-    let Some(row) = rows.next() else {
-        return Ok(None);
-    };
-    if let Some(rest_count) = rows.next().map(|_| 2 + rows.count()) {
-        return Err(Error::new(format!(
-            "release lease query returned {rest_count} rows for {RELEASE_LEASE_REF}"
-        )));
+pub(crate) fn native_origin(repo: &Path) -> Result<crate::github_remote::Remote> {
+    let expected = workspace_repo_slug(repo)?;
+    let origin = crate::github_remote::Remote::origin(repo).map_err(Error::new)?;
+    if !origin.repository().eq_full_name(&expected) {
+        return Err(Error::new(
+            "native publication origin differs from Cargo.toml workspace repository; refusing ref operations",
+        ));
     }
-    let mut fields = row.split_whitespace();
-    let (Some(owner), Some(reference), None) = (fields.next(), fields.next(), fields.next()) else {
-        return Err(Error::new("malformed release lease ls-remote response"));
-    };
-    if reference != RELEASE_LEASE_REF || !valid_lease_owner(owner) {
-        return Err(Error::new(format!("malformed release lease row: {row:?}")));
+    Ok(origin)
+}
+
+fn write_control_refs(
+    origin: &dyn Origin,
+    owner: &str,
+    changes: Vec<ControlRefChange>,
+) -> Result<RefWrite> {
+    let transaction = ControlRefTransaction::new(owner, changes)
+        .map_err(|error| Error::new(error.why.clone()))?;
+    origin.control_transaction(transaction).map_err(Error::new)
+}
+
+fn ref_write_description(written: RefWrite) -> &'static str {
+    match written {
+        RefWrite::Written => "native expected-old transaction completed",
+        RefWrite::Conflict => "native expected-old transaction conflicted without side effects",
     }
-    Ok(Some(owner.to_ascii_lowercase()))
+}
+
+/// Read the exact lightweight lock through the authenticated native origin.
+pub fn release_lease_owner(origin: &dyn Origin) -> Result<Option<String>> {
+    origin
+        .get(RELEASE_LEASE_REF)?
+        .map(|owner| {
+            if !valid_lease_owner(&owner) {
+                return Err(Error::new("release lease is not one raw object ID"));
+            }
+            Ok(owner.to_ascii_lowercase())
+        })
+        .transpose()
 }
 
 /// Read the unique annotated publisher fence and its peeled claim.
-pub fn publisher_fence(git: &dyn GitRunner) -> Result<Option<PublisherFence>> {
-    let peeled_ref = format!("{PUBLISHER_FENCE_REF}^{{}}");
-    let out = git_ok(
-        git,
-        &["ls-remote", "origin", PUBLISHER_FENCE_REF, &peeled_ref],
-    )?;
-    let text = out.stdout_utf8();
-    let mut lines = text.lines();
-    let rows = match (lines.next(), lines.next(), lines.next()) {
-        (None, _, _) => return Ok(None),
-        (Some(r0), Some(r1), None) => [r0, r1],
-        (Some(_), None, _) => {
-            return Err(Error::new(
-                "publisher fence query returned 1 rows; expected an annotated ref plus peel",
-            ));
-        }
-        (Some(_), Some(_), Some(_)) => {
-            return Err(Error::new(format!(
-                "publisher fence query returned {} rows; expected an annotated ref plus peel",
-                3 + lines.count()
-            )));
-        }
+pub fn publisher_fence(origin: &dyn Origin) -> Result<Option<PublisherFence>> {
+    let Some(observed) = remote_annotated_ref(origin, PUBLISHER_FENCE_REF, "publisher fence")?
+    else {
+        return Ok(None);
     };
-    let mut token = None;
-    let mut owner = None;
-    for row in rows {
-        let mut fields = row.split_whitespace();
-        let (Some(oid), Some(reference), None) = (fields.next(), fields.next(), fields.next())
-        else {
-            return Err(Error::new("malformed publisher fence ls-remote response"));
-        };
-        if !valid_lease_owner(oid) {
-            return Err(Error::new(format!(
-                "publisher fence contains malformed object id {oid:?}"
-            )));
-        }
-        match reference {
-            PUBLISHER_FENCE_REF => token = Some(oid.to_ascii_lowercase()),
-            reference if reference == peeled_ref => owner = Some(oid.to_ascii_lowercase()),
-            _ => {
-                return Err(Error::new(format!(
-                    "publisher fence query returned unexpected ref {reference:?}"
-                )));
-            }
-        }
-    }
-    let (Some(token), Some(owner)) = (token, owner) else {
-        return Err(Error::new(
-            "publisher fence is not an annotated tag peeled to a claim commit",
-        ));
+    Ok(Some(PublisherFence {
+        token: observed.token,
+        owner: observed.commit,
+    }))
+}
+
+fn publisher_fence_for_guard(
+    origin: &dyn Origin,
+    guard: &PublisherFenceGuard,
+) -> Result<Option<PublisherFence>> {
+    let Some(token) = origin.get(PUBLISHER_FENCE_REF)? else {
+        return Ok(None);
     };
-    if token == owner {
-        return Err(Error::new(
-            "publisher fence token equals its owner; refusing a lightweight/non-unique fence",
-        ));
+    if token.eq_ignore_ascii_case(guard.token()) {
+        // The private guard was minted only after importing and validating this
+        // exact annotation. Its content-addressed owner cannot change while the
+        // freshly observed token stays identical; no history import is needed.
+        return Ok(Some(PublisherFence {
+            token: guard.token.clone(),
+            owner: guard.owner.clone(),
+        }));
     }
-    Ok(Some(PublisherFence { token, owner }))
+    let observed = resolve_annotated_token(origin, token, "publisher fence")?;
+    Ok(Some(PublisherFence {
+        token: observed.token,
+        owner: observed.commit,
+    }))
 }
 
 /// Version of the `fence-*` identity block in the fence tag body. Format 1 recorded the
@@ -1224,30 +1220,18 @@ pub fn publisher_fence_refusal(
 }
 
 /// Read the identity block out of the fence's annotated-tag object.
-pub fn publisher_fence_identity(git: &dyn GitRunner, token: &str) -> FenceIdentity {
+pub fn publisher_fence_identity(origin: &dyn Origin, token: &str) -> FenceIdentity {
     if !valid_lease_owner(token) {
         return FenceIdentity::unreadable(format!("malformed fence token {token:?}"));
     }
-    let local = git
-        .git(&["cat-file", "-t", token])
-        .map(|out| out.success() && out.stdout_utf8().trim() == "tag")
-        .unwrap_or(false);
-    if !local {
-        let _ = git.git(&[
-            "fetch",
-            "--no-tags",
-            "--quiet",
-            "origin",
-            PUBLISHER_FENCE_REF,
-        ]);
+    if let Err(error) = origin.import(token) {
+        return FenceIdentity::unreadable(format!("cannot import exact fence {token}: {error}"));
     }
-    match git.git(&["cat-file", "tag", token]) {
-        Ok(out) if out.success() => FenceIdentity::parse(&out.stdout_utf8()),
-        Ok(out) => FenceIdentity::unreadable(format!(
-            "git cat-file tag {token} failed: {}",
-            out.stderr_utf8().trim()
-        )),
-        Err(error) => FenceIdentity::unreadable(format!("git cat-file tag {token}: {error}")),
+    match origin.tag_object(token) {
+        Ok(body) => FenceIdentity::parse(&String::from_utf8_lossy(&body)),
+        Err(error) => {
+            FenceIdentity::unreadable(format!("cannot read exact fence {token}: {error}"))
+        }
     }
 }
 
@@ -1261,14 +1245,14 @@ pub enum FenceReclaim {
 
 /// `--resume`'s automatic reclaim.
 pub fn reclaim_dead_publisher_fence(
-    git: &dyn GitRunner,
+    origin: &dyn Origin,
     expected_owner: &str,
     probe: &dyn PublisherProbe,
 ) -> Result<FenceReclaim> {
-    let Some(fence) = publisher_fence(git)? else {
+    let Some(fence) = publisher_fence(origin)? else {
         return Ok(FenceReclaim::NoFence);
     };
-    let identity = publisher_fence_identity(git, &fence.token);
+    let identity = publisher_fence_identity(origin, &fence.token);
     let liveness = fence_liveness(&identity, probe);
     let refusal = |extra: Option<&str>| {
         let base = publisher_fence_refusal(
@@ -1289,7 +1273,7 @@ pub fn reclaim_dead_publisher_fence(
             )),
         });
     }
-    if !release_lease_owner(git)?
+    if !release_lease_owner(origin)?
         .as_deref()
         .is_some_and(|o| o.eq_ignore_ascii_case(expected_owner))
     {
@@ -1305,16 +1289,22 @@ pub fn reclaim_dead_publisher_fence(
             refusal: refusal(None),
         });
     };
-    let lease_arg = format!("--force-with-lease={PUBLISHER_FENCE_REF}:{}", fence.token);
-    let delete = format!(":{PUBLISHER_FENCE_REF}");
-    let pushed = git.git(&["push", &lease_arg, "origin", &delete])?;
-    match publisher_fence(git)? {
+    let written = write_control_refs(
+        origin,
+        &fence.owner,
+        vec![ControlRefChange {
+            reference: PUBLISHER_FENCE_REF.into(),
+            before: Some(fence.token.clone()),
+            after: None,
+        }],
+    )?;
+    match publisher_fence(origin)? {
         None => Ok(FenceReclaim::Reclaimed {
             token: fence.token.clone(),
             detail: detail.clone(),
         }),
         Some(current) if current.token != fence.token => {
-            let identity = publisher_fence_identity(git, &current.token);
+            let identity = publisher_fence_identity(origin, &current.token);
             let liveness = fence_liveness(&identity, probe);
             Ok(FenceReclaim::Kept {
                 refusal: format!(
@@ -1332,15 +1322,15 @@ pub fn reclaim_dead_publisher_fence(
         Some(_) => Ok(FenceReclaim::Kept {
             refusal: refusal(Some(&format!(
                 "not reclaimed: the exact-token delete did not land: {}",
-                pushed.stderr_utf8().trim()
+                ref_write_description(written)
             ))),
         }),
     }
 }
 
-fn ensure_no_publisher_fence(git: &dyn GitRunner) -> Result<()> {
-    if let Some(fence) = publisher_fence(git)? {
-        let identity = publisher_fence_identity(git, &fence.token);
+fn ensure_no_publisher_fence(origin: &dyn Origin) -> Result<()> {
+    if let Some(fence) = publisher_fence(origin)? {
+        let identity = publisher_fence_identity(origin, &fence.token);
         let liveness = fence_liveness(&identity, &LocalProbe);
         return Err(Error::new(publisher_fence_refusal(
             &fence,
@@ -1353,9 +1343,9 @@ fn ensure_no_publisher_fence(git: &dyn GitRunner) -> Result<()> {
 }
 
 /// Read-only fresh-cut preflight.
-pub fn preflight_release_lease(git: &dyn GitRunner) -> Result<()> {
-    ensure_no_publisher_fence(git)?;
-    if let Some(owner) = release_lease_owner(git)? {
+pub fn preflight_release_lease(origin: &dyn Origin) -> Result<()> {
+    ensure_no_publisher_fence(origin)?;
+    if let Some(owner) = release_lease_owner(origin)? {
         return Err(Error::new(format!(
             "the release lock is held by claim {owner}; nothing was claimed. On the machine \
              that cut it: `{CUT_COMMAND}` or `--abandon vX.Y.Z`; from another machine, \
@@ -1381,7 +1371,7 @@ pub fn pre_cut_gates(
         out.push(("staged bundle", e.to_string()));
     }
     if kind == CutKind::Real
-        && let Err(e) = preflight_release_lease(&git)
+        && let Err(e) = native_origin(repo).and_then(|origin| preflight_release_lease(&origin))
     {
         out.push(("release lease", e.to_string()));
     }
@@ -1454,31 +1444,34 @@ pub fn pre_cut_gates(
 
 /// Production `AcquireLease`.
 pub fn acquire_release_lease(
-    git: &dyn GitRunner,
+    origin: &dyn Origin,
     expected_owner: &str,
 ) -> Result<ReleaseLeaseGuard> {
-    ensure_no_publisher_fence(git)?;
+    ensure_no_publisher_fence(origin)?;
     let expected_owner = expected_owner.to_ascii_lowercase();
-    let observed = release_lease_owner(git)?;
+    let observed = release_lease_owner(origin)?;
     if acquire_lease_action(observed.as_deref(), &expected_owner)? == LeaseAcquireAction::Create {
-        let spec = format!("{expected_owner}:{RELEASE_LEASE_REF}");
-        let pushed = git.git(&["push", "origin", &spec])?;
-        if !pushed.success() {
-            let now = release_lease_owner(git)?;
+        let written = write_control_refs(
+            origin,
+            &expected_owner,
+            vec![ControlRefChange {
+                reference: RELEASE_LEASE_REF.into(),
+                before: None,
+                after: Some(expected_owner.clone()),
+            }],
+        )?;
+        if written == RefWrite::Conflict {
+            let now = release_lease_owner(origin)?;
             if now.as_deref() != Some(expected_owner.as_str()) {
                 return Err(Error::new(format!(
                     "atomic release lease create lost: {}; owner is {}",
-                    pushed.stderr_utf8().trim(),
+                    "native expected-old conflict",
                     now.as_deref().unwrap_or("absent")
                 )));
             }
         }
     }
-    let owner = release_lease_owner(git)?;
-    acquire_lease_action(owner.as_deref(), &expected_owner)?;
-    Ok(ReleaseLeaseGuard {
-        owner: expected_owner,
-    })
+    confirm_release_lease_owner(origin, &expected_owner)
 }
 
 fn new_publisher_fence_token(git: &dyn GitRunner, owner: &str) -> Result<String> {
@@ -1522,10 +1515,10 @@ fn new_publisher_fence_token(git: &dyn GitRunner, owner: &str) -> Result<String>
 }
 
 fn confirm_release_lease_owner(
-    git: &dyn GitRunner,
+    origin: &dyn Origin,
     expected_owner: &str,
 ) -> Result<ReleaseLeaseGuard> {
-    let observed = release_lease_owner(git)?;
+    let observed = release_lease_owner(origin)?;
     if !observed
         .as_deref()
         .is_some_and(|o| o.eq_ignore_ascii_case(expected_owner))
@@ -1544,14 +1537,22 @@ fn confirm_release_lease_owner(
 /// Create a unique per-process fence.
 pub fn acquire_publisher_fence(
     git: &dyn GitRunner,
+    origin: &dyn Origin,
     expected_owner: &str,
 ) -> Result<PublisherFenceGuard> {
-    let lease = confirm_release_lease_owner(git, expected_owner)?;
-    ensure_no_publisher_fence(git)?;
+    let lease = confirm_release_lease_owner(origin, expected_owner)?;
+    ensure_no_publisher_fence(origin)?;
     let token = new_publisher_fence_token(git, expected_owner)?;
-    let spec = format!("{token}:{PUBLISHER_FENCE_REF}");
-    let pushed = git.git(&["push", "origin", &spec])?;
-    let now = publisher_fence(git)?;
+    let written = write_control_refs(
+        origin,
+        expected_owner,
+        vec![ControlRefChange {
+            reference: PUBLISHER_FENCE_REF.into(),
+            before: None,
+            after: Some(token.clone()),
+        }],
+    )?;
+    let now = publisher_fence(origin)?;
     if now.as_ref().is_some_and(|fence| {
         fence.token == token && fence.owner.eq_ignore_ascii_case(expected_owner)
     }) {
@@ -1562,7 +1563,7 @@ pub fn acquire_publisher_fence(
     }
     Err(Error::new(format!(
         "atomic publisher-fence create lost: {}; current token is {}",
-        pushed.stderr_utf8().trim(),
+        ref_write_description(written),
         now.as_ref().map_or("absent", |fence| fence.token.as_str())
     )))
 }
@@ -1570,10 +1571,11 @@ pub fn acquire_publisher_fence(
 /// Explicit killed-machine takeover.
 pub fn rotate_publisher_fence_for_recovery(
     git: &dyn GitRunner,
+    origin: &dyn Origin,
     expected_owner: &str,
 ) -> Result<PublisherFenceGuard> {
-    let lease = confirm_release_lease_owner(git, expected_owner)?;
-    let observed = publisher_fence(git)?;
+    let lease = confirm_release_lease_owner(origin, expected_owner)?;
+    let observed = publisher_fence(origin)?;
     if let Some(fence) = &observed
         && !fence.owner.eq_ignore_ascii_case(expected_owner)
     {
@@ -1588,14 +1590,16 @@ pub fn rotate_publisher_fence_for_recovery(
             "publisher-fence rotation generated the old token again; refusing a non-fencing takeover",
         ));
     }
-    let spec = format!("{token}:{PUBLISHER_FENCE_REF}");
-    let out = if let Some(fence) = &observed {
-        let lease = format!("--force-with-lease={PUBLISHER_FENCE_REF}:{}", fence.token);
-        git.git(&["push", &lease, "origin", &spec])?
-    } else {
-        git.git(&["push", "origin", &spec])?
-    };
-    let now = publisher_fence(git)?;
+    let written = write_control_refs(
+        origin,
+        expected_owner,
+        vec![ControlRefChange {
+            reference: PUBLISHER_FENCE_REF.into(),
+            before: observed.as_ref().map(|fence| fence.token.clone()),
+            after: Some(token.clone()),
+        }],
+    )?;
+    let now = publisher_fence(origin)?;
     if now.as_ref().is_some_and(|fence| {
         fence.token == token && fence.owner.eq_ignore_ascii_case(expected_owner)
     }) {
@@ -1606,18 +1610,18 @@ pub fn rotate_publisher_fence_for_recovery(
     }
     Err(Error::new(format!(
         "publisher-fence recovery rotation lost its exact CAS: {}; current token is {}",
-        out.stderr_utf8().trim(),
+        ref_write_description(written),
         now.as_ref().map_or("absent", |fence| fence.token.as_str())
     )))
 }
 
 /// Re-prove both persistent claim ownership and the exact process token before each release mutation.
 pub fn assert_publisher_session(
-    git: &dyn GitRunner,
+    origin: &dyn Origin,
     lease: &ReleaseLeaseGuard,
     fence: &PublisherFenceGuard,
 ) -> Result<()> {
-    let owner = release_lease_owner(git)?;
+    let owner = release_lease_owner(origin)?;
     if !lease.is_owner(owner.as_deref()) || fence.owner() != lease.owner {
         return Err(Error::new(format!(
             "publisher session lost claim ownership: expected {}, observed {}",
@@ -1625,7 +1629,7 @@ pub fn assert_publisher_session(
             owner.as_deref().unwrap_or("absent")
         )));
     }
-    let observed = publisher_fence(git)?;
+    let observed = publisher_fence_for_guard(origin, fence)?;
     if observed
         .as_ref()
         .is_none_or(|current| current.token != fence.token() || current.owner != fence.owner())
@@ -1643,10 +1647,10 @@ pub fn assert_publisher_session(
 
 /// Delete only this process's exact token.
 pub fn release_publisher_fence(
-    git: &dyn GitRunner,
+    origin: &dyn Origin,
     guard: &PublisherFenceGuard,
 ) -> Result<FenceRelease> {
-    match publisher_fence(git)? {
+    match publisher_fence_for_guard(origin, guard)? {
         None => return Ok(FenceRelease::AlreadyAbsent),
         Some(current) if current.token != guard.token => {
             return Ok(FenceRelease::AlreadySuperseded);
@@ -1659,15 +1663,21 @@ pub fn release_publisher_fence(
         }
         Some(_) => {}
     }
-    let lease = format!("--force-with-lease={PUBLISHER_FENCE_REF}:{}", guard.token);
-    let delete = format!(":{PUBLISHER_FENCE_REF}");
-    let out = git.git(&["push", &lease, "origin", &delete])?;
-    match publisher_fence(git)? {
+    let written = write_control_refs(
+        origin,
+        &guard.owner,
+        vec![ControlRefChange {
+            reference: PUBLISHER_FENCE_REF.into(),
+            before: Some(guard.token.clone()),
+            after: None,
+        }],
+    )?;
+    match publisher_fence_for_guard(origin, guard)? {
         None => Ok(FenceRelease::Released),
         Some(current) if current.token != guard.token => Ok(FenceRelease::AlreadySuperseded),
         Some(_) => Err(Error::new(format!(
             "CAS release of publisher fence failed: {}",
-            out.stderr_utf8().trim()
+            ref_write_description(written)
         ))),
     }
 }
@@ -1675,26 +1685,27 @@ pub fn release_publisher_fence(
 /// Withdraw the release tag and unlock the session.
 pub fn withdraw_tag_then_unlock(
     git: &dyn GitRunner,
+    origin: &dyn Origin,
     tag: &str,
     owner: &str,
     lease: &ReleaseLeaseGuard,
     fence: &PublisherFenceGuard,
 ) -> Result<LeaseRelease> {
-    assert_publisher_session(git, lease, fence)?;
-    delete_owned_release_tag(git, tag, owner, lease, fence)?;
-    assert_publisher_session(git, lease, fence)?;
-    release_completed_publisher_session(git, owner, fence)
+    assert_publisher_session(origin, lease, fence)?;
+    delete_owned_release_tag(git, origin, tag, owner, lease, fence)?;
+    assert_publisher_session(origin, lease, fence)?;
+    release_completed_publisher_session(origin, owner, fence)
 }
 
 /// Final unlock deletes the persistent owner and the process token in one atomic ref transaction.
 pub fn release_completed_publisher_session(
-    git: &dyn GitRunner,
+    origin: &dyn Origin,
     expected_owner: &str,
     guard: &PublisherFenceGuard,
 ) -> Result<LeaseRelease> {
     let expected_owner = expected_owner.to_ascii_lowercase();
-    let owner = release_lease_owner(git)?;
-    let fence = publisher_fence(git)?;
+    let owner = release_lease_owner(origin)?;
+    let fence = publisher_fence_for_guard(origin, guard)?;
     match (owner.as_deref(), fence.as_ref()) {
         (None, None) => return Ok(LeaseRelease::AlreadyAbsent),
         (Some(observed), Some(current))
@@ -1716,21 +1727,24 @@ pub fn release_completed_publisher_session(
             )));
         }
     }
-    let owner_lease = format!("--force-with-lease={RELEASE_LEASE_REF}:{expected_owner}");
-    let fence_lease = format!("--force-with-lease={PUBLISHER_FENCE_REF}:{}", guard.token());
-    let owner_delete = format!(":{RELEASE_LEASE_REF}");
-    let fence_delete = format!(":{PUBLISHER_FENCE_REF}");
-    let out = git.git(&[
-        "push",
-        "--atomic",
-        &owner_lease,
-        &fence_lease,
-        "origin",
-        &owner_delete,
-        &fence_delete,
-    ])?;
-    let owner_now = release_lease_owner(git)?;
-    let fence_now = publisher_fence(git)?;
+    let written = write_control_refs(
+        origin,
+        &expected_owner,
+        vec![
+            ControlRefChange {
+                reference: RELEASE_LEASE_REF.into(),
+                before: Some(expected_owner.clone()),
+                after: None,
+            },
+            ControlRefChange {
+                reference: PUBLISHER_FENCE_REF.into(),
+                before: Some(guard.token().into()),
+                after: None,
+            },
+        ],
+    )?;
+    let owner_now = release_lease_owner(origin)?;
+    let fence_now = publisher_fence_for_guard(origin, guard)?;
     match (owner_now.as_deref(), fence_now.as_ref()) {
         (None, None) => Ok(LeaseRelease::Released),
         (Some(_), None) => Ok(LeaseRelease::AlreadySuperseded),
@@ -1742,7 +1756,7 @@ pub fn release_completed_publisher_session(
         }
         _ => Err(Error::new(format!(
             "atomic final unlock failed or left inconsistent refs: {}; owner {}, fence {}",
-            out.stderr_utf8().trim(),
+            ref_write_description(written),
             owner_now.as_deref().unwrap_or("absent"),
             fence_now
                 .as_ref()
@@ -1770,19 +1784,25 @@ pub fn publish_checked(
 
 /// CAS-safe unlock-only crash convergence, valid exclusively after every publishing step is journaled.
 pub fn release_completed_release_lease(
-    git: &dyn GitRunner,
+    origin: &dyn Origin,
     expected_owner: &str,
 ) -> Result<LeaseRelease> {
     let expected_owner = expected_owner.to_ascii_lowercase();
-    match release_lease_owner(git)? {
+    match release_lease_owner(origin)? {
         None => return Ok(LeaseRelease::AlreadyAbsent),
         Some(owner) if owner != expected_owner => return Ok(LeaseRelease::AlreadySuperseded),
         Some(_) => {}
     }
-    let lease = format!("--force-with-lease={RELEASE_LEASE_REF}:{expected_owner}");
-    let delete = format!(":{RELEASE_LEASE_REF}");
-    let out = git.git(&["push", &lease, "origin", &delete])?;
-    let now = release_lease_owner(git)?;
+    let written = write_control_refs(
+        origin,
+        &expected_owner,
+        vec![ControlRefChange {
+            reference: RELEASE_LEASE_REF.into(),
+            before: Some(expected_owner.clone()),
+            after: None,
+        }],
+    )?;
+    let now = release_lease_owner(origin)?;
     if now.is_none() {
         return Ok(LeaseRelease::Released);
     }
@@ -1791,19 +1811,19 @@ pub fn release_completed_release_lease(
     }
     Err(Error::new(format!(
         "CAS release of {RELEASE_LEASE_REF} failed: {}; current owner is {}",
-        out.stderr_utf8().trim(),
+        ref_write_description(written),
         now.as_deref().unwrap_or("absent")
     )))
 }
 
 /// Replay unlock-only cleanup for a completed session when no fence guard is held.
 pub fn release_completed_session_without_guard(
-    git: &dyn GitRunner,
+    origin: &dyn Origin,
     expected_owner: &str,
 ) -> Result<LeaseRelease> {
     let expected_owner = expected_owner.to_ascii_lowercase();
-    let owner = release_lease_owner(git)?;
-    let observed_fence = publisher_fence(git)?;
+    let owner = release_lease_owner(origin)?;
+    let observed_fence = publisher_fence(origin)?;
     match (owner.as_deref(), observed_fence.as_ref()) {
         (Some(current_owner), Some(current_fence))
             if current_owner != expected_owner && current_fence.owner == current_owner =>
@@ -1826,7 +1846,7 @@ pub fn release_completed_session_without_guard(
             stale.token,
             stale.owner
         ))),
-        (_, None) => release_completed_release_lease(git, &expected_owner),
+        (_, None) => release_completed_release_lease(origin, &expected_owner),
     }
 }
 
@@ -4983,62 +5003,63 @@ struct RemoteAnnotatedTag {
     commit: String,
 }
 
-fn remote_annotated_tag(git: &dyn GitRunner, tag: &str) -> Result<Option<RemoteAnnotatedTag>> {
-    let tag_ref = format!("refs/tags/{tag}");
-    let peeled_ref = format!("{tag_ref}^{{}}");
-    let out = git_ok(
-        git,
-        &["ls-remote", "--tags", "origin", &tag_ref, &peeled_ref],
-    )?;
-    let text = out.stdout_utf8();
-    let mut lines = text.lines();
-    let rows = match (lines.next(), lines.next(), lines.next()) {
-        (None, _, _) => return Ok(None),
-        (Some(r0), Some(r1), None) => [r0, r1],
-        _ => {
-            return Err(Error::new(format!(
-                "recovery tag {tag} is not one exact annotated tag plus peel"
-            )));
-        }
+fn remote_annotated_ref(
+    origin: &dyn Origin,
+    reference: &str,
+    label: &str,
+) -> Result<Option<RemoteAnnotatedTag>> {
+    let Some(token) = origin.get(reference)? else {
+        return Ok(None);
     };
-    let mut token = None;
-    let mut commit = None;
-    for row in rows {
-        let mut fields = row.split_whitespace();
-        let (Some(oid), Some(reference), None) = (fields.next(), fields.next(), fields.next())
-        else {
-            return Err(Error::new(format!("malformed remote tag row for {tag}")));
-        };
-        if !valid_lease_owner(oid) {
-            return Err(Error::new(format!("malformed remote tag object for {tag}")));
-        }
-        if reference == tag_ref {
-            token = Some(oid.to_ascii_lowercase());
-        } else if reference == peeled_ref {
-            commit = Some(oid.to_ascii_lowercase());
-        } else {
-            return Err(Error::new(format!(
-                "remote tag query for {tag} returned unexpected ref {reference}"
-            )));
-        }
+    resolve_annotated_token(origin, token, label).map(Some)
+}
+
+fn resolve_annotated_token(
+    origin: &dyn Origin,
+    token: String,
+    label: &str,
+) -> Result<RemoteAnnotatedTag> {
+    if !valid_lease_owner(&token) {
+        return Err(Error::new(format!("{label} is not one raw object ID")));
     }
-    match (token, commit) {
-        (Some(token), Some(commit)) if token != commit => {
-            Ok(Some(RemoteAnnotatedTag { token, commit }))
-        }
-        _ => Err(Error::new(format!(
-            "recovery tag {tag} is lightweight or malformed; refusing ambiguous identity"
-        ))),
+    let token = token.to_ascii_lowercase();
+    // Resolve the advertised object, not another read of a mutable ref or peel.
+    // Native immutable-object reads disable replacement and lazy fetching.
+    origin.import(&token)?;
+    let commit = origin.peel(&token)?.ok_or_else(|| {
+        Error::new(format!(
+            "{label} is not an annotated tag peeled to a claim commit"
+        ))
+    })?;
+    if !valid_lease_owner(&commit) {
+        return Err(Error::new(format!(
+            "{label} has no raw peeled claim object ID"
+        )));
     }
+    let commit = commit.to_ascii_lowercase();
+    if token == commit {
+        return Err(Error::new(format!(
+            "{label} token equals its claim; refusing a lightweight/non-unique tag"
+        )));
+    }
+    Ok(RemoteAnnotatedTag { token, commit })
+}
+
+fn remote_annotated_tag(origin: &dyn Origin, tag: &str) -> Result<Option<RemoteAnnotatedTag>> {
+    remote_annotated_ref(
+        origin,
+        &format!("refs/tags/{tag}"),
+        &format!("recovery tag {tag}"),
+    )
 }
 
 /// Bind a published manifest's commit identity to the exact annotated git tag the release advertises.
 pub fn assert_remote_annotated_tag_commit(
-    git: &dyn GitRunner,
+    origin: &dyn Origin,
     tag: &str,
     expected_commit: &str,
 ) -> Result<()> {
-    let observed = remote_annotated_tag(git, tag)?.ok_or_else(|| {
+    let observed = remote_annotated_tag(origin, tag)?.ok_or_else(|| {
         Error::new(format!(
             "published release {tag} has no remote annotated tag identity"
         ))
@@ -5055,6 +5076,7 @@ pub fn assert_remote_annotated_tag_commit(
 /// Delete an exact annotated tag token while an injected safety proof remains true.
 pub fn delete_release_tag_with_guard(
     git: &dyn GitRunner,
+    origin: &dyn Origin,
     tag: &str,
     expected_commit: &str,
     mut before_each_delete: impl FnMut() -> Result<()>,
@@ -5072,7 +5094,7 @@ pub fn delete_release_tag_with_guard(
             )));
         }
     }
-    let remote = remote_annotated_tag(git, tag)?;
+    let remote = remote_annotated_tag(origin, tag)?;
     if let Some(remote) = &remote
         && remote.commit != expected_commit
     {
@@ -5092,14 +5114,12 @@ pub fn delete_release_tag_with_guard(
         return Ok(());
     };
     let tag_ref = format!("refs/tags/{tag}");
-    let lease = format!("--force-with-lease={tag_ref}:{}", remote.token);
-    let delete = format!(":{tag_ref}");
     before_each_delete()?;
-    let out = git.git(&["push", &lease, "origin", &delete])?;
-    if remote_annotated_tag(git, tag)?.is_some() {
+    let written = origin.delete(&tag_ref, &remote.token).map_err(Error::new)?;
+    if remote_annotated_tag(origin, tag)?.is_some() {
         return Err(Error::new(format!(
             "exact CAS delete of abandoned tag {tag} failed: {}",
-            out.stderr_utf8().trim()
+            ref_write_description(written)
         )));
     }
     Ok(())
@@ -5107,13 +5127,14 @@ pub fn delete_release_tag_with_guard(
 
 pub fn delete_owned_release_tag(
     git: &dyn GitRunner,
+    origin: &dyn Origin,
     tag: &str,
     expected_commit: &str,
     lease_guard: &ReleaseLeaseGuard,
     fence_guard: &PublisherFenceGuard,
 ) -> Result<()> {
-    delete_release_tag_with_guard(git, tag, expected_commit, || {
-        assert_publisher_session(git, lease_guard, fence_guard)
+    delete_release_tag_with_guard(git, origin, tag, expected_commit, || {
+        assert_publisher_session(origin, lease_guard, fence_guard)
     })
 }
 
@@ -5213,8 +5234,8 @@ pub fn withdraw_unpublished_release(
     lease: &ReleaseLeaseGuard,
     fence: &PublisherFenceGuard,
 ) -> Result<String> {
-    let git = GitCli::new(repo);
-    assert_publisher_session(&git, lease, fence)?;
+    let origin = native_origin(repo)?;
+    assert_publisher_session(&origin, lease, fence)?;
     let state = verify::release_state(slug, tag)?;
     if state == verify::ReleaseState::Published {
         return Err(Error::new(format!(
@@ -5282,7 +5303,7 @@ pub fn withdraw_unpublished_release(
             &release,
             false,
             || Ok(()),
-            || assert_publisher_session(&git, lease, fence),
+            || assert_publisher_session(&origin, lease, fence),
         )?;
         if !release_objects_by_tag(slug, tag)?.is_empty() {
             return Err(Error::new(format!(
@@ -5311,7 +5332,7 @@ pub fn withdraw_unpublished_release(
             .expect("withdrawable names come from this inventory");
         let observed = release_object_by_id(slug, release.id)?;
         validate_release_object_snapshot(observed.as_ref(), &release)?;
-        assert_publisher_session(&git, lease, fence)?;
+        assert_publisher_session(&origin, lease, fence)?;
         let endpoint = format!("repos/{slug}/releases/assets/{}", asset.id);
         let said = github_delete(&endpoint);
         if release_asset_identity_for_release_id_optional(slug, release.id, name)?
@@ -5331,8 +5352,13 @@ pub fn withdraw_unpublished_release(
     ))
 }
 
-fn recovery_claim_build(git: &dyn GitRunner, version: &str, owner: &str) -> Result<u64> {
-    git_ok(git, &["fetch", "--no-tags", "origin", RELEASE_LEASE_REF])?;
+fn recovery_claim_build(
+    git: &dyn GitRunner,
+    origin: &dyn Origin,
+    version: &str,
+    owner: &str,
+) -> Result<u64> {
+    origin.import(owner).map_err(Error::new)?;
     let object = git.git(&["cat-file", "-e", &format!("{owner}^{{commit}}")])?;
     if !object.success() {
         return Err(Error::new(format!(
@@ -5352,7 +5378,7 @@ fn recovery_claim_build(git: &dyn GitRunner, version: &str, owner: &str) -> Resu
     Ok(tail.build)
 }
 
-fn recovery_worktree_preflight(git: &dyn GitRunner) -> Result<()> {
+fn recovery_worktree_preflight(git: &dyn GitRunner, origin: &dyn Origin) -> Result<()> {
     gates::clean_tree(git)?;
     let branch = git_ok(git, &["symbolic-ref", "--short", "HEAD"])?
         .stdout_utf8()
@@ -5363,9 +5389,8 @@ fn recovery_worktree_preflight(git: &dyn GitRunner) -> Result<()> {
             "lost-machine recovery must run on main, not {branch:?}"
         )));
     }
-    git_ok(git, &["fetch", "origin", "main"])?;
+    let remote = origin.refresh_main().map_err(Error::new)?;
     let head = rev_parse(git, "HEAD")?;
-    let remote = rev_parse(git, "origin/main")?;
     if head != remote {
         return Err(Error::new(format!(
             "lost-machine recovery requires HEAD == origin/main ({head} != {remote}); pull first"
@@ -5387,13 +5412,16 @@ pub fn recovery_resume_worktree_preflight(
 pub fn ordinary_resume_claim_preflight(
     repo: &Path,
     git: &dyn GitRunner,
+    origin: &dyn Origin,
     journal: &Journal,
 ) -> Result<()> {
     recovery_resume_worktree_preflight(repo, git, journal)?;
     gates::current_own_cutter_gate(git)?;
 
-    git_ok(git, &["fetch", "origin", "main"])
+    let remote_main = origin
+        .refresh_main()
         .map_err(|error| Error::new(format!("cannot refresh origin/main for resume: {error}")))?;
+    origin.import(&journal.commit).map_err(Error::new)?;
     let object = git.git(&["cat-file", "-e", &format!("{}^{{commit}}", journal.commit)])?;
     if !object.success() {
         return Err(Error::new(format!(
@@ -5417,12 +5445,7 @@ pub fn ordinary_resume_claim_preflight(
             journal.version, journal.build_number, tail.version, tail.build
         )));
     }
-    let ancestor = git.git(&[
-        "merge-base",
-        "--is-ancestor",
-        &journal.commit,
-        "origin/main",
-    ])?;
+    let ancestor = git.git(&["merge-base", "--is-ancestor", &journal.commit, &remote_main])?;
     if !ancestor.success() {
         return Err(Error::new(format!(
             "journal claim {} is not an ancestor of origin/main; refusing a stale or foreign resume",
@@ -5470,10 +5493,10 @@ pub(crate) fn validate_claim_provenance(
 
 fn combine_with_fence_release(
     result: Result<()>,
-    git: &dyn GitRunner,
+    origin: &dyn Origin,
     fence: &PublisherFenceGuard,
 ) -> Result<()> {
-    let release = release_publisher_fence(git, fence).map(|_| ());
+    let release = release_publisher_fence(origin, fence).map(|_| ());
     match (result, release) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
@@ -5511,6 +5534,7 @@ pub fn run_recover_lost(
         .ok_or_else(|| Error::new("Cargo.toml repository is not an exact GitHub OWNER/REPO URL"))?;
     let slug = channel_slug(&cargo_text)?;
     let git = GitCli::new(repo);
+    let origin = native_origin(repo)?;
     assert_origin_repo_binding(&git, &origin_slug)?;
     let journal_path = repo.join("dist/cut-state.toml");
     let header = JournalHeader::read(&journal_path)?;
@@ -5522,12 +5546,12 @@ pub fn run_recover_lost(
             header.version, header.commit
         )));
     }
-    if release_lease_owner(&git)?.as_deref() != Some(owner.as_str()) {
+    if release_lease_owner(&origin)?.as_deref() != Some(owner.as_str()) {
         return Err(Error::new(format!(
             "persistent release lease is not owned by supplied claim {owner}; refusing recovery"
         )));
     }
-    let build = recovery_claim_build(&git, version, &owner)?;
+    let build = recovery_claim_build(&git, &origin, version, &owner)?;
     if let Some(header) = &header
         && header.build_number != build
     {
@@ -5537,7 +5561,7 @@ pub fn run_recover_lost(
         )));
     }
     let (tree, journal) = if header.is_some() {
-        git_ok(&git, &["fetch", "origin", "main"])?;
+        origin.refresh_main().map_err(Error::new)?;
         let tree = gates::place_cut_tree(&git, repo, &owner)?.path;
         gates::own_cutter_gate(&GitCli::new(&tree), &owner, false)?;
         let journal = Journal::load(&journal_path)?.ok_or_else(|| {
@@ -5550,10 +5574,11 @@ pub fn run_recover_lost(
         (tree, Some(journal))
     } else {
         gates::current_own_cutter_gate(&git)?;
-        recovery_worktree_preflight(&git)?;
+        recovery_worktree_preflight(&git, &origin)?;
         (repo.to_path_buf(), None)
     };
-    let ancestor = git.git(&["merge-base", "--is-ancestor", &owner, "origin/main"])?;
+    let remote_main = origin.refresh_main().map_err(Error::new)?;
+    let ancestor = git.git(&["merge-base", "--is-ancestor", &owner, &remote_main])?;
     if !ancestor.success() {
         return Err(Error::new(format!(
             "recovery claim {owner} is not an ancestor of origin/main; refusing an unbound lease"
@@ -5582,9 +5607,9 @@ pub fn run_recover_lost(
     }
 
     step("recover", RECOVERY_STOPPED_PROCESS_BANNER);
-    let fence = rotate_publisher_fence_for_recovery(&git, &owner)?;
+    let fence = rotate_publisher_fence_for_recovery(&git, &origin, &owner)?;
     let result = if let Some(journal) = journal {
-        confirm_release_lease_owner(&git, &owner).and_then(|lease| {
+        confirm_release_lease_owner(&origin, &owner).and_then(|lease| {
             resume_cut(
                 ResumePaths {
                     repo,
@@ -5613,7 +5638,7 @@ pub fn run_recover_lost(
             credentials,
         )
     };
-    combine_with_fence_release(result, &git, &fence)
+    combine_with_fence_release(result, &origin, &fence)
 }
 
 struct LostRecoveryPlan<'a> {
@@ -5637,8 +5662,9 @@ fn recover_under_fence(
         operator_asserts_no_post,
     } = plan;
     let git = GitCli::new(repo);
-    let lease = confirm_release_lease_owner(&git, owner)?;
-    assert_publisher_session(&git, &lease, fence)?;
+    let origin = native_origin(repo)?;
+    let lease = confirm_release_lease_owner(&origin, owner)?;
+    assert_publisher_session(&origin, &lease, fence)?;
     let tag = format!("v{version}");
     if verify::release_state(slug, &tag)? == verify::ReleaseState::Published {
         let fresh_policy = fresh_published_recovery_signature_policy(slug, version, credentials)?;
@@ -5669,7 +5695,7 @@ fn recover_under_fence(
         fence,
     )?;
     step("recover", &withdrawn);
-    withdraw_tag_then_unlock(&git, &tag, owner, &lease, fence)?;
+    withdraw_tag_then_unlock(&git, &origin, &tag, owner, &lease, fence)?;
     step("recover", "unpublished cut withdrawn · release lock freed");
     Ok(())
 }
@@ -5829,10 +5855,10 @@ fn recover_published_cut(
     fence: PublisherFenceGuard,
     credentials: Option<&sign::ReleaseCredentials>,
 ) -> Result<()> {
-    let git = GitCli::new(repo);
-    assert_publisher_session(&git, &lease, &fence)?;
+    let origin = native_origin(repo)?;
+    assert_publisher_session(&origin, &lease, &fence)?;
     let tag = format!("v{version}");
-    let remote_tag = remote_annotated_tag(&git, &tag)?.ok_or_else(|| {
+    let remote_tag = remote_annotated_tag(&origin, &tag)?.ok_or_else(|| {
         Error::new(format!(
             "published recovery release {tag} has no remote annotated tag"
         ))
@@ -6321,7 +6347,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let existing = JournalHeader::read(&journal_path)?;
     if opts.resume {
         let Some(header) = existing else {
-            let lock = match release_lease_owner(&operator) {
+            let lock = match native_origin(repo).and_then(|origin| release_lease_owner(&origin)) {
                 Ok(Some(owner)) => format!(
                     "the release lock is held by claim {owner}; once that cut is stopped: `{}`",
                     fence_recover_command(None, &owner)
@@ -6367,7 +6393,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     }
     let published = if kind == CutKind::Real {
         let source = gates::published_source(repo)?;
-        let checkout = gates::place_published(&operator, repo, &source)?;
+        let origin = native_origin(repo)?;
+        let checkout = gates::place_published(&operator, &origin, repo, &source)?;
         step(
             "source",
             &format!(
@@ -6466,7 +6493,20 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         allow_stale_cutter: matches!(kind, CutKind::DryRun),
         published: published.clone(),
     };
-    let gr = gates::run_all(&git, &tree, repo, &gate_opts)?;
+    let gate_origin = if gate_opts.offline {
+        None
+    } else {
+        Some(native_origin(&tree)?)
+    };
+    let gr = gates::run_all(
+        &git,
+        gate_origin
+            .as_ref()
+            .map(|origin| origin as &dyn ledger::Origin),
+        &tree,
+        repo,
+        &gate_opts,
+    )?;
     let tag = if gate_opts.offline {
         "no tag claimed (dry-run)".to_string()
     } else {
@@ -6529,9 +6569,10 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             crate::release::COMMIT_GATES,
         ),
     );
-    let fixtures = gates::handoff_fixture_gate_at(&git, &source, &version)?;
+    let origin = native_origin(&tree)?;
+    let fixtures = gates::handoff_fixture_gate_at(&git, &origin, &source, &version)?;
     step("gate", &gates::handoff_fixtures_line(fixtures.as_ref()));
-    let policy = gates::handoff_policy_gate_at(&git, &source, &version)?;
+    let policy = gates::handoff_policy_gate_at(&git, &origin, &source, &version)?;
     step(
         "gate",
         &format!("handoff policy sealed into the bundle: {policy}"),
@@ -6549,7 +6590,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         )));
     }
     if kind == CutKind::Real {
-        preflight_release_lease(&git)?;
+        preflight_release_lease(&native_origin(repo)?)?;
         step("lock", "release lock is free");
     }
     if kind == CutKind::Real {
@@ -6675,7 +6716,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             let rolls = |source: &str, main: &str| {
                 changelog::claim_changelogs(source, main, &version, &date)
             };
-            let claim = ledger::claim(&git, &tree, &plan, &verified.reserved, &rolls)
+            let origin = native_origin(&tree)?;
+            let claim = ledger::claim(&git, &origin, &tree, &plan, &verified.reserved, &rolls)
                 .map_err(|error| discard_on_lost_race(&git, &dist, &version, reserved, error))?;
             step(
                 "",
@@ -6878,9 +6920,10 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
             verified.reserved.commit
         )));
     }
-    let fixtures = gates::handoff_fixture_gate_at(&git, &source, &version)?;
+    let origin = native_origin(&tree)?;
+    let fixtures = gates::handoff_fixture_gate_at(&git, &origin, &source, &version)?;
     step("gate", &gates::handoff_fixtures_line(fixtures.as_ref()));
-    let policy = gates::handoff_policy_gate_at(&git, &source, &version)?;
+    let policy = gates::handoff_policy_gate_at(&git, &origin, &source, &version)?;
     step(
         "gate",
         &format!("handoff policy sealed into the bundle: {policy}"),
@@ -6991,16 +7034,17 @@ fn resume_cut(
         )));
     };
     let git = GitCli::new(tree);
+    let origin = native_origin(tree)?;
     set_publisher_fence_version(&journal.version);
     println!(
         "aterm-release · cut v{} (build {}) — RESUME at step \"{next}\"",
         journal.version, journal.build_number
     );
 
-    ordinary_resume_claim_preflight(tree, &git, &journal)?;
+    ordinary_resume_claim_preflight(tree, &git, &origin, &journal)?;
 
     if recovered_session.is_none() && next != "unlock" {
-        match reclaim_dead_publisher_fence(&git, &journal.commit, &LocalProbe) {
+        match reclaim_dead_publisher_fence(&origin, &journal.commit, &LocalProbe) {
             Ok(FenceReclaim::NoFence) => {}
             Ok(FenceReclaim::Reclaimed { token, detail }) => {
                 println!("  fence: reclaimed {PUBLISHER_FENCE_REF} (token {token}) — {detail}")
@@ -7120,18 +7164,21 @@ fn run_pipeline(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
         )
     {
         if ctx.lease.is_none() {
-            let git = GitCli::new(&ctx.repo);
-            ctx.lease = Some(acquire_release_lease(&git, &ctx.commit)?);
+            let origin = native_origin(&ctx.repo)?;
+            ctx.lease = Some(acquire_release_lease(&origin, &ctx.commit)?);
         }
         if ctx.fence.is_none() {
             let git = GitCli::new(&ctx.repo);
-            ctx.fence = Some(acquire_publisher_fence(&git, &ctx.commit)?);
+            let origin = native_origin(&ctx.repo)?;
+            ctx.fence = Some(acquire_publisher_fence(&git, &origin, &ctx.commit)?);
         }
         revalidate_ctx_signature_policy(ctx)?;
     }
     let result = run_pipeline_inner(ctx, t0);
     let fence_release = if let Some(fence) = ctx.fence.take() {
-        release_publisher_fence(&GitCli::new(&ctx.repo), &fence).map(|_| ())
+        native_origin(&ctx.repo)
+            .and_then(|origin| release_publisher_fence(&origin, &fence))
+            .map(|_| ())
     } else {
         Ok(())
     };
@@ -7232,7 +7279,7 @@ fn ensure_ctx_release_lease(ctx: &CutCtx) -> Result<()> {
     if ctx.kind != CutKind::Real {
         return Ok(());
     }
-    let git = GitCli::new(&ctx.repo);
+    let origin = native_origin(&ctx.repo)?;
     let lease = ctx
         .lease
         .as_ref()
@@ -7241,7 +7288,7 @@ fn ensure_ctx_release_lease(ctx: &CutCtx) -> Result<()> {
         .fence
         .as_ref()
         .ok_or_else(|| Error::new("real release step has no unique publisher fence"))?;
-    assert_publisher_session(&git, lease, fence)
+    assert_publisher_session(&origin, lease, fence)
 }
 
 fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
@@ -7322,11 +7369,11 @@ fn step_lock(ctx: &mut CutCtx) -> Result<()> {
 }
 
 fn step_unlock(ctx: &mut CutCtx) -> Result<()> {
-    let git = GitCli::new(&ctx.repo);
+    let origin = native_origin(&ctx.repo)?;
     let outcome = if let Some(fence) = ctx.fence.as_ref() {
-        release_completed_publisher_session(&git, &ctx.commit, fence)?
+        release_completed_publisher_session(&origin, &ctx.commit, fence)?
     } else {
-        release_completed_session_without_guard(&git, &ctx.commit).map_err(|error| {
+        release_completed_session_without_guard(&origin, &ctx.commit).map_err(|error| {
             Error::new(format!(
                 "{error}; after proving the old publisher stopped, use \
                  `{SHIP_COMMAND} recover v{} {} --old-publisher-stopped` for a surviving \
@@ -8673,9 +8720,9 @@ fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
         let fence = ctx.fence.as_ref().ok_or_else(|| {
             Error::new("PublishChecked requires a unique publisher fence".to_string())
         })?;
-        let git = GitCli::new(&ctx.repo);
-        assert_publisher_session(&git, guard, fence)?;
-        let observed_owner = release_lease_owner(&git)?;
+        let origin = native_origin(&ctx.repo)?;
+        assert_publisher_session(&origin, guard, fence)?;
+        let observed_owner = release_lease_owner(&origin)?;
         publish_checked(
             guard,
             observed_owner.as_deref(),
@@ -8736,19 +8783,28 @@ fn step_tag(ctx: &mut CutCtx) -> Result<()> {
         )));
     }
     ensure_ctx_release_lease(ctx)?;
-    git_ok(
-        &git,
-        &["push", "origin", &format!("{local_token}:{tag_ref}")],
-    )?;
-    let remote = remote_annotated_tag(&git, &ctx.tag)?.ok_or_else(|| {
+    let origin = native_origin(&ctx.repo)?;
+    if let Some(existing) = remote_annotated_tag(&origin, &ctx.tag)? {
+        if existing.token != local_token || existing.commit != ctx.commit {
+            return Err(Error::new(format!(
+                "remote annotated tag {} is already a different immutable object; refusing overwrite",
+                ctx.tag
+            )));
+        }
+    } else {
+        origin
+            .write(&tag_ref, None, &local_token)
+            .map_err(Error::new)?;
+    }
+    let remote = remote_annotated_tag(&origin, &ctx.tag)?.ok_or_else(|| {
         Error::new(format!(
             "remote {} is absent or not annotated after push",
             ctx.tag
         ))
     })?;
-    if remote.commit != ctx.commit {
+    if remote.token != local_token || remote.commit != ctx.commit {
         return Err(Error::new(format!(
-            "remote annotated tag {} peels to {}, not claim {}",
+            "remote annotated tag {} is not the exact local tag or peels to {}, not claim {}",
             ctx.tag, remote.commit, ctx.commit
         )));
     }

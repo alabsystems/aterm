@@ -41,6 +41,7 @@ struct World {
     fleet_refusal: Option<String>,
     fleet_selected: Option<Line>,
     existing_fleet_line: Option<Line>,
+    supersession: Option<crate::line::Supersession>,
     fleet_audit_refusal: bool,
     fleet_audits: usize,
     dir: aterm_tempfile::TempDir,
@@ -91,6 +92,9 @@ struct World {
     /// cut then fails before it journals anything.
     claim_lands_unjournaled: bool,
     machine_refusals: Vec<Refusal>,
+    /// The numbered origin refresh that refuses, and its structured refusal.
+    fetch_refusal: Option<(usize, Refusal)>,
+    fetches: usize,
     validation_tools: Result<String, Refusal>,
     /// The preflight's own blocks: R's commit-only gates and the engine's readiness.
     blocks: Vec<Refusal>,
@@ -200,9 +204,9 @@ struct World {
     /// The export's staging push begins (its stop then never fires), and it finishes once a
     /// red was said; the tree's run waits for that push.
     export_pushes: bool,
-    /// The tree claims no memory until it ends: the build starts only once the tree's end is
-    /// told.
-    tree_claims_late: bool,
+    /// The build fails before its slices claim memory; later branches wait for its end.
+    build_claims_late: bool,
+    build_admission_waits: usize,
     /// The build and the export do their work once the tree's end is told, and not when their
     /// stop fired by then.
     after_tree: bool,
@@ -246,6 +250,7 @@ impl World {
             fleet_refusal: None,
             fleet_selected: None,
             existing_fleet_line: None,
+            supersession: None,
             fleet_audit_refusal: false,
             fleet_audits: 0,
             dir: aterm_tempfile::tempdir().unwrap(),
@@ -283,6 +288,8 @@ impl World {
             source_dies_after_push: false,
             claim_lands_unjournaled: false,
             machine_refusals: Vec::new(),
+            fetch_refusal: None,
+            fetches: 0,
             validation_tools: Ok("pinned tools ready".into()),
             blocks: Vec::new(),
             audits: VecDeque::new(),
@@ -342,7 +349,8 @@ impl World {
             holds: BTreeSet::new(),
             verify_half: None,
             export_pushes: false,
-            tree_claims_late: false,
+            build_claims_late: false,
+            build_admission_waits: 0,
             after_tree: false,
             keep_build_on_test_red: false,
             sign_code: 0,
@@ -485,15 +493,9 @@ fn ran(code: i32) -> Ran {
     }
 }
 
-/// The graph's branches over the world. Each fake branch does its work under the world's lock;
-/// the tree's work enters first (its `verify release` call, then its claim: the build waits for
-/// it, as the real build waits for the tree's first memory claim), and a branch the world
-/// [`World::holds`] then runs on, unlocked, until its stop fires. A branch's work runs past the
-/// starts the graph makes after it, as a real branch's child, minutes long, does: the tree's
-/// runs once the build's and the export's starts are told (unless it
-/// [`World::tree_claims_late`]), the build's once the export's start is. So no branch's end,
-/// red or signal races a start the graph makes after it, whichever thread the machine runs
-/// first.
+/// The graph's branches over the world. The build marks its slice admission before the
+/// tree starts. Work then runs past the other branch starts, except an early build failure.
+/// A branch in [`World::holds`] runs unlocked until its stop fires.
 struct WorldBranches<'a> {
     w: std::sync::Mutex<&'a mut World>,
     /// The branches whose work entered, the plan's branches and each start told, and the reds
@@ -634,11 +636,12 @@ impl Branches for WorldBranches<'_> {
             .join("logs")
             .join(format!("04-{}.log", branch.row()))
     }
-    fn tree_admitted(&self, ended: &dyn Fn() -> bool) {
-        let late = self.world().tree_claims_late;
+    fn build_admitted(&self, ended: &dyn Fn() -> bool) {
+        self.world().build_admission_waits += 1;
+        let late = self.world().build_claims_late;
         self.wait(
-            "the tree's claim",
-            |seen| !late && seen.contains(&"tree"),
+            "the slices' claims",
+            |seen| !late && seen.contains(&"slices"),
             ended,
         );
     }
@@ -691,7 +694,17 @@ impl Branches for WorldBranches<'_> {
         work: BuildWork,
         stop: &BranchStop,
     ) -> Built {
-        self.after_starts(&[Branch::Export]);
+        if self.world().build_claims_late {
+            let mut world = self.world();
+            world.calls.push("build".into());
+            world.interrupt_at("build");
+            return Built {
+                artifact: Some(Err(Refusal::new("early build failure", "fix the build"))),
+                fixtures: None,
+            };
+        }
+        self.mark("slices");
+        self.after_starts(&[Branch::Tree, Branch::Export]);
         if self.stopped_after_tree(stop) {
             return Built {
                 artifact: Some(Err(
@@ -724,9 +737,7 @@ impl Branches for WorldBranches<'_> {
         self.world().verify_called(run);
         if tree {
             self.mark("tree");
-            if !self.world().tree_claims_late {
-                self.after_starts(&[Branch::Build, Branch::Export]);
-            }
+            self.after_starts(&[Branch::Build, Branch::Export]);
             if self.world().export_pushes {
                 self.wait("the export's push", |seen| seen.contains(&"push"), &|| {
                     false
@@ -1038,11 +1049,35 @@ impl World {
 }
 
 impl Backend for World {
-    fn fleet_existing(&mut self, version: &str) -> Result<Option<Line>, String> {
-        Ok(self
+    fn fleet_supersession(
+        &mut self,
+        _version: &str,
+    ) -> Result<Option<crate::line::Supersession>, Refusal> {
+        Ok(self.supersession.clone())
+    }
+    fn supersede_line(&mut self, line: &Line) -> Result<String, String> {
+        if let Some(why) = &self.fleet_refusal {
+            return Err(why.clone());
+        }
+        let previous = self.existing_fleet_line.clone().ok_or("no fleet line")?;
+        self.supersession = Some(crate::line::Supersession {
+            previous,
+            replacement: line.clone(),
+            reason: "explicit request".into(),
+        });
+        self.existing_fleet_line = Some(line.clone());
+        self.fleet_selected = Some(line.clone());
+        Ok("SUPERSEDED".into())
+    }
+    fn fleet_existing(&mut self, version: &str) -> Result<Option<Line>, Refusal> {
+        let line = self
             .existing_fleet_line
             .clone()
-            .filter(|line| line.version == version))
+            .filter(|line| line.version == version);
+        if line.is_some() {
+            self.fetch()?;
+        }
+        Ok(line)
     }
     fn fleet_line(
         &mut self,
@@ -1142,6 +1177,12 @@ impl Backend for World {
     }
     fn fetch(&mut self) -> Result<String, Refusal> {
         self.observations.push("fetch");
+        self.fetches += 1;
+        if let Some((at, refusal)) = &self.fetch_refusal
+            && *at == self.fetches
+        {
+            return Err(refusal.clone());
+        }
         Ok(self.tip())
     }
     fn head(&mut self) -> String {
@@ -1654,6 +1695,86 @@ fn fleet_line_excludes_a_second_cut_and_rechecks_before_publication() {
 }
 
 #[test]
+fn supersession_is_explicit_and_refuses_public_or_live_lines() {
+    let setup = || {
+        let mut world = World::new();
+        world.versions.insert(TIP.into(), "0.6.0".into());
+        world.versions.insert(NEXT.into(), "0.6.0".into());
+        world.history.insert(1, NEXT.into());
+        world.existing_fleet_line = Some(Line::start("0.6.0", NEXT, 100));
+        world
+    };
+    let options = || ReleaseOptions {
+        commit: Some(TIP.into()),
+        supersede: true,
+        ..mac()
+    };
+    let mut old = setup();
+    let (code, last) = old.run(ReleaseOptions {
+        commit: Some(TIP.into()),
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}");
+    assert_eq!(old.journal().unwrap().commit, NEXT);
+    let mut replacement = setup();
+    let (code, last) = replacement.run(options());
+    assert_eq!(code, 0, "{last}\n{:?}", replacement.out);
+    assert_eq!(replacement.journal().unwrap().commit, TIP);
+    assert!(replacement.supersession.is_some());
+
+    let mut live = setup();
+    live.fleet_refusal = Some("CUTTING ELSEWHERE: live progressing peer".into());
+    let (code, _) = live.run(options());
+    assert_eq!(code, 4);
+    assert!(live.supersession.is_none());
+    assert_eq!(live.count("stage"), 0);
+
+    let mut public = setup();
+    public
+        .published
+        .insert(NEXT.into(), "public-revision".into());
+    public.newest = Some(NEXT.into());
+    let (code, _) = public.run(options());
+    assert_ne!(code, 0);
+    assert!(public.supersession.is_none());
+    assert_eq!(public.count("stage"), 0);
+}
+
+#[test]
+fn superseded_journal_refuses_but_plain_resume_adopts_replacement() {
+    let mut world = World::new();
+    let old = Line::start("0.6.0", NEXT, 100);
+    let new = Line::start("0.6.0", TIP, 200);
+    world.existing_fleet_line = Some(new.clone());
+    world.supersession = Some(crate::line::Supersession {
+        previous: old.clone(),
+        replacement: new.clone(),
+        reason: "broken cutter".into(),
+    });
+    let candidate = || Candidate {
+        commit: NEXT.into(),
+        version: "0.6.0".into(),
+        why: String::new(),
+        bump_from: None,
+        carry: Vec::new(),
+    };
+    let mut c = candidate();
+    let mut journal = Some(Journal {
+        commit: NEXT.into(),
+        version: "0.6.0".into(),
+        line: Some(old),
+        ..Journal::default()
+    });
+    assert!(crate::line_claim::follow(&mut world, &mut c, &mut journal).is_err());
+    assert_eq!(c.commit, NEXT);
+    // Negative control: a clone without the retired journal resumes the new line.
+    let mut journal = None;
+    crate::line_claim::follow(&mut world, &mut c, &mut journal).unwrap();
+    assert_eq!(c.commit, TIP);
+    assert_eq!(journal.unwrap().line(), new);
+}
+
+#[test]
 fn fleet_line_adoption_keeps_the_candidates_head_and_drops_other_trees_records() {
     let mut world = World::new();
     let line = Line::start("0.6.0", NEXT, 123);
@@ -1802,12 +1923,28 @@ fn operational_observation_precedes_prover_network_and_provisioning() {
 }
 
 /// Every step runs in order. Step 4's branches run at once, so their calls interleave: the
-/// tree's comes first (the build waits for it), and the build's bundle before its fixtures.
+/// tree's work follows slice admission, and the build's bundle precedes its fixtures.
 #[test]
 fn a_bump_runs_every_step_in_order_and_ends_released() {
     let mut w = World::new();
     let (code, last) = w.run(bump());
     assert_eq!(code, 0, "{:#?}", w.out);
+    let starts: Vec<_> = w
+        .out
+        .iter()
+        .filter_map(|line| line.strip_prefix("release-event: "))
+        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+        .filter(|event| {
+            event["event"].as_str() == Some("qualify-branch")
+                && event["phase"].as_str() == Some("started")
+        })
+        .filter_map(|event| event["branch"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        starts,
+        ["build", "tree", "export"],
+        "slices claim before tree admission"
+    );
     assert!(
         last.starts_with("RELEASED aterm 0.6.0 (build 1791600000)"),
         "{last}"
@@ -1823,8 +1960,8 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
         .collect();
     let graph = order
         .iter()
-        .position(|c| *c == "verify --tree")
-        .expect("the tree ran");
+        .position(|c| matches!(*c, "verify --tree" | "build" | "stage"))
+        .expect("the graph ran");
     let at = |order: &[&str], call: &str| order.iter().position(|c| *c == call);
     assert!(
         at(&order, "build") < at(&order, "stage-fixtures"),
@@ -2396,6 +2533,71 @@ fn a_dry_run_changes_nothing_and_asks_nobody() {
         "{:?}",
         w.calls
     );
+}
+
+/// A refusal before step 1 starts a child still creates the log its verdict names, with the
+/// native detail that explains why it could not run. NEGATIVE CONTROL: without the refusal-log
+/// append in `Run::final_refusal`, `01-checks.log` does not exist and this read fails.
+#[test]
+fn a_step_one_refusal_keeps_its_detail_in_the_named_log() {
+    const DETAIL: &str = "native route made no byte or CPU progress while waiting for git fetch";
+    let mut w = World::new();
+    w.fetch_refusal = Some((
+        1,
+        Refusal::new(
+            "cannot refresh origin through agh",
+            "check the reported native routing or source-state refusal, then re-run",
+        )
+        .detail([DETAIL.to_string()])
+        .could_not_run(),
+    ));
+    let log = Backend::log_path(&mut w, Step::Checks);
+    let (code, last) = w.run(bump());
+
+    assert_eq!(code, 3, "{last}");
+    assert!(
+        last.starts_with(
+            "REFUSED at 1/10 checks: COULD NOT RUN — cannot refresh origin through agh"
+        ),
+        "{last}"
+    );
+    assert_eq!(w.fetches, 1);
+    let kept = std::fs::read_to_string(&log).expect("the named step log");
+    assert!(kept.contains(DETAIL), "{kept:?}");
+}
+
+/// The cutter refreshes origin again after finding an existing fleet line. That path preserves
+/// the fetch refusal as structured evidence instead of replacing its detail and remedy with a
+/// generic fleet-read error. NEGATIVE CONTROL: converting the refusal to `r.why` makes the log
+/// lose `DETAIL` and this test fail.
+#[test]
+fn an_existing_fleet_lines_second_fetch_keeps_its_refusal_detail() {
+    const DETAIL: &str =
+        "git fetch-batch fixture/app made no progress while waiting on its native fetch step";
+    const REMEDY: &str = "check the reported native routing or source-state refusal, then re-run";
+    let mut w = World::new();
+    w.existing_fleet_line = Some(Line::start("0.6.0", TIP, 999_000));
+    w.fetch_refusal = Some((
+        2,
+        Refusal::new("cannot refresh origin through agh", REMEDY)
+            .detail([DETAIL.to_string()])
+            .could_not_run(),
+    ));
+    let log = Backend::log_path(&mut w, Step::Checks);
+
+    let (code, last) = w.run(bump());
+
+    assert_eq!(code, 3, "{last}");
+    assert!(
+        last.starts_with(
+            "REFUSED at 1/10 checks: COULD NOT RUN — cannot refresh origin through agh"
+        ),
+        "{last}"
+    );
+    assert!(last.contains(REMEDY), "{last}");
+    assert_eq!(w.fetches, 2, "the existing line caused a second refresh");
+    let kept = std::fs::read_to_string(&log).expect("the named step log");
+    assert!(kept.contains(DETAIL), "{kept:?}");
 }
 
 #[test]
@@ -4600,7 +4802,7 @@ fn phases(w: &World, branch: &str) -> Vec<String> {
 /// INTERRUPTED, and the run resumes. NEGATIVE CONTROLS: judging the build's end without the
 /// signal makes it a red that stops the export, firing the stops on the build's signalled end
 /// stops the export (its work ends after that end is told), and starting a branch without asking
-/// starts the build after the tree's signal.
+/// starts the tree after the build's signal.
 #[test]
 fn a_persons_signal_is_no_red_and_adds_no_stop() {
     let interrupted = |w: &mut World| {
@@ -4629,35 +4831,33 @@ fn a_persons_signal_is_no_red_and_adds_no_stop() {
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert_eq!(w.count("build"), 1, "{:?}", w.calls);
 
-    // The build starts only once the tree's end is told; the tree's signal comes first.
+    // A signal before the slices' claims leaves later branches unstarted.
     let mut w = World::new();
-    w.tree_claims_late = true;
-    w.signal_at = Some("verify --tree");
+    w.build_claims_late = true;
+    w.signal_at = Some("build");
     interrupted(&mut w);
-    assert_eq!(phases(&w, "tree"), ["started", "stopped"], "{:#?}", w.out);
-    assert_eq!(phases(&w, "build"), ["stopped"], "{:#?}", w.out);
+    assert_eq!(phases(&w, "tree"), ["stopped"], "{:#?}", w.out);
+    assert_eq!(phases(&w, "build"), ["started", "stopped"], "{:#?}", w.out);
     assert_eq!(phases(&w, "export"), ["stopped"], "{:#?}", w.out);
-    assert_eq!(w.count("build"), 0, "{:?}", w.calls);
+    assert_eq!(w.count("build"), 1, "{:?}", w.calls);
 }
 
-/// A RED STOPS EVERY OTHER BRANCH, AND ONE NOT STARTED NEVER STARTS (Q3): the tree FAILs before
-/// it claimed any memory, so the build has not started; its red stops the build and the export
+/// A RED STOPS EVERY OTHER BRANCH, AND ONE NOT STARTED NEVER STARTS (Q3): the build fails before
+/// its slices claimed memory; its red stops the tree and the export
 /// before either starts, and step 4 refuses R with the FAIL. Negative control: a branch that
-/// starts though its stop fired runs the build here.
+/// starts though its stop fired runs the tree here.
 #[test]
 fn a_red_stops_the_other_branches_and_one_not_started_never_starts() {
     let mut w = World::new();
-    w.verify_outcomes.insert("test", "FAIL");
-    w.verify_code = 1;
-    w.tree_claims_late = true;
+    w.build_claims_late = true;
     let (code, last) = w.run(bump());
     assert_eq!(code, 1, "{last}\n{:#?}", w.out);
     assert!(
-        last.starts_with("REFUSED at 4/10 qualify") && last.contains("FAILED test"),
+        last.starts_with("REFUSED at 4/10 qualify") && last.contains("early build failure"),
         "{last}"
     );
     for never in [
-        "build",
+        "verify --tree",
         "stage-fixtures",
         "stage",
         "verify --bundle",
@@ -4668,12 +4868,12 @@ fn a_red_stops_the_other_branches_and_one_not_started_never_starts() {
     assert!(
         w.out
             .iter()
-            .any(|l| l.contains("tree: RED at") && l.contains("stopping build, export")),
+            .any(|l| l.contains("build: RED at") && l.contains("stopping tree, export")),
         "{:#?}",
         w.out
     );
-    assert_eq!(phases(&w, "tree"), ["started", "red"]);
-    for branch in ["build", "export"] {
+    assert_eq!(phases(&w, "build"), ["started", "red"]);
+    for branch in ["tree", "export"] {
         assert_eq!(phases(&w, branch), ["stopped"], "{branch}");
     }
 }
@@ -5144,6 +5344,20 @@ fn the_execed_cutter_drops_fix_and_resumes_the_journaled_head() {
         .map(Into::into)
         .collect();
     assert_eq!(again, want);
+    let again = mac().exec_args(
+        ["release", "--commit", TIP, "--supersede", "--mac-only"]
+            .iter()
+            .map(Into::into)
+            .collect(),
+    );
+    let want: Vec<std::ffi::OsString> = ["release", "--commit", TIP, "--mac-only"]
+        .iter()
+        .map(Into::into)
+        .collect();
+    assert_eq!(
+        again, want,
+        "the replacement was already recorded before exec"
+    );
 }
 
 /// `--fix` takes one or more commits, may be repeated, and combines with no flag that starts a
@@ -5719,6 +5933,7 @@ fn a_spent_reservation_is_built_again_never_renumbered() {
         let spent = w.journal().unwrap().reserved.unwrap();
 
         w.after_verify = None;
+        w.build_admission_waits = 0;
         let (code, last) = w.run(mac());
         assert_eq!(code, 0, "{case}: {last}\n{:#?}", w.out);
         let fresh = w.journal().unwrap().reserved.unwrap();
@@ -5733,6 +5948,10 @@ fn a_spent_reservation_is_built_again_never_renumbered() {
             w.verify_runs.last().unwrap().checks,
             ["measure"],
             "{case}: the tree's records stand; only the new bundle is judged again"
+        );
+        assert!(
+            w.build_admission_waits > 0,
+            "{case}: a resumed build claims its slices first even when tree records stand"
         );
         assert_eq!(w.cut.as_ref().unwrap().build, fresh.build, "{case}");
     }

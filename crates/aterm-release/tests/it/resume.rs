@@ -6,7 +6,6 @@
 use crate::{cli, ledger, manifest_out, publish, verify};
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use publish::{Journal, STEPS};
 use verify::{CutMode, RemoteState};
@@ -946,65 +945,61 @@ fn yank_published(tag: &str, build: u64, min_build: Option<u64>) -> verify::Publ
     }
 }
 
-struct HistoricalTagGit {
-    output: Mutex<Option<ledger::RunOut>>,
-}
-
-impl HistoricalTagGit {
-    fn with_stdout(stdout: impl Into<Vec<u8>>) -> Self {
-        Self {
-            output: Mutex::new(Some(ledger::RunOut {
-                status: 0,
-                stdout: stdout.into(),
-                stderr: Vec::new(),
-            })),
-        }
-    }
-}
-
-impl ledger::GitRunner for HistoricalTagGit {
-    fn git(&self, args: &[&str]) -> ledger::Result<ledger::RunOut> {
-        assert_eq!(&args[..3], &["ls-remote", "--tags", "origin"]);
-        self.output
-            .lock()
-            .expect("historical tag output lock")
-            .take()
-            .ok_or_else(|| ledger::Error::new("unexpected repeated tag query"))
-    }
-}
-
 #[test]
 fn the_head_tag_binding_accepts_the_exact_annotated_ref() {
+    use crate::publisher_script::{Call, Script};
     let tag_object = "1".repeat(40);
     let commit = "a".repeat(40);
-    let output = format!("{tag_object}\trefs/tags/v0.25.0\n{commit}\trefs/tags/v0.25.0^{{}}\n");
-    let git = HistoricalTagGit::with_stdout(output.into_bytes());
-    publish::assert_remote_annotated_tag_commit(&git, "v0.25.0", &commit).unwrap();
+    let origin = Script::new(vec![
+        Call::get("refs/tags/v0.25.0", Some(&tag_object)),
+        Call::Import(tag_object.clone()),
+        Call::Peel(tag_object, Some(commit.clone())),
+    ]);
+    publish::assert_remote_annotated_tag_commit(&origin, "v0.25.0", &commit).unwrap();
+    origin.done();
 }
 
 #[test]
 fn the_head_tag_binding_rejects_missing_lightweight_wrong_and_malformed_refs() {
+    use crate::publisher_script::{Call, Script};
     let commit = "a".repeat(40);
     let wrong = "b".repeat(40);
     let tag_object = "1".repeat(40);
-    let missing = HistoricalTagGit::with_stdout(Vec::new());
+    let missing = Script::new(vec![Call::get("refs/tags/v0.25.0", None)]);
     assert!(publish::assert_remote_annotated_tag_commit(&missing, "v0.25.0", &commit).is_err());
+    missing.done();
 
-    let lightweight =
-        HistoricalTagGit::with_stdout(format!("{commit}\trefs/tags/v0.25.0\n").into_bytes());
+    let lightweight = Script::new(vec![
+        Call::get("refs/tags/v0.25.0", Some(&commit)),
+        Call::Import(commit.clone()),
+        Call::Peel(commit.clone(), None),
+    ]);
     assert!(publish::assert_remote_annotated_tag_commit(&lightweight, "v0.25.0", &commit).is_err());
+    lightweight.done();
 
-    let wrong_git = HistoricalTagGit::with_stdout(
-        format!("{tag_object}\trefs/tags/v0.25.0\n{wrong}\trefs/tags/v0.25.0^{{}}\n").into_bytes(),
-    );
-    assert!(publish::assert_remote_annotated_tag_commit(&wrong_git, "v0.25.0", &commit).is_err());
-
-    let malformed_git = HistoricalTagGit::with_stdout(
-        format!("{commit}\trefs/tags/v0.25.0\n{commit}\trefs/tags/v0.25.0^{{}}\n").into_bytes(),
-    );
+    let wrong_origin = Script::new(vec![
+        Call::get("refs/tags/v0.25.0", Some(&tag_object)),
+        Call::Import(tag_object.clone()),
+        Call::Peel(tag_object, Some(wrong)),
+    ]);
     assert!(
-        publish::assert_remote_annotated_tag_commit(&malformed_git, "v0.25.0", &commit).is_err()
+        publish::assert_remote_annotated_tag_commit(&wrong_origin, "v0.25.0", &commit).is_err()
     );
+    wrong_origin.done();
+
+    let non_unique = Script::new(vec![
+        Call::get("refs/tags/v0.25.0", Some(&commit)),
+        Call::Import(commit.clone()),
+        Call::Peel(commit.clone(), Some(commit.clone())),
+    ]);
+    assert!(publish::assert_remote_annotated_tag_commit(&non_unique, "v0.25.0", &commit).is_err());
+    non_unique.done();
+    let malformed = Script::new(vec![Call::get(
+        "refs/tags/v0.25.0",
+        Some("not-a-raw-object"),
+    )]);
+    assert!(publish::assert_remote_annotated_tag_commit(&malformed, "v0.25.0", &commit).is_err());
+    malformed.done();
 }
 
 #[test]

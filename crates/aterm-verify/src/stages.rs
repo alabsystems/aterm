@@ -765,7 +765,7 @@ pub(crate) fn step_of(r: &Report) -> &str {
 fn run_compile(ctx: &Ctx, step: &str, call: &str, cmd: &Cmd) -> Compile {
     let cmd = crate::compile_account::with_message_format(cmd.clone());
     let began = std::time::Instant::now();
-    let exec::MachineRun { run, stdout } = exec::run_machine(&cmd, ctx.exec_env());
+    let exec::MachineRun { run, stdout } = exec::run_machine(&cmd, ctx.exec_env(), Some(step));
     let account = crate::compile_account::Account::of(
         step,
         call,
@@ -1132,6 +1132,7 @@ fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compi
 
     let artifacts = crate::shape::artifacts(&stdout);
     let script_runs = crate::shape::script_runs(&stdout);
+    let refusal = crate::compile_width::refusal(&run, &stdout);
     if run.ok {
         let indexed = crate::test_index::identities(&ctx.root, &ctx.tools.targo)
             .and_then(|identity| {
@@ -1151,7 +1152,11 @@ fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compi
     rejoin(&mut run, stdout);
     r.raw(run.output.as_str());
     r.raw(line);
-    r.decide_child(&run, label);
+    if let Some(why) = refusal {
+        r.cannot_run(format!("{label} — {why}"));
+    } else {
+        r.decide_child(&run, label);
+    }
     (run.ok, exes, artifacts, script_runs)
 }
 

@@ -69,7 +69,10 @@ impl Artifacts {
                         .map(PathBuf::from),
                 );
             }
-            Ok(UnitMessage::Ambiguous(_)) if line.contains("\"compiler-artifact\"") => {
+            Ok(UnitMessage::Ambiguous {
+                artifact_reason_seen: true,
+                ..
+            }) => {
                 self.units.unknown += 1;
             }
             Ok(_) | Err(_) => {}

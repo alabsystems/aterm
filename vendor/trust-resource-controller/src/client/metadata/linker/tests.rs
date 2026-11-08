@@ -73,7 +73,7 @@ fn direct_linker_orders_the_exact_actual_cpu_description_without_gnu() {
 fn direct_linker_actual_streams_require_distinct_retirement_and_both_output_eofs() {
     let request = NativeQueryRequest::Linker(fixture::request());
     let (mut streams, mut target, mut stdout, stderr) = streams();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = crate::fixture_deadline(Instant::now() - Duration::from_secs(11));
     prefix(&mut target, deadline);
     let completion = fixture::completion(&fixture::request());
     target.send(&completion.encode().unwrap(), deadline).unwrap();
@@ -100,7 +100,7 @@ fn direct_linker_rejects_legacy_terminal_and_wrong_suspended_child() {
     let request = NativeQueryRequest::Linker(fixture::request());
     for wrong_identity in [false, true] {
         let (mut streams, mut target, stdout, stderr) = streams();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = crate::fixture_deadline(Instant::now());
         if wrong_identity {
             target.send(&status(Status::Attached), deadline).unwrap();
             target.send(&prepared().encode().unwrap(), deadline).unwrap();
@@ -130,7 +130,7 @@ fn direct_linker_rejects_legacy_terminal_and_wrong_suspended_child() {
 fn direct_linker_eof_before_retirement_keeps_actual_failed_prefix() {
     let request = NativeQueryRequest::Linker(fixture::request());
     let (mut streams, mut target, mut stdout, stderr) = streams();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = crate::fixture_deadline(Instant::now());
     prefix(&mut target, deadline);
     stdout.write_all(b"failed\0\xffprefix").unwrap();
     drop((target, stdout, stderr));

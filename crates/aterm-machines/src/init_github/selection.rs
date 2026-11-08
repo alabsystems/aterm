@@ -244,6 +244,51 @@ impl RepositorySelection {
             return Ok(());
         };
         let snapshot = Self::paired_snapshot(sys, user, token, &paths, &config)?;
+        if let Some(previous) = need::peek(&paths)
+            .map_err(|why| why.to_string())?
+            .into_iter()
+            .find(|n| {
+                n.want == need::Want::Gh(need::GhProfile::Dev)
+                    && n.purpose == need::Purpose::AghDev
+                    && !n.state.ended()
+            })
+        {
+            match previous.refused.as_ref() {
+                Some(need::RefusalClaim::Authenticated(floor)) => {
+                    let version = snapshot
+                        .authenticated_version(&paths, &previous.want.entries())
+                        .map_err(|why| why.to_string())?
+                        .ok_or_else(|| {
+                            "the rejected credential source is not authenticated".to_owned()
+                        })?;
+                    match version.relation(floor) {
+                        client::version::VersionRelation::Same
+                            if version.refines_for_recovery(floor) => {}
+                        client::version::VersionRelation::Same => return Ok(()),
+                        client::version::VersionRelation::Advanced => {}
+                        _ => {
+                            return Err("the credential version does not extend its refusal".into());
+                        }
+                    }
+                }
+                Some(need::RefusalClaim::LegacySequence(floor)) => {
+                    let version = snapshot
+                        .authenticated_version(&paths, &previous.want.entries())
+                        .map_err(|why| why.to_string())?;
+                    let eligible = version.as_ref().is_some_and(|version| {
+                        version.envelope_sequence().is_some_and(|seq| seq > *floor)
+                            || (*floor == 0
+                                && snapshot.sequence() == 0
+                                && version.envelope_sequence().is_none()
+                                && version.claim().log().is_some())
+                    });
+                    if !eligible {
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
         current()?;
         match super::signs_in_as(sys, user, token) {
             Ok(None) => {}
@@ -287,11 +332,37 @@ impl RepositorySelection {
             return Ok(());
         };
         let snapshot = Self::paired_snapshot(sys, &self.user, token, &self.paths, &self.config)?;
-        if existing
-            .refused
-            .is_some_and(|floor| snapshot.sequence() <= floor)
-        {
-            return Err("the rejected credential still awaits a later signed vault version".into());
+        if let Some(need::RefusalClaim::Authenticated(floor)) = existing.refused.as_ref() {
+            let version = snapshot
+                .authenticated_version(&self.paths, &existing.want.entries())
+                .map_err(|why| why.to_string())?
+                .ok_or_else(|| "the rejected credential source is not authenticated".to_owned())?;
+            if version.relation(floor) != client::version::VersionRelation::Advanced
+                && !version.refines_for_recovery(floor)
+            {
+                return Err(
+                    "the rejected credential still awaits a later authenticated source version"
+                        .into(),
+                );
+            }
+        } else if let Some(need::RefusalClaim::LegacySequence(floor)) = existing.refused.as_ref() {
+            // A scalar zero cannot reconstruct the old log-only rejection. Confirm the
+            // actual paired value once in this recovery attempt; a 401 records its real floor.
+            let version = snapshot
+                .authenticated_version(&self.paths, &existing.want.entries())
+                .map_err(|why| why.to_string())?;
+            let eligible = version.as_ref().is_some_and(|version| {
+                version.envelope_sequence().is_some_and(|seq| seq > *floor)
+                    || (*floor == 0
+                        && snapshot.sequence() == 0
+                        && version.envelope_sequence().is_none()
+                        && version.claim().log().is_some())
+            });
+            if !eligible {
+                return Err(
+                    "the rejected credential still awaits a later signed vault version".into(),
+                );
+            }
         }
         if self.needs_credential(sys)? {
             return Err(self.waiting());

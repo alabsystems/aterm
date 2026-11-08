@@ -5,14 +5,12 @@
 
 use crate::{ledger, manifest_out, publish, verify};
 
+use crate::publisher_script::{Call, Script};
 use aterm_models_release::{
     release_channel_floor_model, release_published_identity_model,
     release_yank_successor_first_model,
 };
 use aterm_spec::derive::Model;
-use ledger::{GitRunner, RunOut};
-use std::collections::VecDeque;
-use std::sync::Mutex;
 
 fn numeric(floor: Option<u64>) -> i64 {
     i64::try_from(floor.unwrap_or(0)).expect("bounded floor fits i64")
@@ -71,44 +69,6 @@ fn frozen_state(
     state.insert("latest_floor", numeric(newest));
     state.insert("lease_owned", 1);
     state
-}
-
-struct LeaseScript {
-    replies: Mutex<VecDeque<RunOut>>,
-}
-
-impl LeaseScript {
-    fn new(replies: Vec<RunOut>) -> Self {
-        Self {
-            replies: Mutex::new(replies.into()),
-        }
-    }
-}
-
-impl GitRunner for LeaseScript {
-    fn git(&self, _args: &[&str]) -> ledger::Result<RunOut> {
-        self.replies
-            .lock()
-            .expect("lease replies lock")
-            .pop_front()
-            .ok_or_else(|| ledger::Error::new("unexpected lease command"))
-    }
-}
-
-fn lease_owner_row(owner: &str) -> RunOut {
-    RunOut {
-        status: 0,
-        stdout: format!("{owner}\t{}\n", publish::RELEASE_LEASE_REF).into_bytes(),
-        stderr: Vec::new(),
-    }
-}
-
-fn command_ok() -> RunOut {
-    RunOut {
-        status: 0,
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-    }
 }
 
 #[test]
@@ -384,10 +344,10 @@ fn release_lease_seams_conform_through_final_unlock() {
     );
     assert!(admitted, "model rejected exact-owner acquire: {why}");
 
-    let resume_git = LeaseScript::new(vec![
-        command_ok(),
-        lease_owner_row(&owner),
-        lease_owner_row(&owner),
+    let resume_git = Script::new(vec![
+        Call::get(publish::PUBLISHER_FENCE_REF, None),
+        Call::get(publish::RELEASE_LEASE_REF, Some(&owner)),
+        Call::get(publish::RELEASE_LEASE_REF, Some(&owner)),
     ]);
     let guard = publish::acquire_release_lease(&resume_git, &owner)
         .expect("same journal commit resumes exact owner");
@@ -444,7 +404,17 @@ fn release_lease_seams_conform_through_final_unlock() {
     let verified = model.successors("ProveHead", &published)[0].clone();
     assert_eq!(verified["lease_owned"], 1);
 
-    let unlock_git = LeaseScript::new(vec![lease_owner_row(&owner), command_ok(), command_ok()]);
+    let unlock_git = Script::new(vec![
+        Call::get(publish::RELEASE_LEASE_REF, Some(&owner)),
+        Call::control(
+            &owner,
+            publish::RELEASE_LEASE_REF,
+            Some(&owner),
+            None,
+            Ok(ledger::RefWrite::Written),
+        ),
+        Call::get(publish::RELEASE_LEASE_REF, None),
+    ]);
     assert_eq!(
         publish::release_completed_release_lease(&unlock_git, &owner).unwrap(),
         publish::LeaseRelease::Released
@@ -500,12 +470,11 @@ fn published_identity_snapshot_and_tag_resolution_refine_model() {
         "negative control: symbolic history is not a current claim-SHA capability"
     );
     let tag_object = "1".repeat(40);
-    let git = LeaseScript::new(vec![RunOut {
-        status: 0,
-        stdout: format!("{tag_object}\trefs/tags/v0.25\n{manifest_commit}\trefs/tags/v0.25^{{}}\n")
-            .into_bytes(),
-        stderr: Vec::new(),
-    }]);
+    let git = Script::new(vec![
+        Call::get("refs/tags/v0.25", Some(&tag_object)),
+        Call::Import(tag_object.clone()),
+        Call::Peel(tag_object.clone(), Some(manifest_commit.clone())),
+    ]);
     publish::assert_remote_annotated_tag_commit(&git, "v0.25", &manifest_commit).unwrap();
     let accepted = tier1_step(
         &model,
@@ -526,11 +495,11 @@ fn published_identity_snapshot_and_tag_resolution_refine_model() {
     assert!(!model.action_enabled("DeleteWithExactPublishedIdentity", &drifted));
 
     let wrong = "b".repeat(40);
-    let wrong_git = LeaseScript::new(vec![RunOut {
-        status: 0,
-        stdout: format!("{wrong}\trefs/tags/v0.25\n").into_bytes(),
-        stderr: Vec::new(),
-    }]);
+    let wrong_git = Script::new(vec![
+        Call::get("refs/tags/v0.25", Some(&wrong)),
+        Call::Import(wrong.clone()),
+        Call::Peel(wrong.clone(), None),
+    ]);
     assert!(
         publish::assert_remote_annotated_tag_commit(&wrong_git, "v0.25", &manifest_commit).is_err()
     );

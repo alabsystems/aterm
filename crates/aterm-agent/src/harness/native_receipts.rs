@@ -7,7 +7,9 @@
 //! drained operation with no possible execution. Disk records never reconstruct
 //! execution or succession authority. A successor claim only consumes a positive
 //! NoExec receipt; its caller must retain and revalidate live native evidence.
-//! Absence is unknown, never proof of nonexecution.
+//! Absence alone is unknown, never proof of nonexecution: the host's `unadmitted` answer
+//! composes it with its own operation table and an expired same-epoch deadline
+//! ([`contains_operation`]).
 //! The separate enrollment file detects a missing established journal; neither
 //! it nor a signed log protects against rollback of the whole custody tree.
 
@@ -1406,8 +1408,13 @@ fn observe_prepare_at(paths: &Paths, prepare: &Prepare) -> io::Result<Option<Obs
         .map(|entry| entry.observed))
 }
 
-/// Whether any authenticated issuer record already owns this restart ID.
-/// Absence from this catalog is never proof of no execution.
+/// Whether any authenticated issuer record already owns this restart ID. The log only
+/// appends, so a record one read finds, every later read finds, short of a rollback of the
+/// whole custody tree (module docs).
+/// Absence from this catalog alone is never proof of no execution. The host answers a restart
+/// id `unadmitted` only when it is also absent from its operation table, read after its clock
+/// passed the deadline on the same host epoch: every restart admission is recorded here before
+/// it starts, and none starts after its deadline.
 /// Fresh native admission also needs its ordinary live authority and epoch checks.
 /// # Errors
 /// Refuses damaged, incomplete or untrusted established custody.
@@ -1415,6 +1422,14 @@ pub fn contains_operation(id: &str) -> io::Result<bool> {
     contains_operation_at(&Paths::locate().map_err(|_| invalid())?, id)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "IssuerJournal",
+        action = "ContainsA",
+        project = "aterm_agent::harness::native_receipts::tests::issuer_transition"
+    )
+)]
 fn contains_operation_at(paths: &Paths, id: &str) -> io::Result<bool> {
     let Some((key, view)) = read(paths)? else {
         return Ok(false);

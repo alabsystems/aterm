@@ -7,16 +7,18 @@
 //! and reader (`publish::real_cut_version`) against real git and verifies that the model admits
 //! each projected transition and refuses the negative controls.
 
+#![cfg(unix)]
+
 use crate::{changelog, ledger, publish};
 
 use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::publisher_origin::Git;
 use aterm_models_release::release_claim_landing_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
-use ledger::testing::Git;
 use ledger::{ClaimPlan, GitRunner, RunOut};
 
 const SEED: u64 = ledger::LEDGER_FLOOR;
@@ -237,24 +239,56 @@ struct Hooked<'a> {
 
 impl GitRunner for Hooked<'_> {
     fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
-        if args.first() == Some(&"push") {
-            let landed = args
-                .last()
-                .and_then(|spec| spec.split(':').next())
-                .unwrap()
-                .to_string();
-            self.events.borrow_mut().push(Event::Attempt(landed));
-            let env = self.first_push.borrow_mut().take();
-            if let Some(env) = env {
-                let (env, main) = env();
-                self.events.borrow_mut().push(Event::Env(env, main));
-            }
-        }
         self.inner.git(args)
     }
 
     fn git_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
         self.inner.git_input(args, input)
+    }
+}
+
+impl ledger::Origin for Hooked<'_> {
+    fn refresh_main(&self) -> std::result::Result<String, String> {
+        ledger::Origin::refresh_main(&self.inner)
+    }
+    fn get(&self, reference: &str) -> std::result::Result<Option<String>, String> {
+        ledger::Origin::get(&self.inner, reference)
+    }
+    fn import(&self, oid: &str) -> std::result::Result<(), String> {
+        ledger::Origin::import(&self.inner, oid)
+    }
+    fn peel(&self, oid: &str) -> std::result::Result<Option<String>, String> {
+        ledger::Origin::peel(&self.inner, oid)
+    }
+    fn tag_object(&self, oid: &str) -> std::result::Result<Vec<u8>, String> {
+        ledger::Origin::tag_object(&self.inner, oid)
+    }
+    fn write(
+        &self,
+        reference: &str,
+        before: Option<&str>,
+        after: &str,
+    ) -> std::result::Result<ledger::RefWrite, String> {
+        assert_eq!(reference, "refs/heads/main");
+        self.events.borrow_mut().push(Event::Attempt(after.into()));
+        if let Some(env) = self.first_push.borrow_mut().take() {
+            let (env, main) = env();
+            self.events.borrow_mut().push(Event::Env(env, main));
+        }
+        ledger::Origin::write(&self.inner, reference, before, after)
+    }
+    fn delete(
+        &self,
+        reference: &str,
+        expected_oid: &str,
+    ) -> std::result::Result<ledger::RefWrite, String> {
+        ledger::Origin::delete(&self.inner, reference, expected_oid)
+    }
+    fn control_transaction(
+        &self,
+        transaction: ledger::ControlRefTransaction,
+    ) -> std::result::Result<ledger::RefWrite, String> {
+        ledger::Origin::control_transaction(&self.inner, transaction)
     }
 }
 
@@ -451,8 +485,9 @@ impl Harness {
         };
         let rolls =
             |source: &str, main: &str| changelog::claim_changelogs(source, main, VERSION, DATE);
-        let result = ledger::reserve(&hooked, &plan, &rolls)
-            .and_then(|reserved| ledger::claim(&hooked, &self.fix.work, &plan, &reserved, &rolls));
+        let result = ledger::reserve(&hooked, &hooked, &plan, &rolls).and_then(|reserved| {
+            ledger::claim(&hooked, &hooked, &self.fix.work, &plan, &reserved, &rolls)
+        });
         if during.is_some() {
             self.pushes += 1;
         }

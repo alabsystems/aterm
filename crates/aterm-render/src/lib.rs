@@ -11400,21 +11400,14 @@ impl Renderer {
         let cell_w = self.cell_w;
         let gid = key.ch_or_id as u16;
         let parent = GlyphKey::mono_gid(gid, key.style, key.px_q);
-        let (pw, ph, pxmin, pymin);
-        let pbytes: Vec<u8>;
-        {
-            let img = self.glyph_image(parent);
-            pw = img.width();
-            ph = img.height();
-            pxmin = img.xmin();
-            pymin = img.ymin();
-            pbytes = match img {
-                GlyphImage::Mono { bytes, .. } => bytes.clone(),
-                GlyphImage::Rgba { .. } => Vec::new(),
-            };
-        }
+        let img = self.glyph_image(parent);
+        let (pw, ph, pxmin, pymin) = (img.width(), img.height(), img.xmin(), img.ymin());
+        let pbytes = match img {
+            GlyphImage::Mono { bytes, .. } => bytes.as_slice(),
+            GlyphImage::Rgba { .. } => &[],
+        };
         let bytes =
-            ligature_shaping::extract_cell_slice(&pbytes, pw, ph, pxmin, cell_w, i64::from(k));
+            ligature_shaping::extract_cell_slice(pbytes, pw, ph, pxmin, cell_w, i64::from(k));
         GlyphImage::Mono {
             width: cell_w,
             height: ph,

@@ -246,19 +246,24 @@ impl SessionLog {
     /// written): a person's key the timeline's hold kept from the
     /// log first (T2), then the tracker binds the input from `by` with its
     /// `act=` to the approval or question step it was admitted under, or
-    /// led to.
+    /// led to, with what its key (`key`: its class and the frame it was
+    /// admitted on, [`Self::key_frame`]) chose there (fix E8).
     pub(crate) fn ctl_accepted(
         &mut self,
         by: Actor,
         act: Option<aterm_slog::ActWord>,
         adm: Option<aterm_slog::Admission>,
+        key: (super::KeyClass, super::KeyFrame),
         at: Stamp,
     ) -> aterm_slog::Binding {
         self.reconcile_person(at);
         self.resync();
+        let (class, frame) = key;
+        let chose = frame.chose(class, &self.keys);
+        self.keys.reached();
         let Self { log, agent, .. } = self;
         match (agent.as_mut(), adm) {
-            (Some(a), Some(adm)) => a.tracker.accept(log, by, act, adm, at),
+            (Some(a), Some(adm)) => a.tracker.accept(log, by, act, adm.choosing(chose), at),
             _ => aterm_slog::Binding::Unbound,
         }
     }

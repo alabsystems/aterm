@@ -32,7 +32,7 @@ USAGE
       accept the journaled artifact after all other release checks passed.
       Keeps the failed report and its digest; never writes a passing verification.
 
-  targo --unverified ship release [--bump | --commit REV | --fix COMMIT...]
+  targo --unverified ship release [--bump | --commit REV [--supersede] | --fix COMMIT...]
                  (--mac-only | --linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
                   [--linux-worker ARCH=HOST:REPO]...)
                  [--release-credentials <profile.toml>] [--engine DIRECTORY]
@@ -53,6 +53,9 @@ USAGE
                            and start a line at it
         --commit REV       start a line at this commit of origin/main; refused
                            while this clone holds an unpublished line at another
+        --supersede        with --commit REV, explicitly replace an unpublished
+                           fleet line with a newer main base of the same version;
+                           records its retirement on main, after taking its claim
         --fix COMMIT...    carry these landed, non-merge main commits onto this
                            clone's unpublished line, one hop each (its patch onto
                            the head, never main's movement), record the new head
@@ -951,6 +954,7 @@ fn parse_release<'a>(
     while let Some(flag) = it.next() {
         match flag {
             "--bump" => opts.bump = true,
+            "--supersede" => opts.supersede = true,
             "--commit" => {
                 let rev = it.next().filter(|r| !r.is_empty() && !r.starts_with('-'));
                 let rev = rev.ok_or("--commit needs a revision")?;
@@ -1037,6 +1041,16 @@ fn parse_release<'a>(
              and a release after it is a run of its own"
                 .into(),
         );
+    }
+    if opts.supersede
+        && (opts.commit.is_none()
+            || opts.bump
+            || !opts.fix.is_empty()
+            || opts.forget
+            || opts.abandon.is_some()
+            || opts.qualify)
+    {
+        return Err("--supersede requires --commit REV and cannot combine with --bump, --fix, --forget, --abandon or --qualify".into());
     }
     if opts.qualify && (opts.bump || opts.prepare) {
         return Err("--qualify cannot combine with --bump or --prepare".into());
@@ -1393,6 +1407,20 @@ fn repo_root() -> ledger::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn supersede_requires_an_explicit_commit() {
+        let parse = |words: &[&str]| {
+            super::parse(
+                &words
+                    .iter()
+                    .map(|word| (*word).to_string())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(parse(&["release", "--supersede"]).is_err());
+        assert!(parse(&["release", "--commit", "abc", "--supersede"]).is_ok());
+        assert!(parse(&["release", "--commit", "abc", "--supersede", "--qualify"]).is_err());
+    }
     use super::*;
 
     #[test]

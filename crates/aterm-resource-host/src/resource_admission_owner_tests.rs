@@ -29,6 +29,113 @@ const HANG: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(10);
 const MEMORY: u64 = 1024 * 1024 * 1024;
 
+#[cfg(target_os = "macos")]
+fn owner_fixture_sdk_lease(
+    prefix: &std::path::Path,
+    directory: &std::path::Path,
+    who: &str,
+    started: Instant,
+) -> std::io::Result<atpkg::lease::Lease> {
+    let remaining = crate::fixture_deadline(started)
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+    match atpkg::lease::hold_for(prefix, directory, who, remaining) {
+        Ok(atpkg::lease::Hold::Held(lease)) => Ok(lease),
+        _ => Err(std::io::Error::other(
+            "managed fixture SDK lease unavailable",
+        )),
+    }
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn native_owner_fixture_sdk_lease_keeps_original_gc_custody() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let layout = atpkg::store::Layout {
+        prefix: scratch.path().join("manager"),
+    };
+    let build = layout.build_dir("trust", 1);
+    std::fs::create_dir_all(&build).unwrap();
+    let subject = atpkg::lease::Subject::build("trust", 1).unwrap();
+    let lease = owner_fixture_sdk_lease(
+        &layout.prefix,
+        &build,
+        "fixture custody",
+        Instant::now() - Duration::from_secs(3),
+    )
+    .unwrap();
+    assert_eq!(lease.subject(), &subject);
+    lease.check_current().unwrap();
+    assert!(matches!(
+        atpkg::lease::reclaim(&layout.prefix, &subject),
+        atpkg::lease::Reclaim::Keep(atpkg::lease::Holders::Held(_))
+    ));
+    assert_eq!(
+        owner_fixture_sdk_lease(
+            &layout.prefix,
+            &build,
+            "expired",
+            Instant::now() - Duration::from_secs(61)
+        )
+        .unwrap_err()
+        .kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    drop(lease);
+    let atpkg::lease::Reclaim::Clear(guard) = atpkg::lease::reclaim(&layout.prefix, &subject)
+    else {
+        panic!("fixture lease still retained after drop")
+    };
+    drop(guard);
+    std::fs::remove_dir(&build).unwrap();
+    assert!(owner_fixture_sdk_lease(&layout.prefix, &build, "missing", Instant::now()).is_err());
+}
+
+#[cfg(target_os = "macos")]
+fn native_owner_fixture_hello(role: &str) {
+    let (client, server) = aterm_uds::kept_out(CtlStream::pair).unwrap();
+    let peer = wire::local_peer(&server).unwrap();
+    let hello = aterm_json::json!({"role": role});
+    crate::runtime::write_json(&client, &hello, crate::fixture_deadline(Instant::now())).unwrap();
+    let end = crate::fixture_deadline(Instant::now() - Duration::from_secs(9));
+    assert_eq!(crate::runtime::read_json(&server, end).unwrap(), hello);
+    assert_eq!(wire::local_peer(&server).unwrap(), peer);
+    wire::write_frame(
+        &client,
+        b"not-json",
+        crate::fixture_deadline(Instant::now()),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::runtime::read_json(&server, crate::fixture_deadline(Instant::now()))
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Other,
+    );
+    crate::runtime::write_json(&client, &hello, crate::fixture_deadline(Instant::now())).unwrap();
+    assert_eq!(
+        crate::runtime::read_json(
+            &server,
+            crate::fixture_deadline(Instant::now() - Duration::from_secs(61)),
+        )
+        .unwrap_err()
+        .kind(),
+        std::io::ErrorKind::TimedOut,
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn native_owner_fixture_metadata_waits_for_original_hello() {
+    native_owner_fixture_hello("native-metadata-ready-v1");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn native_owner_fixture_resolver_waits_for_original_hello() {
+    native_owner_fixture_hello(trust_resource_controller::resolver::RESOLVER_READY_ROLE);
+}
+
 #[test]
 fn loan_bookkeeping_does_not_resurrect_a_native_terminal_phase() {
     let world = World::new();

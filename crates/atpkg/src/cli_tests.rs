@@ -15030,6 +15030,40 @@ fn clt_install_aliases_are_recognized_by_atpkg_install() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn foreground_clt_readback_waits_for_the_scheduled_compiler() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = crate::testdir::dir("scheduled-clt-readback-");
+    let cc = root.join("cc");
+    std::fs::write(&cc, "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'fixture cc\\n'; exit 0; fi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n").unwrap();
+    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let host = crate::prereq::CcHost {
+        shim_dir: None,
+        xcode_select_link: root.join("no-link"),
+        default_developer_dir: root.join("no-developer-dir"),
+        xcode_developer_dir: None,
+        developer_dir_override: None,
+        sdkroot_override: None,
+        deployment_target_override: None,
+        inherit_environment: false,
+        tmp_root: root.clone(),
+        ..super::clt_install_host()
+    };
+    assert_eq!(
+        crate::prereq::probe_with_elapsed(
+            Some(root.as_os_str()),
+            &host,
+            std::time::Duration::from_secs(6)
+        ),
+        crate::prereq::CcVerdict::Ready { driver: cc.clone() },
+    );
+    assert!(matches!(
+        crate::prereq::probe_with_elapsed(Some(root.as_os_str()), &host, std::time::Duration::from_secs(61)),
+        crate::prereq::CcVerdict::Unanswered { driver, .. } if driver == cc
+    ));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn clt_install_never_runs_setup_for_a_failure_setup_cannot_fix() {

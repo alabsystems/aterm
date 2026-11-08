@@ -539,6 +539,23 @@ pub fn ensure_for_window(label: Option<String>, version: &str) -> Result<String,
 }
 
 #[cfg(unix)]
+fn wait_for_start(
+    socket: &std::path::Path,
+    identity: &Identity,
+    version: &str,
+    started: std::time::Instant,
+) -> bool {
+    let deadline = started + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if ask(socket, identity, version).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+#[cfg(unix)]
 fn start(args: &Args, version: &str) -> ExitCode {
     let label = match chosen_label(args, "start") {
         Ok(label) => label,
@@ -565,16 +582,12 @@ fn start(args: &Args, version: &str) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-    let started = std::time::Instant::now();
-    while started.elapsed() < Duration::from_secs(10) {
-        if ask(&socket, &own, version).is_ok() {
-            println!("keeper=running label={label} socket={}", socket.display());
-            return ExitCode::SUCCESS;
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    if wait_for_start(&socket, &own, version, std::time::Instant::now()) {
+        println!("keeper=running label={label} socket={}", socket.display());
+        return ExitCode::SUCCESS;
     }
     println!(
-        "keeper=submitted label={label} socket={} (not answering after 10 s; its errors: {})",
+        "keeper=submitted label={label} socket={} (not answering after 60 s; its errors: {})",
         socket.display(),
         log.display()
     );
@@ -735,6 +748,48 @@ fn status(args: &Args, version: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn actual_keeper_start_survives_scheduling_delay() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let socket = scratch.path().join("start.sock");
+        let mut server = crate::server::Server::bind(crate::server::ServeConfig {
+            socket: socket.clone(),
+            identity: Identity::same_uid(),
+            relaunch: crate::server::Relauncher::Unavailable,
+            version: "scheduled-start".into(),
+            test_drop_custody: false,
+        })
+        .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let worker = std::thread::spawn(move || {
+            while !done.load(Ordering::SeqCst) {
+                server.step(10).unwrap();
+            }
+        });
+        let accepted = wait_for_start(
+            &socket,
+            &Identity::same_uid(),
+            "start-test",
+            std::time::Instant::now() - Duration::from_secs(11),
+        );
+        let expired = wait_for_start(
+            &socket,
+            &Identity::same_uid(),
+            "start-test",
+            std::time::Instant::now() - Duration::from_secs(61),
+        );
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+        assert!(accepted);
+        assert!(!expired);
+    }
 
     #[cfg(unix)]
     #[test]

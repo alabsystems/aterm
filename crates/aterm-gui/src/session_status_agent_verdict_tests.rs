@@ -3059,3 +3059,410 @@ fn a_read_the_rest_settle_withholds_moves_no_stamp() {
         "CONTROL: the settled read stamps its screen: {idle}"
     );
 }
+
+/// A Kimi Bash box whose record cannot say yet ([`crate::kimi_record::Judged::Again`]) is read
+/// again though its screen stands still, until [`crate::kimi_record::READ_FOR`] has passed; a
+/// Kimi box the record does not judge is not. A read again that reads as before publishes
+/// nothing: its screen did not move. No process leads the group here (pgid -1), so the record
+/// never answers.
+#[test]
+fn a_kimi_box_awaiting_its_record_is_read_again_until_it_stops_asking() {
+    use aterm_phase::kimi::fixtures::{BOX_SHELL_EMPTY_LINE_252, BOX_SHELL_READ_252};
+    use aterm_phase::prompt::fixtures::screen;
+    let generation = crate::control::ScreenGen { epoch: 0, seq: 1 };
+    let kimi = Some("kimi-code".to_string());
+    let floor = super::AGENT_MIN_INTERVAL;
+    for (id, text, detail, again) in [
+        (90_001, BOX_SHELL_READ_252, "bash", true),
+        (
+            90_002,
+            BOX_SHELL_EMPTY_LINE_252,
+            "bash:not-read-only",
+            false,
+        ),
+    ] {
+        let t0 = Instant::now();
+        let policy = StatusPolicy::default();
+        let mut obs = StatusObserver::new(policy, floor);
+        obs.sessions.insert(
+            id,
+            SessionSlot {
+                next_due: t0,
+                ..SessionSlot::new(policy, t0)
+            },
+        );
+        let observe = |obs: &mut StatusObserver, at: Instant| {
+            obs.agent_observe(
+                id,
+                generation,
+                Some(screen(text)),
+                Cursor::Unknown,
+                kimi.clone(),
+                -1,
+                false,
+                "",
+                at,
+            )
+        };
+        let wanted = |obs: &mut StatusObserver, at: Instant| {
+            obs.agent_zone_wanted(id, generation, Cursor::Unknown, &kimi, false, at)
+        };
+        let step = observe(&mut obs, t0);
+        assert_eq!(
+            step.publish.as_ref().map(|p| (p.0, p.1.clone())),
+            Some(("prompt", Some(detail.to_string()))),
+            "{detail}"
+        );
+        assert_eq!(
+            wanted(&mut obs, t0 + floor),
+            again,
+            "{detail}: read again though nothing moved"
+        );
+        if again {
+            let step = observe(&mut obs, t0 + floor);
+            assert!(
+                step.zone_unchanged && step.publish.is_none(),
+                "a read again that reads as before stands on its verdict: {step:?}"
+            );
+            assert_eq!(
+                obs.next_wake(),
+                Some(t0 + floor * 2),
+                "the sweep wakes for it though its screen stands still"
+            );
+            assert!(wanted(&mut obs, t0 + floor * 2), "still within READ_FOR");
+            let late = t0 + crate::kimi_record::READ_FOR;
+            let _ = observe(&mut obs, late);
+            assert_eq!(obs.next_wake(), None, "no wake once it stops asking");
+            assert!(
+                !wanted(&mut obs, late + floor),
+                "a record that never answered is read no more"
+            );
+            let moved = obs.agent_observe(
+                id,
+                crate::control::ScreenGen { epoch: 0, seq: 2 },
+                Some(screen(text)),
+                Cursor::Unknown,
+                kimi.clone(),
+                -1,
+                false,
+                "",
+                late + floor,
+            );
+            assert!(
+                moved.publish.is_some() && !moved.zone_unchanged,
+                "NEGATIVE CONTROL: a screen that moved publishes as before: {moved:?}"
+            );
+        }
+        obs.retire(id);
+    }
+}
+
+/// A Kimi box read again on a screen that did not move publishes what its record now says: the
+/// read that answers turns `bash` to `bash:read-only` with nothing on the screen moving.
+#[test]
+fn a_kimi_box_read_again_publishes_what_its_record_comes_to_say() {
+    use aterm_phase::kimi::fixtures::BOX_SHELL_READ_252;
+    use aterm_phase::prompt::fixtures::screen;
+    let kimi = Some("kimi-code".to_string());
+    let floor = super::AGENT_MIN_INTERVAL;
+    let id = 90_004;
+    let t0 = Instant::now();
+    let mut obs = StatusObserver::new(StatusPolicy::default(), floor);
+    let observe = |obs: &mut StatusObserver, at: Instant| {
+        obs.agent_observe(
+            id,
+            crate::control::ScreenGen { epoch: 0, seq: 1 },
+            Some(screen(BOX_SHELL_READ_252)),
+            Cursor::Unknown,
+            kimi.clone(),
+            -1,
+            false,
+            "",
+            at,
+        )
+    };
+    let detail = |step: &super::AgentStep| step.publish.as_ref().and_then(|p| p.1.clone());
+    assert_eq!(detail(&observe(&mut obs, t0)).as_deref(), Some("bash"));
+    let unread = observe(&mut obs, t0 + floor);
+    assert!(
+        unread.zone_unchanged && unread.publish.is_none(),
+        "NEGATIVE CONTROL: read again as before, it publishes nothing: {unread:?}"
+    );
+    let settled = t0 + crate::kimi_record::SETTLE;
+    crate::kimi_record::tests::hold_read(
+        id,
+        crate::kimi_record::Read {
+            pid: -1,
+            at: settled,
+            pending: crate::kimi_record::tests::honest_record(),
+        },
+    );
+    let answered = observe(&mut obs, settled);
+    assert_eq!(
+        detail(&answered).as_deref(),
+        Some("bash:read-only"),
+        "the record's answer is published though nothing moved: {answered:?}"
+    );
+    assert!(!answered.zone_unchanged);
+    obs.retire(id);
+}
+
+/// A screen move under a Kimi box whose `bash:read-only` came off a read begun before it asks
+/// for the box again one pass later, so a box Kimi swapped for one drawn alike is judged off a
+/// read begun since; a re-read on a screen that did not move asks for nothing more.
+#[test]
+fn a_kimi_box_whose_screen_moved_is_read_again_off_a_read_begun_since() {
+    use aterm_phase::kimi::fixtures::BOX_SHELL_READ_252;
+    use aterm_phase::prompt::fixtures::screen;
+    let kimi = Some("kimi-code".to_string());
+    let floor = super::AGENT_MIN_INTERVAL;
+    let id = 90_008;
+    let t0 = Instant::now();
+    let mut obs = StatusObserver::new(StatusPolicy::default(), floor);
+    let observe = |obs: &mut StatusObserver, seq, at: Instant| {
+        let _ = obs.agent_observe(
+            id,
+            crate::control::ScreenGen { epoch: 0, seq },
+            Some(screen(BOX_SHELL_READ_252)),
+            Cursor::Unknown,
+            kimi.clone(),
+            -1,
+            false,
+            "",
+            at,
+        );
+        obs.agents[&id].kimi_again
+    };
+    let read = t0 + crate::kimi_record::SETTLE;
+    crate::kimi_record::tests::hold_read(
+        id,
+        crate::kimi_record::Read {
+            pid: -1,
+            at: read,
+            pending: crate::kimi_record::tests::honest_record(),
+        },
+    );
+    let _ = observe(&mut obs, 1, t0);
+    let past = t0 + crate::kimi_record::READ_FOR;
+    assert!(
+        !observe(&mut obs, 1, past),
+        "PRECONDITION: past READ_FOR the read-only box settles"
+    );
+    assert!(
+        !observe(&mut obs, 1, past + floor),
+        "NEGATIVE CONTROL: a screen that did not move asks for nothing more"
+    );
+    let moved = past + floor * 2;
+    assert!(
+        observe(&mut obs, 2, moved),
+        "a screen that moved after the read is read again"
+    );
+    crate::kimi_record::tests::hold_read(
+        id,
+        crate::kimi_record::Read {
+            pid: -1,
+            at: moved,
+            pending: crate::kimi_record::tests::honest_record(),
+        },
+    );
+    assert!(
+        !observe(&mut obs, 2, moved + floor),
+        "a read begun since that screen settles it"
+    );
+    obs.retire(id);
+}
+
+/// The sweep hands each read a look at the tab's input and the wall clock after it
+/// ([`aterm_session::sink::SinkWriter::input_look`], [`crate::kimi_record::wall_ms`]), for a
+/// Kimi box's record to be judged against.
+#[test]
+fn the_sweep_looks_at_the_tabs_input_for_its_read() {
+    let (mut app, sid) = app_with_stub();
+    let sink = std::sync::Arc::clone(&app.pool.get(sid).expect("pooled").ctx.sink);
+    let t0 = Instant::now();
+    let seen = |app: &App| app.session_status.agents[&sid].input;
+    paint(&app, sid, &busy_screen(0));
+    let ahead = crate::kimi_record::wall_ms();
+    let _ = app.observe_session_statuses(t0);
+    let behind = crate::kimi_record::wall_ms();
+    let first = seen(&app);
+    assert_eq!(first.look, Some(sink.input_look()), "the sink's own look");
+    assert!(
+        (ahead..=behind).contains(&first.ms),
+        "taken as the sweep looked: {ahead} <= {} <= {behind}",
+        first.ms
+    );
+    let _ = sink.write_frame(b"x");
+    paint(&app, sid, &busy_screen(1));
+    let _ = app.observe_session_statuses(t0 + super::AGENT_MIN_INTERVAL);
+    let typed = seen(&app).look.expect("a look");
+    assert_eq!(typed, sink.input_look(), "the key's look");
+    assert_ne!(
+        typed.mark,
+        first.look.expect("a look").mark,
+        "NEGATIVE CONTROL: the key moved its sink's mark"
+    );
+}
+
+/// When a tab's program last read its input stays put only while two looks in a row find every
+/// driven byte read and nothing driven between them. Any other look moves it to that look's
+/// time, and nothing moves it back.
+#[test]
+fn a_tabs_input_counts_read_from_the_look_that_found_it_so() {
+    use aterm_session::sink::InputLook;
+    let look = |driven, read| InputLook::for_testing(1, driven, read);
+    let mut obs = StatusObserver::new(StatusPolicy::default(), super::AGENT_MIN_INTERVAL);
+    let id = 90_005;
+    let ms = |obs: &StatusObserver| obs.agents[&id].input.ms;
+    obs.note_input(id, look(0, true), 100);
+    assert_eq!(ms(&obs), 100, "the first look is its own time");
+    obs.note_input(id, look(0, true), 200);
+    assert_eq!(ms(&obs), 100, "two read looks, nothing driven between them");
+    obs.note_input(id, look(1, true), 300);
+    assert_eq!(ms(&obs), 300, "a key driven and read between two looks");
+    obs.note_input(id, look(1, false), 400);
+    assert_eq!(ms(&obs), 400, "a look that finds input unread");
+    obs.note_input(id, look(1, true), 500);
+    assert_eq!(ms(&obs), 500, "and the next, the key read between them");
+    obs.note_input(id, look(1, true), 600);
+    assert_eq!(ms(&obs), 500, "NEGATIVE CONTROL: then it stays");
+    obs.note_input(id, InputLook::for_testing(2, 1, true), 700);
+    assert_eq!(
+        ms(&obs),
+        700,
+        "a look at another sink (the tab adopted anew)"
+    );
+    obs.note_input(id, look(3, false), 50);
+    assert_eq!(ms(&obs), 700, "a wall clock stepped back");
+    obs.retire(id);
+}
+
+/// A look that found a Kimi tab's input unread asks for another at the tab's next pass, so the
+/// moment its program read it is found close behind; another agent's tab asks for none.
+#[test]
+fn a_kimi_tabs_unread_input_is_looked_at_again() {
+    use aterm_session::sink::InputLook;
+    let t0 = Instant::now();
+    let floor = super::AGENT_MIN_INTERVAL;
+    let generation = crate::control::ScreenGen { epoch: 0, seq: 1 };
+    for (id, program, rows, wakes) in [
+        (
+            90_006,
+            "kimi",
+            aterm_phase::prompt::fixtures::screen(aterm_phase::kimi::fixtures::BUSY_HELD_240),
+            true,
+        ),
+        (
+            90_007,
+            "claude",
+            vec!["Claude Code composer".to_string()],
+            false,
+        ),
+    ] {
+        let policy = StatusPolicy::default();
+        let mut obs = StatusObserver::new(policy, floor);
+        obs.sessions.insert(
+            id,
+            SessionSlot {
+                next_due: t0 + floor,
+                ..SessionSlot::new(policy, t0)
+            },
+        );
+        let observe = |obs: &mut StatusObserver, rows: Option<Vec<String>>, at| {
+            let _ = obs.agent_observe(
+                id,
+                generation,
+                rows,
+                Cursor::Unknown,
+                Some(program.to_string()),
+                42,
+                false,
+                "",
+                at,
+            );
+        };
+        observe(&mut obs, Some(rows), t0);
+        obs.sessions.get_mut(&id).unwrap().next_due = t0 + floor * 2;
+        observe(&mut obs, None, t0 + floor);
+        obs.note_input(id, InputLook::for_testing(1, 1, true), 100);
+        assert_eq!(
+            obs.next_wake(),
+            None,
+            "{program}: PRECONDITION: nothing owed"
+        );
+        obs.note_input(id, InputLook::for_testing(1, 2, false), 200);
+        assert_eq!(
+            obs.next_wake(),
+            wakes.then_some(t0 + floor * 2),
+            "{program}: a look that found input unread"
+        );
+        obs.note_input(id, InputLook::for_testing(1, 2, true), 300);
+        assert_eq!(obs.next_wake(), None, "{program}: NEGATIVE CONTROL: read");
+        obs.retire(id);
+    }
+}
+
+/// A Kimi box is seen anew, its settle started again, when its own rows change or its tab takes
+/// input (which answering it does), so a box drawn like the one just answered never borrows that
+/// one's read; what repaints around it (the transcript above, the footer's tip below) does not
+/// start it again.
+#[test]
+fn a_kimi_box_is_seen_anew_when_its_rows_change_or_its_tab_takes_input() {
+    use aterm_phase::kimi::fixtures::BOX_SHELL_READ_252;
+    use aterm_phase::prompt::fixtures::screen;
+    let kimi = Some("kimi-code".to_string());
+    let floor = super::AGENT_MIN_INTERVAL;
+    let id = 90_003;
+    let box_rows = screen(BOX_SHELL_READ_252);
+    let mut repainted =
+        crate::kimi_record::tests::edited(BOX_SHELL_READ_252, "ctrl+o expand", "ctrl+t expand");
+    let above = repainted
+        .iter()
+        .position(|r| r.contains("❯ toolstart"))
+        .expect("the prompt row");
+    repainted[above] = repainted[above].replacen("❯ toolstart", "❯ toolstart again", 1);
+    let redrawn = crate::kimi_record::tests::edited(
+        BOX_SHELL_READ_252,
+        "Show the readme",
+        "Show the readme twice",
+    );
+    let t0 = Instant::now();
+    let mut obs = StatusObserver::new(StatusPolicy::default(), floor);
+    let unread = aterm_session::sink::SinkWriter::new(-1).input_look();
+    let observe = |obs: &mut StatusObserver, seq, rows: &[String], input, at: Instant| {
+        obs.note_input(id, unread, input);
+        let _ = obs.agent_observe(
+            id,
+            crate::control::ScreenGen { epoch: 0, seq },
+            Some(rows.to_vec()),
+            Cursor::Unknown,
+            kimi.clone(),
+            -1,
+            false,
+            "",
+            at,
+        );
+        obs.agents[&id]
+            .kimi_box
+            .map(crate::kimi_record::Seen::since)
+    };
+    assert_eq!(observe(&mut obs, 1, &box_rows, 0, t0), Some(t0));
+    assert_eq!(
+        observe(&mut obs, 2, &repainted, 0, t0 + floor),
+        Some(t0),
+        "NEGATIVE CONTROL: a repaint around the box keeps its settle"
+    );
+    let typed = t0 + floor * 2;
+    assert_eq!(
+        observe(&mut obs, 3, &repainted, 1, typed),
+        Some(typed),
+        "input under it starts it again"
+    );
+    let changed = t0 + floor * 3;
+    assert_eq!(
+        observe(&mut obs, 4, &redrawn, 1, changed),
+        Some(changed),
+        "and so does a change to its own rows"
+    );
+    obs.retire(id);
+}

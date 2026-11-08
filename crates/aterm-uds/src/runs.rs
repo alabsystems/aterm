@@ -777,8 +777,12 @@ pub fn append(path: &Path, line: &str) -> std::io::Result<()> {
     write_line(&file, line)
 }
 
-/// The bound on local lock contention for a complete record write, not on the file I/O.
-const RECORD_WRITE_WITHIN: Duration = Duration::from_secs(1);
+/// Hang detector for local lock contention on a complete record write, not its file I/O.
+const RECORD_WRITE_HANG: Duration = Duration::from_secs(60);
+
+fn record_write_deadline_at(started: Instant) -> Instant {
+    started + RECORD_WRITE_HANG
+}
 
 /// A file's shared read or exclusive write scope, explicitly unlocked before the file closes.
 struct RecordLock<'file>(&'file std::fs::File);
@@ -822,12 +826,12 @@ impl Drop for RecordLock<'_> {
 /// The file lock spans all short writes and is explicitly released on errors and unwinding.
 ///
 /// # Errors
-/// The lock's I/O error, `WouldBlock` after one second of contention, or the write's error.
+/// The lock's I/O error, `WouldBlock` after a minute of contention, or the write's error.
 pub fn write_record_text(file: &std::fs::File, text: &str) -> std::io::Result<()> {
     write_record_with(
         file,
         text.as_bytes(),
-        Instant::now() + RECORD_WRITE_WITHIN,
+        record_write_deadline_at(Instant::now()),
         |mut file, bytes| file.write_all(bytes),
     )
 }
@@ -852,7 +856,7 @@ fn write_line_with(
     write_record_with(
         file,
         &bytes,
-        Instant::now() + RECORD_WRITE_WITHIN,
+        record_write_deadline_at(Instant::now()),
         &mut write,
     )
 }

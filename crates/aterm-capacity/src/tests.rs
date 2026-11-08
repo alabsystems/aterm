@@ -621,6 +621,29 @@ fn admitted(w: Waiter, m: &Fixed) -> crate::Claim {
     }
 }
 
+/// Poll until a look is taken in its turn, and expect admission: a look turned away because
+/// another process's admission held the ledger's lock decided nothing (a stand-in polling the
+/// same ledger takes it every few milliseconds), so it is taken again, within the one-minute
+/// hang detector.
+#[track_caller]
+fn admitted_in_its_turn(w: Waiter, m: &Fixed) -> crate::Claim {
+    let mut w = Some(w);
+    until_within(MUST_HAPPEN, "an admission in its turn", || {
+        match w.take().expect("a waiter").poll(m) {
+            Polled::Admitted(c) => Some(c),
+            Polled::Waiting(next, short)
+                if short.shorts.iter().all(|s| matches!(s, Short::Turn { .. })) =>
+            {
+                w = Some(next);
+                None
+            }
+            Polled::Waiting(_, short) => panic!("expected admission, waits: {short}"),
+            Polled::Gone(e) => panic!("expected admission, gone: {e}"),
+            Polled::Unqualified(why) => panic!("expected admission, unqualified: {why}"),
+        }
+    })
+}
+
 /// Poll once and expect a wait.
 #[track_caller]
 fn waits(w: Waiter, m: &Fixed) -> (Waiter, crate::Shortfall) {
@@ -1328,6 +1351,25 @@ fn a_stop_ends_admit_now_waiting_its_turn() {
     drop(turn);
 }
 
+/// A caller stop does not veto an immediate `--admit now` grant. That mode observes stop only
+/// while it waits for the ledger turn; [`a_stop_ends_admit_now_waiting_its_turn`] is the
+/// negative control.
+#[test]
+fn a_stop_does_not_veto_an_immediate_admit_now_grant() {
+    let s = scratch("now-immediate-stop");
+    let claim = admit_until(
+        &s.ledger,
+        &mac48(),
+        Need::new("now with a prior stop"),
+        Admit::Now,
+        Pace::default(),
+        &mut |_| {},
+        &|| true,
+    )
+    .expect("an immediate override leaves stop handling to its caller");
+    assert_eq!(claim.record().need.what, "now with a prior stop");
+}
+
 /// An explicit resource override does not authorize unreadable ledger state. The same request
 /// can override a resource shortage once the ledger works.
 #[test]
@@ -1475,6 +1517,78 @@ fn release_rank_orders_memory_waiters_and_reserves_cores_without_preempting_ordi
     );
 }
 
+/// A Background verifier retains its whole-run disk claim while its stages claim memory and
+/// cores. An Ordinary disk waiter cannot use that disk until the verifier finishes, so it must
+/// not categorically block the verifier's disjoint next-stage admission. Negative controls:
+/// Ordinary work that reserves the same cores goes first, and a Release still ends Background.
+#[test]
+fn a_waiting_ordinary_disk_claim_cannot_deadlock_its_background_disk_holder() {
+    use crate::Rank;
+
+    let reading = with_vol(vol(100, 60, 10));
+    let background_disk = record(
+        10,
+        1,
+        Need::new("background run disk")
+            .rank(Rank::Background)
+            .disk(30 * GIB, "/vol"),
+        Some(0),
+    );
+    let ordinary_disk = record(
+        11,
+        2,
+        Need::new("ordinary disk").disk(30 * GIB, "/vol"),
+        None,
+    );
+    let background_stage = Need::new("background next stage")
+        .rank(Rank::Background)
+        .mem_gib(4)
+        .cores(14);
+    let other = |record| Other {
+        record,
+        used: TreeUse::default(),
+        credited: TreeUse::default(),
+    };
+    assert_eq!(
+        decide(
+            &background_stage,
+            (3, 10, 0),
+            &reading,
+            &[other(&background_disk), other(&ordinary_disk)],
+            4,
+        )
+        .expect("the holder must reach the stage that releases its disk")
+        .cores,
+        14
+    );
+
+    let ordinary_cores = record(11, 2, Need::new("ordinary cores").cores(14), None);
+    assert!(
+        decide(
+            &background_stage,
+            (3, 10, 0),
+            &reading,
+            &[other(&background_disk), other(&ordinary_cores)],
+            4,
+        )
+        .is_err_and(|short| short.shorts.contains(&Short::Cores)),
+        "an Ordinary waiter reserves overlapping cores before Background"
+    );
+
+    let release = record(12, 3, Need::new("release").rank(Rank::Release), None);
+    assert!(
+        decide(
+            &background_stage,
+            (3, 10, 0),
+            &reading,
+            &[other(&background_disk), other(&release)],
+            4,
+        )
+        .is_err_and(|short| short.shorts.contains(&Short::Release)),
+        "a Release remains an unconditional stop"
+    );
+}
+
 #[test]
 fn live_release_context_elevates_claims_but_isolated_machines_keep_their_rank() {
     struct Context {
@@ -1523,6 +1637,17 @@ fn live_release_context_elevates_claims_but_isolated_machines_keep_their_rank() 
                     .is_none(),
                 "invalid rank metadata cannot silently become Ordinary"
             );
+            let nested = admit_until(
+                &s.ledger,
+                &m,
+                Need::new("preemptible child of release"),
+                Admit::Preemptible,
+                Pace::default(),
+                &mut |_| {},
+                &|| false,
+            )
+            .expect("a release context elevates, rather than preempts, its child");
+            assert_eq!(nested.record().need.rank, crate::Rank::Release);
         }
     }
 }
@@ -1551,6 +1676,193 @@ fn admit_now_cannot_bypass_a_release_core_reservation() {
     }
 }
 
+/// A Release that was queued before repeatable Background work asked to enter ends that work,
+/// rather than being waited out before the admitted holder's group guard exists. The Ordinary
+/// negative control is [`overlapping_ordinary_cores_run_before_the_next_background_stage_and_release_ends_its_group`]:
+/// that same mode waits for Ordinary work and resumes.
+#[test]
+fn a_preexisting_release_stops_background_before_admission() {
+    let s = scratch("release-before-background");
+    let machine = mac48();
+    let release = enter(
+        &s,
+        &machine,
+        Need::new("queued release").rank(crate::Rank::Release),
+    );
+    let stopped = admit_until(
+        &s.ledger,
+        &machine,
+        Need::new("background after release"),
+        Admit::Preemptible,
+        Pace::default(),
+        &mut |_| {},
+        &|| false,
+    );
+    assert!(
+        matches!(stopped, Err(Error::Stopped { signal: None, .. })),
+        "the queued Release ends the judgment before admission: {stopped:?}"
+    );
+    assert_eq!(
+        s.ledger
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.need.what)
+            .collect::<Vec<_>>(),
+        ["queued release"],
+        "the stopped Background waiter left no claim"
+    );
+    let ordinary = admit_until(
+        &s.ledger,
+        &machine,
+        Need::new("ordinary after release"),
+        Admit::Wait,
+        Pace::default(),
+        &mut |_| {},
+        &|| false,
+    )
+    .expect("a Release does not cancel Ordinary work");
+    assert_eq!(ordinary.record().need.rank, crate::Rank::Ordinary);
+    drop(ordinary);
+    drop(release);
+}
+
+#[cfg(unix)]
+const RELEASE_DURING_BACKGROUND_WAIT: &str = "ATERM_CAPACITY_RELEASE_DURING_BACKGROUND_WAIT";
+
+/// A dedicated Background test process. If its parent fails before reaping it, tell its
+/// admission to stop and wait for it, so a failed hang detector leaves no worker behind.
+#[cfg(unix)]
+struct BackgroundWaiter {
+    child: aterm_uds::spawnfd::Child,
+    abort: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for BackgroundWaiter {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = std::fs::write(&self.abort, "");
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// A Release that arrives after Background entered the queue but before its resource grant ends
+/// that admission. Ordinary holds every requested core throughout, so no post-grant group guard
+/// can make this pass. The preexisting-Release test above is the before-entry control; the
+/// Ordinary-retention process test below is the non-Release control.
+#[cfg(unix)]
+#[test]
+fn a_release_queued_while_background_waits_stops_before_grant() {
+    let Some(dir) = std::env::var_os(RELEASE_DURING_BACKGROUND_WAIT).map(PathBuf::from) else {
+        let s = scratch("release-during-background-wait");
+        let machine = mac48();
+        let ordinary = admitted(
+            enter(&s, &machine, Need::new("ordinary core holder").cores(14)),
+            &machine,
+        );
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        let child = command
+            .args([
+                "--exact",
+                "tests::a_release_queued_while_background_waits_stops_before_grant",
+                "--nocapture",
+            ])
+            .env(RELEASE_DURING_BACKGROUND_WAIT, s.dir.path())
+            .process_group(0)
+            .spawn()
+            .expect("the dedicated Background stand-in");
+        let mut background = BackgroundWaiter {
+            child,
+            abort: s.dir.path().join("abort"),
+        };
+        until_within(MUST_HAPPEN, "Background to wait behind Ordinary", || {
+            s.dir.path().join("waiting").exists().then_some(())
+        });
+        let waiting = s
+            .ledger
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.need.what == "waiting background")
+            .expect("the Background wait is in the ledger");
+        assert_eq!(waiting.need.rank, crate::Rank::Background);
+        assert!(waiting.held.is_none(), "Background has not been granted");
+
+        let release = enter(
+            &s,
+            &machine,
+            Need::new("release during wait")
+                .rank(crate::Rank::Release)
+                .cores(14),
+        );
+        let release_row = s
+            .ledger
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.need.what == "release during wait")
+            .expect("the Release is queued");
+        assert!(release_row.held.is_none(), "the Release is still queued");
+        let status = until_within(MUST_HAPPEN, "Release to end the Background wait", || {
+            background.child.try_wait().unwrap()
+        });
+        assert!(status.success(), "the race stand-in succeeded: {status}");
+        assert!(s.dir.path().join("stopped").exists());
+        assert!(!s.dir.path().join("granted").exists());
+        assert_eq!(ordinary.cores(), 14, "Ordinary kept the overlapping cores");
+        assert_eq!(
+            s.ledger
+                .list()
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.need.what, row.held.is_some()))
+                .collect::<Vec<_>>(),
+            [
+                ("ordinary core holder".to_owned(), true),
+                ("release during wait".to_owned(), false),
+            ],
+            "the stopped Background waiter left neither a wait nor a grant"
+        );
+        drop((release, ordinary, background));
+        return;
+    };
+
+    let ledger = Ledger::at(dir.join("ledger"));
+    let parent = std::os::unix::process::parent_id();
+    let waiting = dir.join("waiting");
+    let abort = dir.join("abort");
+    let stopped = admit_until(
+        &ledger,
+        &mac48(),
+        Need::new("waiting background").cores(14),
+        Admit::Preemptible,
+        Pace {
+            poll: Duration::from_millis(5),
+            ..Pace::default()
+        },
+        &mut |_| {
+            if !waiting.exists() {
+                let part = waiting.with_extension("part");
+                std::fs::write(&part, "").expect("write the wait marker");
+                std::fs::rename(part, &waiting).expect("publish the wait marker");
+            }
+        },
+        &|| abort.exists() || std::os::unix::process::parent_id() != parent,
+    );
+    match stopped {
+        Err(Error::Stopped { signal: None, .. }) if !abort.exists() => {
+            std::fs::write(dir.join("stopped"), "").expect("write the stop marker");
+        }
+        Ok(claim) => {
+            std::fs::write(dir.join("granted"), "").expect("write the grant marker");
+            panic!("Background was granted {} cores", claim.cores());
+        }
+        other => panic!("Release must stop the waiting Background admission: {other:?}"),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn background_standin() {
@@ -1569,22 +1881,34 @@ fn background_standin() {
     )
     .expect("dedicated background admission");
     assert_eq!(claim.record().need.rank, crate::Rank::Background);
-    assert!(
-        !claim.should_yield().unwrap(),
-        "negative control: no foreground claim yet"
-    );
     std::fs::write(dir.join("held"), "").unwrap();
     until_within(MUST_HAPPEN, "foreground check", || {
         dir.join("check").exists().then_some(())
     });
-    assert!(claim.should_yield().unwrap());
-    std::fs::write(dir.join("yielded"), "").unwrap();
+    drop(claim);
+    std::fs::write(dir.join("boundary"), "").unwrap();
+    let waiting = std::time::Instant::now();
+    let resumed = admit_until(
+        &Ledger::at(dir.join("ledger")),
+        &mac48(),
+        Need::new("repeatable lane after foreground").cores(14),
+        Admit::Preemptible,
+        Pace {
+            poll: Duration::from_millis(5),
+            ..Pace::default()
+        },
+        &mut |_| {},
+        &|| waiting.elapsed() >= MUST_HAPPEN,
+    )
+    .expect("the Background stage waits for Ordinary work instead of cancelling");
+    assert_eq!(resumed.record().need.rank, crate::Rank::Background);
+    std::fs::write(dir.join("resumed"), "").unwrap();
     until_within(MUST_HAPPEN, "release to end background", || None::<()>);
 }
 
 #[cfg(unix)]
 #[test]
-fn foreground_waiters_request_yield_and_release_ends_only_background_groups() {
+fn overlapping_ordinary_cores_run_before_the_next_background_stage_and_release_ends_its_group() {
     use std::os::unix::process::ExitStatusExt as _;
     let s = scratch("background");
     let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
@@ -1597,15 +1921,38 @@ fn foreground_waiters_request_yield_and_release_ends_only_background_groups() {
     until_within(MUST_HAPPEN, "background admission", || {
         s.dir.path().join("held").exists().then_some(())
     });
-    let ordinary = enter(&s, &mac48(), Need::new("foreground").cores(14));
+    let machine = mac48();
+    let ordinary = enter(&s, &machine, Need::new("foreground").cores(14));
     std::fs::write(s.dir.path().join("check"), "").unwrap();
-    until_within(MUST_HAPPEN, "stage-boundary yield", || {
-        s.dir.path().join("yielded").exists().then_some(())
+    until_within(
+        MUST_HAPPEN,
+        "the completed Background stage's boundary",
+        || s.dir.path().join("boundary").exists().then_some(()),
+    );
+    let waiting = until_within(MUST_HAPPEN, "the next Background stage's wait", || {
+        s.ledger
+            .list()
+            .ok()?
+            .into_iter()
+            .find(|row| row.need.what == "repeatable lane after foreground")
     });
+    assert_eq!(waiting.need.rank, crate::Rank::Background);
+    assert!(waiting.held.is_none());
+    assert!(!s.dir.path().join("resumed").exists());
+    let ordinary = admitted_in_its_turn(ordinary, &machine);
+    assert_eq!(
+        ordinary.cores(),
+        14,
+        "Ordinary work owns the released cores"
+    );
     assert!(
         child.try_wait().unwrap().is_none(),
-        "Ordinary must not terminate running work"
+        "Ordinary pressure must retain, not terminate, the judgment"
     );
+    drop(ordinary);
+    until_within(MUST_HAPPEN, "the Background judgment resumes", || {
+        s.dir.path().join("resumed").exists().then_some(())
+    });
     let release = enter(
         &s,
         &mac48(),
@@ -1615,7 +1962,7 @@ fn foreground_waiters_request_yield_and_release_ends_only_background_groups() {
         child.try_wait().unwrap()
     });
     assert_eq!(status.signal(), Some(libc::SIGTERM));
-    drop((ordinary, release));
+    drop(release);
 }
 
 /// A claim's reservation is its peak less what its process tree already uses: memory in use

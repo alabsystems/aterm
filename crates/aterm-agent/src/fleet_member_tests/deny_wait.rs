@@ -44,6 +44,34 @@ fn fleet_pair(tag: &str) -> FleetPair {
 }
 
 #[test]
+fn a_drive_retains_its_local_denial_read_error() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let pair = fleet_pair("drive-denial-cause");
+    let node = member::node_id(&pair.member.places.state).unwrap();
+    let listener = pair.member_serving.take();
+    listener.set_nonblocking(true).unwrap();
+    let paths = vault_beside(&pair.issuer);
+    let source = paths.dir.join("source.toml");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let cause = client::swarm_denied_nodes(&paths).unwrap_err().to_string();
+    let refused = drive_fleet_in(&pair.issuer.places, &node, HANG)
+        .err()
+        .expect("an unread local deny list must refuse the drive");
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    assert!(
+        refused.again,
+        "an unavailable local read is not a peer denial"
+    );
+    assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    assert!(
+        refused.why.contains(&cause),
+        "the refusal lost the error from the actual local read: {refused:?}; cause={cause}"
+    );
+}
+
+#[test]
 fn a_drive_waits_for_its_local_writer_before_dialing_once() {
     let pair = fleet_pair("drive-busy-vault");
     let node = member::node_id(&pair.member.places.state).unwrap();
@@ -243,7 +271,9 @@ fn an_expired_vault_wait_refuses_before_dialing_the_fleet() {
     let joined = join_with_denial_deadline(&member.places, &sync_here(), &code, Instant::now());
     drop(writer);
 
-    assert!(joined.is_err_and(|error| failure_words(error).contains(DENY_LIST_UNREAD)));
+    let words = failure_words(joined.unwrap_err());
+    assert!(words.contains(DENY_LIST_UNREAD));
+    assert!(words.contains(&client::SwarmDenialUnavailable::WriterBusy.to_string()));
     assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
     assert!(!member.places.state.join(KEY_FILE).exists());
     assert_eq!(member.config(), "");

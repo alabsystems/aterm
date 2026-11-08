@@ -59,6 +59,7 @@ pub(crate) use control_input::ask_signal_end;
 #[cfg(all(test, unix))]
 pub(crate) use control_input::cmd_key_guarded;
 pub(crate) use control_input::compile_guard;
+pub(crate) use control_input::key_class;
 pub(crate) use control_input::signal_verb;
 pub(crate) use control_input::{GuardedInput, InputFence, input_if_fenced_observed};
 #[cfg(all(test, target_os = "macos"))]
@@ -9087,6 +9088,11 @@ where
             None,
             false,
         )
+        .keyed(if paste {
+            crate::session_log::KeyClass::Other
+        } else {
+            crate::session_log::KeyClass::of_bytes(&payload)
+        })
         .typed_by(&ctx, serving_caller(route.scope, &ctx))
     });
     let completion = || {
@@ -10644,6 +10650,7 @@ fn serve_session_verb(
             )
             .within_epoch(input_log_epoch)
             .acting(leading.act)
+            .keyed(key_class(verb, rest))
             .typed_by(ctx, serving_caller(scope, ctx))
             .supervised(supervisor_fence.as_ref().and_then(|fence| fence.batch()))
         });

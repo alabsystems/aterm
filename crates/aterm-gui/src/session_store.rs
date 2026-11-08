@@ -1251,6 +1251,8 @@ impl SessionStore {
             tl.slog_mut().bind_mirror(self.mirror.shared());
             tl.slog_mut()
                 .bind_person(std::sync::Arc::clone(&handle.ctx.human_input));
+            tl.slog_mut()
+                .bind_screen(std::sync::Arc::clone(&handle.ctx.screen_moves));
             let at = tl.slog().now();
             tl.slog_mut().open_session(
                 handle.parent.as_ref().map(SessionId::as_str),
@@ -3287,9 +3289,15 @@ title = \"zsh\"
         assert!(store.mark_alive(4));
         assert!(!store.mark_alive(4), "no-op re-mark records nothing");
         store.set_title(4, "vim main.rs");
-        assert!(timeline.lock().unwrap().record_title("vim main.rs"));
+        assert!(timeline.lock().unwrap().record_title(
+            "vim main.rs",
+            crate::session_log::observed::TitleStands::Own
+        ));
         assert!(
-            !timeline.lock().unwrap().record_title("vim main.rs"),
+            !timeline.lock().unwrap().record_title(
+                "vim main.rs",
+                crate::session_log::observed::TitleStands::Own
+            ),
             "unchanged: nothing recorded"
         );
         store.set_state(4, SessionState::Exited);

@@ -1016,6 +1016,202 @@ fn native_push_incremental_preserves_raw_signed_objects_and_ignores_source_graft
     assert!(!source.join(".git/FETCH_HEAD").exists());
 }
 
+/// A real fixture push supplies the objects; its receive reply is replaced once.
+/// Restoring BEFORE models receive failure before commit. Keeping AFTER models
+/// a committed transaction whose reply was lost. The protected reason is the
+/// negative control: it must not read or retry.
+#[test]
+fn native_push_receive_failures_reread_before_retrying() {
+    use agh::policy::{RouteRequest, RouteTarget};
+    for (reason, landed, expected_pushes, stalled, conflict) in [
+        ("failed", false, 2, false, false),
+        ("failed", true, 1, false, false),
+        ("failed", false, 1, true, false),
+        ("failed", false, 1, false, true),
+        ("protected branch hook declined", false, 1, false, false),
+    ] {
+        let world = World::canonical("native-receive-failure");
+        common::canonical_repos(&world.fake);
+        let source = bare_repo(world.path(), "source");
+        let sha = host_git(&source, &["rev-parse", "main"]);
+        let remote = world.path().join("origin.git");
+        host_git(
+            world.path(),
+            &["init", "--quiet", "--bare", &remote.to_string_lossy()],
+        );
+        let slug = common::slug("fixture-dev/app");
+        let batch = push_batch(&[("refs/heads/main", ABSENT, &sha)]);
+        let probe = world
+            .client(git_env())
+            .git_remote_for_tests("fixture-dev/app", &remote)
+            .build();
+        probe
+            .run_git(&GitRun::push_refs(&slug, &source, batch.clone(), true))
+            .unwrap();
+        let spec = probe
+            .fx()
+            .children_run()
+            .into_iter()
+            .find(|s| s.args.iter().any(|a| a == "push"))
+            .unwrap();
+        let args = spec.args.into_iter().filter(|a| a != "--dry-run").collect();
+        let origin = remote.clone();
+        let clock = Arc::new(std::sync::OnceLock::<Arc<Fx>>::new());
+        let advance = clock.clone();
+        let fx = Fx::simulated(live_start()).with_git_intercept_once_for_tests(
+            spec.program,
+            args,
+            || {},
+            move |result| {
+                let out = result.as_mut().expect("real fixture push");
+                assert_eq!(out.code, Some(0));
+                if !landed {
+                    host_git(&origin, &["update-ref", "-d", "refs/heads/main"]);
+                }
+                if conflict {
+                    let tree = host_git(&origin, &["rev-parse", &format!("{sha}^{{tree}}")]);
+                    let other = host_git(
+                        &origin,
+                        &["commit-tree", &tree, "-p", &sha, "-m", "another writer"],
+                    );
+                    host_git(&origin, &["update-ref", "refs/heads/main", &other]);
+                }
+                if stalled {
+                    advance
+                        .get()
+                        .unwrap()
+                        .sleep(Duration::from_secs(3600))
+                        .unwrap();
+                }
+                out.code = Some(1);
+                out.stdout = format!("!\t{sha}:refs/heads/main\t[remote rejected] ({reason})\n")
+                    .into_bytes();
+                out.stderr = b"error: failed to push some refs\n".to_vec();
+            },
+        );
+        let fx = Arc::new(fx);
+        assert!(clock.set(fx.clone()).is_ok());
+        let gh = world
+            .client(git_env())
+            .git_remote_for_tests("fixture-dev/app", &remote)
+            .fx(fx)
+            .build();
+        let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
+        let journal = gh.journal(&slug).unwrap();
+        let result = gh
+            .refs(&slug)
+            .push_atomic(&permit, &source, &batch, &journal)
+            .unwrap()
+            .into_result();
+        if stalled {
+            let error = result.unwrap_err();
+            assert_eq!(
+                (error.kind, error.side_effect),
+                (Kind::CouldNotRun, SideEffect::None)
+            );
+            assert!(error.why.contains("no remote ref progress"));
+        } else if conflict {
+            assert_eq!(result.unwrap_err().kind, Kind::Conflict);
+        } else if reason == "failed" {
+            result.expect("receive failure converges from freshly observed refs");
+            assert_eq!(
+                host_git(&remote, &["rev-parse", "main"]),
+                batch.updates()[0].after
+            );
+        } else {
+            assert_eq!(result.unwrap_err().kind, Kind::Refused);
+        }
+        let calls = gh.fx().children_run();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|s| s.args.iter().any(|a| a == "push"))
+                .count(),
+            expected_pushes
+        );
+        // The two preparation reads precede the push; only transient failures
+        // earn the third, authoritative read.
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|s| s.args.iter().any(|a| a == "ls-remote"))
+                .count(),
+            if reason == "failed" { 3 } else { 2 }
+        );
+    }
+}
+
+#[test]
+fn leased_delete_receive_failures_reread_before_retrying() {
+    for (reason, landed, pushes) in [
+        ("failed", false, 2),
+        ("failed", true, 1),
+        ("protected branch hook declined", false, 1),
+    ] {
+        let world = World::canonical("delete-receive-failure");
+        common::canonical_repos(&world.fake);
+        let remote = bare_repo(world.path(), "origin");
+        let sha = host_git(&remote, &["rev-parse", "main"]);
+        host_git(&remote, &["update-ref", "refs/tags/v1", &sha]);
+        let run = GitRun::push_delete(&common::slug("fixture-dev/app"), "refs/tags/v1", &sha);
+        let probe = world
+            .client(git_env())
+            .git_remote_for_tests("fixture-dev/app", &remote)
+            .build();
+        probe.run_git(&run).unwrap();
+        host_git(&remote, &["update-ref", "refs/tags/v1", &sha]);
+        let spec = probe
+            .fx()
+            .children_run()
+            .into_iter()
+            .find(|s| s.args.iter().any(|a| a == "push"))
+            .unwrap();
+        let origin = remote.clone();
+        let fx = Fx::simulated(live_start()).with_git_intercept_once_for_tests(
+            spec.program,
+            spec.args,
+            || {},
+            move |result| {
+                let out = result.as_mut().unwrap();
+                assert_eq!(out.code, Some(0));
+                if !landed {
+                    host_git(&origin, &["update-ref", "refs/tags/v1", &sha]);
+                }
+                out.code = Some(1);
+                out.stdout = format!("!\t(delete):refs/tags/v1\t[remote rejected] ({reason})\n")
+                    .into_bytes();
+            },
+        );
+        let gh = world
+            .client(git_env())
+            .git_remote_for_tests("fixture-dev/app", &remote)
+            .fx(Arc::new(fx))
+            .build();
+        let result = gh.run_git(&run);
+        if reason == "failed" {
+            result.unwrap();
+            assert_eq!(host_git(&remote, &["for-each-ref", "refs/tags/v1"]), "");
+        } else {
+            assert_eq!(result.unwrap_err().kind, Kind::Refused);
+        }
+        let calls = gh.fx().children_run();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|s| s.args.iter().any(|a| a == "push"))
+                .count(),
+            pushes
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|s| s.args.iter().any(|a| a == "ls-remote"))
+                .count(),
+            usize::from(reason == "failed")
+        );
+    }
+}
+
 /// Both controls execute the actual Git atomic push. One changes a fixture ref
 /// just before advertisement; the other loses only the successful result.
 fn native_push_unknown_case(race_to_after: bool, incremental: bool) {
@@ -2426,6 +2622,297 @@ fn batch_fetch_refuses_unsafe_cache_paths_before_any_fetch() {
     }
 }
 
+/// What a batch fetch's scratch held right after its network transfer returned.
+struct Received {
+    /// The scratch's own objects, loose and packed; borrowed ones are not counted.
+    objects: usize,
+    /// Its `objects/info/alternates`, when it has one.
+    alternates: Option<String>,
+    /// The scratch repository, which must not outlive its run.
+    scratch: PathBuf,
+}
+
+/// The objects `repo` holds itself: `count-objects`' loose `count` plus its `in-pack`.
+fn own_objects(repo: &Path) -> usize {
+    host_git(repo, &["count-objects", "-v"])
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("count: ")
+                .or_else(|| line.strip_prefix("in-pack: "))
+        })
+        .map(|count| count.parse::<usize>().expect("an object count"))
+        .sum()
+}
+
+/// A client whose every network fetch is measured in its scratch as soon as it returns. With
+/// `cold`, that fetch's spec, the scratch's alternates line is removed just before the fetch
+/// runs: the negative control.
+fn measured_client(
+    world: &World,
+    bare: &Path,
+    cold: Option<&ChildSpec>,
+) -> (Github, Arc<std::sync::Mutex<Vec<Received>>>) {
+    use std::sync::{Mutex, OnceLock, Weak};
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let effects: Arc<OnceLock<Weak<Fx>>> = Arc::new(OnceLock::new());
+    let (record, observed) = (Arc::clone(&seen), Arc::clone(&effects));
+    let mut fx = Fx::simulated(live_start()).with_git_child_observer_for_tests(move |span| {
+        let fx = observed.get().and_then(Weak::upgrade).expect("the effects");
+        let spec = &fx.children_run()[span.ordinal];
+        if spec.args.first().is_some_and(|arg| arg == "fetch") {
+            let scratch = spec
+                .cwd
+                .clone()
+                .expect("the network fetch runs in its scratch");
+            record.lock().unwrap().push(Received {
+                objects: own_objects(&scratch),
+                alternates: std::fs::read_to_string(scratch.join("objects/info/alternates")).ok(),
+                scratch,
+            });
+        }
+    });
+    if let Some(spec) = cold {
+        let observed = Arc::clone(&effects);
+        fx = fx.with_git_intercept_once_for_tests(
+            spec.program.clone(),
+            spec.args.clone(),
+            move || {
+                let fx = observed.get().and_then(Weak::upgrade).expect("the effects");
+                let scratch = fx.children_run().last().and_then(|spec| spec.cwd.clone());
+                let alternates = scratch
+                    .expect("the scratch")
+                    .join("objects/info/alternates");
+                std::fs::remove_file(alternates).expect("an alternates line to remove");
+            },
+            |_| {},
+        );
+    }
+    let fx = Arc::new(fx);
+    assert!(effects.set(Arc::downgrade(&fx)).is_ok());
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", bare)
+        .fx(fx)
+        .build();
+    (gh, seen)
+}
+
+/// The commits of [`ahead`]'s origin before upstream moves on.
+const AHEAD_HISTORY: usize = 40;
+
+/// A local origin [`AHEAD_HISTORY`] commits deep and tagged v1 to v3, three callers cloned
+/// from it, then one upstream commit tagged v4 that the callers lack.
+struct Ahead {
+    world: World,
+    bare: PathBuf,
+    /// Two complete clones, the first under a path with spaces, and a shallow one.
+    callers: [PathBuf; 3],
+    /// The callers' main.
+    tip: String,
+    old_tags: [String; 3],
+    new: String,
+    new_tag: String,
+}
+
+fn ahead(label: &str) -> Ahead {
+    let world = World::canonical(label);
+    let bare = bare_repo(world.path(), "app");
+    let tree = host_git(&bare, &["rev-parse", "main^{tree}"]);
+    let mut tip = host_git(&bare, &["rev-parse", "main"]);
+    for index in 1..AHEAD_HISTORY {
+        let message = format!("commit {index}");
+        tip = host_git(&bare, &["commit-tree", &tree, "-p", &tip, "-m", &message]);
+        if index % 10 == 0 {
+            let tag = format!("v{}", index / 10);
+            host_git(&bare, &["tag", "-a", &tag, &tip, "-m", &tag]);
+        }
+    }
+    host_git(&bare, &["update-ref", "refs/heads/main", &tip]);
+    let url = format!("file://{}", bare.display());
+    let callers = [
+        ("caller with spaces", None),
+        ("cold caller", None),
+        ("shallow caller", Some("--depth=1")),
+    ]
+    .map(|(name, depth)| {
+        let dest = world.path().join(name);
+        let dest_text = dest.to_string_lossy().into_owned();
+        let mut args = vec!["clone", "--quiet"];
+        args.extend(depth);
+        args.extend([url.as_str(), dest_text.as_str()]);
+        host_git(world.path(), &args);
+        dest
+    });
+    let old_tags = ["v1", "v2", "v3"].map(|tag| host_git(&bare, &["rev-parse", tag]));
+    let new = host_git(&bare, &["commit-tree", &tree, "-p", &tip, "-m", "upstream"]);
+    host_git(&bare, &["update-ref", "refs/heads/main", &new]);
+    host_git(&bare, &["tag", "-a", "v4", &new, "-m", "v4"]);
+    let new_tag = host_git(&bare, &["rev-parse", "v4"]);
+    Ahead {
+        world,
+        bare,
+        callers,
+        tip,
+        old_tags,
+        new,
+        new_tag,
+    }
+}
+
+impl Ahead {
+    /// The objects `revs` reach in the origin.
+    fn objects(&self, revs: &[&str]) -> usize {
+        let mut args = vec!["rev-list", "--objects"];
+        args.extend(revs);
+        host_git(&self.bare, &args).lines().count()
+    }
+}
+
+/// The one network fetch a measured client's run made.
+fn only_fetch(seen: &std::sync::Mutex<Vec<Received>>) -> Received {
+    let mut seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "one network fetch per run");
+    seen.pop().unwrap()
+}
+
+/// The alternates line that lends `caller`'s objects.
+fn lends(caller: &Path) -> String {
+    let common = host_git(
+        caller,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    format!(
+        "{}/objects\n",
+        std::fs::canonicalize(common).unwrap().display()
+    )
+}
+
+/// `caller`'s cache `refs` name their objects, whose closures it holds, and it gained no
+/// alternates file.
+fn settled(caller: &Path, refs: &[(&str, &str)]) {
+    for (reference, oid) in refs {
+        assert_eq!(&host_git(caller, &["rev-parse", reference]), oid);
+    }
+    host_git(caller, &["rev-list", "--objects", "--glob=refs/agh/*"]);
+    assert!(
+        !caller.join(".git/objects/info/alternates").exists(),
+        "the caller gained an alternates file"
+    );
+}
+
+/// The network fetch a client ran, to replay with its alternates line removed.
+fn network_fetch(gh: &Github) -> ChildSpec {
+    gh.fx()
+        .children_run()
+        .into_iter()
+        .find(|spec| spec.args.first().is_some_and(|arg| arg == "fetch"))
+        .expect("the network fetch")
+}
+
+/// A batch fetch into a complete caller borrows the caller's objects, so its scratch receives
+/// only what the caller lacks. Negative control: the same fetch with the scratch's alternates
+/// line removed receives the whole history, about `AHEAD_HISTORY` times as many objects. A
+/// shallow caller's scratch borrows nothing. No caller gains an alternates file, and no
+/// scratch outlives its run.
+#[test]
+fn batch_fetch_borrows_a_complete_caller_s_objects_and_receives_only_what_it_lacks() {
+    let ahead = ahead("git-batch-haves");
+    let [warm, cold, shallow] = ahead.callers.each_ref().map(PathBuf::as_path);
+    let (new, new_tag, old) = (&ahead.new, &ahead.new_tag, &ahead.old_tags);
+    let rows = fetch_rows(&[
+        ("refs/heads/main", "refs/agh/main", new),
+        ("refs/tags/v1", "refs/agh/v1", &old[0]),
+        ("refs/tags/v2", "refs/agh/v2", &old[1]),
+        ("refs/tags/v3", "refs/agh/v3", &old[2]),
+        ("refs/tags/v4", "refs/agh/v4", new_tag),
+    ]);
+    let history = ahead.objects(&["--all"]);
+    let lacked = ahead.objects(&["--all", "--not", &ahead.tip, &old[0], &old[1], &old[2]]);
+    assert_eq!(lacked, 2, "the upstream commit and its tag");
+    assert!(history > AHEAD_HISTORY);
+    let slug = common::slug("fixture-dev/app");
+    let every_row = [
+        ("refs/agh/main", new.as_str()),
+        ("refs/agh/v1", old[0].as_str()),
+        ("refs/agh/v4", new_tag.as_str()),
+    ];
+
+    let (gh, seen) = measured_client(&ahead.world, &ahead.bare, None);
+    gh.run_git(&GitRun::fetch_batch(&slug, warm, rows.clone(), true))
+        .unwrap_or_else(|error| panic!("{}", error.why));
+    let received = only_fetch(&seen);
+    assert_eq!(received.objects, lacked, "only what the caller lacked");
+    assert_eq!(received.alternates, Some(lends(warm)));
+    assert!(!received.scratch.exists(), "the scratch outlived its run");
+    settled(warm, &every_row);
+
+    let (gh, seen) = measured_client(&ahead.world, &ahead.bare, Some(&network_fetch(&gh)));
+    gh.run_git(&GitRun::fetch_batch(&slug, cold, rows, true))
+        .unwrap_or_else(|error| panic!("{}", error.why));
+    let received = only_fetch(&seen);
+    assert_eq!(
+        received.objects, history,
+        "the whole history, about AHEAD_HISTORY times as much"
+    );
+    assert_eq!(received.alternates, None);
+    assert!(!received.scratch.exists(), "the scratch outlived its run");
+    settled(cold, &every_row);
+
+    let (gh, seen) = measured_client(&ahead.world, &ahead.bare, None);
+    let main = fetch_rows(&[("refs/heads/main", "refs/agh/main", new)]);
+    gh.run_git(&GitRun::fetch_batch(&slug, shallow, main, true))
+        .unwrap_or_else(|error| panic!("{}", error.why));
+    let received = only_fetch(&seen);
+    assert_eq!(received.alternates, None, "a shallow caller lends nothing");
+    assert_eq!(received.objects, ahead.objects(&["main"]));
+    assert!(!received.scratch.exists(), "the scratch outlived its run");
+    settled(shallow, &[("refs/agh/main", new)]);
+}
+
+/// An exact read borrows a complete caller's objects the same way: its scratch receives the
+/// upstream commit and its tag alone. Negative control: with the scratch's alternates line
+/// removed, the same read receives the tag's whole history. A shallow caller lends nothing.
+#[test]
+fn exact_fetch_borrows_a_complete_caller_s_objects_and_receives_only_what_it_lacks() {
+    let ahead = ahead("git-exact-haves");
+    let [warm, cold, shallow] = ahead.callers.each_ref().map(PathBuf::as_path);
+    let slug = common::slug("fixture-dev/app");
+    let read =
+        |caller: &Path| GitRun::fetch_ref(&slug, caller, "refs/tags/v4", "refs/agh/exact", true);
+    let closure = ahead.objects(&["refs/tags/v4"]);
+    let lacked = ahead.objects(&["refs/tags/v4", "--not", &ahead.tip]);
+    assert_eq!(lacked, 2, "the upstream commit and its tag");
+    assert!(closure > AHEAD_HISTORY);
+    let exact = [("refs/agh/exact", ahead.new_tag.as_str())];
+
+    let (gh, seen) = measured_client(&ahead.world, &ahead.bare, None);
+    gh.run_git(&read(warm))
+        .unwrap_or_else(|error| panic!("{}", error.why));
+    let received = only_fetch(&seen);
+    assert_eq!(received.objects, lacked, "only what the caller lacked");
+    assert_eq!(received.alternates, Some(lends(warm)));
+    assert!(!received.scratch.exists(), "the scratch outlived its run");
+    settled(warm, &exact);
+
+    let (gh, seen) = measured_client(&ahead.world, &ahead.bare, Some(&network_fetch(&gh)));
+    gh.run_git(&read(cold))
+        .unwrap_or_else(|error| panic!("{}", error.why));
+    let received = only_fetch(&seen);
+    assert_eq!(received.objects, closure, "the tag's whole history");
+    assert_eq!(received.alternates, None);
+    assert!(!received.scratch.exists(), "the scratch outlived its run");
+    settled(cold, &exact);
+
+    let (gh, seen) = measured_client(&ahead.world, &ahead.bare, None);
+    gh.run_git(&read(shallow))
+        .unwrap_or_else(|error| panic!("{}", error.why));
+    let received = only_fetch(&seen);
+    assert_eq!(received.alternates, None, "a shallow caller lends nothing");
+    assert_eq!(received.objects, closure);
+    assert!(!received.scratch.exists(), "the scratch outlived its run");
+    settled(shallow, &exact);
+}
+
 #[test]
 fn exact_fetch_refuses_filesystem_symlinks_in_refs_and_reflogs() {
     use std::os::unix::fs::symlink;
@@ -3122,6 +3609,80 @@ fn a_dev_repository_is_read_as_dev() {
     assert!(!world.dirs.grants().exists(), "a dev read wrote a grant");
 }
 
+/// An ambient token is not a routing input and cannot reach routed Git. The reader token in
+/// agh.toml answers the native ref refresh, while both planted ambient variables are absent
+/// from the Git child and terminal prompting is disabled. NEGATIVE CONTROL: routing the HTTP
+/// exchange with either planted token cannot authenticate as `fixture-reader`.
+#[test]
+fn dead_ambient_tokens_do_not_override_a_routed_refresh() {
+    use agh_fake::git_backend::{GitHttpBackend, Identity, Service};
+
+    let world = reader_world("git-dead-ambient");
+    let seed = bare_repo(world.path(), "ambient-seed");
+    let main = host_git(&seed, &["rev-parse", "main"]);
+    let backend = GitHttpBackend::start(
+        "fixture-dev/app",
+        &seed,
+        &agh_fake::token("reader"),
+        &agh_fake::token("dev"),
+    )
+    .expect("the private Git fixture");
+    let target = world.path().join("target.git");
+    std::fs::create_dir_all(&target).expect("the target repository");
+    host_git(&target, &["init", "--quiet", "--bare"]);
+    let dead = agh_fake::token("dead-ambient");
+    let env = git_env()
+        .with("GH_TOKEN", &dead)
+        .with("GITHUB_TOKEN", &dead);
+    let ports = world.fake.ports();
+    let gh = git_builder(
+        world.router.clone(),
+        Endpoints::loopback(ports.api, ports.uploads, backend.port(), ports.cdn),
+        &world.dirs,
+        env,
+        live_start(),
+    )
+    .build();
+    let window = Duration::from_secs(60);
+    let out = gh
+        .run_git(
+            &GitRun::fetch_main(&common::slug("fixture-dev/app"), &target, "refs/agh/main")
+                .with_progress_window(window),
+        )
+        .unwrap_or_else(|error| panic!("the routed refresh: {}", error.why));
+    assert_eq!(out.as_.as_deref(), Some("reader"));
+    assert_eq!(host_git(&target, &["rev-parse", "refs/agh/main"]), main);
+    let seen = backend.seen();
+    assert!(
+        seen.iter()
+            .any(|request| request.identity == Identity::Reader
+                && request.service == Some(Service::Upload)
+                && request.backend_attempted),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .all(|request| request.identity != Identity::Unknown),
+        "an ambient credential reached the fixture: {seen:?}"
+    );
+    let children = gh.fx().children_run();
+    assert!(!children.is_empty(), "the routed refresh ran no Git child");
+    for child in &children {
+        assert!(env_of(child, "GH_TOKEN").is_none(), "{child:?}");
+        assert!(env_of(child, "GITHUB_TOKEN").is_none(), "{child:?}");
+        assert_eq!(
+            env_of(child, "GIT_TERMINAL_PROMPT").map(OsString::as_os_str),
+            Some(std::ffi::OsStr::new("0")),
+            "{child:?}"
+        );
+        assert_eq!(
+            child.progress.as_ref().map(|progress| progress.window),
+            Some(window),
+            "{child:?}"
+        );
+    }
+}
+
 #[test]
 fn a_leased_delete_pushes_from_an_empty_repository() {
     let world = World::canonical("git-loopback-lease");
@@ -3291,8 +3852,9 @@ fn native_http_objects_atomic_refusal_and_lost_reply_use_real_git_and_helper() {
         .push_atomic(&permit, &source, &batch, &journal)
         .unwrap()
         .into_result()
-        .expect_err("atomic transaction refused");
-    assert_eq!(refused.kind, Kind::Refused);
+        .expect_err("receive transaction made no progress while its ref stayed locked");
+    assert_eq!(refused.kind, Kind::CouldNotRun);
+    assert!(refused.why.contains("no remote ref progress"));
     assert_eq!(
         host_git(backend.repository(), &["show-ref"]),
         host_git(&seed, &["show-ref"])
@@ -3367,26 +3929,21 @@ fn native_http_objects_atomic_refusal_and_lost_reply_use_real_git_and_helper() {
         ("refs/heads/main", &after, &next),
         ("refs/attest/next", ABSENT, &next),
     ]);
+    let before_loss_posts = posts();
     backend.lose_next_receive_response();
     let outcome = gh
         .refs(&slug)
         .push_atomic(&permit, &source, &next_batch, &journal)
         .unwrap();
-    let agh::write::Outcome::Unknown { intent, error } = outcome else {
-        panic!("lost HTTP response must stay unknown");
-    };
-    assert_eq!(error.side_effect, SideEffect::Unknown);
-    assert_eq!(journal.open().unwrap().len(), 1);
+    outcome
+        .into_result()
+        .expect("fresh remote AFTER resolves the lost response");
+    assert!(journal.open().unwrap().is_empty());
     let after_loss_posts = posts();
-    let blocked = gh
-        .refs(&slug)
-        .push_atomic(&permit, &source, &next_batch, &journal)
-        .expect_err("unknown cannot be retried");
-    assert_eq!(blocked.kind, Kind::OutcomeUnknown);
-    assert_eq!(posts(), after_loss_posts);
+    assert_eq!(after_loss_posts, before_loss_posts + 1);
 
-    // Reconcile from fresh authenticated HTTP ref discovery, without replaying
-    // the write. Only an exact match of every AFTER value closes this intent.
+    // Independently confirm the runner's recovery using authenticated HTTP
+    // discovery. No receive request may be repeated after the complete AFTER.
     let discovered = gh.run_git(&GitRun::ls_remote(&slug, None)).unwrap();
     assert_eq!(discovered.as_.as_deref(), Some("reader"));
     let refs: std::collections::BTreeMap<_, _> = discovered
@@ -3400,9 +3957,6 @@ fn native_http_objects_atomic_refusal_and_lost_reply_use_real_git_and_helper() {
             Some(update.after.as_str())
         );
     }
-    journal
-        .observe(&intent, Some(0))
-        .expect("record confirmed atomic refs");
     assert!(journal.open().unwrap().is_empty());
     assert_eq!(posts(), after_loss_posts);
     assert_eq!(host_git(&seed, &["rev-parse", "main"]), before);
@@ -3468,13 +4022,14 @@ fn a_netrc_in_home_is_never_read() {
 }
 
 #[test]
-fn a_refused_credential_is_unauthenticated_and_redacted() {
-    let world = World::canonical("git-refused");
+fn a_dead_routed_credential_is_unauthenticated_named_and_redacted() {
+    let world = World::canonical("git-dead-routed");
     world.fake.add_repo("fixture-dev/app", RepoSpec::private());
     world
         .fake
         .set_branch("fixture-dev/app", "main", common::MAIN_SHA);
-    let token = agh_fake::token("dev");
+    let token = agh_fake::token("dead-routed");
+    common::write_token(&world.path().join("tokens"), "dev.token", &token);
     let basic = agh_fake::basic(&token);
     let gh = world.client(git_env()).build();
     let err = gh
@@ -3484,6 +4039,7 @@ fn a_refused_credential_is_unauthenticated_and_redacted() {
     let err = err.into_data();
     assert_eq!(err.kind, Kind::Unauthenticated, "{}", err.why);
     assert_eq!(err.kind.exit(), 4);
+    assert!(err.why.contains("routed identity dev"), "{}", err.why);
     for text in [&err.why, &err.next, &printed] {
         assert!(!text.contains(&token), "a token in {text}");
         assert!(!text.contains(&basic), "a credential in {text}");
@@ -3491,12 +4047,13 @@ fn a_refused_credential_is_unauthenticated_and_redacted() {
     assert!(
         git_seen(&world.fake, "fixture-dev/app")
             .iter()
-            .any(|s| s.as_login.as_deref() == Some("fixture-dev-bot")),
-        "the helper answered the dev token"
+            .any(|request| request.had_authorization && request.as_login.is_none()),
+        "the helper did not answer the dead routed token"
     );
     let dir = world.path().join("refused");
     let (exit, stderr) = cli_clone(&world, "fixture-dev/app", &dir, live_start());
     assert_eq!(exit, 4, "{stderr}");
+    assert!(stderr.contains("routed identity dev"), "{stderr}");
     assert!(!stderr.contains(&token), "a token on stderr");
     assert!(!stderr.contains(&basic), "a credential on stderr");
 }
@@ -3539,6 +4096,41 @@ fn a_run_past_its_budget_is_could_not_run() {
     assert!(err.why.contains(&format!("{budget:?}")), "{}", err.why);
     assert!(files(&world.dirs.grants()).is_empty());
     drop(silent);
+}
+
+/// A release caller can replace the ordinary wall budget with one inactivity window. Every
+/// native child of the operation receives it, including the source-admission reads before the
+/// main Git call, and its diagnostic label contains only the canonical operation vocabulary.
+#[test]
+fn a_progress_window_reaches_every_native_git_child() {
+    let world = World::canonical("git-progress-window");
+    let source = bare_repo(world.path(), "source");
+    let slug = common::slug("fixture-dev/app");
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &source)
+        .build();
+    let window = Duration::from_secs(60);
+    gh.run_git(&GitRun::check_local(&slug, &source).with_progress_window(window))
+        .expect("the admitted local source");
+
+    let children = gh.fx().children_run();
+    assert!(!children.is_empty());
+    let mut saw_operation = false;
+    for child in children {
+        let progress = child.progress.expect("progress-bound native child");
+        assert_eq!(progress.window, window);
+        saw_operation |= progress
+            .waiting_on
+            .starts_with("git check-local fixture-dev/app");
+        assert!(
+            progress.waiting_on.starts_with("git "),
+            "{}",
+            progress.waiting_on
+        );
+        assert!(!progress.waiting_on.contains(source.to_str().unwrap()));
+    }
+    assert!(saw_operation, "the main canonical operation was dispatched");
 }
 
 /// Vault adoption routes the run and its helper alike (design §6.10). With no agh.toml, the

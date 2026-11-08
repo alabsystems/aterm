@@ -13223,34 +13223,47 @@ fn restart(
             command.as_ref(),
             back_command.as_ref(),
         );
-        if matches!(admission, Ok(super::native_restart::Recovery::Completed)) {
-            break 'signal Some(said(r.clone(), "wait:native-completed"));
-        }
-        if matches!(admission, Ok(super::native_restart::Recovery::Retired)) {
-            break 'signal Some(said(r.clone(), "failed:native-cohort-retired"));
-        }
-        if matches!(admission, Ok(super::native_restart::Recovery::Held)) {
-            break 'signal Some(said(
-                r.clone(),
-                super::native_restart::WAIT_RETIRED_UNISSUED,
-            ));
-        }
-        if let Err(why) = admission {
-            // The exact plan/id was saved before dispatch. Preserve it on an unknown ACK;
-            // only a proved pre-mutation abort permits a later fresh constructor.
-            if st.native_prepare.is_empty()
-                || super::native_restart::abort(opts, &sf.session_id, c, tab, st)
-            {
-                st.unsent(back);
+        // Every admission names its arm: only an admitted or legacy one reaches the signal step,
+        // whose legacy arm ends the agent with no native binding.
+        match admission {
+            Ok(
+                super::native_restart::Recovery::Admitted | super::native_restart::Recovery::Legacy,
+            ) => {}
+            Ok(super::native_restart::Recovery::Completed) => {
+                break 'signal Some(said(r.clone(), "wait:native-completed"));
             }
-            save(opts, &sf.session_id, st);
-            if st.native_retired_unissued {
+            Ok(super::native_restart::Recovery::Retired) => {
+                break 'signal Some(said(r.clone(), "failed:native-cohort-retired"));
+            }
+            Ok(super::native_restart::Recovery::Held) => {
                 break 'signal Some(said(
                     r.clone(),
                     super::native_restart::WAIT_RETIRED_UNISSUED,
                 ));
             }
-            break 'signal Some(said(r.clone(), format!("wait:{why}")));
+            Ok(
+                super::native_restart::Recovery::Cancelled
+                | super::native_restart::Recovery::Unadmitted,
+            )
+            | Err(_) => {
+                let why = super::native_restart::refusal_word(admission);
+                // The exact plan/id was saved before dispatch. Preserve it on an unknown ACK;
+                // only a proved pre-mutation abort, or the host's proof that it never admitted
+                // the plan, permits a later fresh constructor.
+                if st.native_prepare.is_empty()
+                    || super::native_restart::abort(opts, &sf.session_id, c, tab, st)
+                {
+                    st.unsent(back);
+                }
+                save(opts, &sf.session_id, st);
+                if st.native_retired_unissued {
+                    break 'signal Some(said(
+                        r.clone(),
+                        super::native_restart::WAIT_RETIRED_UNISSUED,
+                    ));
+                }
+                break 'signal Some(said(r.clone(), format!("wait:{why}")));
+            }
         }
         if st.native.is_some()
             && (!typing_fence_read(c, tab).is_ok_and(|(_, read)| turn_over(&read))

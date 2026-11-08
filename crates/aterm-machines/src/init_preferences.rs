@@ -10,7 +10,11 @@ use crate::items::defaults::{self, Target};
 use crate::items::{Activation, Ctx, Item, keyboard, widgets};
 use crate::model::{Effect, PValue, Probe, Read, User};
 use crate::plist::Entries;
-use crate::port::{Cmd, KeyboardMapChange, KeyboardPrefix, System};
+#[cfg(test)]
+use crate::port::KeyboardPrefix;
+use crate::port::{
+    Cmd, KeyboardMapChange, KeyboardServiceObservation, KeyboardServiceState, System,
+};
 use aterm_types::macos_setup::{Selection, Setting};
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
@@ -22,6 +26,7 @@ const FINDER: &str = "com.apple.finder";
 const DOCK: &str = "com.apple.dock";
 const DST: &str = "HIDKeyboardModifierMappingDst";
 const HIDUTIL: &str = aterm_uds::os_path!("hidutil");
+#[cfg(test)]
 const NATIVE_MAPPING: &str = "HIDKeyboardModifierMappingPairs";
 const DOCK_APPS: [(&str, &str, &str); 3] = [
     ("/Applications/aterm.app", "com.aterm.aterm", "aterm"),
@@ -308,6 +313,68 @@ pub fn accept_native_caps_control(vendor: u32, product: u32, registry: u64) -> R
     Ok(())
 }
 
+/// Exact final probe states admitted by attachment activation. A kept service records only
+/// its unowned identity; it makes no claim about its Caps mapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyboardAttachmentReceipt(Vec<AttachmentState>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AttachmentState {
+    Managed(KeyboardServiceState),
+    Unmanaged(KeyboardServiceState),
+    Kept(u64),
+}
+
+impl AttachmentState {
+    fn registry(&self) -> u64 {
+        match self {
+            Self::Managed(state) | Self::Unmanaged(state) => state.registry,
+            Self::Kept(registry) => *registry,
+        }
+    }
+}
+
+impl KeyboardAttachmentReceipt {
+    pub(crate) fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Identities whose final state was verified, or explicitly left under a hold.
+    #[must_use]
+    pub fn registries(&self) -> Vec<u64> {
+        self.0.iter().map(AttachmentState::registry).collect()
+    }
+
+    /// Compare a passive sample with the actual final probe. Unknown reads cannot match
+    /// managed or intentionally unmanaged mappings; kept services remain unowned.
+    #[must_use]
+    pub fn matches(&self, observation: &KeyboardServiceObservation) -> bool {
+        self.0.iter().any(|state| {
+            state.registry() == observation.registry()
+                && match state {
+                    AttachmentState::Managed(state) | AttachmentState::Unmanaged(state) => {
+                        observation.matches(state)
+                    }
+                    AttachmentState::Kept(_) => true,
+                }
+        })
+    }
+
+    /// Forget services that disappeared from the current cohort.
+    pub fn retain(&mut self, registries: &[u64]) {
+        self.0
+            .retain(|state| registries.contains(&state.registry()));
+    }
+
+    /// Replace only services covered by a newer actual activation receipt.
+    pub fn merge(&mut self, newer: Self) {
+        let replaced = newer.registries();
+        self.0.retain(|state| !replaced.contains(&state.registry()));
+        self.0.extend(newer.0);
+        self.0.sort_unstable_by_key(AttachmentState::registry);
+    }
+}
+
 /// Activate the accepted Caps setting on only newly observed services, retaining a device's
 /// explicit saved or live Caps choice. This never writes persistent preferences.
 pub(crate) fn attachment_items(ctx: &Ctx, registries: &[u64]) -> Result<Vec<Attachment>, String> {
@@ -336,6 +403,7 @@ pub(crate) fn attachment_items(ctx: &Ctx, registries: &[u64]) -> Result<Vec<Atta
             },
             registries: registries.to_vec(),
             observed: Mutex::default(),
+            verified: Mutex::default(),
         })
         .collect())
 }
@@ -345,6 +413,7 @@ pub(crate) struct Attachment {
     inner: AttachedKeyboard,
     registries: Vec<u64>,
     observed: Mutex<KeyboardCoverage>,
+    verified: Mutex<Option<KeyboardAttachmentReceipt>>,
 }
 
 impl Attachment {
@@ -363,13 +432,32 @@ impl Attachment {
             .clone()
     }
 
-    fn maps(&self, sys: &dyn System) -> Result<Option<Vec<HidMapping>>, String> {
+    pub(crate) fn verified(&self) -> Option<KeyboardAttachmentReceipt> {
+        self.verified
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn kept_receipt(&self, observed: &KeyboardCoverage) -> KeyboardAttachmentReceipt {
+        KeyboardAttachmentReceipt(
+            self.registries
+                .iter()
+                .copied()
+                .filter(|registry| observed.covers(std::slice::from_ref(registry)))
+                .map(AttachmentState::Kept)
+                .collect(),
+        )
+    }
+
+    fn maps(&self, sys: &dyn System) -> Result<(Vec<HidMapping>, Vec<HidMapping>), String> {
         *self.observed.lock().unwrap_or_else(PoisonError::into_inner) = KeyboardCoverage::default();
+        *self.verified.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let maps = self.inner.mappings_for(sys, Some(&self.registries))?;
         *self.observed.lock().unwrap_or_else(PoisonError::into_inner) =
             KeyboardCoverage::of(maps.iter().map(|map| map.registry));
         if maps.is_empty() {
-            return Ok(None);
+            return Ok((Vec::new(), Vec::new()));
         }
         let target = Target::host("-g", &self.inner.model.key(), &self.inner.user);
         let accepted = match target.read(sys) {
@@ -401,22 +489,19 @@ impl Attachment {
             }
         };
         if !accepted {
-            return Ok(None);
+            return Ok((Vec::new(), maps));
         }
-        let maps: Vec<_> = maps
-            .into_iter()
-            .filter(|map| {
-                matches!(
-                    map.caps_lock(),
-                    keyboard::LEFT_CONTROL | keyboard::RIGHT_CONTROL
-                ) || !map
-                    .native
-                    .iter()
-                    .chain(&map.user)
-                    .any(|(source, _)| *source == keyboard::CAPS_LOCK)
-            })
-            .collect();
-        Ok((!maps.is_empty()).then_some(maps))
+        let (managed, unmanaged) = maps.into_iter().partition(|map| {
+            matches!(
+                map.caps_lock(),
+                keyboard::LEFT_CONTROL | keyboard::RIGHT_CONTROL
+            ) || !map
+                .native
+                .iter()
+                .chain(&map.user)
+                .any(|(source, _)| *source == keyboard::CAPS_LOCK)
+        });
+        Ok((managed, unmanaged))
     }
 }
 
@@ -431,10 +516,22 @@ impl Item for Attachment {
         self.inner.title()
     }
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
-        match self
-            .maps(sys)
-            .and_then(|maps| maps.map(|maps| merged_mapping(&maps)).transpose())
-        {
+        let result = self.maps(sys).and_then(|(managed, unmanaged)| {
+            let change = if managed.is_empty() {
+                None
+            } else {
+                Some(merged_mapping(&managed)?)
+            };
+            if !matches!(change, Some(Some(_))) {
+                let mut states: Vec<_> =
+                    managed.into_iter().map(AttachmentState::Managed).collect();
+                states.extend(unmanaged.into_iter().map(AttachmentState::Unmanaged));
+                *self.verified.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(KeyboardAttachmentReceipt(states));
+            }
+            Ok(change)
+        });
+        match result {
             Err(why) => Probe::Unusable { why },
             Ok(None) => Probe::NotApplicable {
                 why: "no new default keyboard service; explicit choices left untouched".into(),
@@ -452,7 +549,8 @@ impl Item for Attachment {
         if sys.euid() != self.inner.user.uid {
             return Err("keyboard activation must run as the target console user; existing remaps left untouched".into());
         }
-        if let Some(maps) = self.maps(sys)?
+        let (maps, _) = self.maps(sys)?;
+        if !maps.is_empty()
             && let Some(changes) = merged_mapping(&maps)?
         {
             self.inner.set_mappings(sys, &changes)?;
@@ -619,13 +717,7 @@ impl Item for AttachedKeyboard {
 
 type KeyMapping = Vec<(i64, i64)>;
 
-#[derive(Debug)]
-struct HidMapping {
-    registry: u64,
-    prefix: KeyboardPrefix,
-    native: KeyMapping,
-    user: KeyMapping,
-}
+type HidMapping = KeyboardServiceState;
 
 impl HidMapping {
     fn caps_lock(&self) -> i64 {
@@ -758,60 +850,25 @@ fn parse_hid_mappings(text: &str) -> Result<Vec<(u64, KeyMapping)>, String> {
 }
 
 fn live_hid_mappings(text: &str, matched: &[(u64, KeyMapping)]) -> Result<Vec<HidMapping>, String> {
-    let invalid =
-        || "unrecognized live keyboard filter state; existing remaps left untouched".to_owned();
-    let dump = crate::plist::parse(text.as_bytes()).map_err(|_| invalid())?;
-    let PValue::Array(services) = unique_field(&dump, "ServiceRecords").ok_or_else(invalid)? else {
-        return Err(invalid());
-    };
+    if text.len() > aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES {
+        return Err("keyboard service records exceed the complete-read bound".into());
+    }
+    let dump = crate::plist::parse(text.as_bytes()).map_err(|why| why.to_string())?;
+    let records = unique_field(&dump, "ServiceRecords")
+        .ok_or("missing or duplicate keyboard service records")?;
     matched
         .iter()
         .map(|(registry, user)| {
-            let mut matching_services = services.iter().filter(|service| {
-                matches!(unique_field(service, "IORegistryEntryID"), Some(PValue::Int(id)) if u64::try_from(*id).ok() == Some(*registry))
-            });
-            let service = matching_services.next().ok_or_else(invalid)?;
-            if matching_services.next().is_some() {
-                return Err(invalid());
+            let state = KeyboardServiceState::read(records, *registry)?;
+            let mut expected = user.clone();
+            expected.sort_unstable();
+            if state.user != expected {
+                return Err(
+                    "keyboard mappings changed while reading; existing remaps left untouched"
+                        .into(),
+                );
             }
-            if !crate::port::keyboard_usage::is_keyboard_service(service) {
-                return Err(invalid());
-            }
-            let PValue::Array(filters) = unique_field(service, "ServiceFilterDebug").ok_or_else(invalid)? else {
-                return Err(invalid());
-            };
-            let mut filters = filters.iter().filter_map(|filter| {
-                let plugin = unique_field(filter, "plugin")?;
-                matches!(unique_field(plugin, "Class"), Some(PValue::Str(class)) if class == "IOHIDKeyboardFilter").then_some(plugin)
-            });
-            let filter = filters.next().ok_or_else(invalid)?;
-            if filters.next().is_some() {
-                return Err(invalid());
-            }
-            let read = |key: &str| -> Result<KeyMapping, String> {
-                let PValue::Array(pairs) = unique_field(filter, key).ok_or_else(invalid)? else {
-                    return Err(invalid());
-                };
-                let mappings = pairs.iter().map(|pair| {
-                    match (unique_field(pair, "Src"), unique_field(pair, "Dst")) {
-                        (Some(PValue::Int(source)), Some(PValue::Int(destination))) => Ok((*source, *destination)),
-                        _ => Err(invalid()),
-                    }
-                }).collect::<Result<KeyMapping, String>>()?;
-                unique_sources(&mappings)?;
-                Ok(mappings)
-            };
-            let native = read(NATIVE_MAPPING)?;
-            let observed = read("UserKeyMapping")?;
-            let prefix = KeyboardPrefix::read(filter)?;
-            let mut observed_sorted = observed.clone();
-            observed_sorted.sort_unstable();
-            let mut matched_sorted = user.clone();
-            matched_sorted.sort_unstable();
-            if observed_sorted != matched_sorted {
-                return Err("keyboard mappings changed while reading; existing remaps left untouched".into());
-            }
-            Ok(HidMapping { registry: *registry, prefix, native, user: observed })
+            Ok(state)
         })
         .collect()
 }
@@ -2000,6 +2057,7 @@ pub(crate) mod tests {
             },
             registries: vec![2],
             observed: Mutex::default(),
+            verified: Mutex::default(),
         }
     }
 
@@ -2056,7 +2114,9 @@ pub(crate) mod tests {
         let context = ctx(std::slice::from_ref(&who));
         assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
         assert!(item.observed_services().covers(&[2]));
+        assert!(item.verified().is_none(), "a before-image is not a receipt");
         item.apply(&sys, &context).unwrap();
+        assert!(item.verified().is_none(), "a setter is not its read-back");
         let changes = sys.keyboard_changes();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].registry, 2);
@@ -2089,6 +2149,41 @@ pub(crate) mod tests {
             "another model reads no preference or live filter when it owns no new service"
         );
         assert_eq!(sys.keyboard_changes().len(), 1);
+
+        // The final successful probe, not the pre-apply observation or a later passive
+        // read, supplies the receipt. Passive reads reuse this exact modeled data.
+        sys.logged_in(&who);
+        sys.keyboard_services = Some(Ok(vec![2]));
+        let verified_native = changes[0].native.clone().unwrap();
+        let final_dump =
+            composite_keyboard_dump(&[(1, &[], &[]), (2, &verified_native, &user_map)], true);
+        sys.simulate(move |_, cmd| {
+            (cmd.args.first().and_then(|arg| arg.to_str()) == Some("dump"))
+                .then(|| Ran::ok(&final_dump))
+        });
+        assert!(matches!(item.probe(&sys, &context), Probe::Ok { .. }));
+        let receipt = item.verified().unwrap();
+        let calls = sys.calls();
+        let observed = sys.keyboard_service_observations().unwrap();
+        assert_eq!(receipt.registries(), [2]);
+        assert!(receipt.matches(&observed[0]));
+        assert_eq!(sys.calls()[..calls.len()], calls);
+        assert_eq!(&sys.calls()[calls.len()..], &["keyboard-service-ids"]);
+
+        let reset_dump = composite_keyboard_dump(&[(1, &[], &[]), (2, &native, &user_map)], true);
+        sys.simulate(move |_, _| Some(Ran::ok(&reset_dump)));
+        let reset = sys.keyboard_service_observations().unwrap();
+        assert!(
+            !receipt.matches(&reset[0]),
+            "same identity, different native map"
+        );
+        let unknown_dump = composite_keyboard_dump(&[(1, &[], &[]), (2, &native, &user_map)], true)
+            .replace("UserKeyMapping", "UnknownMapping");
+        sys.simulate(move |_, _| Some(Ran::ok(&unknown_dump)));
+        let unknown = sys.keyboard_service_observations().unwrap();
+        assert!(unknown[0].unread().is_some());
+        assert!(!receipt.matches(&unknown[0]));
+        assert_eq!(sys.keyboard_changes().len(), 1, "passive reads never write");
     }
 
     #[test]
@@ -2152,7 +2247,15 @@ pub(crate) mod tests {
                 item.observed_services().covers(&[2]),
                 "an observed explicit choice resolves that service without changing it"
             );
+            sys.logged_in(&who);
+            sys.keyboard_services = Some(Ok(vec![2]));
+            let receipt = item.verified().unwrap();
+            assert!(receipt.matches(&sys.keyboard_service_observations().unwrap()[0]));
             item.apply(&sys, &context).unwrap();
+            assert!(
+                item.verified().is_none(),
+                "apply alone cannot publish a receipt"
+            );
             assert!(sys.keyboard_changes().is_empty());
         }
     }

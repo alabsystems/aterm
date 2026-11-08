@@ -1,0 +1,29 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# E8 (refines T1): a person's Enter on the box whose focused option is `1. Yes`.
+# The key alone says nothing; the screen's focused option and its role do, so
+# the close is the person's, `approved`, at conf=heuristic: the screen is
+# evidence of what the key chose, not a witness of what the program did.
+see busy
+half
+see prompt bash:not-read-only fixture=claude-2.1.280-box-bash-touch
+expect open p1 approval par=t1 box=bash:not-read-only @500
+person key=enter chose=approve
+see busy
+expect close p1 approval out=approved by=human conf=heuristic
+see prompt bash:not-read-only fixture=claude-2.1.282-box-bash-ask-rule
+expect open p2 approval par=t1 box=bash:not-read-only
+person key=2 chose=decline
+see busy
+expect close p2 approval out=declined by=human conf=heuristic
+# Unplaceable keys close `passed`, as before: a navigation key, and a digit
+# naming an option of no known role (this capture garbled `3. No`).
+see prompt bash:not-read-only fixture=claude-2.1.280-box-bash-touch
+expect open p3 approval par=t1 box=bash:not-read-only
+person key=down
+see busy
+expect close p3 approval out=passed by=human conf=strong
+see prompt bash:not-read-only fixture=claude-2.1.280-box-bash-touch
+expect open p4 approval par=t1 box=bash:not-read-only
+person key=3
+see busy
+expect close p4 approval out=passed by=human conf=strong

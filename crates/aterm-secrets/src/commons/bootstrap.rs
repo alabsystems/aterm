@@ -1901,26 +1901,73 @@ impl Bootstrap {
         access: &super::roster::Access,
         basis: [u8; 32],
     ) -> Result<super::roster::Historical> {
-        if journal.trust() != self.trust() || access.local().binding() != self.request()?.binding()
-        {
-            return Err(Error::new(
+        self.historicals(journal, access, &[basis])
+            .pop()
+            .expect("one answer for each basis")
+    }
+
+    /// [`Bootstrap::historical`] for each of `bases`, in order. A log-backed observation checks
+    /// its membership, reads its log and leases its history once for all of them
+    /// ([`super::roster::Access::with_log_history`]), and a basis the log does not open falls back
+    /// on its own: to the control journal, which checks the membership again, and to the handoff
+    /// it was given, which opens under the same history.
+    pub fn historicals(
+        &self,
+        journal: &Journal,
+        access: &super::roster::Access,
+        bases: &[[u8; 32]],
+    ) -> Vec<Result<super::roster::Historical>> {
+        let each = |error: Error| -> Vec<Result<super::roster::Historical>> {
+            bases.iter().map(|_| Err(error.clone())).collect()
+        };
+        if bases.is_empty() {
+            return Vec::new();
+        }
+        if journal.trust() != self.trust() {
+            return each(Error::new(
                 "historical roster has another local trust binding",
             ));
         }
-        // A log-era Commons epoch this device holds no `Wrap` of (one from before it joined)
-        // opens through the handoff it was given, as an older control node does.
-        let native = match access.historical_from_log(journal, &self.device.identity, basis) {
-            Ok(Some(past)) => Ok(past),
-            Ok(None) => access.historical(journal, &self.device.identity, basis),
-            Err(error) => Err(error),
-        };
-        match native {
-            Ok(past) => Ok(past),
-            Err(error) => match self.cached_handoff(basis)? {
-                Some(handoff) => handoff.open(journal, access, &self.device.identity),
-                None => Err(error),
-            },
+        match self.request() {
+            Ok(request) if access.local().binding() == request.binding() => {}
+            Ok(_) => {
+                return each(Error::new(
+                    "historical roster has another local trust binding",
+                ));
+            }
+            Err(error) => return each(error),
         }
+        let identity = &self.device.identity;
+        access.with_log_history(journal, identity, |history| {
+            let history = history.as_ref().map(Option::as_ref);
+            bases
+                .iter()
+                .map(|&basis| {
+                    let from_log = match &history {
+                        Ok(Some(history)) => history.historical(basis),
+                        Ok(None) => Ok(None),
+                        Err(error) => Err((*error).clone()),
+                    };
+                    let native = match from_log {
+                        Ok(Some(past)) => Ok(past),
+                        Ok(None) => access.historical(journal, identity, basis),
+                        Err(error) => Err(error),
+                    };
+                    // A log-era Commons epoch this device holds no `Wrap` of (one from before it
+                    // joined) opens through the handoff it was given, as an older control node
+                    // does.
+                    native.or_else(|error| match self.cached_handoff(basis)? {
+                        Some(handoff) => match &history {
+                            Ok(Some(history)) => {
+                                handoff.open_in(journal, access, identity, history)
+                            }
+                            _ => handoff.open(journal, access, identity),
+                        },
+                        None => Err(error),
+                    })
+                })
+                .collect()
+        })
     }
 
     /// Prepare encrypted historical access for one exact current member. The

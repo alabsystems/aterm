@@ -3487,17 +3487,40 @@ pub(crate) fn note_person_reaching(
     gesture: crate::human_input::Gesture,
     reaches: bool,
 ) -> bool {
+    note_person_keyed(ctx, gesture, reaches, crate::session_log::KeyClass::Other)
+}
+
+/// [`note_person_reaching`] for a gesture of key class `key` (fix E8: what it chose on the box or
+/// question it landed on).
+fn note_person_keyed(
+    ctx: &crate::SessionCtx,
+    gesture: crate::human_input::Gesture,
+    reaches: bool,
+    key: crate::session_log::KeyClass,
+) -> bool {
     let noted = ctx
         .human_input
         .note_reaching(crate::metrics::now_us(), gesture, reaches);
-    deliver_noted(ctx, noted, reaches)
+    deliver_keyed(ctx, noted, reaches, key)
 }
 
-/// The timeline half of [`note_person_reaching`], for the gesture `noted` counted.
+/// The timeline half of [`note_person_reaching`], for the gesture `noted` counted: the seam the
+/// attribution tests (unix only) call.
+#[cfg(all(test, unix))]
 pub(crate) fn deliver_noted(
     ctx: &crate::SessionCtx,
     noted: crate::human_input::Noted,
     reaches: bool,
+) -> bool {
+    deliver_keyed(ctx, noted, reaches, crate::session_log::KeyClass::Other)
+}
+
+/// [`deliver_noted`] for a gesture of key class `key`.
+pub(crate) fn deliver_keyed(
+    ctx: &crate::SessionCtx,
+    noted: crate::human_input::Noted,
+    reaches: bool,
+    key: crate::session_log::KeyClass,
 ) -> bool {
     if noted.burst {
         let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -3505,6 +3528,7 @@ pub(crate) fn deliver_noted(
         let own = crate::session_log::PersonGesture {
             burst: Some(noted.seq),
             reaches,
+            key,
         };
         tl.slog_mut().person_input(Some(own), at);
         tl.ring_rows();
@@ -3514,6 +3538,7 @@ pub(crate) fn deliver_noted(
         let own = crate::session_log::PersonGesture {
             burst: None,
             reaches,
+            key,
         };
         tl.slog_mut().person_input(Some(own), at);
         tl.ring_rows();
@@ -3525,10 +3550,11 @@ pub(crate) fn deliver_noted(
 
 /// [`note_person_reaching`] for the person's gesture `ev` as the seam receives it.
 pub(crate) fn note_person_event(ctx: &crate::SessionCtx, ev: &InputEvent) -> bool {
-    note_person_reaching(
+    note_person_keyed(
         ctx,
         crate::human_input::Gesture::of(ev),
         crate::human_input::reaches_program(ev, &ctx.modes, crate::input::WheelPlatform::Host),
+        crate::session_log::KeyClass::of_event(ev),
     )
 }
 

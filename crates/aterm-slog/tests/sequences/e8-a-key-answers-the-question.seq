@@ -1,0 +1,23 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# E8: a question's chosen option answers it. Enter on the focused `1. Green`
+# of a single-choice question, a person's or a client's, closes it
+# `answered` at conf=heuristic; the review's `2. Cancel` declines it.
+see busy
+half
+see prompt question fixture=claude-2.1.281-ask-one
+expect open p1 question par=t1 @500
+person key=enter chose=answer
+see busy
+expect close p1 question out=answered by=human conf=heuristic
+see prompt question fixture=claude-2.1.281-ask-one
+expect open p2 question par=t1
+admit ctl key=2 chose=answer
+accept
+see busy
+expect close p2 question out=answered by=ctl conf=heuristic
+see prompt question fixture=claude-2.1.282-question-review
+expect open p3 question par=t1
+admit ctl key=2 chose=decline
+accept
+see busy
+expect close p3 question out=declined by=ctl conf=heuristic

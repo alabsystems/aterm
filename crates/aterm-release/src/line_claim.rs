@@ -319,7 +319,24 @@ fn now() -> u64 {
 pub fn existing(repo: &Path, version: &str) -> Result<Option<crate::line::Line>, String> {
     let name = reference(version)?;
     let stopped = AtomicBool::new(false);
-    remote(&Network::new(repo, &stopped)?, &name).map(|old| old.map(|(_, state)| state.line))
+    let old = remote(&Network::new(repo, &stopped)?, &name)?.map(|(_, state)| state.line);
+    current(&GitCli::new(repo), version, old)
+}
+
+/// Apply main's durable retirement to the independently read claim.
+pub(crate) fn current(
+    git: &dyn GitRunner,
+    version: &str,
+    old: Option<crate::line::Line>,
+) -> Result<Option<crate::line::Line>, String> {
+    let current = crate::line::supersession(git, version)?;
+    Ok(match current {
+        Some(record) => Some(old.as_ref().map_or_else(
+            || record.replacement.clone(),
+            |old| preferred(old, &record.replacement),
+        )),
+        None => old,
+    })
 }
 
 /// A read cannot take ownership, but must steer preflight to the saved candidate so an
@@ -328,8 +345,21 @@ pub fn follow(
     backend: &mut dyn crate::release::Backend,
     candidate: &mut crate::release::Candidate,
     journal: &mut Option<crate::release::Journal>,
-) -> Result<(), String> {
+) -> Result<(), crate::release::Refusal> {
     if let Some(selected) = backend.fleet_existing(&candidate.version)? {
+        if let Some(record) = backend.fleet_supersession(&candidate.version)?
+            && journal
+                .as_ref()
+                .is_some_and(|j| j.line().base != record.replacement.base)
+        {
+            return Err(crate::release::Refusal::new(
+                format!(
+                    "this journal's line was superseded by {}: {}",
+                    record.replacement.base, record.reason
+                ),
+                "drop the retired journal with ship release --forget, then resume the current line",
+            ));
+        }
         let selected = journal
             .as_ref()
             .filter(|journal| journal.commit == candidate.commit)
@@ -433,6 +463,17 @@ impl Lease {
         let stopped = AtomicBool::new(false);
         let git = Network::new(repo, &stopped)?;
         loop {
+            crate::github_remote::Remote::origin(repo)?.refresh_main()?;
+            let current = crate::line::supersession(&GitCli::new(repo), &line.version)?;
+            if current
+                .as_ref()
+                .is_some_and(|r| r.replacement.base != line.base)
+            {
+                return Err(
+                    "this line was superseded on main; discard the retired journal and resume"
+                        .into(),
+                );
+            }
             let old = remote(&git, &name)?;
             if let Some((_, state)) = &old {
                 let observed = observe(state, &holder, &env.state);
@@ -461,7 +502,11 @@ impl Lease {
                 |(_, state)| {
                     // A carried fix extends this exact line. A different base selected on a
                     // moving main is discarded when adopting the fleet's existing line.
-                    preferred(line, &state.line)
+                    if let Some(record) = &current {
+                        preferred(line, &preferred(&state.line, &record.replacement))
+                    } else {
+                        preferred(line, &state.line)
+                    }
                 },
             );
             let state = State {

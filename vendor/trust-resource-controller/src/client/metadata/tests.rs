@@ -28,7 +28,7 @@ fn actual_streams() -> (MetadataStreams, UnixStream, std::io::PipeWriter, std::i
 fn a_valid_native_event_survives_scheduling_delay() {
     let (mut streams, peer, _stdout, _stderr) = actual_streams();
     let mut peer = Channel::new(peer).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = crate::fixture_deadline(Instant::now());
     peer.send(&status(Status::Attached).encode().unwrap(), deadline).unwrap();
     assert!(matches!(
         streams.poll_at(&request(), deadline, Instant::now() - Duration::from_secs(1)),
@@ -60,7 +60,7 @@ fn concurrent_fresh_capture_and_lifeline_transfer_preserve_original_pipe_flags()
             let (a, b) = UnixStream::pair().unwrap();
             let mut sender = Channel::new(a).unwrap();
             let mut receiver = Channel::new(b).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(10);
+            let deadline = crate::fixture_deadline(Instant::now());
             sender.send_read_lifeline(reader.as_fd(), deadline).unwrap();
             let actual = receiver.receive_read_lifeline(deadline).unwrap();
             for fd in [reader.as_raw_fd(), actual.as_raw_fd()] {
@@ -85,7 +85,7 @@ fn concurrent_fresh_capture_and_lifeline_transfer_preserve_original_pipe_flags()
 fn actual_partial_output_and_native_frames_survive_event_eof_without_completion() {
     let (mut streams, peer, mut stdout, mut stderr) = actual_streams();
     let mut peer = Channel::new(peer).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = crate::fixture_deadline(Instant::now() - Duration::from_secs(11));
     let mut original_events = Vec::new();
     for event in [
         status(Status::Attached),
@@ -137,7 +137,7 @@ fn actual_malformed_partial_event_preserves_received_prefix_and_output() {
     peer.write_all(&partial).unwrap();
     stdout.write_all(b"before malformed event").unwrap();
     drop((peer, stdout, stderr));
-    assert!(streams.poll(&request(), Instant::now() + Duration::from_secs(10)).is_err());
+    assert!(streams.poll(&request(), crate::fixture_deadline(Instant::now())).is_err());
     let captured = streams.take_failure_observation(&request());
     assert_eq!(captured.stdout, b"before malformed event");
     assert_eq!(captured.event_prefix, partial);
@@ -351,7 +351,7 @@ fn combined_output_bound_does_not_replace_actual_eof() {
     assert!(capture.exceeded);
     assert_eq!(capture.eof, [false; 2]);
     drop((stdout, stderr));
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = crate::fixture_deadline(Instant::now());
     while !capture.eof.iter().all(|eof| *eof) && Instant::now() < deadline {
         capture.drain().unwrap();
         std::thread::sleep(Duration::from_millis(1));
@@ -368,7 +368,7 @@ fn clean_event_eof_does_not_consume_or_hide_partial_trailing_frame() {
     writer.write_all(&[0, 0]).unwrap();
     drop(writer);
     assert!(!channel.at_eof().unwrap());
-    assert!(channel.receive(Instant::now() + Duration::from_secs(1)).is_err());
+    assert!(channel.receive(crate::fixture_deadline(Instant::now())).is_err());
     assert!(channel.poisoned());
     let (reader, writer) = UnixStream::pair().unwrap();
     let channel = Channel::new(reader).unwrap();
@@ -412,7 +412,7 @@ fn explicit_failed_discovery_never_creates_a_store_or_falls_back_to_account() {
         .unwrap()
         .join(format!("missing-native-metadata-store-{}", std::process::id()));
     assert!(!path.exists());
-    let error = Client::discover_at(&path, Instant::now() + Duration::from_secs(1))
+    let error = Client::discover_at(&path, crate::fixture_deadline(Instant::now()))
         .err()
         .expect("explicit discovery must fail");
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
@@ -485,7 +485,7 @@ fn resolver_query_incomplete_native_stream_retains_actual_failed_bytes_without_c
     peer.write_all(&partial).unwrap();
     stdout.write_all(b"actual resolver query bytes\0").unwrap();
     drop((peer, stdout, stderr));
-    assert!(streams.poll(&request, Instant::now() + Duration::from_secs(10)).is_err());
+    assert!(streams.poll(&request, crate::fixture_deadline(Instant::now())).is_err());
     let failed = streams.take_failure_observation(&request);
     assert_eq!(failed.stdout, b"actual resolver query bytes\0");
     assert_eq!(failed.event_prefix, partial);
@@ -529,7 +529,7 @@ fn workload_observer_receives_each_actual_binary_read_before_pipe_eof() {
     stdout.write_all(b"second\xfe").unwrap();
     capture.drain_observed(&mut Some(&mut observer)).unwrap();
     drop((stdout, stderr));
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = crate::fixture_deadline(Instant::now());
     while !capture.eof.iter().all(|value| *value) && Instant::now() < deadline {
         capture.drain_observed(&mut Some(&mut observer)).unwrap();
         std::thread::sleep(Duration::from_millis(1));
@@ -604,7 +604,7 @@ fn workload_final_failed_drain_observes_new_bytes_and_retains_them_on_sink_failu
         streams
             .poll_inner(
                 &workload_request(),
-                Instant::now() + Duration::from_secs(10),
+                crate::fixture_deadline(Instant::now()),
                 &mut Some(&mut observer),
             )
             .unwrap(),

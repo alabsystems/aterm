@@ -4,19 +4,76 @@
 //! The candidate line on real git: a bare origin whose main moved past the line's base, a rival
 //! clone that pushes, and the release's work clone (`crate::line`).
 
-use crate::ledger::{self, GitRunner, RunOut};
+use crate::ledger::{self, GitRunner, Origin, RefWrite, RunOut};
 use crate::line::{self, Admitted, Fix, Hop, Line, Merged, Reason, Recorded, Stop};
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::push_hook::HookRunner;
 use ledger::testing::Git;
 
 const VERSION: &str = "0.26.0";
+
+#[test]
+fn supersession_is_durable_ordered_and_keeps_mains_tree() {
+    let fixture = Fixture::new("supersede");
+    let git = fixture.git();
+    let origin = LocalOrigin::new(&fixture);
+    let old = Line::start(VERSION, &fixture.shas.g, 1);
+    let new = Line::start(VERSION, &fixture.shas.fix_b, 2);
+    assert_eq!(line::supersession(&git, VERSION).unwrap(), None);
+    let record = line::Supersession {
+        previous: old.clone(),
+        replacement: new.clone(),
+        reason: "unfinishable cutter".into(),
+    };
+    let tree = rev(&fixture.origin, "main^{tree}");
+    let merge = line::supersede(&git, &origin, &record).unwrap();
+    assert_eq!(rev(&fixture.origin, "main^{tree}"), tree);
+    assert_eq!(
+        line::supersession(&git, VERSION).unwrap(),
+        Some(record.clone())
+    );
+    assert_eq!(
+        crate::line_claim::current(&git, VERSION, Some(old.clone())).unwrap(),
+        Some(new.clone()),
+        "main's retirement overrides a claim still naming the old base"
+    );
+    assert_eq!(line::supersede(&git, &origin, &record).unwrap(), merge);
+    assert_eq!(origin.writes.get(), 1);
+
+    let newer = line::Supersession {
+        previous: new,
+        replacement: Line::start(VERSION, &fixture.shas.frozen, 3),
+        reason: "second explicit retirement".into(),
+    };
+    line::supersede(&git, &origin, &newer).unwrap();
+    assert_eq!(line::supersession(&git, VERSION).unwrap(), Some(newer));
+    // Negative control: a stale writer cannot restore the first replacement.
+    assert!(line::supersede(&git, &origin, &record).is_err());
+    let backwards = line::Supersession {
+        previous: record.replacement,
+        replacement: old,
+        reason: "backwards".into(),
+    };
+    assert!(line::supersede(&git, &origin, &backwards).is_err());
+}
+
+#[test]
+fn every_public_surface_prevents_supersession() {
+    assert!(line::require_unpublished([false; 5]).is_ok());
+    for index in 0..5 {
+        let mut public = [false; 5];
+        public[index] = true;
+        assert!(
+            line::require_unpublished(public).is_err(),
+            "surface {index}"
+        );
+    }
+}
 
 /// The commits the template's history holds, oldest first.
 #[derive(Clone)]
@@ -460,27 +517,119 @@ fn sibling(fix: &Fixture, message: &str, time: u64) -> Fix {
     }
 }
 
-/// The record push says it landed, and pushes nothing.
-struct NoPush(Git);
+/// File-only typed origin for the real-object line fixtures. The production
+/// GitRunner never needs a remote command; this seam owns all origin effects.
+struct LocalOrigin<'a> {
+    fix: &'a Fixture,
+    writes: Cell<u32>,
+    refreshes: Cell<u32>,
+    before_write: RefCell<Box<dyn FnMut(u32) + 'a>>,
+    no_effect: bool,
+    failure: Option<String>,
+    fail_after_effect: bool,
+}
 
-impl GitRunner for NoPush {
-    fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
-        if args.first() == Some(&"push") {
-            return Ok(RunOut {
-                status: 0,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            });
+impl<'a> LocalOrigin<'a> {
+    fn new(fix: &'a Fixture) -> Self {
+        Self {
+            fix,
+            writes: Cell::new(0),
+            refreshes: Cell::new(0),
+            before_write: RefCell::new(Box::new(|_| {})),
+            no_effect: false,
+            failure: None,
+            fail_after_effect: false,
         }
+    }
+
+    fn checked(repo: &Path, args: &[&str]) -> Result<String, String> {
+        let out = Git::new(repo).git(args).map_err(|e| e.to_string())?;
+        if out.success() {
+            Ok(out.stdout_utf8().trim().to_string())
+        } else {
+            Err(out.stderr_utf8())
+        }
+    }
+}
+
+impl Origin for LocalOrigin<'_> {
+    fn refresh_main(&self) -> Result<String, String> {
+        self.refreshes.set(self.refreshes.get() + 1);
+        Self::checked(&self.fix.work, &["fetch", "-q", "origin", "main"])?;
+        Self::checked(&self.fix.work, &["rev-parse", "origin/main"])
+    }
+
+    fn write(
+        &self,
+        reference: &str,
+        before: Option<&str>,
+        after: &str,
+    ) -> Result<RefWrite, String> {
+        assert_eq!(reference, "refs/heads/main");
+        let expected = before.expect("record always supplies the exact observed main");
+        let n = self.writes.get() + 1;
+        self.writes.set(n);
+        (self.before_write.borrow_mut())(n);
+        if let Some(why) = &self.failure
+            && !self.fail_after_effect
+        {
+            return Err(why.clone());
+        }
+        if self.no_effect {
+            return Ok(RefWrite::Written);
+        }
+        let observed = Self::checked(&self.fix.origin, &["rev-parse", reference])?;
+        if observed != expected {
+            return Ok(RefWrite::Conflict);
+        }
+        // Import only the exact new local object, then CAS the bare fixture ref.
+        Self::checked(
+            &self.fix.origin,
+            &["fetch", "-q", self.fix.work.to_str().unwrap(), after],
+        )?;
+        Self::checked(
+            &self.fix.origin,
+            &["update-ref", reference, after, expected],
+        )?;
+        if let Some(why) = &self.failure {
+            return Err(why.clone());
+        }
+        Ok(RefWrite::Written)
+    }
+
+    fn get(&self, _: &str) -> Result<Option<String>, String> {
+        Err("line uses a complete authenticated main refresh".into())
+    }
+    fn import(&self, _: &str) -> Result<(), String> {
+        Err("line refresh imports its own exact objects".into())
+    }
+    fn peel(&self, _: &str) -> Result<Option<String>, String> {
+        Err("line does not read tags".into())
+    }
+    fn tag_object(&self, _: &str) -> Result<Vec<u8>, String> {
+        Err("line does not read tags".into())
+    }
+    fn delete(&self, _: &str, _: &str) -> Result<RefWrite, String> {
+        Err("line deletes nothing".into())
+    }
+    fn control_transaction(
+        &self,
+        _: crate::ledger::ControlRefTransaction,
+    ) -> Result<RefWrite, String> {
+        Err("line writes only main".into())
+    }
+}
+
+/// Fail the test if production line plumbing tries to use Git for origin I/O.
+struct LocalOnly<'a>(&'a dyn GitRunner);
+
+impl GitRunner for LocalOnly<'_> {
+    fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
+        assert!(!matches!(
+            args.first(),
+            Some(&"fetch" | &"push" | &"ls-remote")
+        ));
         self.0.git(args)
-    }
-
-    fn git_input(&self, args: &[&str], input: &[u8]) -> ledger::Result<RunOut> {
-        self.0.git_input(args, input)
-    }
-
-    fn git_env(&self, args: &[&str], env: &[(&str, &str)]) -> ledger::Result<RunOut> {
-        self.0.git_env(args, env)
     }
 }
 
@@ -536,7 +685,14 @@ fn a_clean_hop_is_the_landed_fixs_patch_on_the_base_and_verifies() {
         "a journaled head origin/main lacks lost its record, and no re-run records it: \
          {unrecorded:?}"
     );
-    let recorded = line::record(&git, VERSION, carried.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    let recorded = line::record(
+        &git,
+        &LocalOrigin::new(&fix),
+        VERSION,
+        carried.head(),
+        line::MAX_RECORD_ATTEMPTS,
+    )
+    .unwrap();
     let Recorded::Pushed { merge, attempt: 1 } = recorded else {
         panic!("a quiet main takes the record merge on the first push: {recorded:?}");
     };
@@ -678,7 +834,14 @@ fn a_carried_fix_resumes_and_one_the_line_holds_is_refused() {
     assert!(l.carried(&s.fix_b));
     assert_eq!(line::admit(&git, &l, &s.fix_b).unwrap(), Admitted::Carried);
     stopped(line::admit(&git, &l, &s.g), Reason::Held);
-    line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    line::record(
+        &git,
+        &LocalOrigin::new(&fix),
+        VERSION,
+        l.head(),
+        line::MAX_RECORD_ATTEMPTS,
+    )
+    .unwrap();
     stopped(line::admit(&git, &l, l.head()), Reason::Held);
     stopped(
         line::admit(&git, &Line::start(VERSION, &s.d_revert, 0), &s.d_fix),
@@ -719,7 +882,14 @@ fn fixes_carry_in_ancestry_order_whatever_order_they_are_named_in() {
         format!("release line v0.26.0 hop 2: carries {} (fix: b2)", s.fix_b)
     );
     l.hops = hops;
-    line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    line::record(
+        &git,
+        &LocalOrigin::new(&fix),
+        VERSION,
+        l.head(),
+        line::MAX_RECORD_ATTEMPTS,
+    )
+    .unwrap();
     let summary = line::verify(&git, &l).unwrap();
     assert!(summary.contains("2 hop(s)"), "{summary}");
 }
@@ -844,12 +1014,15 @@ fn the_record_merge_rebuilds_on_a_rival_push_and_keeps_mains_tree() {
     let mut l = Line::start(VERSION, &s.g, 0);
     l.hops = line::carry(&fix.git(), &l, &[fix_of(&fix.git(), &l, &s.fix_b)]).unwrap();
     let rival_tip = RefCell::new(String::new());
-    let git = HookRunner::new(&fix.work, |n: u32| {
+    let git = fix.git();
+    let origin = LocalOrigin::new(&fix);
+    *origin.before_write.borrow_mut() = Box::new(|n| {
         if n == 1 {
             *rival_tip.borrow_mut() = fix.rival_moves_main("fn a6() {}");
         }
     });
-    let recorded = line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    let recorded =
+        line::record(&git, &origin, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
     let Recorded::Pushed { merge, attempt: 2 } = recorded else {
         panic!("the first push lost to the rival, the rebuild landed: {recorded:?}");
     };
@@ -866,11 +1039,11 @@ fn the_record_merge_rebuilds_on_a_rival_push_and_keeps_mains_tree() {
     );
     assert!(is_ancestor(&fix.origin, l.head(), "main"));
     assert_eq!(
-        line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap(),
+        line::record(&git, &origin, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap(),
         Recorded::Already { tip: merge },
         "a re-run finds the head on main and pushes nothing"
     );
-    assert_eq!(git.pushes.get(), 2);
+    assert_eq!(origin.writes.get(), 2);
 }
 
 #[test]
@@ -879,11 +1052,16 @@ fn the_record_stops_could_not_run_when_every_push_loses() {
     let s = fix.shas.clone();
     let mut l = Line::start(VERSION, &s.g, 0);
     l.hops = line::carry(&fix.git(), &l, &[fix_of(&fix.git(), &l, &s.fix_b)]).unwrap();
-    let git = HookRunner::new(&fix.work, |n: u32| {
+    let git = fix.git();
+    let origin = LocalOrigin::new(&fix);
+    *origin.before_write.borrow_mut() = Box::new(|n| {
         fix.rival_moves_main(&format!("fn rival{n}() {{}}"));
     });
-    stopped(line::record(&git, VERSION, l.head(), 3), Reason::Raced);
-    assert_eq!(git.pushes.get(), 3);
+    stopped(
+        line::record(&git, &origin, VERSION, l.head(), 3),
+        Reason::Raced,
+    );
+    assert_eq!(origin.writes.get(), 3);
     assert!(!is_ancestor(&fix.origin, l.head(), "main"));
 }
 
@@ -893,9 +1071,12 @@ fn an_unreachable_origin_or_a_push_that_lands_nothing_could_not_run() {
     let s = &fix.shas;
     let mut l = Line::start(VERSION, &s.g, 0);
     l.hops = line::carry(&fix.git(), &l, &[fix_of(&fix.git(), &l, &s.fix_b)]).unwrap();
+    let mut no_effect = LocalOrigin::new(&fix);
+    no_effect.no_effect = true;
     stopped(
         line::record(
-            &NoPush(fix.git()),
+            &fix.git(),
+            &no_effect,
             VERSION,
             l.head(),
             line::MAX_RECORD_ATTEMPTS,
@@ -908,9 +1089,45 @@ fn an_unreachable_origin_or_a_push_that_lands_nothing_could_not_run() {
         &["remote", "set-url", "origin", gone.to_str().unwrap()],
     );
     stopped(
-        line::record(&fix.git(), VERSION, l.head(), line::MAX_RECORD_ATTEMPTS),
+        line::record(
+            &fix.git(),
+            &LocalOrigin::new(&fix),
+            VERSION,
+            l.head(),
+            line::MAX_RECORD_ATTEMPTS,
+        ),
         Reason::Unreachable,
     );
+}
+
+#[test]
+fn an_unknown_record_write_stops_without_retry_or_a_race_word_guess() {
+    for after_effect in [false, true] {
+        let fix = Fixture::merging("record-unknown");
+        let git = fix.git();
+        let mut line = Line::start(VERSION, &fix.shas.g, 0);
+        line.hops = line::carry(&git, &line, &[fix_of(&git, &line, &fix.shas.fix_b)]).unwrap();
+        let mut origin = LocalOrigin::new(&fix);
+        origin.failure = Some(
+            "native outcome unknown: [rejected] non-fast-forward; remote may have committed".into(),
+        );
+        origin.fail_after_effect = after_effect;
+        stopped(
+            line::record(&LocalOnly(&git), &origin, VERSION, line.head(), 5),
+            Reason::Unreachable,
+        );
+        assert_eq!(origin.writes.get(), 1, "unknown never becomes a retry");
+        assert_eq!(
+            origin.refreshes.get(),
+            1,
+            "unknown is propagated before any post-read"
+        );
+        assert_eq!(
+            is_ancestor(&fix.origin, line.head(), "main"),
+            after_effect,
+            "both possible outcomes remain unknown to the caller"
+        );
+    }
 }
 
 #[test]
@@ -921,7 +1138,14 @@ fn verify_refuses_each_way_a_line_can_be_wrong_and_passes_the_honest_one() {
     let honest = line::carry(&git, &start, &[fix_of(&git, &start, &s.fix_b)]).unwrap();
     let real = honest[0].clone();
     let hop_a = line::carry(&git, &start, &[fix_of(&git, &start, &s.fix_a)]).unwrap()[0].clone();
-    line::record(&git, VERSION, &hop_a.commit, line::MAX_RECORD_ATTEMPTS).unwrap();
+    line::record(
+        &git,
+        &LocalOrigin::new(&fix),
+        VERSION,
+        &hop_a.commit,
+        line::MAX_RECORD_ATTEMPTS,
+    )
+    .unwrap();
     let on = |base: &str, hops: Vec<Hop>| Line {
         hops,
         ..Line::start(VERSION, base, 0)
@@ -1011,11 +1235,25 @@ fn verify_refuses_each_way_a_line_can_be_wrong_and_passes_the_honest_one() {
         ),
     ];
     for (l, reason) in cases {
-        line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+        line::record(
+            &git,
+            &LocalOrigin::new(&fix),
+            VERSION,
+            l.head(),
+            line::MAX_RECORD_ATTEMPTS,
+        )
+        .unwrap();
         stopped(line::verify(&git, &l), reason);
     }
     let honest = on(&s.g, vec![real.clone()]);
-    line::record(&git, VERSION, honest.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    line::record(
+        &git,
+        &LocalOrigin::new(&fix),
+        VERSION,
+        honest.head(),
+        line::MAX_RECORD_ATTEMPTS,
+    )
+    .unwrap();
     line::verify(&git, &honest).unwrap();
 
     let lacked = "0123456789abcdef0123456789abcdef01234567";
@@ -1067,7 +1305,14 @@ fn a_commit_main_holds_only_through_a_record_merge_never_landed() {
     let start = Line::start(VERSION, &s.g, 0);
     let mut rival = start.clone();
     rival.hops = line::carry(&git, &rival, &[fix_of(&git, &rival, &s.fix_b)]).unwrap();
-    line::record(&git, VERSION, rival.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    line::record(
+        &git,
+        &LocalOrigin::new(&fix),
+        VERSION,
+        rival.head(),
+        line::MAX_RECORD_ATTEMPTS,
+    )
+    .unwrap();
     let rival_hop = rival.head().to_string();
     assert!(
         is_ancestor(&fix.work, &rival_hop, "origin/main"),
@@ -1110,7 +1355,14 @@ fn a_commit_main_holds_only_through_a_record_merge_never_landed() {
             hops: vec![hand_hop(&fix, &s.g, unlanded)],
             ..start.clone()
         };
-        line::record(&git, VERSION, l.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+        line::record(
+            &git,
+            &LocalOrigin::new(&fix),
+            VERSION,
+            l.head(),
+            line::MAX_RECORD_ATTEMPTS,
+        )
+        .unwrap();
         let stop = stopped(line::verify(&git, &l), Reason::OffMain);
         assert!(
             stop.why.starts_with("hop 1: ") && stop.remedy.contains("--forget"),
@@ -1340,7 +1592,14 @@ fn the_cut_signs_only_the_head_of_a_line_that_verifies() {
     let admitted = fix_of(&git, &start, &s.fix_b);
     let mut carried = start.clone();
     carried.hops = line::carry(&git, &start, &[admitted]).unwrap();
-    line::record(&git, VERSION, carried.head(), line::MAX_RECORD_ATTEMPTS).unwrap();
+    line::record(
+        &git,
+        &LocalOrigin::new(&fix),
+        VERSION,
+        carried.head(),
+        line::MAX_RECORD_ATTEMPTS,
+    )
+    .unwrap();
     let head = carried.head().to_string();
     let journal = fix
         .work

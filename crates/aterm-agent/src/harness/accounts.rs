@@ -217,6 +217,9 @@ pub const SCHEMA: u64 = 1;
 /// A state carrying preparation-only execution holds cannot be written by an
 /// older reader which would discard those holds as unknown fields.
 pub const PREPARED_STATE_SCHEMA: u64 = 2;
+/// A native canary owner, including one retained by undo, cannot be discarded
+/// by an older writer that knows only session-based cancellation.
+pub const NATIVE_CANARY_STATE_SCHEMA: u64 = 3;
 
 /// The most walls kept per account (the vendor names six limit types).
 pub const MAX_WALLS: usize = 8;
@@ -6755,14 +6758,45 @@ fn canary_of(v: &Value) -> Option<Canary> {
         sid: word(v.get("sid"), WORD_MAX).unwrap_or_default(),
         at: int(v.get("at"))?,
         took: v.get("took").and_then(Value::as_bool).unwrap_or(false),
-        // Preserve the canary even when its optional native owner is unknown.
-        // Unknown ownership never grants a stale cancellation permission.
+        // State::from_json validates every present owner before sanitizing.
+        // An absent field denotes an ordinary, session-owned canary.
         native_receipt: v
             .get("native_receipt")
             .and_then(Value::as_str)
             .filter(|id| id.len() == 32 && aterm_codec::hex::is_lower(id, 32))
             .map(str::to_owned),
     })
+}
+
+fn validate_native_canary(v: &Value) -> Result<(), Unread> {
+    let Some(owner) = v.get("native_receipt") else {
+        return Ok(());
+    };
+    let valid_owner = owner
+        .as_str()
+        .is_some_and(|id| id.len() == 32 && aterm_codec::hex::is_lower(id, 32));
+    let valid_sid = v
+        .get("sid")
+        .and_then(Value::as_str)
+        .is_some_and(|sid| !sid.is_empty() && one_line(sid, WORD_MAX) == sid);
+    if !valid_owner
+        || !valid_sid
+        || int(v.get("at")).is_none()
+        || v.get("took").and_then(Value::as_bool).is_none()
+    {
+        return Err(Unread::NotOurs("invalid native canary ownership".into()));
+    }
+    Ok(())
+}
+
+fn validate_native_undo(v: &Value) -> Result<(), Unread> {
+    let previous_valid = v
+        .get("previous")
+        .is_none_or(|value| value.is_null() || value.as_str().is_some_and(admissible_label));
+    if !previous_valid || v.get("previous_proven").and_then(Value::as_bool).is_none() {
+        return Err(Unread::NotOurs("invalid native canary undo".into()));
+    }
+    Ok(())
 }
 
 fn undo_json(u: &Undo) -> Value {
@@ -7072,8 +7106,25 @@ impl State {
         o.insert(
             "schema".to_owned(),
             Value::from(
-                if self.schema == SCHEMA && !self.prepared_accounts.is_empty() {
-                    PREPARED_STATE_SCHEMA
+                if matches!(
+                    self.schema,
+                    SCHEMA | PREPARED_STATE_SCHEMA | NATIVE_CANARY_STATE_SCHEMA
+                ) && self
+                    .canary
+                    .iter()
+                    .chain(self.undo.iter().filter_map(|undo| undo.canary.as_ref()))
+                    .any(|canary| canary.native_receipt.is_some())
+                {
+                    NATIVE_CANARY_STATE_SCHEMA
+                } else if matches!(
+                    self.schema,
+                    SCHEMA | PREPARED_STATE_SCHEMA | NATIVE_CANARY_STATE_SCHEMA
+                ) {
+                    if self.prepared_accounts.is_empty() {
+                        SCHEMA
+                    } else {
+                        PREPARED_STATE_SCHEMA
+                    }
                 } else {
                     self.schema
                 },
@@ -7307,8 +7358,9 @@ impl State {
     ///
     /// [`Unread::Torn`]: not JSON, including a file cut short.
     /// [`Unread::NotOurs`]: JSON but not an object, or naming no schema or one other than
-    /// [`SCHEMA`] or [`PREPARED_STATE_SCHEMA`], or a malformed or unknown pending selection:
-    /// a file this build must not guess at or write over.
+    /// [`SCHEMA`], [`PREPARED_STATE_SCHEMA`] or [`NATIVE_CANARY_STATE_SCHEMA`], or
+    /// malformed native canary history or a malformed or unknown pending
+    /// selection: a file this build must not guess at or write over.
     pub fn from_json(text: &str, now: i64) -> Result<State, Unread> {
         let doc: Value = aterm_json::from_str(text)
             .map_err(|e| Unread::Torn(format!("not JSON ({})", shown(&e.to_string()))))?;
@@ -7317,13 +7369,26 @@ impl State {
         }
         let stored_schema = doc.get("schema").and_then(Value::as_u64);
         match stored_schema {
-            Some(SCHEMA | PREPARED_STATE_SCHEMA) => {}
+            Some(SCHEMA | PREPARED_STATE_SCHEMA | NATIVE_CANARY_STATE_SCHEMA) => {}
             Some(other) => {
                 return Err(Unread::NotOurs(format!(
-                    "schema {other}; this build reads schemas {SCHEMA} and {PREPARED_STATE_SCHEMA}"
+                    "schema {other}; this build reads schemas {SCHEMA}, {PREPARED_STATE_SCHEMA} and {NATIVE_CANARY_STATE_SCHEMA}"
                 )));
             }
             None => return Err(Unread::NotOurs("names no schema".to_string())),
+        }
+        if let Some(canary) = doc.get("canary") {
+            validate_native_canary(canary)?;
+        }
+        for undo in doc
+            .get("undo")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let Some(canary) = undo.get("canary") {
+                validate_native_canary(canary)?;
+            }
         }
         let accounts: BTreeMap<String, Account> = doc
             .get("accounts")
@@ -7414,6 +7479,37 @@ impl State {
         });
         let canary = doc.get("canary").and_then(canary_of);
         let made = canary.as_ref().is_some_and(|c| !c.took);
+        let raw_undo = doc.get("undo").and_then(Value::as_array);
+        let protected = stored_schema == Some(NATIVE_CANARY_STATE_SCHEMA);
+        if protected
+            && (!doc
+                .get("canary")
+                .is_some_and(|value| value.is_null() || value.is_object())
+                || !raw_undo.is_some_and(|rows| {
+                    rows.len() <= MAX_UNDO
+                        && rows.iter().all(|row| {
+                            row.is_object()
+                                && row
+                                    .get("canary")
+                                    .is_some_and(|value| value.is_null() || value.is_object())
+                        })
+                }))
+        {
+            return Err(Unread::NotOurs("invalid protected canary history".into()));
+        }
+        for row in raw_undo.into_iter().flatten() {
+            let owned = row
+                .get("canary")
+                .is_some_and(|canary| canary.get("native_receipt").is_some());
+            if protected || owned {
+                validate_native_undo(row)?;
+            }
+            if owned && (!made || raw_undo.is_some_and(|rows| rows.len() > MAX_UNDO)) {
+                return Err(Unread::NotOurs(
+                    "native canary undo would be discarded".into(),
+                ));
+            }
+        }
         let mut undo: Vec<Undo> = doc
             .get("undo")
             .and_then(Value::as_array)
@@ -7424,6 +7520,14 @@ impl State {
             .collect();
         let extra = undo.len().saturating_sub(MAX_UNDO);
         undo.drain(..extra);
+        if protected
+            && !canary
+                .iter()
+                .chain(undo.iter().filter_map(|row| row.canary.as_ref()))
+                .any(|canary| canary.native_receipt.is_some())
+        {
+            return Err(Unread::NotOurs("protected canary owner is missing".into()));
+        }
         let leases: BTreeMap<String, AccountLease> = doc
             .get("leases")
             .and_then(Value::as_object)
@@ -7466,7 +7570,9 @@ impl State {
                 }
             }
         }
-        if (!prepared_accounts.is_empty()) != (stored_schema == Some(PREPARED_STATE_SCHEMA)) {
+        if stored_schema != Some(NATIVE_CANARY_STATE_SCHEMA)
+            && (!prepared_accounts.is_empty()) != (stored_schema == Some(PREPARED_STATE_SCHEMA))
+        {
             return Err(Unread::NotOurs(
                 "prepared-account holds require their guarded state schema".into(),
             ));
@@ -13171,7 +13277,9 @@ impl Store {
 
     /// Admits a usage observation against its captured source and account under the
     /// writer lock. A configured row cannot turn into the implicit default, or the
-    /// default into a configured row. Retained logins may report across renewal.
+    /// default into a configured row. Retained logins may report across renewal. `seen`
+    /// reads the state the edit leaves with the keys the same transaction learns
+    /// ([`super::journal::learn`]), and what it returns comes back with the events.
     /// # Errors
     /// An unattributed process, changed policy, unreadable records, unavailable writer,
     /// edit refusal or failed publication. A missing source remains absent in recovery.
@@ -13183,14 +13291,15 @@ impl Store {
             project = "aterm_agent::harness::accounts::usage_source_tests::usage_source_transition"
         )
     )]
-    pub fn observe_usage_within(
+    pub fn observe_usage_within<T>(
         &self,
         ladder: &[std::time::Duration],
         now: i64,
         captured: &UsageRoster,
         who: &ProcessLogin,
         edit: impl FnOnce(&mut State) -> Result<Vec<Event>, String>,
-    ) -> Result<Vec<Event>, String> {
+        seen: impl FnOnce(&State) -> T,
+    ) -> Result<(Vec<Event>, T), String> {
         if self.dir != captured.store.dir
             || self.logins != captured.store.logins
             || self.cli != captured.store.cli
@@ -13202,20 +13311,26 @@ impl Store {
             .roster
             .row(label)
             .ok_or("usage account is missing")?;
-        self.transact_usage_within(ladder, captured, now, |raw, state, logins| {
-            let implicit = raw.rows.is_empty();
-            let current = if implicit {
-                Roster::own()
-            } else {
-                bound(raw, logins)
-            };
-            if captured.implicit != implicit || !account_matches(row, who, &current) {
-                return Err(format!(
-                    "account `{label}` changed since usage was read; nothing recorded"
-                ));
-            }
-            edit(state)
-        })
+        self.transact_usage_within(
+            ladder,
+            captured,
+            now,
+            |raw, state, logins| {
+                let implicit = raw.rows.is_empty();
+                let current = if implicit {
+                    Roster::own()
+                } else {
+                    bound(raw, logins)
+                };
+                if captured.implicit != implicit || !account_matches(row, who, &current) {
+                    return Err(format!(
+                        "account `{label}` changed since usage was read; nothing recorded"
+                    ));
+                }
+                edit(state)
+            },
+            seen,
+        )
     }
 
     /// Publishes a renewal only while its captured roster and effective target row still
@@ -13443,33 +13558,40 @@ pub fn record_wall(
     let sid = one_line(sid, WORD_MAX);
     let mut changed = false;
     let mut cleared = false;
-    let done = store.observe_usage_within(store.ladder, now, captured, who, |state| {
-        let before = state.clone();
-        let on_it = state
-            .sessions
-            .get(&sid)
-            .is_some_and(|row| row.account == account);
-        let mut events = if on_it {
-            Vec::new()
-        } else {
-            note_session(state, &sid, account, None, now)
-        };
-        cleared = state
-            .accounts
-            .get(account)
-            .is_some_and(|record| record.cleared_since(&window, at, now).is_some());
-        events.extend(note_wall(state, account, &window, until, at, now));
-        note_credits_word(state, account, wall.credits.as_ref(), at);
-        changed = *state != before;
-        Ok(events
-            .into_iter()
-            .map(|event| match event.sid {
-                Some(_) => event,
-                None => event.with_sid(&sid),
-            })
-            .collect())
-    });
-    match done {
+    let done = store.observe_usage_within(
+        store.ladder,
+        now,
+        captured,
+        who,
+        |state| {
+            let before = state.clone();
+            let on_it = state
+                .sessions
+                .get(&sid)
+                .is_some_and(|row| row.account == account);
+            let mut events = if on_it {
+                Vec::new()
+            } else {
+                note_session(state, &sid, account, None, now)
+            };
+            cleared = state
+                .accounts
+                .get(account)
+                .is_some_and(|record| record.cleared_since(&window, at, now).is_some());
+            events.extend(note_wall(state, account, &window, until, at, now));
+            note_credits_word(state, account, wall.credits.as_ref(), at);
+            changed = *state != before;
+            Ok(events
+                .into_iter()
+                .map(|event| match event.sid {
+                    Some(_) => event,
+                    None => event.with_sid(&sid),
+                })
+                .collect())
+        },
+        |_| (),
+    );
+    match done.map(|(events, ())| events) {
         Err(why) => Recorded::Refused(why),
         Ok(_) if cleared => Recorded::Cleared,
         Ok(events) if events.is_empty() && !changed => Recorded::Unchanged,
@@ -13597,40 +13719,47 @@ pub fn record_usage(
     let at = said.at.min(now);
     let sid = one_line(sid, WORD_MAX);
     let (mut decided, mut stats, mut walled) = (false, false, None);
-    let done = store.observe_usage_within(store.ladder, now, captured, who, |state| {
-        let by = state.machine.clone();
-        let Some(record) = account_mut(state, account) else {
-            return Ok(Vec::new());
-        };
-        let before = record.clone();
-        let mut events = Vec::new();
-        if let Some(credits) = said.credits {
-            events.extend(note_in_use(record, account, credits, at, said.day, now));
-        }
-        if let Some(warning) = said.warning {
-            events.extend(note_warning(record, account, warning, at, now));
-        }
-        decided = *record != before;
-        walled = None;
-        if let Some(week) = said.week {
-            let moved = note_week(record, account, week, at, &by, now);
-            if week.wall && moved.is_some() {
-                walled = Some(WeekWalled {
-                    bucket: week.bucket,
-                    reset: week.reset,
-                    at,
-                    by: by.clone(),
-                });
+    let done = store.observe_usage_within(
+        store.ladder,
+        now,
+        captured,
+        who,
+        |state| {
+            let by = state.machine.clone();
+            let Some(record) = account_mut(state, account) else {
+                return Ok(Vec::new());
+            };
+            let before = record.clone();
+            let mut events = Vec::new();
+            if let Some(credits) = said.credits {
+                events.extend(note_in_use(record, account, credits, at, said.day, now));
             }
-            events.extend(moved);
-        }
-        stats = record.weeks_said != before.weeks_said;
-        Ok(events
-            .into_iter()
-            .map(|event| event.with_sid(&sid))
-            .collect())
-    });
-    match done {
+            if let Some(warning) = said.warning {
+                events.extend(note_warning(record, account, warning, at, now));
+            }
+            decided = *record != before;
+            walled = None;
+            if let Some(week) = said.week {
+                let moved = note_week(record, account, week, at, &by, now);
+                if week.wall && moved.is_some() {
+                    walled = Some(WeekWalled {
+                        bucket: week.bucket,
+                        reset: week.reset,
+                        at,
+                        by: by.clone(),
+                    });
+                }
+                events.extend(moved);
+            }
+            stats = record.weeks_said != before.weeks_said;
+            Ok(events
+                .into_iter()
+                .map(|event| event.with_sid(&sid))
+                .collect())
+        },
+        |_| (),
+    );
+    match done.map(|(events, ())| events) {
         Err(why) => Recorded::Refused(why),
         Ok(events) if decided => Recorded::Usage {
             account: account.to_string(),

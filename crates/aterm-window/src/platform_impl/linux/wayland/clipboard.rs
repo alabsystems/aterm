@@ -10,12 +10,11 @@
 //! [`CLAIM_ORDER`], [`CopyOutcome`]).
 
 use std::ffi::{CStr, CString};
-use std::io::{PipeReader, Read, Write};
+use std::io::PipeReader;
 use std::os::fd::OwnedFd;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
-use std::time::{Duration, Instant};
 
 use aterm_wayland::selection::{Source, SourceEvent};
 use tracing::{debug, warn};
@@ -40,17 +39,6 @@ const TEXT_MIMES: [&str; 5] =
 /// [`TEXT_MIMES`] as a source offers them.
 const TEXT_MIMES_C: [&CStr; 5] =
     [c"text/plain;charset=utf-8", c"UTF8_STRING", c"text/plain", c"TEXT", c"STRING"];
-
-/// A foreign paste larger than this is cut off: a terminal paste is text, and an
-/// unbounded read of a hostile source must not exhaust memory.
-const MAX_PASTE_BYTES: usize = 16 << 20;
-
-/// How long a paste waits for a foreign source (the request, the pipe and the
-/// read all fit inside it on a healthy compositor; a hung owner is refused).
-const PASTE_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// How long a copy made off the loop thread waits for the loop's verdict.
-const COPY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The two protocol steps a copy takes at the compositor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,13 +238,17 @@ impl WaylandClipboard {
         if !self.send(ClipboardRequest::Paste { selection, reply }) {
             return None;
         }
-        receiver.recv_timeout(PASTE_TIMEOUT).ok().flatten().filter(|text| !text.is_empty())
+        receiver
+            .recv_timeout(crate::platform_impl::clipboard_transfer::TRANSFER_HANG)
+            .ok()
+            .flatten()
+            .filter(|text| !text.is_empty())
     }
 }
 
 /// The loop's answer to one copy, as the caller's `bool`.
 fn copy_verdict(verdict: &mpsc::Receiver<CopyOutcome>) -> bool {
-    match verdict.recv_timeout(COPY_TIMEOUT) {
+    match crate::platform_impl::clipboard_reply::receive(verdict) {
         Ok(outcome) => outcome.placed(),
         Err(_) => false,
     }
@@ -267,76 +259,24 @@ fn write_on_thread(pipe: OwnedFd, bytes: Vec<u8>) {
     if set_nonblocking(&pipe).is_err() {
         return;
     }
-    let mut pipe = std::fs::File::from(pipe);
+    let pipe = std::fs::File::from(pipe);
     let _ = std::thread::Builder::new().name("wayland-clipboard-send".into()).spawn(move || {
-        let deadline = Instant::now() + PASTE_TIMEOUT;
-        let mut at = 0;
-        while at < bytes.len() {
-            if Instant::now() >= deadline {
-                break;
-            }
-            match pipe.write(&bytes[at..]) {
-                Ok(0) => break,
-                Ok(n) => at += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(2));
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
-                Err(_) => break,
-            }
+        let transfer = crate::platform_impl::clipboard_transfer::write(pipe, &bytes);
+        if transfer.is_err() {
+            debug!("wayland clipboard: selection transfer did not complete: {transfer:?}");
         }
-        let _ = pipe.flush();
     });
 }
 
 /// Read a foreign offer's pipe to EOF on a helper thread and answer `reply`.
-fn read_on_thread(mut pipe: PipeReader, reply: mpsc::Sender<Option<String>>) {
+fn read_on_thread(pipe: PipeReader, reply: mpsc::Sender<Option<String>>) {
     if set_nonblocking(&pipe).is_err() {
         let _ = reply.send(None);
         return;
     }
     let _ = std::thread::Builder::new().name("wayland-clipboard-recv".into()).spawn(move || {
-        let deadline = Instant::now() + PASTE_TIMEOUT;
-        let mut bytes = Vec::new();
-        let mut truncated = false;
-        let mut buf = [0u8; 8192];
-        loop {
-            if Instant::now() >= deadline {
-                break;
-            }
-            match pipe.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    bytes.extend_from_slice(&buf[..n]);
-                    if bytes.len() >= MAX_PASTE_BYTES {
-                        bytes.truncate(MAX_PASTE_BYTES);
-                        truncated = true;
-                        break;
-                    }
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(2));
-                },
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
-                Err(_) => break,
-            }
-        }
-        let _ = reply.send(decode_paste_bytes(bytes, truncated));
+        let _ = reply.send(crate::platform_impl::clipboard_transfer::read(pipe));
     });
-}
-
-fn decode_paste_bytes(bytes: Vec<u8>, truncated: bool) -> Option<String> {
-    let text = match String::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(e) if truncated && e.utf8_error().error_len().is_none() => {
-            let valid_len = e.utf8_error().valid_up_to();
-            let mut bytes = e.into_bytes();
-            bytes.truncate(valid_len);
-            String::from_utf8(bytes).ok()?
-        },
-        Err(_) => return None,
-    };
-    (!text.is_empty()).then_some(text)
 }
 
 /// The MIME type a paste asks a foreign offer for.
@@ -792,17 +732,5 @@ mod tests {
         assert_eq!(handle.paste(WaylandSelection::Primary), None);
         shared.lock().unwrap().clipboard = None;
         assert_eq!(handle.paste_owned(WaylandSelection::Clipboard), None);
-    }
-
-    #[test]
-    fn paste_truncation_mid_codepoint_keeps_complete_prefix_only_when_capped() {
-        // 3-byte UTF-8 '中' = E4 B8 AD cut after 2 bytes at the paste cap keeps "hello".
-        assert_eq!(decode_paste_bytes(b"hello\xE4\xB8".to_vec(), true).as_deref(), Some("hello"));
-        // Without cap truncation, an incomplete trailing UTF-8 sequence is rejected.
-        assert_eq!(decode_paste_bytes(b"hello\xE4\xB8".to_vec(), false), None);
-        // An invalid interior byte is still rejected even when truncated at the cap.
-        assert_eq!(decode_paste_bytes(b"he\xFFllo\xE4".to_vec(), true), None);
-        // Only incomplete bytes with no complete codepoint yields None.
-        assert_eq!(decode_paste_bytes(b"\xE4\xB8".to_vec(), true), None);
     }
 }

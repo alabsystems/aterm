@@ -2026,8 +2026,7 @@ fn join_with_denial_deadline(
         .map_or_else(|| vault_now(places), |synced| synced.under.clone());
     // A join dials, and takes the book of, only members the deny list does not name: with none
     // read, none can be told apart, so the join waits for one.
-    let (denied, log) = denied_and_log_by(places, Some(deadline));
-    let denied = denied.ok_or_else(|| failed(DENY_LIST_UNREAD))?;
+    let (denied, log) = denied_and_log_by(places, Some(deadline)).map_err(failed)?;
     let mut dials = join_places(places, opts, &code, (&denied, log.as_deref()));
     // Automatic joins solicit numeric endpoints before trying cached names.
     // The vault's current log selects candidates; register_with still proves
@@ -3673,7 +3672,7 @@ fn drives_here(places: &Places, node: &str) -> Option<bool> {
     if DriveGrant::admitting(&grants, node, key).is_none() {
         return Some(false);
     }
-    let (Some(denied), log) = denied_and_log(places) else {
+    let Ok((denied, log)) = denied_and_log(places) else {
         return None;
     };
     Some(
@@ -3690,7 +3689,7 @@ fn driving(places: &Places) -> Option<Vec<String>> {
     if grants.is_empty() {
         return Some(Vec::new());
     }
-    let (Some(denied), log) = denied_and_log(places) else {
+    let Ok((denied, log)) = denied_and_log(places) else {
         return None;
     };
     let keys = Keyring::read(&places.state);
@@ -4203,8 +4202,7 @@ fn issuer_copies(places: &Places, book: &[Peer]) -> Vec<Peer> {
     };
     // What a word may name and `peers` lists, never whom this Mac admits or dials: while no deny
     // list is read it hides no copy, and the verbs that dial or admit refuse until one is.
-    let (denied, log) = denied_and_log(places);
-    let denied = denied.unwrap_or_default();
+    let (denied, log) = denied_and_log(places).unwrap_or_default();
     if peer_is_denied_or_held_out(issuer, &denied, log.as_deref()) {
         return Vec::new();
     }
@@ -4956,9 +4954,39 @@ fn vault_now(places: &Places) -> Option<crate::fleet_vault::Vault> {
 /// Why a fleet verb that admits, joins or drives refuses while this Mac cannot read its deny
 /// list or its membership log ([`denied_and_log`]): a refusal to try again, never a verdict on
 /// the peer.
-const DENY_LIST_UNREAD: &str = "this Mac has not read its deny list and membership log yet (a \
-                                vault sync applying now, or its last one failed: `aterm secrets \
-                                sync` says which); try again once it has";
+const DENY_LIST_UNREAD: &str = "this Mac cannot read its deny list and membership log now";
+
+/// A refusal keeps the cause from its own read; diagnosing it must not require another read
+/// that can observe a different vault state. An unavailable snapshot is not an empty deny list.
+#[derive(Debug)]
+enum DenialReadError {
+    DenyListUnavailable(aterm_secrets::client::SwarmDenialUnavailable),
+    DenyList(aterm_secrets::Error),
+    MembershipLog(aterm_secrets::Error),
+}
+
+impl std::fmt::Display for DenialReadError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "{DENY_LIST_UNREAD}; ")?;
+        match self {
+            Self::DenyListUnavailable(reason) => {
+                write!(out, "the local deny-list snapshot is unavailable: {reason}")
+            }
+            Self::DenyList(error) => write!(
+                out,
+                "local deny-list read: {}",
+                aterm_codec::tty::one_line(&error.to_string(), 1024)
+            ),
+            Self::MembershipLog(error) => write!(
+                out,
+                "local membership-log read: {}",
+                aterm_codec::tty::one_line(&error.to_string(), 1024)
+            ),
+        }
+    }
+}
+
+type DeniedAndLog = (Vec<String>, Option<std::sync::Arc<member::MemberKeys>>);
 
 const FLEET_IDENTITY_CHANGED: &str = "this Mac left or changed fleets, or its local identity \
                                      became unreadable, while its vault was being read";
@@ -4979,52 +5007,49 @@ fn local_fleet_matches(places: &Places, secret: &FleetSecret, me: Option<&NodeId
 
 /// This Mac's swarm deny list ([`aterm_secrets::client::swarm_denied_nodes`]) and its membership
 /// log's verdict ([`crate::fleet_log::LocalLog`]; `None` with no log), read whole or not at all:
-/// `(None, None)` while either cannot be read (mid-apply, a failed apply, a revoked or unreadable
+/// an error while either cannot be read (mid-apply, a failed apply, a revoked or unreadable
 /// vault, a log whose store cannot be read), which every verb that admits, joins or drives refuses
-/// ([`DENY_LIST_UNREAD`]) and which removes nothing. Places with no vault read no deny list, which
-/// then names no one, and no log.
-fn denied_and_log(
-    places: &Places,
-) -> (
-    Option<Vec<String>>,
-    Option<std::sync::Arc<member::MemberKeys>>,
-) {
+/// ([`DENY_LIST_UNREAD`]) and which removes nothing. The error preserves the failing read's cause.
+/// Places with no vault read no deny list, which then names no one, and no log.
+fn denied_and_log(places: &Places) -> Result<DeniedAndLog, DenialReadError> {
     denied_and_log_by(places, None)
 }
 
 /// [`denied_and_log`], the deny list's read waiting out a concurrent vault writer until
-/// `deadline` ([`aterm_secrets::client::swarm_denied_nodes_until`]), and the log's read again
+/// `deadline` ([`aterm_secrets::client::swarm_denial_snapshot_until`]), and the log's read again
 /// until then while the list reads and the log does not (a writer took the lock between them).
 fn denied_and_log_by(
     places: &Places,
     deadline: Option<Instant>,
-) -> (
-    Option<Vec<String>>,
-    Option<std::sync::Arc<member::MemberKeys>>,
-) {
+) -> Result<DeniedAndLog, DenialReadError> {
     let Some(paths) = vault_paths_for(places) else {
-        return (Some(Vec::new()), None);
+        return Ok((Vec::new(), None));
     };
-    let denied = match deadline {
-        Some(deadline) => aterm_secrets::client::swarm_denied_nodes_until(&paths, deadline),
-        None => aterm_secrets::client::swarm_denied_nodes(&paths),
+    let snapshot = match deadline {
+        Some(deadline) => aterm_secrets::client::swarm_denial_snapshot_until(&paths, deadline),
+        None => aterm_secrets::client::swarm_denial_snapshot(&paths),
     }
-    .ok()
-    .flatten();
-    let Some(denied) = denied else {
-        return (None, None);
+    .map_err(DenialReadError::DenyList)?;
+    let denied = match snapshot {
+        aterm_secrets::client::SwarmDenialSnapshot::Available(nodes) => nodes,
+        aterm_secrets::client::SwarmDenialSnapshot::Unavailable(reason) => {
+            return Err(DenialReadError::DenyListUnavailable(reason));
+        }
     };
     let mut backoff = Duration::from_millis(1);
     loop {
-        let log = crate::fleet_log::LocalLog::of(&paths).keys();
-        if !log.as_ref().is_some_and(|log| log.unread().is_some()) {
-            return (Some(denied), log);
-        }
+        // This is a fresh read, not a listener retaining an older verdict. The shared reader
+        // verifies exactly the same membership and ahead-removal state as LocalLog, while its
+        // error remains available to the operation that must refuse.
+        let error = match crate::fleet_log::acknowledged_member_keys(&paths) {
+            Ok(log) => return Ok((denied, log.map(std::sync::Arc::new))),
+            Err(error) => error,
+        };
         let remaining = deadline.map_or(Duration::ZERO, |at| {
             at.saturating_duration_since(Instant::now())
         });
         if remaining.is_zero() {
-            return (None, None);
+            return Err(DenialReadError::MembershipLog(error));
         }
         std::thread::sleep(backoff.min(remaining));
         backoff = (backoff * 2).min(Duration::from_millis(50));
@@ -5364,8 +5389,7 @@ fn keep_book(
 ) -> Option<String> {
     // With no deny list read, a fetched book cannot be told from a denied issuer's: keep nothing,
     // as a read that got no book, until one is.
-    let (denied, log) = denied_and_log(places);
-    let denied = denied?;
+    let (denied, log) = denied_and_log(places).ok()?;
     let checked_peers: Vec<Peer> = reads.iter().map(|r| r.peer.clone()).collect();
     member::prune_pushed_facts(&places.state, &checked_peers, &denied, log.as_deref());
     let issuer_denied = |issuer_node: &str| {
@@ -7672,7 +7696,7 @@ fn drive_grants(
             )));
         }
     }
-    let (denied, log) = denied_and_log(places);
+    let admission = denied_and_log(places);
     let mut nodes = Vec::new();
     for word in words {
         if word == aterm_net::fleet::ALL_MEMBERS {
@@ -7680,9 +7704,7 @@ fn drive_grants(
             continue;
         }
         // A node is granted drive only once the deny list says it is not revoked.
-        let Some(denied) = denied.as_deref() else {
-            return Err(failed(DENY_LIST_UNREAD));
-        };
+        let (denied, log) = admission.as_ref().map_err(failed)?;
         let shown = aterm_codec::tty::one_line(word, 40);
         let bound = bound_peer(places, word, missed.as_ref())?;
         if matches!(bound, Bound::Nobody)
@@ -7866,7 +7888,7 @@ struct RegistryTarget {
 /// its predecessors beside its own custody, it takes seconds; each wait for a holder stays the
 /// ordinary admission's. It comes out of the drive's or survey's own budget, which starts before
 /// the word is resolved, so a slow registry leaves the connection less of it.
-const REGISTRY_READ: std::time::Duration = std::time::Duration::from_secs(15);
+const REGISTRY_READ: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The refusal of a label this Mac's registry could not be read for, saying what to do: a label
 /// names a Mac only where the registry and the signed seats agree (one-mesh B2), so the word is
@@ -7880,6 +7902,14 @@ fn registry_unread(word: &str, why: &dyn std::fmt::Display) -> String {
 }
 
 fn registry_target(places: &Places, word: &str) -> Result<Option<RegistryTarget>, String> {
+    registry_target_started(places, word, std::time::Instant::now())
+}
+
+fn registry_target_started(
+    places: &Places,
+    word: &str,
+    started: std::time::Instant,
+) -> Result<Option<RegistryTarget>, String> {
     let explicit = member::is_node_id(word);
     let label = if explicit { None } else { registry_label(word) };
     if !explicit && label.is_none() {
@@ -7890,10 +7920,7 @@ fn registry_target(places: &Places, word: &str) -> Result<Option<RegistryTarget>
         return Ok(None);
     };
     let registry = (!explicit)
-        .then(|| {
-            aterm_db::alab::Registry::at(paths.clone())
-                .view_until(std::time::Instant::now() + REGISTRY_READ)
-        })
+        .then(|| aterm_db::alab::Registry::at(paths.clone()).view_until(started + REGISTRY_READ))
         .transpose()
         .map_err(|why| registry_unread(word, &why))?;
     if registry.as_ref().is_some_and(|view| !view.complete) {
@@ -8958,13 +8985,12 @@ fn drive_fleet_proven_in(
         }
     };
     if let Some(node) = peer.node.as_deref() {
-        let (denied, log) = denied_and_log_by(places, Some(deadline.0));
-        let Some(denied) = denied else {
-            return Err(aterm_ctl::DriveRefused {
+        let (denied, log) = denied_and_log_by(places, Some(deadline.0)).map_err(|error| {
+            aterm_ctl::DriveRefused {
                 again: true,
-                ..aterm_ctl::DriveRefused::once(DENY_LIST_UNREAD.to_owned())
-            });
-        };
+                ..aterm_ctl::DriveRefused::once(error.to_string())
+            }
+        })?;
         if !local_fleet_matches(places, &secret, Some(&me)) {
             return Err(aterm_ctl::DriveRefused::once(
                 FLEET_IDENTITY_CHANGED.to_owned(),
@@ -9118,14 +9144,11 @@ fn copy_again(
     }) else {
         return Ok(false);
     };
-    let (denied, log) = denied_and_log_by(places, Some(deadline.0));
-    let Some(denied) = denied else {
-        return Err(Missed {
-            why: DENY_LIST_UNREAD.to_owned(),
-            silent: false,
-            unserved: false,
-        });
-    };
+    let (denied, log) = denied_and_log_by(places, Some(deadline.0)).map_err(|error| Missed {
+        why: error.to_string(),
+        silent: false,
+        unserved: false,
+    })?;
     if !local_fleet_matches(places, secret, me) {
         return Err(Missed {
             why: FLEET_IDENTITY_CHANGED.to_owned(),

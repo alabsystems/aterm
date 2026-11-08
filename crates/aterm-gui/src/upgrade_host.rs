@@ -1393,7 +1393,8 @@ impl App {
         self.apply_agent_upgrades_owned(rows, None, &[]);
     }
 
-    /// Queue an owner upgrade action from a band capsule, Settings button, or tab menu.
+    /// Queue an owner upgrade action from a message's action (`notice act` or Settings ▸ Messages),
+    /// the tab menu, or a tab's ⬆️ chip.
     pub(crate) fn send_upgrade_word(&mut self, mut ask: WordAsk) -> bool {
         if let Some(press) = ask.press {
             self.upgrade_view

@@ -988,6 +988,7 @@ impl Lab {
         Drafted {
             records: vec![self.records[v].clone()],
             heads: vec![*self.records[v].id()],
+            network: None,
         }
     }
 

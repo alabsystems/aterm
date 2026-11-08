@@ -662,13 +662,45 @@ fn exchange_round(a: &Endpoint, b: &Endpoint, ra: &mut PeerRepair, rb: &mut Peer
             )
         });
         a.exchange(
-            Connection::connect(address, LinkScope::Loopback, Duration::from_secs(2)).unwrap(),
+            fixture_connect(address, std::time::Instant::now()).unwrap(),
             Side::Initiator,
             ra,
         )
         .unwrap();
         server.join().unwrap().unwrap();
     });
+}
+
+pub(crate) fn fixture_connect(
+    address: std::net::SocketAddr,
+    started: std::time::Instant,
+) -> io::Result<Connection> {
+    let deadline = crate::admission::deadline_at(started);
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "fixture connect hung",
+        ));
+    }
+    Connection::connect(address, LinkScope::Loopback, remaining)
+}
+
+#[test]
+fn native_replica_fixture_connect_waits_for_its_original_listener() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    assert_eq!(
+        fixture_connect(address, std::time::Instant::now() - Duration::from_secs(61))
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::TimedOut,
+    );
+    let connection =
+        fixture_connect(address, std::time::Instant::now() - Duration::from_secs(3)).unwrap();
+    let accepted = listener.accept().unwrap().0;
+    drop((connection, accepted));
 }
 
 #[test]

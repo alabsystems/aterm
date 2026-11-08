@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use crate::flow::VendorFetchError;
 use crate::select::Candidate;
 
+mod manifest_api;
+
 fn web_asset_url(slug: &str, tag: &str, name: &str) -> Option<String> {
     let (owner, repo) = slug.split_once('/')?;
     aterm_update_core::cdn::release_download_url(owner, repo, tag, name)
@@ -40,7 +42,7 @@ fn underivable(slug: &str, what: &str) -> String {
     msg
 }
 
-fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String, String)> {
+fn manifest_assets(program: &str, build: u64) -> Option<(String, String, String)> {
     if program.is_empty()
         || !program
             .bytes()
@@ -58,9 +60,15 @@ fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String
     name.push('-');
     name.push_str(&b);
     name.push_str(".toml");
-    let toml = web_asset_url(slug, &tag, &name)?;
-    let mut sig = toml.clone();
+    let mut sig = name.clone();
     sig.push_str(".sig");
+    Some((tag, name, sig))
+}
+
+fn direct_manifest_urls(slug: &str, program: &str, build: u64) -> Option<(String, String)> {
+    let (tag, name, sig) = manifest_assets(program, build)?;
+    let toml = web_asset_url(slug, &tag, &name)?;
+    let sig = web_asset_url(slug, &tag, &sig)?;
     Some((toml, sig))
 }
 
@@ -416,6 +424,8 @@ type HeadFn<'a> = dyn Heads + 'a;
 
 type WebFetch<'a> = dyn Fn(&str, u64) -> Result<Vec<u8>, String> + Sync + 'a;
 
+type ManifestFetch<'a> = dyn Fn(&str, &str, u64) -> Result<(Vec<u8>, Vec<u8>), String> + Sync + 'a;
+
 type HeadVerdict = Result<bool, (String, bool)>;
 
 fn head_verdict(slug: &str, build: u64, head: &HeadFn<'_>) -> HeadVerdict {
@@ -711,6 +721,7 @@ impl GithubFetcher {
         program: &str,
         build: u64,
         fetch: &WebFetch<'_>,
+        api: &ManifestFetch<'_>,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
         let slug = self.slug_for(program, repo);
         let key = (slug.clone(), program.to_string(), build);
@@ -721,8 +732,26 @@ impl GithubFetcher {
         }
         let (toml_url, sig_url) = direct_manifest_urls(&slug, program, build)
             .ok_or_else(|| underivable(&slug, program))?;
-        let pair =
-            std::sync::Arc::new((fetch(&toml_url, MANIFEST_CAP)?, fetch(&sig_url, SIG_CAP)?));
+        let (tag, toml_name, sig_name) =
+            manifest_assets(program, build).ok_or_else(|| underivable(&slug, program))?;
+        // This seam acquires bytes only. Verification/parser errors happen
+        // downstream and must never select another transport. If either web
+        // half fails, acquire BOTH exact assets through the native API owner.
+        let pair = (|| {
+            let urls = [(toml_url.as_str(), MANIFEST_CAP), (sig_url.as_str(), SIG_CAP)];
+            let mut fetched = fan_out_upto(&urls, 2, &|&(url, cap)| fetch(url, cap)).into_iter();
+            let toml = fetched.next().expect("manifest request has a result")
+                .map_err(|error| format!("{program} build {build} package manifest on {slug} tag {tag} asset {toml_name}: {error}"))?;
+            let sig = fetched.next().expect("signature request has a result")
+                .map_err(|error| format!("{program} build {build} package signature on {slug} tag {tag} asset {sig_name}: {error}"))?;
+            Ok((toml, sig))
+        })()
+        .or_else(|web: String| {
+            api(&slug, program, build).map_err(|api| {
+                format!("package metadata web fetch failed: {web}; API fetch failed: {api}")
+            })
+        })?;
+        let pair = std::sync::Arc::new(pair);
         if let Ok(mut memo) = self.manifests.lock() {
             memo.insert(key, std::sync::Arc::clone(&pair));
         }
@@ -879,7 +908,7 @@ impl crate::flow::Fetcher for GithubFetcher {
         program: &str,
         build: u64,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        self.manifest_pair(repo, program, build, &web_fetch_bytes)
+        self.manifest_pair(repo, program, build, &web_fetch_bytes, &manifest_api::fetch)
     }
 
     fn prefetch_manifests(&self, pins: &[(String, String, u64)]) {
@@ -978,6 +1007,10 @@ impl crate::flow::Fetcher for GithubFetcher {
 
     fn source_id(&self) -> String {
         github_source_id(&self.owner)
+    }
+
+    fn package_source_id(&self, repo: &str, program: &str) -> Option<String> {
+        Some(format!("github:{}", self.slug_for(program, repo)))
     }
 }
 
@@ -1130,6 +1163,10 @@ impl crate::flow::Fetcher for DirFetcher {
     fn source_id(&self) -> String {
         format!("dir:{}", self.dir.display())
     }
+
+    fn package_source_id(&self, _repo: &str, _program: &str) -> Option<String> {
+        Some(self.source_id())
+    }
 }
 
 /// Conformance of the real tag walk to the derived `AtpkgIndexPublishWalk` model (the reader
@@ -1140,6 +1177,103 @@ mod index_publish_conformance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manifest_web_success_never_calls_api() {
+        let f = GithubFetcher::new("alabsystems".into());
+        let web = |url: &str, cap| {
+            assert_eq!(
+                cap,
+                if url.ends_with(".sig") {
+                    SIG_CAP
+                } else {
+                    MANIFEST_CAP
+                }
+            );
+            Ok(url.as_bytes().to_vec())
+        };
+        let api = |_: &str, _: &str, _: u64| panic!("successful web pair must not call API");
+        let (raw, sig) = f.manifest_pair("aterm", "cpython", 1, &web, &api).unwrap();
+        assert!(raw.ends_with(b"pkg-cpython-1.toml"));
+        assert!(sig.ends_with(b"pkg-cpython-1.toml.sig"));
+    }
+
+    #[test]
+    fn manifest_partial_web_failure_reacquires_exact_whole_pair_and_memoizes_bytes() {
+        let mut overrides = std::collections::BTreeMap::new();
+        overrides.insert("cpython".into(), "alabsystems/aterm".into());
+        let f = GithubFetcher::new("fixture".into()).with_overrides(overrides);
+        let web = |url: &str, _| {
+            if url.ends_with(".sig") {
+                Err("HTTP 504".into())
+            } else {
+                Ok(b"web half".to_vec())
+            }
+        };
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let api = |slug: &str, program: &str, build| {
+            assert_eq!((slug, program, build), ("alabsystems/aterm", "cpython", 1));
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((b"API toml".to_vec(), b"API sig".to_vec()))
+        };
+        let expected = (b"API toml".to_vec(), b"API sig".to_vec());
+        assert_eq!(
+            f.manifest_pair("ignored", "cpython", 1, &web, &api)
+                .unwrap(),
+            expected
+        );
+        let no_web = |_: &str, _: u64| panic!("memoized pair must not refetch");
+        assert_eq!(
+            f.manifest_pair("ignored", "cpython", 1, &no_web, &api)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn manifest_api_bytes_do_not_grant_signature_trust_or_trigger_crypto_fallback() {
+        use crate::sig::testkit;
+        let f = GithubFetcher::new("alabsystems".into());
+        let web = |_: &str, _: u64| Err("HTTP 504".to_string());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let api = |_: &str, _: &str, _: u64| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok((b"untrusted metadata".to_vec(), vec![0; 64]))
+        };
+        let index = testkit::trusted_index_at(
+            testkit::SEQ,
+            format!(
+                "schema = 2\nindex_build = 47\nvalid_until = \"2099-01-01T00:00:00Z\"\n\
+             machine_id = \"{}\"\nroster_seq = {}\n[programs.cpython]\nrepo = \"aterm\"\n",
+                testkit::MACHINE_ID,
+                testkit::SEQ
+            )
+            .into_bytes(),
+        );
+        let (raw, sig) = f.manifest_pair("aterm", "cpython", 1, &web, &api).unwrap();
+        assert!(index.verify_pkg(raw, &sig).is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn manifest_failed_api_keeps_both_errors_and_invalid_identity_never_fetches() {
+        let f = GithubFetcher::new("alabsystems".into());
+        let web = |_: &str, _: u64| Err("HTTP 504".to_string());
+        let api = |_: &str, _: &str, _: u64| Err("API denied".to_string());
+        let error = f
+            .manifest_pair("aterm", "cpython", 1, &web, &api)
+            .unwrap_err();
+        assert!(error.contains("HTTP 504") && error.contains("API denied"));
+        assert!(error.contains("alabsystems/aterm tag atpkg-cpython-1 asset pkg-cpython-1.toml"));
+        assert!(f.manifests.lock().unwrap().is_empty());
+        let no_web = |_: &str, _: u64| panic!("invalid identity must not fetch");
+        let no_api = |_: &str, _: &str, _: u64| panic!("invalid identity must not fetch");
+        assert!(
+            f.manifest_pair("aterm", "../cpython", 1, &no_web, &no_api)
+                .is_err()
+        );
+    }
 
     #[test]
     fn direct_urls_match_the_publishing_tag_convention() {
@@ -1285,6 +1419,7 @@ mod tests {
 
     #[test]
     fn override_redirects_only_the_named_programs_slug() {
+        use crate::flow::Fetcher as _;
         let mut overrides = std::collections::BTreeMap::new();
         overrides.insert("orc".to_string(), "alabsystems/orc-private".to_string());
         let f = GithubFetcher::new("alabsystems".into()).with_overrides(overrides);
@@ -1293,6 +1428,14 @@ mod tests {
         assert_eq!(f.slug_for("ay", "ay"), "alabsystems/ay");
         let plain = GithubFetcher::new("alabsystems".into());
         assert_eq!(plain.slug_for("orc", "orc"), "alabsystems/orc");
+        assert_ne!(
+            f.package_source_id("orc", "orc"),
+            plain.package_source_id("orc", "orc")
+        );
+        assert_eq!(
+            f.package_source_id("ay", "ay"),
+            plain.package_source_id("ay", "ay")
+        );
     }
 
     #[cfg(unix)]
@@ -2620,6 +2763,49 @@ mod tests {
     }
 
     #[test]
+    fn a_manifest_cache_miss_fetches_both_halves_in_one_wave() {
+        let f = GithubFetcher::new("alabsystems".into());
+        let arrived = (std::sync::Mutex::new(0usize), std::sync::Condvar::new());
+        let wire = |url: &str, cap: u64| -> Result<Vec<u8>, String> {
+            assert_eq!(
+                cap,
+                if url.ends_with(".sig") {
+                    SIG_CAP
+                } else {
+                    MANIFEST_CAP
+                }
+            );
+            let (count, ready) = &arrived;
+            let mut n = count.lock().unwrap();
+            *n += 1;
+            ready.notify_all();
+            let (_arrived, timeout) = ready
+                .wait_timeout_while(n, aterm_spec::wait::MUST_HAPPEN, |n| *n < 2)
+                .unwrap();
+            if timeout.timed_out() {
+                Err("the other request never started".into())
+            } else {
+                Ok(url.as_bytes().to_vec())
+            }
+        };
+        let no_api = |_: &str, _: &str, _: u64| panic!("successful web pair must not use API");
+        let pair = f.manifest_pair("ay", "ay", 8256, &wire, &no_api).unwrap();
+        let (toml, sig) = direct_manifest_urls("alabsystems/ay", "ay", 8256).unwrap();
+        assert_eq!(pair, (toml.into_bytes(), sig.into_bytes()));
+        let hit = f
+            .manifest_pair(
+                "ay",
+                "ay",
+                8256,
+                &|_, _| panic!("a complete pair must be memoized"),
+                &no_api,
+            )
+            .unwrap();
+        assert_eq!(hit, pair);
+        assert_eq!(*arrived.0.lock().unwrap(), 2);
+    }
+
+    #[test]
     fn the_manifest_prefetch_fills_the_memo_with_bytes_not_trust() {
         use crate::sig::testkit;
         let f = GithubFetcher::new("alabsystems".into());
@@ -2669,18 +2855,25 @@ mod tests {
             )
             .into_bytes(),
         );
-        let (raw, sig) = f.manifest_pair("ay", "ay", 8256, &wire).unwrap();
+        let unavailable_api = |_: &str, _: &str, _: u64| Err("fixture API unavailable".to_string());
+        let (raw, sig) = f
+            .manifest_pair("ay", "ay", 8256, &wire, &unavailable_api)
+            .unwrap();
         assert!(
             index.verify_pkg(raw, &sig).is_ok(),
             "the genuine pair verifies"
         );
-        let (raw, sig) = f.manifest_pair("ty", "ty", 3007, &wire).unwrap();
+        let (raw, sig) = f
+            .manifest_pair("ty", "ty", 3007, &wire, &unavailable_api)
+            .unwrap();
         assert!(
             index.verify_pkg(raw, &sig).is_err(),
             "a tampered signature the prefetch carried is refused"
         );
         assert!(asked.lock().unwrap().is_empty(), "both read from the memo");
-        let err = f.manifest_pair("nn", "nn", 108, &wire).unwrap_err();
+        let err = f
+            .manifest_pair("nn", "nn", 108, &wire, &unavailable_api)
+            .unwrap_err();
         assert!(err.contains("HTTP 503"), "{err}");
         assert_eq!(asked.lock().unwrap().len(), 2, "fetched again on the read");
         asked.lock().unwrap().clear();

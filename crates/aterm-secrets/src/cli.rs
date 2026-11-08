@@ -2539,20 +2539,15 @@ mod unix {
     }
 
     fn repair(paths: &Paths, json: bool) -> crate::Result<ExitCode> {
-        let (frontier_outcome, frontier_detail) = match client::repair_legacy_frontier(paths) {
-            Ok(true) => ("repaired", "re-acknowledged the verified local membership log; previous state retained beside state.toml".to_owned()),
-            Ok(false) => ("unchanged", "the applied membership frontier matches the verified local log".to_owned()),
-            Err(error) => ("failed", error.to_string()),
-        };
-        let mut rows = vec![aterm_json::json!({
-            "service":"membership-frontier",
-            "outcome":frontier_outcome,
-            "detail":frontier_detail,
-        })];
-        let (service_rows, service_complete) =
-            repair_with(&mut |job| client::mend_held(paths, job));
-        rows.extend(service_rows);
-        let complete = frontier_outcome != "failed" && service_complete;
+        let (rows, complete) = repair_plan_with(
+            || {
+                client::repair_legacy_frontier(
+                    paths,
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                )
+            },
+            &mut |job| client::mend_held(paths, job),
+        );
         if json {
             println!(
                 "{}",
@@ -2569,6 +2564,30 @@ mod unix {
             }
         }
         Ok(ExitCode::from(if complete { 0 } else { 3 }))
+    }
+
+    /// Service migration must get its chance before waiting for the vault a
+    /// subscriber may hold. Each independent result remains visible even when
+    /// another repair is unavailable.
+    pub(super) fn repair_plan_with(
+        frontier: impl FnOnce() -> crate::Result<bool>,
+        repair: &mut impl FnMut(Job) -> crate::Result<client::HeldMend>,
+    ) -> (Vec<aterm_json::Value>, bool) {
+        let (service_rows, service_complete) = repair_with(repair);
+        let (outcome, detail, frontier_complete) = match frontier() {
+            Ok(true) => ("repaired", "re-acknowledged the verified local membership log; previous state retained beside state.toml".to_owned(), true),
+            Ok(false) => ("unchanged", "the applied membership frontier matches the verified local log".to_owned(), true),
+            Err(error) => (
+                if error.kind() == crate::ErrorKind::TimedOut { "unavailable" } else { "failed" },
+                error.to_string(),
+                false,
+            ),
+        };
+        let mut rows = vec![aterm_json::json!({
+            "service":"membership-frontier", "outcome":outcome, "detail":detail,
+        })];
+        rows.extend(service_rows);
+        (rows, frontier_complete && service_complete)
     }
 
     pub(super) fn repair_with(
@@ -8929,6 +8948,48 @@ mod tests {
 
 #[cfg(all(test, unix))]
 mod repair_tests {
+    #[test]
+    fn busy_frontier_cannot_starve_service_repairs_or_claim_completion() {
+        use crate::{client::HeldMend, service::Job};
+        for frontier_busy in [false, true] {
+            for service_busy in [false, true] {
+                let calls = std::cell::RefCell::new(Vec::new());
+                let (rows, complete) = super::unix::repair_plan_with(
+                    || {
+                        calls.borrow_mut().push("frontier");
+                        if frontier_busy {
+                            Err(crate::Error::of_kind(crate::ErrorKind::TimedOut, "busy"))
+                        } else {
+                            Ok(false)
+                        }
+                    },
+                    &mut |job| {
+                        calls.borrow_mut().push(match job {
+                            Job::Server => "server",
+                            Job::Subscriber => "subscriber",
+                        });
+                        if service_busy && job == Job::Server {
+                            Ok(HeldMend::Unread("busy".into()))
+                        } else {
+                            Ok(HeldMend::NotHeld)
+                        }
+                    },
+                );
+                assert_eq!(*calls.borrow(), ["server", "subscriber", "frontier"]);
+                assert_eq!(complete, !frontier_busy && !service_busy);
+                assert_eq!(rows.len(), 3);
+                assert_eq!(
+                    rows[0]["outcome"].as_str(),
+                    Some(if frontier_busy {
+                        "unavailable"
+                    } else {
+                        "unchanged"
+                    })
+                );
+            }
+        }
+    }
+
     #[test]
     fn a_repair_without_an_installed_release_or_authority_is_incomplete() {
         use crate::client::{HeldKept, HeldMend};

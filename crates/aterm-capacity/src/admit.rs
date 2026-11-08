@@ -246,8 +246,8 @@ fn mem_and_margin(mem: u64, margin: u64) -> String {
 /// One thing a waiter is short of.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Short {
-    /// Background work waits while a foreground claim is present.
-    Foreground,
+    /// A Release claim ends repeatable Background work.
+    Release,
     /// No core remains after held grants and higher ranked reservations.
     Cores,
     /// A typed timing need has no qualifying actual CPU observation yet.
@@ -397,7 +397,7 @@ const fn beyond_room(need: u64, above_floor: u64) -> bool {
 impl fmt::Display for Short {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Short::Foreground => f.write_str("background work yields to foreground claims"),
+            Short::Release => f.write_str("a Release claim ends background work"),
             Short::Cores => f.write_str("all cores are held or reserved by higher priority work"),
             Short::Timing(why) => write!(f, "measurement readiness: {why}"),
             Short::Memory {
@@ -1155,12 +1155,11 @@ pub(crate) fn decide(
     };
     let mut shorts = Vec::new();
     if need.rank == crate::Rank::Background
-        && others.iter().any(|o| {
-            o.record.need.rank == crate::Rank::Release
-                || (o.record.need.rank == crate::Rank::Ordinary && o.record.held.is_none())
-        })
+        && others
+            .iter()
+            .any(|o| o.record.need.rank == crate::Rank::Release)
     {
-        shorts.push(Short::Foreground);
+        shorts.push(Short::Release);
     }
     let (mut want_mem, mut want_disk, mut want_quiet) = (false, false, false);
     // The scratch claims held on the volume a disk need beyond the room waits for
@@ -1834,24 +1833,6 @@ impl Claim {
     pub(crate) fn slept_while_waiting(&mut self, by_ms: u64) {
         self.asked_ms -= by_ms;
         self.record.start_ms -= by_ms;
-    }
-
-    /// Whether repeatable background work must end before its next stage. Ledger errors
-    /// propagate rather than letting a background holder silently outrank foreground work.
-    /// # Errors
-    /// The ledger cannot be read.
-    pub fn should_yield(&self) -> io::Result<bool> {
-        if self.record.need.rank != crate::Rank::Background {
-            return Ok(false);
-        }
-        let dir = self
-            .path()
-            .parent()
-            .ok_or_else(|| io::Error::other("claim has no ledger directory"))?;
-        Ok(Ledger::at(dir).list()?.iter().any(|r| {
-            r.need.rank == crate::Rank::Release
-                || (r.need.rank == crate::Rank::Ordinary && r.held.is_none())
-        }))
     }
 
     /// How a quiet claim started: the load and the GPU, whether at its bound, how long it
@@ -2919,9 +2900,9 @@ impl Waiter {
             && found
                 .decided
                 .as_ref()
-                .is_err_and(|s| s.shorts.contains(&Short::Foreground))
+                .is_err_and(|s| s.shorts.contains(&Short::Release))
         {
-            return Ok(Forced::Turn(self, Shortfall::only(Short::Foreground)));
+            return Ok(Forced::Turn(self, Shortfall::only(Short::Release)));
         }
         let asked = Grant {
             cores: found.cores,
@@ -3122,10 +3103,12 @@ pub enum Error {
     },
     /// The ledger could not be used.
     Ledger(io::Error),
-    /// An interrupt, or the caller ([`admit_until`]), ended the wait. The claim has left the
-    /// queue.
+    /// An interrupt, the caller ([`admit_until`]), or a conservative Background stop before a
+    /// [`crate::Admit::Preemptible`] grant ended the wait. The latter means a Release arrived or
+    /// ledger failure made its absence unknowable. The claim has left the queue.
     Stopped {
-        /// The interrupt ([`aterm_toolchain::interrupt`]); `None` when the caller stopped it.
+        /// The interrupt ([`aterm_toolchain::interrupt`]); `None` when the caller or the
+        /// conservative Background stop ended it.
         signal: Option<i32>,
         /// What it was short of at its last look; `None` when it never looked.
         short: Option<Shortfall>,
@@ -3256,6 +3239,32 @@ pub fn admit(need: Need, mode: Admit) -> Result<Claim, Error> {
             let _ = writeln!(io::stderr(), "{line}");
         },
     )
+}
+
+/// Make one ordinary, non-overriding admission attempt. A caller with several safe
+/// resource envelopes can try them widest first and then wait on its smallest one.
+/// `None` keeps no queue position or reservation. Unlike `Admit::Now`, a shortfall
+/// never admits work. A positive margin also prevents admission ALONE.
+///
+/// # Errors
+/// The ledger cannot be read or written, or requested timing is unavailable.
+pub fn try_admit_with(
+    ledger: &Ledger,
+    machine: &dyn Machine,
+    need: Need,
+) -> Result<Option<Claim>, Error> {
+    if never(&need, &machine.read(need.path.as_deref())).is_some() {
+        return Ok(None);
+    }
+    match Waiter::enter(ledger, machine, need)
+        .map_err(Error::Ledger)?
+        .poll(machine)
+    {
+        Polled::Admitted(claim) => Ok(Some(claim)),
+        Polled::Waiting(_, _) => Ok(None),
+        Polled::Gone(error) => Err(Error::Ledger(error)),
+        Polled::Unqualified(issue) => Err(Error::Timing(issue)),
+    }
 }
 
 /// What a waiter can do about a shortfall besides wait: free what it can before it says it waits
@@ -3454,13 +3463,27 @@ fn admit_deciding(
     say: &mut dyn FnMut(&str),
     stopped: &dyn Fn() -> bool,
 ) -> Result<Claim, Error> {
-    if mode == Admit::Preemptible {
+    let background = mode == Admit::Preemptible && !machine.release_run();
+    if background {
         need.rank = crate::Rank::Background;
     }
     if need.quiet_policy == crate::QuietPolicy::Timing && mode == Admit::Now {
         return Err(Error::Timing(crate::TimingIssue::Now));
     }
     let watch = (mode != Admit::Now).then(aterm_toolchain::interrupt::Watch::enter);
+    // A Background holder starts its group guard only after admission. Observe Release here too,
+    // so one already queued cannot be waited out in the uncovered interval before that guard
+    // exists. A failed ledger read supplies no authority to start repeatable work beside a
+    // release. Ordinary work is deliberately absent: rank and resource reservations order it
+    // ahead of the Background admission where their needs overlap.
+    let release_arrived = || {
+        background
+            && ledger.list().map_or(true, |rows| {
+                rows.iter().any(|row| row.need.rank == crate::Rank::Release)
+            })
+    };
+    let caller_stopped = stopped;
+    let stopped = || caller_stopped() || release_arrived();
     let ended = || match watch
         .as_ref()
         .and_then(aterm_toolchain::interrupt::Watch::take)
@@ -3471,10 +3494,18 @@ fn admit_deciding(
     let interrupted = || watch.as_ref().is_some_and(|w| w.caught().is_some()) || stopped();
     let nap = |d: Duration| match &watch {
         Some(w) => {
-            w.nap(d, stopped);
+            w.nap(d, &stopped);
         }
         None => std::thread::sleep(d),
     };
+    if mode != Admit::Now
+        && let Some(signal) = ended()
+    {
+        return Err(Error::Stopped {
+            signal,
+            short: None,
+        });
+    }
     let at = need.path.clone().or_else(|| std::env::current_dir().ok());
     let reading = machine.read(at.as_deref());
     let refused = never(&need, &reading);
@@ -3524,7 +3555,7 @@ fn admit_deciding(
                         say(&line);
                         said = Some(Instant::now());
                     }
-                    watch.nap(pace.turn_gap(), stopped);
+                    watch.nap(pace.turn_gap(), &stopped);
                     let signal = watch.take();
                     if signal.is_some() || stopped() {
                         drop(w);

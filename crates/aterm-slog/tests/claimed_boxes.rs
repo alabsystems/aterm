@@ -7,8 +7,8 @@
 //! close, attributed only by an input that dismissed it.
 
 use aterm_slog::{
-    ActWord, Actor, AttributionView, Binding, BoxWord, Claimed, ClaimedBox, ClaimedReport, Log,
-    Node, ScreenStep, ShortId, TurnTracker, TxEvent, TxPos, TxState, Verdict,
+    ActWord, Actor, AttributionView, Binding, BoxWord, Chose, Claimed, ClaimedBox, ClaimedReport,
+    Log, Node, ScreenStep, ShortId, TurnTracker, TxEvent, TxPos, TxState, Verdict,
 };
 
 use crate::support::{WALL0, agent_session, at, lines, time_order_holds};
@@ -94,8 +94,9 @@ fn one_step_per_began() {
 }
 
 /// T2: the leave is attributed as a screen step's close is: by the input bound to it within
-/// STEP_ACT_MS (`out=passed`, since neither a person's key nor a ctl input carries a proven
-/// act), else `out=passed` with no `by=`, a late act's word kept as `act=`.
+/// STEP_ACT_MS (a proven actor's act, else what the screen showed its key choose (fix E8), else
+/// `out=passed`, since neither a person's key nor a ctl input carries a proven act), else
+/// `out=passed` with no `by=`, a late act's word kept as `act=`.
 #[test]
 fn the_leave_closes_by_the_bound_input_else_passed() {
     let leave = |input: &dyn Fn(&mut Log, &mut TurnTracker), leave_ms: u64| -> String {
@@ -110,7 +111,7 @@ fn the_leave_closes_by_the_bound_input_else_passed() {
             .expect("the box's close")
     };
     let person = |log: &mut Log, tr: &mut TurnTracker| {
-        assert!(matches!(tr.person(log, at(1_800)), Binding::Step(_)));
+        assert!(matches!(tr.person(log, None, at(1_800)), Binding::Step(_)));
     };
     let ctl = |log: &mut Log, tr: &mut TurnTracker| {
         let adm = tr.admit(at(1_800));
@@ -145,6 +146,28 @@ fn the_leave_closes_by_the_bound_input_else_passed() {
         leave(&harness, 2_000),
         "close p1 approval out=approved dur_ms=1000 by=harness src=engine conf=claim t=+2000",
         "CONTROL: a proven actor's act is the outcome, as on a screen step"
+    );
+    // Fix E8: what the screen showed the dismissing key choose is the outcome, as on a screen
+    // step, and the close keeps the claim's own confidence, below the heuristic a screen step's
+    // close takes.
+    let person_declines = |log: &mut Log, tr: &mut TurnTracker| {
+        let bound = tr.person(log, Some(Chose::Decline), at(1_800));
+        assert!(matches!(bound, Binding::Step(_)), "{bound:?}");
+    };
+    let ctl_approves = |log: &mut Log, tr: &mut TurnTracker| {
+        let adm = tr.admit(at(1_800)).choosing(Some(Chose::Approve));
+        let bound = tr.accept(log, Actor::Ctl, None, adm, at(1_800));
+        assert!(matches!(bound, Binding::Step(_)), "{bound:?}");
+    };
+    assert_eq!(
+        leave(&person_declines, 2_000),
+        "close p1 approval out=declined dur_ms=1000 by=human src=engine conf=claim t=+2000",
+        "a person's key on the option the screen showed refusing"
+    );
+    assert_eq!(
+        leave(&ctl_approves, 2_000),
+        "close p1 approval out=approved dur_ms=1000 by=ctl src=engine conf=claim t=+2000",
+        "a ctl key on the option the screen showed approving"
     );
 }
 
@@ -310,7 +333,7 @@ fn inputs_bind_to_the_claim_step() {
         tr.accept(&log, Actor::Ctl, Some(ActWord::Approve), adm, at(1_100)),
         Binding::Step(p1)
     );
-    assert_eq!(tr.person(&log, at(1_200)), Binding::Step(p1));
+    assert_eq!(tr.person(&log, None, at(1_200)), Binding::Step(p1));
 
     let (mut log, _run, mut tr) = run();
     let _ = tr.claim(&mut log, Claimed::Working, at(100));
@@ -323,7 +346,7 @@ fn inputs_bind_to_the_claim_step() {
     let p1 = tr.claim_node().expect("the box");
     assert_eq!(
         tr.attribution().bound,
-        Some((p1, Actor::Ctl, Some(ActWord::Approve), at(700))),
+        Some((p1, Actor::Ctl, Some(ActWord::Approve), None, at(700))),
         "a lead admitted 300 ms before the box binds it"
     );
 
@@ -336,11 +359,11 @@ fn inputs_bind_to_the_claim_step() {
         at(200),
     );
     let p1 = Node::parse("p1").expect("a step");
-    assert_eq!(tr.person(&log, at(300)), Binding::Step(p1));
+    assert_eq!(tr.person(&log, None, at(300)), Binding::Step(p1));
     assert_eq!(
         tr.attribution(),
         AttributionView {
-            bound: Some((p1, Actor::Human, None, at(300))),
+            bound: Some((p1, Actor::Human, None, None, at(300))),
             lead: None,
             opens: 1,
             closes: 0,

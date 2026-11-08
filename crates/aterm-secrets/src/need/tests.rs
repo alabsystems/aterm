@@ -91,6 +91,7 @@ fn facts_of(s: &ModelState) -> Facts {
     };
     Facts {
         sight: Some(Sight {
+            version: None,
             vault: "alab".into(),
             host: HOST.into(),
             seq: SEQ,
@@ -632,7 +633,16 @@ fn decided_checks_policy_and_refuses_asking_when_already_held_and_absorb_settles
         )
         .is_none()
     );
-    assert!(decided(&open, &unauthorized, &Decision::Published { seq: 9 }).is_none());
+    assert!(
+        decided(
+            &open,
+            &unauthorized,
+            &Decision::Published {
+                version: RefusalClaim::LegacySequence(9)
+            }
+        )
+        .is_none()
+    );
     assert!(
         decided(
             &open,
@@ -643,21 +653,37 @@ fn decided_checks_policy_and_refuses_asking_when_already_held_and_absorb_settles
     );
     for (floor, seq) in [(7, 6), (7, 7), (u64::MAX, u64::MAX)] {
         let refused = Need {
-            refused: Some(floor),
+            refused: Some(RefusalClaim::LegacySequence(floor)),
             ..open.clone()
         };
-        assert!(decided(&refused, &facts, &Decision::Published { seq }).is_none());
+        assert!(
+            decided(
+                &refused,
+                &facts,
+                &Decision::Published {
+                    version: RefusalClaim::LegacySequence(seq)
+                }
+            )
+            .is_none()
+        );
     }
     let refused = Need {
-        refused: Some(7),
+        refused: Some(RefusalClaim::LegacySequence(7)),
         ..open.clone()
     };
-    let newer = decided(&refused, &facts, &Decision::Published { seq: 8 }).unwrap();
+    let newer = decided(
+        &refused,
+        &facts,
+        &Decision::Published {
+            version: RefusalClaim::LegacySequence(8),
+        },
+    )
+    .unwrap();
     assert_eq!((newer.state, newer.seq), (State::Published, Some(8)));
 
     let asking = Need {
         state: State::AwaitingPerson,
-        refused: Some(SEQ),
+        refused: Some(RefusalClaim::LegacySequence(SEQ)),
         ..open.clone()
     };
     let mut given = facts.clone();
@@ -705,7 +731,14 @@ fn decided_checks_policy_and_refuses_asking_when_already_held_and_absorb_settles
             .held
             .insert(catalog::SITE_DEPLOYER_KEY_ENTRY.to_owned());
     }
-    let published = decided(&open, &facts, &Decision::Published { seq: SEQ }).unwrap();
+    let published = decided(
+        &open,
+        &facts,
+        &Decision::Published {
+            version: RefusalClaim::LegacySequence(SEQ),
+        },
+    )
+    .unwrap();
     assert_eq!(settle(&published, &facts).state, State::Fulfilled);
 }
 
@@ -872,7 +905,7 @@ fn a_silent_custodian_hands_over_only_what_the_absence_proof_covers() {
         "an offer is its own line"
     );
     let at_refused = Need {
-        refused: Some(SEQ),
+        refused: Some(RefusalClaim::LegacySequence(SEQ)),
         ..notary.clone()
     };
     assert_eq!(
@@ -1234,6 +1267,50 @@ fn the_ledger_is_idempotent_by_want_and_purpose_and_keeps_its_id_across_a_restar
     let other = raise(&vault.member, Want::SiteDeployerKey, Purpose::ByHand).unwrap();
     assert_ne!(other.id, first.id);
     assert_eq!(list(&vault.member).unwrap().len(), 2);
+    publish(&vault.admin, |doc| {
+        doc.set_entry(
+            &crate::text::Audience::Everyone,
+            "gh_access_token",
+            b"fixture-token",
+        )
+        .unwrap();
+    });
+    client::sync(&vault.member, None).unwrap();
+    let config = client::config(&vault.member).unwrap().unwrap();
+    let paired = client::with_materialization_ready_for_entries(
+        &vault.member,
+        &config,
+        &["gh_access_token"],
+        || Ok(()),
+    )
+    .unwrap()
+    .unwrap();
+    let high = raise_refused(
+        &vault.member,
+        Want::Gh(GhProfile::Dev),
+        Purpose::AghDev,
+        u64::MAX,
+    )
+    .unwrap();
+    let unchanged = raise_refused_from_snapshot(
+        &vault.member,
+        high.want.clone(),
+        high.purpose,
+        &paired.snapshot,
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(unchanged.id, high.id);
+    assert_eq!(
+        unchanged.refused,
+        Some(RefusalClaim::LegacySequence(u64::MAX)),
+        "a genuine lower authenticated version cannot discard a known nonzero floor"
+    );
+    let bytes = std::fs::read(vault.member.dir.join(LEDGER)).unwrap();
+    assert!(
+        acknowledge_from_snapshot(&vault.member, &unchanged, &paired.snapshot, || Ok(())).is_err()
+    );
+    assert_eq!(std::fs::read(vault.member.dir.join(LEDGER)).unwrap(), bytes);
 }
 
 #[test]
@@ -1570,7 +1647,7 @@ fn the_ledger_reads_back_every_field_it_writes() {
     );
     assert!(need.asking);
     let mut declined = act(&need, &facts, &Act::Decline("a \"quoted\" note".into())).unwrap();
-    declined.refused = Some(3);
+    declined.refused = Some(RefusalClaim::LegacySequence(3));
     declined.record = Some(vec![1, 2, 3]);
     declined.raised_again_on_change = Some(true);
     let open = Need {
@@ -1602,6 +1679,62 @@ fn the_ledger_reads_back_every_field_it_writes() {
     let mut rows = vec![need, declined, stood_in, offered];
     ledger::save(&paths, &mut rows).unwrap();
     assert_eq!(ledger::load(&paths).unwrap(), rows);
+    let file = paths.dir.join(LEDGER);
+    let encoded = std::fs::read_to_string(&file).unwrap();
+    let mut table: aterm_toml::Table = aterm_toml::from_str(&encoded).unwrap();
+    let mut legacy_rows = table.remove("need").unwrap().as_table().unwrap()["rows"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for row in &mut legacy_rows {
+        let row = row.as_table_mut().unwrap();
+        if let Some(value) = row.remove("refused_legacy") {
+            row.insert(
+                "refused".into(),
+                aterm_toml::Value::Integer(value.as_str().unwrap().parse().unwrap()),
+            );
+        }
+    }
+    table.insert("need".into(), aterm_toml::Value::Array(legacy_rows));
+    let legacy = aterm_toml::to_string(&table).unwrap();
+    crate::fsx::write_atomic(&file, legacy.as_bytes(), 0o600).unwrap();
+    assert_eq!(ledger::load(&paths).unwrap(), rows);
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        legacy.as_bytes(),
+        "reading a v1 ledger does not migrate it"
+    );
+    with_ledger(&paths, |saved, _| {
+        saved[0].line.push_str(" persisted");
+        Ok(())
+    })
+    .unwrap();
+    rows[0].line.push_str(" persisted");
+    assert_eq!(ledger::load(&paths).unwrap(), rows);
+    let migrated = std::fs::read_to_string(&file).unwrap();
+    let mut document: aterm_toml::Table = aterm_toml::from_str(&migrated).unwrap();
+    assert!(
+        document["need"].as_array().is_none(),
+        "the old reader's required array shape must fail closed"
+    );
+    let mut container = document.remove("need").unwrap();
+    container
+        .as_table_mut()
+        .unwrap()
+        .insert("format".into(), aterm_toml::Value::Integer(99));
+    document.insert("need".into(), container);
+    let unknown = aterm_toml::to_string(&document).unwrap();
+    crate::fsx::write_atomic(&file, unknown.as_bytes(), 0o600).unwrap();
+    let mut entered = false;
+    assert!(
+        with_ledger(&paths, |_, _| {
+            entered = true;
+            Ok(())
+        })
+        .is_err()
+    );
+    assert!(!entered);
+    assert_eq!(std::fs::read(&file).unwrap(), unknown.as_bytes());
 }
 
 /// The configured vault decides the policy; a Mac in no vault has none against it yet.

@@ -35,6 +35,21 @@ pub(crate) fn cmd_scroll(
     format!("OK {offset} {max}\n")
 }
 
+/// The class of a control input verb's key as that verb delivers `body` (fix E8): `key`'s one
+/// key, `send`'s text (a lone `\n` is Enter), `feed`'s raw bytes; `paste`, `ctrl` and the rest
+/// choose nothing.
+pub(crate) fn key_class(verb: &str, body: &str) -> crate::session_log::KeyClass {
+    use crate::session_log::KeyClass;
+    match verb {
+        "key" => parse_key(body)
+            .as_ref()
+            .map_or(KeyClass::Other, KeyClass::of_event),
+        "send" => KeyClass::of_bytes(&send_bytes(body)),
+        "feed" => feed_bytes(body).map_or(KeyClass::Other, |b| KeyClass::of_bytes(&b)),
+        _ => KeyClass::Other,
+    }
+}
+
 /// `send <text>` -> the bytes to write to the PTY.
 pub(crate) fn send_bytes(rest: &str) -> Vec<u8> {
     aterm_types::control_request::send_payload(rest.as_bytes())

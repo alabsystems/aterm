@@ -5,7 +5,8 @@
 
 use std::path::Path;
 
-/// Retires the legacy physical `target.noindex`, then its two legacy links.
+/// Stages the legacy physical `target.noindex`, removes its two legacy links and starts a
+/// background drain. A later call resumes any aside an interrupted drain left.
 ///
 /// The return is the number of entries left in `target.noindex/debug/deps`. A successful
 /// retirement therefore returns zero. A plain `target`, a `target` link with another target,
@@ -14,18 +15,30 @@ use std::path::Path;
 /// # Errors
 ///
 /// The build cache cannot be safely removed, its state cannot be read, an admitted legacy link
-/// cannot be read or removed, or `target.noindex` still stands after the removal attempt.
+/// cannot be read or removed, `target.noindex` still stands after staging, or the drain
+/// worker cannot be started.
 pub(crate) fn retire(clone: &Path) -> Result<usize, String> {
+    retire_using(
+        clone,
+        atpkg::build_cache::retirement::stage,
+        &mut background,
+    )
+}
+
+fn retire_using(
+    clone: &Path,
+    stage: impl FnOnce(&Path) -> std::io::Result<Vec<std::path::PathBuf>>,
+    drain: &mut dyn FnMut(&Path) -> Result<(), String>,
+) -> Result<usize, String> {
     let physical = clone.join("target.noindex");
-    let stood = stands(&physical)?;
-    let removed = atpkg::build_cache::remove_unbuilt(&physical).map_err(|error| {
+    let pending = stage(&physical).map_err(|error| {
         format!(
             "could not safely retire {}: {error}; {}",
             physical.display(),
             remaining_words(&physical)
         )
     })?;
-    if stands(&physical)? || (stood && !removed) {
+    if stands(&physical)? {
         return Err(format!(
             "could not safely retire {}; {}",
             physical.display(),
@@ -36,7 +49,60 @@ pub(crate) fn retire(clone: &Path) -> Result<usize, String> {
     remove_link(&clone.join("target"), Some("target.noindex"))?;
     remove_link(&clone.join("target-gate"), None)?;
 
+    if !pending.is_empty() {
+        drain(&physical)?;
+    }
+
     remaining_deps_entries(&physical)
+}
+
+const DRAIN: &str = "--finish-target-retirement";
+
+/// A separate cutter image survives the release's exec or exit. It owns no release lease,
+/// uses no inherited terminal streams and re-certifies each aside before deleting it.
+fn background(physical: &Path) -> Result<(), String> {
+    let image = std::env::current_exe().map_err(|error| error.to_string())?;
+    let mut command = aterm_uds::spawnfd::command(image);
+    command
+        .arg(DRAIN)
+        .arg(physical)
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    let mut child = command
+        .spawn_in_dedicated_process_group()
+        .map_err(|error| error.to_string())?;
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Private worker entry, handled before release initialization or resource adoption.
+pub(crate) fn finish_if_asked(args: &[std::ffi::OsString]) -> Option<std::process::ExitCode> {
+    if args.first().is_none_or(|arg| arg != DRAIN) {
+        return None;
+    }
+    let result = (|| {
+        if args.len() != 2 {
+            return Err(std::io::Error::other("retirement requires one target path"));
+        }
+        #[cfg(unix)]
+        {
+            // SAFETY: this changes only this worker's scheduling priority; no pointers.
+            if unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 19) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        atpkg::build_cache::retirement::finish(Path::new(&args[1]))
+    })();
+    Some(match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("target retirement drain: {error}");
+            std::process::ExitCode::from(2)
+        }
+    })
 }
 
 /// Whether `path` has any entry of its own, without following a link.
@@ -103,6 +169,21 @@ mod tests {
     use std::fs::File;
     use std::os::unix::fs::symlink;
 
+    fn retire_with(
+        clone: &Path,
+        drain: &mut dyn FnMut(&Path) -> Result<(), String>,
+    ) -> Result<usize, String> {
+        super::retire_using(
+            clone,
+            |physical| {
+                atpkg::build_cache::retirement::stage_with_processes(physical, &|_, _| {
+                    Ok(Default::default())
+                })
+            },
+            drain,
+        )
+    }
+
     fn legacy(clone: &Path, target: &str) {
         let deps = clone.join("target.noindex/debug/deps");
         std::fs::create_dir_all(&deps).unwrap();
@@ -111,6 +192,37 @@ mod tests {
         std::fs::write(clone.join("target.noindex/debug/.cargo-lock"), b"").unwrap();
         symlink(target, clone.join("target")).unwrap();
         symlink("retired-gate.noindex", clone.join("target-gate")).unwrap();
+    }
+
+    fn retire(clone: &Path) -> Result<usize, String> {
+        retire_with(clone, &mut |physical| {
+            atpkg::build_cache::retirement::finish_with_processes(physical, &|_, _| {
+                Ok(Default::default())
+            })
+            .map_err(|e| e.to_string())
+        })
+    }
+
+    /// NEGATIVE CONTROL: synchronous removal would erase the payload before the drain is
+    /// scheduled. A second call must schedule the interrupted aside with the original absent.
+    #[test]
+    fn links_retire_before_bulk_deletion_and_a_later_call_resumes() {
+        let clone = aterm_tempfile::tempdir().unwrap();
+        legacy(clone.path(), "target.noindex");
+        let mut calls = 0;
+        let mut deferred = |_: &Path| {
+            calls += 1;
+            Ok(())
+        };
+        assert_eq!(retire_with(clone.path(), &mut deferred), Ok(0));
+        let aside = clone.path().join(".ubd/target.noindex.removing");
+        assert!(aside.join("debug/deps/one").is_file());
+        assert!(!stands(&clone.path().join("target")).unwrap());
+        assert!(!stands(&clone.path().join("target-gate")).unwrap());
+        assert_eq!(retire_with(clone.path(), &mut deferred), Ok(0));
+        assert_eq!(calls, 2);
+        assert_eq!(retire(clone.path()), Ok(0));
+        assert!(!aside.exists());
     }
 
     /// The physical cache goes first, both admitted spellings of its link go, and the retired

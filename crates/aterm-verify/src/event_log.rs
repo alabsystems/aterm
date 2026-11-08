@@ -26,6 +26,36 @@ pub(crate) fn emit(events: Option<&EventLog>, event: &str) -> String {
     line
 }
 
+/// Optional live progress: stamp each line once and try each sink once for the whole sample.
+/// Busy sinks lose observations; this is neither terminal persistence nor a complete census.
+/// Sample and lock-attempt bounds do not bound stderr or regular-file IO backpressure.
+pub(crate) fn emit_progress_batch(events: Option<&EventLog>, batch: &[String]) {
+    if batch.is_empty() {
+        return;
+    }
+    let bytes: String = batch
+        .iter()
+        .map(|event| events.map_or_else(|| terminated(event), |events| events.prepare(event)))
+        .collect();
+    let _ = std::io::stderr().lock().write_all(bytes.as_bytes());
+    let Some(events) = events else { return };
+    let mut sinks = match events.sinks.try_lock() {
+        Ok(sinks) => sinks,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if let Some(retained) = &mut sinks.retained
+        && let Ok(_held) = AppendLock::try_once(&retained.file)
+    {
+        let _ = (&retained.file).write_all(bytes.as_bytes());
+    }
+    if let Some(file) = &mut sinks.external
+        && let Ok(_held) = AppendLock::try_once(file)
+    {
+        let _ = (&*file).write_all(bytes.as_bytes());
+    }
+}
+
 fn terminated(line: &str) -> String {
     let mut line = line.trim_end_matches('\n').to_owned();
     line.push('\n');
@@ -198,34 +228,30 @@ impl EventLog {
             .sinks
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(external) = &sinks.external {
-            // One physical destination gets one record, including an external hard-link alias.
-            // If comparison fails, preserve the private sink and treat external IO as unavailable.
-            if crate::run_log::file_key(external)
-                .ok()
-                .zip(crate::run_log::file_key(&retained.file).ok())
-                .is_none_or(|(a, b)| a == b)
-            {
-                sinks.external = None;
-            }
-        }
         sinks.retained = Some(retained);
     }
 
     /// Open an external regular append file. Independent writers serialize each record on
-    /// this actual file's lock, including when its path is a hard-link alias.
+    /// this actual file's lock, including when its path is a hard-link alias. Read access is
+    /// required to classify its file role; an unreadable role is refused, never assumed public.
     ///
     /// # Errors
-    /// The file cannot be opened or is not a stable regular file.
+    /// The file cannot be opened, is not a stable regular file, or is a private managed log.
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut open = std::fs::OpenOptions::new();
-        open.append(true).create(true);
+        open.read(true).append(true).create(true);
         private_flags(&mut open);
         let file = open.open(path)?;
         if !file.metadata()?.is_file() || !crate::run_log::same_file(&file, path) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "events is no stable regular file",
+            ));
+        }
+        if crate::run_log::private_managed_file(&file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "private managed logs cannot be opened as public append streams",
             ));
         }
         let mut log = Self::unrecorded();
@@ -299,6 +325,15 @@ impl EventLog {
 
 struct AppendLock<'a>(&'a File);
 impl<'a> AppendLock<'a> {
+    fn try_once(file: &'a File) -> io::Result<Self> {
+        aterm_uds::file_lock::lock_exclusive_until(
+            file,
+            Instant::now(),
+            "progress append is busy",
+        )?;
+        Ok(Self(file))
+    }
+
     fn take(file: &'a File) -> io::Result<Self> {
         aterm_uds::file_lock::lock_exclusive_until(
             file,

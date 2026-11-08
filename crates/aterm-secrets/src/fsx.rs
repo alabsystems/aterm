@@ -502,7 +502,9 @@ pub(crate) fn narrow_lock(file: &File, path: &Path) -> crate::Result<()> {
 /// of the file at a path, its length, and when its contents and its inode last changed (in
 /// nanoseconds). A file renamed over the path, or one written since, has another stamp; only a
 /// rewrite in place of the same length within the clock's granularity keeps it, which no
-/// writer of these files does (each writes a new file and renames it, or appends).
+/// writer of these files does (each writes a new file and renames it, or appends). A `chmod`,
+/// `chown` or `link` moves its inode-change time alone, which a filesystem whose clock ticks
+/// coarsely keeps within one tick: [`Seen`] holds what those change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileStamp {
     /// The device it is on.
@@ -542,6 +544,35 @@ pub fn stamp(path: &Path) -> Option<FileStamp> {
 /// The metadata read fails for any reason other than a missing path.
 pub(crate) fn stamp_if_present(path: &Path) -> crate::Result<Option<FileStamp>> {
     Ok(kind_and_stamp_if_present(path)?.map(|(_, stamp)| stamp))
+}
+
+/// What one `lstat` of a path shows ([`seen_if_present`]): its [`Kind`] and [`FileStamp`], and the
+/// owner, mode and link count that a stamp shows only through its inode-change time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Seen {
+    pub(crate) kind: Kind,
+    pub(crate) stamp: FileStamp,
+    pub(crate) uid: u32,
+    pub(crate) mode: u32,
+    pub(crate) nlink: u64,
+}
+
+/// [`kind_and_stamp_if_present`], with the owner, mode and link count the same `lstat` found.
+///
+/// # Errors
+/// As [`stamp_if_present`].
+pub(crate) fn seen_if_present(path: &Path) -> crate::Result<Option<Seen>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(Seen {
+            kind: kind_of(&meta),
+            stamp: FileStamp::of(&meta),
+            uid: meta.uid(),
+            mode: meta.mode(),
+            nlink: meta.nlink(),
+        })),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
+    }
 }
 
 /// [`stamp_if_present`], with the [`Kind`] the same `lstat` found.

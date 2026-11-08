@@ -193,19 +193,20 @@ fn framed_channel_bounds_partial_input_and_poisoning() {
     let mut b = Channel::new(b).unwrap();
     assert!(!b.ready_to_receive().unwrap());
     let payload = request().encode().unwrap();
-    a.send(&payload, Instant::now() + Duration::from_secs(1)).unwrap();
-    assert_eq!(b.receive(Instant::now() + Duration::from_secs(1)).unwrap(), payload);
+    let deadline = crate::fixture_deadline(Instant::now() - Duration::from_secs(2));
+    a.send(&payload, deadline).unwrap();
+    assert_eq!(b.receive(crate::fixture_deadline(Instant::now())).unwrap(), payload);
     let (mut raw, read) = UnixStream::pair().unwrap();
     let mut read = Channel::new(read).unwrap();
     raw.write_all(&[0, 0, 0, 5, 1]).unwrap();
     drop(raw);
-    assert!(read.receive(Instant::now() + Duration::from_secs(1)).is_err());
+    assert!(read.receive(crate::fixture_deadline(Instant::now())).is_err());
     assert!(read.poisoned());
-    assert!(read.receive(Instant::now() + Duration::from_secs(1)).is_err());
+    assert!(read.receive(crate::fixture_deadline(Instant::now())).is_err());
     let (a, b) = UnixStream::pair().unwrap();
     let mut a = Channel::new(a).unwrap();
     drop(b);
-    assert!(a.send(b"closed", Instant::now() + Duration::from_secs(1)).is_err());
+    assert!(a.send(b"closed", crate::fixture_deadline(Instant::now())).is_err());
     assert!(a.poisoned());
 }
 
@@ -215,14 +216,14 @@ fn closed_peer_is_safe_with_default_sigpipe() {
     const CHILD: &str = "TRUST_CONTROLLER_SIGPIPE_FIXTURE";
     if std::env::var_os(CHILD).is_some() {
         use std::os::unix::net::UnixStream;
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
         // SAFETY: this dedicated reexecuted fixture process owns its signal
         // disposition; restore POSIX default to detect a missing MSG_NOSIGNAL.
         assert_ne!(unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) }, libc::SIG_ERR);
         let (stream, peer) = UnixStream::pair().unwrap();
         drop(peer);
         let mut channel = Channel::new(stream).unwrap();
-        assert!(channel.send(b"closed", Instant::now() + Duration::from_secs(1)).is_err());
+        assert!(channel.send(b"closed", crate::fixture_deadline(Instant::now())).is_err());
         return;
     }
     let status = std::process::Command::new(std::env::current_exe().unwrap())

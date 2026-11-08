@@ -14,20 +14,40 @@ fn seed() -> St {
         .clone()
 }
 
-/// Execute one real replay with a lost response and optional directory failure.
+/// The host's answer to each dispatched replay of the exact saved prepare: none (a lost reply),
+/// or, once the model's host holds it, its proof that it never admitted the id.
+fn answer(state: &State, expected: Request) -> impl FnMut(&str) -> Option<String> + Send + 'static {
+    let unadmitted = state["unadmitted"] == 1;
+    move |line| {
+        assert_eq!(request(line), expected, "replay keeps the exact operation");
+        let Request::Prepare(prepare) = &expected else {
+            return None;
+        };
+        unadmitted.then(|| native_act::unadmitted_reply(&prepare.id).unwrap())
+    }
+}
+
+/// The saved record a model state names: the seed, its wire dropped once `cleared`.
+fn retained(state: &State) -> (St, Request) {
+    let mut st = seed();
+    let expected = Request::parse(&st.native_prepare).unwrap();
+    if state["cleared"] == 1 {
+        st.native_prepare.clear();
+        st.native_rollback = false;
+    }
+    st.native_retired_unissued = state["held"] == 1;
+    (st, expected)
+}
+
+/// Execute one real replay with a lost or unadmitted response and optional directory failure.
 /// Bypassing recovery is the negative control for the old dispatch ordering.
-fn attempt(state: &State, bypass: bool) -> (usize, bool) {
+fn attempt(state: &State, bypass: bool) -> (usize, bool, bool) {
     let root = aterm_tempfile::tempdir().unwrap();
     let mut opts = opts(root.path());
     opts.dry_run = state["dry"] == 1;
-    let mut st = seed();
-    st.native_retired_unissued = state["held"] == 1;
+    let (mut st, expected) = retained(state);
     let original = st.clone();
-    let expected = Request::parse(&st.native_prepare).unwrap();
-    let (mut client, worker) = endpoint(move |line| {
-        assert_eq!(request(line), expected, "replay keeps the exact operation");
-        None
-    });
+    let (mut client, worker) = endpoint(answer(state, expected));
     let fault = (state["barrier_failed"] == 1)
         .then(|| aterm_durable::seam::FailingDirs::with_kind(std::io::ErrorKind::Unsupported));
     if bypass {
@@ -42,8 +62,12 @@ fn attempt(state: &State, bypass: bool) -> (usize, bool) {
                 Ok(Recovery::Held)
             } else if opts.dry_run {
                 Err("native-dry-run")
+            } else if state["cleared"] == 1 {
+                Err("native-plan")
             } else if fault.is_some() {
                 Err("native-unsaved")
+            } else if state["unadmitted"] == 1 {
+                Ok(Recovery::Unadmitted)
             } else {
                 Err("native-unknown")
             }
@@ -51,10 +75,33 @@ fn attempt(state: &State, bypass: bool) -> (usize, bool) {
     }
     drop(fault);
     drop(client);
-    (worker.join().unwrap().len(), st == original)
+    let cleared = dropped(&original, &st);
+    (worker.join().unwrap().len(), st == original, cleared)
 }
 
-fn observed(state: &State, dispatched: usize, intact: bool) -> State {
+/// Whether this attempt dropped the saved wire.
+fn dropped(original: &St, st: &St) -> bool {
+    !original.native_prepare.is_empty() && st.native_prepare.is_empty()
+}
+
+/// Negative control: the replay's reply is lost, and its wire is dropped anyway.
+fn clear_on_lost_reply(state: &State) -> (usize, bool, bool) {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let opts = opts(root.path());
+    let (mut st, expected) = retained(state);
+    let original = st.clone();
+    let (mut client, worker) = endpoint(answer(state, expected));
+    assert_eq!(
+        recover(&opts, "conversation", &mut client, SID, &mut st),
+        Err("native-unknown")
+    );
+    st.native_prepare.clear();
+    drop(client);
+    let cleared = dropped(&original, &st);
+    (worker.join().unwrap().len(), st == original, cleared)
+}
+
+fn observed(state: &State, dispatched: usize, intact: bool, cleared: bool) -> State {
     let mut next = state.clone();
     next.insert("attempts", state["attempts"] + 1);
     next.insert("sent", state["sent"] + i64::try_from(dispatched).unwrap());
@@ -67,10 +114,39 @@ fn observed(state: &State, dispatched: usize, intact: bool) -> State {
             next.insert(violation, 1);
         }
     }
-    if !intact {
+    if cleared {
+        next.insert("cleared", 1);
+        if dispatched == 0 || state["unadmitted"] == 0 {
+            next.insert("lost_cleared", 1);
+        }
+    } else if !intact {
         next.insert("changed", 1);
     }
     next
+}
+
+/// Retire a record that kept only its wire: the replay recovers its binding, or the host's
+/// proof that it never admitted one, which retires it.
+fn bare_retirement_attempt(state: &State) -> (usize, bool, bool) {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mut opts = opts(root.path());
+    opts.dry_run = state["dry"] == 1;
+    let (mut st, expected) = retained(state);
+    let original = st.clone();
+    let (mut client, worker) = endpoint(answer(state, expected));
+    let fault = (state["barrier_failed"] == 1)
+        .then(|| aterm_durable::seam::FailingDirs::with_kind(std::io::ErrorKind::Unsupported));
+    let retired = retire(&opts, "conversation", &mut client, SID, &mut st);
+    assert_eq!(
+        retired,
+        state["held"] == 0
+            && (state["cleared"] == 1
+                || (!opts.dry_run && fault.is_none() && state["unadmitted"] == 1))
+    );
+    drop(fault);
+    drop(client);
+    let cleared = dropped(&original, &st);
+    (worker.join().unwrap().len(), st == original, cleared)
 }
 
 fn retirement_attempt(state: &State, bypass: bool) -> (usize, bool) {
@@ -153,11 +229,7 @@ fn renewal_attempt(state: &State, bypass: bool) -> (usize, bool) {
     (worker.join().unwrap().len(), saved == original)
 }
 
-pub(super) fn transition(state: &State, action: &str) -> State {
-    if action == "Attempt" {
-        let (dispatched, intact) = attempt(state, false);
-        return observed(state, dispatched, intact);
-    }
+fn environment(state: &State, action: &str) -> State {
     let mut next = state.clone();
     let (field, value) = match action {
         "FailBarrier" => ("barrier_failed", 1),
@@ -165,60 +237,98 @@ pub(super) fn transition(state: &State, action: &str) -> State {
         "DryRun" => ("dry", 1),
         "LiveRun" => ("dry", 0),
         "Hold" => ("held", 1),
+        "Unadmit" => ("unadmitted", 1),
         _ => unreachable!("unmapped replay environment input"),
     };
     next.insert(field, value);
     next
 }
 
+pub(super) fn transition(state: &State, action: &str) -> State {
+    if action == "Attempt" {
+        let (dispatched, intact, cleared) = attempt(state, false);
+        observed(state, dispatched, intact, cleared)
+    } else {
+        environment(state, action)
+    }
+}
+
 pub(super) fn retirement_transition(state: &State, action: &str) -> State {
     if action == "Attempt" {
         let (dispatched, intact) = retirement_attempt(state, false);
-        observed(state, dispatched, intact)
+        observed(state, dispatched, intact, false)
     } else {
-        transition(state, action)
+        environment(state, action)
+    }
+}
+
+pub(super) fn bare_retirement_transition(state: &State, action: &str) -> State {
+    if action == "Attempt" {
+        let (dispatched, intact, cleared) = bare_retirement_attempt(state);
+        observed(state, dispatched, intact, cleared)
+    } else {
+        environment(state, action)
     }
 }
 
 pub(super) fn renewal_transition(state: &State, action: &str) -> State {
     if action == "Attempt" {
         let (dispatched, intact) = renewal_attempt(state, false);
-        observed(state, dispatched, intact)
+        observed(state, dispatched, intact, false)
     } else {
-        transition(state, action)
+        environment(state, action)
+    }
+}
+
+/// The model of a record that holds its admission binding.
+fn bound_model() -> aterm_spec::derive::Model {
+    aterm_spec::interp::with_consts(
+        &aterm_models_harness::native_replay_publication_model(),
+        &[("Bound", 1)],
+    )
+}
+
+/// One real lane's projection of a model action.
+type Lane = fn(&State, &str) -> State;
+
+fn refines(model: &aterm_spec::derive::Model, lanes: &[(&str, Lane)]) {
+    for state in aterm_spec::interp::reachable_states(model) {
+        for action in &model.actions {
+            if model.action_enabled(action.name, &state) {
+                for (lane, transition) in lanes {
+                    let next = transition(&state, action.name);
+                    assert!(
+                        model.successors(action.name, &state).contains(&next),
+                        "{lane} {}: {state:?} -> {next:?}",
+                        action.name
+                    );
+                }
+            }
+        }
     }
 }
 
 #[test]
 fn replay_publication_refines_real_persistence_and_transport() {
     let model = aterm_models_harness::native_replay_publication_model();
+    let bound = bound_model();
     aterm_spec::interp::prove_and_catch(&model);
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
+    let faults = aterm_spec::verify::sweep_faults(&[model.clone(), bound.clone()]);
     assert!(faults.is_empty(), "{}", faults.join("\n"));
-    for state in aterm_spec::interp::reachable_states(&model) {
-        for action in &model.actions {
-            if model.action_enabled(action.name, &state) {
-                let next = transition(&state, action.name);
-                assert!(
-                    model.successors(action.name, &state).contains(&next),
-                    "{}: {state:?} -> {next:?}",
-                    action.name
-                );
-                let retired = retirement_transition(&state, action.name);
-                assert!(
-                    model.successors(action.name, &state).contains(&retired),
-                    "retirement {}: {state:?} -> {retired:?}",
-                    action.name
-                );
-                let renewed = renewal_transition(&state, action.name);
-                assert!(
-                    model.successors(action.name, &state).contains(&renewed),
-                    "renewal {}: {state:?} -> {renewed:?}",
-                    action.name
-                );
-            }
-        }
-    }
+    refines(
+        &model,
+        &[
+            ("replay", transition),
+            ("bare retirement", bare_retirement_transition),
+        ],
+    );
+    refines(
+        &bound,
+        &[
+            ("retirement", retirement_transition),
+            ("renewal", renewal_transition),
+        ],
+    );
 }
 
 #[test]
@@ -226,33 +336,44 @@ fn replay_publication_detects_dispatch_after_a_failed_save() {
     let model = aterm_models_harness::native_replay_publication_model();
     let mut before = model.init_state();
     assert!(model.fire("FailBarrier", &mut before));
-    let (dispatched, intact) = attempt(&before, true);
+    let (dispatched, intact, cleared) = attempt(&before, true);
     assert_eq!(dispatched, 1, "the negative control must reach the wire");
-    let bad = observed(&before, dispatched, intact);
+    let bad = observed(&before, dispatched, intact, cleared);
     assert!(!model.check_invariant("PublicationBeforeDispatch", &bad));
     assert!(!model.successors("Attempt", &before).contains(&bad));
 }
 
 #[test]
-fn retirement_publication_detects_dispatch_after_a_failed_save() {
+fn replay_publication_detects_a_clear_on_a_lost_reply() {
     let model = aterm_models_harness::native_replay_publication_model();
+    let before = model.init_state();
+    let (dispatched, intact, cleared) = clear_on_lost_reply(&before);
+    assert_eq!(dispatched, 1, "the negative control must reach the wire");
+    let bad = observed(&before, dispatched, intact, cleared);
+    assert!(!model.check_invariant("ClearedOnlyOnPositive", &bad));
+    assert!(!model.successors("Attempt", &before).contains(&bad));
+}
+
+#[test]
+fn retirement_publication_detects_dispatch_after_a_failed_save() {
+    let model = bound_model();
     let mut before = model.init_state();
     assert!(model.fire("FailBarrier", &mut before));
     let (dispatched, intact) = retirement_attempt(&before, true);
     assert_eq!(dispatched, 1, "the negative control must reach the wire");
-    let bad = observed(&before, dispatched, intact);
+    let bad = observed(&before, dispatched, intact, false);
     assert!(!model.check_invariant("PublicationBeforeDispatch", &bad));
     assert!(!model.successors("Attempt", &before).contains(&bad));
 }
 
 #[test]
 fn renewal_publication_detects_dispatch_after_a_failed_save() {
-    let model = aterm_models_harness::native_replay_publication_model();
+    let model = bound_model();
     let mut before = model.init_state();
     assert!(model.fire("FailBarrier", &mut before));
     let (dispatched, intact) = renewal_attempt(&before, true);
     assert_eq!(dispatched, 1, "the negative control must reach the wire");
-    let bad = observed(&before, dispatched, intact);
+    let bad = observed(&before, dispatched, intact, false);
     assert!(!model.check_invariant("PublicationBeforeDispatch", &bad));
     assert!(!model.successors("Attempt", &before).contains(&bad));
 }

@@ -297,7 +297,8 @@ pub enum Rank {
     /// Foreground development work.
     #[default]
     Ordinary,
-    /// Repeatable work which yields to foreground claims.
+    /// Repeatable work whose next resource admission ranks behind Ordinary work for overlapping
+    /// resources and which a Release can end.
     Background,
 }
 
@@ -663,8 +664,8 @@ pub enum Admit {
     /// Wait for room ([`admit`]).
     #[default]
     Wait,
-    /// Repeatable background work, launched in its own process group. A foreground waiter
-    /// asks it to yield at its next stage; a release ends that group immediately.
+    /// Repeatable background work, launched in its own process group. Ordinary work retains
+    /// priority for overlapping resources; a release stops its wait or ends its group immediately.
     Preemptible,
     /// Override resource-only admission and say what it would have waited for: at once, but
     /// only in its turn, so it waits while another admission holds the ledger's lock.

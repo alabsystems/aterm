@@ -689,6 +689,15 @@ fn own_slice_pool(temporary: &Path) -> Result<SlicePool, String> {
     })
 }
 
+fn slice_memory_need(triple: &str, native: bool) -> aterm_capacity::Need {
+    aterm_capacity::Need::new(format!("release slice {triple}"))
+        .rank(aterm_capacity::Rank::Release)
+        // Rounded up from the 0.174.0 m3 peaks (41.7 and 22.8 GiB).
+        .mem_gib(if native { 42 } else { 23 })
+        // An unclaimed load cannot turn a memory shortage into admission ALONE.
+        .margin(1)
+}
+
 fn build_slices(
     plan: &BuildPlan,
     take: &Take,
@@ -718,7 +727,8 @@ fn build_slices(
             "upstream stable (+r): --target compat slice",
         ),
     ];
-    let one = |(triple, target, lane): (&'static str, Option<&'static str>, &str)| {
+    let one = |(triple, target, lane): (&'static str, Option<&'static str>, &str),
+               admitted: Option<std::sync::mpsc::Sender<()>>| {
         let log = logs.join(format!("{triple}.log"));
         let t = Instant::now();
         println!(
@@ -729,12 +739,13 @@ fn build_slices(
         );
         let built = (|| {
             let memory = aterm_capacity::admit(
-                aterm_capacity::Need::new(format!("release slice {triple}"))
-                    .rank(aterm_capacity::Rank::Release)
-                    .mem_gib(if target.is_none() { 37 } else { 20 }),
+                slice_memory_need(triple, target.is_none()),
                 aterm_capacity::Admit::Wait,
             )
             .map_err(|e| e.to_string())?;
+            if let Some(admitted) = admitted {
+                let _ = admitted.send(());
+            }
             println!(
                 "==> [{triple}] memory waiting_s={:.3}",
                 memory.waited().as_secs_f64()
@@ -774,13 +785,16 @@ fn build_slices(
     };
     let results: Vec<Result<SliceBuild, String>> =
         if matches!(plan.sequencing, Sequencing::OneAtATime) {
-            slices.into_iter().map(one).collect()
+            slices.into_iter().map(|slice| one(slice, None)).collect()
         } else {
             std::thread::scope(|scope| {
-                let handles: Vec<_> = slices
-                    .into_iter()
-                    .map(|slice| scope.spawn(move || one(slice)))
-                    .collect();
+                // The native slice is the longest measured chain. Admit it before
+                // the compat slice asks; the latter still runs beside it when it fits.
+                let (admitted, ready) = std::sync::mpsc::channel();
+                let native = scope.spawn(move || one(slices[0], Some(admitted)));
+                let _ = ready.recv(); // A failed native admission closes the channel too.
+                let compat = scope.spawn(move || one(slices[1], None));
+                let handles = [native, compat];
                 handles
                     .into_iter()
                     .map(|h| {
@@ -2956,6 +2970,28 @@ fn fmt_elapsed(start: Instant) -> String {
 mod tests {
     use std::io::Cursor;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+    #[test]
+    fn release_slice_memory_waits_instead_of_overriding_available_memory() {
+        for (native, gib) in [(true, 42), (false, 23)] {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
+            let machine =
+                aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(128, gib - 1, 16));
+            let need = super::slice_memory_need("injected", native);
+            assert_eq!(need.mem, gib << 30);
+            assert!(
+                aterm_capacity::admit::try_admit_with(&ledger, &machine, need.clone())
+                    .unwrap()
+                    .is_none()
+            );
+            machine.set(aterm_capacity::Reading::of_gib(128, gib + 1, 16));
+            let claim = aterm_capacity::admit::try_admit_with(&ledger, &machine, need)
+                .unwrap()
+                .unwrap();
+            assert!(claim.alone().is_none());
+        }
+    }
 
     /// Under the release's pool the slices make no core claim of their own and draw from that
     /// pool; with none handed, `ship build` makes its own; a pool named but unadoptable refuses.

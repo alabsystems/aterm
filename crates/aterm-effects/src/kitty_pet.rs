@@ -404,6 +404,13 @@ const STREAM_LAPSE: f32 = 0.8;
 /// leaves; two of its jumps closer than this are one burst. Longer than the 50 to 100 ms
 /// between a repainting program's frames.
 const SETTLE: f32 = 0.15;
+/// How many of a burst's own intervals between its jumps the caret must stay put for to have
+/// rested ([`PetBrain::settle`]): a program that writes on at its own pace has not rested while
+/// it keeps that pace, its next write late by a frame or two.
+const SETTLE_RHYTHM: f32 = 2.0;
+/// The longest a burst's own pace makes the caret stay put to have rested ([`PetBrain::settle`]):
+/// the wait a program's lone jump along its row is given ([`LONE_SETTLE`]).
+const SETTLE_RHYTHM_MAX: f32 = LONE_SETTLE;
 /// Seconds from a burst's first jump after which no coil waits for it.
 const SETTLE_CAP: f32 = 0.9;
 /// A key pressed this recently moved the caret itself ([`PetBrain::hand_moved`]): its
@@ -411,11 +418,14 @@ const SETTLE_CAP: f32 = 0.9;
 const HAND_ECHO: f32 = 0.3;
 /// Seconds a paste keeps the caret's burst open ([`PetBrain::paste_holding`]): the
 /// program lays the pasted text out, and a program that pastes and submits (a harness, an
-/// agent's driver) presses Enter within this, its repaint carrying the caret on. The coil
+/// agent's driver) presses Enter within this, its repaint carrying the caret on, as a person
+/// who pastes a command presses Return (120 to 800 ms after it, r16 K3-3). The coil
 /// gathered for the paste's own jump waits it out and leaves once, for where the caret
 /// settles: launched at the paste's jump, it came down on the row the submit's repaint
-/// had just left and leapt again.
-const PASTE_SETTLE: f32 = 0.5;
+/// had just left and leapt again. As long as a burst holds a coil at all ([`SETTLE_CAP`]).
+const PASTE_SETTLE: f32 = SETTLE_CAP;
+/// [`PASTE_SETTLE`] with [`OldPath::PasteHoldsForItsReturn`] reverted.
+const PASTE_SETTLE_OLD: f32 = 0.5;
 /// Seconds a coil waits out a lone jump a program made along the caret's row
 /// ([`PetBrain::lone_settling`]): something it wrote on the line and may take straight back
 /// (a prompt it types and submits, a placeholder it shows and clears). Leapt after at once,
@@ -1766,11 +1776,95 @@ pub enum OldPath {
     /// on the letters of the row under the prompt's in 63 or 73 frames of each run (every face,
     /// the cat and the dog, Linux arm64, 2026-11-07).
     TurnKeepsTheTakeOffTop = 1 << 37,
+    /// A body the margin holds at the wall on a line that leaves it no seat there, and none
+    /// off the line or at rest, fades out where it stands and comes back at the first stand
+    /// clear of the letters, or once the caret leaves the line's row ([`PetBrain::wall_seat`],
+    /// [`PetBrain::unseated_sense`]); reverted, it stands at the wall over the line's last
+    /// letters, a cat tucked behind the block caret, then crumbs between those letters.
+    NoSeatHidesTheBody = 1 << 38,
+    /// Where no key reached the console, a caret's own step forward onto a blank cell is the
+    /// writing's ([`PetBrain::caret_typed_on`], read by [`PetBrain::writing_on`]); reverted, only
+    /// the rhythm's [`RHYTHM_MOVES`] told it, and the first keys typed on past the console after a
+    /// pause found the margin untaken: the body hopped over the caret onto the line's last
+    /// letters at full alpha (the `last-row` line paused six keys short of its end, Linux arm64,
+    /// 2026-11-07).
+    CaretTypesOn = 1 << 39,
+    /// A stand by the caret the head law draws down its row (its head under the row above's
+    /// letters, the row under blank under it) is the cat's seat, as a stand whose head is clear
+    /// is ([`PetBrain::clear_of_letters_above`]); reverted, it slides along its row to the first
+    /// whole seat past the row above's letters, away from the caret: under a line of words a
+    /// held delete sent the cat running back from the caret it followed, rising there and
+    /// sinking again as the caret left it, and at rest it bounded 60 cells to a seat past the
+    /// line's end (r29 K9-1, K9-2).
+    SunkStandSlides = 1 << 43,
+    /// A stand by the caret the head law fits to its row takes a whole seat only within
+    /// [`HEAD_SEAT_REACH`], at rest as while the hand works ([`PetBrain::clear_of_letters_above`]);
+    /// reverted, at rest it is sent along its row to the first whole seat however far, and the
+    /// cat waited there up to 64 cells ahead while the person typed toward it (r29 K9-4).
+    FittedStandSeatsFar = 1 << 44,
+    /// Letters a program writes along the caret's line under a cat on that line, while the
+    /// stream watch is up or once its writing through the cat goes on
+    /// ([`PetBrain::writing_laid_under`]), send it once across the rule under that line (a
+    /// composer's footer under its bottom rule), ground the writing never reaches
+    /// ([`PetBrain::seat_off_the_writing`]: the tick's eviction, and a gather for the caret), and
+    /// a cat off the line watches the writing from where it is
+    /// ([`PetBrain::watch_off_the_writing`]); reverted, it steps off them along its row, into
+    /// the writing's way, and the next chunk lays its letters over it again: a hop a chunk as a
+    /// program typed a prompt into Claude Code's composer, the cat sitting on the new letters
+    /// between them (r29 K9-3).
+    WritingEvictsAlongItsRow = 1 << 45,
+    /// A stand by the caret the head law fits to its row slides along the row to a whole seat
+    /// only on a trip the cat makes anyway, or to the seat it already holds
+    /// ([`PetBrain::clear_of_letters_above`]); reverted, the seat ahead that the writing's stand
+    /// brings within [`HEAD_SEAT_REACH`] takes the cat running on ahead of the writing to wait
+    /// there, and the hand's pause sends a cat fitted by the caret off to one (r29 K9-4).
+    FittedStandRunsAhead = 1 << 46,
+    /// A burst a program makes has rested once the caret stays put for [`SETTLE_RHYTHM`] of the
+    /// burst's own intervals between its jumps, at least [`SETTLE`] ([`PetBrain::settle`]);
+    /// reverted, for [`SETTLE`] whatever its pace, and a program writing a prompt in chunks
+    /// [`SETTLE`] apart (a harness typing into Claude Code's composer) read as at rest between
+    /// them: the stream watch stood down and its burst ended at each late chunk, and the cat
+    /// went for each chunk's end as for a caret at rest (r29 K9-3).
+    SettleIgnoresTheRhythm = 1 << 47,
+    /// A paste holds the caret's burst open for [`PASTE_SETTLE`], within which a person's Return
+    /// after a pasted command comes ([`PetBrain::paste_settle`]); reverted, for half a second,
+    /// and a Return 0.8 s after the paste came while the cat was in the air for the pasted
+    /// line's end: it came down on the new prompt's row 40 cells past the prompt and flew back
+    /// to it (r29 K9-5).
+    PasteHoldsForItsReturn = 1 << 48,
+    /// A body the host carries with the rows it rests on is never hopped off them for the
+    /// obstruction their move lays under it ([`PetBrain::console_carries_at`]); reverted, the cat
+    /// on top of the harness's line over Claude Code's composer leapt a row up at each line a
+    /// program's writing grew the composer by, unless a trip it had planned held it: four hops
+    /// on the spot in the long insert's dictation (r29 K9-3).
+    CarriedBodyHopsOff = 1 << 49,
+    /// A paste opens a burst of its own: its echo joins no burst a program's output left
+    /// behind ([`PetBrain::note_console_input`]); reverted, it joined one seconds settled, the
+    /// paste's burst ran past [`SETTLE_CAP`] at once, and nothing waited the paste and its Return
+    /// out: the cat stepped off the pasted letters for the line's end at once, came down on the
+    /// new prompt's row there and flew back to the prompt (windowed zsh after a command's
+    /// output, every delay, r29 K9-5).
+    PasteOpensItsOwnBurst = 1 << 50,
+    /// A whole seat along the row is held over the fitted stand by the caret only by a cat at
+    /// that seat while the hand runs the caret no other way, and a cat a pounce's gap off makes
+    /// a trip anyway only when it is not running the hand's caret down
+    /// ([`PetBrain::clear_of_letters_above`]); reverted, a cat anywhere ahead of the stand held
+    /// the seat, and one running a held delete down a pounce's gap behind took it: on the grid's
+    /// last row under a line of words, a held delete that began a few cells short of the words'
+    /// end sent the cat running up to 5 cells right, away from the caret deleting left, and
+    /// waiting at the seat past the words until the caret was out of reach (r29 K9-1).
+    SeatHeldAnywhereAhead = 1 << 51,
+    /// A play's leap (a batted peek, a pounce at the pointer) comes down on the grid row nearest
+    /// its aim (`PetAction::Crouch`'s play launch); reverted, at the aim's own fractional row,
+    /// where the head law reads no body ([`PetBrain::head_target`]): the cat that batted a pasted
+    /// command's word-cat walked back to the prompt 0.07 of a row up, drawn whole with its box
+    /// into the command's line instead of drawn down by the caret (r29 K9-5).
+    PlayLandsOffTheRows = 1 << 52,
 }
 
 impl OldPath {
     /// Every law.
-    pub const EVERY: [Self; 38] = [
+    pub const EVERY: [Self; 50] = [
         Self::WatchFromTheLine,
         Self::FirstKeysAhead,
         Self::LookAheadAtTopSpeed,
@@ -1809,6 +1903,18 @@ impl OldPath {
         Self::CrossingRisesIntoTheLine,
         Self::WorldReadsTheBodysRows,
         Self::TurnKeepsTheTakeOffTop,
+        Self::NoSeatHidesTheBody,
+        Self::CaretTypesOn,
+        Self::SunkStandSlides,
+        Self::FittedStandSeatsFar,
+        Self::WritingEvictsAlongItsRow,
+        Self::FittedStandRunsAhead,
+        Self::SettleIgnoresTheRhythm,
+        Self::PasteHoldsForItsReturn,
+        Self::CarriedBodyHopsOff,
+        Self::PasteOpensItsOwnBurst,
+        Self::SeatHeldAnywhereAhead,
+        Self::PlayLandsOffTheRows,
     ];
     /// Every law's bit ([`PetBrain::set_old_paths`], a test seam, so only where it is built).
     #[cfg(any(test, debug_assertions))]
@@ -1917,6 +2023,20 @@ impl WrapAhead {
             Self::Launched(..) | Self::Rest(..) | Self::OffTheLine { .. }
         )
     }
+}
+
+/// Where the margin holds a body at the wall on the caret's row, read afresh by the wall's law
+/// ([`PetBrain::wall_seat`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WallSeat {
+    /// The wall holds it no seat: the box it draws at rest there meets a lettered cell of the
+    /// caret's row, the head law seats it nowhere there, and no seat lies beside the line or
+    /// within reach.
+    NoSeat,
+    /// The stand the margin holds it at, and the hold that keeps it there: a row beside the line
+    /// ([`WrapAhead::OffTheLine`]), a seat within reach ([`WrapAhead::Rest`]), or the wall
+    /// ([`WrapAhead::Approach`]).
+    Seat((f32, f32), WrapAhead),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2106,6 +2226,13 @@ pub struct PetBrain {
     chrome_hop: bool,
     wrap_back: bool,
     wrap_ahead: Option<WrapAhead>,
+    /// The row of the line whose wall held the body no seat, while the hide that began there
+    /// holds: the tick takes the caret as hidden ([`PetBrain::wall_seat`],
+    /// [`PetBrain::unseated_sense`]). It ends once the caret is on another row, and on the row
+    /// once the fade has run out and a stand clear of the letters has come
+    /// ([`PetBrain::unseated_return`]). An Enter on a page's last row scrolls the line away and
+    /// leaves the caret on that row: there the hide ends at the next line's first such stand.
+    unseated: Option<u16>,
     /// When (brain clock) the writing last wrapped the caret back to a line's start
     /// ([`PetBrain::writing_wrapped`]): the bound that follows it is the writing's own.
     writing_wrap: Option<f64>,
@@ -2311,6 +2438,12 @@ pub struct PetBrain {
     /// second jump joins the first).
     jump_at: Option<f64>,
     burst_from: Option<f64>,
+    /// The seconds between the burst's last two jumps, 0 for a jump that joined no burst
+    /// ([`PetBrain::settle`]).
+    jump_gap: f32,
+    /// When a program's last jump along the caret's row wrote through the cat standing on it:
+    /// from short of the body's columns to past them ([`PetBrain::writing_laid_under`]).
+    written_through: Option<f64>,
     /// The last caret jump the hand did not make went along its row and joined no burst
     /// ([`PetBrain::lone_settling`]).
     lone_along: bool,
@@ -2479,6 +2612,7 @@ impl PetBrain {
             chrome_hop: false,
             wrap_back: false,
             wrap_ahead: None,
+            unseated: None,
             writing_wrap: None,
             launch_running: false,
             launch_brisk: false,
@@ -2639,6 +2773,8 @@ impl PetBrain {
             stream_run: 0,
             stream_last: 0.0,
             jump_at: None,
+            jump_gap: 0.0,
+            written_through: None,
             burst_from: None,
             lone_along: false,
             paste_hold: None,
@@ -3030,13 +3166,47 @@ impl PetBrain {
     }
 
     /// The writing runs on toward the margin: its rhythm is open ([`Self::typing_on`]), or the
-    /// hand's own last key, under [`SIT_AFTER`] ago, wrote a letter on a forward run.
+    /// hand's own last key, under [`SIT_AFTER`] ago, wrote a letter on a forward run, or, where
+    /// no key reached the console in that time (keys typed past it, as `aterm ctl key` types
+    /// them), the caret's own last move was a key's ([`Self::caret_typed_on`]).
     #[inline]
     fn writing_on(&self) -> bool {
         self.typing_on()
             || (self.run_dir > 0
                 && self.watch_heat < WATCH_GATE
-                && self.key_within_dur(SIT_AFTER_DUR) == Some(PetInputKind::Text))
+                && match self.key_within_dur(SIT_AFTER_DUR) {
+                    Some(kind) => kind == PetInputKind::Text,
+                    None => self.caret_typed_on(),
+                })
+    }
+
+    /// The caret's last move was a key's on a forward run, as at the end of a line being
+    /// written: it moved within the rhythm's window ([`RHYTHM_WINDOW`]), a key's step forward
+    /// ([`TYPING_STEP_MAX`] cells at most), onto a cell the letter reader sees blank (a letter or
+    /// a space typed behind it; a move along a line's letters stands it on one). `false` where the
+    /// reader certifies nothing there. Read where no key reached the console
+    /// ([`Self::writing_on`]): there the rhythm's [`RHYTHM_MOVES`] were the only sign of a hand,
+    /// and the first keys typed on after a pause, short of them, found the margin untaken. The
+    /// wall side crossed the stand to the caret's left, and the body hopped over the caret onto
+    /// the line's last letters at full alpha (Linux arm64, 2026-11-07: the `last-row` line paused
+    /// six keys short of its end and typed on past the console, on 11 x 28 px cells four blank
+    /// cells past the line, which seat the body: 51 frames on its letters, 38 at full alpha).
+    /// Reverted by [`OldPath::CaretTypesOn`].
+    #[inline]
+    fn caret_typed_on(&self) -> bool {
+        let Some((cr, cc)) = self.last_caret else {
+            return false;
+        };
+        if self.old_path(OldPath::CaretTypesOn) {
+            return false;
+        }
+        let cc = f32::from(cc);
+        self.run_count >= 1
+            && self.run_step <= TYPING_STEP_MAX
+            && matches!(
+                self.observed_ink_in_span(f32::from(cr), cc, cc + 1.0),
+                Some(false)
+            )
     }
 
     /// The console is at rest: the caret has stood still and no key of any kind was pressed
@@ -3078,7 +3248,7 @@ impl PetBrain {
     /// paste still holds the burst open ([`Self::paste_holding`]).
     #[inline]
     const fn caret_moving(&self) -> bool {
-        self.burst_from.is_some() && (self.jumped_within(SETTLE) || self.paste_holding())
+        self.burst_from.is_some() && (self.jumped_within(self.settle()) || self.paste_holding())
     }
 
     /// A program's lone jump along the caret's row is under [`LONE_SETTLE`] old: no burst
@@ -3111,7 +3281,18 @@ impl PetBrain {
             && self.burst_from.is_none()
             && !self.stream
             && !self.writing_wrapped()
-            && self.jumped_within(SETTLE)
+            && self.jumped_within(self.settle())
+    }
+
+    /// How long (s) a paste holds the caret's burst open ([`PASTE_SETTLE`],
+    /// [`OldPath::PasteHoldsForItsReturn`]).
+    #[inline]
+    pub(super) const fn paste_settle(&self) -> f32 {
+        if self.old_path(OldPath::PasteHoldsForItsReturn) {
+            PASTE_SETTLE_OLD
+        } else {
+            PASTE_SETTLE
+        }
     }
 
     /// A paste, or a paste and the Enter after it, pressed under [`PASTE_SETTLE`] ago.
@@ -3131,14 +3312,123 @@ impl PetBrain {
         }
     }
 
+    /// How long (s) a caret a program moves must stay put to have rested: [`SETTLE`], or in a
+    /// burst [`SETTLE_RHYTHM`] of the burst's own interval between its last two jumps, up to
+    /// [`SETTLE_RHYTHM_MAX`] ([`OldPath::SettleIgnoresTheRhythm`]). A program writing a prompt in
+    /// chunks [`SETTLE`] apart, the next one late by a frame, has not rested between them: read
+    /// as rested, the stream watch it armed stood down and its burst ended at each late chunk
+    /// (the long insert's dictation, 127 to 147 ms a chunk, and a harness typing into Claude
+    /// Code's composer), and the cat went for each chunk's end as for a caret at rest.
+    #[inline]
+    const fn settle(&self) -> f32 {
+        if self.jump_gap <= 0.0 || self.old_path(OldPath::SettleIgnoresTheRhythm) {
+            return SETTLE;
+        }
+        (SETTLE_RHYTHM * self.jump_gap).clamp(SETTLE, SETTLE_RHYTHM_MAX)
+    }
+
     /// The caret came by a jump no hand made and has stayed put since for [`SETTLE`].
     #[inline]
     const fn caret_rested_after_jump(&self) -> bool {
         match (self.jump_at, self.moved_at) {
             (Some(jumped), Some(moved)) => {
-                jumped >= moved && ((self.clock - jumped) as f32) >= SETTLE
+                jumped >= moved && ((self.clock - jumped) as f32) >= self.settle()
             }
             _ => false,
+        }
+    }
+
+    /// A program's writing along the caret's line laid its letters under the cat on that line
+    /// ([`OldPath::WritingEvictsAlongItsRow`]): the cat stands on the caret's row on ink, while
+    /// the writing goes on (the stream watch is up: [`STREAM_RUN`] jumps of the caret in
+    /// [`STREAM_WINDOW`], which no hand's keys make), or once a jump of it that wrote through
+    /// the cat (under [`SETTLE_CAP`] ago) has a burst going on after it: a program's first
+    /// chunks of a prompt it writes, not yet a stream, held the cat crouched on their letters
+    /// until the third. Not at the jump alone: a program may take it straight back
+    /// ([`LONE_SETTLE`]). Only letters the caret has passed, the cat's body starting behind it:
+    /// a placeholder a program draws ahead of the caret (Claude Code's empty composer, as its
+    /// first screens paint) is no writing going on, and sent across the rule for it the cat
+    /// flew to the footer and back as a session began.
+    #[inline]
+    fn writing_laid_under(&self, (cr, cc): (u16, u16), width: f32) -> bool {
+        (self.stream
+            || (self.burst_from.is_some()
+                && matches!(self.written_through, Some(at) if ((self.clock - at) as f32) < SETTLE_CAP)))
+            && !self.old_path(OldPath::WritingEvictsAlongItsRow)
+            && self.flight.is_none()
+            && (self.row - f32::from(cr)).abs() < 0.5
+            && self.col < f32::from(cc)
+            && self.ink_overlaps(self.col, self.row, width)
+    }
+
+    /// THE WRITING'S SEAT IS ACROSS ITS RULE ([`OldPath::WritingEvictsAlongItsRow`]): the nearest
+    /// seat to the stand beside the caret ([`Self::head_seat_along`], either way along its row) on
+    /// a row past a rule under the caret's line, within [`HEAD_SEAT_ROWS`] of it (a composer's
+    /// footer under its bottom rule): ground a program's writing along the caret's line never
+    /// reaches, as a composer grows up from its bottom rule and not down past it. `None` where no
+    /// rule lies under the line (a shell's prompt: its writing wraps on down) or no seat past it.
+    #[inline]
+    fn seat_off_the_writing(
+        &self,
+        caret: (u16, u16),
+        (rows, cols): (u16, u16),
+        width: f32,
+    ) -> Option<(f32, f32)> {
+        let caret_row = f32::from(caret.0);
+        let want = self.station_now(caret.1, cols, width);
+        let limit = (f32::from(cols) - width).max(0.0);
+        let rule =
+            (1..=HEAD_SEAT_ROWS).find(|&k| self.console_divides_at(caret_row + f32::from(k)))?;
+        let mut best: Option<(f32, f32, f32)> = None;
+        for below in rule + 1..=HEAD_SEAT_ROWS {
+            let r = caret_row + f32::from(below);
+            if r >= f32::from(rows) {
+                break;
+            }
+            for leftward in [false, true] {
+                let Some(x) = self.head_seat_along(
+                    (want, r),
+                    caret,
+                    (rows, limit),
+                    width,
+                    (f32::INFINITY, leftward),
+                ) else {
+                    continue;
+                };
+                let d = span_eq(x - want, r - caret_row);
+                if best.is_none_or(|(bd, ..)| d < bd) {
+                    best = Some((d, x, r));
+                }
+            }
+        }
+        best.map(|(_, x, r)| (x, r))
+    }
+
+    /// Where the cat watches a program's writing that goes on along the caret's line from, a
+    /// rule under that line ([`OldPath::WritingEvictsAlongItsRow`]): where it is, when that is
+    /// off the caret's row and off ink (on top of a harness's line, on the footer), the host
+    /// carrying it with the rows it stands on as the composer grows; else across the rule
+    /// ([`Self::seat_off_the_writing`]). `None` without the stream watch, in the air, or with no
+    /// rule under the line.
+    #[inline]
+    fn watch_off_the_writing(
+        &self,
+        caret: (u16, u16),
+        dims: (u16, u16),
+        width: f32,
+    ) -> Option<(f32, f32)> {
+        if !self.stream || self.flight.is_some() || self.old_path(OldPath::WritingEvictsAlongItsRow)
+        {
+            return None;
+        }
+        let caret_row = f32::from(caret.0);
+        if !(1..=HEAD_SEAT_ROWS).any(|k| self.console_divides_at(caret_row + f32::from(k))) {
+            return None;
+        }
+        if (self.row - caret_row).abs() >= 0.5 && !self.ink_overlaps(self.col, self.row, width) {
+            Some((self.col, self.row))
+        } else {
+            self.seat_off_the_writing(caret, dims, width)
         }
     }
 
@@ -3168,7 +3458,7 @@ impl PetBrain {
     const fn repaint_settled(&self) -> bool {
         match (self.burst_from, self.jump_at) {
             (Some(from), Some(at)) => {
-                ((self.clock - at) as f32) >= SETTLE
+                ((self.clock - at) as f32) >= self.settle()
                     && !self.paste_holding()
                     && ((at - from) as f32) < SETTLE_CAP
                     && self.stream_last >= from
@@ -3186,13 +3476,14 @@ impl PetBrain {
         self.stream_run = 0;
         self.quiet_leap = true;
         self.burst_from = None;
+        self.jump_gap = 0.0;
     }
 
     /// A program moved the caret by a jump under [`SETTLE`] ago, and not as part of a
     /// burst past [`SETTLE_CAP`] (a stream): where it stands may not be where it stays.
     #[inline]
     const fn caret_unsettled(&self) -> bool {
-        (self.jumped_within(SETTLE) || (self.paste_holding() && self.burst_from.is_some()))
+        (self.jumped_within(self.settle()) || (self.paste_holding() && self.burst_from.is_some()))
             && self.burst_within(SETTLE_CAP, true)
     }
 
@@ -4898,7 +5189,8 @@ impl PetBrain {
         // letters, its own row blank under it as the page shows it; the seat a row under the
         // line is the same place a fifth of a row lower. Sought there, a cat at rest by a prompt
         // under a command's output hopped down to it, and up again to the stand at the first
-        // key: two hops for nothing (r24 K7-1). A whole seat along the row is still taken.
+        // key: two hops for nothing (r24 K7-1). Nor along the row ([`OldPath::SunkStandSlides`],
+        // below): the drawn-down stand is the seat.
         let sunk_clear = head_on_letters
             && !on_ink
             && !self.old_path(OldPath::SunkStandIsASeat)
@@ -4908,6 +5200,14 @@ impl PetBrain {
                 self.head_target(row, (rows, cols), (col, col + width)),
                 Some(HeadRead { law: (sink, fit), .. }) if sink > 0.0 && fit >= 1.0
             );
+        // A STAND THE HEAD LAW DRAWS DOWN IS A SEAT ([`OldPath::SunkStandSlides`]): drawn down
+        // its row, the body by the caret covers no letter of either row, so it is where the cat
+        // rests, as a stand whose head is clear is: no slide along the row to a whole seat past
+        // the row above's letters. Slid there, the cat left the caret it followed: a held delete
+        // under a line of words sent it running back from the caret, rising at the seat and
+        // sinking again as the caret left it behind, and once the caret rested it bounded twice
+        // to a seat 60 cells off, past the line's end (r29 K9-1, K9-2).
+        let sunk_seat = sunk_clear && !self.old_path(OldPath::SunkStandSlides);
         let shifted = span_eq(col - want, row - caret_row);
         // Off the caret's side means a pounce's gap off it, or, for a cat already seated under
         // the caret's line, past [`INK_EVICT_MAX`]: the two thresholds keep a stand a few cells
@@ -5011,7 +5311,7 @@ impl PetBrain {
             }
         }
         let beside = (row - caret_row).abs() < 0.5 && shifted <= off_side && !on_ink;
-        if beside && !head_on_letters {
+        if beside && (!head_on_letters || sunk_seat) {
             return self
                 .seat_kept_through_wrap(want, caret, (rows, cols, limit), width, under_ok)
                 .unwrap_or((col, row));
@@ -5021,7 +5321,7 @@ impl PetBrain {
             Some(at) => (self.clock - at) as f32 >= HEAD_SEAT_SETTLE,
             None => true,
         };
-        let lawful = !head_on_letters && !on_ink;
+        let lawful = (!head_on_letters || sunk_seat) && !on_ink;
         // A cat further from the stand than a short walk ([`BOUND_SPAN_MIN`]; where it stands,
         // or where its flight comes down) has nothing to watch the caret from: it travels there
         // either way, so it goes once, to where it rests. Sent to the stand among the letters
@@ -5038,13 +5338,41 @@ impl PetBrain {
         // Nor along the row past [`HEAD_SEAT_REACH`] while the caret is on the move: slid past
         // the letters over it to the far margin, a cat beside the line's end ran there as the
         // arrow keys walked the caret back into the line, and crossed back once they stopped.
-        let reach = if hand_work || !resting {
+        // Nor ever for a stand the head law fits to its row ([`OldPath::FittedStandSeatsFar`]):
+        // fitted, the body by the caret covers no letter either, and a whole seat is worth
+        // taking over it only by the caret. Sent at rest to the first whole seat however far
+        // (past a listing's or a command's last line on the grid's last row), the cat waited
+        // there up to 64 cells ahead while the person typed toward it (r29 K9-4).
+        let fitted_near = fitted && !self.old_path(OldPath::FittedStandSeatsFar);
+        let reach = if hand_work || !resting || fitted_near {
             HEAD_SEAT_REACH
         } else {
             f32::INFINITY
         };
-        let mut best: Option<(f32, f32, f32)> = if lawful {
-            Some((shifted, col, row))
+        // A STAND THE HEAD LAW FITS IS KEPT BY A CAT AT IT ([`OldPath::FittedStandRunsAhead`]):
+        // fitted, the body by the caret covers no letter, so a cat following the caret there, or
+        // resting there, keeps it; a whole seat along the row is taken over it only on a trip
+        // the cat makes anyway (in the air, on another row, or a pounce's gap off), or where the
+        // cat already holds that seat. Slid to the seat ahead that the writing's stand brought
+        // within reach, the cat ran on ahead of the writing to wait for it.
+        //
+        // A cat a pounce's gap off that runs the hand's caret down on its paws (a held key's)
+        // makes no trip, and the seat it holds is the one it stands at, while the hand runs the
+        // caret no other way ([`OldPath::SeatHeldAnywhereAhead`]): read as a trip, and as the
+        // seat held by any cat ahead of the stand, a held delete under a line of words on the
+        // grid's last row sent the cat running on to the seat past the words' end, away from the
+        // caret deleting left, and waiting there until the caret was out of reach (r29 K9-1).
+        let exact = !self.old_path(OldPath::SeatHeldAnywhereAhead);
+        let trip_anyway = match &self.flight {
+            Some(_) => true,
+            None => {
+                (self.row - row).abs() >= 0.5
+                    || ((self.col - want).abs() > POUNCE_GAP
+                        && !(exact && self.runs_down(want - self.col)))
+            }
+        };
+        let seat = if lawful {
+            None
         } else {
             match self.head_seat_along((col, row), caret, (rows, limit), width, (reach, false)) {
                 Some(x) => {
@@ -5053,6 +5381,23 @@ impl PetBrain {
                 }
                 None => None,
             }
+        };
+        let holds_ahead = self.flight.is_none()
+            && (self.row - row).abs() < 0.5
+            && self.col > want + ARRIVED
+            && (!exact
+                || (matches!(seat, Some((_, x, _)) if (self.col - x).abs() <= ARRIVED)
+                    && !(self.run_dir < 0 && self.rhythm_open())));
+        let slides = !fitted_near
+            || trip_anyway
+            || holds_ahead
+            || self.old_path(OldPath::FittedStandRunsAhead);
+        let mut best: Option<(f32, f32, f32)> = if lawful {
+            Some((shifted, col, row))
+        } else if !slides {
+            None
+        } else {
+            seat
         };
         // A stand among letters by a caret at rest, the hand away, that the slide along its row
         // took off to a seat out past the reach the hand's work allows: the seats under the box
@@ -6161,6 +6506,7 @@ impl PetBrain {
         if let Some(frame) = self.tick_console_resident(sense, width, (dt, move_dt)) {
             return frame;
         }
+        let (sense, seat_back) = self.unseated_sense(sense, width);
         let was_invisible = self.alpha <= 0.0;
         let Some((cr, cc)) = sense.caret else {
             self.stroke.sample(sense.now, None, width);
@@ -6238,6 +6584,7 @@ impl PetBrain {
                 self.stream_run = 0;
                 self.jump_at = None;
                 self.burst_from = None;
+                self.jump_gap = 0.0;
                 self.regrid_caret = None;
                 if let Some((col, row)) = self.deferred_hidden_landing.take() {
                     self.col = col;
@@ -6313,7 +6660,10 @@ impl PetBrain {
             if was_invisible {
                 self.wall_side =
                     f32::from(cc) + STATION_LEAD + self.standoff() + width > f32::from(sense.cols);
-                let (c, r) = self.station_safe((cr, cc), sense.cols, sense.rows, width);
+                let (c, r) = match seat_back {
+                    Some(seat) => seat,
+                    None => self.station_safe((cr, cc), sense.cols, sense.rows, width),
+                };
                 self.col = c;
                 self.row = r;
                 if !sense.reduced_motion
@@ -6401,12 +6751,28 @@ impl PetBrain {
                 if self.hand_moved() {
                     self.jump_at = None;
                     self.burst_from = None;
+                    self.jump_gap = 0.0;
+                    self.written_through = None;
                 } else {
+                    let through = dr == 0.0
+                        && dc >= POUNCE_JUMP
+                        && !self.paste_holding()
+                        && self.flight.is_none()
+                        && (self.row - f32::from(cr)).abs() < 0.5
+                        && f32::from(pcell.1) < self.col + width
+                        && f32::from(cc) > self.col;
+                    if through {
+                        self.written_through = Some(self.clock);
+                    }
                     // A paste's jump opens a burst of its own: the program has the caret
                     // until it settles ([`PASTE_SETTLE`]).
-                    self.burst_from = if self.jumped_within(SETTLE)
-                        || (self.paste_holding() && self.burst_from.is_some())
-                    {
+                    let joins = self.jumped_within(self.settle())
+                        || (self.paste_holding() && self.burst_from.is_some());
+                    self.jump_gap = match self.jump_at {
+                        Some(at) if joins => (self.clock - at) as f32,
+                        _ => 0.0,
+                    };
+                    self.burst_from = if joins {
                         match self.burst_from {
                             Some(b) => Some(b),
                             None => self.jump_at,
@@ -6535,6 +6901,7 @@ impl PetBrain {
             self.stream_run = 0;
             self.jump_at = None;
             self.burst_from = None;
+            self.jump_gap = 0.0;
             self.motes = [None; PET_MOTES_MAX];
             self.content = (self.content + f32::from(self.pending_pet) * PET_CONTENT).min(1.0);
             self.drop_theater();
@@ -6869,6 +7236,14 @@ impl PetBrain {
         }
         let (target, target_row) = self.station_safe((cr, cc), sense.cols, sense.rows, width);
         self.walk_to = Some((target, target_row));
+        // Where a program's writing along the caret's line laid its letters under the cat
+        // ([`Self::writing_laid_under`]): the ground across the composer's rule it goes to
+        // ([`Self::seat_off_the_writing`]).
+        let off_writing = if self.writing_laid_under((cr, cc), width) {
+            self.seat_off_the_writing((cr, cc), (sense.rows, sense.cols), width)
+        } else {
+            None
+        };
         // Chrome the host reserved over the resting body since it came to rest (the harness's
         // lockup laid over the composer's rule once aterm has told the session is Claude
         // Code's): the cat hops off it to its station, as off ink. Left to the host, the body
@@ -6895,18 +7270,29 @@ impl PetBrain {
             && !(self.action.settled() && (self.pending_pounce || self.pending_big_jump))
             && self.wrap_ahead.is_none()
             && {
-                let chrome_over = self.console_yields_at((self.col, self.row), sense)
-                    && !self.console_carries_at((self.col, self.row), sense);
+                // A body the host carries with the rows it rests on (a composer that grows a
+                // row up under the cat on top of its rule) is never hopped off them
+                // ([`OldPath::CarriedBodyHopsOff`]): the rows' move puts the obstruction under it
+                // for the one present before the carry. Hopped off, the cat on top of the
+                // harness's line leapt a row up at each line a program's writing grew the
+                // composer by: four hops on the spot in the long insert's dictation (r29 K9-3).
+                let carried = self.console_carries_at((self.col, self.row), sense);
+                let chrome_over = self.console_yields_at((self.col, self.row), sense) && !carried;
+                let obstructed = self.console_obstructed(sense)
+                    && (!carried || self.old_path(OldPath::CarriedBodyHopsOff));
                 (may_evict_action || chrome_over)
-                    && if chrome_over || self.console_obstructed(sense) {
+                    && if chrome_over || obstructed {
                         true
                     } else {
                         // Nor off the words while a program's burst still walks the caret about
                         // ([`SETTLE`]): the one trip to where it settles is the eviction. Stepped off
                         // the words its repaint wrote under the cat, the cat was launched at a row the
                         // caret was leaving. The host's chrome over it is never waited out: the console
-                        // would step the body aside in one present.
-                        !self.caret_unsettled()
+                        // would step the body aside in one present. Nor are the letters a
+                        // program writes along the caret's line under the cat
+                        // ([`Self::writing_laid_under`]): its writing goes on there, and the cat
+                        // goes once to where it will rest, off the writing's way.
+                        (!self.caret_unsettled() || off_writing.is_some())
                             && (self.ink_overlaps(self.col, self.row, width)
                                 || (was_evicting
                                     && !self.stream
@@ -6925,6 +7311,14 @@ impl PetBrain {
                     self.ink_safe_col(self.col, self.row, width, sense.cols),
                     self.row,
                 )
+            } else if let Some(seat) = off_writing {
+                // THE WRITING'S LETTERS SEND THE CAT ONCE ACROSS ITS RULE
+                // ([`OldPath::WritingEvictsAlongItsRow`]): a program writing along the caret's
+                // line (a harness typing a prompt into Claude Code's composer, chunk by chunk)
+                // laid its letters under the cat on that line. It goes once to ground the
+                // writing never reaches ([`Self::seat_off_the_writing`]). Stepped off along its
+                // row, it stood in the way of the next chunk, and hopped again under each.
+                seat
             } else if self.stream && !self.caret_rested_after_jump() {
                 let stand = self.ink_stand(self.col, self.row, width, sense.cols, sense.rows);
                 self.console_station(stand, (sense.rows, sense.cols), width)
@@ -7078,6 +7472,22 @@ impl PetBrain {
         } else {
             (target, target_row)
         };
+        // THE WRITING'S WAY IS NO PLACE TO WATCH IT FROM ([`OldPath::WritingEvictsAlongItsRow`]):
+        // a program writing on along the caret's line, a rule under it, is watched from where the
+        // cat is when that is off the line, or from across the rule
+        // ([`Self::watch_off_the_writing`]), never from the stand beside the caret or the line's
+        // live edge it would lay its next letters over. Sent to the stand by the caret (the
+        // stream watch lets a cat go to a stand more than [`WATCH_HUG_ROWS`] off), a cat on top
+        // of the harness's line hopped down onto the line a harness was typing into, and off it
+        // again when the next letters came.
+        let (target, target_row) =
+            match self.watch_off_the_writing((cr, cc), (sense.rows, sense.cols), width) {
+                Some(seat) => {
+                    hugging = false;
+                    seat
+                }
+                None => (target, target_row),
+            };
 
         if self.flight.is_none()
             && !self.still_hold_fresh()
@@ -7233,7 +7643,7 @@ impl PetBrain {
                 && move_dr == 0.0
                 && !self.old_path(OldPath::LandWhereItRests)
                 && self.caret_rested_after_jump()
-                && matches!(self.jump_at, Some(j) if j + f64::from(SETTLE) > self.clock - f64::from(f.t))
+                && matches!(self.jump_at, Some(j) if j + f64::from(self.settle()) > self.clock - f64::from(f.t))
                 && (target_row - f.to_row).abs() < 0.5
                 && (target - f.to_col).abs() > ARRIVED
             {
@@ -7684,6 +8094,21 @@ impl PetBrain {
         if self.action == PetAction::Sit && self.drop_sit_t > 0.0 && !(self.stream && !hugging) {
             self.drop_sit_t = (self.drop_sit_t - move_dt).max(0.0);
         }
+        // LETTERS A PROGRAM WRITES UNDER A GATHER ARE NEVER WAITED OUT
+        // ([`OldPath::WritingEvictsAlongItsRow`]): a coil gathered for the caret waits a program's
+        // burst out ([`Self::coil_waits`]) so the trip goes once, to where the cat rests; a burst
+        // that writes along the caret's line under the gathering cat (a harness typing a prompt
+        // into Claude Code's composer) would hold it crouched on the new letters until the burst
+        // ran past [`SETTLE_CAP`]. It leaves at once for ground the writing never reaches
+        // ([`Self::seat_off_the_writing`]): held, it crouched 0.9 s on the dictation's first
+        // letters, and leapt into the writing's way.
+        let off_writing = if self.caret_coiled() && self.writing_laid_under((cr, cc), width) {
+            self.seat_off_the_writing((cr, cc), (sense.rows, sense.cols), width)
+        } else {
+            None
+        };
+        let written_under = off_writing.is_some();
+        let (target, target_row) = off_writing.unwrap_or((target, target_row));
         match self.action {
             PetAction::Sit | PetAction::Stand | PetAction::Perk if self.stream && !hugging => {
                 // The stream watch sits the cat down: the notice keeps its
@@ -7740,7 +8165,12 @@ impl PetBrain {
                     BIG_CROUCH_DUR
                 };
                 self.reads_the_way(target, target_row, dur);
-                if self.coil_waits(dur, hugging, self.console_obstructed(sense), true) {
+                if self.coil_waits(
+                    dur,
+                    hugging,
+                    self.console_obstructed(sense) || written_under,
+                    true,
+                ) {
                     return self.emit(sense, width);
                 }
                 // A gather that waited for a program's jump the caret then took back leaves
@@ -7780,7 +8210,12 @@ impl PetBrain {
                 // drawn on its last ticks as a bound's is.
                 let bound =
                     self.predicted_tier(target, target_row, true, sense.cols, width) == Tier::Bound;
-                if self.coil_waits(CROUCH_DUR, hugging, self.console_obstructed(sense), bound) {
+                if self.coil_waits(
+                    CROUCH_DUR,
+                    hugging,
+                    self.console_obstructed(sense) || written_under,
+                    bound,
+                ) {
                     self.coil_d = CROUCH_DUR;
                     return self.emit(sense, width);
                 }
@@ -7958,6 +8393,19 @@ impl PetBrain {
                         && !self.owes_the_way(sense, width)
                         && let Some((tc, tr)) = self.play_to.take()
                     {
+                        // A PLAY COMES DOWN ON A ROW ([`OldPath::PlayLandsOffTheRows`]): its aim
+                        // is a point (a word-cat peek's head, the pointer), but the cat stands on
+                        // the grid's rows, and the head law that keeps its head off a lettered row
+                        // above reads only a body on one ([`Self::head_target`]). Come down where
+                        // it aimed, 0.07 of a row above the prompt's row, the cat that batted a
+                        // pasted command's word-cat walked back to the prompt there, drawn whole
+                        // with its box 6 px into the command's line instead of drawn down by the
+                        // caret (windowed zsh, every first paste of a session, r29 K9-5).
+                        let tr = if self.old_path(OldPath::PlayLandsOffTheRows) {
+                            tr
+                        } else {
+                            tr.round()
+                        };
                         let vertical = (tr - self.row).abs() >= 0.5;
                         self.leave_ground(tc, tr, vertical, sense.cols, width, LeapPolicy::Play);
                     }
@@ -7975,8 +8423,12 @@ impl PetBrain {
                 let vertical = (target_row - self.row).abs() >= 0.5;
                 let bound = self.predicted_tier(target, target_row, vertical, sense.cols, width)
                     == Tier::Bound;
-                if self.coil_waits(self.coil_d, hugging, self.console_obstructed(sense), bound)
-                    || self.coil_came_home(target, target_row)
+                if self.coil_waits(
+                    self.coil_d,
+                    hugging,
+                    self.console_obstructed(sense) || written_under,
+                    bound,
+                ) || self.coil_came_home(target, target_row)
                     || self.gather_stands_short(target, target_row, sense, width)
                 {
                     return self.emit(sense, width);
@@ -12325,12 +12777,241 @@ impl PetBrain {
     /// [`OldPath::FitCentredAtTheWall`].
     #[inline]
     const fn fitted_to_the_wall(&self, fit: f32, cols: u16, width: f32) -> f32 {
+        self.fitted_to_the_wall_at(self.col, fit, cols, width)
+    }
+
+    /// [`Self::fitted_to_the_wall`] for a body standing at `col`.
+    #[inline]
+    const fn fitted_to_the_wall_at(&self, col: f32, fit: f32, cols: u16, width: f32) -> f32 {
         if fit >= 1.0 || width <= 0.0 || self.old_path(OldPath::FitCentredAtTheWall) {
             return 0.0;
         }
         let limit = (cols as f32 - width).max(0.0);
-        let along = ((self.col - (limit - width)) / width).clamp(0.0, 1.0);
+        let along = ((col - (limit - width)) / width).clamp(0.0, 1.0);
         width * (1.0 - fit) * 0.5 * along
+    }
+
+    /// THE WALL THAT HOLDS NO SEAT HIDES THE BODY. Writing that runs into the margin of a row
+    /// with no seat off the line ([`Self::margin_seat_off_the_line`]) and none at rest within
+    /// reach ([`Self::margin_rest_seat`]) keeps the body at the wall on the line
+    /// ([`WrapAhead::Approach`]). On a full page's last row the row over it is lettered and none
+    /// lies under, so the head law fits the body to its row ([`head_law`]) and the wall draws it
+    /// at its whole box's right edge ([`Self::fitted_to_the_wall`]). A line that ends nearer the
+    /// grid's end than that box is wide runs its last letters under the box, and one that reaches
+    /// the end stands the caret on its last letter there. No seat holds the body clear of them,
+    /// and a smaller body would not read at 1x. Drawn there, under the letters, it was a cat
+    /// tucked behind the block caret and then crumbs between the last letters, for as long as the
+    /// line rested (Linux arm64, 2026-11-07: from two blank cells past the line on a 13 x 29 px
+    /// cell, its art lay on 1 to 166 px of their ink).
+    ///
+    /// So this reads, afresh each tick, where the margin holds such a body: a row beside the line
+    /// ([`Self::margin_seat_off_the_line`]), a seat within reach ([`Self::margin_rest_seat`],
+    /// read whether or not the hand has stopped), or the wall. The wall holds no seat
+    /// ([`WallSeat::NoSeat`]) where the box a body draws at rest there ([`Self::rest_box_inked`])
+    /// meets a lettered cell of the caret's row and the head law seats it nowhere there either
+    /// ([`Self::head_seat_at`]: the whole body's footprint, [`INK_PAD`] in from each edge, on no
+    /// ink and its head under no letter). Then the tick takes the caret as hidden
+    /// ([`Self::unseated_sense`]). The box is judged at the wall, not where the body has got to
+    /// on its way there along the caret's row, so a body that has not reached the wall yet fades
+    /// from the key that leaves the wall no seat, not from its own arrival there.
+    ///
+    /// The margin's hold is read here and not taken from [`Self::wrap_ahead`] alone: under a hide
+    /// the tick sees no caret and leaves the margin's last hold as it was, so a seat that opens
+    /// beside the line while the body is out is found here, and the body comes back on it (the
+    /// trail gallery's row over the line cleared brings it back the same with this reading
+    /// dropped, a later one seating it there too: no replayed scene decides it, nor the slack
+    /// below, nor the hold a return keeps; each is the margin's own, Linux arm64, 2026-11-07).
+    /// `slack` is how far short of the margin the caret may stand ([`Self::at_the_margin`]): none
+    /// to begin a hide, [`WALL_RETURN_MARGIN`] while one holds, the slack a taken margin keeps.
+    ///
+    /// `None` where the margin does not hold the body at the wall on the caret's row (in flight,
+    /// off that row, the margin untaken or holding it elsewhere), where the letter reader
+    /// certifies nothing of the caret's row there or of the row over the body's head, where the
+    /// console places the body itself, and with the law reverted
+    /// ([`OldPath::NoSeatHidesTheBody`]).
+    #[inline]
+    fn wall_seat(
+        &self,
+        (cr, cc): (u16, u16),
+        sense: &PetSense,
+        width: f32,
+        slack: f32,
+    ) -> Option<WallSeat> {
+        let (rows, cols) = (sense.rows, sense.cols);
+        let row = f32::from(cr);
+        let limit = (f32::from(cols) - width).max(0.0);
+        if self.old_path(OldPath::NoSeatHidesTheBody)
+            || self.console_places_body()
+            || sense.cell_w == 0
+            || sense.cell_h == 0
+            || !width.is_finite()
+            || width <= 0.0
+            || self.flight.is_some()
+            || !matches!(self.wrap_ahead, Some(WrapAhead::Approach))
+            || (self.row - row).abs() >= 0.5
+            || !self.at_the_margin((cr, cc), cols, width, slack)
+        {
+            return None;
+        }
+        if let Some((r, over)) = self.margin_seat_off_the_line(cr, (rows, cols), limit, width) {
+            let ahead = WrapAhead::OffTheLine {
+                row: r,
+                over,
+                kept: WALL_RETURN_MARGIN,
+            };
+            return Some(WallSeat::Seat((limit, r), ahead));
+        }
+        if let Some(seat) = self.margin_rest_seat((cr, cc), (rows, limit), width) {
+            return Some(WallSeat::Seat(seat, WrapAhead::Rest(seat.0, seat.1)));
+        }
+        let wall = (limit, row);
+        let head = head_seat_from(limit, width, !self.old_path(OldPath::SeatClearsTheStretch));
+        let inked = self.rest_box_inked(wall, sense, width)?;
+        if row >= 0.5
+            && self
+                .observed_last_letter(row - 1.0, head, limit + width - INK_PAD)
+                .is_none()
+        {
+            return None;
+        }
+        Some(
+            if inked && !self.head_seat_at(wall, (cr, cc), rows, width) {
+                WallSeat::NoSeat
+            } else {
+                WallSeat::Seat(wall, WrapAhead::Approach)
+            },
+        )
+    }
+
+    /// Whether the box a body standing at `(col, row)` draws at rest there meets a lettered cell
+    /// of `row`: its fit, at its place in its whole box by the wall
+    /// ([`Self::fitted_to_the_wall`]), no pose's stretch. `None` where the letter reader certifies
+    /// nothing there.
+    #[inline]
+    fn rest_box_inked(&self, (col, row): (f32, f32), sense: &PetSense, width: f32) -> Option<bool> {
+        if sense.cell_w == 0 || sense.cell_h == 0 {
+            return None;
+        }
+        let (x0, x1, ..) = drawn_body_px(
+            (
+                col + self.fitted_to_the_wall_at(col, self.fit, sense.cols, width),
+                row,
+            ),
+            Stance {
+                scale_x: self.fit,
+                scale_y: self.fit,
+                lift: 0.0,
+                from: StretchFrom::Centre,
+            },
+            (sense.cell_w, sense.cell_h),
+            (sense.cols, sense.rows),
+        );
+        let inv_cw = 1.0 / f32::from(sense.cell_w);
+        self.observed_ink_in_span(row, x0 as f32 * inv_cw, x1 as f32 * inv_cw)
+    }
+
+    /// The sense the tick goes on with ([`Self::wall_seat`]), and the stand a body the law hid
+    /// comes back at this tick. The caret is hidden from the tick where the wall holds the body
+    /// no seat ([`WallSeat::NoSeat`]), and the hide is bound to that line's row:
+    /// - The caret on another row (an Enter or a wrap that moves it down, a program's move) ends
+    ///   it at once: the line it hid the body from is over, and the tick takes the caret as it
+    ///   takes any caret seen again, the body fading back in from where its fade has got to, or
+    ///   standing by the caret ([`Self::station_safe`]) where it has run out.
+    /// - On the row, it holds until its fade has run out ([`FADE_OUT`]) and a stand clear of the
+    ///   letters has come ([`Self::unseated_return`]); then the caret is shown again, the tick
+    ///   stands the body there (`Some`), and the margin holds it there as it found it. No tick
+    ///   whose wall still holds no seat brings it back: the margin keeps the body at that wall, so
+    ///   a stand by the caret clear of the letters there is one the next tick hides again (stood
+    ///   at it, a line whose last letters follow a run of spaces had the body blink back and out
+    ///   every 64 ms from its fade's end to the Enter, Linux arm64, 2026-11-07). An Enter
+    ///   or a wrap on a page's last row scrolls the line away and leaves the caret on its row:
+    ///   the new line's stand by the caret is that stand.
+    #[inline]
+    fn unseated_sense(&mut self, sense: PetSense, width: f32) -> (PetSense, Option<(f32, f32)>) {
+        let Some(caret) = sense.caret else {
+            return (sense, None);
+        };
+        if self.unseated.is_some_and(|row| row != caret.0) {
+            self.unseated = None;
+        }
+        let slack = if self.unseated.is_some() {
+            WALL_RETURN_MARGIN
+        } else {
+            0.0
+        };
+        let seat = self.wall_seat(caret, &sense, width, slack);
+        if matches!(seat, Some(WallSeat::NoSeat)) {
+            self.unseated = Some(caret.0);
+        }
+        let held = match seat {
+            Some(WallSeat::Seat(stand, ahead)) => Some((stand, ahead)),
+            _ => None,
+        };
+        if self.unseated.is_some()
+            && self.alpha <= 0.0
+            && !matches!(seat, Some(WallSeat::NoSeat))
+            && let Some((stand, ahead)) = self.unseated_return(caret, &sense, width, held)
+        {
+            self.unseated = None;
+            if ahead.is_some() {
+                self.wrap_ahead = ahead;
+            }
+            return (sense, Some(stand));
+        }
+        if self.unseated.is_some() {
+            (
+                PetSense {
+                    caret: None,
+                    ..sense
+                },
+                None,
+            )
+        } else {
+            (sense, None)
+        }
+    }
+
+    /// Where a body the wall's law hid comes back on its line's row ([`Self::unseated_sense`]),
+    /// its fade run out, and the margin's hold that keeps it there: the first stand clear of the
+    /// letters, whichever reading finds it, in a tick whose wall holds a seat or does not hold the
+    /// body there at all (the caller asks nothing in a tick whose wall holds no seat).
+    /// - While the margin holds it at the wall on the caret's row (`held`, read by
+    ///   [`Self::wall_seat`] with the slack a taken margin keeps), where the margin holds it now: a
+    ///   row beside the line opened while it was out, a seat within reach, or the wall, once the
+    ///   box it draws there at rest meets no letter (the line erased short of it). The stand the
+    ///   caret gives there ([`Self::station_safe`]) lies on the line's last letters where they run
+    ///   on to it (the margin's caret takes the wall side): read by it alone, the body stayed out
+    ///   to the Enter though the erase had left it its seat (Linux arm64, 2026-11-07: three
+    ///   Backspaces from a line three blank cells or fewer short of the grid's end, on every face,
+    ///   back 20 ms past the Enter, not 20 to 24 ms past the Backspace that left the seat).
+    /// - Anywhere else on the row (the caret moved back into the line, the line erased past the
+    ///   margin, a page's last row scrolled by an Enter or a wrap), the stand the caret gives
+    ///   ([`Self::station_safe`]), once no lettered cell of its row lies under the body's whole
+    ///   width there.
+    ///
+    /// `None` while neither is clear: the caret moved back into a line that runs on to the
+    /// margin under a lettered row leaves no stand by it off the letters, and the body stays out
+    /// until the line is erased or entered (stood by the caret whatever lay under it, it came
+    /// back 32 ms after its fade ran out and lay on the line's letters in 249 to 256 frames from
+    /// there to the Enter, ten Left arrows walking the caret back into the line on the way, on
+    /// every face). Where the letter reader certifies nothing, the stand counts as clear.
+    #[inline]
+    fn unseated_return(
+        &self,
+        (cr, cc): (u16, u16),
+        sense: &PetSense,
+        width: f32,
+        held: Option<((f32, f32), WrapAhead)>,
+    ) -> Option<((f32, f32), Option<WrapAhead>)> {
+        if let Some((stand, ahead)) = held {
+            return Some((stand, Some(ahead)));
+        }
+        let (col, r) = self.station_safe((cr, cc), sense.cols, sense.rows, width);
+        if matches!(self.observed_ink_in_span(r, col, col + width), Some(true)) {
+            None
+        } else {
+            Some(((col, r), None))
+        }
     }
 
     /// Whether the head law keeps the box in its row this frame ([`Self::sunk`]): it draws the
@@ -16303,6 +16984,58 @@ mod tests {
         );
     }
 
+    /// r29 K9-3, ONLY LETTERS THE CARET HAS PASSED ARE WRITING LAID UNDER THE CAT
+    /// ([`PetBrain::writing_laid_under`]). Over Claude Code's composer, the stream watch up and
+    /// the cat on the composer's line on letters: the dictation's letters behind the caret are
+    /// a program's writing going on there, and send it across the composer's bottom rule to the
+    /// footer ([`PetBrain::seat_off_the_writing`]); the placeholder its first screens paint
+    /// ahead of the caret is not. Read as writing, windowed as a session began, it sent the cat
+    /// to the footer and straight back to the caret.
+    #[test]
+    fn only_letters_behind_the_caret_are_writing_laid_under_the_cat() {
+        use crate::pet_world::{PetPane, PetWorldFacts};
+        use aterm_core::terminal::Terminal;
+
+        let laid_under = |line: &str, caret_col: u16| -> (bool, Option<(f32, f32)>) {
+            let rule = "\u{2500}".repeat(100);
+            let mut term = Terminal::new(30, 100);
+            term.process(
+                format!(
+                    "\x1b[5;1H{rule}\x1b[6;1H> {line}\x1b[7;1H{rule}\x1b[8;1H  auto mode on\x1b[6;{}H",
+                    caret_col + 1
+                )
+                .as_bytes(),
+            );
+            let mut pet = PetBrain::default();
+            let input = term.cell_frame(30, 100);
+            let facts = PetWorldFacts::read(&term, 7);
+            pet.observe_console(&input, &facts, PetPane::full(&input));
+            pet.set_console_presentable(true);
+            let end = 2 + line.chars().count() as u16;
+            pet.sense_ink(5, &[(0, end)], None);
+            pet.stream = true;
+            let width = art_cols(10, 20);
+            pet.row = 5.0;
+            pet.col = 7.0;
+            let caret = (5u16, caret_col);
+            (
+                pet.writing_laid_under(caret, width),
+                pet.seat_off_the_writing(caret, (30, 100), width),
+            )
+        };
+        let (written, seat) = laid_under("audit and remove the legacy work around ", 42);
+        assert!(
+            written && seat.is_some_and(|(_, r)| r > 6.5),
+            "the dictation's letters behind the caret send the cat to the footer: {written}, \
+             {seat:?}"
+        );
+        let (placeholder, _) = laid_under("Try \"refactor <filepath>\"", 2);
+        assert!(
+            !placeholder,
+            "a placeholder ahead of the caret is no writing laid under the cat"
+        );
+    }
+
     /// A ROW HOP'S GATHER WHOSE ROW CAME TO IT STANDS UP. The caret goes down a row and
     /// the cat gathers to hop after it; the host carries the gathering cat down that row
     /// with the ground it stands on ([`PetBrain::carry_console_body`]: a composer the
@@ -19371,6 +20104,60 @@ mod tests {
             (f.col - PetBrain::station(14, 100, w)).abs() <= ARRIVED + SIT_FRONT_GAP,
             "home by the caret, got col {}",
             f.col
+        );
+    }
+
+    /// r29 K9-5, A BATTED PEEK COMES DOWN ON A ROW ([`OldPath::PlayLandsOffTheRows`]). A
+    /// word-cat's head lands 0.07 of a row above the cat's row (a peek is a point: its head's
+    /// centre), and the cat bats it: from its leap on, and home again by the caret on its paws,
+    /// the cat stands on the grid's row, where the head law reads it ([`PetBrain::head_target`]).
+    /// Negative control (the law reverted): it came down at the head's fractional row and kept it
+    /// home, the head law reading no body there, so windowed it rested by a pasted command's
+    /// prompt drawn whole with its box in the command's line.
+    #[test]
+    fn a_batted_peek_comes_down_on_a_row() {
+        let rows_after_the_bat = |old: bool| -> Vec<f32> {
+            let start = Instant::now();
+            let mut pet = PetBrain::default();
+            pet.set_old_path(OldPath::PlayLandsOffTheRows, old);
+            let t = awake(&mut pet, start, 4, 12);
+            let (mut t, _) = idle(&mut pet, t, (4, 14), SIT_AFTER + 0.3);
+            pet.mote_serial = 0;
+            pet.note_peek(t, 22.0, 3.93);
+            assert!(
+                pet.pending_bat.is_some(),
+                "fixture: in range, the bat latches"
+            );
+            let mut rows = Vec::new();
+            let mut leapt = false;
+            for _ in 0..400 {
+                t += Duration::from_millis(16);
+                let f = pet.tick(sense(t, Some((4, 14))));
+                leapt |= f.action == PetAction::Leap;
+                if leapt && pet.flight.is_none() {
+                    rows.push(pet.row);
+                }
+            }
+            assert!(leapt, "fixture: the cat leapt to bat the peek");
+            rows
+        };
+        let off = |rows: &[f32]| {
+            rows.iter()
+                .filter(|r| (*r - r.round()).abs() > 0.05)
+                .count()
+        };
+        let now = rows_after_the_bat(false);
+        assert!(
+            !now.is_empty() && off(&now) == 0,
+            "after the bat the cat stood off the grid's rows on {} of {} ticks: {:?}",
+            off(&now),
+            now.len(),
+            now.last()
+        );
+        let old = rows_after_the_bat(true);
+        assert!(
+            off(&old) > 0,
+            "negative control: the bat came down on the grid's row"
         );
     }
 

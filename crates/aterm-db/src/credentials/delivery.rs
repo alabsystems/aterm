@@ -186,6 +186,7 @@ mod tests {
         let mut context = Context {
             policy: Policy::compiled(true),
             signer: None,
+            version: None,
             network: [2; 16],
             members: [original.actor(), successor.actor(), other.actor()]
                 .into_iter()
@@ -272,6 +273,7 @@ mod tests {
         let context = Context {
             policy: Policy::compiled(true),
             signer: None,
+            version: None,
             network: [2; 16],
             members: everyone.iter().map(|binding| binding.actor()).collect(),
             scope: Some(scope),

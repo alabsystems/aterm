@@ -1,4 +1,5 @@
 // Copyright The winit contributors
+// Modifications Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
 // Derived from winit 0.30.13 src/platform_impl/mod.rs,
@@ -9,6 +10,12 @@
 
 use crate::monitor::MonitorHandle as RootMonitorHandle;
 use crate::window::Fullscreen as RootFullscreen;
+
+#[cfg(any(test, wayland_platform))]
+mod clipboard_reply;
+
+#[cfg(any(test, wayland_platform))]
+mod clipboard_transfer;
 
 #[cfg(any(x11_platform, wayland_platform))]
 mod linux;

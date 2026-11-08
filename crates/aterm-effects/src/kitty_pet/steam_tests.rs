@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The trail gallery's `steam` scene on the alternate screen, replayed through the effects
-//! pipeline on fixed cells, so each law it pins is judged on every face's geometry wherever
-//! the tests run (the render tests replay it on the one face their platform bundles).
+//! The trail gallery's `steam` scene on the alternate screen, and its `last-row` on the main
+//! screen's last row, replayed through the effects pipeline on fixed cells, so each law they pin
+//! is judged on every face's geometry wherever the tests run (the render tests replay them on the
+//! one face their platform bundles).
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ClockReading, Rgb, Terminal};
 
-use super::{OldPath, PetInputKind};
+use super::{FADE_OUT, OldPath, PetInputKind, ROW_FIT, art_cols};
 use crate::cursor_fx::TrailColor;
 use crate::cursor_glow::GlowStyle;
 use crate::pipeline::EffectsPipeline;
@@ -47,13 +48,17 @@ enum Ev {
     Key(char, Vec<u8>),
 }
 
-/// A drawn frame: when, the companion's box (`x0, x1, y0, y1` px), the lettered cells
-/// (`row, col`) the box meets by a pixel or more, and how far (rows) the head law draws the body
-/// down its row and the share of its height it fits it to
+/// A Left arrow's key in a replay's events: the console reads it as a move along the line.
+const LEFT: char = '\u{2190}';
+
+/// A drawn frame: when, the companion's alpha on glass and its box (`x0, x1, y0, y1` px), the
+/// lettered cells (`row, col`) the box meets by a pixel or more, and how far (rows) the head law
+/// draws the body down its row and the share of its height it fits it to
 /// ([`EffectsPipeline::companion_head_sink_fit`]).
 #[derive(Clone, Debug)]
 struct Frame {
     ms: u64,
+    alpha: u8,
     pet: Option<(i32, i32, i32, i32)>,
     boxed: Vec<(usize, usize)>,
     sink_fit: (f32, f32),
@@ -61,8 +66,8 @@ struct Frame {
 
 /// `events` replayed on `cell` px cells, the pane `grid` rows by columns, a frame every
 /// [`FRAME_MS`] to `tail` ms past the last, the laws in `old` reverted. A key's echo lands 2 ms
-/// after it; typed at the window (`ctl` false) the console sees each key, as the gallery types it
-/// (`aterm ctl key`) none.
+/// after it; typed at the window (`ctl` false) the console sees each key (a Backspace as a
+/// delete, [`LEFT`] as a move along the line), as the gallery types it (`aterm ctl key`) none.
 fn replay(
     (cell, grid): ((usize, usize), (u16, u16)),
     style: &str,
@@ -132,6 +137,10 @@ fn replay(
                 fx.note_console_input(PetInputKind::Delete);
                 fx.note_keystroke();
             }
+            (0, Ev::Key(LEFT, _)) => {
+                fx.note_console_input(PetInputKind::Navigate);
+                fx.note_keystroke();
+            }
             (0, Ev::Key(c, _)) => {
                 let input = term.cell_frame(rows, cols);
                 let _ = fx.note_committed_char(&mut term, &input, *c);
@@ -163,6 +172,7 @@ fn replay(
                 }
                 frames.push(Frame {
                     ms: clock,
+                    alpha: fx.cursor_pet_alpha(),
                     pet,
                     boxed,
                     sink_fit: fx.companion_head_sink_fit(),
@@ -447,6 +457,544 @@ fn a_body_held_fitted_or_drawn_down_is_drawn_no_taller_than_its_fit_on_every_fac
                  row above's letters only in the frames at {met:?} ms"
             );
         }
+    }
+}
+
+/// The trail gallery's `last-row` page's full row, cycled to the grid's width: a letter in every
+/// cell.
+const LAST_ROW_FULL: &str = "Typography_jumps;quick_brown_gyps(qwerty)_pqgyj_{braces}[ok]|";
+/// The rows `last-row`'s page lays between its full ones.
+const LAST_ROW_RAGGED: [&str; 4] = [
+    "fn main() {",
+    "    let fox = \"the quick brown fox\";",
+    "    // every glyph here must stay legible: pqgyj {braces} [ok]",
+    "}",
+];
+/// The burst `last-row` types along the grid's last row, after `$ `.
+const BURST_TEXT: &str = "echo the quick brown fox jumps over the lazy dog as the kitty flies";
+/// [`Then::Gapped`]'s burst: [`BURST_TEXT`]'s length, its last words a run of fourteen spaces and
+/// two letters, so the line's last letters lie by the margin and a stand by the caret off them
+/// lies in the spaces before them.
+const GAPPED_TEXT: &str = "echo the quick brown fox jumps over the lazy dog as              ab";
+const _: () = assert!(GAPPED_TEXT.len() == BURST_TEXT.len());
+/// How long (ms) the burst's line rests by the margin before its Enter.
+const LAST_ROW_REST: u64 = 3_000;
+/// The blank cells past the burst's line the wall is judged at, on each face's cells: from more
+/// than the fitted body takes on every face to none, and `-1`, a line a cell too long for its row,
+/// which wraps.
+const LAST_ROW_ROOMS: [i16; 6] = [4, 3, 2, 1, 0, -1];
+
+/// What `last-row`'s line does once its burst is typed, before its Enter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Then {
+    /// It rests [`LAST_ROW_REST`].
+    Rests,
+    /// `keys` Backspaces 50 ms apart from `after` ms past the last key, each echoed as a line
+    /// editor echoes one at its line's end (back a cell, erase to the end), the Enter 4 s past
+    /// the last key.
+    Erased { keys: u16, after: u64 },
+    /// Ten Left arrows 50 ms apart from 1.5 s past the last key (echoed back a cell), the Enter
+    /// 5 s past the last key.
+    Back,
+    /// The burst typed to [`PAUSED_SHORT`] keys short of its end, a 3 s pause, then the rest,
+    /// and [`LAST_ROW_REST`].
+    Paused,
+    /// 1.5 s past the last key the program clears the row over the line ([`OPEN_ROW_OVER`]),
+    /// the caret kept where it stands: a seat opens beside the line while the body is out. The
+    /// Enter 4 s past the last key.
+    Opened,
+    /// [`GAPPED_TEXT`] typed for the burst, and [`LAST_ROW_REST`].
+    Gapped,
+}
+
+/// The bytes [`Then::Opened`]'s program writes: the caret saved, a row up, that row cleared,
+/// the caret restored.
+const OPEN_ROW_OVER: &[u8] = b"\x1b7\x1b[A\x1b[2K\x1b8";
+
+/// How many keys short of its end [`Then::Paused`]'s burst pauses.
+const PAUSED_SHORT: usize = 6;
+
+/// A `last-row` replay: its frames, its last key (the wrapping one where the line wraps), its
+/// Enter (ms), and the first key past the burst's line (a Backspace's, a Left arrow's) or, for
+/// [`Then::Paused`], the first key past the pause.
+struct LastRow {
+    frames: Vec<Frame>,
+    last_key: u64,
+    enter: u64,
+    then_from: Option<u64>,
+}
+
+/// The trail gallery's `last-row` on `cell` px cells, the grid as wide as leaves `room` blank
+/// cells past the burst's line on the main screen's last row: the page's rows over it (the row
+/// over the line a letter in every cell), the burst typed from [`TYPING_FROM`] a key every 50 ms,
+/// what `then` says, then an Enter whose answer scrolls the page and prints a new prompt.
+fn last_row(
+    cell: (usize, usize),
+    (room, then): (i16, Then),
+    style: &str,
+    old: &[OldPath],
+    ctl: bool,
+) -> LastRow {
+    let line = ("$ ".len() + BURST_TEXT.len()) as i16;
+    let cols = u16::try_from(line + room).expect("a grid as wide as the line");
+    let mut page = String::from("\x1b[H\x1b[2J");
+    for over in (1..usize::from(ROWS)).rev() {
+        let text: String = if over % 2 == 1 {
+            LAST_ROW_FULL
+                .chars()
+                .cycle()
+                .take(usize::from(cols))
+                .collect()
+        } else {
+            LAST_ROW_RAGGED[over / 2 % LAST_ROW_RAGGED.len()].to_string()
+        };
+        page.push_str(&text);
+        page.push_str("\r\n");
+    }
+    page.push_str("$ ");
+    let mut ev = vec![(200, Ev::Out(page.into_bytes()))];
+    let (last_key, then_from) = if then == Then::Paused {
+        let short = BURST_TEXT.len() - PAUSED_SHORT;
+        ev.extend(typed(&BURST_TEXT[..short], TYPING_FROM, 50));
+        let resume = TYPING_FROM + 50 * short as u64 + 3_000;
+        ev.extend(typed(&BURST_TEXT[short..], resume, 50));
+        (resume + 50 * (PAUSED_SHORT as u64 - 1), Some(resume))
+    } else {
+        let burst = if then == Then::Gapped {
+            GAPPED_TEXT
+        } else {
+            BURST_TEXT
+        };
+        ev.extend(typed(burst, TYPING_FROM, 50));
+        let last_key = TYPING_FROM + 50 * (burst.len() as u64 - 1);
+        let (keys, from, key, echo): (u16, u64, char, &[u8]) = match then {
+            Then::Erased { keys, after } => (keys, after, '\u{7f}', b"\x08\x1b[K"),
+            Then::Back => (10, 1_500, LEFT, b"\x08"),
+            Then::Rests | Then::Paused | Then::Opened | Then::Gapped => (0, 0, ' ', b""),
+        };
+        ev.extend(
+            (0..u64::from(keys)).map(|k| (last_key + from + 50 * k, Ev::Key(key, echo.to_vec()))),
+        );
+        if then == Then::Opened {
+            ev.push((last_key + 1_500, Ev::Out(OPEN_ROW_OVER.to_vec())));
+            (last_key, Some(last_key + 1_500))
+        } else {
+            (last_key, (keys > 0).then_some(last_key + from))
+        }
+    };
+    let enter = last_key
+        + match then {
+            Then::Rests | Then::Paused | Then::Gapped => LAST_ROW_REST,
+            Then::Erased { .. } | Then::Opened => 4_000,
+            Then::Back => 5_000,
+        };
+    ev.push((enter, Ev::Key('\r', b"\r\n".to_vec())));
+    ev.push((enter + 6, Ev::Out(b"Below: pqgyj [ok]\r\n$ ".to_vec())));
+    ev.sort_by_key(|e| e.0);
+    LastRow {
+        frames: replay((cell, (ROWS, cols)), style, &ev, 1_600, old, ctl),
+        last_key,
+        enter,
+        then_from,
+    }
+}
+
+/// What a `last-row` run shows, from 300 ms past the first key to its end.
+#[derive(Clone, Debug)]
+struct WallSeen {
+    /// Frames to the Enter (wrapped: to the wrap) on glass whose box meets a lettered cell.
+    on: usize,
+    /// Frames to the Enter (wrapped: to the wrap) on glass.
+    drawn: usize,
+    /// Frames to the Enter (wrapped: to the wrap).
+    held: usize,
+    /// The most px a box on glass reaches into a lettered cell, to the Enter (wrapped: the wrap).
+    reach: i32,
+    /// The first frame (ms) on glass whose box meets a lettered cell.
+    first: Option<u64>,
+    /// The first frame (ms) from `first` off the glass.
+    gone: Option<u64>,
+    /// Frames (ms) from `first` to `gone` whose alpha rose over the frame before's.
+    rose: Vec<u64>,
+    /// Frames (ms) on glass from `gone` to the Enter (not judged where the line wraps).
+    unfaded: Vec<u64>,
+    /// The first frame (ms) on glass from `gone` to the Enter: the body back before it.
+    returned: Option<u64>,
+    /// Frames (ms) on glass from `gone` to the Enter whose box reaches more than 2 px into a
+    /// lettered cell.
+    relaid: Vec<u64>,
+    /// Frames on glass from the first key past the burst's line ([`LastRow::then_from`]) to the
+    /// Enter whose box meets a lettered cell.
+    then_on: usize,
+    /// Of those, the frames at full alpha whose box reaches more than 2 px into a lettered cell.
+    full: usize,
+    /// Frames (ms) on glass past the Enter (wrapped: past the wrap) whose box meets a lettered
+    /// cell.
+    after: Vec<u64>,
+    /// The first frame (ms) on glass past the Enter (wrapped: the wrap) and past `gone`.
+    back: Option<u64>,
+    /// The Enter (wrapped: the wrap), ms.
+    until: u64,
+}
+
+/// The most px `f`'s box reaches into a lettered cell on cells `cw` px wide (0: none).
+fn reach_of(f: &Frame, cw: usize) -> i32 {
+    match f.pet {
+        Some((x0, x1, ..)) if f.alpha > 0 => f
+            .boxed
+            .iter()
+            .map(|&(_, c)| {
+                let (c0, c1) = ((c * cw) as i32, ((c + 1) * cw) as i32);
+                x1.min(c1) - x0.max(c0)
+            })
+            .max()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// A `last-row` run's sum ([`WallSeen`]) on cells `cw` px wide: `wraps`, the line wraps at its
+/// last key.
+fn wall_seen(run: &LastRow, wraps: bool, cw: usize) -> WallSeen {
+    let from = TYPING_FROM + 300;
+    let until = if wraps { run.last_key } else { run.enter };
+    let lettered = |f: &Frame| f.alpha > 0 && !f.boxed.is_empty();
+    let held: Vec<&Frame> = run
+        .frames
+        .iter()
+        .filter(|f| f.ms >= from && f.ms < until)
+        .collect();
+    let reach = held.iter().map(|f| reach_of(f, cw)).max().unwrap_or(0);
+    let first = held.iter().find(|f| lettered(f)).map(|f| f.ms);
+    let gone = first.and_then(|first| {
+        run.frames
+            .iter()
+            .find(|f| f.ms >= first && f.alpha == 0)
+            .map(|f| f.ms)
+    });
+    let rose = match (first, gone) {
+        (Some(first), Some(gone)) => run
+            .frames
+            .windows(2)
+            .filter(|w| w[0].ms >= first && w[1].ms <= gone && w[1].alpha > w[0].alpha)
+            .map(|w| w[1].ms)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let rested: Vec<&&Frame> = match gone {
+        Some(gone) if !wraps => held.iter().filter(|f| f.ms >= gone).collect(),
+        _ => Vec::new(),
+    };
+    let past: Vec<&Frame> = run.frames.iter().filter(|f| f.ms > until).collect();
+    WallSeen {
+        on: held.iter().filter(|f| lettered(f)).count(),
+        drawn: held.iter().filter(|f| f.alpha > 0).count(),
+        held: held.len(),
+        reach,
+        first,
+        gone,
+        rose,
+        unfaded: rested
+            .iter()
+            .filter(|f| f.alpha > 0)
+            .map(|f| f.ms)
+            .collect(),
+        returned: rested.iter().find(|f| f.alpha > 0).map(|f| f.ms),
+        relaid: rested
+            .iter()
+            .filter(|f| reach_of(f, cw) > 2)
+            .map(|f| f.ms)
+            .collect(),
+        then_on: run.then_from.map_or(0, |t| {
+            held.iter().filter(|f| f.ms >= t && lettered(f)).count()
+        }),
+        full: run.then_from.map_or(0, |t| {
+            held.iter()
+                .filter(|f| f.ms >= t && f.alpha == u8::MAX && reach_of(f, cw) > 2)
+                .count()
+        }),
+        after: past.iter().filter(|f| lettered(f)).map(|f| f.ms).collect(),
+        back: past
+            .iter()
+            .find(|f| f.alpha > 0 && gone.is_none_or(|g| f.ms > g))
+            .map(|f| f.ms),
+        until,
+    }
+}
+
+/// The blank cells past the burst's line on a grid `room` cells wider than it once `keys`
+/// Backspaces have erased it ([`Then::Erased`]): a cell each, and two for the first where the
+/// line ran to the grid's end, since the caret stood on its last letter there, the back-step
+/// leaves that letter after it, and the erase to the line's end takes it.
+fn erased_room(room: i16, keys: u16) -> i16 {
+    room + keys as i16 + i16::from(room == 0 && keys > 0)
+}
+
+/// What [`a_wall_that_holds_no_seat_hides_the_body_on_every_face`] replays past the burst's line
+/// where the line leaves the body no seat: the rest, an erase after the fade (3, 6 and 12
+/// Backspaces), one during it, Left arrows back into the line, a pause before its last keys
+/// (replayed where the line seats the body too), the row over the line cleared, and a line whose
+/// last letters follow a run of spaces (replayed where it seats the body too).
+const WALL_THENS: [Then; 9] = [
+    Then::Rests,
+    Then::Erased {
+        keys: 3,
+        after: 1_500,
+    },
+    Then::Erased {
+        keys: 6,
+        after: 1_500,
+    },
+    Then::Erased {
+        keys: 12,
+        after: 1_500,
+    },
+    Then::Erased {
+        keys: 6,
+        after: 150,
+    },
+    Then::Back,
+    Then::Paused,
+    Then::Opened,
+    Then::Gapped,
+];
+
+/// A run of the wall's scene: the cells, the blank cells past the line and what follows the
+/// burst, the companion, whether keys come as the gallery types them, and the law its negative
+/// control reverts, if it is one.
+type WallRun = (
+    (usize, usize),
+    (i16, Then),
+    &'static str,
+    bool,
+    Option<OldPath>,
+);
+
+/// THE WALL THAT HOLDS NO SEAT HIDES THE BODY ([`OldPath::NoSeatHidesTheBody`]), on every face's
+/// cells ([`CELLS`]): the trail gallery's `last-row` on the main screen's last row, the row over it
+/// lettered in every cell and none under, the burst's line ending 4, 3, 2, 1 and 0 cells short of
+/// the grid's end, and one cell too long for its row, so that it wraps ([`LAST_ROW_ROOMS`]). The
+/// cat and the dog, keys typed at the window and as the gallery types them, from 300 ms past the
+/// first key. Where the line leaves the room the body fitted to its row takes (`art_cols` x
+/// [`ROW_FIT`] cells: 3.38 on 13 x 29, 2.82 on 14 x 26, 3.86 on 11 x 28), typed to its end at once,
+/// paused [`PAUSED_SHORT`] keys short of it ([`Then::Paused`]) or its last letters after a run of
+/// spaces ([`Then::Gapped`]), it is on glass in every frame to the Enter (the caret's cell is not
+/// judged here: on 14 x 26 the box overlaps it), and its box meets no lettered cell but by a pose's
+/// swell at the wall, which the grid's end pushes back onto the line
+/// ([`OldPath::StretchOffLetters`] leaves it so), 2 px at most (measured on 11 x 28 at four cells:
+/// 1 px, in 3 frames, and in 7 past the pause; none on the others). Where the line leaves less, a
+/// frame's box meets its last letters as they come, and from that frame the body fades out
+/// ([`FADE_OUT`]), its alpha never rising, and is off the glass a fade and two frames on. Past the
+/// Enter, and where the line wraps past the wrap, it is back on glass within a second
+/// ([`super::FADE_IN`]) and no frame's box meets a lettered cell: it comes back by the new caret,
+/// and never crosses the wrapped line's first row.
+///
+/// Where the line leaves no seat, what follows it before the Enter ([`WALL_THENS`]):
+/// - It rests: off the glass from its fade's end to the Enter.
+/// - 3, 6 or 12 Backspaces 1.5 s past the last key, or 6 from 150 ms, while it fades: where the
+///   erase leaves the fitted body its room ([`erased_room`]), it is back on glass within a second
+///   of the erase's last key (or of its fade's end), and where it leaves less, off the glass to
+///   the Enter. Either way no frame from its fade's end to the Enter lays its box more than 2 px
+///   into a lettered cell (the same swell, 1 px in 3 frames on 11 x 28 at four cells).
+/// - Ten Left arrows back into the line 1.5 s past the last key: off the glass from its fade's
+///   end to the Enter, no stand by the caret being off the letters.
+/// - The burst paused [`PAUSED_SHORT`] keys short of its end for 3 s: off the glass within
+///   [`FADE_OUT`] and 150 ms of its last key, and to the Enter.
+/// - 1.5 s past the last key the program clears the row over the line ([`Then::Opened`]), so a
+///   seat opens beside the line while the body is out: back on glass within a second of the
+///   clearing (or of its fade's end; measured 24 ms past the clearing on every face), and no
+///   frame from its fade's end to the Enter lays its box more than 2 px into a lettered cell.
+///   Past the Enter, the frame before it moves has the Enter's scroll carry the line up under
+///   that seat (the same at four blank cells, which seat the body, and with the law reverted):
+///   that frame is the scroll's, and is not judged.
+/// - The burst's last two letters typed after fourteen spaces ([`Then::Gapped`]), so that a stand
+///   by the caret off the letters lies in the spaces: off the glass from its fade's end to the
+///   Enter, the wall holding it no seat on every tick there (stood at that stand, the body blinked
+///   back and out every 64 ms from its fade's end to the Enter on every face), and where the line
+///   seats it, on glass in every frame to the Enter (replayed there too).
+///
+/// In each, from the first key past the line (past the pause) to the Enter, at full alpha its
+/// box reaches more than 2 px into a lettered cell in one frame at most (measured: one past the
+/// pause at one blank cell and at none on 13 x 29 and 11 x 28, at none on 14 x 26; none in the
+/// others).
+///
+/// Negative control (the law reverted, the cat, every face, both ways of typing, every room that
+/// leaves no seat): it stands at the wall over the line's last letters to the Enter, its box on
+/// them in 126 frames or more, two thirds of the fewest measured (188 to 197 of the 375 held; 188
+/// to 191 past the gap, each at full alpha). Where
+/// the line wraps, as the gallery types it, its crossing back after the wrap lays its box on the
+/// wrapped line's letters in 21 frames or more, two thirds of those measured (31 on every face);
+/// typed at the window the reverted crossing keeps off them (measured 0), so that control is the
+/// gallery's typing alone. From the first Left arrow to the Enter it follows the caret along the
+/// line's letters, its box on them in 146 frames or more (measured 219 of 219); from the end of
+/// the pause, in 125 or more (187 to 197 of 203). The erase after the line ran to the grid's end
+/// leaves it on the letters from the first Backspace to the Enter in 18 frames or more (measured
+/// 26 to 240: 156 with three, 45 to 156 with six, 26 to 35 with twelve, 44 to 240 with six while
+/// it fades; at the other rooms the reverted body is clear of the letters within 8 frames of the
+/// erase, and no control is taken there).
+///
+/// Negative control of the caret's own steps ([`OldPath::CaretTypesOn`] reverted, the cat, every
+/// face, typed as the gallery types them, the pause at every room but the wrap): the keys typed
+/// on after the pause, short of the rhythm's [`super::RHYTHM_MOVES`], find the margin untaken,
+/// and the body hops over the caret onto the line's last letters at full alpha. Over the rooms
+/// its box reaches more than 2 px into them at full alpha in 15 frames or more, two thirds of
+/// the fewest measured (22 on 13 x 29: 10 at three blank cells, 10 at two, 1 at one and 1 at
+/// none; 24 on 14 x 26: 11 at two, 12 at one, 1 at none; 40 on 11 x 28: 30 at four, which seat
+/// the body, 8 at three, none at two, 1 at one and 1 at none), against 2, 1 and 2 with the law.
+/// Linux arm64, 2026-11-07.
+#[test]
+fn a_wall_that_holds_no_seat_hides_the_body_on_every_face() {
+    let mut runs: Vec<WallRun> = Vec::new();
+    for cell in CELLS {
+        let fitted = art_cols(cell.0 as u16, cell.1 as u16) * ROW_FIT;
+        for room in LAST_ROW_ROOMS {
+            for then in WALL_THENS {
+                let unseated = f32::from(room) < fitted;
+                let judged = match then {
+                    Then::Rests => true,
+                    Then::Paused | Then::Gapped => room >= 0,
+                    _ => room >= 0 && unseated,
+                };
+                if !judged {
+                    continue;
+                }
+                for ctl in [false, true] {
+                    for style in STYLES {
+                        runs.push((cell, (room, then), style, ctl, None));
+                    }
+                    let control = match then {
+                        Then::Rests => room >= 0 || ctl,
+                        Then::Erased { .. } => room == 0,
+                        Then::Back | Then::Paused | Then::Gapped => true,
+                        Then::Opened => false,
+                    };
+                    if unseated && control {
+                        let old = Some(OldPath::NoSeatHidesTheBody);
+                        runs.push((cell, (room, then), STYLES[0], ctl, old));
+                    }
+                    if then == Then::Paused && ctl {
+                        let old = Some(OldPath::CaretTypesOn);
+                        runs.push((cell, (room, then), STYLES[0], ctl, old));
+                    }
+                }
+            }
+        }
+    }
+    let seen = aterm_spec::check::each(&runs, |&(cell, scene, style, ctl, control)| {
+        let old: Vec<OldPath> = control.into_iter().collect();
+        let run = last_row(cell, scene, style, &old, ctl);
+        (wall_seen(&run, scene.0 < 0, cell.0), run.last_key)
+    });
+    for cell in CELLS {
+        let full: Vec<usize> = runs
+            .iter()
+            .zip(&seen)
+            .filter(|(run, _)| run.0 == cell && run.4 == Some(OldPath::CaretTypesOn))
+            .map(|(_, (s, _))| s.full)
+            .collect();
+        assert!(
+            full.iter().sum::<usize>() >= 15,
+            "negative control on {cell:?} ({:?}): typed on past the console after the pause, \
+             its box met the letters at full alpha in only {full:?} frames",
+            OldPath::CaretTypesOn
+        );
+    }
+    for (&(cell, (room, then), style, ctl, control), (s, last_key)) in runs.iter().zip(&seen) {
+        let why = format!("{style} on {cell:?}, {room} cells past the line, {then:?} (ctl {ctl})");
+        let fitted = art_cols(cell.0 as u16, cell.1 as u16) * ROW_FIT;
+        assert!(s.held >= 150, "fixture: {why} holds {} frames", s.held);
+        if control == Some(OldPath::CaretTypesOn) {
+            continue;
+        }
+        if control.is_some() {
+            let (met, bites) = match then {
+                Then::Rests if room < 0 => (s.after.len(), 21),
+                Then::Rests | Then::Gapped => (s.on, 126),
+                Then::Erased { .. } => (s.then_on, 18),
+                Then::Back => (s.then_on, 146),
+                Then::Paused => (s.then_on, 125),
+                Then::Opened => unreachable!("no control is taken where a seat opens"),
+            };
+            assert!(
+                met >= bites,
+                "negative control, {why}: with no seat, its box met the letters in only {met} \
+                 frames ({s:?})"
+            );
+            continue;
+        }
+        if f32::from(room) >= fitted {
+            assert!(
+                s.drawn == s.held && s.reach <= 2,
+                "{why}: seated, the body left the glass or its box reached {} px into a letter's \
+                 cell ({s:?})",
+                s.reach
+            );
+            continue;
+        }
+        let first = s
+            .first
+            .unwrap_or_else(|| panic!("fixture: {why}: the line never met the box ({s:?})"));
+        let gone = s
+            .gone
+            .unwrap_or_else(|| panic!("{why}: the body never left the glass ({s:?})"));
+        let fade = (FADE_OUT * 1_000.0) as u64;
+        let by = match then {
+            Then::Paused => last_key + fade + 150,
+            _ => first + fade + 2 * FRAME_MS,
+        };
+        assert!(
+            s.rose.is_empty() && gone <= by,
+            "{why}: from the box's meeting the letters at {first} ms its fade rose at {:?}, or \
+             took to {gone} ms",
+            s.rose
+        );
+        assert!(
+            s.full <= 1,
+            "{why}: past the line, its box met the letters at full alpha in {} frames ({s:?})",
+            s.full
+        );
+        assert!(
+            s.relaid.is_empty(),
+            "{why}: frames on glass after its fade whose box lies on a letter: {:?}",
+            s.relaid
+        );
+        match then {
+            Then::Erased { keys, after } if f32::from(erased_room(room, keys)) >= fitted => {
+                let erased = last_key + after + 50 * u64::from(keys - 1);
+                assert!(
+                    s.returned.is_some_and(|r| r <= erased.max(gone) + 1_000),
+                    "{why}: the erase left it its room and it was not back on glass a second \
+                     past it ({s:?})"
+                );
+            }
+            Then::Opened => {
+                let opened = last_key + 1_500;
+                assert!(
+                    s.returned.is_some_and(|r| r <= opened.max(gone) + 1_000),
+                    "{why}: a seat opened beside the line and it was not back on glass a second \
+                     past it ({s:?})"
+                );
+            }
+            _ => assert!(
+                s.unfaded.is_empty(),
+                "{why}: frames on glass after its fade, the line under it: {:?}",
+                s.unfaded
+            ),
+        }
+        assert!(
+            s.back.is_some_and(|b| b <= s.until.max(gone) + 1_000),
+            "{why}: not back on glass a second past the wrap or the Enter ({s:?})"
+        );
+        // Off the line on the row the seat opened over it, the body has the Enter's scroll carry
+        // the line up under it for the frame before it moves (measured the same at four blank
+        // cells, which seat it, and with the law reverted): that frame is the scroll's, not the
+        // wall's.
+        let scrolled_under = |ms: u64| then == Then::Opened && ms <= s.until + FRAME_MS;
+        assert!(
+            s.after.iter().all(|&ms| scrolled_under(ms)),
+            "{why}: frames past the wrap or the Enter whose box meets a letter: {:?}",
+            s.after
+        );
     }
 }
 

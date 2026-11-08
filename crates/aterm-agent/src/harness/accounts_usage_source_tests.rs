@@ -178,17 +178,24 @@ pub(crate) fn usage_source_transition(
             let held = (case == 11).then(|| store.acquire().unwrap());
             let mut written = false;
             let writer = if case == 13 { &other } else { &store };
-            let result = writer.observe_usage_within(&[], NOW, &captured, &who, |state| {
-                written = true;
-                Ok(note_wall(
-                    state,
-                    "main",
-                    "five_hour",
-                    Some(NOW + 3600),
-                    NOW,
-                    NOW,
-                ))
-            });
+            let result = writer.observe_usage_within(
+                &[],
+                NOW,
+                &captured,
+                &who,
+                |state| {
+                    written = true;
+                    Ok(note_wall(
+                        state,
+                        "main",
+                        "five_hour",
+                        Some(NOW + 3600),
+                        NOW,
+                        NOW,
+                    ))
+                },
+                |_| (),
+            );
             drop(held);
             assert_eq!(result.is_ok(), written, "case {case}: {result:?}");
             next.insert("phase", 2);
@@ -264,16 +271,23 @@ fn missing_roster_receipts_recover_only_while_the_source_stays_missing() {
         std::fs::create_dir(&witness).unwrap();
         assert!(
             store
-                .observe_usage_within(&[], NOW, &captured, &who, |state| {
-                    Ok(note_wall(
-                        state,
-                        "main",
-                        "five_hour",
-                        Some(NOW + 3600),
-                        NOW,
-                        NOW,
-                    ))
-                })
+                .observe_usage_within(
+                    &[],
+                    NOW,
+                    &captured,
+                    &who,
+                    |state| {
+                        Ok(note_wall(
+                            state,
+                            "main",
+                            "five_hour",
+                            Some(NOW + 3600),
+                            NOW,
+                            NOW,
+                        ))
+                    },
+                    |_| ()
+                )
                 .is_err()
         );
         assert!(store.sync_needs_recovery());
@@ -340,16 +354,23 @@ fn usage_recovers_legacy_receipts_through_the_original_parent_alias() {
         route: crate::harness::accounts::AuthRoute::Stored,
     };
     store
-        .observe_usage_within(&[], NOW, &captured, &who, |state| {
-            Ok(note_wall(
-                state,
-                "main",
-                "five_hour",
-                Some(NOW + 3600),
-                NOW,
-                NOW,
-            ))
-        })
+        .observe_usage_within(
+            &[],
+            NOW,
+            &captured,
+            &who,
+            |state| {
+                Ok(note_wall(
+                    state,
+                    "main",
+                    "five_hour",
+                    Some(NOW + 3600),
+                    NOW,
+                    NOW,
+                ))
+            },
+            |_| (),
+        )
         .unwrap();
     assert!(!store.sync_needs_recovery());
     assert!(
@@ -381,16 +402,23 @@ fn an_absent_roster_cannot_alias_an_uncreated_state_file_through_a_parent_link()
     };
     assert!(
         store
-            .observe_usage_within(&[], NOW, &captured, &who, |state| {
-                Ok(note_wall(
-                    state,
-                    "main",
-                    "five_hour",
-                    Some(NOW + 3600),
-                    NOW,
-                    NOW,
-                ))
-            })
+            .observe_usage_within(
+                &[],
+                NOW,
+                &captured,
+                &who,
+                |state| {
+                    Ok(note_wall(
+                        state,
+                        "main",
+                        "five_hour",
+                        Some(NOW + 3600),
+                        NOW,
+                        NOW,
+                    ))
+                },
+                |_| ()
+            )
             .is_err()
     );
     assert!(!store.state_file().exists());

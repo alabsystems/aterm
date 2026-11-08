@@ -14,6 +14,18 @@ use super::{SessionLog, name_fp, tok, with};
 /// A bell is said at most this often (monotonic ms): a flood of BELs is one count a second.
 pub(crate) const BELL_EVERY_MS: u64 = 1_000;
 
+/// WHAT THE OSC TITLE STANDS FOR when the drift flush reads it ([`SessionLog::observe_title`]),
+/// read off the engine under the flush's guard ([`crate::session_status::title_stands`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TitleStands {
+    /// The title's own words: the shell's (its directory, at its prompt) or a program's (an
+    /// editor's file, an agent's summary of its conversation), kept as text at tier C.
+    Own,
+    /// The command line a shell announced (OSC 633;E), as its integration sets a running
+    /// command's title: kept as its fingerprint alone, at tier C.
+    CommandLine,
+}
+
 /// A program's moves written at once before its run's bucket is empty (6F-4, U17).
 pub(crate) const PROGRAM_BURST: u64 = 20;
 /// Past the burst, a program's run earns one program mark this often (monotonic ms).
@@ -522,6 +534,16 @@ impl SessionLog {
             .mark(Mark::new(kind, src, conf).at(node).fields(f), at);
     }
 
+    /// A point fact of what runs now, on the DEEPEST OPEN NODE (§2.1, which `Log::mark` picks
+    /// for a mark that names none): the open step, else the open turn, else the open run, else
+    /// `-` (unit J1-1, SMOKE-1c). A notification, a bell and a mail go there, so the run, the
+    /// turn or the step they came in reads them, and a mail counts in every open ancestor's
+    /// close (`mail=`, §2.3). Never `Self::front_run`, which would leave a turn's close without
+    /// its mail.
+    fn put_open(&mut self, kind: Kind, src: Src, conf: Conf, f: Fields, at: Stamp) {
+        let _ = self.log.mark(Mark::new(kind, src, conf).fields(f), at);
+    }
+
     /// THE ENGINE'S MARKS, from one read under the sweep's guard.
     pub(crate) fn observe_engine(&mut self, e: &EngineRead, at: Stamp) {
         let integration = integration_word(e.integration);
@@ -540,7 +562,7 @@ impl SessionLog {
         match self.observed.notify {
             Some(base) if e.notify_total > base => {
                 let f = with(Fields::new(), Key::N, Some(Val::U(e.notify_total - base)));
-                self.put(Kind::Notify, Src::Engine, Conf::Exact, Node::SESSION, f, at);
+                self.put_open(Kind::Notify, Src::Engine, Conf::Exact, f, at);
                 self.observed.notify = Some(e.notify_total);
             }
             Some(base) if e.notify_total >= base => {}
@@ -554,7 +576,7 @@ impl SessionLog {
                     .is_none_or(|t| at.mono_ms.saturating_sub(t) >= BELL_EVERY_MS);
                 if due {
                     let f = with(Fields::new(), Key::N, Some(Val::U(e.bell_total - base)));
-                    self.put(Kind::Bell, Src::Engine, Conf::Exact, Node::SESSION, f, at);
+                    self.put_open(Kind::Bell, Src::Engine, Conf::Exact, f, at);
                     self.observed.bell = Some(e.bell_total);
                     self.observed.bell_at = Some(at.mono_ms);
                 }
@@ -983,8 +1005,17 @@ impl SessionLog {
         true
     }
 
-    /// `mark - title title=<informative title>`, when it moved; returns whether it marked.
-    pub(crate) fn observe_title(&mut self, title: &str, at: Stamp) -> bool {
+    /// `mark - title title=<informative title>` for the title's own words, `mark - title
+    /// title_fp=<16 hex>` for a command line (`stands`), when it moved; returns whether it
+    /// marked. Both fields are tier C: below it the mark says only that the title moved, and when.
+    ///
+    /// aterm's zsh, bash, fish and PowerShell integrations set the title to the command line
+    /// they announce (633;E) while it runs, and command lines are not stored (§3.6): that title
+    /// keeps only its fingerprint, the [`title_fp`], in RAM, so the journal, the bus and every
+    /// reader below `tier=content` hold nothing of it (unit J1-1, SMOKE-1e). A program's own
+    /// title, an agent's summary above all, keeps its text at C, which is why C exists. The tab
+    /// shows the title the shell set, whatever the log keeps.
+    pub(crate) fn observe_title(&mut self, title: &str, stands: TitleStands, at: Stamp) -> bool {
         let fp = title_fp(title);
         if self.observed.title == Some(fp) {
             return false;
@@ -995,8 +1026,20 @@ impl SessionLog {
             return false;
         }
         let mut f = Fields::new();
-        if let Some(t) = BoundedText::new(Key::Title, title) {
-            let _ = f.set(Key::Title, Val::Text(t));
+        match stands {
+            TitleStands::Own => {
+                if let Some(t) = BoundedText::new(Key::Title, title) {
+                    let _ = f.set(Key::Title, Val::Text(t));
+                }
+            }
+            TitleStands::CommandLine => {
+                if let Some(id) = (fp != 0)
+                    .then(|| aterm_slog::ShortId::new(&format!("{fp:016x}")))
+                    .flatten()
+                {
+                    let _ = f.set(Key::TitleFp, Val::Id(id));
+                }
+            }
         }
         self.put(Kind::Title, Src::Engine, Conf::Exact, Node::SESSION, f, at);
         true
@@ -1248,11 +1291,19 @@ impl SessionLog {
             }
         };
         let elastic = (kind == Kind::Mail).then_some(Key::Via);
+        // A mail, in or out, is a point fact of what runs now: the deepest open node's
+        // (`Self::put_open`), so `mail=` counts it in each open ancestor's close (unit J1-1,
+        // SMOKE-1c). The rest are the session's: a landing or a verdict answers an earlier mail by
+        // its inbox id, and a hold, a topic, an advisory, a fetch or a gap is the session's own
+        // lane.
         let mark = |f: Fields| {
-            Mark::new(kind, Src::Fabric, Conf::Exact)
-                .at(Node::SESSION)
-                .by(by)
-                .fields(f)
+            let m = Mark::new(kind, Src::Fabric, Conf::Exact);
+            let m = if kind == Kind::Mail {
+                m
+            } else {
+                m.at(Node::SESSION)
+            };
+            m.by(by).fields(f)
         };
         let _ = self.mark_within_record(mark, f, elastic, at);
     }

@@ -6583,6 +6583,8 @@ struct SetupActivity {
     readback_subjects: Vec<aterm_types::macos_setup::Subject>,
     /// Captured before this job reads its execution target, never rebased by START.
     readback_owner: Option<SetupReadbackScope>,
+    /// Scoped stage rows still owing a current fact when their owner ends.
+    readback_missing: Vec<aterm_types::macos_setup::Subject>,
     /// The one keeper's actual activation/read-failure batch. It has separate
     /// custody from a setup stage that may still be finishing its own lease.
     input_readback: bool,
@@ -6654,6 +6656,7 @@ static SETUP_ACTIVITY: std::sync::Mutex<SetupActivity> = std::sync::Mutex::new(S
     readback: None,
     readback_subjects: Vec::new(),
     readback_owner: None,
+    readback_missing: Vec::new(),
     input_readback: false,
 });
 
@@ -7499,11 +7502,23 @@ fn setup_stage(event: aterm_cli::macos_doctor::StageEvent<'_>) {
     }
 }
 
-/// The small input worker updates only already-paid observations. It neither
-/// reads full setup status nor starts healing, private readers or other lanes.
+/// The small input worker publishes already-paid observations and reserves its owned
+/// rows for an ordinary read if their scoped pass ends without a current fact.
+/// It never requests whole-page status, healing or another setup lane.
 #[cfg(target_os = "macos")]
 fn setup_readback_stage(event: aterm_cli::macos_doctor::StageEvent<'_>) {
-    let _ = record_setup_stage(event);
+    let missing = record_setup_stage(event);
+    if let Ok(mut activity) = SETUP_ACTIVITY.lock()
+        && activity
+            .readback_owner
+            .is_some_and(|owner| owner.revision == Some(event.revision))
+    {
+        for subject in missing {
+            if !activity.readback_missing.contains(&subject) {
+                activity.readback_missing.push(subject);
+            }
+        }
+    }
     publish_setup_readings();
 }
 
@@ -7643,17 +7658,29 @@ fn capture_setup_readback_scope(revision: Option<u64>) -> SetupReadbackScope {
 }
 
 #[cfg(target_os = "macos")]
-struct SetupReadbackOwner(Option<SetupReadbackScope>);
+struct SetupReadbackOwner {
+    scope: SetupReadbackScope,
+    previous: Option<SetupReadbackScope>,
+    previous_missing: Vec<aterm_types::macos_setup::Subject>,
+}
 
 #[cfg(target_os = "macos")]
 impl SetupReadbackOwner {
     fn begin(scope: SetupReadbackScope) -> Self {
-        Self(
-            SETUP_ACTIVITY
-                .lock()
-                .ok()
-                .and_then(|mut activity| activity.readback_owner.replace(scope)),
-        )
+        let (previous, previous_missing) = SETUP_ACTIVITY
+            .lock()
+            .map(|mut activity| {
+                (
+                    activity.readback_owner.replace(scope),
+                    std::mem::take(&mut activity.readback_missing),
+                )
+            })
+            .unwrap_or_default();
+        Self {
+            scope,
+            previous,
+            previous_missing,
+        }
     }
 }
 
@@ -7661,13 +7688,47 @@ impl SetupReadbackOwner {
 impl Drop for SetupReadbackOwner {
     fn drop(&mut self) {
         end_setup_activity();
-        if let Ok(mut activity) = SETUP_ACTIVITY.lock() {
+        let missing: Vec<_> = if let Ok(mut activity) = SETUP_ACTIVITY.lock() {
             activity.readback = None;
-            activity.readback_owner = self.0;
+            activity.readback_owner = self.previous;
+            let missing = std::mem::replace(
+                &mut activity.readback_missing,
+                std::mem::take(&mut self.previous_missing),
+            );
             // The scoped worker owns no final whole-page refresh.
             activity.readback_subjects.clear();
-        }
+            if let Ok(rows) = OBSERVED_ROWS.lock()
+                && self.scope.choices == Some(rows.choices)
+            {
+                // Any current fact, including an accepted Unknown or a competing
+                // observer's result, already paid for this row's native read.
+                missing
+                    .into_iter()
+                    .filter(|subject| !rows.rows.iter().any(|row| row.subject == *subject))
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        // The scoped pass has returned and released its profile lease. Stop may read
+        // durable records, so sample it outside the observation mutexes, only for debt.
+        let current = !missing.is_empty()
+            && self.scope.revision.is_some_and(|revision| {
+                setup_run() == Some(revision) && !setup_stop_requested(revision)
+            });
         publish_setup_readings();
+        if current && let Some(choices) = self.scope.choices {
+            queue_observation(ObserveRequest {
+                plan: None,
+                choices,
+                subjects: missing,
+                forced: false,
+                pending_repositories: false,
+                refresh: true,
+            });
+        }
     }
 }
 
@@ -7717,6 +7778,8 @@ struct ObserveQueue {
     next: Option<ObserveRequest>,
     /// Latest explicit Check. Its scope never transfers to another plan.
     check: Option<ObserveRequest>,
+    /// Only a worker that never started owes a dispatch retry.
+    retry: Option<aterm_secrets::converge::RunnerRetry>,
 }
 
 #[cfg(target_os = "macos")]
@@ -7792,6 +7855,7 @@ static OBSERVE_QUEUE: std::sync::Mutex<ObserveQueue> = std::sync::Mutex::new(Obs
     running: false,
     next: None,
     check: None,
+    retry: None,
 });
 
 /// The latest reading of each row, keyed by row, with the generation the page
@@ -7940,51 +8004,102 @@ fn observe_pending_repositories() {
 /// between capturing its scope and acquiring the queue.
 #[cfg(target_os = "macos")]
 fn queue_observation(request: ObserveRequest) -> bool {
-    queue_observation_with(request, |job| {
-        std::thread::Builder::new()
-            .name("aterm-setup-observe".into())
-            .spawn(job)
-            .map(|_| ())
-    })
+    queue_observation_with(request, start_observation)
 }
 
 #[cfg(target_os = "macos")]
 type ObservationJob = Box<dyn FnOnce() + Send>;
 
 #[cfg(target_os = "macos")]
+fn start_observation(job: ObservationJob) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("aterm-setup-observe".into())
+        .spawn(job)
+        .map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn observation_millis() -> u64 {
+    static CLOCK: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    u64::try_from(
+        CLOCK
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// The existing window keeper retries only retained, never-started work. An idle
+/// or running queue takes no clock reading and starts nothing.
+#[cfg(target_os = "macos")]
+fn maintain_observation_dispatch() {
+    dispatch_observation_with(None, observation_millis, start_observation);
+}
+
+#[cfg(target_os = "macos")]
 fn queue_observation_with(
     request: ObserveRequest,
+    spawn: impl FnOnce(ObservationJob) -> std::io::Result<()>,
+) -> bool {
+    dispatch_observation_with(Some(request), observation_millis, spawn)
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_observation_with(
+    request: Option<ObserveRequest>,
+    now: impl FnOnce() -> u64,
     spawn: impl FnOnce(ObservationJob) -> std::io::Result<()>,
 ) -> bool {
     let Ok(mut queue) = OBSERVE_QUEUE.lock() else {
         return false;
     };
-    if queue.running {
+    if let Some(request) = request {
         queue.enqueue(request);
+    }
+    if queue.running || (queue.next.is_none() && queue.check.is_none()) {
+        return true;
+    }
+    let now = now();
+    if queue
+        .retry
+        .as_ref()
+        .and_then(|retry| retry.remaining(now))
+        .is_some_and(|left| !left.is_zero())
+    {
         return true;
     }
     queue.running = true;
-    // Admit another caller only after this worker exists. A failed spawn
-    // cannot leave a concurrently acknowledged request without a worker.
-    let spawned = spawn(Box::new(move || {
-        let mut batch = [Some(request), None];
+    // Keep the finite pending batch in the queue until its worker actually starts.
+    // Holding this admission lock also serializes concurrent callers with spawn.
+    let spawned = spawn(Box::new(|| {
         loop {
+            let batch = {
+                let Ok(mut queue) = OBSERVE_QUEUE.lock() else {
+                    return;
+                };
+                queue.retry = None;
+                let batch = queue.take_pending();
+                if batch.iter().all(Option::is_none) {
+                    queue.running = false;
+                    return;
+                }
+                batch
+            };
+            // A started read, Unknown included, is consumed once. Only new requests
+            // enter the queue while this finite batch runs.
             for request in batch.into_iter().flatten() {
                 observe_rows(request);
-            }
-            let Ok(mut queue) = OBSERVE_QUEUE.lock() else {
-                return;
-            };
-            batch = queue.take_pending();
-            if batch.iter().all(Option::is_none) {
-                queue.running = false;
-                return;
             }
         }
     }));
     queue.running = spawned.is_ok();
-    drop(queue);
     if let Err(why) = spawned {
+        queue
+            .retry
+            .get_or_insert_default()
+            .reaped(aterm_secrets::converge::Last::Failed, now);
+        drop(queue);
         aterm_log::warn!("System State could not read its rows: {why}");
         return false;
     }
@@ -12100,6 +12215,7 @@ mod initial_setup_result_tests {
             running: false,
             next: None,
             check: None,
+            retry: None,
         };
         let pending = || ObserveRequest {
             plan: None,
@@ -12996,6 +13112,7 @@ mod initial_setup_result_tests {
         use aterm_secrets::client::MaterializationMark;
         let _globals = globals();
         let _io = TestIo::install();
+        let _queue = ObserverDispatchReset;
         let mark =
             |byte: u8| MaterializationMark::from_cache_key(&format!("{byte:02x}").repeat(32));
         script().vault_mark = mark(1);
@@ -13009,15 +13126,16 @@ mod initial_setup_result_tests {
         let choices = OBSERVED_ROWS.lock().unwrap().choices;
         let refused =
             read_github_again_if_its_token_moved_with(plan.clone(), |plan, subjects, forced| {
-                queue_observation_with(
-                    ObserveRequest {
+                dispatch_observation_with(
+                    Some(ObserveRequest {
                         plan,
                         choices,
                         subjects,
                         forced,
                         pending_repositories: false,
                         refresh: false,
-                    },
+                    }),
+                    || 0,
                     |_| {
                         Err(std::io::Error::other(
                             "injected token observation spawn refusal",
@@ -13029,28 +13147,34 @@ mod initial_setup_result_tests {
         assert!(observe_idle());
         assert_eq!(script().reads.len(), 1, "no worker read the renewed token");
 
-        let mut worker = None;
-        let (release, held) = std::sync::mpsc::sync_channel(1);
         let accepted =
             read_github_again_if_its_token_moved_with(plan.clone(), |plan, subjects, forced| {
-                queue_observation_with(
-                    ObserveRequest {
+                dispatch_observation_with(
+                    Some(ObserveRequest {
                         plan,
                         choices,
                         subjects,
                         forced,
                         pending_repositories: false,
                         refresh: false,
-                    },
-                    |job| {
-                        worker = Some(std::thread::spawn(move || {
-                            held.recv_timeout(HANG).unwrap();
-                            job();
-                        }));
-                        Ok(())
-                    },
+                    }),
+                    || 0,
+                    |_| panic!("another request must not bypass the failed-start backoff"),
                 )
             });
+        let mut worker = None;
+        let (release, held) = std::sync::mpsc::sync_channel(1);
+        assert!(dispatch_observation_with(
+            None,
+            || aterm_secrets::converge::FIRST_RETRY_MS,
+            |job| {
+                worker = Some(std::thread::spawn(move || {
+                    held.recv_timeout(HANG).unwrap();
+                    job();
+                }));
+                Ok(())
+            },
+        ));
         // An accepted reading still waiting to run owns this mark. Another
         // look must not enqueue a duplicate before the worker samples it.
         let repeated = read_github_again_if_its_token_moved(plan.clone());
@@ -13154,6 +13278,7 @@ mod initial_setup_result_tests {
             queue.running = false;
             queue.next = None;
             queue.check = None;
+            queue.retry = None;
         }
     }
 
@@ -13174,15 +13299,16 @@ mod initial_setup_result_tests {
             refresh: false,
         };
         let mut second = None;
-        let started = queue_observation_with(
-            ObserveRequest {
+        let started = dispatch_observation_with(
+            Some(ObserveRequest {
                 plan: Some(left_as_is()),
                 choices: request.choices,
                 subjects: vec![Subject::Setting(Setting::Dock)],
                 forced: false,
                 pending_repositories: false,
                 refresh: false,
-            },
+            }),
+            || 0,
             |_| {
                 let (reached, wait) = std::sync::mpsc::sync_channel(1);
                 second = Some(std::thread::spawn(move || {
@@ -13202,10 +13328,14 @@ mod initial_setup_result_tests {
                         reached.send(()).unwrap();
                     }
                     let mut worker = None;
-                    let accepted = queue_observation_with(request, |job| {
-                        worker = Some(std::thread::spawn(job));
-                        Ok(())
-                    });
+                    let accepted = dispatch_observation_with(
+                        Some(request),
+                        || 0,
+                        |job| {
+                            worker = Some(std::thread::spawn(job));
+                            Ok(())
+                        },
+                    );
                     if unlocked {
                         reached.send(()).unwrap();
                     }
@@ -13216,8 +13346,26 @@ mod initial_setup_result_tests {
             },
         );
         assert!(!started, "the failed caller reports refusal");
-        let (accepted, worker) = second.take().unwrap().join().unwrap();
+        let (accepted, mut worker) = second.take().unwrap().join().unwrap();
         assert!(accepted);
+        assert!(
+            worker.is_none(),
+            "a new arrival retains the failed-start backoff"
+        );
+        assert!(script().reads.is_empty(), "neither request started");
+        assert!(dispatch_observation_with(
+            None,
+            || 0,
+            |_| panic!("the keeper pulse must preserve the failed-start backoff"),
+        ));
+        assert!(dispatch_observation_with(
+            None,
+            || aterm_secrets::converge::FIRST_RETRY_MS,
+            |job| {
+                worker = Some(std::thread::spawn(job));
+                Ok(())
+            },
+        ));
         let ran = worker.is_some();
         if let Some(worker) = worker {
             worker.join().unwrap();
@@ -13227,14 +13375,29 @@ mod initial_setup_result_tests {
             "accepted work must have a worker after the failed start"
         );
         let script = script();
-        assert_eq!(script.reads.len(), 1);
-        assert_eq!(script.reads[0].0, expected);
-        assert_eq!(script.reads[0].1, [Subject::Setting(Setting::Repositories)]);
+        assert_eq!(
+            script.reads.len(),
+            2,
+            "the refused start must retain its original request"
+        );
+        assert_eq!(script.reads[0].0, left_as_is());
+        assert_eq!(script.reads[0].1, [Subject::Setting(Setting::Dock)]);
         assert!(
-            script.reads[0].2,
+            !script.reads[0].2,
+            "the ordinary request gains no Check scope"
+        );
+        assert_eq!(script.reads[1].0, expected);
+        assert_eq!(script.reads[1].1, [Subject::Setting(Setting::Repositories)]);
+        assert!(
+            script.reads[1].2,
             "the accepted Check retains its forced scope"
         );
         assert!(observe_idle());
+        assert!(dispatch_observation_with(
+            None,
+            || panic!("an idle pulse reads no clock"),
+            |_| panic!("completed observations are never replayed"),
+        ));
     }
 
     #[test]
@@ -14184,6 +14347,125 @@ mod initial_setup_result_tests {
         wait_until("the injected Stop is saved", stop_worker_idle);
         reset_worker_state();
 
+        // A scoped pass can finish without changing the already-correct native maps,
+        // while a concurrent invalidation fences its paid readback out of the cache.
+        for completion in [
+            "paid",
+            "fenced",
+            "observed",
+            "unknown",
+            "nested",
+            "panic",
+            "panic-nested",
+            "revision",
+            "run",
+            "choice",
+            "stop",
+        ] {
+            *SETUP_STOP.lock().unwrap() = None;
+            set_setup_run(Some(1));
+            {
+                let mut rows = OBSERVED_ROWS.lock().unwrap();
+                rows.plan = Some(Plan::from(selection));
+                rows.rows = vec![Observation::unknown(caps)];
+            }
+            OBSERVE_QUEUE.lock().unwrap().next = None;
+            change(|script| script.reads.clear());
+            let interrupted = std::panic::catch_unwind(|| {
+                with_setup_readback(capture_setup_readback_scope(Some(1)), || {
+                    setup_readback_stage(StageEvent {
+                        revision: if completion == "revision" { 2 } else { 1 },
+                        settings: &[Setting::CapsLock],
+                        subjects: &[caps],
+                        running: true,
+                        readback: &aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
+                    });
+                    if completion == "panic-nested" {
+                        with_setup_readback(capture_setup_readback_scope(Some(1)), || {});
+                        assert!(OBSERVE_QUEUE.lock().unwrap().next.is_none());
+                    }
+                    assert!(
+                        !matches!(completion, "panic" | "panic-nested"),
+                        "injected scoped stage unwind before END"
+                    );
+                    if completion != "paid" {
+                        invalidate_input_observations();
+                    }
+                    setup_readback_stage(StageEvent {
+                        revision: if completion == "revision" { 2 } else { 1 },
+                        settings: &[Setting::CapsLock],
+                        subjects: &[caps],
+                        running: false,
+                        readback: &readback,
+                    });
+                    match completion {
+                        "observed" | "unknown" => {
+                            change(|script| {
+                                script.panic_read = completion == "unknown";
+                                script.readings = [readback.observations().to_vec()].into();
+                            });
+                            let choices = OBSERVED_ROWS.lock().unwrap().choices;
+                            observe_rows(ObserveRequest {
+                                plan: Some(Plan::from(selection)),
+                                choices,
+                                subjects: vec![caps],
+                                forced: false,
+                                pending_repositories: false,
+                                refresh: false,
+                            });
+                            change(|script| script.panic_read = false);
+                        }
+                        "nested" => {
+                            with_setup_readback(capture_setup_readback_scope(Some(1)), || {});
+                            assert!(OBSERVE_QUEUE.lock().unwrap().next.is_none());
+                        }
+                        "run" => set_setup_run(Some(2)),
+                        "choice" => {
+                            let _ = begin_setup_choice(&plan, false, 0);
+                        }
+                        "stop" => stop_setup_run(1),
+                        _ => {}
+                    }
+                });
+            });
+            assert_eq!(
+                interrupted.is_err(),
+                matches!(completion, "panic" | "panic-nested")
+            );
+            assert!(native.keyboard_changes().is_empty());
+            assert_eq!(native.calls(), paid_commands);
+            let ready = setup_readings()
+                .observed
+                .iter()
+                .any(|row| row.subject == caps && row.standing == Standing::InPlace);
+            assert_eq!(ready, matches!(completion, "paid" | "observed"));
+            assert_eq!(
+                script().reads.len(),
+                usize::from(matches!(completion, "observed" | "unknown"))
+            );
+            if completion == "unknown" {
+                assert!(
+                    setup_readings()
+                        .observed
+                        .iter()
+                        .any(|row| { row.subject == caps && row.standing == Standing::Unknown })
+                );
+            }
+            let queued = OBSERVE_QUEUE.lock().unwrap().next.take();
+            assert_eq!(
+                queued.is_some(),
+                matches!(completion, "fenced" | "nested" | "panic" | "panic-nested"),
+                "scoped no-op completion {completion}"
+            );
+            if let Some(queued) = queued {
+                assert_eq!(queued.subjects, [caps]);
+                assert!(!queued.forced && !queued.pending_repositories);
+            }
+        }
+        set_setup_run(None);
+        wait_until("the scoped Stop is saved", stop_worker_idle);
+        reset_worker_state();
+
         // The ordinary scoped coordinator uses the same observation boundary,
         // without the full window setup/status or an ordinary native reread.
         use super::input_coordinator::fixture::{Event, Native};
@@ -14273,7 +14555,10 @@ mod initial_setup_result_tests {
                             invalidate,
                         )
                     });
-                assert!(activation.unwrap());
+                assert!(matches!(
+                    activation.unwrap(),
+                    aterm_machines::init::KeyboardAttachmentActivation::Verified(_)
+                ));
                 assert!(!retired, "a real no-op does not queue a success refresh");
                 assert!(
                     setup_readings()
@@ -14332,7 +14617,11 @@ mod initial_setup_result_tests {
                 let choices = OBSERVED_ROWS.lock().unwrap().choices;
                 let (entered, entering) = std::sync::mpsc::sync_channel(1);
                 let (release, released) = std::sync::mpsc::sync_channel(1);
-                type ActivationReply = (Result<bool, String>, bool, usize);
+                type ActivationReply = (
+                    Result<aterm_machines::init::KeyboardAttachmentActivation, String>,
+                    bool,
+                    usize,
+                );
                 struct Effect {
                     release: Option<std::sync::mpsc::SyncSender<()>>,
                     worker: Option<std::thread::JoinHandle<ActivationReply>>,
@@ -14401,7 +14690,12 @@ mod initial_setup_result_tests {
                 let (failed, retired, writes) = effect.worker.take().unwrap().join().unwrap();
                 release_readings();
                 late_reader.0.take().unwrap().join().unwrap();
-                assert!(!failed.unwrap() && retired);
+                assert!(
+                    matches!(
+                        failed.unwrap(),
+                        aterm_machines::init::KeyboardAttachmentActivation::Unfinished
+                    ) && retired
+                );
                 assert_eq!(
                     writes, 2,
                     "the actual setter wrote both services before failed readback"

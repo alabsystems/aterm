@@ -651,7 +651,6 @@ fn a_title_reads_whole_short_or_short_cut_never_as_a_stub_of_itself() {
                 let r = row(cols);
                 let tier = title_tier(&r, title, short)
                     .unwrap_or_else(|| panic!("{label} {cols}: a stub of the title: {r:?}"));
-                assert_eq!(r.full_title, title, "{cols}: the spoken title");
                 let shown = excerpt_of(&r);
                 if shown.as_ref().is_some_and(|d| d != step && d != SHORT) {
                     assert!(
@@ -852,7 +851,6 @@ fn a_title_is_cut_only_after_a_whole_word() {
                 "{title}@{cols}: {:?}",
                 row.title.1
             );
-            assert_eq!(row.full_title, title, "{title}@{cols}: spoken whole");
         }
     }
     let narrow = revealed(config("Keybinding skipped"), 22);
@@ -901,7 +899,6 @@ fn an_all_cjk_title_stands_on_the_band_at_every_narrow_width() {
                         !matches!(next, Some('」' | '。' | '，')),
                         "{title}@{cols}: {shown:?} leaves {next:?} to start the rest"
                     );
-                    assert_eq!(row.full_title, title, "{title}@{cols}: spoken whole");
                 }
             }
         }

@@ -3,6 +3,16 @@
 
 //! The toolbar driver.
 
+const WINDOW_START_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn pump_window_start(started: std::time::Instant, mut step: impl FnMut() -> bool) {
+    while started.elapsed() < WINDOW_START_HANG {
+        if !step() {
+            break;
+        }
+    }
+}
+
 /// Every check passed.
 #[cfg(target_os = "macos")]
 pub(crate) const PASS: i32 = 0;
@@ -1011,12 +1021,13 @@ mod macos {
             blocked: None,
         };
         let start = Instant::now();
-        while d.window.is_none() && start.elapsed() < Duration::from_secs(20) {
-            if let PumpStatus::Exit(_) = el.pump_app_events(Some(Duration::from_millis(8)), &mut d)
-            {
-                break;
-            }
-        }
+        super::pump_window_start(start, || {
+            d.window.is_none()
+                && !matches!(
+                    el.pump_app_events(Some(Duration::from_millis(8)), &mut d),
+                    PumpStatus::Exit(_)
+                )
+        });
         let Some(win) = d.window.as_ref() else {
             crate::logging::stderr_line!(
                 "objc-toolbar-drive: NOT RUN — {}",
@@ -2560,6 +2571,27 @@ mod macos {
         } else {
             println!("objc-toolbar-drive: OK");
             PASS
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn required_window_start_pumps_after_scheduling_delay() {
+        for (age, expected) in [(21, true), (61, false)] {
+            let started = std::time::Instant::now() - std::time::Duration::from_secs(age);
+            let mut created = false;
+            pump_window_start(started, || {
+                created = true;
+                false
+            });
+            assert_eq!(
+                created, expected,
+                "only a live startup pumps the required creation"
+            );
         }
     }
 }

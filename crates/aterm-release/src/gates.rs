@@ -380,6 +380,7 @@ pub struct GateReport {
 /// Run every gate that depends on the cut's moment, in the transcript's order.
 pub fn run_all(
     git: &dyn GitRunner,
+    origin: Option<&dyn crate::ledger::Origin>,
     tree: &Path,
     state: &Path,
     opts: &GateOpts,
@@ -399,7 +400,7 @@ pub fn run_all(
         )));
     }
     own_cutter_gate(git, &head, opts.allow_stale_cutter)?;
-    tag_gate(git, &opts.version, !opts.offline)?;
+    tag_gate(git, origin, &opts.version, !opts.offline)?;
     let github_login = github_identity_gate(opts.offline)?;
     let free_disk_gib = disk_gate(tree)?;
     let processes_checked =
@@ -423,6 +424,7 @@ pub fn run_all(
 /// predecessor can be named); or the policy drops what its predecessor sealed without retiring it.
 pub fn handoff_policy_gate_at(
     git: &dyn GitRunner,
+    origin: &dyn crate::ledger::Origin,
     commit: &str,
     version: &str,
 ) -> Result<CutHandoffPolicy> {
@@ -437,8 +439,8 @@ pub fn handoff_policy_gate_at(
         &format!("{SOURCE_PATH} at {}", short(commit)),
     )
     .map_err(refused)?;
-    let predecessor = predecessor_in(git, &tree, version).map_err(|e| refused(e.0))?;
-    sealed_policy_kept(git, &tree, predecessor.as_deref(), policy, &text)
+    let predecessor = predecessor_in(origin, &tree, version).map_err(|e| refused(e.0))?;
+    sealed_policy_kept(git, origin, &tree, predecessor.as_deref(), policy, &text)
 }
 
 /// What [`handoff_policy_gate_at`] judged.
@@ -468,6 +470,7 @@ impl std::fmt::Display for CutHandoffPolicy {
 
 fn sealed_policy_kept(
     git: &dyn GitRunner,
+    origin: &dyn crate::ledger::Origin,
     tree: &GateTree<'_>,
     predecessor: Option<&str>,
     policy: aterm_update_core::handoff_policy::PolicyFile,
@@ -505,7 +508,7 @@ fn sealed_policy_kept(
             retires: Vec::new(),
         });
     };
-    let shipped = shipped_commit(git, release)?;
+    let shipped = shipped_commit(origin, release)?;
     let listed = git_ok(
         git,
         &["ls-tree", "--name-only", &shipped, "--", SOURCE_PATH],
@@ -615,43 +618,16 @@ fn builds_handing_over(ledger_text: &str, release: &str) -> Result<Vec<u64>> {
         .collect())
 }
 
-fn shipped_commit(git: &dyn GitRunner, release: &str) -> Result<String> {
-    let tag = format!("refs/tags/v{release}");
-    let listing = git_ok(
-        git,
-        &[
-            "ls-remote",
-            "--tags",
-            "origin",
-            &tag,
-            &format!("{tag}^{{}}"),
-        ],
-    )?;
-    let Some(commit) = tag_commits(&listing.stdout_utf8()).remove(&format!("v{release}")) else {
+fn shipped_commit(origin: &dyn crate::ledger::Origin, release: &str) -> Result<String> {
+    let Some(commit) = origin
+        .tag_commit(&format!("v{release}"))
+        .map_err(Error::new)?
+    else {
         return Err(Error::new(format!(
             "handoff-policy gate: origin no longer carries v{release}, the release this cut \
              succeeds; nothing was claimed — run it again"
         )));
     };
-    let at = format!("{commit}^{{commit}}");
-    let present = || {
-        git.git(&["rev-parse", "--verify", "-q", &at])
-            .map(|out| out.success())
-    };
-    if !present()? {
-        git_ok(
-            git,
-            &["fetch", "-q", "--no-tags", "--refmap=", "origin", &tag],
-        )?;
-        if !present()? {
-            return Err(Error::new(format!(
-                "handoff-policy gate: origin's v{release} named {} when listed, and fetching \
-                 it did not bring that commit (origin moved the tag); nothing was claimed — \
-                 run it again",
-                short(&commit)
-            )));
-        }
-    }
     Ok(commit)
 }
 
@@ -722,32 +698,30 @@ pub fn engine_copy(release: &Path) -> PathBuf {
 /// whatever last moved it.
 pub struct OriginMain {
     scratch: aterm_tempfile::TempDir,
+    commit: String,
 }
 
 /// How a git child is run and waited for (a release forwards its interrupts to it).
 pub type RunGit<'a> = &'a dyn Fn(&mut Command) -> std::io::Result<std::process::Output>;
 
 impl OriginMain {
-    /// Fetch `origin`'s main, each git child run by `run`.
+    /// Import the authenticated origin's exact main into an isolated object store.
     ///
     /// # Errors
     /// No scratch directory, or git's own words for a fetch that failed.
-    pub fn fetch(origin: &str, run: RunGit<'_>) -> std::result::Result<Self, String> {
+    pub(crate) fn fetch(
+        origin: &str,
+        run: RunGit<'_>,
+        open: &dyn Fn(&Path) -> std::result::Result<crate::github_remote::Remote, String>,
+    ) -> std::result::Result<Self, String> {
         let scratch = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
-        let main = Self { scratch };
+        let mut main = Self {
+            scratch,
+            commit: String::new(),
+        };
         main.git(&["init", "--quiet", "--bare"], run, false)?;
-        main.git(
-            &[
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--depth=1",
-                origin,
-                "refs/heads/main",
-            ],
-            run,
-            true,
-        )?;
+        main.git(&["remote", "add", "origin", origin], run, true)?;
+        main.commit = open(&main.scratch.path().join("main.git"))?.refresh_main()?;
         Ok(main)
     }
 
@@ -756,7 +730,7 @@ impl OriginMain {
     /// # Errors
     /// git's own words: no such file there, or not UTF-8.
     pub fn text(&self, path: &str, run: RunGit<'_>) -> std::result::Result<String, String> {
-        let out = self.git(&["show", &format!("FETCH_HEAD:{path}")], run, true)?;
+        let out = self.git(&["show", &format!("{}:{path}", self.commit)], run, true)?;
         String::from_utf8(out).map_err(|e| format!("{path}: {e}"))
     }
 
@@ -768,6 +742,7 @@ impl OriginMain {
     ) -> std::result::Result<Vec<u8>, String> {
         let at = self.scratch.path().join("main.git");
         let mut cmd = command(aterm_uds::os_path!("git"));
+        cmd.args(["-c", "protocol.allow=never"]);
         if within {
             cmd.arg("--git-dir").arg(&at);
         }
@@ -867,6 +842,7 @@ const ORIGIN_READ_PATIENCE: std::time::Duration = std::time::Duration::from_secs
 fn ledger_text(
     repo: &Path,
     var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    open: &dyn Fn(&Path, &Path) -> std::result::Result<crate::github_remote::Remote, String>,
 ) -> Result<(String, String)> {
     if let Some(named) = var("PUBLICATION_ENGINE").filter(|v| !v.is_empty()) {
         let ledger = PathBuf::from(named).join("mappings.json");
@@ -883,7 +859,7 @@ fn ledger_text(
     }
     let copy = engine_copy(&release_dir(repo));
     let home = var("HOME").map(|home| PathBuf::from(home).join("publication"));
-    let origin = [Some(copy.clone()), home.clone()]
+    let (source, origin) = [Some(copy.clone()), home.clone()]
         .into_iter()
         .flatten()
         .filter(|engine| engine.join(".git").exists())
@@ -894,6 +870,7 @@ fn ledger_text(
                 .filter(crate::ledger::RunOut::success)
                 .map(|out| out.stdout_utf8().trim().to_string())
                 .filter(|url| !url.is_empty())
+                .map(|url| (engine, url))
         })
         .ok_or_else(|| {
             Error::new(format!(
@@ -908,7 +885,7 @@ fn ledger_text(
         aterm_uds::deadline::output_within(cmd, ORIGIN_READ_PATIENCE)
             .map_err(|e| std::io::Error::other(e.to_string()))
     };
-    let text = OriginMain::fetch(&origin, run)
+    let text = OriginMain::fetch(&origin, run, &|at| open(at, &source))
         .and_then(|main| main.text("mappings.json", run))
         .map_err(|e| {
             Error::new(format!(
@@ -1109,14 +1086,17 @@ pub(crate) fn read_bounded_string(path: &Path, max_bytes: u64) -> std::io::Resul
 /// # Errors
 /// An unreadable or rowless ledger is a refusal.
 pub fn published_source(repo: &Path) -> Result<PublishedSource> {
-    published_source_in(repo, &|name| env::var_os(name))
+    published_source_in(repo, &|name| env::var_os(name), &|at, _| {
+        crate::github_remote::Remote::origin(at)
+    })
 }
 
 fn published_source_in(
     repo: &Path,
     var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    open: &dyn Fn(&Path, &Path) -> std::result::Result<crate::github_remote::Remote, String>,
 ) -> Result<PublishedSource> {
-    let (text, read) = ledger_text(repo, var)?;
+    let (text, read) = ledger_text(repo, var, open)?;
     newest_published_source(&text).map_err(|e| Error::new(format!("{read}: {e}")))
 }
 
@@ -1139,10 +1119,12 @@ pub struct PublishedCheckout {
 /// Each precondition above, [`place_cut_tree`]'s, and any git failure.
 pub fn place_published(
     git: &dyn GitRunner,
+    origin: &dyn crate::ledger::Origin,
     repo: &Path,
     source: &PublishedSource,
 ) -> Result<PublishedCheckout> {
-    git_ok(git, &["fetch", "origin", "main"])
+    let main = origin
+        .refresh_main()
         .map_err(|e| Error::new(format!("cannot reach origin (no offline cuts): {e}")))?;
     let commit = source.commit.as_str();
     if !git
@@ -1156,7 +1138,7 @@ pub fn place_published(
             source.verified_at
         )));
     }
-    let on_main = git.git(&["merge-base", "--is-ancestor", commit, "origin/main"])?;
+    let on_main = git.git(&["merge-base", "--is-ancestor", commit, &main])?;
     match on_main.status {
         0 => {}
         1 => {
@@ -1175,7 +1157,7 @@ pub fn place_published(
             )));
         }
     }
-    let range = format!("{commit}..origin/main");
+    let range = format!("{commit}..{main}");
     let count_out = git_ok(git, &["rev-list", "--count", &range])?.stdout_utf8();
     let count_trimmed = count_out.trim();
     if !count_trimmed.bytes().all(|b| b.is_ascii_digit()) {
@@ -1693,16 +1675,25 @@ impl Precheck {
 ///
 /// # Errors
 /// `rev` names no commit, or the commit's Cargo.toml carries no release version.
-pub fn precheck(git: &dyn GitRunner, rev: &str) -> Result<Precheck> {
-    precheck_with(git, rev, crate::cutter::running())
+pub fn precheck(
+    git: &dyn GitRunner,
+    origin: Result<&dyn crate::ledger::Origin>,
+    rev: &str,
+) -> Result<Precheck> {
+    precheck_with(git, origin, rev, crate::cutter::running())
 }
 
 /// Source-only main sampling asks every commit gate and makes no claim about bundle bytes.
 /// # Errors
 /// The revision cannot be read or names no release version.
-pub fn precheck_source(git: &dyn GitRunner, rev: &str) -> Result<Precheck> {
+pub fn precheck_source(
+    git: &dyn GitRunner,
+    origin: Result<&dyn crate::ledger::Origin>,
+    rev: &str,
+) -> Result<Precheck> {
     precheck_parts(
         git,
+        origin,
         rev,
         crate::cutter::running(),
         None::<fn(&str) -> Result<String>>,
@@ -1711,23 +1702,28 @@ pub fn precheck_source(git: &dyn GitRunner, rev: &str) -> Result<Precheck> {
 
 fn precheck_with(
     git: &dyn GitRunner,
+    origin: Result<&dyn crate::ledger::Origin>,
     rev: &str,
     stamp: std::result::Result<&str, &crate::cutter::NotOwn>,
 ) -> Result<Precheck> {
-    precheck_with_judge(git, rev, stamp, |commit| verify_gate_at(git, commit))
+    precheck_with_judge(git, origin, rev, stamp, |commit| {
+        verify_gate_at(git, commit)
+    })
 }
 
 fn precheck_with_judge(
     git: &dyn GitRunner,
+    origin: Result<&dyn crate::ledger::Origin>,
     rev: &str,
     stamp: std::result::Result<&str, &crate::cutter::NotOwn>,
     verify: impl FnOnce(&str) -> Result<String>,
 ) -> Result<Precheck> {
-    precheck_parts(git, rev, stamp, Some(verify))
+    precheck_parts(git, origin, rev, stamp, Some(verify))
 }
 
 fn precheck_parts(
     git: &dyn GitRunner,
+    origin: Result<&dyn crate::ledger::Origin>,
     rev: &str,
     stamp: std::result::Result<&str, &crate::cutter::NotOwn>,
     verify: Option<impl FnOnce(&str) -> Result<String>>,
@@ -1762,6 +1758,10 @@ fn precheck_parts(
             return Ok(found);
         }
     };
+    let with_origin = |check: &dyn Fn(&dyn crate::ledger::Origin) -> Result<String>| match &origin {
+        Ok(origin) => check(*origin),
+        Err(error) => Err(Error::new(error.to_string())),
+    };
     let answer = |outcome: Result<String>| match outcome {
         Ok(line) => Outcome::Pass(line),
         Err(e) => Outcome::Refuse(gate_refusal(&e.to_string())),
@@ -1781,21 +1781,23 @@ fn precheck_parts(
         },
         PrecheckGate {
             name: "handoff fixtures",
-            outcome: answer(
-                handoff_fixture_gate_at(git, &commit, &version)
-                    .map(|found| handoff_fixtures_line(found.as_ref())),
-            ),
+            outcome: answer(with_origin(&|origin| {
+                handoff_fixture_gate_at(git, origin, &commit, &version)
+                    .map(|found| handoff_fixtures_line(found.as_ref()))
+            })),
         },
         PrecheckGate {
             name: "harness versions",
-            outcome: answer(harness_versions_gate_at(git, &commit, &version)),
+            outcome: answer(with_origin(&|origin| {
+                harness_versions_gate_at(git, origin, &commit, &version)
+            })),
         },
         PrecheckGate {
             name: "handoff policy",
-            outcome: answer(
-                handoff_policy_gate_at(git, &commit, &version)
-                    .map(|found| format!("handoff policy a cut seals into the bundle: {found}")),
-            ),
+            outcome: answer(with_origin(&|origin| {
+                handoff_policy_gate_at(git, origin, &commit, &version)
+                    .map(|found| format!("handoff policy a cut seals into the bundle: {found}"))
+            })),
         },
     ];
     if let Some(verify) = verify {
@@ -1814,10 +1816,11 @@ fn precheck_parts(
 /// A harness owes a bump, or as [`harness_versions_base`].
 pub fn harness_versions_gate_at(
     git: &dyn GitRunner,
+    origin: &dyn crate::ledger::Origin,
     commit: &str,
     version: &str,
 ) -> Result<String> {
-    match harness_versions_base(git, commit, version)? {
+    match harness_versions_base(git, origin, commit, version)? {
         None => Ok("harness versions: no earlier public release to compare".to_string()),
         Some((release, released)) => {
             crate::harness_versions::gate(git, (&release, &released), commit)
@@ -1833,10 +1836,11 @@ pub fn harness_versions_gate_at(
 /// As [`harness_versions_base`], or git cannot diff the window.
 pub fn harness_versions_bump_writes_at(
     git: &dyn GitRunner,
+    origin: &dyn crate::ledger::Origin,
     commit: &str,
     version: &str,
 ) -> Result<String> {
-    let Some((release, released)) = harness_versions_base(git, commit, version)? else {
+    let Some((release, released)) = harness_versions_base(git, origin, commit, version)? else {
         return Ok("harness versions: no earlier public release to compare".to_string());
     };
     let owed = crate::harness_versions::owed_between(git, &released, commit)?;
@@ -1861,18 +1865,19 @@ pub fn harness_versions_bump_writes_at(
 /// shipped, or the previous release's commit is not in this clone.
 fn harness_versions_base(
     git: &dyn GitRunner,
+    origin: &dyn crate::ledger::Origin,
     commit: &str,
     version: &str,
 ) -> Result<Option<(String, String)>> {
     let ledger_text = GateTree::Commit { git, commit }.text(crate::ledger::LEDGER_FILE)?;
-    let listing = git_ok(git, &["ls-remote", "--tags", "origin"]).map_err(|e| {
+    let listing = origin.tag_catalog().map_err(|e| {
         Error::new(format!(
             "harness versions gate: cannot list origin's tags, which name the previous public \
              release: {e}"
         ))
     })?;
     let Some((release, released)) =
-        crate::harness_versions::previous_release(&ledger_text, version, &listing.stdout_utf8())?
+        crate::harness_versions::previous_release(&ledger_text, version, &listing)?
     else {
         return Ok(None);
     };
@@ -2276,10 +2281,6 @@ impl std::fmt::Display for PinRefusal {
     }
 }
 
-/// A fetch that receives nothing for two minutes ends, rather than at the forge's own gateway
-/// timeout (one HTTP 504 took ten).
-const FETCH_STALL: [&str; 4] = ["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=120"];
-
 /// The waits before a failed fetch's second and third attempts: a forge's 5xx or a dropped
 /// connection clears in seconds, and a fetch repeats safely.
 pub const FETCH_RETRIES: [std::time::Duration; 2] = [
@@ -2294,13 +2295,17 @@ pub const FETCH_RETRIES: [std::time::Duration; 2] = [
 /// [`PinRefusal::Off`] for a pin its branch does not carry or a gitlink `.gitmodules` does not
 /// declare; [`PinRefusal::Unread`] when git cannot list the tree, every fetch attempt fails, or
 /// git cannot decide ancestry.
-pub fn submodules_on_declared_branch(git: &dyn GitRunner) -> std::result::Result<(), PinRefusal> {
-    on_declared_branch_waiting(git, &FETCH_RETRIES, &mut std::thread::sleep)
+pub fn submodules_on_declared_branch(
+    git: &dyn GitRunner,
+    origin: &dyn crate::ledger::Origin,
+) -> std::result::Result<(), PinRefusal> {
+    on_declared_branch_waiting(git, origin, &FETCH_RETRIES, &mut std::thread::sleep)
 }
 
 /// [`submodules_on_declared_branch`], waiting `retries` between fetch attempts through `wait`.
 fn on_declared_branch_waiting(
     git: &dyn GitRunner,
+    origin: &dyn crate::ledger::Origin,
     retries: &[std::time::Duration],
     wait: &mut dyn FnMut(std::time::Duration),
 ) -> std::result::Result<(), PinRefusal> {
@@ -2351,29 +2356,24 @@ fn on_declared_branch_waiting(
         } else {
             ("HEAD".to_string(), "HEAD".to_string())
         };
-        let mut fetch = vec!["-C", path.as_str()];
-        fetch.extend(FETCH_STALL);
-        fetch.extend(["fetch", "--quiet", "--no-tags", "origin", &source]);
-        let mut fetched = git.git(&fetch).map_err(unread)?;
+        let mut fetched = origin.submodule_tip(Path::new(path), &source);
         let mut attempts = 1;
         for pause in retries {
-            if fetched.success() {
+            if fetched.is_ok() {
                 break;
             }
             wait(*pause);
-            fetched = git.git(&fetch).map_err(unread)?;
+            fetched = origin.submodule_tip(Path::new(path), &source);
             attempts += 1;
         }
-        if !fetched.success() {
-            return Err(PinRefusal::Unread(format!(
+        let tip = fetched.map_err(|why| {
+            PinRefusal::Unread(format!(
                 "cannot fetch {path}'s declared branch {branch} from its origin in {attempts} \
-                 attempts (last exit {}): {}, so whether its pin {pin} is on it is unknown",
-                fetched.status,
-                fetched.stderr_utf8().trim()
-            )));
-        }
+             attempts: {why}, so whether its pin {pin} is on it is unknown"
+            ))
+        })?;
         let on = git
-            .git(&["-C", path, "merge-base", "--is-ancestor", pin, "FETCH_HEAD"])
+            .git(&["-C", path, "merge-base", "--is-ancestor", pin, &tip])
             .map_err(unread)?;
         match on.status {
             0 => {}
@@ -2593,17 +2593,23 @@ pub fn current_own_cutter_gate(git: &dyn GitRunner) -> Result<()> {
 
 /// A publishing cut requires an unused tag locally and on origin. A signing
 /// rehearsal claims no tag and does not need to query either namespace.
-fn tag_gate(git: &dyn GitRunner, version: &str, publishes: bool) -> Result<()> {
+fn tag_gate(
+    git: &dyn GitRunner,
+    origin: Option<&dyn crate::ledger::Origin>,
+    version: &str,
+    publishes: bool,
+) -> Result<()> {
     if !publishes {
         return Ok(());
     }
+    let origin = origin.ok_or_else(|| Error::new("a publishing cut needs its native origin"))?;
     let tag = format!("v{version}");
     let local = git.git(&["rev-parse", "-q", "--verify", &format!("refs/tags/{tag}")])?;
-    let remote = git_ok(
-        git,
-        &["ls-remote", "--tags", "origin", &format!("refs/tags/{tag}")],
-    )?;
-    if !remote.stdout_utf8().trim().is_empty() {
+    if origin
+        .get(&format!("refs/tags/{tag}"))
+        .map_err(Error::new)?
+        .is_some()
+    {
         return Err(Error::new(format!(
             "tag {tag} is on origin: v{version} was cut. The next release is v{}: `pub bump \
              aterm --minor --write` on main, commit and push, then `pub stage aterm` and `pub \
@@ -2668,10 +2674,11 @@ pub struct HandoffFixtures {
 /// Refuse a release whose predecessor's handoff fixtures are not checked in and pinned, judged on the commit.
 pub fn handoff_fixture_gate_at(
     git: &dyn GitRunner,
+    origin: &dyn crate::ledger::Origin,
     commit: &str,
     version: &str,
 ) -> Result<Option<HandoffFixtures>> {
-    handoff_fixture_gate_in(git, &GateTree::Commit { git, commit }, version)
+    handoff_fixture_gate_in(origin, &GateTree::Commit { git, commit }, version)
 }
 
 /// Where a gate reads the tree it judges: a commit's objects.
@@ -2749,11 +2756,11 @@ impl GateTree<'_> {
 }
 
 fn handoff_fixture_gate_in(
-    git: &dyn GitRunner,
+    origin: &dyn crate::ledger::Origin,
     tree: &GateTree<'_>,
     version: &str,
 ) -> Result<Option<HandoffFixtures>> {
-    let predecessor = predecessor_in(git, tree, version)
+    let predecessor = predecessor_in(origin, tree, version)
         .map_err(|e| Error::new(format!("handoff-fixture gate: {e}")))?;
     match predecessor {
         Some(release) => handoff_fixtures_of(tree, &release).map(Some),
@@ -2769,18 +2776,18 @@ fn handoff_fixture_gate_in(
 /// versions shipped. The message names no gate: each caller says which of its gates asked
 /// (`handoff-fixture gate:`, `handoff-policy gate:`).
 fn predecessor_in(
-    git: &dyn GitRunner,
+    origin: &dyn crate::ledger::Origin,
     tree: &GateTree<'_>,
     version: &str,
 ) -> Result<Option<String>> {
     let ledger_text = tree.text(crate::ledger::LEDGER_FILE)?;
-    let listing = git_ok(git, &["ls-remote", "--tags", "origin"]).map_err(|e| {
+    let listing = origin.tag_catalog().map_err(|e| {
         Error::new(format!(
             "cannot list origin's tags, which is how the gate tells the releases that shipped \
              from claims that were abandoned: {e}"
         ))
     })?;
-    let tags = tag_commits(&listing.stdout_utf8());
+    let tags = tag_commits(&listing);
     let shipped = |v: &str| tags.contains_key(&format!("v{v}"));
     predecessor_release(&ledger_text, version, &shipped)
 }
@@ -3385,6 +3392,10 @@ pub fn disk_gate(repo: &Path) -> Result<u64> {
 }
 
 #[cfg(test)]
+#[path = "gates/fixture_origin.rs"]
+pub(crate) mod fixture_origin;
+
+#[cfg(test)]
 mod universal_gate_tests {
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -3617,6 +3628,7 @@ mod submodule_tests {
             let mut answers = self.answers.lock().expect("answers");
             match answers.iter().position(|(needle, _)| line.contains(needle)) {
                 Some(i) => Ok(answers.remove(i).1),
+                None if args.contains(&"rev-parse") => Ok(out(0, &"1".repeat(40))),
                 None => Ok(out(0, "")),
             }
         }
@@ -3738,18 +3750,25 @@ mod submodule_tests {
         );
         git(&top, &["commit", "-q", "-m", "pin the bus's main"]);
         let runner = Git::new(&top);
-        submodules_on_declared_branch(&runner).expect("main carries the pin");
+        submodules_on_declared_branch(&runner, &fixture_origin::FixtureOrigin(&runner))
+            .expect("main carries the pin");
 
         git(&top.join("vendor/bus"), &["checkout", "-q", &side]);
         git(&top, &["commit", "-q", "-am", "pin the side branch"]);
-        let off = submodules_on_declared_branch(&runner).expect_err("a side-branch pin is refused");
+        let off = submodules_on_declared_branch(&runner, &fixture_origin::FixtureOrigin(&runner))
+            .expect_err("a side-branch pin is refused");
         assert!(matches!(off, PinRefusal::Off(_)), "{off}");
 
         git(&bus, &["tag", "main", &side]);
         git(&bus, &["checkout", "-q", "side"]);
         git(&bus, &["branch", "-D", "main"]);
-        let unread = on_declared_branch_waiting(&runner, &FETCH_RETRIES, &mut drop)
-            .expect_err("a same-named tag cannot stand in for a missing branch");
+        let unread = on_declared_branch_waiting(
+            &runner,
+            &fixture_origin::FixtureOrigin(&runner),
+            &FETCH_RETRIES,
+            &mut drop,
+        )
+        .expect_err("a same-named tag cannot stand in for a missing branch");
         assert!(matches!(unread, PinRefusal::Unread(_)), "{unread}");
     }
 
@@ -3774,19 +3793,12 @@ mod submodule_tests {
         };
 
         let git = fake(vec![]);
-        submodules_on_declared_branch(&git).expect("on the remote's HEAD");
+        submodules_on_declared_branch(&git, &fixture_origin::FixtureOrigin(&git))
+            .expect("on the remote's HEAD");
         let calls = git.calls.lock().expect("calls").clone();
         assert!(
-            calls.contains(
-                &"-C vendor/astream -c http.lowSpeedLimit=1 -c http.lowSpeedTime=120 fetch \
-                  --quiet --no-tags origin HEAD"
-                    .to_string()
-            ),
-            "{calls:?}"
-        );
-        assert!(
             calls.contains(&format!(
-                "-C vendor/astream merge-base --is-ancestor {pin} FETCH_HEAD"
+                "-C vendor/astream merge-base --is-ancestor {pin} {pin}"
             )),
             "{calls:?}"
         );
@@ -3803,9 +3815,14 @@ mod submodule_tests {
         };
         let mut waited = Vec::new();
         let unfetched = fake(vec![failed(), failed(), failed()]);
-        let refused = on_declared_branch_waiting(&unfetched, &FETCH_RETRIES, &mut |d| {
-            waited.push(d);
-        })
+        let refused = on_declared_branch_waiting(
+            &unfetched,
+            &fixture_origin::FixtureOrigin(&unfetched),
+            &FETCH_RETRIES,
+            &mut |d| {
+                waited.push(d);
+            },
+        )
         .expect_err("no fetch, no verdict");
         assert!(matches!(refused, PinRefusal::Unread(_)), "{refused}");
         assert!(refused.to_string().contains("in 3 attempts"), "{refused}");
@@ -3814,8 +3831,13 @@ mod submodule_tests {
         // A forge's passing 5xx is retried: the second attempt fetches and the gate decides.
         let mut waited = Vec::new();
         let recovered = fake(vec![failed()]);
-        on_declared_branch_waiting(&recovered, &FETCH_RETRIES, &mut |d| waited.push(d))
-            .expect("the retried fetch decides");
+        on_declared_branch_waiting(
+            &recovered,
+            &fixture_origin::FixtureOrigin(&recovered),
+            &FETCH_RETRIES,
+            &mut |d| waited.push(d),
+        )
+        .expect("the retried fetch decides");
         assert_eq!(waited, FETCH_RETRIES[..1]);
         let fetches = recovered
             .calls
@@ -3828,7 +3850,8 @@ mod submodule_tests {
 
         let undecided = fake(vec![("merge-base", out(128, ""))]);
         let refused =
-            submodules_on_declared_branch(&undecided).expect_err("no ancestry, no verdict");
+            submodules_on_declared_branch(&undecided, &fixture_origin::FixtureOrigin(&undecided))
+                .expect_err("no ancestry, no verdict");
         assert!(matches!(refused, PinRefusal::Unread(_)), "{refused}");
     }
 }
@@ -4093,14 +4116,25 @@ mod tag_gate_tests {
     #[test]
     fn a_taken_tag_refuses_the_cut() {
         for (local, on_origin) in [(true, true), (true, false), (false, true)] {
-            tag_gate(&Tags { local, on_origin }, "0.97.0", true)
-                .expect_err("a taken tag is refused");
+            tag_gate(
+                &Tags { local, on_origin },
+                Some(&fixture_origin::FixtureOrigin(&Tags { local, on_origin })),
+                "0.97.0",
+                true,
+            )
+            .expect_err("a taken tag is refused");
         }
         let free = Tags {
             local: false,
             on_origin: false,
         };
-        tag_gate(&free, "0.97.0", true).expect("a free tag passes");
+        tag_gate(
+            &free,
+            Some(&fixture_origin::FixtureOrigin(&free)),
+            "0.97.0",
+            true,
+        )
+        .expect("a free tag passes");
     }
 
     #[test]
@@ -4113,7 +4147,13 @@ mod tag_gate_tests {
             }
         }
 
-        tag_gate(&NoTagQueries, "0.97.0", false).unwrap();
+        tag_gate(
+            &NoTagQueries,
+            Some(&fixture_origin::FixtureOrigin(&NoTagQueries)),
+            "0.97.0",
+            false,
+        )
+        .unwrap();
     }
 }
 
@@ -4220,7 +4260,11 @@ mod handoff_fixture_gate_tests {
         repo: &Path,
         version: &str,
     ) -> Result<Option<HandoffFixtures>> {
-        handoff_fixture_gate_in(git, &GateTree::Dir(repo), version)
+        handoff_fixture_gate_in(
+            &fixture_origin::FixtureOrigin(git),
+            &GateTree::Dir(repo),
+            version,
+        )
     }
 
     fn refusal(scratch: &Scratch, origin: &Origin, version: &str) {
@@ -4525,7 +4569,14 @@ mod handoff_policy_gate_tests {
     ) -> Result<CutHandoffPolicy> {
         let (text, policy) = crate::bundle::handoff_policy_for_cut(repo)
             .map_err(|why| Error::new(format!("handoff-policy gate: {why}")))?;
-        sealed_policy_kept(git, &GateTree::Dir(repo), predecessor, policy, &text)
+        sealed_policy_kept(
+            git,
+            &fixture_origin::FixtureOrigin(git),
+            &GateTree::Dir(repo),
+            predecessor,
+            policy,
+            &text,
+        )
     }
 
     struct NoGit;
@@ -4809,8 +4860,13 @@ mod published_commit_tests {
         let tip = repo.commit("docs: a peer's doc", &[("README", "y")]);
         repo.push();
 
-        let checkout = place_published(&repo.git(), &repo.work(), &source(&published))
-            .expect("pushes after the publish are not a refusal");
+        let checkout = place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&published),
+        )
+        .expect("pushes after the publish are not a refusal");
         let tree = repo.root.path().join("work-cut.noindex");
         assert_eq!(checkout.tree, tree, "the cut tree sits beside the checkout");
         assert!(checkout.moved);
@@ -4840,12 +4896,24 @@ mod published_commit_tests {
             "v2"
         );
 
-        let again = place_published(&repo.git(), &repo.work(), &source(&published)).unwrap();
+        let again = place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&published),
+        )
+        .unwrap();
         assert!(!again.moved);
         assert_eq!(again.main_ahead, 2);
 
         fs::remove_dir_all(&tree).unwrap();
-        let recreated = place_published(&repo.git(), &repo.work(), &source(&published)).unwrap();
+        let recreated = place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&published),
+        )
+        .unwrap();
         assert!(recreated.moved);
         assert_eq!(in_tree(&["rev-parse", "HEAD"]), published);
     }
@@ -4866,9 +4934,14 @@ mod published_commit_tests {
             );
             repo.publish_origin();
             let first = repo.run(&["rev-parse", "HEAD"]);
-            let tree = place_published(&repo.git(), &repo.work(), &source(&first))
-                .unwrap()
-                .tree;
+            let tree = place_published(
+                &repo.git(),
+                &fixture_origin::FixtureOrigin(&repo.git()),
+                &repo.work(),
+                &source(&first),
+            )
+            .unwrap()
+            .tree;
             let files = [
                 ("tools/old/out/model.tla", "spec"),
                 ("tools/old/Cargo.lock", "lock"),
@@ -4890,7 +4963,12 @@ mod published_commit_tests {
             }
             let second = repo.commit("the tool left the tree", &changed);
             repo.push();
-            let placed = place_published(&repo.git(), &repo.work(), &source(&second));
+            let placed = place_published(
+                &repo.git(),
+                &fixture_origin::FixtureOrigin(&repo.git()),
+                &repo.work(),
+                &source(&second),
+            );
             if leftovers {
                 if placed.is_ok() {
                     failures.push(format!(
@@ -4929,9 +5007,14 @@ mod published_commit_tests {
             fs::write(tree.join("NOTES"), "mine").unwrap();
             let third = repo.commit("another", &[("src/lib.rs", "v3")]);
             repo.push();
-            let error = place_published(&repo.git(), &repo.work(), &source(&third))
-                .expect_err("pre-existing work refuses")
-                .to_string();
+            let error = place_published(
+                &repo.git(),
+                &fixture_origin::FixtureOrigin(&repo.git()),
+                &repo.work(),
+                &source(&third),
+            )
+            .expect_err("pre-existing work refuses")
+            .to_string();
             assert!(error.contains("has changes"), "{error}");
             assert_eq!(fs::read_to_string(tree.join("NOTES")).unwrap(), "mine");
             assert_eq!(
@@ -4965,16 +5048,26 @@ mod published_commit_tests {
         repo.run(&["checkout", "-q", "-b", "side"]);
         let side = repo.commit("a side commit", &[("a", "2")]);
         repo.run(&["checkout", "-q", "main"]);
-        place_published(&repo.git(), &repo.work(), &source(&side))
-            .expect_err("a commit main does not carry is no release source");
+        place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&side),
+        )
+        .expect_err("a commit main does not carry is no release source");
         assert!(
             !repo.root.path().join("work-cut.noindex").exists(),
             "no cut tree was made"
         );
 
         let unknown = "f".repeat(40);
-        place_published(&repo.git(), &repo.work(), &source(&unknown))
-            .expect_err("a commit this repository does not have");
+        place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&unknown),
+        )
+        .expect_err("a commit this repository does not have");
     }
 
     #[test]
@@ -4985,8 +5078,13 @@ mod published_commit_tests {
         let second = repo.commit("later", &[("a", "2")]);
         repo.push();
         fs::write(repo.work().join("a"), "uncommitted").unwrap();
-        let checkout = place_published(&repo.git(), &repo.work(), &source(&first))
-            .expect("the operator's uncommitted work is not the cut's business");
+        let checkout = place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&first),
+        )
+        .expect("the operator's uncommitted work is not the cut's business");
         assert_eq!(
             fs::read_to_string(repo.work().join("a")).unwrap(),
             "uncommitted",
@@ -4994,8 +5092,13 @@ mod published_commit_tests {
         );
 
         fs::write(checkout.tree.join("a"), "edited in the cut tree").unwrap();
-        place_published(&repo.git(), &repo.work(), &source(&second))
-            .expect_err("a cut tree with changes must refuse before it moves");
+        place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&second),
+        )
+        .expect_err("a cut tree with changes must refuse before it moves");
         assert_eq!(
             fs::read_to_string(checkout.tree.join("a")).unwrap(),
             "edited in the cut tree",
@@ -5022,13 +5125,23 @@ mod published_commit_tests {
             "",
             "porcelain sees nothing"
         );
-        let error = place_published(&repo.git(), &repo.work(), &source(&second))
-            .expect_err("a file only info/exclude hides is a change")
-            .to_string();
+        let error = place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&second),
+        )
+        .expect_err("a file only info/exclude hides is a change")
+        .to_string();
         assert!(error.contains("stray.txt"), "{error}");
         fs::remove_file(checkout.tree.join("stray.txt")).unwrap();
-        place_published(&repo.git(), &repo.work(), &source(&second))
-            .expect("a clean cut tree moves");
+        place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&second),
+        )
+        .expect("a clean cut tree moves");
     }
 
     #[test]
@@ -5039,7 +5152,13 @@ mod published_commit_tests {
         let foreign = repo.root.path().join("work-cut.noindex");
         fs::create_dir_all(&foreign).unwrap();
         fs::write(foreign.join("keep"), "mine").unwrap();
-        place_published(&repo.git(), &repo.work(), &source(&published)).expect_err("not ours");
+        place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&published),
+        )
+        .expect_err("not ours");
         assert_eq!(fs::read_to_string(foreign.join("keep")).unwrap(), "mine");
     }
 
@@ -5053,16 +5172,26 @@ mod published_commit_tests {
         let cut = repo.root.path().join("work-cut.noindex");
         for line in ["* text eol=crlf", "a -text", "[attr]crlfy text eol=crlf"] {
             fs::write(info.join("attributes"), format!("# mine\n{line}\n")).unwrap();
-            let error = place_published(&repo.git(), &repo.work(), &source(&published))
-                .expect_err(line)
-                .to_string();
+            let error = place_published(
+                &repo.git(),
+                &fixture_origin::FixtureOrigin(&repo.git()),
+                &repo.work(),
+                &source(&published),
+            )
+            .expect_err(line)
+            .to_string();
             assert!(error.contains(line), "{error}");
             assert!(!cut.exists(), "{line}: no cut tree was made");
         }
         fs::write(info.join("attributes"), b"#\xff\n* text eol=crlf\n").unwrap();
         assert_eq!(repo.run(&["check-attr", "eol", "--", "a"]), "a: eol: crlf");
-        place_published(&repo.git(), &repo.work(), &source(&published))
-            .expect_err("unreadable attributes cannot establish the checkout's bytes");
+        place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&published),
+        )
+        .expect_err("unreadable attributes cannot establish the checkout's bytes");
         assert!(!cut.exists(), "no cut tree was made after a failed read");
 
         fs::remove_file(info.join("attributes")).unwrap();
@@ -5071,8 +5200,13 @@ mod published_commit_tests {
             .expect_err("an attributes directory is not a missing attributes file");
         fs::remove_dir(info.join("attributes")).unwrap();
         fs::write(info.join("attributes"), "# mine\n*.png diff=exif\n").unwrap();
-        let checkout = place_published(&repo.git(), &repo.work(), &source(&published))
-            .expect("an attribute that rewrites nothing");
+        let checkout = place_published(
+            &repo.git(),
+            &fixture_origin::FixtureOrigin(&repo.git()),
+            &repo.work(),
+            &source(&published),
+        )
+        .expect("an attribute that rewrites nothing");
         assert_eq!(fs::read_to_string(checkout.tree.join("a")).unwrap(), "1\n");
     }
 
@@ -5184,9 +5318,13 @@ mod published_commit_tests {
         let git = repo.git();
         let check = |rev: &str| {
             let own = repo.run(&["rev-parse", rev]);
-            precheck_with_judge(&git, rev, Ok(&own), |commit| {
-                verify_gate_at_with_inputs(&git, commit, || Ok("inputs".into()))
-            })
+            precheck_with_judge(
+                &git,
+                Ok(&fixture_origin::FixtureOrigin(&git)),
+                rev,
+                Ok(&own),
+                |commit| verify_gate_at_with_inputs(&git, commit, || Ok("inputs".into())),
+            )
             .expect("a releasable commit")
         };
 
@@ -5198,6 +5336,7 @@ mod published_commit_tests {
         assert_eq!(found.refused(), ["verify release"]);
         let source = precheck_parts(
             &git,
+            Ok(&fixture_origin::FixtureOrigin(&git)),
             &candidate,
             Ok(&candidate),
             None::<fn(&str) -> Result<String>>,
@@ -5210,6 +5349,27 @@ mod published_commit_tests {
         );
         assert_eq!(source.gates.len() + 1, found.gates.len());
         assert!(!source.gates.iter().any(|g| g.name == "verify release"));
+
+        let unavailable = precheck_parts(
+            &git,
+            Err(Error::new("native source binding unavailable")),
+            &candidate,
+            Ok(&candidate),
+            None::<fn(&str) -> Result<String>>,
+        )
+        .unwrap();
+        assert_eq!(
+            unavailable.refused(),
+            ["handoff fixtures", "harness versions", "handoff policy"],
+            "native-origin failure stays on the checks that need it"
+        );
+        assert!(
+            unavailable
+                .gates
+                .iter()
+                .filter(|g| matches!(g.name, "cutter identity" | "changelog"))
+                .all(|g| matches!(g.outcome, Outcome::Pass(_)))
+        );
 
         let macho = "ab".repeat(32);
         crate::release::Journal {
@@ -5266,8 +5426,22 @@ mod published_commit_tests {
             "a patch version",
             &[("Cargo.toml", &cargo.replace("0.2.0", "0.2.1"))],
         );
-        precheck_with(&git, &patch, Ok(&patch)).expect_err("no release version");
-        assert!(precheck_with(&git, "no-such-commit", Ok(&patch)).is_err());
+        precheck_with(
+            &git,
+            Ok(&fixture_origin::FixtureOrigin(&git)),
+            &patch,
+            Ok(&patch),
+        )
+        .expect_err("no release version");
+        assert!(
+            precheck_with(
+                &git,
+                Ok(&fixture_origin::FixtureOrigin(&git)),
+                "no-such-commit",
+                Ok(&patch)
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5307,7 +5481,8 @@ mod published_commit_tests {
         let git = repo.git();
         let judge = |policy: &str| {
             let commit = repo.commit(policy, &[(SOURCE_PATH, policy)]);
-            handoff_policy_gate_at(&git, &commit, "0.2.0").map(|p| p.to_string())
+            handoff_policy_gate_at(&git, &fixture_origin::FixtureOrigin(&git), &commit, "0.2.0")
+                .map(|p| p.to_string())
         };
 
         for kept in [
@@ -5386,7 +5561,13 @@ mod published_commit_tests {
         bare.run(&["push", "-q", "origin", "v0.97.0"]);
         let judge = |policy: &str| {
             let commit = bare.commit(policy, &[(SOURCE_PATH, policy)]);
-            handoff_policy_gate_at(&bare.git(), &commit, "0.98.0").map(|p| p.to_string())
+            handoff_policy_gate_at(
+                &bare.git(),
+                &fixture_origin::FixtureOrigin(&bare.git()),
+                &commit,
+                "0.98.0",
+            )
+            .map(|p| p.to_string())
         };
         judge("schema = 1\n").expect("nothing sealed");
         judge(&ranged("[1790563767, 1790585188]")).expect("names v0.97.0's build");
@@ -5420,7 +5601,13 @@ mod published_commit_tests {
         repo.publish_origin();
         let judge = || {
             let commit = repo.commit("the cut's policy", &[(SOURCE_PATH, "schema = 1\n")]);
-            handoff_policy_gate_at(&repo.git(), &commit, "0.98.0").map(|p| p.to_string())
+            handoff_policy_gate_at(
+                &repo.git(),
+                &fixture_origin::FixtureOrigin(&repo.git()),
+                &commit,
+                "0.98.0",
+            )
+            .map(|p| p.to_string())
         };
         let refused = judge().expect_err("no shipped predecessor").to_string();
         let unshipped = predecessor_release(
@@ -5466,7 +5653,8 @@ mod published_commit_tests {
         let git = repo.git();
         let judge = |policy: &str| {
             let commit = repo.commit(policy, &[(SOURCE_PATH, policy)]);
-            handoff_policy_gate_at(&git, &commit, "0.2.0").map(|p| p.to_string())
+            handoff_policy_gate_at(&git, &fixture_origin::FixtureOrigin(&git), &commit, "0.2.0")
+                .map(|p| p.to_string())
         };
 
         judge(&sealed).unwrap_or_else(|e| panic!("both kept: {e}"));
@@ -5515,12 +5703,19 @@ mod published_commit_tests {
             ],
         );
         let git = repo.git();
-        let found = precheck_with(&git, &candidate, Ok(&candidate)).expect("its own");
+        let found = precheck_with(
+            &git,
+            Ok(&fixture_origin::FixtureOrigin(&git)),
+            &candidate,
+            Ok(&candidate),
+        )
+        .expect("its own");
         assert_eq!(found.gates[0].name, "cutter identity");
         assert!(matches!(found.gates[0].outcome, Outcome::Pass(_)));
         let docs = repo.commit("a doc", &[("docs/NOTE.md", "prose\n")]);
         let not_run = |stamp: std::result::Result<&str, &crate::cutter::NotOwn>| {
-            let found = precheck_with(&git, &docs, stamp).expect("the commit reads");
+            let found = precheck_with(&git, Ok(&fixture_origin::FixtureOrigin(&git)), &docs, stamp)
+                .expect("the commit reads");
             assert_eq!(
                 found.not_run(),
                 ["cutter identity"],
@@ -5664,14 +5859,15 @@ mod ledger_reader_tests {
                 .commit
         };
 
-        let by_hand = published_source_in(&repo, &var(None)).unwrap();
+        let open = crate::github_remote::engine_fixture;
+        let by_hand = published_source_in(&repo, &var(None), &open).unwrap();
         assert_eq!(by_hand.commit, new, "the origin's newest row");
         assert_eq!(
             in_place(&shared),
             old,
             "NEGATIVE CONTROL: the checkout's own is older"
         );
-        let child = published_source_in(&repo, &var(Some(&shared))).unwrap();
+        let child = published_source_in(&repo, &var(Some(&shared)), &open).unwrap();
         assert_eq!(
             child.commit, old,
             "PUBLICATION_ENGINE's ledger, read in place"
@@ -5686,7 +5882,9 @@ mod ledger_reader_tests {
             &ledger(&[(&third, "2026-11-02T00:00:00Z")]),
         );
         assert_eq!(
-            published_source_in(&repo, &var(None)).unwrap().commit,
+            published_source_in(&repo, &var(None), &open)
+                .unwrap()
+                .commit,
             third
         );
         // A row the clone's engine committed and could not push is as recorded as the origin's.
@@ -5701,7 +5899,9 @@ mod ledger_reader_tests {
         .unwrap();
         git_in(&copy, &["commit", "-q", "-am", "unpushed row"]);
         assert_eq!(
-            published_source_in(&repo, &var(None)).unwrap().commit,
+            published_source_in(&repo, &var(None), &open)
+                .unwrap()
+                .commit,
             fourth
         );
         assert_eq!(
@@ -5713,7 +5913,7 @@ mod ledger_reader_tests {
         // No engine names an origin: nothing is read, and the refusal says where it looked.
         std::fs::remove_dir_all(&copy).unwrap();
         std::fs::remove_dir_all(&shared).unwrap();
-        let none = published_source_in(&repo, &var(None))
+        let none = published_source_in(&repo, &var(None), &open)
             .unwrap_err()
             .to_string();
         assert!(none.contains("names the ledger's origin"), "{none}");

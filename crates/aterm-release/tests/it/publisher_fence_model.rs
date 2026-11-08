@@ -5,10 +5,11 @@
 
 use crate::{ledger, publish};
 
+#[cfg(unix)]
+use crate::publisher_origin::{Git, bare_remote};
 use aterm_models_release::{release_publisher_fence_model, release_yank_successor_first_model};
 use aterm_spec::derive::Model;
 use ledger::Result;
-use ledger::testing::Git;
 use std::path::{Path, PathBuf};
 
 struct BareFixture {
@@ -129,13 +130,14 @@ fn transition(
 }
 
 fn assert_session(
-    git: &Git,
+    origin: &dyn ledger::Origin,
     lease: &publish::ReleaseLeaseGuard,
     guard: &publish::PublisherFenceGuard,
 ) -> Result<()> {
-    publish::assert_publisher_session(git, lease, guard)
+    publish::assert_publisher_session(origin, lease, guard)
 }
 
+#[cfg(unix)]
 #[test]
 fn stopped_process_recovery_rejects_residual_guard_and_exact_cleanup() {
     let fixture = bare_fixture("rotation");
@@ -144,7 +146,7 @@ fn stopped_process_recovery_rejects_residual_guard_and_exact_cleanup() {
 
     let model = release_publisher_fence_model();
     let mut state = model.init_state();
-    let stale = publish::acquire_publisher_fence(&git, &fixture.owner).unwrap();
+    let stale = publish::acquire_publisher_fence(&git, &git, &fixture.owner).unwrap();
     let observed = publish::publisher_fence(&git).unwrap().unwrap();
     assert_eq!(observed.owner, fixture.owner);
     assert_eq!(observed.token, stale.token());
@@ -154,18 +156,16 @@ fn stopped_process_recovery_rejects_residual_guard_and_exact_cleanup() {
         "AcquireA",
         "publisher fence: create-only unique token",
     );
-    let peel = format!("{}^{{}}", publish::PUBLISHER_FENCE_REF);
-    let out = ledger::GitRunner::git(
-        &git,
-        &["ls-remote", "origin", publish::PUBLISHER_FENCE_REF, &peel],
-    )
-    .unwrap();
-    assert!(out.success());
-    let answer = out.stdout_utf8();
-    let rows: Vec<_> = answer.lines().collect();
-    assert_eq!(rows.len(), 2, "one fence, two rows: {answer}");
-    assert!(rows.iter().any(|row| row.ends_with(&peel)));
-    assert!(rows.iter().any(|row| row.starts_with(&observed.owner)));
+    // The fresh advertised token and imported immutable annotation form one
+    // snapshot; an unrelated later peel advertisement cannot supply its owner.
+    assert_eq!(
+        ledger::Origin::get(&git, publish::PUBLISHER_FENCE_REF).unwrap(),
+        Some(observed.token.clone())
+    );
+    assert_eq!(
+        ledger::Origin::peel(&git, &observed.token).unwrap(),
+        Some(observed.owner.clone())
+    );
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     assert!(!model.action_enabled("RefuseWellFormedFence", &state));
     let wedged = buggy.successors("RefuseWellFormedFence", &state)[0].clone();
@@ -185,7 +185,7 @@ fn stopped_process_recovery_rejects_residual_guard_and_exact_cleanup() {
         "StopA",
         "publisher fence: old publisher stopped before recovery",
     );
-    let fresh = publish::rotate_publisher_fence_for_recovery(&git, &fixture.owner).unwrap();
+    let fresh = publish::rotate_publisher_fence_for_recovery(&git, &git, &fixture.owner).unwrap();
     assert_ne!(fresh.token(), stale.token());
     state = transition(
         &model,
@@ -236,12 +236,13 @@ fn stopped_process_recovery_rejects_residual_guard_and_exact_cleanup() {
     publish::release_completed_release_lease(&git, &fixture.owner).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn real_final_unlock_atomically_deletes_owner_and_fence() {
     let fixture = bare_fixture("atomic-final");
     let git = Git::new(&fixture.repo);
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
-    let fence = publish::acquire_publisher_fence(&git, &fixture.owner).unwrap();
+    let fence = publish::acquire_publisher_fence(&git, &git, &fixture.owner).unwrap();
 
     let model = release_publisher_fence_model();
     let before = model.init_state();
@@ -273,12 +274,13 @@ fn real_final_unlock_atomically_deletes_owner_and_fence() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn ordinary_reentry_cannot_reuse_an_old_stopped_process_proof() {
     let fixture = bare_fixture("fresh-stop-proof");
     let git = Git::new(&fixture.repo);
     let lease = publish::acquire_release_lease(&git, &fixture.owner).unwrap();
-    let first = publish::acquire_publisher_fence(&git, &fixture.owner).unwrap();
+    let first = publish::acquire_publisher_fence(&git, &git, &fixture.owner).unwrap();
 
     let model = release_publisher_fence_model();
     let mut state = transition(
@@ -304,7 +306,7 @@ fn ordinary_reentry_cannot_reuse_an_old_stopped_process_proof() {
         "publisher reentry: ordinary token release retains claim",
     );
 
-    let second = publish::acquire_publisher_fence(&git, &fixture.owner).unwrap();
+    let second = publish::acquire_publisher_fence(&git, &git, &fixture.owner).unwrap();
     assert_ne!(first.token(), second.token());
     state = transition(
         &model,
@@ -322,7 +324,8 @@ fn ordinary_reentry_cannot_reuse_an_old_stopped_process_proof() {
         "StopA",
         "publisher reentry: new process obtains its own stop proof",
     );
-    let recovered = publish::rotate_publisher_fence_for_recovery(&git, &fixture.owner).unwrap();
+    let recovered =
+        publish::rotate_publisher_fence_for_recovery(&git, &git, &fixture.owner).unwrap();
     state = transition(
         &model,
         &state,
@@ -354,6 +357,7 @@ fn ordinary_reentry_cannot_reuse_an_old_stopped_process_proof() {
     assert!(!buggy.check_invariant("StoppedProofIsPerProcess", &stale));
 }
 
+#[cfg(unix)]
 #[test]
 fn yank_cleanup_refines_real_session_guards_and_atomic_unlock() {
     let fixture = bare_fixture("yank-cleanup");
@@ -373,7 +377,7 @@ fn yank_cleanup_refines_real_session_guards_and_atomic_unlock() {
         "AcquireCleanupLease",
         "yank cleanup: real persistent owner ref acquired",
     );
-    let fence = publish::acquire_publisher_fence(&git, &fixture.owner).unwrap();
+    let fence = publish::acquire_publisher_fence(&git, &git, &fixture.owner).unwrap();
     state = transition(
         &model,
         &state,
@@ -423,12 +427,13 @@ fn yank_cleanup_refines_real_session_guards_and_atomic_unlock() {
     assert_eq!(publish::publisher_fence(&git).unwrap(), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn yank_cleanup_lease_loss_refuses_and_mutant_is_non_vacuous() {
     let fixture = bare_fixture("yank-lease-loss");
     let repo_git = Git::new(&fixture.repo);
     let lease = publish::acquire_release_lease(&repo_git, &fixture.owner).unwrap();
-    let fence = publish::acquire_publisher_fence(&repo_git, &fixture.owner).unwrap();
+    let fence = publish::acquire_publisher_fence(&repo_git, &repo_git, &fixture.owner).unwrap();
 
     let model = release_yank_successor_first_model();
     let mut state = model.init_state();
@@ -448,7 +453,15 @@ fn yank_cleanup_lease_loss_refuses_and_mutant_is_non_vacuous() {
         fixture.owner
     );
     let delete = format!(":{}", publish::RELEASE_LEASE_REF);
-    git(&fixture.repo, &["push", &owner_lease, "origin", &delete]);
+    git(
+        &fixture.repo,
+        &[
+            "push",
+            &owner_lease,
+            bare_remote(&fixture.repo).to_str().unwrap(),
+            &delete,
+        ],
+    );
     assert!(assert_session(&repo_git, &lease, &fence).is_err());
     state = transition(
         &model,

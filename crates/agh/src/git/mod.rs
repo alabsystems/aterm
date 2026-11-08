@@ -7,6 +7,7 @@
 //! release-tier owner or a push's writer. This module runs the `git` program. It is not
 //! `agh::github::git`, M1's REST git-data API (commits, refs, trees).
 
+mod control;
 pub mod credential;
 mod fetch;
 pub mod grant;
@@ -16,6 +17,9 @@ mod run;
 #[cfg(unix)]
 mod source_config;
 
+pub use control::{
+    ControlRefChange, ControlRefTransaction, PUBLISHER_FENCE_REF, RELEASE_LEASE_REF,
+};
 pub use fetch::{FetchBatch, FetchRow};
 pub use run::{GitOp, GitOut, GitRun, HelperCommand};
 

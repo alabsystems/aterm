@@ -1,0 +1,26 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# E8: what a key does on a focused option does not depend on who pressed it.
+# `aterm ctl key enter` on the box's focused `1. Yes` closes it `approved`,
+# by the client (attribution unchanged), at conf=heuristic; a digit naming the
+# box's `2. No` closes it `declined`, whatever the client's `act=` claimed. The harness's own act still decides its
+# close at conf=strong, whatever its key chose.
+see busy
+half
+see prompt bash:not-read-only fixture=claude-2.1.280-box-bash-touch
+expect open p1 approval par=t1 box=bash:not-read-only @500
+admit ctl key=enter chose=approve
+accept
+see busy
+expect close p1 approval out=approved by=ctl conf=heuristic
+see prompt bash:not-read-only fixture=claude-2.1.282-box-bash-ask-rule
+expect open p2 approval par=t1 box=bash:not-read-only
+admit ctl act=approve key=2 chose=decline
+accept
+see busy
+expect close p2 approval out=declined by=ctl conf=heuristic
+see prompt bash:not-read-only fixture=claude-2.1.280-box-bash-touch
+expect open p3 approval par=t1 box=bash:not-read-only
+admit harness act=approve key=enter chose=approve
+accept
+see busy
+expect close p3 approval out=approved by=harness conf=strong

@@ -8535,6 +8535,12 @@ pub fn event_line(turn: &Turn, python_allow: &[String]) -> String {
     )
 }
 
+/// The `EVENT` line's words for `turn`: a box's kind, its `classify=` verdict and command, or the
+/// last line the agent said. `classify=` is the read-only rule on the screen's readings alone. A
+/// Kimi Code box passes its command's control characters through raw, so its drawn command may
+/// not be the one Kimi runs (D23 of `docs/DESIGN-harness-repos-2026-10-24.md`); only the
+/// presence verdict also reads Kimi's own record (`docs/DESIGN-kimi-wire-verdict-2026-11-07.md`),
+/// and nothing presses on Kimi.
 fn event_summary(turn: &Turn, python_allow: &[String]) -> String {
     let rows = &turn.screen.rows;
     let reader = aterm_phase::identify(None, rows);

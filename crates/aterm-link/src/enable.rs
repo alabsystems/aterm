@@ -8664,6 +8664,18 @@ mod tests {
     const FAKE_PLIST: &str = "/nonexistent/LaunchAgents/systems.alab.astream-broker.x.plist";
     const FAKE_LABEL: &str = "systems.alab.astream-broker.x";
 
+    #[test]
+    fn required_removal_accepts_the_observation_after_three_hundred_polls() {
+        let manager = FakeLaunchd::new(false, 0);
+        manager.letting_go.set(301);
+        assert!(
+            let_go(&manager, FAKE_LABEL),
+            "the actual later absent observation is accepted"
+        );
+        assert_eq!(manager.calls().len(), 302);
+        assert_eq!(manager.pauses.get(), 301);
+    }
+
     fn rewrite(old: Option<&str>) -> Rewrite {
         Rewrite {
             text: "new".to_string(),

@@ -4650,13 +4650,6 @@ const NO_HANDOFF_WRITES_OFF_MACOS: &[(&str, &str)] = &[
 const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("control", "Wire.turn_ids"),
     ("manifest", "WindowCarry.presence_row"),
-    // Retired when a successor stopped taking the message band's rows and glass from its carry:
-    // the newest recorded release wrote them, so the hold wants them named here until a
-    // release's `fields.toml` omits them. The first one recorded after the fields went does;
-    // these rows then answer "listed, but no desk reaches it" and generate_handoff_fixtures
-    // fails: remove them then. Older manifests keep the keys; the reader skips them.
-    ("manifest", "WindowCarry.status_bar_rows"),
-    ("manifest", "CarriedMessage.on_glass"),
     ("layout", "WindowLayout.presence_row"),
     ("layout", "WindowLayout.maximized"),
     ("layout", "TerminalLeafRestore.held"),

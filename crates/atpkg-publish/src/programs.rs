@@ -251,6 +251,17 @@ pub static PROGRAMS: &[ProgramDef] = &[
         }),
     },
     ProgramDef {
+        name: "trust-resource-controller",
+        repo: "trust",
+        group: None,
+        system: None,
+        unavailable_hint: Some("The managed serial-command helper is published for ARM macOS only"),
+        shape: Shape::Plain {
+            darwin: ARM_DARWIN,
+            harness: None,
+        },
+    },
+    ProgramDef {
         name: "codex",
         repo: "codex-alab",
         group: None,

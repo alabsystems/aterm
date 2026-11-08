@@ -1924,6 +1924,30 @@ pub(super) fn relaunch(
     r
 }
 
+/// Whether `prepare` is the rollback [`super::native_restart::begin_completed_rollback`] mints
+/// from this record's completed forward: that forward's own rollback command, run on its observed
+/// vendor's death.
+fn completed_rollback_of(st: &St, prepare: &super::native_act::Prepare) -> bool {
+    let super::native_act::NativePlan::Restart {
+        forward,
+        observation: Some(_),
+        ..
+    } = &prepare.plan
+    else {
+        return false;
+    };
+    st.native_completed_prepare
+        .as_deref()
+        .is_some_and(|done| match &done.plan {
+            super::native_act::NativePlan::Restart {
+                rollback: Some(back),
+                ..
+            } => back == forward,
+            super::native_act::NativePlan::Restart { rollback: None, .. }
+            | super::native_act::NativePlan::OwnImage { .. } => false,
+        })
+}
+
 fn relaunch_held(
     opts: &Opts,
     r: Report,
@@ -1963,12 +1987,19 @@ fn relaunch_held(
             Ok(super::native_restart::Recovery::Cancelled) => {
                 return said(r, "wait:native-crash-observation");
             }
+            Ok(super::native_restart::Recovery::Unadmitted) => {
+                // Still Exiting: the next pass mints the rollback afresh.
+                save(opts, session, st);
+                return said(r, super::native_restart::WAIT_UNADMITTED);
+            }
             Err(why) => return said(r, format!("wait:{why}")),
         }
     }
     let old = st.pid;
     if st.native.is_some() || !st.native_prepare.is_empty() {
         let tab = st.tab.clone();
+        let rollback = super::native_restart::retained_prepare(st)
+            .is_ok_and(|prepare| completed_rollback_of(st, &prepare));
         match super::native_restart::recover(opts, session, c, &tab, st) {
             Ok(super::native_restart::Recovery::Completed) => {
                 save(opts, session, st);
@@ -1986,6 +2017,15 @@ fn relaunch_held(
             Ok(super::native_restart::Recovery::Held) => {
                 save(opts, session, st);
                 return said(r, super::native_restart::WAIT_RETIRED_UNISSUED);
+            }
+            Ok(super::native_restart::Recovery::Unadmitted) => {
+                // Nothing ran. A rollback stays Exiting and is minted afresh on the next pass; a
+                // crash's record ends, and the next pass plans that exit afresh.
+                if !rollback {
+                    st.stop("native-unadmitted", now_s());
+                }
+                save(opts, session, st);
+                return said(r, super::native_restart::WAIT_UNADMITTED);
             }
             Ok(
                 super::native_restart::Recovery::Admitted | super::native_restart::Recovery::Legacy,
@@ -5514,46 +5554,53 @@ fn restart_locked(
                 None,
             )
         };
-        if matches!(admission, Ok(super::native_restart::Recovery::Completed)) {
-            break 'signal Some(said(r.clone(), "wait:native-completed"));
-        }
-        if matches!(admission, Ok(super::native_restart::Recovery::Cancelled)) {
-            let _ = super::native_record::restore_inactive(opts, &session, &mut st, prior.as_ref());
-            break 'signal Some(said(r.clone(), "wait:native-cancelled-before-mutation"));
-        }
-        if matches!(admission, Ok(super::native_restart::Recovery::Retired)) {
-            break 'signal Some(said(r.clone(), "failed:native-cohort-retired"));
-        }
-        if matches!(admission, Ok(super::native_restart::Recovery::Held)) {
-            break 'signal Some(said(
-                r.clone(),
-                super::native_restart::WAIT_RETIRED_UNISSUED,
-            ));
-        }
-        if let Err(why) = admission {
-            if st.native_prepare.is_empty()
-                || super::native_restart::abort(opts, &session, &mut c, &tab, &mut st)
-            {
-                if super::native_restart::coordinated(&st) {
-                    let _ = super::native_record::restore_inactive(
-                        opts,
-                        &session,
-                        &mut st,
-                        prior.as_ref(),
-                    );
-                } else {
-                    restore(opts, &session, prior.as_ref());
-                }
-            } else {
-                save(opts, &session, &st);
+        match admission {
+            Ok(
+                super::native_restart::Recovery::Admitted | super::native_restart::Recovery::Legacy,
+            ) => {}
+            Ok(super::native_restart::Recovery::Completed) => {
+                break 'signal Some(said(r.clone(), "wait:native-completed"));
             }
-            if st.native_retired_unissued {
+            Ok(super::native_restart::Recovery::Cancelled) => {
+                let _ =
+                    super::native_record::restore_inactive(opts, &session, &mut st, prior.as_ref());
+                break 'signal Some(said(r.clone(), "wait:native-cancelled-before-mutation"));
+            }
+            Ok(super::native_restart::Recovery::Retired) => {
+                break 'signal Some(said(r.clone(), "failed:native-cohort-retired"));
+            }
+            Ok(super::native_restart::Recovery::Held) => {
                 break 'signal Some(said(
                     r.clone(),
                     super::native_restart::WAIT_RETIRED_UNISSUED,
                 ));
             }
-            break 'signal Some(said(r.clone(), format!("wait:{why}")));
+            Ok(super::native_restart::Recovery::Unadmitted) | Err(_) => {
+                let why = super::native_restart::refusal_word(admission);
+                if st.native_prepare.is_empty()
+                    || super::native_restart::abort(opts, &session, &mut c, &tab, &mut st)
+                {
+                    if super::native_restart::coordinated(&st) {
+                        let _ = super::native_record::restore_inactive(
+                            opts,
+                            &session,
+                            &mut st,
+                            prior.as_ref(),
+                        );
+                    } else {
+                        restore(opts, &session, prior.as_ref());
+                    }
+                } else {
+                    save(opts, &session, &st);
+                }
+                if st.native_retired_unissued {
+                    break 'signal Some(said(
+                        r.clone(),
+                        super::native_restart::WAIT_RETIRED_UNISSUED,
+                    ));
+                }
+                break 'signal Some(said(r.clone(), format!("wait:{why}")));
+            }
         }
         let signal_check = if st.native.is_some() {
             restart_source_current(
@@ -5844,10 +5891,12 @@ fn retry_checked_relaunch(
     match native_restart::observe_relaunch(opts, session, &mut client, &tab, &mut st) {
         native_restart::RelaunchObservation::Signalled => {
             save(opts, session, &st);
+            drop(client);
             return Some(carry_in_flight(opts, r, st, session, &tab));
         }
         native_restart::RelaunchObservation::Terminal(Recovery::Completed) => {
             save(opts, session, &st);
+            drop(client);
             return Some(carry_in_flight(opts, r, st, session, &tab));
         }
         native_restart::RelaunchObservation::Terminal(Recovery::Cancelled) => {
@@ -5858,6 +5907,11 @@ fn retry_checked_relaunch(
         native_restart::RelaunchObservation::Terminal(Recovery::Retired | Recovery::Held) => {
             save(opts, session, &st);
             return Some(said(r, native_restart::WAIT_RETIRED_UNISSUED));
+        }
+        native_restart::RelaunchObservation::Terminal(Recovery::Unadmitted) => {
+            st.stop("native-unadmitted", now_s());
+            save(opts, session, &st);
+            return Some(said(r, native_restart::WAIT_UNADMITTED));
         }
         native_restart::RelaunchObservation::Terminal(Recovery::Legacy | Recovery::Admitted)
         | native_restart::RelaunchObservation::Pending => {}
@@ -5905,6 +5959,11 @@ fn retry_checked_relaunch(
             Ok(Recovery::Retired | Recovery::Held) => {
                 save(opts, session, &st);
                 return stopped(said(r, native_restart::WAIT_RETIRED_UNISSUED));
+            }
+            Ok(Recovery::Unadmitted) => {
+                st.stop("native-unadmitted", now_s());
+                save(opts, session, &st);
+                return stopped(said(r, native_restart::WAIT_UNADMITTED));
             }
             Ok(Recovery::Legacy) | Err(_) => {
                 save(opts, session, &st);
@@ -5955,6 +6014,7 @@ fn retry_checked_relaunch(
             }
         }
     });
+    drop(client);
     match result {
         Some(Ok((report, st))) => Some(carry_in_flight(opts, report, st, session, &tab)),
         Some(Err(report)) => Some(*report),
@@ -7662,6 +7722,11 @@ fn launch_after_exit(
             Ok(super::native_restart::Recovery::Legacy) => {}
             Ok(super::native_restart::Recovery::Cancelled) => {
                 return said(r, "wait:native-crash-observation");
+            }
+            Ok(super::native_restart::Recovery::Unadmitted) => {
+                st.stop("native-unadmitted", now_s());
+                save(opts, &session, &st);
+                return said(r, super::native_restart::WAIT_UNADMITTED);
             }
             Err(why) => return said(r, format!("wait:{why}")),
         }

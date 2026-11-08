@@ -5,6 +5,33 @@ use super::*;
 use std::os::unix::net::UnixStream;
 
 fn seed_log(lab: &Lab) -> aterm_secrets::membership_log::Log {
+    seed_log_with(lab, 0, Holder::Wrapped)
+}
+
+/// How many rotations of the vault's key the long-log workloads' history holds past
+/// [`seed_log`]'s. Each is what a rotation adds where the fold is off
+/// (`client::log_entries::rotate_epochs_after_remove`): an `[everyone]` epoch and a Commons
+/// epoch, a wrap of each to the Macs that hold it, the Commons control entry resealed under the
+/// new key, and one put under the `[everyone]` key (a `secrets set` under the current key adds
+/// that put alone). Together 9,605 records, 7.2 MB, and 7,207 records, 5.6 MB, where only the
+/// first Mac holds the older rotations ([`Holder::Handoff`]). On a Mac whose log had grown to
+/// 4.5 MB each quiet round cost seconds of CPU
+/// (`docs/measured/commons-long-log-rounds-2026-11-07.md`).
+const LONG_LOG_ROTATIONS: u64 = 1_200;
+
+/// How the second Mac holds the epochs of the long history's rotations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holder {
+    /// Each is wrapped to it, as to the first.
+    Wrapped,
+    /// Only the newest is, as for a Mac admitted after the rest, which a vault no longer wraps to
+    /// it: it opens each older one through the first Mac's handoff ([`pair_from_lab_with`]).
+    Handoff,
+}
+
+/// [`seed_log`], with `history` rotations of the vault's key past it ([`LONG_LOG_ROTATIONS`]), each
+/// an `[everyone]` and a Commons epoch, held by the second Mac as `holder` says.
+fn seed_log_with(lab: &Lab, history: u64, holder: Holder) -> aterm_secrets::membership_log::Log {
     use aterm_secrets::{
         client::{save_records, test_found},
         membership_log::{Entrant, EpochAudience, Log, encode_records},
@@ -56,6 +83,53 @@ fn seed_log(lab: &Lab) -> aterm_secrets::membership_log::Log {
         .with_seed(|seed| draft.sign(seed, incarnation))
         .unwrap();
     log.insert(put).unwrap();
+    let sign = |draft: aterm_secrets::membership_log::Draft| {
+        bootstrap
+            .device()
+            .with_seed(|seed| draft.sign(seed, incarnation))
+            .unwrap()
+    };
+    for generation in 1..=history {
+        let at = 2_000 + generation * 10;
+        let wrapped = |n: usize| n == 0 || holder == Holder::Wrapped || generation == history;
+        // Mint an epoch of `audience` at `ms` and wrap its key to each Mac that holds it.
+        let mut mint = |ms: u64, audience: EpochAudience, generation: u64| {
+            let (draft, key) = log.draft_epoch(&actor, ms, audience, generation).unwrap();
+            let epoch = sign(draft);
+            log.insert(epoch.clone()).unwrap();
+            for n in (0..lab.paths.len()).filter(|&n| wrapped(n)) {
+                let recipient = lab.bootstrap(n).request().unwrap().binding().recipient();
+                let draft = log
+                    .draft_wrap(&actor, ms + 1, *epoch.id(), &key, recipient)
+                    .unwrap();
+                log.insert(sign(draft)).unwrap();
+            }
+            (*epoch.id(), key)
+        };
+        let (everyone, key) = mint(at, EpochAudience::Everyone, generation);
+        let (commons, commons_key) = mint(at + 3, EpochAudience::Commons, generation + 1);
+        let draft = log
+            .draft_commons_put(
+                &actor,
+                at + 5,
+                commons,
+                &commons_key,
+                control.value.as_slice(),
+            )
+            .unwrap();
+        log.insert(sign(draft)).unwrap();
+        let entry = aterm_secrets::text::Entry {
+            name: format!("history-{}", generation % 40),
+            value: aterm_secrets::SecretBytes::from([b'x'; 64].as_slice()),
+            audience: aterm_secrets::text::Audience::Everyone,
+            if_absent: false,
+            anchor: None,
+        };
+        let draft = log
+            .draft_put(&actor, at + 6, everyone, &key, &entry)
+            .unwrap();
+        log.insert(sign(draft)).unwrap();
+    }
     for paths in &lab.paths {
         save_records(paths, &encode_records(log.records())).unwrap();
     }
@@ -63,7 +137,15 @@ fn seed_log(lab: &Lab) -> aterm_secrets::membership_log::Log {
 }
 
 fn pair_from_lab(lab: Lab) -> Pair {
-    seed_log(&lab);
+    pair_from_lab_with(lab, 0, Holder::Wrapped)
+}
+
+/// [`pair_from_lab`] over a log with `history` rotations of the vault's key past [`seed_log`]'s,
+/// held by the second Mac as `holder` says. A [`Holder::Handoff`] Mac has imported the first Mac's
+/// handoff of each epoch it cannot open, as the repair rounds before a quiet one would have brought
+/// it.
+fn pair_from_lab_with(lab: Lab, history: u64, holder: Holder) -> Pair {
+    seed_log_with(&lab, history, holder);
     let bootstrap = lab.bootstrap(0);
     let session = Session::open(&bootstrap).unwrap();
     assert!(session.legacy_observation().unwrap().is_some());
@@ -81,6 +163,33 @@ fn pair_from_lab(lab: Lab) -> Pair {
     let session = Session::open(&peer).unwrap();
     Store::join(&session, &paths[1], scope).unwrap();
     drop(session);
+    if holder == Holder::Handoff {
+        let needs = |bootstrap: &Bootstrap| {
+            let session = Session::open(bootstrap).unwrap();
+            session.history_needs(None, usize::MAX).unwrap().0
+        };
+        let older = needs(&peer);
+        assert_eq!(
+            older.len() as u64,
+            2 * (history - 1),
+            "CONTROL: the late Mac opens no older epoch of either audience"
+        );
+        let actor = peer.request().unwrap().binding().actor();
+        let handoffs = Session::open(&bootstrap)
+            .unwrap()
+            .handoffs(actor, &older)
+            .unwrap();
+        let session = Session::open(&peer).unwrap();
+        for (source, handoff) in older.iter().zip(handoffs) {
+            let handoff = handoff.expect("the first Mac issues each older epoch's handoff");
+            session.import_handoff(*source, &handoff).unwrap();
+        }
+        drop(session);
+        assert!(
+            needs(&peer).is_empty(),
+            "each older epoch opens by its handoff"
+        );
+    }
     Pair { lab, scope, paths }
 }
 
@@ -482,7 +591,7 @@ fn loopback_round(
 #[test]
 #[ignore = "isolated CPU measurement; run with verify perf commons-quiet"]
 fn a_round_that_moves_nothing_reports_its_cpu() {
-    quiet_rounds(8, false);
+    quiet_rounds(8, Workload::Explicit);
 }
 
 /// The same quiet pair kept busy long enough to sample its current-source process. This
@@ -490,7 +599,7 @@ fn a_round_that_moves_nothing_reports_its_cpu() {
 #[test]
 #[ignore = "sustained isolated CPU measurement; run with verify perf commons-quiet --sustained"]
 fn a_sustained_quiet_pair_reports_its_cpu() {
-    quiet_rounds(256, false);
+    quiet_rounds(256, Workload::Explicit);
 }
 
 /// Ordinary catalog discovery and subscription are part of this workload;
@@ -498,29 +607,75 @@ fn a_sustained_quiet_pair_reports_its_cpu() {
 #[test]
 #[ignore = "isolated CPU measurement; run with verify perf commons-quiet --catalog"]
 fn a_quiet_catalog_pair_reports_its_cpu() {
-    quiet_rounds(8, true);
+    quiet_rounds(8, Workload::Catalog);
 }
 
 /// What the suite keeps of the measurements above: a converged catalog pair's rounds move nothing
 /// and visit both its tables. The asserts are a superset of the explicit pair's.
-/// GAP: the explicit pair runs only when measured, so a defect that moves records only on an
-/// explicitly listed table is not seen here, and neither is the `WitnessLogs` loop at the end of
-/// `quiet_rounds` (`control::tests` holds its round robin).
+/// An explicitly listed table's rounds are kept by
+/// [`quiet_rounds_over_a_vault_history_move_nothing`].
+/// GAP: the `WitnessLogs` loop at the end of `quiet_rounds` runs only when measured
+/// (`control::tests` holds its round robin), and so do the explicit pair over [`seed_log`] alone
+/// and the [`LONG_LOG_ROTATIONS`] log.
 #[test]
 fn quiet_catalog_rounds_move_nothing_and_visit_both_tables() {
-    quiet_rounds(2, true);
+    quiet_rounds(2, Workload::Catalog);
 }
 
 #[test]
 #[ignore = "sustained isolated CPU measurement; run with verify perf commons-quiet --catalog --sustained"]
 fn a_sustained_quiet_catalog_pair_reports_its_cpu() {
-    quiet_rounds(256, true);
+    quiet_rounds(256, Workload::Catalog);
+}
+
+/// [`a_round_that_moves_nothing_reports_its_cpu`] over a long vault history
+/// ([`LONG_LOG_ROTATIONS`]): how much a round that moves nothing costs for the records the vault's
+/// log holds.
+#[test]
+#[ignore = "isolated CPU measurement; run with verify perf commons-quiet --long-log"]
+fn a_quiet_pair_over_a_long_log_reports_its_cpu() {
+    quiet_rounds(8, Workload::LongLog(LONG_LOG_ROTATIONS));
+}
+
+#[test]
+#[ignore = "sustained isolated CPU measurement; run with verify perf commons-quiet --long-log --sustained"]
+fn a_sustained_quiet_pair_over_a_long_log_reports_its_cpu() {
+    quiet_rounds(256, Workload::LongLog(LONG_LOG_ROTATIONS));
+}
+
+/// What the suite keeps of the long-log measurement: over 41 rotations of the vault's key (one
+/// put's name written twice under two keys), a converged pair's rounds move nothing.
+#[test]
+fn quiet_rounds_over_a_vault_history_move_nothing() {
+    quiet_rounds(2, Workload::LongLog(41));
+}
+
+/// [`a_quiet_pair_over_a_long_log_reports_its_cpu`] where the second Mac was admitted after the
+/// history and opens each older epoch through a handoff, as most Macs of a fleet do.
+#[test]
+#[ignore = "isolated CPU measurement; run with verify perf commons-quiet --late-joiner"]
+fn a_quiet_late_joiner_over_a_long_log_reports_its_cpu() {
+    quiet_rounds(8, Workload::LateJoiner(LONG_LOG_ROTATIONS));
+}
+
+#[test]
+#[ignore = "sustained isolated CPU measurement; run with verify perf commons-quiet --late-joiner --sustained"]
+fn a_sustained_quiet_late_joiner_over_a_long_log_reports_its_cpu() {
+    quiet_rounds(256, Workload::LateJoiner(LONG_LOG_ROTATIONS));
+}
+
+/// What the suite keeps of the late-joiner measurement: a Mac that opens the 80 older epochs of 40
+/// rotations (an `[everyone]` and a Commons epoch each) through handoffs takes part in rounds that
+/// move nothing.
+#[test]
+fn quiet_rounds_of_a_late_joiner_move_nothing() {
+    quiet_rounds(2, Workload::LateJoiner(41));
 }
 
 #[test]
 #[ignore = "process-wide retained-history diagnostic; run this exact test alone with --ignored --nocapture"]
 fn a_quiet_catalog_pair_reports_retained_history_reads() {
-    quiet_rounds_observed(8, true, true);
+    quiet_rounds_observed(8, Workload::Catalog, true);
 }
 
 #[test]
@@ -664,13 +819,68 @@ fn catalog_inventories(pair: &Pair) -> [BTreeMap<Digest, BTreeSet<Digest>>; 2] {
     })
 }
 
-fn quiet_rounds(measured: u32, catalog: bool) {
-    quiet_rounds_observed(measured, catalog, false);
+/// What a quiet-round measurement repairs ([`quiet_rounds`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Workload {
+    /// One explicitly listed table, over a short log ([`log_pair`]).
+    Explicit,
+    /// A catalog-discovered application table beside the catalog ([`catalog_pair`]).
+    Catalog,
+    /// [`Workload::Explicit`] over this many rotations of the vault's key past [`seed_log`]'s
+    /// ([`LONG_LOG_ROTATIONS`] when measured).
+    LongLog(u64),
+    /// [`Workload::LongLog`] whose second Mac opens every epoch but the newest through a
+    /// handoff ([`Holder::Handoff`]).
+    LateJoiner(u64),
 }
 
-fn quiet_rounds_observed(measured: u32, catalog: bool, history_reads: bool) {
+impl Workload {
+    /// Its name in a report, which `verify perf commons-quiet` checks.
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Catalog => "catalog",
+            Self::LongLog(_) => "long-log",
+            Self::LateJoiner(_) => "late-joiner",
+        }
+    }
+    /// How many tables each of its rounds visits.
+    const fn tables(self) -> u64 {
+        match self {
+            Self::Catalog => 2,
+            Self::Explicit | Self::LongLog(_) | Self::LateJoiner(_) => 1,
+        }
+    }
+    /// How many rotations of the vault's key its log holds past [`seed_log`]'s.
+    const fn history(self) -> u64 {
+        match self {
+            Self::LongLog(rotations) | Self::LateJoiner(rotations) => rotations,
+            Self::Explicit | Self::Catalog => 0,
+        }
+    }
+}
+
+fn quiet_rounds(measured: u32, workload: Workload) {
+    quiet_rounds_observed(measured, workload, false);
+}
+
+fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool) {
+    let catalog = workload == Workload::Catalog;
     let warm = if catalog { 8 } else { 2 };
-    let pair = if catalog { catalog_pair() } else { log_pair() };
+    let pair = match workload {
+        Workload::Explicit => log_pair(),
+        Workload::Catalog => catalog_pair(),
+        Workload::LongLog(epochs) => pair_from_lab_with(
+            Lab::new(&[Role::Writer, Role::Writer]),
+            epochs,
+            Holder::Wrapped,
+        ),
+        Workload::LateJoiner(epochs) => pair_from_lab_with(
+            Lab::new(&[Role::Writer, Role::Writer]),
+            epochs,
+            Holder::Handoff,
+        ),
+    };
     let endpoint = |n| {
         if catalog {
             let deadline = Instant::now() + Duration::from_secs(60);
@@ -757,8 +967,8 @@ fn quiet_rounds_observed(measured: u32, catalog: bool, history_reads: bool) {
             aterm_json::json!({
                 "schema": 1,
                 "scope": "retained-history-read-cache",
-                "workload": if catalog { "catalog" } else { "explicit" },
-                "tables": if catalog { 2 } else { 1 },
+                "workload": workload.word(),
+                "tables": workload.tables(),
                 "warmup_rounds": warm,
                 "rounds": measured,
                 "moved_records": 0,
@@ -767,12 +977,17 @@ fn quiet_rounds_observed(measured: u32, catalog: bool, history_reads: bool) {
         );
         return;
     }
+    // Both Macs hold the same records file: the history every check of a round reads.
+    let records = aterm_secrets::client::load_records(&pair.lab.paths[0]).unwrap();
     eprintln!(
         "COMMONS-QUIET {}",
         aterm_json::json!({
             "schema": 1,
-            "workload": if catalog { "catalog" } else { "explicit" },
-            "tables": if catalog { 2 } else { 1 },
+            "workload": workload.word(),
+            "tables": workload.tables(),
+            "history_rotations": workload.history(),
+            "log_records": records.len(),
+            "log_bytes": records.encode().len(),
             "warmup_rounds": warm,
             "rounds": measured,
             "process_cpu_ns": u64::try_from(spent.as_nanos()).unwrap(),

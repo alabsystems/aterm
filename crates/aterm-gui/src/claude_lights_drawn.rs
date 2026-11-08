@@ -130,7 +130,11 @@ impl WindowLights {
             .iter()
             .find(|f| f.session == session && f.pane == pane && f.used)
         else {
-            return if self.footers.iter().any(|(s, _)| *s == session) {
+            return if self
+                .footers
+                .iter()
+                .any(|(s, term_row, _)| *s == session && !covered(*term_row))
+            {
                 Drawn::NoRoom
             } else if self.border_toggles.iter().any(|b| {
                 b.session == session
@@ -149,7 +153,13 @@ impl WindowLights {
             .fold((false, false), |(_, seen), h| {
                 (true, seen || !covered(h.term_row))
             });
-        if painted && !seen {
+        if (painted && !seen)
+            || (!painted
+                && self
+                    .footers
+                    .iter()
+                    .any(|(s, term_row, _)| *s == session && covered(*term_row)))
+        {
             return Drawn::NoRule;
         }
         if seen
@@ -172,8 +182,8 @@ impl WindowLights {
 }
 
 impl App {
-    /// `aterm ctl chrome`'s `a11y` lines (a development build's): each window's Autopilot chip and
-    /// Messages band row nodes as its grid's accessibility tree is built for the adapter
+    /// `aterm ctl chrome`'s `a11y` lines (a development build's): each window's Autopilot chip
+    /// nodes as its grid's accessibility tree is built for the adapter
     /// ([`crate::a11y_tree::harness_node_lines`] over [`App::grid_a11y_tree`], the tree
     /// `push_a11y_tree_with_plan` hands a terminal tab's window), so a check reads the node a
     /// screen reader is handed, not the words beside it. A window with an overlay open, whose tree

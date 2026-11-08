@@ -70,7 +70,8 @@ where
 }
 
 /// What a file is now, followed through links: its path as resolved, device, inode, length and
-/// modification time to the nanosecond. This is metadata identity, not a content digest:
+/// modification time to the nanosecond, plus Unix mode and ownership. This is metadata identity,
+/// not a content digest:
 /// an in-place rewrite preserving length and modification time can retain it.
 #[must_use]
 pub fn identity(path: &Path) -> Option<String> {
@@ -90,7 +91,14 @@ pub(crate) fn metadata_identity(path: &Path, meta: &std::fs::Metadata) -> Option
     #[cfg(unix)]
     let node = {
         use std::os::unix::fs::MetadataExt as _;
-        format!("{}:{}", meta.dev(), meta.ino())
+        format!(
+            "{}:{}:{}:{}:{}",
+            meta.dev(),
+            meta.ino(),
+            meta.mode(),
+            meta.uid(),
+            meta.gid()
+        )
     };
     #[cfg(not(unix))]
     let node = String::new();

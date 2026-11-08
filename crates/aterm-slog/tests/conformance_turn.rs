@@ -5,10 +5,10 @@
 
 use aterm_models_session::turn_tracker_model;
 use aterm_slog::{
-    ActWord, Actor, Admission, Binding, BoxWord, CarryAdopt, CarryBudget, Conf, Cursor, Fields,
-    Key, Kind, LastClose, Limits, Log, Lvl, Node, Op, Open, Rec, STEP_ACT_MS, ScreenStep,
-    SettleCause, ShortId, Src, Stamp, TurnTracker, TxEvent, TxPos, TxState, Verdict, WallJudge,
-    WallKind, dismisses, within_lead,
+    ActWord, Actor, Admission, Binding, BoxWord, CarryAdopt, CarryBudget, Chose, Conf, Cursor,
+    Fields, Key, Kind, LastClose, Limits, Log, Lvl, Node, Op, Open, Out, Rec, STEP_ACT_MS,
+    ScreenStep, SettleCause, ShortId, Src, Stamp, TurnTracker, TxEvent, TxPos, TxState, Verdict,
+    WallJudge, WallKind, dismisses, within_lead,
 };
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, with_buggy};
@@ -137,9 +137,10 @@ pub struct Rig {
     pub bound_next: bool,
     pub bound_twice: bool,
     /// A close said `approved`, `declined` or `answered` that neither an act an input it observed
-    /// said (a proven sender's, bound to the step and dismissing it) nor the screen backs: the
-    /// screen backs only `declined` on an approval its next verdict closed after it reported the
-    /// person's interrupt ([`Self::interrupt_fed`]).
+    /// said (a proven sender's, bound to the step and dismissing it), nor what the screen showed
+    /// that input's key choose (fix E8: any sender's, bound and dismissing it, at
+    /// `conf=heuristic`), nor the screen backs: the screen backs only `declined` on an approval
+    /// its next verdict closed after it reported the person's interrupt ([`Self::interrupt_fed`]).
     pub approved_unseen: bool,
     /// The screen reported the interrupt with a turn open and no verdict published since (the
     /// tracker's own `interrupt_fresh`): the approval the next verdict closes was declined.
@@ -251,9 +252,10 @@ impl Rig {
         next
     }
 
-    /// The host admits an input from `by` with `act` now (T1).
-    pub fn admit(&mut self, by: Actor, act: Option<ActWord>) {
-        let adm = self.tracker.admit(self.stamp());
+    /// The host admits an input from `by` with `act` now (T1), whose key the frame showed choosing
+    /// `chose` (fix E8).
+    pub fn admit(&mut self, by: Actor, act: Option<ActWord>, chose: Option<Chose>) {
+        let adm = self.tracker.admit(self.stamp()).choosing(chose);
         let a = self.tracker.attribution();
         self.pending = Some((adm, by, act, a.opens, a.closes));
     }
@@ -276,11 +278,12 @@ impl Rig {
         Some(bound)
     }
 
-    /// A person's input now (admitted and accepted at once).
-    pub fn person(&mut self) -> Binding {
+    /// A person's input now (admitted and accepted at once), whose key the frame showed choosing
+    /// `chose` (fix E8).
+    pub fn person(&mut self, chose: Option<Chose>) -> Binding {
         let before = self.before();
         let stamp = self.stamp();
-        let bound = self.tracker.person(&self.log, stamp);
+        let bound = self.tracker.person(&self.log, chose, stamp);
         if let Binding::Step(n) = bound {
             self.person_on = Some((n, self.now));
         }
@@ -333,7 +336,7 @@ impl Rig {
             }
             if matches!(call, Call::See)
                 && by == Actor::Human
-                && let Some((_, _, _, acc)) = a.bound
+                && let Some((.., acc)) = a.bound
             {
                 self.person_on = Some((node, acc.mono_ms));
             }
@@ -344,16 +347,28 @@ impl Rig {
                 continue;
             }
             let held = b.bound.filter(|(n, ..)| *n == r.node);
-            if let Some((_, by, act, acc)) = held
+            if let Some((_, by, act, chose, acc)) = held
                 && r.by == by
-                && a.bound
-                    .is_some_and(|(_, by2, act2, acc2)| (by2, act2, acc2) == (by, act, acc))
+                && a.bound.is_some_and(|(_, by2, act2, chose2, acc2)| {
+                    (by2, act2, chose2, acc2) == (by, act, chose, acc)
+                })
             {
                 self.bound_twice = true;
             }
             if matches!(r.out(), Some("approved" | "declined" | "answered")) {
-                let seen = held.is_some_and(|(_, by, act, acc)| {
-                    by.is_proven() && act.is_some() && dismisses(acc, now)
+                let step = if r.k == Kind::Approval {
+                    ScreenStep::Approval(BoxWord::OTHER)
+                } else {
+                    ScreenStep::Question
+                };
+                let seen = held.is_some_and(|(_, by, act, chose, acc)| {
+                    dismisses(acc, now)
+                        && ((by.is_proven() && act.is_some())
+                            || (r.conf == Conf::Heuristic
+                                && chose
+                                    .and_then(|c| c.out_for(step))
+                                    .map(|o| Out::Step(o).word())
+                                    == r.out()))
                 });
                 let screen = matches!(call, Call::See)
                     && self.see_declines
@@ -459,7 +474,7 @@ enum Call {
 /// What a rig call is judged against.
 #[derive(Clone, Copy)]
 struct Before {
-    bound: Option<(Node, Actor, Option<ActWord>, Stamp)>,
+    bound: Option<aterm_slog::BoundInput>,
     pd: i64,
     pl: i64,
     seq: u64,
@@ -605,7 +620,7 @@ pub fn project(rig: &Rig, sturn_override: Option<i64>) -> State {
     let open = rig.open_binding();
     let bk = match rig.tracker.attribution().bound {
         None => 0,
-        Some((node, by, _, accepted)) => {
+        Some((node, by, _, _, accepted)) => {
             assert_eq!(Some(node), open, "a binding outlived its step");
             match (dismisses(accepted, rig.stamp()), by == Actor::Human) {
                 (false, _) => 3,
@@ -762,12 +777,14 @@ pub enum Step {
     Interrupted,
     /// A seamless update, carried (`true`) or not ([`handoff`]).
     Handoff(bool),
-    /// The host admits an input from the actor with its act (`AdmitCtl` or `AdmitHarness`).
-    Admit(Actor, Option<ActWord>),
+    /// The host admits an input from the actor with its act (`AdmitCtl` or `AdmitHarness`), and
+    /// what the frame showed its key choose (fix E8).
+    Admit(Actor, Option<ActWord>, Option<Chose>),
     /// The host accepts the input in flight (`Accept`; nothing when none is).
     Accept,
-    /// A person's input (`Person` when an approval/question step is open, else `PersonLeads`).
-    Person,
+    /// A person's input (`Person` when an approval/question step is open, else `PersonLeads`),
+    /// and what the frame showed its key choose (fix E8).
+    Person(Option<Chose>),
 }
 
 /// Drive `steps`, checking each against the model.
@@ -950,9 +967,9 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
             rig.interrupted();
             admitted(m, rig, &[], &prev, &project(rig, None), before);
         }
-        Step::Admit(by, act) => {
+        Step::Admit(by, act, chose) => {
             assert_eq!(prev["pd"], 0, "one input in flight at a time");
-            rig.admit(by, act);
+            rig.admit(by, act, chose);
             admitted(
                 m,
                 rig,
@@ -970,8 +987,8 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
             };
             admitted(m, rig, path, &prev, &project(rig, None), before);
         }
-        Step::Person => {
-            rig.person();
+        Step::Person(chose) => {
+            rig.person(chose);
             let path: &[&str] = if matches!(prev["step"], 1 | 2) {
                 &["Person"]
             } else {
@@ -1024,6 +1041,12 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
     }
 }
 
+/// What the frame showed a generated input's key choose (fix E8): nothing half the time, else
+/// any choice, whatever the step (a choice that does not fit its step decides nothing).
+fn chose(rng: &mut XorShift) -> Option<Chose> {
+    (rng.below(2) == 1).then(|| Chose::ALL[rng.index(Chose::ALL.len())])
+}
+
 const POOL: &[Verdict] = &[
     Verdict::Busy,
     Verdict::Busy,
@@ -1064,10 +1087,10 @@ fn turn_tracker_conforms_to_derived_model() {
                         Some(ActWord::Deny),
                         Some(ActWord::Answer),
                     ][rng.index(4)];
-                    Step::Admit(by, act)
+                    Step::Admit(by, act, chose(&mut rng))
                 }
                 14 | 15 => Step::Accept,
-                16 => Step::Person,
+                16 => Step::Person(chose(&mut rng)),
                 _ => {
                     let mut v = POOL[rng.index(POOL.len())];
                     if rng.below(5) == 0 {
@@ -1109,10 +1132,10 @@ fn turn_tracker_conforms_to_derived_model() {
             apply(&m, &mut rig, step);
             let next = project(&rig, None);
             for (name, moved) in [
-                ("AdmitCtl", matches!(step, Step::Admit(Actor::Ctl, _))),
+                ("AdmitCtl", matches!(step, Step::Admit(Actor::Ctl, ..))),
                 (
                     "AdmitHarness",
-                    matches!(step, Step::Admit(Actor::Harness, _)),
+                    matches!(step, Step::Admit(Actor::Harness, ..)),
                 ),
                 ("a ctl act binds", next["bk"] == 1 && next["ba"] == 1),
                 ("a harness act binds", next["bk"] == 1 && next["ba"] == 2),
@@ -1121,10 +1144,10 @@ fn turn_tracker_conforms_to_derived_model() {
                 ("Accept late", prev["pd"] == 4 && next["pd"] == 0),
                 ("the lead's open binds", prev["pd"] == 3 && next["bk"] == 1),
                 ("the lead's open admits", prev["pd"] == 2 && next["pd"] == 1),
-                ("Person", matches!(step, Step::Person) && next["bk"] == 2),
+                ("Person", matches!(step, Step::Person(_)) && next["bk"] == 2),
                 (
                     "PersonLeads",
-                    matches!(step, Step::Person) && next["pl"] == 1,
+                    matches!(step, Step::Person(_)) && next["pl"] == 1,
                 ),
                 ("a person's lead binds", prev["pl"] == 1 && next["bk"] == 2),
                 ("Age", prev["bk"] != 3 && next["bk"] == 3),
@@ -1142,6 +1165,11 @@ fn turn_tracker_conforms_to_derived_model() {
             for r in rig.since(seq0) {
                 if r.op == Op::Close && matches!(r.k, Kind::Approval | Kind::Question) {
                     ran.insert(match (r.out(), r.by) {
+                        (Some("approved" | "declined" | "answered"), _)
+                            if r.conf == Conf::Heuristic =>
+                        {
+                            "a close the key's frame decided"
+                        }
                         (Some("approved" | "declined" | "answered"), _) => "a close an act decided",
                         (_, Actor::Human) => "a close a person's input attributed",
                         (_, Actor::Ctl | Actor::Harness) => {
@@ -1187,6 +1215,7 @@ fn turn_tracker_conforms_to_derived_model() {
         "Age",
         "LeadOut",
         "a close an act decided",
+        "a close the key's frame decided",
         "a close a person's input attributed",
         "a close an unproven or unacted input attributed",
         "a close no input attributed",
@@ -1410,7 +1439,7 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
         Step::See(edit),
-        Step::Admit(Actor::Harness, Some(ActWord::Approve)),
+        Step::Admit(Actor::Harness, Some(ActWord::Approve), None),
         Step::See(bash),
     ]);
     let late = project(&rig, None);
@@ -1440,7 +1469,7 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
         Step::See(edit),
-        Step::Admit(Actor::Harness, Some(ActWord::Approve)),
+        Step::Admit(Actor::Harness, Some(ActWord::Approve), None),
         Step::Accept,
         Step::Pass(600),
     ]);
@@ -1471,12 +1500,12 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
         Step::See(edit),
-        Step::Admit(Actor::Harness, Some(ActWord::Approve)),
+        Step::Admit(Actor::Harness, Some(ActWord::Approve), None),
         Step::Accept,
     ]);
     let acted = project(&rig, None);
     assert_eq!(acted["bk"], 1);
-    checked(&mut rig, Step::Person);
+    checked(&mut rig, Step::Person(None));
     assert_eq!(project(&rig, None)["bk"], 2);
     let seq0 = rig.log.last_seq();
     checked(&mut rig, Step::See(Verdict::Busy));
@@ -1492,13 +1521,13 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
 
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
-        Step::Admit(Actor::Harness, Some(ActWord::Approve)),
+        Step::Admit(Actor::Harness, Some(ActWord::Approve), None),
         Step::Accept,
     ]);
     let led = project(&rig, None);
     assert_eq!((led["step"], led["pd"], led["pl"]), (0, 3, 0));
     checked(&mut rig, Step::Pass(100));
-    checked(&mut rig, Step::Person);
+    checked(&mut rig, Step::Person(None));
     let took = project(&rig, None);
     assert_eq!((took["pd"], took["pl"]), (0, 1), "the person took the lead");
     checked(&mut rig, Step::Pass(200));
@@ -1520,7 +1549,7 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
     let mut rig = drive(&[
         Step::See(Verdict::Busy),
         Step::See(edit),
-        Step::Admit(Actor::Harness, Some(ActWord::Approve)),
+        Step::Admit(Actor::Harness, Some(ActWord::Approve), None),
         Step::Accept,
     ]);
     let bound = project(&rig, None);
@@ -1554,7 +1583,7 @@ fn turn_tracker_conformance_rejects_inputs_that_bind_the_wrong_box() {
             steps.push(Step::See(edit));
         }
         steps.extend([
-            Step::Admit(Actor::Ctl, Some(ActWord::Approve)),
+            Step::Admit(Actor::Ctl, Some(ActWord::Approve), None),
             Step::Accept,
         ]);
         if lead {
@@ -1597,13 +1626,13 @@ fn the_fold_counts_each_approval_by_who_dismissed_it() {
     let edit = Verdict::Prompt(BoxWord::from_detail("edit"));
     let mut steps = vec![Step::See(Verdict::Busy)];
     for input in [
-        vec![Step::Person],
+        vec![Step::Person(None)],
         vec![
-            Step::Admit(Actor::Harness, Some(ActWord::Approve)),
+            Step::Admit(Actor::Harness, Some(ActWord::Approve), None),
             Step::Accept,
         ],
         vec![
-            Step::Admit(Actor::Ctl, Some(ActWord::Approve)),
+            Step::Admit(Actor::Ctl, Some(ActWord::Approve), None),
             Step::Accept,
         ],
         vec![],

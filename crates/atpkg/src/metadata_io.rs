@@ -1,10 +1,49 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded, same-handle reads for private package metadata files.
+//! Bounded, same-handle reads and private atomic writes for package metadata.
 
 use std::io::{self, Read as _};
 use std::path::Path;
+
+/// Replace metadata with a complete private file. The caller prepares and
+/// hardens the parent directory according to its store layout.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    PendingMetadata::prepare(path, bytes)?.commit()
+}
+
+struct PendingMetadata {
+    directory: aterm_tempfile::TempDir,
+    destination: std::path::PathBuf,
+}
+
+impl PendingMetadata {
+    fn prepare(path: &Path, bytes: &[u8]) -> io::Result<Self> {
+        let parent = path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "metadata has no parent directory",
+            )
+        })?;
+        let directory = aterm_tempfile::Builder::new()
+            .prefix("package-metadata-")
+            .suffix(".noindex")
+            .tempdir_in(parent)?;
+        let mut file = crate::platform::create_private_new(&directory.path().join("data"))?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        crate::platform::set_mode_on(&file, 0o600)?;
+        Ok(Self {
+            directory,
+            destination: path.to_path_buf(),
+        })
+    }
+
+    fn commit(self) -> io::Result<()> {
+        // Each pending write owns its path until rename. Concurrent writers may
+        // replace the destination, but cannot unlink one another's staging file.
+        std::fs::rename(self.directory.path().join("data"), &self.destination)
+    }
+}
 
 fn too_large(limit: usize) -> io::Error {
     io::Error::new(
@@ -291,6 +330,48 @@ pub(crate) fn read_bounded_regular_utf8_follow_final_links(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlapping_metadata_writes_publish_complete_bytes_and_keep_independent_staging() {
+        let root = fixture("overlap");
+        let path = root.join("metadata");
+        std::fs::write(&path, b"original").unwrap();
+        let first = PendingMetadata::prepare(&path, b"first complete version").unwrap();
+        let second = PendingMetadata::prepare(&path, b"second complete version").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        first.commit().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first complete version");
+        second.commit().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second complete version");
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            1,
+            "staging is cleaned"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn abandoned_and_failed_metadata_writes_preserve_destination_and_remove_staging() {
+        let root = fixture("abandon");
+        let path = root.join("metadata");
+        std::fs::write(&path, b"original").unwrap();
+        drop(PendingMetadata::prepare(&path, b"abandoned").unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        let blocked = root.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(write_private_atomic(&blocked, b"cannot replace a directory").is_err());
+        assert!(blocked.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+    }
 
     fn fixture(label: &str) -> crate::testdir::Dir {
         crate::testdir::dir(&format!("atpkg-metadata-{label}-"))

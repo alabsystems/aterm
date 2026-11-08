@@ -20,6 +20,9 @@ fn main() -> std::process::ExitCode {
     // inherits the raised limit.
     aterm_uds::spawnfd::raise_soft_nofile();
     let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if let Some(code) = aterm_verify::compile_width::wrapper_entry(&raw) {
+        return std::process::ExitCode::from(code);
+    }
     if raw
         .first()
         .is_some_and(|a| a == aterm_verify::docdriver::RUNTOOL_FLAG)

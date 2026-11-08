@@ -470,31 +470,57 @@ impl Access {
         identity: &Identity,
         basis: [u8; 32],
     ) -> Result<Option<Historical>> {
-        let Some(paths) = &self.log_paths else {
-            return Ok(None);
-        };
-        if !self.is_current(journal) || self.local().binding.recipient() != identity.recipient() {
-            return Err(Error::new(
-                "historical access requires the current local membership",
-            ));
-        }
-        let Some((log, _heads_digest)) = crate::client::trusted_commons_log(paths, self.trust)?
-        else {
-            return Err(Error::new("Commons membership log is unavailable"));
-        };
-        self.historical_from_history(
-            identity,
-            basis,
-            &crate::membership_log::history::HistoryView::new(&log),
-        )
+        self.with_log_history(journal, identity, |history| match history? {
+            Some(history) => history.historical(basis),
+            None => Ok(None),
+        })
     }
 
-    // The public path checks current local membership before obtaining this immutable view.
-    fn historical_from_history(
+    /// Lend `read` one check of the current local membership, one read of the log and one lease
+    /// of its complete history, which every historical read of a batch shares: `None` where this
+    /// observation is not log-backed, and an error where this is not the current local
+    /// membership, or the log is unavailable or one of its complete records cannot be leased. A
+    /// repair round reads a batch (`aterm-db`'s `Session::history_needs`), and when each basis
+    /// checked, read and leased again that was 30% of a quiet round's CPU over 4,805 records
+    /// (`docs/measured/commons-long-log-rounds-2026-11-07.md`).
+    pub(super) fn with_log_history<R>(
+        &self,
+        journal: &Journal,
+        identity: &Identity,
+        read: impl FnOnce(Result<Option<LogHistory<'_>>>) -> R,
+    ) -> R {
+        let Some(paths) = &self.log_paths else {
+            return read(Ok(None));
+        };
+        if !self.is_current(journal) || self.local().binding.recipient() != identity.recipient() {
+            return read(Err(Error::new(
+                "historical access requires the current local membership",
+            )));
+        }
+        let log = match crate::client::trusted_commons_log(paths, self.trust) {
+            Ok(Some((log, _heads_digest))) => log,
+            Ok(None) => return read(Err(Error::new("Commons membership log is unavailable"))),
+            Err(error) => return read(Err(error)),
+        };
+        let history = crate::membership_log::history::HistoryView::new(&log);
+        // Validate required history before a warm positive or negative cache entry. Pending
+        // records do not change the complete-generation digest and must not hit cached absence.
+        match history.lease_complete() {
+            Ok(lease) => read(Ok(Some(LogHistory {
+                access: self,
+                identity,
+                lease: &lease,
+            }))),
+            Err(error) => read(Err(error)),
+        }
+    }
+
+    // The public path checks current local membership before it leases this immutable history.
+    fn historical_from_lease(
         &self,
         identity: &Identity,
         basis: [u8; 32],
-        history: &crate::membership_log::history::HistoryView<'_>,
+        lease: &crate::membership_log::history::HistoryLease<'_>,
     ) -> Result<Option<Historical>> {
         use crate::membership_log::history::{Generation, RecordState};
         type HistoricalCacheKey = (Trust, [u8; 32], Generation, [u8; 32]);
@@ -506,9 +532,6 @@ impl Access {
         let Some(paths) = &self.log_paths else {
             return Ok(None);
         };
-        // Validate required history before a warm positive or negative cache entry. Pending
-        // records do not change the complete-generation digest and must not hit cached absence.
-        let lease = history.lease_complete()?;
         let epoch = match lease.record(&basis)? {
             RecordState::Complete(epoch) => Some(epoch),
             RecordState::Pending => {
@@ -614,48 +637,10 @@ impl Access {
         under: [u8; 32],
         key: &[u8; 32],
     ) -> Result<Option<Historical>> {
-        use crate::membership_log::history::{HistoryView, RecordState};
-        let Some(paths) = &self.log_paths else {
-            return Ok(None);
-        };
-        if !self.is_current(journal) || self.local().binding.recipient() != identity.recipient() {
-            return Err(Error::new(
-                "history handoff requires current local membership",
-            ));
-        }
-        let Some((log, _heads_digest)) = crate::client::trusted_commons_log(paths, self.trust)?
-        else {
-            return Err(Error::new("Commons membership log is unavailable"));
-        };
-        let view = HistoryView::new(&log);
-        let lease = view.lease_complete()?;
-        let epoch = match lease.record(&source)? {
-            RecordState::Complete(epoch) => epoch,
-            RecordState::Pending => {
-                return Err(Error::new("historical Commons epoch is not complete"));
-            }
-            RecordState::Absent => return Ok(None),
-        };
-        let Some((generation, bindings)) = lease.historical_commons_writers(&epoch)? else {
-            return Ok(None);
-        };
-        if !lease.commons_epoch_key_under(&epoch, &under, key)? {
-            return Err(Error::new(
-                "history handoff key does not open its Commons epoch under its issuance",
-            ));
-        }
-        Ok(Some(Historical {
-            trust: self.trust,
-            head: self.head,
-            basis: self.basis,
-            source,
-            generation,
-            members: self.log_writers(bindings),
-            key: SecretBytes::from(key.as_slice()),
-            log_paths: Some(paths.clone()),
-            log_heads_digest: self.log_heads_digest,
-            local_recipient: Some(self.local().binding.recipient()),
-        }))
+        self.with_log_history(journal, identity, |history| match history? {
+            Some(history) => history.historical_with_key(source, under, key),
+            None => Ok(None),
+        })
     }
 
     /// Open an older selected roster using the same recipient. This validates
@@ -796,6 +781,66 @@ impl Access {
             log_heads_digest: self.log_heads_digest,
             local_recipient: Some(self.local().binding.recipient()),
         })
+    }
+}
+
+/// One check of the current local membership and one lease of the log's complete history, which
+/// the historical reads of one batch share ([`Access::with_log_history`]).
+pub(super) struct LogHistory<'h> {
+    access: &'h Access,
+    identity: &'h Identity,
+    lease: &'h crate::membership_log::history::HistoryLease<'h>,
+}
+
+impl LogHistory<'_> {
+    /// Whether this history was leased for `access` and `identity`.
+    pub(super) fn serves(&self, access: &Access, identity: &Identity) -> bool {
+        std::ptr::eq(self.access, access) && self.identity.recipient() == identity.recipient()
+    }
+
+    /// [`Access::historical_from_log`] of `basis`, over this history.
+    pub(super) fn historical(&self, basis: [u8; 32]) -> Result<Option<Historical>> {
+        self.access
+            .historical_from_lease(self.identity, basis, self.lease)
+    }
+
+    /// [`Access::historical_from_log_with_key`], over this history.
+    pub(super) fn historical_with_key(
+        &self,
+        source: [u8; 32],
+        under: [u8; 32],
+        key: &[u8; 32],
+    ) -> Result<Option<Historical>> {
+        use crate::membership_log::history::RecordState;
+        let access = self.access;
+        let lease = self.lease;
+        let epoch = match lease.record(&source)? {
+            RecordState::Complete(epoch) => epoch,
+            RecordState::Pending => {
+                return Err(Error::new("historical Commons epoch is not complete"));
+            }
+            RecordState::Absent => return Ok(None),
+        };
+        let Some((generation, bindings)) = lease.historical_commons_writers(&epoch)? else {
+            return Ok(None);
+        };
+        if !lease.commons_epoch_key_under(&epoch, &under, key)? {
+            return Err(Error::new(
+                "history handoff key does not open its Commons epoch under its issuance",
+            ));
+        }
+        Ok(Some(Historical {
+            trust: access.trust,
+            head: access.head,
+            basis: access.basis,
+            source,
+            generation,
+            members: access.log_writers(bindings),
+            key: SecretBytes::from(key.as_slice()),
+            log_paths: access.log_paths.clone(),
+            log_heads_digest: access.log_heads_digest,
+            local_recipient: Some(access.local().binding.recipient()),
+        }))
     }
 }
 
@@ -1022,7 +1067,7 @@ pub(super) fn current_from_loaded_log(
         return Ok(None);
     }
     // The fold's adoption gate (`commons::fold`) decides which audience this Mac writes under;
-    // readers open both whatever it says (`historical_from_history`).
+    // readers open both whatever it says (`historical_from_lease`).
     let view = if crate::commons::fold::on(paths) {
         log.fold_epoch_view(identity)?
     } else {

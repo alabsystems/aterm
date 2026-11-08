@@ -10,8 +10,10 @@ use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use crate::publisher_origin::Git;
 use crate::push_hook::HookRunner;
-use ledger::testing::Git;
+use ledger::testing::Git as LocalGit;
 use ledger::{ClaimPlan, GitRunner, LEDGER_FLOOR, RunOut};
 
 const NOW: u64 = 1_790_000_000;
@@ -177,8 +179,20 @@ fn rival_peer_push(fix: &Fixture) {
     run(&fix.rival, "git", &["push", "-q", "origin", "main"]);
 }
 
-fn do_claim(
+#[cfg(unix)]
+fn do_claim<T: GitRunner + ledger::Origin>(
+    git: &T,
+    work: &Path,
+    version: &str,
+    allow_existing_section: bool,
+) -> (ledger::Result<ledger::Claim>, u32) {
+    do_claim_with_origin(git, git, work, version, allow_existing_section)
+}
+
+#[cfg(unix)]
+fn do_claim_with_origin(
     git: &dyn GitRunner,
+    origin: &dyn ledger::Origin,
     work: &Path,
     version: &str,
     allow_existing_section: bool,
@@ -196,8 +210,8 @@ fn do_claim(
         attempts.set(attempts.get() + 1);
         changelog::claim_changelogs(published, main, version, DATE)
     };
-    let res = ledger::reserve(git, &plan, &rolls)
-        .and_then(|reserved| ledger::claim(git, work, &plan, &reserved, &rolls));
+    let res = ledger::reserve(git, origin, &plan, &rolls)
+        .and_then(|reserved| ledger::claim(git, origin, work, &plan, &reserved, &rolls));
     (res, attempts.get())
 }
 
@@ -284,7 +298,8 @@ fn next_build_is_monotonic_and_floored() {
 
 #[test]
 fn claim_rejects_non_canonical_three_component_versions() {
-    let git = Git::new("/nonexistent");
+    let git = LocalGit::new("/nonexistent");
+    let origin = crate::publisher_script::Script::new(Vec::new());
     let reserved = ledger::Reserved {
         build: NOW,
         commit: "0000000000000000000000000000000000000002".into(),
@@ -302,18 +317,26 @@ fn claim_rejects_non_canonical_three_component_versions() {
         };
         let rolls = |s: &str, m: &str| Ok((s.to_string(), m.to_string()));
         for err in [
-            ledger::reserve(&git, &plan, &rolls)
+            ledger::reserve(&git, &origin, &plan, &rolls)
                 .unwrap_err()
                 .to_string(),
-            ledger::claim(&git, Path::new("/nonexistent"), &plan, &reserved, &rolls)
-                .unwrap_err()
-                .to_string(),
+            ledger::claim(
+                &git,
+                &origin,
+                Path::new("/nonexistent"),
+                &plan,
+                &reserved,
+                &rolls,
+            )
+            .unwrap_err()
+            .to_string(),
         ] {
             assert!(err.contains("MAJOR.MINOR.PATCH"), "{bad:?} → {err}");
         }
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn happy_path_claims_appends_and_verifies() {
     let fix = Fixture::new("happy");
@@ -350,6 +373,7 @@ fn happy_path_claims_appends_and_verifies() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_published_commit_behind_main_is_released_and_merged() {
     let fix = Fixture::new("behind");
@@ -423,9 +447,10 @@ fn a_published_commit_behind_main_is_released_and_merged() {
     assert!(!released.contains("A peer's entry"), "{released}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_failure_building_mains_commit_leaves_the_checkout_on_the_published_commit() {
-    struct FailingLanding(Git);
+    struct FailingLanding(LocalGit);
     impl GitRunner for FailingLanding {
         fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
             let parents = args.iter().filter(|a| **a == "-p").count();
@@ -446,8 +471,10 @@ fn a_failure_building_mains_commit_leaves_the_checkout_on_the_published_commit()
     let fix = Fixture::new("landing-fails");
     let source = head_of(&fix.work);
     rival_peer_push(&fix);
-    let (res, attempts) = do_claim(
-        &FailingLanding(Git::new(&fix.work)),
+    let origin = Git::new(&fix.work);
+    let (res, attempts) = do_claim_with_origin(
+        &FailingLanding(LocalGit::new(&fix.work)),
+        &origin,
         &fix.work,
         "0.26.0",
         false,
@@ -458,6 +485,7 @@ fn a_failure_building_mains_commit_leaves_the_checkout_on_the_published_commit()
     assert_clean_at(&fix, &source);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_checkout_off_the_published_commit_is_refused_before_anything() {
     let fix = Fixture::new("off-source");
@@ -475,14 +503,15 @@ fn a_checkout_off_the_published_commit_is_refused_before_anything() {
         source: &tip,
     };
     let rolls = |s: &str, m: &str| changelog::claim_changelogs(s, m, "0.26.0", DATE);
-    let reserved = ledger::reserve(&git, &plan, &rolls).expect("reserved from objects");
-    ledger::claim(&git, &fix.work, &plan, &reserved, &|_, _| {
+    let reserved = ledger::reserve(&git, &git, &plan, &rolls).expect("reserved from objects");
+    ledger::claim(&git, &git, &fix.work, &plan, &reserved, &|_, _| {
         panic!("nothing is rolled")
     })
     .unwrap_err();
     assert!(!origin_subjects(&fix).contains("release: v0.26.0"));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_reservation_the_tail_reached_refuses_and_burns_nothing() {
     for (name, winner) in [
@@ -513,6 +542,7 @@ fn a_reservation_the_tail_reached_refuses_and_burns_nothing() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fresh_reservation_after_a_stale_one_lands_above_the_winner() {
     let fix = Fixture::new("stale-again");
@@ -536,6 +566,7 @@ fn a_fresh_reservation_after_a_stale_one_lands_above_the_winner() {
     assert_eq!(parents(&fix.work, &c.commit), vec![source]);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_lost_race_below_the_reservation_lands_it_with_its_own_number() {
     let fix = Fixture::new("cas-clock");
@@ -560,6 +591,7 @@ fn a_lost_race_below_the_reservation_lands_it_with_its_own_number() {
     assert_ne!(c.landed, c.commit, "the winner moved main: a merge");
 }
 
+#[cfg(unix)]
 #[test]
 fn retry_cap_aborts_clean_with_nothing_burned() {
     let fix = Fixture::new("cap");
@@ -580,6 +612,7 @@ fn retry_cap_aborts_clean_with_nothing_burned() {
     assert_eq!(origin_file(&fix, "RELEASES.ledger"), expected);
 }
 
+#[cfg(unix)]
 #[test]
 fn remote_tag_means_version_cut_elsewhere() {
     let fix = Fixture::new("tag-elsewhere");
@@ -605,6 +638,7 @@ fn remote_tag_means_version_cut_elsewhere() {
     assert_clean_at(&fix, &source);
 }
 
+#[cfg(unix)]
 #[test]
 fn remote_changelog_section_means_version_cut_elsewhere() {
     let fix = Fixture::new("section-elsewhere");
@@ -623,6 +657,7 @@ fn remote_changelog_section_means_version_cut_elsewhere() {
     assert_clean_at(&fix, &source);
 }
 
+#[cfg(unix)]
 #[test]
 fn recut_flag_claims_fresh_n_past_existing_section() {
     let fix = Fixture::new("recut");
@@ -646,6 +681,7 @@ fn recut_flag_claims_fresh_n_past_existing_section() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_recut_from_a_source_carrying_the_section_moves_only_the_ledger() {
     let fix = Fixture::new("recut-tip");
@@ -675,6 +711,7 @@ fn a_recut_from_a_source_carrying_the_section_moves_only_the_ledger() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_reservation_that_is_not_the_claims_is_refused_before_the_push() {
     let fix = Fixture::new("not-the-claims");
@@ -688,7 +725,7 @@ fn a_reservation_that_is_not_the_claims_is_refused_before_the_push() {
         source: &source,
     };
     let rolls = |s: &str, m: &str| changelog::claim_changelogs(s, m, "0.26.0", DATE);
-    let reserved = ledger::reserve(&git, &plan, &rolls).expect("reserved");
+    let reserved = ledger::reserve(&git, &git, &plan, &rolls).expect("reserved");
     let ledger_text = run(
         &fix.work,
         "git",
@@ -732,7 +769,7 @@ fn a_reservation_that_is_not_the_claims_is_refused_before_the_push() {
             ..reserved.clone()
         };
         assert!(
-            ledger::claim(&git, &fix.work, &plan, &forged, &rolls).is_err(),
+            ledger::claim(&git, &git, &fix.work, &plan, &forged, &rolls).is_err(),
             "{why}"
         );
     }
@@ -751,6 +788,7 @@ fn a_reservation_that_is_not_the_claims_is_refused_before_the_push() {
     .unwrap();
     let err = ledger::claim(
         &git,
+        &git,
         &fix.work,
         &plan,
         &ledger::Reserved {
@@ -765,9 +803,10 @@ fn a_reservation_that_is_not_the_claims_is_refused_before_the_push() {
     assert_clean_at(&fix, &source);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_claim_that_landed_unjournaled_is_spent_and_the_re_run_claims_anew() {
-    struct FailingCheckout(Git);
+    struct FailingCheckout(LocalGit);
     impl GitRunner for FailingCheckout {
         fn git(&self, args: &[&str]) -> ledger::Result<RunOut> {
             if args.contains(&"checkout") {
@@ -785,8 +824,10 @@ fn a_claim_that_landed_unjournaled_is_spent_and_the_re_run_claims_anew() {
         }
     }
     let fix = Fixture::new("landed-unjournaled");
-    let (res, _) = do_claim(
-        &FailingCheckout(Git::new(&fix.work)),
+    let origin = Git::new(&fix.work);
+    let (res, _) = do_claim_with_origin(
+        &FailingCheckout(LocalGit::new(&fix.work)),
+        &origin,
         &fix.work,
         "0.26.0",
         false,
@@ -806,6 +847,7 @@ fn a_claim_that_landed_unjournaled_is_spent_and_the_re_run_claims_anew() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn malformed_remote_ledger_aborts_before_any_commit() {
     let fix = Fixture::new("malformed");
@@ -821,38 +863,92 @@ fn malformed_remote_ledger_aborts_before_any_commit() {
     assert_clean_at(&fix, &source);
 }
 
+#[cfg(unix)]
 #[test]
 fn offline_fetch_fails_closed() {
     let fix = Fixture::new("offline");
-    let gone = fix.root.path().join("nonexistent.git");
-    run(
-        &fix.work,
-        "git",
-        &["remote", "set-url", "origin", gone.to_str().unwrap()],
-    );
     let git = Git::new(&fix.work);
+    fs::rename(&fix.origin, fix.root.path().join("offline.git")).unwrap();
     let (res, attempts) = do_claim(&git, &fix.work, "0.26.0", false);
     res.unwrap_err();
     assert_eq!(attempts, 0, "no offline claim may roll anything");
 }
 
+#[cfg(unix)]
 #[test]
-fn a_push_lost_at_the_remote_is_a_lost_race_and_a_refused_one_is_not() {
-    // git 2.56's receive-pack, whose ref moved between its advertisement and its update (a
-    // pre-receive hook moved it), says why on the push's own line, below a `remote: error:
-    // cannot lock ref …` line of its own; GitHub gives the lock's words as the reason.
-    let git_reason = " ! [remote rejected] main -> main (incorrect old value provided)\nerror: \
-                      failed to push some refs to '/tmp/o.git'";
-    let github = " ! [remote rejected] main -> main (cannot lock ref 'refs/heads/main': is at \
-                  bd0944f2c96d but expected f5da300a05b1)\nerror: failed to push some refs";
-    let here = " ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs";
-    for stderr in [git_reason, github, here] {
-        assert!(ledger::lost_race(stderr), "{stderr}");
+fn an_uncertain_native_claim_never_retries_or_rereads_as_a_race() {
+    struct LostReply {
+        inner: Git,
+        refreshes: Cell<u32>,
+        writes: Cell<u32>,
     }
-    let refused = " ! [remote rejected] main -> main (protected branch hook declined)\nerror: \
-                   failed to push some refs";
-    let offline = "fatal: unable to access 'https://github.com/o/r/': Could not resolve host";
-    for stderr in [refused, offline] {
-        assert!(!ledger::lost_race(stderr), "{stderr}");
+    impl ledger::Origin for LostReply {
+        fn refresh_main(&self) -> std::result::Result<String, String> {
+            self.refreshes.set(self.refreshes.get() + 1);
+            ledger::Origin::refresh_main(&self.inner)
+        }
+        fn get(&self, _: &str) -> std::result::Result<Option<String>, String> {
+            panic!("unknown is not a conflict/tag probe")
+        }
+        fn import(&self, _: &str) -> std::result::Result<(), String> {
+            panic!("unexpected import")
+        }
+        fn peel(&self, _: &str) -> std::result::Result<Option<String>, String> {
+            panic!("unexpected peel")
+        }
+        fn tag_object(&self, _: &str) -> std::result::Result<Vec<u8>, String> {
+            panic!("unexpected tag")
+        }
+        fn write(
+            &self,
+            reference: &str,
+            before: Option<&str>,
+            after: &str,
+        ) -> std::result::Result<ledger::RefWrite, String> {
+            self.writes.set(self.writes.get() + 1);
+            assert_eq!(
+                ledger::Origin::write(&self.inner, reference, before, after)?,
+                ledger::RefWrite::Written
+            );
+            // The real native backend accepted the exact main update; this
+            // fixture withholds only its reply. Journal persistence is tested
+            // separately at the real native adapter's intent boundary.
+            Err("outcome unknown; side_effect=unknown; [rejected] non-fast-forward".into())
+        }
+        fn delete(&self, _: &str, _: &str) -> std::result::Result<ledger::RefWrite, String> {
+            panic!("unexpected delete")
+        }
+        fn control_transaction(
+            &self,
+            _: ledger::ControlRefTransaction,
+        ) -> std::result::Result<ledger::RefWrite, String> {
+            panic!("unexpected control")
+        }
     }
+    let fix = Fixture::new("unknown-reply");
+    let source = head_of(&fix.work);
+    let origin = LostReply {
+        inner: Git::new(&fix.work),
+        refreshes: Cell::new(0),
+        writes: Cell::new(0),
+    };
+    let (result, _) = do_claim_with_origin(&origin.inner, &origin, &fix.work, "0.26.0", false);
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains("outcome unknown"), "{error}");
+    assert_eq!(origin.writes.get(), 1, "no repeated mutation");
+    assert_eq!(
+        origin.refreshes.get(),
+        2,
+        "only reservation and initial claim snapshots, no post-read"
+    );
+    assert_eq!(
+        head_of(&fix.work),
+        source,
+        "no successful claim/detach is reported"
+    );
+    assert_eq!(
+        origin_file(&fix, "RELEASES.ledger"),
+        format!("{SEED_LEDGER}1790000000 0.26.0\n"),
+        "the native write really landed despite the withheld reply"
+    );
 }

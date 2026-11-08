@@ -9,11 +9,15 @@ use aterm_agent::harness::relaunch::{
 #[path = "native_memory_signal_fence_tests.rs"]
 mod signal_fence;
 
+// Kernel PIDs are positive signed integers. Keep the synthetic controller outside
+// that range so inserting a real resumed child cannot replace its authority.
+const CONTROLLER_PID: u32 = u32::MAX;
+
 fn builtin() -> SupervisorInputCaller {
     SupervisorInputCaller {
         principal: Principal::Harness,
         connection: Some(8),
-        peer: Some(900),
+        peer: Some(CONTROLLER_PID),
         proof: None,
     }
 }
@@ -29,6 +33,14 @@ fn complete_cold_source(
     use crate::input::{Delivery, EgressReceipt};
     let ctx = &handle.ctx;
     let mut kernel = DeferredFacts::new();
+    {
+        let mut processes = kernel.base.processes.lock().unwrap();
+        processes.remove(&900);
+        processes.insert(
+            CONTROLLER_PID,
+            process(CONTROLLER_PID, 1, CONTROLLER_PID, 400, 20),
+        );
+    }
     // The real producer captures this image independently when it builds its recipe.
     // Keep the synthetic helper image too; neither path admits an arbitrary launcher.
     kernel.actual_launcher = Some(Image::at(&std::env::current_exe().unwrap()).unwrap());
@@ -53,7 +65,7 @@ fn complete_cold_source(
         settles: None,
     };
     let mut old_pid = world.process().pid.checked_add(1_000_000).unwrap();
-    while [world.process().pid, world.shell().pid, 900].contains(&old_pid) {
+    while [world.process().pid, world.shell().pid, CONTROLLER_PID].contains(&old_pid) {
         old_pid = old_pid.checked_add(1).unwrap();
     }
     let mut old = process(

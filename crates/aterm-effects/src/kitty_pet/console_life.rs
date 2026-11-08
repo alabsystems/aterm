@@ -851,15 +851,32 @@ impl PetBrain {
             self.console.repair_until = None;
             self.console.repair_target = None;
         }
+        let since_tick = match self.last_now {
+            Some(tick) => now.saturating_duration_since(tick).as_secs_f64(),
+            None => 0.0,
+        };
+        // A PASTE OPENS A BURST OF ITS OWN ([`OldPath::PasteOpensItsOwnBurst`]): its echo joins
+        // no burst a program's output left behind, seconds settled. Joined to one (a command's
+        // lines printed before the prompt), the paste's burst began seconds before it, past
+        // [`SETTLE_CAP`]: no coil or eviction waited the paste and its Return out, and the cat
+        // stepped off the pasted letters at once for the line's end, came down on the new
+        // prompt's row there and flew back (windowed zsh, every delay, r29 K9-5).
+        if kind == PetInputKind::Paste && !self.old_path(OldPath::PasteOpensItsOwnBurst) {
+            self.burst_from = None;
+            self.jump_gap = 0.0;
+        }
         self.paste_hold = match kind {
-            PetInputKind::Paste => {
-                let since_tick = match self.last_now {
-                    Some(tick) => now.saturating_duration_since(tick).as_secs_f64(),
-                    None => 0.0,
-                };
-                Some(self.clock + since_tick + f64::from(PASTE_SETTLE))
-            }
-            PetInputKind::Submit => self.paste_hold,
+            PetInputKind::Paste => Some(self.clock + since_tick + f64::from(self.paste_settle())),
+            // The Return the paste held its burst open for has come: the hold runs on only for
+            // its echo ([`HAND_ECHO`]), the Enter's repaint a burst of its own after it
+            // ([`OldPath::PasteHoldsForItsReturn`]). Held on to its end, a paste entered 120 ms
+            // after it sent the cat to the new prompt 0.9 s after the paste.
+            PetInputKind::Submit => match self.paste_hold {
+                Some(until) if !self.old_path(OldPath::PasteHoldsForItsReturn) => {
+                    Some(until.min(self.clock + since_tick + f64::from(HAND_ECHO)))
+                }
+                held => held,
+            },
             _ => None,
         };
         self.console.seq = self.console.seq.wrapping_add(1).max(1);
@@ -4202,6 +4219,23 @@ impl PetBrain {
             return false;
         };
         matches!(world.rule_line(row.round() as usize), Some(true))
+    }
+
+    /// Whether `row` divides a composer's writing from the rows past it: drawn as a rule
+    /// ([`Self::console_rule_at`]), or the host's line, its chrome laid on the rule (the footer
+    /// chips on a composer's lower rule leave too few strokes for a rule's, [`PetWorld::host_line`]).
+    #[inline]
+    pub(super) const fn console_divides_at(&self, row: f32) -> bool {
+        if self.console_rule_at(row) {
+            return true;
+        }
+        if !self.console.presentable || !row.is_finite() || row < -0.5 {
+            return false;
+        }
+        let Some(world) = self.console.world.as_ref() else {
+            return false;
+        };
+        matches!(world.host_line(row.round() as usize), Some(true))
     }
 
     /// Whether the console lets a cat rest at `desired` (`(col, foot row)`) and settle there: no lasting protected cell (the host's chrome; a selection or an overlay passes) under its whole body, as a rest is judged when no escort passes under the host's labels, nor [`ARRIVED`] to either side of it, where the walk that brings it there may stop. Unobserved ground and a console that is not presentable admit it.

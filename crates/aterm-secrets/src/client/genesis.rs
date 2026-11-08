@@ -15,6 +15,19 @@ use crate::commons::bootstrap::{Availability, Bootstrap};
 use crate::membership_log::genesis::{self, Machine};
 use crate::membership_log::{Record, Root};
 
+const GENESIS_READ_HANG: Duration = Duration::from_secs(60);
+
+fn genesis_bootstrap_started(paths: &Paths, started: Instant) -> crate::Result<Bootstrap> {
+    match Bootstrap::observe_until(paths, started + GENESIS_READ_HANG)? {
+        Availability::Available(bootstrap) => Ok(*bootstrap),
+        Availability::Unavailable(reason) => Err(Error::new(format!(
+            "reading the Commons bindings needs this Mac's Commons control applied ({}): {}",
+            reason.code(),
+            reason.explanation()
+        ))),
+    }
+}
+
 /// What [`admin_sign_genesis`] wrote.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SignedGenesis {
@@ -211,17 +224,7 @@ fn sign_genesis_in_realm(
             "Genesis v2 lists each Mac's Commons binding, and this vault has no Commons control yet: aterm secrets commons init founds it",
         ));
     };
-    let bootstrap = match Bootstrap::observe_until(paths, Instant::now() + Duration::from_secs(30))?
-    {
-        Availability::Available(bootstrap) => *bootstrap,
-        Availability::Unavailable(reason) => {
-            return Err(Error::new(format!(
-                "reading the Commons bindings needs this Mac's Commons control applied ({}): {}",
-                reason.code(),
-                reason.explanation()
-            )));
-        }
-    };
+    let bootstrap = genesis_bootstrap_started(paths, Instant::now())?;
     let trust = descriptor.trust();
     if bootstrap.trust() != trust {
         return Err(Error::new(

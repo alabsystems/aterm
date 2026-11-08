@@ -38,7 +38,7 @@ use aterm_json::Value;
 use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 /// What one pass did.
@@ -113,6 +113,63 @@ pub(crate) fn pass_with(
     off: bool,
     now: u64,
 ) -> Result<Flushed> {
+    pass_started(paths, spool, presence, holdings, off, now, Instant::now())
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn native_journal_flush_waits_for_unchanged_custody() {
+    use std::{os::unix::fs::MetadataExt as _, time::Duration};
+
+    let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
+    lab.bootstrap(0);
+    let paths = &lab.paths[0];
+    let held = aterm_uds::private_file::PrivateLock::take_with(
+        &paths.dir,
+        "commons.lock",
+        Duration::ZERO,
+        "private custody held",
+        || {},
+    )
+    .unwrap();
+    let named = std::fs::metadata(paths.dir.join("commons.lock")).unwrap();
+    let identity = (named.dev(), named.ino());
+    let mut held = Some(held);
+    let result = aterm_uds::file_lock::with_lock_wait_observer(
+        move |file| {
+            let actual = file.metadata().unwrap();
+            assert_eq!((actual.dev(), actual.ino()), identity);
+            if let Some(held) = held.take() {
+                drop(held);
+            }
+        },
+        || {
+            let started = Instant::now() - Duration::from_secs(3);
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let spool = Spool::at(scratch.path().join("spool"));
+            pass_started(
+                paths,
+                &spool,
+                &Presence::default,
+                &|| None,
+                false,
+                1_728_000_600,
+                started,
+            )
+        },
+    );
+    assert!(matches!(result, Ok(Flushed::Wrote { .. })), "{result:?}");
+}
+
+fn pass_started(
+    paths: &Paths,
+    spool: &Spool,
+    presence: &dyn Fn() -> Presence,
+    holdings: &dyn Fn() -> Option<Vec<Holding>>,
+    off: bool,
+    now: u64,
+    started: Instant,
+) -> Result<Flushed> {
     let absorbed = spool.absorb()?;
     let mut book = Book::load(spool);
     let held = spool.outbox()?;
@@ -165,7 +222,7 @@ pub(crate) fn pass_with(
 
     let selected = crate::generation::selected(paths)?;
     let paths = &selected;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = crate::admission::deadline_at(started);
     let (bootstrap, journal) =
         Bootstrap::required_with_journal_until(paths, deadline).map_err(crate::table::failure)?;
     let session = Session::from_admitted_journal(&bootstrap, journal)?;

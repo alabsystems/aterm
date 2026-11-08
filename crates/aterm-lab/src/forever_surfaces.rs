@@ -123,7 +123,7 @@ pub struct Window {
     /// `autopilot` line, title and all (`-` where its label was not in the strip).
     pub held: Vec<(i64, String)>,
     /// What a screen reader is handed at each of those looks, one per [`Self::held`] entry at its
-    /// time: `sid`'s Autopilot chip node and the window's Messages band row nodes ([`ax_of`]).
+    /// time: `sid`'s Autopilot chip node ([`ax_of`]).
     pub held_ax: Vec<(i64, String)>,
     /// `cruise-n`'s stand-in ask beside its N4 report ([`stopped::ask_step`]): what Needs you
     /// showed of the two ([`stopped::Read::line`]).
@@ -863,9 +863,8 @@ pub fn chip_of(chrome: &str, sid: &str) -> Option<String> {
 }
 
 /// THE SCREEN READER'S HARNESS NODES in a `chrome` read (a development build's `a11y` lines,
-/// §14.3's windowed read): `sid`'s Autopilot chip node and every Messages band row node, as the
-/// window's accessibility tree is built for the adapter, one a line without the `a11y ` head;
-/// `-` where `chrome` printed none.
+/// §14.3's windowed read): `sid`'s Autopilot chip node, as the window's accessibility tree is
+/// built for the adapter, one a line without the `a11y ` head; `-` where `chrome` printed none.
 #[must_use]
 pub fn ax_of(chrome: &str, sid: &str) -> String {
     let chip = format!("autopilot sid={sid} ");
@@ -874,7 +873,7 @@ pub fn ax_of(chrome: &str, sid: &str) -> String {
         .filter_map(|l| l.strip_prefix("a11y "))
         .filter(|l| {
             l.split_once(' ')
-                .is_some_and(|(_, node)| node.starts_with(&chip) || node.starts_with("band row="))
+                .is_some_and(|(_, node)| node.starts_with(&chip))
         })
         .collect();
     if nodes.is_empty() {

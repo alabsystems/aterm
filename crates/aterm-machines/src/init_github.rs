@@ -838,7 +838,7 @@ mod tests {
     fn fixture() -> (Fake, Auth, Ctx) {
         let mut sys = Fake::root();
         sys.euid = 501;
-        sys.stat_of(GIT, stat(0o755, 0));
+        sys.stat_of(GIT, stat(0o755, 1));
         sys.file(SOURCE, VALUE.as_bytes())
             .stat_of(SOURCE, stat(0o600, VALUE.len()));
         let u = user("alice", 501);
@@ -1134,7 +1134,7 @@ mod tests {
 
         let mut bare = Fake::root();
         bare.euid = 501;
-        bare.stat_of(GIT, stat(0o755, 0));
+        bare.stat_of(GIT, stat(0o755, 1));
         bare.file(SOURCE, VALUE.as_bytes())
             .stat_of(SOURCE, stat(0o600, VALUE.len()));
         let Probe::Blocked { why } = auth.probe(&bare, &context) else {

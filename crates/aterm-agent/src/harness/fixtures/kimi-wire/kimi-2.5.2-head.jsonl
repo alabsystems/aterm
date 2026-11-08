@@ -1,0 +1,6 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1794115339358}
+{"type":"environment.set_binding","environmentId":"local","agentId":"main","time":1794115339368}
+{"type":"permission.set_mode","agentId":"main","mode":"manual","time":1794115339380}
+{"type":"turn.prompt","agentId":"main","input":[{"type":"text","text":"toolstart"}],"origin":{"kind":"user"},"promptId":"msg_01M6WSQ140QQ0KX3AH45116CC7","turnId":0,"time":1794115339396}
+{"turnId":0,"queueItemId":"msg_01M6WSQ140QQ0KX3AH45116CC7","type":"agent.turn.started","time":1794115339394,"kind":"event"}
+{"type":"usage.record","agentId":"main","model":"lab","usage":{"inputOther":14073,"output":30,"inputCacheCreation":0},"usageScope":"turn","time":1794115339414}

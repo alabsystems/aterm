@@ -103,6 +103,9 @@ fn main() -> std::process::ExitCode {
         };
     }
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(code) = release_target::finish_if_asked(&args) {
+        return code;
+    }
     if args.len() == 1 && args[0] == "--version" {
         println!("{}", release_tools::CUTTER_VERSION);
         return std::process::ExitCode::SUCCESS;

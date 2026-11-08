@@ -681,15 +681,6 @@ impl RenamePreview {
     pub fn waits(&self) -> bool {
         self.name.migration == Some(Migration::Waiting)
     }
-
-    /// This read as though other nodes' records carried `taken`, for another crate's test of what
-    /// it says of a shared nickname.
-    #[cfg(any(test, debug_assertions))]
-    #[must_use]
-    pub fn with_taken_for_test(mut self, taken: Vec<Nickname>) -> Self {
-        self.taken = taken;
-        self
-    }
 }
 
 /// Read what [`set_name`] judges a rename by, for [`RenamePreview::judge`]: the name as a first

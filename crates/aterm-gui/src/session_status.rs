@@ -163,6 +163,30 @@ struct AgentWatch {
     /// [`AGENT_MIN_INTERVAL`] of it is read again then rather than published
     /// ([`StatusObserver::agent_observe`]).
     rest_at: Option<Instant>,
+    /// The Kimi Bash box standing, judged against its record ([`crate::kimi_record::judge`]).
+    kimi_box: Option<crate::kimi_record::Seen>,
+    /// That box is not settled yet: its screen is read again at [`AGENT_MIN_INTERVAL`] though
+    /// nothing on it moved ([`crate::kimi_record::Judged::Again`]).
+    kimi_again: bool,
+    /// What the sweep's looks found of the tab's input ([`StatusObserver::note_input`]).
+    input: InputSeen,
+    /// When the screen this watch last read was first seen: its generation or cursor moved
+    /// then. A Kimi box's verdict is read again until a read of its record begun since counts
+    /// ([`crate::kimi_record::judge`]).
+    screen_at: Option<Instant>,
+    /// The last verdict was a Kimi agent's: a look that found its input unread asks for
+    /// another at the next pass ([`StatusObserver::next_wake`]).
+    kimi: bool,
+}
+
+/// What the sweep's looks at a tab's input found ([`StatusObserver::note_input`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct InputSeen {
+    /// The last look; none before the first.
+    look: Option<aterm_session::sink::InputLook>,
+    /// No earlier than when the program read the last input driven into it: wall-clock
+    /// milliseconds since the Unix epoch.
+    ms: u64,
 }
 
 /// Published agent status tuple: `(word, detail, prompt_subject, program_name)`.
@@ -810,6 +834,107 @@ pub(crate) fn block_read(
 }
 
 pub(crate) const BLOCK_READ_MAX: usize = 32;
+
+/// THE CLOSE'S LAST VISIT (unit J1-1, SMOKE-3c): what the status sweep reads of a session, read
+/// once more as it closes, before its log does. Command runs are opened and closed only by the
+/// sweep's visit, whenever the session is due; a command the engine finished after that visit
+/// was otherwise never logged and never counted. Here its run's open and close are written from
+/// the block's own stamps (the read the sweep makes, [`block_read`], and its writer,
+/// `SessionLog::shell_blocks`, whose losses are its `gap` and `lost=`), and the engine's marks
+/// since the visit (a notification, a bell, progress) are said. Never both held: the log's
+/// block cursor under the timeline lock, then the block read and the engine read under the term
+/// guard, then both written under the timeline lock; a read cut at its cap reads on while the
+/// cursor moves.
+pub(crate) fn last_visit(
+    term: &std::sync::Mutex<aterm_core::terminal::Terminal>,
+    ctx: &crate::SessionCtx,
+) {
+    let mut engine_said = false;
+    loop {
+        let (from, since_wall) = {
+            let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                timeline.slog().block_cursor(),
+                timeline.slog().opened_wall(),
+            )
+        };
+        let (blocks, engine) = {
+            let guard = crate::term_lock(term);
+            (
+                block_read(&guard, from, since_wall, &ctx.ran),
+                (!engine_said).then(|| crate::session_log::observed::EngineRead::of(&guard)),
+            )
+        };
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        let at = timeline.slog().now();
+        timeline.slog_mut().shell_blocks(&blocks, None, at);
+        if let Some(engine) = engine {
+            timeline.slog_mut().observe_engine(&engine, at);
+            engine_said = true;
+        }
+        let moved = timeline.slog().block_cursor() != from;
+        drop(timeline);
+        if !blocks.more || !moved {
+            break;
+        }
+    }
+}
+
+/// WHAT `term`'S OSC TITLE STANDS FOR (unit J1-1, SMOKE-1e): the command line the shell
+/// announced (OSC 633;E) for the block it builds or the one it archived last, when the title, or
+/// its informative part, is that line as a shell integration sets a running command's title
+/// ([`title_is_line`]); else the title's own words, the shell's directory or a program's own
+/// title (an agent's summary). Judged by the title against the line, never by the block's state:
+/// aterm's zsh, bash, fish and PowerShell integrations set the title to the line right after E,
+/// before C, and set the directory again only after D, after the user's own precmd hooks, so the
+/// line stands from E to the next prompt's title. Read off the engine under the drift flush's own
+/// guard, never off the log, whose `cmd` run the status sweep opens and closes on its own cadence.
+pub(crate) fn title_stands(
+    term: &aterm_core::terminal::Terminal,
+) -> crate::session_log::observed::TitleStands {
+    use crate::session_log::observed::TitleStands;
+    let title = term.title();
+    let shown = crate::tab_label::informative(title).to_string();
+    let announced = [term.current_block(), term.last_completed_block()];
+    let line_stands = announced
+        .into_iter()
+        .flatten()
+        .filter_map(|b| b.commandline.as_deref())
+        .any(|line| title_is_line(title, line) || title_is_line(&shown, line));
+    if line_stands {
+        TitleStands::CommandLine
+    } else {
+        TitleStands::Own
+    }
+}
+
+/// Whether `title` is the command `line` as a shell integration sets a running command's title:
+/// the line with its control characters dropped (zsh, bash, fish and PowerShell drop them, the
+/// engine drops them and the bidi overrides), or that line cut short and ended by an ellipsis
+/// (`…`, which aterm's integrations put after 255 characters, or `...`), a cut that a shell
+/// counting bytes may have ended inside a character (U+FFFD).
+pub(crate) fn title_is_line(title: &str, line: &str) -> bool {
+    fn kept(c: &char) -> bool {
+        !c.is_control() && !matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    }
+    let title: String = title.chars().filter(kept).collect();
+    let line = || line.chars().filter(kept);
+    if title.is_empty() || line().next().is_none() {
+        return false;
+    }
+    if line().eq(title.chars()) {
+        return true;
+    }
+    ["\u{2026}", "..."].into_iter().any(|ellipsis| {
+        title
+            .strip_suffix(ellipsis)
+            .map(|cut| cut.trim_end_matches('\u{FFFD}'))
+            .is_some_and(|cut| {
+                let mut rest = line();
+                !cut.is_empty() && cut.chars().all(|c| rest.next() == Some(c))
+            })
+    })
+}
 
 /// The [`command_detail`] of `term`'s currently executing block, confirmed against `ran`.
 pub(crate) fn executing_detail(
@@ -3030,10 +3155,25 @@ impl StatusObserver {
                 let settle = w
                     .rest_at
                     .map(|at| (at + AGENT_MIN_INTERVAL).max(slot.next_due));
-                [followup, unresolved, confirmation, build_wait, settle]
-                    .into_iter()
-                    .flatten()
-                    .min()
+                let kimi = w.kimi_again.then(|| {
+                    w.read_at.map_or(slot.next_due, |at| {
+                        (at + AGENT_MIN_INTERVAL).max(slot.next_due)
+                    })
+                });
+                let unread = (w.kimi && w.input.look.is_some_and(|look| !look.read))
+                    .then_some(slot.next_due);
+                [
+                    followup,
+                    unresolved,
+                    confirmation,
+                    build_wait,
+                    settle,
+                    kimi,
+                    unread,
+                ]
+                .into_iter()
+                .flatten()
+                .min()
             })
             .min();
         let rollout_wake = self
@@ -3167,6 +3307,34 @@ impl StatusObserver {
         }
     }
 
+    /// Notes one `look` at `session`'s input ([`aterm_session::sink::SinkWriter::input_look`]),
+    /// taken after its screen was read, and `wall_ms`, the wall clock read after the look
+    /// ([`crate::kimi_record::wall_ms`]), for the next [`Self::agent_observe`]: a Kimi Bash box's
+    /// record is judged against when the program last read its input
+    /// ([`crate::kimi_record::judge`]). That moment is this look's, unless this look and the one
+    /// before it both found every driven byte read and nothing driven between them: then it
+    /// stays where it was. So the program read no input after it that it had read by this
+    /// look. It never moves back, whatever the wall clock does.
+    pub(crate) fn note_input(
+        &mut self,
+        session: u64,
+        look: aterm_session::sink::InputLook,
+        wall_ms: u64,
+    ) {
+        let w = self.agents.entry(session).or_insert_with(|| AgentWatch {
+            pgid: -1,
+            ..AgentWatch::default()
+        });
+        let quiet = look.read
+            && w.input
+                .look
+                .is_some_and(|last| last.read && last.mark == look.mark);
+        if !quiet {
+            w.input.ms = w.input.ms.max(wall_ms);
+        }
+        w.input.look = Some(look);
+    }
+
     /// Returns whether the current sweep should read `session`'s terminal screen rows for agent
     /// classification. `runs` is the title's run bit ([`crate::presence::title_runs`]): a move of
     /// it alone is a move, since a title-only OSC moves neither the screen nor the cursor, and so
@@ -3192,7 +3360,8 @@ impl StatusObserver {
             || w.cursor_seen != Some(cursor)
             || program_moved
             || w.runs_seen != runs
-            || settle_due;
+            || settle_due
+            || w.kimi_again;
         if !moved {
             return false;
         }
@@ -3303,6 +3472,9 @@ impl StatusObserver {
         };
         w.read_at = Some(now);
         let moved = screen_moved;
+        if moved || w.screen_at.is_none() {
+            w.screen_at = Some(now);
+        }
         w.seq_seen = Some(generation);
         w.cursor_seen = Some(cursor);
         w.followup = moved || resolving;
@@ -3328,7 +3500,7 @@ impl StatusObserver {
         w.classified_at = Some(now);
         let known = w.frame.filter(|(g, _)| *g == pgid).map(|(_, p)| p);
         let pending = program.is_none() && pgid > 0;
-        let verdict = crate::presence::agent_verdict_guarded(
+        let mut verdict = crate::presence::agent_verdict_guarded(
             session,
             program.as_deref(),
             pending,
@@ -3338,6 +3510,36 @@ impl StatusObserver {
             title,
             now,
         );
+        // A Kimi Bash box the screen reads as read-only is judged against Kimi's own record too.
+        // That verdict rests on more than the live zone (the record, and the tab's input), so the
+        // next screen is classified whole, and a box not yet settled is read again though nothing
+        // moves (a request may land on disk after it).
+        let judged = crate::kimi_record::judge(
+            session,
+            pgid,
+            &mut verdict,
+            || crate::presence::prompt_drawn(aterm_phase::Program::Kimi, &rows),
+            (w.input.ms, w.screen_at.unwrap_or(now)),
+            &mut w.kimi_box,
+            now,
+        );
+        w.kimi_again = judged == crate::kimi_record::Judged::Again;
+        // Only a Kimi box is judged against when its program read its input.
+        w.kimi = match verdict.program() {
+            Some(aterm_phase::Program::Kimi) => true,
+            Some(
+                aterm_phase::Program::Claude
+                | aterm_phase::Program::Codex
+                | aterm_phase::Program::Agy
+                | aterm_phase::Program::Muse
+                | aterm_phase::Program::Grok
+                | aterm_phase::Program::Generic,
+            )
+            | None => false,
+        };
+        if judged != crate::kimi_record::Judged::Untouched {
+            w.zone_hash = None;
+        }
         if let crate::presence::AgentVerdict::Agent {
             by_frame: true,
             program,
@@ -3362,6 +3564,18 @@ impl StatusObserver {
         }
         let reading = verdict.reading().cloned();
         let reading_changed = reading != w.reading;
+        if judged != crate::kimi_record::Judged::Untouched
+            && !moved
+            && !program_moved
+            && !reading_changed
+        {
+            // A box read again for its record alone, on a screen that did not move, that reads
+            // as it did: the published verdict stands for this screen, as an unchanged zone's.
+            return AgentStep {
+                zone_unchanged: true,
+                ..AgentStep::default()
+            };
+        }
         if reading_changed {
             self.agent_seq += 1;
             w.reading = reading;
@@ -3584,6 +3798,7 @@ impl StatusObserver {
         self.footer_asked.remove(&session);
         crate::codex_rollout_tap::retire_session(session);
         self.rollout_asked.remove(&session);
+        crate::kimi_record::forget(session);
         if self.sessions.remove(&session).is_some() {
             self.next_due_any = self.sessions.values().map(|slot| slot.next_due).min();
         }
@@ -3773,6 +3988,9 @@ impl crate::App {
                     now,
                 ))
             .then(|| std::sync::Arc::new(crate::frame_memo::ScreenText::of(&guard)));
+            // The screen's moves as this read saw them: the reader counts a feed under the term
+            // lock held here (fix E8, `SessionLog::note_frame`).
+            let read_moves = session.ctx.screen_moves.count();
             drop(guard);
             let (zone, stamp) = match read {
                 Some(text) => {
@@ -4016,6 +4234,9 @@ impl crate::App {
                 crate::integration_notice::heal_for(channel, front_agent, moves, codex_line)
             });
             let _ = self.integration_notices.observe(id, heal, now);
+            let look = session.ctx.sink.input_look();
+            self.session_status
+                .note_input(id, look, crate::kimi_record::wall_ms());
             let step = self.session_status.agent_observe(
                 id, generation, zone, cursor, program, pgid, resolve, &title, now,
             );
@@ -4037,6 +4258,7 @@ impl crate::App {
                         timeline.set_gauges(step.gauges);
                         timeline.note_grid(grid, now);
                         let moved = timeline.publish_agent(word, detail, subject, reader, stamp);
+                        timeline.slog_mut().note_frame(step.turn.keys, read_moves);
                         let at = timeline.slog().now();
                         timeline.slog_mut().observe_screen_facts(
                             step.turn.ctx_pct,
@@ -4057,8 +4279,11 @@ impl crate::App {
                     timeline.note_grid(grid, now);
                     // Only an unchanged zone's read stands for the published word; a read the
                     // rest settle withheld leaves the stamp on the screen that word was read from.
+                    // The frame a key lands on follows the same rule: an unchanged zone's frame
+                    // stands at this read's moves, a withheld read's does not (fix E8).
                     if step.zone_unchanged {
                         timeline.note_agent_stamp(stamp);
+                        timeline.slog_mut().note_same_frame(read_moves);
                     }
                     false
                 }

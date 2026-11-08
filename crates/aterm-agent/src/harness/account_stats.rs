@@ -757,11 +757,6 @@ pub fn dollars(look: &Look<'_>, view: &View, win: &Win) -> Option<spend::Figure>
         on_credits: on_credits(look.record(), from),
         attribution: look.attribution(from),
         api_key_seen: look.api_key_seen,
-        machines: spend::Machines {
-            reported: 1,
-            used: 1,
-            silent: 0,
-        },
         now: look.now,
     };
     Some(spend::figure(spend, &ask))
@@ -1311,7 +1306,6 @@ pub fn window_value(win: &Win, now: i64) -> Value {
         Value::from(f.map(|f| f.source.clone())),
     );
     o.insert("by".to_owned(), Value::from(f.map(|f| f.by.clone())));
-    o.insert("cached".to_owned(), Value::from(false));
     o.insert(
         "since".to_owned(),
         win.since.as_ref().map_or(Value::Null, since_value),
@@ -1390,19 +1384,15 @@ fn spend_window_json(win: &Win, figure: &spend::Figure, on_credits: bool) -> Val
         .filter(|_| !figure.rolling)
         .map(|w| w.as_str());
     o.insert("suppressed".to_owned(), Value::from(suppressed));
-    let mut m = Map::new();
-    m.insert("reported".to_owned(), Value::from(1u64));
-    m.insert("used".to_owned(), Value::from(1u64));
-    o.insert("machines".to_owned(), Value::Object(m));
     Value::Object(o)
 }
 
-/// Render the `--json` document of `look` (schema 1).
+/// Render the `--json` document of `look` (schema 2).
 #[must_use]
 pub fn json(look: &Look<'_>, view: &View, aterm: &str) -> String {
     let now = look.now;
     let mut doc = Map::new();
-    doc.insert("schema".to_owned(), Value::from(1u64));
+    doc.insert("schema".to_owned(), Value::from(2u64));
     doc.insert("kind".to_owned(), Value::from("account-stats"));
     put_time(&mut doc, "as_of", Some(now));
     let mut missing = Vec::new();
@@ -1434,11 +1424,9 @@ pub fn json(look: &Look<'_>, view: &View, aterm: &str) -> String {
         "id".to_owned(),
         Value::from(look.machine.map(str::to_owned)),
     );
-    machine.insert("name".to_owned(), Value::Null);
     machine.insert("aterm".to_owned(), Value::from(aterm));
     put_time(&mut machine, "clock", Some(now));
     doc.insert("machine".to_owned(), Value::Object(machine));
-    doc.insert("fleet".to_owned(), Value::Null);
 
     let p = look.profile.as_ref().ok();
     let mut a = Map::new();
@@ -1559,7 +1547,6 @@ pub fn json(look: &Look<'_>, view: &View, aterm: &str) -> String {
                         "machine".to_owned(),
                         Value::from(look.machine.map(str::to_owned)),
                     );
-                    o.insert("name".to_owned(), Value::from("here"));
                     o.insert(
                         "sessions".to_owned(),
                         Value::from(u64::try_from(n).unwrap_or(u64::MAX)),

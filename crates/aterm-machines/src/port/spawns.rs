@@ -5,7 +5,7 @@
 
 use super::{Cmd, Live, Ran, RunFailed, Scratch, Stat, System, User};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Records every command spawned through a [`Live`] system along with its standard input.
@@ -143,6 +143,9 @@ impl System for Spawns<'_> {
     }
     fn stat(&self, path: &Path) -> io::Result<Stat> {
         self.live.stat(path)
+    }
+    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        self.live.canonicalize(path)
     }
     fn list_dir(&self, path: &Path) -> io::Result<Vec<String>> {
         self.live.list_dir(path)

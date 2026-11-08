@@ -24,11 +24,21 @@ use crate::bonjour::{self, Bonjour};
 pub(crate) const MAX_LIVE: usize = 128;
 
 /// How long a client may take to send its hello and request once admitted.
-const REQUEST_HANG: Duration = Duration::from_secs(10);
+const REQUEST_HANG: Duration = Duration::from_secs(60);
 
 /// How long a client may take to say it took a passed socket in ([`wire::pass`]): a hang
 /// detector, as it says so as soon as its receive returns.
-const TAKE_HANG: Duration = Duration::from_secs(30);
+const TAKE_HANG: Duration = Duration::from_secs(60);
+
+pub(crate) fn pass_socket(
+    stream: &CtlStream,
+    frame: &Frame,
+    fd: std::os::fd::BorrowedFd<'_>,
+    started: Instant,
+) -> io::Result<()> {
+    let deadline = started + TAKE_HANG;
+    wire::pass(stream, frame, fd, deadline)
+}
 
 /// What `aterm lan serve` serves.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,7 +124,7 @@ impl Admission {
             Self::Code(identity) => identity.check_named(
                 stream,
                 aterm_uds::peer::peer_audit_token(stream),
-                aterm_keeper::identity::PEER_CHECK_HANG,
+                aterm_uds::peer::CHECK_HANG,
             ),
         }
     }
@@ -341,6 +351,15 @@ impl Server {
 
 /// Serve one connection: admit its peer, exchange hellos, and answer its one request.
 pub(crate) fn connection(shared: &Shared, stream: &CtlStream) {
+    connection_clock(shared, stream, Instant::now);
+}
+
+#[cfg(test)]
+pub(crate) fn connection_at(shared: &Shared, stream: &CtlStream, started: Instant) {
+    connection_clock(shared, stream, || started);
+}
+
+fn connection_clock(shared: &Shared, stream: &CtlStream, started: impl FnOnce() -> Instant) {
     let pid = aterm_uds::fdpass::peer_pid(stream).unwrap_or(0);
     if let Err(why) = shared.admission.check(stream) {
         let judged = if matches!(why, CheckError::Refused(_)) {
@@ -360,7 +379,7 @@ pub(crate) fn connection(shared: &Shared, stream: &CtlStream) {
         return;
     }
     let mut reader = Reader::new(0);
-    let deadline = Some(Instant::now() + REQUEST_HANG);
+    let deadline = Some(started() + REQUEST_HANG);
     match reader.frame(stream, deadline) {
         Ok(Some(Frame::Hello { protocol, .. })) if protocol == aterm_uds::lan::PROTOCOL => {}
         Ok(Some(Frame::Hello { protocol, build })) => {
@@ -478,13 +497,13 @@ fn answer(shared: &Shared, stream: &CtlStream, request: Request) -> Result<(), F
                     here::dial_any(&addrs, deadline, options).map_err(|e| failure(&e))?
                 }
             };
-            wire::pass(
+            pass_socket(
                 stream,
                 &Frame::Socket {
                     reached: Some(reached),
                 },
                 connected.as_fd(),
-                Instant::now() + TAKE_HANG,
+                Instant::now(),
             )
             .map_err(|e| failure(&e))
         }
@@ -503,11 +522,11 @@ fn answer(shared: &Shared, stream: &CtlStream, request: Request) -> Result<(), F
                 ttl,
             })
             .map_err(|e| failure(&e))?;
-            wire::pass(
+            pass_socket(
                 stream,
                 &Frame::Socket { reached: None },
                 socket.as_fd(),
-                Instant::now() + TAKE_HANG,
+                Instant::now(),
             )
             .map_err(|e| failure(&e))
         }

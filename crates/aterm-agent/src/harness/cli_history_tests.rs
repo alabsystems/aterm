@@ -426,10 +426,11 @@ fn listing(dir: &Path) -> Vec<(PathBuf, bool, u64, std::time::SystemTime)> {
     out
 }
 
-/// A HISTORY WRITES NOTHING. Over a series a compaction would rewrite (a five-hour window that
-/// ended with no close stored, and no pass stamped), a named history, one of every row, their
-/// JSON and `--rows` leave every file and directory as they were, its length and mtime included,
-/// and add none. Negative control: a history that compacts what it reads
+/// A HISTORY WRITES NOTHING. Over records with no accounts publication cut short (which a
+/// history, like every accounts read, would complete) and a series a compaction would rewrite (a
+/// five-hour window that ended with no close stored, and no pass stamped), a named history, one
+/// of every row, their JSON and `--rows` leave every file and directory as they were, its length
+/// and mtime included, and add none. Negative control: a history that compacts what it reads
 /// (`account_series::compact_dir` on the series directory in `run`) rewrites the series and
 /// writes the stamp, and the assertion fails.
 #[test]
@@ -673,6 +674,364 @@ fn a_renamed_day_is_counted_once() {
             "  Fri Sep 19  week 40% \u{2192} 52% (resets Wed Sep 24 00:00) \u{b7} 5h 2 windows, \
           peak 100%, 1 full"
         ],
+        "{text}"
+    );
+}
+
+/// Keeps of the series at `path` what a bound that had to give up every other row leaves: its
+/// newest `day` row and its newest close of each window, which the bound never gives up.
+fn keep_what_the_bound_leaves(path: &Path) {
+    let text = std::fs::read_to_string(path).expect("the series");
+    let rows: Vec<(&str, SeriesRow)> = text
+        .lines()
+        .filter_map(|l| Some((l, SeriesRow::parse(l)?)))
+        .collect();
+    let newest = |of: &dyn Fn(&Said) -> bool| {
+        rows.iter()
+            .filter(|(_, r)| of(&r.said))
+            .max_by_key(|(_, r)| r.t)
+            .map(|(l, _)| *l)
+    };
+    let kept: String = [
+        newest(&|said| matches!(said, Said::Day(_))),
+        newest(&|said| matches!(said, Said::Close(c) if c.w == accounts::SESSION_LIMIT)),
+        newest(&|said| matches!(said, Said::Close(c) if c.w == accounts::WEEK_LIMIT)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|l| format!("{l}\n"))
+    .collect();
+    std::fs::write(path, kept).expect("write");
+}
+
+/// A RENAMED DAY COUNTS THE WINDOWS A FILE PAST THE BOUND HOLDS BY ITS DAY ROW. The row `before`
+/// became `now` at 07:00 on Friday, after its windows that ended at 01:00 (30%, then 50%) and at
+/// 06:00 (30%, then 60%); under `now` one window ended at 12:00, full, and another at 18:00. Both
+/// files were compacted, and `before` then kept what a bound that gives up every other row
+/// leaves, its `day` row of Friday and the close of its last window, while `now` still holds its
+/// closes: Friday is four windows, one full, its week from `before`'s first figure to `now`'s
+/// last. Negative control: on a day two files hold, counting the closes still held in place of
+/// the files' counts (the recount as it was) says three windows, and the assertion fails.
+#[test]
+fn a_renamed_day_counts_the_windows_a_file_past_the_bound_holds_by_its_day_row() {
+    let tmp = tmp_dir("history-renamed-day-bound");
+    let env = env_at(&tmp);
+    let now = env.now;
+    let a = AccountKey::claude(UUID).expect("key");
+    let machine = pool(&tmp, &env, &["now"], &[("now", a)]);
+    let friday = now - 2 * D;
+    let (w0, w1, w2, w3, week) = (
+        friday + H,
+        friday + 6 * H,
+        friday + 12 * H,
+        friday + 18 * H,
+        now + 3 * D,
+    );
+    let before = write_series(
+        &env,
+        "before",
+        &machine,
+        &[
+            keyed(friday + 600, Some((300, w0)), Some((380, week)), a),
+            keyed(friday + 2400, Some((500, w0)), Some((390, week)), a),
+            keyed(friday + 3 * H, Some((300, w1)), Some((400, week)), a),
+            keyed(friday + 5 * H, Some((600, w1)), Some((420, week)), a),
+        ],
+    );
+    let after = write_series(
+        &env,
+        "now",
+        &machine,
+        &[
+            keyed(friday + 8 * H, Some((500, w2)), Some((450, week)), a),
+            keyed(friday + 11 * H, Some((1000, w2)), Some((480, week)), a),
+            keyed(friday + 14 * H, Some((200, w3)), Some((520, week)), a),
+        ],
+    );
+    for path in [&before, &after] {
+        account_series::compact_locked(path, now, |_| 0).expect("compact");
+    }
+    keep_what_the_bound_leaves(&before);
+    let rows = account_series::read_file(&before);
+    assert!(
+        matches!(rows.as_slice(), [day, close]
+            if day.t == friday && matches!(day.said, Said::Day(_))
+                && matches!(&close.said, Said::Close(c) if c.reset == w1)),
+        "PRECONDITION: `before` holds Friday's day row and its last window's close: {rows:?}"
+    );
+    let text = history_of(&env, Some("now"), (false, false), |_| 0);
+    assert_eq!(
+        day_lines(&text),
+        [
+            "  Fri Sep 19  week 38% \u{2192} 52% (resets Wed Sep 24 00:00) \u{b7} 5h 4 windows, \
+          peak 100%, 1 full"
+        ],
+        "{text}"
+    );
+}
+
+/// Each day of `name`'s history in JSON, read in UTC: its date, its five-hour windows and how
+/// many of them read full.
+fn windows_by_date(env: &Env, name: &str) -> Vec<(String, u64, u64)> {
+    let doc: Value = aterm_json::from_str(history_of(env, Some(name), (true, false), |_| 0).trim())
+        .expect("JSON");
+    doc["days"]
+        .as_array()
+        .expect("days")
+        .iter()
+        .map(|d| {
+            (
+                d["date"].as_str().unwrap_or_default().to_owned(),
+                d["five_hour"]["windows"].as_u64().unwrap_or(0),
+                d["five_hour"]["full"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect()
+}
+
+/// A WINDOW TWO FILES CLOSED ON TWO DATES COUNTS ONCE, ON THE EARLIER. The row `before` read the
+/// window that resets at 01:00 on Saturday at 21:00 and 22:00 on Friday and became `now` at
+/// 22:30; `now` read the window full at 23:00, used a limit reset, and began its next window at
+/// 23:45 (it resets at 04:45). `now`'s close of the shared window ends early, at 23:45 on
+/// Friday; `before`, which saw no next window begin, closes it at its reset, on Saturday. Friday
+/// counts the shared window, full, and Saturday the next one alone, from the readings and again
+/// from the rows both files store once compacted. Negative control: counting a window on every
+/// date a part names it (no `on_first_dates` in `days_of`) counts the shared window again on
+/// Saturday, and the first assertion fails.
+#[test]
+fn a_window_two_files_closed_on_two_dates_counts_once_on_the_earlier() {
+    let tmp = tmp_dir("history-two-dates");
+    let env = env_at(&tmp);
+    let now = env.now;
+    let a = AccountKey::claude(UUID).expect("key");
+    let machine = pool(&tmp, &env, &["now"], &[("now", a)]);
+    let friday = now - 2 * D;
+    let began = friday + 23 * H + 45 * 60;
+    let (shared, next) = (friday + 25 * H, began + 5 * H);
+    let before = write_series(
+        &env,
+        "before",
+        &machine,
+        &[
+            keyed(friday + 21 * H, Some((400, shared)), None, a),
+            keyed(friday + 22 * H, Some((600, shared)), None, a),
+        ],
+    );
+    let after = write_series(
+        &env,
+        "now",
+        &machine,
+        &[
+            keyed(friday + 23 * H, Some((1000, shared)), None, a),
+            keyed(began, Some((50, next)), None, a),
+        ],
+    );
+    let counted = [
+        ("2025-09-19".to_owned(), 1, 1),
+        ("2025-09-20".to_owned(), 1, 0),
+    ];
+    assert_eq!(windows_by_date(&env, "now"), counted, "from the readings");
+    for path in [&before, &after] {
+        account_series::compact_locked(path, now, |_| 0).expect("compact");
+    }
+    let ended = |path: &Path| {
+        account_series::read_file(path)
+            .into_iter()
+            .find(|r| matches!(&r.said, Said::Close(c) if c.reset == shared))
+            .map(|r| r.t)
+    };
+    assert_eq!(
+        (ended(&before), ended(&after)),
+        (Some(shared), Some(began)),
+        "PRECONDITION: the two files' closes of the shared window end on two dates"
+    );
+    assert_eq!(
+        windows_by_date(&env, "now"),
+        counted,
+        "from the stored rows"
+    );
+}
+
+/// Writes the series at `path` again with its `day` rows naming no window, as rows were written
+/// before they named them.
+fn unname_days(path: &Path) {
+    let text = std::fs::read_to_string(path).expect("the series");
+    let lines: String = text
+        .lines()
+        .map(|l| match SeriesRow::parse(l) {
+            Some(mut row) => {
+                if let Said::Day(d) = &mut row.said
+                    && let Some(five) = d.five_hour.as_mut()
+                {
+                    five.anchors.clear();
+                    return format!("{}\n", row.line().expect("a row"));
+                }
+                format!("{l}\n")
+            }
+            None => format!("{l}\n"),
+        })
+        .collect();
+    std::fs::write(path, lines).expect("write");
+}
+
+/// ROWS WRITTEN BEFORE THEY NAMED THEIR WINDOWS COUNT A SHARED WINDOW ONCE BY THE CLOSES BESIDE
+/// THEM. As in `a_renamed_day_is_counted_once`, the row `before` became `now` inside the window
+/// that ended at 11:00, and the next ended at 18:00; both files were compacted, and their `day`
+/// rows are then written again naming no window, as rows were before they did, beside the closes
+/// each file still holds. Friday is two windows, the shared one full once. Negative control: a
+/// stored row naming only the anchors it stores (no held close's anchor added in `file_days`)
+/// counts each of its windows as one no other file's is told from, three windows, and the
+/// assertion fails.
+#[test]
+fn rows_written_before_they_named_their_windows_count_a_shared_window_once() {
+    let tmp = tmp_dir("history-unnamed-rows");
+    let env = env_at(&tmp);
+    let now = env.now;
+    let a = AccountKey::claude(UUID).expect("key");
+    let machine = pool(&tmp, &env, &["now"], &[("now", a)]);
+    let friday = now - 2 * D;
+    let (w1, w2, week) = (friday + 11 * H, friday + 18 * H, now + 3 * D);
+    let before = write_series(
+        &env,
+        "before",
+        &machine,
+        &[
+            keyed(friday + 8 * H, Some((300, w1)), Some((400, week)), a),
+            keyed(friday + 10 * H, Some((500, w1)), Some((450, week)), a),
+        ],
+    );
+    let after = write_series(
+        &env,
+        "now",
+        &machine,
+        &[
+            keyed(
+                friday + 10 * H + 45 * 60,
+                Some((700, w1)),
+                Some((480, week)),
+                a,
+            ),
+            keyed(
+                friday + 10 * H + 50 * 60,
+                Some((1000, w1)),
+                Some((500, week)),
+                a,
+            ),
+            keyed(friday + 14 * H, Some((200, w2)), Some((520, week)), a),
+        ],
+    );
+    for path in [&before, &after] {
+        account_series::compact_locked(path, now, |_| 0).expect("compact");
+        unname_days(path);
+        let rows = account_series::read_file(path);
+        assert!(
+            rows.iter().any(|r| matches!(&r.said, Said::Day(d)
+                if r.t == friday && d.five_hour.as_ref().is_some_and(|f| f.anchors.is_empty()))),
+            "PRECONDITION: {} holds Friday's day row naming no window: {rows:?}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        windows_by_date(&env, "now"),
+        [("2025-09-19".to_owned(), 2, 1)]
+    );
+}
+
+/// A BUSY RENAMED DAY COUNTS EACH WINDOW ONCE. On Friday `before` began a new five-hour window
+/// every three hours from 00:30, a limit reset used each time (seven windows, each but the last
+/// ending early), and became `now` inside the seventh, which `now` read once more; neither file
+/// was compacted. Friday is seven windows: a history names every window it summarizes, more
+/// than a stored row names ([`account_series::DAY_ANCHORS_MAX`]). Negative control: summaries
+/// naming only the oldest `DAY_ANCHORS_MAX` (as stored rows do) leave the seventh unnamed in
+/// `before`, counted again beside `now`'s, eight windows, and the assertion fails.
+#[test]
+fn a_busy_renamed_day_counts_each_window_once() {
+    let tmp = tmp_dir("history-busy-renamed");
+    let env = env_at(&tmp);
+    let now = env.now;
+    let a = AccountKey::claude(UUID).expect("key");
+    let machine = pool(&tmp, &env, &["now"], &[("now", a)]);
+    let friday = now - 2 * D;
+    let began: Vec<i64> = (0..7).map(|i| friday + 1800 + i * 3 * H).collect();
+    let rows: Vec<SeriesRow> = began
+        .iter()
+        .map(|at| keyed(*at, Some((300, at + 5 * H)), None, a))
+        .collect();
+    write_series(&env, "before", &machine, &rows);
+    let last = began[6];
+    write_series(
+        &env,
+        "now",
+        &machine,
+        &[keyed(last + H, Some((400, last + 5 * H)), None, a)],
+    );
+    assert_eq!(
+        windows_by_date(&env, "now"),
+        [("2025-09-19".to_owned(), 7, 0)]
+    );
+}
+
+/// A WINDOW ACROSS A RENAME COUNTS ONCE PAST THE CLOSE HORIZON. As in
+/// `a_renamed_day_is_counted_once`, the row `before` became `now` inside the window that ended at
+/// 11:00 (30% and 50% under the old label, 70% and then 100% under the new one) and the next
+/// ended at 18:00, but on a Friday 100 days back: compacted then and again now, each file holds
+/// only its `day` row of Friday, its closes past the 90-day horizon and its readings gone.
+/// Friday is two windows, the shared one full once. Negative control: day rows that name no
+/// window (`day_summaries` writing `anchors: Vec::new()`, as rows were written before) count the
+/// shared window in each file, three windows, and the assertion fails.
+#[test]
+fn a_window_across_a_rename_counts_once_past_the_close_horizon() {
+    let tmp = tmp_dir("history-renamed-horizon");
+    let env = env_at(&tmp);
+    let now = env.now;
+    let a = AccountKey::claude(UUID).expect("key");
+    let machine = pool(&tmp, &env, &["now"], &[("now", a)]);
+    let friday = now - 100 * D;
+    let (w1, w2) = (friday + 11 * H, friday + 18 * H);
+    let before = write_series(
+        &env,
+        "before",
+        &machine,
+        &[
+            keyed(friday + 8 * H, Some((300, w1)), None, a),
+            keyed(friday + 10 * H, Some((500, w1)), None, a),
+        ],
+    );
+    let after = write_series(
+        &env,
+        "now",
+        &machine,
+        &[
+            keyed(friday + 10 * H + 45 * 60, Some((700, w1)), None, a),
+            keyed(friday + 10 * H + 50 * 60, Some((1000, w1)), None, a),
+            keyed(friday + 14 * H, Some((200, w2)), None, a),
+        ],
+    );
+    for path in [&before, &after] {
+        account_series::compact_locked(path, friday + 2 * D, |_| 0).expect("compact then");
+        account_series::compact_locked(path, now, |_| 0).expect("compact now");
+        let rows = account_series::read_file(path);
+        assert!(
+            matches!(rows.as_slice(), [r] if r.t == friday && matches!(r.said, Said::Day(_))),
+            "PRECONDITION: {} holds Friday's day row alone: {rows:?}",
+            path.display()
+        );
+    }
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = crate::harness::cli::history::run(
+        Cli::Claude,
+        &env,
+        (Some("now"), false, 120 * D, false),
+        |_| 0,
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&err));
+    let text = String::from_utf8(out).expect("utf-8");
+    assert_eq!(
+        day_lines(&text),
+        ["  Fri Jun 13  5h 2 windows, peak 100%, 1 full"],
         "{text}"
     );
 }

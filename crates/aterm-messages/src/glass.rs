@@ -63,7 +63,7 @@ pub enum RowKind {
     Message(MessageId),
     /// A retired live row's completion echo in the slot it held.
     Echo(MessageId),
-    /// `N more messages` — one link to Settings ▸ Messages.
+    /// `k more ›` — one link to Settings ▸ Messages.
     Overflow {
         /// How many eligible rows are not on glass.
         hidden: usize,
@@ -87,8 +87,6 @@ pub struct RowLayout {
     pub glyph: (usize, char),
     /// The (possibly elided) title and its column.
     pub title: (usize, String),
-    /// The title in full — what is spoken, width-independent.
-    pub full_title: String,
     /// The excerpt text and its column, when it fits.
     pub detail: Option<(usize, String)>,
     /// `(col, width, fill_permille)` of the row's meter: always `(0, cols, fill)`, the whole row, whenever the message carries a fill.
@@ -137,7 +135,8 @@ pub struct CapsuleLayout {
     pub width: usize,
     /// The long or short form, as fitted.
     pub text: String,
-    /// The full label — what a screen reader says.
+    /// The intent's whole label (`""` on an echo's blank capsule): the band reads it against
+    /// [`Self::text`] so one label reads one way across the band at a width.
     pub full_label: &'static str,
     /// Its ink.
     pub role: CapsuleRole,
@@ -324,53 +323,6 @@ impl RowLayout {
             (Some(_), true) => ELAPSED_SHORT_W,
         }
     }
-
-    /// Width-independent spoken sentence (`title` or `title · <detail[0]>`) with pictographic joints spoken as words ([`speakable`]).
-    #[must_use]
-    pub fn spoken(&self, full_detail0: &str) -> String {
-        if full_detail0.is_empty() {
-            speakable(&self.full_title)
-        } else {
-            speakable(&format!("{} \u{00b7} {full_detail0}", self.full_title))
-        }
-    }
-}
-
-/// The painted words as a screen reader should say them.
-#[must_use]
-pub(crate) fn speakable(words: &str) -> String {
-    let chars: Vec<char> = words.chars().collect();
-    let mut out = String::with_capacity(words.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        let spaced =
-            |i: usize| i > 0 && chars.get(i - 1) == Some(&' ') && chars.get(i + 1) == Some(&' ');
-        match c {
-            '\u{2192}' if spaced(i) => {
-                out.pop();
-                out.push_str(", did you mean ");
-                i += 2;
-                continue;
-            }
-            '\u{25b8}' if spaced(i) => {
-                out.pop();
-                out.push_str(", ");
-                i += 2;
-                continue;
-            }
-            '\u{00d7}'
-                if i > 0
-                    && chars[i - 1].is_ascii_digit()
-                    && chars.get(i + 1).is_some_and(char::is_ascii_digit) =>
-            {
-                out.push_str(" by ");
-            }
-            _ => out.push(c),
-        }
-        i += 1;
-    }
-    out
 }
 
 /// Whether the implicit links are laid out: a row's `Details ›` (`+N ›` on a single row) and the overflow row's `Messages ›`.
@@ -391,7 +343,8 @@ pub(crate) struct CapsuleSpec {
     pub short: String,
     /// The long form the row pays for.
     pub paid: String,
-    /// The full label a screen reader says.
+    /// The intent's whole label (`""` once [`Self::blanked`]): the band lays an intent short by it
+    /// on every row once one row paints it short.
     pub full_label: &'static str,
     /// Its ink.
     pub role: CapsuleRole,
@@ -596,14 +549,6 @@ fn overflow_fit(
     }
 }
 
-fn overflow_spoken(words: &str) -> String {
-    let bare = words.trim_end_matches('\u{203a}').trim_end();
-    match bare.strip_suffix(" more") {
-        Some(head) => format!("{head} more messages"),
-        None => bare.to_string(),
-    }
-}
-
 const TITLE_CUT_TRAIL: [char; 14] = [
     ' ', ',', ';', ':', '.', '\u{b7}', '\u{2014}', '\u{2013}', '\u{3001}', '\u{3002}', '\u{ff0c}',
     '\u{ff1a}', '\u{ff1b}', '\u{30fb}',
@@ -678,7 +623,6 @@ pub(crate) fn finish_title(
     let short = laid.saturating_sub(width(&title));
     title.extend(std::iter::repeat_n(' ', short));
     row.title.1 = title;
-    row.full_title = words.to_string();
 }
 
 fn painted(caps: &[CapsuleSpec], short: bool) -> impl Iterator<Item = &CapsuleSpec> {
@@ -1199,10 +1143,6 @@ fn place(
     fit: &Fit,
     extras: Extras,
 ) -> RowLayout {
-    let full_title = match spec.kind {
-        RowKind::Overflow { .. } => overflow_spoken(&fit.title),
-        RowKind::Message(_) | RowKind::Echo(_) => spec.title.to_string(),
-    };
     let fill = spec.fill();
     let mut col = TITLE_COL + width(&fit.title);
     let detail = extras.detail.map(|d| {
@@ -1263,7 +1203,6 @@ fn place(
         live: spec.live,
         glyph: (GLYPH_COL, fit.glyph),
         title: (TITLE_COL, fit.title.clone()),
-        full_title,
         detail,
         meter,
         busy,
@@ -1962,7 +1901,7 @@ pub(crate) mod tests {
                         !(short_prev && !short_now) || row.capsules.len() != p.capsules.len(),
                         "{name}@{cols}: capsules never go long again as the row narrows"
                     );
-                    let elided_prev = p.title.1 != p.full_title;
+                    let elided_prev = p.title.1 != spec.title;
                     if elided_prev && authored > 0 {
                         assert!(
                             short_now,
@@ -2276,47 +2215,6 @@ pub(crate) mod tests {
         let row = layout_row(&filled, 160, &chars);
         assert!(!row.busy && row.track.is_none());
         assert_eq!(row.meter, Some((0, 160, 500)));
-    }
-
-    #[test]
-    fn spoken_is_width_independent() {
-        let spec = fixtures()
-            .into_iter()
-            .find(|(n, _)| *n == "crash")
-            .unwrap()
-            .1;
-        let wide = layout_row(&spec, 160, &chars);
-        let narrow = layout_row(&spec, 24, &chars);
-        assert_ne!(wide.title.1, narrow.title.1, "the narrow title elides");
-        assert_eq!(wide.spoken(CRASH_DETAIL), narrow.spoken(CRASH_DETAIL));
-        assert_eq!(wide.spoken(""), "aterm closed unexpectedly last time");
-        assert!(wide.spoken(CRASH_DETAIL).ends_with(".log.seen"));
-    }
-
-    #[test]
-    fn spoken_says_the_band_pictographs_as_words() {
-        assert_eq!(
-            speakable("Unknown key \u{00b7} windw_padding \u{2192} window_padding?"),
-            "Unknown key \u{00b7} windw_padding, did you mean window_padding?"
-        );
-        assert_eq!(
-            speakable("Split refused \u{00b7} pane 20\u{00d7}5, needs 20\u{00d7}7"),
-            "Split refused \u{00b7} pane 20 by 5, needs 20 by 7"
-        );
-        assert_eq!(
-            speakable(
-                "Enable aterm in Full Disk Access \u{00b7} Privacy & Security \u{25b8} Full Disk Access"
-            ),
-            "Enable aterm in Full Disk Access \u{00b7} Privacy & Security, Full Disk Access"
-        );
-        for plain in [
-            "\u{2192}",
-            "a\u{00d7}b",
-            "x \u{25b8}",
-            "Installing Homebrew",
-        ] {
-            assert_eq!(speakable(plain), plain, "no joint to say: {plain:?}");
-        }
     }
 
     fn wide(s: &str) -> usize {

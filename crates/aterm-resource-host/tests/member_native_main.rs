@@ -14,6 +14,11 @@
 #[path = "../src/actor.rs"]
 mod actor;
 #[cfg(unix)]
+#[path = "../src/fixture_wait.rs"]
+mod fixture_wait;
+#[cfg(unix)]
+use fixture_wait::{HANG as FIXTURE_HANG, deadline as fixture_deadline};
+#[cfg(unix)]
 #[path = "../src/client.rs"]
 mod client;
 #[cfg(unix)]

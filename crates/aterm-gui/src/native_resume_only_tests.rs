@@ -895,6 +895,57 @@ fn a_first_leg_root_retires_only_after_positive_native_no_start() {
 }
 
 #[test]
+fn native_no_start_does_not_erase_conflicting_execution_metadata() {
+    let world = world_with_signal(8130, false, false);
+    assert_eq!(
+        run(
+            &world.handle.ctx,
+            &world.facts,
+            Request::Abort(world.old.clone()),
+            world.actor.clone()
+        ),
+        ROLLBACK_SAFE
+    );
+    for case in 0..6 {
+        let mut root = world.root.clone();
+        match case {
+            0 => root.launch_attempted = true,
+            1 => root.accepted_turn = Some(root.intent.wall.clone()),
+            2 => {
+                root.current_attempt = Some(recovery::AttemptRef {
+                    id: "b".repeat(32),
+                    generation: 1,
+                });
+            }
+            3 => {
+                root.candidate = Some(recovery::Candidate {
+                    pid: 10,
+                    birth: 1,
+                    parent: 1,
+                    group: 10,
+                    session: 10,
+                    launcher_device: 1,
+                    launcher_inode: 2,
+                    launcher_path: b"/native/launcher".to_vec(),
+                    forward: true,
+                });
+            }
+            4 => root.successor_pid = Some(10),
+            5 => root.successor_birth = Some(1),
+            _ => unreachable!(),
+        }
+        recovery::write_receipt(&world.env, &root).unwrap();
+        let path = recovery::receipt_path(&world.env, &root.id).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            !renewal::fixture_retire_unstarted(&world.handle.ctx, &world.env, &root),
+            "execution witness {case} must survive even a native no-start proof"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+}
+
+#[test]
 fn a_retry_captures_connection_loss_during_publication() {
     let mut world = world(8122);
     let (root, attempt, request) = publish(&world, "d5");

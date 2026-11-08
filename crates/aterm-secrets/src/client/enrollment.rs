@@ -479,20 +479,26 @@ fn admin_cached_observed(paths: &Paths, lock: Option<&StateLock>) -> crate::Resu
     let mut admissions = opened.admissions.clone();
     // A cached open lands no pending set: its callers may hold the state lock, or an author's
     // own observation of it (`log_entries::view_waiting`).
-    let (log_base, shown) = admin_base(
+    let AdminBase {
+        log_base,
+        shown,
+        version,
+    } = admin_base(
         paths,
         &config,
         &envelope,
+        &handoff,
         &identity,
         &opened,
         &mut doc,
         &mut admissions,
         false,
-    );
+    )?;
     Ok(Admin {
         commons_eligibility: crate::commons::membership::Eligibility::from_document(&doc),
         admissions,
         published_doc: doc.clone(),
+        version,
         published_control: super::inspection::PublishedControl::read(&opened.doc)?,
         served_machines,
         doc,

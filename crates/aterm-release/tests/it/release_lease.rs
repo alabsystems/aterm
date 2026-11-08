@@ -5,13 +5,11 @@
 
 use crate::{ledger, publish};
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 
-use ledger::testing::Git;
-use ledger::{Error, GitRunner, Result, RunOut};
+#[cfg(unix)]
+use crate::publisher_origin::{Git, bare_remote};
 use publish::{FenceRelease, LeaseRelease, PUBLISHER_FENCE_REF, RELEASE_LEASE_REF};
 
 fn command(dir: &Path, args: &[&str]) -> String {
@@ -125,65 +123,7 @@ fn build_bare(root: &Path) -> (String, String) {
     (first, second)
 }
 
-struct FenceProbeBarrier {
-    inner: Git,
-    barrier: Arc<Barrier>,
-    first_probe: AtomicBool,
-}
-
-impl FenceProbeBarrier {
-    fn new(repo: PathBuf, barrier: Arc<Barrier>) -> Self {
-        Self {
-            inner: Git::new(repo),
-            barrier,
-            first_probe: AtomicBool::new(true),
-        }
-    }
-}
-
-impl GitRunner for FenceProbeBarrier {
-    fn git(&self, args: &[&str]) -> Result<RunOut> {
-        let output = self.inner.git(args)?;
-        if args.len() == 4
-            && args[0] == "ls-remote"
-            && args[1] == "origin"
-            && args[2] == PUBLISHER_FENCE_REF
-            && self.first_probe.swap(false, Ordering::SeqCst)
-        {
-            self.barrier.wait();
-        }
-        Ok(output)
-    }
-}
-
-struct FirstProbeBarrier {
-    inner: Git,
-    barrier: Arc<Barrier>,
-    first_probe: AtomicBool,
-}
-
-impl FirstProbeBarrier {
-    fn new(repo: PathBuf, barrier: Arc<Barrier>) -> Self {
-        Self {
-            inner: Git::new(repo),
-            barrier,
-            first_probe: AtomicBool::new(true),
-        }
-    }
-}
-
-impl GitRunner for FirstProbeBarrier {
-    fn git(&self, args: &[&str]) -> Result<RunOut> {
-        let output = self.inner.git(args)?;
-        if args == ["ls-remote", "origin", RELEASE_LEASE_REF]
-            && self.first_probe.swap(false, Ordering::SeqCst)
-        {
-            self.barrier.wait();
-        }
-        Ok(output)
-    }
-}
-
+#[cfg(unix)]
 #[test]
 fn real_bare_remote_allows_one_claim_and_only_owner_recovery() {
     let fixture = bare_fixture("atomic-race");
@@ -192,8 +132,10 @@ fn real_bare_remote_allows_one_claim_and_only_owner_recovery() {
     let owner_a = fixture.owner_a.clone();
     let owner_b = fixture.owner_b.clone();
     let barrier = Arc::new(Barrier::new(2));
-    let runner_a = FirstProbeBarrier::new(repo_a.clone(), Arc::clone(&barrier));
-    let runner_b = FirstProbeBarrier::new(repo_b.clone(), Arc::clone(&barrier));
+    let runner_a =
+        Git::new(repo_a.clone()).with_first_get_barrier(RELEASE_LEASE_REF, Arc::clone(&barrier));
+    let runner_b =
+        Git::new(repo_b.clone()).with_first_get_barrier(RELEASE_LEASE_REF, Arc::clone(&barrier));
 
     let (result_a, result_b) = std::thread::scope(|scope| {
         let a = scope.spawn(|| publish::acquire_release_lease(&runner_a, &owner_a));
@@ -270,6 +212,7 @@ fn real_bare_remote_allows_one_claim_and_only_owner_recovery() {
     publish::release_completed_release_lease(&loser_git, &loser).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn same_claim_publishers_get_one_unique_fence_and_exact_token_cleanup() {
     let fixture = bare_fixture("same-owner-fence");
@@ -280,11 +223,13 @@ fn same_claim_publishers_get_one_unique_fence_and_exact_token_cleanup() {
     publish::acquire_release_lease(&git_a, &owner).unwrap();
 
     let barrier = Arc::new(Barrier::new(2));
-    let runner_a = FenceProbeBarrier::new(repo_a.clone(), Arc::clone(&barrier));
-    let runner_b = FenceProbeBarrier::new(repo_b.clone(), Arc::clone(&barrier));
+    let runner_a =
+        Git::new(repo_a.clone()).with_first_get_barrier(PUBLISHER_FENCE_REF, Arc::clone(&barrier));
+    let runner_b =
+        Git::new(repo_b.clone()).with_first_get_barrier(PUBLISHER_FENCE_REF, Arc::clone(&barrier));
     let (result_a, result_b) = std::thread::scope(|scope| {
-        let a = scope.spawn(|| publish::acquire_publisher_fence(&runner_a, &owner));
-        let b = scope.spawn(|| publish::acquire_publisher_fence(&runner_b, &owner));
+        let a = scope.spawn(|| publish::acquire_publisher_fence(&runner_a, &runner_a, &owner));
+        let b = scope.spawn(|| publish::acquire_publisher_fence(&runner_b, &runner_b, &owner));
         (a.join().unwrap(), b.join().unwrap())
     });
     assert_ne!(result_a.is_ok(), result_b.is_ok(), "one create-only winner");
@@ -310,6 +255,7 @@ fn same_claim_publishers_get_one_unique_fence_and_exact_token_cleanup() {
     publish::release_completed_release_lease(&git_a, &owner).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn killed_session_recovery_rotates_exact_old_token_with_one_winner() {
     let fixture = bare_fixture("recovery-rotation");
@@ -318,14 +264,18 @@ fn killed_session_recovery_rotates_exact_old_token_with_one_winner() {
     let owner = fixture.owner_a.clone();
     let git_a = Git::new(&repo_a);
     publish::acquire_release_lease(&git_a, &owner).unwrap();
-    let stale = publish::acquire_publisher_fence(&git_a, &owner).unwrap();
+    let stale = publish::acquire_publisher_fence(&git_a, &git_a, &owner).unwrap();
 
     let barrier = Arc::new(Barrier::new(2));
-    let runner_a = FenceProbeBarrier::new(repo_a.clone(), Arc::clone(&barrier));
-    let runner_b = FenceProbeBarrier::new(repo_b.clone(), Arc::clone(&barrier));
+    let runner_a =
+        Git::new(repo_a.clone()).with_first_get_barrier(PUBLISHER_FENCE_REF, Arc::clone(&barrier));
+    let runner_b =
+        Git::new(repo_b.clone()).with_first_get_barrier(PUBLISHER_FENCE_REF, Arc::clone(&barrier));
     let (result_a, result_b) = std::thread::scope(|scope| {
-        let a = scope.spawn(|| publish::rotate_publisher_fence_for_recovery(&runner_a, &owner));
-        let b = scope.spawn(|| publish::rotate_publisher_fence_for_recovery(&runner_b, &owner));
+        let a = scope
+            .spawn(|| publish::rotate_publisher_fence_for_recovery(&runner_a, &runner_a, &owner));
+        let b = scope
+            .spawn(|| publish::rotate_publisher_fence_for_recovery(&runner_b, &runner_b, &owner));
         (a.join().unwrap(), b.join().unwrap())
     });
     assert_ne!(
@@ -354,6 +304,7 @@ fn killed_session_recovery_rotates_exact_old_token_with_one_winner() {
     publish::release_completed_release_lease(&git_a, &owner).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn unlock_only_replay_leaves_a_coherent_foreign_successor_pair_untouched() {
     let fixture = bare_fixture("unlock-successor-pair");
@@ -362,11 +313,11 @@ fn unlock_only_replay_leaves_a_coherent_foreign_successor_pair_untouched() {
     let successor_owner = fixture.owner_b.clone();
     let git = Git::new(&repo);
     publish::acquire_release_lease(&git, &old_owner).unwrap();
-    let old_fence = publish::acquire_publisher_fence(&git, &old_owner).unwrap();
+    let old_fence = publish::acquire_publisher_fence(&git, &git, &old_owner).unwrap();
     publish::release_completed_publisher_session(&git, &old_owner, &old_fence).unwrap();
 
     publish::acquire_release_lease(&git, &successor_owner).unwrap();
-    let successor_fence = publish::acquire_publisher_fence(&git, &successor_owner).unwrap();
+    let successor_fence = publish::acquire_publisher_fence(&git, &git, &successor_owner).unwrap();
     assert_eq!(
         publish::release_completed_session_without_guard(&git, &old_owner).unwrap(),
         LeaseRelease::AlreadySuperseded
@@ -387,6 +338,7 @@ fn unlock_only_replay_leaves_a_coherent_foreign_successor_pair_untouched() {
     publish::release_completed_publisher_session(&git, &successor_owner, &successor_fence).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn final_unlock_refuses_incoherent_foreign_owner_and_old_fence() {
     let fixture = bare_fixture("incoherent-final-unlock");
@@ -395,13 +347,13 @@ fn final_unlock_refuses_incoherent_foreign_owner_and_old_fence() {
     let foreign = fixture.owner_b.clone();
     let git = Git::new(&repo);
     publish::acquire_release_lease(&git, &owner).unwrap();
-    let fence = publish::acquire_publisher_fence(&git, &owner).unwrap();
+    let fence = publish::acquire_publisher_fence(&git, &git, &owner).unwrap();
     command(
         &repo,
         &[
             "push",
             "--force",
-            "origin",
+            bare_remote(&repo).to_str().unwrap(),
             &format!("{foreign}:{RELEASE_LEASE_REF}"),
         ],
     );
@@ -415,13 +367,25 @@ fn final_unlock_refuses_incoherent_foreign_owner_and_old_fence() {
         fence.token()
     );
 
-    command(&repo, &["push", "origin", &format!(":{RELEASE_LEASE_REF}")]);
     command(
         &repo,
-        &["push", "origin", &format!(":{PUBLISHER_FENCE_REF}")],
+        &[
+            "push",
+            bare_remote(&repo).to_str().unwrap(),
+            &format!(":{RELEASE_LEASE_REF}"),
+        ],
+    );
+    command(
+        &repo,
+        &[
+            "push",
+            bare_remote(&repo).to_str().unwrap(),
+            &format!(":{PUBLISHER_FENCE_REF}"),
+        ],
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
     let fixture = bare_fixture("clean-tree-recovery");
@@ -469,87 +433,90 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
     );
 }
 
-struct ScriptedGit {
-    replies: Mutex<VecDeque<RunOut>>,
-    calls: Mutex<Vec<Vec<String>>>,
-}
-
-impl ScriptedGit {
-    fn new(replies: Vec<RunOut>) -> Self {
-        Self {
-            replies: Mutex::new(replies.into()),
-            calls: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-impl GitRunner for ScriptedGit {
-    fn git(&self, args: &[&str]) -> Result<RunOut> {
-        self.calls
-            .lock()
-            .expect("calls lock")
-            .push(args.iter().map(|arg| (*arg).to_string()).collect());
-        self.replies
-            .lock()
-            .expect("replies lock")
-            .pop_front()
-            .ok_or_else(|| Error::new("unexpected scripted git call"))
-    }
-}
-
-fn ls_remote(owner: &str) -> RunOut {
-    RunOut {
-        status: 0,
-        stdout: format!("{owner}\t{RELEASE_LEASE_REF}\n").into_bytes(),
-        stderr: vec![],
-    }
+#[test]
+fn unknown_unlock_outcome_is_not_reinterpreted_as_successor_convergence() {
+    use crate::publisher_script::{Call, Script};
+    let owner = "a".repeat(40);
+    let origin = Script::new(vec![
+        Call::get(RELEASE_LEASE_REF, Some(&owner)),
+        Call::control(
+            &owner,
+            RELEASE_LEASE_REF,
+            Some(&owner),
+            None,
+            Err("native outcome unknown; side_effect=unknown".into()),
+        ),
+    ]);
+    let failure = publish::release_completed_release_lease(&origin, &owner).unwrap_err();
+    assert!(failure.to_string().contains("outcome unknown"));
+    origin.done(); // No state reread can erase the unresolved durable intent.
 }
 
 #[test]
-fn failed_unlock_transport_with_foreign_reread_is_safe_successor_convergence() {
+fn a_known_conflict_can_converge_to_a_create_only_successor() {
+    use crate::publisher_script::{Call, Script};
     let owner = "a".repeat(40);
     let successor = "b".repeat(40);
-    let git = ScriptedGit::new(vec![
-        ls_remote(&owner),
-        RunOut {
-            status: 1,
-            stdout: vec![],
-            stderr: b"injected timeout after server accepted delete".to_vec(),
-        },
-        ls_remote(&successor),
+    let origin = Script::new(vec![
+        Call::get(RELEASE_LEASE_REF, Some(&owner)),
+        Call::control(
+            &owner,
+            RELEASE_LEASE_REF,
+            Some(&owner),
+            None,
+            Ok(ledger::RefWrite::Conflict),
+        ),
+        Call::get(RELEASE_LEASE_REF, Some(&successor)),
     ]);
-
     assert_eq!(
-        publish::release_completed_release_lease(&git, &owner).unwrap(),
-        LeaseRelease::AlreadySuperseded,
-        "create-only foreign ownership proves the old ref was absent even when push status lies"
+        publish::release_completed_release_lease(&origin, &owner).unwrap(),
+        LeaseRelease::AlreadySuperseded
     );
-    let calls = git.calls.lock().unwrap();
-    assert_eq!(calls.len(), 3);
-    assert_eq!(
-        calls[1],
-        [
-            "push".to_string(),
-            format!("--force-with-lease={RELEASE_LEASE_REF}:{owner}"),
-            "origin".to_string(),
-            format!(":{RELEASE_LEASE_REF}"),
-        ],
-        "unlock must be exact-owner CAS deletion, never an unconditional force/delete"
-    );
+    origin.done();
 }
 
 #[test]
 fn a_foreign_owner_is_never_deleted_by_the_unlock() {
+    use crate::publisher_script::{Call, Script};
     let expected = "a".repeat(40);
     let foreign = "b".repeat(40);
-    let git = ScriptedGit::new(vec![ls_remote(&foreign)]);
+    let origin = Script::new(vec![Call::get(RELEASE_LEASE_REF, Some(&foreign))]);
     assert_eq!(
-        publish::release_completed_release_lease(&git, &expected).unwrap(),
+        publish::release_completed_release_lease(&origin, &expected).unwrap(),
         LeaseRelease::AlreadySuperseded
     );
-    assert_eq!(
-        git.calls.lock().unwrap().len(),
-        1,
-        "no delete was attempted"
-    );
+    origin.done();
+}
+
+#[test]
+fn a_disappeared_create_does_not_mint_a_lease_guard() {
+    use crate::publisher_script::{Call, Script};
+    let owner = "a".repeat(40);
+    let origin = Script::new(vec![
+        Call::get(PUBLISHER_FENCE_REF, None),
+        Call::get(RELEASE_LEASE_REF, None),
+        Call::control(
+            &owner,
+            RELEASE_LEASE_REF,
+            None,
+            Some(&owner),
+            Ok(ledger::RefWrite::Written),
+        ),
+        Call::get(RELEASE_LEASE_REF, None),
+    ]);
+    let error = publish::acquire_release_lease(&origin, &owner).unwrap_err();
+    assert!(error.to_string().contains("ownership changed"));
+    origin.done();
+}
+
+#[test]
+fn an_authenticated_ref_failure_is_not_an_absent_release_lease() {
+    use crate::publisher_script::{Call, Script};
+    let origin = Script::new(vec![Call::Get(
+        RELEASE_LEASE_REF,
+        Err("native authentication unavailable".into()),
+    )]);
+    let error = publish::release_lease_owner(&origin).unwrap_err();
+    assert!(error.to_string().contains("authentication unavailable"));
+    origin.done();
 }

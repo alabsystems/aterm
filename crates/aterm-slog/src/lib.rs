@@ -55,10 +55,11 @@ pub use rec::{Rec, Stamp};
 #[cfg(any(test, debug_assertions))]
 pub use turn::ClaimView;
 pub use turn::{
-    ATTRIBUTION_MS, ActWord, Admission, AttributionView, Binding, Claimed, ClaimedBox,
-    ClaimedReport, LastClose, SETTLE_MS, STEP_ACT_MS, STEP_INPUT_LEAD_MS, ScreenStep, SettleCause,
-    TX_TOOLS_MAX, TrackerView, TurnTracker, TxEvent, TxMark, TxPos, TxState, TxView, Verdict,
-    WallJudge, attributes, dismisses, rebase, settle_due, settle_out, tx_close_at, within_lead,
+    ATTRIBUTION_MS, ActWord, Admission, AttributionView, Binding, BoundInput, Chose, Claimed,
+    ClaimedBox, ClaimedReport, LastClose, SETTLE_MS, STEP_ACT_MS, STEP_INPUT_LEAD_MS, ScreenStep,
+    SettleCause, TX_TOOLS_MAX, TrackerView, TurnTracker, TxEvent, TxMark, TxPos, TxState, TxView,
+    Verdict, WallJudge, attributes, dismisses, rebase, settle_due, settle_out, tx_close_at,
+    within_lead,
 };
 pub use vocab::{
     Actor, Conf, FLEET_ACTOR_PREFIX, Kind, Lvl, Node, Op, RESERVED_ACTOR_WORDS, ShortId, Src,

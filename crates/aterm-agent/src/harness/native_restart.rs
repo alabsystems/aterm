@@ -35,9 +35,23 @@ pub(super) enum Recovery {
     Completed,
     Retired,
     Held,
+    /// The host proved it never admitted the saved prepare, which is dropped: nothing ran.
+    Unadmitted,
 }
 
 pub(super) const WAIT_RETIRED_UNISSUED: &str = "wait:native-retired-unissued";
+/// The wait of a lane whose saved prepare the host proved never admitted ([`Recovery::Unadmitted`]).
+pub(super) const WAIT_UNADMITTED: &str = "wait:native-unadmitted";
+
+/// The wait word of a [`begin`] that admitted nothing: its refusal, or the answer that dropped
+/// its prepare. A cancellation is `begin`'s own refusal word.
+pub(super) const fn refusal_word(admission: Result<Recovery, &'static str>) -> &'static str {
+    match admission {
+        Err(why) => why,
+        Ok(Recovery::Unadmitted) => "native-unadmitted",
+        Ok(_) => "native-cancelled",
+    }
+}
 
 pub(super) fn coordinated(st: &St) -> bool {
     st.native_coordination
@@ -239,6 +253,14 @@ pub(super) fn terminal_for_test(st: &mut St, reply: &Reply) -> Option<Recovery> 
         project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeRetirementDebt",
+        action = "LoseAdmission",
+        reason = "The host's admission reply is lost before the harness reads its binding"
+    )
+)]
 fn recover_reply(st: &mut St, reply: Reply) -> Result<Recovery, &'static str> {
     if let Some(outcome) = terminal_reply(st, &reply) {
         return Ok(outcome);
@@ -249,8 +271,39 @@ fn recover_reply(st: &mut St, reply: Reply) -> Result<Recovery, &'static str> {
             Ok(Recovery::Admitted)
         }
         Reply::Pending(_) => Err("native-predecessors"),
+        Reply::Unadmitted(id) => unadmitted(st, &id),
         _ => Err("native-unknown"),
     }
+}
+
+/// Drop the saved prepare the host proved it never admitted. Only a record that kept that exact
+/// restart prepare and no binding may: a binding is the receipt of an admission, and a terminal
+/// record of the same id is a completion. Nothing is recorded completed; the coordination and
+/// any earlier completion stay for the lane that plans afresh.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeRetirementDebt",
+        action = "Unadmitted",
+        project = "aterm_agent::harness::native_restart::retirement_debt_tests::transition"
+    )
+)]
+fn unadmitted(st: &mut St, id: &str) -> Result<Recovery, &'static str> {
+    let prepare = retained_prepare(st).map_err(|_| "native-unknown")?;
+    if st.native.is_some()
+        || prepare.id != id
+        || !matches!(prepare.plan, NativePlan::Restart { .. })
+        || prepare.asked.is_some()
+        || [&st.native_noexec_prepare, &st.native_completed_prepare]
+            .into_iter()
+            .flatten()
+            .any(|done| done.id == id)
+    {
+        return Err("native-unknown");
+    }
+    st.native_prepare.clear();
+    st.native_rollback = false;
+    Ok(Recovery::Unadmitted)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -785,6 +838,14 @@ fn begin_plan(
 )]
 #[cfg_attr(
     any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "NativeReplayPublication",
+        action = "Unadmit",
+        reason = "The host's clock passes the deadline of a prepare it never admitted"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
     aterm_spec_anchor::refines(
         machine = "NativeReplayPublication",
         action = "Attempt",
@@ -822,6 +883,7 @@ pub(super) fn recover(
         },
     )?;
     if matches!(&reply, Reply::Admitted(binding) | Reply::Pending(binding) if binding.id != expected_id)
+        || matches!(&reply, Reply::Unadmitted(id) if *id != expected_id)
     {
         return Err("native-unknown");
     }
@@ -892,7 +954,7 @@ pub(super) fn abort(
     st: &mut St,
 ) -> bool {
     match recover(opts, session, client, tab, st) {
-        Ok(Recovery::Cancelled) => return true,
+        Ok(Recovery::Cancelled | Recovery::Unadmitted) => return true,
         Ok(Recovery::Completed | Recovery::Retired | Recovery::Held | Recovery::Legacy)
         | Err(_) => return false,
         Ok(Recovery::Admitted) => {}
@@ -1086,6 +1148,14 @@ pub(super) fn human_seq(status: &str) -> Option<u64> {
         project = "aterm_agent::harness::native_restart::transport_tests::replay_model::retirement_transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "NativeReplayPublication",
+        action = "Attempt",
+        project = "aterm_agent::harness::native_restart::transport_tests::replay_model::bare_retirement_transition"
+    )
+)]
 pub(super) fn retire(
     opts: &Opts,
     session: &str,
@@ -1108,7 +1178,7 @@ pub(super) fn retire(
         // replacement id or signal/resume a command merely to close it.
         match recover(opts, session, client, tab, st) {
             Ok(Recovery::Admitted) => {}
-            Ok(Recovery::Retired | Recovery::Cancelled) => return true,
+            Ok(Recovery::Retired | Recovery::Cancelled | Recovery::Unadmitted) => return true,
             _ => return false,
         }
     }

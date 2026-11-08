@@ -9,9 +9,9 @@ use std::path::PathBuf;
 
 use aterm_models_session::{transcript_join_model, turn_tracker_model};
 use aterm_slog::{
-    ActWord, Actor, Close, Conf, Cursor, Fields, GapWhy, Key, Kind, Limits, Log, Lvl, MAX_BYTES,
-    Mark, Node, Op, Open, Out, Rec, RunOut, ShortId, Src, Tier, TurnTracker, TxEvent, TxPos,
-    TxState, Verdict, WallJudge, WallKind, encode,
+    ActWord, Actor, Chose, Close, Conf, Cursor, Fields, GapWhy, Key, Kind, Limits, Log, Lvl,
+    MAX_BYTES, Mark, Node, Op, Open, Out, Rec, RunOut, ShortId, Src, Tier, TurnTracker, TxEvent,
+    TxPos, TxState, Verdict, WallJudge, WallKind, encode,
 };
 use aterm_spec::derive::{InvariantKind, Model};
 use aterm_spec::interp::{State, admits, with_buggy};
@@ -101,10 +101,12 @@ pub enum Ev {
     Wake,
     VendorTurn,
     JudgeRefutes,
-    /// Admitted and accepted control/person input (`Admit`).
-    Admit(Actor, Option<ActWord>),
+    /// Admitted and accepted control/person input (`Admit`), and what the frame showed its key
+    /// choose (`chose=`, fix E8).
+    Admit(Actor, Option<ActWord>, Option<Chose>),
     Accept,
-    Person,
+    /// A person's input, and what the frame showed its key choose (`chose=`, fix E8).
+    Person(Option<Chose>),
     State(TxState),
     File(u64),
     Bind(u64),
@@ -519,7 +521,7 @@ fn step(rig: RigKind, toks: &[&str]) -> Result<Ev, String> {
         ["judge-refutes"] => only(screen, Ev::JudgeRefutes),
         ["admit", by, rest @ ..] => {
             let (opts, bare) = split_opts(rest);
-            if let Some(k) = opts.keys().find(|k| **k != "act") {
+            if let Some(k) = opts.keys().find(|k| !["act", "chose", "key"].contains(*k)) {
                 return Err(format!("`{k}=` is no option of `admit`"));
             }
             if !bare.is_empty() {
@@ -529,10 +531,20 @@ fn step(rig: RigKind, toks: &[&str]) -> Result<Ev, String> {
                 None => None,
                 Some(w) => Some(ActWord::from_word(w).ok_or_else(|| format!("`{w}` is no act"))?),
             };
-            only(screen, Ev::Admit(Actor::from_word(by), act))
+            let chose = keyed(&opts)?;
+            only(screen, Ev::Admit(Actor::from_word(by), act, chose))
         }
         ["accept"] => only(screen, Ev::Accept),
-        ["person"] => only(screen, Ev::Person),
+        ["person", rest @ ..] => {
+            let (opts, bare) = split_opts(rest);
+            if let Some(k) = opts.keys().find(|k| !["chose", "key"].contains(*k)) {
+                return Err(format!("`{k}=` is no option of `person`"));
+            }
+            if !bare.is_empty() {
+                return Err(format!("`{bare:?}` after `person`"));
+            }
+            only(screen, Ev::Person(keyed(&opts)?))
+        }
         ["state", s] => only(
             !screen,
             Ev::State(TxState::from_word(s).ok_or_else(|| format!("`{s}` is no state"))?),
@@ -569,6 +581,29 @@ fn step(rig: RigKind, toks: &[&str]) -> Result<Ev, String> {
         }
         ["tx", rest @ ..] => only(!screen, Ev::Tx(tx_row(rest)?)),
         _ => Err(format!("`{}` is no step", toks.join(" "))),
+    }
+}
+
+/// The keys a `key=` names (fix E8): aterm-gui's corpus test reads each on the frame the last
+/// `see … fixture=` line names and holds the line's `chose=` to what presence makes of it.
+pub const KEYS: &[&str] = &[
+    "enter", "esc", "down", "text", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+];
+
+/// A line's `chose=` (what the frame showed its key choose), its `key=` checked against
+/// [`KEYS`]; a `chose=` names its `key=`.
+fn keyed(opts: &BTreeMap<&str, &str>) -> Result<Option<Chose>, String> {
+    if let Some(k) = opts.get("key")
+        && !KEYS.contains(k)
+    {
+        return Err(format!("`key={k}` is no key"));
+    }
+    match opts.get("chose") {
+        None => Ok(None),
+        Some(_) if !opts.contains_key("key") => Err("`chose=` names its `key=`".into()),
+        Some(w) => Chose::from_word(w)
+            .map(Some)
+            .ok_or_else(|| format!("`{w}` is no choice")),
     }
 }
 
@@ -921,7 +956,7 @@ impl TxRig {
             | Ev::JudgeRefutes
             | Ev::Admit(..)
             | Ev::Accept
-            | Ev::Person => {
+            | Ev::Person(_) => {
                 return Err("a screen rig's step".to_string());
             }
             Ev::Nothing | Ev::Expect(_) => {}
@@ -1366,9 +1401,9 @@ pub fn replay(seq: &Seq, broken: Broken) -> Result<Replay, String> {
                         Ev::Wake => Step::Wake,
                         Ev::VendorTurn => Step::TxEnd,
                         Ev::JudgeRefutes => Step::TxRefute,
-                        Ev::Admit(by, act) => Step::Admit(*by, *act),
+                        Ev::Admit(by, act, chose) => Step::Admit(*by, *act, *chose),
                         Ev::Accept => Step::Accept,
-                        Ev::Person => Step::Person,
+                        Ev::Person(chose) => Step::Person(*chose),
                         other => return Err(at_line(format!("{other:?} on the screen rig"))),
                     };
                     catch_unwind(AssertUnwindSafe(|| conformance_turn::apply(&m, rig, s)))
@@ -2316,6 +2351,12 @@ fn the_parser_refuses_what_the_format_does_not_say() {
         "ctl now",
         "ctl cause=",
         "expect link=3",
+        "person chose=approve",
+        "person key=enter chose=maybe",
+        "person key=f13",
+        "person now",
+        "admit ctl chose=answer",
+        "admit ctl key=tab",
     ] {
         assert!(
             parse("bad.seq", &format!("{head}{bad}\n")).is_err(),

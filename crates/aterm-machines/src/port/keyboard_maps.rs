@@ -20,7 +20,9 @@ type Ref = *const c_void;
 type Mapping = Vec<(i64, i64)>;
 type RestrictedRemapping = unsafe extern "C" fn(Ref) -> bool;
 
+#[cfg(test)]
 const NATIVE: &str = "HIDKeyboardModifierMappingPairs";
+#[cfg(test)]
 const USER: &str = "UserKeyMapping";
 const INVALID: &str = "unrecognized live keyboard filter state; existing remaps left untouched";
 const STALE: &str = "keyboard mappings changed during activation; remaining remaps left untouched";
@@ -129,15 +131,33 @@ pub(super) fn service_ids() -> Result<Vec<u64>, String> {
         Owned::new(unsafe { IOHIDEventSystemClientCreateWithType(ptr::null(), 2, ptr::null()) })?;
     // SAFETY: client is owned and live; CopyServices returns an owned CFArray.
     let services = Owned::new(unsafe { IOHIDEventSystemClientCopyServices(client.0) })?;
+    identities(services.0)
+}
+
+/// One Passive client supplies both the current cohort and its filter properties.
+pub(super) fn observations() -> Result<Vec<super::KeyboardServiceObservation>, String> {
+    // SAFETY: Passive (2) permits property reads without events or a subscription.
+    let client =
+        Owned::new(unsafe { IOHIDEventSystemClientCreateWithType(ptr::null(), 2, ptr::null()) })?;
+    // SAFETY: client is live; CopyServices returns an owned CFArray.
+    let services = Owned::new(unsafe { IOHIDEventSystemClientCopyServices(client.0) })?;
+    super::keyboard_observations(identities(services.0)?, &records(client.0)?)
+}
+
+fn identities(services: Ref) -> Result<Vec<u64>, String> {
     // SAFETY: services is a non-null CF object, checked before array operations.
-    if unsafe { CFGetTypeID(services.0) != CFArrayGetTypeID() } {
+    if unsafe { CFGetTypeID(services) != CFArrayGetTypeID() } {
         return Err(INVALID.into());
     }
     let mut ids = Vec::new();
     // SAFETY: services is an owned CFArray and every index is in its bounds.
-    for index in 0..unsafe { CFArrayGetCount(services.0) } {
+    let count = unsafe { CFArrayGetCount(services) };
+    if count < 0 {
+        return Err(INVALID.into());
+    }
+    for index in 0..count {
         // SAFETY: CopyServices supplies live service clients borrowed from this array.
-        let service = unsafe { CFArrayGetValueAtIndex(services.0, index) };
+        let service = unsafe { CFArrayGetValueAtIndex(services, index) };
         // SAFETY: the public IOKit conformance query accepts a live service and HID usages.
         if unsafe { IOHIDServiceClientConformsTo(service, 1, 6) } == 0 {
             continue;
@@ -146,7 +166,14 @@ pub(super) fn service_ids() -> Result<Vec<u64>, String> {
         let PValue::Int(id) = value(unsafe { IOHIDServiceClientGetRegistryID(service) })? else {
             return Err(INVALID.into());
         };
-        ids.push(u64::try_from(id).map_err(|_| INVALID)?);
+        let id = u64::try_from(id).map_err(|_| INVALID)?;
+        if id == 0 {
+            return Err(INVALID.into());
+        }
+        ids.push(id);
+        if ids.len() > 4096 {
+            return Err(INVALID.into());
+        }
     }
     ids.sort_unstable();
     if ids.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -193,7 +220,7 @@ fn value(value: Ref) -> Result<PValue, String> {
     let length = usize::try_from(unsafe { CFDataGetLength(data.0) }).map_err(|_| INVALID)?;
     // SAFETY: data is a live CFData; its byte pointer remains valid while data is owned.
     let bytes = unsafe { CFDataGetBytePtr(data.0) };
-    if length == 0 || bytes.is_null() {
+    if length == 0 || length > aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES || bytes.is_null() {
         return Err(INVALID.into());
     }
     // SAFETY: CFData supplies length initialized bytes, and its owner is still alive.
@@ -242,6 +269,7 @@ fn mapping_value(mapping: &Mapping) -> Result<Owned, String> {
     })
 }
 
+#[cfg(test)]
 fn field<'a>(value: &'a PValue, key: &str) -> Option<&'a PValue> {
     let PValue::Dict(fields) = value else {
         return None;
@@ -260,56 +288,19 @@ fn unique_sources(mapping: &Mapping) -> Result<(), String> {
     Ok(())
 }
 
-fn filter_mapping(filter: &PValue, name: &str) -> Result<Mapping, String> {
-    let Some(PValue::Array(pairs)) = field(filter, name) else {
-        return Err(INVALID.into());
-    };
-    let mapping = pairs
-        .iter()
-        .map(|pair| match (field(pair, "Src"), field(pair, "Dst")) {
-            (Some(PValue::Int(source)), Some(PValue::Int(destination))) => {
-                Ok((*source, *destination))
-            }
-            _ => Err(INVALID.to_owned()),
-        })
-        .collect::<Result<Mapping, String>>()?;
-    unique_sources(&mapping)?;
-    Ok(mapping)
-}
-
 fn check_snapshot(records: &PValue, change: &KeyboardMapChange) -> Result<(), String> {
-    let PValue::Array(records) = records else {
-        return Err(INVALID.into());
-    };
-    let mut services = records.iter().filter(|record| {
-        matches!(field(record, "IORegistryEntryID"), Some(PValue::Int(id)) if u64::try_from(*id).ok() == Some(change.registry))
-    });
-    let service = services.next().ok_or(INVALID)?;
-    if services.next().is_some() || !super::keyboard_usage::is_keyboard_service(service) {
-        return Err(INVALID.into());
-    }
-    let Some(PValue::Array(filters)) = field(service, "ServiceFilterDebug") else {
-        return Err(INVALID.into());
-    };
-    let mut filters = filters.iter().filter_map(|filter| {
-        let plugin = field(filter, "plugin")?;
-        matches!(field(plugin, "Class"), Some(PValue::Str(name)) if name == "IOHIDKeyboardFilter")
-            .then_some(plugin)
-    });
-    let filter = filters.next().ok_or(INVALID)?;
-    if filters.next().is_some() {
-        return Err(INVALID.into());
-    }
-    if super::KeyboardPrefix::read(filter)? != change.before_prefix {
+    let state = super::KeyboardServiceState::read(records, change.registry)?;
+    if state.prefix != change.before_prefix {
         return Err(STALE.into());
     }
-    for (name, expected) in [(NATIVE, &change.before_native), (USER, &change.before_user)] {
+    for (actual, expected) in [
+        (&state.native, &change.before_native),
+        (&state.user, &change.before_user),
+    ] {
         unique_sources(expected)?;
-        let mut actual = filter_mapping(filter, name)?;
         let mut expected = expected.clone();
-        actual.sort_unstable();
         expected.sort_unstable();
-        if actual != expected {
+        if *actual != expected {
             return Err(STALE.into());
         }
     }

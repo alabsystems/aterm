@@ -300,7 +300,7 @@ fn log_member_standings(
 /// ([`aterm_secrets::client::applied_version_names_log`]): that vault's records are not here (as
 /// after a join of it, before they arrive), so its removals cannot be read, and the book does not
 /// stand in for them.
-fn acknowledged_member_keys(
+pub(crate) fn acknowledged_member_keys(
     paths: &aterm_secrets::client::Paths,
 ) -> aterm_secrets::Result<Option<MemberKeys>> {
     let read = aterm_secrets::client::load_acknowledged_and_ahead(paths)?;

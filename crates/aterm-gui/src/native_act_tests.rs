@@ -50,6 +50,9 @@ mod publication;
 #[cfg(unix)]
 #[path = "native_receipt_tests.rs"]
 mod receipts;
+#[cfg(unix)]
+#[path = "native_unadmitted_tests.rs"]
+mod unadmitted;
 
 const PATIENCE: Duration = Duration::from_secs(60);
 
@@ -110,6 +113,8 @@ struct Facts {
     foreground: AtomicU32,
     signals: AtomicU32,
     constructors: AtomicBool,
+    /// Holds the next constructor check, once: a prepare's last read before its clock.
+    constructor_gate: Mutex<Option<PublicationGate>>,
     physical_target: Option<Vec<u8>>,
     account_allowed: AtomicBool,
     reservation: Option<(Arc<Barrier>, Arc<Barrier>)>,
@@ -263,6 +268,7 @@ impl Facts {
             foreground: AtomicU32::new(4242),
             signals: AtomicU32::new(0),
             constructors: AtomicBool::new(true),
+            constructor_gate: Mutex::new(None),
             physical_target: None,
             account_allowed: AtomicBool::new(true),
             reservation: None,
@@ -780,6 +786,18 @@ impl Kernel for Facts {
             .ok_or(())
     }
     fn constructor_enabled(&self, _: Constructor) -> bool {
+        let gate = self.constructor_gate.lock().unwrap().take();
+        if let Some((entered, proceed)) = gate {
+            entered.send(()).unwrap();
+            let (lock, ready) = &*proceed;
+            let (guard, waited) = ready
+                .wait_timeout_while(lock.lock().unwrap(), PATIENCE, |go| !*go)
+                .unwrap();
+            assert!(
+                *guard && !waited.timed_out(),
+                "constructor check was not released"
+            );
+        }
         self.constructors.load(Ordering::Acquire)
     }
     fn clock(&self) -> Clock {

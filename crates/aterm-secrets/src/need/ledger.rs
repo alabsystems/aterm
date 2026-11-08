@@ -7,7 +7,8 @@
 //! the words a person reads, never a value.
 
 use super::{
-    Act, Ask, Facts, Need, Proof, Purpose, Reason, Retirement, State, Wait, Want, act, settle,
+    Act, Ask, Facts, Need, Proof, Purpose, Reason, RefusalClaim, Retirement, State, Wait, Want,
+    act, settle,
 };
 use crate::client::{Paths, toml_str};
 use crate::{Error, fsx};
@@ -79,9 +80,64 @@ pub(crate) fn load(paths: &Paths) -> crate::Result<Vec<Need>> {
     let Some(rows) = table.get("need") else {
         return Ok(Vec::new());
     };
-    let rows = rows.as_array().ok_or_else(damaged)?;
+    let (rows, versioned): (&[_], bool) = match rows {
+        aterm_toml::Value::Array(rows) => (rows, false),
+        aterm_toml::Value::Table(container)
+            if container
+                .get("format")
+                .and_then(aterm_toml::Value::as_integer)
+                == Some(2) =>
+        {
+            let rows = match container.get("rows") {
+                None => &[][..],
+                Some(rows) => rows.as_array().ok_or_else(damaged)?.as_slice(),
+            };
+            (rows, true)
+        }
+        _ => return Err(damaged()),
+    };
+    let mut resolved = std::collections::BTreeMap::new();
     rows.iter()
-        .map(|row| row.as_table().and_then(row_of).ok_or_else(damaged))
+        .map(|row| {
+            let table = row.as_table().ok_or_else(damaged)?;
+            let mut need = row_of(table).ok_or_else(damaged)?;
+            let present = ["refused", "refused_legacy", "refused_version"]
+                .iter()
+                .filter(|key| table.get(key).is_some())
+                .count();
+            if present > 1
+                || (!versioned
+                    && (table.get("refused_legacy").is_some()
+                        || table.get("refused_version").is_some()))
+            {
+                return Err(damaged());
+            }
+            if table.get("refused").is_some() && need.refused.is_none() {
+                return Err(damaged());
+            }
+            if let Some(value) = table.get("refused_legacy") {
+                need.refused = Some(RefusalClaim::LegacySequence(
+                    value
+                        .as_str()
+                        .ok_or_else(damaged)?
+                        .parse()
+                        .map_err(|_| damaged())?,
+                ));
+            }
+            if let Some(value) = table.get("refused_version") {
+                let text = value
+                    .as_str()
+                    .filter(|text| text.len() <= 2048)
+                    .ok_or_else(damaged)?;
+                let bytes = unhex(text).ok_or_else(damaged)?;
+                if !resolved.contains_key(&bytes) {
+                    let claim = crate::client::version::resolve_reference(paths, &bytes)?;
+                    resolved.insert(bytes.clone(), claim);
+                }
+                need.refused = Some(RefusalClaim::Authenticated(resolved[&bytes].clone()));
+            }
+            Ok(need)
+        })
         .collect()
 }
 
@@ -147,7 +203,7 @@ fn row_of(t: &aterm_toml::Table) -> Option<Need> {
         raised: n("raised")?,
         updated: n("updated")?,
         raises: u32::try_from(n("raises")?).ok()?,
-        refused: n("refused"),
+        refused: n("refused").map(RefusalClaim::LegacySequence),
         needed: b("needed")?,
         asking: b("asking")?,
         proof,
@@ -171,13 +227,13 @@ fn int(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
-fn render(rows: &[Need]) -> String {
+fn render(paths: &Paths, rows: &[Need]) -> crate::Result<String> {
     let mut text = String::from(
         "# aterm secrets need ledger (docs/DESIGN-credential-requests-2026-10-27.md).\n\
-         # Written by aterm; names, states and explanations only, never a value.\n",
+         # Written by aterm; names, states and explanations only, never a value.\n\n[need]\nformat = 2\n",
     );
     for need in rows {
-        text.push_str("\n[[need]]\n");
+        text.push_str("\n[[need.rows]]\n");
         let mut put = |key: &str, value: String| text.push_str(&format!("{key} = {value}\n"));
         put("id", toml_str(&hex(&need.id)));
         put("want", toml_str(&need.want.key()));
@@ -196,8 +252,16 @@ fn render(rows: &[Need]) -> String {
         if let Some(seq) = need.seq {
             put("seq", int(seq).to_string());
         }
-        if let Some(refused) = need.refused {
-            put("refused", int(refused).to_string());
+        if let Some(refused) = &need.refused {
+            match refused {
+                RefusalClaim::LegacySequence(seq) => {
+                    put("refused_legacy", toml_str(&seq.to_string()))
+                }
+                RefusalClaim::Authenticated(claim) => {
+                    let reference = crate::client::version::retained_reference(paths, claim)?;
+                    put("refused_version", toml_str(&hex(&reference)));
+                }
+            }
         }
         if let Some(changed) = need.raised_again_on_change {
             put("raised_again_on_change", changed.to_string());
@@ -244,7 +308,10 @@ fn render(rows: &[Need]) -> String {
             put("needs_you", toml_str(&ask.needs_you));
         }
     }
-    text
+    if text.len() > MAX_BYTES {
+        return Err(Error::new("the need ledger exceeds its bounded storage"));
+    }
+    Ok(text)
 }
 
 /// Write every row, keeping at most [`MAX_ROWS`] (the oldest ended ones go first). A row with
@@ -268,7 +335,11 @@ pub(crate) fn save(paths: &Paths, rows: &mut Vec<Need>) -> crate::Result<()> {
         rows.remove(oldest);
     }
     fsx::ensure_private_dir(&paths.dir)?;
-    fsx::write_atomic(&paths.dir.join(FILE), render(rows).as_bytes(), 0o600)
+    fsx::write_atomic(
+        &paths.dir.join(FILE),
+        render(paths, rows)?.as_bytes(),
+        0o600,
+    )
 }
 
 fn now() -> u64 {
@@ -328,7 +399,12 @@ pub fn raise(paths: &Paths, want: Want, purpose: Purpose) -> crate::Result<Need>
 /// # Errors
 /// As [`raise`].
 pub fn raise_refused(paths: &Paths, want: Want, purpose: Purpose, seq: u64) -> crate::Result<Need> {
-    raise_with(paths, want, purpose, Some(seq))
+    raise_with(
+        paths,
+        want,
+        purpose,
+        Some(RefusalClaim::LegacySequence(seq)),
+    )
 }
 
 /// Record a consumer refusal only while the captured paired materialization's exact
@@ -347,9 +423,28 @@ pub fn raise_refused_from_snapshot(
     current: impl Fn() -> crate::Result<()>,
 ) -> crate::Result<Need> {
     let entries = want.entries();
-    with_snapshot_ledger(paths, &entries, snapshot, true, current, |rows, facts| {
-        raise_in(rows, facts, want, purpose, Some(snapshot.sequence()))
-    })
+    with_snapshot_ledger(
+        paths,
+        &entries,
+        snapshot,
+        true,
+        true,
+        current,
+        |rows, facts| {
+            let version = facts
+                .sight
+                .as_ref()
+                .and_then(|sight| sight.version.as_ref())
+                .ok_or_else(|| Error::new("the refusal has no authenticated source version"))?;
+            raise_in(
+                rows,
+                facts,
+                want,
+                purpose,
+                Some(RefusalClaim::Authenticated(version.claim().clone())),
+            )
+        },
+    )
 }
 
 fn with_snapshot_ledger<T>(
@@ -357,12 +452,17 @@ fn with_snapshot_ledger<T>(
     entries: &[String],
     snapshot: &crate::client::MaterializationSnapshot,
     require_signed: bool,
+    retain: bool,
     current: impl Fn() -> crate::Result<()>,
     change: impl FnOnce(&mut Vec<Need>, &Facts) -> crate::Result<T>,
 ) -> crate::Result<T> {
     let _lock = Lock::take(paths)?;
     current()?;
     let commons = super::observed_commons(paths);
+    if retain {
+        snapshot.retain_for_refusal(paths)?;
+        current()?;
+    }
     snapshot.at_current_version(paths, entries, || {
         let facts = super::facts_with_commons(paths, now(), || commons)?;
         with_rows(paths, &facts, |rows, facts| {
@@ -388,7 +488,7 @@ fn raise_with(
     paths: &Paths,
     want: Want,
     purpose: Purpose,
-    refused: Option<u64>,
+    refused: Option<RefusalClaim>,
 ) -> crate::Result<Need> {
     with_ledger(paths, |rows, facts| {
         raise_in(rows, facts, want, purpose, refused)
@@ -400,7 +500,7 @@ fn raise_in(
     facts: &Facts,
     want: Want,
     purpose: Purpose,
-    refused: Option<u64>,
+    refused: Option<RefusalClaim>,
 ) -> crate::Result<Need> {
     let at = rows
         .iter()
@@ -414,19 +514,19 @@ fn raise_in(
         Some(old)
             if old.state == State::Fulfilled
                 || (!old.state.ended()
-                    && refused
-                        .is_some_and(|next| old.refused.is_none_or(|before| next > before))) =>
+                    && advances(facts, refused.as_ref(), old.refused.as_ref())) =>
         {
             let mut need = super::fresh(new_id()?, want, purpose, facts);
             need.raises = old.raises.saturating_add(1);
-            need.refused = refused.or(old.seq).max(old.refused);
+            let incoming = refused.or_else(|| old.seq.map(RefusalClaim::LegacySequence));
+            need.refused = later_floor(facts, incoming, old.refused);
             settle(&need, facts)
         }
         Some(old) if old.state.ended() => {
             let again = act(&old, facts, &Act::NeedAgain).unwrap_or(old);
             match reraise(&again, facts)? {
                 Some(mut raised) => {
-                    raised.refused = refused.max(raised.refused);
+                    raised.refused = later_floor(facts, refused, raised.refused);
                     settle(&raised, facts)
                 }
                 None => again,
@@ -439,6 +539,50 @@ fn raise_in(
         None => rows.push(next.clone()),
     }
     Ok(next)
+}
+
+fn advances(facts: &Facts, next: Option<&RefusalClaim>, before: Option<&RefusalClaim>) -> bool {
+    match (next, before) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(RefusalClaim::LegacySequence(next)), Some(RefusalClaim::LegacySequence(old))) => {
+            next > old
+        }
+        (Some(RefusalClaim::Authenticated(next)), Some(RefusalClaim::LegacySequence(old))) => {
+            facts.sight.as_ref().is_some_and(|sight| {
+                sight.version.as_ref().is_some_and(|current| {
+                    current.claim() == next
+                        && (current.envelope_sequence().is_some_and(|seq| seq > *old)
+                            || (*old == 0
+                                && sight.seq == 0
+                                && next.log().is_some()
+                                && current.envelope_sequence().is_none()))
+                })
+            })
+        }
+        (Some(RefusalClaim::Authenticated(next)), Some(RefusalClaim::Authenticated(old))) => facts
+            .sight
+            .as_ref()
+            .and_then(|sight| sight.version.as_ref())
+            .is_some_and(|current| {
+                current.relation_between(next, old)
+                    == crate::client::version::VersionRelation::Advanced
+                    || (current.claim() == next && current.refines_for_recovery(old))
+            }),
+        _ => false,
+    }
+}
+
+fn later_floor(
+    facts: &Facts,
+    next: Option<RefusalClaim>,
+    before: Option<RefusalClaim>,
+) -> Option<RefusalClaim> {
+    if advances(facts, next.as_ref(), before.as_ref()) {
+        next
+    } else {
+        before.or(next)
+    }
 }
 
 /// `need` raised again under a new request id, when it ended for a reason whose condition has
@@ -464,8 +608,9 @@ pub fn satisfied(paths: &Paths, want: &Want, purpose: Purpose) -> crate::Result<
 }
 
 /// The consumer accepted its paired credential. An explicit refusal additionally requires
-/// prior provider acceptance at a later signed version; ordinary local consumption may
-/// retire an unneeded request without claiming signed or protocol delivery.
+/// prior provider acceptance at a later signed version or an exact-envelope witness
+/// refinement; ordinary local consumption may retire an unneeded request without claiming
+/// signed or protocol delivery.
 /// A prior request's acceptance cannot settle a concurrent replacement or new refusal.
 /// `current` has the same local-read-only contract as [`raise_refused_from_snapshot`].
 /// # Errors
@@ -481,6 +626,7 @@ pub fn acknowledge_from_snapshot(
         &expected.want.entries(),
         snapshot,
         expected.refused.is_some(),
+        false,
         current,
         |rows, facts| {
             let row = rows
@@ -490,9 +636,32 @@ pub fn acknowledge_from_snapshot(
             if row.id != expected.id
                 || row.refused != expected.refused
                 || row.state.ended()
-                || row
-                    .refused
-                    .is_some_and(|floor| snapshot.sequence() <= floor)
+                || match row.refused.as_ref() {
+                    Some(RefusalClaim::Authenticated(floor)) => {
+                        !facts.after_refusal(row.refused.as_ref())
+                            && !facts
+                                .sight
+                                .as_ref()
+                                .and_then(|sight| sight.version.as_ref())
+                                .is_some_and(|version| version.refines_for_recovery(floor))
+                    }
+                    Some(RefusalClaim::LegacySequence(floor))
+                        if !facts.after_refusal(row.refused.as_ref()) =>
+                    {
+                        // No historical log witness exists for old scalar zero. A consumer may
+                        // confirm the actual current paired value without inventing that past.
+                        *floor != 0
+                            || snapshot.sequence() != 0
+                            || facts
+                                .sight
+                                .as_ref()
+                                .and_then(|s| s.version.as_ref())
+                                .is_none_or(|v| {
+                                    v.claim().log().is_none() || v.envelope_sequence().is_some()
+                                })
+                    }
+                    _ => false,
+                }
             {
                 return Err(Error::new(
                     "the credential request or refusal changed during confirmation",
@@ -598,7 +767,7 @@ pub fn absorb(
                 Absorb::Reissued { nonce, record } if !need.state.ended() && need.posted => {
                     let fresh = Need {
                         raises: need.raises.saturating_add(1),
-                        refused: need.refused,
+                        refused: need.refused.clone(),
                         ..super::fresh(*nonce, need.want.clone(), need.purpose, facts)
                     };
                     act(&fresh, facts, &Act::Flush).map(|next| Need {

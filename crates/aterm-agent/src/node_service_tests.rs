@@ -4,6 +4,68 @@
 use super::*;
 use std::cell::RefCell;
 
+#[cfg(unix)]
+#[test]
+fn required_manager_command_waits_for_a_scheduled_child() {
+    let program = aterm_uds::deadline::stand_in(Path::new("/bin/echo"));
+    let result = run_service_after(&program, &["ready"], Duration::from_secs(31));
+    let out = result.expect("required manager command completed");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"ready\n");
+
+    let refusal = aterm_uds::deadline::stand_in(Path::new("/usr/bin/false"));
+    let out = run_service_after(&refusal, &[], Duration::from_secs(31)).unwrap();
+    assert_eq!(out.status.code(), Some(1), "an actual refusal is retained");
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let unmade = scratch.path().join("not-launched");
+    let mkdir = aterm_uds::deadline::stand_in(Path::new("/bin/mkdir"));
+    let result = run_service_after(&mkdir, &[unmade.to_str().unwrap()], Duration::from_secs(61));
+    assert!(result.is_err());
+    assert!(!unmade.exists(), "an expired action starts no child");
+}
+
+#[test]
+fn required_node_bootout_waits_for_a_scheduled_observation() {
+    let mut polls = 0;
+    let result = await_bootout(
+        "gui/501/systems.alab.aterm-node",
+        Instant::now() - Duration::from_secs(31),
+        BOOTOUT_SETTLE,
+        || {
+            polls += 1;
+            Ok(polls == 1)
+        },
+        |_| {},
+    );
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(polls, 2);
+
+    let mut held_polls = 0;
+    let result = await_bootout(
+        "gui/501/systems.alab.aterm-node",
+        Instant::now() - Duration::from_secs(61),
+        BOOTOUT_SETTLE,
+        || {
+            held_polls += 1;
+            Ok(true)
+        },
+        |_| panic!("an expired held observation never pauses"),
+    );
+    let error = result.unwrap_err();
+    assert!(error.contains("gui/501/systems.alab.aterm-node"), "{error}");
+    assert_eq!(held_polls, 1);
+
+    let result = await_bootout(
+        "gui/501/systems.alab.aterm-node",
+        Instant::now(),
+        BOOTOUT_SETTLE,
+        || Err("print refused".into()),
+        |_| panic!("a real print error never pauses"),
+    );
+    assert_eq!(result.unwrap_err(), "print refused");
+}
+
 #[test]
 fn mesh_node_hosts_local_fabric_without_swarm_or_membership() {
     let tmp = aterm_tempfile::tempdir().unwrap();

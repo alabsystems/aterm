@@ -139,7 +139,7 @@ const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
 
 /// How long one `launchctl` call may take before it is called hung, killed and refused.
 #[cfg(unix)]
-const LAUNCHCTL_HANG: std::time::Duration = std::time::Duration::from_secs(30);
+const LAUNCHCTL_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The label of the job for executable `exe` ([`INSTALLED_LABEL`], [`INSTALLED_EXECUTABLE`]).
 #[must_use]
@@ -913,9 +913,24 @@ pub enum Started {
 /// Run one `launchctl` command with `/dev/null` stdin under [`LAUNCHCTL_HANG`].
 #[cfg(unix)]
 fn launchctl(argv: &[String]) -> io::Result<std::process::Output> {
-    let mut cmd = aterm_uds::spawnfd::command(LAUNCHCTL);
+    launchctl_after(Path::new(LAUNCHCTL), argv, std::time::Duration::ZERO)
+}
+
+#[cfg(unix)]
+fn launchctl_after(
+    program: &Path,
+    argv: &[String],
+    elapsed: std::time::Duration,
+) -> io::Result<std::process::Output> {
+    let remaining = LAUNCHCTL_HANG
+        .checked_sub(elapsed)
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::TimedOut, "launchctl hang detector elapsed")
+        })?;
+    let mut cmd = aterm_uds::spawnfd::command(program);
     cmd.args(argv);
-    aterm_uds::deadline::output_within(&mut cmd, LAUNCHCTL_HANG)
+    aterm_uds::deadline::output_within(&mut cmd, remaining)
         .map_err(|e| io::Error::other(format!("launchctl {}: {e}", argv.join(" "))))
 }
 
@@ -1099,6 +1114,35 @@ fn write_session_plist(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_required_launchctl_child_waits_for_its_actual_reply() {
+        use std::time::Duration;
+
+        let program = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+        let argv = ["-c", "printf ready"].map(str::to_owned);
+        let output = launchctl_after(&program, &argv, Duration::from_secs(31)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready");
+
+        let argv = ["-c", "printf refused >&2; exit 7"].map(str::to_owned);
+        let output = launchctl_after(&program, &argv, Duration::from_secs(31)).unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stderr, b"refused");
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let marker = root.path().join("must-not-exist");
+        let argv = [
+            "-c".to_owned(),
+            "printf wrote > \"$1\"".to_owned(),
+            "sh".to_owned(),
+            marker.to_str().unwrap().to_owned(),
+        ];
+        let error = launchctl_after(&program, &argv, Duration::from_secs(61)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(!marker.exists(), "an expired command is never started");
+    }
 
     #[test]
     fn the_installed_app_and_dev_builds_never_share_a_label() {

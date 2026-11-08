@@ -22,6 +22,9 @@ pub(crate) struct InputMark {
     /// What the input says it means for the box it dismisses.
     act: Option<aterm_slog::ActWord>,
     admission: Option<aterm_slog::Admission>,
+    /// The input's key class ([`Self::keyed`]) and the frame it was admitted on (fix E8).
+    key: crate::session_log::KeyClass,
+    frame: crate::session_log::KeyFrame,
     accepted: Arc<AtomicBool>,
     /// Informational credit captured at admission.
     typist: Option<(
@@ -58,10 +61,14 @@ impl InputMark {
         cause: Option<aterm_slog::ShortId>,
         turn: bool,
     ) -> Self {
-        let (epoch, admission) = {
+        let (epoch, admission, frame) = {
             let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let slog = timeline.slog();
-            (slog.log().ep(), slog.admit_input(slog.now()))
+            (
+                slog.log().ep(),
+                slog.admit_input(slog.now()),
+                slog.key_frame(),
+            )
         };
         Self {
             timeline: Arc::downgrade(&ctx.timeline),
@@ -73,6 +80,8 @@ impl InputMark {
             turn,
             act: None,
             admission,
+            key: crate::session_log::KeyClass::Other,
+            frame,
             accepted: Arc::new(AtomicBool::new(false)),
             typist: None,
             supervisor: None,
@@ -85,6 +94,12 @@ impl InputMark {
     /// The input's `act=`.
     pub(crate) const fn acting(mut self, act: Option<aterm_slog::ActWord>) -> Self {
         self.act = act;
+        self
+    }
+
+    /// The input's key class (fix E8): what it chooses on the frame it was admitted on.
+    pub(crate) const fn keyed(mut self, key: crate::session_log::KeyClass) -> Self {
+        self.key = key;
         self
     }
 
@@ -247,6 +262,7 @@ impl InputCompletion {
                 self.mark.actor,
                 self.mark.act,
                 self.mark.admission,
+                (self.mark.key, self.mark.frame),
                 at,
             );
             let acted = crate::session_log::InputAct::of_acceptance(self.mark.act, bound);
@@ -316,12 +332,21 @@ pub(crate) mod testing {
     ) -> bool {
         let event =
             crate::input::InputEvent::Paste(text.to_owned(), crate::input::PasteFraming::AtDrain);
+        input(handle, mark, &event)
+    }
+
+    /// `event` written to the program under `mark`, as the control path writes it.
+    pub(crate) fn input(
+        handle: &crate::session_store::SessionHandle,
+        mark: &InputMark,
+        event: &crate::input::InputEvent,
+    ) -> bool {
         let receipt = crate::app_input::tracked_egress(
             &handle.term,
             &handle.ctx.modes,
             &handle.ctx.sink,
             &handle.ctx.output_echo,
-            &event,
+            event,
             crate::input::EgressMode::Backpressured,
         );
         let accepted = receipt.fully_accepted_nonempty();

@@ -12,8 +12,9 @@
 //!   release` judged are the bytes that ship, and a release that refuses before the claim
 //!   burns no number.
 //! * [`claim`] lands the reservation: main takes C (a fast-forward, or a merge onto a tip
-//!   peers moved), and that `git push` is a compare-and-swap on the ledger tail, retried on
-//!   rejection up to [`MAX_CLAIM_ATTEMPTS`] times and verified afterwards against the
+//!   peers moved), through the native expected-old main transaction. Only a typed conflict
+//!   without side effects retries, up to [`MAX_CLAIM_ATTEMPTS`] times; an unknown result
+//!   stops before rereading can reinterpret it. A successful write is verified against the
 //!   remote tail byte for byte. A reservation whose `n` the tail has reached is never
 //!   re-numbered (its bytes carry `n`): it refuses, and the release reserves and builds
 //!   again.
@@ -110,14 +111,109 @@ pub trait GitRunner {
     }
 }
 
-/// A `git push` that failed because the remote ref moved (a lost compare-and-swap, which a rebuild on the new tip answers), judged by git's stderr: refused by this git, which saw the moved tip in the remote's advertisement (`[rejected]`, `fetch first`, `non-fast-forward`), or by the remote, whose ref moved between that advertisement and its update (`[remote rejected]` with git's `incorrect old value provided`, or a `cannot lock ref`, as GitHub words it).
-pub(crate) fn lost_race(push_stderr: &str) -> bool {
-    push_stderr.contains("non-fast-forward")
-        || push_stderr.contains("fetch first")
-        || push_stderr.contains("[rejected]")
-        || (push_stderr.contains("[remote rejected]")
-            && (push_stderr.contains("incorrect old value")
-                || push_stderr.contains("cannot lock ref")))
+/// Typed origin operations, separate from local Git object and worktree plumbing.
+/// Only a native conflict with no side effect is a lost compare-and-swap.
+pub use crate::github_remote::RefWrite;
+pub use agh::git::{ControlRefChange, ControlRefTransaction};
+
+pub trait Origin {
+    fn refresh_main(&self) -> std::result::Result<String, String>;
+    /// A complete validated full-ref/peeled tag listing, independent of main.
+    fn tag_catalog(&self) -> std::result::Result<String, String> {
+        Err("this origin does not provide a tag catalog".into())
+    }
+    /// One freshly observed tag resolved to an imported commit.
+    fn tag_commit(&self, _tag: &str) -> std::result::Result<Option<String>, String> {
+        Err("this origin does not resolve release tag commits".into())
+    }
+    /// A child's exact imported declared branch tip, or its advertised HEAD.
+    fn submodule_tip(&self, _path: &Path, _reference: &str) -> std::result::Result<String, String> {
+        Err("this origin does not resolve submodule tips".into())
+    }
+    fn get(&self, reference: &str) -> std::result::Result<Option<String>, String>;
+    fn import(&self, oid: &str) -> std::result::Result<(), String>;
+    /// An annotated tag's final commit. A lightweight object returns `None`;
+    /// an annotated tag ending at a tree/blob refuses rather than becoming a claim.
+    fn peel(&self, oid: &str) -> std::result::Result<Option<String>, String>;
+    fn tag_object(&self, oid: &str) -> std::result::Result<Vec<u8>, String>;
+    fn write(
+        &self,
+        reference: &str,
+        before: Option<&str>,
+        after: &str,
+    ) -> std::result::Result<crate::github_remote::RefWrite, String>;
+    fn delete(
+        &self,
+        reference: &str,
+        expected_oid: &str,
+    ) -> std::result::Result<crate::github_remote::RefWrite, String>;
+    /// One validated canonical control transaction, including paired unlock.
+    fn control_transaction(
+        &self,
+        transaction: ControlRefTransaction,
+    ) -> std::result::Result<RefWrite, String>;
+}
+
+impl Origin for crate::github_remote::Remote {
+    fn refresh_main(&self) -> std::result::Result<String, String> {
+        Self::refresh_main(self)
+    }
+
+    fn tag_catalog(&self) -> std::result::Result<String, String> {
+        Self::tag_catalog(self)
+    }
+
+    fn tag_commit(&self, tag: &str) -> std::result::Result<Option<String>, String> {
+        Self::tag_commit(self, tag)
+    }
+
+    fn submodule_tip(&self, path: &Path, reference: &str) -> std::result::Result<String, String> {
+        Self::submodule_tip(self, path, reference)
+    }
+
+    fn get(&self, reference: &str) -> std::result::Result<Option<String>, String> {
+        Self::get(self, reference)
+    }
+
+    fn import(&self, oid: &str) -> std::result::Result<(), String> {
+        self.fetch_exact(oid)
+    }
+
+    fn peel(&self, oid: &str) -> std::result::Result<Option<String>, String> {
+        let Some(commit) = self.peel_tag(oid)? else {
+            return Ok(None);
+        };
+        self.require_commit(&commit)?;
+        Ok(Some(commit))
+    }
+
+    fn tag_object(&self, oid: &str) -> std::result::Result<Vec<u8>, String> {
+        Self::tag_object(self, oid)
+    }
+
+    fn write(
+        &self,
+        reference: &str,
+        before: Option<&str>,
+        after: &str,
+    ) -> std::result::Result<crate::github_remote::RefWrite, String> {
+        self.write_ref(reference, before, after)
+    }
+
+    fn delete(
+        &self,
+        reference: &str,
+        expected_oid: &str,
+    ) -> std::result::Result<crate::github_remote::RefWrite, String> {
+        self.delete_ref(reference, expected_oid)
+    }
+
+    fn control_transaction(
+        &self,
+        transaction: ControlRefTransaction,
+    ) -> std::result::Result<RefWrite, String> {
+        self.control_refs(transaction)
+    }
 }
 
 /// Run `cmd` (a `git` with its leading arguments) with `args` and `input` on its stdin, captured as [`RunOut`].
@@ -377,21 +473,22 @@ pub type ClaimChangelogs<'a> = &'a dyn Fn(&str, &str) -> Result<(String, String)
 /// Reserve the release's identity before anything is built: read origin's ledger tail, `n = max(tail + 1, plan.now)`, and make the release commit C (`plan.source` plus `n version` appended to its ledger and its rolled changelog, `changelogs`' first half) from git objects ([`commit_with`]), with no worktree, index or push.
 pub fn reserve(
     git: &dyn GitRunner,
+    origin: &dyn Origin,
     plan: &ClaimPlan<'_>,
     changelogs: ClaimChangelogs<'_>,
 ) -> Result<Reserved> {
     check_version_shape(plan.version)?;
-    git_ok(git, &["fetch", "origin", "main"]).map_err(|e| {
+    let main = origin.refresh_main().map_err(|e| {
         Error::new(format!(
             "cannot reach origin (no offline cuts — the reservation reads origin's ledger \
              tail): {e}"
         ))
     })?;
-    source_on_main(git, plan.source)?;
+    source_on_main(git, plan.source, &main)?;
     let source_ledger = show_utf8(git, plan.source, LEDGER_FILE)?;
     let source_changelog = show_utf8(git, plan.source, changelog::CHANGELOG_FILE)?;
-    let n = next_build(tail(&show_origin_ledger(git)?)?.build, plan.now)?;
-    let main_changelog = show_utf8(git, "origin/main", changelog::CHANGELOG_FILE)?;
+    let n = next_build(tail(&show_utf8(git, &main, LEDGER_FILE)?)?.build, plan.now)?;
+    let main_changelog = show_utf8(git, &main, changelog::CHANGELOG_FILE)?;
     let (release_changelog, _) = changelogs(&source_changelog, &main_changelog)?;
     let line = format!("{n} {}", plan.version);
     let commit = commit_with(
@@ -415,6 +512,7 @@ pub fn reserve(
 /// Claim a reservation: main takes the release commit `reserved.commit` whatever its tip is, as a fast-forward when main has not moved past the published commit, else as a merge onto the tip (the tip's tree plus the same ledger line and the shipped notes moved out of `[Unreleased]`, `changelogs`' second half).
 pub fn claim(
     git: &dyn GitRunner,
+    origin: &dyn Origin,
     worktree: &Path,
     plan: &ClaimPlan<'_>,
     reserved: &Reserved,
@@ -422,7 +520,7 @@ pub fn claim(
 ) -> Result<Claim> {
     check_version_shape(plan.version)?;
 
-    git_ok(git, &["fetch", "origin", "main"]).map_err(|e| {
+    let mut tip = origin.refresh_main().map_err(|e| {
         Error::new(format!(
             "cannot reach origin (no offline cuts — the ledger claim IS the push): {e}"
         ))
@@ -435,7 +533,7 @@ pub fn claim(
             plan.source
         )));
     }
-    source_on_main(git, plan.source)?;
+    source_on_main(git, plan.source, &tip)?;
     reservation_is_the_claims(git, plan, reserved)?;
     let source_changelog = show_utf8(git, plan.source, changelog::CHANGELOG_FILE)?;
     let (n, release, line) = (
@@ -444,7 +542,7 @@ pub fn claim(
         reserved.line.as_str(),
     );
 
-    let mut base = show_origin_ledger(git)?;
+    let mut base = show_utf8(git, &tip, LEDGER_FILE)?;
     let mut attempt = 0u32;
     let landed = loop {
         attempt += 1;
@@ -459,11 +557,10 @@ pub fn claim(
                 RELEASE_COMMAND
             )));
         }
-        let tip = rev_parse(git, "origin/main")?;
         let landed = if tip == plan.source {
             release.to_string()
         } else {
-            let main_changelog = show_utf8(git, "origin/main", changelog::CHANGELOG_FILE)?;
+            let main_changelog = show_utf8(git, &tip, changelog::CHANGELOG_FILE)?;
             let (_, landing_changelog) = changelogs(&source_changelog, &main_changelog)?;
             commit_with(
                 git,
@@ -481,21 +578,20 @@ pub fn claim(
             )?
         };
 
-        let push = git.git(&["push", "origin", &format!("{landed}:refs/heads/main")])?;
-        if push.success() {
+        let written = origin
+            .write("refs/heads/main", Some(&tip), &landed)
+            .map_err(|error| {
+                Error::new(format!(
+                    "native main claim failed; refusing to reinterpret it as a known \
+                 compare-and-swap conflict: {error}"
+                ))
+            })?;
+        if written == RefWrite::Written {
             break landed;
         }
-        let push_err = push.stderr_utf8().trim().to_string();
-
-        if !lost_race(&push_err) {
-            return Err(Error::new(format!(
-                "git push origin main failed (NOT a fast-forward rejection — retrying \
-                 cannot help); aborting with the checkout on the published commit, nothing \
-                 burned: {push_err}"
-            )));
-        }
-
-        git_ok(git, &["fetch", "origin", "main"])?;
+        // Only native Conflict with no side effect reaches this retry path.
+        let push_err = "native expected-old conflict without side effects";
+        tip = origin.refresh_main().map_err(Error::new)?;
 
         if attempt >= plan.max_attempts {
             return Err(Error::new(format!(
@@ -506,15 +602,14 @@ pub fn claim(
         }
 
         let tag_ref = format!("refs/tags/v{}", plan.version);
-        let tags = git_ok(git, &["ls-remote", "--tags", "origin", &tag_ref])?;
-        if !tags.stdout_utf8().trim().is_empty() {
+        if origin.get(&tag_ref).map_err(Error::new)?.is_some() {
             return Err(Error::new(format!(
                 "v{} cut elsewhere: origin already has tag v{}",
                 plan.version, plan.version
             )));
         }
         if !plan.allow_existing_section {
-            let cl = show_utf8(git, "origin/main", changelog::CHANGELOG_FILE)?;
+            let cl = show_utf8(git, &tip, changelog::CHANGELOG_FILE)?;
             if changelog::has_section(&cl, plan.version) {
                 return Err(Error::new(format!(
                     "v{} cut elsewhere: origin/main already has a \"## [{}]\" changelog \
@@ -524,7 +619,7 @@ pub fn claim(
             }
         }
 
-        base = show_origin_ledger(git)?;
+        base = show_utf8(git, &tip, LEDGER_FILE)?;
     };
 
     let unjournaled = |why: String| {
@@ -537,14 +632,14 @@ pub fn claim(
             RELEASE_COMMAND
         ))
     };
-    git_ok(git, &["fetch", "origin", "main"]).map_err(|e| unjournaled(e.to_string()))?;
-    let origin_tip = rev_parse(git, "origin/main").map_err(|e| unjournaled(e.to_string()))?;
+    let origin_tip = origin.refresh_main().map_err(unjournaled)?;
     if origin_tip != landed {
         return Err(unjournaled(format!(
             "origin/main ({origin_tip}) is not the pushed claim ({landed})"
         )));
     }
-    let remote = show_origin_ledger(git).map_err(|e| unjournaled(e.to_string()))?;
+    let remote =
+        show_utf8(git, &origin_tip, LEDGER_FILE).map_err(|e| unjournaled(e.to_string()))?;
     let remote_tail = remote.lines().last().unwrap_or("");
     if remote_tail != line {
         return Err(unjournaled(format!(
@@ -570,9 +665,9 @@ pub fn claim(
 }
 
 /// `source` is a commit of `origin/main`: a claim lands on main.
-fn source_on_main(git: &dyn GitRunner, source: &str) -> Result<()> {
+fn source_on_main(git: &dyn GitRunner, source: &str, main: &str) -> Result<()> {
     if git
-        .git(&["merge-base", "--is-ancestor", source, "origin/main"])?
+        .git(&["merge-base", "--is-ancestor", source, main])?
         .success()
     {
         return Ok(());

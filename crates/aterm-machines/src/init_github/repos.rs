@@ -1966,7 +1966,7 @@ pub(super) mod tests {
         let who = user("alice", 501);
         sys.euid = who.uid;
         sys.stat_of(&who.home, directory(who.uid));
-        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
         let profile = "/Users//alice/.config/aterm/init.toml";
         let bytes = format!("[github]\naccount='alice'\nowner='alice'\ntoken_file='{SOURCE}'\n");
         sys.file(profile, bytes.as_bytes()).stat_of(

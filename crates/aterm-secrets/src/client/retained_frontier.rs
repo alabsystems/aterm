@@ -42,6 +42,10 @@ impl Frontier {
         &self.network
     }
 
+    pub(super) fn names_heads(&self, heads: &[RecordId]) -> bool {
+        self.heads.len() == heads.len() && self.heads.iter().eq(heads.iter())
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.heads.is_empty()
     }

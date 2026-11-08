@@ -1684,6 +1684,17 @@ pub enum Reply {
     /// This exact phase's attached helper died, its group is gone and its input
     /// attempt settled, all without an exec grant. The same plan may retry.
     Unissued(ImagePhase),
+    /// The host never admitted this restart operation id, and no later replay can: its
+    /// deadline passed on this host epoch's clock, no table holds the id and no issuer
+    /// record names it. Only a constructor that saved this exact prepare without a binding
+    /// may drop it; it records nothing completed.
+    Unadmitted(String),
+}
+
+/// The host's [`Reply::Unadmitted`] line for operation `id`, or `None` for a malformed id.
+#[must_use]
+pub fn unadmitted_reply(id: &str) -> Option<String> {
+    aterm_codec::hex::is_lower(id, 32).then(|| format!("OK native-act state=unadmitted id={id}\n"))
 }
 
 impl Reply {
@@ -1888,6 +1899,13 @@ impl Reply {
                 },
             )),
             "unwritten" => Self::Unwritten,
+            "unadmitted" => {
+                let id = words.next()?.strip_prefix("id=")?;
+                if !aterm_codec::hex::is_lower(id, 32) {
+                    return None;
+                }
+                Self::Unadmitted(id.to_string())
+            }
             "unissued" => Self::Unissued(match words.next()?.strip_prefix("phase=")? {
                 "forward" => ImagePhase::Forward,
                 "rollback" => ImagePhase::Rollback,
@@ -2036,6 +2054,28 @@ mod tests {
                 version: "0.1.0+g123".into(),
             },
         })
+    }
+
+    #[test]
+    fn unadmitted_reply_names_exactly_one_lower_hex_operation_id() {
+        let id = "ab".repeat(16);
+        let line = unadmitted_reply(&id).expect("a canonical id");
+        assert_eq!(Reply::parse(&line), Some(Reply::Unadmitted(id.clone())));
+        for bad in [
+            "OK native-act state=unadmitted\n".to_string(),
+            "OK native-act state=unadmitted id=\n".to_string(),
+            format!("OK native-act state=unadmitted id={}\n", "AB".repeat(16)),
+            format!("OK native-act state=unadmitted id={}\n", "ab".repeat(15)),
+            format!(
+                "OK native-act state=unadmitted id={id} cap={}\n",
+                "cd".repeat(32)
+            ),
+            format!("OK native-act state=unadmitted {id}\n"),
+        ] {
+            assert_eq!(Reply::parse(&bad), None, "{bad}");
+        }
+        assert_eq!(unadmitted_reply(&"AB".repeat(16)), None);
+        assert_eq!(unadmitted_reply("ab"), None);
     }
 
     #[test]

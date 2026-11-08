@@ -714,8 +714,160 @@ fn day_rows_follow_the_local_day() {
     );
     let week = got[1].1.seven_day.expect("a week");
     assert_eq!((week.first, week.last, week.closed), (24, 47, false));
-    let five = got[1].1.five_hour.expect("five-hour windows");
+    let five = got[1].1.five_hour.as_ref().expect("five-hour windows");
     assert_eq!(five.closed, 24, "one closed each hour");
+}
+
+/// A DAY ROW NAMES THE FIVE-HOUR WINDOWS IT COUNTS BY ANCHOR. Three windows end on one UTC day,
+/// the middle one read full: compaction's `day` row names each by its reset, oldest first, the
+/// full one marked, and its line reads back as the row. A day of a window an hour still counts
+/// all 24 and names its oldest [`DAY_ANCHORS_MAX`]. A row of the longest machine id, both keys,
+/// every count and figure at its widest (figures at `10 *` [`accounts::PCT_MAX`], which a row
+/// may hold) and every anchor full names all six of its windows at ten-digit instants, and of
+/// seven the oldest six; at the widest instants a row may hold it is still written, under
+/// [`ROW_MAX`], naming the oldest that fit, with its counts. Negative controls: `day_summaries`
+/// naming no anchor (`anchors: Vec::new()`) fails the first assertion, and a row written whole
+/// or not at all (no fitting in `SeriesRow::line`) writes neither the row of seven nor the
+/// widest.
+#[test]
+fn a_day_row_names_its_windows_by_anchor() {
+    let dir = tmp("anchors");
+    let path = path_of(dir.path(), "me", MACHINE).unwrap();
+    let day = NOW.div_euclid(D) * D - 3 * D;
+    let resets = [day + 6 * H, day + 12 * H, day + 18 * H];
+    let rows: Vec<SeriesRow> = resets
+        .iter()
+        .zip([400, 1000, 500])
+        .flat_map(|(reset, peak)| {
+            [
+                fig_row(
+                    reset - 3 * H,
+                    Some(fig_of(200, *reset, reset - 3 * H)),
+                    None,
+                ),
+                fig_row(reset - H, Some(fig_of(peak, *reset, reset - H)), None),
+            ]
+        })
+        .collect();
+    write_rows(&path, &rows);
+    compact_locked(&path, NOW, utc).unwrap();
+    let got = days(&rows_at(&path));
+    let [(t, d)] = got.as_slice() else {
+        panic!("one day: {got:?}");
+    };
+    let five = d.five_hour.as_ref().expect("five-hour windows");
+    assert_eq!(
+        five.anchors,
+        [(resets[0], false), (resets[1], true), (resets[2], false)],
+        "{five:?}"
+    );
+    assert_eq!((*t, five.closed, five.walled), (day, 3, 1));
+    let line = lines_of(&path)
+        .into_iter()
+        .find(|l| l.contains(r#""k":"day""#))
+        .expect("the day's line");
+    let row = SeriesRow::parse(&line).expect("the day reads");
+    assert_eq!(
+        row.line().as_deref(),
+        Some(line.as_str()),
+        "it reads back whole"
+    );
+
+    let most = i64::try_from(DAY_ANCHORS_MAX).unwrap();
+    let busy = path_of(dir.path(), "busy", MACHINE).unwrap();
+    let hourly: Vec<SeriesRow> = (0..24)
+        .map(|i| day + i * H)
+        .map(|t| fig_row(t, Some(fig_of(100, t + H / 2, t)), None))
+        .chain([fig_row(
+            day + D,
+            Some(fig_of(100, day + D + H / 2, day + D)),
+            None,
+        )])
+        .collect();
+    write_rows(&busy, &hourly);
+    compact_locked(&busy, NOW, utc).unwrap();
+    let got = days(&rows_at(&busy));
+    let five = got
+        .iter()
+        .find(|(t, _)| *t == day)
+        .and_then(|(_, d)| d.five_hour.clone())
+        .expect("the busy day");
+    assert_eq!(five.closed, 24, "every window counts");
+    assert_eq!(
+        five.anchors,
+        (0..most)
+            .map(|i| (day + i * H + H / 2, false))
+            .collect::<Vec<_>>(),
+        "the oldest {DAY_ANCHORS_MAX} are named"
+    );
+
+    let widest = |at: i64, anchors: &[i64]| SeriesRow {
+        t: at,
+        by: "f".repeat(accounts::WORD_MAX),
+        said: Said::Day(Day {
+            span_s: 25 * H,
+            tz_s: -14 * H,
+            five_hour: Some(DayFive {
+                closed: u32::MAX,
+                peak: 10 * accounts::PCT_MAX,
+                walled: u32::MAX,
+                anchors: anchors.iter().map(|a| (*a, true)).collect(),
+            }),
+            seven_day: Some(DayWeek {
+                first: 10 * accounts::PCT_MAX,
+                last: 10 * accounts::PCT_MAX,
+                reset: at,
+                closed: false,
+            }),
+            n: u32::MAX,
+            ac: Some("ac-ffffffffffffffff".into()),
+            key: profile::AccountKey::claude("ffffffff-ffff-4fff-bfff-ffffffffffff"),
+        }),
+    };
+    let ten_digits = 9_999_999_999;
+    let seven: Vec<i64> = (0..=most).map(|i| ten_digits - most + i).collect();
+    let six = &seven[..DAY_ANCHORS_MAX];
+    let line = widest(ten_digits, six).line().expect("the row is written");
+    assert!(line.len() <= ROW_MAX, "{} bytes", line.len());
+    assert_eq!(
+        SeriesRow::parse(&line),
+        Some(widest(ten_digits, six)),
+        "six windows are named at ten-digit instants"
+    );
+    assert_eq!(
+        widest(ten_digits, &seven)
+            .line()
+            .as_deref()
+            .and_then(SeriesRow::parse),
+        Some(widest(ten_digits, six)),
+        "of seven the oldest six"
+    );
+    let eleven: Vec<i64> = (0..most).map(|i| -ten_digits + i).collect();
+    let line = widest(-ten_digits, &eleven)
+        .line()
+        .expect("the widest row is written");
+    assert!(line.len() <= ROW_MAX, "{} bytes", line.len());
+    let back = SeriesRow::parse(&line).expect("it reads");
+    let Said::Day(Day {
+        five_hour: Some(five),
+        ..
+    }) = &back.said
+    else {
+        panic!("a day row: {back:?}");
+    };
+    assert_eq!((five.closed, five.walled), (u32::MAX, u32::MAX), "{back:?}");
+    assert!(
+        !five.anchors.is_empty()
+            && five.anchors.len() < DAY_ANCHORS_MAX
+            && eleven.starts_with(
+                &five
+                    .anchors
+                    .iter()
+                    .map(|(reset, _)| *reset)
+                    .collect::<Vec<_>>()
+            ),
+        "the oldest that fit: {back:?}"
+    );
 }
 
 /// A 420-day series of a figure every half hour over its last 91 days and every two hours

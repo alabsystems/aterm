@@ -44,7 +44,7 @@ pub(super) struct GitHook {
 pub(super) struct SimClock {
     start_unix_secs: u64,
     /// The time slept so far, and each sleep in order.
-    state: Mutex<(Duration, Vec<Duration>)>,
+    simulated_time: Mutex<(Duration, Vec<Duration>)>,
     /// The children `Fx::child` answers from, in order.
     scripted: Mutex<VecDeque<ScriptedChild>>,
     /// Every spec `Fx::child` or `Fx::git` accepted (one `child::check` passed), in call order.
@@ -62,7 +62,7 @@ impl SimClock {
     pub(super) const fn new(start_unix_secs: u64) -> SimClock {
         SimClock {
             start_unix_secs,
-            state: Mutex::new((Duration::ZERO, Vec::new())),
+            simulated_time: Mutex::new((Duration::ZERO, Vec::new())),
             scripted: Mutex::new(VecDeque::new()),
             run: Mutex::new(Vec::new()),
             #[cfg(unix)]
@@ -76,7 +76,10 @@ impl SimClock {
 
     /// The time slept so far.
     pub(super) fn mono(&self) -> Duration {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner).0
+        self.simulated_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .0
     }
 
     /// `start_unix_secs` plus the whole seconds slept.
@@ -86,14 +89,17 @@ impl SimClock {
 
     /// Move both clocks by `d`, taking no real time.
     pub(super) fn sleep(&self, d: Duration) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.0 = state.0.saturating_add(d);
-        state.1.push(d);
+        let mut simulated_time = self
+            .simulated_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        simulated_time.0 = simulated_time.0.saturating_add(d);
+        simulated_time.1.push(d);
     }
 
     /// Every sleep so far, in order.
     pub(super) fn slept(&self) -> Vec<Duration> {
-        self.state
+        self.simulated_time
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .1

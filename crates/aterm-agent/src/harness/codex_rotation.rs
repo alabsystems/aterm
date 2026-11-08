@@ -265,8 +265,8 @@ pub fn with_prepared_writer<T>(
     use_prepared: impl FnOnce(&Successor, &ReceiptWriter<'_>) -> Result<T, &'static str>,
 ) -> Result<Option<T>, &'static str> {
     if receipt.phase != renewal::Phase::Ready
-        || receipt.launch_attempted
-        || receipt.accepted_turn.is_some()
+        || receipt.revoked
+        || !receipt.has_no_execution_evidence()
     {
         return Err("not-ready");
     }

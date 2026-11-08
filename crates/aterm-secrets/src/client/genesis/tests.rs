@@ -185,6 +185,35 @@ impl Lab {
 }
 
 #[test]
+fn genesis_bindings_wait_for_the_local_writer() {
+    let lab = Lab::new();
+    admin_commons_init(&lab.paths).unwrap();
+    let expected = Bootstrap::required(&lab.paths).unwrap().trust();
+    let held = std::rc::Rc::new(std::cell::RefCell::new(Some(
+        StateLock::take_at(&lab.paths, &lab.paths.lock_file()).unwrap(),
+    )));
+    let released = std::rc::Rc::clone(&held);
+    let actual = crate::commons::bootstrap::tests::while_held(
+        move || drop(released.borrow_mut().take()),
+        || genesis_bootstrap_started(&lab.paths, Instant::now() - Duration::from_secs(31)),
+    );
+    drop(held.borrow_mut().take());
+    assert_eq!(actual.unwrap().trust(), expected);
+
+    let held = StateLock::take_at(&lab.paths, &lab.paths.lock_file()).unwrap();
+    assert!(
+        genesis_bootstrap_started(&lab.paths, Instant::now() - Duration::from_secs(61)).is_err()
+    );
+    drop(held);
+    assert_eq!(
+        genesis_bootstrap_started(&lab.paths, Instant::now())
+            .unwrap()
+            .trust(),
+        expected
+    );
+}
+
+#[test]
 fn every_current_member_is_in_after_genesis_v2() {
     if let Ok(input) = std::env::var(CLI_INPUT) {
         let input: aterm_json::Value = aterm_json::from_str(&input).unwrap();

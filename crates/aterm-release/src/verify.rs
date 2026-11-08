@@ -655,7 +655,7 @@ pub fn post_publish(
             "published release {tag} manifest has no immutable claim commit"
         ))
     })?;
-    publish::assert_remote_annotated_tag_commit(&ledger::GitCli::new(repo), &tag, commit)?;
+    publish::assert_remote_annotated_tag_commit(&publish::native_origin(repo)?, &tag, commit)?;
     let release_id = best.release_id.ok_or_else(|| {
         Error::new("selected production release has no immutable GitHub release ID")
     })?;
@@ -1105,10 +1105,13 @@ fn published_commit(published: &Published) -> Result<String> {
         .to_ascii_lowercase())
 }
 
-fn ensure_yank_cleanup_session_absent(git: &ledger::GitCli, successor: &Published) -> Result<()> {
+fn ensure_yank_cleanup_session_absent(
+    origin: &dyn ledger::Origin,
+    successor: &Published,
+) -> Result<()> {
     let expected_owner = published_commit(successor)?;
-    let owner = publish::release_lease_owner(git)?;
-    let fence = publish::publisher_fence(git)?;
+    let owner = publish::release_lease_owner(origin)?;
+    let fence = publish::publisher_fence(origin)?;
     match (owner.as_deref(), fence.as_ref()) {
         (None, None) => Ok(()),
         (Some(observed), None) if observed == expected_owner => Err(Error::new(format!(
@@ -1210,7 +1213,7 @@ fn demote_yank_release_convergently(
     repo: &Path,
     slug: &str,
     bad: &Published,
-    git: &ledger::GitCli,
+    origin: &dyn ledger::Origin,
     lease: &publish::ReleaseLeaseGuard,
     fence: &publish::PublisherFenceGuard,
 ) -> Result<()> {
@@ -1233,7 +1236,7 @@ fn demote_yank_release_convergently(
             prove_yank_successor(repo, slug, bad)?.ok_or_else(|| {
                 Error::new("ratcheted successor proof disappeared before the demotion")
             })?;
-            publish::assert_publisher_session(git, lease, fence)
+            publish::assert_publisher_session(origin, lease, fence)
         },
     )?;
     Ok(())
@@ -1278,6 +1281,7 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     let slug = publish::workspace_channel_slug(repo)?;
     println!("aterm-release · yank build {build} ({slug})");
     let git = ledger::GitCli::new(repo);
+    let origin = publish::native_origin(repo)?;
     yank_local_gates(
         &git,
         &origin_slug_of(repo)?,
@@ -1291,7 +1295,7 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     if matching == 0
         && let Some(successor) = prove_absent_yank_converged(repo, &slug, build)?
     {
-        ensure_yank_cleanup_session_absent(&git, &successor)?;
+        ensure_yank_cleanup_session_absent(&origin, &successor)?;
         step(
             "yank",
             &format!(
@@ -1349,8 +1353,8 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
     })?;
     let cleanup_owner = published_commit(&successor)?;
 
-    let cleanup_lease = publish::acquire_release_lease(&git, &cleanup_owner)?;
-    let cleanup_fence = publish::acquire_publisher_fence(&git, &cleanup_owner)
+    let cleanup_lease = publish::acquire_release_lease(&origin, &cleanup_owner)?;
+    let cleanup_fence = publish::acquire_publisher_fence(&git, &origin, &cleanup_owner)
         .map_err(|error| yank_cleanup_failure(error, &successor, &cleanup_owner))?;
 
     step(
@@ -1365,24 +1369,24 @@ pub fn run_yank(repo: &Path, build: u64, opts: &YankOptions) -> Result<()> {
         .commit
         .as_deref()
         .expect("validated published identity has commit");
-    publish::delete_release_tag_with_guard(&git, &bad.tag, bad_commit, || {
+    publish::delete_release_tag_with_guard(&git, &origin, &bad.tag, bad_commit, || {
         prove_yank_successor(repo, &slug, &bad)?
             .map(|_| ())
             .ok_or_else(|| {
                 Error::new("ratcheted successor proof disappeared before tag cleanup")
             })?;
-        publish::assert_publisher_session(&git, &cleanup_lease, &cleanup_fence)
+        publish::assert_publisher_session(&origin, &cleanup_lease, &cleanup_fence)
     })
     .map_err(|error| yank_cleanup_failure(error, &successor, &cleanup_owner))?;
-    demote_yank_release_convergently(repo, &slug, &bad, &git, &cleanup_lease, &cleanup_fence)
+    demote_yank_release_convergently(repo, &slug, &bad, &origin, &cleanup_lease, &cleanup_fence)
         .map_err(|error| yank_cleanup_failure(error, &successor, &cleanup_owner))?;
 
     prove_absent_yank_converged(repo, &slug, build)?
         .ok_or_else(|| Error::new("yank cleanup finished without a converged successor proof"))
         .map_err(|error| yank_cleanup_failure(error, &successor, &cleanup_owner))?;
-    publish::assert_publisher_session(&git, &cleanup_lease, &cleanup_fence)
+    publish::assert_publisher_session(&origin, &cleanup_lease, &cleanup_fence)
         .map_err(|error| yank_cleanup_failure(error, &successor, &cleanup_owner))?;
-    match publish::release_completed_publisher_session(&git, &cleanup_owner, &cleanup_fence)
+    match publish::release_completed_publisher_session(&origin, &cleanup_owner, &cleanup_fence)
         .map_err(|error| yank_cleanup_failure(error, &successor, &cleanup_owner))?
     {
         publish::LeaseRelease::Released | publish::LeaseRelease::AlreadyAbsent => {}
@@ -1430,6 +1434,7 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
         )));
     }
     let git = ledger::GitCli::new(repo);
+    let origin = publish::native_origin(repo)?;
     publish::assert_origin_repo_binding(&git, &origin_slug_of(repo)?)?;
     gates::own_cutter_gate(&git, &header.commit, false)?;
     let journal = publish::Journal::load(&journal_path)?.ok_or_else(|| {
@@ -1438,7 +1443,7 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
             journal_path.display()
         ))
     })?;
-    publish::ordinary_resume_claim_preflight(repo, &git, &journal)?;
+    publish::ordinary_resume_claim_preflight(repo, &git, &origin, &journal)?;
 
     if release_state(&slug, &tag)? == ReleaseState::Published {
         return Err(Error::new(format!(
@@ -1453,8 +1458,8 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
     }
 
     let owner = journal.commit.clone();
-    let lease = publish::acquire_release_lease(&git, &owner)?;
-    let fence = publish::acquire_publisher_fence(&git, &owner)?;
+    let lease = publish::acquire_release_lease(&origin, &owner)?;
+    let fence = publish::acquire_publisher_fence(&git, &origin, &owner)?;
     let action = (|| -> Result<()> {
         let withdrawn = publish::withdraw_unpublished_release(
             repo,
@@ -1466,7 +1471,8 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
             &fence,
         )?;
         step("abandon", &withdrawn);
-        let released = publish::withdraw_tag_then_unlock(&git, &tag, &owner, &lease, &fence)?;
+        let released =
+            publish::withdraw_tag_then_unlock(&git, &origin, &tag, &owner, &lease, &fence)?;
         if released == publish::LeaseRelease::AlreadySuperseded {
             return Err(Error::new(
                 "abandon was fenced out before final unlock; journal retained for the winner",
@@ -1485,7 +1491,7 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
         );
         Ok(())
     })();
-    let cleanup = publish::release_publisher_fence(&git, &fence).map(|_| ());
+    let cleanup = publish::release_publisher_fence(&origin, &fence).map(|_| ());
     match (action, cleanup) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),

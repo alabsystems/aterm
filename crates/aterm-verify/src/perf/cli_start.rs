@@ -21,7 +21,9 @@
 //! - `version`: `aterm --version`;
 //! - `ctl-help`: `aterm ctl --help`;
 //! - `ctl-status`: `aterm ctl --sock <sock> @<sid> status` against a headless `aterm-lab
-//!   instance` of the same aterm, its first session;
+//!   instance` of the current checkout's debug app, its first session. The measured client
+//!   remains the requested release binary; Cargo must report debug assertions enabled and
+//!   a non-test executable for the fixture before it can launch;
 //! - the controls, the programs of `aterm-start-controls`, whose `main`s do no work:
 //!   `start-control-none`, `start-control-all` and `start-control-cli` are empty `main`s, and
 //!   `start-control-binds`' only hands its table of addresses to `black_box`.
@@ -1356,7 +1358,7 @@ mod live {
         (rc == 0).then(|| unsafe { info.assume_init() })
     }
 
-    /// A headless `aterm-lab instance` of the aterm measured, held for the `ctl-status` arm and
+    /// A headless instance of the checkout's debug app, held for the measured CLI's `ctl-status` arm and
     /// ended (`SIGTERM` to the lab, which ends its instance) on drop.
     struct Instance {
         lab: Child,
@@ -1365,27 +1367,87 @@ mod live {
     }
 
     impl Instance {
+        fn build_fixture(client: &Path) -> Result<(PathBuf, PathBuf), String> {
+            use super::super::bench_build::{self, Targo};
+            let cache =
+                super::super::workspace_root().join("target/.ubd/cli-start-fixture.noindex");
+            std::fs::create_dir_all(&cache)
+                .map_err(|e| format!("could not create fixture cache: {e}"))?;
+            let cache = cache.canonicalize().map_err(|e| e.to_string())?;
+            let client = client.canonicalize().map_err(|e| e.to_string())?;
+            if client.starts_with(&cache) {
+                return Err(
+                    "measured client is inside the fixture cache; building would overwrite it"
+                        .into(),
+                );
+            }
+            let target = cache.to_str().ok_or("fixture cache path is not UTF-8")?;
+            let args = [
+                "-q",
+                "--target-dir",
+                target,
+                "--profile",
+                "test",
+                "-p",
+                "aterm-lab",
+                "--bin",
+                "aterm-lab",
+                "-p",
+                "aterm",
+                "--bin",
+                "aterm",
+                "--message-format=json-render-diagnostics",
+            ];
+            let targo = Targo::new(super::super::driver::cargo_driver()?)
+                .with_build_dir(&cache.join("build.noindex"))?;
+            let flags = bench_build::config_rustflags(&targo)
+                .map_err(|why| format!("debug fixture configuration: {why:?}"))?;
+            if let Some(why) = bench_build::flags::refusal(&flags) {
+                return Err(why);
+            }
+            let plan = bench_build::audit(&targo, "build", &args)
+                .map_err(|why| format!("debug fixture plan: {why:?}"))?;
+            let promise = bench_build::units::Promise::of(bench_build::bench_profile::Profile::Dev);
+            if let Some(why) = plan.refusal(promise) {
+                return Err(why);
+            }
+            eprintln!("  debug fixture plan: {}", plan.summary());
+            eprintln!("  $ {}", targo.display("build", &args));
+            let out = targo
+                .command("build")
+                .args(args)
+                .stderr(Stdio::inherit())
+                .output()
+                .map_err(|e| format!("could not build debug fixture: {e}"))?;
+            if !out.status.success() {
+                return Err(format!("debug fixture build exited {}", out.status));
+            }
+            let messages = String::from_utf8_lossy(&out.stdout);
+            Ok((
+                bench_build::built_debug_app(&messages, "aterm-lab")?,
+                bench_build::built_debug_app(&messages, "aterm")?,
+            ))
+        }
+
         fn start(aterm: &Path) -> Result<Instance, String> {
-            let messages = build(
-                &[
-                    "-q",
-                    "-p",
-                    "aterm-lab",
-                    "--bin",
-                    "aterm-lab",
-                    "--message-format=json-render-diagnostics",
-                ],
-                &[],
-            )?;
-            let lab = super::super::bench_build::built_executable(&messages, "aterm-lab", "bin")?;
+            let (lab, fixture) = Self::build_fixture(aterm)?;
             let mut cmd = command(&lab);
             cmd.arg("instance")
                 .arg("--aterm")
-                .arg(aterm)
+                .arg(&fixture)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit());
-            eprintln!("  $ {} instance --aterm {}", lab.display(), aterm.display());
+            eprintln!(
+                "  ctl-status client: {}; debug fixture: {}",
+                aterm.display(),
+                fixture.display()
+            );
+            eprintln!(
+                "  $ {} instance --aterm {}",
+                lab.display(),
+                fixture.display()
+            );
             let mut child = cmd
                 .spawn()
                 .map_err(|e| format!("could not spawn aterm-lab: {e}"))?;

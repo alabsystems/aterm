@@ -546,6 +546,7 @@ fn the_secrets_lanes_end_leaves_workstation_running() {
         readback: None,
         readback_subjects: Vec::new(),
         readback_owner: None,
+        readback_missing: Vec::new(),
         input_readback: false,
     };
     let dock = Subject::Setting(Setting::Dock);

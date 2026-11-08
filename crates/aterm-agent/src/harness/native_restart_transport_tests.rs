@@ -1372,6 +1372,108 @@ fn unknown_prepare_replay_keeps_original_dispatch() {
 }
 
 #[test]
+fn an_unadmitted_answer_drops_only_its_own_prepare_and_the_next_begin_plans_afresh() {
+    let command = planned();
+    let options = |dir: &aterm_tempfile::TempDir| opts(dir.path());
+    // An answer naming another id is not about this record.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let opts = options(&dir);
+    let lost = lost_prepare(&opts, &command);
+    let mut st = lost.clone();
+    let (mut client, worker) = endpoint(|line| match request(line) {
+        Request::Prepare(_) => native_act::unadmitted_reply(&"cd".repeat(16)),
+        other => panic!("only the saved prepare replays: {other:?}"),
+    });
+    assert_eq!(
+        recover(&opts, "conversation", &mut client, SID, &mut st),
+        Err("native-unknown")
+    );
+    assert!(!abort(&opts, "conversation", &mut client, SID, &mut st));
+    assert_eq!(st, lost);
+    drop(client);
+    assert_eq!(worker.join().unwrap().len(), 2);
+    // The host's proof about this id ends an abort and a retirement alike.
+    for retiring in [false, true] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let opts = options(&dir);
+        let mut st = lost_prepare(&opts, &command);
+        let (mut client, worker) = endpoint(|line| match request(line) {
+            Request::Prepare(plan) => native_act::unadmitted_reply(&plan.id),
+            other => panic!("only the saved prepare replays: {other:?}"),
+        });
+        let ended = if retiring {
+            retire(&opts, "conversation", &mut client, SID, &mut st)
+        } else {
+            abort(&opts, "conversation", &mut client, SID, &mut st)
+        };
+        drop(client);
+        let seen = worker.join().unwrap();
+        assert!(ended, "retiring={retiring} seen={seen:?} st={st:?}");
+        assert_eq!(seen.len(), 1);
+        assert!(st.native_prepare.is_empty() && st.native.is_none() && !st.native_rollback);
+        assert!(st.native_coordination);
+        assert!(st.native_completed_prepare.is_none() && st.native_noexec_prepare.is_none());
+    }
+    // A begin answered so saves the dropped prepare, and the next one mints a fresh id.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let opts = options(&dir);
+    let (mut st, _) = state(&command);
+    let mut prepares = 0;
+    let (mut client, worker) = endpoint(move |line| {
+        common(line).or_else(|| {
+            let Request::Prepare(plan) = request(line) else {
+                panic!("only prepares are dispatched");
+            };
+            prepares += 1;
+            Some(if prepares == 1 {
+                native_act::unadmitted_reply(&plan.id).unwrap()
+            } else {
+                format!(
+                    "OK native-act state=admitted id={} cap={}\n",
+                    plan.id,
+                    binding().capability
+                )
+            })
+        })
+    });
+    let mut begin_relaunch = |st: &mut St| {
+        begin(
+            &opts,
+            &mut client,
+            st,
+            "conversation",
+            Scope::Relaunch,
+            &command.target,
+            Some(&command),
+            Some(&command),
+        )
+    };
+    let admission = begin_relaunch(&mut st);
+    assert_eq!(admission, Ok(Recovery::Unadmitted));
+    assert_eq!(refusal_word(admission), "native-unadmitted");
+    assert!(st.native_prepare.is_empty());
+    assert!(
+        upgrade_drive::load(&opts, "conversation")
+            .unwrap()
+            .native_prepare
+            .is_empty()
+    );
+    assert_eq!(begin_relaunch(&mut st), Ok(Recovery::Admitted));
+    drop(client);
+    let ids = worker
+        .join()
+        .unwrap()
+        .iter()
+        .filter_map(|line| match actual_request(line) {
+            Some(Request::Prepare(plan)) => Some(plan.id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1], "a fresh plan has a fresh id");
+}
+
+#[test]
 fn private_constructor_refuses_current_person_before_prepare_and_never_sends_raw_signal() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let mut opts = opts(dir.path());

@@ -108,7 +108,7 @@ impl SwarmRoster {
     /// Parse `aterm-swarm-roster` TOML text.
     pub fn from_toml(text: &str) -> Result<Self> {
         let table: Table = aterm_toml::from_str(text)
-            .map_err(|e| Error::new(format!("invalid {ROSTER_ENTRY}: {e}")))?;
+            .map_err(|e| Error::new(format!("invalid {ROSTER_ENTRY}: {}", e.log_words())))?;
         let deny_labels = normalize_label_set(string_array(&table, "deny_labels")?);
         let deny_nodes = normalize_word_set(string_array(&table, "deny_nodes")?);
         let mut members = Vec::new();
@@ -132,7 +132,7 @@ impl SwarmRoster {
                 let raw_label = required_str(row, "label", idx)?;
                 let (_, label) = leading_m_label(&raw_label).ok_or_else(|| {
                     Error::new(format!(
-                        "{ROSTER_ENTRY} member {}: invalid m<N> label `{raw_label}`",
+                        "{ROSTER_ENTRY} member {}: invalid m<N> label",
                         idx + 1
                     ))
                 })?;
@@ -145,7 +145,7 @@ impl SwarmRoster {
                         leading_m_label(&raw)
                             .ok_or_else(|| {
                                 Error::new(format!(
-                                    "{ROSTER_ENTRY} member {}: invalid claimed_label `{raw}`",
+                                    "{ROSTER_ENTRY} member {}: invalid claimed_label",
                                     idx + 1
                                 ))
                             })?
@@ -402,7 +402,7 @@ impl SwarmPolicy {
     /// Parse `aterm-swarm-policy` TOML text.
     pub fn from_toml(text: &str) -> Result<Self> {
         let table: Table = aterm_toml::from_str(text)
-            .map_err(|e| Error::new(format!("invalid {POLICY_ENTRY}: {e}")))?;
+            .map_err(|e| Error::new(format!("invalid {POLICY_ENTRY}: {}", e.log_words())))?;
         let network_id = optional_str(&table, "network_id");
         let reserved_labels = normalize_label_set(string_array(&table, "reserved_labels")?);
         let release_hosts = normalize_label_set(string_array(&table, "release_hosts")?);
@@ -422,7 +422,7 @@ impl SwarmPolicy {
                 let raw_label = required_str(row, "label", idx)?;
                 let (_, label) = leading_m_label(&raw_label).ok_or_else(|| {
                     Error::new(format!(
-                        "{POLICY_ENTRY} steward {}: invalid m<N> label `{raw_label}`",
+                        "{POLICY_ENTRY} steward {}: invalid m<N> label",
                         idx + 1
                     ))
                 })?;
@@ -635,7 +635,7 @@ impl SwarmLease {
     /// Parse `aterm-swarm-lease` TOML text.
     pub fn from_toml(text: &str) -> Result<Self> {
         let table: Table = aterm_toml::from_str(text)
-            .map_err(|e| Error::new(format!("invalid {LEASE_ENTRY}: {e}")))?;
+            .map_err(|e| Error::new(format!("invalid {LEASE_ENTRY}: {}", e.log_words())))?;
         let raw_holder = table
             .get("holder")
             .and_then(Value::as_str)
@@ -938,6 +938,33 @@ fn normalize_word_set(raw: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserved_entry_errors_do_not_quote_values() {
+        let private = "private-vault-value-must-not-escape";
+        let malformed = format!("value = [\"{private}\" !]\n");
+        let syntax = [
+            SwarmRoster::from_toml(&malformed).unwrap_err(),
+            SwarmPolicy::from_toml(&malformed).unwrap_err(),
+            SwarmLease::from_toml(&malformed).unwrap_err(),
+        ];
+        for error in syntax {
+            assert!(!error.to_string().contains(private));
+            assert!(error.to_string().contains("line 1"));
+        }
+        let member = "[[member]]\nrecipient = 'recipient'\nvault_name = 'vault'\n";
+        let semantics = [
+            SwarmRoster::from_toml(&format!("{member}label = '{private}'\n")).unwrap_err(),
+            SwarmRoster::from_toml(&format!(
+                "{member}label = 'm1'\nclaimed_label = '{private}'\n"
+            ))
+            .unwrap_err(),
+            SwarmPolicy::from_toml(&format!("[[steward]]\nlabel = '{private}'\n")).unwrap_err(),
+        ];
+        for error in semantics {
+            assert!(!error.to_string().contains(private));
+        }
+    }
 
     /// Negative control: dropping historical aliases when rendering loses the revoked key.
     #[test]

@@ -1153,9 +1153,11 @@ pub fn rainbow_summary(flags: &[bool], duplicates: &[bool]) -> (usize, usize, us
 /// compositor pickup or display scanout.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecordingIndex {
-    pub stamps: BTreeMap<String, i64>,
-    pub covered_from: Option<i64>,
-    pub ticks: Vec<i64>,
+    stamps: BTreeMap<String, i64>,
+    covered_from: Option<i64>,
+    /// The origin used by `video status elapsed_ms`, on the frame-stamp clock.
+    started_at: Option<i64>,
+    ticks: Vec<i64>,
     /// Every offscreen composition was retained, with no rate cap, loss or truncation.
     all_composed_frames: bool,
 }
@@ -1186,6 +1188,9 @@ impl RecordingIndex {
             .unwrap_or_default();
         let covered_from = value
             .pointer("/meta/covered_us/0")
+            .and_then(aterm_json::Value::as_i64);
+        let started_at = value
+            .pointer("/meta/wall_start_us")
             .and_then(aterm_json::Value::as_i64);
         let ticks = value
             .get("ticks")
@@ -1233,6 +1238,9 @@ impl RecordingIndex {
                         <= pair[1].get("t_us").and_then(aterm_json::Value::as_i64)
                 })
                 && covered_from == stamps.values().min().copied()
+                && started_at
+                    .zip(covered_from)
+                    .is_some_and(|(start, first)| start <= first)
                 && value
                     .pointer("/meta/covered_us/1")
                     .and_then(aterm_json::Value::as_i64)
@@ -1241,6 +1249,7 @@ impl RecordingIndex {
         Ok(Self {
             stamps,
             covered_from,
+            started_at,
             ticks,
             all_composed_frames,
         })
@@ -1253,6 +1262,9 @@ impl RecordingIndex {
             && names.len() == self.stamps.len()
             && names.iter().all(|name| self.stamps.contains_key(name))
             && names.iter().collect::<BTreeSet<_>>().len() == names.len()
+            && names
+                .windows(2)
+                .all(|pair| self.stamps[&pair[0]] <= self.stamps[&pair[1]])
     }
 
     /// Read and parse `path`.
@@ -1333,18 +1345,27 @@ pub fn driven_window_darkness(
         .map(String::as_str)
         .zip(duplicates.iter().copied())
         .collect();
-    let anchor = i128::from(index.covered_from.unwrap_or(ordered[0].0));
+    let Some(start) = index.started_at else {
+        return DrivenWindow::NOT_MEASURED;
+    };
+    let anchor = i128::from(start);
     let low = anchor + i128::from(lo_ms) * 1000;
-    let high = anchor + i128::from(hi_ms) * 1000 + i128::from(DRIVEN_GRACE_US);
+    // Status truncates to milliseconds. Its closing bracket can be up to 999 us later;
+    // include that uncertainty rather than shorten the driven window. Its opening status
+    // already observed a captured frame, so the same quantization can precede it by <1 ms.
+    let high = anchor + i128::from(hi_ms) * 1000 + 999 + i128::from(DRIVEN_GRACE_US);
     let all_composed_frames = complete_ledger
-        && low >= anchor
+        && index
+            .covered_from
+            .is_some_and(|first| low + 999 >= i128::from(first))
         && index
             .stamps
             .values()
             .max()
             .is_some_and(|&end| high <= i128::from(end));
     let window: Vec<(i64, &str)> = ordered
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|&(t, _)| {
             let t128 = i128::from(t);
             low <= t128 && t128 <= high
@@ -1353,9 +1374,9 @@ pub fn driven_window_darkness(
     if window.len() < 2 {
         return DrivenWindow::NOT_MEASURED;
     }
-    let mut resolved = Vec::with_capacity(window.len());
+    let mut history = Vec::with_capacity(ordered.len());
     let mut previous = false;
-    for &(t, name) in &window {
+    for &(t, name) in &ordered {
         let duplicate = dup_by_name.get(name).copied().unwrap_or(false);
         let lit = if duplicate {
             previous
@@ -1363,18 +1384,48 @@ pub fn driven_window_darkness(
             lit_by_name.get(name).copied().unwrap_or(false)
         };
         previous = lit;
-        resolved.push((t, lit, duplicate));
+        history.push((t, lit, duplicate));
+    }
+    let mut resolved: Vec<_> = history
+        .iter()
+        .copied()
+        .filter(|&(t, _, _)| low <= i128::from(t) && i128::from(t) <= high)
+        .collect();
+    let window_start = if all_composed_frames {
+        clamp_i64(low.max(i128::from(index.covered_from.expect("complete coverage"))))
+    } else {
+        window[0].0
+    };
+    // The last image before the bracket is the state held at its opening. Starting at the
+    // first later composition would hide a blackout while no new frame was produced.
+    let initial = if all_composed_frames {
+        history
+            .iter()
+            .rev()
+            .find(|&&(t, _, _)| t <= window_start)
+            .map(|&(_, lit, _)| lit)
+    } else {
+        None
+    };
+    if let Some(lit) = initial
+        && resolved.first().is_some_and(|&(t, _, _)| t > window_start)
+    {
+        resolved.insert(0, (window_start, lit, true));
     }
     let distinct: Vec<(i64, bool)> = resolved
         .iter()
         .filter(|&&(_, _, dup)| !dup)
         .map(|&(t, lit, _)| (t, lit))
         .collect();
-    let window_start = window[0].0;
-    let onset = distinct
-        .windows(2)
-        .find(|pair| pair[0].1 && pair[1].1)
-        .map(|pair| pair[0].0);
+    let onset = initial
+        .filter(|lit| *lit)
+        .map(|_| window_start)
+        .or_else(|| {
+            distinct
+                .windows(2)
+                .find(|pair| pair[0].1 && pair[1].1)
+                .map(|pair| pair[0].0)
+        });
     let charge_from = onset.unwrap_or(window_start);
     let mature_lead = clamp_i64(i128::from(charge_from) - i128::from(window_start));
     let mut worst = 0_i128;
@@ -1410,7 +1461,12 @@ pub fn driven_window_darkness(
         worst = worst.max((end - i128::from(first) - allowance).max(0));
     }
     let window_end = window[window.len() - 1].0;
-    let samples: BTreeSet<i64> = window
+    let observed = if all_composed_frames {
+        &ordered
+    } else {
+        &window
+    };
+    let samples: BTreeSet<i64> = observed
         .iter()
         .map(|&(t, _)| t)
         .chain(
@@ -1418,12 +1474,15 @@ pub fn driven_window_darkness(
                 .ticks
                 .iter()
                 .copied()
-                .filter(|&t| window_start <= t && t <= window_end),
+                .filter(|&t| all_composed_frames || window_start <= t && t <= window_end),
         )
         .collect();
     let samples: Vec<i64> = samples.into_iter().collect();
     let hole = samples
         .windows(2)
+        .filter(|pair| {
+            !all_composed_frames || i128::from(pair[1]) >= low && i128::from(pair[0]) <= high
+        })
         .map(|w| i128::from(w[1]) - i128::from(w[0]))
         .max()
         .unwrap_or(0);
@@ -1751,6 +1810,8 @@ impl std::fmt::Display for FrameReport {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScanReport {
     pub frames: usize,
+    /// The scan read the entire complete composition ledger, including takes with no keys.
+    pub all_composed_frames: bool,
     pub cell: Cell,
     /// The busiest single frame's ink and its hue count.
     pub best_ink: usize,
@@ -1957,6 +2018,10 @@ pub fn scan_frames(
 
     let mut r = ScanReport {
         frames: n,
+        all_composed_frames: ctx
+            .index
+            .as_ref()
+            .is_some_and(|index| index.covers_all_composed_frames(names)),
         cell,
         best_ink: 0,
         best_hues: 0,

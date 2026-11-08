@@ -18743,6 +18743,22 @@ impl App {
             .is_some_and(|ws| chrome_owns_terminal_row_of(ws, row))
     }
 
+    /// Frame rows (`0..n`) that `wid`'s top confirmation banner (`paste_banner` or `close_band`)
+    /// claims when spliced.
+    pub(crate) fn top_confirmation_band_rows(&self, wid: WindowId) -> usize {
+        let Some(ws) = self.windows.get(&wid) else {
+            return 0;
+        };
+        let (avail, cols) = (ws.input_scratch.cells.len(), ws.cols as usize);
+        if let Some(pending) = self.paste_banner.as_ref().filter(|p| p.wid == wid) {
+            return pending.wanted_rows(cols).min(avail);
+        }
+        if let Some(pending) = self.close_band(wid) {
+            return pending.wanted_rows(cols).min(avail);
+        }
+        0
+    }
+
     fn splice_band_rows(
         &mut self,
         wid: WindowId,
@@ -18753,7 +18769,13 @@ impl App {
     ) {
         debug_assert_eq!(built.len(), panel_rows);
         self.splice_band_rows_at(wid, 0, built, cols, cell_h);
+        self.note_band_covered(wid);
         self.evict_stale_glass_hover(wid);
+        if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid)
+            && !self.autopilot_menu_anchored(wid)
+        {
+            self.close_autopilot_menu();
+        }
     }
 
     fn splice_band_rows_at(

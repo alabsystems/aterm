@@ -293,6 +293,94 @@ fn a_signed_pack_is_one_the_client_verifies_and_extracts_to_its_signed_root() {
 }
 
 #[test]
+fn a_standalone_nested_workspace_packs_its_declared_serial_command() {
+    let w = world("pack-serial-command");
+    let checkout = w.checkout.join("crates/trust-resource-controller");
+    put(
+        &checkout.join("Cargo.toml"),
+        b"[workspace]\n[package]\nname='trust-resource-controller'\nversion='0.13.0'\n\
+          [package.metadata.atpkg]\nexpose=['trust-serial-command']\n\
+          build-args=['--locked','--features','serial-command','--bin','trust-serial-command']\n",
+    );
+    let args = [
+        "--locked",
+        "--features",
+        "serial-command",
+        "--bin",
+        "trust-serial-command",
+    ];
+    let meta = aterm_json::json!({
+        "packages": [{
+            "name": "trust-resource-controller",
+            "version": "0.13.0",
+            "manifest_path": checkout.join("Cargo.toml").to_string_lossy().into_owned(),
+            "metadata": {"atpkg": {
+                "expose": ["trust-serial-command"],
+                "build-args": args,
+            }},
+        }],
+        "metadata": {},
+    });
+    let mut t = FakeTools::new("aarch64-apple-darwin");
+    t.answer = cargo(
+        &checkout,
+        aterm_json::to_string(&meta).expect("metadata"),
+        vec![
+            (
+                "trust-serial-command",
+                bin_bytes(macho(CPU_ARM64), "serial command"),
+            ),
+            (
+                "internal-probe",
+                bin_bytes(macho(CPU_ARM64), "unshipped probe"),
+            ),
+        ],
+        false,
+    );
+    let mut req = w.request(AARCH64_APPLE_DARWIN);
+    req.program = "trust-resource-controller".into();
+    req.checkout = checkout.clone();
+    req.build = None;
+    let out = pack::pack_with(&w.ctx, &req, &t).expect("the standalone crate packs");
+    assert_eq!(
+        out.build,
+        atpkg_publish::git::rev_count(&w.checkout, "HEAD").expect("count")
+    );
+    assert_eq!(out.version, "0.13.0");
+    assert_eq!(out.exposes, ["trust-serial-command"]);
+    let row = atpkg_publish::programs::get("trust-resource-controller").expect("row");
+    assert_eq!(row.repo, "trust");
+    assert!(row.group.is_none());
+    assert!(row.is_plain());
+    for verb in ["metadata", "config", "build"] {
+        let runs = t.runs_of(verb);
+        assert!(!runs.is_empty(), "{verb} ran");
+        assert!(
+            runs.iter()
+                .all(|run| run.cwd.as_deref() == Some(checkout.as_path()))
+        );
+    }
+    let build = &t.runs_of("build")[0];
+    assert_eq!(&build.argv()[3..3 + args.len()], args);
+    assert!(
+        !build
+            .argv()
+            .iter()
+            .any(|arg| arg == "--manifest-path" || arg == "--target")
+    );
+    assert!(build.env_of("RUSTFLAGS").is_none());
+    client_verifies(
+        &w.ctx,
+        &out.manifest,
+        out.signature.as_ref().expect("signature"),
+    )
+    .expect("the existing client verifies the package");
+    let bin = w.root.join("out/trust-resource-controller/root/bin");
+    assert!(bin.join("trust-serial-command").is_file());
+    assert!(!bin.join("internal-probe").exists());
+}
+
+#[test]
 fn native_pack_preserves_repository_policy_and_appends_its_distribution_floor() {
     let w = world("pack-native-policy");
     let mut t = tools(

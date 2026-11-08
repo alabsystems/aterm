@@ -6548,9 +6548,20 @@ impl App {
         let (reason, by) = session_store::current_close_attribution();
         let (closing, instance) = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());
-            let ctx = store.by_local(id).map(|h| std::sync::Arc::clone(&h.ctx));
-            (ctx, store.instance_watchers())
+            let held = store.by_local(id).map(|h| {
+                (
+                    std::sync::Arc::clone(&h.term),
+                    std::sync::Arc::clone(&h.ctx),
+                )
+            });
+            (held, store.instance_watchers())
         };
+        // The close's last visit, before the log closes: a command the engine finished since the
+        // sweep's last visit is logged, not lost uncounted (unit J1-1, SMOKE-3c).
+        let closing = closing.map(|(term, ctx)| {
+            crate::session_status::last_visit(&term, &ctx);
+            ctx
+        });
         let tasked = closing.as_ref().is_some_and(|ctx| {
             ctx.timeline
                 .lock()

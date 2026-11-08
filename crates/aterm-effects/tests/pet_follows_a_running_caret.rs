@@ -158,6 +158,9 @@ impl Host {
                 Rec::In(b) => match b.as_slice() {
                     [0x7f] => h.owner.note_console_input(h.now, PetInputKind::Delete),
                     [b'\r'] => h.owner.note_console_input(h.now, PetInputKind::Submit),
+                    b if b.starts_with(b"\x1b[200~") => {
+                        h.owner.note_console_input(h.now, PetInputKind::Paste);
+                    }
                     _ => h.owner.note_console_input(h.now, PetInputKind::Text),
                 },
                 Rec::Out(b) => {
@@ -356,6 +359,236 @@ fn a_held_delete_across_a_wrap_is_one_bound_onto_the_carets_row() {
             }
         }
     }
+}
+
+/// A line of words a command printed (72 cells), over the prompt.
+const WORDS: &str = "abc def ghi jkl mno pqr stu vwx yz ab cd ef gh ij kl mn op qr st uv wx yz";
+
+/// [`line_editor`] with [`WORDS`] printed on the row over the prompt's.
+fn line_editor_under_words(row0: u16, keys: &[(u64, Key)]) -> Vec<(u64, Rec)> {
+    let mut ev = line_editor(row0, keys);
+    ev[0].1 = Rec::Out(format!("\x1b[2J\x1b[{row0};1H{WORDS}\x1b[{};1H$ ", row0 + 1).into_bytes());
+    ev
+}
+
+/// A line held to the next row from a prompt under [`WORDS`] (100 keys 41 ms apart), and after
+/// a 1.1 s pause held back over the wrap to the prompt (100 deletes `gap` ms apart), as
+/// windowed zsh replays take it (r29 K9-1): the replay, when the deletes begin and when the
+/// last one came.
+fn held_delete_under_words(row0: u16, gap: u64, old: &[OldPath]) -> (Host, u64, u64) {
+    let mut keys = typed(100, 41);
+    keys.extend((0..100).map(|i| (if i == 0 { 1_100 } else { gap }, Key::Delete)));
+    let at = key_times(&keys);
+    let mut ev = line_editor_under_words(row0, &keys);
+    ev.push((at[at.len() - 1] + 4_500, Rec::Out(Vec::new())));
+    (Host::replay_old(ev, old), at[100], at[at.len() - 1])
+}
+
+/// How the replay drew the cat from the landing of the first flight at or after `from` ms to
+/// `to` ms: `(cells it moved right in all, times its drawn feet rose whole from the sink or sank
+/// from whole)`. The deletes walk the caret left, so every cell right is a cell away from it.
+fn after_the_crossing(shots: &[Shot], from: u64, to: u64) -> (f32, usize) {
+    let landed = shots
+        .iter()
+        .skip_while(|s| s.ms < from || s.frame.action != PetAction::Leap)
+        .skip_while(|s| matches!(s.frame.action, PetAction::Leap | PetAction::Land))
+        .take_while(|s| s.ms <= to)
+        .collect::<Vec<_>>();
+    let right = landed
+        .windows(2)
+        .map(|w| (w[1].frame.col - w[0].frame.col).max(0.0))
+        .sum();
+    let mut sunk: Option<bool> = None;
+    let mut turns = 0;
+    for s in &landed {
+        let now = if s.frame.lift < -0.5 {
+            Some(true)
+        } else if s.frame.lift > -0.1 {
+            Some(false)
+        } else {
+            None
+        };
+        if let (Some(was), Some(is)) = (sunk, now)
+            && was != is
+        {
+            turns += 1;
+        }
+        sunk = now.or(sunk);
+    }
+    (right, turns)
+}
+
+/// A HELD DELETE UNDER A LINE OF WORDS IS FOLLOWED BY THE CARET, AND ITS END COSTS NO TRIP. A
+/// line held from a prompt under a command's line of words to the next row and held back over
+/// the wrap, mid-screen and near the top: the wrap's one crossing lands on the caret's row, and
+/// from there the cat follows the caret back along it, drawn down its row under the words (the
+/// head law, its head off their letters, the row under blank): it never moves right, away from
+/// the caret walking left, by more than a cell in all, and is drawn down or whole by turns at
+/// most once (going under the words). Once the deletes stop by the prompt it rests there: no
+/// flight in the next 4 s, and never further than [`BY_THE_CARET`] from the caret.
+///
+/// NEGATIVE CONTROL ([`OldPath::SunkStandSlides`] alone, as on main 7f638f26d0, windowed zsh
+/// replays in 5 of 5, r29 K9-1 and K9-2): the stand drawn down beside the caret slid along the
+/// row to the first whole seat past the words' last letter, so the landed cat ran 2 to 6 cells
+/// right while the caret deleted left, rose whole there, stood while the caret went 25 to 40
+/// cells away and sank again to chase it; and 2 s after the last delete it bounded twice, 60
+/// cells, to the seat past the line's end.
+#[test]
+fn a_held_delete_under_a_line_of_words_follows_the_caret_and_rests_by_it() {
+    let mut takes = Vec::new();
+    for row0 in [3u16, 12] {
+        for gap in [32u64, 40, 48] {
+            takes.push((row0, gap));
+        }
+    }
+    let run = |old: &'static [OldPath]| {
+        crate::common::par_map(&takes, |&(row0, gap)| {
+            let (h, from, last) = held_delete_under_words(row0, gap, old);
+            let label = format!("prompt on row {row0}, a delete every {gap} ms");
+            let mut faults = Vec::new();
+            let during = flights_from(&h.shots, from)
+                .into_iter()
+                .filter(|f| f.0 <= last)
+                .collect::<Vec<_>>();
+            if during.len() != 1
+                || during
+                    .iter()
+                    .any(|f| (f.1.1 - f32::from(f.3.0)).abs() > 0.5)
+            {
+                faults.push(format!(
+                    "{label}: flights while held back (ms, landing, ms aloft, caret): {during:?}"
+                ));
+            }
+            let (right, turns) = after_the_crossing(&h.shots, from, last);
+            if right > 1.0 || turns > 1 {
+                faults.push(format!(
+                    "{label}: after the crossing the cat moved {right:.1} cells right, away from \
+                     the caret, and rose or sank {turns} times"
+                ));
+            }
+            let rest = flights_from(&h.shots, last + 1);
+            if !rest.is_empty() {
+                faults.push(format!("{label}: flights after the last delete: {rest:?}"));
+            }
+            if let Some(far) = h
+                .shots
+                .iter()
+                .filter(|s| s.ms > last + 600)
+                .find(|s| (s.frame.col - f32::from(s.caret.1)).abs() > BY_THE_CARET)
+            {
+                faults.push(format!(
+                    "{label}: {} ms after the last delete the cat is at ({:.1}, {:.1}), the caret \
+                     at {:?}",
+                    far.ms - last,
+                    far.frame.col,
+                    far.frame.row,
+                    far.caret
+                ));
+            }
+            faults
+        })
+    };
+    let faults: Vec<String> = run(&[]).into_iter().flatten().collect();
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+    let old = run(&[OldPath::SunkStandSlides]);
+    assert!(
+        old.iter().all(|f| !f.is_empty()),
+        "negative control: the slide past the words left the caret in every take: {old:?}"
+    );
+}
+
+/// A line held from a prompt on the grid's last row under [`WORDS`] to `n` keys (`type_gap` ms
+/// apart, short of the margin), and after a 1.1 s pause held back to the prompt (`del_gap` ms
+/// apart), with `old` laws reverted: the replay, when the deletes begin and when the last one
+/// came.
+fn held_back_on_the_last_row(
+    n: usize,
+    (type_gap, del_gap): (u64, u64),
+    old: &[OldPath],
+) -> (Host, u64, u64) {
+    let mut keys = typed(n, type_gap);
+    keys.extend((0..n).map(|i| (if i == 0 { 1_100 } else { del_gap }, Key::Delete)));
+    let at = key_times(&keys);
+    let mut ev = line_editor_under_words(ROWS - 1, &keys);
+    let last = at[at.len() - 1];
+    ev.push((last + 4_500, Rec::Out(Vec::new())));
+    (Host::replay_old(ev, old), at[n], last)
+}
+
+/// r29 K9-1 ON THE GRID'S LAST ROW: A HELD DELETE UNDER A LINE OF WORDS IS FOLLOWED THERE TOO.
+/// The prompt on the last row under a command's 72-cell line of words, a line held to its column
+/// 52 to 66 and after a pause held back to the prompt: the stand by the caret is fitted to its
+/// row under the words (no row under to draw it down into), and the seat past the words' end
+/// comes within the head law's reach as the line nears it. While the deletes run the cat never
+/// moves right, away from the caret walking left, by more than a cell in all, and takes no
+/// flight; after the last one it rests within [`BY_THE_CARET`] of the caret.
+///
+/// NEGATIVE CONTROL ([`OldPath::SeatHeldAnywhereAhead`] alone, as on the r29 fixer's branch,
+/// windowed zsh at 80x24: 1.6 cells right then a chase): a cat anywhere ahead of the stand held
+/// the seat past the words, and one running the deletes down a pounce's gap behind took it as a
+/// trip, so the cat ran up to 5 cells right as the deletes began and waited at the seat until
+/// the caret was out of reach.
+#[test]
+fn a_held_delete_on_the_last_row_under_words_follows_the_caret() {
+    let mut takes = Vec::new();
+    for n in [50usize, 58, 60, 62, 64] {
+        for pace in [(41u64, 40u64), (90, 32), (120, 48)] {
+            takes.push((n, pace));
+        }
+    }
+    let run = |old: &'static [OldPath]| {
+        crate::common::par_map(&takes, |&(n, pace)| {
+            let (h, from, last) = held_back_on_the_last_row(n, pace, old);
+            let label = format!("{n} keys {} ms apart, deletes {} ms apart", pace.0, pace.1);
+            let mut faults = Vec::new();
+            let dels: Vec<&Shot> = h
+                .shots
+                .iter()
+                .filter(|s| (from..=last).contains(&s.ms) && s.frame.action != PetAction::Leap)
+                .collect();
+            let right: f32 = dels
+                .windows(2)
+                .map(|w| (w[1].frame.col - w[0].frame.col).max(0.0))
+                .sum();
+            if right > 1.0 {
+                faults.push(format!(
+                    "{label}: the cat moved {right:.1} cells right while the caret deleted left"
+                ));
+            }
+            let flights = flights_from(&h.shots, from);
+            if !flights.is_empty() {
+                faults.push(format!(
+                    "{label}: flights from the first delete on: {flights:?}"
+                ));
+            }
+            if let Some(far) = h
+                .shots
+                .iter()
+                .filter(|s| s.ms > last + 600)
+                .find(|s| (s.frame.col - f32::from(s.caret.1)).abs() > BY_THE_CARET)
+            {
+                faults.push(format!(
+                    "{label}: {} ms after the last delete the cat is at {:.1}, the caret at {:?}",
+                    far.ms - last,
+                    far.frame.col,
+                    far.caret
+                ));
+            }
+            faults
+        })
+    };
+    let faults: Vec<String> = run(&[]).into_iter().flatten().collect();
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+    let old: Vec<String> = run(&[OldPath::SeatHeldAnywhereAhead])
+        .into_iter()
+        .flatten()
+        .collect();
+    assert!(
+        old.len() >= 5,
+        "negative control: holding the seat ahead anywhere, the cat ran from the caret in only \
+         {} takes: {old:?}",
+        old.len()
+    );
 }
 
 /// A HELD KEY RUNS, AND EACH WRAP TYPED THROUGH IS ONE FLIGHT, down on the caret's new row:
@@ -1203,38 +1436,46 @@ fn listing_then_prompt(n: usize) -> String {
     page
 }
 
+/// Words typed at a person's pace with pauses of 0.2 to 2 s at the prompt under
+/// [`listing_then_prompt`]`(n)`, from 2.4 s, with `old` laws reverted: the replay.
+fn typed_under_a_listing(n: usize, old: &[OldPath]) -> Host {
+    let mut ev = vec![(300u64, Rec::Out(listing_then_prompt(n).into_bytes()))];
+    let text = b"echo the quick brown fox jumps over the lazy dog";
+    let pauses = [600u64, 1_200, 300, 800, 2_000, 200, 1_000, 700, 500];
+    let (mut t, mut word) = (2_000u64, 0);
+    for (i, &c) in text.iter().enumerate() {
+        t += if i == 0 {
+            400
+        } else if text[i - 1] == b' ' {
+            word += 1;
+            pauses[word - 1]
+        } else {
+            90 + (i as u64 * 37) % 51
+        };
+        ev.push((t, Rec::In(vec![c])));
+        ev.push((t + 2, Rec::Out(vec![c])));
+    }
+    ev.push((t + 3_000, Rec::Out(Vec::new())));
+    Host::replay_old(ev, old)
+}
+
 /// TYPING TOWARD A SEAT AHEAD TAKES NO FLIGHT. Under a listing's ragged ends, on the grid's last
-/// row, the stand beside a long prompt has its head among the row above's letters, so the cat
-/// at rest takes the whole body's seat past that row's last letter, 37 cells along. Words typed
-/// at a person's pace with pauses of 0.2 to 2 s write toward it: the cat keeps the seat until the
-/// writing reaches it and walks on from there, no flight from the first key to the scene's end.
+/// row, the stand beside a long prompt has its head among the row above's letters, and a cat
+/// may be down on the whole body's seat past that row's last letter, 37 cells along, out of
+/// the hand's reach (two pounces, 28 cells): where a composer's or a full-screen program's seat
+/// put it, and as a shell's rest put it on main before r29 (with
+/// [`OldPath::FittedStandSeatsFar`] reverted, as here). Words typed at a person's pace with
+/// pauses of 0.2 to 2 s write toward it: the cat keeps the seat until the writing reaches it
+/// and walks on from there, no flight from the first key to the scene's end.
 ///
-/// NEGATIVE CONTROL ([`OldPath::SeatAheadPulledBack`] alone, as on main 9a5399f8ed): the first
+/// NEGATIVE CONTROL ([`OldPath::SeatAheadPulledBack`] too, as on main 9a5399f8ed): the first
 /// keys pulled the cat back within the hand's reach to a fitted stand by the caret, 0.64 s in the
 /// air, and a second later the writing brought the seat within reach and it flew out to it
 /// again: two flights for a word typed (r24 K7-1, measured windowed at 80x24 after `ls -la`).
 #[test]
 fn typing_toward_a_seat_ahead_takes_no_flight() {
     let run = |old: &[OldPath]| {
-        let mut ev = vec![(300u64, Rec::Out(listing_then_prompt(40).into_bytes()))];
-        let text = b"echo the quick brown fox jumps over the lazy dog";
-        let pauses = [600u64, 1_200, 300, 800, 2_000, 200, 1_000, 700, 500];
-        let (mut t, mut word) = (2_000u64, 0);
-        for (i, &c) in text.iter().enumerate() {
-            t += if i == 0 {
-                400
-            } else if text[i - 1] == b' ' {
-                word += 1;
-                pauses[word - 1]
-            } else {
-                90 + (i as u64 * 37) % 51
-            };
-            ev.push((t, Rec::In(vec![c])));
-            ev.push((t + 2, Rec::Out(vec![c])));
-        }
-        let last = t;
-        ev.push((last + 3_000, Rec::Out(Vec::new())));
-        let h = Host::replay_old(ev, old);
+        let h = typed_under_a_listing(40, old);
         let rest = h
             .shots
             .iter()
@@ -1242,7 +1483,7 @@ fn typing_toward_a_seat_ahead_takes_no_flight() {
             .map(|s| (s.frame.col, s.frame.row, s.caret));
         (flights_from(&h.shots, 2_400), rest)
     };
-    let (flights, rest) = run(&[]);
+    let (flights, rest) = run(&[OldPath::FittedStandSeatsFar]);
     assert!(
         rest.is_some_and(|(col, row, caret)| row == 23.0 && col > f32::from(caret.1) + 30.0),
         "fixture: the cat rests on the seat past the row above's last letter: {rest:?}"
@@ -1251,7 +1492,7 @@ fn typing_toward_a_seat_ahead_takes_no_flight() {
         flights.is_empty(),
         "flights as the hand typed toward the seat (ms, landing, ms aloft, caret): {flights:?}"
     );
-    let (old, _) = run(&[OldPath::SeatAheadPulledBack]);
+    let (old, _) = run(&[OldPath::FittedStandSeatsFar, OldPath::SeatAheadPulledBack]);
     assert!(
         old.len() >= 2,
         "negative control: pulled in to the hand's reach, the cat took {} flights",
@@ -1259,12 +1500,60 @@ fn typing_toward_a_seat_ahead_takes_no_flight() {
     );
 }
 
+/// r29 K9-4, THE CAT WAITS BY THE CARET, NOT PAST THE ROW ABOVE'S LAST LETTER. Under a
+/// listing whose last line ends 59 cells in, on the grid's last row, the stand beside a long
+/// prompt is fitted under that line, and the whole body's seat past its last letter lies 36
+/// cells on, past the head law's reach: the cat rests fitted by the caret, and while words
+/// typed at a person's pace (pauses of 0.2 to 2 s) write on along the line it keeps within
+/// [`BY_THE_CARET`] of it, and takes no flight.
+///
+/// NEGATIVE CONTROLS, each alone ([`OldPath::FittedStandSeatsFar`], as on main 7f638f26d0,
+/// windowed zsh after `ls`, r29 K9-4): at rest the fitted stand gave way to the first whole seat
+/// however far, and the cat waited past the line's end, up to 64 cells ahead, while the person
+/// typed toward it for up to 11 s; and taking the seat ahead the writing brought within the head
+/// law's reach on no trip ([`OldPath::FittedStandRunsAhead`]), it ran on ahead of the writing
+/// to wait there.
+#[test]
+fn typing_under_a_listing_s_long_last_line_is_watched_by_the_caret() {
+    let ahead = |old: &[OldPath]| {
+        let h = typed_under_a_listing(40, old);
+        let far = h
+            .shots
+            .iter()
+            .filter(|s| s.ms >= 2_400 && s.frame.action != PetAction::Leap)
+            .map(|s| (s.frame.col - f32::from(s.caret.1), s.ms))
+            .fold((f32::MIN, 0), |a, b| if b.0 > a.0 { b } else { a });
+        (far, flights_from(&h.shots, 2_400))
+    };
+    let ((most, at), flights) = ahead(&[]);
+    assert!(
+        most <= BY_THE_CARET,
+        "the cat stood {most:.1} cells ahead of the caret at {at} ms"
+    );
+    assert!(
+        flights.is_empty(),
+        "flights as the hand typed (ms, landing, ms aloft, caret): {flights:?}"
+    );
+    let ((old, _), _) = ahead(&[OldPath::FittedStandSeatsFar]);
+    assert!(
+        old > 30.0,
+        "negative control: the cat waited past the line's end, at most {old:.1} cells ahead"
+    );
+    let ((ran, _), _) = ahead(&[OldPath::FittedStandRunsAhead]);
+    assert!(
+        ran > 2.0 * BY_THE_CARET,
+        "negative control: the cat never ran on ahead to the seat the writing brought within \
+         reach, at most {ran:.1} cells ahead"
+    );
+}
+
 /// A shell's Enter under a full screen: `rows` lines of a command's earlier output, the prompt
 /// under them with `echo the quick brown fox jumps over the lazy dog` typed at a person's pace,
 /// the Enter, its output line and the new prompt under it, and `git status` typed 1.9 s later.
-/// Returns the flights from the Enter on (ms, landing, ms aloft, caret at landing, caret as it
-/// left).
-fn enter_under_output(rows: usize, old: &[OldPath]) -> Vec<Aloft> {
+/// With `late`, the output line is written before its newline and the newline and the new
+/// prompt that many ms after it. Returns the flights from the Enter on (ms, landing, ms aloft,
+/// caret at landing, caret as it left).
+fn enter_under_output(rows: usize, late: Option<u64>, old: &[OldPath]) -> Vec<Aloft> {
     let mut page = String::from("\x1b[2J\x1b[H");
     for i in 0..rows {
         page.push_str(&format!("line {i}\r\n"));
@@ -1287,10 +1576,19 @@ fn enter_under_output(rows: usize, old: &[OldPath]) -> Vec<Aloft> {
     t += 350;
     let enter = t;
     ev.push((t, Rec::In(vec![b'\r'])));
-    ev.push((
-        t + 5,
-        Rec::Out(b"\r\nthe quick brown fox jumps over the lazy dog\r\n~/project % ".to_vec()),
-    ));
+    match late {
+        None => ev.push((
+            t + 5,
+            Rec::Out(b"\r\nthe quick brown fox jumps over the lazy dog\r\n~/project % ".to_vec()),
+        )),
+        Some(late) => {
+            ev.push((
+                t + 5,
+                Rec::Out(b"\r\nthe quick brown fox jumps over the lazy dog".to_vec()),
+            ));
+            ev.push((t + 5 + late, Rec::Out(b"\r\n~/project % ".to_vec())));
+        }
+    }
     t += 1_500;
     typed_at(&mut ev, &mut t, b"git status");
     ev.push((t + 3_000, Rec::Out(Vec::new())));
@@ -1300,37 +1598,203 @@ fn enter_under_output(rows: usize, old: &[OldPath]) -> Vec<Aloft> {
 
 /// AN ENTER UNDER A COMMAND'S OUTPUT COSTS ONE FLIGHT, and the keys typed at the new prompt
 /// none. The new prompt comes under the output's line, which ends at its column 43: on the
-/// grid's last row the stand beside the prompt is fitted under that line and the cat rests whole
-/// past the line's end; mid-screen the head law draws it down beside the prompt. Either way the
-/// cat's one bound goes to where it rests: it leaves once the new prompt has come to rest, for
-/// the rest seat ([`OldPath::BoundLeavesUnrested`]), and a stand the head law draws down needs
-/// no seat a row under the line ([`OldPath::SunkStandIsASeat`]).
+/// grid's last row the stand beside the prompt is fitted under that line, mid-screen the head
+/// law draws it down; either way the cat rests there, by the prompt. Its one bound goes to
+/// where it rests, whether the line and the prompt come together or the prompt 100 ms after the
+/// line: it leaves once the new prompt has come to rest ([`OldPath::BoundLeavesUnrested`]), and
+/// a stand the head law draws down needs no seat a row under the line
+/// ([`OldPath::SunkStandIsASeat`]).
 ///
-/// NEGATIVE CONTROLS, each alone: on the last row the brisk bound left for the stand beside
-/// the prompt before it had rested, came down fitted there and flew again to the seat past the
-/// line's end (two flights; on main 9a5399f8ed its slower bound did the same, measured windowed
-/// at 80x24 after `echo`, r24 K7-1, and a0b35922ab's turned round in the air for it); mid-screen
-/// it hopped down a row to the seat under the line once the caret rested and back up to the
-/// stand at the first key (three flights).
+/// NEGATIVE CONTROLS, each alone: on the last row the brisk bound left at once for the stand by
+/// the output line's end, the prompt came under it behind it as it flew, and it came down there
+/// and flew back (two flights; with the prompt and the line together, on main 9a5399f8ed its
+/// bound came down by the prompt before the seat past the line's end was known and flew on to
+/// it, measured windowed at 80x24 after `echo`, r24 K7-1); mid-screen it hopped down a row to
+/// the seat under the line once the caret rested and back up to the stand at the first key
+/// (three flights).
 #[test]
 fn an_enter_under_a_command_s_output_costs_one_flight() {
     for (rows, label) in [(22usize, "on the last row"), (20, "mid-screen")] {
-        let flights = enter_under_output(rows, &[]);
-        assert_eq!(
-            flights.len(),
-            1,
-            "{label}: flights from the Enter on (ms, landing, ms aloft, caret): {flights:?}"
-        );
+        for late in [None, Some(100u64)] {
+            let flights = enter_under_output(rows, late, &[]);
+            assert_eq!(
+                flights.len(),
+                1,
+                "{label}, the prompt {late:?} ms after the line: flights from the Enter on (ms, \
+                 landing, ms aloft, caret): {flights:?}"
+            );
+        }
     }
-    let landed = enter_under_output(22, &[OldPath::BoundLeavesUnrested]);
+    let landed = enter_under_output(22, Some(100), &[OldPath::BoundLeavesUnrested]);
     assert!(
         landed.len() >= 2,
-        "negative control (on the last row): the bound left for the rest seat and the cat \
-         flew once ({landed:?})"
+        "negative control (on the last row): leaving at once, the cat flew once ({landed:?})"
     );
-    let under = enter_under_output(20, &[OldPath::SunkStandIsASeat]);
+    let under = enter_under_output(20, None, &[OldPath::SunkStandIsASeat]);
     assert!(
         under.len() >= 2,
         "negative control (mid-screen): the cat kept the stand drawn down ({under:?})"
+    );
+}
+
+/// When [`paste_then_enter`] pastes, ms.
+const PASTE_AT: u64 = 2_000;
+
+/// A shell's paste and the Enter after it: `rows` lines of output over the prompt (printed with
+/// it in one write, or with `burst` the prompt 5 ms after them, a burst of the program's), a
+/// 41-cell command
+/// pasted at 2 s and echoed whole, the Enter `delay` ms after it, its output line and the new
+/// prompt under it. Returns the flights from the paste on.
+fn paste_then_enter(rows: usize, delay: u64, burst: bool, old: &[OldPath]) -> Vec<Aloft> {
+    let mut page = String::from("\x1b[2J\x1b[H");
+    for i in 0..rows {
+        page.push_str(&format!("output line number {i} of the listing\r\n"));
+    }
+    let mut ev = Vec::new();
+    // As a shell runs a command: its output, and the prompt 5 ms after it.
+    if burst {
+        ev.push((300u64, Rec::Out(std::mem::take(&mut page).into_bytes())));
+    }
+    page.push_str("~/project % ");
+    ev.push((305u64, Rec::Out(page.into_bytes())));
+    let text = "echo pasted words for the cat to see here";
+    let paste = PASTE_AT;
+    ev.push((
+        paste,
+        Rec::In(format!("\x1b[200~{text}\x1b[201~").into_bytes()),
+    ));
+    ev.push((paste + 3, Rec::Out(text.as_bytes().to_vec())));
+    ev.push((paste + delay, Rec::In(vec![b'\r'])));
+    ev.push((
+        paste + delay + 5,
+        Rec::Out(b"\r\npasted words for the cat to see here\r\n~/project % ".to_vec()),
+    ));
+    ev.push((paste + delay + 4_000, Rec::Out(Vec::new())));
+    let h = Host::replay_old(ev, old);
+    flights_from(&h.shots, paste)
+}
+
+/// A PASTE AND ITS ENTER COST ONE FLIGHT. A command pasted at a shell's prompt and entered 120,
+/// 300, 450 and 800 ms later (a person's Return, a harness's or an agent's driver), with the
+/// prompt near the top, mid-screen and on the grid's last row: the cat goes once, to where it
+/// rests by the new prompt under the command's output line, and stays; it leaves within 0.6 s of
+/// the Enter (the paste's hold runs on only for the Return's echo: held to its end, a paste
+/// entered 120 ms after it sent the cat 0.8 s after the Enter).
+///
+/// The lines over the prompt are printed with it in one write, and before it as a command's
+/// output (a burst of the program's that settled seconds before the paste).
+///
+/// NEGATIVE CONTROLS (r29 K9-5: on main 7f638f26d0, windowed zsh at 80x24, every delay cost two
+/// flights): joined to the burst the output left ([`OldPath::PasteOpensItsOwnBurst`]), the
+/// paste's burst was past its cap (0.9 s) at once, and the cat stepped off the pasted letters for
+/// the line's end 50 ms after the paste, came down on the new prompt's row there and flew back,
+/// in 6 of the 8 takes with printed lines; and with the paste held open half a second
+/// ([`OldPath::PasteHoldsForItsReturn`]) the cat was in the air for the pasted line's end when
+/// the Return 800 ms after the paste came, and did the same.
+#[test]
+fn a_paste_and_its_enter_cost_one_flight() {
+    let mut takes = Vec::new();
+    for rows in [0usize, 8, 21] {
+        for delay in [120u64, 300, 450, 800] {
+            for burst in [false, true] {
+                takes.push((rows, delay, burst));
+            }
+        }
+    }
+    let faults = |old: &'static [OldPath]| {
+        crate::common::par_map(&takes, |&(rows, delay, burst)| {
+            (
+                rows,
+                delay,
+                burst,
+                paste_then_enter(rows, delay, burst, old),
+            )
+        })
+        .into_iter()
+        .filter(|&(_, delay, _, ref f)| f.len() != 1 || f[0].0 > PASTE_AT + delay + 600)
+        .map(|(rows, delay, burst, f)| {
+            format!(
+                "{rows} rows over the prompt (a burst {burst}), the Enter {delay} ms after the \
+                 paste: {f:?}"
+            )
+        })
+        .collect::<Vec<String>>()
+    };
+    let now = faults(&[]);
+    assert!(now.is_empty(), "{}", now.join("\n"));
+    assert!(
+        !faults(&[OldPath::PasteHoldsForItsReturn]).is_empty(),
+        "negative control: with the paste held half a second, every paste and its Enter still \
+         cost one flight"
+    );
+    let joined = faults(&[OldPath::PasteOpensItsOwnBurst]);
+    assert!(
+        joined.len() >= 6 && joined.iter().all(|f| f.contains("(a burst true)")),
+        "negative control: joined to the output's settled burst, the paste after it still cost \
+         one flight: {joined:?}"
+    );
+}
+
+/// A program on the alternate screen (Claude Code's composer under a transcript) quits back to
+/// the shell, whose prompt comes up under the line that started it: `cols` columns, the flights
+/// from the quit on.
+fn program_quits(old: &[OldPath]) -> Vec<Aloft> {
+    let mut page = String::from("\x1b[2J\x1b[H~/project % ls\r\n");
+    page.push_str(
+        "alpha  beta-gamma  delta_epsilon  zeta.txt  eta-theta-iota.md  kappa  lambda\r\n",
+    );
+    page.push_str("~/project % claude --resume the-session-of-yesterday");
+    let mut ev = vec![(300u64, Rec::Out(page.into_bytes()))];
+    ev.push((1_500, Rec::In(vec![b'\r'])));
+    let mut alt = String::from("\r\n\x1b[?1049h\x1b[2J\x1b[H");
+    for r in 0..ROWS - 6 {
+        alt.push_str(&format!(
+            "\x1b[{};1Htranscript words on row {r} of the session",
+            r + 1
+        ));
+    }
+    let rule = "─".repeat(usize::from(COLS));
+    alt.push_str(&format!(
+        "\x1b[{};1H{rule}\x1b[{};1H> \x1b[{};1H{rule}\x1b[{};3H",
+        ROWS - 4,
+        ROWS - 3,
+        ROWS - 2,
+        ROWS - 3
+    ));
+    ev.push((1_520, Rec::Out(alt.into_bytes())));
+    let quit = 6_000u64;
+    ev.push((quit, Rec::Out(b"\x1b[?1049l~/project % ".to_vec())));
+    ev.push((quit + 4_000, Rec::Out(Vec::new())));
+    let h = Host::replay_old(ev, old);
+    flights_from(&h.shots, quit)
+}
+
+/// A PROGRAM'S QUIT BACK TO THE SHELL COSTS ONE FLIGHT, TO THE PROMPT. Claude Code's composer
+/// on the alternate screen quits, and the shell's prompt comes up under the 51-cell line that
+/// started it: the cat goes once, to the stand by that prompt, drawn down under the line's
+/// letters, and stays there, within [`BY_THE_CARET`] of the caret.
+///
+/// NEGATIVE CONTROL ([`OldPath::SunkStandSlides`], as on main 7f638f26d0, r29 K9-6): the stand
+/// drawn down by the prompt slid along its row to the seat past the line's end, and the cat came
+/// down 39 cells past the prompt (windowed, where the bound came down by the prompt first, a
+/// second went 48 cells on to that seat: there and back within 1.1 s).
+#[test]
+fn a_program_s_quit_costs_one_flight_to_the_prompt() {
+    let landed = |old: &[OldPath]| -> (usize, f32) {
+        let flights = program_quits(old);
+        let off = flights
+            .last()
+            .map_or(f32::NAN, |f| (f.1.0 - f32::from(f.3.1)).abs());
+        (flights.len(), off)
+    };
+    let (n, off) = landed(&[]);
+    assert!(
+        n == 1 && off <= BY_THE_CARET,
+        "{n} flights from the quit on, the last landing {off:.1} cells from the caret"
+    );
+    let (_, old) = landed(&[OldPath::SunkStandSlides]);
+    assert!(
+        old > 30.0,
+        "negative control: the cat came down {old:.1} cells from the caret"
     );
 }

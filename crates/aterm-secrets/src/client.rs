@@ -76,6 +76,7 @@ mod steward;
 mod subscriber;
 mod toml_cache;
 mod vault_memo;
+pub mod version;
 use admin_keys::parse_admin;
 pub use admission::{Evidence as AdmissionEvidence, Method as AdmissionMethod};
 pub use admit::{
@@ -104,9 +105,9 @@ pub(crate) use entry::read_claude_token_until;
 #[cfg(any(test, debug_assertions))]
 pub use fleet::test_without_roster_wait;
 pub use fleet::{
-    AlabFleet, FLEET_CODE_ENTRY, SWARM_ROSTER_ENTRY, admin_publish_alab_fleet, alab_fleet,
-    alab_fleet_code, parse_denied_nodes_toml, swarm_denied_nodes, swarm_denied_nodes_until,
-    swarm_roster_until,
+    AlabFleet, FLEET_CODE_ENTRY, SWARM_ROSTER_ENTRY, SwarmDenialSnapshot, SwarmDenialUnavailable,
+    admin_publish_alab_fleet, alab_fleet, alab_fleet_code, parse_denied_nodes_toml,
+    swarm_denial_snapshot, swarm_denial_snapshot_until, swarm_denied_nodes, swarm_roster_until,
 };
 #[cfg(any(test, debug_assertions))]
 pub use fleet::{test_alab_fleet, test_hold_state_lock, test_with_denied_nodes_busy};
@@ -408,13 +409,15 @@ impl Paths {
         self.dir.join("records")
     }
 
-    /// The current data file selected by the records entry, without changing storage.
+    /// The current data file selected by the records entry, without changing storage
+    /// (`records_storage::reader_path`: a pinned layout standing as a reader last judged it is
+    /// not read again).
     ///
     /// # Errors
     /// The layout is pending, unsafe, missing its current file, inconsistent with its pin, or
     /// requires a larger reader capacity than this build supports.
     pub fn records_data_file(&self) -> crate::Result<PathBuf> {
-        crate::records_storage::data_path(&self.records_file())
+        crate::records_storage::reader_path(&self.records_file())
     }
 
     /// The crossed mark beside [`Self::records_file`] ([`crate::crossing::Mark`]): stored once
@@ -2878,6 +2881,39 @@ impl MaterializationSnapshot {
         self.seq
     }
 
+    /// Observe authenticated public version evidence for this exact paired source. This
+    /// performs no custody establishment or writes, and returns no provider-acceptance claim.
+    /// # Errors
+    /// The captured source/version or requested materialization no longer holds.
+    pub fn authenticated_version(
+        &self,
+        paths: &Paths,
+        entries: &[String],
+    ) -> crate::Result<Option<version::AuthenticatedVersion>> {
+        self.at_current_version(paths, entries, || {
+            Ok(sight(paths)?.and_then(|sight| sight.version))
+        })
+    }
+
+    /// An actual refusal effect may establish the existing retained-history owner before
+    /// taking the shared observation used for its ledger mutation. Reads never call this.
+    pub(crate) fn retain_for_refusal(&self, paths: &Paths) -> crate::Result<()> {
+        if config(paths)?.as_ref() != Some(&self.config) {
+            return Err(Error::new("the refused credential source changed"));
+        }
+        let lock = StateLock::take(paths)?;
+        let (_, state) = materialization_source_state(paths, Some(&self.config), &lock)?
+            .map_err(|_| Error::new("the refused credential source is unavailable"))?;
+        if state.seq != self.seq
+            || state.digest.or(state.records_digest) != self.digest
+            || !self.matches_manifest(&state.manifest)
+            || !files_intact(paths, &state)
+        {
+            return Err(Error::new("the refused credential version changed"));
+        }
+        Ok(())
+    }
+
     /// Hold the ordinary readiness guard while using this exact source/version, rather
     /// than the looser scoped-file currency that permits unrelated later versions.
     pub(crate) fn at_current_version<T>(
@@ -3290,6 +3326,13 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
                 config.host
             };
             return Ok(Some(crate::need::Sight {
+                version: Some(version::AuthenticatedVersion::from_source(
+                    &config.name,
+                    pin,
+                    config.followed.iter().copied(),
+                    None,
+                    Some(&configured.log),
+                )?),
                 alab,
                 vault: config.name,
                 host,
@@ -3328,6 +3371,7 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
     }
     let mut hidden = false;
     let mut held = BTreeSet::new();
+    let mut accepted_log = None;
     if steward::local_recipient_denied_in_roster(paths) {
         return Ok(None);
     }
@@ -3346,6 +3390,7 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
         && log_entries::log_base(Some(log), &envelope, &identity)? == log_entries::LogBase::Covers
         && log_entries::reads_log(log, &identity)
     {
+        accepted_log = Some(log);
         let Some(opened) = log.open_entry_set(&identity)? else {
             return Ok(None);
         };
@@ -3374,6 +3419,20 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
         }
     }
     Ok(Some(crate::need::Sight {
+        version: Some(version::AuthenticatedVersion::from_source(
+            &config.name,
+            envelope.signer,
+            config
+                .followed
+                .iter()
+                .copied()
+                .chain(envelope.reached_from()),
+            Some(version::EnvelopeVersion {
+                seq: envelope.seq,
+                digest: envelope.digest(),
+            }),
+            accepted_log,
+        )?),
         alab: alab_vault(&config),
         vault: config.name,
         host: config.host,
@@ -7466,12 +7525,12 @@ type Repaired = Option<(([u8; 32], u64), BTreeSet<String>)>;
 /// Re-acknowledge the raw, verified membership log when the applied digest alone prevents any
 /// read. The explicit repair retains the prior state before changing only that digest, and never
 /// accepts an unverified store or rewrites identity, membership, proof or vault contents.
-pub(crate) fn repair_legacy_frontier(paths: &Paths) -> crate::Result<bool> {
+/// Its state-lock wait shares the caller's deadline; a busy writer grants no repair authority.
+pub(crate) fn repair_legacy_frontier(paths: &Paths, deadline: Instant) -> crate::Result<bool> {
     let Some(_config) = config(paths)? else {
         return Ok(false);
     };
-    let _lock = StateLock::take(paths)
-        .map_err(|error| Error::new(format!("membership state lock failed: {error}")))?;
+    let _lock = bounded::take(paths, Some(deadline))?;
     let configured = load_records(paths)
         .map_err(|error| Error::new(format!("verified local membership log failed: {error}")))?;
     let log = configured
@@ -11519,6 +11578,8 @@ pub struct Admin {
     pub config: Config,
     /// Authenticated baseline, unaffected by edits through the public draft.
     published_doc: Document,
+    /// The exact accepted envelope/log source of the baseline, before pending local writes.
+    version: version::AuthenticatedVersion,
     /// Control metadata from the authenticated envelope, before the log overlay.
     published_control: inspection::PublishedControl,
     /// The age recipients the opened version's own `[machines]` names, before the membership
@@ -11575,6 +11636,43 @@ impl Admin {
     /// Immutable authenticated baseline, excluding edits to the public draft.
     pub fn published_document(&self) -> &Document {
         &self.published_doc
+    }
+
+    /// The logical authenticated version of the immutable accepted baseline for this requester.
+    /// Progress permits another consumer attempt; it does not prove that an entry changed or
+    /// that its consumer accepted it. Public draft edits cannot advance this version.
+    /// A local waiting write has not entered the accepted log yet; other entries remain usable.
+    ///
+    /// # Errors
+    /// A requested entry is supplied by a waiting write whose accepted envelope origin is not
+    /// retained in the waiting view. The ordinary vault pass makes it covered once signed.
+    pub fn version_for_requester(
+        &self,
+        recipient: &age::Recipient,
+        entries: &[&str],
+    ) -> crate::Result<version::AuthenticatedVersion> {
+        let host = self
+            .host_of_recipient(recipient)
+            .ok_or_else(|| Error::new("the authenticated vault names no requester"))?;
+        let baseline = self.published_doc.entries();
+        let received = crate::text::merge_for(&host, baseline.clone())
+            .map_err(|error| Error::new(error.to_string()))?;
+        for name in entries {
+            // An existing recipient reads its host override, then everyone. A missing
+            // recipient entry is copied from the first baseline occurrence, as copy_into_host.
+            let source = received
+                .iter()
+                .find(|entry| entry.name == *name)
+                .or_else(|| baseline.iter().find(|entry| entry.name == *name));
+            if self.shown.contains(name)
+                && source.is_none_or(|source| source.audience == Audience::Everyone)
+            {
+                return Err(Error::new(
+                    "the requested credential still waits for its authenticated log write",
+                ));
+            }
+        }
+        Ok(self.version.clone())
     }
 
     /// The `[everyone]` entries `doc` shows as this Mac's writes waiting for a removal's new key
@@ -12116,20 +12214,26 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
         .collect();
     let mut doc = opened.doc.clone();
     let mut admissions = opened.admissions.clone();
-    let (log_base, shown) = admin_base(
+    let AdminBase {
+        log_base,
+        shown,
+        version,
+    } = admin_base(
         paths,
         &config,
         &envelope,
+        &handoff,
         &identity,
         &opened,
         &mut doc,
         &mut admissions,
         true,
-    );
+    )?;
     Ok(Admin {
         commons_eligibility: crate::commons::membership::Eligibility::from_document(&doc),
         admissions,
         published_doc: doc.clone(),
+        version,
         published_control: inspection::PublishedControl::read(&opened.doc)?,
         served_machines,
         doc,
@@ -12197,6 +12301,12 @@ pub fn overtaken_shown(paths: &Paths, admin: &Admin) -> crate::Result<()> {
     log_entries::overtaken_seen(paths, &admin.overtaken)
 }
 
+struct AdminBase {
+    log_base: log_entries::LogBase,
+    shown: log_entries::Waiting,
+    version: version::AuthenticatedVersion,
+}
+
 /// How this Mac's seeded log stands to the version `envelope` an admin opened, with `doc` (that
 /// version's text) given the log's entries where the log holds the version. A version a writer
 /// with no seat in the log published, or one whose records this log lacks, is edited as it
@@ -12213,12 +12323,25 @@ fn admin_base(
     paths: &Paths,
     config: &Config,
     envelope: &Envelope,
+    handoff: &[([u8; 32], [u8; 64])],
     identity: &Identity,
     opened: &admin_keys::AdminText,
     doc: &mut Document,
     admissions: &mut admission::Ledger,
     land: bool,
-) -> (log_entries::LogBase, log_entries::Waiting) {
+) -> crate::Result<AdminBase> {
+    let version = |log| {
+        version::AuthenticatedVersion::from_source(
+            &config.name,
+            envelope.signer,
+            handoff.iter().map(|(key, _)| *key),
+            Some(version::EnvelopeVersion {
+                seq: envelope.seq,
+                digest: envelope.digest(),
+            }),
+            log,
+        )
+    };
     // An unreadable records file or locker opens the version as it stands, never fails the open
     // (`admin_cached` answers whether this Mac is an admin at all).
     let seeded = log_entries::trusted_seeded_log(paths, config, envelope)
@@ -12248,7 +12371,11 @@ fn admin_base(
             // The version's text without the log's entries is no base to diff the log against:
             // an edit drafted from it would write the version's older values over every log-only
             // edit. The edit goes out unstamped, read from its lockers, as from a log behind it.
-            return (log_entries::LogBase::Behind, shown);
+            return Ok(AdminBase {
+                log_base: log_entries::LogBase::Behind,
+                shown,
+                version: version(None)?,
+            });
         }
         // One-mesh W3: this Mac's `[everyone]` writes that wait for a removal's new key show over
         // the log's values, so a person sees them and can change or take them back; the edit is
@@ -12292,10 +12419,23 @@ fn admin_base(
             *doc = overlaid;
             *admissions = next_admissions;
         } else {
-            return (log_entries::LogBase::Behind, shown);
+            return Ok(AdminBase {
+                log_base: log_entries::LogBase::Behind,
+                shown,
+                version: version(None)?,
+            });
         }
     }
-    (base, shown)
+    let accepted_log = if base == log_entries::LogBase::Covers {
+        seeded.as_ref().map(|(log, _)| log)
+    } else {
+        None
+    };
+    Ok(AdminBase {
+        log_base: base,
+        shown,
+        version: version(accepted_log)?,
+    })
 }
 
 fn recipients_of(names: &[String], doc: &Document) -> crate::Result<Vec<Recipient>> {
@@ -12500,6 +12640,8 @@ fn seal_stamped(
 pub struct Published {
     /// The version published.
     pub seq: u64,
+    /// Exact published envelope and its drafted log frontier, never a later source observation.
+    version: version::VersionClaim,
     /// Whether it is signed by a new vault key the old one endorsed.
     pub rotated: bool,
     /// Compiled-in keys required in the next release after an ALab vault key rotation.
@@ -12522,6 +12664,14 @@ pub struct Published {
     /// them as waiting ([`Admin::waiting`]). A take-back waits with them, unnamed: it is done once
     /// its version lands, and nothing is signed for it.
     pub waiting: Vec<String>,
+}
+
+impl Published {
+    /// The exact authenticated publication, for a signed delivery record.
+    #[must_use]
+    pub const fn version(&self) -> &version::VersionClaim {
+        &self.version
+    }
 }
 
 /// Compiled-in keys required after an ALab vault rotation, in padded base64.
@@ -13088,7 +13238,23 @@ fn publish_as_with_removal(
     // the version back as a head (`log_entries::adopt_held_draft`), whatever a later publish from
     // the same opened version was told meanwhile.
     publication_current(deadline)?;
-    let version = envelope::parse(&bytes)?.digest();
+    let sealed = envelope::parse(&bytes)?;
+    let version = sealed.digest();
+    let published_version = version::VersionClaim::new(
+        sealed.name.clone(),
+        sealed.signer,
+        Some(version::EnvelopeVersion {
+            seq: sealed.seq,
+            digest: version,
+        }),
+        drafted.as_ref().and_then(|drafted| {
+            drafted.network.map(|network| version::LogVersion {
+                network,
+                heads: drafted.heads.clone(),
+            })
+        }),
+    )?;
+    drop(sealed);
     if let Some(drafted) = &drafted {
         log_entries::hold_drafted(paths, drafted, seq, &version, &reach)?;
     }
@@ -13292,6 +13458,7 @@ fn publish_as_with_removal(
     };
     Ok(Published {
         seq,
+        version: published_version,
         rotated: rotate,
         alab_release: release,
         first_long_chain: pairs >= 2 && admin.opened_pairs < 2,

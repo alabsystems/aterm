@@ -634,11 +634,133 @@ pub struct KeyboardMapChange {
     pub user: Option<Vec<(i64, i64)>>,
 }
 
+/// A passive read of one keyboard service. An unreadable filter stays unknown rather
+/// than becoming an empty mapping or evidence that an earlier activation still holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyboardServiceObservation {
+    registry: u64,
+    state: Result<KeyboardServiceState, String>,
+}
+
+impl KeyboardServiceObservation {
+    /// The exact native service this read concerns.
+    #[must_use]
+    pub const fn registry(&self) -> u64 {
+        self.registry
+    }
+
+    /// Why this service's complete effective mapping could not be read.
+    #[must_use]
+    pub fn unread(&self) -> Option<&str> {
+        self.state.as_ref().err().map(String::as_str)
+    }
+
+    pub(crate) fn matches(&self, state: &KeyboardServiceState) -> bool {
+        self.state.as_ref() == Ok(state)
+    }
+}
+
+/// Complete normalized filter state; constructing it requires the checked live parser.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeyboardServiceState {
+    pub(crate) registry: u64,
+    pub(crate) prefix: KeyboardPrefix,
+    pub(crate) native: Vec<(i64, i64)>,
+    pub(crate) user: Vec<(i64, i64)>,
+}
+
+impl KeyboardServiceState {
+    pub(crate) fn read(records: &crate::model::PValue, registry: u64) -> Result<Self, String> {
+        use crate::model::PValue;
+        const INVALID: &str =
+            "unrecognized live keyboard filter state; existing remaps left untouched";
+        fn field<'a>(value: &'a PValue, key: &str) -> Option<&'a PValue> {
+            let PValue::Dict(fields) = value else {
+                return None;
+            };
+            let mut found = fields.iter().filter(|(name, _)| name == key);
+            let value = &found.next()?.1;
+            found.next().is_none().then_some(value)
+        }
+        let PValue::Array(records) = records else {
+            return Err(INVALID.into());
+        };
+        let mut services = records.iter().filter(|service| {
+            matches!(field(service, "IORegistryEntryID"), Some(PValue::Int(id)) if u64::try_from(*id).ok() == Some(registry))
+        });
+        let service = services.next().ok_or(INVALID)?;
+        if services.next().is_some() || !keyboard_usage::is_keyboard_service(service) {
+            return Err(INVALID.into());
+        }
+        let Some(PValue::Array(filters)) = field(service, "ServiceFilterDebug") else {
+            return Err(INVALID.into());
+        };
+        let mut filters = filters.iter().filter_map(|filter| {
+            let plugin = field(filter, "plugin")?;
+            matches!(field(plugin, "Class"), Some(PValue::Str(class)) if class == "IOHIDKeyboardFilter").then_some(plugin)
+        });
+        let filter = filters.next().ok_or(INVALID)?;
+        if filters.next().is_some() {
+            return Err(INVALID.into());
+        }
+        let read = |name| -> Result<Vec<(i64, i64)>, String> {
+            let Some(PValue::Array(pairs)) = field(filter, name) else {
+                return Err(INVALID.into());
+            };
+            let mut mappings = pairs
+                .iter()
+                .map(|pair| match (field(pair, "Src"), field(pair, "Dst")) {
+                    (Some(PValue::Int(source)), Some(PValue::Int(destination))) => {
+                        Ok((*source, *destination))
+                    }
+                    _ => Err(INVALID.to_owned()),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            mappings.sort_unstable();
+            if mappings.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return Err(INVALID.into());
+            }
+            Ok(mappings)
+        };
+        Ok(Self {
+            registry,
+            prefix: KeyboardPrefix::read(filter)?,
+            native: read("HIDKeyboardModifierMappingPairs")?,
+            user: read("UserKeyMapping")?,
+        })
+    }
+}
+
+#[cfg(any(target_os = "macos", test, debug_assertions))]
+pub(crate) fn keyboard_observations(
+    mut ids: Vec<u64>,
+    records: &crate::model::PValue,
+) -> Result<Vec<KeyboardServiceObservation>, String> {
+    if ids.len() > 4096 || ids.contains(&0) {
+        return Err("invalid keyboard service identities".into());
+    }
+    ids.sort_unstable();
+    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("duplicate keyboard service identity".into());
+    }
+    Ok(ids
+        .into_iter()
+        .map(|registry| KeyboardServiceObservation {
+            registry,
+            state: KeyboardServiceState::read(records, registry),
+        })
+        .collect())
+}
+
 /// The operating system, as items see it.
 pub trait System: Sync {
     /// Keyboard-capable HID service identities, read without events or child processes.
     fn keyboard_service_ids(&self) -> Result<Vec<u64>, String> {
         Err("native keyboard service census is unavailable".into())
+    }
+    /// Complete per-service mapping reads without child processes or event subscriptions.
+    fn keyboard_service_observations(&self) -> Result<Vec<KeyboardServiceObservation>, String> {
+        Err("native keyboard mapping observation is unavailable".into())
     }
     /// What the Bonjour request `ask` hears within `within`, through the root LAN broker on
     /// macOS ([`bonjour::live`]): every event it heard by then, in order.
@@ -1779,6 +1901,16 @@ pub fn responsible_window() -> Option<String> {
 }
 
 impl System for Live {
+    fn keyboard_service_observations(&self) -> Result<Vec<KeyboardServiceObservation>, String> {
+        #[cfg(target_os = "macos")]
+        {
+            keyboard_maps::observations()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("native keyboard services are available only on macOS".into())
+        }
+    }
     fn keyboard_service_ids(&self) -> Result<Vec<u64>, String> {
         #[cfg(target_os = "macos")]
         {
@@ -3678,10 +3810,19 @@ mod fake {
 
         /// Seed a file.
         pub fn file(&self, path: &str, bytes: &[u8]) -> &Self {
+            self.file_with_mode(path, bytes, 0o644)
+        }
+
+        /// Seed an executable file.
+        pub fn executable(&self, path: &str, bytes: &[u8]) -> &Self {
+            self.file_with_mode(path, bytes, 0o755)
+        }
+
+        fn file_with_mode(&self, path: &str, bytes: &[u8], mode: u32) -> &Self {
             self.files
                 .lock()
                 .unwrap()
-                .insert(PathBuf::from(path), (bytes.to_vec(), 0o644));
+                .insert(PathBuf::from(path), (bytes.to_vec(), mode));
             self
         }
 
@@ -3895,6 +4036,51 @@ mod fake {
             self.keyboard_services
                 .clone()
                 .unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        fn keyboard_service_observations(
+            &self,
+        ) -> Result<Vec<super::KeyboardServiceObservation>, String> {
+            let ids = self.keyboard_service_ids()?;
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            // Read the same modeled property data as activation, without pretending a
+            // passive native read launched hidutil or consuming a command reply.
+            let mut cmd = Cmd::new("/usr/bin/hidutil").args(["dump", "services", "-f", "xml"]);
+            if let Some(identity) = self.identity.lock().unwrap().as_ref() {
+                cmd = cmd.as_user(&identity.user);
+            }
+            let model = self.model.lock().unwrap().clone();
+            let reply = model
+                .and_then(|model| model(self, &cmd))
+                .or_else(|| {
+                    self.replies
+                        .lock()
+                        .unwrap()
+                        .get(&cmd.display())
+                        .and_then(|rows| rows.first())
+                        .cloned()
+                })
+                .ok_or("fake: no keyboard property data scripted")?;
+            if !reply.success()
+                || reply.stdout.len() > aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES
+            {
+                return Err("fake: keyboard property data is unavailable or incomplete".into());
+            }
+            let dump = crate::plist::parse(&reply.stdout).map_err(|why| why.to_string())?;
+            let crate::model::PValue::Dict(fields) = dump else {
+                return Err("fake: missing keyboard service records".into());
+            };
+            let mut records = fields.iter().filter(|(name, _)| name == "ServiceRecords");
+            let records_value = &records
+                .next()
+                .ok_or("fake: missing keyboard service records")?
+                .1;
+            if records.next().is_some() {
+                return Err("fake: duplicate keyboard service records".into());
+            }
+            super::keyboard_observations(ids, records_value)
         }
 
         fn clt_mark(&self) -> &dyn aterm_types::clt_mark::Files {

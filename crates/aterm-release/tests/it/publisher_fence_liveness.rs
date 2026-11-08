@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ledger::testing::Git;
+#[cfg(unix)]
+use crate::publisher_origin::{Git, bare_remote};
 use publish::{
     FenceIdentity, FenceLiveness, FenceReclaim, GroupState, LocalProbe, PUBLISHER_FENCE_REF,
     PidState, PublisherProbe,
@@ -129,6 +130,7 @@ fn build_bare(root: &Path) -> (String, String) {
     (owner, other_owner)
 }
 
+#[cfg(unix)]
 fn forge_fence(repo: &Path, owner: &str, body: &str) -> String {
     let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let local = format!("forged-fence-{}-{sequence}", std::process::id());
@@ -139,7 +141,7 @@ fn forge_fence(repo: &Path, owner: &str, body: &str) -> String {
         &[
             "push",
             "--force",
-            "origin",
+            bare_remote(repo).to_str().unwrap(),
             &format!("{token}:{PUBLISHER_FENCE_REF}"),
         ],
     );
@@ -609,6 +611,7 @@ const LAST_STAMPED_BOOT_FORMAT: u32 = 2;
 /// compares it as text, so a boot id would read to it as another boot: it would tell the
 /// operator a live publisher "cannot be that publisher any more". The format this binary
 /// writes must be one that cutter refuses as newer than its own, by its own rule.
+#[cfg(unix)]
 #[test]
 fn a_fence_naming_its_boot_by_id_is_a_format_a_stamp_reader_refuses_as_newer() {
     let fixture = bare_fixture("format-names-boot-id");
@@ -616,7 +619,7 @@ fn a_fence_naming_its_boot_by_id_is_a_format_a_stamp_reader_refuses_as_newer() {
     let git_b = Git::new(&fixture.repo_b);
     this_invocation_publishes();
     publish::acquire_release_lease(&git_a, &fixture.owner).unwrap();
-    let guard = publish::acquire_publisher_fence(&git_a, &fixture.owner).unwrap();
+    let guard = publish::acquire_publisher_fence(&git_a, &git_a, &fixture.owner).unwrap();
     let written = publish::publisher_fence_identity(&git_b, guard.token());
     publish::release_publisher_fence(&git_a, &guard).unwrap();
     let boot = written.boot.as_deref().expect("the fence records its boot");
@@ -687,6 +690,7 @@ fn the_version_note_names_the_format_that_first_recorded_a_version() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fence_this_binary_writes_is_readable_from_another_clone() {
     let fixture = bare_fixture("round-trip");
@@ -694,7 +698,7 @@ fn a_fence_this_binary_writes_is_readable_from_another_clone() {
     let git_b = Git::new(&fixture.repo_b);
     this_invocation_publishes();
     publish::acquire_release_lease(&git_a, &fixture.owner).unwrap();
-    let guard = publish::acquire_publisher_fence(&git_a, &fixture.owner).unwrap();
+    let guard = publish::acquire_publisher_fence(&git_a, &git_a, &fixture.owner).unwrap();
 
     let identity = publish::publisher_fence_identity(&git_b, guard.token());
     assert_eq!(identity.unreadable, None, "{identity:?}");
@@ -742,6 +746,7 @@ fn a_long_executable_path_keeps_a_live_publisher_alive() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_live_publisher_still_refuses_and_is_never_reclaimed() {
     let fixture = bare_fixture("live-refuses");
@@ -775,6 +780,7 @@ fn a_live_publisher_still_refuses_and_is_never_reclaimed() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_resume_reclaims_a_fence_whose_publisher_is_provably_dead() {
     let fixture = bare_fixture("dead-reclaimed");
@@ -809,7 +815,7 @@ fn a_resume_reclaims_a_fence_whose_publisher_is_provably_dead() {
         "the reclaimed token must be gone"
     );
 
-    let mine = publish::acquire_publisher_fence(&git, &fixture.owner).unwrap();
+    let mine = publish::acquire_publisher_fence(&git, &git, &fixture.owner).unwrap();
     assert_ne!(mine.token(), stale);
     match publish::reclaim_dead_publisher_fence(&git, &fixture.owner, &LocalProbe).unwrap() {
         FenceReclaim::Kept { .. } => {}
@@ -818,6 +824,7 @@ fn a_resume_reclaims_a_fence_whose_publisher_is_provably_dead() {
     publish::release_publisher_fence(&git, &mine).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_reused_pid_is_proof_of_death_end_to_end() {
     let fixture = bare_fixture("reused-pid");
@@ -845,6 +852,7 @@ fn a_reused_pid_is_proof_of_death_end_to_end() {
     assert_eq!(publish::publisher_fence(&git).unwrap(), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_spawned_request_that_outlives_the_publisher_keeps_the_fence_end_to_end() {
     let fixture = bare_fixture("orphaned-child");
@@ -892,6 +900,7 @@ fn a_spawned_request_that_outlives_the_publisher_keeps_the_fence_end_to_end() {
     assert_eq!(publish::publisher_fence(&git).unwrap(), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fence_from_another_host_refuses_and_is_kept() {
     let fixture = bare_fixture("other-host");
@@ -984,6 +993,7 @@ fn dead_publishers_fence_naming_boot_is_kept(name: &str, format: u32, boot: &str
     refusal
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fence_naming_this_boot_in_the_other_letter_case_is_reclaimed() {
     let fixture = bare_fixture("boot-case");
@@ -1026,6 +1036,7 @@ fn a_fence_naming_this_boot_in_the_other_letter_case_is_reclaimed() {
     assert_eq!(publish::publisher_fence(&git).unwrap(), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fence_written_by_an_older_binary_refuses_instead_of_crashing() {
     let fixture = bare_fixture("legacy-fence");
@@ -1052,6 +1063,7 @@ fn a_fence_written_by_an_older_binary_refuses_instead_of_crashing() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fence_for_another_claim_is_never_reclaimed() {
     let fixture = bare_fixture("foreign-claim");
@@ -1082,6 +1094,7 @@ fn a_fence_for_another_claim_is_never_reclaimed() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unreadable_fence_body_refuses_rather_than_crashing() {
     let fixture = bare_fixture("unreadable-body");

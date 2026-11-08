@@ -272,17 +272,13 @@ fn host() {
         && atpkg::lease::Subject::of_dir(&target_layout.prefix, &target_root.join("bin")).is_some()
     {
         Some(
-            match atpkg::lease::hold_for(
+            owner_fixture_sdk_lease(
                 &target_layout.prefix,
                 &target_root.join("bin"),
                 "actual bounded native metadata qualification",
-                Duration::from_secs(2),
+                Instant::now(),
             )
-            .unwrap()
-            {
-                atpkg::lease::Hold::Held(lease) => lease,
-                _ => panic!("managed target requires its actual in-use lease"),
-            },
+            .unwrap(),
         )
     } else {
         None
@@ -504,7 +500,7 @@ fn host() {
         }
         match aterm_uds::kept_out(|| listener.accept()) {
             Ok((stream, _)) => {
-                let end = Instant::now() + Duration::from_secs(8);
+                let end = crate::fixture_deadline(Instant::now());
                 let peer = match wire::local_peer(&stream) {
                     Ok(peer) => peer,
                     Err(error) if error.kind() == io::ErrorKind::NotConnected => continue,

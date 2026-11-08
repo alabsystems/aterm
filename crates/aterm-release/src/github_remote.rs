@@ -17,7 +17,10 @@ use agh::policy::{Named, Router, Tier};
 use agh::{Github, GithubBuilder, Slug};
 
 const CALLER: &str = "aterm-release";
-const BUDGET: Duration = Duration::from_secs(120);
+/// A native Git operation that produces no output and whose complete descendant tree consumes
+/// no CPU or I/O for this long is hung. This is an inactivity detector, never a fetch latency
+/// budget: any observed progress starts another full window.
+const STALL_WINDOW: Duration = Duration::from_secs(60);
 // GitOut keeps the final 64 KiB, at a UTF-8 boundary. A near-limit answer may
 // therefore be incomplete and cannot establish that a ref was absent.
 const COMPLETE_LIMIT: usize = 64 * 1024 - 4;
@@ -31,9 +34,11 @@ pub(crate) struct FetchedOrigin {
 
 #[path = "github_remote/write.rs"]
 mod write;
-pub(crate) use write::RefWrite;
-#[cfg(all(test, unix))]
+pub use write::RefWrite;
+#[cfg(test)]
 pub(crate) use write::claim_fixture;
+#[cfg(test)]
+pub(crate) use write::engine_fixture;
 
 pub(crate) struct Remote {
     client: Github,
@@ -44,6 +49,12 @@ pub(crate) struct Remote {
 
 /// Read recorded vault adoption and explicit agh configuration. No credential
 /// pointer, owner row or publication grant is synthesized by the cutter.
+fn bind_configured(dirs: &agh::config::Dirs, base: &Github) -> Result<Github, String> {
+    agh::routing::view(dirs, base.env())
+        .and_then(|routing| routing.bind(base))
+        .map_err(|error| base.redactor().apply(&error.why))
+}
+
 fn configured(dirs: &agh::config::Dirs) -> Result<Github, String> {
     let env = Arc::new(agh::identity::ProcessEnv);
     let base = GithubBuilder::new(Router::empty())
@@ -55,17 +66,36 @@ fn configured(dirs: &agh::config::Dirs) -> Result<Github, String> {
         .rate_book(agh::rate::RateBook::at(dirs.rate()))
         .refuse_anonymous_api(true)
         .build();
-    agh::routing::view(dirs, base.env())
-        .and_then(|routing| routing.bind(&base))
-        .map_err(|error| base.redactor().apply(&error.why))
+    bind_configured(dirs, &base)
 }
 
-fn origin_slug(repo: &Path) -> Result<Slug, String> {
+/// Read a declared repository through its own routed identity, including private staging.
+pub(crate) fn repository_file(slug: &str, reference: &str, path: &str) -> Result<Vec<u8>, String> {
+    let dirs = agh::config::Dirs::from_env()
+        .ok_or("agh configuration and state directories are unavailable")?;
+    repository_file_with(&configured(&dirs)?, slug, reference, path)
+}
+
+fn repository_file_with(
+    client: &Github,
+    slug: &str,
+    reference: &str,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let slug = Slug::parse(slug).map_err(|error| error.why.clone())?;
+    client
+        .contents(&slug)
+        .raw(Some(reference), path, 16 << 20)
+        .map_err(|error| client.redactor().apply(&error.why))
+}
+
+pub(crate) fn origin_slug(repo: &Path) -> Result<Slug, String> {
     let mut command = crate::ledger::object_git(repo);
     command.args(["remote", "get-url", "origin"]);
-    let out = aterm_uds::deadline::output_until_complete_stdout(
+    let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
         &mut command,
-        std::time::Instant::now() + BUDGET,
+        STALL_WINDOW,
+        "git remote get-url origin",
     )
     .map_err(|error| format!("cannot read this source's origin: {error}"))?;
     if !out.status.success() {
@@ -96,6 +126,11 @@ pub(crate) fn helper_arguments(
 }
 
 impl Remote {
+    /// The immutable repository captured when this source was admitted.
+    pub(crate) fn repository(&self) -> &Slug {
+        &self.slug
+    }
+
     pub(crate) fn origin(repo: &Path) -> Result<Self, String> {
         let slug = origin_slug(repo)?;
         let dirs = agh::config::Dirs::from_env()
@@ -128,8 +163,69 @@ impl Remote {
 
     fn run(&self, run: GitRun) -> Result<agh::git::GitOut, String> {
         self.client
-            .run_git(&run.with_named(self.named.clone()).with_budget(BUDGET))
+            .run_git(
+                &run.with_named(self.named.clone())
+                    .with_progress_window(STALL_WINDOW),
+            )
             .map_err(|error| self.client.redactor().apply(&error.why))
+    }
+
+    fn ensure_origin(&self) -> Result<(), String> {
+        if origin_slug(&self.repo)? != self.slug {
+            return Err("source origin changed during its native read".into());
+        }
+        Ok(())
+    }
+
+    fn tag_inventory(&self) -> Result<BTreeMap<String, String>, String> {
+        self.ensure_origin()?;
+        let out = self.run(GitRun::ls_remote(&self.slug, Some("refs/tags/*")))?;
+        let tags = parse_tags(&out.stdout)?;
+        self.ensure_origin()?;
+        Ok(tags)
+    }
+
+    fn import_snapshot(&self, objects: impl IntoIterator<Item = String>) -> Result<(), String> {
+        self.ensure_origin()?;
+        let objects = objects.into_iter().collect::<BTreeSet<_>>();
+        if !objects.is_empty() {
+            let batch = FetchBatch::new(
+                objects
+                    .into_iter()
+                    .map(|oid| FetchRow {
+                        source: oid.clone(),
+                        into: format!("refs/agh/aterm-release/object/{oid}"),
+                        expected_oid: oid,
+                    })
+                    .collect(),
+            )
+            .map_err(|error| self.client.redactor().apply(&error.why))?;
+            self.run(GitRun::fetch_batch(&self.slug, &self.repo, batch, false))?;
+        }
+        self.ensure_origin()
+    }
+
+    /// Tag inventory is useful even for a repository with no main branch.
+    pub(crate) fn tag_catalog(&self) -> Result<String, String> {
+        let tags = self.tag_inventory()?;
+        self.import_snapshot(tags.values().cloned())?;
+        let tags = self.peel_tags(tags)?;
+        self.ensure_origin()?;
+        Ok(render_tags(tags))
+    }
+
+    /// Refresh main alone for a ledger or source-line operation. Exact imports
+    /// and the final captured-origin/tracking CAS use the same admission as a
+    /// complete origin refresh; a caller does not need the tag catalog here.
+    pub(crate) fn refresh_main(&self) -> Result<String, String> {
+        let before = self.tracking_main()?;
+        let main = self
+            .get("refs/heads/main")?
+            .ok_or("the authenticated origin has no main branch")?;
+        self.fetch_exact(&main)?;
+        self.require_commit(&main)?;
+        self.record_main(before.as_deref(), &main)?;
+        Ok(main)
     }
 
     /// Read main and every tag through the configured native identity, import
@@ -139,34 +235,16 @@ impl Remote {
         let main = self
             .get("refs/heads/main")?
             .ok_or("the authenticated origin has no main branch")?;
-        let out = self.run(GitRun::ls_remote(&self.slug, Some("refs/tags/*")))?;
-        let tags = parse_tags(&out.stdout)?;
+        let tags = self.tag_inventory()?;
         // Each native import uses a fresh admitted scratch repository. Import
         // the observed objects together rather than transfer history per tag.
-        let objects = std::iter::once(main.clone())
-            .chain(tags.values().cloned())
-            .collect::<BTreeSet<_>>();
-        let batch = FetchBatch::new(
-            objects
-                .into_iter()
-                .map(|oid| FetchRow {
-                    source: oid.clone(),
-                    into: format!("refs/agh/aterm-release/object/{oid}"),
-                    expected_oid: oid,
-                })
-                .collect(),
-        )
-        .map_err(|error| self.client.redactor().apply(&error.why))?;
-        self.run(GitRun::fetch_batch(&self.slug, &self.repo, batch, false))?;
+        self.import_snapshot(std::iter::once(main.clone()).chain(tags.values().cloned()))?;
         self.require_commit(&main)?;
         let tags = self.peel_tags(tags)?;
         self.record_main(before.as_deref(), &main)?;
         Ok(FetchedOrigin {
             main,
-            tags: tags
-                .into_iter()
-                .map(|(name, oid)| format!("{oid}\t{name}\n"))
-                .collect(),
+            tags: render_tags(tags),
         })
     }
 
@@ -180,7 +258,70 @@ impl Remote {
             return Ok(None);
         };
         self.fetch_exact(&oid)?;
-        Ok(Some(self.peel_tag(&oid)?.unwrap_or(oid)))
+        let target = self.peel_tag(&oid)?.unwrap_or(oid);
+        self.ensure_origin()?;
+        Ok(Some(target))
+    }
+
+    pub(crate) fn tag_commit(&self, tag: &str) -> Result<Option<String>, String> {
+        let commit = self.tag(tag)?;
+        if let Some(oid) = &commit {
+            self.require_commit(oid)?;
+        }
+        self.ensure_origin()?;
+        Ok(commit)
+    }
+
+    pub(crate) fn submodule_tip(&self, path: &Path, reference: &str) -> Result<String, String> {
+        self.submodule_tip_with(path, reference, Self::origin)
+    }
+
+    fn submodule_tip_with(
+        &self,
+        path: &Path,
+        reference: &str,
+        open: impl FnOnce(&Path) -> Result<Self, String>,
+    ) -> Result<String, String> {
+        self.ensure_origin()?;
+        if path.as_os_str().is_empty()
+            || !path
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err("a submodule tip needs a normal relative path".into());
+        }
+        if reference != "HEAD"
+            && !(reference.starts_with("refs/heads/") && agh::path::ref_name_ok(reference))
+        {
+            return Err("a submodule tip needs a full heads ref or exact HEAD".into());
+        }
+        let parent = self
+            .repo
+            .canonicalize()
+            .map_err(|error| format!("resolve parent repository: {error}"))?;
+        let child_path = self
+            .repo
+            .join(path)
+            .canonicalize()
+            .map_err(|error| format!("resolve submodule: {error}"))?;
+        if child_path == parent || !child_path.starts_with(&parent) {
+            return Err("the submodule repository escapes its parent".into());
+        }
+        let child = open(&child_path)?;
+        child.ensure_origin()?;
+        let oid = if reference == "HEAD" {
+            let out = child.run(GitRun::ls_remote(&child.slug, Some("HEAD")))?;
+            parse_head(&out.stdout)?
+        } else {
+            child
+                .get(reference)?
+                .ok_or("the declared submodule branch is absent")?
+        };
+        child.fetch_exact(&oid)?;
+        child.require_commit(&oid)?;
+        child.ensure_origin()?;
+        self.ensure_origin()?;
+        Ok(oid)
     }
 
     fn peel_tags(
@@ -217,7 +358,10 @@ impl Remote {
         Ok(tags)
     }
 
-    fn peel_tag(&self, oid: &str) -> Result<Option<String>, String> {
+    pub(crate) fn peel_tag(&self, oid: &str) -> Result<Option<String>, String> {
+        if !agh::path::is_sha(oid) {
+            return Err("a tag peel needs one raw object ID".into());
+        }
         // The caller imported this exact object through the native boundary.
         // No lazy network read or per-tag history transfer occurs here.
         let kind = self.local(&["cat-file", "-t", oid])?;
@@ -244,14 +388,29 @@ impl Remote {
         }
     }
 
+    /// Read the imported tag body under its immutable raw ID, with replacement
+    /// refs and lazy transport disabled. A non-tag object remains an error.
+    pub(crate) fn tag_object(&self, oid: &str) -> Result<Vec<u8>, String> {
+        if !agh::path::is_sha(oid) {
+            return Err("a tag object read needs one raw object ID".into());
+        }
+        let out = self.local(&["cat-file", "tag", oid])?;
+        if !out.status.success() {
+            return Err(self.local_error("read imported tag object", &out));
+        }
+        Ok(out.stdout)
+    }
+
     /// Git here reads or updates local metadata only. The explicit checkout,
     /// scrubbed Git context and disabled hooks cannot select a remote transport.
     fn local(&self, args: &[&str]) -> Result<std::process::Output, String> {
         let mut command = crate::ledger::object_git(&self.repo);
         command.args(["-c", "core.hooksPath=/dev/null"]).args(args);
-        aterm_uds::deadline::output_until_complete_stdout(
+        let waiting_on = format!("local git {}", args.join(" "));
+        aterm_uds::deadline::output_while_process_progressing_complete_stdout(
             &mut command,
-            std::time::Instant::now() + BUDGET,
+            STALL_WINDOW,
+            &waiting_on,
         )
         .map_err(|error| {
             self.client
@@ -268,10 +427,10 @@ impl Remote {
         ))
     }
 
-    fn require_commit(&self, oid: &str) -> Result<(), String> {
+    pub(crate) fn require_commit(&self, oid: &str) -> Result<(), String> {
         let out = self.local(&["cat-file", "-t", oid])?;
         if !out.status.success() || out.stdout != b"commit\n" {
-            return Err("origin/main must resolve to an available commit object".into());
+            return Err("the observed object must be an available commit".into());
         }
         Ok(())
     }
@@ -333,8 +492,11 @@ impl Remote {
             return Err("a release ref listing needs a full ref namespace".into());
         }
         let pattern = format!("{namespace}*");
+        self.ensure_origin()?;
         let out = self.run(GitRun::ls_remote(&self.slug, Some(&pattern)))?;
-        parse_refs(&out.stdout, namespace)
+        let refs = parse_refs(&out.stdout, namespace)?;
+        self.ensure_origin()?;
+        Ok(refs)
     }
 
     /// Resolve one exact full ref without interpreting it as a pattern.
@@ -342,11 +504,13 @@ impl Remote {
         if !agh::path::ref_name_ok(reference) {
             return Err("a release ref read needs a full Git ref".into());
         }
+        self.ensure_origin()?;
         let out = self.run(GitRun::ls_remote(&self.slug, Some(reference)))?;
         let mut refs = parse_refs(&out.stdout, reference)?;
         if refs.keys().any(|name| name != reference) {
             return Err("GitHub answered an exact ref read with another ref".into());
         }
+        self.ensure_origin()?;
         Ok(refs.remove(reference))
     }
 
@@ -356,9 +520,10 @@ impl Remote {
         if !agh::path::is_sha(oid) {
             return Err("an exact release fetch needs a raw lowercase object ID".into());
         }
+        self.ensure_origin()?;
         let into = format!("refs/agh/aterm-release/object/{oid}");
         self.run(GitRun::fetch_ref(&self.slug, &self.repo, oid, &into, false))?;
-        Ok(())
+        self.ensure_origin()
     }
 
     /// Read a blob from the imported raw tree, ignoring replacement refs and
@@ -376,9 +541,10 @@ impl Remote {
         let path = path.to_str().ok_or("release tree path is not UTF-8")?;
         let mut command = crate::ledger::object_git(&self.repo);
         command.args(["cat-file", "blob", &format!("{oid}:{path}")]);
-        let out = aterm_uds::deadline::output_until_complete_stdout(
+        let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
             &mut command,
-            std::time::Instant::now() + BUDGET,
+            STALL_WINDOW,
+            "git cat-file imported release blob",
         )
         .map_err(|error| format!("cannot read imported release blob: {error}"))?;
         if !out.status.success() {
@@ -389,6 +555,31 @@ impl Remote {
         }
         Ok(out.stdout)
     }
+}
+
+fn render_tags(tags: BTreeMap<String, String>) -> String {
+    tags.into_iter()
+        .map(|(name, oid)| format!("{oid}\t{name}\n"))
+        .collect()
+}
+
+fn parse_head(text: &str) -> Result<String, String> {
+    if text.len() >= COMPLETE_LIMIT || text.contains(['\r', '\0']) {
+        return Err("the remote HEAD answer is malformed or may be incomplete".into());
+    }
+    let mut lines = text.lines();
+    let (oid, name) = lines
+        .next()
+        .and_then(|line| line.split_once('\t'))
+        .ok_or("the remote HEAD answer must contain one exact row")?;
+    if lines.next().is_some()
+        || name != "HEAD"
+        || !agh::path::is_sha(oid)
+        || oid.bytes().all(|byte| byte == b'0')
+    {
+        return Err("the remote HEAD answer must contain one raw object ID and exact HEAD".into());
+    }
+    Ok(oid.into())
 }
 
 fn parse_refs(text: &str, prefix: &str) -> Result<BTreeMap<String, String>, String> {

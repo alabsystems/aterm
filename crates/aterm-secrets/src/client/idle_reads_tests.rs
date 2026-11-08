@@ -260,9 +260,14 @@ fn reads_during<T>(paths: &Paths, read: impl FnOnce() -> T) -> (T, BTreeMap<Path
     (answer, reads)
 }
 
-/// A settled observation of `paths` is the fresh one, and a second one of the same files reads
-/// none of them but the records pin, whose few bytes name the data file to stamp; every file the
-/// fresh one reads is among those whose stamps the memo compares.
+/// A settled observation of `paths` is the fresh one, and a second one of the same files opens
+/// none of them, the records pin included (`Paths::records_data_file` names the data file to stamp
+/// from `records_storage::selected`'s `lstat`s); every file the fresh one reads is among those
+/// whose stamps the memo compares.
+///
+/// NEGATIVE CONTROL (2026-11-08): with `Paths::records_data_file` back on
+/// `records_storage::data_path`, the second observation opens the missing pin (`a settled
+/// observation of unchanged files`).
 fn settles(paths: &Paths, expected: &str) {
     let (fresh, read) = reads_during(paths, || observe_commons(paths));
     assert_eq!(verdict(&fresh), expected);
@@ -272,8 +277,7 @@ fn settles(paths: &Paths, expected: &str) {
     assert_eq!(verdict(&commons::observe_settled(paths)), expected);
     let (again, read) = reads_during(paths, || commons::observe_settled(paths));
     assert_eq!(verdict(&again), expected);
-    let pin = paths.dir.join("records.layout");
-    let read: Vec<_> = read.into_iter().filter(|(path, _)| *path != pin).collect();
+    let read: Vec<_> = read.into_iter().collect();
     assert_eq!(read, vec![], "a settled observation of unchanged files");
 }
 
@@ -446,8 +450,8 @@ fn denies(roster: &crate::Result<Option<SwarmRoster>>, label: &str) -> bool {
 
 /// A Commons peer check reads this Mac's roster, its acknowledged log and the roster for that log
 /// at every check, four or five checks a session, every session. Every file those reads open is
-/// one the memos stamp; read through them again, with no file moved, they open none (but the
-/// records pin); a vault change is read at the next call. While a writer holds the vault's state
+/// one the memos stamp; read through them again, with no file moved, they open none, the records
+/// pin included; a vault change is read at the next call. While a writer holds the vault's state
 /// lock nothing kept is given: the roster for the log refuses the busy vault and the roster read
 /// finds it busy, as each did before, so a busy writer never yields a permissive verdict.
 ///
@@ -455,7 +459,9 @@ fn denies(roster: &crate::Result<Option<SwarmRoster>>, label: &str) -> bool {
 /// kept roster for the log is given under the writer (`a writer holding the vault meets the
 /// read`); with `local_swarm_roster_for_log_now` keyed by no log's heads (`[0; 32]`), the grown
 /// log gets the roster kept for the log before it (`the roster for another log is read for it`:
-/// `deny_labels: ["m99"]` against `["m98"]`).
+/// `deny_labels: ["m99"]` against `["m98"]`). (2026-11-08): with `Paths::records_data_file` back
+/// on `records_storage::data_path`, the kept reads open the missing pin (`kept reads of unchanged
+/// files`).
 #[test]
 fn a_peer_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer() {
     let _answering = ServersAnswering::set();
@@ -496,8 +502,7 @@ fn a_peer_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer() {
     assert_eq!(again.0.as_ref().ok(), first.0.as_ref().ok());
     assert_eq!(again.1.as_ref().ok(), first.1.as_ref().ok());
     assert_eq!(again.2.as_ref().ok(), for_log.as_ref().ok());
-    let pin = m7.dir.join("records.layout");
-    let read: Vec<_> = read.into_iter().filter(|(path, _)| *path != pin).collect();
+    let read: Vec<_> = read.into_iter().collect();
     assert_eq!(read, vec![], "kept reads of unchanged files");
 
     {

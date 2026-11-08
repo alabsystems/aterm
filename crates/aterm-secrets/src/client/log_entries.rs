@@ -2101,9 +2101,20 @@ fn pending_remove_cutoffs(
 pub(super) struct Drafted {
     pub(super) records: Vec<Record>,
     pub(super) heads: Vec<RecordId>,
+    /// Exact verified root when captured for publication. A retention-only record set can
+    /// lack that source observation and grants no log-version claim.
+    pub(super) network: Option<RecordId>,
 }
 
 impl Drafted {
+    pub(super) fn from_log(records: Vec<Record>, log: &Log) -> Self {
+        Self {
+            records,
+            heads: log.heads(),
+            network: Some(*log.network()),
+        }
+    }
+
     /// The stamp the envelope sealed with these records carries.
     pub(super) fn stamp(&self) -> Option<String> {
         stamp_line(&self.heads)
@@ -4352,13 +4363,7 @@ fn draft_document_diff_with(
         Ok(())
     })?;
 
-    Ok(Some((
-        Drafted {
-            records: minted,
-            heads: log.heads(),
-        },
-        everyone,
-    )))
+    Ok(Some((Drafted::from_log(minted, &log), everyone)))
 }
 
 /// What a store's membership log is for judging a Commons peer ([`acknowledged_commons_log`]).

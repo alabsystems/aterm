@@ -229,6 +229,8 @@ fn cleanup_terminal_pool(ctx: &crate::SessionCtx, env: &Env, root: &Receipt) -> 
     if root.intent.purpose != renewal::Purpose::WeeklyQuota {
         return true;
     }
+    // A contradictory unattempted root must reach the writer's refusal, not
+    // fall through as cleanup complete while its pool binding is still held.
     if root.phase == Phase::Consumed || (root.phase == Phase::Retired && !root.launch_attempted) {
         return renewal::retire_pool_record(env, root).is_ok_and(|result| result.is_some());
     }
@@ -251,6 +253,8 @@ fn cleanup_terminal_pool(ctx: &crate::SessionCtx, env: &Env, root: &Receipt) -> 
         && root.current_attempt.is_none()
         && root.candidate.is_none()
         && root.successor_pid.is_none()
+        && root.successor_birth.is_none()
+        && root.accepted_turn.is_none()
     {
         match unstarted_completion(ctx, root) {
             Unstarted::Pending => return false,
@@ -410,8 +414,7 @@ pub(in crate::native_act) fn retire_unstarted(
     root: &Receipt,
 ) -> bool {
     if root.phase != Phase::Committing
-        || root.current_attempt.is_some()
-        || root.launch_attempted
+        || !root.has_no_execution_evidence()
         || unstarted_completion(ctx, root) != Unstarted::Proven
     {
         return false;

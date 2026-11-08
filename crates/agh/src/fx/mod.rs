@@ -13,8 +13,10 @@ use std::io::Read;
 use std::path::Path;
 #[cfg(any(unix, test))]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use aterm_types::MutexExt;
 
 /// A real elapsed native validation phase, observed only on a simulated client.
 /// The span includes dispatch and result checking; it is not CPU time inside Git.
@@ -181,10 +183,6 @@ pub struct Fx {
     requested: Mutex<Vec<crate::wire::Deadlines>>,
 }
 
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 fn infallible<T>(read: std::result::Result<T, std::convert::Infallible>) -> T {
     match read {
         Ok(value) => value,
@@ -199,7 +197,10 @@ fn tape_exchange(
     request: &[u8],
     reply: &[u8],
 ) {
-    infallible(lock(seam).exchange(door, request, &mut |_| reply.to_vec()));
+    infallible(
+        seam.lock_or_recover()
+            .exchange(door, request, &mut |_| reply.to_vec()),
+    );
 }
 
 fn read_whole(
@@ -545,7 +546,7 @@ impl Fx {
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn requested_deadlines(&self) -> Vec<crate::wire::Deadlines> {
-        lock(&self.requested).clone()
+        self.requested.lock_or_recover().clone()
     }
 
     /// Tests: `mono` starts at 0 and `wall_secs` at `start_unix_secs`.
@@ -660,13 +661,15 @@ impl Fx {
     }
 
     fn latched(&self) -> Result<()> {
-        let fault = lock(&self.stream_verdicts)
+        let fault = self
+            .stream_verdicts
+            .lock_or_recover()
             .iter()
-            .find_map(|verdict| lock(verdict).clone());
+            .find_map(|verdict| verdict.lock_or_recover().clone());
         if let Some(e) = fault {
-            lock(&self.latch).get_or_insert(e);
+            self.latch.lock_or_recover().get_or_insert(e);
         }
-        match &*lock(&self.latch) {
+        match &*self.latch.lock_or_recover() {
             Some(e) => Err(e.clone()),
             None => Ok(()),
         }
@@ -693,7 +696,7 @@ impl Fx {
             ) => e.with_next(live.clone()),
             _ => e,
         };
-        let mut latch = lock(&self.latch);
+        let mut latch = self.latch.lock_or_recover();
         latch.get_or_insert(e).clone()
     }
 
@@ -723,7 +726,10 @@ impl Fx {
     ) -> Result<T> {
         self.latched()?;
         let request = request()?;
-        let reply = self.replayed(lock(from).exchange(door, &request, &mut |_| Vec::new()))?;
+        let reply = self.replayed(
+            from.lock_or_recover()
+                .exchange(door, &request, &mut |_| Vec::new()),
+        )?;
         let answer = decode(&reply).map_err(|e| self.latch(e))?;
         if let Seam::Rerecording { to, .. } = &self.seam {
             rerecorded(&reply)?;
@@ -741,20 +747,20 @@ impl Fx {
     /// A replay's divergence (`Sub::Replay`), which the Fx latches.
     pub fn mono(&self) -> Result<Duration> {
         let nanos = match &self.seam {
-            Seam::Live(seam) => infallible(lock(seam).mono_nanos()),
+            Seam::Live(seam) => infallible(seam.lock_or_recover().mono_nanos()),
             #[cfg(any(test, debug_assertions))]
             Seam::Simulated(clock) => return Ok(clock.mono()),
             Seam::Recording { seam, .. } => {
                 self.latched()?;
-                infallible(lock(seam).mono_nanos())
+                infallible(seam.lock_or_recover().mono_nanos())
             }
             Seam::Replaying { seam, .. } => {
                 self.latched()?;
-                self.replayed(lock(seam).mono_nanos())?
+                self.replayed(seam.lock_or_recover().mono_nanos())?
             }
             Seam::Rerecording { from, to, .. } => {
                 self.latched()?;
-                let nanos = self.replayed(lock(from).mono_nanos())?;
+                let nanos = self.replayed(from.lock_or_recover().mono_nanos())?;
                 to.append(&EffectRecord::Mono(nanos));
                 nanos
             }
@@ -767,20 +773,20 @@ impl Fx {
     /// As `mono`.
     pub fn wall_secs(&self) -> Result<u64> {
         let nanos = match &self.seam {
-            Seam::Live(seam) => infallible(lock(seam).now_nanos()),
+            Seam::Live(seam) => infallible(seam.lock_or_recover().now_nanos()),
             #[cfg(any(test, debug_assertions))]
             Seam::Simulated(clock) => return Ok(clock.wall_secs()),
             Seam::Recording { seam, .. } => {
                 self.latched()?;
-                infallible(lock(seam).now_nanos())
+                infallible(seam.lock_or_recover().now_nanos())
             }
             Seam::Replaying { seam, .. } => {
                 self.latched()?;
-                self.replayed(lock(seam).now_nanos())?
+                self.replayed(seam.lock_or_recover().now_nanos())?
             }
             Seam::Rerecording { from, to, .. } => {
                 self.latched()?;
-                let nanos = self.replayed(lock(from).now_nanos())?;
+                let nanos = self.replayed(from.lock_or_recover().now_nanos())?;
                 to.append(&EffectRecord::Clock(nanos));
                 nanos
             }
@@ -800,7 +806,10 @@ impl Fx {
                 self.latched()?;
                 std::thread::sleep(d);
                 let request = sleep_request(d);
-                infallible(lock(seam).exchange(DOOR_SLEEP, &request, &mut |_| Vec::new()));
+                infallible(
+                    seam.lock_or_recover()
+                        .exchange(DOOR_SLEEP, &request, &mut |_| Vec::new()),
+                );
             }
             Seam::Replaying { seam: from, .. } | Seam::Rerecording { from, .. } => {
                 self.replay_exchange(
@@ -826,7 +835,7 @@ impl Fx {
     ) -> Result<std::result::Result<WireResponse, WireError>> {
         let keep = |headers| canon::keep(endpoints, headers);
         #[cfg(any(test, debug_assertions))]
-        lock(&self.requested).push(req.deadlines);
+        self.requested.lock_or_recover().push(req.deadlines);
         match &self.seam {
             Seam::Live(_) => Ok(read_whole(transport, req, keep).map(canon::Reply::into_response)),
             #[cfg(any(test, debug_assertions))]
@@ -921,7 +930,7 @@ impl Fx {
         req: WireRequest<'_>,
     ) -> Result<std::result::Result<WireResponse, WireError>> {
         #[cfg(any(test, debug_assertions))]
-        lock(&self.requested).push(req.deadlines);
+        self.requested.lock_or_recover().push(req.deadlines);
         match &self.seam {
             Seam::Live(_) => {}
             #[cfg(any(test, debug_assertions))]
@@ -1001,8 +1010,11 @@ impl Fx {
                 }))
             }
             Seam::Replaying { seam, .. } => {
-                let reply =
-                    self.replayed(lock(seam).exchange(DOOR_GH, &request, &mut |_| Vec::new()))?;
+                let reply = self.replayed(seam.lock_or_recover().exchange(
+                    DOOR_GH,
+                    &request,
+                    &mut |_| Vec::new(),
+                ))?;
                 let head = match canon::stream_decode(&reply).map_err(|e| self.latch(e))? {
                     Ok(head) => head,
                     Err(wire) => return Ok(Err(wire)),
@@ -1015,7 +1027,7 @@ impl Fx {
                     verdict.clone(),
                 )
                 .map_err(|e| self.latch(e))?;
-                lock(&self.stream_verdicts).push(verdict);
+                self.stream_verdicts.lock_or_recover().push(verdict);
                 Ok(Ok(WireResponse {
                     status: head.status,
                     headers: canon::keep(endpoints, head.headers),
@@ -1023,8 +1035,11 @@ impl Fx {
                 }))
             }
             Seam::Rerecording { from, to, .. } => {
-                let reply =
-                    self.replayed(lock(from).exchange(DOOR_GH, &request, &mut |_| Vec::new()))?;
+                let reply = self.replayed(from.lock_or_recover().exchange(
+                    DOOR_GH,
+                    &request,
+                    &mut |_| Vec::new(),
+                ))?;
                 let head = match canon::stream_decode(&reply).map_err(|e| self.latch(e))? {
                     Ok(head) => head,
                     Err(wire) => {
@@ -1052,7 +1067,9 @@ impl Fx {
                     Ok(copy) if copy.hex == head.hex && copy.len == head.len => copy,
                     Ok(_) => return Err(self.latch(other())),
                     Err(tape::StoreFault::Read(_)) => {
-                        return Err(self.latch(lock(&verdict).clone().unwrap_or_else(other)));
+                        return Err(
+                            self.latch(verdict.lock_or_recover().clone().unwrap_or_else(other))
+                        );
                     }
                     Err(tape::StoreFault::Write(e)) => {
                         to.discard();
@@ -1117,11 +1134,14 @@ impl Fx {
             Seam::Simulated(_) => {}
             Seam::Recording { seam, .. } => {
                 self.latched()?;
-                infallible(lock(seam).emit(DOOR_STDOUT, bytes));
+                infallible(seam.lock_or_recover().emit(DOOR_STDOUT, bytes));
             }
             Seam::Replaying { seam, .. } => {
                 self.latched()?;
-                self.replayed(lock(seam).emit(DOOR_STDOUT, &tape::shaped(bytes)))?;
+                self.replayed(
+                    seam.lock_or_recover()
+                        .emit(DOOR_STDOUT, &tape::shaped(bytes)),
+                )?;
             }
             Seam::Rerecording { to, .. } => {
                 self.latched()?;
@@ -1149,19 +1169,21 @@ impl Fx {
                 if sink.discarded() {
                     return self.latched();
                 }
-                infallible(lock(seam).emit(DOOR_EXIT, code.as_bytes()));
+                infallible(seam.lock_or_recover().emit(DOOR_EXIT, code.as_bytes()));
                 sink.finish()
             }
             Seam::Replaying { seam, len, .. } => {
                 self.latched()?;
-                let mut seam = lock(seam);
+                let mut seam = seam.lock_or_recover();
                 self.replayed(seam.emit(DOOR_EXIT, code.as_bytes()))?;
                 seam.finish().map_err(|d| self.latch(ended(&d, *len)))
             }
             Seam::Rerecording { from, len, to, .. } => {
-                let replayed = self
-                    .latched()
-                    .and_then(|()| lock(from).finish().map_err(|d| self.latch(ended(&d, *len))));
+                let replayed = self.latched().and_then(|()| {
+                    from.lock_or_recover()
+                        .finish()
+                        .map_err(|d| self.latch(ended(&d, *len)))
+                });
                 if replayed.is_err() {
                     to.discard();
                     return replayed;
@@ -1299,11 +1321,11 @@ impl Fx {
             Seam::Simulated(_) => {}
             Seam::Recording { seam, .. } => {
                 self.latched()?;
-                infallible(lock(seam).emit(door, bytes));
+                infallible(seam.lock_or_recover().emit(door, bytes));
             }
             Seam::Replaying { seam, .. } => {
                 self.latched()?;
-                self.replayed(lock(seam).emit(door, &tape::shaped(bytes)))?;
+                self.replayed(seam.lock_or_recover().emit(door, &tape::shaped(bytes)))?;
             }
             Seam::Rerecording { to, .. } => {
                 self.latched()?;

@@ -123,7 +123,13 @@ impl Item for Keychain {
         if sys.euid() != self.user.uid {
             return Err("git's GitHub settings belong to their local user".into());
         }
+        if !super::settings_managed(sys, &self.user)? {
+            return Err("off: [github] enabled = false".into());
+        }
         let git = Git::for_user(sys, &self.user);
+        if !git.installed(sys) {
+            return Err("no executable Git is available to change its settings".into());
+        }
         let Some(block) =
             git.keychain_block(sys, &self.user, &|| super::token_here(sys, &self.user))?
         else {
@@ -136,7 +142,18 @@ impl Item for Keychain {
         drop(journaled);
         let helper =
             super::helper(sys, &self.user).ok_or_else(|| Helper::unavailable(sys, &self.user))?;
-        git.replace_keychain_block(sys, &self.user, &block, &helper)?;
+        git.replace_keychain_block(sys, &self.user, &block, &helper, &|| {
+            if !super::settings_managed(sys, &self.user)? {
+                return Err("off: [github] enabled = false".into());
+            }
+            if !git.installed(sys) {
+                return Err("no executable Git is available to change its settings".into());
+            }
+            if super::helper(sys, &self.user).as_ref() != Some(&helper) {
+                return Err("GitHub credential helper changed during replacement".into());
+            }
+            Ok(())
+        })?;
         self.replaced.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -162,13 +179,209 @@ mod tests {
     use crate::git_credential::script;
     use crate::items::defaults::tests::{ctx, user};
     use crate::model::{Mode, Outcome};
-    use crate::port::{Fake, Ran};
+    use crate::port::{Fake, Ran, Stat};
+
+    #[test]
+    fn keychain_stops_dispatch_when_admission_changes_during_the_read_or_replacement() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        let mut observations = Vec::new();
+        for after_write in [false, true] {
+            for fault in ["off", "unread", "nonexec"] {
+                let (sys, who, context) = mac();
+                script::keychain_block(&sys, &who, "alice");
+                script::keychain_block(&sys, &who, "alice");
+                script::replaces_keychain_block(&sys, &who);
+                let queries = Arc::new(AtomicUsize::new(0));
+                let stopped = Arc::new(AtomicBool::new(false));
+                let cutoff = Arc::new(AtomicUsize::new(0));
+                let all_commands = Arc::new(AtomicUsize::new(0));
+                let commands = all_commands.clone();
+                let (reads, stop, boundary) = (queries.clone(), stopped.clone(), cutoff.clone());
+                let owner = who.clone();
+                sys.simulate(move |sys, command| {
+                    let serial = commands.fetch_add(1, Ordering::SeqCst) + 1;
+                    let query = command.args.iter().any(|arg| arg == "--get-regexp");
+                    let write = command
+                        .args
+                        .iter()
+                        .any(|arg| arg == "--unset-all" || arg == "--add");
+                    let due = if after_write {
+                        write
+                    } else {
+                        query && reads.fetch_add(1, Ordering::SeqCst) == 1
+                    };
+                    if due && !stop.swap(true, Ordering::SeqCst) {
+                        if fault == "nonexec" {
+                            sys.stat_of(
+                                crate::items::github::CLT_GIT,
+                                Stat {
+                                    uid: 0,
+                                    gid: 0,
+                                    mode: 0o644,
+                                    dir: false,
+                                    symlink: false,
+                                    len: 3,
+                                },
+                            );
+                        } else {
+                            let profile = format!("{}/.config/aterm/init.toml", owner.home);
+                            let bytes = b"[github]\nenabled=false\n";
+                            sys.file(&profile, bytes).stat_of(
+                                &profile,
+                                Stat {
+                                    uid: owner.uid,
+                                    gid: owner.gid,
+                                    mode: 0o600,
+                                    dir: false,
+                                    symlink: false,
+                                    len: bytes.len() as u64,
+                                },
+                            );
+                            if fault == "unread" {
+                                sys.stat_fails(&profile, std::io::ErrorKind::PermissionDenied);
+                            }
+                        }
+                        boundary.store(serial, Ordering::SeqCst);
+                    }
+                    None
+                });
+                let item = Keychain::new(who);
+                assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
+                let result = item.apply(&sys, &context);
+                assert!(
+                    stopped.load(Ordering::SeqCst),
+                    "the mutation boundary was reached"
+                );
+                observations.push((
+                    after_write,
+                    fault,
+                    result.is_err(),
+                    all_commands.load(Ordering::SeqCst) - cutoff.load(Ordering::SeqCst),
+                ));
+            }
+        }
+        assert!(
+            observations
+                .iter()
+                .all(|(_, _, refused, later_commands)| *refused && *later_commands == 0),
+            "{observations:#?}"
+        );
+    }
+
+    #[test]
+    fn keychain_reads_no_settings_through_an_unadmitted_git() {
+        let mut observations = Vec::new();
+        for fault in ["missing", "nonexec", "empty", "loop", "install-shim"] {
+            let (sys, who, context) = mac();
+            let path = crate::items::github::CLT_GIT;
+            match fault {
+                "missing" => {
+                    sys.stat_fails(path, std::io::ErrorKind::NotFound);
+                }
+                "nonexec" | "empty" => {
+                    sys.stat_of(
+                        path,
+                        Stat {
+                            uid: 0,
+                            gid: 0,
+                            mode: if fault == "nonexec" { 0o644 } else { 0o755 },
+                            dir: false,
+                            symlink: false,
+                            len: if fault == "empty" { 0 } else { 3 },
+                        },
+                    );
+                }
+                "loop" => {
+                    sys.link(path, path);
+                }
+                "install-shim" => {
+                    sys.link(path, crate::items::github::SYSTEM_GIT);
+                    sys.executable(crate::items::github::SYSTEM_GIT, b"shim");
+                }
+                _ => unreachable!(),
+            }
+            let result = Keychain::new(who).probe(&sys, &context);
+            observations.push((
+                fault,
+                matches!(result, Probe::NotApplicable { .. }),
+                sys.calls(),
+            ));
+        }
+        let (sys, who, context) = mac();
+        script::unconfigured(&sys, &who);
+        assert!(matches!(
+            Keychain::new(who).probe(&sys, &context),
+            Probe::NotApplicable { .. }
+        ));
+        assert!(
+            !sys.calls().is_empty(),
+            "the executable control reads settings"
+        );
+        assert!(
+            observations
+                .iter()
+                .all(|(_, skipped, calls)| *skipped && calls.is_empty()),
+            "{observations:#?}"
+        );
+    }
+
+    #[test]
+    fn keychain_apply_rechecks_git_and_the_persons_switch_before_any_command() {
+        let mut observations = Vec::new();
+        for fault in ["nonexec", "off", "unread"] {
+            let (sys, who, context) = mac();
+            script::keychain_block(&sys, &who, "alice");
+            script::keychain_block(&sys, &who, "alice");
+            let item = Keychain::new(who.clone());
+            assert!(matches!(item.probe(&sys, &context), Probe::Change { .. }));
+            let before = sys.calls().len();
+            if fault == "nonexec" {
+                sys.stat_of(
+                    crate::items::github::CLT_GIT,
+                    Stat {
+                        uid: 0,
+                        gid: 0,
+                        mode: 0o644,
+                        dir: false,
+                        symlink: false,
+                        len: 3,
+                    },
+                );
+            } else {
+                let path = format!("{}/.config/aterm/init.toml", who.home);
+                let bytes = b"[github]\nenabled=false\n";
+                sys.file(&path, bytes).stat_of(
+                    &path,
+                    Stat {
+                        uid: who.uid,
+                        gid: who.gid,
+                        mode: 0o600,
+                        dir: false,
+                        symlink: false,
+                        len: bytes.len() as u64,
+                    },
+                );
+                if fault == "unread" {
+                    sys.stat_fails(&path, std::io::ErrorKind::PermissionDenied);
+                }
+            }
+            let result = item.apply(&sys, &context);
+            observations.push((fault, result.is_err(), sys.calls()[before..].to_vec()));
+        }
+        assert!(
+            observations
+                .iter()
+                .all(|(_, refused, calls)| *refused && calls.is_empty()),
+            "{observations:#?}"
+        );
+    }
 
     /// A Mac with git, a launcher and no token file: the item needs nothing more.
     fn mac() -> (Fake, User, Ctx) {
         let mut sys = Fake::root();
         sys.euid = 501;
-        sys.file(crate::items::github::CLT_GIT, b"git");
+        sys.executable(crate::items::github::CLT_GIT, b"git");
         let who = user("alice", 501);
         script::launcher(&sys, &who);
         let context = ctx(std::slice::from_ref(&who));
@@ -356,7 +569,7 @@ mod tests {
     fn no_launcher_leaves_the_block_where_it_is() {
         let mut sys = Fake::root();
         sys.euid = 501;
-        sys.file(crate::items::github::CLT_GIT, b"git");
+        sys.executable(crate::items::github::CLT_GIT, b"git");
         let who = user("alice", 501);
         let context = ctx(std::slice::from_ref(&who));
         script::keychain_block(&sys, &who, "alice");

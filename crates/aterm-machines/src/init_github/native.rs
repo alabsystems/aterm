@@ -1474,7 +1474,7 @@ pub(super) mod tests {
 
     fn fixture() -> (Fake, NativeRepositories) {
         let (sys, item) = bare();
-        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
         script::launcher(&sys, &item.user);
         source(&sys, "/Users//alice/.secrets/gh_access_token");
         metadata(&sys, &item.user, aterm_json::json!([]));
@@ -1522,7 +1522,7 @@ pub(super) mod tests {
         } else {
             crate::items::github::SYSTEM_GIT
         };
-        sys.file(git, b"synthetic git");
+        sys.executable(git, b"synthetic git");
         script::launcher(sys, user);
         sys.stat_of(&user.home, stat(true, 0o700));
         let home = Path::new(&user.home);
@@ -1551,7 +1551,7 @@ pub(super) mod tests {
     #[test]
     fn a_captured_local_blocker_is_not_reread_after_capture() {
         let (sys, item) = bare();
-        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
         let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         let captured = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
         // A later local reading could succeed. The frozen capture must still
@@ -2024,7 +2024,7 @@ pub(super) mod tests {
         let launcher =
             aterm_types::installed_command::legacy(Path::new(&item.user.home))[0].clone();
         let preserved = b"preserved older command";
-        sys.file(launcher.to_str().unwrap(), preserved);
+        sys.executable(launcher.to_str().unwrap(), preserved);
         let missing = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let route_missing = Arc::clone(&missing);
         sys.simulate(move |_, command| {
@@ -2172,6 +2172,26 @@ pub(super) mod tests {
             },
         )
         .unwrap();
+        let fixture = materialized_fixture(root, paths, source, source_text, git, &inventory);
+        let parent = home.join("parent");
+        fixture
+            .sys
+            .stat_of(parent.to_str().unwrap(), stat(true, 0o700));
+        repos::tests::script_existing(&fixture.sys, &fixture.who, &parent, "parent");
+        fixture
+    }
+
+    /// Fake command observations around an already genuinely materialized private vault.
+    /// Custody and entry production belong to each caller's ordinary client setup.
+    fn materialized_fixture(
+        root: aterm_tempfile::TempDir,
+        paths: aterm_secrets::client::Paths,
+        source: std::path::PathBuf,
+        source_text: String,
+        git: bool,
+        inventory: &aterm_json::Value,
+    ) -> ReadbackFixture {
+        let home = &paths.home;
         let who = User {
             home: home.to_string_lossy().into_owned(),
             ..user("alice", 501)
@@ -2181,7 +2201,7 @@ pub(super) mod tests {
         sys.logged_in(&who);
         sys.stat_of(home.to_str().unwrap(), stat(true, 0o700));
         if git {
-            sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+            sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
         }
         let token = home.join(super::super::TOKEN_FILE);
         sys.file(token.to_str().unwrap(), TOKEN.as_bytes())
@@ -2189,9 +2209,6 @@ pub(super) mod tests {
         metadata(&sys, &who, inventory["repositories"].clone());
         script::launcher(&sys, &who);
         script::lookups_hold(&sys, &who, GITHUB, "alice", TOKEN);
-        let parent = home.join("parent");
-        sys.stat_of(parent.to_str().unwrap(), stat(true, 0o700));
-        repos::tests::script_existing(&sys, &who, &parent, "parent");
         let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&who));
         ReadbackFixture {
             paths,
@@ -2203,6 +2220,38 @@ pub(super) mod tests {
             token,
             _root: root,
         }
+    }
+
+    /// Ordinary signed creation and publication, before Fake command observations are installed.
+    fn signed_materialized_fixture(
+        inventory: &aterm_json::Value,
+        audience: &aterm_secrets::text::Audience,
+    ) -> (ReadbackFixture, u64) {
+        use aterm_secrets::client;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = client::Paths::for_home(&root.path().join("signed-home"));
+        let source = root.path().join("team.vault");
+        let created =
+            client::create(&paths, source.to_str().unwrap(), None, Some("fixture")).unwrap();
+        assert!(created.local.is_none(), "the signed source was installed");
+        let admin = client::admin_open(&paths).unwrap();
+        let mut document = admin.doc.clone();
+        document
+            .set_entry(audience, "gh_access_token", TOKEN.as_bytes())
+            .unwrap();
+        document
+            .set_entry(
+                audience,
+                "github-repositories.json",
+                inventory.to_string().as_bytes(),
+            )
+            .unwrap();
+        let published = client::admin_publish(&paths, &admin, &document).unwrap();
+        client::sync(&paths, None).unwrap();
+        (
+            materialized_fixture(root, paths, source, String::new(), true, inventory),
+            published.seq,
+        )
     }
 
     #[test]
@@ -2377,7 +2426,7 @@ pub(super) mod tests {
             .file(cold.token.to_str().unwrap(), TOKEN.as_bytes())
             .stat_of(cold.token.to_str().unwrap(), stat(false, 0o600));
         cold.sys
-            .file(crate::items::github::CLT_GIT, b"synthetic git");
+            .executable(crate::items::github::CLT_GIT, b"synthetic git");
         cold.sys.simulate(|_, command| {
             let command = command.display();
             assert!(
@@ -2640,10 +2689,6 @@ pub(super) mod tests {
         // A present credential that the provider definitively rejects is different from
         // missing materialization. Exercise the actual private clone failure before the
         // canonical need is inspected; no live provider or credential is involved.
-        let root = aterm_tempfile::tempdir().unwrap();
-        let home = root.path().join("signed-home");
-        let paths = client::Paths::for_home(&home);
-        let signed_source = root.path().join("team.vault");
         let repositories = aterm_json::json!([
             repository("alice", "private-missing", 1),
             repository("alice", "also-missing", 2),
@@ -2651,57 +2696,8 @@ pub(super) mod tests {
         let inventory = aterm_json::json!({
             "schema":2,"account":"alice","repositories":repositories
         });
-        // A fresh public create/publish producer supplies the actual signed version;
-        // the older Plain-file fixtures above retain their narrower contract.
-        let created = client::create(
-            &paths,
-            signed_source.to_str().unwrap(),
-            None,
-            Some("fixture"),
-        )
-        .unwrap();
-        assert!(created.local.is_none(), "the signed source was installed");
-        let admin = client::admin_open(&paths).unwrap();
-        let mut document = admin.doc.clone();
         let audience = aterm_secrets::text::Audience::Hosts(vec!["fixture".into()]);
-        document
-            .set_entry(&audience, "gh_access_token", TOKEN.as_bytes())
-            .unwrap();
-        document
-            .set_entry(
-                &audience,
-                "github-repositories.json",
-                inventory.to_string().as_bytes(),
-            )
-            .unwrap();
-        let published = client::admin_publish(&paths, &admin, &document).unwrap();
-        client::sync(&paths, None).unwrap();
-        let who = User {
-            home: home.to_string_lossy().into_owned(),
-            ..user("alice", 501)
-        };
-        let mut sys = Fake::root();
-        sys.euid = who.uid;
-        sys.logged_in(&who);
-        sys.stat_of(home.to_str().unwrap(), stat(true, 0o700));
-        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
-        let token = home.join(super::super::TOKEN_FILE);
-        sys.file(token.to_str().unwrap(), TOKEN.as_bytes())
-            .stat_of(token.to_str().unwrap(), stat(false, 0o600));
-        script::launcher(&sys, &who);
-        script::lookups_hold(&sys, &who, GITHUB, "alice", TOKEN);
-        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&who));
-        let rejected = ReadbackFixture {
-            paths,
-            source: signed_source,
-            source_text: String::new(),
-            sys,
-            who,
-            ctx,
-            token,
-            _root: root,
-        };
-        metadata(&rejected.sys, &rejected.who, repositories);
+        let (rejected, published_seq) = signed_materialized_fixture(&inventory, &audience);
         for name in ["private-missing", "also-missing"] {
             let endpoint = format!("https://github.com/alice/{name}.git");
             rejected.sys.on(
@@ -2718,7 +2714,7 @@ pub(super) mod tests {
             .unwrap()
             .seq;
         assert_eq!(
-            sequence, published.seq,
+            sequence, published_seq,
             "the paired token has an actual signed version"
         );
         rejected.sys.simulate(|_, command| {
@@ -2727,7 +2723,7 @@ pub(super) mod tests {
                 .contains("ls-remote --symref --")
                 .then(|| Ran::exit(128, "synthetic remote failure; no private output"))
         });
-        for status in [401, 401, 401, 401, 401, 403, 429] {
+        for status in [401, 401, 401, 403, 429] {
             rejected.sys.on_github_api(
                 &rejected.who,
                 "/user",
@@ -2792,7 +2788,13 @@ pub(super) mod tests {
             1,
             "the rejected present credential needs recovery"
         );
-        assert_eq!(requests[0].refused, Some(sequence));
+        assert_eq!(
+            requests[0]
+                .refused
+                .as_ref()
+                .and_then(|floor| floor.sequence()),
+            Some(sequence)
+        );
         assert_ne!(
             requests[0].id, pending.id,
             "a posted request body cannot gain a new floor in place"
@@ -2864,7 +2866,10 @@ pub(super) mod tests {
             advanced.id, requests[0].id,
             "an active undelivered request needs a fresh body for its newer floor"
         );
-        assert_eq!(advanced.refused, Some(later.seq));
+        assert_eq!(
+            advanced.refused.as_ref().and_then(|floor| floor.sequence()),
+            Some(later.seq)
+        );
         run_failed();
         assert_eq!(
             aterm_secrets::need::peek(&rejected.paths).unwrap()[0].id,
@@ -2873,7 +2878,10 @@ pub(super) mod tests {
         let lower =
             aterm_secrets::need::raise_refused(&rejected.paths, want.clone(), purpose, sequence)
                 .unwrap();
-        assert_eq!((lower.id, lower.refused), (advanced.id, Some(later.seq)));
+        assert_eq!(
+            (lower.id, lower.refused),
+            (advanced.id, advanced.refused.clone())
+        );
 
         let api_calls = || {
             rejected
@@ -2885,8 +2893,8 @@ pub(super) mod tests {
         };
         assert_eq!(
             api_calls(),
-            4,
-            "one classification per failed network batch"
+            2,
+            "the same authenticated refused version does not repeat classification"
         );
         let paths: Vec<_> = ["private-missing", "also-missing"]
             .map(|name| Path::new(&rejected.who.home).join(name))
@@ -2905,7 +2913,7 @@ pub(super) mod tests {
         run_failed();
         assert_eq!(
             api_calls(),
-            4,
+            2,
             "local-only ack must not become a healthy authentication probe"
         );
         assert_eq!(
@@ -2933,12 +2941,18 @@ pub(super) mod tests {
             .unwrap()
             .remove(0);
         assert_ne!(refused_again.id, advanced.id);
-        assert_eq!(refused_again.refused, Some(eligible.seq));
-        assert_eq!(api_calls(), 5);
+        assert_eq!(
+            refused_again
+                .refused
+                .as_ref()
+                .and_then(|floor| floor.sequence()),
+            Some(eligible.seq)
+        );
+        assert_eq!(api_calls(), 3);
         run_failed();
         assert_eq!(
             api_calls(),
-            5,
+            3,
             "the same refused version does not repeat recovery auth"
         );
         let admin = client::admin_open(&rejected.paths).unwrap();
@@ -2968,7 +2982,13 @@ pub(super) mod tests {
         )
         .unwrap();
         assert_ne!(concurrent.id, refused_again.id);
-        assert_eq!(concurrent.refused, Some(receipt.sequence()));
+        assert_eq!(
+            concurrent
+                .refused
+                .as_ref()
+                .and_then(|floor| floor.sequence()),
+            Some(receipt.sequence())
+        );
         let refused_bytes = std::fs::read(&ledger).unwrap();
         assert!(
             aterm_secrets::need::acknowledge_from_snapshot(
@@ -3004,7 +3024,7 @@ pub(super) mod tests {
         );
         assert_eq!(
             api_calls(),
-            9,
+            7,
             "only the parsed provider success accepts recovery"
         );
 
@@ -3023,7 +3043,7 @@ pub(super) mod tests {
                 "non-401 responses and an unreached provider do not rearm"
             );
         }
-        assert_eq!(api_calls(), 13);
+        assert_eq!(api_calls(), 11);
 
         for path in &paths {
             rejected
@@ -3041,7 +3061,7 @@ pub(super) mod tests {
         assert_eq!(stage(&ready).outcome, crate::model::Outcome::Ok);
         assert_eq!(
             api_calls(),
-            13,
+            11,
             "healthy preseeded work stays entirely local"
         );
 
@@ -3057,7 +3077,7 @@ pub(super) mod tests {
         run_failed();
         assert_eq!(
             api_calls(),
-            13,
+            11,
             "local failures never classify provider authentication"
         );
         assert_eq!(std::fs::read(&ledger).unwrap(), before);
@@ -3089,7 +3109,7 @@ pub(super) mod tests {
             .is_err()
         );
         assert!(stopped.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(api_calls(), 13, "Stop before recovery starts no auth read");
+        assert_eq!(api_calls(), 11, "Stop before recovery starts no auth read");
         assert_eq!(std::fs::read(&ledger).unwrap(), before);
 
         // The exact-version registration must reject a later unrelated publication even
@@ -3154,6 +3174,637 @@ pub(super) mod tests {
             "a whole snapshot without the requested credential is no receipt"
         );
         assert_eq!(std::fs::read(&ledger).unwrap(), before);
+
+        // A genuinely observed nonzero legacy floor still blocks both retry paths
+        // until its signed source advances; it is not the unknown log-only zero case.
+        let want = aterm_secrets::need::Want::Gh(aterm_secrets::need::GhProfile::Dev);
+        let (legacy, scalar) = signed_materialized_fixture(&inventory, &audience);
+        assert!(scalar > 0);
+        aterm_secrets::need::test_alab_policy(&legacy.paths);
+        let raised =
+            aterm_secrets::need::raise_refused(&legacy.paths, want.clone(), purpose, scalar)
+                .unwrap();
+        assert!(!raised.state.ended());
+        assert!(matches!(raised.refused,
+            Some(aterm_secrets::need::RefusalClaim::LegacySequence(sequence)) if sequence == scalar));
+        let record = legacy.paths.dir.join(aterm_secrets::need::LEDGER);
+        let legacy_bytes = std::fs::read(&record).unwrap();
+        for name in ["private-missing", "also-missing"] {
+            let endpoint = format!("https://github.com/alice/{name}.git");
+            legacy.sys.on(
+                &crate::checkout::git(&legacy.sys, &legacy.who, None)
+                    .args(["ls-remote", "--get-url", "--", &endpoint])
+                    .display(),
+                Ran::ok(&endpoint),
+            );
+        }
+        legacy.sys.simulate(|_, command| {
+            command
+                .display()
+                .contains("ls-remote --symref --")
+                .then(|| Ran::exit(128, "synthetic legacy remote failure"))
+        });
+        let run_legacy = || {
+            let rows = run_with(
+                &legacy.sys,
+                &legacy.ctx,
+                Mode::Apply,
+                RepositoryWork::Repair,
+                None,
+            )
+            .unwrap();
+            assert_eq!(stage(&rows).outcome, crate::model::Outcome::Failed);
+            assert!(
+                !legacy
+                    .sys
+                    .calls()
+                    .iter()
+                    .any(|call| call.contains("agh GET /user"))
+            );
+            assert_eq!(std::fs::read(&record).unwrap(), legacy_bytes);
+        };
+        run_legacy();
+        for name in ["private-missing", "also-missing"] {
+            let path = Path::new(&legacy.who.home).join(name);
+            legacy
+                .sys
+                .stat_of(path.to_str().unwrap(), stat(true, 0o700));
+            repos::tests::script_existing(&legacy.sys, &legacy.who, &path, name);
+        }
+        run_legacy();
+        assert_eq!(std::fs::read(&ledger).unwrap(), before);
+
+        // Exercise the actual Native consumer on a supported log-only recipient,
+        // established by ordinary URL creation, genesis and the member's signed handout.
+        struct HeldServer(Option<aterm_secrets::server::Running>);
+        impl HeldServer {
+            fn stop(&mut self) {
+                if let Some(server) = self.0.take() {
+                    server.stop();
+                }
+            }
+        }
+        impl Drop for HeldServer {
+            fn drop(&mut self) {
+                self.stop();
+            }
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = listener.local_addr().unwrap();
+        let store = root.path().join("served");
+        let mut server = HeldServer(Some(
+            aterm_secrets::server::start(
+                listener,
+                &aterm_secrets::server::Options {
+                    listen,
+                    store: store.clone(),
+                    advertise: None,
+                    pins: Vec::new(),
+                    hold: std::time::Duration::from_millis(10),
+                    keep_awake: false,
+                },
+            )
+            .unwrap(),
+        ));
+        let admin_paths = client::Paths::for_home(&root.path().join("admin"));
+        client::create(
+            &admin_paths,
+            &format!("http://{listen}/v1/native"),
+            None,
+            Some("admin"),
+        )
+        .unwrap();
+        let inventory = aterm_json::json!({
+            "schema":2,"account":"alice","repositories":[repository("alice", "parent", 1)]
+        });
+        let admin = client::admin_open(&admin_paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &aterm_secrets::text::Audience::Everyone,
+            "gh_access_token",
+            TOKEN.as_bytes(),
+        )
+        .unwrap();
+        doc.set_entry(
+            &aterm_secrets::text::Audience::Everyone,
+            "github-repositories.json",
+            inventory.to_string().as_bytes(),
+        )
+        .unwrap();
+        client::admin_publish(&admin_paths, &admin, &doc).unwrap();
+        client::seed_vault_genesis(&admin_paths, &root.path().join("genesis.v2")).unwrap();
+        let recipient = client::Paths::for_home(&root.path().join("recipient"));
+        client::machine_identity(&recipient).unwrap();
+        let device = aterm_secrets::commons::bootstrap::Device::open(&recipient)
+            .unwrap()
+            .unwrap();
+        let bootstrap =
+            aterm_secrets::commons::bootstrap::Bootstrap::required(&admin_paths).unwrap();
+        let trust = bootstrap.trust();
+        let request = device.request(trust.network, trust.authority).unwrap();
+        let allowed = bootstrap
+            .device()
+            .with_seed(|seed| {
+                aterm_secrets::members::Allowed::sign(request.binding(), "recipient", seed)
+            })
+            .unwrap();
+        let handout = client::hand_over(
+            &admin_paths,
+            &aterm_secrets::members::desk::Handing {
+                request: &request,
+                node: request.binding().recipient().0,
+                name: allowed.name(),
+                allowed: &allowed,
+                reader: aterm_secrets::members::bundle::Reader::LegacyLog,
+                restore: false,
+                node_proven: false,
+                held: None,
+            },
+        )
+        .unwrap();
+        assert!(handout.logged);
+        client::write_from_log_bundle(
+            &recipient,
+            &aterm_secrets::members::Bundle::decode(handout.bundle.as_slice()).unwrap(),
+        )
+        .unwrap();
+        server.stop();
+        let logged = materialized_fixture(
+            root,
+            recipient,
+            store.join("native.vault"),
+            String::new(),
+            true,
+            &inventory,
+        );
+        aterm_secrets::need::test_alab_policy(&logged.paths);
+        let parent = Path::new(&logged.who.home).join("parent");
+        logged
+            .sys
+            .stat_of(parent.to_str().unwrap(), stat(true, 0o700));
+        repos::tests::script_existing(&logged.sys, &logged.who, &parent, "parent");
+        let snapshot = || {
+            let config = client::config(&logged.paths).unwrap().unwrap();
+            client::with_materialization_ready_for_entries(
+                &logged.paths,
+                &config,
+                &super::super::VAULT_INPUT_ENTRIES,
+                || Ok(()),
+            )
+            .unwrap()
+            .unwrap()
+            .snapshot
+        };
+        assert_eq!(snapshot().sequence(), 0);
+        assert!(!logged.paths.dir.join("vault").exists());
+        aterm_secrets::need::raise_refused(&logged.paths, want.clone(), purpose, 0).unwrap();
+        let record = logged.paths.dir.join(aterm_secrets::need::LEDGER);
+        let legacy = std::fs::read(&record).unwrap();
+        let run_logged = || {
+            run_with(
+                &logged.sys,
+                &logged.ctx,
+                Mode::Apply,
+                RepositoryWork::Repair,
+                None,
+            )
+            .unwrap()
+        };
+        let log_api_calls = || {
+            logged
+                .sys
+                .calls()
+                .iter()
+                .filter(|call| call.contains("agh GET /user"))
+                .count()
+        };
+        logged
+            .sys
+            .fail_github_api(&logged.who, "/user", crate::port::GithubFailure::Unreached);
+        for status in [200, 401, 200] {
+            logged.sys.on_github_api(
+                &logged.who,
+                "/user",
+                Ok(GithubResponse {
+                    status,
+                    headers: Vec::new(),
+                    body: br#"{"login":"alice"}"#.to_vec(),
+                }),
+            );
+        }
+        assert_eq!(stage(&run_logged()).outcome, crate::model::Outcome::Failed);
+        assert_eq!(std::fs::read(&record).unwrap(), legacy);
+        assert_eq!(stage(&run_logged()).outcome, crate::model::Outcome::Changed);
+        let accepted = aterm_secrets::need::peek(&logged.paths).unwrap().remove(0);
+        assert_eq!(accepted.state, aterm_secrets::need::State::Retired);
+        assert_eq!(
+            accepted.retired.unwrap().reason,
+            aterm_secrets::need::Reason::NotNeeded
+        );
+        assert_eq!(log_api_calls(), 2);
+        assert_eq!(stage(&run_logged()).outcome, crate::model::Outcome::Ok);
+        assert_eq!(log_api_calls(), 2, "healthy log-only work stays local");
+
+        let legacy = aterm_secrets::need::raise_refused(&logged.paths, want, purpose, 0).unwrap();
+        logged.sys.remove(&parent).unwrap();
+        let endpoint = "https://github.com/alice/parent.git";
+        logged.sys.on(
+            &crate::checkout::git(&logged.sys, &logged.who, None)
+                .args(["ls-remote", "--get-url", "--", endpoint])
+                .display(),
+            Ran::ok(endpoint),
+        );
+        logged.sys.simulate(|_, command| {
+            command
+                .display()
+                .contains("ls-remote --symref --")
+                .then(|| Ran::exit(128, "synthetic log-only remote failure"))
+        });
+        assert_eq!(stage(&run_logged()).outcome, crate::model::Outcome::Failed);
+        let typed = aterm_secrets::need::peek(&logged.paths).unwrap().remove(0);
+        assert_ne!(typed.id, legacy.id);
+        assert!(matches!(
+            typed.refused,
+            Some(aterm_secrets::need::RefusalClaim::Authenticated(_))
+        ));
+        assert_eq!(log_api_calls(), 3);
+        let typed_bytes = std::fs::read(&record).unwrap();
+        assert_eq!(stage(&run_logged()).outcome, crate::model::Outcome::Failed);
+        assert_eq!(log_api_calls(), 3, "same log source does not repeat auth");
+        assert_eq!(std::fs::read(&record).unwrap(), typed_bytes);
+        logged
+            .sys
+            .stat_of(parent.to_str().unwrap(), stat(true, 0o700));
+        repos::tests::script_existing(&logged.sys, &logged.who, &parent, "parent");
+        assert_eq!(stage(&run_logged()).outcome, crate::model::Outcome::Failed);
+        assert_eq!(
+            log_api_calls(),
+            3,
+            "same-source local ack starts no auth read"
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), typed_bytes);
+
+        const UPDATED: &str = "fixture_updated_log_token_only";
+        assert_eq!(
+            client::member_set(
+                &admin_paths,
+                &client::MemberEntry {
+                    name: "gh_access_token".into(),
+                    value: aterm_secrets::SecretBytes::from(UPDATED.as_bytes()),
+                    if_absent: false,
+                    anchor: client::Anchor::Keep,
+                    fleet_reads_anchors: false,
+                },
+                client::OnBusy::Refuse(
+                    std::time::Instant::now() + std::time::Duration::from_secs(60)
+                )
+            )
+            .unwrap(),
+            client::MemberWritten::SignedHere
+        );
+        client::ingest_mesh_records(
+            &logged.paths,
+            client::load_records(&admin_paths)
+                .unwrap()
+                .log()
+                .unwrap()
+                .records()
+                .cloned()
+                .collect(),
+        )
+        .unwrap();
+        client::sync(&logged.paths, None).unwrap();
+        assert_eq!(snapshot().sequence(), 0);
+        assert!(!logged.paths.dir.join("vault").exists());
+        assert_eq!(
+            std::fs::read(logged.paths.home.join(".secrets/gh_access_token")).unwrap(),
+            UPDATED.as_bytes()
+        );
+        logged
+            .sys
+            .file(logged.token.to_str().unwrap(), UPDATED.as_bytes());
+        let helper_read = logged
+            .sys
+            .calls()
+            .into_iter()
+            .find(|call| call.contains(" credential fill"))
+            .expect("the ordinary route already read back its helper");
+        let helper_token = logged.token.clone();
+        logged.sys.simulate(move |_, command| {
+            (command.display() == helper_read).then(|| {
+                let token = aterm_secrets::fsx::read_private(&helper_token, INPUT_MAX)
+                    .expect("the synchronized fixture token is readable")
+                    .expect("the synchronized fixture token exists");
+                let token = token.as_str().expect("the fixture token is UTF-8");
+                Ran::ok(&format!(
+                    "protocol=https\nhost={GITHUB}\nusername=alice\npassword={token}\n"
+                ))
+            })
+        });
+        assert_eq!(stage(&run_logged()).outcome, crate::model::Outcome::Changed);
+        let accepted = aterm_secrets::need::peek(&logged.paths).unwrap().remove(0);
+        assert_eq!(accepted.state, aterm_secrets::need::State::Retired);
+        assert_eq!(
+            accepted.retired.unwrap().reason,
+            aterm_secrets::need::Reason::NotNeeded
+        );
+        assert_eq!(log_api_calls(), 4);
+        assert_eq!(stage(&run_logged()).outcome, crate::model::Outcome::Ok);
+        assert_eq!(
+            log_api_calls(),
+            4,
+            "accepted changed log source stays local"
+        );
+
+        // A later successful clone also goes through the acknowledgment caller. Its
+        // ended-request guard must keep this healthy work from another provider read.
+        let accepted_bytes = std::fs::read(&record).unwrap();
+        logged.sys.remove(&parent).unwrap();
+        script::alike(&logged.sys, &logged.who);
+        let (_, _, clone) =
+            repos::tests::script_clone_named(&logged.sys, &logged.who, "parent", 2, false);
+        assert_eq!(stage(&run_logged()).outcome, crate::model::Outcome::Changed);
+        assert!(logged.sys.calls().contains(&clone));
+        assert_eq!(
+            log_api_calls(),
+            4,
+            "healthy later clone starts no auth read"
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), accepted_bytes);
+
+        // A stamped envelope may arrive before its records. Accepting its Covers graph
+        // refines that same baseline, without claiming causal advancement or sign-in.
+        for status in [200, 401] {
+            let audience = aterm_secrets::text::Audience::Everyone;
+            let root = aterm_tempfile::tempdir().unwrap();
+            let start_server = |store: &Path| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let listen = listener.local_addr().unwrap();
+                let server = HeldServer(Some(
+                    aterm_secrets::server::start(
+                        listener,
+                        &aterm_secrets::server::Options {
+                            listen,
+                            store: store.to_path_buf(),
+                            advertise: None,
+                            pins: Vec::new(),
+                            hold: std::time::Duration::from_millis(10),
+                            keep_awake: false,
+                        },
+                    )
+                    .unwrap(),
+                ));
+                (server, format!("http://{listen}/v1/refinement"))
+            };
+            let (source_server, url) = start_server(&root.path().join("source"));
+            let admin_paths = client::Paths::for_home(&root.path().join("admin"));
+            let created = client::create(&admin_paths, &url, None, Some("admin")).unwrap();
+            let recipient = client::Paths::for_home(&root.path().join("recipient"));
+            let recipient_key = client::machine_identity(&recipient)
+                .unwrap()
+                .recipient()
+                .to_bech32();
+            let admin = client::admin_open(&admin_paths).unwrap();
+            let mut doc = admin.doc.clone();
+            doc.add_machine("recipient", &recipient_key).unwrap();
+            doc.set_entry(&audience, "gh_access_token", b"before-refinement")
+                .unwrap();
+            doc.set_entry(
+                &audience,
+                "github-repositories.json",
+                inventory.to_string().as_bytes(),
+            )
+            .unwrap();
+            client::admin_publish_approved(
+                &admin_paths,
+                &admin,
+                &doc,
+                std::slice::from_ref(&recipient_key),
+            )
+            .unwrap();
+            client::seed_vault_genesis(&admin_paths, &root.path().join("genesis.v2")).unwrap();
+            let genesis = client::load_records(&admin_paths).unwrap().encode();
+            let admin = client::admin_open(&admin_paths).unwrap();
+            let mut doc = admin.doc.clone();
+            doc.set_entry(&audience, "gh_access_token", TOKEN.as_bytes())
+                .unwrap();
+            let published = client::admin_publish(&admin_paths, &admin, &doc).unwrap();
+            assert!(published.local.is_none(), "the source applied its rotation");
+            let aterm_secrets::transport::Fetched::Body(envelope) =
+                aterm_secrets::transport::fetch(
+                    &aterm_secrets::transport::Source::Url(url.clone()),
+                    None,
+                    std::time::Duration::ZERO,
+                )
+                .unwrap()
+            else {
+                panic!("the source serves its actual published envelope");
+            };
+            let complete = client::load_records(&admin_paths).unwrap().encode();
+            let (mirror_server, mirror) = start_server(&root.path().join("mirror"));
+            aterm_secrets::transport::publish(
+                &aterm_secrets::transport::Source::Url(mirror.clone()),
+                &envelope,
+            )
+            .unwrap();
+            client::join(
+                &recipient,
+                &client::JoinOptions {
+                    source: format!("{mirror}#{}", created.signer),
+                    host: Some("recipient".into()),
+                    interactive: false,
+                    wait: std::time::Duration::ZERO,
+                    confirm: &|_| false,
+                    password: client::JoinPassword::Given(None),
+                    fetched: None,
+                    requested: &|| {},
+                    say: &|_| {},
+                },
+            )
+            .unwrap();
+            assert!(client::load_records(&recipient).unwrap().log().is_none());
+            assert_eq!(
+                std::fs::read(recipient.home.join(".secrets/gh_access_token")).unwrap(),
+                TOKEN.as_bytes()
+            );
+            // Server guards precede the root owner in this aggregate's drop order.
+            struct ServedReadback {
+                _servers: [HeldServer; 2],
+                fixture: ReadbackFixture,
+            }
+            let source = root.path().join("mirror/refinement.vault");
+            let served = ServedReadback {
+                _servers: [source_server, mirror_server],
+                fixture: materialized_fixture(
+                    root,
+                    recipient,
+                    source,
+                    String::new(),
+                    true,
+                    &inventory,
+                ),
+            };
+            let refined = &served.fixture;
+            aterm_secrets::need::test_alab_policy(&refined.paths);
+            let current_snapshot = || {
+                let config = client::config(&refined.paths).unwrap().unwrap();
+                client::with_materialization_ready_for_entries(
+                    &refined.paths,
+                    &config,
+                    &super::super::VAULT_INPUT_ENTRIES,
+                    || Ok(()),
+                )
+                .unwrap()
+                .unwrap()
+                .snapshot
+            };
+            let current_version = || {
+                current_snapshot()
+                    .authenticated_version(
+                        &refined.paths,
+                        &aterm_secrets::need::Want::Gh(aterm_secrets::need::GhProfile::Dev)
+                            .entries(),
+                    )
+                    .unwrap()
+                    .unwrap()
+            };
+            assert_eq!(current_snapshot().sequence(), published.seq);
+            assert!(current_version().claim().envelope().is_some());
+            assert!(current_version().claim().log().is_none());
+            let parent = Path::new(&refined.who.home).join("parent");
+            let endpoint = "https://github.com/alice/parent.git";
+            refined.sys.on(
+                &crate::checkout::git(&refined.sys, &refined.who, None)
+                    .args(["ls-remote", "--get-url", "--", endpoint])
+                    .display(),
+                Ran::ok(endpoint),
+            );
+            refined.sys.simulate(|_, command| {
+                command
+                    .display()
+                    .contains("ls-remote --symref --")
+                    .then(|| Ran::exit(128, "synthetic refinement remote failure"))
+            });
+            refined.sys.on_github_api(
+                &refined.who,
+                "/user",
+                Ok(GithubResponse {
+                    status: 401,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                }),
+            );
+            refined.sys.fail_github_api(
+                &refined.who,
+                "/user",
+                crate::port::GithubFailure::Unreached,
+            );
+            refined.sys.on_github_api(
+                &refined.who,
+                "/user",
+                Ok(GithubResponse {
+                    status,
+                    headers: Vec::new(),
+                    body: br#"{"login":"alice"}"#.to_vec(),
+                }),
+            );
+            let run_refined = || {
+                run_with(
+                    &refined.sys,
+                    &refined.ctx,
+                    Mode::Apply,
+                    RepositoryWork::Repair,
+                    None,
+                )
+                .unwrap()
+            };
+            let api_calls = || {
+                refined
+                    .sys
+                    .calls()
+                    .iter()
+                    .filter(|call| call.contains("agh GET /user"))
+                    .count()
+            };
+            assert_eq!(stage(&run_refined()).outcome, crate::model::Outcome::Failed);
+            assert_eq!(api_calls(), 1);
+            let previous = aterm_secrets::need::peek(&refined.paths).unwrap().remove(0);
+            let Some(aterm_secrets::need::RefusalClaim::Authenticated(floor)) = &previous.refused
+            else {
+                panic!("the actual envelope-backed 401 records its authenticated floor");
+            };
+            assert!(floor.envelope().is_some());
+            assert!(floor.log().is_none());
+            let ledger = refined.paths.dir.join(aterm_secrets::need::LEDGER);
+            let previous_bytes = std::fs::read(&ledger).unwrap();
+            assert_eq!(stage(&run_refined()).outcome, crate::model::Outcome::Failed);
+            assert_eq!(api_calls(), 1, "the same envelope starts no auth read");
+            aterm_secrets::transport::post_records(&mirror, &genesis).unwrap();
+            client::sync(&refined.paths, None).unwrap();
+            assert!(
+                client::load_records(&refined.paths)
+                    .unwrap()
+                    .log()
+                    .is_some()
+            );
+            assert!(current_version().claim().log().is_none(), "still Behind");
+            assert_eq!(stage(&run_refined()).outcome, crate::model::Outcome::Failed);
+            assert_eq!(api_calls(), 1, "a Behind graph starts no auth read");
+            assert_eq!(std::fs::read(&ledger).unwrap(), previous_bytes);
+            aterm_secrets::transport::post_records(&mirror, &complete).unwrap();
+            client::sync(&refined.paths, None).unwrap();
+            let version = current_version();
+            assert_eq!(version.claim().envelope(), floor.envelope());
+            assert!(version.claim().log().is_some());
+            assert_eq!(
+                version.relation(floor),
+                client::version::VersionRelation::Same,
+                "accepting Covers is not causal advancement"
+            );
+            if status == 200 {
+                refined
+                    .sys
+                    .stat_of(parent.to_str().unwrap(), stat(true, 0o700));
+                repos::tests::script_existing(&refined.sys, &refined.who, &parent, "parent");
+            }
+            assert_eq!(stage(&run_refined()).outcome, crate::model::Outcome::Failed);
+            assert_eq!(api_calls(), 2);
+            assert_eq!(std::fs::read(&ledger).unwrap(), previous_bytes);
+            let rows = run_refined();
+            assert_eq!(api_calls(), 3);
+            let after = aterm_secrets::need::peek(&refined.paths).unwrap().remove(0);
+            if status == 200 {
+                assert_eq!(stage(&rows).outcome, crate::model::Outcome::Changed);
+                assert_eq!(after.id, previous.id);
+                assert_eq!(after.state, aterm_secrets::need::State::Retired);
+                assert_eq!(
+                    after.retired.unwrap().reason,
+                    aterm_secrets::need::Reason::NotNeeded
+                );
+                assert_eq!(stage(&run_refined()).outcome, crate::model::Outcome::Ok);
+                assert_eq!(api_calls(), 3, "healthy accepted work stays local");
+            } else {
+                assert_eq!(stage(&rows).outcome, crate::model::Outcome::Failed);
+                assert_ne!(after.id, previous.id);
+                assert_eq!(
+                    after.refused,
+                    Some(aterm_secrets::need::RefusalClaim::Authenticated(
+                        version.claim().clone()
+                    ))
+                );
+                let strengthened = std::fs::read(&ledger).unwrap();
+                assert_eq!(stage(&run_refined()).outcome, crate::model::Outcome::Failed);
+                assert_eq!(api_calls(), 3, "the strengthened floor starts no auth read");
+                refined
+                    .sys
+                    .stat_of(parent.to_str().unwrap(), stat(true, 0o700));
+                repos::tests::script_existing(&refined.sys, &refined.who, &parent, "parent");
+                assert_eq!(stage(&run_refined()).outcome, crate::model::Outcome::Failed);
+                assert_eq!(api_calls(), 3, "local ack cannot erase the refined refusal");
+                assert_eq!(std::fs::read(&ledger).unwrap(), strengthened);
+            }
+        }
     }
 
     #[test]
@@ -3429,7 +4080,7 @@ pub(super) mod tests {
     #[test]
     fn missing_or_invalid_private_inventory_never_falls_back_to_public_discovery() {
         let (sys, item) = bare();
-        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
         source(&sys, "/Users//alice/.secrets/gh_access_token");
         answer(
             &sys,
@@ -3623,7 +4274,7 @@ pub(super) mod tests {
                 sys.euid = who.uid;
                 sys.logged_in(&who);
                 sys.stat_of(home.to_str().unwrap(), stat(true, 0o700));
-                sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+                sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
                 let token_path = home.join(super::super::TOKEN_FILE);
                 sys.file(token_path.to_str().unwrap(), TOKEN.as_bytes())
                     .stat_of(token_path.to_str().unwrap(), stat(false, 0o600));
@@ -3979,7 +4630,7 @@ pub(super) mod tests {
         // Git and the token, without GitHub's answer to `/user`.
         let signed_out = || {
             let (sys, item) = bare();
-            sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+            sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
             source(&sys, "/Users//alice/.secrets/gh_access_token");
             scope(&sys, &item.user);
             (sys, item)
@@ -4003,7 +4654,7 @@ pub(super) mod tests {
                 "no token yet",
                 {
                     let (sys, item) = bare();
-                    sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+                    sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
                     (sys, item)
                 },
                 Some(Wait::Token),
@@ -4135,7 +4786,7 @@ pub(super) mod tests {
     #[test]
     fn an_apply_github_did_not_answer_keeps_the_reason_it_decided() {
         let (sys, item) = bare();
-        sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+        sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
         source(&sys, "/Users//alice/.secrets/gh_access_token");
         scope(&sys, &item.user);
         sys.fail_github_api(&item.user, "/user", GithubFailure::Unreached);
@@ -4222,7 +4873,7 @@ pub(super) mod tests {
         let cases: [(&str, Setup); 2] = [
             ("no token", || {
                 let (sys, item) = bare();
-                sys.file(crate::items::github::CLT_GIT, b"synthetic git");
+                sys.executable(crate::items::github::CLT_GIT, b"synthetic git");
                 script::launcher(&sys, &item.user);
                 (sys, item)
             }),
@@ -4793,7 +5444,7 @@ pub(super) mod tests {
                         ..stat(true, 0o700)
                     },
                 )
-                .file(crate::items::github::CLT_GIT, b"selected fixture git")
+                .executable(crate::items::github::CLT_GIT, b"selected fixture git")
                 .stat_of(
                     repos.work.to_str().unwrap(),
                     Stat {
@@ -5144,7 +5795,7 @@ pub(super) mod tests {
                     ..stat(true, 0o700)
                 },
             )
-            .file(crate::items::github::CLT_GIT, b"selected fixture git")
+            .executable(crate::items::github::CLT_GIT, b"selected fixture git")
             .stat_of(
                 repos.work.to_str().unwrap(),
                 Stat {
@@ -6079,7 +6730,7 @@ pub(super) mod tests {
         }
         // So does an init.toml `[github]` account's step, whose token file is not there yet
         // (with the distribution's git there, so the step reaches the token).
-        linux.file(crate::items::github::SYSTEM_GIT, b"synthetic git");
+        linux.executable(crate::items::github::SYSTEM_GIT, b"synthetic git");
         match item(&bare.user, None, false, RepositoryWork::Refresh, None).probe(&linux, &context) {
             Probe::Person { how, .. } => {
                 assert!(how.contains("is not on this machine yet"), "{how}");

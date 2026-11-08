@@ -16,6 +16,7 @@ use crate::lookup::{Record, Status};
 use crate::sig::{Anchor, BuildFloor, TrustedIndex};
 use crate::store::Layout;
 
+mod manifest_cache;
 mod named;
 pub use named::configured_build;
 
@@ -92,7 +93,7 @@ fn admitted_in(
         crate::flow::now_unix(),
         triple,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("signed prerequisite index: {e}"))?;
     let session = session.with_description(who);
     let mut current = true;
     if install {
@@ -299,7 +300,38 @@ impl<'a> Session<'a> {
             .index
             .program(program)
             .ok_or("the signed index has no prerequisite program")?;
-        let (raw, signature) = self.fetcher.pkg_manifest(&row.repo, program, build)?;
+        let source = self.fetcher.package_source_id(&row.repo, program);
+        let cache = manifest_cache::Cache::new(self.layout);
+        if let Some((raw, signature)) = source
+            .as_deref()
+            .and_then(|source| cache.load(source, program, build))
+        {
+            // A cache hit is only a byte source. Recheck the current delegation,
+            // recipe and target exactly as for bytes received from the network.
+            if let Ok(prepared) = self.prepare_package(want, build, named, raw, signature) {
+                return Ok(prepared);
+            }
+        }
+        let (raw, signature) = self
+            .fetcher
+            .pkg_manifest(&row.repo, program, build)
+            .map_err(|why| format!("{program} build {build} signed manifest fetch: {why}"))?;
+        let prepared = self.prepare_package(want, build, named, raw, signature)?;
+        if let Some(source) = source {
+            cache.store(&source, program, build, &prepared.signed);
+        }
+        Ok(prepared)
+    }
+
+    fn prepare_package(
+        &self,
+        want: Prerequisite,
+        build: u64,
+        named: bool,
+        raw: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> Result<Prepared, String> {
+        let program = want.program();
         let verified = self
             .index
             .verify_pkg(raw.clone(), &signature)

@@ -213,23 +213,50 @@ fn checkout(lib: &str) -> (aterm_tempfile::TempDir, Ctx) {
 fn verdict(ctx: &Ctx) -> (Vec<Outcome>, Vec<String>) {
     let mut r = Report::new("export-scan");
     run_with(ctx, &mut r, || {
-        let wants = &[atpkg::prerequisite::Prerequisite::Gitleaks];
-        if let Some(prefix) = std::env::var_os("ATERM_TEST_PACKAGE_PREFIX") {
-            atpkg::prerequisite::configured_in(
-                &atpkg::store::Layout {
-                    prefix: prefix.into(),
-                },
-                wants,
-                "export-scan test",
-            )
-        } else {
-            atpkg::prerequisite::configured(wants, "export-scan test")
-        }
+        Ok(Scanner::Fixture(aterm_uds::host::need_tool("gitleaks")))
     });
+    if r.outcomes()
+        .any(|(outcome, _)| outcome == Outcome::Fail(Severity::CouldNotRun))
+    {
+        eprintln!(
+            "export-scan fixture could not run: {:?}",
+            r.outcomes().collect::<Vec<_>>()
+        );
+    }
+    require_fixture(&r).unwrap_or_else(|why| aterm_uds::host::could_not_run(why));
     (
         r.outcomes().map(|(o, _)| o).collect(),
         r.findings().iter().map(|f| f.id.clone()).collect(),
     )
+}
+
+fn require_fixture(report: &Report) -> Result<(), String> {
+    let failed = report
+        .outcomes()
+        .any(|(outcome, _)| outcome == Outcome::Fail(Severity::GateFailed));
+    let unavailable = report
+        .outcomes()
+        .any(|(outcome, _)| outcome == Outcome::Fail(Severity::CouldNotRun));
+    if unavailable && !failed {
+        Err(report.render())
+    } else {
+        Ok(())
+    }
+}
+
+#[test]
+fn an_unavailable_export_fixture_is_not_a_product_failure() {
+    let mut report = Report::new("export fixture");
+    report.pass("the independent export checks passed");
+    report.cannot_run("signed scanner unavailable");
+    let why = require_fixture(&report).expect_err("no scanner verdict was observed");
+    assert!(why.contains("signed scanner unavailable"));
+    report.fail("an independent guard actually refused the export");
+    assert_eq!(
+        require_fixture(&report),
+        Ok(()),
+        "a real refusal still fails"
+    );
 }
 
 /// The three cut reds the engine's gitleaks guard found from 2026-11-01 to 11-05 were each an
@@ -237,7 +264,6 @@ fn verdict(ctx: &Ctx) -> (Vec<Outcome>, Vec<String>) {
 /// push, and passes the same file without it.
 #[test]
 fn a_fixture_gitleaks_refuses_is_found_before_a_cut() {
-    let _gitleaks = aterm_uds::host::need_tool("gitleaks");
     let key = planted_key();
     let (_dir, ctx) = checkout(&format!("// a fixture\nlet api_key = \"{key}\";\n"));
     let (outcomes, ids) = verdict(&ctx);

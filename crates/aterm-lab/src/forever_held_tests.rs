@@ -364,26 +364,21 @@ fn the_wants_fold_into_a_same_reply_chains_last_scenario() {
     );
 }
 
-/// `ax_of` keeps `chrome`'s `a11y` lines for the tab's own chip node and every band row node, its
-/// head cut; another tab's chip node, other lines and a `chrome` with no `a11y` line read `-`.
+/// `ax_of` keeps `chrome`'s `a11y` line for the tab's own chip node, its head cut; another tab's
+/// chip node, other lines and a `chrome` with no such `a11y` line read `-`.
 #[test]
-fn the_screen_readers_nodes_are_the_tabs_chip_and_the_band_rows() {
+fn the_screen_readers_node_is_the_tabs_chip() {
     let chrome = "OK 5\n\
          autopilot sid=s-c window=2 program=claude face=land drawn=\"⤓\"\n\
-         a11y window=2 band row=0 role=Alert label=\"aterm stopped typing\" description=-\n\
          a11y window=2 autopilot sid=s-d role=Button label=\"Autopilot: land.\" description=-\n\
          a11y window=2 autopilot sid=s-c role=Button label=\"Autopilot: land.\" description=\"x\"\n\
          statusitem title=❯ needs=0";
     assert_eq!(
         ax_of(chrome, "s-c"),
-        "window=2 band row=0 role=Alert label=\"aterm stopped typing\" description=-\n\
-         window=2 autopilot sid=s-c role=Button label=\"Autopilot: land.\" description=\"x\""
+        "window=2 autopilot sid=s-c role=Button label=\"Autopilot: land.\" description=\"x\""
     );
     assert_eq!(ax_of("OK 1\nstatusitem title=❯ needs=0", "s-c"), "-");
-    assert_eq!(
-        ax_of(chrome, "s-e"),
-        "window=2 band row=0 role=Alert label=\"aterm stopped typing\" description=-"
-    );
+    assert_eq!(ax_of(chrome, "s-e"), "-");
 }
 
 /// Same-land's chip may say `theirs` from its person's turn on, never before it and never on

@@ -7070,7 +7070,7 @@ fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
     let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
     let null = |v: &Value, key: &str| v.get(key) == Some(&Value::Null);
 
-    assert_eq!(int(&doc, "schema"), Some(1));
+    assert_eq!(int(&doc, "schema"), Some(2));
     assert_eq!(text(&doc, "kind").as_deref(), Some("accounts"));
     assert_eq!(int(&doc, "as_of"), Some(now));
     assert_eq!(text(&doc, "as_of_rfc3339"), Some(rfc3339_utc(now)));
@@ -10285,7 +10285,7 @@ fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
     );
     assert_eq!(code, format!("{:?}", ExitCode::SUCCESS), "{err}");
     let doc: Value = aterm_json::from_str(out.trim()).expect("one JSON document");
-    assert_eq!(doc["schema"], Value::from(1u64));
+    assert_eq!(doc["schema"], Value::from(2u64));
     assert_eq!(doc["kind"], Value::from("account-stats"));
     assert_eq!(doc["as_of"], Value::from(env.now));
     let account = &doc["accounts"][0];

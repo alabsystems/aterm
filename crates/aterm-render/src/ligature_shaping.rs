@@ -134,17 +134,22 @@ pub fn extract_cell_slice(
     let mut tile = vec![0u8; cell_w * height];
     let cell_w_i64 = i64::try_from(cell_w).unwrap_or(i64::MAX);
     let base = k.saturating_mul(cell_w_i64).saturating_sub(i64::from(xmin));
+    let src_start = usize::try_from(base.max(0)).unwrap_or(usize::MAX);
+    let dst_start = if base < 0 {
+        usize::try_from(base.unsigned_abs()).unwrap_or(usize::MAX)
+    } else {
+        0
+    };
+    let len = raster_w
+        .saturating_sub(src_start)
+        .min(cell_w.saturating_sub(dst_start));
+    if len == 0 {
+        return tile;
+    }
     for row in 0..height {
-        let src_row = row * raster_w;
-        let dst_row = row * cell_w;
-        for j in 0..cell_w {
-            let src_col = base.saturating_add(i64::try_from(j).unwrap_or(i64::MAX));
-            if let Ok(col) = usize::try_from(src_col)
-                && col < raster_w
-            {
-                tile[dst_row + j] = raster[src_row + col];
-            }
-        }
+        let src = row * raster_w + src_start;
+        let dst = row * cell_w + dst_start;
+        tile[dst..dst + len].copy_from_slice(&raster[src..src + len]);
     }
     tile
 }
@@ -873,6 +878,41 @@ mod tests {
         );
         assert_eq!(out[5], ColumnGlyph::PerCell, "space");
         assert_eq!(out[6], ColumnGlyph::PerCell, "lone 'y' stays per-cell");
+    }
+
+    #[test]
+    fn slice_clipping_matches_geometric_pixels_at_signed_extremes() {
+        for cell_w in [1usize, 8, 31] {
+            for raster_w in [0usize, 1, 7, 23] {
+                let height = 3;
+                let raster: Vec<u8> = (0..raster_w * height)
+                    .map(|i| (i % 251 + 1) as u8)
+                    .collect();
+                for xmin in [i32::MIN, -32, -1, 0, 1, 32, i32::MAX] {
+                    for k in [i64::MIN, -4, -1, 0, 1, 4, i64::MAX] {
+                        let tile = extract_cell_slice(&raster, raster_w, height, xmin, cell_w, k);
+                        let expected: Vec<u8> = (0..height)
+                            .flat_map(|row| {
+                                let raster = &raster;
+                                (0..cell_w).map(move |col| {
+                                    let source = i128::from(k) * cell_w as i128 - i128::from(xmin)
+                                        + col as i128;
+                                    if source >= 0 && source < raster_w as i128 {
+                                        raster[row * raster_w + source as usize]
+                                    } else {
+                                        0
+                                    }
+                                })
+                            })
+                            .collect();
+                        assert_eq!(
+                            tile, expected,
+                            "cell={cell_w} raster={raster_w} xmin={xmin} k={k}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

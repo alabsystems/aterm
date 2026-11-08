@@ -16,6 +16,32 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LOGS_KEPT: usize = 20;
 
+/// Immutable file-role header, not a run identity or deletion capability.
+pub(crate) const PRIVATE_EVENTS_HEADER: &str = "verify-event: {\"schema\":1,\"event\":\"private-run-events\",\"storage\":\"aterm-verify-private-v1\"}\n";
+pub(crate) const PRIVATE_HUMAN_HEADER: &str = "verify-event: {\"schema\":1,\"event\":\"private-run-log\",\"storage\":\"aterm-verify-private-human-v1\"}\n";
+
+/// Inspect the actual descriptor, including hard-link aliases, within a fixed prefix bound.
+pub(crate) fn private_managed_file(file: &File) -> io::Result<bool> {
+    Ok(has_header(file, PRIVATE_EVENTS_HEADER)? || has_header(file, PRIVATE_HUMAN_HEADER)?)
+}
+
+fn has_header(file: &File, expected: &str) -> io::Result<bool> {
+    // Callers either own an append description or have not exposed the human writer yet.
+    // Human admission explicitly seeks to the end after reset, before writing the pairing.
+    let mut reader = file.try_clone()?;
+    reader.rewind()?;
+    let mut header = vec![0; expected.len()];
+    let mut count = 0;
+    while count < header.len() {
+        let read = reader.read(&mut header[count..])?;
+        if read == 0 {
+            break;
+        }
+        count += read;
+    }
+    Ok(&header[..count] == expected.as_bytes())
+}
+
 pub(super) struct Log {
     pub(super) path: PathBuf,
     file: File,
@@ -77,7 +103,7 @@ pub(super) fn open(
         },
         |path| cwd.join(path),
     );
-    match open_paired_at(&path, chosen.is_none(), Some(invocation)) {
+    match open_paired_at(&path, chosen.is_none(), invocation) {
         Ok(log) => Some(log),
         Err(error) => {
             eprintln!(
@@ -106,9 +132,9 @@ pub(crate) fn file_key(file: &File) -> io::Result<(String, String)> {
     Ok((stat.st_dev.to_string(), stat.st_ino.to_string()))
 }
 
-fn first_line(file: &File) -> io::Result<String> {
+fn first_line_at(file: &File, offset: u64) -> io::Result<String> {
     let mut reader = file.try_clone()?;
-    reader.rewind()?;
+    reader.seek(io::SeekFrom::Start(offset))?;
     let mut bytes = Vec::new();
     reader.take(8192).read_to_end(&mut bytes)?;
     let end = bytes
@@ -119,7 +145,10 @@ fn first_line(file: &File) -> io::Result<String> {
 }
 
 fn owned_events(human: &File, path: &Path, events: File) -> io::Result<File> {
-    let line = first_line(human)?;
+    if !has_header(&events, PRIVATE_EVENTS_HEADER)? || !has_header(human, PRIVATE_HUMAN_HEADER)? {
+        return Err(io::Error::other("existing pair has no private file roles"));
+    }
+    let line = first_line_at(human, PRIVATE_HUMAN_HEADER.len() as u64)?;
     let value: aterm_json::Value = aterm_json::from_str(
         line.strip_prefix("verify-pair: ")
             .ok_or_else(|| io::Error::other("existing companion has no owned pairing record"))?,
@@ -149,7 +178,7 @@ fn owned_events(human: &File, path: &Path, events: File) -> io::Result<File> {
             "existing companion is not the recorded physical file",
         ));
     }
-    let line = first_line(&events)?;
+    let line = first_line_at(&events, PRIVATE_EVENTS_HEADER.len() as u64)?;
     let first: aterm_json::Value = aterm_json::from_str(
         line.strip_prefix("verify-event: ")
             .ok_or_else(|| io::Error::other("existing companion has no stamped first record"))?,
@@ -169,25 +198,83 @@ fn owned_events(human: &File, path: &Path, events: File) -> io::Result<File> {
     Ok(events)
 }
 
-fn admit_events(human: &File, log: &Path) -> io::Result<File> {
+fn admit_events(human: &File, log: &Path, new_human: bool) -> io::Result<File> {
     let path = events_path(log);
-    let mut open = std::fs::OpenOptions::new();
-    open.read(true).append(true).create_new(true);
-    crate::event_log::private_flags(&mut open);
-    match open.open(&path) {
-        Ok(file) => Ok(file),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let mut open = std::fs::OpenOptions::new();
-            open.read(true).append(true);
-            crate::event_log::private_flags(&mut open);
-            let file = open.open(&path)?;
-            if !file.metadata()?.is_file() {
-                return Err(io::Error::other("companion is not regular"));
-            }
-            owned_events(human, &path, file)
-        }
-        Err(error) => Err(error),
+    if new_human {
+        return publish_marked(&path, Role::Events);
     }
+    let file = Role::Events.open(&path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("companion is not regular"));
+    }
+    owned_events(human, &path, file)
+}
+
+/// Only this created staging inode is eligible for cleanup; the destination is never removed.
+struct StagedLogFile {
+    file: File,
+    path: PathBuf,
+}
+
+impl Drop for StagedLogFile {
+    fn drop(&mut self) {
+        if same_file(&self.file, &self.path) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Role {
+    Human,
+    Events,
+}
+
+impl Role {
+    fn header(self) -> &'static str {
+        match self {
+            Self::Human => PRIVATE_HUMAN_HEADER,
+            Self::Events => PRIVATE_EVENTS_HEADER,
+        }
+    }
+    fn open(self, path: &Path) -> io::Result<File> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        match self {
+            Self::Human => {
+                options.write(true);
+            }
+            Self::Events => {
+                options.append(true);
+            }
+        }
+        crate::event_log::private_flags(&mut options);
+        options.open(path)
+    }
+}
+
+fn publish_marked(path: &Path, role: Role) -> io::Result<File> {
+    // Atomic-file staging is private implementation work, not a supported public destination.
+    // This does not defend against deliberate same-account interference with a staging inode,
+    // nor promise power-loss durability. The role is complete before destination publication.
+    let (temporary, file) = aterm_uds::atomic_file::create_temp_beside(path, 0o600)?;
+    let mut staged = StagedLogFile {
+        file,
+        path: temporary,
+    };
+    staged.file.write_all(role.header().as_bytes())?;
+    staged.file.flush()?;
+    // The first visible destination already has its entire immutable role marker. A public
+    // append opener that won this name is preserved, never truncated or replaced.
+    std::fs::hard_link(&staged.path, path)?;
+    let file = role.open(path)?;
+    if !file.metadata()?.is_file()
+        || file_key(&file)? != file_key(&staged.file)?
+        || !has_header(&file, role.header())?
+    {
+        return Err(io::Error::other("published companion changed"));
+    }
+    Ok(file)
 }
 
 fn sidecar(path: &Path) -> PathBuf {
@@ -208,39 +295,27 @@ fn directory_lock(dir: &Path) -> io::Result<LockFile> {
 
 #[cfg(test)]
 fn open_at(path: &Path, generated: bool) -> io::Result<Log> {
-    open_paired_at(path, generated, None)
+    let mut events = crate::event_log::EventLog::unrecorded();
+    let mut log = open_paired_at(path, generated, events.id())?;
+    events.retain(log.take_events().expect("admitted companion"));
+    events.write("verify-event: {\"schema\":1,\"event\":\"invocation-started\"}");
+    Ok(log)
 }
 
-fn open_paired_at(
-    path: &Path,
-    generated: bool,
-    invocation: Option<Option<&str>>,
-) -> io::Result<Log> {
+fn open_paired_at(path: &Path, generated: bool, invocation: Option<&str>) -> io::Result<Log> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
     let directory = directory_lock(parent)?;
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .write(true)
-        .read(true)
-        .create(!generated)
-        .create_new(generated)
-        .truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let mut file = options.open(path)?;
+    let (mut file, new_human) = match publish_marked(path, Role::Human) {
+        Ok(file) => (file, true),
+        Err(error) if !generated && error.kind() == io::ErrorKind::AlreadyExists => {
+            (Role::Human.open(path)?, false)
+        }
+        Err(error) => return Err(error),
+    };
     // A failed generated collision must not give an existing file retention custody.
     // The directory interlock excludes openers and pruners until custody is held.
     let custody = LockFile::take(
@@ -255,30 +330,25 @@ fn open_paired_at(
         ));
     }
     // Admit the paired file before either previous artifact can be truncated.
-    let events = invocation.map(|_| admit_events(&file, path)).transpose()?;
-    if !same_file(&file, path)
-        || events
-            .as_ref()
-            .is_some_and(|f| !same_file(f, &events_path(path)))
-    {
+    let events = admit_events(&file, path, new_human)?;
+    if !same_file(&file, path) || !same_file(&events, &events_path(path)) {
         return Err(io::Error::other("run log pair changed during admission"));
     }
-    if let Some(events) = &events {
-        events.set_len(0)?;
-    }
-    file.set_len(0)?;
-    file.rewind()?;
-    if let (Some(id), Some(events)) = (invocation, events.as_ref()) {
-        let (device, inode) = file_key(events)?;
+    // Both private roles remain visible throughout reuse, before new run records.
+    events.set_len(PRIVATE_EVENTS_HEADER.len() as u64)?;
+    file.set_len(PRIVATE_HUMAN_HEADER.len() as u64)?;
+    file.seek(io::SeekFrom::End(0))?;
+    {
+        let (device, inode) = file_key(&events)?;
         writeln!(
             file,
             "verify-pair: {}",
-            aterm_json::json!({"schema":1, "id":id, "device":device, "inode":inode})
+            aterm_json::json!({"schema":1, "id":invocation, "device":device, "inode":inode})
         )?;
     }
     let custody = Arc::new(custody);
-    let events = events.map(|file| crate::event_log::Retained {
-        file,
+    let events = Some(crate::event_log::Retained {
+        file: events,
         _custody: Arc::clone(&custody),
     });
     // The directory lock and the log's stable-file proof make this sample namespace belong to
@@ -325,7 +395,7 @@ pub(crate) fn same_file(file: &File, path: &Path) -> bool {
 }
 
 struct Candidate {
-    events: Option<File>,
+    events: File,
     path: PathBuf,
     file: File,
     modified: SystemTime,
@@ -351,18 +421,10 @@ impl Candidate {
         let (file, metadata) =
             aterm_uds::regular_file::open(&path).map_err(|_| CandidateError::Unproven)?;
         let events_at = events_path(&path);
-        let events = match std::fs::symlink_metadata(&events_at) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Ok(metadata) if metadata.file_type().is_file() => {
-                let (events, _) = aterm_uds::regular_file::open(&events_at)
-                    .map_err(|_| CandidateError::Unproven)?;
-                Some(
-                    owned_events(&file, &events_at, events)
-                        .map_err(|_| CandidateError::Unproven)?,
-                )
-            }
-            _ => return Err(CandidateError::Unproven),
-        };
+        let (events, _) =
+            aterm_uds::regular_file::open(&events_at).map_err(|_| CandidateError::Unproven)?;
+        let events =
+            owned_events(&file, &events_at, events).map_err(|_| CandidateError::Unproven)?;
         Ok(Self {
             events,
             path,
@@ -373,20 +435,14 @@ impl Candidate {
     }
 
     fn remove(&self) -> bool {
-        if !same_file(&self.file, &self.path)
-            || self
-                .events
-                .as_ref()
-                .is_some_and(|file| !same_file(file, &events_path(&self.path)))
+        if !same_file(&self.file, &self.path) || !same_file(&self.events, &events_path(&self.path))
         {
             return false;
         }
         if std::fs::remove_file(&self.path).is_err() {
             return false;
         }
-        if self.events.is_some() {
-            let _ = std::fs::remove_file(events_path(&self.path));
-        }
+        let _ = std::fs::remove_file(events_path(&self.path));
         remove_samples(&self.path);
         // The directory interlock still excludes an opener of this name, and custody is
         // retained until this candidate drops. Only an admitted generated log has this sidecar.
@@ -440,13 +496,259 @@ mod tests {
 
     fn paired(path: &Path) -> (Log, crate::event_log::EventLog) {
         let mut events = crate::event_log::EventLog::unrecorded();
-        let mut log = open_paired_at(path, false, Some(events.id())).unwrap();
+        let mut log = open_paired_at(path, false, events.id()).unwrap();
         events.retain(log.take_events().unwrap());
         crate::event_log::emit(
             Some(&events),
             "verify-event: {\"schema\":1,\"event\":\"invocation-started\"}",
         );
         (log, events)
+    }
+
+    fn payload(path: &Path) -> Vec<u8> {
+        let bytes = std::fs::read(path).unwrap();
+        let after_header = bytes.strip_prefix(PRIVATE_HUMAN_HEADER.as_bytes()).unwrap();
+        let newline = after_header.iter().position(|byte| *byte == b'\n').unwrap();
+        assert!(after_header.starts_with(b"verify-pair: "));
+        after_header[newline + 1..].to_vec()
+    }
+
+    #[test]
+    fn published_private_roles_survive_reset_and_refuse_public_hardlink_openers() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("chosen.log");
+        let (log, events) = paired(&path);
+        let companion = events_path(&path);
+        let alias = dir.path().join("alias");
+        std::fs::hard_link(&companion, &alias).unwrap();
+        let human_alias = dir.path().join("human-alias");
+        std::fs::hard_link(&path, &human_alias).unwrap();
+        drop((log, events));
+        for target in [&companion, &alias, &path, &human_alias] {
+            assert!(crate::event_log::EventLog::open(target).is_err());
+        }
+        let next = crate::event_log::EventLog::unrecorded();
+        let log = open_paired_at(&path, false, next.id()).unwrap();
+        // The interval before the new invocation descriptor is still private, never empty.
+        assert_eq!(
+            std::fs::read(&companion).unwrap(),
+            PRIVATE_EVENTS_HEADER.as_bytes()
+        );
+        assert_eq!(
+            std::fs::read(&alias).unwrap(),
+            PRIVATE_EVENTS_HEADER.as_bytes()
+        );
+        assert!(crate::event_log::EventLog::open(&alias).is_err());
+        assert!(
+            std::fs::read(&human_alias)
+                .unwrap()
+                .starts_with(PRIVATE_HUMAN_HEADER.as_bytes())
+        );
+        assert!(crate::event_log::EventLog::open(&human_alias).is_err());
+        assert!(Candidate::take(path.clone()).is_err());
+        drop(log);
+        // A marker alone supplies no positive pairing/descriptor authority after a crash.
+        assert!(Candidate::take(path.clone()).is_err());
+        assert!(companion.exists());
+    }
+
+    #[test]
+    fn a_public_human_destination_wins_before_either_managed_artifact_changes() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-17.log");
+        let public = crate::event_log::EventLog::open(&path).unwrap();
+        public.write("verify-event: {\"schema\":1,\"event\":\"public-human\"}");
+        let before = std::fs::read(&path).unwrap();
+        let companion = events_path(&path);
+        std::fs::write(&companion, b"foreign existing companion\n").unwrap();
+        assert!(open_paired_at(&path, false, public.id()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::read(&companion).unwrap(),
+            b"foreign existing companion\n"
+        );
+        public.write("verify-event: {\"schema\":1,\"event\":\"still-public\"}");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("still-public")
+        );
+        assert!(Candidate::take(path.clone()).is_err());
+    }
+
+    #[test]
+    fn a_human_header_without_pairing_is_not_reuse_or_deletion_authority() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-18.log");
+        let (log, events) = paired(&path);
+        log.file.set_len(PRIVATE_HUMAN_HEADER.len() as u64).unwrap();
+        drop((log, events));
+        let companion_before = std::fs::read(events_path(&path)).unwrap();
+        assert!(open_paired_at(&path, false, None).is_err());
+        assert!(Candidate::take(path.clone()).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            PRIVATE_HUMAN_HEADER.as_bytes()
+        );
+        assert_eq!(std::fs::read(events_path(&path)).unwrap(), companion_before);
+        assert!(crate::event_log::EventLog::open(&path).is_err());
+    }
+
+    #[test]
+    fn an_old_unmarked_human_pair_preserves_its_public_writer_under_real_retention_pressure() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-19.log");
+        let (log, events) = paired(&path);
+        log.file
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        drop((log, events));
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(
+            &path,
+            bytes.strip_prefix(PRIVATE_HUMAN_HEADER.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        // Restore deterministic old age after the historical-format write.
+        Role::Human
+            .open(&path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        let public = crate::event_log::EventLog::open(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let companion_before = std::fs::read(events_path(&path)).unwrap();
+        let physical = file_key(&aterm_uds::regular_file::open(&path).unwrap().0).unwrap();
+        assert!(open_paired_at(&path, false, public.id()).is_err());
+        assert!(Candidate::take(path.clone()).is_err());
+        let mut managed = Vec::new();
+        for at in 0..LOGS_KEPT + 5 {
+            let newer = dir.path().join(format!("{}-{}.log", 200 + at, 2000 + at));
+            let (log, events) = paired(&newer);
+            log.file
+                .set_modified(UNIX_EPOCH + Duration::from_secs((200 + at) as u64))
+                .unwrap();
+            drop((log, events));
+            managed.push(newer);
+        }
+        let lock = directory_lock(dir.path()).unwrap();
+        prune(dir.path(), &lock);
+        assert_eq!(
+            managed.iter().filter(|path| path.exists()).count(),
+            LOGS_KEPT
+        );
+        for old in managed.iter().take(5) {
+            assert!(!old.exists());
+            assert!(!events_path(old).exists());
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::read(events_path(&path)).unwrap(), companion_before);
+        assert_eq!(
+            file_key(&aterm_uds::regular_file::open(&path).unwrap().0).unwrap(),
+            physical
+        );
+        public.write("verify-event: {\"schema\":1,\"event\":\"still-public-human\"}");
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.starts_with(&before));
+        assert!(
+            String::from_utf8(after)
+                .unwrap()
+                .contains("still-public-human")
+        );
+    }
+
+    #[test]
+    fn a_public_destination_winner_cannot_be_truncated_replaced_or_pruned_as_managed() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-15.log");
+        let companion = events_path(&path);
+        let public = crate::event_log::EventLog::open(&companion).unwrap();
+        public.write("verify-event: {\"schema\":1,\"event\":\"public-one\"}");
+        let before = std::fs::read(&companion).unwrap();
+        let physical = file_key(&aterm_uds::regular_file::open(&companion).unwrap().0).unwrap();
+        assert!(open_paired_at(&path, false, public.id()).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            PRIVATE_HUMAN_HEADER.as_bytes()
+        );
+        assert_eq!(std::fs::read(&companion).unwrap(), before);
+        assert_eq!(
+            file_key(&aterm_uds::regular_file::open(&companion).unwrap().0).unwrap(),
+            physical
+        );
+        public.write("verify-event: {\"schema\":1,\"event\":\"public-two\"}");
+        let after = std::fs::read(&companion).unwrap();
+        assert!(after.starts_with(&before));
+        let lock = directory_lock(dir.path()).unwrap();
+        prune(dir.path(), &lock);
+        assert!(Candidate::take(path.clone()).is_err());
+        assert_eq!(std::fs::read(&companion).unwrap(), after);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            PRIVATE_HUMAN_HEADER.as_bytes()
+        );
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp."))
+        );
+    }
+
+    #[test]
+    fn an_old_unmarked_pair_stays_unknown_while_its_public_writer_remains_usable() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join("1-16.log");
+        let (log, events) = paired(&path);
+        log.file
+            .set_modified(UNIX_EPOCH + Duration::from_secs(1))
+            .unwrap();
+        drop((log, events));
+        let companion = events_path(&path);
+        let marked = std::fs::read(&companion).unwrap();
+        std::fs::write(
+            &companion,
+            marked
+                .strip_prefix(PRIVATE_EVENTS_HEADER.as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+        let human = std::fs::read(&path).unwrap();
+        let public = crate::event_log::EventLog::open(&companion).unwrap();
+        let before = std::fs::read(&companion).unwrap();
+        let physical = file_key(&aterm_uds::regular_file::open(&companion).unwrap().0).unwrap();
+        assert!(open_paired_at(&path, false, public.id()).is_err());
+        assert!(Candidate::take(path.clone()).is_err());
+        let mut managed = Vec::new();
+        for at in 0..LOGS_KEPT + 5 {
+            let newer = dir.path().join(format!("{}-{}.log", 100 + at, 1000 + at));
+            let (log, events) = paired(&newer);
+            log.file
+                .set_modified(UNIX_EPOCH + Duration::from_secs((100 + at) as u64))
+                .unwrap();
+            drop((log, events));
+            managed.push(newer);
+        }
+        let lock = directory_lock(dir.path()).unwrap();
+        prune(dir.path(), &lock);
+        assert_eq!(
+            managed.iter().filter(|path| path.exists()).count(),
+            LOGS_KEPT
+        );
+        for removed in managed.iter().take(5) {
+            assert!(!removed.exists());
+            assert!(!events_path(removed).exists());
+        }
+        assert_eq!(std::fs::read(&companion).unwrap(), before);
+        assert_eq!(std::fs::read(&path).unwrap(), human);
+        assert_eq!(
+            file_key(&aterm_uds::regular_file::open(&companion).unwrap().0).unwrap(),
+            physical
+        );
+        public.write("verify-event: {\"schema\":1,\"event\":\"still-public\"}");
+        let after = std::fs::read(&companion).unwrap();
+        assert!(after.starts_with(&before));
+        assert!(String::from_utf8(after).unwrap().contains("still-public"));
     }
 
     #[test]
@@ -475,7 +777,7 @@ mod tests {
         }
         let active = dir.path().join("999-999.log");
         let mut events = crate::event_log::EventLog::unrecorded();
-        let mut log = open_paired_at(&active, true, Some(events.id())).unwrap();
+        let mut log = open_paired_at(&active, true, events.id()).unwrap();
         events.retain(log.take_events().unwrap());
         crate::event_log::emit(
             Some(&events),
@@ -504,7 +806,7 @@ mod tests {
         let (log, events) = paired(&path);
         drop(log);
         assert!(Candidate::take(path.clone()).is_err());
-        assert!(open_paired_at(&path, false, Some(events.id())).is_err());
+        assert!(open_paired_at(&path, false, events.id()).is_err());
         events.write("verify-event: {\"schema\":1,\"event\":\"still-owned\"}");
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _writer = events;
@@ -525,10 +827,26 @@ mod tests {
         let (mut log, events) = paired(&path);
         log.write_all(b"old human record\n").unwrap();
         let old_id = events.id().unwrap().to_owned();
+        let key = file_key(
+            &aterm_uds::regular_file::open(&events_path(&path))
+                .unwrap()
+                .0,
+        )
+        .unwrap();
         drop((log, events));
         let (log, events) = paired(&path);
+        assert_eq!(
+            file_key(
+                &aterm_uds::regular_file::open(&events_path(&path))
+                    .unwrap()
+                    .0
+            )
+            .unwrap(),
+            key
+        );
         assert_ne!(events.id(), Some(old_id.as_str()));
         let retained = std::fs::read_to_string(events_path(&path)).unwrap();
+        assert!(retained.starts_with(PRIVATE_EVENTS_HEADER));
         assert!(retained.contains(events.id().unwrap()));
         assert!(!retained.contains(&old_id));
         assert!(
@@ -542,12 +860,16 @@ mod tests {
         let foreign = crate::event_log::EventLog::unrecorded();
         std::fs::write(
             events_path(&path),
-            foreign.prepare("verify-event: {\"schema\":1,\"event\":\"invocation-started\"}"),
+            format!(
+                "{}{}",
+                PRIVATE_EVENTS_HEADER,
+                foreign.prepare("verify-event: {\"schema\":1,\"event\":\"invocation-started\"}")
+            ),
         )
         .unwrap();
         let human_before = std::fs::read(&path).unwrap();
         let events_before = std::fs::read(events_path(&path)).unwrap();
-        assert!(open_paired_at(&path, false, Some(foreign.id())).is_err());
+        assert!(open_paired_at(&path, false, foreign.id()).is_err());
         assert!(Candidate::take(path.clone()).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), human_before);
         assert_eq!(std::fs::read(events_path(&path)).unwrap(), events_before);
@@ -559,24 +881,30 @@ mod tests {
         let path = dir.path().join("chosen.log");
         std::fs::write(&path, b"unproven human bytes\n").unwrap();
         std::fs::write(events_path(&path), b"foreign bytes\n").unwrap();
-        assert!(
-            open_paired_at(&path, false, Some(Some("0123456789abcdef0123456789abcdef"))).is_err()
-        );
+        assert!(open_paired_at(&path, false, Some("0123456789abcdef0123456789abcdef")).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"unproven human bytes\n");
         assert_eq!(
             std::fs::read(events_path(&path)).unwrap(),
             b"foreign bytes\n"
         );
         std::fs::remove_file(events_path(&path)).unwrap();
+        // An old unmarked human is never migrated, even when its companion is absent.
+        assert!(open_paired_at(&path, false, None).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"unproven human bytes\n");
+        assert!(!events_path(&path).exists());
+        std::fs::remove_file(&path).unwrap();
         let events = crate::event_log::EventLog::unrecorded();
-        drop(open_paired_at(&path, false, Some(events.id())).unwrap());
+        drop(open_paired_at(&path, false, events.id()).unwrap());
         let before = std::fs::read(&path).unwrap();
         assert!(
-            open_paired_at(&path, false, Some(events.id())).is_err(),
+            open_paired_at(&path, false, events.id()).is_err(),
             "an old empty file is not the current admitted creation"
         );
         assert_eq!(std::fs::read(&path).unwrap(), before);
-        assert_eq!(std::fs::read(events_path(&path)).unwrap(), b"");
+        assert_eq!(
+            std::fs::read(events_path(&path)).unwrap(),
+            PRIVATE_EVENTS_HEADER.as_bytes()
+        );
     }
 
     #[cfg(unix)]
@@ -588,9 +916,7 @@ mod tests {
         std::fs::write(&path, b"human\n").unwrap();
         std::fs::write(&outside, b"keep\n").unwrap();
         std::os::unix::fs::symlink(&outside, events_path(&path)).unwrap();
-        assert!(
-            open_paired_at(&path, false, Some(Some("0123456789abcdef0123456789abcdef"))).is_err()
-        );
+        assert!(open_paired_at(&path, false, Some("0123456789abcdef0123456789abcdef")).is_err());
         assert!(
             std::fs::symlink_metadata(events_path(&path))
                 .unwrap()
@@ -610,13 +936,15 @@ mod tests {
 
         let root = aterm_tempfile::tempdir().unwrap();
         let log = root.path().join("chosen.log");
-        std::fs::write(&log, b"old run\n").unwrap();
+        let mut old = open_at(&log, false).unwrap();
+        old.write_all(b"old run\n").unwrap();
+        drop(old);
         let samples = sample_dir(&log);
         std::fs::create_dir(&samples).unwrap();
         std::fs::write(samples.join("old.sample.txt"), b"old stack\n").unwrap();
 
         drop(open_at(&log, false).expect("reopen the explicit log"));
-        assert_eq!(std::fs::read(&log).unwrap(), b"");
+        assert_eq!(payload(&log), b"");
         assert!(!samples.exists(), "the old run's samples survived");
 
         let outside = root.path().join("outside");
@@ -689,9 +1017,9 @@ mod tests {
         pressure(dir.path(), 2);
         let directory = directory_lock(dir.path()).unwrap();
         prune(dir.path(), &directory);
-        assert_eq!(std::fs::read(&path).unwrap(), b"still writing\n");
+        assert_eq!(payload(&path), b"still writing\n");
         active.file.write_all(b"finished\n").unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), b"still writing\nfinished\n");
+        assert_eq!(payload(&path), b"still writing\nfinished\n");
         active.file.set_modified(UNIX_EPOCH).unwrap();
         drop(active);
         pressure_cannot_open_while_locked(dir.path());
@@ -792,16 +1120,16 @@ mod tests {
             open_at(&path, false).err().unwrap().kind(),
             io::ErrorKind::WouldBlock
         );
-        assert_eq!(std::fs::read(&path).unwrap(), b"retained");
+        assert_eq!(payload(&path), b"retained");
         drop(first);
         assert_eq!(
             open_at(&path, true).err().unwrap().kind(),
             io::ErrorKind::AlreadyExists
         );
-        assert_eq!(std::fs::read(&path).unwrap(), b"retained");
+        assert_eq!(payload(&path), b"retained");
         let chosen = open_at(&path, false).unwrap();
         assert!(
-            std::fs::read(&path).unwrap().is_empty(),
+            payload(&path).is_empty(),
             "an admitted chosen path retains truncation"
         );
         drop(chosen);
@@ -922,17 +1250,14 @@ mod tests {
         pressure(dir.path(), 2);
         let directory = directory_lock(dir.path()).unwrap();
         prune(dir.path(), &directory);
-        assert_eq!(std::fs::read(&path).unwrap(), b"child writing\n");
+        assert_eq!(payload(&path), b"child writing\n");
         drop(directory);
         drop(writer.0.stdin.take());
         let ended = until_within(MUST_HAPPEN, "the owned writer ends", || {
             writer.0.try_wait().unwrap()
         });
         assert!(ended.success(), "{ended}");
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            b"child writing\nchild finished\n"
-        );
+        assert_eq!(payload(&path), b"child writing\nchild finished\n");
         pressure(dir.path(), 100);
         let directory = directory_lock(dir.path()).unwrap();
         prune(dir.path(), &directory);

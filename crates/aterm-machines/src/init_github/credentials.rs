@@ -118,7 +118,17 @@ pub fn sync_vault_git_credentials(sys: &dyn System, journaled: &str) -> Result<S
         return Err("git's GitHub settings changed since their revert was journaled".into());
     }
     let helper = helper(sys, &user).ok_or_else(|| Helper::unavailable(sys, &user))?;
-    git.replace_keychain_block(sys, &user, &block, &helper)?;
+    git.replace_keychain_block(sys, &user, &block, &helper, &|| {
+        let (current, _) =
+            prepare(sys).map_err(|status| format!("GitHub settings changed: {status:?}"))?;
+        if current != user || !git.installed(sys) {
+            return Err("GitHub login or Git changed during replacement".into());
+        }
+        if super::helper(sys, &user).as_ref() != Some(&helper) {
+            return Err("GitHub credential helper changed during replacement".into());
+        }
+        Ok(())
+    })?;
     Ok("replaced the keychain GitHub block with aterm's helper; no repositories changed".into())
 }
 
@@ -130,6 +140,55 @@ mod tests {
     use crate::port::{Fake, Live, Scratch, Stat};
 
     const DEV: &str = "fixture_dev_token";
+
+    #[test]
+    fn vault_replacement_stops_commands_when_the_person_turns_settings_off() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        for after_write in [false, true] {
+            let who = user("alice", 501);
+            let sys = fake(&who);
+            script::keychain_block(&sys, &who, "alice");
+            script::keychain_block(&sys, &who, "alice");
+            script::replaces_keychain_block(&sys, &who);
+            let queries = Arc::new(AtomicUsize::new(0));
+            let stopped = Arc::new(AtomicBool::new(false));
+            let cutoff = Arc::new(AtomicUsize::new(0));
+            let all_commands = Arc::new(AtomicUsize::new(0));
+            let commands = all_commands.clone();
+            let (reads, stop, boundary) = (queries.clone(), stopped.clone(), cutoff.clone());
+            let owner = who.clone();
+            sys.simulate(move |sys, command| {
+                let serial = commands.fetch_add(1, Ordering::SeqCst) + 1;
+                let query = command.args.iter().any(|arg| arg == "--get-regexp");
+                let write = command
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--unset-all" || arg == "--add");
+                let due = if after_write {
+                    write
+                } else {
+                    query && reads.fetch_add(1, Ordering::SeqCst) == 1
+                };
+                if due && !stop.swap(true, Ordering::SeqCst) {
+                    profiled(sys, &owner, "[github]\nenabled=false\n");
+                    boundary.store(serial, Ordering::SeqCst);
+                }
+                None
+            });
+            let GithubRead::Due { revert, .. } = vault_git_credentials(&sys).unwrap() else {
+                panic!("the valid control plans its replacement")
+            };
+            let result = sync_vault_git_credentials(&sys, &revert);
+            assert!(stopped.load(Ordering::SeqCst));
+            assert!(result.is_err());
+            assert_eq!(
+                all_commands.load(Ordering::SeqCst),
+                cutoff.load(Ordering::SeqCst),
+                "no command starts after Off: after_write={after_write}"
+            );
+        }
+    }
 
     fn stat(who: &User, len: usize) -> Stat {
         Stat {
@@ -147,7 +206,7 @@ mod tests {
         let mut sys = Fake::root();
         sys.euid = who.uid;
         sys.logged_in(who);
-        sys.file(crate::items::github::CLT_GIT, b"git");
+        sys.executable(crate::items::github::CLT_GIT, b"git");
         script::launcher(&sys, who);
         sys
     }
@@ -284,7 +343,7 @@ mod tests {
         let mut sys = Fake::root();
         sys.euid = who.uid;
         sys.logged_in(&who);
-        sys.file(crate::items::github::CLT_GIT, b"git");
+        sys.executable(crate::items::github::CLT_GIT, b"git");
         script::keychain_block(&sys, &who, "alice");
         let GithubRead::Deferred(why) = vault_git_credentials(&sys).unwrap() else {
             panic!("no launcher, no replacement");
@@ -395,7 +454,7 @@ mod tests {
             .unwrap()
             .expect("the block init wrote");
         let helper = crate::git_credential::Helper::stand_in("!true");
-        git.replace_keychain_block(&live, &who, &found, &helper)
+        git.replace_keychain_block(&live, &who, &found, &helper, &|| Ok(()))
             .unwrap();
         let after = std::fs::read_to_string(&gitconfig).unwrap();
         assert!(!after.contains("osxkeychain"), "{after}");

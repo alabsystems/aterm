@@ -11,7 +11,7 @@ use std::process::Output;
 use crate::gates::{
     GateTree, HANDOFF_FIXTURE_GUARD, HANDOFF_FIXTURE_README, HANDOFF_FIXTURE_ROOT, HandoffFixtures,
 };
-use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
+use crate::ledger::{Error, GitRunner, Origin, RefWrite, Result, git_ok, rev_parse};
 
 #[path = "fixture_reader_inputs.rs"]
 mod reader_inputs;
@@ -1125,6 +1125,7 @@ pub enum Landed {
     /// Fixtures were committed and pushed to `origin/main`.
     Pushed {
         commit: String,
+        /// Number of reader judgments, excluding disjoint compositions.
         attempt: u32,
         answers: Answers,
         /// Main's consumer test verdict; a red never prevents landing producer truth.
@@ -1153,7 +1154,7 @@ impl Landed {
                 pins.tag(),
                 commit.get(..12).unwrap_or(commit),
                 if *attempt > 1 {
-                    format!(" (try {attempt}: main moved meanwhile)")
+                    format!(" ({attempt} reader judgments: fixture files changed meanwhile)")
                 } else {
                     String::new()
                 },
@@ -1166,9 +1167,11 @@ impl Landed {
 
 /// Commits and pushes `staged` fixtures onto `origin/main` with compare-and-swap retry.
 ///
-/// A non-fast-forward rejection is a lost race: rebuild on the winner's tip, up to
-/// `max_attempts` tries; any other push failure stops at once. A push that succeeds is
-/// verified: origin/main is the commit, or has it.
+/// A native compare-and-swap conflict composes onto the winner's tip when its changed
+/// files are disjoint from the fixture edit and Git's merge is clean. Overlapping edits
+/// re-run the reader; a merge conflict or transport failure stops at once. There is no
+/// attempt limit: another writer's progress does not invalidate this release's fixtures.
+/// A push that succeeds is verified: origin/main is the commit, or has it.
 ///
 /// # Errors
 /// Each stop above, a push origin/main does not hold, a tip whose fixture directory for the
@@ -1177,20 +1180,19 @@ impl Landed {
 /// and any git failure.
 pub fn land(
     git: &dyn GitRunner,
+    origin: &dyn Origin,
     staged: &Staged,
     pins: &Pins,
-    max_attempts: u32,
     read_main: &mut dyn FnMut(&str) -> Reading,
 ) -> Result<Landed> {
     let mut attempt = 0_u32;
+    let mut tip = origin.refresh_main().map_err(|e| {
+        Error::new(format!(
+            "handoff fixtures: cannot reach origin to land them: {e}"
+        ))
+    })?;
     loop {
-        attempt += 1;
-        git_ok(git, &["fetch", "origin", "main"]).map_err(|e| {
-            Error::new(format!(
-                "handoff fixtures: cannot reach origin to land them: {e}"
-            ))
-        })?;
-        let tip = rev_parse(git, "origin/main")?;
+        attempt = attempt.saturating_add(1);
         if let Some(found) = on_commit(git, &tip, &pins.version)? {
             return Ok(Landed::Already {
                 tip,
@@ -1203,41 +1205,105 @@ pub fn land(
         };
         let (preview, _) = fixture_commit(git, &tip, staged, pins, &pending)?;
         let reading = read_main(&preview);
-        let (commit, answers) = fixture_commit(git, &tip, staged, pins, &reading)?;
-        let push = git.git(&["push", "origin", &format!("{commit}:refs/heads/main")])?;
-        if push.success() {
-            git_ok(git, &["fetch", "origin", "main"])?;
-            let now = rev_parse(git, "origin/main")?;
-            let holds = now == commit
-                || git
-                    .git(&["merge-base", "--is-ancestor", &commit, &now])?
-                    .success();
-            if !holds {
-                return Err(Error::new(format!(
-                    "handoff fixtures: the push of {commit} succeeded, and origin/main ({now}) \
+        let (mut commit, answers) = fixture_commit(git, &tip, staged, pins, &reading)?;
+        let checked = preview;
+        loop {
+            let written = origin.write("refs/heads/main", Some(&tip), &commit).map_err(|why| {
+            Error::new(format!("handoff fixtures: native main write failed; refusing to reinterpret it as a known compare-and-swap conflict: {why}"))
+        })?;
+            if written == RefWrite::Written {
+                let now = origin.refresh_main().map_err(Error::new)?;
+                let holds = now == commit
+                    || git
+                        .git(&["merge-base", "--is-ancestor", &commit, &now])?
+                        .success();
+                if !holds {
+                    return Err(Error::new(format!(
+                        "handoff fixtures: the push of {commit} succeeded, and origin/main ({now}) \
                      does not hold it — run the release again, which lands them if they are \
                      still missing"
-                )));
+                    )));
+                }
+                return Ok(Landed::Pushed {
+                    commit,
+                    attempt,
+                    answers,
+                    checks: reading.checks,
+                });
             }
-            return Ok(Landed::Pushed {
-                commit,
-                attempt,
-                answers,
-                checks: reading.checks,
-            });
-        }
-        let why = push.stderr_utf8().trim().to_string();
-        if !crate::ledger::lost_race(&why) {
-            return Err(Error::new(format!(
-                "handoff fixtures: git push origin main failed (not a fast-forward rejection, \
-                 so retrying cannot help): {why}"
-            )));
-        }
-        if attempt >= max_attempts {
-            return Err(Error::new(format!(
-                "handoff fixtures: main moved under the push {attempt} times; run the release \
-                 again, which lands them on the tip it finds. Last rejection: {why}"
-            )));
+            let next = origin.refresh_main().map_err(Error::new)?;
+            if next == tip {
+                return Err(Error::new(
+                    "handoff fixtures: compare-and-swap conflict without main advancing",
+                ));
+            }
+            if let Some(found) = on_commit(git, &next, &pins.version)? {
+                return Ok(Landed::Already {
+                    tip: next,
+                    desks: found.desks,
+                });
+            }
+            let merged = git_ok(
+                git,
+                &[
+                    "merge-tree",
+                    "--write-tree",
+                    "--no-messages",
+                    &commit,
+                    &next,
+                ],
+            )?
+            .stdout_utf8();
+            let tree = merged
+                .lines()
+                .next()
+                .ok_or_else(|| Error::new("handoff fixtures: merge returned no tree"))?;
+            let files = |from: &str, to: &str| -> Result<std::collections::BTreeSet<Vec<u8>>> {
+                Ok(git_ok(
+                    git,
+                    &[
+                        "diff-tree",
+                        "-r",
+                        "-z",
+                        "--name-only",
+                        "--no-renames",
+                        "--ignore-submodules=none",
+                        from,
+                        to,
+                    ],
+                )?
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect())
+            };
+            if !files(&tip, &commit)?.is_disjoint(&files(&tip, &next)?) {
+                tip = next;
+                break;
+            }
+            let message = format!(
+                "test(handoff): compose {}'s checked fixtures onto main\n\nFixture-Reader-Checked: {checked}\nFixture-Composed-Onto: {next}\nMain reader checks: {}\n",
+                pins.tag(),
+                reading.checks
+            );
+            commit = git_ok(
+                git,
+                &[
+                    "commit-tree",
+                    tree,
+                    "-p",
+                    &commit,
+                    "-p",
+                    &next,
+                    "-m",
+                    &message,
+                ],
+            )?
+            .stdout_utf8()
+            .trim()
+            .to_owned();
+            tip = next;
         }
     }
 }

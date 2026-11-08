@@ -33,6 +33,9 @@ pub(crate) use report::{KeepReason, RetainedCheck};
 #[path = "build_cache_inventory.rs"]
 mod inventory;
 
+#[path = "build_cache_retirement.rs"]
+pub mod retirement;
+
 /// THE TESTS' CALL INTO A PASS between an entry's intent on record and its rename aside (the
 /// leaf's in [`Sweep::walk`], a tooling entry's in [`tooling::reclaim`]), with the entry's path:
 /// where a test sets what refuses that rename after the check. Unix test builds alone: only this

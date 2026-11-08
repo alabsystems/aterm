@@ -628,13 +628,17 @@ impl Store {
 
     /// Usage also works without configured rows. An absent file is a retained absence
     /// in the receipt, so a later configuration cannot silently admit old observations.
-    pub(super) fn transact_usage_within(
+    /// `seen` reads the state once the edit ran and the journal learned its rows' keys
+    /// ([`super::super::journal::learn`]), so what it reads carries the keys this transaction
+    /// learns; it runs only where the edit succeeded.
+    pub(super) fn transact_usage_within<T>(
         &self,
         ladder: &[std::time::Duration],
         captured: &UsageRoster,
         now: i64,
         edit: impl FnOnce(&Roster, &mut State, &mut Logins) -> Result<Vec<Event>, String>,
-    ) -> Result<Vec<Event>, String> {
+        seen: impl FnOnce(&State) -> T,
+    ) -> Result<(Vec<Event>, T), String> {
         let held = self
             .acquire_within(ladder)
             .map_err(|why| format!("{}: {why}", self.dir.display()))?
@@ -661,7 +665,8 @@ impl Store {
             .transpose()?
             .unwrap_or_default();
         let cli = self.cli;
-        self.transact_images_held(
+        let mut read_back = None;
+        let events = self.transact_images_held(
             &held,
             now,
             &mut None,
@@ -677,10 +682,13 @@ impl Store {
             |state, logins| {
                 let events = edit(&raw, state, logins)?;
                 super::super::journal::learn(cli, &raw, state);
+                read_back = Some(seen(state));
                 Ok(events)
             },
             || Ok(()),
-        )
+        )?;
+        let read_back = read_back.ok_or("usage transaction committed without its edit")?;
+        Ok((events, read_back))
     }
 
     pub(in crate::harness) fn sync_needs_recovery(&self) -> bool {

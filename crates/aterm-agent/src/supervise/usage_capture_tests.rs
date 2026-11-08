@@ -252,43 +252,59 @@ fn a_capture_masks_the_composers_draft() {
 
 /// The Fable consent box the approval policy's own tests draw
 /// (`a_credits_consent_is_taken_only_under_usage_credits`), over the reset confirmation's head
-/// rows.
-fn consent_rows() -> Vec<String> {
+/// rows, the focus on `Switch to Opus 5.5 and continue` as it opens, or moved down onto
+/// `Continue with Fable 5.1` (`on_consent`).
+fn consent_rows(on_consent: bool) -> Vec<String> {
+    let (switch, consent) = if on_consent {
+        ("  ", "❯ ")
+    } else {
+        ("❯ ", "  ")
+    };
     let mut rows: Vec<String> = screen(aterm_phase::reset::fixtures::CONFIRM)[..3].to_vec();
-    rows.extend(
-        [
-            "   You've reached your Fable limit",
-            "",
-            "   You've used your included Fable usage for this week. Continuing on Fable 5.1 uses",
-            "   usage credits — you have $12.00 in credits.",
-            "   https://support.claude.com/en/articles/12429409-extra-usage-for-paid-claude-plans",
-            "",
-            "   ❯ Switch to Opus 5.5 and continue",
-            "     Continue with Fable 5.1",
-            "",
-            "   Enter to confirm · Esc to cancel",
-        ]
-        .map(str::to_string),
-    );
+    rows.extend([
+        "   You've reached your Fable limit".to_string(),
+        String::new(),
+        "   You've used your included Fable usage for this week. Continuing on Fable 5.1 uses"
+            .to_string(),
+        "   usage credits — you have $12.00 in credits.".to_string(),
+        "   https://support.claude.com/en/articles/12429409-extra-usage-for-paid-claude-plans"
+            .to_string(),
+        String::new(),
+        format!("   {switch}Switch to Opus 5.5 and continue"),
+        format!("   {consent}Continue with Fable 5.1"),
+        String::new(),
+        "   Enter to confirm · Esc to cancel".to_string(),
+    ]);
     rows
 }
 
-/// A consent box `credits-decline@v1` cancels with Esc is kept first: the look keeps its
-/// `CAPTURED … usage-consent` record before it decides the box, so the record is journaled ahead
-/// of the decline's `APPROVED` line and the one Esc, and the box the Esc takes away is still
-/// measured. NEGATIVE CONTROL: with usage credits on (`[harness] usage_credits`) the decline rule
-/// does not answer the box and no Esc is pressed, and the box is kept just the same: the capture
-/// does not depend on the answer.
+/// A consent box is kept before it is answered: the look keeps its `CAPTURED … usage-consent`
+/// record before it decides the box, so the record is journaled ahead of the answer's `APPROVED`
+/// line and its keys, and the box the answer takes away is still measured. With usage credits
+/// off, the default, `credits-decline@v1` cancels it with one Esc; with them on (`[harness]
+/// usage_credits`) `credits-consent@v1` moves the focus down onto `Continue with Fable 5.1`, sees
+/// it land there, and enters it. The script draws the box again with the focus moved, as Claude
+/// Code redraws it under the arrow: the loop enters only a focus it has read land, so a script
+/// with no such screen leaves the arrow unconfirmed and the box escalated. NEGATIVE CONTROL: each
+/// switch's answer is never the other's: no Esc and no decline with credits on, no consent and no
+/// Enter with them off.
 #[test]
-fn a_box_credits_decline_cancels_is_captured_before_its_esc() {
+fn a_credits_consent_box_is_captured_before_its_answer() {
     for credits in [false, true] {
         let (dir, path) = journal_file(if credits {
             "usage-consent-on"
         } else {
             "usage-consent-off"
         });
-        let mut m = fenced(vec![consent_rows(), idle_screen()]);
-        m.key_releases = Some(0);
+        let mut m = if credits {
+            let mut m = fenced(vec![consent_rows(false), consent_rows(true), idle_screen()]);
+            m.key_gates = vec![(0, 0), (1, 1)];
+            m
+        } else {
+            let mut m = fenced(vec![consent_rows(false), idle_screen()]);
+            m.key_releases = Some(0);
+            m
+        };
         let mut opts = auto(30);
         opts.policy.approve = Approve::All;
         opts.policy.usage_credits = credits;
@@ -315,16 +331,31 @@ fn a_box_credits_decline_cancels_is_captured_before_its_esc() {
             "{:#?}",
             c.rows
         );
-        let declined = lines.iter().any(|l| l.contains("rule=credits-decline@v1"));
-        let esc = m.presses().iter().any(|p| p.ends_with(" esc"));
-        assert_eq!((declined, esc), (!credits, !credits), "{lines:#?}");
-        if !credits {
-            let approved = lines
-                .iter()
-                .position(|l| l.starts_with("APPROVED "))
-                .unwrap_or_else(|| panic!("the decline: {lines:#?}"));
-            assert!(*at < approved, "{lines:#?}");
-            assert_eq!(m.presses().len(), 1, "{:#?}", m.requests);
+        let (rule, other) = if credits {
+            ("rule=credits-consent@v1", "rule=credits-decline@v1")
+        } else {
+            ("rule=credits-decline@v1", "rule=credits-consent@v1")
+        };
+        let approved = lines
+            .iter()
+            .position(|l| l.starts_with("APPROVED "))
+            .unwrap_or_else(|| panic!("{rule}: {lines:#?}"));
+        assert!(*at < approved, "{lines:#?}");
+        assert!(lines.iter().any(|l| l.contains(rule)), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains(other)), "{lines:#?}");
+        let presses = m.presses();
+        let keys: Vec<&str> = presses
+            .iter()
+            .map(|p| p.rsplit(' ').next().unwrap_or_default())
+            .collect();
+        if credits {
+            assert_eq!(keys, ["down", "enter"], "{:#?}", m.requests);
+            assert!(
+                presses[1].contains("Continue\\x20with\\x20Fable\\x205\\.1"),
+                "entered on the consent's own row: {presses:#?}"
+            );
+        } else {
+            assert_eq!(keys, ["esc"], "{:#?}", m.requests);
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -170,6 +170,16 @@ pub(crate) fn verify_gui(
     endpoint: &Path,
     nonce: &str,
 ) -> io::Result<GuiAuthority> {
+    verify_gui_at(peer, program, endpoint, nonce, Instant::now())
+}
+
+fn verify_gui_at(
+    peer: Peer,
+    program: &Program,
+    endpoint: &Path,
+    nonce: &str,
+    started: Instant,
+) -> io::Result<GuiAuthority> {
     // Enrollment hashes executable content once per connection, not per job.
     // Serialize that expensive authentication work; unknown clients cannot
     // turn the bounded socket pool into 128 parallel whole-image readers.
@@ -180,7 +190,7 @@ pub(crate) fn verify_gui(
     }
     program.validate_process(peer.pid, Birth(peer.birth))?;
     let before = aterm_uds::listener::listener_read(endpoint)?.ok_or_else(refused)?;
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = started + Duration::from_secs(60);
     let stream = aterm_uds::connect::until(endpoint, deadline)?;
     stream.set_nonblocking(true)?;
     if wire::local_peer(&stream)? != peer {
@@ -218,4 +228,100 @@ pub(crate) fn verify_gui(
     program.validate_process(peer.pid, Birth(peer.birth))?;
     authority.check(peer)?;
     Ok(authority)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use std::os::{fd::AsFd as _, unix::fs::PermissionsExt as _};
+
+    #[test]
+    fn native_gui_enrollment_waits_for_an_unchanged_authenticated_endpoint() {
+        exchange(Duration::from_secs(5), false).unwrap();
+        assert_eq!(
+            exchange(Duration::from_secs(61), false).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(
+            exchange(Duration::from_secs(5), true).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    fn exchange(age: Duration, wrong_nonce: bool) -> io::Result<()> {
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("enroll-")
+            .suffix(".noindex")
+            .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+            .unwrap();
+        let store_path = scratch.path().join("store");
+        let store = aterm_capacity::host_executable::Store::prepare_at(&store_path).unwrap();
+        aterm_capacity::host_executable::narrow_test_image();
+        let program = store.cache_current().unwrap();
+        let endpoint = scratch.path().join("gui.sock");
+        let listener = aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(&endpoint)).unwrap();
+        std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let token = "ab".repeat(32);
+        let token_name = aterm_types::control_socket::token_names_for_sock("gui.sock").remove(0);
+        let token_path = scratch.path().join(token_name);
+        std::fs::write(&token_path, &token).unwrap();
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let nonce = "cd".repeat(32);
+        let offered = nonce.clone();
+        let response = if wrong_nonce {
+            "ef".repeat(32)
+        } else {
+            nonce.clone()
+        };
+        let (finished, wait_finished) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || -> io::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            aterm_uds::ready::until(listener.as_fd(), aterm_uds::ready::Interest::Read, deadline)?;
+            let (stream, _) = aterm_uds::kept_out(|| listener.accept())?;
+            assert_eq!(wire::read_line(&stream, deadline)?, format!("AUTH {token}"));
+            assert_eq!(wire::read_line(&stream, deadline)?, "version");
+            wire::write_all(&stream, b"OK native fixture\n", deadline)?;
+            assert_eq!(
+                wire::read_line(&stream, deadline)?,
+                format!("resource-admission-v3 enroll nonce={offered}")
+            );
+            wire::write_all(
+                &stream,
+                format!(
+                    "OK resource-admission-v3 enroll\n{{\"version\":3,\"nonce\":\"{response}\"}}\n"
+                )
+                .as_bytes(),
+                deadline,
+            )?;
+            wait_finished
+                .recv_timeout(Duration::from_secs(60))
+                .map_err(io::Error::other)?;
+            drop(stream);
+            Ok(())
+        });
+        let pid = std::process::id();
+        let peer = Peer {
+            pid,
+            birth: aterm_uds::process::read_birth(pid as i32).unwrap().0,
+        };
+        let result = verify_gui_at(peer, &program, &endpoint, &nonce, Instant::now() - age);
+        if result.is_err() {
+            // Wake only this failed fixture's private accept; no enrollment is replayed.
+            let _ = aterm_uds::connect::until(&endpoint, Instant::now() + Duration::from_secs(60));
+        }
+        let _ = finished.send(());
+        let served = server.join().unwrap();
+        // These cached images were read, never executed, by this fixture.
+        for entry in std::fs::read_dir(store_path.join("images")).unwrap() {
+            std::fs::set_permissions(
+                entry.unwrap().path(),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        let authority = result?;
+        served?;
+        authority.check(peer)
+    }
 }

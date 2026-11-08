@@ -1,0 +1,13 @@
+seq v=1 rig=screen program=claude build=2.1.0
+# E8 with T1's supersession (`PersonSupersedesAct`, unchanged): the harness
+# approved, then a person pressed the box's `2. No`. The person's input is the
+# box's latest, so the close is theirs, and their key's outcome: `declined`.
+see busy
+half
+see prompt bash:not-read-only fixture=claude-2.1.282-box-bash-ask-rule
+expect open p1 approval par=t1 box=bash:not-read-only @500
+admit harness act=approve
+accept
+at 600 person key=2 chose=decline
+at 700 see busy
+expect close p1 approval out=declined by=human conf=heuristic @700

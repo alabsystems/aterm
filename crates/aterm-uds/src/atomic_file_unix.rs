@@ -92,7 +92,7 @@ pub const TTY_OPEN_FLAGS: i32 = 0;
 pub const TTY_PROBE_OPEN_FLAGS: i32 = TTY_OPEN_FLAGS | LOCK_OPEN_FLAGS;
 
 /// How long an edit waits for the config service's write lock.
-pub const CONFIG_LOCK_WAIT: Duration = Duration::from_secs(2);
+pub const CONFIG_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// aterm.toml, read for one edit and written the way the config service writes a Settings save.
 pub struct ConfigFile {
@@ -112,10 +112,27 @@ struct ConfigWriteLock(std::fs::File);
 
 impl ConfigWriteLock {
     fn take(target: &Path) -> io::Result<Self> {
-        Self::take_within(target, CONFIG_LOCK_WAIT, || {})
+        Self::take_default_at(target, Instant::now(), || {})
     }
 
-    fn take_within(target: &Path, wait: Duration, mut busy: impl FnMut()) -> io::Result<Self> {
+    fn take_default_at(target: &Path, started: Instant, busy: impl FnMut()) -> io::Result<Self> {
+        Self::take_until(
+            target,
+            crate::deadline::saturating_after(started, CONFIG_LOCK_WAIT),
+            busy,
+        )
+    }
+
+    #[cfg(test)]
+    fn take_within(target: &Path, wait: Duration, busy: impl FnMut()) -> io::Result<Self> {
+        Self::take_until(
+            target,
+            crate::deadline::saturating_after(Instant::now(), wait),
+            busy,
+        )
+    }
+
+    fn take_until(target: &Path, deadline: Instant, mut busy: impl FnMut()) -> io::Result<Self> {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         let name = target
             .file_name()
@@ -152,7 +169,6 @@ impl ConfigWriteLock {
         if meta.permissions().mode() & 0o7777 != 0o600 {
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        let deadline = crate::deadline::saturating_after(Instant::now(), wait);
         let mut backoff = Duration::from_millis(1);
         loop {
             #[expect(

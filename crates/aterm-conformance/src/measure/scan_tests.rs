@@ -1223,6 +1223,7 @@ fn index_of(count: usize, holes: &[i64], ticks: Option<Vec<i64>>) -> (RecordingI
         RecordingIndex {
             stamps,
             covered_from: Some(start),
+            started_at: Some(start),
             ticks: ticks.unwrap_or_default(),
             all_composed_frames: false,
         },
@@ -1339,7 +1340,8 @@ fn complete_composition_index() -> (aterm_json::Value, Vec<String>) {
             "meta": {"mode": "offscreen-present-real", "frames_written": 20,
                 "dropped_frames": 0, "ring_skipped": 0, "evicted_frames": 0,
                 "decimated_frames": 0, "head_truncated": false, "resized_early_stop": false, "half_res": false,
-                "fps_cap": null, "covered_us": [1_000_000, *index.stamps.values().max().unwrap()]},
+                "fps_cap": null, "wall_start_us": 1_000_000,
+                "covered_us": [1_000_000, *index.stamps.values().max().unwrap()]},
             "frames": frames, "ticks": []
         }),
         names,
@@ -1348,6 +1350,25 @@ fn complete_composition_index() -> (aterm_json::Value, Vec<String>) {
 
 fn parse_index(value: &aterm_json::Value) -> RecordingIndex {
     RecordingIndex::parse(aterm_json::to_string(value).unwrap().as_bytes()).unwrap()
+}
+
+#[test]
+fn a_video_without_keys_still_requires_every_indexed_image_to_be_scanned() {
+    let (raw, names) = complete_composition_index();
+    let ctx = TakeContext {
+        cell: CELL,
+        statuses: None,
+        index: Some(parse_index(&raw)),
+        driven_ms: None,
+        typed_row: None,
+    };
+    let read = |names: &[String]| {
+        scan_frames(names, names.iter().map(|_| Ok(frame(40, 4, &[]))), &ctx).unwrap()
+    };
+    let full = read(&names);
+    assert!(full.all_composed_frames);
+    assert_eq!(full.driven, DrivenWindow::NOT_MEASURED);
+    assert!(!read(&names[1..]).all_composed_frames);
 }
 
 #[test]
@@ -1372,10 +1393,80 @@ fn a_complete_composition_history_charges_the_image_held_through_a_render_gap() 
     let mut repeated = names.clone();
     repeated[1] = repeated[0].clone();
     assert!(!index.covers_all_composed_frames(&repeated));
+    let mut reversed = names.clone();
+    reversed.swap(0, 1);
+    assert!(!index.covers_all_composed_frames(&reversed));
     assert!(
         !driven_window_darkness(Some(&index), Some((0, 10_000)), &names, &flags, &duplicates)
             .all_composed_frames
     );
+}
+
+#[test]
+fn status_brackets_use_recording_start_and_do_not_hide_the_first_key_behind_startup() {
+    let (mut index, names) = index_of(40, &[NOMINAL; 40], None);
+    for stamp in index.stamps.values_mut() {
+        *stamp += 180_000;
+    }
+    index.covered_from = Some(1_180_000);
+    index.all_composed_frames = true;
+    let mut flags = vec![true; 40];
+    flags[..10].fill(false);
+    let duplicates = vec![false; 40];
+    let read = |index: &RecordingIndex| {
+        driven_window_darkness(Some(index), Some((180, 400)), &names, &flags, &duplicates)
+    };
+    let actual = read(&index);
+    assert!(actual.all_composed_frames);
+    assert_eq!(actual.mature_lead_us, 160_000);
+    // NEGATIVE CONTROL: treating the first frame as elapsed_ms's zero shifts past the
+    // first key and hides a startup blackout longer than the unchanged 150 ms bound.
+    let mut wrong_clock = index.clone();
+    wrong_clock.started_at = wrong_clock.covered_from;
+    assert_eq!(read(&wrong_clock).mature_lead_us, 0);
+    index.started_at = None;
+    assert_eq!(read(&index), DrivenWindow::NOT_MEASURED);
+}
+
+#[test]
+fn complete_coverage_accounts_for_the_status_clocks_millisecond_quantization() {
+    for (delay, complete) in [(999, true), (1000, false)] {
+        let (mut index, names) = index_of(40, &[NOMINAL; 40], None);
+        for stamp in index.stamps.values_mut() {
+            *stamp += delay;
+        }
+        index.covered_from = Some(1_000_000 + delay);
+        index.all_composed_frames = true;
+        let read = driven_window_darkness(
+            Some(&index),
+            Some((0, 250)),
+            &names,
+            &[true; 40],
+            &[false; 40],
+        );
+        assert_eq!(read.all_composed_frames, complete, "{delay}");
+    }
+}
+
+#[test]
+fn the_image_held_at_the_first_key_counts_before_the_next_composition() {
+    let mut intervals = [NOMINAL; 40];
+    intervals[12] = 200_000;
+    let (mut index, names) = index_of(40, &intervals, None);
+    index.all_composed_frames = true;
+    let mut flags = [true; 40];
+    flags[..13].fill(false);
+    let read = |flags: &[bool]| {
+        driven_window_darkness(Some(&index), Some((200, 400)), &names, flags, &[false; 40])
+    };
+    let dark = read(&flags);
+    assert!(dark.all_composed_frames);
+    assert_eq!(dark.mature_lead_us, 192_000);
+    assert_eq!(dark.sampling_hole_us, 200_000);
+    // The same render gap holds a lit image when this preceding composition was lit.
+    flags[12] = true;
+    let lit = read(&flags);
+    assert_eq!((lit.mature_lead_us, lit.dark_us), (0, 0));
 }
 
 #[test]
@@ -1394,6 +1485,7 @@ fn every_loss_rate_cap_or_missing_capture_account_withholds_complete_history() {
         ("fps_cap", json!(60)),
         ("frames_written", json!(19)),
         ("mode", json!("swapchain-tap")),
+        ("wall_start_us", json!(1_000_001)),
         ("covered_us", json!([1_000_001, 1_488_000])),
     ] {
         for replacement in [Some(wrong), None] {
@@ -1528,6 +1620,7 @@ fn no_index_reports_not_measured() {
     let extreme_idx = RecordingIndex {
         stamps: extreme_stamps,
         covered_from: Some(i64::MIN),
+        started_at: Some(i64::MIN),
         ticks: vec![0],
         all_composed_frames: false,
     };
@@ -1545,10 +1638,11 @@ fn no_index_reports_not_measured() {
 #[test]
 fn the_recording_index_parses_stamps_coverage_and_integer_ticks() {
     let index = RecordingIndex::parse(
-        br#"{"meta":{"covered_us":[1000,9000]},"frames":[{"file":"frame_0000.png","seq":0,"t_us":1000},{"file":"frame_0001.png","t_us":1016}],"ticks":[1008,1012.5,"x"]}"#,
+        br#"{"meta":{"wall_start_us":100,"covered_us":[1000,9000]},"frames":[{"file":"frame_0000.png","seq":0,"t_us":1000},{"file":"frame_0001.png","t_us":1016}],"ticks":[1008,1012.5,"x"]}"#,
     )
     .expect("parses");
     assert_eq!(index.covered_from, Some(1000));
+    assert_eq!(index.started_at, Some(100));
     assert_eq!(index.stamps.get("frame_0001.png"), Some(&1016));
     assert_eq!(index.ticks, [1008]);
     assert!(RecordingIndex::parse(b"[]").is_err());
@@ -1578,6 +1672,7 @@ fn recorded_take(band_frames: &[usize]) -> ScanReport {
         index: Some(RecordingIndex {
             stamps,
             covered_from: Some(1_000_000),
+            started_at: Some(1_000_000),
             ticks: vec![],
             all_composed_frames: false,
         }),

@@ -593,7 +593,7 @@ fn a_complete_echo_without_a_past_tense_says_done() {
                 for (row, rm) in p.rows.iter().zip(&m.rows) {
                     let said = rm.eta.as_deref().or(rm.readout.as_deref());
                     assert!(row.pct.is_none(), "@{cols}: {:?}", row.title.1);
-                    if row.full_title.starts_with("Downloaded") {
+                    if row.kind == RowKind::Echo(past) {
                         assert_eq!(said, None, "@{cols}: past tense says nothing more");
                     } else {
                         assert!(

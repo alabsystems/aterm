@@ -4,10 +4,12 @@
 //! Recovered membership records under the current vault and admitted key set, kept within a
 //! byte budget ([`MAX_BYTES`]).
 //!
-//! A read whose opened records file shows the [`fsx::FileStamp`] an entry was read under takes
+//! A read whose opened records file shows a [`fsx::FileStamp`] an entry was read under takes
 //! that entry without reading the file again: the stamp tells one file's contents from another's,
-//! and every writer of this file renames a new one over it. Any other read streams the file, and
-//! a file past [`MAX_INPUT_BYTES`] is hashed whole. On a Mac whose records file had grown past
+//! and every writer of this file renames a new one over it. An entry keeps the stamps of the last
+//! [`STAMPS`] files its bytes were read from, so two vault folders whose records files hold the
+//! same bytes in one process (two Macs of a test's lab) do not take each other's turn. Any other
+//! read streams the file, and a file past [`MAX_INPUT_BYTES`] is hashed whole. On a Mac whose records file had grown past
 //! that bound, each Commons check in a repair round re-hashed it: 3.6 MB about 200 times a round,
 //! which held an idle 0.154.0 at two to four cores (2026-11-05, m117).
 
@@ -25,6 +27,11 @@ use std::{
 use zeroize::Zeroizing;
 
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
+/// The most files an entry is known by ([`Entry::stamps`]). Kept to one, a read of each of two
+/// such files took the entry from the other and read its whole file again at every Commons check
+/// of the pair's rounds, hashing it past [`MAX_INPUT_BYTES`]: on a 2.4 MB log most of a quiet
+/// round's CPU in `aterm-db`'s two-Mac measurement (2026-11-07).
+const STAMPS: usize = 4;
 /// The entry charges kept together: records and index ([`Store::footprint`]), a small
 /// file's bytes, and entry/context storage. The budget is one maximum store plus a small
 /// file; smaller entries share that room, oldest let go first. This is a cache charge,
@@ -56,9 +63,10 @@ struct Entry {
     /// others.
     budgets: RecordBudgets,
     digest: [u8; 32],
-    /// The stamp of the newest opened file these bytes were read from, unchanged across that
-    /// read.
-    stamp: fsx::FileStamp,
+    /// The stamps of up to [`STAMPS`] opened files these bytes were read from, each unchanged
+    /// across its read, the one known longest first: in the entry itself, so its charge
+    /// ([`Entry::kept`]) holds them.
+    stamps: [Option<fsx::FileStamp>; STAMPS],
     bytes: Option<SecretBytes>,
     store: Store,
     /// Its record/index, file, entry and context charge ([`MAX_BYTES`]).
@@ -114,7 +122,7 @@ impl Cache {
         if let Ok(entries) = self.entries.lock()
             && let Some(entry) = entries
                 .iter()
-                .find(|entry| same_context(entry) && entry.stamp == stamp)
+                .find(|entry| same_context(entry) && entry.stamps.contains(&Some(stamp)))
         {
             after_observation();
             reader.check_unchanged()?;
@@ -139,7 +147,7 @@ impl Cache {
         {
             reader.check_unchanged()?;
             selected.confirm()?;
-            entry.stamp = stamp;
+            entry.known_by(stamp);
             return Ok(entry.store.clone());
         }
         #[cfg(test)]
@@ -155,7 +163,7 @@ impl Cache {
         {
             reader.check_unchanged()?;
             selected.confirm()?;
-            entry.stamp = stamp;
+            entry.known_by(stamp);
             return Ok(entry.store.clone());
         }
         let (store, bytes) = match observed {
@@ -205,7 +213,7 @@ impl Cache {
                     network,
                     budgets,
                     digest,
-                    stamp,
+                    stamps: Entry::known_only_by(stamp),
                     bytes,
                     store: store.clone(),
                     kept,
@@ -213,6 +221,24 @@ impl Cache {
             }
         }
         Ok(store)
+    }
+}
+
+impl Entry {
+    /// The stamps of an entry first read from the file `stamp` names.
+    fn known_only_by(stamp: fsx::FileStamp) -> [Option<fsx::FileStamp>; STAMPS] {
+        let mut stamps = [None; STAMPS];
+        stamps[STAMPS - 1] = Some(stamp);
+        stamps
+    }
+
+    /// Its bytes are also those of the file `stamp` names, which takes the place of the stamp it
+    /// has known longest once it knows [`STAMPS`].
+    fn known_by(&mut self, stamp: fsx::FileStamp) {
+        if !self.stamps.contains(&Some(stamp)) {
+            self.stamps.rotate_left(1);
+            self.stamps[STAMPS - 1] = Some(stamp);
+        }
     }
 }
 
@@ -706,6 +732,52 @@ mod tests {
                 "large={large}: the rewritten file holds no record under SIGNER"
             );
             assert_eq!(counts().0, renamed.0 + 1, "large={large}");
+        }
+    }
+
+    /// Two vault folders whose records files hold the same bytes, as two Macs of a test's lab do,
+    /// read in turn: the second is read once and taken from the first's entry, and from then on
+    /// each is taken by its own stamp, unread. NEGATIVE CONTROL: an entry known by one file
+    /// (`STAMPS` = 1) reads each file again at every turn, and hashes it when large.
+    #[test]
+    fn two_files_of_the_same_records_are_each_taken_by_their_stamp() {
+        for large in [false, true] {
+            let homes = [
+                aterm_tempfile::tempdir().unwrap(),
+                aterm_tempfile::tempdir().unwrap(),
+            ];
+            let paths = homes.each_ref().map(|home| Paths::for_home(home.path()));
+            let mut wire = signed(&SIGNER, 1);
+            if large {
+                wire.resize(MAX_INPUT_BYTES + 64, 0);
+            }
+            for paths in &paths {
+                fsx::ensure_private_dir(&paths.dir).unwrap();
+                fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
+            }
+            let cache = Cache::new();
+            let read = |paths: &Paths| {
+                cache
+                    .read(paths, "fixture".into(), base(&SIGNER))
+                    .unwrap()
+                    .encode()
+            };
+            for paths in &paths {
+                assert_eq!(read(paths), signed(&SIGNER, 1));
+            }
+            let observed = cache.observations.load(Ordering::Relaxed);
+            assert_eq!(observed, 2, "large={large}: each file is read once");
+            for _ in 0..3 {
+                for paths in &paths {
+                    assert_eq!(read(paths), signed(&SIGNER, 1));
+                }
+            }
+            assert_eq!(
+                cache.observations.load(Ordering::Relaxed),
+                observed,
+                "large={large}: each file is taken by its stamp"
+            );
+            assert_eq!(cache.entries.lock().unwrap().len(), 1, "large={large}");
         }
     }
 

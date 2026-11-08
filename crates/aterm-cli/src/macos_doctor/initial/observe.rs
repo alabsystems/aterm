@@ -632,10 +632,10 @@ const TURNED_OFF: &str = "You turned sync off on this Mac";
 /// the join lands only once sync is on again.
 const PENDING_OFF: &str = "You turned sync off, so an approved join lands once it's on";
 
-/// The note of a member Mac whose subscriber cannot run from the copy of aterm
-/// that is open (a disk image): the person's step, after which the Secrets stage
-/// installs it. The menu line carries it too.
-const FLEETING: &str = "Move aterm to Applications and open it from there";
+/// The note of a member Mac whose subscriber cannot run from this transient copy.
+/// A normal released app installs itself before setup continues; a read-only check
+/// does not start that installation. The menu line carries the note too.
+const FLEETING: &str = "Open the released aterm app to install it automatically and continue setup";
 
 /// The note of a Mac that asked to join and whose approval code this Mac does not
 /// hold: an admin Mac approves it, and the subscriber finishes the join.
@@ -714,7 +714,7 @@ fn vault_observation(
                 None => PENDING_OFF.to_owned(),
             }),
         ),
-        // Only a person moves aterm: nothing retries its way out of a disk image.
+        // This observation does not launch the released app's automatic installation.
         VaultRead::Fleeting => (person, "Out of sync", Some(FLEETING.to_owned())),
         VaultRead::Pending {
             approve: Some(approve),
@@ -1517,10 +1517,10 @@ mod tests {
         );
     }
 
-    /// A member whose subscriber cannot run from a disk image needs the person to move aterm; a
-    /// running subscriber there only waits for the sync.
+    /// A member whose subscriber cannot run from a disk image waits for the installed app;
+    /// a running subscriber there only waits for the sync.
     #[test]
-    fn a_vault_member_run_from_a_disk_image_says_to_move_aterm_to_applications() {
+    fn a_vault_member_run_from_a_disk_image_waits_for_the_installed_app() {
         let image = Path::new("/Volumes/aterm/aterm.app/Contents/MacOS/aterm");
         let installed = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
         for off in [Subscriber::Stopped, Subscriber::Removed] {

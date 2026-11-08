@@ -1695,14 +1695,20 @@ fn a_clone_and_a_copy_of_a_home_are_the_same_tree() {
 
 #[test]
 fn a_log_behind_the_envelope_never_writes_an_older_value() {
-    let macs = two_macs(&[(Audience::Everyone, "gh-token", b"token-v1".as_slice())]);
+    use crate::need::{self, GhProfile, Purpose, Want};
+
+    let macs = two_macs(&[(
+        Audience::Everyone,
+        "gh_access_token",
+        b"token-v1".as_slice(),
+    )]);
     let (m22, m7) = (&macs.m22, &macs.m7);
     let genesis_era = load_records(m22).unwrap().encode();
 
     // m22 rotates the token.
     let admin = admin_open(m22).unwrap();
     let mut doc = admin.doc.clone();
-    doc.set_entry(&Audience::Everyone, "gh-token", b"token-v2")
+    doc.set_entry(&Audience::Everyone, "gh_access_token", b"token-v2")
         .unwrap();
     admin_publish(m22, &admin, &doc).expect("rotate gh-token");
     let rotated = std::fs::read(m22.cache_file()).unwrap();
@@ -1716,9 +1722,39 @@ fn a_log_behind_the_envelope_never_writes_an_older_value() {
     clone_identity_to(m7, &p);
     join_host(&p, &format!("{url2}#{}", macs.signer), "m7");
     assert_eq!(
-        std::fs::read(p.home.join(".secrets/gh-token")).unwrap(),
+        std::fs::read(p.home.join(".secrets/gh_access_token")).unwrap(),
         b"token-v2"
     );
+    need::test_alab_policy(&p);
+    let paired = || {
+        let config = config(&p).unwrap().unwrap();
+        with_materialization_ready_for_entries(&p, &config, &["gh_access_token"], || Ok(()))
+            .unwrap()
+            .unwrap()
+            .snapshot
+    };
+    let envelope = paired();
+    let refused = need::raise_refused_from_snapshot(
+        &p,
+        Want::Gh(GhProfile::Dev),
+        Purpose::AghDev,
+        &envelope,
+        || Ok(()),
+    )
+    .unwrap();
+    let accepting = need::raise_refused_from_snapshot(
+        &p,
+        Want::Gh(GhProfile::Dev),
+        Purpose::HarnessSignIn,
+        &envelope,
+        || Ok(()),
+    )
+    .unwrap();
+    let Some(need::RefusalClaim::Authenticated(floor)) = &refused.refused else {
+        panic!("the actual signed envelope supplies the refusal floor");
+    };
+    assert!(floor.envelope().is_some() && floor.log().is_none());
+    assert_eq!(accepting.refused, refused.refused);
 
     // The genesis-era records reach s2 (a peer pull, or Commons repair): p's log is behind the
     // version it applied, and p keeps v2.
@@ -1726,7 +1762,7 @@ fn a_log_behind_the_envelope_never_writes_an_older_value() {
     sync(&p, None).expect("p syncs the genesis-era log");
     assert!(load_records(&p).unwrap().log().is_some());
     assert_eq!(
-        std::fs::read(p.home.join(".secrets/gh-token")).unwrap(),
+        std::fs::read(p.home.join(".secrets/gh_access_token")).unwrap(),
         b"token-v2",
         "a log behind the envelope wrote the older value over the newer file"
     );
@@ -1735,10 +1771,61 @@ fn a_log_behind_the_envelope_never_writes_an_older_value() {
     transport::post_records(&url2, &load_records(m22).unwrap().encode()).unwrap();
     sync(&p, None).expect("p syncs the whole log");
     assert_eq!(
-        std::fs::read(p.home.join(".secrets/gh-token")).unwrap(),
+        std::fs::read(p.home.join(".secrets/gh_access_token")).unwrap(),
         b"token-v2"
     );
     assert!(load_state(&p).unwrap().records_digest.is_some());
+    let covers = paired();
+    assert_eq!(covers.sequence(), envelope.sequence());
+    assert_eq!(
+        load_state(&p).unwrap().digest,
+        floor.envelope().map(|e| e.digest)
+    );
+    let refined = covers
+        .authenticated_version(&p, &refused.want.entries())
+        .unwrap()
+        .unwrap();
+    assert_eq!(refined.relation(floor), version::VersionRelation::Same);
+    assert!(refined.refines_for_recovery(floor));
+    assert!(
+        !need::facts(&p, 1_000_000)
+            .unwrap()
+            .after_refusal(refused.refused.as_ref())
+    );
+    let strengthened = need::raise_refused_from_snapshot(
+        &p,
+        refused.want.clone(),
+        refused.purpose,
+        &covers,
+        || Ok(()),
+    )
+    .unwrap();
+    assert_ne!(strengthened.id, refused.id);
+    assert_eq!(strengthened.raises, refused.raises + 1);
+    assert_eq!(
+        strengthened.refused,
+        Some(need::RefusalClaim::Authenticated(refined.claim().clone()))
+    );
+    let repeated = need::raise_refused_from_snapshot(
+        &p,
+        strengthened.want.clone(),
+        strengthened.purpose,
+        &covers,
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(repeated.id, strengthened.id);
+    let file = p.dir.join(need::LEDGER);
+    let before = std::fs::read(&file).unwrap();
+    assert!(need::acknowledge_from_snapshot(&p, &refused, &covers, || Ok(())).is_err());
+    assert!(need::acknowledge_from_snapshot(&p, &strengthened, &covers, || Ok(())).is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+    // An actual consumer may accept the independently captured request's new paired
+    // view; discovering the log is neither an envelope change nor a new publication.
+    let accepted = need::acknowledge_from_snapshot(&p, &accepting, &covers, || Ok(()))
+        .expect("the same accepted envelope with its complete graph permits confirmation")
+        .unwrap();
+    assert!(accepted.state.ended());
 
     s2.stop();
     macs.server.stop();
@@ -2374,6 +2461,22 @@ fn an_admin_outside_a_host_list_deletes_an_entry_there_for_every_mac_in_it() {
     assert!(
         !opened.by_audience.contains_key(&ring),
         "m22 holds no [m7] key"
+    );
+    let recipient = read_identity(m7).unwrap().unwrap().recipient();
+    let mut admin = admin_open(m22).unwrap();
+    let hidden = admin
+        .version_for_requester(&recipient, &["m7-cred"])
+        .unwrap();
+    admin
+        .doc
+        .set_entry(&ring, "m7-cred", b"unpublished-draft")
+        .unwrap();
+    assert_eq!(
+        admin
+            .version_for_requester(&recipient, &["m7-cred"])
+            .unwrap()
+            .claim(),
+        hidden.claim()
     );
 
     // A publish that leaves `[m7]` alone writes nothing there.
@@ -6683,7 +6786,14 @@ fn enrollment_returns_while_the_vault_source_holds_its_post() {
 
 #[test]
 fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by_log_label() {
-    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let macs = two_macs(&[
+        (Audience::Everyone, "shared", b"everyone-v1".as_slice()),
+        (
+            Audience::Everyone,
+            "gh_access_token",
+            b"token-v1".as_slice(),
+        ),
+    ]);
     let m22 = &macs.m22;
     let m7 = &macs.m7;
 
@@ -6727,6 +6837,40 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
         admit::log_admitted_actors(&m50).contains(&actor50),
         "log_admitted_actors must include active log-only member m50"
     );
+    // The signed log is an actual materialized source even before any envelope arrives.
+    // This fixture models the credential consumer's acceptance, not provider authentication.
+    crate::need::test_alab_policy(&m50);
+    let cfg50 = config(&m50).unwrap().unwrap();
+    let before_token =
+        with_materialization_ready_for_entries(&m50, &cfg50, &["gh_access_token"], || Ok(()))
+            .unwrap()
+            .unwrap();
+    assert_eq!(before_token.snapshot.sequence(), 0);
+    let rejected = crate::need::raise_refused_from_snapshot(
+        &m50,
+        crate::need::Want::Gh(crate::need::GhProfile::Dev),
+        crate::need::Purpose::AghDev,
+        &before_token.snapshot,
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(rejected.refused.is_some() && !rejected.state.ended());
+    let need_file = m50.dir.join(crate::need::LEDGER);
+    let need_bytes = std::fs::read(&need_file).unwrap();
+    assert_eq!(
+        crate::need::peek(&m50).unwrap()[0].refused,
+        rejected.refused
+    );
+    assert_eq!(
+        std::fs::read(&need_file).unwrap(),
+        need_bytes,
+        "resolving a retained witness must not rewrite the ledger"
+    );
+    assert!(
+        crate::need::acknowledge_from_snapshot(&m50, &rejected, &before_token.snapshot, || Ok(()),)
+            .is_err(),
+        "the same refused log version is not recovery"
+    );
 
     // A log-only member (`state.digest == None`, `state.records_digest.is_some()`) can also hand
     // F10's `[everyone]` files (`Handed::Files`) to a pre-F15 joiner (`reads_log == false`).
@@ -6755,6 +6899,8 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
         b"release_hosts = [\"m22\"]\n",
     )
     .unwrap();
+    doc.set_entry(&Audience::Everyone, "gh_access_token", b"token-v2")
+        .unwrap();
     doc.set_entry(
         &Audience::Everyone,
         "ai-pool.toml",
@@ -6788,6 +6934,47 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
             .value()
             .as_slice(),
         b"for-m50-only"
+    );
+    let accepted_token =
+        with_materialization_ready_for_entries(&m50, &cfg50, &["gh_access_token"], || {
+            fsx::read_private(&m50.home.join(".secrets/gh_access_token"), 1024)
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted_token.inputs.unwrap().as_slice(), b"token-v2");
+    assert_eq!(
+        accepted_token.snapshot.sequence(),
+        0,
+        "the genuine log update did not require an envelope version"
+    );
+    assert_eq!(
+        crate::need::peek(&m50).unwrap()[0].refused,
+        rejected.refused,
+        "newer receipts retain the earlier refusal's exact historical prefix"
+    );
+    let journal = m50.dir.join("frontiers.astream");
+    let held_journal = m50.dir.join("frontiers.fixture-held");
+    std::fs::rename(&journal, &held_journal).unwrap();
+    assert!(
+        crate::need::peek(&m50).is_err(),
+        "missing retained evidence is not an absent need"
+    );
+    assert_eq!(std::fs::read(&need_file).unwrap(), need_bytes);
+    std::fs::copy(&held_journal, &journal).unwrap();
+    assert_eq!(
+        crate::need::peek(&m50).unwrap()[0].refused,
+        rejected.refused,
+        "a byte-exact private restore resolves without binding a physical inode"
+    );
+    assert!(
+        crate::need::acknowledge_from_snapshot(
+            &m50,
+            &rejected,
+            &accepted_token.snapshot,
+            || Ok(()),
+        )
+        .is_ok(),
+        "a newer authenticated log credential must pass the version floor"
     );
 
     // `prepare_account_decision` on `m22` and `read_account_bound_entry` on log-only `m50` both
@@ -7970,12 +8157,44 @@ fn legacy_frontier_repair_restores_the_verified_digest_and_keeps_the_damaged_sta
         .unwrap()
         .expect("damaged state");
 
-    assert!(repair_legacy_frontier(&m7).expect("repair frontier"));
+    // A busy state lock must return an unavailable repair, without touching
+    // the state. The minute is a hang detector for an accidentally unbounded
+    // lock acquisition, not a latency assertion on the repair.
+    let timed_out = std::thread::scope(|scope| {
+        let held = StateLock::take(&m7).expect("hold state");
+        let (send, receive) = std::sync::mpsc::channel();
+        let paths = &m7;
+        scope.spawn(move || {
+            send.send(repair_legacy_frontier(
+                paths,
+                Instant::now() + Duration::from_millis(10),
+            ))
+            .unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(60));
+        drop(held);
+        result.expect("repair remained blocked on a busy state lock")
+    });
+    assert_eq!(timed_out.unwrap_err().kind(), crate::ErrorKind::TimedOut);
+    assert!(
+        fsx::read_private(&m7.state_file(), MAX_STATE)
+            .unwrap()
+            .is_some_and(|state| state.as_slice() == damaged.as_slice()),
+        "unavailable repair changed state"
+    );
+
+    assert!(
+        repair_legacy_frontier(&m7, Instant::now() + Duration::from_secs(60))
+            .expect("repair frontier")
+    );
     assert_eq!(load_state(&m7).unwrap().records_digest, Some(expected));
     let backup = fsx::read_private(&m7.dir.join("state.before-frontier-repair"), MAX_STATE)
         .unwrap()
         .expect("state backup");
     assert_eq!(backup.as_slice(), damaged.as_slice());
-    assert!(!repair_legacy_frontier(&m7).expect("idempotent repair"));
+    assert!(
+        !repair_legacy_frontier(&m7, Instant::now() + Duration::from_secs(60))
+            .expect("idempotent repair")
+    );
     sync(&m7, None).expect("sync after repair");
 }
