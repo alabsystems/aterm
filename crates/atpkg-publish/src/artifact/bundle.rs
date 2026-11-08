@@ -307,17 +307,18 @@ pub fn admit<'a>(
         hello_compiler = Some(c);
     }
     let own_compiler = atpkg::toolchain::is_executable_file(&sysroot.join("bin/trustc"));
-    if !own_compiler && ctx.frontend_component.is_some() {
+    if !own_compiler && (ctx.frontend_component.is_some() || ctx.targo_component.is_some()) {
         return Err(Error::refused(
-            "--frontend-component requires the bundle's own raw compiler seal",
+            "component selection requires the bundle's own raw compiler seal",
         ));
     }
     let admitting = if own_compiler {
-        toolchain::admit_with_frontend(
+        toolchain::admit_with_components(
             tools,
             &sysroot.join("bin"),
             &switch,
             ctx.frontend_component.as_deref(),
+            ctx.targo_component.as_deref(),
         )?
     } else if let Some(c) = hello_compiler {
         c
@@ -1257,11 +1258,12 @@ fn gates(
     compiler_gate(root).map_err(read)?;
     let probe = |p: &Path| tools::version(b.tools, p);
     if b.own_compiler && b.proven {
-        super::lineage::stamp_with_frontend(
+        super::lineage::stamp_with_components(
             root,
             &b.sysroot.join("bin"),
             &probe,
             b.ctx.frontend_component.as_deref(),
+            b.ctx.targo_component.as_deref(),
         )
         .map_err(|r| {
             ran(Error::refused(format!(

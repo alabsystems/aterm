@@ -522,24 +522,46 @@ fn a_seed_mint_admits_the_bytes_it_compared_and_nothing_else() {
 }
 
 #[test]
-fn an_explicit_frontend_never_becomes_unused_dormant_or_lineage_permission() {
+fn explicit_components_never_become_unused_dormant_or_lineage_permission() {
     let (_dir, root) = tmp("explicit-frontend-authority");
     let bin = toolchain(&root, b"");
     let probe = probe_says(trust_vv(TRUST));
     let selected = "a".repeat(64);
     check_compiler_with(&bin, LineagePolicy::Dormant, &probe).expect("ordinary dormant route");
-    let refused =
-        check_compiler_with_frontend(&bin, LineagePolicy::Dormant, &probe, Some(&selected))
-            .expect_err("selected authority requires its mint");
-    assert!(refused.iter().any(|line| line.contains("no raw SEED-MINT")));
+    for (frontend, targo) in [
+        (Some(selected.as_str()), None),
+        (None, Some(selected.as_str())),
+        (Some(selected.as_str()), Some(selected.as_str())),
+    ] {
+        let refused =
+            check_compiler_with_components(&bin, LineagePolicy::Dormant, &probe, frontend, targo)
+                .expect_err("selected authority requires its mint");
+        assert!(refused.iter().any(|line| line.contains("no raw SEED-MINT")));
+    }
     std::fs::write(root.join(LINEAGE_FILE), b"not a usable raw seal").unwrap();
+    for (frontend, targo) in [
+        (Some(selected.as_str()), None),
+        (None, Some(selected.as_str())),
+        (Some(selected.as_str()), Some(selected.as_str())),
+    ] {
+        let refused =
+            check_compiler_with_components(&bin, LineagePolicy::Require, &probe, frontend, targo)
+                .expect_err("selection must not flow into transformed LINEAGE");
+        assert!(
+            refused
+                .iter()
+                .any(|line| line.contains("not a transformed LINEAGE"))
+        );
+    }
+    std::fs::remove_file(root.join(LINEAGE_FILE)).unwrap();
+    seed_mint(&root, TRUST, &[]);
     let refused =
-        check_compiler_with_frontend(&bin, LineagePolicy::Require, &probe, Some(&selected))
-            .expect_err("selection must not flow into transformed LINEAGE");
+        check_compiler_with_components(&bin, LineagePolicy::Require, &probe, None, Some(&selected))
+            .expect_err("native authority requires its explicit frontend selection");
     assert!(
         refused
             .iter()
-            .any(|line| line.contains("not a transformed LINEAGE"))
+            .any(|line| line.contains("explicitly selected frontend"))
     );
 }
 

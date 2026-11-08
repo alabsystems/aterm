@@ -237,6 +237,17 @@ mod native {
         })
     }
 
+    /// The selection recorded under `home`, admitted as owned by `uid` and written by no one
+    /// else; `None` where no installer recorded one. It names a location only.
+    ///
+    /// # Errors
+    /// The record is unsafe, oversized, malformed or unreadable.
+    pub fn selected(home: &Path, uid: u32) -> io::Result<Option<Selection>> {
+        read(&path(home), uid)?
+            .map(|bytes| Selection::decode(&bytes).map_err(invalid))
+            .transpose()
+    }
+
     fn absent(command: &Path) -> io::Result<bool> {
         match std::fs::symlink_metadata(command) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
@@ -286,7 +297,7 @@ mod native {
 }
 
 #[cfg(unix)]
-pub use native::{record, remove_if_matches};
+pub use native::{record, remove_if_matches, selected};
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -317,8 +328,25 @@ mod tests {
             !declaration.exists(),
             "another executable cannot select this runtime"
         );
+        assert_eq!(
+            selected(&home, uid).unwrap(),
+            None,
+            "no installer recorded one"
+        );
 
         record(&home, &first, &first).unwrap();
+        assert_eq!(
+            selected(&home, uid).unwrap().unwrap().executable(),
+            first,
+            "the recorded selection reads back"
+        );
+        std::fs::set_permissions(&declaration, std::fs::Permissions::from_mode(0o622)).unwrap();
+        assert_eq!(
+            selected(&home, uid).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "a record others may write selects nothing"
+        );
+        std::fs::set_permissions(&declaration, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
             std::fs::metadata(dir).unwrap().permissions().mode() & 0o777,
             0o755

@@ -37,8 +37,8 @@ pub const REMOTE: &str = "origin";
 pub const MAIN: &str = "main";
 /// How many times a moved main is merged and judged again before the tool stops.
 pub const REJUDGES: usize = 3;
-/// How many times in a row a moved main is composed onto, each a few seconds of plumbing,
-/// before the tool stops: the bound that keeps a main moving faster than a push from looping.
+/// How many composition and pre-send obstruction races are allowed before the tool stops.
+/// A different writer or intent never renews this bound.
 pub const COMPOSES: usize = 10;
 /// The exit of a landing the tool stopped while main kept moving: the branch is merged and
 /// judged, not pushed (`EX_TEMPFAIL`, as a yielding `verify watch --sample`).
@@ -47,6 +47,45 @@ pub const STOPPED: i32 = 75;
 const LOCAL: Duration = Duration::from_secs(60);
 /// The hang detector on a git step that reaches the network or checks out a merge.
 const NETWORK: Duration = Duration::from_secs(600);
+
+/// What the freshly fetched main proves after another writer's pre-send obstruction closes.
+enum PushObservation {
+    Landed,
+    Unchanged,
+    Moved(String),
+}
+
+/// The ordinary push and its existing refusal policy are supplied unchanged. Only an exact
+/// pre-send obstruction permits another attempt, sharing the composition bound with main
+/// movement. The live callbacks all share the original push's absolute network deadline.
+fn push_after_intents(
+    composes: &mut usize,
+    attempt: &dyn Fn() -> Result<crate::remote::Pushed, String>,
+    wait: &dyn Fn(&agh::IntentId) -> Result<(), String>,
+    observe: &dyn Fn() -> Result<PushObservation, String>,
+    refused: &dyn Fn(&str) -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    loop {
+        match attempt()? {
+            crate::remote::Pushed::Done => return Ok(None),
+            crate::remote::Pushed::Rejected(why) => return refused(&why),
+            crate::remote::Pushed::Blocked { intent, why } => {
+                if *composes == COMPOSES {
+                    return Err(format!(
+                        "{why}; stopped after {COMPOSES} push/composition races"
+                    ));
+                }
+                *composes += 1;
+                wait(&intent)?;
+                match observe()? {
+                    PushObservation::Landed => return Ok(None),
+                    PushObservation::Moved(tip) => return Ok(Some(tip)),
+                    PushObservation::Unchanged => {}
+                }
+            }
+        }
+    }
+}
 
 pub use crate::event_log::{CheckRow, Finished, Judged};
 
@@ -261,6 +300,7 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
     let mut onto = merged.clone();
     let mut composed_tree: Option<String> = None;
     let (mut rejudges, mut composes) = (0, 0);
+    let mut push_until = Instant::now() + NETWORK;
     loop {
         stated.composed_onto = (onto != merged).then(|| onto.clone());
         let message = format!("{subject}\n\n{}", stated.trailers());
@@ -280,7 +320,7 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
             }
             None => git.commit(&git.tree(&judged_at)?, &[&judged_at, &onto], &message)?,
         };
-        let tip = match git.push(&landing, &onto)? {
+        let tip = match git.push(&landing, &onto, &mut composes, push_until)? {
             None => {
                 let adopted = git.adopt(&landing, &judged_at);
                 say(seams, landed_line(&landing, &stated));
@@ -316,8 +356,8 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
                 say(
                     seams,
                     format!(
-                        "verify land: STOPPED — {REMOTE}/{MAIN} moved {COMPOSES} times in a row \
-                         while composing; the branch is merged with {merged} and judged, and \
+                        "verify land: STOPPED after {COMPOSES} push/composition races; \
+                         the branch is merged with {merged} and judged, and \
                          nothing was pushed. Run it again"
                     ),
                 );
@@ -387,6 +427,7 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
                 )? {
                     return Ok(code);
                 }
+                push_until = Instant::now() + NETWORK;
             }
         }
     }
@@ -739,16 +780,52 @@ impl Git<'_> {
 
     /// Push `landing` to main, expecting main at `onto`: `None` once it landed, or main's new
     /// tip where it moved ([`Self::settle`]).
-    fn push(&self, landing: &str, onto: &str) -> Result<Option<String>, String> {
-        let until = Instant::now() + NETWORK;
+    fn push(
+        &self,
+        landing: &str,
+        onto: &str,
+        composes: &mut usize,
+        until: Instant,
+    ) -> Result<Option<String>, String> {
         let run = |tool, args: &[std::ffi::OsString]| {
             crate::remote::run(self.root, self.make, tool, args, until)
         };
         let remote = crate::remote::Remote::open(self.root, REMOTE, &run)?;
-        match remote.push(&format!("refs/heads/{MAIN}"), Some(onto), landing)? {
-            crate::remote::Pushed::Done => Ok(None),
-            crate::remote::Pushed::Rejected(why) => self.settle(landing, onto, &why),
-        }
+        push_after_intents(
+            composes,
+            &|| {
+                if Instant::now() >= until {
+                    return Err("atomic push exceeded its network deadline".into());
+                }
+                remote.push(&format!("refs/heads/{MAIN}"), Some(onto), landing)
+            },
+            &|intent| {
+                remote.wait_for_intent(intent, &|| {
+                    let remaining = until.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(
+                            "foreign atomic intent remained open at the push deadline".into()
+                        );
+                    }
+                    std::thread::sleep(remaining.min(Duration::from_millis(100)));
+                    Ok(())
+                })
+            },
+            &|| {
+                let tip = remote.refresh_main()?;
+                self.local(&["update-ref", &format!("refs/remotes/{REMOTE}/{MAIN}"), &tip])?;
+                if tip == landing || self.is_ancestor(landing, &tip)? {
+                    return Ok(PushObservation::Landed);
+                }
+                if tip != onto {
+                    return Ok(PushObservation::Moved(tip));
+                }
+                // The refused attempt sent nothing and main is unchanged. Re-run both
+                // dry-run and expected-ref push; this is not replay of an unknown write.
+                Ok(PushObservation::Unchanged)
+            },
+            &|why| self.settle(landing, onto, why),
+        )
     }
 
     /// Where a push of `landing` onto `onto` git reported failed (`why`) left main, fetched: a

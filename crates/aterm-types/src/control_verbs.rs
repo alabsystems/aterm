@@ -3366,7 +3366,9 @@ pub const VERBS: &[VerbSpec] = &[
          holds). `sessions` (Owner-only) \
          pushes `EVENT * session-created <sid>[ watch=deferred]`, `EVENT * session-exited <sid> \
          reason=<shell-exit|ctl-close|ui-close|window-close|reaper|unknown>`, `EVENT * \
-         fabric-retire <sid>`, and `EVENT * bye <quit|handoff>`. `mail` pushes live `MAIL <local> \
+         fabric-retire <sid>`, `EVENT * quit-closes` (a clean quit closed every live session's \
+         log `out=app-quit`, before its bye), and `EVENT * bye <quit|handoff>`. `mail` pushes live \
+         `MAIL <local> \
          id=<n> off=<n> from=<p> kind=<k>[ re=<n>][ topic=<t>]` (filtered by `mail:kinds=<k,..>`, \
          `mail:from=<class|principal>`, `mail:topic=<t>`) and `GAP <local> mail-dropped=<n>`. \
          `cells` sends no frame past the 8 MiB reply line cap, saying `GAP <local> \

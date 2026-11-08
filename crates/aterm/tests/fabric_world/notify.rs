@@ -18,12 +18,10 @@ use std::time::Duration;
 use aterm_models_session::notify_follow_checkpoint_model;
 use harness::{FLEET, Fleet, until};
 
-/// The bound a `--once` run puts on each broker answer ([`harness::ACK_WAIT`]'s seam) and on
-/// each page command (`--exec-timeout`): half the hang detector, so an answer that never comes
-/// or a command that never ends fails the run in words before [`harness::output_within`]'s
-/// bound on it ends the test. A follower, which nothing bounds, waits the hang detector for
-/// both. Each replaces the product's bound (5 s, 30 s): the broker is the test's own, and a
-/// command a test holds (a FIFO it releases once its checks are done) ends when the test lets it.
+/// An explicit page-command execution limit (`--exec-timeout`) for a `--once` run: half
+/// the hang detector, so a command that never ends fails in words before
+/// [`harness::output_within`] ends the test. A follower's commands use the hang detector.
+/// Broker answers use the product's minute detector in both modes.
 const ONCE_WAIT: Duration = Duration::from_secs(harness::DEADLINE.as_secs() / 2);
 
 struct Run {
@@ -98,9 +96,7 @@ impl Watch {
         let mut args = self.argv(on, exec, ONCE_WAIT, extra);
         args.push("--once".to_string());
         let mut cmd = Command::new(harness::aterm_to_launch());
-        cmd.arg("link")
-            .args(&args)
-            .env(harness::ACK_WAIT.0, ONCE_WAIT.as_millis().to_string());
+        cmd.arg("link").args(&args);
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -126,10 +122,6 @@ impl Watch {
         let mut cmd = aterm_uds::spawnfd::command(harness::aterm_to_launch());
         cmd.arg("link")
             .args(self.argv(on, exec, harness::DEADLINE, extra))
-            .env(
-                harness::ACK_WAIT.0,
-                harness::ACK_WAIT.1.as_millis().to_string(),
-            )
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .stdout(out)
             .stderr(err);

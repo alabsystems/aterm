@@ -11,6 +11,146 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 #[test]
+fn a_closed_foreign_intent_refreshes_main_before_any_new_attempt() {
+    use std::cell::Cell;
+    for observed in ["unchanged", "moved", "landed"] {
+        let attempts = Cell::new(0);
+        let waited = Cell::new(false);
+        let refreshed = Cell::new(false);
+        let mut races = 2;
+        let result = push_after_intents(
+            &mut races,
+            &|| {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if attempt == 0 {
+                    Ok(crate::remote::Pushed::Blocked {
+                        intent: agh::IntentId::parse("66-fc387e8b41a0").unwrap(),
+                        why: "pre-send".into(),
+                    })
+                } else {
+                    assert!(waited.get() && refreshed.get());
+                    assert_eq!(observed, "unchanged");
+                    Ok(crate::remote::Pushed::Done)
+                }
+            },
+            &|intent| {
+                assert_eq!(intent.as_str(), "66-fc387e8b41a0");
+                waited.set(true);
+                Ok(())
+            },
+            &|| {
+                assert!(waited.get());
+                refreshed.set(true);
+                Ok(match observed {
+                    "unchanged" => PushObservation::Unchanged,
+                    "moved" => PushObservation::Moved("fresh-main".into()),
+                    _ => PushObservation::Landed,
+                })
+            },
+            &|_| panic!("a pre-send obstruction is not generic rejection"),
+        );
+        assert_eq!(
+            result,
+            Ok((observed == "moved").then(|| "fresh-main".into()))
+        );
+        assert_eq!(attempts.get(), if observed == "unchanged" { 2 } else { 1 });
+        assert_eq!(races, 3);
+    }
+}
+
+#[test]
+fn foreign_intent_recovery_keeps_one_budget_and_never_retries_unknown_or_refused_writes() {
+    use std::cell::Cell;
+    let attempts = Cell::new(0);
+    let waits = Cell::new(0);
+    let mut races = COMPOSES - 2;
+    let result = push_after_intents(
+        &mut races,
+        &|| {
+            attempts.set(attempts.get() + 1);
+            Ok(crate::remote::Pushed::Blocked {
+                intent: agh::IntentId::parse(&format!("{}-000000000000", attempts.get())).unwrap(),
+                why: "pre-send".into(),
+            })
+        },
+        &|_| {
+            waits.set(waits.get() + 1);
+            Ok(())
+        },
+        &|| Ok(PushObservation::Unchanged),
+        &|_| unreachable!(),
+    );
+    assert!(result.is_err());
+    assert_eq!((races, attempts.get(), waits.get()), (COMPOSES, 3, 2));
+
+    for mode in ["unknown", "rejected", "read-failed", "deadline"] {
+        let attempts = Cell::new(0);
+        let mut races = 0;
+        let result = push_after_intents(
+            &mut races,
+            &|| {
+                attempts.set(attempts.get() + 1);
+                match mode {
+                    "unknown" => Err("unknown own outcome".into()),
+                    "rejected" => Ok(crate::remote::Pushed::Rejected("refused in place".into())),
+                    _ => Ok(crate::remote::Pushed::Blocked {
+                        intent: agh::IntentId::parse("66-fc387e8b41a0").unwrap(),
+                        why: "pre-send".into(),
+                    }),
+                }
+            },
+            &|_| Err(mode.into()),
+            &|| panic!("no refresh after failed wait"),
+            &|why| Err(why.into()),
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.get(), 1);
+    }
+}
+
+#[test]
+fn a_new_composition_attempt_keeps_the_original_push_deadline() {
+    use std::cell::Cell;
+    let now = Cell::new(0);
+    let until = 10;
+    let sent = Cell::new(0);
+    let attempt = || {
+        if now.get() >= until {
+            return Err("original deadline".into());
+        }
+        sent.set(sent.get() + 1);
+        Ok(crate::remote::Pushed::Blocked {
+            intent: agh::IntentId::parse("66-fc387e8b41a0").unwrap(),
+            why: "pre-send".into(),
+        })
+    };
+    let mut races = 0;
+    let first = push_after_intents(
+        &mut races,
+        &attempt,
+        &|_| Ok(()),
+        &|| {
+            now.set(until);
+            Ok(PushObservation::Moved("fresh-main".into()))
+        },
+        &|_| unreachable!(),
+    );
+    assert_eq!(first, Ok(Some("fresh-main".into())));
+    // The driver passes the same absolute bound after its clean composition. An expired
+    // attempt cannot even inspect another blocker, much less send another atomic batch.
+    let second = push_after_intents(
+        &mut races,
+        &attempt,
+        &|_| panic!("no new wait"),
+        &|| panic!("no new observation"),
+        &|_| unreachable!(),
+    );
+    assert_eq!(second, Err("original deadline".into()));
+    assert_eq!((sent.get(), races), (1, 1));
+}
+
+#[test]
 fn resource_admission_cannot_replace_the_landing_check_scope() {
     let args = |values: &[&str]| {
         values

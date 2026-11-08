@@ -264,10 +264,6 @@ impl Inst {
                 harness::STALE_HORIZON.1.as_millis().to_string(),
             )
             .env(
-                harness::ACK_WAIT.0,
-                harness::ACK_WAIT.1.as_millis().to_string(),
-            )
-            .env(
                 harness::LIVE_WAIT.0,
                 harness::LIVE_WAIT.1.as_millis().to_string(),
             )
@@ -770,9 +766,8 @@ fn cli(inst: &Inst, args: &[&str]) -> (i32, String, String) {
 
 /// `<aterm> <args>` as [`cli`] runs it on the machine whose scratch is `root`: its HOME, config,
 /// runtime, state and temporary dirs, and nothing of the test's `ATERM_*` but the verify run's
-/// mark ([`harness::kept_from_runner`]). Survey probes and notify answers use their explicit
-/// seams ([`aterm_ctl::PROBE_WITHIN_SEAM`], [`harness::ACK_WAIT`]); required fabric replies use
-/// the product's minute detector.
+/// mark ([`harness::kept_from_runner`]). Survey probes use their explicit
+/// [`aterm_ctl::PROBE_WITHIN_SEAM`]; required fabric replies use the product's minute detector.
 pub(crate) fn cli_command(aterm: &str, root: &Path, args: &[&str]) -> aterm_uds::spawnfd::Command {
     let mut cmd = aterm_uds::spawnfd::command(aterm);
     harness::kept_from_runner(&mut cmd)
@@ -781,7 +776,6 @@ pub(crate) fn cli_command(aterm: &str, root: &Path, args: &[&str]) -> aterm_uds:
             aterm_ctl::PROBE_WITHIN_SEAM,
             (DEADLINE / 2).as_millis().to_string(),
         )
-        .env(harness::ACK_WAIT.0, (DEADLINE / 2).as_millis().to_string())
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("cfg"))
         .env("XDG_RUNTIME_DIR", root.join("run"))

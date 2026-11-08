@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `crash [tag] [--gap SECS] [--keep-tree]`.
+//! `crash [tag] [--gap SECS] [--keep-tree]`, and `relaunch [tag]`: the instance started again
+//! on its own state after it ended by itself.
 
 use std::time::Duration;
 
@@ -358,6 +359,57 @@ pub fn cmd_crash(args: &[String]) -> Res {
     let mut run = Run::load(&tag)?;
     stop::install();
     crash(&mut run, &asked, &mut Live)?;
+    Ok(0)
+}
+
+/// `relaunch [tag]` (fix unit Q1): the lab's instance, which ended by itself (`ctl invoke Quit`,
+/// or anything else that ended it), started again on its own state and socket, the way a crash's
+/// relaunch is ([`crate::restore::relaunch_instance`], which waits for an `up --fabric` lab's
+/// bridge too): a clean quit's next launch, so a reader of the lab's bus sees what a quit and
+/// its relaunch leave there. Refused while the recorded instance is still a process of the lab
+/// (nothing is ended here: a quit is the lab's own `ctl invoke Quit`, a crash is `crash`'s), or
+/// while its egress witness is not running. Returns when the relaunched socket came up.
+/// # Errors
+/// Refused as above, interrupted, or the relaunch did not come up.
+fn relaunch(run: &mut Run, ops: &mut impl Ops) -> Result<i64, Fail> {
+    let old = run.instance_pid;
+    if ops.names_lab(run, old) {
+        return Err(Fail::usage(format!(
+            "relaunch: lab '{0}' instance {old} still runs: end it first ({LAB} ctl {0} invoke \
+             Quit, or {LAB} crash {0}): nothing started",
+            run.tag
+        )));
+    }
+    ops.witness(run)
+        .map_err(|e| Fail::die(format!("relaunch: {e}: nothing started")))?;
+    let t_end = ops.now_ms();
+    let (_, t_up) = ops.relaunch(run, "end", false, t_end)?;
+    println!(
+        "relaunch: instance {old} had ended; instance {} up at {t_up} ms",
+        run.instance_pid
+    );
+    Ok(t_up)
+}
+
+/// `relaunch [tag]`: it takes the tag alone.
+pub fn cmd_relaunch(args: &[String]) -> Res {
+    let mut words = args.to_vec();
+    let tag = take_only_tag(&mut words)?;
+    match words.first().map(String::as_str) {
+        None => {}
+        Some("-h" | "--help") => {
+            print!("{}", crate::USAGE);
+            return Ok(0);
+        }
+        Some(other) => {
+            return Err(Fail::usage(format!(
+                "relaunch: unknown argument '{other}' (relaunch [tag])"
+            )));
+        }
+    }
+    let mut run = Run::load(&tag)?;
+    stop::install();
+    relaunch(&mut run, &mut Live)?;
     Ok(0)
 }
 
@@ -887,6 +939,47 @@ mod tests {
         };
         let did = crash(&mut seam, &Asked::default(), &mut f).unwrap();
         assert_eq!(did.t_end, 1_000_000 + 30_000);
+    }
+
+    /// RELAUNCH STARTS AN ENDED INSTANCE AGAIN, AND NEVER ONE THAT RUNS (fix unit Q1). Once the
+    /// recorded instance is no process of the lab (a quit ended it), `relaunch` starts it once on
+    /// the same socket, killing and sleeping nothing; while it runs, or with no egress witness,
+    /// nothing is started. NEGATIVE CONTROL, run: a relaunch that does not read the recorded pid
+    /// first starts a second instance beside the one that runs.
+    #[test]
+    fn relaunch_starts_an_ended_instance_once_and_never_one_that_runs() {
+        let mut ended = Fake {
+            ours: false,
+            ..fake()
+        };
+        let mut run = lab();
+        let t_up = relaunch(&mut run, &mut ended).unwrap();
+        assert_eq!(
+            ended.relaunches(),
+            vec![Ev::Relaunch {
+                how: "end".into(),
+                armed: false,
+                t_end: 1_000_000,
+                sock: "/tmp/at.AbCd/a.sock".into(),
+                at: 1_000_000,
+            }]
+        );
+        assert_eq!((t_up, run.instance_pid), (1_001_500, NEXT));
+        assert!(ended.kills().is_empty() && ended.slept_after_kill().is_zero());
+        let mut runs = fake();
+        let e = relaunch(&mut lab(), &mut runs).unwrap_err();
+        assert_eq!(e.code, 2, "a running instance is refused as a usage error");
+        assert!(runs.relaunches().is_empty() && runs.kills().is_empty());
+        let mut blind = Fake {
+            ours: false,
+            witness: false,
+            ..fake()
+        };
+        assert!(relaunch(&mut lab(), &mut blind).is_err());
+        assert!(
+            blind.relaunches().is_empty(),
+            "no egress witness, no relaunch"
+        );
     }
 
     #[test]

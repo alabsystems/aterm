@@ -69,6 +69,8 @@ pub struct Ctx {
     pub trust_repo: PathBuf,
     /// Explicit portable frontend receipt on the raw source seal; never inferred from files.
     pub frontend_component: Option<String>,
+    /// Explicit portable native Targo receipt, bound to the selected frontend.
+    pub targo_component: Option<String>,
     /// The accounts.
     pub accounts: Accounts,
     /// The token files.
@@ -219,6 +221,7 @@ impl Ctx {
             pkg_prefix: atpkg::toolchain::atpkg_prefix(home, xdg_config_home),
             trust_repo: home.join("trust"),
             frontend_component: None,
+            targo_component: None,
             accounts: Accounts {
                 staging: STAGING_OWNER.to_string(),
                 public: aterm_update_core::ATPKG_INDEX_OWNER.to_string(),

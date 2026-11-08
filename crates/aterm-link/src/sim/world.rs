@@ -988,6 +988,8 @@ pub(crate) struct Stats {
     pub(crate) held_for_the_disk: u64,
     /// Quits ([`Opts::quits`]).
     pub(crate) quits: u64,
+    /// Quits whose closes the bus held before their bye (fix unit Q1, [`World::quit`]).
+    pub(crate) quit_closes_landed: u64,
     pub(crate) clean_stops: u64,
     /// Kills that met the bridge holding an inbox commit for its next write (critic item B08).
     pub(crate) kills_holding: u64,
@@ -2863,15 +2865,42 @@ impl World {
         self.open_sessions();
     }
 
-    /// Quits and restarts aterm in the same boot ([`Opts::quits`]).
+    /// Quits and restarts aterm in the same boot ([`Opts::quits`]), in aterm's order (fix unit
+    /// Q1, `fabric_launch::quit_in_order`): every live session's log closes `out=app-quit`, the
+    /// `quit-closes` line wakes the bridge's mirror, and, while the bridge can land them (its
+    /// link as aterm's `mirror_lands_now` reads it, [`Endpoint::mirror_lands_now`]), the quit
+    /// waits a bounded count of passes for the bus to hold every live log through its close,
+    /// then says `bye quit`. The law ([`World::judge_quit_order`]) holds each close the quit
+    /// made before its withdrawal.
     fn quit(&mut self) {
-        let Some(live) = &self.live else {
+        if self.live.is_none() {
             return;
-        };
+        }
         self.stats.quits += 1;
         self.note("aterm quits");
-        live.mailbox
-            .note_bye(aterm_types::fabric_grammar::Bye::Quit);
+        let start = self.log().len() as u64;
+        let closed = self.ep.close_logs_at_quit(self.stamp());
+        let mut landed = closed.is_empty();
+        if !closed.is_empty() {
+            self.push_event("EVENT * quit-closes");
+            for _ in 0..8 {
+                landed = self.live.is_some() && self.ep.quit_closes_landed();
+                if landed || self.live.is_none() || !self.ep.mirror_lands_now() {
+                    break;
+                }
+                self.pass();
+                self.collect_notes();
+            }
+            landed = self.live.is_some() && self.ep.quit_closes_landed();
+            if landed {
+                self.stats.quit_closes_landed += 1;
+            }
+        }
+        let bye_at = self.log().len() as u64;
+        if let Some(live) = &self.live {
+            live.mailbox
+                .note_bye(aterm_types::fabric_grammar::Bye::Quit);
+        }
         self.push_event("EVENT * bye quit");
         let acked = lock(&self.ep.state).byes_acked;
         for _ in 0..8 {
@@ -2891,6 +2920,8 @@ impl World {
             self.pass();
             self.collect_notes();
         }
+        let bad = self.judge_quit_order(&closed, start, landed.then_some(bye_at));
+        self.violations.extend(bad);
         self.kill();
         let run = crate::state::StateDir::peek(&self.cfg.state_dir).last_run();
         if matches!(run, Ok(Some(run)) if run.clean) {
@@ -3385,6 +3416,59 @@ impl World {
             }
         }
         (bad, left)
+    }
+
+    /// A CLEAN QUIT'S CLOSE PRECEDES ITS WITHDRAWAL (fix unit Q1), judged as the quit ends,
+    /// before anything can take a record from the log. Where the quit's closes landed before its
+    /// bye (`bye_at`, the log's length as the bye was said), each session it closed (`closed`)
+    /// has its own `out=app-quit` close on its `ev` face among the records since the quit began
+    /// (`start`), below the bye and below every `exited` row the bridge withdrew it with. A quit
+    /// that did not wait (its mirror could not land) or whose closes missed its passes is owed
+    /// neither: its withdrawal tells the quit from a crash, and a close the mirror lands after
+    /// it is still the session's own (a reader takes the close first).
+    fn judge_quit_order(&self, closed: &[String], start: u64, bye_at: Option<u64>) -> Vec<String> {
+        let Some(bye_at) = bye_at else {
+            return Vec::new();
+        };
+        let prefix = format!("/f/{FLEET}/pub/{NODE}/");
+        let log = self.log();
+        let since = || {
+            log.iter()
+                .enumerate()
+                .skip(usize::try_from(start).unwrap_or(usize::MAX))
+                .filter(|(_, rec)| !rec.hidden)
+        };
+        let mut bad = Vec::new();
+        for sid in closed {
+            let face = format!("{prefix}{sid}/ev");
+            let close = since().find_map(|(off, rec)| {
+                (rec.subject == face
+                    && rec.slog().is_some_and(|b| {
+                        b.rec.op == aterm_slog::Op::Close
+                            && b.rec.node == aterm_slog::Node::SESSION
+                            && b.rec.out() == Some("app-quit")
+                    }))
+                .then_some(off as u64)
+            });
+            let row = format!("{prefix}{sid}/presence");
+            let withdrawn = since().find_map(|(off, rec)| {
+                (rec.subject == row
+                    && rec.fabric().unknown.get("state").map(String::as_str) == Some("exited"))
+                .then_some(off as u64)
+            });
+            if !close.is_some_and(|c| c < bye_at) {
+                bad.push(format!(
+                    "quit order: {sid}'s quit close landed before the bye @{bye_at} but the \
+                     log holds it at {close:?}"
+                ));
+            }
+            if withdrawn.is_some_and(|w| close.is_some_and(|c| c > w)) {
+                bad.push(format!(
+                    "quit order: {sid} withdrawn @{withdrawn:?} before its quit close @{close:?}"
+                ));
+            }
+        }
+        bad
     }
 
     /// THE READER'S VIEW of every session's `ev` face, decoded and deduped by

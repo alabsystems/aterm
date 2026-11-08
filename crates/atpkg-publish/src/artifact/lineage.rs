@@ -8,7 +8,7 @@ use std::path::Path;
 
 use atpkg::lineage::{
     Finding, LINEAGE_FILE, LINEAGE_SCHEMA, LineagePolicy, LineageProof, SEED_MINT_FILE,
-    admit_content_with, check_compiler_with_frontend, receipt_sha256, scan_if_compiled_object,
+    admit_content_with, check_compiler_with_components, receipt_sha256, scan_if_compiled_object,
 };
 
 /// What [`scan_tree`] read.
@@ -68,7 +68,22 @@ pub fn stamp_with_frontend(
     probe: &dyn Fn(&Path) -> Result<String, String>,
     frontend: Option<&str>,
 ) -> Result<String, Vec<String>> {
-    let source = check_compiler_with_frontend(source_bin, LineagePolicy::Require, probe, frontend)?;
+    stamp_with_components(stage_root, source_bin, probe, frontend, None)
+}
+
+/// [`stamp_with`] after validating both explicitly selected raw components.
+/// Final LINEAGE still binds the ordinary transformed output bytes.
+/// # Errors
+/// Every refusal, one line each; nothing is written then.
+pub fn stamp_with_components(
+    stage_root: &Path,
+    source_bin: &Path,
+    probe: &dyn Fn(&Path) -> Result<String, String>,
+    frontend: Option<&str>,
+    targo: Option<&str>,
+) -> Result<String, Vec<String>> {
+    let source =
+        check_compiler_with_components(source_bin, LineagePolicy::Require, probe, frontend, targo)?;
     let (receipt_sha256_of_source, relation) = match &source.lineage {
         LineageProof::Lineage {
             receipt_sha256,

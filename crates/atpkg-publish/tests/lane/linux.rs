@@ -121,8 +121,13 @@ impl World {
     }
 
     fn run(&self, dry_run: bool) -> (Result<Outcome>, Transcript) {
+        self.run_mode(dry_run, false)
+    }
+
+    fn run_mode(&self, dry_run: bool, staged_only: bool) -> (Result<Outcome>, Transcript) {
         let tx = Transcript::memory(linux::ME);
-        let opts = Options::new(&self.fx.ctx, self.host, dry_run, &[]).expect("options");
+        let mut opts = Options::new(&self.fx.ctx, self.host, dry_run, &[]).expect("options");
+        opts.staged_only = staged_only;
         let sw = |_: &Ctx| -> Result<Switch> {
             Ok(self
                 .switch
@@ -206,7 +211,8 @@ fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to
             1,
         );
     fx.publish_pkg("git", 12, &public);
-    fx.publish_head(7, &[("git", 12)]);
+    fx.publish_pkg("ay", 10, &manifest("ay", 10, &DARWIN));
+    fx.publish_head(7, &[("git", 12), ("ay", 10)]);
     let w = World::of(fx);
     w.fx.packer.upstream.store(true, Ordering::SeqCst);
     w.builder.0.lock().unwrap().clear();
@@ -309,18 +315,20 @@ fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to
     assert_eq!(std::fs::read(&staged_paths[0]).unwrap(), bytes);
     w.fx.publish_pkg("git", 12, &public);
 
-    let (staged, _) = ok(w.run(false));
+    let (staged, tx) = ok(w.run_mode(false, true));
     assert!(staged.staged.is_empty());
     assert_eq!(staged.ready, ["git"]);
     assert!(staged.signed.is_empty());
+    assert!(tx.text().contains("deferred 1 unstaged program(s): ay"));
     assert!(w.fx.packer.legs().is_empty());
     assert!(
         w.fx.calls("clone ").is_empty(),
         "an upstream Git package is not built from the aterm repo"
     );
     w.rekey();
-    let (published, _) = ok(w.run(false));
+    let (published, _) = ok(w.run_mode(false, true));
     assert_eq!(published.signed, ["git"]);
+    assert_eq!(published.published, Some(8));
     assert!(
         w.fx.packer.legs().is_empty(),
         "staged qualified rows are reused"
@@ -338,6 +346,86 @@ fn missing_declared_gnu_git_rows_are_acquired_without_a_repo_build_and_resume_to
         package
             .artifact_for(AARCH64_APPLE_DARWIN.as_str())
             .is_some()
+    );
+}
+
+#[test]
+fn staged_only_is_explicit_linux_only_and_refuses_an_empty_stage_without_building_or_indexing() {
+    use atpkg_publish::lane::RunFlags;
+
+    assert!(!RunFlags::parse(LaneKind::Linux, &[]).unwrap().staged_only);
+    assert!(
+        RunFlags::parse(LaneKind::Linux, &["--staged-only".into()])
+            .unwrap()
+            .staged_only
+    );
+    assert!(RunFlags::parse(LaneKind::Alab, &["--staged-only".into()]).is_err());
+    let w = World::new("linux-staged-only-empty");
+    for dry_run in [true, false] {
+        let (result, tx) = w.run_mode(dry_run, true);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("no eligible staged rows"),
+            "{}",
+            tx.text()
+        );
+        assert!(tx.text().contains("STAGED_ONLY"));
+        assert!(w.fx.packer.legs().is_empty());
+        assert!(w.fx.calls("clone ").is_empty());
+        assert_eq!(w.fx.indexer.count(), 0);
+        assert!(!w.staged().join("READY.md").exists());
+        assert!(
+            !LaneState::of(LaneKind::Linux, &w.fx.ctx.state_dir)
+                .index_seen
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn staged_only_keeps_lineage_and_whole_group_refusals_before_signing() {
+    let w = World::after_staging("linux-staged-only-live-lineage", true);
+    w.rekey();
+    *w.switch.lock().unwrap() = Some(Switch::Live);
+    let before = w.fx.packer.legs().len();
+    let (result, _) = w.run_mode(false, true);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("origin main now carries a minted re-pin")
+    );
+    assert_eq!(w.fx.packer.legs().len(), before);
+    assert_eq!(w.fx.indexer.count(), 0);
+    assert!(
+        !linux::staged_manifest(&w.staged(), "ay", 10)
+            .with_extension("toml.sig")
+            .exists()
+    );
+
+    let w = World::after_staging("linux-staged-only-held-group", false);
+    w.rekey();
+    for program in ["ay", "clean"] {
+        std::fs::remove_dir_all(w.staged().join(program)).unwrap();
+    }
+    let ready_before = w.ready();
+    let before = w.fx.packer.legs().len();
+    let (result, _) = w.run_mode(false, true);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("no eligible staged rows")
+    );
+    assert_eq!(w.fx.packer.legs().len(), before);
+    assert_eq!(w.fx.indexer.count(), 0);
+    assert_eq!(w.ready(), ready_before, "no new ceremony is written");
+    assert!(
+        !linux::staged_manifest(&w.staged(), "trust-ir", 40)
+            .with_extension("toml.sig")
+            .exists()
     );
 }
 

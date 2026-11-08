@@ -842,6 +842,13 @@ impl Columns {
     /// Lay out `c` after everything fed so far: whether it opened a cell of its own (at the
     /// column before it), rather than being stored in or folded into the cell before it.
     pub(crate) fn step(&mut self, c: char) -> bool {
+        // Printable ASCII always opens a new one-column cell, including after a joiner.
+        // Retain its base so a following variation selector or combining mark still sees it.
+        if (' '..='~').contains(&c) {
+            self.cell = Some(Cell::open(c, false));
+            self.cursor += 1;
+            return true;
+        }
         let width = cell_width(c);
         match self.cell.as_mut() {
             Some(cell) if width == 0 => {

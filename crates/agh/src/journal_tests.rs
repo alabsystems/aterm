@@ -602,6 +602,9 @@ fn begin_judges_again_under_the_lock() {
         .begin(&draft(WriteOp::ReleaseCreate, "v1"))
         .expect_err("the racing second is refused");
     assert_eq!(e.exit(), 13);
+    let diagnostic = e.to_json(&crate::redact::Redactor::new());
+    assert_eq!(diagnostic["error"]["intent"].as_str(), Some(first.as_str()));
+    assert_eq!(diagnostic["error"]["side_effect"].as_str(), Some("none"));
     assert_eq!(
         e.sub,
         Sub::IntentOpen {

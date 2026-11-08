@@ -825,6 +825,21 @@ pub(crate) fn relaunch_instance(
         since(t_launch, t_up),
         since(t_end, t_up)
     );
+    // AN `up --fabric` LAB COMES BACK WITH ITS BUS (fix unit Q1): the relaunch reads the same
+    // `[fabric]` table, so its bridge starts again over the lab's broker, and the lab is
+    // relaunched once that bridge is connected, as `up --fabric` is up once its first one is.
+    if !run.fabric.is_empty() {
+        crate::lab::await_bridge(run).map_err(|e| {
+            Fail::exit(
+                1,
+                format!("restore: FAIL: the relaunched instance's bridge did not connect ({e})"),
+            )
+        })?;
+        println!(
+            "  relaunch  bridge connected ({} after the launch)",
+            since(t_launch, now_ms())
+        );
+    }
     Ok((t_launch, t_up))
 }
 

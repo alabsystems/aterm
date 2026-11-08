@@ -391,6 +391,21 @@ impl crate::App {
             );
         }
     }
+
+    /// THE QUIT'S CLOSES, in the order every close takes (`SessionStore::deregister_closing`):
+    /// each tab still placed closes first ([`Self::close_tabs_at_quit`]), then each live session's log
+    /// closes `out=app-quit` (`session_log::close_logs_at_quit`), which on unix reaches the bus
+    /// before the bridge hears `bye quit` (`fabric_launch::bye_at_quit`, fix unit Q1). A
+    /// session's close is the last record its log takes (a mark after it is refused,
+    /// `Refused::SessionClosed`), so a tab close written after it would be lost, from the
+    /// journal and the bus alike.
+    pub(crate) fn close_sessions_at_quit(&self) {
+        self.close_tabs_at_quit();
+        #[cfg(unix)]
+        crate::fabric_launch::bye_at_quit(&self.store);
+        #[cfg(not(unix))]
+        let _ = crate::session_log::close_logs_at_quit(&self.store);
+    }
 }
 
 #[cfg(test)]

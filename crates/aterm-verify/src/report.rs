@@ -346,9 +346,12 @@ pub fn stage_started(index: usize, title: &str) -> String {
 /// Child CPU is a sampled lower bound, excluding verifier work and descendants
 /// missed between samples. With no observed process counter, the field is JSON
 /// null rather than zero.
+/// Finding diagnostics reuse the report's existing excerpts. Only this added payload is
+/// bounded; pre-existing decisions and finding IDs retain their existing representation.
 #[must_use]
 pub fn stage_event(
     index: usize,
+    check: Option<Check>,
     report: &Report,
     waiting: Duration,
     execution: Duration,
@@ -359,12 +362,15 @@ pub fn stage_event(
         .outcomes()
         .map(|(outcome, label)| aterm_json::json!({"outcome": word(outcome), "detail": label}))
         .collect();
+    let findings = report.findings();
+    let diagnostics = stage_finding_diagnostics(&findings);
     format!(
         "verify-event: {}\n",
         aterm_json::json!({
             "schema": 1,
             "event": "stage-finished",
             "stage_index": index,
+            "check": check.map(Check::name),
             "stage": report.title,
             "ended_at_unix_ms": at,
             "at_unix_ms": at,
@@ -379,10 +385,56 @@ pub fn stage_event(
                 "observed_processes": cpu.processes,
             })),
             "decisions": decisions,
-            "findings": report.findings().into_iter().map(|f| f.id).collect::<Vec<_>>(),
+            "findings": findings.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            "finding_diagnostics": diagnostics,
         })
     )
 }
+
+/// Limit the complete added JSON object, including its counters and encoding overhead.
+/// These are excerpts from the existing findings, not a new classification or raw-log copy.
+const STAGE_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+const STAGE_MESSAGE_LINES: usize = crate::findings::MESSAGE_LINES;
+
+fn stage_finding_diagnostics(findings: &[Finding]) -> aterm_json::Value {
+    let envelope = |rows: &[aterm_json::Value]| {
+        aterm_json::json!({
+            "rows":rows, "rows_total":findings.len(), "rows_omitted":findings.len() - rows.len(),
+            "row_limit":FINDINGS_SHOWN, "encoded_byte_limit":STAGE_DIAGNOSTIC_BYTES,
+            "complete":false,
+        })
+    };
+    let mut rows = Vec::new();
+    for finding in findings.iter().take(FINDINGS_SHOWN) {
+        let id = clip_json(&finding.id, EVENT_ROW_BYTES);
+        let message: Vec<_> = finding
+            .message
+            .iter()
+            .take(STAGE_MESSAGE_LINES)
+            .map(|line| clip_json(line, EVENT_ROW_BYTES))
+            .collect();
+        let truncated_lines = message
+            .iter()
+            .zip(&finding.message)
+            .filter(|(shown, original)| *shown != *original)
+            .count();
+        rows.push(aterm_json::json!({
+            "id_truncated":id != finding.id, "id":id, "message":message,
+            "message_lines_total":finding.message.len(),
+            "message_lines_omitted":finding.message.len().saturating_sub(STAGE_MESSAGE_LINES),
+            "message_truncated_lines":truncated_lines,
+        }));
+        if envelope(&rows).to_string().len() > STAGE_DIAGNOSTIC_BYTES {
+            rows.pop();
+            break;
+        }
+    }
+    envelope(&rows)
+}
+
+#[cfg(test)]
+#[path = "report_stage_event_tests.rs"]
+mod stage_event_tests;
 
 /// One stage's compile or drive boundary. CPU is the child's sampled process-group
 /// lower bound, with the same scope as the parent stage, never elapsed wall time.
@@ -1398,6 +1450,7 @@ mod tests {
         report.cannot_run("window never focused");
         let line = stage_event(
             7,
+            Some(Check::Measure),
             &report,
             Duration::from_secs(12),
             Duration::from_secs(3),
@@ -1470,6 +1523,7 @@ mod tests {
     fn observed_cpu_is_a_separate_lower_bound_not_execution_wall_time() {
         let line = stage_event(
             8,
+            None,
             &Report::new("parallel build"),
             Duration::from_secs(12),
             Duration::from_secs(3),

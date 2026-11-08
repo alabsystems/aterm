@@ -76,26 +76,10 @@ pub const FLEET: &str = "f1";
 /// The ceiling on every wait.
 pub const DEADLINE: Duration = aterm_spec::wait::MUST_HAPPEN;
 
-/// How long a test's bridge waits for each broker answer: its `ACK_DEADLINE` seam
-/// (`ATERM_LINK_ACK_DEADLINE_MS`) set to the hang detector, as the bridge's own unit tests
-/// wait (`ACK_DEADLINE` under `cfg(test)`). Set by [`prepare_gui_environment`] and
-/// [`scratch_spawnfd`], so every instance a test starts through them carries it to the bridge
-/// it runs (a world's first boot, a relaunch, a successor, a sibling, a [`Fleet`]'s nodes),
-/// and so does a bridge a test starts through them itself; `owner_ask`'s instances, which
-/// build their own environment, set it beside [`STALE_HORIZON`]. `aterm link notify` waits each
-/// broker answer by the same seam, which the runs of it that build their own commands
-/// (`notify`'s, `owner_ask`'s) set themselves. A test's broker runs on the test's machine,
-/// beside every other test, so an answer that comes late is that machine, not a broker gone
-/// silent. Under the product's 5 s, an answer the loaded machine held past it
-/// took the link down (`stalled reason=no-ack`, then `connected` on the same bridge's redial)
-/// under tests whose property is no latency. The test of that verdict names its own deadline
-/// (`link_state::a_broker_that_accepts_but_never_acks_is_stalled_no_ack`).
-pub const ACK_WAIT: (&str, Duration) = ("ATERM_LINK_ACK_DEADLINE_MS", DEADLINE);
-
 /// How long a test's bridge reads a broker subscription with nothing arriving before it takes
 /// the link for dead: its live read deadline seam (`ATERM_LINK_LIVE_DEADLINE_MS`; astream's
-/// `IDLE_MARK_DEADLINE`, 30 s, in the product) set to the hang detector, beside [`ACK_WAIT`]
-/// and set where it is, for the same reason: the world's broker runs in the test's own process
+/// `IDLE_MARK_DEADLINE`, 30 s, in the product) set to the hang detector on each instance:
+/// the world's broker runs in the test's own process
 /// on the test's loaded machine, so a tail that marks late is that machine. Under the
 /// product's 30 s, a tail that wrote nothing for that long took the link down (`stalled
 /// reason=cut-inbox` or `cut-fleet`, then `connected` on the same bridge's redial) under tests
@@ -394,7 +378,7 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
 
 /// The bounds every child of a test has in place of the product's ([`prepare_gui_environment`],
 /// [`scratch_spawnfd`]).
-const TEST_WAITS: [(&str, Duration); 3] = [STALE_HORIZON, ACK_WAIT, LIVE_WAIT];
+const TEST_WAITS: [(&str, Duration); 2] = [STALE_HORIZON, LIVE_WAIT];
 
 /// The sleep every instance a test starts reads in its hosted harness loops
 /// ([`aterm_types::domain::ENV_DEBUG_HOST_SLEEP`]), set where [`TEST_WAITS`] are: none, a host

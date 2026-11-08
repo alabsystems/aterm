@@ -365,6 +365,38 @@ fn program_version_output_must_be_complete_before_caching() {
 
 #[cfg(unix)]
 #[test]
+fn a_program_version_must_name_one_numeric_release_before_caching() {
+    for (reply, expected, rejected) in [
+        (
+            b"solver version 1.2.3\n".as_slice(),
+            "1.2.3",
+            b"solver version unavailable\n".as_slice(),
+        ),
+        (
+            b"This is solver version 2.3.4\n",
+            "2.3.4",
+            b"solver 1.2.3 4.5.6\n",
+        ),
+        (b"3.4.5\n", "3.4.5", b"solver 1.2.3\n\xff\n"),
+        (
+            b"solver v4.5.6-rc.1+build.2\r\n",
+            "4.5.6-rc.1",
+            b"solver 1.2.\n",
+        ),
+        (b"solver 1.2.3+build.2\n", "1.2.3", b"solver 1.2.3+\n"),
+    ] {
+        check_rejected_version_reply(
+            probe_version_with_cache,
+            "--version complete-exit-zero-v1",
+            rejected,
+            reply,
+            expected,
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn a_compiler_commit_must_be_unique_and_full_before_caching() {
     let valid =
         b"rustc compatibility report\r\ncommit-hash: 0123456789abcdef0123456789abcdef01234567\r\n";

@@ -60,6 +60,8 @@ impl LaneKind {
 pub struct RunFlags {
     /// Decide and print; change nothing.
     pub dry_run: bool,
+    /// Publish eligible existing Linux stages without building missing rows this run.
+    pub staged_only: bool,
     /// The sha256 the unit names for this binary.
     pub sha256: Option<String>,
     /// Write the transcript to this file instead of stdout (what a unit passes).
@@ -83,6 +85,7 @@ impl RunFlags {
             };
             match a.as_str() {
                 "--dry-run" => flags.dry_run = true,
+                "--staged-only" if kind == LaneKind::Linux => flags.staged_only = true,
                 "--sha256" => {
                     let v = value("--sha256")?;
                     if v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -102,7 +105,7 @@ impl RunFlags {
                          --log <file>{})",
                         kind.as_str(),
                         if kind == LaneKind::Linux {
-                            ", --triple <linux target>"
+                            ", --triple <linux target>, --staged-only"
                         } else {
                             ""
                         }
@@ -206,7 +209,8 @@ fn run_with_production_deps(
                     "this lane packs Linux rows and the client ships no target for this host",
                 )
             })?;
-            let opts = linux::Options::new(ctx, host, flags.dry_run, &flags.triples)?;
+            let mut opts = linux::Options::new(ctx, host, flags.dry_run, &flags.triples)?;
+            opts.staged_only = flags.staged_only;
             let builder = linux::TrustBuilder::new(ctx);
             let deps = linux::Deps {
                 packer: &packer,

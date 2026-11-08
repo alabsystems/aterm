@@ -34,8 +34,8 @@ pub const FLEETS_MAX: usize = 4;
 /// The most bytes a well-formed file takes, with room to spare.
 pub const FILE_MAX: usize = 16 * 1024;
 
-/// How long a change waits for another writer's lock.
-pub const LOCK_WAIT: Duration = Duration::from_secs(10);
+/// Hang detector for required name creation or replacement behind a native writer.
+pub const LOCK_HANG: Duration = Duration::from_secs(60);
 
 /// A migration from an older build's names that has not finished (§7.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,16 +225,28 @@ pub fn read(state: &Path) -> io::Result<Option<MachineName>> {
 /// none.
 ///
 /// # Errors
-/// As [`read`], the lock is held past [`LOCK_WAIT`], `first` fails, or the file cannot be
+/// As [`read`], the lock is held past [`LOCK_HANG`], `first` fails, or the file cannot be
 /// written.
 pub fn read_or_create(
     state: &Path,
     first: impl FnOnce() -> io::Result<MachineName>,
 ) -> io::Result<(MachineName, bool)> {
+    read_or_create_with_lock(state, first, take_name_lock)
+}
+
+fn take_name_lock(state: &Path, within: Duration) -> io::Result<PrivateLock> {
+    PrivateLock::take(state, LOCK, within, "machine-name.lock is busy")
+}
+
+fn read_or_create_with_lock(
+    state: &Path,
+    first: impl FnOnce() -> io::Result<MachineName>,
+    take: impl FnOnce(&Path, Duration) -> io::Result<PrivateLock>,
+) -> io::Result<(MachineName, bool)> {
     if let Some(name) = read(state)? {
         return Ok((name, false));
     }
-    let _lock = PrivateLock::take(state, LOCK, LOCK_WAIT, "machine-name.lock is busy")?;
+    let _lock = take(state, LOCK_HANG)?;
     if let Some(name) = read(state)? {
         return Ok((name, false));
     }
@@ -249,13 +261,21 @@ pub fn read_or_create(
 /// now stands.
 ///
 /// # Errors
-/// The lock is held past [`LOCK_WAIT`], there is no file yet ([`read_or_create`] makes it), it
+/// The lock is held past [`LOCK_HANG`], there is no file yet ([`read_or_create`] makes it), it
 /// cannot be read or written, or `edit` refuses.
 pub fn replace(
     state: &Path,
     edit: impl FnOnce(&mut MachineName) -> io::Result<()>,
 ) -> io::Result<MachineName> {
-    let _lock = PrivateLock::take(state, LOCK, LOCK_WAIT, "machine-name.lock is busy")?;
+    replace_with_lock(state, edit, take_name_lock)
+}
+
+fn replace_with_lock(
+    state: &Path,
+    edit: impl FnOnce(&mut MachineName) -> io::Result<()>,
+    take: impl FnOnce(&Path, Duration) -> io::Result<PrivateLock>,
+) -> io::Result<MachineName> {
+    let _lock = take(state, LOCK_HANG)?;
     let held = read(state)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("{FILE}: not created yet"))
     })?;

@@ -769,6 +769,7 @@ fn reservations(ahead: &[&Other<'_>], volume: Option<&Volume>) -> Vec<Reserve> {
     order.sort_unstable_by_key(|&i| {
         (
             ahead[i].record.held.is_none(),
+            !ahead[i].record.need.leads,
             ahead[i].record.need.rank,
             ahead[i].record.order(),
         )
@@ -1027,21 +1028,29 @@ pub fn covering_disk(
 /// floor, which is what the floor is kept for. Without a process sweep no ancestor is known,
 /// and every claim counts.
 ///
-/// QUIET-FIRST: so is a waiter whose own process holds the quiet machine (verify's timed stage,
-/// which claims its memory once it holds the run's quiet claim): it is held to the held claims
-/// alone, its own included, and to no waiter. Every other timed run waits for its quiet claim,
-/// which is held for the run's timed work alone, so a wait behind the queue would hold the quiet
-/// machine for nothing while the run measured nothing.
+/// LEADS-FIRST: a waiter inside held work still counts each SURE lead that is none of its kin
+/// ([`Need::leads`]: a release slice's compiler beside the release's tree, [`sure_leads`]), which
+/// [`decide`] puts ahead of it. A sure lead fits once every held claim but the PARENTS has ended,
+/// a parent being a held claim that may end only once a waiter under it has run (its holder is
+/// that waiter's process or an ancestor of it, or it credits one). So counting it closes no
+/// cycle: the lead waits only for held claims and for the sure leads ahead of it, and neither
+/// waits for the waiters that count it. What is available is read as it is, memory no claim
+/// holds left out of it, so that memory makes a lead unsure rather than holding the waiters that
+/// count it.
+///
+/// QUIET-FIRST: a waiter whose own process holds the quiet machine (verify's timed stage, which
+/// claims its memory once it holds the run's quiet claim) is held to the held claims alone, its
+/// own included, and to no waiter. Every other timed run waits for its quiet claim, which is held
+/// for the run's timed work alone, so a wait behind the queue would hold the quiet machine for
+/// nothing while the run measured nothing.
 pub(crate) fn counted<'r>(
     records: Vec<&'r Record>,
     pid: u32,
     procs: Option<&crate::Procs>,
+    available: Option<u64>,
 ) -> Vec<&'r Record> {
     let ancestors = procs.map(|p| p.ancestors(pid)).unwrap_or_default();
-    let kin = |r: &Record| {
-        r.accounting == crate::Accounting::Holder
-            && (ancestors.contains(&r.pid) || credits(r, pid, &ancestors))
-    };
+    let kin = |r: &Record| kin_of(r, pid, &ancestors);
     let measuring = records.iter().any(|r| {
         r.accounting == crate::Accounting::Holder
             && r.pid == pid
@@ -1049,10 +1058,117 @@ pub(crate) fn counted<'r>(
             && r.need.quiet.is_some()
     });
     let inside = measuring || records.iter().any(|r| r.held.is_some() && kin(r));
+    let sure = if inside && !measuring {
+        sure_leads(&records, (pid, &ancestors), procs, available)
+    } else {
+        Vec::new()
+    };
     records
         .into_iter()
-        .filter(|r| !kin(r) && (!inside || r.held.is_some()))
+        .filter(|r| !kin(r) && (!inside || r.held.is_some() || sure.contains(&r.order())))
         .collect()
+}
+
+/// Whether `r` is a claim of the process `pid`'s kin: one its ancestors (`ancestors`) hold, or a
+/// held one that credits it or an ancestor ([`credits`]), which its own admission leaves out.
+fn kin_of(r: &Record, pid: u32, ancestors: &[u32]) -> bool {
+    r.accounting == crate::Accounting::Holder
+        && (ancestors.contains(&r.pid) || credits(r, pid, ancestors))
+}
+
+/// The SURE leads among `records` ([`counted`]), by their order: the waiters that lead, in rank
+/// and arrival order, while each fits, its need with its margin, in the room it would have once
+/// every held claim none of its kin but the PARENTS has ended. A parent is a held claim whose
+/// holder is a waiting process (the asking waiter, `asker`, with its ancestors, among them) or one
+/// of its ancestors in `procs`, or one that credits a waiting process or an ancestor
+/// ([`credits`]), each its kin: it may end only once that waiter has run. That room is what is
+/// `available` now, less what each parent's holder has yet to use of its claims, plus what each
+/// other holder's tree uses now, at most its claims, which its end gives back; a claim no tree
+/// measures gives back only its reservation. A parent held ALONE leaves no lead room
+/// ([`Short::Alone`]). The first lead that does not fit ends them, since each lead waits for the
+/// leads ahead of it. With no process sweep or no reading of memory, none is sure.
+fn sure_leads(
+    records: &[&Record],
+    asker: (u32, &[u32]),
+    procs: Option<&crate::Procs>,
+    available: Option<u64>,
+) -> Vec<(u64, u32, u64)> {
+    let (Some(procs), Some(available)) = (procs, available) else {
+        return Vec::new();
+    };
+    let mut leads: Vec<&Record> = records
+        .iter()
+        .copied()
+        .filter(|r| r.held.is_none() && r.need.leads)
+        .collect();
+    if leads.is_empty() {
+        return Vec::new();
+    }
+    leads.sort_unstable_by_key(|r| (r.need.rank, r.order()));
+    let mut lines: HashMap<u32, Vec<u32>> = HashMap::from([(asker.0, asker.1.to_vec())]);
+    for r in records.iter().filter(|r| r.held.is_none()) {
+        lines.entry(r.pid).or_insert_with(|| procs.ancestors(r.pid));
+    }
+    let is_parent = |r: &Record| {
+        r.accounting == crate::Accounting::Holder
+            && lines
+                .iter()
+                .any(|(pid, line)| r.pid == *pid || kin_of(r, *pid, line))
+    };
+    let held: Vec<(&Record, bool)> = records
+        .iter()
+        .copied()
+        .filter(|r| r.held.is_some())
+        .map(|r| (r, is_parent(r)))
+        .collect();
+    let mut roots: Vec<u32> = held
+        .iter()
+        .filter(|(r, _)| r.accounting == crate::Accounting::Holder)
+        .map(|(r, _)| r.pid)
+        .collect();
+    roots.sort_unstable();
+    roots.dedup();
+    let trees = procs.trees(&roots);
+    let mut sure = Vec::with_capacity(leads.len());
+    for lead in leads {
+        let line = lines.get(&lead.pid).map_or(&[][..], Vec::as_slice);
+        let theirs: Vec<(&Record, bool)> = held
+            .iter()
+            .copied()
+            .filter(|(r, _)| !kin_of(r, lead.pid, line))
+            .collect();
+        if theirs
+            .iter()
+            .any(|(r, parent)| *parent && r.held.is_some_and(|h| h.alone))
+        {
+            break;
+        }
+        // Each holder's claims none of the lead's kin, and whether one of them is a parent.
+        let mut holders: HashMap<u32, (u64, bool)> = HashMap::new();
+        for (r, parent) in theirs
+            .iter()
+            .filter(|(r, _)| r.accounting == crate::Accounting::Holder)
+        {
+            let slot = holders.entry(r.pid).or_default();
+            slot.0 = slot.0.saturating_add(r.need.mem);
+            slot.1 |= *parent;
+        }
+        let (mut back, mut owed) = (0u64, 0u64);
+        for (pid, (claimed, parent)) in holders {
+            let used = trees.get(&pid).map_or(0, |t| t.footprint);
+            if parent {
+                owed = owed.saturating_add(claimed.saturating_sub(used));
+            } else {
+                back = back.saturating_add(used.min(claimed));
+            }
+        }
+        let room = available.saturating_add(back).saturating_sub(owed);
+        if room < lead.need.mem.saturating_add(lead.need.margin) {
+            break;
+        }
+        sure.push(lead.order());
+    }
+    sure
 }
 
 /// The quiet claim whose reservation holds `mine` back at `now` (unix ms), among `records` (the
@@ -1130,7 +1246,7 @@ impl fmt::Display for Alone {
     }
 }
 
-/// Whether `need` fits now beside every claim ahead of the waiter at `mine` (held, or waiting since earlier, less the disk of a waiter no claim's end can admit: [`reservations`]), and, for a need of memory, under memory pressure short of critical ([`Short::Pressure`]), with no claim held alone ([`Short::Alone`]), or alone where it is short only of memory no claim holds and either asked to be or is below what can ever be available (ALONE, [`mod@admit`]): `Ok(what it is granted)`, or what it is short of. A waiter of `mine`'s own process (`mine.1`) is not ahead of its memory.
+/// Whether `need` fits now beside every claim ahead of the waiter at `mine` (held, or waiting ahead: one that leads where `need` does not ([`Need::leads`]), else one of a higher rank or the same rank since earlier, less the disk of a waiter no claim's end can admit: [`reservations`]), and, for a need of memory, under memory pressure short of critical ([`Short::Pressure`]), with no claim held alone ([`Short::Alone`]), or alone where it is short only of memory no claim holds and either asked to be or is below what can ever be available (ALONE, [`mod@admit`]): `Ok(what it is granted)`, or what it is short of. A waiter of `mine`'s own process (`mine.1`) is not ahead of its memory.
 pub(crate) fn decide(
     need: &Need,
     mine: (u64, u32, u64),
@@ -1141,7 +1257,9 @@ pub(crate) fn decide(
     let ahead: Vec<&Other<'_>> = others
         .iter()
         .filter(|o| {
-            o.record.held.is_some() || (o.record.need.rank, o.record.order()) < (need.rank, mine)
+            o.record.held.is_some()
+                || (!o.record.need.leads, o.record.need.rank, o.record.order())
+                    < (!need.leads, need.rank, mine)
         })
         .collect();
     let volume = reading.volume.as_ref();
@@ -2587,7 +2705,12 @@ impl Waiter {
         let records = if self.record.accounting == crate::Accounting::CohortOwned {
             records
         } else {
-            counted(records, self.record.pid, procs.as_ref())
+            counted(
+                records,
+                self.record.pid,
+                procs.as_ref(),
+                reading.available.or(reading.physical),
+            )
         };
         let mut claimants = HashSet::with_capacity(records.len() + 1);
         claimants.extend(records.iter().map(|r| r.pid));

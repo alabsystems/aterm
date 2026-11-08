@@ -1164,7 +1164,6 @@ impl MessageCenter {
             let title = clip(&title, TITLE_CAP);
             if title != row.msg.title {
                 row.msg.finished = None;
-                row.msg.short_title = None;
             }
             row.msg.title = title;
         }
@@ -1172,9 +1171,6 @@ impl MessageCenter {
             row.msg.finished = finished
                 .map(|w| clip(&w, TITLE_CAP))
                 .filter(|w| !w.is_empty());
-        }
-        if let Some(short) = r.short_title {
-            row.msg.short_title = short.map(|w| clip(&w, TITLE_CAP)).filter(|w| !w.is_empty());
         }
         if let Some(detail) = r.detail {
             row.msg.detail = detail
@@ -2355,7 +2351,6 @@ impl MessageCenter {
                 severity,
                 glyph: Glyph::or_fallback(c.glyph),
                 title: c.title.clone(),
-                short_title: c.short_title.clone(),
                 detail: c.detail.clone(),
                 actions: c.actions.iter().filter_map(|a| Intent::decode(a)).collect(),
                 hold,
@@ -3284,7 +3279,6 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
         live: matches!(msg.hold, Hold::Live { .. } | Hold::Standing(_)),
         glyph: msg.glyph.ch(),
         title: &msg.title,
-        title_short: msg.short_title.as_deref(),
         detail0,
         step,
         step_short,
@@ -3487,7 +3481,6 @@ fn carried_message(l: &Live, posted_severity: Option<Severity>) -> CarriedMessag
             .map(|severity| severity.as_str().to_string()),
         glyph: l.msg.glyph.ch(),
         title: l.msg.title.clone(),
-        short_title: l.msg.short_title.clone(),
         detail: l.msg.detail.clone(),
         actions: l.msg.actions.iter().map(Intent::encode).collect(),
         hold: l.msg.hold.encode(),

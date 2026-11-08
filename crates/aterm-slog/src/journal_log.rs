@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Journal snapshot, clean-quit close generation, and read-only log reconstruction.
+//! Journal snapshot and read-only log reconstruction. A clean quit closes the live log itself
+//! (the host's own close, `out=app-quit`), so the journal and the bus mirror carry one close.
 
 use super::{CarryError, GapWhy, Limits, Log, MAX_HOLES, MAX_OPEN, OpenEntry, Rollup, level_slot};
-use crate::Close;
 use crate::field::{Fields, Key, Val};
 use crate::rec::{Rec, Stamp};
 use crate::vocab::{Actor, Conf, Kind, Lvl, Node, Op, Src};
-use crate::words::{Out, SessionOut};
 
 /// Maximum records a [`JournalImage`] may pass to [`Log::from_journal`].
 pub const JOURNAL_IMAGE_MAX_RECORDS: usize = 1 << 20;
@@ -64,28 +63,6 @@ impl Log {
             }
         }
         out
-    }
-
-    /// Returns the close records a clean quit at `at` would emit, without mutating `self`.
-    #[must_use]
-    pub fn quit_closes(&self, at: Stamp) -> Vec<Rec> {
-        if self.session_closed {
-            return Vec::new();
-        }
-        let mut copy = self.clone();
-        copy.notify = None;
-        copy.fence = None;
-        let head = copy.last_seq;
-        let close =
-            Close::new(Out::Session(SessionOut::AppQuit), Src::Aterm, Conf::Exact).by(Actor::Aterm);
-        if copy.close_session(close, at).is_err() {
-            return Vec::new();
-        }
-        copy.ring
-            .iter()
-            .filter(|e| e.rec.seq > head)
-            .map(|e| Rec::clone(&e.rec))
-            .collect()
     }
 
     /// Appends a `gap` record whose last known seq is `after` (`why=<why> after=<seq>`), returning its seq.

@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, TryLockError};
 
 use aterm_types::MutexExt as _;
 
@@ -42,6 +42,10 @@ pub(crate) struct Shared {
     /// at its [`sync`], or at its [`StoreMirror::retire`]), or a
     /// predecessor's tombstone was adopted: sticky.
     cursors: AtomicBool,
+    /// How many `log-landed` verbs this store answered, and the condition a clean quit waits
+    /// on for its closes' landings ([`Self::await_landing`], fix unit Q1).
+    landings: Mutex<u64>,
+    landed: Condvar,
 }
 
 impl Shared {
@@ -65,6 +69,48 @@ impl Shared {
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
+
+    /// A `log-landed` was answered: a quit waiting for its closes reads its logs again.
+    fn note_landing(&self) {
+        *self.landings.lock_or_recover() += 1;
+        self.landed.notify_all();
+    }
+
+    /// How many `log-landed` verbs were answered so far.
+    #[cfg(any(unix, test))]
+    pub(crate) fn landings(&self) -> u64 {
+        *self.landings.lock_or_recover()
+    }
+
+    /// Park until a landing past `seen` was answered or `wait` passed, whichever is first.
+    #[cfg(any(unix, test))]
+    pub(crate) fn await_landing(&self, seen: u64, wait: std::time::Duration) {
+        let n = self.landings.lock_or_recover();
+        let _ = self
+            .landed
+            .wait_timeout_while(n, wait, |n| *n <= seen)
+            .unwrap_or_else(|p| p.into_inner());
+    }
+}
+
+/// WHETHER THE BUS HOLDS EVERY LIVE SESSION'S LOG, its quit's closes among them (fix unit Q1):
+/// each live log's mirror landed through its head, a closed one's last mail counts with it
+/// ([`aterm_slog::Log::mirror_complete`]). A log no take has engaged yet holds nothing on the
+/// bus, so it is not landed: a mirroring bridge's next take engages it. A clean quit reads this
+/// after it closed every live log, while a bridge can land them, to say `bye quit` only once its
+/// closes are on the bus. Only the unix quit order reads it, so it is unix-only, tests included.
+#[cfg(unix)]
+pub(crate) fn quit_closes_landed(store: &crate::session_store::Store) -> bool {
+    let live: Vec<Arc<crate::SessionCtx>> = store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .live_handles()
+        .map(|h| Arc::clone(&h.ctx))
+        .collect();
+    live.iter().all(|ctx| {
+        let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        tl.slog_mut().mirror_log().mirror_complete()
+    })
 }
 
 /// A SESSION LOG MEETS THE MIRROR'S STATE, under its timeline's lock: a cursor of a replaced bus log (`seen` is the generation it last synced under) is forgotten, and while the node mirrors the log is engaged from its first record; a cursor it then holds is noted for the update's Commit ([`StoreMirror::past_draw`]).
@@ -806,6 +852,12 @@ fn land_owned(store: &crate::session_store::Store, pairs: Vec<(&str, BusCursor)>
         let adopting = adopting && broken != Broken::GoneWhileAdopting;
         words.push(if adopting { "adopting" } else { "gone" });
     }
+    store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .mirror()
+        .shared
+        .note_landing();
     format!("OK {}\n", words.join(" "))
 }
 

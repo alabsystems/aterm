@@ -6,7 +6,6 @@
 use crate::harness;
 use crate::retention_live::{link_moves_since, node_log_cursor};
 
-use std::io::Read as _;
 use std::os::unix::net::UnixListener;
 use std::time::{Duration, Instant};
 
@@ -254,28 +253,44 @@ fn a_broker_path_nothing_listens_on_is_stalled_and_never_connected() {
 fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
     let dir = harness::sock_dir("stub13");
     let stub = dir.path().join("s.sock").to_string_lossy().into_owned();
-    let listener = harness::kept(UnixListener::bind(&stub).expect("bind the stub"));
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { return };
-            let mut stream = harness::kept(stream);
-            std::thread::spawn(move || {
-                let mut sink = [0u8; 4096];
-                while stream.read(&mut sink).is_ok_and(|n| n > 0) {}
-            });
+    let listener = UnixListener::bind(&stub).expect("bind the stub");
+    listener.set_nonblocking(true).unwrap();
+    let (stop, stopping) = std::sync::mpsc::channel();
+    struct Stub(
+        Option<std::sync::mpsc::Sender<()>>,
+        Option<std::thread::JoinHandle<()>>,
+    );
+    impl Drop for Stub {
+        fn drop(&mut self) {
+            drop(self.0.take());
+            self.1.take().unwrap().join().unwrap();
+        }
+    }
+    let worker = std::thread::spawn(move || {
+        let mut streams = Vec::new();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => streams.push(stream),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => panic!("accept the bridge: {e}"),
+            }
+            if !matches!(
+                stopping.recv_timeout(Duration::from_millis(20)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                break;
+            }
         }
     });
+    let _stub = Stub(Some(stop), Some(worker));
 
-    let w = World::boot_at(
-        "r13-stub",
-        &[],
-        &[("ATERM_LINK_ACK_DEADLINE_MS", "250")],
-        Some(&stub),
-    );
-    until("the bridge to attach", || {
+    let w = World::boot_at("r13-stub", &[], &[], Some(&stub));
+    // Observe the product's minute hang detector, then allow a minute for the status probe.
+    let within = harness::DEADLINE + harness::DEADLINE;
+    harness::until_within(within, "the bridge to attach", || {
         (kv(&fabric_status(&w), "state") == Some("stalled")).then_some(())
     });
-    let fs = until("stalled reason=no-ack", || {
+    let fs = harness::until_within(within, "stalled reason=no-ack", || {
         let fs = fabric_status(&w);
         (kv(&fs, "reason") == Some("no-ack")).then_some(fs)
     });

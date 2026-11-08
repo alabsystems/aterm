@@ -17,7 +17,9 @@ use crate::swarm_roster::SwarmRoster;
 use std::{os::unix::fs::MetadataExt as _, path::PathBuf, sync::Mutex};
 
 /// How many answers a memo keeps: a process reads one vault folder (a keyed read, a few logs of
-/// it); tests read many.
+/// it). This crate's own test process (`cfg(test)`), whose tests each read their own folders at
+/// once, keeps as many for each folder, so one test's reads never let go of another's answers
+/// ([`Memo::keep`]).
 const MAX_FOLDERS: usize = 16;
 
 /// [`swarm_denied_nodes`](super::swarm_denied_nodes), read again only when one of the files it
@@ -82,7 +84,9 @@ pub(crate) fn observe_commons_quiet(paths: &Paths) -> crate::Result<crate::commo
 /// take included) meets a fresh read. Every table session a repair round opens checks this Mac's
 /// own denial under its access (`Bootstrap::access_in_observed`), 18 times a round on each side of
 /// a loopback pair, reading the vault, its log and roster each time: 7% of a quiet round's CPU
-/// (2026-11-08) and a third of its reads of the vault. The swarm's checks of this Mac
+/// (2026-11-08) and a third of its reads of the vault. That access asks it under its own
+/// observation of the state lock, `lock`, which the memo takes for its own as
+/// [`trusted_commons_log_under`] does. The swarm's checks of this Mac
 /// ([`local_recipient_denied_in_roster`](super::local_recipient_denied_in_roster)) read afresh, so
 /// one that cannot read a file it was settled on takes this Mac as denied. This one, like every
 /// memo here, gives the answer it kept through a read fault on files that have not moved: the
@@ -92,9 +96,9 @@ pub(crate) fn observe_commons_quiet(paths: &Paths) -> crate::Result<crate::commo
 ///
 /// # Errors
 /// As [`local_recipient_denied`](super::steward::local_recipient_denied).
-pub(crate) fn local_recipient_denied_now(paths: &Paths) -> crate::Result<bool> {
+pub(crate) fn local_recipient_denied_under(paths: &Paths, lock: &StateLock) -> crate::Result<bool> {
     static MEMO: Memo<bool> = Memo::keyed(observation_inputs, true);
-    MEMO.read_keyed(paths, &(), |paths| {
+    MEMO.read_keyed_under(paths, &(), lock, |paths| {
         super::steward::local_recipient_denied(&super::Reads::new(paths))
     })
 }
@@ -130,12 +134,14 @@ pub fn acknowledged_commons_log_now(
     paths: &Paths,
     trust: crate::commons::journal::Trust,
 ) -> crate::Result<super::CommonsLog> {
-    static MEMO: Memo<super::CommonsLog, crate::commons::journal::Trust> =
-        Memo::keyed(inputs, true);
-    MEMO.read_keyed(paths, &trust, |paths| {
+    ACKNOWLEDGED.read_keyed(paths, &trust, |paths| {
         super::acknowledged_commons_log(paths, trust)
     })
 }
+
+/// What [`acknowledged_commons_log_now`] and [`trusted_commons_log_under`] keep.
+static ACKNOWLEDGED: Memo<super::CommonsLog, crate::commons::journal::Trust> =
+    Memo::keyed(inputs, true);
 
 /// [`trusted_commons_log`](super::trusted_commons_log) through
 /// [`acknowledged_commons_log_now`]. A Commons repair round checks its roster access, the log
@@ -150,6 +156,31 @@ pub fn trusted_commons_log_now(
     trust: crate::commons::journal::Trust,
 ) -> crate::Result<Option<(crate::membership_log::Log, [u8; 32])>> {
     acknowledged_commons_log_now(paths, trust).map(super::CommonsLog::trusted)
+}
+
+/// [`trusted_commons_log_now`] for a caller that holds `lock`: a roster access check
+/// (`commons::roster::log_observation_is_current`) and a table session's access
+/// (`Bootstrap::access_in_observed`), each under its own observation of the vault's state lock,
+/// ask it at nearly every step of a repair round, and each ask opened, observed and closed that
+/// lock again: with this Mac's own denial check under the same access
+/// ([`local_recipient_denied_under`]), 7.8% of a sustained quiet round's samples over a long log
+/// and 10.4% over a short one (2026-11-08). While `lock` is a shared observation
+/// that still guards the lock at the vault's path ([`StateLock::observes`]), it is the observation
+/// the memo would take, so what it kept is given without another. A writer's own take, or a lock
+/// that guards another file, is [`trusted_commons_log_now`]'s call.
+///
+/// # Errors
+/// As [`trusted_commons_log`](super::trusted_commons_log).
+pub(crate) fn trusted_commons_log_under(
+    paths: &Paths,
+    trust: crate::commons::journal::Trust,
+    lock: &StateLock,
+) -> crate::Result<Option<(crate::membership_log::Log, [u8; 32])>> {
+    ACKNOWLEDGED
+        .read_keyed_under(paths, &trust, lock, |paths| {
+            super::acknowledged_commons_log(paths, trust)
+        })
+        .map(super::CommonsLog::trusted)
 }
 
 /// [`swarm_roster_until`](super::swarm_roster_until), read again only when one of the files it
@@ -399,6 +430,28 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
             .map(|held| held.answer.clone())
     }
 
+    /// [`Memo::read_keyed`] for a caller that holds `lock`. A quiet memo takes the caller's shared
+    /// observation of the state lock for the one `read_keyed` takes before its stamps, while it
+    /// still guards the lock at the vault's path ([`StateLock::observes`]): no writer holds that
+    /// lock, and none can write until the caller drops it. Anything else, a miss included, is
+    /// `read_keyed`'s.
+    fn read_keyed_under(
+        &self,
+        paths: &Paths,
+        key: &K,
+        lock: &StateLock,
+        read: impl FnOnce(&Paths) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        if self.quiet
+            && lock.observes(paths)
+            && let Some(stamps) = stamp_inputs(paths, self.inputs)
+            && let Some(answer) = self.kept(paths, key, &stamps)
+        {
+            return Ok(answer);
+        }
+        self.read_keyed(paths, key, read)
+    }
+
     fn read_keyed(
         &self,
         paths: &Paths,
@@ -469,22 +522,40 @@ impl<T: Clone, K: Clone + PartialEq> Memo<T, K> {
         let observed = read(paths)?;
         drop(observation);
         if settled {
-            let mut held = self
-                .held
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            held.retain(|held| held.paths != *paths || held.key != *key);
-            if held.len() >= MAX_FOLDERS {
-                held.remove(0);
-            }
-            held.push(Held {
-                paths: paths.clone(),
-                key: key.clone(),
-                stamps,
-                answer: observed.clone(),
-            });
+            self.keep(paths, key, stamps, observed.clone());
         }
         Ok(observed)
+    }
+
+    /// Keep `answer` for `paths` and `key` under `stamps`, in place of the one kept for them, and
+    /// let the oldest go past [`MAX_FOLDERS`]. In this crate's test process the bound is each
+    /// folder's, and a folder whose home is gone (its test ended) lets its answers go: a law that
+    /// counts the reads its own warm memo makes holds whatever other tests read meanwhile.
+    fn keep(&self, paths: &Paths, key: &K, stamps: InputStamps, answer: T) {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.retain(|held| held.paths != *paths || held.key != *key);
+        #[cfg(not(test))]
+        if held.len() >= MAX_FOLDERS {
+            held.remove(0);
+        }
+        #[cfg(test)]
+        {
+            held.retain(|held| held.paths.home.exists());
+            if held.iter().filter(|held| held.paths == *paths).count() >= MAX_FOLDERS
+                && let Some(oldest) = held.iter().position(|held| held.paths == *paths)
+            {
+                held.remove(oldest);
+            }
+        }
+        held.push(Held {
+            paths: paths.clone(),
+            key: key.clone(),
+            stamps,
+            answer,
+        });
     }
 }
 
@@ -896,5 +967,90 @@ mod tests {
         assert_eq!(none(), None);
         assert_eq!(none(), None);
         assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// A quiet memo asked under its caller's shared observation of the state lock gives what it
+    /// kept without opening the lock again, and reads a changed file as `read_keyed` does.
+    ///
+    /// NEGATIVE CONTROL (2026-11-08): with `read_keyed_under` making `read_keyed`'s call (the
+    /// shape before), each kept answer opens the lock again (`left: 2, right: 0`).
+    #[test]
+    fn a_quiet_memo_under_its_callers_observation_opens_no_lock_of_its_own() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = vault(home.path());
+        drop(StateLock::take(&paths).unwrap());
+        let memo = Memo::<Option<Vec<String>>>::keyed(inputs, true);
+        let reads = AtomicUsize::new(0);
+        assert_eq!(
+            memo.read_keyed(&paths, &(), |p| lines(p, &reads)).unwrap(),
+            Some(vec!["m60".to_owned()])
+        );
+        let lock = StateLock::observe(&paths).unwrap().expect("no writer");
+        let under = || memo.read_keyed_under(&paths, &(), &lock, |p| lines(p, &reads));
+
+        let opens = super::super::lock_opens_of(&paths);
+        assert_eq!(under().unwrap(), Some(vec!["m60".to_owned()]));
+        assert_eq!(under().unwrap(), Some(vec!["m60".to_owned()]));
+        assert_eq!(super::super::lock_opens_of(&paths) - opens, 0);
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "read once");
+
+        fsx::write_atomic(&paths.records_file(), b"m61-longer\n", 0o600).unwrap();
+        assert_eq!(under().unwrap(), Some(vec!["m61-longer".to_owned()]));
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "a changed file is read");
+    }
+
+    /// Only a shared observation that still guards the lock at the vault's path stands in for the
+    /// memo's own: under a writer's own exclusive take, and under an observation of a lock file
+    /// another was renamed over while a writer holds the new one, the memo reads afresh, as
+    /// `read_keyed` meets that writer, and keeps nothing.
+    ///
+    /// NEGATIVE CONTROLS (2026-11-08): with `StateLock::observes` taking any lock (no `shared`),
+    /// the writer's own check is given the answer kept from before its take (`left: 1, right:
+    /// 3`, `a writer's own take reads afresh`); with it taking a shared one without `guards`, the
+    /// observation of the lock renamed away is given the answer kept under the new lock while its
+    /// writer holds it (`left: 4, right: 5`, `a lock renamed away guards nothing`).
+    #[test]
+    fn a_writers_take_or_a_lock_renamed_away_is_no_observation_for_a_memo() {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let paths = vault(home.path());
+        drop(StateLock::take(&paths).unwrap());
+        let memo = Memo::<Option<Vec<String>>>::keyed(inputs, true);
+        let reads = AtomicUsize::new(0);
+        let kept = || memo.read_keyed(&paths, &(), |p| lines(p, &reads)).unwrap();
+        assert_eq!(kept(), Some(vec!["m60".to_owned()]));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        {
+            let writer = StateLock::take(&paths).unwrap();
+            for _ in 0..2 {
+                assert_eq!(
+                    memo.read_keyed_under(&paths, &(), &writer, |p| lines(p, &reads))
+                        .unwrap(),
+                    Some(vec!["m60".to_owned()])
+                );
+            }
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                3,
+                "a writer's own take reads afresh"
+            );
+        }
+
+        let renamed_away = StateLock::observe(&paths).unwrap().expect("no writer");
+        fsx::write_atomic(&paths.lock_file(), b"", 0o600).unwrap();
+        assert_eq!(kept(), Some(vec!["m60".to_owned()]));
+        assert_eq!(kept(), Some(vec!["m60".to_owned()]));
+        assert_eq!(reads.load(Ordering::SeqCst), 4, "kept under the new lock");
+        let _writer = StateLock::take(&paths).unwrap();
+        assert_eq!(
+            memo.read_keyed_under(&paths, &(), &renamed_away, |p| lines(p, &reads))
+                .unwrap(),
+            Some(vec!["m60".to_owned()])
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            5,
+            "a lock renamed away guards nothing"
+        );
     }
 }

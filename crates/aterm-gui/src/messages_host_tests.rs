@@ -4529,58 +4529,6 @@ fn a_fixed_config_problem_is_logged_in_the_words_of_how_it_ended() {
 }
 
 #[test]
-fn a_restatement_carries_the_titles_short_form() {
-    use aterm_agent::supervise::policy::exception::Exception;
-    use aterm_agent::supervise::policy::notice;
-    let spot = crate::message_reporters::UpgradeSpot {
-        place: "in tab 1".to_string(),
-        nav: Some(aterm_messages::Intent::ShowTab { tab: 1, window: 1 }),
-    };
-    let ask = |text: &notice::NoticeText| {
-        crate::message_reporters::resume_ask(
-            "s-1",
-            &spot,
-            &Exception::of_notice(text, None, None, "x"),
-        )
-    };
-    let first = ask(&notice::LOGIN_SIGN_IN);
-    let then = ask(&notice::LIMIT_ROSTER);
-    assert_ne!(first.title, then.title, "the title changes");
-    let short = then.short_title.clone().expect("a short form");
-    let restated = |r: Restatement| {
-        let now = aterm_messages::Instant::now();
-        let mut c = aterm_messages::MessageCenter::new(aterm_messages::MessageLog::empty(), now);
-        let id = c
-            .post(first.clone(), aterm_messages::WallStamp { unix_ms: 1 }, now)
-            .id;
-        assert!(c.restate(id, r, now), "the row is live");
-        let kept = c.live(id).and_then(|l| l.msg.short_title.clone());
-        let later = now + aterm_messages::PROGRESS_GRACE + aterm_messages::Duration::from_millis(1);
-        let _ = c.settle(later, true);
-        c.commit_rows(later, 3);
-        let mut p = c.presentation(
-            40,
-            &aterm_messages::text::char_width,
-            aterm_messages::Links::Painted,
-        );
-        assert_eq!(p.rows.len(), 1, "one row on the band");
-        (kept, p.rows.remove(0).title.1)
-    };
-    let (kept, shown) = restated(restatement_of(&then));
-    assert_eq!(kept.as_deref(), Some(short.as_str()));
-    assert_eq!(shown, short, "the band paints the new short form");
-    let (kept, shown) = restated(Restatement {
-        short_title: None,
-        ..restatement_of(&then)
-    });
-    assert_eq!(kept, None, "the title's change drops the short form");
-    assert!(
-        shown.ends_with('\u{2026}') && then.title.starts_with(shown.trim_end_matches('\u{2026}')),
-        "the control: a cut of the whole title: {shown:?}"
-    );
-}
-
-#[test]
 fn a_tools_later_entry_is_one_digest_entry_its_link_press_files() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("aterm-later-cause-")

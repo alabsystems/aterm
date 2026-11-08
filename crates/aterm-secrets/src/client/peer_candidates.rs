@@ -327,7 +327,7 @@ fn saved_start(paths: &Paths, purpose: PeerUse, count: usize, limit: usize) -> O
         reason = "optional peer cursor never waits for a lock; StateLock releases it on drop"
     )]
     file.try_lock().ok()?;
-    let _lock = StateLock(file);
+    let _lock = StateLock::exclusive(file);
     let path = paths.dir.join(name);
     let mut offsets = [0u64; 3];
     if let Some(bytes) = fsx::read_private(&path, MAX_SIZE).ok()? {

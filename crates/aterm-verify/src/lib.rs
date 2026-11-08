@@ -1198,6 +1198,10 @@ struct Seams {
     admit_memory: Admitter,
 }
 
+#[cfg(test)]
+#[path = "stage_diagnostic_tests.rs"]
+mod stage_diagnostic_tests;
+
 /// The stages themselves, and the per-user capacity ledger on the live machine.
 const LIVE: Seams = Seams {
     stage: stages::run_stage,
@@ -2393,7 +2397,9 @@ fn run_with(
             let execution = begun_at.elapsed();
             // The ordered log and aggregate check result can wait for other stages;
             // the completed stage's decisions must already be visible to the caller.
-            let event = ctx.record_event(&report::stage_event(i, &report, waiting, execution, cpu));
+            let event = ctx.record_event(&report::stage_event(
+                i, owners[i], &report, waiting, execution, cpu,
+            ));
             if let Ok(mut o) = out.lock() {
                 let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
             }

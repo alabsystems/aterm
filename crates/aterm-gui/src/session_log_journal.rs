@@ -2131,7 +2131,7 @@ impl<T: Targets> Writer<T> {
         if !matches!(self.state, State::Running) || self.handed_done || self.lock.is_none() {
             return;
         }
-        let mut last = None;
+        let mut whole = false;
         for _ in 0..FINISH_PASSES {
             if self.clock.mono() >= deadline || !matches!(self.state, State::Running) {
                 return;
@@ -2140,19 +2140,15 @@ impl<T: Targets> Writer<T> {
             if !matches!(self.state, State::Running) {
                 return;
             }
-            if wrote == 0 && !self.owed {
-                last = self.quit_lines();
-                if last.is_some() {
-                    break;
-                }
+            if wrote == 0 && !self.owed && self.quit_whole() {
+                whole = true;
+                break;
             }
         }
-        let Some(mut buf) = last else {
-            return;
-        };
-        if self.clock.mono() >= deadline {
+        if !whole || self.clock.mono() >= deadline {
             return;
         }
+        let mut buf = Vec::new();
         if let Some(line) = encode_frame(&Frame::End {
             why: EndWhy::Quit,
             t: self.clock.wall_ms(),
@@ -2202,44 +2198,40 @@ impl<T: Targets> Writer<T> {
         );
     }
 
-    /// The quit's closes, only while every session is wholly journaled: each
-    /// track not done holds its timeline, its cursor at its log's head in the
-    /// space it last wrote, and its snap in this segment (so a reader places
-    /// the closes); a retired session not done (its close or its loss not yet
-    /// written) is behind too.
-    fn quit_lines(&self) -> Option<Vec<u8>> {
+    /// Whether the quit's `#fin` may follow: every session closed and wholly journaled. Each
+    /// track not done holds its timeline, its log closed (the quit closed every live session,
+    /// `session_log::close_logs_at_quit`, before it asked for this: its closes are records the
+    /// passes journal as any other, the very records the bus mirror takes, and this writer
+    /// builds none of its own), its cursor at its log's head in the space it last wrote, and its
+    /// snap in this segment (so a reader places the records); a retired session not done (its
+    /// close or its loss not yet written) is behind too. A session still open holds the `#fin`
+    /// back, so its chain reads as a crash, never as a clean end over a session it holds open.
+    fn quit_whole(&self) -> bool {
         if self.targets.pending_targets() {
-            return None;
+            return false;
         }
-        let n = self.seg.as_ref()?.n;
-        let mut buf = Vec::new();
+        let Some(n) = self.seg.as_ref().map(|seg| seg.n) else {
+            return false;
+        };
         for t in self.tracks.values().filter(|t| !t.done) {
-            let guard = match t.timeline.as_ref()?.try_lock() {
+            let Some(timeline) = t.timeline.as_ref() else {
+                return false;
+            };
+            let guard = match timeline.try_lock() {
                 Ok(g) => g,
                 Err(TryLockError::Poisoned(p)) => p.into_inner(),
-                Err(TryLockError::WouldBlock) => return None,
+                Err(TryLockError::WouldBlock) => return false,
             };
             let log = guard.slog().log();
-            let whole = t.cursor == Some(log.last_seq())
+            let whole = !log.is_open(aterm_slog::Node::SESSION)
+                && t.cursor == Some(log.last_seq())
                 && t.space == Some((log.base_ep(), log.ep()))
                 && t.snapped == Some(n);
             if !whole {
-                return None;
-            }
-            let closes = log.quit_closes(guard.slog().now());
-            drop(guard);
-            for rec in closes {
-                if let Some(line) = encode_frame(&Frame::Rec {
-                    sid: t.sid,
-                    rec,
-                    restated: false,
-                }) {
-                    buf.extend_from_slice(line.as_bytes());
-                    buf.push(b'\n');
-                }
+                return false;
             }
         }
-        Some(buf)
+        true
     }
 
     /// Retention, under `prune.lock` (busy: skipped this time).

@@ -132,7 +132,6 @@ fn a_needs_a_person_line_names_the_reason_by_its_length() {
         id: text.id,
         code: text.code,
         title: text.title,
-        short_title: text.short_title,
         did: text.did.to_string(),
         expect: text.expect.to_string(),
         command: None,

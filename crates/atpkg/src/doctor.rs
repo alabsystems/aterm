@@ -3767,13 +3767,48 @@ fn probe_version(bin: &Path) -> String {
 }
 
 fn probe_version_with_cache(bin: &Path, cache: Option<&Path>) -> String {
-    kept_answer(bin, "--version complete-exit-zero-v1", cache, || {
+    kept_answer(bin, "--version unique-numeric-release-v1", cache, || {
         let stdout = version_stdout(aterm_uds::spawnfd::command(bin).arg("--version"))?;
-        let text = String::from_utf8_lossy(&stdout);
-        let token = text.lines().next()?.split_whitespace().nth(1)?;
-        Some(token.split('+').next().unwrap_or(token).to_string())
+        let text = std::str::from_utf8(&stdout).ok()?;
+        let mut versions = text
+            .lines()
+            .next()?
+            .split_whitespace()
+            .filter_map(numeric_release);
+        let version = versions.next()?;
+        versions.next().is_none().then(|| version.to_owned())
     })
     .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// A dotted numeric release, optionally prefixed by `v`, with nonempty ASCII prerelease and
+/// build identifiers. Keep prereleases distinct while ignoring build metadata in comparisons.
+fn numeric_release(token: &str) -> Option<&str> {
+    let token = token.strip_prefix('v').unwrap_or(token);
+    let identifiers = |text: &str| {
+        text.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    };
+    let (release, build) = token
+        .split_once('+')
+        .map_or((token, None), |(r, b)| (r, Some(b)));
+    if build.is_some_and(|build| !identifiers(build)) {
+        return None;
+    }
+    let core = match release.split_once('-') {
+        Some((core, pre)) if identifiers(pre) => core,
+        Some(_) => return None,
+        None => release,
+    };
+    (core.split('.').count() >= 2
+        && core
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())))
+    .then_some(release)
 }
 
 const TRUST_COMPILER_FIX: &str = "ship trustc as one signed plain file, never a symbolic link";

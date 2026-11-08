@@ -874,6 +874,7 @@ impl App {
     }
 
     /// Toggle match-case (⌥⌘C / a click on the `Aa` indicator): flip the active find's flag, remember it as the app-sticky default, and re-run.
+    #[cfg(test)]
     pub(crate) fn search_toggle_case(&mut self) {
         let Some(wid) = self.frontmost_window else {
             return;
@@ -899,6 +900,7 @@ impl App {
     }
 
     /// Toggle regex mode (⌥⌘R / a click on the `.*` indicator): flip the active find's flag, remember it as the app-sticky default, and re-run.
+    #[cfg(test)]
     pub(crate) fn search_toggle_regex(&mut self) {
         let Some(wid) = self.frontmost_window else {
             return;

@@ -66,9 +66,22 @@ const CLT_DEVELOPER: &str = "/Library/Developer/CommandLineTools";
 const NOT_RELEASE_HOST: &str = "release-notary waits for an authorized release ring \
      (a private matching profile/key and current master-signed roster)";
 
-/// What a round says while xcrun has nothing to run notarytool with.
+/// What a round says on a Mac while xcrun has nothing to run notarytool with.
 const WAITS_FOR_CLT: &str = "release-notary waits for Command Line Tools: xcrun has no \
      developer directory with notarytool, so nothing runs it";
+
+/// What a round says off a Mac, where no developer directory ever comes.
+const MAC_ONLY: &str = "release-notary runs on a Mac: notarytool comes with Apple's developer \
+     tools, which this machine has none of";
+
+/// What a round says while it finds no developer directory, on this host.
+fn no_developer_dir() -> &'static str {
+    if cfg!(target_os = "macos") {
+        WAITS_FOR_CLT
+    } else {
+        MAC_ONLY
+    }
+}
 
 pub(super) struct Notary {
     apple_id: Zeroizing<String>,
@@ -524,7 +537,7 @@ fn sync_notary_with(
         return Ok(None);
     }
     if (tools.developer_dir)().is_none() {
-        return Err(Error::new(WAITS_FOR_CLT));
+        return Err(Error::new(no_developer_dir()));
     }
     materialize_with(paths, tools)
 }
@@ -606,7 +619,7 @@ impl NotaryRounds {
             return Step::Waits(NOT_RELEASE_HOST);
         }
         if (tools.developer_dir)().is_none() {
-            return Step::Waits(WAITS_FOR_CLT);
+            return Step::Waits(no_developer_dir());
         }
         self.checked = None;
         match materialize_with(paths, tools) {

@@ -209,9 +209,14 @@ pub const USAGE: &str = "\
                                    address, whose beacons a Commons runtime drops as its own), and
                                    the row FAILS unless the joiner's aterm db emails --digest is the
                                    seed's: one epoch, the row and its password, one digest
-                  successor        install.sh --version N (the release before the latest), then the
-                                   updater to the latest with a window open, and the successor's setup
-                                   and Full Disk Access lines in its first 30 s
+                  successor        install.sh --version N (the public release before the latest), its
+                                   ordinary selected base.clt item to completion and a recorded attempt,
+                                   then the real updater with a window open: the running target build,
+                                   its selected item's completion, unchanged attempt episode
+                                   and zero observed additional setup sudo attempts/accounting root
+                                   runs. No nonempty password supplied or dialogs pressed. This is
+                                   not whole GUI coordinator settlement or every password sheet;
+                                   public releases only, --app does not select the updater target
                   install-sh       tools/install.sh on a terminal as the account at the console: first
                                    byte, end, its last line, the aterm process after its exit (and the
                                    typed steps a person still has), then the opened app's first log line
@@ -616,7 +621,7 @@ impl Scenario {
     }
 
     /// Whether its clone's disk grows to [`FIRST_LAUNCH_DISK_GB`] first: a row that lets a toolset
-    /// pass run, whether the opened app's or `aterm init --apply`'s `base.pkg.toolset` row (whose
+    /// pass run, whether the opened app's or `aterm init`'s `base.pkg.toolset` row (whose
     /// refusal on the image's 4.4 GiB was every earlier init-apply's `base.pkg.toolset failed`).
     #[must_use]
     pub const fn grows_disk(self) -> bool {
@@ -625,6 +630,7 @@ impl Scenario {
             Scenario::FirstLaunch
                 | Scenario::LanAllowed
                 | Scenario::InitApply
+                | Scenario::Successor
                 | Scenario::InstallSh
                 | Scenario::PassHeld
                 | Scenario::LaunchRepairs
@@ -4672,7 +4678,7 @@ fn watch_elevations(g: &Guest) -> Result<Option<lan::Daemon>, Fail> {
     g.sh(
         &root_command(
             g.standard,
-            &format!(": > {ACCOUNTING} && /usr/sbin/accton {ACCOUNTING}"),
+            &format!("mkdir -p /var/account && : > {ACCOUNTING} && /usr/sbin/accton {ACCOUNTING}"),
         ),
         STEP,
     )?;
@@ -4782,9 +4788,9 @@ pub fn root_aterm_runs(lastcomm: &str) -> usize {
 
 /// The root halves among the root `aterm` processes process accounting saw end (`lastcomm`,
 /// [`root_aterm_runs`]), with launchd's view of the LAN broker (`broker`, `launchctl print`
-/// read just after accounting stopped, in the same root command, so every broker exit accounting
-/// recorded is one launchd's `runs` already holds; a broker that ends between the two is
-/// subtracted with no record, which can only hide a root half, never add one).
+/// read before accounting stops, in the same root command: a broker that exits between these
+/// reads is counted without being subtracted, conservatively overcounting a root half rather
+/// than allowing a zero-run assertion to hide one).
 ///
 /// The rule: every root `aterm` that ended is a root half, but for each broker process that
 /// ended, which launchd counts. Accounting records a process only as it exits, by its command
@@ -4843,13 +4849,60 @@ fn sightings(seen: &[(u64, u32)], open_ms: u64) -> String {
     )
 }
 
+/// Stop and read the existing elevation watch/accounting interval. Preserve both raw inputs in
+/// the guest before another interval can overwrite them; `retain_raw` keeps them with the row.
+fn finish_elevations(
+    g: &Guest,
+    before: Option<&lan::Daemon>,
+    label: &str,
+) -> Result<(Elevations, usize, String), Fail> {
+    // A bounded diagnostic tail can omit an earlier attempt. Zero requires the complete
+    // interval; the existing complete reader refuses oversized or incomplete output.
+    let read = |script: String| -> Result<String, Fail> {
+        let out = g.vm.exec_complete(&script, STEP).map_err(Fail::die)?;
+        if !out.status.success() {
+            return Err(Fail::die(format!(
+                "elevation evidence read failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        String::from_utf8(out.stdout).map_err(|error| Fail::die(error.to_string()))
+    };
+    let text = read(format!(
+        "f={GUEST_NUX}/{ELEVATIONS}; kill $(cat $f.pid) 2>/dev/null; \
+             cp $f {GUEST_NUX}/{label}-elevations.txt && cat $f"
+    ))?;
+    let report = read(format!(
+        "{} > {GUEST_NUX}/{label}-accounting.txt && cat {GUEST_NUX}/{label}-accounting.txt",
+        root_command(
+            g.standard,
+            &format!(
+                "/bin/launchctl print system/{} 2>&1; /usr/sbin/accton || exit; \
+                     echo {PRINTED}; /usr/bin/lastcomm -f {ACCOUNTING}",
+                aterm_uds::lan::LABEL
+            )
+        )
+    ))?;
+    let (print, report) = report
+        .split_once(PRINTED)
+        .ok_or_else(|| Fail::die("the elevation accounting boundary did not read back"))?;
+    let broker = lan::read_launchctl(print);
+    let accounted = root_halves(report, before, broker.as_ref());
+    Ok((
+        with_accounting(read_elevations(&text), accounted),
+        accounted,
+        print.to_owned(),
+    ))
+}
+
 /// What setup's one early elevation asked and did (`docs/DESIGN-init-on-by-default-2026-10-25.md`,
 /// owner ruling 2026-11-02): how many times it asked for the Mac password (the row fails on more
 /// than one), whether the account's sudo asks one at all (the image's administrator's asks none,
 /// so no prompt can show there: the ask is counted by its `sudo` process instead), the prompts
 /// still on screen, and what it was to apply with no press: developer mode, the naming rule, the
 /// Mac's own names; then the PTY keeper, on by default. Whether the root half ran, and launchd's
-/// view of the LAN broker (`launchctl print`), read once accounting stopped, for
+/// view of the LAN broker (`launchctl print`), read before accounting stops, for
 /// [`lan::broker_cells`].
 fn elevation_cells(
     g: &Guest,
@@ -4858,31 +4911,7 @@ fn elevation_cells(
     open_ms: u64,
     before: Option<&lan::Daemon>,
 ) -> Result<(bool, String), Fail> {
-    let text = g.sh(
-        &format!(
-            "f={GUEST_NUX}/{ELEVATIONS}; kill $(cat $f.pid) 2>/dev/null; cat $f 2>/dev/null || true"
-        ),
-        STEP,
-    )?;
-    let report = g.sh(
-        &format!(
-            "{}; /usr/bin/lastcomm -f {ACCOUNTING} 2>/dev/null || true",
-            root_command(
-                g.standard,
-                &format!(
-                    "/usr/sbin/accton; /bin/launchctl print system/{} 2>&1; echo {PRINTED}",
-                    aterm_uds::lan::LABEL
-                )
-            )
-        ),
-        STEP,
-    )?;
-    let (print, report) = report.split_once(PRINTED).unwrap_or(("", &report));
-    let broker = lan::read_launchctl(print);
-    let seen = with_accounting(
-        read_elevations(&text),
-        root_halves(report, before, broker.as_ref()),
-    );
+    let (seen, _, print) = finish_elevations(g, before, "setup")?;
     row.cell(
         "setup's Mac password asks (target 1)",
         if seen.asks.is_empty() {
@@ -4999,7 +5028,7 @@ fn elevation_cells(
             squeeze(&keeper, 80)
         ));
     }
-    Ok((!seen.root_runs.is_empty(), print.to_owned()))
+    Ok((!seen.root_runs.is_empty(), print))
 }
 
 /// What the naming rule setup left lets the account do with no password, the name an admission
@@ -6271,10 +6300,6 @@ pub fn toolset_pass(log: &str, since_ms: u64) -> (Found, Found) {
     )
 }
 
-/// How long `successor` reads the updated app's log once it is in place: its startup, when a
-/// successor would offer setup or read Full Disk Access.
-const SUCCESSOR_WATCH: Duration = Duration::from_secs(30);
-
 /// The guest's clock (epoch ms) and the installed app's version, read together.
 fn installed_at(g: &Guest) -> Result<(Option<u64>, String), Fail> {
     let out = g.run(
@@ -6287,6 +6312,134 @@ fn installed_at(g: &Guest) -> Result<(Option<u64>, String), Fail> {
     Ok((at, lines.next().unwrap_or("").to_owned()))
 }
 
+/// Exact public bundle identity at this observation, retained with the guest's raw evidence.
+fn successor_identity(g: &Guest, row: &mut Row, label: &str) -> Result<String, Fail> {
+    let text = g.sh(
+        &format!(
+            "(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' {app}/Contents/Info.plist \
+             && /usr/bin/shasum -a 256 {aterm}) > {GUEST_NUX}/{label}-identity.txt \
+             && cat {GUEST_NUX}/{label}-identity.txt",
+            app = g.app,
+            aterm = g.aterm,
+        ),
+        STEP,
+    )?;
+    let mut lines = text.lines();
+    let build = lines.next().unwrap_or("").trim();
+    let hash = lines
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or("");
+    if build.parse::<u64>().ok().is_none_or(|n| n == 0)
+        || hash.len() != 64
+        || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(Fail::die("the public app's build/hash did not read back"));
+    }
+    row.cell(
+        format!("{label}: build and executable SHA256"),
+        Value::Text(format!("{build}; {hash}")),
+    );
+    Ok(build.to_owned())
+}
+
+/// Safely read the account episode the ordinary app produced, preserving its exact bytes in
+/// the guest's raw evidence. Validate with the shared parser, never plant or repair a record.
+fn successor_episode(g: &Guest, label: &str) -> Result<String, Fail> {
+    use std::io::Write as _;
+
+    let text = g.sh(
+        &format!(
+            "/usr/bin/perl -MFcntl=:DEFAULT,:mode -MEncode=decode,FB_CROAK,LEAVE_SRC -e 'sysopen(my $f, $ARGV[0], O_RDONLY|O_NOFOLLOW|O_NONBLOCK) or die $!; \
+             my @s=stat($f); S_ISREG($s[2]) && $s[4] == $< && $s[7] <= {max} or die \"unsafe episode\"; \
+             my $n=sysread($f, my $text, {most}); defined($n) && $n == $s[7] && $n <= {max} or die \"unread episode\"; \
+             decode(\"UTF-8\", $text, FB_CROAK|LEAVE_SRC); print $text' \
+             \"$HOME/Library/Application Support/aterm/{file}\" > {GUEST_NUX}/{label}-episode.txt \
+             && cat {GUEST_NUX}/{label}-episode.txt",
+            max = aterm_types::clt_mark::BYTES,
+            most = aterm_types::clt_mark::BYTES + 1,
+            file = aterm_types::clt_mark::FILE,
+        ),
+        STEP,
+    )?;
+    let dir = aterm_tempfile::tempdir().map_err(|error| Fail::die(error.to_string()))?;
+    let path = dir.path().join(aterm_types::clt_mark::FILE);
+    crate::util::create_new_regular_file(&path, 0o600)
+        .and_then(|mut file| file.write_all(text.as_bytes()))
+        .map_err(|error| Fail::die(error.to_string()))?;
+    match aterm_types::clt_mark::reading(&aterm_types::clt_mark::Live, &path) {
+        aterm_types::clt_mark::Asked::Spent => Ok(text),
+        _ => Err(Fail::die("the account has no valid spent password episode")),
+    }
+}
+
+/// Require the running successor's build, rather than only an installed replacement. Setup's
+/// private rows may legitimately remain unknown; this is no coordinator-completion claim.
+fn wait_successor(g: &Guest, row: &mut Row, build: &str) -> Result<bool, Fail> {
+    let started = Instant::now();
+    loop {
+        stop::check()?;
+        let status = g.run(&format!("{} ctl update status 2>&1", g.aterm), STEP)?;
+        if status.starts_with("OK ") && status_field(&status, "current_build") == Some(build) {
+            row.cell(
+                "installed to running target",
+                Value::Ms(millis(started.elapsed())),
+            );
+            row.cell("running successor", Value::Text(status.trim().to_owned()));
+            return Ok(true);
+        }
+        if started.elapsed() >= ROW {
+            row.cell(
+                "running successor",
+                Value::Missing(status.trim().to_owned()),
+            );
+            row.fail("the target build did not answer before the hang detector".into());
+            return Ok(false);
+        }
+        stop::sleep(SETUP_POLL)?;
+    }
+}
+
+/// The ordinary user-side base.clt consumer, which claims the real account episode before sudo.
+/// Its explicit authority can retry new missing steps; this does not exercise automatic
+/// withholding or certify every root configuration. The existing driver submits blank replies
+/// if a password is requested.
+fn successor_root(g: &Guest, row: &mut Row, label: &str) -> Result<bool, Fail> {
+    let (drive, out) = g.drive(
+        label,
+        "NUX_SUDO=''",
+        &format!("{} init --only base.clt --json", g.aterm),
+    )?;
+    drive_cells(row, &format!("{label}: "), &drive);
+    row.cell(
+        format!("{label}: root report"),
+        Value::Text(said_beside_the_pass(&out)),
+    );
+    Ok(drive.exit == Some(0) && completed_root_report(&out))
+}
+
+/// A nonvacuous completed base.clt report. Overall completeness alone also accepts deferred
+/// items; it cannot establish this endpoint.
+fn completed_root_report(out: &str) -> bool {
+    out.lines().rev().find_map(|line| {
+        let report: aterm_json::Value = aterm_json::from_str(line.trim()).ok()?;
+        let items = report.get("items")?.as_array()?;
+        Some(
+            report.get("complete").and_then(aterm_json::Value::as_bool) == Some(true)
+                && items.len() == 1
+                && items[0].get("id").and_then(aterm_json::Value::as_str) == Some("base.clt")
+                && matches!(
+                    items[0].get("outcome").and_then(aterm_json::Value::as_str),
+                    Some("ok" | "changed")
+                ),
+        )
+    }) == Some(true)
+}
+
+/// The real signed public pair, with an old base.clt attempt and its consumed account episode
+/// established before its GUI can start the updater. `--app` cannot replace either release.
+/// The endpoint is the target's explicit base.clt consumer, not whole GUI coordinator settlement,
+/// automatic withholding or an unreleased candidate's updater.
 fn successor(g: &Guest, row: &mut Row) -> Result<(), Fail> {
     let (major, minor, _) = latest_release(g)?;
     let Some(before) = minor.checked_sub(1) else {
@@ -6303,11 +6456,48 @@ fn successor(g: &Guest, row: &mut Row) -> Result<(), Fail> {
         ));
         return Ok(());
     }
+    let old_build = successor_identity(g, row, "successor-old")?;
+    let before = watch_elevations(g)?;
+    let completed = successor_root(g, row, "successor-old-root")?;
+    let (old, accounted, _) = finish_elevations(g, before.as_ref(), "successor-old")?;
+    row.cell(
+        "old base.clt consumer's observed sudo attempts",
+        Value::Count(old.asks.len() as u64),
+    );
+    row.cell(
+        "old base.clt consumer's accounting root runs",
+        Value::Count(accounted as u64),
+    );
+    if !completed || old.asks.len() != 1 || accounted != 1 {
+        return Err(not_run(
+            "the old public app did not complete its selected base.clt item with one observed/accounted root episode; no nonempty password was supplied or dialogs pressed",
+        ));
+    }
+    let episode = successor_episode(g, "successor-before")?;
+    row.cell(
+        "old account's administrator-attempt episode",
+        Value::Text(episode.trim().to_owned()),
+    );
+    if installed_version(g)? != from {
+        return Err(not_run(
+            "the old public app changed before the consumed-episode boundary",
+        ));
+    }
     let app = if g.standard {
         format!("/Users/{STANDARD_USER}/Applications/aterm.app")
     } else {
         "/Applications/aterm.app".to_owned()
     };
+    let before = watch_elevations(g)?;
+    if !before
+        .as_ref()
+        .is_some_and(|broker| broker.running() && broker.pid.is_some() && broker.runs.is_some())
+    {
+        return Err(not_run(
+            "the broker's running baseline/counter is unknown, so the update interval cannot prove zero root runs",
+        ));
+    }
+    let boundary = g.clock_ms()?;
     let started = Instant::now();
     g.sh(&format!("open {app}"), STEP)?;
     let mut updated = None;
@@ -6338,24 +6528,61 @@ fn successor(g: &Guest, row: &mut Row) -> Result<(), Fail> {
         ));
         return Ok(());
     }
-    let Some(since) = still_n else {
-        row.cell(
-            "successor's lines",
-            Value::Missing("the guest's clock did not read back before the update".into()),
-        );
-        return Ok(());
-    };
-    stop::sleep(SUCCESSOR_WATCH)?;
-    let launch = read_launch(&g.log()?, since);
+    let build = successor_identity(g, row, "successor-target")?;
+    if build == old_build {
+        row.fail("the public update did not change the installed build".into());
+    }
+    let running = wait_successor(g, row, &build)?;
+    if running && !successor_root(g, row, "successor-target-root")? {
+        row.fail("the target's selected base.clt consumer did not complete".into());
+    }
+    let (seen, accounted, print) = finish_elevations(g, before.as_ref(), "successor-after")?;
+    if !lan::read_launchctl(&print)
+        .is_some_and(|broker| broker.running() && broker.pid.is_some() && broker.runs.is_some())
+    {
+        return Err(not_run(
+            "the broker's final running state/counter is unknown, so the update interval cannot prove zero root runs",
+        ));
+    }
+    row.cell(
+        "additional observed setup sudo attempts (target 0)",
+        Value::Count(seen.asks.len() as u64),
+    );
+    row.cell(
+        "additional accounting root runs (target 0)",
+        Value::Count(accounted as u64),
+    );
+    if !seen.asks.is_empty() || !seen.root_runs.is_empty() {
+        row.fail("another setup elevation was observed during the update/consumer interval".into());
+    }
+    let after = successor_episode(g, "successor-after")?;
+    row.cell(
+        "administrator-attempt episode retained",
+        Value::Text((after == episode).to_string()),
+    );
+    if after != episode {
+        row.fail("the update/consumer interval changed the account's attempt episode".into());
+    }
+    if running && installed_version(g)? != to {
+        row.fail("the installed public app changed during the root consumer interval".into());
+    }
+    if running {
+        let status = g.run(&format!("{} ctl update status 2>&1", g.aterm), STEP)?;
+        if !status.starts_with("OK ")
+            || status_field(&status, "current_build") != Some(build.as_str())
+        {
+            row.fail("the running target changed during its selected consumer interval".into());
+        }
+    }
+    let launch = read_launch(&g.log()?, still_n.unwrap_or(boundary));
     let (fda, setup): (Vec<_>, Vec<_>) = launch.setup.into_iter().partition(|(_, line)| {
         line.starts_with("full disk access") || line.starts_with("macOS access card")
     });
-    let within = SUCCESSOR_WATCH.as_secs();
     for (name, lines) in [("setup lines", setup), ("Full Disk Access lines", fda)] {
         row.cell(
             format!("successor's {name}"),
             Value::Text(if lines.is_empty() {
-                format!("none in its first {within} s")
+                "none in the observed update interval".into()
             } else {
                 format!("{}: {}", lines.len(), timeline(&lines, SETUP_SHOWN))
             }),
@@ -8369,6 +8596,24 @@ mod tests {
         );
         assert_eq!(release_tag("v1.2"), None);
         assert_eq!(release_tag(""), None);
+
+        for outcome in ["ok", "changed"] {
+            assert!(completed_root_report(&format!(
+                "terminal noise\r\n{{\"complete\":true,\"items\":[{{\"id\":\"base.clt\",\"outcome\":\"{outcome}\"}}]}}\r\n"
+            )));
+        }
+        for report in [
+            r#"{"complete":true,"items":[]}"#,
+            r#"{"complete":false,"items":[{"id":"base.clt","outcome":"ok"}]}"#,
+            r#"{"complete":true,"items":[{"id":"base.clt","outcome":"deferred"}]}"#,
+            r#"{"complete":true,"items":[{"id":"base.clt","outcome":"not-applicable"}]}"#,
+            r#"{"complete":true,"items":[{"id":"another","outcome":"ok"}]}"#,
+            r#"{"complete":true,"items":[{"id":"base.clt"}]}"#,
+            r#"{"items":[{"id":"base.clt","outcome":"ok"}]}"#,
+            "no report",
+        ] {
+            assert!(!completed_root_report(report), "{report}");
+        }
 
         let json = r#"{"schema":1,"items":[{"id":"a","elapsed_ms":4},{"id":"b"}],"phases":{"gather":10,"lock":2}}"#;
         let j = read_report_json(json).unwrap();

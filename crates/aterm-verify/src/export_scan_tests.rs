@@ -224,6 +224,18 @@ fn verdict(ctx: &Ctx, scanner: Result<Scanner, String>) -> (Vec<Outcome>, Vec<St
     )
 }
 
+/// Everything the stage shows: its rows and each finding's place and words.
+fn shown(r: &Report) -> String {
+    let mut text = r.render();
+    for f in r.findings() {
+        text.push_str(&f.id);
+        text.push('\n');
+        text.push_str(&f.message.join("\n"));
+        text.push('\n');
+    }
+    text
+}
+
 fn require_fixture(report: &Report) -> Result<(), String> {
     let failed = report
         .outcomes()
@@ -273,6 +285,143 @@ fn a_fixture_gitleaks_refuses_is_found_before_a_cut() {
     let (outcomes, ids, report) = verdict(&ctx, Ok(Scanner::Fixture(scanner)));
     require_fixture(&report).unwrap_or_else(|why| aterm_uds::host::could_not_run(why));
     assert_eq!(outcomes, [Outcome::Ok], "{ids:?}; {report:#?}");
+}
+
+/// The values of the two test lines the engine's gitleaks refused in cuts on 2026-11-01, made at
+/// run time so this file holds neither: a tape test's generation beside the word `key`, and a db
+/// test row's twelve-digit `key`.
+fn incident_values() -> [String; 2] {
+    [
+        ["if-gen=", "0.1096"].concat(),
+        ["012345", "6789ab"].concat(),
+    ]
+}
+
+/// Those two lines, each as first written (`fixed` false) or as its fix forward wrote it
+/// (65cd90c756 bound the generation apart from the word; 064d85a9a9 made the row's value twelve
+/// of one letter): the tape test's, then the db test's.
+fn incident_lines(fixed: bool) -> [String; 2] {
+    const WORD: &str = "key";
+    let [generation, digits] = incident_values();
+    if fixed {
+        [
+            format!("let gen_1096 = \"{generation}\";\nlet enter = [\"{WORD}\", gen_1096];\n"),
+            format!("let row = json!({{\"{WORD}\": \"a\".repeat(12)}});\n"),
+        ]
+    } else {
+        [
+            format!("let enter = [\"{WORD}\", \"{generation}\"];\n"),
+            format!("let row = json!({{\"{WORD}\": \"{digits}\"}});\n"),
+        ]
+    }
+}
+
+/// THE CHANGE IS WHAT THE BRANCH COMMITTED AND WHAT IT HAS NOT YET: the two lines the engine
+/// refused on 2026-11-01, one committed on a topic branch and one an unstaged edit of a file that
+/// branch tracks, are each found at their line by the gitleaks guard's rule, and neither value is
+/// shown. Once a later commit fixes the first forward and the edit is rewritten as the second's
+/// fix, the change passes: the snapshot is judged, as the export judges it.
+#[test]
+fn a_line_committed_on_the_branch_or_left_uncommitted_is_found_by_place_and_rule() {
+    let scanner = aterm_uds::host::need_tool("gitleaks");
+    let [tape, db] = incident_lines(false);
+    let (_dir, ctx) = checkout(&format!("// a tape test\n{tape}"));
+    let lib = ctx.root.join("crates/x/src/lib.rs");
+    let row = ctx.root.join("crates/x/src/row.rs");
+    std::fs::write(&row, "// a db test\n").expect("row.rs");
+    git(&ctx.root, &["checkout", "-q", "-b", "topic"]);
+    git(&ctx.root, &["add", "-A"]);
+    git(&ctx.root, &["commit", "-q", "-m", "the branch's commit"]);
+    std::fs::write(&row, format!("// a db test\n{db}")).expect("an unstaged edit");
+    let (_, mut ids, r) = verdict(&ctx, Ok(Scanner::Fixture(scanner.clone())));
+    require_fixture(&r).unwrap_or_else(|why| aterm_uds::host::could_not_run(why));
+    let text = shown(&r);
+    ids.sort();
+    assert_eq!(
+        ids,
+        ["crates/x/src/lib.rs:2", "crates/x/src/row.rs:2"],
+        "{text}"
+    );
+    assert!(
+        r.findings().iter().all(|f| f
+            .message
+            .iter()
+            .any(|m| m.starts_with("gitleaks: generic-api-key"))),
+        "{text}"
+    );
+    for value in incident_values() {
+        assert!(!text.contains(&value), "the value is shown: {text}");
+    }
+    let [tape, db] = incident_lines(true);
+    std::fs::write(&lib, format!("// a tape test\n{tape}")).expect("the fix forward");
+    git(
+        &ctx.root,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "the fix forward",
+            "--",
+            "crates/x/src/lib.rs",
+        ],
+    );
+    std::fs::write(&row, format!("// a db test\n{db}")).expect("the edit fixed");
+    let (outcomes, ids, r) = verdict(&ctx, Ok(Scanner::Fixture(scanner)));
+    require_fixture(&r).unwrap_or_else(|why| aterm_uds::host::could_not_run(why));
+    assert_eq!(outcomes, [Outcome::Ok], "{ids:?}; {r:#?}");
+}
+
+/// A HOST WITHOUT GITLEAKS IS COULD NOT RUN, NEVER A PASS: over a change gitleaks would pass,
+/// the stage that could not acquire it says so in a COULD NOT RUN row that names where it comes
+/// from, beside the pass of the guards it could run.
+#[test]
+fn a_host_without_gitleaks_is_could_not_run_never_a_pass() {
+    let (_dir, ctx) = checkout("// a fixture\nlet api_key = \"\";\n");
+    let mut r = Report::new("export-scan");
+    run_with(&ctx, &mut r, || Err("no signed scanner in fixture".into()));
+    let rows: Vec<(Outcome, String)> = r.outcomes().map(|(o, l)| (o, l.to_string())).collect();
+    let outcomes: Vec<Outcome> = rows.iter().map(|(o, _)| *o).collect();
+    assert_eq!(
+        outcomes,
+        [Outcome::Ok, Outcome::Fail(Severity::CouldNotRun)],
+        "{rows:#?}"
+    );
+    assert!(
+        rows[1].1.contains("gitleaks") && rows[1].1.contains("aterm pkg install gitleaks"),
+        "{rows:#?}"
+    );
+}
+
+/// GITLEAKS' REPORT AND THE VERDICT HOLD NO MATCHED SECRET: gitleaks writes its report redacted,
+/// so the key it found is neither in that file (which a run ended before its cleanup leaves in
+/// the scratch folder) nor in anything the stage shows.
+#[test]
+fn neither_gitleaks_report_nor_the_verdict_holds_the_secret() {
+    let scanner = aterm_uds::host::need_tool("gitleaks");
+    let key = planted_key();
+    let line = format!("// a fixture\nlet api_key = \"{key}\";\n");
+    let (_dir, ctx) = checkout(&line);
+    let (_, _, r) = verdict(&ctx, Ok(Scanner::Fixture(scanner.clone())));
+    require_fixture(&r).unwrap_or_else(|why| aterm_uds::host::could_not_run(why));
+    assert!(!r.findings().is_empty(), "{}", r.render());
+    assert!(!shown(&r).contains(&key), "{}", shown(&r));
+    let work = ctx.scratch.join("redaction.noindex");
+    std::fs::create_dir_all(work.join("tree/crates/x/src")).expect("tree");
+    let tree = work.join("tree").canonicalize().expect("canonical");
+    std::fs::write(tree.join(CONFIG), ACCEPTED).expect("config");
+    std::fs::write(tree.join("crates/x/src/lib.rs"), &line).expect("lib.rs");
+    let leaks =
+        gitleaks_leaks(&ctx, &Scanner::Fixture(scanner), &work, &tree).expect("gitleaks ran");
+    assert_eq!(
+        leaks.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+        ["crates/x/src/lib.rs:2"]
+    );
+    let written = std::fs::read_to_string(work.join("gitleaks.json")).expect("its report");
+    assert!(written.contains("\"RuleID\""), "{written}");
+    assert!(
+        !written.contains(&key),
+        "the report holds the key: {written}"
+    );
 }
 
 /// THE ENGINE'S BASELINE IS ITS COMMIT, NEVER ITS WORKING TREE: a row a session left

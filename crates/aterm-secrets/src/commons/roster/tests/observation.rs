@@ -177,6 +177,37 @@ fn a_warm_access_check_opens_no_identity_while_the_vault_stands() {
     });
 }
 
+/// A warm access check and a warm access each observe the vault's state lock once, for the call:
+/// the log and this Mac's denial they keep are given under that observation
+/// ([`client::trusted_commons_log_under`]), with no other observation of their own.
+/// NEGATIVE CONTROLS (2026-11-08): with `log_observation_is_current` back on
+/// `trusted_commons_log_now`, a check observes the lock twice (`left: 2`, `a check's
+/// observations`); with `Bootstrap::access_in_observed`'s log back on it, an access twice
+/// (`left: 2`, `an access's observations`).
+#[test]
+fn a_warm_access_check_observes_the_state_lock_once() {
+    let vault = Vault::new();
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        assert!(access.is_current(&vault.journal));
+        let opens = client::lock_opens_of(&vault.paths);
+        assert!(access.is_current(&vault.journal));
+        assert_eq!(
+            client::lock_opens_of(&vault.paths) - opens,
+            1,
+            "a check's observations"
+        );
+        assert!(vault.bootstrap.access_in(&vault.journal).unwrap().is_some());
+        let opens = client::lock_opens_of(&vault.paths);
+        assert!(vault.bootstrap.access_in(&vault.journal).unwrap().is_some());
+        assert_eq!(
+            client::lock_opens_of(&vault.paths) - opens,
+            1,
+            "an access's observations"
+        );
+    });
+}
+
 #[test]
 fn a_failed_vault_read_cannot_poison_commons_access_without_an_input_change() {
     struct ReadFault(std::path::PathBuf);

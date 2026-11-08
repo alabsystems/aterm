@@ -29,11 +29,13 @@ pub use run::{GitOp, GitOut, GitRun, HelperCommand};
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativePushPhase {
-    /// Build the complete commit/tree/tag metadata pack for BEFORE and AFTER.
+    /// Pack exact remote-owned roots, or complete BEFORE/AFTER metadata for
+    /// an update that introduces file content.
     MetadataPack,
     /// Strictly verify that metadata pack and its original object IDs.
     MetadataVerify,
-    /// Walk AFTER's connectivity, including referenced blob presence.
+    /// Walk AFTER's connectivity, including referenced blob presence, unless
+    /// a hashed parent witness already established the remote owns its closure.
     Connectivity,
 }
 // `run` stays a private module; its runner is re-exported to the crate alone, so

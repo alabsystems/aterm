@@ -527,3 +527,51 @@ fn a_quit_closes_every_open_tab_by_who_asked_once() {
         "CONTROL: nobody is named: {close}"
     );
 }
+
+/// A QUIT CLOSES EACH TAB BEFORE ITS SESSION (fix unit Q1's land, over the quit's tab closes):
+/// the quit's closes ([`App::close_sessions_at_quit`], at the bye's place) write a placed tab's
+/// `tab act=close out=app-quit` with its totals, by whoever asked, and then the session's own
+/// quit close, the order every close takes; the session's close is the last record its log
+/// takes. With no bridge the quit waits for nothing. NEGATIVE CONTROL, run: the sessions closed
+/// before the tabs (the bye's closes first, as the merge of Q1 onto the tab closes first had
+/// it) leaves the log with no tab close.
+#[test]
+fn a_quit_closes_each_tab_before_its_session() {
+    crate::fabric::with_link_reset(|| {
+        let mut app = App::headless_for_test();
+        let (_, tab_ctx) = person_tab(&mut app);
+        app.note_quit_by();
+        app.close_sessions_at_quit();
+        let reply = crate::control::cmd_log(&tab_ctx, "");
+        assert!(reply.starts_with("OK "), "{reply}");
+        let lines: Vec<&str> = reply.lines().skip(1).collect();
+        let tab = lines
+            .iter()
+            .position(|l| l.contains(" mark - tab act=close "))
+            .unwrap_or_else(|| panic!("the tab's close: {lines:#?}"));
+        let session = lines
+            .iter()
+            .position(|l| l.contains(" close - ") && l.contains(" out=app-quit "))
+            .unwrap_or_else(|| panic!("the session's quit close: {lines:#?}"));
+        assert!(
+            tab < session,
+            "the tab closes before its session: {lines:#?}"
+        );
+        assert_eq!(
+            session,
+            lines.len() - 1,
+            "and nothing follows the session's close"
+        );
+        for (key, want) in [("out", "app-quit"), ("by", "human")] {
+            assert_eq!(field(lines[tab], key), Some(want), "{key}: {}", lines[tab]);
+        }
+        let tl = tab_ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            !tl.slog().log().is_open(aterm_slog::Node::SESSION),
+            "the session is closed"
+        );
+    });
+}

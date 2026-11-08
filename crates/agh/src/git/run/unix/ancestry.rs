@@ -34,6 +34,7 @@ struct Reader<'a, 'gh> {
     api_bytes: usize,
     serial: usize,
     how: How,
+    local_only: bool,
 }
 
 impl Reader<'_, '_> {
@@ -107,6 +108,9 @@ impl Reader<'_, '_> {
         }
         for (id, line) in ids.iter().zip(lines) {
             if line == format!("{id} missing") {
+                if self.local_only {
+                    return Err(Error::local("the local commit witness is incomplete"));
+                }
                 self.acquire(id)?;
             } else {
                 let fields = line.split(' ').collect::<Vec<_>>();
@@ -332,6 +336,7 @@ pub(super) fn read(
             .as_profile(profile.map(str::to_owned))
             .anonymous(anonymous)
             .retry_policy(crate::retry::RetryPolicy::NONE),
+        local_only: false,
     };
     let common = reader.checked(
         "common-dir",
@@ -389,4 +394,51 @@ pub(super) fn read(
         stdout: aterm_json::to_vec(&value).map_err(|error| Error::protocol(error.to_string()))?,
         stderr: Vec::new(),
     })
+}
+
+/// A short, original-parent witness that a fresh remote tip already owns a
+/// commit's whole closure. Hash every body used in the witness. Distant roots
+/// use the full graph admission; this path never acquires anything over HTTP.
+pub(super) fn witnessed_local_path(
+    children: &Children<'_>,
+    run: &GitRun,
+    source: &Path,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool> {
+    let mut reader = Reader {
+        children,
+        run,
+        source: source.to_path_buf(),
+        view: children.scratch_git.clone(),
+        began: children.gh.fx().mono()?,
+        acquired: 0,
+        api_bytes: 0,
+        serial: 0,
+        how: How::read(),
+        local_only: true,
+    };
+    reader.read(&[ancestor.to_owned()])?;
+    let mut pending = vec![descendant.to_owned()];
+    let mut seen = BTreeSet::new();
+    while !pending.is_empty() {
+        if seen.len() + pending.len() > 256 {
+            return Ok(false);
+        }
+        let batch = std::mem::take(&mut pending);
+        for (id, body) in batch.iter().zip(reader.read(&batch)?) {
+            if id == ancestor {
+                return Ok(true);
+            }
+            for parent in object::parents(&body)? {
+                if parent == ancestor {
+                    return Ok(true);
+                }
+                if seen.insert(parent.clone()) {
+                    pending.push(parent);
+                }
+            }
+        }
+    }
+    Ok(false)
 }

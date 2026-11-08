@@ -121,20 +121,39 @@ fn under_ci() -> bool {
     std::env::var_os("CI").is_some()
 }
 
+/// The file this account's installed command resolves to, where an installer recorded one
+/// that is safe to read and its executable is there; `None` otherwise.
+fn declared_command() -> Option<PathBuf> {
+    let home = aterm_types::dirs::home_dir()?;
+    aterm_types::installed_command::selected(&home, aterm_uds::peer::our_uid())
+        .ok()
+        .flatten()?
+        .executable()
+        .canonicalize()
+        .ok()
+}
+
 /// `sync.fabric`'s read of a fabric with no command, as `unset` reads it: the person's off and a
 /// CI run are not this pass's; a fabric never turned off is, where the program the turn-on names
 /// for the broker is one that stays: an `aterm` on `$PATH` (`on_path`,
 /// [`aterm_link::enable::names_aterm_on_path`]), or `exe`, this process's canonical executable,
-/// the installed release app. A build or a held copy found on no `$PATH` would name its own file,
-/// which can go, and leave the broker's job a program that no longer starts.
+/// the installed release app or the file the account's installed command resolves to
+/// (`declared`, [`aterm_types::installed_command`]: where an install script, not an app bundle,
+/// placed aterm, and a job's `$PATH` may not reach). A build or a held copy found on no `$PATH`
+/// would name its own file, which can go, and leave the broker's job a program that no longer
+/// starts.
 fn fabric_unset(
     unset: Option<aterm_link::enable::Unset>,
     ci: bool,
     on_path: bool,
     exe: Option<&Path>,
+    declared: Option<&Path>,
 ) -> FabricRead {
     use aterm_link::enable::Unset;
-    let kept = on_path || exe.is_some_and(atpkg::hooks::is_installed_release_exe);
+    let kept = on_path
+        || exe.is_some_and(|exe| {
+            atpkg::hooks::is_installed_release_exe(exe) || declared == Some(exe)
+        });
     match unset {
         None => FabricRead::Current("on: [fabric] command is set".to_owned()),
         Some(Unset::PersonOff(why)) => FabricRead::NotApplicable(why),
@@ -2276,6 +2295,7 @@ impl Ports for Live {
                         .and_then(|exe| exe.canonicalize())
                         .ok()
                         .as_deref(),
+                    declared_command().as_deref(),
                 ),
                 BrokerRenewal::Current(now) => FabricRead::Current(now),
                 BrokerRenewal::Kept(why) => FabricRead::NotApplicable(why),
@@ -2961,12 +2981,16 @@ mod tests {
 
     /// A fabric with no command reads as `unset` says: the person's off and a CI run are left
     /// alone, a fabric never turned off is the pass's to turn on, where the program it names for
-    /// the broker stays (an `aterm` on `$PATH`, or this process the installed app); a build, a
-    /// copy on a mounted volume or an unread executable found on no `$PATH` leaves it, since it
-    /// would name its own file. The live port passes only its process's reads.
+    /// the broker stays (an `aterm` on `$PATH`, this process the installed app, or this process
+    /// the file the account's installed command resolves to, as an install script leaves it on
+    /// Linux, where a job's `$PATH` has no `~/.local/bin`); a build, a copy on a mounted volume or
+    /// an unread executable found on no `$PATH` leaves it, since it would name its own file. The
+    /// live port passes only its process's reads.
     /// NEGATIVE CONTROLS: a read that ignores `CI` hands a CI run's pass a fabric to turn on; one
     /// that ignores the program hands a worktree build's pass a broker job naming that build; one
-    /// that reads only `$PATH` leaves the installed app's fabric off.
+    /// that reads only `$PATH` leaves the installed app's fabric off; one that ignores the
+    /// declaration leaves a script-installed aterm's fabric off; one that takes any declaration
+    /// as enough hands a build's pass a broker job naming that build.
     #[test]
     fn a_fabric_never_turned_off_is_the_passs_outside_ci() {
         use aterm_link::enable::Unset;
@@ -2974,33 +2998,55 @@ mod tests {
         let app = Path::new("/Applications/aterm.app/Contents/MacOS/aterm");
         let build = Path::new("/Users//x/aterm-wt.noindex/target/debug/aterm");
         let mounted = Path::new("/Volumes/aterm/aterm.app/Contents/MacOS/aterm");
+        let store = Path::new("/home/x/.local/lib/aterm/bin/aterm");
         assert!(matches!(
-            fabric_unset(never(), false, true, Some(build)),
+            fabric_unset(never(), false, true, Some(build), None),
             FabricRead::Unset(_)
         ));
         assert!(matches!(
-            fabric_unset(never(), false, false, Some(app)),
+            fabric_unset(never(), false, false, Some(app), None),
             FabricRead::Unset(_)
         ));
         assert!(matches!(
-            fabric_unset(never(), true, true, Some(app)),
+            fabric_unset(never(), false, false, Some(store), Some(store)),
+            FabricRead::Unset(_)
+        ));
+        assert!(matches!(
+            fabric_unset(never(), true, true, Some(app), None),
             FabricRead::NotApplicable(why) if why.contains("CI")
         ));
-        for exe in [Some(build), Some(mounted), None] {
+        assert!(matches!(
+            fabric_unset(never(), true, false, Some(store), Some(store)),
+            FabricRead::NotApplicable(why) if why.contains("CI")
+        ));
+        for (exe, declared) in [
+            (Some(build), None),
+            (Some(mounted), None),
+            (None, None),
+            (Some(store), None),
+            (Some(build), Some(store)),
+            (None, Some(store)),
+        ] {
             assert!(
                 matches!(
-                    fabric_unset(never(), false, false, exe),
+                    fabric_unset(never(), false, false, exe, declared),
                     FabricRead::NotApplicable(why) if why.contains("not the installed app")
                 ),
-                "{exe:?}"
+                "{exe:?} declared {declared:?}"
             );
         }
         assert!(matches!(
-            fabric_unset(Some(Unset::PersonOff("off by your choice".to_owned())), false, true, Some(app)),
+            fabric_unset(
+                Some(Unset::PersonOff("off by your choice".to_owned())),
+                false,
+                true,
+                Some(store),
+                Some(store)
+            ),
             FabricRead::NotApplicable(why) if why == "off by your choice"
         ));
         assert!(matches!(
-            fabric_unset(None, false, false, None),
+            fabric_unset(None, false, false, None, None),
             FabricRead::Current(_)
         ));
     }

@@ -951,30 +951,34 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<(PaneFacts, scrollbar::Lane, (u32, u32), scrollbar::Hit)> {
-        if self.band_banner_at(wid, x, y).is_some() || self.find_bar_cell_at(wid, x, y).is_some() {
-            return None;
-        }
         let inputs = self.laid_overlay_inputs(wid).filter(|i| i.scrollbar)?;
         let ws = self.windows.get(&wid)?;
         let (gx, gy) = self.grid_pixel(wid, x, y);
         let (cw, ch) = inputs.cell;
         let m = Metrics::for_cell(u32::try_from(cw).ok()?, u32::try_from(ch).ok()?);
-        ws.pane_overlay.facts.iter().find_map(|f| {
-            if f.alt || f.history == 0 {
-                return None;
-            }
-            let lane = scrollbar::lane(
-                (f.rect.row, f.rect.col, f.rect.rows, f.rect.cols),
-                inputs.win_cols,
-                inputs.cell,
-                inputs.pad,
-                m,
-            )?;
-            let rows = u32::try_from(f.rect.rows).ok()?;
-            let thumb = scrollbar::thumb(lane, rows, f.history, f.offset, m)?;
-            let hit = scrollbar::hit(lane, thumb, gx, gy, m)?;
-            Some((*f, lane, thumb, hit))
-        })
+        ws.pane_overlay
+            .facts
+            .iter()
+            .find_map(|f| {
+                if f.alt || f.history == 0 {
+                    return None;
+                }
+                let lane = scrollbar::lane(
+                    (f.rect.row, f.rect.col, f.rect.rows, f.rect.cols),
+                    inputs.win_cols,
+                    inputs.cell,
+                    inputs.pad,
+                    m,
+                )?;
+                let rows = u32::try_from(f.rect.rows).ok()?;
+                let thumb = scrollbar::thumb(lane, rows, f.history, f.offset, m)?;
+                let hit = scrollbar::hit(lane, thumb, gx, gy, m)?;
+                Some((*f, lane, thumb, hit))
+            })
+            .filter(|_| {
+                self.band_banner_at(wid, x, y).is_none()
+                    && self.find_bar_cell_at(wid, x, y).is_none()
+            })
     }
 
     /// Request a redraw of window `wid`.

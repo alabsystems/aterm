@@ -141,7 +141,6 @@ fn forced_short_time_words_take_the_short_slot_and_spend_nothing() {
         live: true,
         glyph: '\u{21e3}',
         title: "Downloading aterm v0.95.0",
-        title_short: None,
         detail0: Some("from github.com over the office network, resumed where it stopped"),
         step: false,
         step_short: None,
@@ -610,178 +609,144 @@ fn a_step_cut_short_of_its_first_action_ends_in_an_ellipsis() {
     );
 }
 
-fn title_tier(row: &RowLayout, title: &str, short: &str) -> Option<u8> {
+/// Where `row`'s title stands: 1 whole, 0 cut after a whole word of it; `None` is a stub of it.
+fn title_tier(row: &RowLayout, title: &str) -> Option<u8> {
     let shown = row.title.1.as_str();
-    let said = shown.trim_end_matches('\u{2026}');
     if shown == title {
-        Some(2)
-    } else if shown == short {
         Some(1)
-    } else if shown.ends_with('\u{2026}') && !said.is_empty() && short.starts_with(said) {
+    } else if shown.ends_with('\u{2026}') && crate::glass::tests::whole_words_of(shown, title) {
         Some(0)
     } else {
         None
     }
 }
 
-fn titled(title: &str, short_title: &str, step: &str, short: Option<&str>) -> Message {
-    step_or_short(title, step, short).short_title(short_title)
+/// Where an ask's step dropped from `r`, the way its cells went, held to the width law's order:
+/// first the title, then the capsules' long forms, then `Details ›`. 0 is the title cut after the
+/// last word that fits beside the capsules' short forms, no earlier than `stood` (the title beside
+/// the step a column wider); 1 the whole title beside the short forms; 2 beside the long forms; 3
+/// beside the long forms and `Details ›`.
+fn where_the_steps_cells_went(r: &RowLayout, title: &str, stood: &str, at: &str) -> usize {
+    let shown = r.title.1.as_str();
+    let blank = r.capsules[0]
+        .col
+        .saturating_sub(r.title.0 + char_width(shown) + crate::BEFORE_CAPSULES);
+    let long = r.capsules.iter().all(|c| c.text == c.full_label);
+    let details = r.capsules.iter().any(|c| c.role == CapsuleRole::Details);
+    match (title_tier(r, title), long, details) {
+        (Some(0), false, false) => {
+            let next = next_cut_cells(shown, title)
+                .unwrap_or_else(|| panic!("{at}: a cut title with no next word: {r:?}"));
+            assert!(
+                next > char_width(shown) + blank,
+                "{at}: the title's next word fits in the step's cells: {r:?}"
+            );
+            assert!(
+                char_width(shown) >= char_width(stood),
+                "{at}: the title is cut earlier than beside the step ({stood:?}): {r:?}"
+            );
+            0
+        }
+        (Some(1), false, false) => {
+            let longer: usize = r
+                .capsules
+                .iter()
+                .map(|c| char_width(c.full_label).saturating_sub(char_width(&c.text)))
+                .sum();
+            assert!(
+                blank < longer,
+                "{at}: the capsules' long forms fit in the step's cells: {r:?}"
+            );
+            1
+        }
+        (Some(1), true, false) => {
+            let link = char_width("Details \u{203a}") + 2 + crate::CAPSULE_GAP;
+            assert!(
+                blank < link,
+                "{at}: `Details \u{203a}` fits in the step's cells: {r:?}"
+            );
+            2
+        }
+        (Some(1), true, true) => 3,
+        _ => panic!("{at}: the capsules took the step's cells before the whole title: {r:?}"),
+    }
 }
 
 #[test]
-fn a_title_reads_whole_short_or_short_cut_never_as_a_stub_of_itself() {
-    let title = "Claude's login expired in tab 1";
-    let short = "Login expired";
-    for label in ["main", "client-acme-research-024"] {
-        let commands = [
-            (
-                format!("Type /login in the tab and sign in as {label}."),
-                None,
-            ),
-            (
-                format!("Run aterm harness accounts renew {label}"),
-                Some(SHORT),
-            ),
-        ];
-        for (step, step_short) in &commands {
-            let row = |cols| revealed(titled(title, short, step, *step_short), cols);
-            let (mut wholes, mut shorts, mut drops) = (0, 0, 0);
-            let mut prev = None::<(u8, bool, bool)>;
-            for cols in (20..=200).rev() {
-                let r = row(cols);
-                let tier = title_tier(&r, title, short)
-                    .unwrap_or_else(|| panic!("{label} {cols}: a stub of the title: {r:?}"));
-                let shown = excerpt_of(&r);
-                if shown.as_ref().is_some_and(|d| d != step && d != SHORT) {
+fn a_title_reads_whole_or_cut_after_a_word_and_comes_back_only_where_the_step_gives_way() {
+    let mut ways = [0_usize; 4];
+    for title in [
+        "Claude usage limit reached in tab 1",
+        "Claude's login expired in tab 1",
+        "Claude's login expired",
+        "Tab 1 needs you",
+    ] {
+        for label in ["main", "client-acme-research-024"] {
+            let commands = [
+                (
+                    format!("Type /login in the tab and sign in as {label}."),
+                    None,
+                ),
+                (
+                    format!("Run aterm harness accounts renew {label}"),
+                    Some(SHORT),
+                ),
+            ];
+            for (step, step_short) in &commands {
+                let row = |cols| revealed(step_or_short(title, step, *step_short), cols);
+                let (mut wholes, mut cuts, mut drops) = (0, 0, 0);
+                let mut prev = None::<(u8, bool, bool, String)>;
+                for cols in (22..=200).rev() {
+                    let r = row(cols);
+                    let at = format!("{title:?} {label} {cols}");
+                    let tier = title_tier(&r, title)
+                        .unwrap_or_else(|| panic!("{at}: a stub of the title: {r:?}"));
+                    let shown = excerpt_of(&r);
+                    if shown.as_ref().is_some_and(|d| d != step && d != SHORT) {
+                        assert!(
+                            at_floor(&r.title.1, title),
+                            "{at}: the step cut beside a title above its floor: {r:?}"
+                        );
+                    }
+                    wholes += usize::from(tier == 1);
+                    cuts += usize::from(tier == 0);
+                    let replaced = shown.as_deref() == Some(SHORT);
+                    let stands = r.detail.is_some();
+                    // The title beside the step a column wider, where the step drops here.
+                    let dropped = prev
+                        .as_ref()
+                        .filter(|(_, _, stood, _)| *stood && !stands)
+                        .map(|(.., words)| words.as_str());
                     assert!(
-                        at_floor(&r.title.1, title) || at_floor(&r.title.1, short),
-                        "{label} {cols}: the step cut beside a title above its floor: {r:?}"
+                        prev.as_ref().is_none_or(|(p, was, ..)| {
+                            tier <= *p || (replaced && !was) || dropped.is_some()
+                        }),
+                        "{at}: the title came back whole as the row narrowed: {r:?}"
                     );
+                    if let Some(stood) = dropped {
+                        drops += 1;
+                        ways[where_the_steps_cells_went(&r, title, stood, &at)] += 1;
+                    }
+                    prev = Some((tier, replaced, stands, r.title.1.clone()));
                 }
-                wholes += usize::from(tier == 2);
-                shorts += usize::from(tier == 1);
-                let replaced = shown.as_deref() == Some(SHORT);
-                let stands = r.detail.is_some();
-                let dropped = !stands && prev.is_some_and(|(_, _, stood)| stood);
                 assert!(
-                    prev.is_none_or(
-                        |(p, was, _)| tier <= p || ((replaced && !was) || dropped) && tier < 2
-                    ),
-                    "{label} {cols}: the title widened as the row narrowed: {r:?}"
+                    wholes > 0 && cuts > 0,
+                    "{title:?} {label}: {wholes} whole, {cuts} cut"
                 );
-                if dropped {
-                    drops += 1;
-                    let details = r.capsules.iter().any(|c| c.text == "Details \u{203a}");
-                    let long = r.capsules.iter().all(|c| c.text == c.full_label);
-                    let end = r.title.0 + char_width(&r.title.1);
-                    let blank = r.capsules[0]
-                        .col
-                        .saturating_sub(end + crate::BEFORE_CAPSULES);
-                    let link = char_width("Details \u{203a}") + 2 + crate::CAPSULE_GAP;
-                    assert!(
-                        details || long && blank < link,
-                        "{label} {cols}: the step's cells left blank, no way to it: {r:?}"
-                    );
-                }
-                prev = Some((tier, replaced, stands));
-            }
-            assert!(
-                wholes > 0 && shorts > 0,
-                "{label}: {wholes} whole, {shorts} short"
-            );
-            assert_eq!(drops, 1, "{label}: the step goes once");
-            assert_eq!(row(200).title.1, title, "{label}: the wide band");
-            let default = row(80);
-            assert_eq!(
-                title_tier(&default, title, short).map(|t| t < 2),
-                Some(true)
-            );
-            assert!(excerpt_of(&default).is_some(), "{label} at 80: {default:?}");
-            if label == "main" {
-                assert_eq!(default.title.1, short, "{label} at 80: {default:?}");
+                assert_eq!(drops, 1, "{title:?} {label}: the step goes once");
+                assert_eq!(row(200).title.1, title, "{title:?} {label}: the wide band");
+                let default = row(80);
+                assert!(
+                    excerpt_of(&default).is_some(),
+                    "{title:?} {label} at 80: {default:?}"
+                );
             }
         }
     }
-    let step = "Type /login in the tab and sign in as main.";
-    let plain = revealed(step_or_short(title, step, None), 70);
-    let said = plain.title.1.trim_end_matches('\u{2026}');
     assert!(
-        plain.title.1.ends_with('\u{2026}') && title.starts_with(said),
-        "{plain:?}"
+        ways.iter().all(|&n| n > 0),
+        "premise: the step's cells go each way the law orders, [cut, whole, long, Details]: {ways:?}"
     );
-    assert_eq!(title_tier(&plain, title, short), None, "{plain:?}");
-}
-
-#[test]
-fn beside_a_steps_short_form_the_short_title_keeps_details() {
-    let title = "Claude usage limit reached in tab 1";
-    let step = "Run aterm harness accounts renew client-acme-research-024";
-    let caps = |row: &RowLayout| {
-        row.capsules
-            .iter()
-            .map(|c| c.text.clone())
-            .collect::<Vec<_>>()
-    };
-    for cols in [70, 80] {
-        let row = revealed(titled(title, "Usage limit", step, Some(SHORT)), cols);
-        assert_eq!(row.title.1, "Usage limit", "{cols}: {row:?}");
-        assert_eq!(excerpt_of(&row).as_deref(), Some(SHORT), "{cols}: {row:?}");
-        assert_eq!(caps(&row)[0], "Show tab 1", "{cols}: {row:?}");
-    }
-    let default = revealed(titled(title, "Usage limit", step, Some(SHORT)), 80);
-    assert_eq!(
-        caps(&default),
-        ["Show tab 1", "Details \u{203a}"],
-        "{default:?}"
-    );
-    let plain = revealed(step_or_short(title, step, Some(SHORT)), 80);
-    assert!(
-        !caps(&plain).iter().any(|c| c == "Details \u{203a}"),
-        "{plain:?}"
-    );
-}
-
-#[test]
-fn a_short_title_stands_only_where_the_whole_one_does_not_fit() {
-    let step = "Type /login in the tab and sign in again.";
-    let wide = revealed(
-        titled("Claude's login expired", "Login expired", step, None),
-        200,
-    );
-    assert_eq!(wide.title.1, "Claude's login expired", "{wide:?}");
-    let longer = revealed(
-        titled("Login gone", "Claude's login expired", step, None),
-        30,
-    );
-    assert!(
-        "Login gone".starts_with(longer.title.1.trim_end_matches('\u{2026}')),
-        "{longer:?}"
-    );
-    let narrow = revealed(
-        titled("Claude's login expired", "Login expired", step, None),
-        70,
-    );
-    assert_eq!(narrow.title.1, "Login expired", "{narrow:?}");
-}
-
-#[test]
-fn a_short_title_gives_back_the_cells_the_whole_title_took() {
-    let title = "Claude's login expired in tab 1";
-    let step = "Finish signing in in your browser.";
-    let cols = 80;
-    let caps = |row: &RowLayout| {
-        row.capsules
-            .iter()
-            .map(|c| c.text.clone())
-            .collect::<Vec<_>>()
-    };
-    let row = revealed(titled(title, "Login expired", step, None), cols);
-    assert_eq!(row.title.1, "Login expired", "{row:?}");
-    assert_eq!(excerpt_of(&row).as_deref(), Some(step), "{row:?}");
-    assert_eq!(caps(&row), ["Show tab 1", "Details \u{203a}"], "{row:?}");
-    let plain = revealed(step_or_short(title, step, None), cols);
-    assert!(plain.title.1.ends_with('\u{2026}'), "{plain:?}");
-    assert_eq!(caps(&plain), ["Tab 1"], "{plain:?}");
 }
 
 #[test]
@@ -792,18 +757,14 @@ fn a_title_is_cut_only_after_a_whole_word() {
             .map(|c| if c.is_ascii_uppercase() { 2 } else { 1 })
             .sum()
     };
-    let honest = |shown: &str, title: &str, short: Option<&str>| {
-        shown.is_empty()
-            || whole_words_of(shown, title)
-            || short.is_some_and(|short| whole_words_of(shown, short))
-    };
-    assert!(!honest("Keybindin\u{2026}", "Keybinding skipped", None));
+    let honest = |shown: &str, title: &str| shown.is_empty() || whole_words_of(shown, title);
+    assert!(!honest("Keybindin\u{2026}", "Keybinding skipped"));
     for (name, spec) in fixtures().into_iter().chain(motion_fixtures()) {
         for cols in 22..=42 {
             for width in [&char_width as &dyn Fn(&str) -> usize, &two_cell] {
                 let row = layout_row(&spec, cols, width);
                 assert!(
-                    honest(&row.title.1, spec.title, spec.title_short),
+                    honest(&row.title.1, spec.title),
                     "{name}@{cols}: {:?}",
                     row.title.1
                 );
@@ -815,7 +776,7 @@ fn a_title_is_cut_only_after_a_whole_word() {
             .line("skipping \"cmd+shift+k\": unknown action")
             .action(Intent::OpenConfigEditor { line: None })
     };
-    let mut rows: Vec<(Message, &str, Option<&str>)> = [
+    let mut rows: Vec<(Message, &str)> = [
         "Keybinding skipped",
         "3 keybindings skipped",
         "Unknown setting",
@@ -830,24 +791,18 @@ fn a_title_is_cut_only_after_a_whole_word() {
         "Couldn't change Secure Keyboard Entry",
     ]
     .into_iter()
-    .map(|title| (config(title), title, None))
+    .map(|title| (config(title), title))
     .collect();
     let notice = "Claude usage limit reached in tab 1";
     rows.push((
         step_first(notice, "Run aterm harness accounts renew main"),
         notice,
-        None,
     ));
-    rows.push((
-        step_first(notice, "Run aterm harness accounts renew main").short_title("Usage limit"),
-        notice,
-        Some("Usage limit"),
-    ));
-    for (msg, title, short) in rows {
+    for (msg, title) in rows {
         for cols in 22..=42 {
             let row = revealed(msg.clone(), cols);
             assert!(
-                honest(&row.title.1, title, short),
+                honest(&row.title.1, title),
                 "{title}@{cols}: {:?}",
                 row.title.1
             );

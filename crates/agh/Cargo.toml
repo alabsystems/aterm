@@ -62,6 +62,7 @@ aterm-durable = { workspace = true }
 aterm-spec-anchor = { workspace = true }
 
 [dev-dependencies]
+aterm-sysprobe = { workspace = true }
 # The loopback GitHub the loopback, resource and CLI tests drive.
 agh-fake = { workspace = true }
 # StepEvidence, interp and xref for the route-wall conformance.

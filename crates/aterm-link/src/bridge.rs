@@ -41,25 +41,16 @@ use crate::wait_tally::Recorder;
 #[path = "bridge_mirror.rs"]
 mod mirror_run;
 
-/// Maximum time the publisher connection waits for the broker to answer a single request.
-#[cfg(not(test))]
-pub(crate) const ACK_DEADLINE: Duration = Duration::from_secs(5);
-/// The unit tests' broker runs in-process, so a request it answers late is a loaded machine,
-/// not a broker gone silent: their connections wait the hang detector.
-#[cfg(test)]
-pub(crate) const ACK_DEADLINE: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// Hang detector for a required broker answer, including a locally scheduled broker.
+pub(crate) const ACK_DEADLINE: Duration = Duration::from_secs(60);
 
-const ACK_DEADLINE_SEAM: &str = "ATERM_LINK_ACK_DEADLINE_MS";
-
-/// [`ACK_DEADLINE`], or the [`ACK_DEADLINE_SEAM`] a seam-enabled build was given, read once: the
-/// bound on each broker answer of the bridge's links and of `notify`'s.
+/// The bound on each broker answer of the bridge's links and of `notify`'s.
 pub(crate) fn ack_deadline() -> Duration {
-    static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *AT.get_or_init(|| {
-        aterm_types::dev_seam!(ACK_DEADLINE_SEAM)
-            .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?))
-            .map_or(ACK_DEADLINE, Duration::from_millis)
-    })
+    ack_remaining(Duration::ZERO)
+}
+
+pub(crate) fn ack_remaining(elapsed: Duration) -> Duration {
+    ACK_DEADLINE.saturating_sub(elapsed)
 }
 
 /// How long a subscription's reader reads nothing before it takes the link for dead
@@ -68,8 +59,8 @@ pub(crate) fn ack_deadline() -> Duration {
 const LIVE_DEADLINE: Duration = astream_broker::IDLE_MARK_DEADLINE;
 
 /// [`LIVE_DEADLINE`]'s seam, in milliseconds, in a seam-enabled build: the fabric_world
-/// harness sets it to the hang detector on every instance it starts (its `LIVE_WAIT`, beside
-/// [`ACK_DEADLINE_SEAM`]), since its broker runs on the test's loaded machine.
+/// harness sets it to the hang detector on every instance it starts (its `LIVE_WAIT`), since
+/// its broker runs on the test's loaded machine.
 const LIVE_DEADLINE_SEAM: &str = "ATERM_LINK_LIVE_DEADLINE_MS";
 
 fn live_deadline() -> Duration {

@@ -127,7 +127,6 @@ impl Exception {
                 id: text.id,
                 code: text.code,
                 title: text.title,
-                short_title: text.short_title,
                 did: filled.did,
                 expect: filled.expect,
                 command: filled.command,

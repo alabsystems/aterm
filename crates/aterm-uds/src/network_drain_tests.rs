@@ -5,7 +5,7 @@ use super::{MAX_DRAIN_MESSAGES, RouteChanges};
 use std::collections::VecDeque;
 use std::io;
 
-// A macOS address event; Linux's subscribed groups classify any nonempty read as a change.
+// A macOS address event; on Linux a netlink message of neither type that can report no change.
 fn change_message() -> Vec<u8> {
     [24_u32, 1, 1, 1, 37, 1]
         .into_iter()

@@ -169,6 +169,9 @@ mod sign;
 #[path = "../../src/site/mod.rs"]
 #[allow(dead_code)]
 mod site;
+#[path = "../../src/slice_units.rs"]
+#[allow(dead_code)]
+mod slice_units;
 #[path = "../../src/snapshot.rs"]
 #[allow(dead_code)]
 mod snapshot;

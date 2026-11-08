@@ -80,6 +80,8 @@ aterm-ctl = { path = "../aterm-ctl" }
 # (`aterm_containment::consent::OPEN_PROBE_VERB`). std, aterm-log, aterm-uds and aterm-tempfile.
 aterm-containment = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+# Decode the journal's public intent identity with its native parser.
+agh = { workspace = true }
 # `glue` and `wasm-glue` read the descriptor aterm-wasm-abi's `#[export]`
 # writes, with that crate's own decoder and lowering table.
 aterm-wasm-abi = { workspace = true }
@@ -136,7 +138,6 @@ aterm-vz = { workspace = true }
 
 [dev-dependencies]
 # Manual journal-store admission measurement; all network and identities are fixtures.
-agh = { workspace = true }
 agh-fake = { workspace = true }
 # Tier-1 of `EndByProof` (tests/conformance_end_by_proof.rs): the model and the interpreter
 # that drives it against the real `aterm_uds::process::end_proven`.

@@ -326,7 +326,7 @@ fn the_line_escapes() {
 }
 
 #[test]
-fn the_object_has_its_nineteen_keys() {
+fn the_object_has_its_schema_keys() {
     let value = full_error().to_json(&Redactor::new());
     let object = value
         .get("error")
@@ -338,6 +338,7 @@ fn the_object_has_its_nineteen_keys() {
         "documentation_url",
         "errors",
         "exit",
+        "intent",
         "kind",
         "message",
         "next",
@@ -357,6 +358,7 @@ fn the_object_has_its_nineteen_keys() {
     .into_iter()
     .collect();
     assert_eq!(keys, expected);
+    assert_eq!(object.get("intent"), Some(&aterm_json::Value::Null));
     assert_eq!(object.get("v").and_then(|v| v.as_u64()), Some(1));
     assert_eq!(object.get("exit").and_then(|v| v.as_u64()), Some(5));
     assert_eq!(

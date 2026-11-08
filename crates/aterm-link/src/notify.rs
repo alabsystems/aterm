@@ -2890,8 +2890,9 @@ says it exited before its close reached the bus has no need; a session's close r
 session whose close never reached the bus pages `exited` with detail `gone` once, at a
 successor's restore that names it (`restore prev=<sid>`), when its aterm died: the
 incarnation that hosted it ended and never said it exited, as `fabric brief` derives its
-close. A quit withdraws every session it carried, so the restores of the relaunch after it
-page nothing, nor does a reopened tab's. A
+close. A clean quit closes every session it carried on the bus (`out=app-quit`) before
+its bridge withdraws them, and that close pages nothing; nor do the restores of the relaunch
+after it, nor a reopened tab's. A
 node's will (its row's `state=away`, or the legacy `gone`) pages and clears nothing, so a
 reattach that restores the same needs pages nothing. A session whose fold is partial (the
 brief's `partial`: no start, lost records, or a snapshot short of its needs) clears nothing,
@@ -5742,6 +5743,23 @@ mod tests {
                 .expect("closes");
         }
 
+        /// A clean quit's close of the session (aterm-gui's `SessionLog::close_at_quit`, fix
+        /// unit Q1): `out=app-quit by=aterm`, which closes every node the session holds open.
+        fn quit(&mut self) {
+            let at = self.at();
+            self.log
+                .close_session(
+                    aterm_slog::Close::new(
+                        aterm_slog::Out::Session(aterm_slog::SessionOut::AppQuit),
+                        aterm_slog::Src::Aterm,
+                        aterm_slog::Conf::Exact,
+                    )
+                    .by(aterm_slog::Actor::Aterm),
+                    at,
+                )
+                .expect("the quit closes");
+        }
+
         fn bodies(&mut self) -> Vec<String> {
             mirrored(&mut self.log)
         }
@@ -6478,6 +6496,119 @@ mod tests {
             );
             assert_eq!(standing_words(&n, NEED_FACE), ["exited"], "{tag}");
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// A CLEAN QUIT'S CLOSE AND ITS RELAUNCH PAGE NOTHING; A CRASH PAGES ITS EXIT ONCE (fix unit
+    /// Q1). On n-a, s-q pages a failure and waits in a turn, and its aterm quits cleanly: its
+    /// close `out=app-quit` reaches the bus before the bridge's `bye quit`, with the bridge's
+    /// withdrawal after it (`exited` under `inc=1`) or with none (a withdrawal that never
+    /// landed); the node's will fires as the bridge goes, the node relaunches under `inc=2`, and
+    /// s-z's restore names s-q: nothing pages for s-q but its failure, and none of its pairs
+    /// stands. On n-c, s-c pages the same failure and waits, and its aterm crashes (no close, no
+    /// withdrawal); the node relaunches, and s-w's restore names s-c: `exited gone s-c` pages
+    /// once. Under bare `--on need` and `need:exited`. NEGATIVE CONTROLS, run: a watch that pages
+    /// a quit's close as any other close pages `exited` at s-q's close; one that pages no
+    /// `exited` at all pages nothing for s-c.
+    #[test]
+    fn a_clean_quits_close_and_its_relaunch_page_nothing_and_a_crash_pages_its_exit_once() {
+        let face = |node: &str, sid: &str| format!("/f/f1/pub/{node}/{sid}/ev");
+        let row = |node: &str, sid: &str| format!("/f/f1/pub/{node}/{sid}/presence");
+        let mut quitting = Needs::open();
+        let cmd = quitting.cmd_open();
+        quitting.cmd_close(cmd, aterm_slog::RunOut::Fail);
+        quitting.turn();
+        let waiting = quitting.bodies();
+        quitting.quit();
+        let quit = quitting.bodies();
+        assert!(
+            quit.iter()
+                .any(|b| b.contains(" op=close node=- ") && b.contains(" out=app-quit")),
+            "PRECONDITION: the quit's close crosses the bus: {quit:?}"
+        );
+        for withdrawn in [true, false] {
+            for (tag, sel) in [
+                ("exited", Sel::Need(Some(vec!["exited"]))),
+                ("any", Sel::Need(None)),
+            ] {
+                let dir = scratch(&format!("need-quit-{withdrawn}-{tag}"));
+                let said = Path::new(&dir).join("said");
+                let (mut n, fired) = appending(
+                    &dir,
+                    100,
+                    &format!(
+                        "printf '%s %s %s\\n' \"$ATERM_NOTIFY_NEED\" \"$ATERM_NOTIFY_DETAIL\" \
+                         \"$ATERM_NOTIFY_SID\" >> {}; ",
+                        said.display()
+                    ),
+                );
+                n.cfg.on = vec![sel.clone()];
+                let mut off = 0;
+                let mut feed = |n: &mut Notifier, subject: &str, body: &[u8]| {
+                    off += 1;
+                    n.on_record(&sel, off, subject, body).expect("on_record");
+                    off
+                };
+                let mut want = Vec::new();
+                for (node, sid) in [("n-a", "s-q"), ("n-c", "s-c")] {
+                    feed(&mut n, &row(node, "node"), b"v=1 t=1 state=live inc=1");
+                    feed(&mut n, &row(node, sid), b"v=1 t=1 inc=1 state=live");
+                    for b in &waiting {
+                        let at = feed(&mut n, &face(node, sid), b.as_bytes());
+                        if b.contains("out=fail") && tag == "any" {
+                            want.push(at);
+                        }
+                    }
+                }
+                for b in &quit {
+                    feed(&mut n, &face("n-a", "s-q"), b.as_bytes());
+                }
+                if withdrawn {
+                    feed(&mut n, &row("n-a", "s-q"), b"v=1 t=2 inc=1 state=exited");
+                }
+                for node in ["n-a", "n-c"] {
+                    feed(
+                        &mut n,
+                        &row(node, "node"),
+                        b"v=1 t=2 state=away inc=1 fabric=disconnected",
+                    );
+                    feed(&mut n, &row(node, "node"), b"v=1 t=3 state=live inc=2");
+                }
+                for b in restore_of("s-q") {
+                    feed(&mut n, &face("n-a", "s-z"), b.as_bytes());
+                }
+                assert_eq!(
+                    fired_offsets(&fired),
+                    want,
+                    "{tag}, withdrawn {withdrawn}: a clean quit's close and its relaunch page \
+                     nothing"
+                );
+                assert_eq!(
+                    standing_words(&n, &face("n-a", "s-q")),
+                    Vec::<&str>::new(),
+                    "{tag}, withdrawn {withdrawn}: the quit's close leaves no pair standing"
+                );
+                for b in restore_of("s-c") {
+                    let at = feed(&mut n, &face("n-c", "s-w"), b.as_bytes());
+                    if b.contains(" k=restore ") {
+                        want.push(at);
+                    }
+                }
+                assert_eq!(
+                    fired_offsets(&fired),
+                    want,
+                    "{tag}, withdrawn {withdrawn}: the crash pages its exit once, at the restore"
+                );
+                let said = std::fs::read_to_string(&said).unwrap_or_default();
+                assert_eq!(
+                    said.lines()
+                        .filter(|l| l.starts_with("exited "))
+                        .collect::<Vec<_>>(),
+                    ["exited gone s-c"],
+                    "{tag}, withdrawn {withdrawn}: {said}"
+                );
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     }
 

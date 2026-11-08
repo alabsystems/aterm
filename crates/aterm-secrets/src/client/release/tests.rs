@@ -469,7 +469,7 @@ fn no_developer_tools_or_no_release_host_runs_nothing() {
     ring(&paths, &["m22"], &[]);
     assert_eq!(
         script.step(&mut rounds, &paths, &no_clt),
-        Step::Waits(WAITS_FOR_CLT)
+        Step::Waits(no_developer_dir())
     );
     assert_eq!(script.runs(), 0, "no xcrun");
 }

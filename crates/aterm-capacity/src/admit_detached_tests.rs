@@ -34,7 +34,7 @@ fn held(accounting: Accounting) -> Record {
 
 fn decide_with(machine: &Fixed, records: &[Record]) -> Result<Grant, Shortfall> {
     let procs = machine.procs();
-    let records = counted(records.iter().collect(), CONTENDER, procs.as_ref());
+    let records = counted(records.iter().collect(), CONTENDER, procs.as_ref(), None);
     let roots: Vec<_> = records
         .iter()
         .flat_map(|record| std::iter::once(record.pid).chain(record.credit.iter().copied()))
@@ -132,10 +132,13 @@ fn reused_owner_ancestor_cannot_exclude_or_cover_detached_memory() {
     ]);
     let machine = fixed(procs.clone());
     let ordinary = held(Accounting::Holder);
-    assert!(counted(vec![&ordinary], CONTENDER, Some(&procs)).is_empty());
+    assert!(counted(vec![&ordinary], CONTENDER, Some(&procs), None).is_empty());
     assert!(decide_with(&machine, &[ordinary]).is_ok());
     let mut detached = held(Accounting::Detached);
-    assert_eq!(counted(vec![&detached], CONTENDER, Some(&procs)).len(), 1);
+    assert_eq!(
+        counted(vec![&detached], CONTENDER, Some(&procs), None).len(),
+        1
+    );
     assert_full_budget_refused(&machine, detached.clone());
     // Even an inconsistent old coverage flag in an observational Record supplies no
     // ancestor or credit authority when its accounting is detached. The transfer API

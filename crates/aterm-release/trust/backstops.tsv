@@ -15669,7 +15669,20 @@ aterm-grid	c3ea829b7b70c93e	wall-backstop	aterm_grid::grid::scrollback_offload::
 aterm-grid	cc0cfe30db8940a2	rss-backstop	aterm_grid::grid::scrollback_offload::<impl aterm_grid::grid::Grid>::resize_offloading_scrollback_with_policy hardened_panic_boundary crates/aterm-grid/src/grid/scrollback_offload.rs:523 `store.line_count() + lazy_staged.len()`
 aterm-gui-consent	-	cancelled	0
 aterm-gui-fabric	-	cancelled	0
-aterm-gui-fabric	54159f1d78bd2267	wall-backstop	aterm_gui_fabric::_#4::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::PostCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:900 `serde::Serialize`
+aterm-gui-fabric	54159f1d78bd2267	wall-backstop	aterm_gui_fabric::_#4::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::PostCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:928 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
+aterm-gui-fabric	b13c7b8f2bd7ea83	wall-backstop	aterm_gui_fabric::_#2::<impl aterm_serde::ser::Serialize for aterm_gui_fabric::FabricCarry>::serialize arithmetic_overflow_add crates/aterm-gui-fabric/src/lib.rs:857 `serde::Serialize`
 aterm-gui-tabs	-	cancelled	0
 aterm-gui-timing	-	cancelled	0
 aterm-hash	-	cancelled	0
@@ -15695,76 +15708,456 @@ aterm-http	-	cancelled	0
 aterm-keeper	-	cancelled	0
 aterm-lexicon	-	cancelled	0
 aterm-link	-	cancelled	0
-aterm-link	0211a8b51b685dbe	rss-backstop	<aterm_link::fabric::FaceRead as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/fabric.rs:5108 `PartialEq`
-aterm-link	024479462e84ba90	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:487 `used += line_tokens(&line)`
-aterm-link	074dadca661820fa	rss-backstop	aterm_link::wait_tally::Hist::since index_out_of_bounds crates/aterm-link/src/wait_tally.rs:308 `self.buckets[i]`
-aterm-link	0811b6d5bb7b533f	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_sub crates/aterm-link/src/fabric_brief.rs:458 `shown.len() - i`
-aterm-link	098a3263e3e516ab	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:458 `more += shown.len() - i`
-aterm-link	0c8ac2669680c0d1	rss-backstop	<aterm_link::state::journal::Frame as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/state/journal.rs:60 `PartialEq`
-aterm-link	0e7d2f48e8ac2364	rss-backstop	aterm_link::wait_tally::Hist::floor hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:267 `(1u64 << (i - 1).min(63)) << unit.shift()`
-aterm-link	1884071c869688b7	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:477 `folded += 1`
-aterm-link	1bdbd350ac33cb53	rss-backstop	aterm_link::wait_tally::Tally::since index_out_of_bounds crates/aterm-link/src/wait_tally.rs:609 `self.rows[i]`
-aterm-link	1f57e203baca7237	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1885 `self.counts.skipped += 1`
-aterm-link	20b11769e9aa1250	rss-backstop	aterm_link::wait_tally::Hist::floor hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:267 `(1u64 << (i - 1).min(63))`
-aterm-link	212f6c49b3a79063	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1891 `self.counts.standing += 1`
-aterm-link	225c1241356fb7c8	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:461 `(left / (shown.len() - i))`
-aterm-link	229574baefb15d03	rss-backstop	aterm_link::notify::Notifier::advance arithmetic_overflow_add crates/aterm-link/src/notify.rs:1688 `lag.records += 1`
-aterm-link	2361055d92137f0e	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:480 `foreign += space.foreign`
-aterm-link	2377090965fb1621	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:458 `more += shown.len() - i`
-aterm-link	2c3850149e96388f	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:475 `partial += 1`
-aterm-link	3346d2e4db12d134	rss-backstop	aterm_link::wait_tally::Hist::since hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:308 `self.buckets[i]`
-aterm-link	33ee17a69e7aa6b9	rss-backstop	aterm_link::wait_tally::Hist::floor shift_overflow_shl crates/aterm-link/src/wait_tally.rs:267 `(1u64 << (i - 1).min(63)) << unit.shift()`
-aterm-link	3752b25f84a580ed	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:478 `dup += space.dup`
-aterm-link	387e316f4f699725	rss-backstop	aterm_link::wait_tally::Tally::since hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:609 `self.rows[i]`
-aterm-link	40095d2514c56067	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:475 `partial += 1`
-aterm-link	445992d0e8007d7c	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_sub crates/aterm-link/src/fabric_brief.rs:461 `(shown.len() - i)`
-aterm-link	47162679d0dbe3d6	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:479 `reordered += space.reordered`
-aterm-link	4a36bdd04e239ad6	rss-backstop	aterm_link::fabric_brief::render division_by_zero crates/aterm-link/src/fabric_brief.rs:461 `(left / (shown.len() - i))`
-aterm-link	4a7ac57e82f37e78	rss-backstop	aterm_link::wait_tally::Hist::since::{closure#1} index_out_of_bounds crates/aterm-link/src/wait_tally.rs:313 `earlier.buckets[i]`
-aterm-link	51ebfa14f79d61a8	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1917 `self.counts.dropped += 1`
-aterm-link	570d41f11a4064b0	rss-backstop	<aterm_link::bridge::Unfetched as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/bridge.rs:821 `PartialEq`
-aterm-link	5b88a5cd55fba11b	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:461 `(shown.len() - i)`
-aterm-link	5cfb374264133f52	rss-backstop	<aterm_link::notify::Stand as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/notify.rs:449 `PartialEq`
-aterm-link	5d9e238b65f9dd94	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1885 `self.counts.skipped += 1`
-aterm-link	5ec7fd764dee70cf	rss-backstop	aterm_link::wait_tally::Tally::since::{closure#1} index_out_of_bounds crates/aterm-link/src/wait_tally.rs:611 `Row::ALL[i]`
-aterm-link	61b80e1cf063d707	rss-backstop	<aterm_link::fabric::Off as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/fabric.rs:2646 `PartialEq`
-aterm-link	6388e1a0f373147e	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1905 `self.suppressed + 1`
-aterm-link	63ed858091e8e76d	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_sub crates/aterm-link/src/fabric_brief.rs:464 `share - head_t`
-aterm-link	654705e432a991b6	rss-backstop	aterm_link::wait_tally::Hist::floor hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:267 `(i - 1)`
-aterm-link	6fd54875967dda05	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:480 `foreign += space.foreign`
-aterm-link	7ef028fce8de5fc3	rss-backstop	aterm_link::wait_tally::Hist::since::{closure#1} index_out_of_bounds crates/aterm-link/src/wait_tally.rs:314 `self.buckets[i]`
-aterm-link	7f5055a7845cfb9f	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:481 `used += head_t + body_t`
-aterm-link	8026628bfa73ce79	rss-backstop	aterm_link::notify::Notifier::take_one::{closure#0} arithmetic_overflow_add crates/aterm-link/src/notify.rs:2301 `h.subject.len() + h.body.len()`
-aterm-link	8bb88fe0a3b9578f	rss-backstop	aterm_link::wait_tally::Hist::top::{closure#1} arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:294 `i + 1`
-aterm-link	8e31a3ea34290896	rss-backstop	aterm_link::notify::Notifier::verdicts hardened_panic_boundary crates/aterm-link/src/notify.rs:1751 `self.counts.fired + self.counts.dropped`
-aterm-link	8e7ebd407177de58	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:478 `dup += space.dup`
-aterm-link	94109d6dead4732a	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1917 `self.counts.dropped += 1`
-aterm-link	9743ba28059fc55d	rss-backstop	aterm_link::wait_tally::Tally::since::{closure#1} hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:611 `Row::ALL[i]`
-aterm-link	a2ac5ee46e2a5125	rss-backstop	aterm_link::wait_tally::Hist::since::{closure#1} hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:313 `earlier.buckets[i]`
-aterm-link	ac3d5961c23fb619	rss-backstop	aterm_link::wait_tally::Hist::top arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:294 `i + 1`
-aterm-link	b60cb31fa54f6cea	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:479 `reordered += space.reordered`
-aterm-link	b7462ab6e84f91fb	rss-backstop	aterm_link::wait_tally::Hist::since::{closure#1} hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:314 `self.buckets[i]`
-aterm-link	babf2ff556533207	rss-backstop	aterm_link::notify::Notifier::take_one::{closure#0} hardened_panic_boundary crates/aterm-link/src/notify.rs:2301 `h.subject.len() + h.body.len()`
-aterm-link	bc89177ca25bfa3a	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:481 `head_t + body_t`
-aterm-link	bcf144be669ab4a7	rss-backstop	aterm_link::notify::Notifier::take_one::{closure#1} slice_bounds_check crates/aterm-link/src/notify.rs:2356 `[idx]`
-aterm-link	c3ab39139c587f17	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:464 `share - head_t`
-aterm-link	c518112850c1c6e2	rss-backstop	<aterm_link::enable::Unset as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/enable.rs:2087 `PartialEq`
-aterm-link	c7ce6bf2d2d3f219	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1905 `self.suppressed + 1`
-aterm-link	c999c221a4ab0eef	rss-backstop	aterm_link::notify::Notifier::verdicts arithmetic_overflow_add crates/aterm-link/src/notify.rs:1751 `self.counts.fired + self.counts.dropped`
-aterm-link	c9a9ec440497d291	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:477 `folded += 1`
-aterm-link	d0c265ec348e2764	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:481 `head_t + body_t`
-aterm-link	d45ae2da9c9de2f6	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1891 `self.counts.standing += 1`
-aterm-link	ddefa1c0c1ecc6cd	rss-backstop	aterm_link::wait_tally::Hist::floor arithmetic_overflow_sub crates/aterm-link/src/wait_tally.rs:267 `(i - 1)`
-aterm-link	dff396ba814d4249	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:487 `used += line_tokens(&line)`
-aterm-link	e060f8fcac5ff9fc	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:481 `used += head_t + body_t`
-aterm-link	e738a97e548ded4b	rss-backstop	<aterm_link::ctl::Reply as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/ctl.rs:58 `PartialEq`
-aterm-link	e832ba1f6dba76aa	rss-backstop	aterm_link::wait_tally::Hist::top::{closure#1} hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:294 `i + 1`
-aterm-link	f2f664832ee08506	rss-backstop	aterm_link::wait_tally::Hist::floor shift_overflow_shl crates/aterm-link/src/wait_tally.rs:267 `(1u64 << (i - 1).min(63))`
-aterm-link	f4d1c17f67bce28c	rss-backstop	aterm_link::notify::Notifier::advance hardened_panic_boundary crates/aterm-link/src/notify.rs:1688 `lag.records += 1`
-aterm-link	f5d3ebc0653415a2	rss-backstop	<aterm_link::person::Act as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/person.rs:25 `PartialEq`
-aterm-link	f844e61506d2f4f9	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:458 `shown.len() - i`
-aterm-link	fbdebecf4dc514a1	rss-backstop	aterm_link::wait_tally::Hist::top hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:294 `i + 1`
-aterm-link	fd96d1e934f1346c	rss-backstop	<aterm_link::fabric::RetireRefusal as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/fabric.rs:3874 `PartialEq`
+aterm-link	001d687183537a7c	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 10`
+aterm-link	0046681a36459a55	rss-backstop	aterm_link::notify::Notifier::count_drop arithmetic_overflow_add crates/aterm-link/src/notify.rs:1553 `self.suppressed += 1`
+aterm-link	00f48022d1d4e1e6	rss-backstop	aterm_link::enable::command_value_end slice_bounds_check crates/aterm-link/src/enable.rs:1452 `lines[at]`
+aterm-link	014783e8d36b2164	rss-backstop	aterm_link::cli::dispatch_with_inherited_lanes::{closure#0} slice_bounds_check crates/aterm-link/src/cli.rs:81 `[1..]`
+aterm-link	018b2dc9f0661463	rss-backstop	aterm_link::cli::broker slice_bounds_check crates/aterm-link/src/cli.rs:514 `extra`
+aterm-link	0211a8b51b685dbe	rss-backstop	<aterm_link::fabric::FaceRead as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/fabric.rs:6021 `PartialEq`
+aterm-link	024479462e84ba90	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:850 `used += line_tokens(&line)`
+aterm-link	02865f6fc65c8134	rss-backstop	aterm_link::fabric_brief::render_json hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:961 `dup += space.dup`
+aterm-link	02b427a4a6639101	rss-backstop	aterm_link::enable::unserved unreachable crates/aterm-link/src/enable.rs:4576 `fn unserved(found: &Found, why: &str) -> String { … }`
+aterm-link	0384e3c7f4ddcc35	rss-backstop	aterm_link::fabric::serve_flags arithmetic_overflow_add crates/aterm-link/src/fabric.rs:786 `at + 1`
+aterm-link	03c745084cfc01b5	rss-backstop	aterm_link::wait_tally::tail_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:617 `" slow_calls=".len() + 20 + " calls=".len() + CALLS_KEPT * (2 + 16 + 1 + 16 + 1)…#dcf87c3ddec0`
+aterm-link	04b4e0699487d81c	rss-backstop	aterm_link::glance::Row::parse slice_bounds_check crates/aterm-link/src/glance.rs:69 `[3]`
+aterm-link	05147a4f09693730	rss-backstop	aterm_link::enable::command_value_end::{closure#3} arithmetic_overflow_add crates/aterm-link/src/enable.rs:1465 `at + 2 + i`
+aterm-link	05b0a423a1d9391e	rss-backstop	aterm_link::wait_tally::Recorder::idle arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:1261 `at + tail.len()`
+aterm-link	077a41156d469f7c	rss-backstop	aterm_link::fabric::clock hardened_panic_boundary crates/aterm-link/src/fabric.rs:4272 `rem / 3600`
+aterm-link	07becd8079f99b56	rss-backstop	aterm_link::fabric_brief::Read::presence hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:215 `self.node_rows += 1`
+aterm-link	0811b6d5bb7b533f	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_sub crates/aterm-link/src/fabric_brief.rs:820 `shown.len() - i`
+aterm-link	098a3263e3e516ab	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:820 `more += shown.len() - i`
+aterm-link	0994d550ea30ff9f	rss-backstop	aterm_link::enable::table_header::{closure#0} arithmetic_overflow_add crates/aterm-link/src/enable.rs:1399 `open.len() + at + close.len()`
+aterm-link	09cb465b40be0a1f	rss-backstop	aterm_link::enable::fix_for hardened_panic_boundary crates/aterm-link/src/enable.rs:6632 `crate::broker_rules::DEFAULT_BYTES >> 20`
+aterm-link	09cf30e705321c80	rss-backstop	aterm_link::fabric_brief::render_json arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:961 `dup += space.dup`
+aterm-link	0a5ed39e65ad251b	rss-backstop	aterm_link::enable::command_value_end hardened_panic_boundary crates/aterm-link/src/enable.rs:1452 `lines[at]`
+aterm-link	0ae7afd97e8f2b53	rss-backstop	aterm_link::enable::set_fabric_command hardened_panic_boundary crates/aterm-link/src/enable.rs:1549 `lines.len() + 5`
+aterm-link	0b64aec863799fd6	rss-backstop	aterm_link::fabric::tail_on hardened_panic_boundary crates/aterm-link/src/fabric.rs:5957 `TRAFFIC_HEADER[1]`
+aterm-link	0c8ac2669680c0d1	rss-backstop	<aterm_link::state::journal::Frame as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/state/journal.rs:96 `PartialEq`
+aterm-link	0d20a384dd48a948	rss-backstop	aterm_link::wait_tally::Recorder::idle assertion @sysroot/core/src/macros/mod.rs:52 `-`
+aterm-link	0dababf18ec42442	rss-backstop	aterm_link::person::parse_lifetime hardened_panic_boundary crates/aterm-link/src/person.rs:1096 `hours * HOUR_MS`
+aterm-link	10577a3ff7d431f1	rss-backstop	aterm_link::fabric::traffic_of_body slice_bounds_check crates/aterm-link/src/fabric.rs:2059 `[4]`
+aterm-link	10577a3ff7d431f1	rss-backstop	aterm_link::fabric::traffic_of_body slice_bounds_check crates/aterm-link/src/fabric.rs:2065 `[4]`
+aterm-link	1113db96ed3d7b32	rss-backstop	aterm_link::fabric::tail_line_at slice_bounds_check crates/aterm-link/src/fabric.rs:5606 `[2]`
+aterm-link	142474e02d8d3054	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " full=".len()`
+aterm-link	1472ae41ead58451	rss-backstop	aterm_link::bridge::Bridge::pass::{closure#0} assertion @sysroot/core/src/panic.rs:61 `-`
+aterm-link	1537cfba8d2353d7	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + FLUSHES_COUNTED.len()`
+aterm-link	15f54211789b1bda	rss-backstop	aterm_link::enable::table_header::{closure#0} arithmetic_overflow_add crates/aterm-link/src/enable.rs:1394 `at + close.len()`
+aterm-link	15fda9b5816058e4	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " dir=".len()`
+aterm-link	1615de030cc790ad	rss-backstop	aterm_link::fabric::in_sender hardened_panic_boundary crates/aterm-link/src/fabric.rs:2118 `segs[7]`
+aterm-link	17e85375dddcb58d	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 1`
+aterm-link	181b34a56fb08725	rss-backstop	aterm_link::fabric::join_sessions hardened_panic_boundary crates/aterm-link/src/fabric.rs:3387 `report.exited += 1`
+aterm-link	1884071c869688b7	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:840 `folded += 1`
+aterm-link	19866ef9ee7307b3	rss-backstop	aterm_link::bridge::Bridge::pass::{closure#1} assertion @sysroot/core/src/panic.rs:61 `-`
+aterm-link	1a3f9d63a796f4ed	rss-backstop	aterm_link::fabric::in_sender hardened_panic_boundary crates/aterm-link/src/fabric.rs:2118 `segs[5]`
+aterm-link	1b66cd356a0d29c5	rss-backstop	aterm_link::enable::fill_defaults unbounded_allocation crates/aterm-link/src/enable.rs:1364 `Vec::with_capacity(args.len() + 8)`
+aterm-link	1bda0f70eac67b86	rss-backstop	aterm_link::enable::set_fabric_command unbounded_allocation crates/aterm-link/src/enable.rs:1549 `Vec::with_capacity(lines.len() + 5)`
+aterm-link	1bdbd350ac33cb53	rss-backstop	aterm_link::wait_tally::Tally::since index_out_of_bounds crates/aterm-link/src/wait_tally.rs:938 `self.rows[i]`
+aterm-link	1c0eff57275fe6de	rss-backstop	aterm_link::notify_need::bound hardened_panic_boundary crates/aterm-link/src/notify_need.rs:607 `space.len() - SPACE_KEEP`
+aterm-link	1ccc8b609d4bee04	rss-backstop	aterm_link::fabric::FaceMerge::new unbounded_allocation @sysroot/alloc/src/macros.rs:48 `-`
+aterm-link	1ccc8b609d4bee04	rss-backstop	aterm_link::fabric::FaceMerge::new unbounded_allocation @sysroot/alloc/src/macros.rs:48 `-`
+aterm-link	1d9d5ccae5a93139	rss-backstop	aterm_link::enable::command_value_end::{closure#3} hardened_panic_boundary crates/aterm-link/src/enable.rs:1465 `at + 2`
+aterm-link	1e4be7d8b6167325	rss-backstop	aterm_link::notify::Notifier::need_hit hardened_panic_boundary crates/aterm-link/src/notify.rs:1884 `self.counts.standing += 1`
+aterm-link	1ec4b29001dfc763	rss-backstop	aterm_link::enable::Out::done hardened_panic_boundary crates/aterm-link/src/enable.rs:2144 `self.changed += 1`
+aterm-link	1f57e203baca7237	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1961 `self.counts.skipped += 1`
+aterm-link	1f65e7a2fbf1008d	rss-backstop	aterm_link::broker_health::bytes hardened_panic_boundary crates/aterm-link/src/broker_health.rs:254 `u128::from(n) * 10`
+aterm-link	212f6c49b3a79063	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1967 `self.counts.standing += 1`
+aterm-link	218a27a329b6594d	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:661 `head + rows + tail_len() + " sum=".len()`
+aterm-link	2238a53cf525a130	rss-backstop	aterm_link::wait_tally::Recorder::idle hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:1263 `at += tail_len()`
+aterm-link	225c1241356fb7c8	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:823 `(left / (shown.len() - i))`
+aterm-link	2286b93be52435e2	rss-backstop	aterm_link::fabric::filter_meet unbounded_allocation crates/aterm-link/src/fabric.rs:2360 `Vec::with_capacity(a.len().max(b.len()))`
+aterm-link	229574baefb15d03	rss-backstop	aterm_link::notify::Notifier::advance arithmetic_overflow_add crates/aterm-link/src/notify.rs:1755 `lag.records += 1`
+aterm-link	23447547340006c5	rss-backstop	aterm_link::fabric::clock hardened_panic_boundary crates/aterm-link/src/fabric.rs:4272 `(rem % 3600) / 60`
+aterm-link	2361055d92137f0e	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:843 `foreign += space.foreign`
+aterm-link	2377090965fb1621	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:820 `more += shown.len() - i`
+aterm-link	23b96a18044774e6	rss-backstop	aterm_link::wait_tally::Recorder::idle arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:1255 `at + len`
+aterm-link	248836b7d87684de	rss-backstop	aterm_link::enable::fabric_table_spans::{closure#2} hardened_panic_boundary crates/aterm-link/src/enable.rs:1420 `i + 1 + n`
+aterm-link	248bbb9823cc0cb9	rss-backstop	aterm_link::wait_tally::SlowCalls::last arithmetic_overflow_sub crates/aterm-link/src/wait_tally.rs:428 `len - skip`
+aterm-link	25d8c580c2da5045	rss-backstop	aterm_link::glance::Row::parse slice_bounds_check crates/aterm-link/src/glance.rs:69 `[6]`
+aterm-link	2603b91a20fbbaed	rss-backstop	aterm_link::fabric::tail_line_at slice_bounds_check crates/aterm-link/src/fabric.rs:5606 `[5]`
+aterm-link	2678c5a645d66118	rss-backstop	aterm_link::enable::command_value_end slice_bounds_check crates/aterm-link/src/enable.rs:1462 `[at + 1..]`
+aterm-link	269549e0be416a94	rss-backstop	aterm_link::fabric::serve_flags slice_bounds_check crates/aterm-link/src/fabric.rs:786 `[at + 1..]`
+aterm-link	273945baeb4267ea	rss-backstop	aterm_link::fabric::bridge_program slice_bounds_check crates/aterm-link/src/fabric.rs:804 `[1..end]`
+aterm-link	27a97b3f50aab503	rss-backstop	aterm_link::glance::json_string arithmetic_overflow_add crates/aterm-link/src/glance.rs:173 `s.len() + 2`
+aterm-link	28372b934cf2d433	rss-backstop	aterm_link::fabric::tail_line_at slice_bounds_check crates/aterm-link/src/fabric.rs:5606 `[1]`
+aterm-link	283c02e3d4a09f77	rss-backstop	aterm_link::enable::broker_step assertion crates/aterm-link/src/enable.rs:3858 `&view`
+aterm-link	283c02e3d4a09f77	rss-backstop	aterm_link::enable::broker_step assertion crates/aterm-link/src/enable.rs:3941 `&view`
+aterm-link	284443fde51a5dfe	rss-backstop	aterm_link::enable::flag_value::{closure#1} hardened_panic_boundary crates/aterm-link/src/enable.rs:1042 `w[1]`
+aterm-link	288978b03c8ee7db	rss-backstop	aterm_link::cli::by_hand hardened_panic_boundary crates/aterm-link/src/cli.rs:846 `at + 1`
+aterm-link	28de275260c145e6	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " committed=".len()`
+aterm-link	2aead3820121fc52	rss-backstop	aterm_link::enable::table_header::{closure#0} hardened_panic_boundary crates/aterm-link/src/enable.rs:1394 `at + close.len()`
+aterm-link	2b1a9fd9ea63e897	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " full=".len()`
+aterm-link	2c3850149e96388f	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:838 `partial += 1`
+aterm-link	2cd4877396b05c91	rss-backstop	aterm_link::enable::remove_fabric_table unbounded_allocation crates/aterm-link/src/enable.rs:1639 `Vec::with_capacity(lines.len())`
+aterm-link	2d0721acc4a0114e	rss-backstop	aterm_link::enable::flag_value::{closure#1} index_out_of_bounds crates/aterm-link/src/enable.rs:1042 `w[1]`
+aterm-link	2d3b7f6926ecea83	rss-backstop	aterm_link::notify::Notifier::count_drop hardened_panic_boundary crates/aterm-link/src/notify.rs:1553 `self.suppressed += 1`
+aterm-link	301db069e140e933	rss-backstop	aterm_link::enable::node_broker_step::{closure#0} assertion crates/aterm-link/src/enable.rs:4364 `&view`
+aterm-link	306d15e138dde027	rss-backstop	aterm_link::fabric::local_offset_at_ms hardened_panic_boundary crates/aterm-link/src/fabric.rs:4260 `i64::MAX / 2`
+aterm-link	30fdc6460570a25c	rss-backstop	aterm_link::fabric_brief::render_json arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:957 `more += shown.len() - i`
+aterm-link	31e167ceccb34995	rss-backstop	aterm_link::cli::by_hand::{closure#0} arithmetic_overflow_add crates/aterm-link/src/cli.rs:842 `argv.len().saturating_sub(args) + at`
+aterm-link	3276261e30da5000	rss-backstop	aterm_link::notify::Notifier::fire arithmetic_overflow_sub crates/aterm-link/src/notify.rs:2051 `self.suppressed -= carried`
+aterm-link	32c5ad11ca884f7f	rss-backstop	aterm_link::transport::jittered hardened_panic_boundary crates/aterm-link/src/transport.rs:287 `r % span.saturating_add(1)`
+aterm-link	33072978861f2c19	rss-backstop	aterm_link::fabric::clock hardened_panic_boundary crates/aterm-link/src/fabric.rs:4270 `i64::MAX / 2`
+aterm-link	332df1d8715666b0	rss-backstop	aterm_link::mailbox::Mailbox::copy_wakes hardened_panic_boundary crates/aterm-link/src/mailbox.rs:638 `t.rows[row.index()]`
+aterm-link	33c57c14730b0712	rss-backstop	aterm_link::enable::command_value_end::{closure#3} arithmetic_overflow_add crates/aterm-link/src/enable.rs:1465 `at + 2`
+aterm-link	3523bc119c4b87f3	rss-backstop	aterm_link::wait_tally::Recorder::idle hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:1261 `at + tail.len()`
+aterm-link	35af1f112e5a4b70	rss-backstop	aterm_link::enable::toml_str arithmetic_overflow_add crates/aterm-link/src/enable.rs:1324 `s.len() + 2`
+aterm-link	371e57b278b24efc	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … .sum::<usize>()`
+aterm-link	3752b25f84a580ed	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:841 `dup += space.dup`
+aterm-link	3772c531f239754b	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " barrier=".len()`
+aterm-link	37a77f15bc0016c9	rss-backstop	aterm_link::enable::flag_value::{closure#0} slice_bounds_check crates/aterm-link/src/enable.rs:1041 `w[0]`
+aterm-link	37b167cfee7846e1	rss-backstop	aterm_link::cli::mint hardened_panic_boundary crates/aterm-link/src/cli.rs:1164 `i += 1`
+aterm-link	387e316f4f699725	rss-backstop	aterm_link::wait_tally::Tally::since hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:938 `self.rows[i]`
+aterm-link	39957e4f4bc409c5	rss-backstop	aterm_link::enable::toml_str unbounded_allocation crates/aterm-link/src/enable.rs:1324 `String::with_capacity(s.len() + 2)`
+aterm-link	3b1f507af1cf3d27	rss-backstop	aterm_link::fabric::last_hold hardened_panic_boundary crates/aterm-link/src/fabric.rs:2717 `at + 1`
+aterm-link	3d9f44fce00ab840	rss-backstop	aterm_link::broker_rules::mesh_rules::{closure#0} assertion @sysroot/core/src/panic.rs:61 `-`
+aterm-link	3e5d04f6eecbb4e6	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " barrier=".len()`
+aterm-link	3f9674210796ebe0	rss-backstop	aterm_link::broker_rules::rate_limit::{closure#1} unreachable @sysroot/core/src/panic.rs:61 `-`
+aterm-link	40095d2514c56067	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:838 `partial += 1`
+aterm-link	406b58bbcd9dd039	rss-backstop	aterm_link::notify::Notifier::fire hardened_panic_boundary crates/aterm-link/src/notify.rs:2060 `self.counts.dup += 1`
+aterm-link	411733be487c11f4	rss-backstop	aterm_link::durability::read_mark unbounded_allocation crates/aterm-link/src/durability.rs:442 `Vec::with_capacity(usize::try_from(meta.len().min(4096).saturating_add(1)).unwrap_or(256))`
+aterm-link	41270ce06c896b7d	rss-backstop	aterm_link::fabric::clock arithmetic_overflow_add crates/aterm-link/src/fabric.rs:4270 `i64::try_from(t_ms / 1000).unwrap_or(i64::MAX / 2) + offset`
+aterm-link	41bad5b969538099	rss-backstop	aterm_link::notify::Notifier::restore slice_bounds_check crates/aterm-link/src/notify.rs:1579 `self.stamps.insert(at, t)`
+aterm-link	4349d38e89387ece	rss-backstop	aterm_link::fabric::is_link_verb hardened_panic_boundary crates/aterm-link/src/fabric.rs:777 `words[i - 1]`
+aterm-link	4349d38e89387ece	rss-backstop	aterm_link::fabric::is_link_verb hardened_panic_boundary crates/aterm-link/src/fabric.rs:777 `words[i - 1]`
+aterm-link	443d570160f6026f	rss-backstop	aterm_link::person::parse_lifetime arithmetic_overflow_mul crates/aterm-link/src/person.rs:1096 `hours * HOUR_MS`
+aterm-link	4449da9cc121083e	rss-backstop	aterm_link::glance::Row::parse slice_bounds_check crates/aterm-link/src/glance.rs:75 `[5]`
+aterm-link	445992d0e8007d7c	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_sub crates/aterm-link/src/fabric_brief.rs:823 `(shown.len() - i)`
+aterm-link	44a4e4ff35d5e1c5	rss-backstop	aterm_link::enable::retire_through_bridge::{closure#3} hardened_panic_boundary crates/aterm-link/src/enable.rs:6977 `done += 1`
+aterm-link	47162679d0dbe3d6	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:842 `reordered += space.reordered`
+aterm-link	4792f66b73edb0b6	rss-backstop	aterm_link::fabric::bridge_program index_out_of_bounds crates/aterm-link/src/fabric.rs:803 `argv[0]`
+aterm-link	4800dff359813208	rss-backstop	aterm_link::glance::Row::parse slice_bounds_check crates/aterm-link/src/glance.rs:72 `[4]`
+aterm-link	4800dff359813208	rss-backstop	aterm_link::glance::Row::parse slice_bounds_check crates/aterm-link/src/glance.rs:82 `[4]`
+aterm-link	48c03c0756a82d57	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:661 `head + rows + tail_len()`
+aterm-link	4902f2beba87981d	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + FLUSH_CLOCK.word().len()`
+aterm-link	498b28ab7c5df05b	rss-backstop	aterm_link::wait_tally::tail_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:617 `" slow_calls=".len() + 20 + " calls=".len()`
+aterm-link	49d7af7f0e61a1e6	rss-backstop	aterm_link::enable::command_value_end hardened_panic_boundary crates/aterm-link/src/enable.rs:1455 `line.len() - value.len()`
+aterm-link	4a36bdd04e239ad6	rss-backstop	aterm_link::fabric_brief::render division_by_zero crates/aterm-link/src/fabric_brief.rs:823 `(left / (shown.len() - i))`
+aterm-link	4a44cb4d9ea1f8b3	rss-backstop	aterm_link::notify::Notifier::take_one hardened_panic_boundary crates/aterm-link/src/notify.rs:2477 `self.held_bytes += size`
+aterm-link	4a9dd729c0e8967d	rss-backstop	aterm_link::fabric::local_offset_at_ms arithmetic_overflow_div crates/aterm-link/src/fabric.rs:4260 `i64::MAX / 2`
+aterm-link	4b532996849c2431	rss-backstop	aterm_link::notify::Notifier::release arithmetic_overflow_sub crates/aterm-link/src/notify.rs:2543 `self.held_bytes -= h.subject.len() + h.body.len()`
+aterm-link	4bd187daed0519e7	rss-backstop	aterm_link::notify::Sel::hit slice_bounds_check crates/aterm-link/src/notify.rs:411 `[6]`
+aterm-link	4bd187daed0519e7	rss-backstop	aterm_link::notify::Sel::hit slice_bounds_check crates/aterm-link/src/notify.rs:424 `[6]`
+aterm-link	4be748f7e2b76037	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:661 `head + rows + tail_len() + " sum=".len() + 16`
+aterm-link	4c516f3ccd62c345	rss-backstop	aterm_link::notify::Notifier::take_one hardened_panic_boundary crates/aterm-link/src/notify.rs:2402 `self.held_bytes -= dropped`
+aterm-link	4d98b45473715dc7	rss-backstop	aterm_link::fabric::clock hardened_panic_boundary crates/aterm-link/src/fabric.rs:4270 `i64::try_from(t_ms / 1000).unwrap_or(i64::MAX / 2) + offset`
+aterm-link	4e32fb81217c03a1	rss-backstop	aterm_link::federate::Shared::push::{closure#0}::{closure#0} hardened_panic_boundary crates/aterm-link/src/federate.rs:1770 `running.status.appended += appended as u64`
+aterm-link	4ed4afd73a392106	rss-backstop	aterm_link::notify::Sel::hit slice_bounds_check crates/aterm-link/src/notify.rs:404 `[3]`
+aterm-link	4ee6a361aae1d2df	rss-backstop	aterm_link::fabric_brief::render_json arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:962 `reordered += space.reordered`
+aterm-link	514145fed07f9bfe	rss-backstop	aterm_link::fabric::zone_word hardened_panic_boundary crates/aterm-link/src/fabric.rs:4310 `o / 3600`
+aterm-link	51ebfa14f79d61a8	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1993 `self.counts.dropped += 1`
+aterm-link	537005c0f1f5ca7b	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + FLUSHES_COUNTED.len()`
+aterm-link	56806f457789daaf	rss-backstop	aterm_link::fabric::zone_word arithmetic_overflow_div crates/aterm-link/src/fabric.rs:4310 `(o % 3600) / 60`
+aterm-link	56fb61d11da4e4f4	rss-backstop	aterm_link::broker_args::BrokerArgs::<'_, S>::from_invocation slice_bounds_check crates/aterm-link/src/broker_args.rs:36 `rest`
+aterm-link	570d41f11a4064b0	rss-backstop	<aterm_link::bridge::Unfetched as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/bridge.rs:1023 `PartialEq`
+aterm-link	573f5cd7c2441366	rss-backstop	aterm_link::cli::broker slice_bounds_check crates/aterm-link/src/cli.rs:508 `sock`
+aterm-link	573f5cd7c2441366	rss-backstop	aterm_link::cli::broker slice_bounds_check crates/aterm-link/src/cli.rs:509 `sock`
+aterm-link	585b4c7711f946cb	rss-backstop	aterm_link::bridge::Bridge::pass::{closure#2} assertion @sysroot/core/src/panic.rs:61 `-`
+aterm-link	5867acb8f7898e1c	rss-backstop	aterm_link::fabric_brief::read division_by_zero crates/aterm-link/src/fabric_brief.rs:389 `WINDOW_MAX / u64::from(PAGE_MAX)`
+aterm-link	59b1a49c5abf53a1	rss-backstop	aterm_link::fabric::is_link_verb hardened_panic_boundary crates/aterm-link/src/fabric.rs:776 `words[i]`
+aterm-link	59b4ceef260ebb15	rss-backstop	aterm_link::fabric::zone_word hardened_panic_boundary crates/aterm-link/src/fabric.rs:4310 `(o % 3600)`
+aterm-link	59caf056c737bfe1	rss-backstop	aterm_link::wait_tally::tail_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:617 `" slow_calls=".len() + 20 + " calls=".len()`
+aterm-link	5a47ab29ae181a03	rss-backstop	aterm_link::fabric_brief::lived_history hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:435 `WINDOW_MAX / u64::from(PAGE_MAX)`
+aterm-link	5a78aba958fa59af	rss-backstop	aterm_link::broker_rules::default_rules::{closure#0} assertion @sysroot/core/src/panic.rs:61 `-`
+aterm-link	5ac4741580ad9050	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " pid=".len()`
+aterm-link	5aee6591b9b32e5f	rss-backstop	aterm_link::fabric::clock hardened_panic_boundary crates/aterm-link/src/fabric.rs:4272 `rem % 60`
+aterm-link	5b787e1d45c04a07	rss-backstop	aterm_link::broker_rules::mesh_rules_scaled::{closure#0} assertion @sysroot/core/src/panic.rs:61 `-`
+aterm-link	5b88a5cd55fba11b	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:823 `(shown.len() - i)`
+aterm-link	5cfb374264133f52	rss-backstop	<aterm_link::notify::Stand as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/notify.rs:470 `PartialEq`
+aterm-link	5d9e238b65f9dd94	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1961 `self.counts.skipped += 1`
+aterm-link	5ffb9676249d0e68	rss-backstop	aterm_link::fabric::traffic_of_body slice_bounds_check crates/aterm-link/src/fabric.rs:2061 `[6]`
+aterm-link	604e43a307fa0980	rss-backstop	aterm_link::fabric::is_link_verb index_out_of_bounds crates/aterm-link/src/fabric.rs:776 `words[i]`
+aterm-link	612a2bf407698eb2	rss-backstop	aterm_link::fabric::bridge_program hardened_panic_boundary crates/aterm-link/src/fabric.rs:798 `argv[at - 1]`
+aterm-link	61b80e1cf063d707	rss-backstop	<aterm_link::fabric::Off as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/fabric.rs:3021 `PartialEq`
+aterm-link	61d5cbd422ec0854	rss-backstop	aterm_link::enable::fabric_table_spans slice_bounds_check crates/aterm-link/src/enable.rs:1417 `[i + 1..]`
+aterm-link	61feab2c3e6aaab5	rss-backstop	aterm_link::cli::column arithmetic_overflow_sub crates/aterm-link/src/cli.rs:206 `crate::glance::ATTENTION_CAP - ELLIPSIS.len()`
+aterm-link	623542a9eec48e07	rss-backstop	aterm_link::enable::command_value_end::{closure#3} hardened_panic_boundary crates/aterm-link/src/enable.rs:1465 `at + 2 + i`
+aterm-link	632d1c6267e38113	rss-backstop	aterm_link::fabric::in_sender slice_bounds_check crates/aterm-link/src/fabric.rs:2118 `segs[7]`
+aterm-link	63397a134f92759b	rss-backstop	aterm_link::fabric::clock_at hardened_panic_boundary crates/aterm-link/src/fabric.rs:4294 `i64::MAX / 2`
+aterm-link	635f3fee8f33a63c	rss-backstop	aterm_link::broker_args::BrokerArgs::<'_, S>::parse hardened_panic_boundary crates/aterm-link/src/broker_args.rs:98 `i += 1`
+aterm-link	6388e1a0f373147e	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1981 `self.suppressed + 1`
+aterm-link	63ed858091e8e76d	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_sub crates/aterm-link/src/fabric_brief.rs:826 `share - head_t`
+aterm-link	63fdc68e463eaed7	rss-backstop	aterm_link::fabric::OverdueScan::finish_on_lanes::{closure#1}::{closure#0} arithmetic_overflow_sub crates/aterm-link/src/fabric.rs:2472 `now_ms - due`
+aterm-link	640588f1416ad091	rss-backstop	aterm_link::notify::Notifier::fire hardened_panic_boundary crates/aterm-link/src/notify.rs:2062 `self.counts.fired += 1`
+aterm-link	6437b59b07ed8629	rss-backstop	aterm_link::fabric::tail_on hardened_panic_boundary crates/aterm-link/src/fabric.rs:5958 `TRAFFIC_HEADER[2]`
+aterm-link	644e7fa1a6ea1c45	rss-backstop	aterm_link::fabric::tail_line_at slice_bounds_check crates/aterm-link/src/fabric.rs:5606 `[6]`
+aterm-link	6489df74ab543fbc	rss-backstop	aterm_link::notify::Notifier::take_one arithmetic_overflow_add crates/aterm-link/src/notify.rs:2452 `subject.len() + body.len()`
+aterm-link	6490806eb90bba2e	rss-backstop	aterm_link::wait_tally::tail_text unbounded_allocation crates/aterm-link/src/wait_tally.rs:588 `String::with_capacity(tail_len())`
+aterm-link	660038634d3d94a3	rss-backstop	aterm_link::fabric_brief::render_json hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:956 `used + t`
+aterm-link	66d93cfda8ebddce	rss-backstop	aterm_link::notify::Notifier::run hardened_panic_boundary crates/aterm-link/src/notify.rs:2381 `off + 1`
+aterm-link	66ea084de0ce8c5a	rss-backstop	aterm_link::wait_tally::tail_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:617 `" slow_calls=".len() + 20 + " calls=".len() + CALLS_KEPT * (2 + 16 + 1 + 16 + 1)`
+aterm-link	673dfb2461cde1f7	rss-backstop	aterm_link::fabric::in_sender slice_bounds_check crates/aterm-link/src/fabric.rs:2118 `segs[5]`
+aterm-link	67b8550e85b04c62	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 1`
+aterm-link	686558a50546c2f9	rss-backstop	aterm_link::cli::mint index_out_of_bounds crates/aterm-link/src/cli.rs:1140 `args[i]`
+aterm-link	68cedf7214592828	rss-backstop	aterm_link::fabric::zone_word arithmetic_overflow_rem crates/aterm-link/src/fabric.rs:4310 `(o % 3600)`
+aterm-link	697d6eed7e979551	rss-backstop	aterm_link::notify_need::Pair::same unreachable crates/aterm-link/src/notify_need.rs:75 `pub fn same(&self, other: &Pair) -> bool { … }`
+aterm-link	6a9b2e55222cc616	rss-backstop	aterm_link::fabric_brief::render_json hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:965 `used += t`
+aterm-link	6ab9c948ecf3c3b0	rss-backstop	aterm_link::federate::Shared::carry_one::{closure#3} hardened_panic_boundary crates/aterm-link/src/federate.rs:2308 `carry.refused += 1`
+aterm-link	6b1def89fff06354	rss-backstop	aterm_link::fabric::subject_session slice_bounds_check crates/aterm-link/src/fabric.rs:5650 `[5]`
+aterm-link	6c86d3fa9dcc0e6f	rss-backstop	aterm_link::notify::Notifier::release arithmetic_overflow_add crates/aterm-link/src/notify.rs:2543 `h.subject.len() + h.body.len()`
+aterm-link	6d95eea8e91ba76a	rss-backstop	aterm_link::wait_tally::Recorder::idle arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:1257 `at += len`
+aterm-link	6dfe430143b7b175	rss-backstop	aterm_link::fabric::table::{closure#1} arithmetic_overflow_add crates/aterm-link/src/fabric.rs:4332 `i + 1`
+aterm-link	6f95a1bfb1a24d38	rss-backstop	aterm_link::fabric::zone_word negation_overflow crates/aterm-link/src/fabric.rs:4309 `o.abs()`
+aterm-link	6fd54875967dda05	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:843 `foreign += space.foreign`
+aterm-link	704c01a1d38b5af9	rss-backstop	aterm_link::broker_health::bytes hardened_panic_boundary crates/aterm-link/src/broker_health.rs:248 `u128::from(n) / scale`
+aterm-link	70ab6a2f57b9ba9b	rss-backstop	aterm_link::enable::command_value_end::{closure#1} hardened_panic_boundary crates/aterm-link/src/enable.rs:1455 `(empty)`
+aterm-link	714443826de2f0fe	rss-backstop	aterm_link::enable::fabric_table_spans::{closure#2} arithmetic_overflow_add crates/aterm-link/src/enable.rs:1420 `i + 1 + n`
+aterm-link	717d17beae860050	rss-backstop	aterm_link::fabric::tail_on hardened_panic_boundary crates/aterm-link/src/fabric.rs:5962 `TRAFFIC_HEADER[6]`
+aterm-link	72447f7f4bc341b6	rss-backstop	<aterm_link::state::asks::Frame as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/state/asks.rs:65 `PartialEq`
+aterm-link	724abdf9b83a847d	rss-backstop	aterm_link::fabric::subjects_of::{closure#0} arithmetic_overflow_add crates/aterm-link/src/fabric.rs:3261 `n += 1`
+aterm-link	72ee7dc691d81dac	rss-backstop	aterm_link::cli::broker unreachable crates/aterm-link/src/cli.rs:390 `fn broker(args: &[String]) -> ExitCode { … }`
+aterm-link	739288d4b37f2e05	rss-backstop	aterm_link::glance::Row::parse slice_bounds_check crates/aterm-link/src/glance.rs:66 `[0]`
+aterm-link	74e874ce6f2820a5	rss-backstop	aterm_link::enable::flag_value::{closure#0} index_out_of_bounds crates/aterm-link/src/enable.rs:1041 `w[0]`
+aterm-link	75798f9699c286a8	rss-backstop	aterm_link::broker_rules::mesh_rules_scaled_unforgetting::{closure#0} assertion @sysroot/core/src/panic.rs:61 `-`
+aterm-link	75ced1bcae249947	rss-backstop	aterm_link::person::parse_post slice_bounds_check crates/aterm-link/src/person.rs:232 `[text_at..]`
+aterm-link	760f856f6d0f54ca	rss-backstop	aterm_link::fabric_brief::lived_history assertion crates/aterm-link/src/fabric_brief.rs:435 `WINDOW_MAX / u64::from(PAGE_MAX)`
+aterm-link	782c3c60ebc3e0c5	rss-backstop	aterm_link::notify_need::bound arithmetic_overflow_sub crates/aterm-link/src/notify_need.rs:607 `space.len() - SPACE_KEEP`
+aterm-link	7977386ea08b97f6	rss-backstop	aterm_link::fabric_brief::render_json arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:966 `partial += u64::from(is_partial)`
+aterm-link	7a48ecae3517a008	rss-backstop	aterm_link::notify::Notifier::need_hit arithmetic_overflow_add crates/aterm-link/src/notify.rs:1884 `self.counts.standing += 1`
+aterm-link	7a56db61e5249e47	rss-backstop	aterm_link::fabric::bridge_program index_out_of_bounds crates/aterm-link/src/fabric.rs:798 `argv[at - 1]`
+aterm-link	7afb41bf04d202df	rss-backstop	aterm_link::fabric::tail_on hardened_panic_boundary crates/aterm-link/src/fabric.rs:5960 `TRAFFIC_HEADER[4]`
+aterm-link	7bb849702a166ce4	rss-backstop	aterm_link::fabric::zone_word arithmetic_overflow_div crates/aterm-link/src/fabric.rs:4310 `o / 3600`
+aterm-link	7d2edfabcfc95b1d	rss-backstop	aterm_link::wait_tally::tail_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:617 `" slow_calls=".len() + 20 + " calls=".len() + CALLS_KEPT * (2 + 16 + 1 + 16 + 1)…#dcf87c3ddec0`
+aterm-link	7e5bf6361e150480	rss-backstop	aterm_link::fabric::tail_on hardened_panic_boundary crates/aterm-link/src/fabric.rs:5959 `TRAFFIC_HEADER[3]`
+aterm-link	7eba0c91c27b3859	rss-backstop	aterm_link::cli::by_hand::{closure#0} hardened_panic_boundary crates/aterm-link/src/cli.rs:842 `argv.len().saturating_sub(args) + at`
+aterm-link	7f5055a7845cfb9f	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:844 `used += head_t + body_t`
+aterm-link	8026628bfa73ce79	rss-backstop	aterm_link::notify::Notifier::take_one::{closure#0} arithmetic_overflow_add crates/aterm-link/src/notify.rs:2400 `h.subject.len() + h.body.len()`
+aterm-link	812005544e60eec9	rss-backstop	aterm_link::cli::mint hardened_panic_boundary crates/aterm-link/src/cli.rs:1140 `args[i]`
+aterm-link	81bbe7d64afd9c64	rss-backstop	aterm_link::fabric::tail_line_at slice_bounds_check crates/aterm-link/src/fabric.rs:5606 `[4]`
+aterm-link	825a14960cf13f82	rss-backstop	aterm_link::fabric::subject_session::{closure#1} slice_bounds_check crates/aterm-link/src/fabric.rs:5649 `[4]`
+aterm-link	8549ab3f3f884754	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 10`
+aterm-link	85bb9c23e67d334e	rss-backstop	<aterm_link::federate::Lane as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/federate.rs:685 `PartialEq`
+aterm-link	86fa15106988fb81	rss-backstop	aterm_link::enable::table_header::{closure#0} hardened_panic_boundary crates/aterm-link/src/enable.rs:1399 `open.len() + at + close.len()`
+aterm-link	88d6eff7d7e1c30f	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:661 `head + rows`
+aterm-link	8b6c6782dbc55a21	rss-backstop	<aterm_link::person_key::Signer<'_> as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/person_key.rs:193 `PartialEq`
+aterm-link	8bb06ff25d5e872d	rss-backstop	aterm_link::fabric_brief::render_json hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:957 `more += shown.len() - i`
+aterm-link	8bb60129cffd1155	rss-backstop	aterm_link::fabric::tail_on hardened_panic_boundary crates/aterm-link/src/fabric.rs:5961 `TRAFFIC_HEADER[5]`
+aterm-link	8c5ec05471a74f20	rss-backstop	aterm_link::glance::Row::parse slice_bounds_check crates/aterm-link/src/glance.rs:69 `[2]`
+aterm-link	8c98f369d20f07ff	rss-backstop	aterm_link::person_key::vouch::{closure#0} arithmetic_overflow_sub crates/aterm-link/src/person_key.rs:410 `now_ms - cert.issued_ms`
+aterm-link	8db9897e29b663f7	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + FLUSH_CLOCK.word().len()`
+aterm-link	8dc92b0fc6528c40	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:661 `head + rows + tail_len() + " sum=".len() + 16`
+aterm-link	8e31a3ea34290896	rss-backstop	aterm_link::notify::Notifier::verdicts hardened_panic_boundary crates/aterm-link/src/notify.rs:1818 `self.counts.fired + self.counts.dropped`
+aterm-link	8e7ebd407177de58	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:841 `dup += space.dup`
+aterm-link	8eee09e4be8dab47	rss-backstop	aterm_link::fabric::in_sender hardened_panic_boundary crates/aterm-link/src/fabric.rs:2128 `segs[4]`
+aterm-link	8f2000cecd087efc	rss-backstop	aterm_link::cli::mint arithmetic_overflow_add crates/aterm-link/src/cli.rs:1164 `i += 1`
+aterm-link	8f7f83b862f8e2c0	rss-backstop	aterm_link::broker_health::bytes arithmetic_overflow_mul crates/aterm-link/src/broker_health.rs:251 `scale *= 1024`
+aterm-link	90c6802bf2cb2808	rss-backstop	aterm_link::wait_tally::Tally::since::{closure#3} index_out_of_bounds crates/aterm-link/src/wait_tally.rs:940 `Row::ALL[i]`
+aterm-link	91d0dac0cbd2f5b0	rss-backstop	aterm_link::enable::table_header::{closure#0} arithmetic_overflow_add crates/aterm-link/src/enable.rs:1399 `open.len() + at`
+aterm-link	92adad77c984ee74	rss-backstop	aterm_link::notify::Notifier::release hardened_panic_boundary crates/aterm-link/src/notify.rs:2543 `self.held_bytes -= h.subject.len() + h.body.len()`
+aterm-link	9324c91a95d3b90f	rss-backstop	aterm_link::broker_health::bytes hardened_panic_boundary crates/aterm-link/src/broker_health.rs:246 `UNITS[0]`
+aterm-link	94109d6dead4732a	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1993 `self.counts.dropped += 1`
+aterm-link	949f7ab1cae361a7	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:661 `head + rows + tail_len() + " sum=".len() + 16 + "\n".len()`
+aterm-link	94bf60a172c9797a	rss-backstop	aterm_link::cli::by_hand arithmetic_overflow_add crates/aterm-link/src/cli.rs:846 `at + 1`
+aterm-link	9556366bdee83850	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " at=".len()`
+aterm-link	96fe12410d0a3d32	rss-backstop	aterm_link::broker_rules::rules_scaled::{closure#0} assertion @sysroot/core/src/panic.rs:61 `-`
+aterm-link	986d53a7ca565cbd	rss-backstop	aterm_link::fabric::clock_at arithmetic_overflow_div crates/aterm-link/src/fabric.rs:4294 `i64::MAX / 2`
+aterm-link	9945a7620f9fd513	rss-backstop	aterm_link::wait_tally::SlowCalls::last slice_bounds_check crates/aterm-link/src/wait_tally.rs:428 `[..len - skip]`
+aterm-link	9990c9a1eee2a7fb	rss-backstop	aterm_link::fabric::table::{closure#1} assertion crates/aterm-link/src/fabric.rs:4340 `pad + 2`
+aterm-link	99eda7b1afc478f7	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " dir=".len()`
+aterm-link	9a79a5a8e38622bc	rss-backstop	aterm_link::enable::supervisor_last_word arithmetic_overflow_sub crates/aterm-link/src/enable.rs:713 `(meta.len() - from)`
+aterm-link	9b5730461692bb47	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " committed=".len()`
+aterm-link	9be0d44cdd32cbdf	rss-backstop	aterm_link::glance::json_string unbounded_allocation crates/aterm-link/src/glance.rs:173 `String::with_capacity(s.len() + 2)`
+aterm-link	9d2642f99249eec2	rss-backstop	aterm_link::enable::supervisor_last_word unbounded_allocation crates/aterm-link/src/enable.rs:714 `Vec::with_capacity(usize::try_from(want.saturating_add(1)).unwrap_or(0))`
+aterm-link	9d33526d4bae6b5b	rss-backstop	aterm_link::notify::Sel::hit slice_bounds_check crates/aterm-link/src/notify.rs:407 `[7]`
+aterm-link	9d464435c8b7c77e	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 20`
+aterm-link	9d464435c8b7c77e	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 20`
+aterm-link	9d464435c8b7c77e	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 20`
+aterm-link	9d464435c8b7c77e	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 20`
+aterm-link	9d464435c8b7c77e	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 20`
+aterm-link	9d4d88db55de53d3	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:661 `head + rows`
+aterm-link	9e95de4439981982	rss-backstop	aterm_link::notify::Notifier::run assertion crates/aterm-link/src/notify.rs:2379 `page.sel`
+aterm-link	9eae045fb71c2df0	rss-backstop	aterm_link::fabric::bridge_program hardened_panic_boundary crates/aterm-link/src/fabric.rs:803 `argv[0]`
+aterm-link	9eb0b7c464de139f	rss-backstop	aterm_link::fabric_brief::render_json arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:963 `foreign += space.foreign`
+aterm-link	9ec2ee4b3d76e800	rss-backstop	aterm_link::cli::by_hand::{closure#1} hardened_panic_boundary crates/aterm-link/src/cli.rs:844 `at + 1`
+aterm-link	9ef8577528f06df4	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:661 `head + rows + tail_len()`
+aterm-link	a06cff9a5429b028	rss-backstop	aterm_link::fabric_brief::read arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:394 `r.pages += 1`
+aterm-link	a213427dd421006f	rss-backstop	aterm_link::federate::Shared::push::{closure#0}::{closure#0} arithmetic_overflow_add crates/aterm-link/src/federate.rs:1771 `running.status.deduped += report.deduped as u64`
+aterm-link	a23a508f74ce764f	rss-backstop	aterm_link::fabric_brief::Read::presence arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:215 `self.node_rows += 1`
+aterm-link	a2c0fc20c7d9c8a1	rss-backstop	aterm_link::enable::command_value_end arithmetic_overflow_sub crates/aterm-link/src/enable.rs:1455 `line.len() - value.len()`
+aterm-link	a387b3d89d9b0bc7	rss-backstop	aterm_link::cli::dispatch_with_inherited_lanes slice_bounds_check crates/aterm-link/src/cli.rs:100 `[1..]`
+aterm-link	a387b3d89d9b0bc7	rss-backstop	aterm_link::cli::dispatch_with_inherited_lanes slice_bounds_check crates/aterm-link/src/cli.rs:101 `[1..]`
+aterm-link	a387b3d89d9b0bc7	rss-backstop	aterm_link::cli::dispatch_with_inherited_lanes slice_bounds_check crates/aterm-link/src/cli.rs:79 `[1..]`
+aterm-link	a387b3d89d9b0bc7	rss-backstop	aterm_link::cli::dispatch_with_inherited_lanes slice_bounds_check crates/aterm-link/src/cli.rs:93 `[1..]`
+aterm-link	a387b3d89d9b0bc7	rss-backstop	aterm_link::cli::dispatch_with_inherited_lanes slice_bounds_check crates/aterm-link/src/cli.rs:98 `[1..]`
+aterm-link	a387b3d89d9b0bc7	rss-backstop	aterm_link::cli::dispatch_with_inherited_lanes slice_bounds_check crates/aterm-link/src/cli.rs:99 `[1..]`
+aterm-link	a424dc19ad3a8efc	rss-backstop	aterm_link::enable::fabric_table_spans::{closure#2} hardened_panic_boundary crates/aterm-link/src/enable.rs:1420 `i + 1`
+aterm-link	a43488ca27d2a87b	rss-backstop	aterm_link::fabric::clock arithmetic_overflow_rem crates/aterm-link/src/fabric.rs:4272 `rem % 60`
+aterm-link	a44768b4064a63cf	rss-backstop	aterm_link::enable::node_broker_step assertion crates/aterm-link/src/enable.rs:4359 `&view`
+aterm-link	a472fc6a43ee31ef	rss-backstop	aterm_link::glance::Row::parse slice_bounds_check crates/aterm-link/src/glance.rs:69 `[1]`
+aterm-link	a4b7b30115f64a3a	rss-backstop	aterm_link::fabric_brief::render_json arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:956 `used + t`
+aterm-link	a4c038c993a31034	rss-backstop	aterm_link::broker_args::BrokerArgs::<'_, S>::parse arithmetic_overflow_add crates/aterm-link/src/broker_args.rs:98 `i += 1`
+aterm-link	a6feb98e9c02c90e	rss-backstop	aterm_link::broker_health::bytes hardened_panic_boundary crates/aterm-link/src/broker_health.rs:254 `(u128::from(n) * 10 + scale / 2) / scale`
+aterm-link	a722cfcfc7dd47a2	rss-backstop	aterm_link::notify::Sel::hit slice_bounds_check crates/aterm-link/src/notify.rs:405 `[4]`
+aterm-link	a7626b33b80d5e3f	rss-backstop	aterm_link::wait_tally::tail_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:617 `" slow_calls=".len() + 20 + " calls=".len() + CALLS_KEPT * (2 + 16 + 1 + 16 + 1)…#7eecccb7799f`
+aterm-link	a7c00a910c67df00	rss-backstop	aterm_link::notify::Notifier::run arithmetic_overflow_add crates/aterm-link/src/notify.rs:2381 `off + 1`
+aterm-link	a9b847309bcef98f	rss-backstop	aterm_link::notify::Notifier::tell_exec hardened_panic_boundary crates/aterm-link/src/notify.rs:1220 `at[2]`
+aterm-link	aa50bc3132ea9fe7	rss-backstop	aterm_link::federate::Shared::push::{closure#0}::{closure#0} hardened_panic_boundary crates/aterm-link/src/federate.rs:1771 `running.status.deduped += report.deduped as u64`
+aterm-link	abefa5e391633de4	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:661 `head + rows + tail_len() + " sum=".len() + 16 + "\n".len()`
+aterm-link	ac305c71c95dde2a	rss-backstop	aterm_link::notify::read_bounded_text unbounded_allocation crates/aterm-link/src/notify.rs:1000 `Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0))`
+aterm-link	ac651382fb035f37	rss-backstop	aterm_link::fabric::bridge_program hardened_panic_boundary crates/aterm-link/src/fabric.rs:798 `at - 1`
+aterm-link	ad158ad771d6f261	rss-backstop	aterm_link::wait_tally::Recorder::idle hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:1255 `at + len`
+aterm-link	ad19a05f0263f928	rss-backstop	aterm_link::fabric::table::{closure#1} hardened_panic_boundary crates/aterm-link/src/fabric.rs:4340 `pad + 2`
+aterm-link	ad4a46f921711172	rss-backstop	aterm_link::notify::Notifier::take_one arithmetic_overflow_sub crates/aterm-link/src/notify.rs:2402 `self.held_bytes -= dropped`
+aterm-link	ae0443047fc74a95	rss-backstop	aterm_link::fabric::tail_on hardened_panic_boundary crates/aterm-link/src/fabric.rs:5956 `TRAFFIC_HEADER[0]`
+aterm-link	af1d6265e77b3f9e	rss-backstop	aterm_link::enable::flag_value::{closure#0} hardened_panic_boundary crates/aterm-link/src/enable.rs:1041 `w[0]`
+aterm-link	b01492cae73c1fe8	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:661 `head + rows + tail_len() + " sum=".len()`
+aterm-link	b08badf3142de141	rss-backstop	aterm_link::person::inbox arithmetic_overflow_add crates/aterm-link/src/person.rs:950 `count += 1`
+aterm-link	b198731a70cb9ae2	rss-backstop	aterm_link::broker_health::bytes arithmetic_overflow_mul crates/aterm-link/src/broker_health.rs:254 `u128::from(n) * 10`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2398 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2403 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2409 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2412 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2413 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2415 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2416 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2429 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2450 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2450 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2455 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2456 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2468 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2478 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2490 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2491 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2501 `[idx]`
+aterm-link	b2cf6aa0a8b771a9	rss-backstop	aterm_link::notify::Notifier::take_one slice_bounds_check crates/aterm-link/src/notify.rs:2501 `[idx]`
+aterm-link	b36d850a073b5f6a	rss-backstop	aterm_link::fabric::table::{closure#1} slice_bounds_check crates/aterm-link/src/fabric.rs:4331 `[i]`
+aterm-link	b38ab331af3c780f	rss-backstop	aterm_link::fabric::clock arithmetic_overflow_rem crates/aterm-link/src/fabric.rs:4272 `(rem % 3600)`
+aterm-link	b38d94803fed2e89	rss-backstop	aterm_link::enable::instances hardened_panic_boundary crates/aterm-link/src/enable.rs:4848 `found.len() + unasked`
+aterm-link	b51f6df097340782	rss-backstop	aterm_link::fabric_brief::Read::presence hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:195 `self.node_inc.len() + self.nodes_gone.len()`
+aterm-link	b533b509f82b7af2	rss-backstop	aterm_link::notify::Notifier::tell_exec hardened_panic_boundary crates/aterm-link/src/notify.rs:1219 `at[1]`
+aterm-link	b60cb31fa54f6cea	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:842 `reordered += space.reordered`
+aterm-link	b72daf0997508976	rss-backstop	aterm_link::enable::broker_step::{closure#2} assertion crates/aterm-link/src/enable.rs:3861 `&view`
+aterm-link	b751e8086d3c0f61	rss-backstop	aterm_link::fabric::join_sessions arithmetic_overflow_add crates/aterm-link/src/fabric.rs:3387 `report.exited += 1`
+aterm-link	b7de0225563e31a7	rss-backstop	aterm_link::fabric_brief::render_json hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:963 `foreign += space.foreign`
+aterm-link	b83823fd42f90dc4	rss-backstop	aterm_link::notify::Notifier::release hardened_panic_boundary crates/aterm-link/src/notify.rs:2543 `h.subject.len() + h.body.len()`
+aterm-link	b88b599db2098977	rss-backstop	aterm_link::fabric_brief::read hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:389 `WINDOW_MAX / u64::from(PAGE_MAX)`
+aterm-link	b8a3daf2ea3b4b0f	rss-backstop	aterm_link::broker_health::bytes division_by_zero crates/aterm-link/src/broker_health.rs:248 `u128::from(n) / scale`
+aterm-link	b8b4fbad051ca0ba	rss-backstop	aterm_link::fabric::tail_line_at slice_bounds_check crates/aterm-link/src/fabric.rs:5606 `[3]`
+aterm-link	ba9b120015154310	rss-backstop	aterm_link::fabric::zone_word hardened_panic_boundary crates/aterm-link/src/fabric.rs:4310 `(o % 3600) / 60`
+aterm-link	babf2ff556533207	rss-backstop	aterm_link::notify::Notifier::take_one::{closure#0} hardened_panic_boundary crates/aterm-link/src/notify.rs:2400 `h.subject.len() + h.body.len()`
+aterm-link	bb9b1673df5d7835	rss-backstop	aterm_link::enable::fabric_table_spans::{closure#2} arithmetic_overflow_add crates/aterm-link/src/enable.rs:1420 `i + 1`
+aterm-link	bc89177ca25bfa3a	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:844 `head_t + body_t`
+aterm-link	bcf144be669ab4a7	rss-backstop	aterm_link::notify::Notifier::take_one::{closure#1} slice_bounds_check crates/aterm-link/src/notify.rs:2455 `[idx]`
+aterm-link	bda1f7b40f6d925b	rss-backstop	aterm_link::fabric::subjects_of::{closure#0} hardened_panic_boundary crates/aterm-link/src/fabric.rs:3261 `n += 1`
+aterm-link	be1f546206bacd2e	rss-backstop	aterm_link::notify::Notifier::take_one hardened_panic_boundary crates/aterm-link/src/notify.rs:2453 `self.held_bytes + size`
+aterm-link	be1f546206bacd2e	rss-backstop	aterm_link::notify::Notifier::take_one hardened_panic_boundary crates/aterm-link/src/notify.rs:2463 `self.held_bytes + size`
+aterm-link	be23e185438117ed	rss-backstop	aterm_link::fabric::serve_flags hardened_panic_boundary crates/aterm-link/src/fabric.rs:786 `at + 1`
+aterm-link	be3133df364ca0be	rss-backstop	aterm_link::fabric::render_text_local arithmetic_overflow_div crates/aterm-link/src/fabric.rs:4785 `i64::MAX / 2`
+aterm-link	bf4958046c471959	rss-backstop	aterm_link::fabric::render_text_local hardened_panic_boundary crates/aterm-link/src/fabric.rs:4785 `i64::MAX / 2`
+aterm-link	bfdbfecc80c98ae5	rss-backstop	aterm_link::cli::by_hand::{closure#1} arithmetic_overflow_add crates/aterm-link/src/cli.rs:844 `at + 1`
+aterm-link	c013d7f071b31206	rss-backstop	aterm_link::fabric::table::{closure#1} hardened_panic_boundary crates/aterm-link/src/fabric.rs:4332 `i + 1`
+aterm-link	c2a221a05394e97b	rss-backstop	aterm_link::broker_health::bytes arithmetic_overflow_add crates/aterm-link/src/broker_health.rs:254 `(u128::from(n) * 10 + scale / 2)`
+aterm-link	c3ab39139c587f17	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:826 `share - head_t`
+aterm-link	c3edf6e40dacb285	rss-backstop	aterm_link::enable::set_fabric_command slice_bounds_check crates/aterm-link/src/enable.rs:1559 `[i]`
+aterm-link	c3edf6e40dacb285	rss-backstop	aterm_link::enable::set_fabric_command slice_bounds_check crates/aterm-link/src/enable.rs:1562 `[i]`
+aterm-link	c518112850c1c6e2	rss-backstop	<aterm_link::enable::Unset as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/enable.rs:2499 `PartialEq`
+aterm-link	c57dff91657c06e4	rss-backstop	aterm_link::fabric_brief::Read::presence arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:195 `self.node_inc.len() + self.nodes_gone.len()`
+aterm-link	c6208ef50b629a6d	rss-backstop	aterm_link::wait_tally::SlowCalls::last hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:428 `len - skip`
+aterm-link	c67d16a737a213f5	rss-backstop	aterm_link::broker_health::bytes hardened_panic_boundary crates/aterm-link/src/broker_health.rs:254 `(u128::from(n) * 10 + scale / 2)`
+aterm-link	c718595b296883f4	rss-backstop	aterm_link::enable::set_fabric_command arithmetic_overflow_add crates/aterm-link/src/enable.rs:1557 `start + 1`
+aterm-link	c7a1b1762ebddb4f	rss-backstop	aterm_link::person::inbox hardened_panic_boundary crates/aterm-link/src/person.rs:950 `count += 1`
+aterm-link	c7ce6bf2d2d3f219	rss-backstop	aterm_link::notify::Notifier::on_record hardened_panic_boundary crates/aterm-link/src/notify.rs:1981 `self.suppressed + 1`
+aterm-link	c9111628b46826c8	rss-backstop	aterm_link::enable::Out::done arithmetic_overflow_add crates/aterm-link/src/enable.rs:2144 `self.changed += 1`
+aterm-link	c98f889af37b553c	rss-backstop	aterm_link::notify::Notifier::take_one hardened_panic_boundary crates/aterm-link/src/notify.rs:2452 `subject.len() + body.len()`
+aterm-link	c999c221a4ab0eef	rss-backstop	aterm_link::notify::Notifier::verdicts arithmetic_overflow_add crates/aterm-link/src/notify.rs:1818 `self.counts.fired + self.counts.dropped`
+aterm-link	c9a9ec440497d291	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:840 `folded += 1`
+aterm-link	c9c7492d8f35c9ef	rss-backstop	aterm_link::broker_health::bytes division_by_zero crates/aterm-link/src/broker_health.rs:254 `(u128::from(n) * 10 + scale / 2) / scale`
+aterm-link	c9cef2542e0c8e3f	rss-backstop	aterm_link::notify::Notifier::take_one arithmetic_overflow_add crates/aterm-link/src/notify.rs:2453 `self.held_bytes + size`
+aterm-link	c9cef2542e0c8e3f	rss-backstop	aterm_link::notify::Notifier::take_one arithmetic_overflow_add crates/aterm-link/src/notify.rs:2463 `self.held_bytes + size`
+aterm-link	c9f888dd52b20dcd	rss-backstop	aterm_link::fabric::parse_args slice_bounds_check crates/aterm-link/src/fabric.rs:252 `[1..]`
+aterm-link	c9f888dd52b20dcd	rss-backstop	aterm_link::fabric::parse_args slice_bounds_check crates/aterm-link/src/fabric.rs:254 `[1..]`
+aterm-link	c9f888dd52b20dcd	rss-backstop	aterm_link::fabric::parse_args slice_bounds_check crates/aterm-link/src/fabric.rs:261 `[1..]`
+aterm-link	cae9b51307ab43f4	rss-backstop	aterm_link::enable::set_fabric_command arithmetic_overflow_add crates/aterm-link/src/enable.rs:1549 `lines.len() + 5`
+aterm-link	cb22bebbcfc60e11	rss-backstop	aterm_link::notify::Notifier::new unbounded_allocation crates/aterm-link/src/notify.rs:1161 `(0..n).map(|_| std::collections::VecDeque::new()).collect()`
+aterm-link	cb3dbc0ade2d9495	rss-backstop	aterm_link::fabric::clock arithmetic_overflow_div crates/aterm-link/src/fabric.rs:4270 `i64::MAX / 2`
+aterm-link	cd04ba5ddd013024	rss-backstop	aterm_link::fabric_brief::Read::ingest hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:272 `self.opaque += 1`
+aterm-link	ce15d73392d46a0f	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " clock=".len()`
+aterm-link	ce552f15010d0f4a	rss-backstop	aterm_link::wait_tally::Recorder::idle arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:1263 `at += tail_len()`
+aterm-link	ce5c8c4667a2eae0	rss-backstop	aterm_link::enable::broker_step::{closure#4} assertion crates/aterm-link/src/enable.rs:3944 `&view`
+aterm-link	cf48622487c28dbc	rss-backstop	aterm_link::mailbox::Mailbox::copy_wakes index_out_of_bounds crates/aterm-link/src/mailbox.rs:638 `t.rows[row.index()]`
+aterm-link	d06f41d4c93a6976	rss-backstop	aterm_link::fabric::in_sender slice_bounds_check crates/aterm-link/src/fabric.rs:2118 `segs[6]`
+aterm-link	d0a8a723ae3cbd46	rss-backstop	aterm_link::enable::instances arithmetic_overflow_add crates/aterm-link/src/enable.rs:4848 `found.len() + unasked`
+aterm-link	d0c265ec348e2764	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:844 `head_t + body_t`
+aterm-link	d164357c9b4b5544	rss-backstop	aterm_link::fabric_brief::render_json hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:962 `reordered += space.reordered`
+aterm-link	d18a2311cc27517e	rss-backstop	aterm_link::enable::retire_through_bridge::{closure#3} arithmetic_overflow_add crates/aterm-link/src/enable.rs:6977 `done += 1`
+aterm-link	d1ebcdab0da9017c	rss-backstop	aterm_link::fabric_brief::render_json hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:957 `shown.len() - i`
+aterm-link	d3523a0e26dc2977	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " at=".len()`
+aterm-link	d403842db7ff2163	rss-backstop	aterm_link::fabric::clock arithmetic_overflow_div crates/aterm-link/src/fabric.rs:4272 `rem / 3600`
+aterm-link	d45ae2da9c9de2f6	rss-backstop	aterm_link::notify::Notifier::on_record arithmetic_overflow_add crates/aterm-link/src/notify.rs:1967 `self.counts.standing += 1`
+aterm-link	d559e2a41e8eeeb9	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 3`
+aterm-link	d69b2f2140cecd38	rss-backstop	aterm_link::glance::json_string hardened_panic_boundary crates/aterm-link/src/glance.rs:173 `s.len() + 2`
+aterm-link	d70e3ba978b1a635	rss-backstop	aterm_link::wait_tally::Recorder::idle hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:1257 `at += len`
+aterm-link	d722c9c0d9e9834c	rss-backstop	aterm_link::fabric_brief::read hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:394 `r.pages += 1`
+aterm-link	d842052b8714fe3a	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 3`
+aterm-link	d936d91b5afd3cea	rss-backstop	aterm_link::wait_tally::Tally::since::{closure#3} hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:940 `Row::ALL[i]`
+aterm-link	da4bbecb1d0e2cec	rss-backstop	aterm_link::fabric::clock arithmetic_overflow_div crates/aterm-link/src/fabric.rs:4272 `(rem % 3600) / 60`
+aterm-link	da6f759f93c2843c	rss-backstop	aterm_link::federate::Shared::carry_one::{closure#2} hardened_panic_boundary crates/aterm-link/src/federate.rs:2270 `carry.carried += 1`
+aterm-link	dabd6c98071ed749	rss-backstop	aterm_link::fabric_brief::render_json arithmetic_overflow_sub crates/aterm-link/src/fabric_brief.rs:957 `shown.len() - i`
+aterm-link	db59de5f8cc7ef6c	rss-backstop	aterm_link::federate::Shared::push::{closure#0}::{closure#0} arithmetic_overflow_add crates/aterm-link/src/federate.rs:1770 `running.status.appended += appended as u64`
+aterm-link	db6866f89ad37062	rss-backstop	aterm_link::fabric::in_sender hardened_panic_boundary crates/aterm-link/src/fabric.rs:2118 `segs[6]`
+aterm-link	db94e14d40f03147	rss-backstop	aterm_link::notify::Notifier::fire arithmetic_overflow_add crates/aterm-link/src/notify.rs:2060 `self.counts.dup += 1`
+aterm-link	dd4494361697cbb0	rss-backstop	aterm_link::fabric::in_sender index_out_of_bounds crates/aterm-link/src/fabric.rs:2128 `segs[4]`
+aterm-link	ddfe42ba72299ad8	rss-backstop	aterm_link::enable::toml_str hardened_panic_boundary crates/aterm-link/src/enable.rs:1324 `s.len() + 2`
+aterm-link	de35a411bb1fbdb6	rss-backstop	aterm_link::notify::Sel::hit slice_bounds_check crates/aterm-link/src/notify.rs:406 `[5]`
+aterm-link	dec20ccc467a1809	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 20`
+aterm-link	dec20ccc467a1809	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 20`
+aterm-link	dec20ccc467a1809	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 20`
+aterm-link	dec20ccc467a1809	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 20`
+aterm-link	dec20ccc467a1809	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + 20`
+aterm-link	dfbb4f29ed2ec92b	rss-backstop	aterm_link::fabric_brief::Read::ingest division_by_zero crates/aterm-link/src/fabric_brief.rs:258 `body.windows(RESTORE_WORD.len())`
+aterm-link	dff396ba814d4249	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:850 `used += line_tokens(&line)`
+aterm-link	e060f8fcac5ff9fc	rss-backstop	aterm_link::fabric_brief::render arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:844 `used += head_t + body_t`
+aterm-link	e181eed825d2f82f	rss-backstop	aterm_link::fabric::table slice_bounds_check crates/aterm-link/src/fabric.rs:4325 `[i]`
+aterm-link	e181eed825d2f82f	rss-backstop	aterm_link::fabric::table slice_bounds_check crates/aterm-link/src/fabric.rs:4325 `[i]`
+aterm-link	e183aa257f591f43	rss-backstop	aterm_link::wait_tally::tail_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:617 `" slow_calls=".len() + 20 + " calls=".len() + CALLS_KEPT * (2 + 16 + 1 + 16 + 1)…#7eecccb7799f`
+aterm-link	e335e634bc6be31e	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " pid=".len()`
+aterm-link	e3f07e798fae3c34	rss-backstop	aterm_link::bridge::Bridge::take_one::{closure#0} assertion @sysroot/core/src/panic.rs:61 `-`
+aterm-link	e456b1bd2a733214	rss-backstop	aterm_link::wait_tally::SlowCalls::last slice_bounds_check crates/aterm-link/src/wait_tally.rs:428 `[skip..len]`
+aterm-link	e633ec7404c76e99	rss-backstop	aterm_link::enable::table_header::{closure#0} hardened_panic_boundary crates/aterm-link/src/enable.rs:1399 `open.len() + at`
+aterm-link	e6624882eb602fcf	rss-backstop	aterm_link::fabric_brief::render_json arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:965 `used += t`
+aterm-link	e6b670cdcc4c4759	rss-backstop	aterm_link::fabric_brief::render_json hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:966 `partial += u64::from(is_partial)`
+aterm-link	e71b77f4344bacec	rss-backstop	aterm_link::federate::Shared::carry_one::{closure#2} arithmetic_overflow_add crates/aterm-link/src/federate.rs:2270 `carry.carried += 1`
+aterm-link	e738a97e548ded4b	rss-backstop	<aterm_link::ctl::Reply as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/ctl.rs:102 `PartialEq`
+aterm-link	e78e059f34a77f30	rss-backstop	aterm_link::notify::Notifier::fire arithmetic_overflow_add crates/aterm-link/src/notify.rs:2062 `self.counts.fired += 1`
+aterm-link	e7e596648a201f93	rss-backstop	aterm_link::cli::column hardened_panic_boundary crates/aterm-link/src/cli.rs:206 `crate::glance::ATTENTION_CAP - ELLIPSIS.len()`
+aterm-link	e97de78bd443da3c	rss-backstop	aterm_link::transport::jittered remainder_by_zero crates/aterm-link/src/transport.rs:287 `r % span.saturating_add(1)`
+aterm-link	ea79c744cb138b88	rss-backstop	aterm_link::notify::Notifier::fire hardened_panic_boundary crates/aterm-link/src/notify.rs:2051 `self.suppressed -= carried`
+aterm-link	ea9920c0e9a045bf	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " clock=".len()`
+aterm-link	ea9aaaf8b0422c4e	rss-backstop	aterm_link::fabric_brief::Read::ingest arithmetic_overflow_add crates/aterm-link/src/fabric_brief.rs:272 `self.opaque += 1`
+aterm-link	eb1b3a165d2a77a7	rss-backstop	aterm_link::fabric::bridge_program arithmetic_overflow_sub crates/aterm-link/src/fabric.rs:798 `at - 1`
+aterm-link	ec1753ec6ff48913	rss-backstop	aterm_link::notify::Notifier::new unbounded_allocation @sysroot/alloc/src/macros.rs:48 `-`
+aterm-link	ec9e9a9efc25907b	rss-backstop	aterm_link::enable::fix_for hardened_panic_boundary crates/aterm-link/src/enable.rs:6631 `crate::broker_rules::MAIL_BYTES >> 20`
+aterm-link	ed300ecbd853e4fc	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " counted=".len()`
+aterm-link	eef8d0558adf444f	rss-backstop	aterm_link::fabric::tail_line_at slice_bounds_check crates/aterm-link/src/fabric.rs:5606 `[0]`
+aterm-link	ef419c9d398932ac	rss-backstop	aterm_link::person_key::vouch::{closure#0} hardened_panic_boundary crates/aterm-link/src/person_key.rs:410 `now_ms - cert.issued_ms`
+aterm-link	efa1bfa7111201db	rss-backstop	aterm_link::fabric::is_link_verb index_out_of_bounds crates/aterm-link/src/fabric.rs:777 `words[i - 1]`
+aterm-link	efa1bfa7111201db	rss-backstop	aterm_link::fabric::is_link_verb index_out_of_bounds crates/aterm-link/src/fabric.rs:777 `words[i - 1]`
+aterm-link	efde90386a927cd5	rss-backstop	aterm_link::fabric::last_hold arithmetic_overflow_add crates/aterm-link/src/fabric.rs:2717 `at + 1`
+aterm-link	f2e5e19e1edb9a35	rss-backstop	aterm_link::notify::Notifier::take_one arithmetic_overflow_add crates/aterm-link/src/notify.rs:2477 `self.held_bytes += size`
+aterm-link	f443e37526b7d7eb	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " plain=".len()`
+aterm-link	f4d1c17f67bce28c	rss-backstop	aterm_link::notify::Notifier::advance hardened_panic_boundary crates/aterm-link/src/notify.rs:1755 `lag.records += 1`
+aterm-link	f4f4eeb19064d6a7	rss-backstop	aterm_link::enable::command_value_end::{closure#1} arithmetic_overflow_add crates/aterm-link/src/enable.rs:1455 `(empty)`
+aterm-link	f5ab25e18b485ed3	rss-backstop	aterm_link::wait_tally::tail_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:617 `" slow_calls=".len() + 20 + " calls=".len() + CALLS_KEPT * (2 + 16 + 1 + 16 + 1)`
+aterm-link	f5d3ebc0653415a2	rss-backstop	<aterm_link::person::Act as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/person.rs:53 `PartialEq`
+aterm-link	f5e5fb707d6c6e2b	rss-backstop	aterm_link::fabric::OverdueScan::finish_on_lanes::{closure#1}::{closure#0} hardened_panic_boundary crates/aterm-link/src/fabric.rs:2472 `now_ms - due`
+aterm-link	f712679b1b341a44	rss-backstop	aterm_link::wait_tally::line_len hardened_panic_boundary crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " counted=".len()`
+aterm-link	f76e61b573384d96	rss-backstop	aterm_link::broker_health::bytes hardened_panic_boundary crates/aterm-link/src/broker_health.rs:251 `scale *= 1024`
+aterm-link	f844e61506d2f4f9	rss-backstop	aterm_link::fabric_brief::render hardened_panic_boundary crates/aterm-link/src/fabric_brief.rs:820 `shown.len() - i`
+aterm-link	f9688772106e6144	rss-backstop	aterm_link::enable::set_fabric_command hardened_panic_boundary crates/aterm-link/src/enable.rs:1557 `start + 1`
+aterm-link	fa0bed3d09168a11	rss-backstop	aterm_link::notify::Notifier::tell_exec hardened_panic_boundary crates/aterm-link/src/notify.rs:1218 `at[0]`
+aterm-link	fa0d8b3f0322a25b	rss-backstop	aterm_link::notify::Notifier::release slice_bounds_check crates/aterm-link/src/notify.rs:2524 `[idx]`
+aterm-link	fa0d8b3f0322a25b	rss-backstop	aterm_link::notify::Notifier::release slice_bounds_check crates/aterm-link/src/notify.rs:2532 `[idx]`
+aterm-link	fa0d8b3f0322a25b	rss-backstop	aterm_link::notify::Notifier::release slice_bounds_check crates/aterm-link/src/notify.rs:2540 `[idx]`
+aterm-link	fa0d8b3f0322a25b	rss-backstop	aterm_link::notify::Notifier::release slice_bounds_check crates/aterm-link/src/notify.rs:2551 `[idx]`
+aterm-link	fa0d8b3f0322a25b	rss-backstop	aterm_link::notify::Notifier::release slice_bounds_check crates/aterm-link/src/notify.rs:2552 `[idx]`
+aterm-link	fa7fadd39135b905	rss-backstop	aterm_link::enable::supervisor_last_word hardened_panic_boundary crates/aterm-link/src/enable.rs:713 `(meta.len() - from)`
+aterm-link	fac2a75e8a8a9f14	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … + " plain=".len()`
+aterm-link	fc1b0ed5f5ab8066	rss-backstop	aterm_link::wait_tally::line_len arithmetic_overflow_add crates/aterm-link/src/wait_tally.rs:629 `FORMAT.len() … .sum::<usize>()`
+aterm-link	fc5b0d7e9f4046c1	rss-backstop	aterm_link::fabric::clock hardened_panic_boundary crates/aterm-link/src/fabric.rs:4272 `(rem % 3600)`
+aterm-link	fd96d1e934f1346c	rss-backstop	<aterm_link::fabric::RetireRefusal as core::cmp::PartialEq>::eq unreachable crates/aterm-link/src/fabric.rs:4661 `PartialEq`
+aterm-link	fe1707d462d09471	rss-backstop	aterm_link::cli::broker slice_bounds_check crates/aterm-link/src/cli.rs:483 `log`
+aterm-link	fe1707d462d09471	rss-backstop	aterm_link::cli::broker slice_bounds_check crates/aterm-link/src/cli.rs:509 `log`
+aterm-link	ff188ed792051b66	rss-backstop	aterm_link::federate::Shared::carry_one::{closure#3} arithmetic_overflow_add crates/aterm-link/src/federate.rs:2308 `carry.refused += 1`
 aterm-log	-	cancelled	0
 aterm-machines	-	cancelled	0
 aterm-machines	00135a80b76f8425	rss-backstop	aterm_machines::port::secret::Secret::new assertion crates/aterm-machines/src/port/secret.rs:35 `secret.bytes`

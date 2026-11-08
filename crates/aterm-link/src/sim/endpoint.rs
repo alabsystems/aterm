@@ -218,6 +218,10 @@ pub(crate) struct EpState {
     pub(crate) mirror_said: String,
     /// How many times a bridge said its mirror stopped for its pin.
     pub(crate) pin_stops: u64,
+    /// Whether a quit's closes can land now, as aterm's `mirror_lands_now` reads its link (fix
+    /// unit Q1): the newest bridge's `hello` was answered `log=turns`, it has not said `link
+    /// down` since its last `link up`, and its mirror has said nothing or `on` since its hello.
+    pub(crate) lands: Lands,
     /// How many of aterm's last words a bridge acknowledged.
     pub(crate) byes_acked: u64,
     /// Every alias key a take named.
@@ -256,6 +260,24 @@ pub(crate) struct EpState {
     /// (item C14): the post stays unretired and the bridge's pin of it stands, as a power cut
     /// between the pin and the retire leaves it, until the world cuts the power.
     pub(crate) unretired: BTreeSet<String>,
+}
+
+/// What the endpoint keeps of its newest bridge's link for a quit's wait ([`EpState::lands`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Lands {
+    /// The newest `hello` was answered `log=turns`.
+    pub(crate) mirrors: bool,
+    /// The bridge said `link down` (its broker unreachable) and no `link up` since.
+    pub(crate) down: bool,
+    /// The bridge's mirror said a state other than `on` (stopped, capped, budget, unretained).
+    pub(crate) held: bool,
+}
+
+impl Lands {
+    /// Whether a quit waits for its closes' landings ([`Endpoint::mirror_lands_now`]).
+    pub(crate) const fn now(self) -> bool {
+        self.mirrors && !self.down && !self.held
+    }
 }
 
 /// One `link gap` a bridge told, scoped as aterm-gui-fabric's `cmd_link_gap` scopes it.
@@ -484,6 +506,48 @@ impl Endpoint {
         s.roster_seq += 1;
     }
 
+    /// THE QUIT'S CLOSES (fix unit Q1), as aterm's `session_log::close_logs_at_quit`: every live
+    /// session's open log closes `out=app-quit` by aterm at `at`, the one producer of a quit's
+    /// closes, which the mirror then takes as any other record; the sids it closed.
+    pub(crate) fn close_logs_at_quit(&self, at: aterm_slog::Stamp) -> Vec<String> {
+        let mut s = lock(&self.state);
+        s.stamp = at;
+        let mut closed = Vec::new();
+        for session in s.sessions.values_mut() {
+            let Some(log) = session.log.as_mut() else {
+                continue;
+            };
+            if !log.is_open(aterm_slog::Node::SESSION) {
+                continue;
+            }
+            let close = aterm_slog::Close::new(
+                aterm_slog::Out::Session(aterm_slog::SessionOut::AppQuit),
+                aterm_slog::Src::Aterm,
+                aterm_slog::Conf::Exact,
+            )
+            .by(aterm_slog::Actor::Aterm);
+            if log.close_session(close, at).is_ok() {
+                closed.push(session.sid.clone());
+            }
+        }
+        closed
+    }
+
+    /// Whether a quit's closes can land now ([`EpState::lands`]).
+    pub(crate) fn mirror_lands_now(&self) -> bool {
+        lock(&self.state).lands.now()
+    }
+
+    /// Whether the bus holds every live session's log through its head, a quit's closes among
+    /// them (aterm's `session_log_mirror::quit_closes_landed`).
+    pub(crate) fn quit_closes_landed(&self) -> bool {
+        lock(&self.state)
+            .sessions
+            .values()
+            .filter_map(|x| x.log.as_ref())
+            .all(aterm_slog::Log::mirror_complete)
+    }
+
     /// Session `local` appends to its log.
     pub(crate) fn append_log(&self, local: u64, bus: bool, at: aterm_slog::Stamp) -> bool {
         let mut s = lock(&self.state);
@@ -686,6 +750,10 @@ impl Endpoint {
                     .to_string();
                 let asked = request.split_whitespace().any(|t| t == "log=turns");
                 let log = if asked && s.mirror { " log=turns" } else { "" };
+                s.lands = Lands {
+                    mirrors: asked && s.mirror,
+                    ..Lands::default()
+                };
                 format!("OK lane={} build={build}{log}\n", s.rules.lane)
             }
             "log-take" if s.mirror => s.log_take(words),
@@ -759,8 +827,17 @@ impl Endpoint {
                     }
                     None => "ERR usage\n".to_string(),
                 },
+                Some("up") => {
+                    s.lands.down = false;
+                    "OK\n".to_string()
+                }
+                Some("down") => {
+                    s.lands.down = true;
+                    "OK\n".to_string()
+                }
                 Some("mirror") => {
                     s.mirror_said = words.collect::<Vec<_>>().join(" ");
+                    s.lands.held = s.mirror_said != "on";
                     if s.mirror_said == "stopped reason=pin" {
                         s.pin_stops += 1;
                     }

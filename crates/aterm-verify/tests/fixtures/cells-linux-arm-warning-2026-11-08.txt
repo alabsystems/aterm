@@ -1,0 +1,13 @@
+  FAIL  cell linux-arm (aarch64-unknown-linux-gnu) — TEST-TARGET-WARNING(1)
+cell linux-arm (aarch64-unknown-linux-gnu): 598s
+in `aterm-resource-host`:
+warning: field `producer_returns` is never read
+  --> crates/aterm-resource-host/src/resource_admission_member/tests.rs:44:5
+   |
+32 | struct Fixture {
+   |        ------- field in this struct
+...
+44 |     producer_returns: usize,
+   |     ^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default

@@ -450,45 +450,6 @@ fn a_pin_names_how_it_ends() {
     assert_eq!(LIMIT_DRAFT.undo, None, "the control");
 }
 
-fn short_title_fault(short: &str, title: &str) -> Option<&'static str> {
-    let words = aterm_messages::text::title_words(short);
-    if !(2..=3).contains(&words) {
-        Some("two or three words")
-    } else if short.chars().count() >= title.chars().count() {
-        Some("no narrower than the title")
-    } else if short.chars().any(|c| c.is_ascii_digit()) || short.to_lowercase().contains("tab") {
-        Some("a tab named")
-    } else {
-        aterm_messages::text::glass_title_fault(short)
-    }
-}
-
-#[test]
-fn a_short_title_says_what_happened_in_two_or_three_words() {
-    for n in ALL {
-        assert_eq!(
-            short_title_fault(n.short_title, n.title),
-            None,
-            "{}: {:?}",
-            n.id,
-            n.short_title
-        );
-        for m in ALL {
-            assert_eq!(
-                n.short_title == m.short_title,
-                n.title == m.title,
-                "{} and {}",
-                n.id,
-                m.id
-            );
-        }
-    }
-    let title = LIMIT_USE.title;
-    assert!(short_title_fault("Limit in tab 1", "Claude usage limit reached in tab 1").is_some());
-    assert!(short_title_fault(title, title).is_some());
-    assert!(short_title_fault("Limit", title).is_some());
-}
-
 fn step_args(f: &Filled) -> Option<Vec<String>> {
     let step = f.command.as_deref().unwrap_or(&f.todo);
     let at = step.find(COMMAND)?;

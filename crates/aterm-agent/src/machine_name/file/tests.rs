@@ -133,6 +133,135 @@ fn a_field_outside_its_grammar_is_refused() {
 }
 
 #[test]
+fn required_name_creation_and_replacement_wait_for_the_native_writer() {
+    for replacing in [false, true] {
+        for age in [Duration::from_secs(11), Duration::from_secs(61)] {
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let root = state();
+            let initial = MachineName::unnumbered(nick("otter"), NOW);
+            if replacing {
+                read_or_create(root.path(), || Ok(initial.clone())).unwrap();
+            }
+            let held = std::cell::RefCell::new(Some(
+                PrivateLock::take(root.path(), LOCK, Duration::from_secs(60), "fixture writer")
+                    .unwrap(),
+            ));
+            let observed = std::cell::Cell::new(0);
+            let called = std::cell::Cell::new(0);
+            let before = std::fs::read(root.path().join(FILE)).ok();
+            if replacing {
+                let cached =
+                    read_or_create(root.path(), || panic!("the atomic file is already there"))
+                        .unwrap();
+                assert_eq!(
+                    cached,
+                    (initial.clone(), false),
+                    "an existing-name read needs no writer lock"
+                );
+            }
+            let take = |dir: &Path, within: Duration| {
+                PrivateLock::take_with(
+                    dir,
+                    LOCK,
+                    within.saturating_sub(age),
+                    "fixture writer busy",
+                    || {
+                        observed.set(observed.get() + 1);
+                        if !expired {
+                            drop(held.borrow_mut().take());
+                        }
+                    },
+                )
+            };
+            let check_held = || {
+                called.set(called.get() + 1);
+                match PrivateLock::take(root.path(), LOCK, Duration::ZERO, "already held") {
+                    Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
+                    Ok(_) => panic!("the actual name callback must keep its native guard"),
+                }
+            };
+            let mut expected = initial.clone();
+            let result = if replacing {
+                expected.num = Some(num(179));
+                expected.rev += 1;
+                replace_with_lock(
+                    root.path(),
+                    |name| {
+                        check_held();
+                        name.num = Some(num(179));
+                        name.rev = expected.rev;
+                        Ok(())
+                    },
+                    take,
+                )
+            } else {
+                read_or_create_with_lock(
+                    root.path(),
+                    || {
+                        check_held();
+                        Ok(initial.clone())
+                    },
+                    take,
+                )
+                .map(|(name, created)| {
+                    assert!(created);
+                    name
+                })
+            };
+            assert_eq!(
+                held.borrow().is_some(),
+                expired,
+                "only actual unexpired contention releases the native writer"
+            );
+            drop(held.borrow_mut().take());
+            if expired {
+                assert_eq!(
+                    result.as_ref().err().map(io::Error::kind),
+                    Some(io::ErrorKind::WouldBlock)
+                );
+                assert_eq!(observed.get(), 0);
+                assert_eq!(called.get(), 0);
+                assert_eq!(
+                    std::fs::read(root.path().join(FILE)).ok(),
+                    before,
+                    "expiry changes no name bytes"
+                );
+                drop(
+                    PrivateLock::take(root.path(), LOCK, Duration::ZERO, "fresh native lock")
+                        .unwrap(),
+                );
+                let fresh = if replacing {
+                    replace(root.path(), |name| {
+                        name.num = Some(num(179));
+                        name.rev += 1;
+                        Ok(())
+                    })
+                    .unwrap()
+                } else {
+                    read_or_create(root.path(), || Ok(initial.clone()))
+                        .unwrap()
+                        .0
+                };
+                assert_eq!(fresh, expected);
+            } else {
+                assert!(observed.get() > 0);
+                assert_eq!(called.get(), 1);
+                assert_eq!(result.unwrap(), expected);
+                assert_eq!(
+                    std::fs::metadata(root.path().join(FILE))
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+            }
+            assert_eq!(read(root.path()).unwrap(), Some(expected));
+        }
+    }
+}
+
+#[test]
 fn the_first_reader_creates_it_and_every_other_reads_that_back() {
     let root = state();
     assert_eq!(read(root.path()).expect("reads"), None);

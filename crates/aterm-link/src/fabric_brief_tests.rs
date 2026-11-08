@@ -560,13 +560,15 @@ fn in_approval(at: u64, tool: &str) -> Log {
     log
 }
 
-const SCHEMA: [&str; 12] = [
+const SCHEMA: [&str; 13] = [
     "node", "sid", "this", "ep", "need", "detail", "open", "mail_in", "mail_out", "last_seq",
-    "age_s", "partial",
+    "age_s", "partial", "closed",
 ];
 
-const DERIVED: [&str; 8] = [
-    "node", "sid", "this", "ep", "level", "last_seq", "age_s", "partial",
+/// The keys the brief writes of its own reading, never a body's field: `closed` is the fold's
+/// close's `out=` word, a `&'static` word of the closed vocabulary (fix unit Q1).
+const DERIVED: [&str; 9] = [
+    "node", "sid", "this", "ep", "level", "last_seq", "age_s", "partial", "closed",
 ];
 
 fn json_of(text: &str) -> aterm_json::Value {
@@ -954,6 +956,13 @@ fn partial_of(s: &aterm_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// A session object's `closed` word (its close's `out=`), `None` while it is open.
+fn closed_of(s: &aterm_json::Value) -> Option<String> {
+    s.get("closed")
+        .and_then(aterm_json::Value::as_str)
+        .map(str::to_string)
+}
+
 /// A session object's `need` and `detail`.
 fn need_of(s: &aterm_json::Value) -> (Option<String>, Option<String>) {
     let w = |k: &str| {
@@ -1017,6 +1026,7 @@ fn a_session_a_later_incarnation_retired_reads_closed_out_gone_derived_never_wri
             in_approval_path(),
             "after {row}: a will or a relaunch derives nothing"
         );
+        assert_eq!(closed_of(&s), None, "after {row}: open, so not closed");
     }
     r.presence("n-1", "s-dead", b"v=1 t=4 inc=3 state=exited")
         .expect("the sweep's row");
@@ -1030,6 +1040,11 @@ fn a_session_a_later_incarnation_retired_reads_closed_out_gone_derived_never_wri
         "{json}"
     );
     assert_eq!(partial_of(&s), ["no-close"], "{json}");
+    assert_eq!(
+        closed_of(&s).as_deref(),
+        Some("gone"),
+        "the derived close: {json}"
+    );
     assert_eq!(
         s.get("last_seq").and_then(aterm_json::Value::as_u64),
         Some(head),
@@ -1256,6 +1271,93 @@ fn a_session_whose_close_reached_the_bus_reads_as_it_did_whatever_says_it_died()
             .any(|l| l.starts_with("- closed out=shell-exit ")),
         "its own close: {text}"
     );
+}
+
+/// A CLEAN QUIT'S CLOSE ON THE BUS READS CLOSED `out=app-quit`, NEVER GONE (fix unit Q1). A
+/// session whose quit closed it on the bus before its bridge's `bye quit` reads its own close,
+/// with no `partial` word and no derived record, whether or not the bridge's withdrawal landed
+/// after it, though its node's will fired, the node relaunched and a successor's restore names
+/// it: in the JSON read it is `closed` `app-quit` with no `partial` word, and in the text read
+/// `- closed out=app-quit`. NEGATIVE CONTROLS, run: deriving over a fold that holds its close
+/// reads `closed out=gone` for the read without the withdrawal; a JSON `closed` that is always
+/// null fails the machine form's word.
+#[test]
+fn a_clean_quits_close_on_the_bus_reads_closed_out_app_quit_never_gone() {
+    let at = 1_760_000_000_000;
+    let now = at + 600_000;
+    let mut quit = in_approval(at, "bash");
+    quit.close_session(
+        Close::new(
+            Out::Session(aterm_slog::SessionOut::AppQuit),
+            Src::Aterm,
+            Conf::Exact,
+        )
+        .by(Actor::Aterm),
+        Stamp::new(at + 10, 10),
+    )
+    .expect("the quit closes");
+    let quit = bodies(&mut quit);
+    let next = bodies(&mut successor("s-quit", at + 60_000));
+    for withdrawn in [true, false] {
+        let mut r = read_of(&[
+            ("n-1", "s-quit", quit.clone()),
+            ("n-1", "s-next", next.clone()),
+        ]);
+        let mut rows = vec![
+            ("node", "v=1 t=1 state=live inc=1"),
+            ("s-quit", "v=1 t=1 inc=1 state=live"),
+        ];
+        if withdrawn {
+            rows.push(("s-quit", "v=1 t=2 inc=1 state=exited"));
+        }
+        rows.extend([
+            ("node", "v=1 t=2 state=away inc=1 fabric=disconnected"),
+            ("node", "v=1 t=3 state=live inc=2"),
+        ]);
+        for (sid, row) in rows {
+            r.presence("n-1", sid, row.as_bytes()).expect("a row");
+        }
+        let f = settled_fold(
+            &r,
+            "n-1",
+            &r.sessions[&("n-1".to_string(), "s-quit".to_string())],
+            Derive::Paged,
+        )
+        .expect("a fold");
+        assert!(
+            f.died.is_none() && f.derived.is_empty() && f.closed_on_bus(),
+            "withdrawn {withdrawn}: {:?}",
+            f.derived
+        );
+        let json = render_json(&cfg(), &json_opts(), &r, now, None);
+        let s = session_obj(&json, "s-quit");
+        assert_eq!(
+            partial_of(&s),
+            Vec::<String>::new(),
+            "withdrawn {withdrawn}: {json}"
+        );
+        assert_eq!(
+            closed_of(&s).as_deref(),
+            Some("app-quit"),
+            "withdrawn {withdrawn}: the machine form says the quit's own close: {json}"
+        );
+        let text = render(&cfg(), &BriefOpts::default(), &r, now);
+        let lines = lines_of(&text, "s-quit");
+        assert!(
+            !lines[0].contains("partial"),
+            "withdrawn {withdrawn}: {text}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("- closed out=app-quit ")),
+            "withdrawn {withdrawn}: its own close: {text}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("out=gone")),
+            "withdrawn {withdrawn}: never gone: {text}"
+        );
+    }
 }
 
 /// NEITHER A WILL, NOR A RELAUNCH, NOR AN EXIT UNDER ITS OWN INCARNATION DERIVES A CLOSE (fix

@@ -8,7 +8,8 @@
 //! It reads explicit configuration and recorded vault identities, and sends nothing. A
 //! writer whose token is not in a token file fails its check: a lane unit carries
 //! no token variable, and agh's git credential helper reads only token files, so a unit reads
-//! what this check read.
+//! what this check read. `--lane linux` additionally reads and authenticates the fresh signed
+//! channel to select the repositories that lane may serve; the generic inventory sends nothing.
 
 use agh::config::Dirs;
 use agh::policy::Tier;
@@ -17,6 +18,7 @@ use crate::ctx::{Ctx, HostChoice};
 use crate::error::{Error, Result};
 use crate::host::agh::{AghHost, CALLER};
 use crate::lane::install::Machine;
+use crate::lane::{LaneKind, linux};
 
 /// The runbook every provisioning step points at.
 const RUNBOOK: &str = "docs/RUNBOOK-atpkg-republish.md";
@@ -56,6 +58,65 @@ pub fn program_repos() -> Vec<String> {
         }
     }
     repos
+}
+
+/// Repositories selected by the Linux lane's signed channel pins, across its default targets.
+/// Build numbers may differ by target: grants name repositories, not package versions.
+fn linux_program_repos(index: &atpkg::Index) -> Result<Vec<String>> {
+    let channel = index.channels.first().ok_or_else(|| {
+        Error::refused("the signed index carries no channel — no Linux pins to serve")
+    })?;
+    let mut repos = Vec::new();
+    for target in linux::default_targets() {
+        for name in crate::pins::for_targets(channel, &[target])?.keys() {
+            let definition = crate::programs::get(name);
+            if matches!(
+                linux::Class::of(name, definition),
+                linux::Class::Vendor | linux::Class::AppleOnly
+            ) {
+                continue;
+            }
+            let repo = index
+                .programs
+                .get(name)
+                .map(|p| p.repo.as_str())
+                .or_else(|| definition.map(|d| d.repo))
+                .unwrap_or(name);
+            if !repos.iter().any(|r| r == repo) {
+                repos.push(repo.to_string());
+            }
+        }
+    }
+    Ok(repos)
+}
+
+/// Judge a Linux lane against a fresh authenticated channel selection.
+///
+/// Configuration, writers and the index grant must hold before any request. The signed
+/// channel then selects the repository grants, using the same pin and program classification
+/// owners as the lane. An unselected table entry is not publication authority.
+///
+/// # Errors
+/// What fetching and verifying the fresh signed head answers, or a channel with no pins.
+pub fn check_linux(
+    ctx: &Ctx,
+    dirs: &Dirs,
+    choice: HostChoice,
+    keyless: bool,
+) -> Result<Vec<HostCheck>> {
+    let preliminary = check(ctx, dirs, choice, keyless, &[]);
+    if !failed(&preliminary).is_empty() {
+        return Ok(preliminary);
+    }
+    let scratch = crate::channel::Scratch::new("linux-hosts-check")?;
+    let (_, head) = crate::quad::fetch_head(ctx, &ctx.index_slug(), scratch.path())?;
+    Ok(check(
+        ctx,
+        dirs,
+        choice,
+        keyless,
+        &linux_program_repos(&head.index)?,
+    ))
 }
 
 /// The router agh.toml under `dirs` builds, or the failing `config` detail.
@@ -254,7 +315,9 @@ pub(crate) fn render(choice: HostChoice, checks: &[HostCheck]) -> String {
     object.to_string()
 }
 
-/// The CLI verb: `atpkg-publish hosts check [--host agh-staging|agh] [--unit-env] [--keyless]`.
+/// The CLI verb: `atpkg-publish hosts check [--host agh-staging|agh] [--unit-env] [--keyless]
+/// [--lane alab|linux]`. Linux scope authenticates the fresh signed channel; without a lane,
+/// this remains the local inventory check over the whole producer table.
 /// It prints one JSON object, `{"checks":[…],"host":"…","ok":…}`, and exits 0 when every
 /// check holds, else 1 (Refused). `--keyless` judges a staging-only lane only on a builder
 /// with no machine key: a keyed builder's run writes the public owner, so it is judged keyed.
@@ -262,14 +325,74 @@ pub(crate) fn render(choice: HostChoice, checks: &[HostCheck]) -> String {
 /// # Errors
 ///
 /// Usage for a bad flag. With `--unit-env`, `Machine::production`'s refusal (an OS other than
-/// macOS or Linux). Could-not-run when agh's directories cannot be resolved. Refused, after
+/// macOS or Linux). For Linux scope, the fresh signed-head check can also refuse. Could-not-run
+/// when agh's directories cannot be resolved. Refused, after
 /// the object is printed, when any check fails.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
+    let CheckFlags {
+        choice,
+        unit_env,
+        keyless,
+        lane,
+    } = parse(args)?;
+    let dirs = if unit_env {
+        Machine::production(ctx)?.agh_dirs(ctx)
+    } else {
+        Dirs::from_env()
+    }
+    .ok_or_else(|| {
+        Error::cannot_run(
+            "agh's directories cannot be resolved: no home, config or state directory",
+        )
+    })?;
+    let checks = if lane == Some(LaneKind::Linux) {
+        check_linux(ctx, &dirs, choice, stages_only(ctx, keyless))?
+    } else {
+        check(
+            ctx,
+            &dirs,
+            choice,
+            stages_only(ctx, keyless),
+            &program_repos(),
+        )
+    };
+    println!("{}", render(choice, &checks));
+    let failed = failed(&checks);
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::refused(format!(
+            "hosts check --host {}: {} failed",
+            choice.as_str(),
+            failed.join(", ")
+        )))
+    }
+}
+
+struct CheckFlags {
+    choice: HostChoice,
+    unit_env: bool,
+    keyless: bool,
+    lane: Option<LaneKind>,
+}
+
+/// Linux metadata uses the parsed transport; a generic local inventory needs no host context.
+pub(crate) fn context_host(args: &[String]) -> Result<HostChoice> {
+    let flags = parse(args)?;
+    Ok(if flags.lane == Some(LaneKind::Linux) {
+        flags.choice
+    } else {
+        HostChoice::Gh
+    })
+}
+
+fn parse(args: &[String]) -> Result<CheckFlags> {
     let Some(("check", flags)) = args.split_first().map(|(v, r)| (v.as_str(), r)) else {
         return Err(Error::usage("hosts takes one sub-verb: check"));
     };
     let mut choice = HostChoice::Agh;
     let (mut unit_env, mut keyless) = (false, false);
+    let mut lane = None;
     let mut it = flags.iter();
     while let Some(flag) = it.next() {
         let value = match flag.as_str() {
@@ -281,12 +404,19 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
                 keyless = true;
                 continue;
             }
+            "--lane" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| Error::usage("--lane needs alab or linux"))?;
+                lane = Some(LaneKind::parse(value)?);
+                continue;
+            }
             other => match HostChoice::flag_value(other, &mut it) {
                 Some(value) => value,
                 None => {
                     return Err(Error::usage(format!(
                         "hosts check does not take `{other}` (--host agh-staging|agh, \
-                         --unit-env, --keyless)"
+                         --unit-env, --keyless, --lane alab|linux)"
                     )));
                 }
             },
@@ -300,34 +430,12 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
             }
         };
     }
-    let dirs = if unit_env {
-        Machine::production(ctx)?.agh_dirs(ctx)
-    } else {
-        Dirs::from_env()
-    }
-    .ok_or_else(|| {
-        Error::cannot_run(
-            "agh's directories cannot be resolved: no home, config or state directory",
-        )
-    })?;
-    let checks = check(
-        ctx,
-        &dirs,
+    Ok(CheckFlags {
         choice,
-        stages_only(ctx, keyless),
-        &program_repos(),
-    );
-    println!("{}", render(choice, &checks));
-    let failed = failed(&checks);
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(Error::refused(format!(
-            "hosts check --host {}: {} failed",
-            choice.as_str(),
-            failed.join(", ")
-        )))
-    }
+        unit_env,
+        keyless,
+        lane,
+    })
 }
 
 #[cfg(test)]

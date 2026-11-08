@@ -4281,6 +4281,10 @@ fn every_seed_with_write_errors_holds_every_law() {
             sum(|s| s.held_for_the_disk),
         ),
         ("quits of aterm", sum(|s| s.quits)),
+        (
+            "quits whose closes the bus held before their bye",
+            sum(|s| s.quit_closes_landed),
+        ),
         ("clean stops of a run", sum(|s| s.clean_stops)),
         ("posts", sum(|s| s.posts)),
         ("power cuts", sum(|s| s.power_cuts)),

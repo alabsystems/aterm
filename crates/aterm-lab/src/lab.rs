@@ -1284,10 +1284,11 @@ fn stand_bus(run: &mut Run, armed: bool) -> Result<String, String> {
 }
 
 /// The lab's bridge connected (`ctl fabric status` gives `state=connected`), waited for as a
-/// one-minute hang detector ([`READY_HANG`]), never a latency budget.
+/// one-minute hang detector ([`READY_HANG`]), never a latency budget: at `up --fabric`, and at
+/// each relaunch of such a lab on its own state ([`crate::restore::relaunch_instance`]).
 /// # Errors
 /// It never connected (naming the last status), or the wait was interrupted.
-fn await_bridge(run: &Run) -> Result<(), String> {
+pub(crate) fn await_bridge(run: &Run) -> Result<(), String> {
     let door = Door::new(run)?;
     let end = Instant::now() + READY_HANG;
     loop {

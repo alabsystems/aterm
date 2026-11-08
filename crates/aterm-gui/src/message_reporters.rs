@@ -239,31 +239,6 @@ impl ConfigFamily {
         }
     }
 
-    /// The band's short title for `n` warnings, led by what is wrong so a narrow
-    /// band never paints a bare count (`2…`) or a lone `Couldn't…`; at most 11
-    /// cells (whole beside `Edit` at 22 columns) or cut to its subject.
-    pub(crate) const fn short_title(self, n: usize) -> Option<&'static str> {
-        let one = n == 1;
-        match self {
-            Self::Keybindings if one => None,
-            Self::Keybindings => Some("Keybindings"),
-            Self::IgnoredKeys if one => Some("Unknown key"),
-            // `Unknown keys` is a cell too long for 22 columns, where its cut
-            // kept `Unknown…` alone.
-            Self::IgnoredKeys => Some("Bad keys"),
-            Self::UnacceptedValues if one => Some("Bad value"),
-            Self::UnacceptedValues => Some("Bad values"),
-            Self::CursorTrail if one => Some("Trail error"),
-            Self::CursorTrail => Some("Bad trail"),
-            Self::Fonts if one => Some("Font error"),
-            Self::Fonts => Some("Font errors"),
-            Self::Assets if one => Some("Image error"),
-            Self::Assets => Some("Bad images"),
-            Self::SecureKeyboard => Some("Secure Entry"),
-            Self::Restart | Self::RetiredKeys => None,
-        }
-    }
-
     /// Resolution log title when a clean reload clears `n` warnings in this family.
     pub(crate) fn fixed_title(self, title: &str, n: usize) -> Option<String> {
         let one = n == 1;
@@ -588,30 +563,24 @@ pub(crate) fn excerpt_head(sentence: &str, cap: usize) -> &str {
 
 fn config_family_message(family: ConfigFamily, sentences: &[String]) -> Message {
     let stripped: Vec<&str> = sentences.iter().map(|s| family.strip_prefix(s)).collect();
-    let (title, short) = match (family, stripped.as_slice()) {
-        (ConfigFamily::Restart, [only]) => (restart_title(only), None),
+    let title = match (family, stripped.as_slice()) {
+        (ConfigFamily::Restart, [only]) => restart_title(only),
         (ConfigFamily::IgnoredKeys, all)
             if all
                 .iter()
                 .all(|s| unknown_key_excerpt(s).is_some_and(|e| e.contains('\u{2192}'))) =>
         {
             match all.len() {
-                1 => ("Misspelled setting".to_string(), Some("Key typo")),
-                n => (format!("{n} misspelled settings"), Some("Key typos")),
+                1 => "Misspelled setting".to_string(),
+                n => format!("{n} misspelled settings"),
             }
         }
-        _ => (
-            family.title(stripped.len()),
-            family.short_title(stripped.len()),
-        ),
+        _ => family.title(stripped.len()),
     };
     let fixed = family.fixed_title(&title, stripped.len());
     let mut msg = Message::new(tags::CONFIG, family.severity(), title)
         .action(Intent::OpenConfigEditor { line: None })
         .key(family.key());
-    if let Some(short) = short {
-        msg = msg.short_title(short);
-    }
     let record = family.hold() == Hold::LogOnly;
     if record {
         msg = msg.record();
@@ -1379,11 +1348,10 @@ pub(crate) const KEY_RESTORED_HELD: &str = "harness.restored-held";
 
 /// Builds the error message when `aterm.toml` fails to load at launch.
 pub(crate) fn launch_load_failure(notice: &str) -> Message {
-    // The band's short title says what is wrong, whole at 22 columns (item 87).
-    let (title, short) = if notice.starts_with("aterm.toml could not be read") {
-        ("Couldn't read your settings", "Read error")
+    let title = if notice.starts_with("aterm.toml could not be read") {
+        "Couldn't read your settings"
     } else {
-        ("Couldn't load your settings", "TOML error")
+        "Couldn't load your settings"
     };
     let rows = notice
         .split_once(" (")
@@ -1395,7 +1363,7 @@ pub(crate) fn launch_load_failure(notice: &str) -> Message {
     } else {
         rows.into_iter().next().filter(|row| !row.is_empty())
     };
-    let mut msg = Message::new(tags::CONFIG, Severity::Error, title).short_title(short);
+    let mut msg = Message::new(tags::CONFIG, Severity::Error, title);
     let painted = error.is_some();
     if let Some(error) = error {
         msg = msg.line(error);
@@ -1839,18 +1807,6 @@ fn lane_title(head: &str) -> (&'static str, bool) {
     }
 }
 
-/// A lane title's short form for the band: what did not happen, never a lone
-/// `Couldn't…` or a verb a cut would read as a command.
-fn lane_short_title(title: &str) -> &'static str {
-    match title {
-        "Couldn't read your settings" => "TOML error",
-        "Couldn't save settings changes" | "Couldn't save a settings change" => "Not saved",
-        "Couldn't apply saved settings" => "Not applied",
-        "Couldn't confirm settings saved" => "Unconfirmed",
-        _ => "Not changed",
-    }
-}
-
 /// Builds the error message when the native config observation lane fails.
 pub(crate) fn config_lane_error(words: &str) -> Message {
     let mut rows = diagnostic_lines(words).into_iter();
@@ -1873,8 +1829,7 @@ pub(crate) fn config_lane_error(words: &str) -> Message {
     let lost = head
         .strip_prefix("Config reconciliation failed; ")
         .filter(|lost| !lost.is_empty());
-    let msg =
-        Message::new(tags::CONFIG, Severity::Warn, title).short_title(lane_short_title(title));
+    let msg = Message::new(tags::CONFIG, Severity::Warn, title);
     let msg = match lost {
         Some(lost) => msg.line(lost),
         None => msg,
@@ -6502,16 +6457,12 @@ pub(crate) fn notice_ask_key(sid: &str, notice: Option<&str>) -> String {
 pub(crate) fn resume_ask(sid: &str, spot: &UpgradeSpot, exception: &Exception) -> Message {
     let clean = |line: &str| atpkg::progress::sanitize_for_tty(line, 240);
     let notice = exception.notice.as_ref();
-    let (title, short_title) = match notice {
-        Some(n) => (n.title, n.short_title),
-        None => ("Harness decision", "Harness decision"),
-    };
+    let title = notice.map_or("Harness decision", |n| n.title);
     let mut message = Message::new(
         tags::HARNESS,
         Severity::Warn,
         fitted_title(title, &spot.place),
     )
-    .short_title(short_title)
     .line(clean(&exception.action))
     .line(clean(&exception.why));
     if let Some(n) = notice {

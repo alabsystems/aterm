@@ -59,8 +59,8 @@ const MAX_TABLE: usize = 1 << 20;
 /// hang detector are looked at this often ([`store_patiently`]).
 const WRITE_TICK: Duration = Duration::from_secs(1);
 
-/// How long the preflight's read of the write route waits for a vault pass.
-const PREFLIGHT_WAIT: Duration = Duration::from_secs(2);
+/// Hang detector for the required preflight read behind a native vault writer.
+const PREFLIGHT_HANG: Duration = Duration::from_secs(60);
 
 /// How long a removal waits for this Mac's vault state.
 const REMOVE_WAIT: Duration = Duration::from_secs(60);
@@ -1293,6 +1293,18 @@ pub fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    run_with_clock(env, host, name, mode, out, err, Instant::now)
+}
+
+fn run_with_clock(
+    env: &Env,
+    host: &dyn AccountsHost,
+    name: &str,
+    mode: TokenMode,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    now: impl FnOnce() -> Instant,
+) -> ExitCode {
     let refuse = |err: &mut dyn Write, why: &str| {
         let _ = writeln!(err, "aterm harness accounts token: {why}");
         ExitCode::from(1)
@@ -1337,7 +1349,7 @@ pub fn run(
     let Some(vault) = host.token_vault() else {
         return refuse(err, "this Mac has no vault to store a token in");
     };
-    match vault.route(Instant::now() + PREFLIGHT_WAIT) {
+    match vault.route(now() + PREFLIGHT_HANG) {
         Ok(route) => {
             if let Some(why) = route_refusal(route) {
                 return refuse(err, why);

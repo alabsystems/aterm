@@ -24,8 +24,6 @@ pub struct CarriedMessage {
     pub glyph: char,
     /// The title.
     pub title: String,
-    /// Short title for the band (`Message::short_title`).
-    pub short_title: Option<String>,
     /// The detail lines.
     pub detail: Vec<String>,
     /// Encoded intents; an unknown one is dropped silently.

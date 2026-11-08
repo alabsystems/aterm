@@ -8,7 +8,9 @@
 //! [`Read::following`]) and folds a session's newest seq space with the brief's
 //! [`crate::fabric_brief::newest_fold`] after each of its `ev` records, through
 //! [`crate::fabric_brief::settled_fold`], which derives the close of a session a successor's
-//! restore names (fix unit E9): there is no second parser of `ev` bodies and no second fold.
+//! restore names (fix unit E9): there is no second parser of `ev` bodies and no second fold. A
+//! clean quit's own close (`out=app-quit`, on the bus before its bridge's `bye quit`, fix unit
+//! Q1) wins over both the derived close and the bridge's withdrawal, and pages nothing.
 //! Each need the fold names is a [`Pair`], its word and the record that raised it; what the
 //! notifier does with them (page a pair it has not paged, keep the pairs standing that the
 //! fold still holds) is [`crate::notify`]'s standing rule.
@@ -191,7 +193,8 @@ pub enum Step {
 /// Whether the session's own row says it exited although its newest fold holds no close of it
 /// ([`fabric_brief::gone_settled`]'s `no-close`): nobody there can answer its need, and none
 /// comes back. A session whose close the fold holds is not: its close raised `exited` (§7.1)
-/// and dropped every other need, whichever of its close and its row the bus carried first; nor
+/// and dropped every other need, whichever of its close and its row the bus carried first (a
+/// clean quit's close, `out=app-quit`, leaves no need a watch pages, [`quit_closed`]); nor
 /// is one whose successor's restore says it died, whose close the watch derives (fix unit E9,
 /// [`fabric_brief::Derive::Paged`]) and whose `exited` stands once paged.
 fn exited_unclosed(r: &Read, node: &str, s: &fabric_brief::Session) -> bool {
@@ -242,7 +245,13 @@ fn named(r: &Read, node: &str, s: &fabric_brief::Session, live: Option<&Live>) -
     .flatten();
     let knows_all = complete(space, seed);
     let known = live.filter(|l| l.ep == ep);
-    let observed = || st.needs.iter().flatten().filter(|n| n.observed());
+    let quit = quit_closed(st);
+    let observed = || {
+        st.needs
+            .iter()
+            .flatten()
+            .filter(move |n| n.observed() && !(quit && n.word == "exited"))
+    };
     let needs = observed()
         .map(|n| {
             let held = Raised::At {
@@ -280,6 +289,18 @@ fn named(r: &Read, node: &str, s: &fabric_brief::Session, live: Option<&Live>) -
         named: observed().map(|n| (n.word, n.node)).collect(),
     });
     Some(Judged { needs, whole, live })
+}
+
+/// Whether the fold holds its session's own close by a clean quit (`out=app-quit`, fix unit Q1):
+/// the quit closed the session on the bus before its bridge said `bye quit`, and the successor a
+/// restore makes carries it on, so its `exited` is no need a watch pages or keeps standing. Its
+/// other needs the close already dropped (§7.1). A close of any other `out=` raises `exited` as
+/// before, and a session that died without its close reaching the bus is the derived close's
+/// ([`fabric_brief::Died::Restored`]).
+fn quit_closed(st: &aterm_slog::SessionState) -> bool {
+    st.closed
+        .as_ref()
+        .is_some_and(|c| c.out == aterm_slog::Out::Session(aterm_slog::SessionOut::AppQuit).word())
 }
 
 /// Whether a fold of `space` that started at `seed` knows every need its session held as of its

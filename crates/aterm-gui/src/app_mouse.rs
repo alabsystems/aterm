@@ -2355,10 +2355,9 @@ impl App {
     fn native_hover_hit(
         &self,
         wid: WindowId,
-        geom: PointerGeometry,
         x: f64,
         y: f64,
-        over_pane_header: bool,
+        over_chrome: bool,
     ) -> Option<(
         crate::tab_model::ViewId,
         u64,
@@ -2366,11 +2365,7 @@ impl App {
         bool,
         bool,
     )> {
-        if over_pane_header
-            || self.strip_col_at_with(wid, geom, x, y).is_some()
-            || self.band_banner_at(wid, x, y).is_some()
-            || self.find_bar_cell_at(wid, x, y).is_some()
-        {
+        if over_chrome {
             return None;
         }
         self.retained_native_leaf_at_pointer(wid, x, y)
@@ -2413,8 +2408,11 @@ impl App {
             return;
         }
         let geom = self.pointer_geometry(wid);
-        let over_pane_header = self.pane_header_at_with(wid, geom, x, y).is_some();
-        let hit = self.native_hover_hit(wid, geom, x, y, over_pane_header);
+        let over_chrome = self.pane_header_at_with(wid, geom, x, y).is_some()
+            || self.strip_col_at_with(wid, geom, x, y).is_some()
+            || self.band_banner_at(wid, x, y).is_some()
+            || self.find_bar_cell_at(wid, x, y).is_some();
+        let hit = self.native_hover_hit(wid, x, y, over_chrome);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.native_rehover = false;
         }
@@ -3059,9 +3057,9 @@ impl App {
         let on =
             |span: &Option<std::ops::Range<usize>>| span.as_ref().is_some_and(|r| r.contains(&col));
         if on(&hit.case_cols) {
-            self.search_toggle_case();
+            self.search_toggle_case_in(wid);
         } else if on(&hit.regex_cols) {
-            self.search_toggle_regex();
+            self.search_toggle_regex_in(wid);
         } else if on(&hit.prev_cols) || on(&hit.next_cols) {
             self.search_repeat_in(wid, on(&hit.next_cols));
         } else if on(&hit.close_cols) {
@@ -3742,11 +3740,12 @@ impl App {
             self.overview_pointer_motion(wid, x, y);
             return;
         }
-        if !self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| ws.selecting || ws.held_mouse_button.is_some())
-            && self.stats_pointer_motion(wid, crate::metrics::host_now())
+        if !self.windows.get(&wid).is_some_and(|ws| {
+            ws.selecting
+                || ws.held_mouse_button.is_some()
+                || ws.divider_drag.is_some()
+                || ws.pane_overlay.drag.is_some()
+        }) && self.stats_pointer_motion(wid, crate::metrics::host_now())
         {
             if let Some(ws) = self.windows.get_mut(&wid)
                 && (ws.hover_pointer || ws.native_text_cursor)
@@ -3757,6 +3756,36 @@ impl App {
                     w.set_cursor(CursorIcon::Default);
                 }
             }
+            return;
+        }
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.divider_drag.is_some())
+        {
+            self.refresh_mouse_cell(wid, geom, x, y);
+            let (gx, gy) = self.pointer_grid_px(wid, geom, x, y);
+            let (raw_r, raw_c) = self
+                .windows
+                .get(&wid)
+                .map_or((0, 0), |ws| ws.last_mouse_window_cell);
+            let px_off = crate::input::PixelOffset {
+                x: divider_drag_off_axis(gx, raw_c, geom.cell.0),
+                y: divider_drag_off_axis(gy, raw_r, geom.cell.1),
+            };
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.last_mouse_px_off = px_off;
+            }
+            self.drag_divider(wid);
+            return;
+        }
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.pane_overlay.drag.is_some())
+            && self.scrollbar_pointer_motion(wid, x, y)
+        {
+            self.set_hover_cursor(wid, CursorIcon::Default, false, false);
             return;
         }
         let over_pane_header = self.pane_header_at_with(wid, geom, x, y).is_some();
@@ -3775,7 +3804,11 @@ impl App {
                 let _ =
                     self.native_editor_pointer_select(wid, target_view, byte, true, visible_lines);
             }
-            let native_hover = self.native_hover_hit(wid, geom, x, y, over_pane_header);
+            let over_strip = self.strip_col_at_with(wid, geom, x, y).is_some();
+            let over_banner = self.band_banner_at(wid, x, y).is_some()
+                || self.find_bar_cell_at(wid, x, y).is_some();
+            let over_chrome = over_pane_header || over_strip || over_banner;
+            let native_hover = self.native_hover_hit(wid, x, y, over_chrome);
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.native_rest = NativePointerRest::after_motion(
                     ws.native_rest.take(),
@@ -3794,30 +3827,37 @@ impl App {
                     .as_ref()
                     .map(|(view, _, key, ..)| (*view, key.clone())),
             );
-            let over_banner = self.band_banner_at(wid, x, y).is_some()
-                || self.find_bar_cell_at(wid, x, y).is_some();
-            let text_cursor = !over_pane_header
-                && !over_banner
-                && (editor_target.is_some() || text_field_hovered);
-            let pointer = over_pane_header
-                || (!text_field_hovered
-                    && native_hover
-                        .as_ref()
-                        .is_some_and(|(_, _, key, ..)| key.as_str() != "editor/buffer"));
-            if let Some(ws) = self.windows.get_mut(&wid)
-                && (ws.hover_pointer != pointer || ws.native_text_cursor != text_cursor)
+            if !dragging_editor
+                && !over_strip
+                && !self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|ws| ws.selecting || ws.held_mouse_button.is_some())
+                && self.scrollbar_pointer_motion(wid, x, y)
             {
-                ws.hover_pointer = pointer;
-                ws.native_text_cursor = text_cursor;
-                if let Some(window) = &ws.os_window {
-                    window.set_cursor(if text_cursor {
-                        CursorIcon::Text
-                    } else if pointer {
-                        CursorIcon::Pointer
-                    } else {
-                        CursorIcon::Default
-                    });
-                }
+                self.set_hover_cursor(wid, CursorIcon::Default, false, false);
+                return;
+            }
+            if !over_chrome
+                && !dragging_editor
+                && let Some(icon) = self.divider_cursor_under_pointer(wid)
+            {
+                self.set_hover_cursor(wid, icon, true, true);
+            } else {
+                let text_cursor = !over_chrome && (editor_target.is_some() || text_field_hovered);
+                let pointer = over_pane_header
+                    || (!text_field_hovered
+                        && native_hover
+                            .as_ref()
+                            .is_some_and(|(_, _, key, ..)| key.as_str() != "editor/buffer"));
+                let icon = if text_cursor {
+                    CursorIcon::Text
+                } else if pointer {
+                    CursorIcon::Pointer
+                } else {
+                    CursorIcon::Default
+                };
+                self.set_hover_cursor(wid, icon, pointer, text_cursor);
             }
             if !self.pointer_routes_to_a_terminal_pane(wid) {
                 return;
@@ -3839,30 +3879,11 @@ impl App {
         }
         let mapped_cell = self.refresh_mouse_cell(wid, geom, x, y);
         let (lr, lc) = mapped_cell.pane_cell;
-        if self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| ws.divider_drag.is_some())
-        {
-            let (gx, gy) = self.pointer_grid_px(wid, geom, x, y);
-            let (raw_r, raw_c) = self
+        if self.active_native_view(wid).is_none()
+            && !self
                 .windows
                 .get(&wid)
-                .map_or((0, 0), |ws| ws.last_mouse_window_cell);
-            let px_off = crate::input::PixelOffset {
-                x: divider_drag_off_axis(gx, raw_c, geom.cell.0),
-                y: divider_drag_off_axis(gy, raw_r, geom.cell.1),
-            };
-            if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.last_mouse_px_off = px_off;
-            }
-            self.drag_divider(wid);
-            return;
-        }
-        if !self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| ws.selecting || ws.held_mouse_button.is_some())
+                .is_some_and(|ws| ws.selecting || ws.held_mouse_button.is_some())
             && self.scrollbar_pointer_motion(wid, x, y)
         {
             self.set_hover_cursor(wid, CursorIcon::Default, false, false);
@@ -4990,11 +5011,9 @@ impl App {
                     }
                     return None;
                 }
-            } else if self
-                .windows
-                .get(&wid)
-                .is_some_and(|ws| !ws.selecting && ws.held_mouse_button.is_none())
-                && self.stats_owns_pointer(wid)
+            } else if self.windows.get(&wid).is_some_and(|ws| {
+                !ws.selecting && ws.held_mouse_button.is_none() && ws.divider_drag.is_none()
+            }) && self.stats_owns_pointer(wid)
             {
                 return None;
             }
@@ -5023,6 +5042,13 @@ impl App {
                 || self.find_bar_cell_at(wid, px, py).is_some();
             let in_content = !on_banner && self.strip_col_at(wid, px, py).is_none();
             if in_content && self.press_claude_light(wid, at) {
+                return None;
+            }
+            if in_content && self.scrollbar_press(wid) {
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
                 return None;
             }
             if in_content && self.begin_divider_drag_with_plan(wid, Some(&plan)) {
@@ -5074,6 +5100,12 @@ impl App {
                 .get(&wid)
                 .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
             if !pressed && button == WinitMouseButton::Left {
+                if self.finish_divider_drag(wid) {
+                    if let Some(ws) = self.windows.get_mut(&wid) {
+                        ws.held_mouse_button = held_button(ws.reported_buttons);
+                    }
+                    return native_press;
+                }
                 let Some((_, view)) = self.active_native_view(wid) else {
                     return native_press;
                 };
@@ -11722,12 +11754,45 @@ mod tests {
             "find bar shields native hover hit underneath it"
         );
 
-        let before_case = app.search_sticky_case;
+        app.frontmost_window = Some(WindowId(99));
+        let before_case = app.windows[&wid]
+            .search
+            .as_ref()
+            .expect("search")
+            .case_sensitive;
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
         app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
         assert_ne!(
-            app.search_sticky_case, before_case,
-            "left click on find bar over active native view routes to find_bar_click_at"
+            app.windows[&wid]
+                .search
+                .as_ref()
+                .expect("search")
+                .case_sensitive,
+            before_case,
+            "left click on find bar case toggle targets wid even when frontmost_window differs"
+        );
+
+        app.windows
+            .get_mut(&wid)
+            .expect("window")
+            .find_bar_hit
+            .as_mut()
+            .expect("find bar hit")
+            .case_cols = None;
+        app.windows
+            .get_mut(&wid)
+            .expect("window")
+            .find_bar_hit
+            .as_mut()
+            .expect("find bar hit")
+            .regex_cols = Some(0..cols);
+        let before_regex = app.windows[&wid].search.as_ref().expect("search").is_regex;
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        assert_ne!(
+            app.windows[&wid].search.as_ref().expect("search").is_regex,
+            before_regex,
+            "left click on find bar regex toggle targets wid even when frontmost_window differs"
         );
     }
 }

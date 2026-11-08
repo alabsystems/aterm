@@ -60,6 +60,7 @@ const MAX_SEAL_BYTES: u64 = 1024 * 1024;
 /// A compiler or SDK cannot be resolved or read, an input changed while it was hashed, or this
 /// is not a macOS host.
 pub fn current() -> Result<String, String> {
+    let _timing = crate::cut_timing::Timer::new("inputs seal recheck");
     #[cfg(target_os = "macos")]
     {
         on_this_machine(false)

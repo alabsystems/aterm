@@ -1779,7 +1779,7 @@ mod tests {
 
     #[test]
     fn every_flow_row_completes_in_its_finished_form() {
-        use crate::messages_host::assert_completes_in_place as completes;
+        use crate::messages_host::assert_records_its_finished_words as completes;
         let dl = |total| {
             progress(
                 &aterm_update::Progress::Downloading {

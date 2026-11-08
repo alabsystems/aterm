@@ -342,6 +342,8 @@ pub struct Need {
     pub covers: bool,
     /// Its disk is scratch ([`Self::scratch`]): space its writes may return by its claim's end.
     pub scratch: bool,
+    /// It LEADS the waiters ([`Self::leads`]).
+    pub leads: bool,
     /// End its wait behind holders that make no progress ([`Self::ends_when_stuck`]): how long
     /// they may make none first. The waiter's own, never in a [`Record`].
     pub stuck_ends: Option<std::time::Duration>,
@@ -401,6 +403,19 @@ impl Need {
     #[must_use]
     pub const fn margin(mut self, bytes: u64) -> Need {
         self.margin = bytes;
+        self
+    }
+
+    /// LEADS: while it waits it is ahead of every waiter that does not lead, whatever their rank
+    /// and arrival, and a waiter inside held work, which counts no other waiter, counts it where
+    /// it fits beside every held claim that waits for a waiter under it ([`crate::admit::counted`]):
+    /// a release slice's compiler, the release's critical path, whose room the release's other
+    /// work leaves while it waits rather than taking it first.
+    /// Waiters that lead keep rank and arrival order among themselves; a held claim is never
+    /// preempted. Its record says so; a build that predates it reads an ordinary waiter.
+    #[must_use]
+    pub const fn leads(mut self) -> Need {
+        self.leads = true;
         self
     }
 

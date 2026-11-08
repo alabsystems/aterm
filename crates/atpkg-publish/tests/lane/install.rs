@@ -500,6 +500,22 @@ fn an_edit_that_lands_during_the_build_is_never_snapshotted() {
     r.expect("a still tree, dirty on purpose");
 }
 
+#[test]
+fn a_compiler_lock_added_during_the_build_is_never_snapshotted() {
+    let mut b = machine("install-lock-race", Os::Darwin);
+    b.machine.builder = Box::new(FakeBuild {
+        edit: Some("trust.lock"),
+        ..FakeBuild::default()
+    });
+    let (result, _) = install(&b, LaneKind::Alab, InstallFlags::default());
+    assert!(
+        result
+            .expect_err("compiler selection changed during build")
+            .to_string()
+            .contains("changed while the snapshot was building")
+    );
+}
+
 /// A dirty build input whose diff is more than a git query's whole stdout may be
 /// (`MAX_COMPLETE_STDOUT_BYTES`) is compared whole: an install allowed dirty takes it, and the
 /// same input grown at its end while the snapshot builds is still caught.

@@ -34,51 +34,9 @@ pub const LINE_MAX: usize = 2048;
 /// blocks on a full pipe.
 pub const LINES_MAX: usize = 512;
 
-/// How long a sign-in's output is read once its child exited: a grandchild that keeps the pipe
-/// open does not hold the sign-in to [`HANG`].
-const OUTPUT_GRACE: Duration = Duration::from_secs(2);
-
-#[cfg(test)]
-thread_local! {
-    static OUTPUT_GRACE_SET: std::cell::Cell<Option<Duration>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// While held, this thread's [`drive`] reads a sign-in's output for the grace it was set with
-/// once the child exited. Its drop, a panic's unwind included, puts back the grace it replaced.
-#[cfg(test)]
-struct GraceSet(Option<Duration>);
-
-#[cfg(test)]
-impl GraceSet {
-    fn set(grace: Duration) -> Self {
-        Self(OUTPUT_GRACE_SET.replace(Some(grace)))
-    }
-}
-
-#[cfg(test)]
-impl Drop for GraceSet {
-    fn drop(&mut self) {
-        OUTPUT_GRACE_SET.set(self.0);
-    }
-}
-
-/// How long [`drive`] reads output once its child exited: [`OUTPUT_GRACE`]. The unit tests'
-/// stand-ins leave no pipe open past their exit, so there it is the hang detector, which waits
-/// for a reader thread a loaded machine starves, unless a test set a grace on this thread
-/// ([`GraceSet`]).
-fn output_grace() -> Duration {
-    #[cfg(not(test))]
-    {
-        OUTPUT_GRACE
-    }
-    #[cfg(test)]
-    {
-        OUTPUT_GRACE_SET
-            .get()
-            .unwrap_or(aterm_spec::wait::MUST_HAPPEN)
-    }
-}
+/// Hang detector for draining a sign-in's output after its actual child exit. A grandchild
+/// keeping the pipe open does not hold the sign-in to [`HANG`].
+const OUTPUT_DRAIN_HANG: Duration = Duration::from_secs(60);
 
 /// The shortest and longest code a grammar admits ([`is_code`]).
 const CODE_LEN: std::ops::RangeInclusive<usize> = 4..=16;
@@ -858,6 +816,25 @@ pub fn drive(spec: &Spec<'_>, approver: &mut dyn Approver) -> Drove {
 }
 
 fn drive_until(spec: &Spec<'_>, approver: &mut dyn Approver, deadline: Deadline<'_>) -> Drove {
+    drive_until_with_readers(
+        spec,
+        approver,
+        deadline,
+        |work, read| spawn_reader(work, read).map(|_| ()),
+        Instant::now,
+    )
+}
+
+fn drive_until_with_readers(
+    spec: &Spec<'_>,
+    approver: &mut dyn Approver,
+    deadline: Deadline<'_>,
+    mut spawn: impl FnMut(
+        Option<super::account_work::Scope>,
+        Box<dyn FnOnce() + Send>,
+    ) -> std::io::Result<()>,
+    mut now: impl FnMut() -> Instant,
+) -> Drove {
     use aterm_uds::spawnfd::Stdio;
     let mut cmd = aterm_uds::spawnfd::command(spec.program);
     cmd.args(spec.lead)
@@ -942,7 +919,7 @@ fn drive_until(spec: &Spec<'_>, approver: &mut dyn Approver, deadline: Deadline<
             closed.fetch_add(1, Ordering::SeqCst);
             let _ = tx.send(None);
         };
-        if let Err(why) = spawn_reader(work.clone(), read) {
+        if let Err(why) = spawn(work.clone(), Box::new(read)) {
             return Drove {
                 outcome: Outcome::Unverified(format!(
                     "native sign-in pipe reader could not start: {why}"
@@ -960,7 +937,7 @@ fn drive_until(spec: &Spec<'_>, approver: &mut dyn Approver, deadline: Deadline<
     let mut host = None;
     let mut status = None;
     let mut exited_at: Option<Instant> = None;
-    let grace = output_grace();
+    let grace = OUTPUT_DRAIN_HANG;
     loop {
         if work
             .as_ref()
@@ -1020,7 +997,7 @@ fn drive_until(spec: &Spec<'_>, approver: &mut dyn Approver, deadline: Deadline<
                 Approval::Approved { page: shown } => {
                     page = shown;
                     if status.is_some() {
-                        exited_at = Some(Instant::now());
+                        exited_at = Some(now());
                     }
                 }
                 Approval::NotRun(why) => {
@@ -1064,7 +1041,7 @@ fn drive_until(spec: &Spec<'_>, approver: &mut dyn Approver, deadline: Deadline<
             match child.try_wait() {
                 Ok(Some(exited)) => {
                     status = Some(exited);
-                    exited_at = Some(Instant::now());
+                    exited_at = Some(now());
                 }
                 Ok(None) => {}
                 Err(_) => {
@@ -1079,7 +1056,7 @@ fn drive_until(spec: &Spec<'_>, approver: &mut dyn Approver, deadline: Deadline<
         if open == 0 && status.is_some() {
             break;
         }
-        if exited_at.is_some_and(|at| at.elapsed() >= grace) {
+        if exited_at.is_some_and(|at| now().saturating_duration_since(at) >= grace) {
             break;
         }
     }

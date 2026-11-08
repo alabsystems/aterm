@@ -533,8 +533,6 @@ pub struct CarriedMessage {
     pub posted_severity: Option<String>,
     pub glyph: char,
     pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub short_title: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detail: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -600,7 +598,6 @@ impl From<&aterm_messages::CarriedMessage> for CarriedMessage {
             posted_severity: m.posted_severity.clone(),
             glyph: m.glyph,
             title: m.title.clone(),
-            short_title: m.short_title.clone(),
             detail: m.detail.clone(),
             actions: m.actions.clone(),
             hold: m.hold.clone(),
@@ -627,7 +624,6 @@ impl From<&CarriedMessage> for aterm_messages::CarriedMessage {
             posted_severity: m.posted_severity.clone(),
             glyph: m.glyph,
             title: m.title.clone(),
-            short_title: m.short_title.clone(),
             detail: m.detail.clone(),
             actions: m.actions.clone(),
             hold: m.hold.clone(),
@@ -1081,6 +1077,11 @@ pub(crate) enum RosterChange {
     RetireRequested,
     #[cfg(any(unix, test))]
     Bye(aterm_types::fabric_grammar::Bye),
+    /// A clean quit closed its sessions' logs (`out=app-quit`, fix unit Q1): the line that wakes
+    /// a mirroring bridge to take those closes before the quit's `bye`. Only the unix quit
+    /// order says it (`fabric_launch`), so it is unix-only, tests included.
+    #[cfg(unix)]
+    QuitCloses,
 }
 
 /// Reason a session left the registry (`reason=<token>`).
@@ -1342,6 +1343,19 @@ impl SessionStore {
             "*".to_string(),
             0,
             RosterChange::Bye(bye),
+            ExitReason::Unknown,
+            crate::turn_ledger::now_ms(),
+        );
+    }
+
+    /// Appends the quit's `quit-closes` record (fix unit Q1): every live session's log closed
+    /// `out=app-quit`, the bridge's mirror owes a take ([`RosterChange::QuitCloses`]).
+    #[cfg(unix)]
+    pub(crate) fn say_quit_closes(&mut self) {
+        self.record_roster(
+            "*".to_string(),
+            0,
+            RosterChange::QuitCloses,
             ExitReason::Unknown,
             crate::turn_ledger::now_ms(),
         );
@@ -3339,6 +3353,8 @@ title = \"zsh\"
                         set.remove(&r.sid);
                     }
                     RosterChange::RetireRequested | RosterChange::Bye(_) => {}
+                    #[cfg(unix)]
+                    RosterChange::QuitCloses => {}
                 }
             }
             set

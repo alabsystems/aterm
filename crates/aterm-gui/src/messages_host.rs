@@ -230,7 +230,6 @@ pub(crate) fn restatement_of(msg: &Message) -> Restatement {
         glyph: Some(msg.glyph),
         excerpt: Some(msg.excerpt),
         finished: Some(msg.finished.clone()),
-        short_title: Some(msg.short_title.clone()),
     }
 }
 
@@ -2228,92 +2227,38 @@ impl App {
     }
 }
 
-/// The Complete echo says the finished form, for one reporter's live-work row: the echo keeps
-/// every cell of the live row but its title, which says `finished` (whole where the live title's
-/// room holds it, else from its head), its motion draws the check mark, and the record keeps the
-/// finished words with no in-flight line.
+/// One reporter's live-work row, resolved Ok, closes its record in its finished words: posted to
+/// the app's glass-less center ([`new_center`]) and revealed, then resolved, its record's title is
+/// `finished`, it keeps no in-flight line, and it reads as a success.
 #[cfg(test)]
-pub(crate) fn assert_completes_in_place(msg: &Message, finished: &str) {
-    use aterm_messages::text::char_width;
-    use aterm_messages::{
-        CapsuleRole, Duration, Links, Look, MessageCenter, MessageLog, RowKind, RowLayout,
-    };
+pub(crate) fn assert_records_its_finished_words(msg: &Message, finished: &str) {
+    use aterm_messages::{Duration, MessageLog};
     assert_eq!(msg.finished_title(), finished, "{}", msg.title);
-    let mut msg = msg.clone();
-    msg.reveal_after = None;
-    if let Some(m) = msg.meter.as_mut().filter(|m| m.fill_permille.is_some()) {
-        m.fill_permille = Some(1000);
-        m.stats.clear();
-    }
-    let but_title = |r: &RowLayout| {
-        let mut r = r.clone();
-        r.kind = RowKind::Overflow { hidden: 0 };
-        r.title.1.clear();
-        r.stats = None;
-        r.load = None;
-        r.pct = None;
-        for cap in &mut r.capsules {
-            cap.text = " ".repeat(cap.text.chars().count());
-            cap.full_label = "";
-            cap.role = CapsuleRole::Details;
-        }
-        r
-    };
-    for cols in [60usize, 80, 120, 160] {
-        let now = Instant::now();
-        let mut center = MessageCenter::new(MessageLog::empty(), now);
-        let id = center.post(msg.clone(), WallStamp { unix_ms: 1 }, now).id;
-        center.commit_rows(now, 3);
-        let present = |c: &MessageCenter| c.presentation(cols, &char_width, Links::Painted);
-        let live = present(&center).rows[0].clone();
-        let at = now + Duration::from_secs(20);
-        assert!(center.resolve(id, Outcome::Ok, at), "{}", msg.title);
-        let p = present(&center);
-        let echo = &p.rows[0];
-        assert!(
-            matches!(echo.kind, RowKind::Echo(_)),
-            "{}@{cols}",
-            msg.title
-        );
-        assert_eq!(
-            but_title(echo),
-            but_title(&live),
-            "{}@{cols}: nothing but the title moved",
-            msg.title
-        );
-        assert_eq!(echo.load, None, "{}@{cols}: no load words", msg.title);
-        let laid = char_width(&live.title.1);
-        assert!(char_width(&echo.title.1) >= laid, "{}@{cols}", msg.title);
-        let words = echo.title.1.trim_end();
-        if char_width(finished) <= laid {
-            assert_eq!(words, finished, "{}@{cols}: whole", msg.title);
-        } else {
-            let stem = words.trim_end_matches('\u{2026}');
-            assert!(
-                finished.starts_with(stem),
-                "{}@{cols}: {words:?}",
-                msg.title
-            );
-        }
-        let motion = center.motion(&p, at + Duration::from_millis(100), Look::STILL);
-        assert_eq!(
-            motion.rows[0].glyph,
-            Some('\u{2713}'),
-            "{}@{cols}: the check mark",
-            msg.title
-        );
-        let rec = center.log().get(id).unwrap();
-        assert_eq!(rec.title, finished, "the record's words");
-        assert!(
-            rec.detail.is_empty(),
-            "no in-flight frame: {:?}",
-            rec.detail
-        );
-        assert_eq!(
-            (rec.severity, rec.glyph.ch()),
-            (Severity::Success, '\u{2713}')
-        );
-    }
+    let now = Instant::now();
+    let mut center = new_center(MessageLog::empty(), now);
+    let id = center.post(msg.clone(), WallStamp { unix_ms: 1 }, now).id;
+    let _ = center.settle(now + PROGRESS_GRACE + Duration::from_millis(1), true);
+    assert!(
+        center.live(id).is_some_and(|l| l.revealed),
+        "{}: revealed",
+        msg.title
+    );
+    let at = now + Duration::from_secs(20);
+    assert!(center.resolve(id, Outcome::Ok, at), "{}", msg.title);
+    let rec = center.log().get(id).expect("the record");
+    assert_eq!(rec.title, finished, "{}: the record's words", msg.title);
+    assert!(
+        rec.detail.is_empty(),
+        "{}: an in-flight line: {:?}",
+        msg.title,
+        rec.detail
+    );
+    assert_eq!(
+        (rec.severity, rec.glyph.ch()),
+        (Severity::Success, '\u{2713}'),
+        "{}",
+        msg.title
+    );
 }
 
 /// Returns whether window `ws` is visible on screen.

@@ -506,6 +506,7 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
     if !pf.seal_commit.is_empty() {
         let dormant = receipt.is_none()
             && ctx.frontend_component.is_none()
+            && ctx.targo_component.is_none()
             && parts.probe.lineage_switch(ctx, &req.trust_repo) == Switch::Dormant;
         if dormant {
             pf.notes.push(format!(
@@ -516,10 +517,11 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
             ));
         } else {
             pf.problems
-                .extend(atpkg::lineage::seed_mint_refusals_with_frontend(
+                .extend(atpkg::lineage::seed_mint_refusals_with_components(
                     seal,
                     &pf.seal_commit,
                     ctx.frontend_component.as_deref(),
+                    ctx.targo_component.as_deref(),
                 ));
             if let Some(text) = &receipt {
                 pf.seed_line = Some(seed::describe(text));

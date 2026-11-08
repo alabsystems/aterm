@@ -334,7 +334,9 @@ PUSH FRAMES (subscribe):
                                  inbox-seen, post, fetch, post-landed, hold,
                                  topic), closing, then exited. The `sessions`
                                  stream adds `EVENT * session-created`,
-                                 `session-exited`, `fabric-retire` and
+                                 `session-exited`, `fabric-retire`,
+                                 `quit-closes` (a clean quit closed its
+                                 sessions, before its bye) and
                                  `bye <quit|handoff>`. `subscribe --help`
                                  gives each one's fields.
       BYTES <local> <len>        then <len> raw PTY bytes and a newline.

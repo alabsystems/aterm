@@ -31,6 +31,8 @@ pub const ME: &str = "linux-auto-atpkg";
 pub struct Options {
     /// Decide and print; change nothing.
     pub dry_run: bool,
+    /// Consume existing stages only; never persist this choice in an installed unit.
+    pub staged_only: bool,
     /// The target this builder runs on.
     pub host: Triple,
     /// The Linux targets this lane serves.
@@ -54,16 +56,23 @@ impl Options {
             )));
         }
         let triples = if requested.is_empty() {
-            Triple::all().filter(|t| t.os() == Os::Linux).collect()
+            default_targets()
         } else {
             requested.to_vec()
         };
         Ok(Self {
             dry_run,
+            staged_only: false,
             host,
             triples,
         })
     }
+}
+
+/// Every Linux target served by the client, in its canonical order.
+#[must_use]
+pub fn default_targets() -> Vec<Triple> {
+    Triple::all().filter(|t| t.os() == Os::Linux).collect()
 }
 
 /// What this builder can produce.
@@ -243,7 +252,7 @@ pub enum Class {
 }
 
 impl Class {
-    fn of(name: &str, def: Option<&ProgramDef>) -> Self {
+    pub(crate) fn of(name: &str, def: Option<&ProgramDef>) -> Self {
         if atpkg::vendor_direct::is_vendor(name) {
             return Self::Vendor;
         }
@@ -767,19 +776,27 @@ impl Run<'_> {
             self.failures = true;
         }
         self.say_table(n, &channel.name, &head, &programs, &decisions, &staged_dir);
-        let build_list: Vec<usize> = decisions
+        let mut build_list: Vec<usize> = decisions
             .iter()
             .enumerate()
             .filter(|(_, d)| matches!(d, Decision::Build { .. }))
             .map(|(i, _)| i)
             .collect();
+        if opts.staged_only {
+            self.tx.say(format!(
+                "STAGED_ONLY — deferred {} unstaged program(s): {}; no new builds this run",
+                build_list.len(),
+                list(build_list.iter().map(|i| programs[*i].name.as_str()))
+            ));
+            build_list.clear();
+        }
         let mut outcome = Outcome {
             head: Some(n),
             can: can.clone(),
             cannot: cannot.clone(),
             ..Outcome::default()
         };
-        if opts.dry_run {
+        if opts.dry_run && !opts.staged_only {
             self.tx.say(format!(
                 "DRY_RUN — would build: {}; no clone/build/upload/state change",
                 list(build_list.iter().map(|i| programs[*i].name.as_str()))
@@ -858,6 +875,22 @@ impl Run<'_> {
         outcome.ready = ready.iter().map(|(p, _)| p.name.clone()).collect();
         outcome.held = held.iter().map(|(p, _)| p.name.clone()).collect();
         outcome.unsignable = unsignable.iter().map(|(p, _)| p.name.clone()).collect();
+
+        if opts.staged_only && ready.is_empty() && signed_earlier.is_empty() {
+            return Err(Error::refused(
+                "--staged-only found no eligible staged rows for the fresh signed head — \
+                 nothing signed or indexed; missing rows remain deferred",
+            ));
+        }
+        if opts.dry_run {
+            self.tx.say(format!(
+                "DRY_RUN — existing stages ready: {}; signed earlier: {}; no build/sign/upload/state change",
+                list(ready.iter().map(|(p, _)| p.name.as_str())),
+                list(signed_earlier.iter().map(|p| p.name.as_str()))
+            ));
+            outcome.table = programs.into_iter().zip(decisions).collect();
+            return Ok(outcome);
+        }
 
         let have_key = ctx.identity.key.is_file();
         let ceremony = ctx.shown(&staged_dir.join("READY.md"));

@@ -524,6 +524,390 @@ fn incremental_source(world: &World) -> (PathBuf, PathBuf, String, String) {
     (remote, source, before, after)
 }
 
+/// The cut's actual tag, main claim and paired unlock, against a local bare
+/// receive-pack. Run explicitly for before/after measurements, single-threaded.
+#[test]
+#[ignore = "local git CPU measurement; run with --ignored --nocapture --test-threads=1"]
+fn native_cut_push_measurement() {
+    use agh::git::{
+        ControlRefChange, ControlRefTransaction, PUBLISHER_FENCE_REF, RELEASE_LEASE_REF,
+    };
+    let world = World::canonical("cut-push-measure");
+    common::canonical_repos(&world.fake);
+    let (remote, source, _, _) = incremental_source(&world);
+    // A deterministic history with wide trees and changing binary blobs makes
+    // local import/compression work visible, without any network or credential.
+    let mut input = Vec::new();
+    let mut random = 7_u64;
+    let base = host_git(&source, &["rev-parse", "main"]);
+    for n in 0..6000 {
+        let mut blob = vec![0_u8; 8192];
+        for byte in &mut blob {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            *byte = random as u8;
+        }
+        let from = if n == 0 {
+            format!("from {base}\n")
+        } else {
+            String::new()
+        };
+        input.extend_from_slice(format!("commit refs/heads/history\ncommitter fixture <fixture> {} +0000\ndata 7\nhistory\n{from}M 100644 inline file-{}\ndata {}\n", 1700000000 + n, n % 512, blob.len()).as_bytes());
+        input.extend_from_slice(&blob);
+        input.extend_from_slice(b"\n\n");
+    }
+    input.extend_from_slice(b"done\n");
+    let mut cmd = aterm_uds::spawnfd::command(host_git_path());
+    cmd.args(["fast-import", "--quiet", "--done"])
+        .current_dir(&source);
+    let out = aterm_uds::deadline::output_with_input_until(
+        &mut cmd,
+        aterm_uds::secret::Secret::new(&input),
+        std::time::Instant::now() + common::HANG,
+        1 << 20,
+    )
+    .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    host_git(&source, &["repack", "-adf", "--window=0"]);
+    host_git(&source, &["push", "--quiet", "origin", "history:main"]);
+    let before = host_git(&source, &["rev-parse", "history"]);
+    let tree = host_git(&source, &["rev-parse", "history^{tree}"]);
+    let after = host_git(
+        &source,
+        &["commit-tree", &tree, "-p", &before, "-m", "claim"],
+    );
+    host_git(&source, &["tag", "-a", "cut-tag", "-m", "cut", &before]);
+    let tag = host_git(&source, &["rev-parse", "cut-tag"]);
+    host_git(&source, &["tag", "-a", "cut-fence", "-m", "fence", &before]);
+    let fence = host_git(&source, &["rev-parse", "cut-fence"]);
+    host_git(
+        &source,
+        &[
+            "push",
+            "--quiet",
+            "origin",
+            &format!("{before}:{RELEASE_LEASE_REF}"),
+            &format!("{fence}:{PUBLISHER_FENCE_REF}"),
+        ],
+    );
+    host_git(
+        &source,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/fixture-dev/app.git",
+        ],
+    );
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    let permit = common::permit(
+        &gh,
+        &agh::policy::RouteRequest::write(agh::policy::RouteTarget::Repo(slug.clone())),
+    );
+    let unlock = ControlRefTransaction::new(
+        &before,
+        vec![
+            ControlRefChange {
+                reference: RELEASE_LEASE_REF.into(),
+                before: Some(before.clone()),
+                after: None,
+            },
+            ControlRefChange {
+                reference: PUBLISHER_FENCE_REF.into(),
+                before: Some(fence),
+                after: None,
+            },
+        ],
+    )
+    .unwrap();
+    for (name, run) in [
+        (
+            "tag",
+            Some(GitRun::push_refs(
+                &slug,
+                &source,
+                push_batch(&[("refs/tags/cut-tag", ABSENT, &tag)]),
+                false,
+            )),
+        ),
+        (
+            "claim",
+            Some(GitRun::push_refs(
+                &slug,
+                &source,
+                push_batch(&[("refs/heads/main", &before, &after)]),
+                false,
+            )),
+        ),
+        ("unlock", None),
+    ] {
+        let cpu = aterm_sysprobe::jobs::counters_of(std::process::id()).unwrap();
+        let start = std::time::Instant::now();
+        if let Some(run) = run {
+            gh.run_git(&run).unwrap();
+        } else {
+            gh.refs(&slug)
+                .check_control(&permit, &source, &unlock, agh::git::GIT_BUDGET)
+                .unwrap();
+        }
+        let wall = start.elapsed().as_secs_f64();
+        let end = aterm_sysprobe::jobs::counters_of(std::process::id()).unwrap();
+        println!(
+            "cut fixture {name}: wall {wall:.3}s child {:.3}s self {:.3}s",
+            (end.child_cpu_ns.unwrap() - cpu.child_cpu_ns.unwrap()) as f64 / 1e9,
+            (end.cpu_ns - cpu.cpu_ns) as f64 / 1e9
+        );
+    }
+    assert_eq!(host_git(&remote, &["rev-parse", "main"]), after);
+    assert_eq!(host_git(&remote, &["rev-parse", "refs/tags/cut-tag"]), tag);
+}
+
+/// NEGATIVE CONTROL: the old create path fetches the entire source closure.
+/// The received pack must contain exactly one annotated tag when main already
+/// owns its commit, and a tag of new content must take the full admission.
+#[test]
+fn native_push_tags_pack_only_what_the_observed_remote_lacks() {
+    for published in [true, false] {
+        let world = World::canonical("tag-pack-count");
+        let (remote, source, before, after) = incremental_source(&world);
+        host_git(&remote, &["config", "receive.unpackLimit", "0"]);
+        let commit = if published { &before } else { &after };
+        host_git(&source, &["tag", "-a", "release", "-m", "release", commit]);
+        let tag = host_git(&source, &["rev-parse", "release"]);
+        let gh = world
+            .client(git_env())
+            .git_remote_for_tests("fixture-dev/app", &remote)
+            .build();
+        gh.run_git(&GitRun::push_refs(
+            &common::slug("fixture-dev/app"),
+            &source,
+            push_batch(&[("refs/tags/release", ABSENT, &tag)]),
+            false,
+        ))
+        .unwrap();
+        let packs: Vec<_> = std::fs::read_dir(remote.join("objects/pack"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "pack"))
+            .collect();
+        assert_eq!(packs.len(), 1);
+        let bytes = std::fs::read(&packs[0]).unwrap();
+        let objects = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(objects, if published { 1 } else { 4 });
+        assert_eq!(
+            host_git(&remote, &["rev-parse", "release^{commit}"]),
+            *commit
+        );
+        let children = gh.fx().children_run();
+        assert_eq!(
+            children.iter().any(|s| s.args.iter().any(|a| a == "fetch")),
+            !published
+        );
+        if published {
+            let pack = children
+                .iter()
+                .find(|s| s.args.iter().any(|a| a == "pack-objects"))
+                .unwrap();
+            assert!(pack.args.iter().any(|a| a == "--no-revs"));
+        }
+        if !published {
+            assert_eq!(
+                host_git(&remote, &["show", "release:new"]),
+                "new object that must be checked"
+            );
+        }
+    }
+}
+
+/// A local ref is no authority for remote ownership. A corrupt parent witness
+/// or raw tag must fail before the writer, even if Git can peel its contents.
+#[test]
+fn native_push_remote_owned_tags_refuse_corrupt_witnesses_and_tags() {
+    for broken in ["witness", "tag"] {
+        let world = World::canonical("tag-witness-corrupt");
+        let (remote, source, before, after) = incremental_source(&world);
+        host_git(&source, &["push", "--quiet", "origin", "main"]);
+        host_git(&source, &["tag", "-a", "release", "-m", "release", &before]);
+        let tag = host_git(&source, &["rev-parse", "release"]);
+        if broken == "witness" {
+            replace_loose(&source, &after, &before);
+        } else {
+            host_git(&source, &["tag", "-a", "other", "-m", "other", &before]);
+            let other = host_git(&source, &["rev-parse", "other"]);
+            replace_loose(&source, &tag, &other);
+        }
+        let gh = world
+            .client(git_env())
+            .git_remote_for_tests("fixture-dev/app", &remote)
+            .build();
+        let error = gh
+            .run_git(&GitRun::push_refs(
+                &common::slug("fixture-dev/app"),
+                &source,
+                push_batch(&[("refs/tags/release", ABSENT, &tag)]),
+                false,
+            ))
+            .unwrap_err();
+        assert_eq!(error.side_effect, SideEffect::None);
+        assert!(
+            !gh.fx()
+                .children_run()
+                .iter()
+                .any(|s| s.args.iter().any(|a| a == "push"))
+        );
+    }
+}
+
+/// NEGATIVE CONTROL: using the incremental ID inventory for a cold publication
+/// refuses a valid graph once its IDs exceed the complete-output admission cap.
+#[test]
+fn native_push_cold_history_is_not_limited_by_the_incremental_inventory() {
+    let world = World::canonical("cold-history");
+    let (remote, source, _, _) = incremental_source(&world);
+    let mut input = Vec::new();
+    for n in 0..10_000 {
+        let blob = format!("blob {n}\n");
+        input.extend_from_slice(format!("commit refs/heads/cold\ncommitter fixture <fixture> {} +0000\ndata 4\nseed\nM 100644 inline file\ndata {}\n{blob}\n", 1700000000 + n, blob.len()).as_bytes());
+    }
+    input.extend_from_slice(b"done\n");
+    let mut cmd = aterm_uds::spawnfd::command(host_git_path());
+    cmd.args(["fast-import", "--quiet", "--done"])
+        .current_dir(&source);
+    let out = aterm_uds::deadline::output_with_input_until(
+        &mut cmd,
+        aterm_uds::secret::Secret::new(&input),
+        std::time::Instant::now() + common::HANG,
+        1 << 20,
+    )
+    .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let head = host_git(&source, &["rev-parse", "cold"]);
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    gh.run_git(&GitRun::push_refs(
+        &common::slug("fixture-dev/app"),
+        &source,
+        push_batch(&[("refs/heads/cold", ABSENT, &head)]),
+        false,
+    ))
+    .unwrap();
+    assert_eq!(host_git(&remote, &["rev-parse", "cold"]), head);
+    assert_eq!(host_git(&remote, &["show", "cold:file"]), "blob 9999");
+    assert_eq!(host_git(&remote, &["rev-list", "--count", "cold"]), "10000");
+    let inventory = host_git(&remote, &["count-objects", "-v"]);
+    let objects: usize = inventory
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(": ")?;
+            matches!(key, "count" | "in-pack").then(|| value.parse::<usize>().unwrap())
+        })
+        .sum();
+    assert!(objects * 41 > 1 << 20);
+    assert!(
+        gh.fx()
+            .children_run()
+            .iter()
+            .any(|s| s.args.iter().any(|a| a == "fetch"))
+    );
+}
+
+/// NEGATIVE CONTROL: importing or walking the owner's complete file graph on
+/// create/unlock restores the cut's historical pack work.
+#[test]
+fn native_push_controls_prove_remote_ownership_without_importing_history() {
+    use agh::git::{
+        ControlRefChange, ControlRefTransaction, PUBLISHER_FENCE_REF, RELEASE_LEASE_REF,
+    };
+    let world = World::canonical("control-owned-closure");
+    common::canonical_repos(&world.fake);
+    let (remote, source, owner, _) = incremental_source(&world);
+    host_git(
+        &source,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/fixture-dev/app.git",
+        ],
+    );
+    host_git(&source, &["tag", "-a", "fence", "-m", "fence", &owner]);
+    let token = host_git(&source, &["rev-parse", "fence"]);
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    let permit = common::permit(
+        &gh,
+        &agh::policy::RouteRequest::write(agh::policy::RouteTarget::Repo(slug.clone())),
+    );
+    let create = ControlRefTransaction::new(
+        &owner,
+        vec![ControlRefChange {
+            reference: RELEASE_LEASE_REF.into(),
+            before: None,
+            after: Some(owner.clone()),
+        }],
+    )
+    .unwrap();
+    gh.refs(&slug)
+        .check_control(&permit, &source, &create, agh::git::GIT_BUDGET)
+        .unwrap();
+    host_git(
+        &source,
+        &[
+            "push",
+            "--quiet",
+            &remote.to_string_lossy(),
+            &format!("{owner}:{RELEASE_LEASE_REF}"),
+            &format!("{token}:{PUBLISHER_FENCE_REF}"),
+        ],
+    );
+    let delete = ControlRefTransaction::new(
+        &owner,
+        vec![
+            ControlRefChange {
+                reference: RELEASE_LEASE_REF.into(),
+                before: Some(owner.clone()),
+                after: None,
+            },
+            ControlRefChange {
+                reference: PUBLISHER_FENCE_REF.into(),
+                before: Some(token),
+                after: None,
+            },
+        ],
+    )
+    .unwrap();
+    gh.refs(&slug)
+        .check_control(&permit, &source, &delete, agh::git::GIT_BUDGET)
+        .unwrap();
+    let children = gh.fx().children_run();
+    let packs: Vec<_> = children
+        .iter()
+        .filter(|s| s.args.iter().any(|a| a == "pack-objects"))
+        .collect();
+    assert_eq!(packs.len(), 2);
+    assert!(
+        packs
+            .iter()
+            .all(|s| s.args.iter().any(|a| a == "--no-revs"))
+    );
+    assert!(!children.iter().any(|s| {
+        s.args
+            .iter()
+            .any(|a| a == "fetch" || a == "--connectivity-only")
+    }));
+    assert_eq!(host_git(&remote, &["rev-parse", RELEASE_LEASE_REF]), owner);
+}
+
 fn native_object_fact_queries(specs: &[ChildSpec]) -> (Vec<String>, Vec<(String, String)>) {
     let kinds = specs
         .iter()

@@ -29167,8 +29167,11 @@ pub fn main_entry_with_network(
     if let Some(host) = harness.as_ref() {
         host.shutdown_and_join();
     }
-    #[cfg(unix)]
-    crate::fabric_launch::bye_at_quit(&app.store);
+    // THE QUIT CLOSES EVERY TAB, THEN EVERY LIVE SESSION'S LOG, HERE (fix unit Q1), where its
+    // bye stood: on unix `bye_at_quit` closes the logs, gives the bus those closes within the
+    // quit budget, then says `bye quit`; elsewhere they close alone. Either way the journal's
+    // last lines below carry the same records, and a closed log takes no record after its close.
+    app.close_sessions_at_quit();
     app.write_harness_ab_at_exit();
     let _ = app.vitals.stop_at_exit(vitals_host::STOP_BOUND);
     let _ = app.video_abort_app_shutdown();
@@ -29182,8 +29185,6 @@ pub fn main_entry_with_network(
     }
     app.kitty_log.flush_exit();
     let _ = app.close_messages_at_exit();
-    // Every tab still open closes with the quit, before the journal writes the logs a last time.
-    app.close_tabs_at_quit();
     app.session_log_journal
         .finish_at_quit(session_log_journal::quit_budget());
     let mut quit_wrote_its_desk = false;

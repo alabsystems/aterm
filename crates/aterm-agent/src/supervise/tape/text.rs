@@ -2,6 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! A TAPE AS TEXT (the replay plan's §6.6): one record per line, every body line by line, that reads back to the very same items ([`parse`]).
+//!
+//! A round trip's reply longer than 1 KiB (`SAME_MIN`) that is its door's last reply over again is
+//! written once: the record's head says `same` and no reply follows it. A door's last reply is
+//! its last round trip's written as raw request and reply bytes; a control round trip written as
+//! its words and reply is neither a door's last nor `same`.
+
+use std::collections::HashMap;
 
 use astream_effects::EffectRecord;
 
@@ -13,6 +20,14 @@ use crate::supervise::CtlReply;
 /// The first line's words.
 const MAGIC: &str = "atape-text 1";
 
+/// The longest reply written again where its door's last reply was the same (longer, it is
+/// `same`). The window host's answer to `transcript_tail` is Claude Code's whole transcript while
+/// it is shorter than a read, and the loop reads it at each turn end and each wall, mostly
+/// unchanged: written out each time, those copies were nearly half of a tape (`c7-cruise-same`,
+/// 2026-11-08: ten reads, 245 KB, six of them repeats). A short reply (a flag, a pid, a clock
+/// offset) reads better where it was read than as a look back.
+const SAME_MIN: usize = 1024;
+
 /// `header` and `items` as text ([module docs](self)).
 #[must_use]
 pub fn render(header: Option<&str>, items: &[Item]) -> String {
@@ -23,8 +38,9 @@ pub fn render(header: Option<&str>, items: &[Item]) -> String {
         out.push_str("header\n");
         pieces(&mut out, '|', header.as_bytes());
     }
+    let mut last = HashMap::new();
     for item in items {
-        item_text(&mut out, item);
+        item_text(&mut out, item, &mut last);
     }
     out
 }
@@ -123,9 +139,9 @@ fn stamp_token(stamp: Option<Stamp>) -> String {
     })
 }
 
-fn item_text(out: &mut String, item: &Item) {
+fn item_text<'i>(out: &mut String, item: &'i Item, last: &mut HashMap<&'i str, &'i [u8]>) {
     match item {
-        Item::Effect { record, stamp } => effect_text(out, record, *stamp),
+        Item::Effect { record, stamp } => effect_text(out, record, *stamp, last),
         Item::Note { kind, text } => {
             out.push_str(&format!("note {}\n", token(kind)));
             pieces(out, '|', text.as_bytes());
@@ -153,7 +169,12 @@ fn is_control(door: &str) -> bool {
     super::ctl::is_control_door(door)
 }
 
-fn effect_text(out: &mut String, record: &EffectRecord, stamp: Option<Stamp>) {
+fn effect_text<'i>(
+    out: &mut String,
+    record: &'i EffectRecord,
+    stamp: Option<Stamp>,
+    last: &mut HashMap<&'i str, &'i [u8]>,
+) {
     let st = stamp_token(stamp);
     match record {
         EffectRecord::Clock(ns) => out.push_str(&format!("clock {ns}{st}\n")),
@@ -214,9 +235,14 @@ fn effect_text(out: &mut String, record: &EffectRecord, stamp: Option<Stamp>) {
                 }
                 None => {
                     let raw = if is_control(door) { " raw" } else { "" };
-                    out.push_str(&format!("exchange {}{raw}{st}\n", token(door)));
+                    let before = last.insert(door.as_str(), reply.as_slice());
+                    let same = reply.len() > SAME_MIN && before == Some(reply.as_slice());
+                    let tag = if same { " same" } else { "" };
+                    out.push_str(&format!("exchange {}{raw}{tag}{st}\n", token(door)));
                     pieces(out, '>', request);
-                    pieces(out, '<', reply);
+                    if !same {
+                        pieces(out, '<', reply);
+                    }
                 }
             }
         }
@@ -248,6 +274,7 @@ pub fn parse(text: &str) -> Result<(Option<String>, Vec<Item>), String> {
     }
     let mut header = None;
     let mut items = Vec::new();
+    let mut last = HashMap::new();
     while let Some(head) = lines.next() {
         let at = lines.at;
         let words: Vec<&str> = head.split(' ').collect();
@@ -274,7 +301,7 @@ pub fn parse(text: &str) -> Result<(Option<String>, Vec<Item>), String> {
             ["end", "unwound"] => Item::End(End::Unwound {
                 message: lines.text('|')?,
             }),
-            [kind, rest @ ..] => effect(kind, rest, &mut lines, at)?,
+            [kind, rest @ ..] => effect(kind, rest, &mut lines, at, &mut last)?,
             [] => return Err(format!("line {at}: empty")),
         };
         items.push(item);
@@ -368,7 +395,13 @@ fn split_stamp<'w>(
     }
 }
 
-fn effect(kind: &str, fields: &[&str], lines: &mut Lines<'_>, at: usize) -> Result<Item, String> {
+fn effect(
+    kind: &str,
+    fields: &[&str],
+    lines: &mut Lines<'_>,
+    at: usize,
+    last: &mut HashMap<String, Vec<u8>>,
+) -> Result<Item, String> {
     let (fields, stamp) = split_stamp(fields, at)?;
     let control_door = match (kind, fields) {
         ("exchange", [door]) => Some(name(door)?).filter(|d| is_control(d)),
@@ -396,11 +429,34 @@ fn effect(kind: &str, fields: &[&str], lines: &mut Lines<'_>, at: usize) -> Resu
                 .find(|k| format!("{k:?}") == *kind)
                 .ok_or_else(|| format!("line {at}: no error kind {kind:?}"))?,
         },
-        ("exchange", [door] | [door, "raw"]) => EffectRecord::Exchange {
-            door: name(door)?,
-            request: lines.bytes('>')?,
-            reply: lines.bytes('<')?,
-        },
+        ("exchange", [door, tags @ ..])
+            if matches!(*tags, [] | ["raw"] | ["same"] | ["raw", "same"]) =>
+        {
+            let door = name(door)?;
+            match (tags.first() == Some(&"raw"), is_control(&door)) {
+                (true, false) => {
+                    return Err(format!("line {at}: `raw` on {door:?}, no control door"));
+                }
+                (false, true) => {
+                    return Err(format!("line {at}: control door {door:?} without `raw`"));
+                }
+                _ => {}
+            }
+            let request = lines.bytes('>')?;
+            let reply = if tags.last() == Some(&"same") {
+                last.get(&door).cloned().ok_or_else(|| {
+                    format!("line {at}: `same` where {door:?} gave no reply before")
+                })?
+            } else {
+                lines.bytes('<')?
+            };
+            last.insert(door.clone(), reply.clone());
+            EffectRecord::Exchange {
+                door,
+                request,
+                reply,
+            }
+        }
         ("emit", [door]) => EffectRecord::Emit {
             door: name(door)?,
             bytes: lines.bytes('|')?,

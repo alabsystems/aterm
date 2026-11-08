@@ -9,8 +9,8 @@ use aterm_slog::journal::{
 };
 use aterm_slog::{
     Actor, CarryAdopt, CarryBudget, Close, Conf, Cursor, Fields, GapWhy, IdCounters, Key, Kind,
-    Limits, Log, Lvl, MAX_BYTES, MAX_RECORDS, Mark, Node, Op, Open, Out, Rec, RunOut, ShortId, Src,
-    TurnOut,
+    Limits, Log, Lvl, MAX_BYTES, MAX_RECORDS, Mark, Node, Op, Open, Out, Rec, RunOut, SessionOut,
+    ShortId, Src, TurnOut,
 };
 use aterm_spec::rng::XorShift;
 
@@ -380,6 +380,10 @@ fn a_dead_chain_reads_crash_closes_innermost_first() {
     assert!(open.log.is_open(t));
 }
 
+/// A clean quit closes the live log itself (`out=app-quit`, the host's own close, which the bus
+/// mirror takes too), the writer journals those closes as it journals any record, and `#fin
+/// why=quit` ends the chain: it reads closed, no crash derived. A handoff's chain ends `#handed`
+/// and reads open.
 #[test]
 fn a_chain_ended_by_a_quit_or_a_handoff_reads_no_crash() {
     let mut log = Log::new(1);
@@ -387,18 +391,13 @@ fn a_chain_ended_by_a_quit_or_a_handoff_reads_no_crash() {
     let _ = cmd(&mut log, 1);
     let mut w = Writer::new("p1-a1", 0);
     w.pass(&log, 512);
-    let closes = log.quit_closes(at(5));
-    assert!(
-        log.is_open(Node::SESSION),
-        "quit_closes leaves the log as it was"
-    );
-    for r in &closes {
-        w.line(&Frame::Rec {
-            sid: sid(),
-            rec: r.clone(),
-            restated: false,
-        });
-    }
+    let mut quit = log.clone();
+    quit.close_session(
+        Close::new(Out::Session(SessionOut::AppQuit), Src::Aterm, Conf::Exact).by(Actor::Aterm),
+        at(5),
+    )
+    .expect("the quit closes the live log");
+    w.pass(&quit, 512);
     w.fin(EndWhy::Quit);
     let v = view(&[w.read(Liveness::Dead)]);
     assert!(!v.crashed);

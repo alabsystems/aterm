@@ -311,6 +311,161 @@ fn a_rejected_dry_run_never_writes_and_an_unknown_write_never_replays() {
     }
 }
 
+const INTENT: &str = "66-fc387e8b41a0";
+
+fn intent_refusal() -> Value {
+    agh::error::Error::new(
+        agh::error::Kind::OutcomeUnknown,
+        "another intent began first",
+    )
+    .with_sub(agh::error::Sub::IntentOpen {
+        intent: INTENT.into(),
+    })
+    .with_repo("fixture/repo".to_owned())
+    .to_json(&agh::redact::Redactor::new())
+}
+
+fn refused_out(value: &Value) -> Output {
+    let mut result = out(13, "");
+    result.stderr = format!("human diagnostic is not parsed\n{value}\n").into_bytes();
+    result
+}
+
+#[test]
+fn only_exact_structured_presend_intent_refusals_allow_observation() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let valid = intent_refusal();
+    assert_eq!(
+        blocking_intent(&refused_out(&valid), "fixture/repo"),
+        agh::IntentId::parse(INTENT)
+    );
+    for (field, value) in [
+        ("v", json!(2)),
+        ("exit", json!(9)),
+        ("kind", json!("refused")),
+        ("sub", json!("unknown")),
+        ("side_effect", json!("unknown")),
+        ("repo", json!("other/repo")),
+        ("intent", Value::Null),
+        ("intent", json!("66-INVALID")),
+    ] {
+        let mut changed = valid.clone();
+        let Value::Object(outer) = &mut changed else {
+            unreachable!()
+        };
+        let Value::Object(error) = outer.get_mut("error").unwrap() else {
+            unreachable!()
+        };
+        error.insert(field.into(), value);
+        assert!(
+            blocking_intent(&refused_out(&changed), "fixture/repo").is_none(),
+            "{changed}"
+        );
+    }
+    let mut duplicate = refused_out(&valid);
+    duplicate.stderr = String::from_utf8(duplicate.stderr)
+        .unwrap()
+        .replace(
+            "\"side_effect\":\"none\"",
+            "\"side_effect\":\"unknown\",\"side_effect\":\"none\"",
+        )
+        .into_bytes();
+    assert!(blocking_intent(&duplicate, "fixture/repo").is_none());
+    for actual in [false, true] {
+        let calls = Cell::new(0);
+        let run = |tool, args: &[OsString]| {
+            if let Some(result) = url(tool, args) {
+                return Ok(result);
+            }
+            let call = calls.get();
+            calls.set(call + 1);
+            assert_eq!(args.last().unwrap() == "--dry-run", call == 0);
+            Ok(if actual && call == 0 {
+                out(0, "")
+            } else {
+                refused_out(&valid)
+            })
+        };
+        assert!(matches!(Remote::open(root.path(), "origin", &run).unwrap()
+            .push("refs/heads/main", Some(BEFORE), AFTER),
+            Ok(Pushed::Blocked { intent, .. }) if intent.as_str() == INTENT));
+        assert_eq!(calls.get(), if actual { 2 } else { 1 });
+    }
+}
+
+#[test]
+fn observing_a_foreign_intent_never_writes_and_requires_its_exact_identity() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let document = json!({"id":INTENT,"repo":"fixture/repo","op":"ref.update-atomic",
+        "key":"atomic refs","open":true});
+    let reads = Cell::new(0);
+    let pauses = Cell::new(0);
+    let run = |tool, args: &[OsString]| {
+        if let Some(result) = url(tool, args) {
+            return Ok(result);
+        }
+        assert_eq!(tool, Tool::Agh);
+        assert_eq!(
+            args,
+            words(&["intent", "show", "fixture/repo", INTENT, "--format", "json"])
+        );
+        let mut doc = document.clone();
+        let Value::Object(fields) = &mut doc else {
+            unreachable!()
+        };
+        fields.insert("open".into(), json!(reads.get() < 2));
+        reads.set(reads.get() + 1);
+        Ok(out(0, &doc.to_string()))
+    };
+    let intent = agh::IntentId::parse(INTENT).unwrap();
+    Remote::open(root.path(), "origin", &run)
+        .unwrap()
+        .wait_for_intent(&intent, &|| {
+            pauses.set(pauses.get() + 1);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!((reads.get(), pauses.get()), (3, 2));
+    for (field, value) in [
+        ("id", json!("67-000000000000")),
+        ("repo", json!("other/repo")),
+        ("op", json!("release.create")),
+        ("key", json!("other")),
+        ("open", Value::Null),
+    ] {
+        let mut doc = document.clone();
+        let Value::Object(fields) = &mut doc else {
+            unreachable!()
+        };
+        fields.insert(field.into(), value);
+        let run = |tool, args: &[OsString]| {
+            Ok(url(tool, args).unwrap_or_else(|| out(0, &doc.to_string())))
+        };
+        assert!(
+            Remote::open(root.path(), "origin", &run)
+                .unwrap()
+                .wait_for_intent(&intent, &|| panic!("invalid identity must not wait"))
+                .is_err()
+        );
+    }
+    let run = |tool, args: &[OsString]| {
+        Ok(url(tool, args).unwrap_or_else(|| out(0, &document.to_string())))
+    };
+    let ticks = Cell::new(0);
+    let result = Remote::open(root.path(), "origin", &run)
+        .unwrap()
+        .wait_for_intent(&intent, &|| {
+            ticks.set(ticks.get() + 1);
+            if ticks.get() == 3 {
+                Err("absolute deadline".into())
+            } else {
+                Ok(())
+            }
+        });
+    assert_eq!(result, Err("absolute deadline".into()));
+    assert_eq!(ticks.get(), 3);
+}
+
 #[test]
 fn several_or_different_expanded_urls_stop_before_network_or_write() {
     let root = aterm_tempfile::tempdir().unwrap();

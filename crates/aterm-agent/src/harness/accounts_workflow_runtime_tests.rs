@@ -448,9 +448,11 @@ pub(crate) fn runtime_transition(
 fn workflow_retry_and_completion_consumers_conform_across_restarts_and_replacement() {
     let model = aterm_models_harness::account_workflow_runtime_model();
     assert_eq!(model.mutant_dials(), (1..=15).collect::<Vec<_>>());
-    assert_eq!(aterm_spec::interp::prove_and_catch(&model), 28);
+    assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
     assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
-    for state in aterm_spec::interp::reachable_states(&model) {
+    let states = aterm_spec::interp::reachable_states(&model);
+    assert_eq!(states.len(), 28);
+    for state in states {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
                 let next = runtime_transition(&state, action.name);

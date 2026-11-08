@@ -1026,7 +1026,8 @@ const KERNEL_EVENT_PROTOCOL: libc::c_int = 1;
 /// Whether a kernel notification names an address, router, attachment or link-state change.
 /// macOS `net/net_kev.h` supplies the subclasses and event codes; the kernel filters the
 /// vendor and class before delivery. Route lookups and misses never enter this socket.
-/// On Linux the groups joined carry only changes. An overflow (`ENOBUFS`) counts as a change.
+/// On Linux every message of the groups joined is one but those that report no change
+/// ([`netlink_names_a_change`]). An overflow (`ENOBUFS`) counts as a change.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn names_a_change(message: &[u8]) -> bool {
     #[cfg(target_os = "macos")]
@@ -1052,8 +1053,83 @@ fn names_a_change(message: &[u8]) -> bool {
     }
     #[cfg(target_os = "linux")]
     {
-        !message.is_empty()
+        netlink_names_a_change(message)
     }
+}
+
+/// `linux/netlink.h` and `linux/rtnetlink.h`: a message header's length, the two message types
+/// that can report no change, the fixed headers before their attributes, and the attributes
+/// that tell (with `NLA_TYPE_MASK`, which drops the nested and byte-order flags).
+#[cfg(target_os = "linux")]
+mod netlink {
+    pub(super) const HEADER: usize = 16;
+    pub(super) const RTM_NEWLINK: u16 = 16;
+    pub(super) const RTM_NEWADDR: u16 = 20;
+    pub(super) const IFINFOMSG: usize = 16;
+    pub(super) const IFADDRMSG: usize = 8;
+    pub(super) const IFLA_WIRELESS: u16 = 11;
+    pub(super) const IFA_CACHEINFO: u16 = 6;
+    pub(super) const TYPE_MASK: u16 = 0x3fff;
+}
+
+/// Whether one datagram of the route socket names a change of network on Linux: any message in
+/// it but two the kernel sends of a link or an address that stays as it was. A wireless
+/// extensions event (`RTM_NEWLINK` carrying `IFLA_WIRELESS`) reports a scan's results or the
+/// like (a radio that is up and joined to nothing sends one every few minutes); a link's own
+/// change comes as its own message, which carries none. An address's lifetime refresh
+/// (`RTM_NEWADDR` whose `IFA_CACHEINFO` update stamp has moved on from its creation stamp)
+/// renews an address that was already there (each router advertisement renews every SLAAC
+/// address it covers, a DHCP renewal its lease); an address added anew carries both stamps
+/// equal. A datagram that does not parse counts as a change.
+#[cfg(target_os = "linux")]
+fn netlink_names_a_change(datagram: &[u8]) -> bool {
+    use netlink::{
+        HEADER, IFA_CACHEINFO, IFADDRMSG, IFINFOMSG, IFLA_WIRELESS, RTM_NEWADDR, RTM_NEWLINK,
+    };
+    let word = |bytes: &[u8], at: usize| -> Option<u32> {
+        Some(u32::from_ne_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+    };
+    let mut rest = datagram;
+    while !rest.is_empty() {
+        let Some(length) = word(rest, 0).and_then(|length| usize::try_from(length).ok()) else {
+            return true;
+        };
+        let Some(message) = rest.get(..length).filter(|_| length >= HEADER) else {
+            return true;
+        };
+        let kind = u16::from_ne_bytes([message[4], message[5]]);
+        let unchanged = match kind {
+            RTM_NEWLINK => {
+                netlink_attribute(&message[HEADER..], IFINFOMSG, IFLA_WIRELESS).is_some()
+            }
+            RTM_NEWADDR => netlink_attribute(&message[HEADER..], IFADDRMSG, IFA_CACHEINFO)
+                .and_then(|info| Some((word(info, 8)?, word(info, 12)?)))
+                .is_some_and(|(created, updated)| created != updated),
+            _ => false,
+        };
+        if !unchanged {
+            return true;
+        }
+        rest = rest.get(length.next_multiple_of(4)..).unwrap_or_default();
+    }
+    false
+}
+
+/// The payload of attribute `wanted` among those after a message's fixed header of `fixed`
+/// bytes, if it carries one; `None` where it does not or they do not parse.
+#[cfg(target_os = "linux")]
+fn netlink_attribute(payload: &[u8], fixed: usize, wanted: u16) -> Option<&[u8]> {
+    let mut attributes = payload.get(fixed..)?;
+    while let Some(head) = attributes.get(..4) {
+        let length = usize::from(u16::from_ne_bytes([head[0], head[1]]));
+        let kind = u16::from_ne_bytes([head[2], head[3]]) & netlink::TYPE_MASK;
+        let body = attributes.get(4..length)?;
+        if kind == wanted {
+            return Some(body);
+        }
+        attributes = attributes.get(length.next_multiple_of(4)..)?;
+    }
+    None
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1497,6 +1573,110 @@ mod route_change_tests {
         assert!(!names_a_change(&message(1, 1)[..23]));
     }
 
+    /// One netlink message of type `kind` whose fixed header of `fixed` bytes is followed by
+    /// `attributes` (each a type and its payload), padded as the kernel pads them.
+    #[cfg(target_os = "linux")]
+    fn netlink_message(kind: u16, fixed: usize, attributes: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut body = vec![0_u8; fixed];
+        for (attribute, payload) in attributes {
+            let length = u16::try_from(4 + payload.len()).expect("a short attribute");
+            body.extend(length.to_ne_bytes());
+            body.extend(attribute.to_ne_bytes());
+            body.extend(*payload);
+            body.resize(body.len().next_multiple_of(4), 0);
+        }
+        let length = u32::try_from(netlink::HEADER + body.len()).expect("a short message");
+        let mut message = length.to_ne_bytes().to_vec();
+        message.extend(kind.to_ne_bytes());
+        message.extend([0_u8; 10]);
+        message.extend(body);
+        message
+    }
+
+    /// Linux: a wireless extensions event and an address's lifetime refresh, which the kernel
+    /// sends of a link and an address that stay as they were (a radio joined to nothing, every
+    /// router advertisement), wake no reader, alone or together in one datagram; a link's own
+    /// change, an address added (both stamps equal), one removed, a route, and a datagram that
+    /// does not parse each do, and so does any datagram holding one of them.
+    /// NEGATIVE CONTROLS: a read that counts every message (as before) wakes on the scan and
+    /// the refresh; one that drops every address message misses an address added; one that
+    /// drops every link message misses a carrier change.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn netlink_notifications_ignore_scans_and_lifetime_refreshes() {
+        use netlink::{
+            IFA_CACHEINFO, IFADDRMSG, IFINFOMSG, IFLA_WIRELESS, RTM_NEWADDR, RTM_NEWLINK,
+        };
+        const IFLA_IFNAME: u16 = 3;
+        const IFA_ADDRESS: u16 = 1;
+        const RTM_DELADDR: u16 = 21;
+        const RTM_NEWROUTE: u16 = 24;
+        let cacheinfo = |created: u32, updated: u32| -> Vec<u8> {
+            [1800_u32, 1800, created, updated]
+                .into_iter()
+                .flat_map(u32::to_ne_bytes)
+                .collect()
+        };
+        let address = [
+            0x20_u8, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        let scan = netlink_message(
+            RTM_NEWLINK,
+            IFINFOMSG,
+            &[(IFLA_IFNAME, b"wlP9s9\0"), (IFLA_WIRELESS, &[0; 8])],
+        );
+        let refresh = netlink_message(
+            RTM_NEWADDR,
+            IFADDRMSG,
+            &[
+                (IFA_ADDRESS, &address),
+                (IFA_CACHEINFO, &cacheinfo(1776, 479_815_188)),
+            ],
+        );
+        let carrier = netlink_message(RTM_NEWLINK, IFINFOMSG, &[(IFLA_IFNAME, b"enP7s7\0")]);
+        let added = netlink_message(
+            RTM_NEWADDR,
+            IFADDRMSG,
+            &[
+                (IFA_ADDRESS, &address),
+                (IFA_CACHEINFO, &cacheinfo(5000, 5000)),
+            ],
+        );
+        let unstamped = netlink_message(RTM_NEWADDR, IFADDRMSG, &[(IFA_ADDRESS, &address)]);
+        let removed = netlink_message(
+            RTM_DELADDR,
+            IFADDRMSG,
+            &[
+                (IFA_ADDRESS, &address),
+                (IFA_CACHEINFO, &cacheinfo(1776, 479_815_188)),
+            ],
+        );
+        let route = netlink_message(RTM_NEWROUTE, 12, &[]);
+        let both = [scan.clone(), refresh.clone()].concat();
+        for quiet in [&scan, &refresh, &both] {
+            assert!(!names_a_change(quiet), "{quiet:?}");
+        }
+        assert!(!names_a_change(&[]));
+        for moved in [&carrier, &added, &unstamped, &removed, &route] {
+            assert!(names_a_change(moved), "{moved:?}");
+            assert!(
+                names_a_change(&[both.clone(), moved.clone()].concat()),
+                "{moved:?}"
+            );
+            assert!(
+                names_a_change(&[moved.clone(), both.clone()].concat()),
+                "{moved:?}"
+            );
+        }
+        let mut long = scan.clone();
+        long[..4].copy_from_slice(&u32::try_from(scan.len() + 4).unwrap().to_ne_bytes());
+        let mut short = refresh.clone();
+        short[..4].copy_from_slice(&8_u32.to_ne_bytes());
+        for garbled in [&scan[..12], &long[..], &short[..]] {
+            assert!(names_a_change(garbled), "{garbled:?}");
+        }
+    }
+
     /// A wait's length beside a flood: long against a poll's millisecond, short for a test.
     #[cfg(target_os = "macos")]
     const FLOODED: std::time::Duration = std::time::Duration::from_millis(300);
@@ -1513,7 +1693,8 @@ mod route_change_tests {
     }
 
     /// One kernel event message as `PF_SYSTEM` delivers it: Apple's, the network class's. On
-    /// Linux any message of the groups joined is a change, so each stands for one there.
+    /// Linux it reads as a netlink message of neither type that can report no change, so each
+    /// stands for a change there.
     fn kernel_event(subclass: u32, code: u32) -> Vec<u8> {
         [24_u32, 1, 1, subclass, 37, code]
             .into_iter()

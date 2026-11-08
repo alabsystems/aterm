@@ -2394,25 +2394,15 @@ mod unix {
                 "native push requires a complete, non-shallow source repository",
             ));
         }
-        let mut import = vec![
-            os("-c"),
-            os("protocol.file.allow=always"),
-            os("fetch"),
-            os("--quiet"),
-            os("--no-tags"),
-            os("--no-write-fetch-head"),
-            os("--recurse-submodules=no"),
-            dir.as_os_str().to_owned(),
-        ];
-        for (i, oid) in batch.source_roots().iter().enumerate() {
-            import.push(os(format!("{oid}:refs/agh/source/{i}")));
-        }
-        let incremental = batch.updates().iter().any(|u| u.before != ZERO);
-        if !incremental {
-            checked("objects", import, scratch)?;
+        // A newly created tag has no BEFORE of its own. Observe main too, so
+        // a tag of an already published commit need not import its history.
+        // This is remote authority, never origin/main or a source accelerator.
+        let mut guards = batch.guard_refs();
+        if !guards.contains(&"refs/heads/main") {
+            guards.push("refs/heads/main");
         }
         let mut list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
-        list.extend(batch.guard_refs().iter().map(|reference| os(*reference)));
+        list.extend(guards.iter().map(|reference| os(*reference)));
         let listed = checked("remote", list, scratch)?;
         let text = std::str::from_utf8(&listed.stdout)
             .map_err(|_| Error::protocol("git returned non-UTF-8 refs"))?;
@@ -2422,7 +2412,7 @@ mod unix {
                 .split_once('\t')
                 .ok_or_else(|| Error::protocol("git returned malformed refs"))?;
             if !crate::path::is_sha(oid)
-                || !batch.guard_refs().contains(&reference)
+                || !guards.contains(&reference)
                 || found.insert(reference, oid).is_some()
             {
                 return Err(Error::protocol("git returned unexpected or duplicate refs"));
@@ -2443,11 +2433,15 @@ mod unix {
                 found.get(crate::git::PUBLISHER_FENCE_REF).copied(),
             )?;
         }
-        // Only a freshly observed remote BEFORE can exclude an old object
+        // Only freshly observed remote objects can exclude an old object
         // closure. Source refs, grafts, replacement objects and accelerator
         // files are never copied into this private read/write repository.
         let alternate = scratch.map(|p| p.join("objects/info/alternates"));
-        if incremental {
+        let mut remote_main = None;
+        let mut remote_owned = false;
+        let incremental = batch.updates().iter().any(|u| u.before != ZERO);
+        let mut commit_facts = BTreeMap::<String, bool>::new();
+        {
             let common = checked(
                 "source-common",
                 vec![
@@ -2468,96 +2462,186 @@ mod unix {
                 std::fs::write(path, format!("{common}/objects\n"))
                     .map_err(|e| Error::local(format!("private object view: {e}")))?;
             }
-            let mut metadata_roots = String::new();
-            for u in batch.updates() {
-                if u.after != ZERO {
-                    metadata_roots.push_str(&u.after);
-                    metadata_roots.push('\n');
-                }
-                if u.before != ZERO {
-                    metadata_roots.push_str(&u.before);
-                    metadata_roots.push('\n');
+            if let Some(main) = found.get("refs/heads/main") {
+                let available = step(
+                    "main-present",
+                    vec![os("cat-file"), os("-e"), os(*main)],
+                    scratch,
+                )?;
+                if available.code == Some(0) {
+                    remote_main = Some(*main);
                 }
             }
-            if let Some(control) = batch.control() {
-                metadata_roots.push_str(control.owner_commit());
-                metadata_roots.push('\n');
+            // Tags and canonical lease/fence transitions introduce no file
+            // content when their commit is already held by the observed main.
+            // Verify their exact raw objects and a short hashed parent witness,
+            // rather than copying or re-proving that remote-owned history.
+            if let Some(main) = remote_main
+                && (batch.control().is_some() || batch.updates().iter().all(|u| u.before == ZERO))
+            {
+                remote_owned = true;
+                let mut witnessed = BTreeSet::new();
+                for (i, root) in batch.source_roots().iter().enumerate() {
+                    let kind = checked(
+                        &format!("root-kind-{i}"),
+                        vec![os("cat-file"), os("-t"), os(*root)],
+                        scratch,
+                    )?;
+                    commit_facts.insert((*root).to_owned(), kind.stdout == b"commit\n");
+                    let target = if kind.stdout == b"commit\n" {
+                        (*root).to_owned()
+                    } else if kind.stdout == b"tag\n" {
+                        let tag = checked(
+                            &format!("root-tag-{i}"),
+                            vec![os("cat-file"), os("tag"), os(*root)],
+                            scratch,
+                        )?;
+                        let target = std::str::from_utf8(&tag.stdout).ok().and_then(|s| {
+                            let mut lines = s.lines();
+                            let id = lines.next()?.strip_prefix("object ")?;
+                            (crate::path::is_sha(id) && lines.next()? == "type commit")
+                                .then(|| id.to_owned())
+                        });
+                        let Some(target) = target.filter(|_| !tag.stdout_may_be_truncated()) else {
+                            remote_owned = false;
+                            break;
+                        };
+                        target
+                    } else {
+                        remote_owned = false;
+                        break;
+                    };
+                    if witnessed.insert(target.clone())
+                        && !ancestry::witnessed_local_path(children, run, &dir, &target, main)?
+                    {
+                        remote_owned = false;
+                        break;
+                    }
+                }
             }
-            let prefix = scratch
-                .map_or_else(|| PathBuf::from("scratch.git"), Path::to_path_buf)
-                .join("objects/pack/pack");
-            let metadata = children.gh.fx().native_push_phase(
-                crate::git::NativePushPhase::MetadataPack,
-                || {
-                    checked_input(
-                        "metadata-pack",
-                        vec![
+            if !incremental && !remote_owned {
+                // A genuinely unpublished closure needs a complete strictly
+                // checked import, not the bounded incremental ID inventory.
+                // Its source alternate must not satisfy the fetch's admission.
+                if let Some(path) = &alternate {
+                    std::fs::remove_file(path)
+                        .map_err(|e| Error::local(format!("private object view: {e}")))?;
+                }
+                let mut import = vec![
+                    os("-c"),
+                    os("protocol.file.allow=always"),
+                    os("-c"),
+                    os("fetch.fsckObjects=true"),
+                    os("-c"),
+                    os("transfer.fsckObjects=true"),
+                    os("fetch"),
+                    os("--quiet"),
+                    os("--no-tags"),
+                    os("--no-write-fetch-head"),
+                    os("--recurse-submodules=no"),
+                    dir.as_os_str().to_owned(),
+                ];
+                for (i, oid) in batch.source_roots().iter().enumerate() {
+                    import.push(os(format!("{oid}:refs/agh/source/{i}")));
+                }
+                checked("objects", import, scratch)?;
+            } else {
+                let mut metadata_roots = String::new();
+                for u in batch.updates() {
+                    if u.after != ZERO {
+                        metadata_roots.push_str(&u.after);
+                        metadata_roots.push('\n');
+                    }
+                    if u.before != ZERO {
+                        metadata_roots.push_str(&u.before);
+                        metadata_roots.push('\n');
+                    }
+                }
+                if let Some(control) = batch.control() {
+                    metadata_roots.push_str(control.owner_commit());
+                    metadata_roots.push('\n');
+                }
+                if let Some(main) = remote_main.filter(|_| !remote_owned) {
+                    metadata_roots.push_str(main);
+                    metadata_roots.push('\n');
+                }
+                let prefix = scratch
+                    .map_or_else(|| PathBuf::from("scratch.git"), Path::to_path_buf)
+                    .join("objects/pack/pack");
+                let metadata = children.gh.fx().native_push_phase(
+                    crate::git::NativePushPhase::MetadataPack,
+                    || {
+                        let mut args = vec![
                             os("-c"),
                             os("core.commitGraph=false"),
                             os("-c"),
                             os("pack.useBitmaps=false"),
                             os("pack-objects"),
                             os("--quiet"),
-                            os("--revs"),
-                            os("--filter=blob:none"),
                             os("--threads=8"),
                             os("--no-use-bitmap-index"),
-                            prefix.as_os_str().to_owned(),
-                        ],
-                        metadata_roots.as_bytes(),
-                    )
-                },
-            )?;
-            let hash = std::str::from_utf8(&metadata.stdout)
-                .ok()
-                .and_then(|s| s.strip_suffix('\n'))
-                .filter(|s| crate::path::is_sha(s))
-                .ok_or_else(|| Error::protocol("metadata pack ID is malformed"))?;
-            children.gh.fx().native_push_phase(
-                crate::git::NativePushPhase::MetadataVerify,
-                || {
-                    checked(
-                        "metadata-verify",
-                        vec![
-                            os("index-pack"),
-                            os("--verify"),
-                            os("--strict"),
-                            os("--threads=8"),
-                            prefix
-                                .with_file_name(format!("pack-{hash}.pack"))
-                                .into_os_string(),
-                        ],
-                        scratch,
-                    )
-                },
-            )?;
-            let mut args = vec![
-                os("-c"),
-                os("core.commitGraph=false"),
-                os("-c"),
-                os("pack.useBitmaps=false"),
-                os("fsck"),
-                os("--connectivity-only"),
-                os("--no-dangling"),
-                os("--no-reflogs"),
-                os("--no-progress"),
-            ];
-            args.extend(batch.source_roots().iter().map(|oid| os(*oid)));
-            // Connectivity-only does not hash every tree. The full metadata
-            // pack above independently verifies all commit/tree/tag bytes and
-            // their original index IDs before any old closure is excluded.
-            // This extra walk checks referenced blob presence. New blob bytes
-            // are checked below; old blob bytes are already held by BEFORE.
-            children
-                .gh
-                .fx()
-                .native_push_phase(crate::git::NativePushPhase::Connectivity, || {
-                    checked("connectivity", args, scratch)
-                })?;
+                        ];
+                        if remote_owned {
+                            args.push(os("--no-revs"));
+                        } else {
+                            args.extend([os("--revs"), os("--filter=blob:none")]);
+                        }
+                        args.push(prefix.as_os_str().to_owned());
+                        checked_input("metadata-pack", args, metadata_roots.as_bytes())
+                    },
+                )?;
+                let hash = std::str::from_utf8(&metadata.stdout)
+                    .ok()
+                    .and_then(|s| s.strip_suffix('\n'))
+                    .filter(|s| crate::path::is_sha(s))
+                    .ok_or_else(|| Error::protocol("metadata pack ID is malformed"))?;
+                children.gh.fx().native_push_phase(
+                    crate::git::NativePushPhase::MetadataVerify,
+                    || {
+                        checked(
+                            "metadata-verify",
+                            vec![
+                                os("index-pack"),
+                                os("--verify"),
+                                os("--strict"),
+                                os("--threads=8"),
+                                prefix
+                                    .with_file_name(format!("pack-{hash}.pack"))
+                                    .into_os_string(),
+                            ],
+                            scratch,
+                        )
+                    },
+                )?;
+                if !remote_owned {
+                    let mut args = vec![
+                        os("-c"),
+                        os("core.commitGraph=false"),
+                        os("-c"),
+                        os("pack.useBitmaps=false"),
+                        os("fsck"),
+                        os("--connectivity-only"),
+                        os("--no-dangling"),
+                        os("--no-reflogs"),
+                        os("--no-progress"),
+                    ];
+                    args.extend(batch.source_roots().iter().map(|oid| os(*oid)));
+                    // Connectivity-only does not hash every tree. The full metadata
+                    // pack above independently verifies all commit/tree/tag bytes and
+                    // their original index IDs before any old closure is excluded.
+                    // This extra walk checks referenced blob presence. New blob bytes
+                    // are checked below; old blob bytes are already held by BEFORE.
+                    children
+                        .gh
+                        .fx()
+                        .native_push_phase(crate::git::NativePushPhase::Connectivity, || {
+                            checked("connectivity", args, scratch)
+                        })?;
+                }
+            }
         }
         // The admitted private object view stays fixed through these queries.
         // Share successful facts, while deciding each reference's policy separately.
-        let mut commit_facts = BTreeMap::<String, bool>::new();
         let mut is_commit = |name: &str, oid: &str| -> Result<bool> {
             if let Some(commit) = commit_facts.get(oid) {
                 return Ok(*commit);
@@ -2660,7 +2744,7 @@ mod unix {
                 }
             }
         }
-        if incremental && batch.updates().iter().any(|row| row.after != ZERO) {
+        if incremental && !remote_owned && batch.updates().iter().any(|row| row.after != ZERO) {
             let mut roots = String::new();
             for u in batch.updates().iter().filter(|row| row.after != ZERO) {
                 roots.push_str(&u.after);
@@ -2669,6 +2753,11 @@ mod unix {
             for u in batch.updates().iter().filter(|u| u.before != ZERO) {
                 roots.push('^');
                 roots.push_str(&u.before);
+                roots.push('\n');
+            }
+            if let Some(main) = remote_main {
+                roots.push('^');
+                roots.push_str(main);
                 roots.push('\n');
             }
             let expected = checked_input(
@@ -2774,7 +2863,7 @@ mod unix {
             }
         }
         let mut final_list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
-        final_list.extend(batch.guard_refs().iter().map(|reference| os(*reference)));
+        final_list.extend(guards.iter().map(|reference| os(*reference)));
         if checked("remote-final", final_list, scratch)?.stdout != listed.stdout {
             return Err(Error::new(
                 Kind::Conflict,
@@ -2828,7 +2917,7 @@ mod unix {
             // A receive failure says nothing about whether the CAS committed.
             // Read all guarded refs, including the control refs we do not change.
             let mut list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
-            list.extend(batch.guard_refs().iter().map(|reference| os(*reference)));
+            list.extend(guards.iter().map(|reference| os(*reference)));
             let read = checked("remote-recover", list, scratch).map_err(|read| {
                 Error::could_not_run(format!(
                     "{}; remote re-read failed: {}",
@@ -2852,7 +2941,7 @@ mod unix {
                         .with_side_effect(SideEffect::Unknown)
                 })?;
                 if !crate::path::is_sha(oid)
-                    || !batch.guard_refs().contains(&reference)
+                    || !guards.contains(&reference)
                     || observed.insert(reference, oid).is_some()
                 {
                     return Err(Error::protocol("git returned unexpected or duplicate refs")

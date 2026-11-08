@@ -222,6 +222,11 @@ fn text_it_did_not_write_is_refused_by_line() {
         ("atape-text 1\nmono 12x\n", "no number"),
         ("atape-text 1\nfile-err NoSuchKind /x\n", "no error kind"),
         ("atape-text 1\nnote k\n|x\n", "no space"),
+        (
+            "atape-text 1\nexchange host.memory raw\n>\n< 0\n",
+            "no control door",
+        ),
+        ("atape-text 1\nexchange ctl same\n>\n", "without `raw`"),
     ] {
         let err = parse(text).expect_err(text);
         assert!(err.contains(says), "{text:?}: {err}");
@@ -363,4 +368,77 @@ fn agh_fixture_tape_is_atape_text() {
         );
     }
     assert_eq!(render(header.as_deref(), &items), text);
+}
+
+#[test]
+fn a_long_reply_its_door_gave_last_time_is_written_once() {
+    let exchange = |door: &str, request: &[u8], reply: &[u8]| {
+        Item::effect(EffectRecord::Exchange {
+            door: door.to_string(),
+            request: request.to_vec(),
+            reply: reply.to_vec(),
+        })
+    };
+    let tail = |reply: &[u8]| exchange("host.transcript_tail", b"", reply);
+    let (long, other, short) = (
+        vec![b'a'; SAME_MIN + 1],
+        vec![b'b'; SAME_MIN + 1],
+        vec![b'c'; SAME_MIN],
+    );
+    let words = codec::ctl_reply(&Ok(CtlReply {
+        code: 0,
+        stdout: "x".repeat(SAME_MIN + 1),
+        stderr: String::new(),
+    }));
+    let mut raw = vec![0x83, 0x00];
+    raw.extend_from_slice(&codec::ctl_request(&["a", "b", "c"])[1..]);
+    let items = vec![
+        tail(&long),
+        exchange("host.transcript_tail", b"again", &long),
+        exchange("host.memory", b"", &long),
+        tail(&other),
+        tail(&long),
+        tail(&long),
+        tail(&short),
+        tail(&short),
+        tail(&long),
+        exchange(doors::CTL, &raw, &words),
+        exchange(doors::CTL, &codec::ctl_request(&["text"]), &words),
+        exchange(doors::CTL, &raw, &words),
+    ];
+    let text = render(None, &items);
+    let heads: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("exchange "))
+        .collect();
+    assert_eq!(
+        heads,
+        [
+            "exchange host.transcript_tail",
+            "exchange host.transcript_tail same",
+            "exchange host.memory",
+            "exchange host.transcript_tail",
+            "exchange host.transcript_tail",
+            "exchange host.transcript_tail same",
+            "exchange host.transcript_tail",
+            "exchange host.transcript_tail",
+            "exchange host.transcript_tail",
+            "exchange ctl raw",
+            "exchange ctl",
+            "exchange ctl raw same",
+        ],
+        "{text}"
+    );
+    assert_eq!(
+        text.matches(&*String::from_utf8_lossy(&long)).count(),
+        4,
+        "{text}"
+    );
+    assert_eq!(parse(&text).expect("reads").1, items);
+    let err = parse("atape-text 1\nexchange host.transcript_tail same\n>\n")
+        .expect_err("a `same` with nothing before it");
+    assert!(
+        err.contains("line 2") && err.contains("no reply before"),
+        "{err}"
+    );
 }

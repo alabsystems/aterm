@@ -115,7 +115,7 @@ mod measuring {
         ),
         // The window above at full motion (what the shipped `auto` resolves to on a Mac whose
         // Reduce Motion is off) under the shipped cursor style, the rainbow kitty pet, measured
-        // from 40 s after its prompt went quiet. A pet in deep sleep takes no frame and offers no
+        // once its status reports deep sleep. A pet in deep sleep takes no frame and offers no
         // deadline, so the cursor-effect lane is bounded at 0. A window without the focus asks its
         // pet for none either, so a take that does not open and end focused, at full motion with
         // the pet past its breath window (`pet_deep`), is a refusal, never a pass (`PET_READY`).
@@ -165,7 +165,7 @@ mod measuring {
             },
         ),
         // The row above with the window's rest on (`idle_rest_secs = 30`, ATERM-KI-1027-4; the
-        // rest is off unless set), measured over 20 s from 40 s after its prompt went quiet, past
+        // rest is off unless set), measured over 20 s once its status reports readiness, past
         // the rest and the pet's deep sleep. A resting window's deck draws as an unfocused one's:
         // no live-edge frame, no needle sweep, a reading every 5 s and a frame for each, so the
         // live-edge, needle and cursor-effect lanes are bounded at 0, and its frames and wakes

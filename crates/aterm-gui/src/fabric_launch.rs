@@ -304,12 +304,32 @@ pub(crate) fn bye_at_handoff(store: &crate::session_store::Store, attempt: u64) 
     }
 }
 
-/// THE QUIT'S BYE.
+/// THE QUIT'S BYE, after its closes (fix unit Q1): every live session's log closes `out=app-quit`
+/// ([`crate::session_log::close_logs_at_quit`], the one producer the bus mirror and the journal
+/// both carry), the bus is given those closes within the quit's budget, and only then does the
+/// bridge hear `bye quit` ([`quit_in_order`]).
 pub(crate) fn bye_at_quit(store: &crate::session_store::Store) {
     RETIRED.store(true, Ordering::SeqCst);
     let word = quit_bye(aterm_types::dev_seam!(QUIT_BYE_SEAM).as_deref());
     let bridged = crate::fabric::bridge_attached_now();
-    if !bye(store, word, BYE_WAIT) && bridged {
+    let budget = crate::session_log_journal::quit_budget();
+    let order = quit_in_order(store, word, budget, &LiveBus::of(store));
+    aterm_log::info!(
+        "fabric: the quit closed {} session log(s): {} before its `bye {}` (taken: {})",
+        order.closed,
+        order.landing.word(),
+        word.word(),
+        order.taken
+    );
+    if order.closed > 0 && order.landing == Landing::Missed {
+        aterm_log::warn!(
+            "fabric: {} session close(s) of the quit had not landed on the bus within {:.1}s; \
+             the journal holds them, and the bus reads the bridge's withdrawal instead",
+            order.closed,
+            budget.as_secs_f64()
+        );
+    }
+    if !order.taken && bridged {
         aterm_log::warn!(
             "fabric: the bridge did not take `bye {}` within {:.1}s; this instance's \
              sessions are withdrawn only if it reads the word before the lanes close, \
@@ -317,6 +337,169 @@ pub(crate) fn bye_at_quit(store: &crate::session_store::Store) {
             word.word(),
             BYE_WAIT.as_secs_f64()
         );
+    }
+}
+
+/// How a quit's closes met the bus before its bye ([`quit_in_order`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Landing {
+    /// The bus holds every live log through its close, or the quit closed none.
+    Landed,
+    /// No bridge could land them now (none mirrors, its link is futile, its mirror is stopped).
+    Unserved,
+    /// The budget ran out first, or the link went futile while it waited: the quit went on.
+    Missed,
+    /// The quit's word was `bye handoff` (the QA seam): the closes followed the word.
+    After,
+}
+
+impl Landing {
+    /// The words aterm.log says it in ([`bye_at_quit`]).
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Landed => "landed on the bus",
+            Self::Unserved => "not waited for (no bridge could land them)",
+            Self::Missed => "missed the budget",
+            Self::After => "closed after the word",
+        }
+    }
+}
+
+/// What a quit did before and at its bye.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QuitOrder {
+    /// How many live session logs the quit closed.
+    pub(crate) closed: usize,
+    /// How those closes met the bus.
+    pub(crate) landing: Landing,
+    /// Whether the bridge took the bye ([`bye`]).
+    pub(crate) taken: bool,
+}
+
+/// What a quit's order waits on, injected so a test drives its clock and plays its bridge.
+pub(crate) trait QuitBus {
+    /// The monotonic now.
+    fn now(&self) -> Instant;
+    /// Whether the quit's closes can land now ([`crate::fabric::mirror_lands_now`]).
+    fn lands(&self) -> bool;
+    /// How many landings this store answered so far ([`crate::session_log_mirror::Shared`]).
+    fn landings(&self) -> u64;
+    /// Park until a landing past `seen`, or `until`, whichever is first.
+    fn park(&self, seen: u64, until: Instant);
+    /// Say the bye ([`bye`]): whether the bridge took it.
+    fn bye(&self, store: &crate::session_store::Store, word: Bye) -> bool;
+}
+
+/// The longest one park of a live quit lasts, so the link is read again ([`QuitBus::lands`]):
+/// a bridge that went away, or a broker it reported unreachable, ends the wait at once.
+pub(crate) const QUIT_PARK_SLICE: Duration = Duration::from_millis(20);
+
+/// The live bus: the store's own landings and the link's state.
+struct LiveBus {
+    shared: std::sync::Arc<crate::session_log_mirror::Shared>,
+}
+
+impl LiveBus {
+    fn of(store: &crate::session_store::Store) -> Self {
+        Self {
+            shared: store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .mirror()
+                .shared(),
+        }
+    }
+}
+
+impl QuitBus for LiveBus {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn lands(&self) -> bool {
+        crate::fabric::mirror_lands_now()
+    }
+
+    fn landings(&self) -> u64 {
+        self.shared.landings()
+    }
+
+    fn park(&self, seen: u64, until: Instant) {
+        let wait = until.saturating_duration_since(Instant::now());
+        self.shared.await_landing(seen, wait.min(QUIT_PARK_SLICE));
+    }
+
+    fn bye(&self, store: &crate::session_store::Store, word: Bye) -> bool {
+        bye(store, word, BYE_WAIT)
+    }
+}
+
+/// THE QUIT'S ORDER (fix unit Q1): close, land, then bye. It lives here, on the instance's side
+/// of the link, because the instance owns the quit, its budget and the live logs the landings
+/// move; the bridge's mirror only has to take what it is woken for (`EVENT * quit-closes`), as
+/// it takes any other record, and the bridge's own `bye` handling stays as it was. Every live
+/// session's log closes `out=app-quit` first ([`crate::session_log::close_logs_at_quit`]): the
+/// one producer, whose records the journal's last passes write as any other. Then, while a
+/// bridge can land them ([`QuitBus::lands`]), the quit waits at most `budget` for the bus to hold
+/// every live log through its close ([`crate::session_log_mirror::quit_closes_landed`]), and
+/// only then says `bye quit`: a bus reader reads the close before the bridge withdraws the
+/// session. A bus that cannot be reached never blocks the quit: an unserved or futile link is
+/// not waited for, and a budget that runs out moves on, the journal holding the closes either
+/// way. The QA seam's `bye handoff` keeps the word first, as a handoff (whose sessions go on)
+/// says it, and closes the logs after it for the journal.
+pub(crate) fn quit_in_order(
+    store: &crate::session_store::Store,
+    word: Bye,
+    budget: Duration,
+    bus: &impl QuitBus,
+) -> QuitOrder {
+    if word == Bye::Handoff {
+        let taken = bus.bye(store, word);
+        let closed = crate::session_log::close_logs_at_quit(store);
+        return QuitOrder {
+            closed,
+            landing: Landing::After,
+            taken,
+        };
+    }
+    let closed = crate::session_log::close_logs_at_quit(store);
+    let landing = if closed == 0 {
+        Landing::Landed
+    } else {
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .say_quit_closes();
+        land_quit_closes(store, budget, bus)
+    };
+    let taken = bus.bye(store, word);
+    QuitOrder {
+        closed,
+        landing,
+        taken,
+    }
+}
+
+/// The wait of [`quit_in_order`]: until the bus holds every live log, the link cannot land them,
+/// or `budget` passed.
+fn land_quit_closes(
+    store: &crate::session_store::Store,
+    budget: Duration,
+    bus: &impl QuitBus,
+) -> Landing {
+    if !bus.lands() {
+        return Landing::Unserved;
+    }
+    let deadline = bus.now() + budget;
+    loop {
+        let seen = bus.landings();
+        if crate::session_log_mirror::quit_closes_landed(store) {
+            return Landing::Landed;
+        }
+        if !bus.lands() || bus.now() >= deadline {
+            return Landing::Missed;
+        }
+        bus.park(seen, deadline);
     }
 }
 

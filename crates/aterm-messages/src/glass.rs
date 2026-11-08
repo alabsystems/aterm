@@ -420,8 +420,6 @@ pub(crate) struct RowSpec<'a> {
     pub glyph: char,
     /// The full title.
     pub title: &'a str,
-    /// The title's short form ([`crate::Message`]'s `short_title`).
-    pub title_short: Option<&'a str>,
     /// `detail[0]`, when any.
     pub detail0: Option<&'a str>,
     /// `detail0` IS THE ONE STEP the row asks for.
@@ -491,7 +489,6 @@ pub(crate) const fn overflow_spec(hidden: usize, words: &str) -> RowSpec<'_> {
         live: false,
         glyph: OVERFLOW_GLYPH,
         title: words,
-        title_short: None,
         detail0: None,
         step: false,
         step_short: None,
@@ -720,9 +717,6 @@ fn excerpt_floor(spec: &RowSpec<'_>, activity: Activity, width: &dyn Fn(&str) ->
 
 struct Head {
     title: String,
-    /// The words `title` stands for: the whole title, or its short form
-    /// where the head was fitted around that.
-    words: String,
     /// The capsules' cells, and the clearance before them.
     caps: usize,
     before: usize,
@@ -732,40 +726,15 @@ struct Head {
     fixed: usize,
 }
 
-/// The title's forms a row may paint: the whole title, and its short form
-/// ([`RowSpec::title_short`]) where the row has one narrower than it.
-#[derive(Clone, Copy)]
-struct Titles<'t> {
-    full: &'t str,
-    short: Option<&'t str>,
-}
-
-impl<'t> Titles<'t> {
-    fn of(spec: &RowSpec<'t>, full: &'t str, width: &dyn Fn(&str) -> usize) -> Self {
-        let short = spec
-            .title_short
-            .filter(|_| matches!(spec.kind, RowKind::Message(_) | RowKind::Echo(_)))
-            .filter(|s| !s.is_empty() && width(s) < width(full));
-        Self { full, short }
-    }
-}
-
 fn fit_head(
     spec: &RowSpec<'_>,
-    titles: Titles<'_>,
+    title: &str,
     budget: usize,
     a: usize,
     ex: usize,
     width: &dyn Fn(&str) -> usize,
 ) -> Head {
-    let head = head_around(spec, titles.full, budget, a, ex, width);
-    if head.fixed <= budget {
-        return head;
-    }
-    let (title, mut head) = match titles.short {
-        Some(short) => (short, head_around(spec, short, budget, a, ex, width)),
-        None => (titles.full, head),
-    };
+    let mut head = head_around(spec, title, budget, a, ex, width);
     if head.fixed > budget {
         head.title = elide(
             title,
@@ -785,7 +754,6 @@ fn head_around(
     ex: usize,
     width: &dyn Fn(&str) -> usize,
 ) -> Head {
-    let words = title.to_string();
     let title = title.to_string();
     let mut short = false;
     let mut caps = capsules_width(&spec.capsules, false, width);
@@ -815,7 +783,6 @@ fn head_around(
     }
     Head {
         title,
-        words,
         caps,
         before,
         short,
@@ -838,7 +805,6 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
         RowKind::Message(_) | RowKind::Echo(_) => (None, spec.glyph),
     };
     let full_title = overflow_title.as_deref().unwrap_or(spec.title);
-    let titles = Titles::of(spec, full_title, width);
     let mut activity = spec.activity();
     let action_excerpt = action_excerpt(spec, activity);
     let mut a = activity.cells() + load_cells(spec, activity, width);
@@ -850,7 +816,7 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
             + clearance(&spec.capsules, false)
             + capsules_width(&spec.capsules, false, width),
     );
-    let mut head = fit_head(spec, titles, budget, a, ex, width);
+    let mut head = fit_head(spec, full_title, budget, a, ex, width);
     let mut words = ExcerptWords::Detail;
     if head.fixed > budget && spec.step && ex > 3 + DETAIL_FLOOR {
         // An ask's step that the title at its floor still cannot pay for
@@ -865,11 +831,7 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
         if let Some(short) = spec.step_short {
             words = ExcerptWords::Short;
             ex = 3 + width(short);
-            let kept = Titles {
-                full: titles.short.unwrap_or(titles.full),
-                short: None,
-            };
-            head = fit_head(spec, kept, budget, a, ex, width);
+            head = fit_head(spec, full_title, budget, a, ex, width);
         }
         let left = budget.saturating_sub(2 + width(&head.title) + a + head.before + head.caps);
         ex = left.max(3 + DETAIL_FLOOR).min(ex);
@@ -877,15 +839,10 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
     }
     if head.fixed > budget && ex > 0 {
         ex = 0;
-        let alone = Titles {
-            full: titles.short.unwrap_or(full_title),
-            short: None,
-        };
-        head = fit_head(spec, alone, budget, a, ex, width);
+        head = fit_head(spec, full_title, budget, a, ex, width);
     }
     let Head {
         mut title,
-        words: title_words,
         mut caps,
         before,
         short,
@@ -907,9 +864,9 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
         // The spare clear cell goes to the title where it keeps a word more.
         let left = budget.saturating_sub(2 + clear + caps);
         let spare = clear.saturating_sub(1);
-        let tight = title_in(&title_words, left, width);
+        let tight = title_in(full_title, left, width);
         let roomy = if spare > 0 {
-            title_in(&title_words, left + spare, width)
+            title_in(full_title, left + spare, width)
         } else {
             None
         };
@@ -1408,14 +1365,9 @@ pub(crate) mod tests {
         let cells = width(shown);
         let words = |text: &str| text.trim_end_matches('\u{2026}').split_whitespace().count();
         cells > 0
-            && [Some(spec.title), spec.title_short]
-                .into_iter()
-                .flatten()
-                .any(|title| {
-                    title_in(title, cells, width).as_deref() == Some(shown.as_str())
-                        && title_in(title, cells - 1, width)
-                            .is_none_or(|fewer| words(&fewer) < words(shown))
-                })
+            && title_in(spec.title, cells, width).as_deref() == Some(shown.as_str())
+            && title_in(spec.title, cells - 1, width)
+                .is_none_or(|fewer| words(&fewer) < words(shown))
     }
 
     fn id(n: u64) -> MessageId {
@@ -1448,7 +1400,6 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{26a0}',
                     title: "aterm closed unexpectedly last time",
-                    title_short: None,
                     detail0: Some(CRASH_DETAIL),
                     step: false,
                     step_short: None,
@@ -1469,7 +1420,6 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{2139}',
                     title: "File access not confirmed",
-                    title_short: None,
                     detail0: Some("Full Disk Access may already be enabled"),
                     step: false,
                     step_short: None,
@@ -1497,7 +1447,6 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{2713}',
                     title: "aterm v0.91.0 is ready",
-                    title_short: None,
                     detail0: Some(STAGED_MANUAL),
                     step: false,
                     step_short: None,
@@ -1518,7 +1467,6 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{2713}',
                     title: "aterm v0.91.0 is ready",
-                    title_short: None,
                     detail0: Some(STAGED_AUTO),
                     step: false,
                     step_short: None,
@@ -1539,7 +1487,6 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{26a0}',
                     title: "3 keybindings in aterm.toml were skipped",
-                    title_short: None,
                     detail0: Some("skipping \"cmd+shift+k\": unknown action \"foo\""),
                     step: false,
                     step_short: None,
@@ -1560,7 +1507,6 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing ALab tools",
-                    title_short: None,
                     detail0: Some("trust \u{00b7} extracting"),
                     step: false,
                     step_short: None,
@@ -1589,7 +1535,6 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21bb}',
                     title: "Downloading aterm v0.92.0",
-                    title_short: None,
                     detail0: None,
                     step: false,
                     step_short: None,
@@ -1610,7 +1555,6 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing ALab tools",
-                    title_short: None,
                     detail0: None,
                     step: false,
                     step_short: None,
@@ -1631,7 +1575,6 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing ALab tools",
-                    title_short: None,
                     detail0: None,
                     step: false,
                     step_short: None,
@@ -1652,7 +1595,6 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing Command Line Tools and Homebrew",
-                    title_short: None,
                     detail0: Some("enter your password in the macOS dialog"),
                     step: false,
                     step_short: None,
@@ -1673,7 +1615,6 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{2191}',
                     title: "Finishing aterm v0.92.0",
-                    title_short: None,
                     detail0: Some("keys typed now arrive in a moment"),
                     step: false,
                     step_short: None,
@@ -1694,7 +1635,6 @@ pub(crate) mod tests {
                     live: false,
                     glyph: '\u{26a0}',
                     title: "ALab tools",
-                    title_short: None,
                     detail0: Some("trust \u{2014} extracting 120 MB / 900 MB"),
                     step: false,
                     step_short: None,
@@ -1729,7 +1669,6 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{26a0}',
                     title,
-                    title_short: None,
                     detail0: Some(detail0),
                     step: false,
                     step_short: None,
@@ -2135,7 +2074,6 @@ pub(crate) mod tests {
             live: true,
             glyph: '\u{21bb}',
             title: "Installing aterm v0.92.0",
-            title_short: None,
             detail0: Some("installs within a minute \u{2014} keep working"),
             step: false,
             step_short: None,
@@ -2148,7 +2086,6 @@ pub(crate) mod tests {
             capsules: caps(&[]),
         };
         let with_stats = RowSpec {
-            title_short: None,
             detail0: Some("downloading"),
             step: false,
             step_short: None,
@@ -2156,7 +2093,6 @@ pub(crate) mod tests {
             ..flow.clone()
         };
         let bare = RowSpec {
-            title_short: None,
             detail0: None,
             step: false,
             step_short: None,
@@ -2236,7 +2172,6 @@ pub(crate) mod tests {
             live: false,
             glyph: '\u{2139}',
             title: "Installing",
-            title_short: None,
             detail0: Some(&detail),
             step: false,
             step_short: None,
@@ -2281,7 +2216,6 @@ pub(crate) mod tests {
                 live: animated,
                 glyph: '\u{21e3}',
                 title: "Installing ALab tools",
-                title_short: None,
                 detail0: Some("trust \u{00b7} extracting 120 MB of 900 MB"),
                 step: false,
                 step_short: None,
@@ -2389,7 +2323,6 @@ pub(crate) mod tests {
             live: true,
             glyph: '\u{2139}',
             title: "Building aterm and tools",
-            title_short: None,
             detail0: None,
             step: false,
             step_short: None,
@@ -2431,7 +2364,6 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing ALab tools",
-                    title_short: None,
                     detail0: None,
                     step: false,
                     step_short: None,
@@ -2507,7 +2439,6 @@ pub(crate) mod tests {
             live: true,
             glyph: '\u{2193}',
             title: "Updating ALab tools",
-            title_short: None,
             detail0: None,
             step: false,
             step_short: None,
@@ -2572,7 +2503,6 @@ pub(crate) mod tests {
                     live: true,
                     glyph: '\u{21e3}',
                     title: "Installing ALab tools",
-                    title_short: None,
                     detail0: None,
                     step: false,
                     step_short: None,

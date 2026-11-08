@@ -29,7 +29,7 @@ pub enum SpinScene {
     /// it opens holds the focus.
     Windowed,
     /// [`Self::Windowed`] at full motion under the shipped cursor style, the rainbow kitty pet,
-    /// measured once the pet is in deep sleep ([`PET_DEEP_SLEEP`], read as `pet_deep` as the window
+    /// measured once the pet is in deep sleep (read as `pet_deep` as the window
     /// opens). A pet asleep past its breath window takes no frame and offers no deadline, so the
     /// cursor-effect lane fires none while its window keeps the focus and takes no event. A window
     /// that loses the focus retires its pet, which fades back in over 0.30 s when the focus
@@ -40,7 +40,7 @@ pub enum SpinScene {
     /// deck; a take whose window rests anyway is a refusal ([`rest_unready`]).
     PetAsleep,
     /// [`Self::PetAsleep`] with the rest on at its measured candidate (`idle_rest_secs = 30`; off
-    /// unless set): by [`PET_DEEP_SLEEP`] the window has rested (ATERM-KI-1027-4), so its deck
+    /// unless set): the window must have rested (ATERM-KI-1027-4), so its deck
     /// draws still on background readings. The take decides only once the window reads
     /// `resting=true` as it opens and as it ends, and, since any window event would wake it, only
     /// with no window event other than a redraw.
@@ -110,10 +110,8 @@ pub const LIVE_LANE: &str = "stats_live";
 /// frames on the link's ticks, window events that [`SpinRow::max_wakes`] counts.
 pub const WAKES_PER_NEEDLE_FRAME: u64 = 2;
 
-/// How long the pet scene waits on a quiet prompt before its window opens: past the pet's deep
-/// sleep, which `kitty_pet.rs` begins `SLEEP_AFTER` (22 s) and `BREATH_WINDOW` (10 s) after the
-/// caret last moved (a lab instance showed it about 34 s after the last key), with room.
-pub const PET_DEEP_SLEEP: Duration = Duration::from_secs(40);
+/// The pet rows' existing total deadline, including their readiness wait and observation.
+const PET_BUDGET_SECS: u64 = 130;
 
 /// The cursor style the pet scene draws: the shipped default (`DEFAULT_CURSOR_TRAIL_STYLE`),
 /// named so the scene keeps the pet if that default moves.
@@ -551,7 +549,31 @@ fn pet_take(ctl: &Ctl, scene: SpinScene, edge: &str) -> Result<String, CouldNotR
     Ok(fields)
 }
 
-/// Raise the sole test session's native window before starting the sleep clock.
+/// Wait for the same state the observation's two edges require. Probe traffic precedes the
+/// metrics reset. A failed read ends this attempt; a missing state never becomes a pass.
+fn await_pet_ready(
+    budget: Budget,
+    scene: SpinScene,
+    mut read: impl FnMut() -> Result<String, CouldNotRun>,
+) -> Result<(), CouldNotRun> {
+    let mut last = String::new();
+    budget
+        .await_event(
+            "the focused pet's deep sleep and the scene's rest state",
+            || {
+                let line = match read() {
+                    Ok(line) => line,
+                    Err(error) => return Some(Err(error)),
+                };
+                let ready = pet_unready(&line).is_none() && rest_unready(scene, &line).is_none();
+                last = pet_fields(&line);
+                ready.then_some(Ok(()))
+            },
+        )
+        .map_err(|error| error.map(|why| format!("{why}; last trail state: {last}")))?
+}
+
+/// Raise the sole test session's native window before waiting for readiness.
 /// Sending a PTY focus report would not establish this OS precondition.
 fn prepare_pet_focus(ctl: &Ctl) -> Result<(), CouldNotRun> {
     let sessions = ctl.call(&["ls"]);
@@ -604,12 +626,11 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     });
     super::instance::first_exec(&rig.fake_tui)?;
-    let settle = if row.scene.pet() {
-        PET_DEEP_SLEEP
+    let budget = Budget::from_now(if row.scene.pet() {
+        PET_BUDGET_SECS
     } else {
-        Duration::ZERO
-    };
-    let budget = Budget::from_now(BUDGET_SECS + settle.as_secs());
+        BUDGET_SECS
+    });
     let mut scratch = Scratch::new("atspin")
         .map_err(|e| CouldNotRun::Refused(format!("cannot make a scratch world: {e}")))?;
     if std::env::var_os("ATERM_PAINT_KEEP").is_some() {
@@ -644,7 +665,26 @@ pub fn measure(rig: &Rig, row: &SpinRow) -> Result<SpinReport, CouldNotRun> {
         prepare_pet_focus(ctl)?;
     }
     ctl.ok(&["await", "idle", SETTLE_QUIET_MS, "timeout=60000"])?;
-    std::thread::sleep(settle);
+    if row.scene.pet() {
+        let started = std::time::Instant::now();
+        await_pet_ready(ctl.budget(), row.scene, || {
+            let reply = ctl.call(&["trail", "status"]);
+            if reply.ok() {
+                Ok(reply.stdout)
+            } else {
+                could_not_run(format!(
+                    "the pet readiness read failed: {} {}",
+                    reply.stdout.trim(),
+                    reply.stderr.trim()
+                ))
+            }
+        })?;
+        eprintln!(
+            "measure spin: {:?} readiness_seconds={:.3}",
+            row.scene,
+            started.elapsed().as_secs_f64()
+        );
+    }
     if row.scene == SpinScene::Rewound {
         ctl.ok(&["send", "printf 'rewind spin\\n'"])?;
         ctl.ok(&["key", "enter"])?;
@@ -1216,7 +1256,67 @@ mod tests {
 
 #[cfg(test)]
 mod focus_precondition_tests {
-    use super::sole_session;
+    use super::{Budget, CouldNotRun, SpinScene, await_pet_ready, sole_session};
+
+    const READY: &str = "resolved=rainbow-kitty focused=true motion_stage=full \
+                        pet_active=true pet_action=sleep pet_deep=true resting=false";
+
+    #[test]
+    fn readiness_wait_observes_deep_sleep_instead_of_assuming_it() {
+        for (from, to) in [
+            ("resolved=rainbow-kitty", "resolved=comet"),
+            ("focused=true", "focused=false"),
+            ("motion_stage=full", "motion_stage=reduced"),
+            ("pet_active=true", "pet_active=false"),
+            ("pet_action=sleep", "pet_action=loaf"),
+            ("pet_deep=true", "pet_deep=false"),
+            ("pet_deep=true", ""),
+            ("resting=false", "resting=true"),
+        ] {
+            let mut calls = 0;
+            await_pet_ready(Budget::from_now(60), SpinScene::PetAsleep, || {
+                calls += 1;
+                Ok(if calls == 1 {
+                    READY.replace(from, to)
+                } else {
+                    READY.to_owned()
+                })
+            })
+            .unwrap();
+            assert_eq!(calls, 2, "the first reading is not ready: {from} -> {to}");
+        }
+    }
+
+    #[test]
+    fn resting_readiness_needs_rest_and_does_not_retry_a_failed_read() {
+        let failure = CouldNotRun::Refused("planted lost reader".to_owned());
+        let mut calls = 0;
+        let result = await_pet_ready(Budget::from_now(60), SpinScene::Resting, || {
+            calls += 1;
+            match calls {
+                1 => Ok(READY.to_owned()),
+                2 => Err(failure.clone()),
+                _ => panic!("a failed read must not be re-rolled"),
+            }
+        });
+        assert_eq!(result, Err(failure));
+        assert_eq!(calls, 2, "an awake window cannot satisfy the resting row");
+
+        await_pet_ready(Budget::from_now(60), SpinScene::Resting, || {
+            Ok(READY.replace("resting=false", "resting=true"))
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn an_expired_readiness_wait_never_samples_an_unready_pet() {
+        assert!(
+            await_pet_ready(Budget::from_now(0), SpinScene::PetAsleep, || {
+                Ok(READY.replace("pet_deep=true", "pet_deep=false"))
+            })
+            .is_err()
+        );
+    }
 
     #[test]
     fn native_raise_selects_only_the_isolated_session() {

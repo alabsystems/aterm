@@ -448,11 +448,18 @@ fn denies(roster: &crate::Result<Option<SwarmRoster>>, label: &str) -> bool {
         .is_ok_and(|roster| roster.as_ref().is_some_and(|r| r.is_label_denied(label)))
 }
 
-/// Whether `paths`' own denial check, as a table session's access asks it
+/// Whether `paths`' own denial check, as a table session's access asks it under `lock`
 /// (`Bootstrap::access_in_observed`), finds this Mac denied, with the files it read.
-fn denial(paths: &Paths) -> (bool, BTreeMap<PathBuf, usize>) {
-    let (denied, read) = reads_during(paths, || local_recipient_denied_now(paths));
+fn denial(paths: &Paths, lock: &StateLock) -> (bool, BTreeMap<PathBuf, usize>) {
+    let (denied, read) = reads_during(paths, || local_recipient_denied_under(paths, lock));
     (denied.expect("the denial check reads"), read)
+}
+
+/// A shared observation of `paths`' state lock, as a table session's access holds one.
+fn observation(paths: &Paths) -> StateLock {
+    StateLock::observe(paths)
+        .unwrap()
+        .expect("no writer holds the vault")
 }
 
 /// A Commons repair round checks its custody against the vault (`Bootstrap::revalidate_custody`)
@@ -460,12 +467,13 @@ fn denial(paths: &Paths) -> (bool, BTreeMap<PathBuf, usize>) {
 /// Each answer is the fresh read's, and every file the fresh reads open is one the memos stamp;
 /// read again with no file moved, they open none. While a writer holds the vault's state lock
 /// nothing kept is given: the custody check finds the vault busy, as a fresh read does, and the
-/// writer's own denial check reads afresh. A denial the vault writes is seen at the next call.
+/// writer's own denial check, under its own take, reads afresh. A denial the vault writes is seen at
+/// the next call.
 ///
 /// NEGATIVE CONTROLS (2026-11-08): with `observe_commons_quiet`'s memo not quiet
 /// (`Memo::keyed(observation_inputs, false)`), the custody check under the writer is given the
 /// observation kept from before it (`left: "visible", right: "vault-busy"`); with
-/// `local_recipient_denied_now`'s not quiet, the writer's own check reads nothing
+/// `local_recipient_denied_under`'s not quiet, the writer's own check reads nothing
 /// (`a writer's denial check reads afresh`).
 #[test]
 fn a_custody_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer() {
@@ -488,22 +496,22 @@ fn a_custody_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer()
     assert!(unstamped.is_empty(), "read but not stamped: {unstamped:#?}");
 
     assert_eq!(verdict(&observe_commons_quiet(m7)), "visible");
-    assert!(!denial(m7).0);
+    assert!(!denial(m7, &observation(m7)).0);
     let (again, read) = reads_during(m7, || observe_commons_quiet(m7));
     assert_eq!(verdict(&again), "visible");
-    let (denied, denial_read) = denial(m7);
+    let (denied, denial_read) = denial(m7, &observation(m7));
     assert!(!denied);
     let read: Vec<_> = read.into_iter().chain(denial_read).collect();
     assert_eq!(read, vec![], "kept checks of unchanged files");
 
     {
-        let _writer = StateLock::take(m7).unwrap();
+        let writer = StateLock::take(m7).unwrap();
         assert_eq!(
             verdict(&observe_commons_quiet(m7)),
             verdict(&observe_commons(m7)),
             "a writer holding the vault meets the custody check"
         );
-        let (denied, read) = denial(m7);
+        let (denied, read) = denial(m7, &writer);
         assert!(!denied);
         assert!(!read.is_empty(), "a writer's denial check reads afresh");
     }
@@ -522,7 +530,10 @@ fn a_custody_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer()
     .unwrap();
     admin_publish(&lab.m22, &admin, &doc).unwrap();
     sync(m7, None).expect("m7 syncs");
-    assert!(denial(m7).0, "m7's denial at the next call");
+    assert!(
+        denial(m7, &observation(m7)).0,
+        "m7's denial at the next call"
+    );
     let ((observed, denied), read) = reads_during(m7, || {
         (
             verdict(&observe_commons(m7)),

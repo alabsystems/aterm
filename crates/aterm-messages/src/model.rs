@@ -1435,8 +1435,6 @@ pub struct Message {
     pub glyph: Glyph,
     /// ≤ [`TITLE_CAP`] chars, one line, sanitized.
     pub title: String,
-    /// The title's short form.
-    pub short_title: Option<String>,
     /// ≤ [`DETAIL_LINES_CAP`] × [`DETAIL_LINE_CAP`], no line empty.
     pub detail: Vec<String>,
     /// ≤ [`MAX_ACTIONS`].
@@ -1474,7 +1472,6 @@ impl Message {
             glyph: severity.default_glyph(),
             severity,
             title: clip(title.as_ref(), TITLE_CAP),
-            short_title: None,
             detail: Vec::new(),
             actions: Vec::new(),
             hold: Hold::Default,
@@ -1689,14 +1686,6 @@ impl Message {
         self
     }
 
-    /// The title's short form for the band.
-    #[must_use]
-    pub fn short_title(mut self, words: impl AsRef<str>) -> Self {
-        let w = clip(words.as_ref(), TITLE_CAP);
-        self.short_title = (!w.is_empty()).then_some(w);
-        self
-    }
-
     /// The title a Complete echo paints.
     #[must_use]
     pub fn finished_title(&self) -> String {
@@ -1805,11 +1794,6 @@ impl Message {
     #[must_use]
     pub fn normalized(mut self) -> Self {
         self.title = clip(&self.title, TITLE_CAP);
-        self.short_title = self
-            .short_title
-            .as_deref()
-            .map(|w| clip(w, TITLE_CAP))
-            .filter(|w| !w.is_empty());
         for line in &mut self.detail {
             *line = clip(line, DETAIL_LINE_CAP);
         }
@@ -1860,8 +1844,6 @@ pub struct Restatement {
     pub excerpt: Option<bool>,
     /// New finished words ([`Message::finished`]; `Some(None)` clears them).
     pub finished: Option<Option<String>>,
-    /// The new title's short form ([`Message::short_title`]; `Some(None)` clears it).
-    pub short_title: Option<Option<String>>,
 }
 
 impl Restatement {
@@ -2223,7 +2205,6 @@ mod tests {
             severity: Severity::Warn,
             glyph: Glyph::FALLBACK,
             title: "a\u{1b}[31mb\u{7}".into(),
-            short_title: Some("\u{1b}Short".into()),
             detail: vec!["ok".into()],
             actions: vec![
                 Intent::Details,
@@ -2245,7 +2226,6 @@ mod tests {
         }
         .normalized();
         assert_eq!(literal.finished.as_deref(), Some("Done"));
-        assert_eq!(literal.short_title.as_deref(), Some("Short"));
         assert_eq!(
             literal.title, "a[31mb",
             "the ESC and BEL go; the printable bytes stay"

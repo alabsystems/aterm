@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Verb dispatch. Each verb parses its own typed flags; [`crate::ctx::Ctx::from_env_hosts`]
-//! reads the environment and builds the hosts a leading `--host` chooses (`gh` by default).
+//! reads the environment and builds the selected hosts. Linux scoped checks and installs
+//! parse their local host choice before context construction; other host operations use a
+//! leading `--host` (`gh` by default).
 
 use std::ffi::{OsStr, OsString};
 use std::process::ExitCode;
@@ -102,12 +104,12 @@ pub const VERBS: &[Verb] = &[
     },
     Verb {
         name: "lane",
-        synopsis: "lane stage linux --reuse-package PKG… | lane run <alab|linux> [--dry-run] [--sha256 HEX] [--log FILE] [--triple T]… | lane install <alab|linux> [--allow-dirty] [--no-arm] [--keyless] [--host gh|agh-staging|agh] | lane disarm <alab|linux>",
+        synopsis: "lane stage linux --reuse-package PKG… | lane run <alab|linux> [--dry-run] [--staged-only] [--sha256 HEX] [--log FILE] [--triple T]… | lane install <alab|linux> [--allow-dirty] [--no-arm] [--keyless] [--host gh|agh-staging|agh] | lane disarm <alab|linux>",
         does: "stage retained GNU bottles unsigned, or run/install/disarm a lane (a run without --dry-run needs its installed unit's --sha256)",
     },
     Verb {
         name: "hosts",
-        synopsis: "hosts check [--host agh-staging|agh] [--unit-env] [--keyless]",
+        synopsis: "hosts check [--host agh-staging|agh] [--unit-env] [--keyless] [--lane alab|linux]",
         does: "whether this builder's agh.toml is ready for --host agh-staging or agh (reads files, sends nothing)",
     },
     Verb {
@@ -193,25 +195,60 @@ fn host_flag(args: &[String]) -> Result<(Option<HostChoice>, &[String])> {
 
 /// An explicit raw-seal component selection after the optional global host.
 fn frontend_flag(args: &[String]) -> Result<(Option<String>, &[String])> {
+    component_flag(args, "--frontend-component")
+}
+
+fn component_flag<'a>(args: &'a [String], flag: &str) -> Result<(Option<String>, &'a [String])> {
     let Some((first, rest)) = args.split_first() else {
         return Ok((None, args));
     };
-    let (value, rest) = if first == "--frontend-component" {
+    let (value, rest) = if first == flag {
         let (value, rest) = rest
             .split_first()
-            .ok_or_else(|| Error::usage("--frontend-component needs its receipt SHA256"))?;
+            .ok_or_else(|| Error::usage(format!("{flag} needs its receipt SHA256")))?;
         (value.as_str(), rest)
-    } else if let Some(value) = first.strip_prefix("--frontend-component=") {
+    } else if let Some(value) = first
+        .strip_prefix(flag)
+        .and_then(|suffix| suffix.strip_prefix('='))
+    {
         (value, rest)
     } else {
         return Ok((None, args));
     };
     if !aterm_codec::hex::is_lower(value, 64) {
-        return Err(Error::usage(
-            "--frontend-component needs a lowercase SHA256",
-        ));
+        return Err(Error::usage(format!("{flag} needs a lowercase SHA256")));
     }
     Ok((Some(value.to_owned()), rest))
+}
+
+fn component_flags(mut args: &[String]) -> Result<(Option<String>, Option<String>, &[String])> {
+    let mut frontend = None;
+    let mut targo = None;
+    loop {
+        let (selected, rest) = frontend_flag(args)?;
+        if let Some(selected) = selected {
+            if frontend.replace(selected).is_some() {
+                return Err(Error::usage("duplicate --frontend-component"));
+            }
+            args = rest;
+            continue;
+        }
+        let (selected, rest) = component_flag(args, "--targo-component")?;
+        if let Some(selected) = selected {
+            if targo.replace(selected).is_some() {
+                return Err(Error::usage("duplicate --targo-component"));
+            }
+            args = rest;
+            continue;
+        }
+        break;
+    }
+    if targo.is_some() && frontend.is_none() {
+        return Err(Error::usage(
+            "--targo-component requires --frontend-component",
+        ));
+    }
+    Ok((frontend, targo, args))
 }
 
 /// Run one command line (without `argv[0]`).
@@ -222,14 +259,27 @@ fn frontend_flag(args: &[String]) -> Result<(Option<String>, &[String])> {
 /// (before any context is built), or a global `--host` before `hosts`, `agh` or
 /// `lane install` (each takes its own, or none).
 pub fn run(args: &[String]) -> Result<()> {
+    run_with_context(args, |choice, learn| {
+        if learn {
+            Ctx::from_env_hosts(choice)
+        } else {
+            Ctx::from_env_hosts_view(choice)
+        }
+    })
+}
+
+fn run_with_context(
+    args: &[String],
+    context: impl FnOnce(HostChoice, bool) -> Result<Ctx>,
+) -> Result<()> {
     let (choice, args) = host_flag(args)?;
-    let (frontend_component, args) = frontend_flag(args)?;
+    let (frontend_component, targo_component, args) = component_flags(args)?;
     let Some((verb, rest)) = args.split_first() else {
         eprint!("{}", usage());
         return Err(Error::usage("no verb (atpkg-publish help)"));
     };
     if matches!(verb.as_str(), "help" | "--help" | "-h") {
-        if frontend_component.is_some() {
+        if frontend_component.is_some() || targo_component.is_some() {
             return Err(Error::usage(
                 "--frontend-component selects pack, pack-bundle, or publish-group rustc",
             ));
@@ -266,7 +316,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if !VERBS.iter().any(|v| v.name == verb.as_str()) {
         return Err(unknown_verb(verb));
     }
-    if frontend_component.is_some()
+    if (frontend_component.is_some() || targo_component.is_some())
         && !(matches!(verb.as_str(), "pack" | "pack-bundle")
             || verb == "publish-group" && rest.first().is_some_and(|v| v == "rustc"))
     {
@@ -274,12 +324,25 @@ pub fn run(args: &[String]) -> Result<()> {
             "--frontend-component selects pack, pack-bundle, or publish-group rustc",
         ));
     }
-    let mut ctx = if live_identity_lookup(verb, rest) {
-        Ctx::from_env_hosts(choice.unwrap_or_default())?
-    } else {
-        Ctx::from_env_hosts_view(choice.unwrap_or_default())?
+    let selected = match verb.as_str() {
+        "hosts" => crate::hosts_check::context_host(rest)?,
+        "lane" if rest.first().is_some_and(|w| w == "install") => {
+            let kind = rest
+                .get(1)
+                .ok_or_else(|| Error::usage("lane install needs alab or linux"))?;
+            let kind = crate::lane::LaneKind::parse(kind)?;
+            let flags = crate::lane::install::InstallFlags::parse(&rest[2..])?;
+            if kind == crate::lane::LaneKind::Linux {
+                flags.host
+            } else {
+                HostChoice::Gh
+            }
+        }
+        _ => choice.unwrap_or_default(),
     };
+    let mut ctx = context(selected, live_identity_lookup(verb, rest))?;
     ctx.frontend_component = frontend_component;
+    ctx.targo_component = targo_component;
     dispatch(&ctx, verb, rest)
 }
 
@@ -353,7 +416,7 @@ pub fn usage() -> String {
     use std::fmt::Write as _;
     let mut s = String::from(
         "atpkg-publish — owner-side atpkg producer (never shipped)\n\n\
-         usage: atpkg-publish [--host gh|agh-staging|agh] [--frontend-component SHA256] <verb> [args]\n\n",
+         usage: atpkg-publish [--host gh|agh-staging|agh] [--frontend-component SHA256] [--targo-component SHA256] <verb> [args]\n\n",
     );
     for v in VERBS {
         let _ = writeln!(s, "  {}\n      {}", v.synopsis, v.does);
@@ -364,6 +427,66 @@ pub fn usage() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_selection_requires_matching_explicit_frontend_and_unique_flags() {
+        let words = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let frontend = "a".repeat(64);
+        let targo = "b".repeat(64);
+        for args in [
+            words(&[
+                "--frontend-component",
+                &frontend,
+                "--targo-component",
+                &targo,
+                "pack",
+            ]),
+            words(&[
+                "--targo-component",
+                &targo,
+                "--frontend-component",
+                &frontend,
+                "pack",
+            ]),
+        ] {
+            let (f, t, rest) = super::component_flags(&args).unwrap();
+            assert_eq!(f.as_deref(), Some(frontend.as_str()));
+            assert_eq!(t.as_deref(), Some(targo.as_str()));
+            assert_eq!(rest, &["pack"]);
+        }
+        for args in [
+            words(&["--targo-component", &targo, "pack"]),
+            words(&["--targo-component", "bad", "pack"]),
+            words(&[
+                "--frontend-component",
+                &frontend,
+                "--frontend-component",
+                &frontend,
+                "pack",
+            ]),
+            words(&[
+                "--frontend-component",
+                &frontend,
+                "--targo-component",
+                &targo,
+                "--targo-component",
+                &targo,
+                "pack",
+            ]),
+            words(&[
+                "--frontend-component",
+                &frontend,
+                "--targo-component",
+                &targo,
+                "index",
+            ]),
+        ] {
+            assert!(matches!(
+                super::run(&args),
+                Err(crate::error::Error::Usage(_))
+            ));
+        }
+    }
+
     #[test]
     fn frontend_selection_is_explicit_and_rejects_unused_or_invalid_authority() {
         let words = |args: &[&str]| args.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -451,6 +574,61 @@ mod tests {
         match host_flag(&words(&["--host", "github"])) {
             Err(Error::Usage(why)) => assert!(why.contains("github"), "{why}"),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_host_selection_reaches_the_actual_context_factory_before_metadata() {
+        for (args, expected) in [
+            (
+                vec![
+                    "hosts",
+                    "check",
+                    "--host",
+                    "agh",
+                    "--unit-env",
+                    "--lane",
+                    "linux",
+                ],
+                HostChoice::Agh,
+            ),
+            (
+                vec!["hosts", "check", "--host=agh-staging", "--lane", "linux"],
+                HostChoice::AghStaging,
+            ),
+            (vec!["hosts", "check", "--host", "agh"], HostChoice::Gh),
+            (
+                vec!["lane", "install", "linux", "--host", "agh", "--no-arm"],
+                HostChoice::Agh,
+            ),
+            (vec!["lane", "install", "linux"], HostChoice::Gh),
+        ] {
+            let observed = std::cell::Cell::new(None);
+            let error = super::run_with_context(&words(&args), |choice, learn| {
+                observed.set(Some((choice, learn)));
+                Err(Error::cannot_run("owned context factory observation"))
+            })
+            .expect_err("the inert factory stops before any host request");
+            assert_eq!(observed.get(), Some((expected, false)), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn invalid_local_host_flags_and_global_conflicts_construct_no_context() {
+        for args in [
+            vec!["hosts", "check", "--host", "bad", "--lane", "linux"],
+            vec!["hosts", "check", "--lane"],
+            vec!["lane", "install", "linux", "--host", "bad"],
+            vec!["--host", "agh", "lane", "install", "linux"],
+        ] {
+            let called = std::cell::Cell::new(false);
+            let error = super::run_with_context(&words(&args), |_, _| {
+                called.set(true);
+                Err(Error::cannot_run("unexpected context construction"))
+            })
+            .expect_err("invalid flags refuse before identity lookup");
+            assert!(matches!(error, Error::Usage(_)), "{args:?}: {error}");
+            assert!(!called.get(), "{args:?}");
         }
     }
 

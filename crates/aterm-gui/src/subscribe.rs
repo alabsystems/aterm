@@ -731,6 +731,10 @@ fn drain_roster(
                     crate::session_store::RosterChange::Bye(bye) => {
                         out.push_str(&format!("EVENT * bye {}\n", bye.word()));
                     }
+                    #[cfg(unix)]
+                    crate::session_store::RosterChange::QuitCloses => {
+                        out.push_str("EVENT * quit-closes\n");
+                    }
                 }
             }
         }

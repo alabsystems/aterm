@@ -1616,6 +1616,278 @@ fn a_mail_count_the_rate_holds_back_says_when_it_is_due() {
     });
 }
 
+/// The bridge and the bus a quit's order meets (fix unit Q1), played by the test on its own
+/// clock: a park is the bridge's mirror woken (`EVENT * quit-closes`), which takes what the store
+/// hands out (at most `take` slots a pass) and lands it when its broker answers, and moves the
+/// clock by the slice a live park waits at most; the bus is the session closes that landed and
+/// the bye, in the order they reached it.
+#[cfg(unix)]
+struct QuitRig<'a> {
+    store: &'a crate::session_store::Store,
+    generation: crate::fabric::BridgeGeneration,
+    /// The broker answers: a park's take lands.
+    answers: bool,
+    /// The most slots one pass of the mirror takes (its `log-take n=`).
+    take: usize,
+    clock: std::cell::Cell<std::time::Instant>,
+    bus: std::cell::RefCell<Vec<String>>,
+    parks: std::cell::Cell<u32>,
+}
+
+#[cfg(unix)]
+impl QuitRig<'_> {
+    /// One pass of the bridge's mirror: its take, and its landing of every slot.
+    fn mirror_pass(&self) {
+        let (got, _) = slots(&cmd_log_take(
+            self.store,
+            &format!("n={} key={KEY}", self.take),
+            Some(self.generation),
+        ));
+        if got.is_empty() {
+            return;
+        }
+        for (sid, _, body) in &got {
+            if body.contains(" op=close node=- ") {
+                let out = if body.contains(" out=app-quit") {
+                    "app-quit"
+                } else {
+                    "other"
+                };
+                self.bus.borrow_mut().push(format!("close {sid} {out}"));
+            }
+        }
+        let landed = cmd_log_landed(self.store, &landings(&got), Some(self.generation));
+        assert!(landed.starts_with("OK "), "{landed}");
+    }
+}
+
+#[cfg(unix)]
+impl crate::fabric_launch::QuitBus for QuitRig<'_> {
+    fn now(&self) -> std::time::Instant {
+        self.clock.get()
+    }
+
+    fn lands(&self) -> bool {
+        crate::fabric::mirror_lands_now()
+    }
+
+    fn landings(&self) -> u64 {
+        self.store.read().unwrap().mirror().shared().landings()
+    }
+
+    fn park(&self, _seen: u64, until: std::time::Instant) {
+        self.parks.set(self.parks.get() + 1);
+        assert!(self.parks.get() < 10_000, "the quit never stopped waiting");
+        if self.answers {
+            self.mirror_pass();
+        }
+        let next = self.clock.get() + crate::fabric_launch::QUIT_PARK_SLICE;
+        self.clock.set(next.min(until));
+    }
+
+    fn bye(
+        &self,
+        store: &crate::session_store::Store,
+        word: aterm_types::fabric_grammar::Bye,
+    ) -> bool {
+        store.write().unwrap().say_bye(word);
+        self.bus.borrow_mut().push(format!("bye {}", word.word()));
+        if self.answers {
+            self.mirror_pass();
+        }
+        true
+    }
+}
+
+/// A CLEAN QUIT'S CLOSES REACH THE BUS BEFORE ITS BYE (fix unit Q1). Two live sessions, a
+/// mirroring bridge whose broker answers: the quit closes both logs `out=app-quit`, says the
+/// `quit-closes` line that wakes the bridge's mirror (before the `bye` on the sessions stream),
+/// waits until the bus holds both closes, and only then says `bye quit`. The bus reads both
+/// sessions' own quit closes, then the bye; the live logs are closed and wholly landed.
+/// NEGATIVE CONTROL, run: the order before Q1 (the bye first, the closes after it) puts `bye
+/// quit` first on the bus.
+#[cfg(unix)]
+#[test]
+fn a_clean_quits_closes_reach_the_bus_before_its_bye() {
+    use crate::fabric_launch::{Landing, QuitOrder, quit_in_order};
+    use aterm_types::fabric_grammar::Bye;
+    crate::fabric::with_link_reset(|| {
+        let generation = mirroring();
+        let store = crate::session_store::new_store();
+        let a = session(&store, 1);
+        let b = session(&store, 2);
+        let rig = QuitRig {
+            store: &store,
+            generation,
+            answers: true,
+            take: 64,
+            clock: std::cell::Cell::new(std::time::Instant::now()),
+            bus: std::cell::RefCell::new(Vec::new()),
+            parks: std::cell::Cell::new(0),
+        };
+        let order = quit_in_order(
+            &store,
+            Bye::Quit,
+            crate::session_log_journal::QUIT_BUDGET,
+            &rig,
+        );
+        assert_eq!(
+            order,
+            QuitOrder {
+                closed: 2,
+                landing: Landing::Landed,
+                taken: true,
+            }
+        );
+        let bus = rig.bus.borrow().clone();
+        let mut closes: Vec<String> = bus[..bus.len().saturating_sub(1)].to_vec();
+        closes.sort();
+        let mut want = vec![
+            format!("close {} app-quit", a.sid.as_str()),
+            format!("close {} app-quit", b.sid.as_str()),
+        ];
+        want.sort();
+        assert_eq!(
+            closes, want,
+            "each session's own quit close, first: {bus:?}"
+        );
+        assert_eq!(bus.last().map(String::as_str), Some("bye quit"), "{bus:?}");
+        let roster: Vec<crate::session_store::RosterChange> = store
+            .read()
+            .unwrap()
+            .roster_since(0)
+            .map(|r| r.change)
+            .filter(|c| {
+                matches!(
+                    c,
+                    crate::session_store::RosterChange::QuitCloses
+                        | crate::session_store::RosterChange::Bye(_)
+                )
+            })
+            .collect();
+        assert_eq!(
+            roster,
+            [
+                crate::session_store::RosterChange::QuitCloses,
+                crate::session_store::RosterChange::Bye(Bye::Quit)
+            ],
+            "the mirror's wake precedes the bye on the sessions stream"
+        );
+        for h in [&a, &b] {
+            let mut tl = h.ctx.timeline.lock().unwrap();
+            let log = tl.slog_mut().mirror_log();
+            assert!(!log.is_open(aterm_slog::Node::SESSION), "closed");
+            assert!(log.mirror_complete(), "and wholly on the bus");
+        }
+    });
+}
+
+/// A QUIT WAITS FOR EVERY LIVE LOG'S CLOSE, NOT THE FIRST ONE TO LAND (fix unit Q1). Two live
+/// sessions whose logs the bus already holds through their heads, and a mirroring bridge that
+/// takes one slot a pass: the quit's two closes land on separate passes, and the quit says
+/// `bye quit` only after the second, so the bus reads both sessions' own quit closes and then
+/// the bye. NEGATIVE CONTROL, run: a quit that goes on once any live log landed
+/// (`quit_closes_landed` reading `any`) says the bye between the two closes.
+#[cfg(unix)]
+#[test]
+fn a_quit_waits_for_every_live_logs_close_not_the_first_to_land() {
+    use crate::fabric_launch::{Landing, quit_in_order};
+    use aterm_types::fabric_grammar::Bye;
+    crate::fabric::with_link_reset(|| {
+        let generation = mirroring();
+        let store = crate::session_store::new_store();
+        let a = session(&store, 1);
+        let b = session(&store, 2);
+        let rig = QuitRig {
+            store: &store,
+            generation,
+            answers: true,
+            take: 64,
+            clock: std::cell::Cell::new(std::time::Instant::now()),
+            bus: std::cell::RefCell::new(Vec::new()),
+            parks: std::cell::Cell::new(0),
+        };
+        rig.mirror_pass();
+        for h in [&a, &b] {
+            let mut tl = h.ctx.timeline.lock().unwrap();
+            assert!(
+                tl.slog_mut().mirror_log().mirror_complete(),
+                "PRECONDITION: the bus holds each log through its head"
+            );
+        }
+        let rig = QuitRig { take: 1, ..rig };
+        let order = quit_in_order(
+            &store,
+            Bye::Quit,
+            crate::session_log_journal::QUIT_BUDGET,
+            &rig,
+        );
+        let bus = rig.bus.borrow().clone();
+        let mut closes: Vec<String> = bus[..bus.len().saturating_sub(1)].to_vec();
+        closes.sort();
+        let mut want = vec![
+            format!("close {} app-quit", a.sid.as_str()),
+            format!("close {} app-quit", b.sid.as_str()),
+        ];
+        want.sort();
+        assert_eq!(closes, want, "both quit closes before the bye: {bus:?}");
+        assert_eq!(bus.last().map(String::as_str), Some("bye quit"), "{bus:?}");
+        assert_eq!((order.closed, order.landing), (2, Landing::Landed));
+        assert!(
+            rig.parks.get() >= 2,
+            "and the closes landed on separate passes: {} parks",
+            rig.parks.get()
+        );
+    });
+}
+
+/// A `LOG-LANDED` WAKES A QUIT PARKED ON ITS LANDINGS, AND A COUNT AT ITS `SEEN` KEEPS IT PARKED
+/// (fix unit Q1). The live quit parks on the store's landing count
+/// (`Shared::await_landing`): with no landing past the count it last read, a park lasts its
+/// whole wait; the bridge's `log-landed` answered by this store (the real verb) counts one
+/// landing and wakes a park that waits for one, which returns well inside the one-minute hang
+/// detector, the count past what it read. NEGATIVE CONTROLS, run: a landing that neither counts
+/// nor wakes (`Shared::note_landing` a no-op) leaves the park to its hang detector; a park that
+/// wakes at a count equal to its `seen` returns at once.
+#[test]
+fn a_log_landed_wakes_a_parked_quit_and_a_count_at_its_seen_keeps_it_parked() {
+    use aterm_spec::wait::MUST_HAPPEN;
+    crate::fabric::with_link_reset(|| {
+        let generation = mirroring();
+        let store = crate::session_store::new_store();
+        let _a = session(&store, 1);
+        let shared = store.read().unwrap().mirror().shared();
+        let seen = shared.landings();
+        let hold = std::time::Duration::from_millis(30);
+        let parked = std::time::Instant::now();
+        shared.await_landing(seen, hold);
+        assert!(
+            parked.elapsed() >= hold,
+            "no landing past its seen: the park lasts its wait ({:?})",
+            parked.elapsed()
+        );
+        let (got, _) = slots(&cmd_log_take(&store, "", Some(generation)));
+        assert!(!got.is_empty(), "PRECONDITION: a take to land");
+        let waited = std::thread::scope(|scope| {
+            let quit = scope.spawn(|| {
+                let parked = std::time::Instant::now();
+                shared.await_landing(seen, MUST_HAPPEN);
+                parked.elapsed()
+            });
+            assert_eq!(
+                cmd_log_landed(&store, &landings(&got), Some(generation)),
+                "OK ok\n"
+            );
+            quit.join().expect("the parked quit")
+        });
+        assert!(
+            waited < MUST_HAPPEN,
+            "the landing woke the park before its hang detector ({waited:?})"
+        );
+        assert_eq!(shared.landings(), seen + 1, "one landing counted");
+    });
+}
+
 /// The sessions a take's header names as held back (`held=`), in its order.
 fn held_of(reply: &str) -> Vec<String> {
     let (header, _) = reply.split_once('\n').expect("a header line");

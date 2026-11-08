@@ -21,7 +21,8 @@ const SUDO: &str = "/usr/bin/sudo";
 /// `-k`: this password authorizes these words only, and sudo neither reads nor writes the record
 /// it would otherwise key on aterm's own pid, shared by every session.
 const SUDO_ARGS: [&str; 3] = ["-k", "-A", "--"];
-const STDIO_WAIT: Duration = Duration::from_secs(10);
+/// Hang detector for an admitted caller's required descriptor handoff.
+const STDIO_HANG: Duration = Duration::from_secs(60);
 
 static BOUND: Mutex<Vec<Arc<Bound>>> = Mutex::new(Vec::new());
 
@@ -170,18 +171,26 @@ fn rename_purpose(words: &[String]) -> Option<String> {
 
 /// The caller's stdin, stdout and stderr, sent as one message once it read the admission.
 fn receive_stdio(stream: &CtlStream) -> Option<[Stdio; 3]> {
-    let deadline = Instant::now() + STDIO_WAIT;
-    let _ = stream.set_read_timeout(Some(STDIO_WAIT));
+    receive_stdio_with_clock(stream, Instant::now).map(|fds| fds.map(Stdio::from))
+}
+
+fn receive_stdio_with_clock(
+    stream: &CtlStream,
+    mut now: impl FnMut() -> Instant,
+) -> Option<[std::os::fd::OwnedFd; 3]> {
+    let deadline = now() + STDIO_HANG;
+    let remaining = deadline.checked_duration_since(now())?;
+    if remaining.is_zero() {
+        return None;
+    }
+    stream.set_read_timeout(Some(remaining)).ok()?;
     loop {
         let mut byte = [0u8; 1];
         match aterm_uds::fdpass::recv_with_fds(stream, &mut byte, 3) {
             Ok(received) => {
-                let [stdin, stdout, stderr]: [_; 3] = received.fds.try_into().ok()?;
-                return Some([stdin.into(), stdout.into(), stderr.into()]);
+                return received.fds.try_into().ok();
             }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
-            {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock && now() < deadline => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(_) => return None,
@@ -321,7 +330,7 @@ pub(crate) fn serve(
         return String::new();
     }
     let Some([stdin, stdout, stderr]) = receive_stdio(stream) else {
-        return "ERR sudo refused the caller sent no stdio\n".to_string();
+        return "ERR sudo refused the caller's stdio handoff did not complete\n".to_string();
     };
     let mut command = aterm_uds::spawnfd::command(SUDO);
     command
@@ -561,6 +570,70 @@ mod tests {
             crate::cpu_policy_authorization::read_identity(pid).is_some(),
             "still running"
         );
+    }
+
+    #[test]
+    fn admitted_stdio_waits_for_its_native_sender() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsFd as _;
+        for age in [Duration::from_secs(11), Duration::from_secs(61)] {
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let (client, server) = CtlStream::pair().unwrap();
+            server.set_nonblocking(true).unwrap();
+            let (stdin, mut input) = std::io::pipe().unwrap();
+            let (mut output, stdout) = std::io::pipe().unwrap();
+            let (mut errors, stderr) = std::io::pipe().unwrap();
+            input.write_all(b"stdin proof").unwrap();
+            drop(input);
+            aterm_uds::fdpass::send_with_fds(
+                &client,
+                b"s",
+                &[stdin.as_fd(), stdout.as_fd(), stderr.as_fd()],
+            )
+            .unwrap();
+            drop((stdin, stdout, stderr));
+            let mut observations = 0;
+            let result = receive_stdio_with_clock(&server, || {
+                observations += 1;
+                Instant::now()
+                    - if observations == 1 {
+                        age
+                    } else {
+                        Duration::ZERO
+                    }
+            });
+            let result = if expired {
+                assert!(
+                    result.is_none(),
+                    "expiry must not consume queued native descriptors"
+                );
+                receive_stdio_with_clock(&server, Instant::now)
+            } else {
+                result
+            };
+            let [stdin, stdout, stderr] = result.expect("a scheduled native sender is not absent");
+            assert_eq!(
+                observations, 2,
+                "the actual wait starts before native receipt"
+            );
+            let mut text = String::new();
+            std::fs::File::from(stdin)
+                .read_to_string(&mut text)
+                .unwrap();
+            assert_eq!(text, "stdin proof");
+            let mut stdout = std::fs::File::from(stdout);
+            stdout.write_all(b"stdout proof").unwrap();
+            drop(stdout);
+            let mut stderr = std::fs::File::from(stderr);
+            stderr.write_all(b"stderr proof").unwrap();
+            drop(stderr);
+            let mut text = String::new();
+            output.read_to_string(&mut text).unwrap();
+            assert_eq!(text, "stdout proof");
+            let mut text = String::new();
+            errors.read_to_string(&mut text).unwrap();
+            assert_eq!(text, "stderr proof");
+        }
     }
 
     #[test]

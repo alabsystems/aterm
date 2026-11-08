@@ -1860,13 +1860,18 @@ impl Bootstrap {
         // Mac keeps the access it held, as a server keeps the role it holds while its device
         // cannot be read; the swarm's checks of this Mac
         // (`client::local_recipient_denied_in_roster`) read afresh and give such a Mac nothing
-        // new.
-        if lock.is_some() && client::local_recipient_denied_now(&self.paths)? {
+        // new. Both memos take the caller's own shared observation for theirs
+        // (`client::trusted_commons_log_under`).
+        if let Some(lock) = lock
+            && client::local_recipient_denied_under(&self.paths, lock)?
+        {
             return Ok(None);
         }
-        let maybe_access = if let Some((log, heads_digest)) =
-            client::trusted_commons_log_now(&self.paths, self.trust())?
-        {
+        let trusted = match lock {
+            Some(lock) => client::trusted_commons_log_under(&self.paths, self.trust(), lock)?,
+            None => client::trusted_commons_log_now(&self.paths, self.trust())?,
+        };
+        let maybe_access = if let Some((log, heads_digest)) = trusted {
             let lock =
                 lock.ok_or_else(|| Error::new("Commons membership log has no vault observation"))?;
             let me = self.device.identity.recipient();

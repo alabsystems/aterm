@@ -803,6 +803,37 @@ pub(crate) const fn exit_out(reason: crate::session_store::ExitReason) -> Sessio
     }
 }
 
+/// THE QUIT'S CLOSES (fix unit Q1): every live session of `store` closed `out=app-quit`
+/// ([`SessionLog::close_at_quit`]) under its timeline's lock, one at a time, and its readers
+/// woken (a `subscribe … log` watcher, the journal's writer): how many it closed. The one
+/// producer of a quit's closes: the bus mirror's take (`session_log_mirror`) and the journal's
+/// pass (`session_log_journal`) each carry the records it appended, and neither builds a close.
+/// On unix the quit's bye runs it first (`fabric_launch::quit_in_order`), elsewhere the quit
+/// itself, before the journal's last lines either way.
+pub(crate) fn close_logs_at_quit(store: &crate::session_store::Store) -> usize {
+    let live: Vec<Arc<crate::SessionCtx>> = store
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .live_handles()
+        .map(|h| Arc::clone(&h.ctx))
+        .collect();
+    live.iter()
+        .filter(|ctx| close_timeline_at_quit(&ctx.timeline))
+        .count()
+}
+
+/// One session's part of [`close_logs_at_quit`]: its log closed `out=app-quit` at its own clock's
+/// now, so the close says how long each node lived, and its readers woken; whether it closed.
+pub(crate) fn close_timeline_at_quit(
+    timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+) -> bool {
+    let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+    let at = tl.slog().now();
+    let closed = tl.slog_mut().close_at_quit(at);
+    let _ = tl.slog_take_wake();
+    closed
+}
+
 fn with(mut f: Fields, key: Key, val: Option<Val>) -> Fields {
     if let Some(val) = val {
         let _ = f.set(key, val);
@@ -1213,6 +1244,18 @@ impl SessionLog {
         self.fg = None;
         self.agent = None;
         let _ = self.take_close_due();
+    }
+
+    /// THE QUIT'S CLOSE (fix unit Q1): a session still open at a clean quit closes `out=app-quit
+    /// by=aterm`, through [`Self::close_session`], the close every other end takes, so the bus
+    /// mirror's take and the journal's pass carry these same records and neither builds a close
+    /// of its own. Whether this closed it (a log already closed, or never opened, closes nothing).
+    pub(crate) fn close_at_quit(&mut self, at: Stamp) -> bool {
+        if !self.log.is_open(Node::SESSION) {
+            return false;
+        }
+        self.close_session(SessionOut::AppQuit, Actor::Aterm, "-", None, at);
+        true
     }
 
     /// The first block id the sweep's next block read must report: the open `cmd` run's block, else the one past the newest the log handled (`None`: every block the terminal holds).

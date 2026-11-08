@@ -212,7 +212,8 @@ pub use vault_memo::{
     swarm_denied_nodes_now, swarm_roster_now_until, trusted_commons_log_now,
 };
 pub(crate) use vault_memo::{
-    local_recipient_denied_now, observe_commons_now, observe_commons_quiet,
+    local_recipient_denied_under, observe_commons_now, observe_commons_quiet,
+    trusted_commons_log_under,
 };
 #[cfg(test)]
 mod approver_queue_tests;
@@ -840,7 +841,14 @@ fn read_toml(
     toml_cache::read(path, what, max)
 }
 
-pub(crate) struct StateLock(std::fs::File);
+/// A lock this process holds on the vault's state lock file (or, for a peer cursor, another lock
+/// file), released when it drops.
+pub(crate) struct StateLock {
+    file: std::fs::File,
+    /// Whether this is a shared observation ([`StateLock::classify`]): no writer holds the lock
+    /// while it does. Every other take is a writer's own, exclusive.
+    shared: bool,
+}
 
 /// A missing observation place and a writer holding it are different read outcomes.
 enum StateObservation {
@@ -898,6 +906,22 @@ impl Drop for Drafting {
 }
 
 impl StateLock {
+    /// A writer's take of `file`, which this process has locked exclusively.
+    fn exclusive(file: std::fs::File) -> Self {
+        Self {
+            file,
+            shared: false,
+        }
+    }
+
+    /// Whether this is a shared observation of the vault's state lock that still guards the lock
+    /// file at `paths`' path ([`Self::guards`]): while it does, no writer holds that lock, and none
+    /// can take it until this drops. A writer's own take, or a lock that guards another file (one
+    /// renamed away, another vault's), is not.
+    pub(crate) fn observes(&self, paths: &Paths) -> bool {
+        self.shared && self.guards(&paths.lock_file())
+    }
+
     /// Panics where an exclusive take of the lock at `path` would wait on this thread's own
     /// [`Drafting`] observation of it for good.
     #[cfg(debug_assertions)]
@@ -951,7 +975,7 @@ impl StateLock {
             )]
             file.lock()
                 .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
-            let lock = StateLock(file);
+            let lock = StateLock::exclusive(file);
             if lock.guards(path) {
                 return Ok(lock);
             }
@@ -964,7 +988,7 @@ impl StateLock {
     /// take that finds that drops it and takes the file at `path` again.
     fn guards(&self, path: &Path) -> bool {
         use std::os::unix::fs::MetadataExt as _;
-        self.0
+        self.file
             .metadata()
             .is_ok_and(|held| fsx::file_id(path) == Some((held.dev(), held.ino())))
     }
@@ -980,7 +1004,7 @@ impl StateLock {
                 deadline,
                 "vault publication lock is busy",
             )?;
-            let lock = StateLock(file);
+            let lock = StateLock::exclusive(file);
             if lock.guards(path) {
                 break lock;
             }
@@ -1005,7 +1029,7 @@ impl StateLock {
             )]
             match file.try_lock() {
                 Ok(()) => {
-                    let lock = StateLock(file);
+                    let lock = StateLock::exclusive(file);
                     if lock.guards(&path) {
                         return lock.recovered(paths).map(Some);
                     }
@@ -1038,7 +1062,7 @@ impl StateLock {
         )]
         match file.try_lock() {
             Ok(()) => {
-                let lock = Self(file);
+                let lock = Self::exclusive(file);
                 // A lock file renamed away since it was opened guards nothing here: busy.
                 if lock.guards(&paths.lock_file()) {
                     lock.recovered(paths).map(Some)
@@ -1088,6 +1112,8 @@ impl StateLock {
             }
         }
         let path = paths.lock_file();
+        #[cfg(test)]
+        count_lock_open(&path);
         let file = match aterm_uds::kept_out(|| {
             std::fs::OpenOptions::new()
                 .read(true)
@@ -1218,7 +1244,7 @@ impl StateLock {
         )]
         match file.try_lock_shared() {
             Ok(()) => {
-                let lock = StateLock(file);
+                let lock = StateLock { file, shared: true };
                 // A lock file renamed away since it was opened guards nothing here: busy, and a
                 // wait opens the one at the path again.
                 Ok(if lock.guards(&path) {
@@ -1259,6 +1285,32 @@ impl StateLock {
     }
 }
 
+/// How many times this test process opened each state lock file to observe it
+/// ([`StateLock::open_existing`]; each tempdir path is one test's).
+#[cfg(test)]
+static LOCK_OPENS: std::sync::Mutex<BTreeMap<PathBuf, usize>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+fn count_lock_open(path: &Path) {
+    *LOCK_OPENS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .or_default() += 1;
+}
+
+/// How many times this test process opened the state lock file of `paths` to observe it.
+#[cfg(test)]
+pub(crate) fn lock_opens_of(paths: &Paths) -> usize {
+    LOCK_OPENS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&paths.lock_file())
+        .copied()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 std::thread_local! {
     /// A test's action on each blocked try of [`StateLock::observe_until`] that will try again,
@@ -1269,7 +1321,7 @@ std::thread_local! {
 
 impl Drop for StateLock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        let _ = self.file.unlock();
     }
 }
 
@@ -1639,7 +1691,7 @@ fn start_over_then(
         "the vault folder's state lock is busy",
     )
     .map_err(|e| Error::new(format!("{}: {e}", lock_path.display())))?;
-    let lock = StateLock(lock);
+    let lock = StateLock::exclusive(lock);
     // Under the lock, the folder at the vault's path is still the lab one: another process's
     // set-aside, which holds this lock while it renames, moved none, or this reads its new one.
     let Some((_, Some(mark))) = read_identity_marked(paths)? else {

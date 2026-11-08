@@ -3495,6 +3495,24 @@ pub fn bridge_attached_now() -> bool {
     )
 }
 
+/// WHETHER A QUIT'S CLOSES CAN LAND ON THE BUS NOW (fix unit Q1): a bridge owns the link, its
+/// recorded `hello` asked for the mirror, the link is not futile (a broker the bridge reported
+/// unreachable, a stale or absent link), and the mirror runs or is starting (not stopped, capped,
+/// held by the broker's window, or unretained). A quit waits for its closes' landings only then,
+/// and never past its budget.
+#[must_use]
+pub fn mirror_lands_now() -> bool {
+    if !bridge_mirrors_logs() || wait_is_futile() {
+        return false;
+    }
+    LINK.link
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mirror
+        .as_ref()
+        .is_none_or(|m| matches!(m.state, MirrorState::Starting | MirrorState::On))
+}
+
 fn note_bye_taken(generation: Option<BridgeGeneration>) -> bool {
     let owner = LINK.generation.lock().unwrap_or_else(|p| p.into_inner());
     if !generation.is_some_and(|g| g.0 == *owner) || *owner == 0 {

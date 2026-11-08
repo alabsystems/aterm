@@ -14,8 +14,10 @@ use aterm_uds::lan::wire::{self, Event, Frame, Request};
 use crate::server::Failure;
 
 /// `kDNSServiceErr_Unsupported`.
-#[cfg(not(target_os = "macos"))]
 pub(crate) const UNSUPPORTED: i32 = -65544;
+
+#[cfg(target_os = "macos")]
+mod api;
 /// `kDNSServiceErr_BadParam`.
 #[cfg(target_os = "macos")]
 pub(crate) const BAD_PARAM: i32 = -65540;
@@ -135,8 +137,7 @@ mod native {
     use super::{BAD_PARAM, Bonjour, Live, txt_record, txt_strings};
     use crate::server::Failure;
 
-    type Reference = *mut c_void;
-    type RecordRef = *mut c_void;
+    use super::api::{self, Api, DNSRecordRef as RecordRef, DNSServiceRef as Reference};
 
     const FLAGS_ADD: u32 = 0x2;
     const FLAGS_UNIQUE: u32 = 0x20;
@@ -145,118 +146,6 @@ mod native {
     const TYPE_A: u16 = 1;
     const TYPE_AAAA: u16 = 28;
     const HOST_TTL: u32 = 240;
-
-    type BrowseReply = unsafe extern "C" fn(
-        Reference,
-        u32,
-        u32,
-        i32,
-        *const c_char,
-        *const c_char,
-        *const c_char,
-        *mut c_void,
-    );
-    type ResolveReply = unsafe extern "C" fn(
-        Reference,
-        u32,
-        u32,
-        i32,
-        *const c_char,
-        *const c_char,
-        u16,
-        u16,
-        *const u8,
-        *mut c_void,
-    );
-    type QueryReply = unsafe extern "C" fn(
-        Reference,
-        u32,
-        u32,
-        i32,
-        *const c_char,
-        u16,
-        u16,
-        u16,
-        *const c_void,
-        u32,
-        *mut c_void,
-    );
-    type RegisterReply = unsafe extern "C" fn(
-        Reference,
-        u32,
-        i32,
-        *const c_char,
-        *const c_char,
-        *const c_char,
-        *mut c_void,
-    );
-    type RecordReply = unsafe extern "C" fn(Reference, RecordRef, u32, i32, *mut c_void);
-
-    // The macOS SDK re-exports libsystem_dnssd through libSystem.
-    #[link(name = "System")]
-    unsafe extern "C" {
-        fn DNSServiceBrowse(
-            reference: *mut Reference,
-            flags: u32,
-            interface: u32,
-            service: *const c_char,
-            domain: *const c_char,
-            reply: BrowseReply,
-            context: *mut c_void,
-        ) -> i32;
-        fn DNSServiceResolve(
-            reference: *mut Reference,
-            flags: u32,
-            interface: u32,
-            name: *const c_char,
-            service: *const c_char,
-            domain: *const c_char,
-            reply: ResolveReply,
-            context: *mut c_void,
-        ) -> i32;
-        fn DNSServiceQueryRecord(
-            reference: *mut Reference,
-            flags: u32,
-            interface: u32,
-            name: *const c_char,
-            rrtype: u16,
-            rrclass: u16,
-            reply: QueryReply,
-            context: *mut c_void,
-        ) -> i32;
-        fn DNSServiceRegister(
-            reference: *mut Reference,
-            flags: u32,
-            interface: u32,
-            name: *const c_char,
-            service: *const c_char,
-            domain: *const c_char,
-            host: *const c_char,
-            port: u16,
-            txt_len: u16,
-            txt: *const c_void,
-            reply: RegisterReply,
-            context: *mut c_void,
-        ) -> i32;
-        fn DNSServiceCreateConnection(reference: *mut Reference) -> i32;
-        fn DNSServiceRegisterRecord(
-            reference: Reference,
-            record: *mut RecordRef,
-            flags: u32,
-            interface: u32,
-            name: *const c_char,
-            rrtype: u16,
-            rrclass: u16,
-            rdlen: u16,
-            rdata: *const c_void,
-            ttl: u32,
-            reply: RecordReply,
-            context: *mut c_void,
-        ) -> i32;
-        fn DNSServiceRefSockFD(reference: Reference) -> i32;
-        fn DNSServiceProcessResult(reference: Reference) -> i32;
-        fn DNSServiceRefDeallocate(reference: Reference);
-    }
 
     pub(super) struct System;
 
@@ -270,6 +159,7 @@ mod native {
     /// One DNS-SD operation: its connection (`main`), a registration shared on it (`shared`),
     /// and the boxed context its callbacks write, at a fixed address until both are deallocated.
     struct Operation {
+        api: &'static Api,
         main: Reference,
         shared: Option<Reference>,
         fd: i32,
@@ -283,9 +173,9 @@ mod native {
             // one before the connection it shares.
             unsafe {
                 if let Some(shared) = self.shared.take() {
-                    DNSServiceRefDeallocate(shared);
+                    (self.api.ref_deallocate)(shared);
                 }
-                DNSServiceRefDeallocate(self.main);
+                (self.api.ref_deallocate)(self.main);
             }
         }
     }
@@ -471,18 +361,20 @@ mod native {
     impl Operation {
         /// An operation whose `main` reference was just started on `heard`.
         fn started(
+            api: &'static Api,
             main: Reference,
             shared: Option<Reference>,
             heard: Box<Heard>,
         ) -> Result<Self, Failure> {
             let mut operation = Self {
+                api,
                 main,
                 shared,
                 fd: -1,
                 heard,
             };
             // SAFETY: `main` is live and owned by `operation`.
-            let fd = unsafe { DNSServiceRefSockFD(operation.main) };
+            let fd = unsafe { (api.ref_sock_fd)(operation.main) };
             if fd < 0 {
                 return Err((
                     BAD_PARAM,
@@ -498,7 +390,10 @@ mod native {
         }
     }
 
-    fn register(advert: &Advert) -> Result<Operation, Failure> {
+    fn register(
+        advert: &Advert,
+        load: impl FnOnce() -> Result<&'static Api, Failure>,
+    ) -> Result<Operation, Failure> {
         let name = c(&advert.name)?;
         let service = c(&advert.service)?;
         let domain = c(&advert.domain)?;
@@ -511,6 +406,7 @@ mod native {
             txt.as_ptr().cast::<c_void>()
         };
         let interface = advert.interface.unwrap_or(0);
+        let api = load()?;
         let mut heard = Box::<Heard>::default();
         let context = std::ptr::from_mut(heard.as_mut()).cast::<c_void>();
         let proxy = host.as_ref().filter(|_| !advert.addresses.is_empty());
@@ -519,7 +415,7 @@ mod native {
             // SAFETY: every string and the TXT bytes live through the call; `context` stays at
             // its boxed address until the operation is deallocated.
             let rc = unsafe {
-                DNSServiceRegister(
+                (api.register)(
                     &raw mut reference,
                     0,
                     interface,
@@ -537,15 +433,15 @@ mod native {
             if rc != 0 {
                 return Err(failed(rc, "DNSServiceRegister"));
             }
-            return Operation::started(reference, None, heard);
+            return Operation::started(api, reference, None, heard);
         };
         let mut connection: Reference = std::ptr::null_mut();
         // SAFETY: an out-parameter for one new connection.
-        let rc = unsafe { DNSServiceCreateConnection(&raw mut connection) };
+        let rc = unsafe { (api.create_connection)(&raw mut connection) };
         if rc != 0 {
             return Err(failed(rc, "DNSServiceCreateConnection"));
         }
-        let mut operation = Operation::started(connection, None, heard)?;
+        let mut operation = Operation::started(api, connection, None, heard)?;
         for address in &advert.addresses {
             let v4;
             let v6;
@@ -563,7 +459,7 @@ mod native {
             // SAFETY: the connection is live and owned by `operation`; the name and rdata live
             // through the call; the record is freed with the connection.
             let rc = unsafe {
-                DNSServiceRegisterRecord(
+                (api.register_record)(
                     operation.main,
                     &raw mut record,
                     FLAGS_UNIQUE,
@@ -587,7 +483,7 @@ mod native {
         // `kDNSServiceFlagsShareConnection` requires, and comes back the registration's own
         // reference on it.
         let rc = unsafe {
-            DNSServiceRegister(
+            (api.register)(
                 &raw mut shared,
                 FLAGS_SHARE_CONNECTION,
                 interface,
@@ -611,82 +507,92 @@ mod native {
 
     impl Bonjour for System {
         fn start(&self, request: &Request) -> Result<Box<dyn Live>, Failure> {
-            if let Request::Register(advert) = request {
-                return Ok(Box::new(register(advert)?));
-            }
-            let mut heard = Box::<Heard>::default();
-            let context = std::ptr::from_mut(heard.as_mut()).cast::<c_void>();
-            let mut reference: Reference = std::ptr::null_mut();
-            let (rc, what) = match request {
-                Request::Browse { service, domain } => {
-                    let (service, domain) = (c(service)?, c(domain)?);
-                    // SAFETY: the strings live through the call, the out-parameter is
-                    // writable, and `context` stays at its boxed address until the reference is
-                    // deallocated.
-                    let rc = unsafe {
-                        DNSServiceBrowse(
-                            &raw mut reference,
-                            0,
-                            0,
-                            service.as_ptr(),
-                            c_or_null(&domain),
-                            browse_reply,
-                            context,
-                        )
-                    };
-                    (rc, "DNSServiceBrowse")
-                }
-                Request::ResolveService {
-                    name,
-                    service,
-                    domain,
-                } => {
-                    let (name, service, domain) = (c(name)?, c(service)?, c(domain)?);
-                    // SAFETY: the strings live through the call, the out-parameter is
-                    // writable, and `context` stays at its boxed address until the reference is
-                    // deallocated.
-                    let rc = unsafe {
-                        DNSServiceResolve(
-                            &raw mut reference,
-                            0,
-                            0,
-                            name.as_ptr(),
-                            service.as_ptr(),
-                            domain.as_ptr(),
-                            resolve_reply,
-                            context,
-                        )
-                    };
-                    (rc, "DNSServiceResolve")
-                }
-                Request::Query { name, rrtype } => {
-                    let name = c(name)?;
-                    // SAFETY: the strings live through the call, the out-parameter is
-                    // writable, and `context` stays at its boxed address until the reference is
-                    // deallocated.
-                    let rc = unsafe {
-                        DNSServiceQueryRecord(
-                            &raw mut reference,
-                            0,
-                            0,
-                            name.as_ptr(),
-                            *rrtype,
-                            CLASS_IN,
-                            query_reply,
-                            context,
-                        )
-                    };
-                    (rc, "DNSServiceQueryRecord")
-                }
-                other => {
-                    return Err((BAD_PARAM, format!("{other:?} is no Bonjour request")));
-                }
-            };
-            if rc != 0 {
-                return Err(failed(rc, what));
-            }
-            Ok(Box::new(Operation::started(reference, None, heard)?))
+            start_using(request, api::system)
         }
+    }
+
+    fn start_using(
+        request: &Request,
+        load: impl FnOnce() -> Result<&'static Api, Failure>,
+    ) -> Result<Box<dyn Live>, Failure> {
+        if let Request::Register(advert) = request {
+            return Ok(Box::new(register(advert, load)?));
+        }
+        let mut heard = Box::<Heard>::default();
+        let context = std::ptr::from_mut(heard.as_mut()).cast::<c_void>();
+        let mut reference: Reference = std::ptr::null_mut();
+        let (api, rc, what) = match request {
+            Request::Browse { service, domain } => {
+                let (service, domain) = (c(service)?, c(domain)?);
+                let api = load()?;
+                // SAFETY: the strings live through the call, the out-parameter is
+                // writable, and `context` stays at its boxed address until the reference is
+                // deallocated.
+                let rc = unsafe {
+                    (api.browse)(
+                        &raw mut reference,
+                        0,
+                        0,
+                        service.as_ptr(),
+                        c_or_null(&domain),
+                        browse_reply,
+                        context,
+                    )
+                };
+                (api, rc, "DNSServiceBrowse")
+            }
+            Request::ResolveService {
+                name,
+                service,
+                domain,
+            } => {
+                let (name, service, domain) = (c(name)?, c(service)?, c(domain)?);
+                let api = load()?;
+                // SAFETY: the strings live through the call, the out-parameter is
+                // writable, and `context` stays at its boxed address until the reference is
+                // deallocated.
+                let rc = unsafe {
+                    (api.resolve)(
+                        &raw mut reference,
+                        0,
+                        0,
+                        name.as_ptr(),
+                        service.as_ptr(),
+                        domain.as_ptr(),
+                        resolve_reply,
+                        context,
+                    )
+                };
+                (api, rc, "DNSServiceResolve")
+            }
+            Request::Query { name, rrtype } => {
+                let name = c(name)?;
+                let api = load()?;
+                // SAFETY: the strings live through the call, the out-parameter is
+                // writable, and `context` stays at its boxed address until the reference is
+                // deallocated.
+                let rc = unsafe {
+                    (api.query_record)(
+                        &raw mut reference,
+                        0,
+                        0,
+                        name.as_ptr(),
+                        *rrtype,
+                        CLASS_IN,
+                        query_reply,
+                        context,
+                    )
+                };
+                (api, rc, "DNSServiceQueryRecord")
+            }
+            other => {
+                return Err((BAD_PARAM, format!("{other:?} is no Bonjour request")));
+            }
+        };
+        if rc != 0 {
+            return Err(failed(rc, what));
+        }
+        Ok(Box::new(Operation::started(api, reference, None, heard)?))
     }
 
     impl Live for Operation {
@@ -698,7 +604,7 @@ mod native {
         fn process(&mut self) -> Result<Vec<Event>, Failure> {
             // SAFETY: the reference and its context are live and driven on this thread alone;
             // the callbacks run here, synchronously.
-            let rc = unsafe { DNSServiceProcessResult(self.main) };
+            let rc = unsafe { (self.api.process_result)(self.main) };
             if let Some(error) = self.heard.error.take() {
                 return Err(failed(error, "the DNS-SD operation"));
             }
@@ -708,6 +614,9 @@ mod native {
             Ok(std::mem::take(&mut self.heard.events))
         }
     }
+
+    #[cfg(test)]
+    mod tests;
 }
 
 #[cfg(all(test, target_os = "macos"))]

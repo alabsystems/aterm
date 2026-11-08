@@ -2130,19 +2130,23 @@ fn a_claim_inside_held_work_is_held_to_the_other_held_claims_only() {
     let started_by_verify = Procs::of(vec![p(1, 0), p(10, 1), p(9, 10), p(20, 9), p(11, 1)]);
     assert_eq!(started_by_verify.ancestors(20), [9, 10, 1, 0]);
     assert_eq!(
-        pids(counted(all(), 20, Some(&started_by_verify))),
+        pids(counted(all(), 20, Some(&started_by_verify), None)),
         [11],
         "the trust run alone"
     );
     let unrelated = Procs::of(vec![p(1, 0), p(10, 1), p(20, 1)]);
-    assert_eq!(pids(counted(all(), 20, Some(&unrelated))), [10, 11, 12]);
-    assert_eq!(pids(counted(all(), 20, None)), [10, 11, 12]);
+    assert_eq!(
+        pids(counted(all(), 20, Some(&unrelated), None)),
+        [10, 11, 12]
+    );
+    assert_eq!(pids(counted(all(), 20, None, None)), [10, 11, 12]);
     let waiting = record(10, 0, Need::new("verify").disk(27 * GIB, "/vol"), None);
     assert_eq!(
         pids(counted(
             vec![&waiting, &trust, &boot],
             20,
-            Some(&started_by_verify)
+            Some(&started_by_verify),
+            None
         )),
         [11, 12]
     );
@@ -2169,12 +2173,12 @@ fn a_process_that_holds_the_quiet_machine_waits_behind_no_waiter() {
         decide(&stage.need, stage.order(), &m, &ahead, 30)
     };
     let held = quiet(Some(0));
-    let measuring = counted(vec![&disk, &held, &lab, &b12, &b13], 10, None);
+    let measuring = counted(vec![&disk, &held, &lab, &b12, &b13], 10, None, None);
     assert_eq!(pids(&measuring), [10, 10, 11], "the held claims alone");
     assert!(look(&measuring).is_ok(), "admitted beside the lab");
 
     let waiting = quiet(None);
-    let queued = counted(vec![&disk, &waiting, &lab, &b12, &b13], 10, None);
+    let queued = counted(vec![&disk, &waiting, &lab, &b12, &b13], 10, None, None);
     assert_eq!(pids(&queued), [10, 10, 11, 12, 13]);
     let short = look(&queued).expect_err("behind the builds");
     assert_eq!(
@@ -2186,7 +2190,7 @@ fn a_process_that_holds_the_quiet_machine_waits_behind_no_waiter() {
             reserved: 48 * GIB
         }]
     );
-    let plain_run = counted(vec![&disk, &lab, &b12, &b13], 10, None);
+    let plain_run = counted(vec![&disk, &lab, &b12, &b13], 10, None, None);
     assert_eq!(pids(&plain_run), [10, 11, 12, 13]);
     assert!(
         look(&plain_run).is_err(),
@@ -7143,4 +7147,325 @@ fn an_adoption_proves_its_lock_is_held_and_one_that_fails_lets_nothing_go() {
     assert_eq!(listed.len(), 1, "{listed:?}");
     drop(made);
     assert!(s.ledger.list().expect("listed").is_empty());
+}
+
+/// THE LEDGER REFINES THE QUALIFY'S MEMORY MODEL, SURE LEADS FIRST
+/// (`aterm_models_capacity::qualify_memory_model`): each step of an m3-sized qualify is asked of
+/// [`counted`] and [`decide`] as the claims stand, laid out as a qualify runs: the release (1)
+/// holds its line, one `ship build` (30) holds both slices' drivers, each link's wrapper (31, 41)
+/// runs under its slice's Cargo (35, 45), and the tree's units (11, 12) under verify's Cargo (15)
+/// under verify (10), which holds the tree's driver. The ledger admits exactly where the model's
+/// action is enabled. The native link waits for 42 GiB beside the compat link's 23; it is sure
+/// beside the tree's 2 GiB driver, so the tree's heavy unit (23.52 GiB), which asked before it,
+/// waits for it, and a small unit that fits beside its room runs. With a 40 GiB tree driver the
+/// link is not sure, and the tree's unit, leaving that driver spare, no longer counts it, as the
+/// model's guard says (counting it, the ledger would refuse that unit). The
+/// model ends every run, a 40 GiB tree driver's too. NEGATIVE CONTROLS: the same native link
+/// without `leads` is a waiter the tree's inside unit does not count, so the ledger admits that
+/// heavy unit, which only the buggy model's `HeavyPasses` does, breaking `LeadsFirst`; and where
+/// every lead is sure (the buggy dial at 2), the tree's units count a link its own driver leaves
+/// no room, and the model deadlocks.
+#[test]
+fn the_ledger_refines_the_qualify_memory_model_and_its_sure_leads_go_first() {
+    use crate::Rank;
+    use aterm_spec::interp::{State, find_deadlock, with_consts};
+    const CENTI: u64 = GIB / 100;
+    let model = aterm_models_capacity::qualify_memory_model();
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut reading = Reading::of_gib(128, 76, 18);
+    reading.available = Some(7580 * CENTI);
+    let p = |pid, ppid| Proc {
+        pid,
+        ppid,
+        footprint: 0,
+        whole: 0,
+        written: 0,
+        cpu_ns: 0,
+        runnable_ns: 0,
+    };
+    let procs = Procs::of(vec![
+        p(1, 0),
+        p(10, 1),
+        p(15, 10),
+        p(11, 15),
+        p(12, 15),
+        p(30, 1),
+        p(35, 30),
+        p(31, 35),
+        p(45, 30),
+        p(41, 45),
+    ]);
+    // A driver leaves an unclaimed load no ALONE admission; a unit leaves spare the drivers its
+    // own admission does not count: the tree's one, or the build's two.
+    let claim = |pid: u32, at: u64, centi: u64, margin: u64, leads: bool| {
+        let need = Need::new(format!("pid {pid}"))
+            .rank(Rank::Release)
+            .mem(centi * CENTI)
+            .margin(margin);
+        record(pid, at, if leads { need.leads() } else { need }, None)
+    };
+    let driver = |pid, at, centi| claim(pid, at, centi, 1, false);
+    let unit = |pid, at, centi| claim(pid, at, centi, 200 * CENTI, false);
+    let link = |pid, at, centi| claim(pid, at, centi, 400 * CENTI, true);
+    let held = |mut r: Record| {
+        r.held = Some(crate::Held {
+            admitted_ms: r.start_ms,
+            cores: 0,
+            alone: false,
+        });
+        r
+    };
+    let admits = |records: &[Record], asker: &Record| {
+        let all: Vec<&Record> = records
+            .iter()
+            .filter(|r| r.order() != asker.order())
+            .collect();
+        let others: Vec<Other<'_>> = counted(all, asker.pid, Some(&procs), reading.available)
+            .into_iter()
+            .map(plain)
+            .collect();
+        decide(&asker.need, asker.order(), &reading, &others, 0).is_ok()
+    };
+    fn enabled(
+        m: &aterm_spec::derive::Model,
+        state: &aterm_spec::interp::State,
+        action: &str,
+    ) -> bool {
+        !m.successors(action, state).is_empty()
+    }
+    fn run(m: &aterm_spec::derive::Model, state: &mut State, action: &str) {
+        let mut next = m.successors(action, state);
+        assert_eq!(next.len(), 1, "{action}");
+        *state = next.pop().expect("one successor");
+    }
+    let mut state = model.init_state();
+    let line = held(record(
+        1,
+        1,
+        Need::new("release line").rank(Rank::Release),
+        None,
+    ));
+    let mut records: Vec<Record> = vec![line.clone()];
+    let step =
+        |state: &mut State, records: &mut Vec<Record>, action: &str, asker: Option<Record>| {
+            if let Some(asker) = asker {
+                let admitted = admits(records, &asker);
+                assert_eq!(admitted, enabled(&model, state, action), "{action}");
+                assert!(admitted, "{action} is a step of this run");
+                records.retain(|r| r.order() != asker.order());
+                records.push(held(asker));
+            }
+            run(&model, state, action);
+        };
+    for at in [30, 31] {
+        let asker = driver(30, at, 200);
+        assert!(admits(&records, &asker), "slice driver {at}");
+        records.push(held(asker));
+    }
+    step(&mut state, &mut records, "SlicesStart", None);
+    records.push(link(41, 41, 2300));
+    step(&mut state, &mut records, "CompatAsks", None);
+    step(
+        &mut state,
+        &mut records,
+        "CompatRuns",
+        Some(link(41, 41, 2300)),
+    );
+    step(
+        &mut state,
+        &mut records,
+        "StartDriver",
+        Some(driver(10, 50, 200)),
+    );
+    records.push(link(31, 60, 4200));
+    step(&mut state, &mut records, "NativeAsks", None);
+
+    let heavy = unit(11, 55, 2352);
+    assert!(
+        !admits(&records, &heavy),
+        "the heavy unit waits for the link's room"
+    );
+    assert!(!enabled(&model, &state, "HeavyUnit"));
+    let mut unled = records.clone();
+    unled.retain(|r| r.pid != 31);
+    unled.push(claim(31, 60, 4200, 400 * CENTI, false));
+    assert!(
+        admits(&unled, &heavy),
+        "NEGATIVE CONTROL: a link that does not lead is passed"
+    );
+    assert!(enabled(&buggy, &state, "HeavyPasses"));
+    assert!(!enabled(&model, &state, "HeavyPasses"));
+
+    step(
+        &mut state,
+        &mut records,
+        "SmallUnit",
+        Some(unit(12, 65, 200)),
+    );
+    step(
+        &mut state,
+        &mut records,
+        "NativeRuns",
+        Some(link(31, 60, 4200)),
+    );
+    assert!(!admits(&records, &heavy), "both links leave no room for it");
+    assert!(!enabled(&model, &state, "HeavyUnit"));
+    records.retain(|r| r.pid != 41 && !(r.pid == 30 && r.start_ms == 31));
+    step(&mut state, &mut records, "CompatEnds", None);
+    step(&mut state, &mut records, "HeavyUnit", Some(heavy));
+
+    // A tree driver of 40 GiB leaves the waiting native link no room: it is not sure, and the
+    // tree's unit, inside that driver, no longer counts it.
+    let parent = with_consts(&model, &[("Tree", 4000)]);
+    let mut state = parent.init_state();
+    for action in ["SlicesStart", "StartDriver", "NativeAsks"] {
+        run(&parent, &mut state, action);
+    }
+    let mut records = vec![line, held(driver(10, 50, 4000)), link(31, 60, 4200)];
+    for at in [30, 31] {
+        records.push(held(driver(30, at, 200)));
+    }
+    let small = claim(12, 65, 200, 4000 * CENTI, false);
+    let held_to: Vec<u32> = counted(
+        records.iter().collect(),
+        small.pid,
+        Some(&procs),
+        reading.available,
+    )
+    .into_iter()
+    .map(|r| r.pid)
+    .collect();
+    assert_eq!(held_to, [30, 30], "the slices' drivers, not the link");
+    assert!(admits(&records, &small));
+    assert!(enabled(&parent, &state, "SmallUnit"));
+    let every = with_consts(&model, &[("Tree", 4000), ("Buggy", 2)]);
+    assert!(!enabled(&every, &state, "SmallUnit"));
+
+    let ended = |s: &State| s["ndone"] == 1 && s["cdone"] == 1 && s["tree"] == 2;
+    assert!(aterm_spec::interp::bmc(&model).is_ok());
+    assert!(aterm_spec::interp::bmc(&parent).is_ok());
+    assert!(aterm_spec::interp::bmc(&buggy).is_err());
+    assert_eq!(find_deadlock(&model, ended), None, "every qualify ends");
+    assert_eq!(find_deadlock(&parent, ended), None, "a large parent's too");
+    let stuck = find_deadlock(&every, ended).expect("counting every lead deadlocks");
+    assert_eq!(
+        (stuck["tree"], stuck["nwait"], stuck["small"]),
+        (1, 1, 0),
+        "the tree's driver waits for its units, which wait for the link, which waits for it"
+    );
+    assert!(stuck["left"] > 0 || stuck["heavy"] == 0, "{stuck:?}");
+}
+
+/// AN INSIDE WAITER COUNTS A LEAD ONLY WHERE IT IS SURE ([`counted`]): a waiter under held work
+/// (11 under 10) counts a waiting lead (21, 22 under 20) that fits once every held claim but the
+/// parents has ended, in what is available now, less what each parent has yet to use, plus what
+/// each other holder's tree uses now, which its end gives back. A lead behind one that does not
+/// fit waits as it does. NEGATIVE CONTROLS: a parent that leaves a lead no room makes it, and the
+/// lead behind it, a waiter the inside waiter does not count; so does a claim that credits the
+/// waiter's ancestor (a parent through credit), which without its credit is counted and ends; so
+/// does a parent held alone; a holder whose 30 GiB in use would come back makes a lead sure in
+/// 20 GiB available, where the same holder as a parent does not; with no process sweep or no
+/// reading of memory none is sure, as before leads were.
+#[test]
+fn an_inside_waiter_counts_a_lead_only_where_it_is_sure() {
+    let p = |pid, ppid, footprint| Proc {
+        pid,
+        ppid,
+        footprint,
+        whole: footprint,
+        written: 0,
+        cpu_ns: 0,
+        runnable_ns: 0,
+    };
+    let procs = Procs::of(vec![
+        p(1, 0, 0),
+        p(10, 1, 0),
+        p(11, 10, 0),
+        p(20, 1, 0),
+        p(21, 20, 0),
+        p(22, 20, 0),
+        p(60, 1, 0),
+        p(70, 1, 30 * GIB),
+    ]);
+    let held = |pid, at, gib| record(pid, at, Need::new("held").mem_gib(gib), Some(0));
+    let lead = |pid, at, gib| record(pid, at, Need::new("lead").mem_gib(gib).leads(), None);
+    let crediting = |mut r: Record| {
+        r.credit = vec![10];
+        r
+    };
+    let counts = |extra: &[Record], available: u64, procs: Option<&Procs>| {
+        let mut records = vec![held(20, 2, 2), lead(21, 3, 30), lead(22, 4, 10)];
+        records.extend_from_slice(extra);
+        let mut pids: Vec<u32> = counted(records.iter().collect(), 11, procs, Some(available))
+            .into_iter()
+            .map(|r| r.pid)
+            .collect();
+        pids.sort_unstable();
+        pids
+    };
+    let sweep = Some(&procs);
+    assert_eq!(counts(&[held(10, 1, 4)], 64 * GIB, sweep), [20, 21, 22]);
+    assert_eq!(
+        counts(&[held(10, 1, 40)], 64 * GIB, sweep),
+        [20],
+        "the first is short beside 40 GiB; the second, which would fit, waits behind it"
+    );
+    let credit = crediting(held(60, 5, 36));
+    assert_eq!(counts(&[held(10, 1, 4), credit], 64 * GIB, sweep), [20]);
+    assert_eq!(
+        counts(&[held(10, 1, 4), held(60, 5, 36)], 64 * GIB, sweep),
+        [20, 21, 22, 60]
+    );
+    let mut alone = held(10, 1, 4);
+    alone.held = Some(crate::Held {
+        admitted_ms: 1,
+        cores: 0,
+        alone: true,
+    });
+    assert_eq!(counts(&[alone], 64 * GIB, sweep), [20]);
+    assert_eq!(
+        counts(&[held(10, 1, 4), held(70, 6, 32)], 20 * GIB, sweep),
+        [20, 21, 22, 70]
+    );
+    assert_eq!(
+        counts(
+            &[held(10, 1, 4), crediting(held(70, 6, 32))],
+            20 * GIB,
+            sweep
+        ),
+        [20]
+    );
+    let records = [held(10, 1, 4), held(20, 2, 2), lead(21, 3, 30)];
+    assert_eq!(counted(records.iter().collect(), 11, sweep, None).len(), 1);
+    assert_eq!(
+        counts(&[held(10, 1, 4)], 64 * GIB, None),
+        [10, 20, 21, 22],
+        "no ancestor is known"
+    );
+}
+
+/// A CLAIM THAT LEADS SAYS SO IN ITS RECORD: admitted with `leads`, the ledger lists it so.
+/// NEGATIVE CONTROL: an ordinary claim's record says nothing of it and reads as not leading,
+/// as a record of a build that predates the key does.
+#[test]
+fn a_claim_that_leads_says_so_in_its_record() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(dir.path());
+    let machine = Fixed::new(Reading::of_gib(48, 40, 14));
+    let lead =
+        crate::admit::try_admit_with(&ledger, &machine, Need::new("lead").mem_gib(1).leads())
+            .unwrap()
+            .expect("admitted");
+    let plain = crate::admit::try_admit_with(&ledger, &machine, Need::new("plain").mem_gib(1))
+        .unwrap()
+        .expect("admitted");
+    let listed = ledger.list().unwrap();
+    let leads = |what: &str| {
+        listed
+            .iter()
+            .find(|r| r.need.what == what)
+            .map(|r| r.need.leads)
+    };
+    assert_eq!((leads("lead"), leads("plain")), (Some(true), Some(false)));
+    drop((lead, plain));
 }

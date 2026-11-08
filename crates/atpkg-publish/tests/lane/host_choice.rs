@@ -663,6 +663,7 @@ fn a_keyless_install_under_agh_needs_no_public_writer() {
     write_token(&tokens, "dev", &agh_fake::token("dev"));
     write_config(&unit_dirs(&b.fx.ctx), &dev_config(&tokens));
     std::fs::remove_file(&b.fx.ctx.identity.key).expect("rm key");
+    b.fx.publish_head(1, &[("git", 7)]);
 
     let (r, tx) = install(
         &b,
@@ -698,11 +699,141 @@ fn a_keyless_install_under_agh_needs_no_public_writer() {
             .to_string();
         assert!(shown.contains("public_writer"), "{keyless}: {shown}");
         assert!(
-            shown.ends_with("--unit-env; nothing installed"),
+            shown.ends_with("--unit-env --lane linux; nothing installed"),
             "{keyless}: {shown}"
         );
         assert!(!shown.contains(" --keyless"), "{keyless}: {shown}");
     }
+}
+
+/// Every file and identity here is owned fixture data; no live token or policy is read.
+fn linux_selection_box(label: &str, grants: &[&str]) -> Box_ {
+    let mut b = machine(label, Os::Linux);
+    fixture_accounts(&mut b.fx.ctx);
+    let tokens = tokens(&b.fx);
+    write_token(&tokens, "dev", &agh_fake::token("dev"));
+    write_token(&tokens, "release", &agh_fake::token("release"));
+    write_config(
+        &unit_dirs(&b.fx.ctx),
+        &release_config(
+            &tokens,
+            &grants.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+        ),
+    );
+    b
+}
+
+#[test]
+fn linux_install_grants_follow_signed_pins_not_unselected_table_entries() {
+    let b = linux_selection_box("linux-selected-install", &["alabsystems/aterm"]);
+    b.fx.publish_head(1, &[("git", 7)]);
+    let (result, tx) = install(
+        &b,
+        LaneKind::Linux,
+        InstallFlags {
+            host: HostChoice::Agh,
+            no_arm: true,
+            ..InstallFlags::default()
+        },
+    );
+    let done = result.unwrap_or_else(|e| panic!("{e}\n{}", tx.text()));
+    assert!(done.binary.is_file());
+    assert!(done.armed.is_empty());
+    assert!(tx.text().contains("every check holds"));
+}
+
+#[test]
+fn linux_preflight_requires_the_selected_repo_and_keeps_the_index_grant() {
+    let b = linux_selection_box("linux-selected-grants", &["alabsystems/aterm"]);
+    let text = b.fx.keys.index_toml(
+        1,
+        &[
+            ("git", "selected-git-assets"),
+            ("claude-code-alab", "closed-unselected"),
+        ],
+        &[("git", 7)],
+    );
+    b.fx.publish_index_text(1, &text);
+    let dirs = unit_dirs(&b.fx.ctx);
+    let checks =
+        hosts_check::check_linux(&b.fx.ctx, &dirs, HostChoice::Agh, false).expect("signed head");
+    assert!(!named(&checks, "grants").ok);
+    assert!(
+        named(&checks, "grants")
+            .detail
+            .contains("alabsystems/selected-git-assets")
+    );
+    assert!(
+        !named(&checks, "grants")
+            .detail
+            .contains("closed-unselected")
+    );
+    let tokens = tokens(&b.fx);
+    write_config(
+        &dirs,
+        &release_config(
+            &tokens,
+            &[
+                "alabsystems/aterm".into(),
+                "alabsystems/selected-git-assets".into(),
+            ],
+        ),
+    );
+    all_hold(
+        &hosts_check::check_linux(&b.fx.ctx, &dirs, HostChoice::Agh, false)
+            .expect("selected grant"),
+    );
+    write_config(
+        &dirs,
+        &release_config(&tokens, &["alabsystems/selected-git-assets".into()]),
+    );
+    let checks = hosts_check::check_linux(&b.fx.ctx, &dirs, HostChoice::Agh, false)
+        .expect("index grant refusal");
+    assert!(!named(&checks, "grants").ok);
+    assert!(
+        named(&checks, "grants")
+            .detail
+            .contains("alabsystems/aterm")
+    );
+}
+
+#[test]
+fn linux_preflight_refetches_and_authenticates_the_head() {
+    let b = linux_selection_box("linux-selected-fresh-head", &["alabsystems/aterm"]);
+    b.fx.publish_head(1, &[("git", 7)]);
+    let dirs = unit_dirs(&b.fx.ctx);
+    all_hold(
+        &hosts_check::check_linux(&b.fx.ctx, &dirs, HostChoice::Agh, false)
+            .expect("first signed head"),
+    );
+    b.fx.publish_head(2, &[("git", 7), ("ay", 8)]);
+    let checks = hosts_check::check_linux(&b.fx.ctx, &dirs, HostChoice::Agh, false)
+        .expect("new signed head");
+    assert!(named(&checks, "grants").detail.contains("alabsystems/ay"));
+    b.fx.host.put_asset(
+        &b.fx.ctx.index_slug(),
+        "atpkg-index-2",
+        "index.toml.sig",
+        vec![0; 64],
+    );
+    assert!(hosts_check::check_linux(&b.fx.ctx, &dirs, HostChoice::Agh, false).is_err());
+}
+
+#[test]
+fn linux_preflight_resolves_linux_overlays_without_darwin_grants() {
+    let b = linux_selection_box("linux-selected-overlay", &["alabsystems/aterm"]);
+    let mut text = b.fx.keys.index_toml(
+        1,
+        &[("git", "aterm"), ("ay", "ay"), ("nn", "nn")],
+        &[("git", 7)],
+    );
+    text.push_str("\n[channels.pin_by_target.aarch64-unknown-linux-gnu]\nay = 8\n[channels.pin_by_target.aarch64-apple-darwin]\nnn = 9\n");
+    b.fx.publish_index_text(1, &text);
+    let checks = hosts_check::check_linux(&b.fx.ctx, &unit_dirs(&b.fx.ctx), HostChoice::Agh, false)
+        .expect("target-resolved head");
+    let missing = &named(&checks, "grants").detail;
+    assert!(missing.contains("alabsystems/ay"), "{missing}");
+    assert!(!missing.contains("alabsystems/nn"), "{missing}");
 }
 
 #[test]

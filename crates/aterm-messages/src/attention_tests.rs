@@ -1402,62 +1402,6 @@ fn the_complete_echo_says_the_finished_form_without_a_reflow() {
 }
 
 #[test]
-fn a_restatement_takes_the_short_form_it_carries() {
-    let now = t0();
-    let mut c = fresh(now);
-    let id = c
-        .post(
-            busy("Claude's login expired in tab 1").short_title("Login expired"),
-            stamp(),
-            now,
-        )
-        .id;
-    let short = |c: &MessageCenter| c.live(id).and_then(|l| l.msg.short_title.clone());
-    let retitle = |title: &str, short_title: Option<Option<String>>| Restatement {
-        title: Some(title.into()),
-        short_title,
-        ..Restatement::default()
-    };
-    assert!(c.restate(
-        id,
-        retitle("Claude's login expired in tab 1", None),
-        now + ms(1)
-    ));
-    assert_eq!(
-        short(&c).as_deref(),
-        Some("Login expired"),
-        "the same title"
-    );
-    let usage = Some(Some("Usage limit".to_string()));
-    assert!(c.restate(
-        id,
-        retitle("Claude usage limit reached in tab 1", usage.clone()),
-        now + ms(2)
-    ));
-    assert_eq!(short(&c).as_deref(), Some("Usage limit"));
-    assert!(c.restate(
-        id,
-        Restatement {
-            short_title: Some(None),
-            ..Restatement::default()
-        },
-        now + ms(3)
-    ));
-    assert_eq!(short(&c), None, "cleared");
-    assert!(c.restate(
-        id,
-        retitle("Claude usage limit reached in tab 1", usage),
-        now + ms(4)
-    ));
-    assert!(c.restate(
-        id,
-        retitle("Claude sign-in cancelled in tab 1", None),
-        now + ms(5)
-    ));
-    assert_eq!(short(&c), None, "the control");
-}
-
-#[test]
 fn an_echo_keeps_the_load_slot_but_draws_no_load_words() {
     let filled = |m: Message| {
         m.meter(Meter {

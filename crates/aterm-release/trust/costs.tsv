@@ -1,7 +1,7 @@
 # The trust lane's cost-history SEED: the fallback a clone with no history of its own reads (of a library's rows under one prover in this file and its git directory's aterm-release/trust-costs.tsv, the newer is the one read). `targo --unverified ship trust run -p <crate>… --update-ratchet` rewrites it with floors.tsv and memory.tsv. A library with no row a run can read, or one with no check under its prover that finished, runs first, claiming at least 16 GiB or half the RAM, whichever is less, and at least what another prover's newest row of it claims, unless its own row's peak is refused by itself.
 # trust lane cost history: <name> <CPU s> <wall s> <peak memory bytes: the larger of the largest process's resident high-water mark and the largest footprint its processes were read with> <when> <prover> <cut> <raised>, one row per library and prover (its `targo --version`; a row with none predates rows that name one); <cut>, where a check did not finish, says how it ended (over-budget, interrupted or failed), and its figures are then each the least it would have taken, which its row raises and never lowers, and <raised> is `raised` where it raised the row of a check that finished; a run reads its prover's row, else a library's newest row where that names no prover, and a library with neither is unmeasured; the slots take the longest first, a library with no row or none of a check that finished first of all, and each check claims its peak and a margin (at least what a library with no row claims, where no check of it finished) before it starts, and where no check under its prover has finished, at least what another prover's newest row of it claims, unless its own row's peak is refused by itself (a claim not below what can ever be available, the RAM less what is wired, is refused up front)
 amacs	723	759	8131362816	2026-10-20T22:24:50Z
-amacs-files	240	220	2146713600	2026-10-20T22:21:37Z
+amacs-files	402	387	2478981120	2026-11-01T20:27:44Z
 amacs-term	279	260	3841851392	2026-10-21T00:55:28Z
 astream-aead	60	51	1569079296	2026-10-18T03:34:43Z
 astream-broker	3958	2703	10792910848	2026-10-27T04:50:07Z
@@ -23,10 +23,10 @@ aterm-buffer	12	15	700006400	2026-10-28T03:38:09Z
 aterm-cap	2	3	256966656	2026-10-28T05:51:17Z
 aterm-census	2832	3084	23487381504	2026-11-02T18:35:23Z
 aterm-cg	102	102	1411563520	2026-10-19T01:56:59Z
-aterm-cli	1603	1393	7704805376	2026-10-27T03:33:52Z
+aterm-cli	2360	2285	8841576448	2026-11-02T07:48:23Z
 aterm-codec	501	344	4058136576	2026-10-27T04:50:54Z
 aterm-conformance	822	805	3572596736	2026-10-27T03:20:08Z
-aterm-containment	308	346	1796456448	2026-10-17T00:44:17Z
+aterm-containment	335	375	3158589440	2026-11-02T01:03:15Z
 aterm-contract-probe	105	105	1396178944	2026-10-19T05:36:11Z
 aterm-control	333	314	2167504896	2026-10-29T18:57:07Z
 aterm-converge	261	265	6198083584	2026-10-21T06:23:02Z
@@ -50,7 +50,7 @@ aterm-gui	16972	17245	62450089984	2026-10-20T17:45:18Z	targo 1.101.0-dev (targo 
 aterm-gui	5862	7547	47198031152	2026-10-31T01:00:39Z	targo 1.99.0-dev (20565c325 2026-10-19) (targo 0.11.0+g20565c325)	interrupted
 aterm-gui-consent	277	249	2337423360	2026-10-27T02:38:41Z
 aterm-gui-documents	296	299	5025562624	2026-10-21T16:40:31Z
-aterm-gui-fabric	806	797	7934361600	2026-10-27T05:23:27Z
+aterm-gui-fabric	1376	1364	8131231744	2026-11-08T04:01:36Z	targo 1.101.0-dev (29ebb403d 2026-10-28) (targo 0.12.0+g29ebb403d)
 aterm-gui-tabs	486	464	2241249280	2026-10-27T02:57:34Z
 aterm-gui-timing	39	38	1042579456	2026-10-27T02:44:28Z
 aterm-hash	465	472	15481405440	2026-11-03T06:41:07Z
@@ -60,7 +60,7 @@ aterm-json	155	159	1485078528	2026-10-19T00:09:05Z
 aterm-keeper	371	374	3432792064	2026-10-29T16:31:48Z
 aterm-lab-clock	223	192	2827042816	2026-10-20T01:22:19Z
 aterm-lexicon	231	267	4026253312	2026-11-04T08:20:12Z
-aterm-link	2302	2245	13648789504	2026-11-01T11:28:46Z
+aterm-link	3034	2336	16480501760	2026-11-08T08:46:29Z	targo 1.101.0-dev (29ebb403d 2026-10-28) (targo 0.12.0+g29ebb403d)
 aterm-log	76	78	1856487424	2026-10-28T10:44:43Z
 aterm-lz4	45	47	455065600	2026-10-29T14:23:48Z
 aterm-machines	2482	2498	13722697728	2026-10-27T04:17:00Z
@@ -77,7 +77,7 @@ aterm-models-misc	139	148	1025851392	2026-10-17T00:44:17Z
 aterm-models-native	7	6	662241280	2026-10-21T02:03:19Z
 aterm-models-release	185	190	601128960	2026-10-17T00:44:17Z
 aterm-models-render	97	99	725123072	2026-10-17T00:44:17Z
-aterm-models-session	20	15	849002496	2026-11-01T13:09:50Z
+aterm-models-session	19	14	840761344	2026-11-01T13:10:19Z
 aterm-models-update	150	151	868581376	2026-10-17T00:44:17Z
 aterm-net	408	415	3660595200	2026-10-27T03:10:38Z
 aterm-objc	355	364	1673986048	2026-10-19T01:15:31Z
@@ -87,7 +87,7 @@ aterm-phase	997	1075	7470120960	2026-11-02T20:16:18Z
 aterm-png	1246	927	4114644992	2026-10-29T13:58:06Z
 aterm-policy	109	112	1469235200	2026-10-19T01:17:23Z
 aterm-predict	362	359	3267805184	2026-11-02T17:51:03Z
-aterm-primer	112	117	2492661760	2026-10-26T19:23:57Z
+aterm-primer	141	151	2364702720	2026-11-02T05:57:39Z
 aterm-provenance	95	96	485163008	2026-10-19T05:52:44Z
 aterm-pty	303	340	1911209984	2026-11-01T08:48:16Z
 aterm-regex	245	248	1714143232	2026-10-18T23:41:11Z
@@ -105,8 +105,8 @@ aterm-serde-derive	240	290	1859256320	2026-10-17T01:26:52Z
 aterm-session	326	392	2320596992	2026-11-02T16:32:55Z
 aterm-shell-integration	271	265	1961787392	2026-10-27T02:30:27Z
 aterm-sixel	12	12	1079918592	2026-10-29T16:49:43Z
-aterm-slog	1151	1266	6892748800	2026-11-01T17:45:25Z
-aterm-spec	194	199	975683584	2026-10-18T07:32:48Z
+aterm-slog	1306	1509	7884161024	2026-11-08T06:36:55Z	targo 1.101.0-dev (29ebb403d 2026-10-28) (targo 0.12.0+g29ebb403d)
+aterm-spec	467	474	3506438144	2026-11-08T01:00:40Z	targo 1.101.0-dev (29ebb403d 2026-10-28) (targo 0.12.0+g29ebb403d)
 aterm-spec-anchor	4	4	579469312	2026-10-25T03:40:45Z
 aterm-spec-macros	100	104	1176010752	2026-10-17T01:26:52Z
 aterm-spec-models	1	2	109166592	2026-10-17T21:02:55Z
@@ -117,11 +117,11 @@ aterm-time	187	187	1465057280	2026-10-19T04:09:02Z
 aterm-toml	243	255	3547037696	2026-10-29T13:07:23Z
 aterm-toolchain	89	95	1315471360	2026-10-29T18:53:30Z
 aterm-tty	182	189	1518485504	2026-10-20T12:07:47Z
-aterm-types	11672	1725	9077800960	2026-11-01T18:14:23Z
-aterm-uds	1828	2250	14744092672	2026-11-01T09:55:49Z
+aterm-types	11852	2068	9144303616	2026-11-02T04:27:36Z
+aterm-uds	2197	2287	14129266688	2026-11-08T02:13:41Z	targo 1.101.0-dev (29ebb403d 2026-10-28) (targo 0.12.0+g29ebb403d)
 aterm-update	2011	1154	9420275712	2026-11-01T08:41:52Z
 aterm-update-core	332	329	2760851456	2026-10-29T17:27:50Z
-aterm-verify	2337	2511	21724905472	2026-10-28T14:23:24Z
+aterm-verify	2153	2179	24972853248	2026-11-02T19:20:02Z
 aterm-vitals	974	333	4125229056	2026-10-20T19:15:07Z
 aterm-wasm	364	352	2644295680	2026-10-27T03:03:41Z
 aterm-wasm-abi	262	266	893435904	2026-10-17T08:18:24Z
@@ -135,7 +135,7 @@ aterm-winsign	258	249	2375712768	2026-10-27T02:21:47Z
 aterm-x11	132	140	1776877568	2026-10-21T05:39:58Z
 aterm-xkb	104	104	1397604352	2026-10-19T01:47:39Z
 aterm-zstd	1316	1292	2300002304	2026-10-17T01:26:52Z
-atpkg	5906	3535	15928868864	2026-11-01T14:19:09Z
+atpkg	7594	5085	16655581184	2026-11-02T15:22:42Z
 atpkg-keys	246	234	1417576448	2026-10-29T13:07:02Z
 atpkg-publish	1063	1073	8110145536	2026-10-27T05:07:27Z
 cfg-if	1	1	109068288	2026-10-17T21:43:36Z

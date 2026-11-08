@@ -25,6 +25,7 @@ aterm-tempfile = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+aterm-dl = { workspace = true }
 # The allowed direct path (src/direct.rs): the app macOS holds responsible for this process,
 # whose Local Network answer it applies.
 aterm-containment = { workspace = true }

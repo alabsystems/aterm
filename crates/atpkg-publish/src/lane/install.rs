@@ -23,6 +23,7 @@ pub const BUILD_INPUTS: &[&str] = &[
     "Cargo.lock",
     "Cargo.toml",
     "rust-toolchain.toml",
+    "trust.lock",
     ".cargo",
 ];
 
@@ -185,7 +186,8 @@ impl Machine {
             systemd_dir: config.join("systemd/user"),
             config_home: config,
             builder: Box::new(TargoBuild {
-                bin: atpkg::toolchain::store_stage2_bin(&ctx.pkg_prefix),
+                home: ctx.home.clone(),
+                prefix: ctx.pkg_prefix.clone(),
             }),
             services,
         })
@@ -305,19 +307,28 @@ pub fn install_with(
                 "lane install --host {h}: agh's directories cannot be resolved for this unit"
             ))
         })?;
-        let checks = crate::hosts_check::check(
-            ctx,
-            &dirs,
-            flags.host,
-            stages_only,
-            &crate::hosts_check::program_repos(),
-        );
+        let checks = if kind == LaneKind::Linux {
+            crate::hosts_check::check_linux(ctx, &dirs, flags.host, stages_only)?
+        } else {
+            crate::hosts_check::check(
+                ctx,
+                &dirs,
+                flags.host,
+                stages_only,
+                &crate::hosts_check::program_repos(),
+            )
+        };
         let failed = crate::hosts_check::failed(&checks);
         if !failed.is_empty() {
             return Err(Error::refused(format!(
                 "lane install --host {h}: hosts check failed ({}) — run atpkg-publish hosts \
-                 check --host {h} --unit-env{}; nothing installed",
+                 check --host {h} --unit-env{}{}; nothing installed",
                 failed.join(", "),
+                if kind == LaneKind::Linux {
+                    " --lane linux"
+                } else {
+                    ""
+                },
                 if stages_only { " --keyless" } else { "" }
             )));
         }
@@ -842,18 +853,68 @@ fn write_units(dir: &Path, units: &[Unit]) -> Result<Vec<PathBuf>> {
         .collect()
 }
 
-/// The production build: the atpkg store's `targo` in the unverified lane, with `--locked` (the
-/// lockfile is the reviewed dependency set) and the toolchain and flag variables scrubbed (a
-/// `RUSTFLAGS` replaces the config's flags).
+/// The production build: canonical Trust discovery in the checkout, in the unverified lane
+/// with `--locked`. Discovery preserves the checkout's compiler lock and explicit override
+/// rules; the selected managed toolchain is held through the build.
 #[derive(Debug)]
 pub struct TargoBuild {
-    /// The store's Trust bin dir.
-    pub bin: PathBuf,
+    /// The actual publishing user's home.
+    pub home: PathBuf,
+    /// The atpkg prefix this lane's context resolved.
+    pub prefix: PathBuf,
+}
+
+impl TargoBuild {
+    fn resolve(
+        &self,
+        repo: &Path,
+        explicit: Option<&Path>,
+        rustup: &Path,
+        path: &std::ffi::OsStr,
+        before_probe: &mut dyn FnMut(&Path) -> std::result::Result<(), String>,
+    ) -> Result<atpkg::toolchain::Toolchain> {
+        let lock = atpkg::trust_lock::found_for(repo, Some(&self.prefix));
+        let pinned = atpkg::toolchain::pinned_channel(repo)
+            .unwrap_or_else(|| atpkg::seam::DEFAULT_SEAM.to_owned());
+        let selected = atpkg::toolchain::Toolchain::discover_with_store_guarded(
+            explicit,
+            rustup,
+            Some(&self.prefix),
+            path,
+            Some(&pinned),
+            lock.as_ref(),
+            before_probe,
+        )
+        .map_err(Error::refused)?;
+        if !selected.have_targo() {
+            return Err(Error::refused(selected.missing_targo_label()));
+        }
+        Ok(selected)
+    }
 }
 
 impl SnapshotBuilder for TargoBuild {
     fn build(&self, repo: &Path, target_dir: &Path, log: &Path) -> Result<Built> {
-        let targo = self.bin.join("targo");
+        let explicit = std::env::var_os("TRUST_STAGE2_BIN").map(PathBuf::from);
+        let rustup =
+            atpkg::toolchain::rustup_home(std::env::var_os("RUSTUP_HOME").as_deref(), &self.home);
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut leases = Vec::new();
+        let mut held = std::collections::BTreeSet::new();
+        let mut before_probe = |dir: &Path| {
+            if held.insert(dir.to_path_buf()) {
+                let who = format!("atpkg-publish lane install (pid {})", std::process::id());
+                if let Some(lease) = atpkg::lease::take_for_dir(&self.prefix, dir, &who)
+                    .map_err(|e| e.to_string())?
+                {
+                    leases.push(lease);
+                }
+            }
+            Ok(())
+        };
+        let selected =
+            self.resolve(repo, explicit.as_deref(), &rustup, &path, &mut before_probe)?;
+        let targo = &selected.targo;
         let version = |tool: &Path, args: &[&str]| {
             aterm_uds::spawnfd::command(tool)
                 .args(args)
@@ -862,14 +923,22 @@ impl SnapshotBuilder for TargoBuild {
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         };
-        let targo_v = version(&targo, &["--unverified", "--version"]).ok_or_else(|| {
+        let targo_v = version(targo, &["--unverified", "--version"]).ok_or_else(|| {
             Error::refused(format!(
                 "no Trust targo at {} answering `--unverified --version` — `aterm pkg install \
                  trust`, then re-run",
                 targo.display()
             ))
         })?;
-        let trustc_v = version(&self.bin.join("trustc"), &["-V"]).unwrap_or_default();
+        let trustc = selected
+            .stage2_dir
+            .join(atpkg::toolchain::tool_file("trustc"));
+        let trustc_v = version(&trustc, &["-V"]).ok_or_else(|| {
+            Error::refused(format!(
+                "selected Trust compiler {} did not answer -V",
+                trustc.display()
+            ))
+        })?;
         let log_file = {
             use std::os::unix::fs::OpenOptionsExt as _;
             let file = std::fs::OpenOptions::new()
@@ -896,7 +965,7 @@ impl SnapshotBuilder for TargoBuild {
         let err_file = log_file
             .try_clone()
             .map_err(|e| Error::io(format!("open {}", log.display()), &e))?;
-        let status = aterm_uds::spawnfd::command(&targo)
+        let status = aterm_uds::spawnfd::command(targo)
             .current_dir(repo)
             .args([
                 "--unverified",
@@ -909,6 +978,7 @@ impl SnapshotBuilder for TargoBuild {
             .env("CARGO_TARGET_DIR", target_dir)
             .env_remove("RUSTUP_TOOLCHAIN")
             .env_remove("RUSTC")
+            .env_remove("CARGO_BUILD_RUSTC")
             .env_remove("RUSTFLAGS")
             .env_remove("RUSTDOCFLAGS")
             .env_remove("CARGO_ENCODED_RUSTFLAGS")
@@ -932,10 +1002,21 @@ impl SnapshotBuilder for TargoBuild {
         }
         Ok(Built {
             binary,
-            toolchain: format!("{targo_v} / {trustc_v}"),
+            toolchain: format!(
+                "{targo_v} / {trustc_v} / {}{}",
+                selected.stage2_dir.display(),
+                selected
+                    .lock_override
+                    .as_ref()
+                    .map_or_else(String::new, |why| format!(" / {why}"))
+            ),
         })
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "install_toolchain_tests.rs"]
+mod toolchain_tests;
 
 fn run_tool(tool: &str, args: &[&str]) -> Result<std::process::Output> {
     aterm_uds::spawnfd::command(tool)

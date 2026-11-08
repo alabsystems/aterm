@@ -932,7 +932,8 @@ fn log_observation_is_current(
     if recipient.is_some_and(|expected| expected != local) {
         return Ok(false);
     }
-    let Some((log, heads_digest)) = crate::client::trusted_commons_log_now(paths, trust)? else {
+    let Some((log, heads_digest)) = crate::client::trusted_commons_log_under(paths, trust, lock)?
+    else {
         return Ok(false);
     };
     if remembered == Some(commons_log_state_digest(paths, heads_digest)?) {

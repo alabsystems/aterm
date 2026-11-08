@@ -1143,6 +1143,13 @@ impl Error {
         object.insert("reset".into(), self.reset.map_or(Value::Null, Value::from));
         object.insert("side_effect".into(), Value::from(self.side_effect.slug()));
         object.insert(
+            "intent".into(),
+            match &self.sub {
+                Sub::IntentOpen { intent } => text(intent),
+                _ => Value::Null,
+            },
+        );
+        object.insert(
             "status".into(),
             self.http
                 .as_ref()

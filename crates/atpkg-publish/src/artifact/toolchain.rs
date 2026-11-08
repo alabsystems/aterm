@@ -156,8 +156,21 @@ pub fn admit_with_frontend(
     switch: &Switch,
     frontend: Option<&str>,
 ) -> Result<atpkg::lineage::Compiler> {
+    admit_with_components(tools, bin, switch, frontend, None)
+}
+
+/// Admit explicitly selected raw-seal components through the portable validator.
+/// # Errors
+/// A refusal carrying every reason the checker gave.
+pub fn admit_with_components(
+    tools: &dyn Tools,
+    bin: &Path,
+    switch: &Switch,
+    frontend: Option<&str>,
+    targo: Option<&str>,
+) -> Result<atpkg::lineage::Compiler> {
     let probe = |p: &Path| tools::version(tools, p);
-    atpkg::lineage::check_compiler_with_frontend(bin, switch.policy(), &probe, frontend).map_err(|lines| {
+    atpkg::lineage::check_compiler_with_components(bin, switch.policy(), &probe, frontend, targo).map_err(|lines| {
         let unknown = match switch {
             Switch::Unknown(why) => {
                 format!("\n  (the receipt is required because nothing shows the switch is dormant: {why})")

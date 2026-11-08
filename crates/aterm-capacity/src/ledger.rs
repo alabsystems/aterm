@@ -271,6 +271,9 @@ impl Record {
         if self.need.scratch {
             o.insert("scratch".to_owned(), Value::from(true));
         }
+        if self.need.leads {
+            o.insert("leads".to_owned(), Value::from(true));
+        }
         if let Some(p) = self.need.patience {
             let mut q = Map::new();
             q.insert("reserve_ms".to_owned(), Value::from(millis(p.reserve)));
@@ -429,6 +432,7 @@ impl Record {
             alone: head.get("alone").and_then(Value::as_bool) == Some(true),
             covers: head.get("covers").and_then(Value::as_bool) == Some(true),
             scratch: head.get("scratch").and_then(Value::as_bool) == Some(true),
+            leads: head.get("leads").and_then(Value::as_bool) == Some(true),
             stuck_ends: None,
             at_bound: crate::AtBound::Refuse,
         };

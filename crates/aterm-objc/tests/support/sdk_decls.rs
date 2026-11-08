@@ -205,6 +205,38 @@ fn parse(file: &str) -> Decls {
             }
         } else if rest.contains("opaque!") && !rest.starts_with("macro_rules!") {
             d.opaque.extend(split_top(body(rest), ','));
+        } else if rest.starts_with("aterm_dl::table!") {
+            // Read the actual table types and symbol literals, not a second declaration list.
+            for part in items(body(rest)) {
+                let (_, part) = strip_attrs(&part);
+                assert!(
+                    part.contains("struct ") || part.starts_with("optional"),
+                    "{file}: an entry-point table item this probe cannot read: {part:?}"
+                );
+                for field in split_top(body(part), ';') {
+                    let (_, field) = strip_attrs(&field);
+                    let (_, row) = field.split_once('=').expect("a table symbol binding");
+                    let (symbol, ty) = row.split_once(':').expect("a typed table entry");
+                    let name = symbol
+                        .trim()
+                        .strip_prefix("c\"")
+                        .and_then(|s| s.strip_suffix('"'))
+                        .expect("a C symbol literal");
+                    assert!(
+                        !name.is_empty()
+                            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                        "{file}: the SDK probe needs a C identifier, got {name:?}"
+                    );
+                    let ty = ty.trim();
+                    assert!(
+                        ty.starts_with("unsafe extern \"C\" fn(")
+                            || ty.starts_with("extern \"C\" fn("),
+                        "{file}: a table type this probe cannot read: {ty:?}"
+                    );
+                    let (params, ret) = signature(ty);
+                    d.fns.push((name.to_owned(), params, ret));
+                }
+            }
         } else if rest.starts_with("unsafe extern \"C") {
             for decl in items(body(rest)) {
                 let (_, decl) = strip_attrs(&decl);
@@ -334,6 +366,7 @@ fn probe(d: &Decls, invert: Option<&str>) -> String {
          #include <IOKit/IOKitLib.h>\n\
          #include <IOKit/pwr_mgt/IOPMLib.h>\n\
          #include <dlfcn.h>\n\
+         #include <dns_sd.h>\n\
          #include <mach/processor_info.h>\n\
          #include <stddef.h>\n\
          #include <stdint.h>\n\

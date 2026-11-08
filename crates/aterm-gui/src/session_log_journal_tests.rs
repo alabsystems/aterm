@@ -88,6 +88,15 @@ impl Sessions {
         tl
     }
 
+    /// The quit's closes, as the host makes them before it asks the writer for its last lines
+    /// (`session_log::close_logs_at_quit`, fix unit Q1): every session listed closed
+    /// `out=app-quit` through the one producer.
+    fn quit(&self) {
+        for (_, tl) in self.list.lock().unwrap_or_else(|p| p.into_inner()).iter() {
+            let _ = crate::session_log::close_timeline_at_quit(tl);
+        }
+    }
+
     fn remove(&self, sid: &str) {
         self.list
             .lock()
@@ -814,6 +823,7 @@ fn a_failed_flush_is_counted_and_the_journal_goes_on() {
     assert_eq!(rig.report.attention().1, Attention::None, "nothing paused");
     mark(&tl, 1);
     assert!(w.pass() > 0, "the writer goes on");
+    rig.sessions.quit();
     w.finish(rig.clock.mono() + QUIT_BUDGET);
     assert_eq!(
         flushes(&rig),
@@ -835,6 +845,7 @@ fn a_failed_flush_is_counted_and_the_journal_goes_on() {
     let mut w = rig.writer();
     rig.fs.state().flush_fault = Some(libc::ENOTSUP);
     assert!(w.pass() > 0);
+    rig.sessions.quit();
     w.finish(rig.clock.mono() + QUIT_BUDGET);
     assert_eq!(flushes(&rig), 0, "a refusal is the volume's, not a failure");
 }
@@ -1316,6 +1327,7 @@ fn a_clean_quit_closes_its_journal_and_a_late_one_reads_as_a_crash() {
     let r = cmd(&tl, 1);
     let mut w = rig.writer();
     w.pass();
+    rig.sessions.quit();
     let deadline = rig.clock.mono() + QUIT_BUDGET;
     w.finish(deadline);
     drop(w);
@@ -1336,15 +1348,26 @@ fn a_clean_quit_closes_its_journal_and_a_late_one_reads_as_a_crash() {
     let last = all(&v.log).last().cloned().expect("records");
     assert_eq!(last.out(), Some("app-quit"));
     assert!(!v.log.is_open(r));
-    assert!(
-        tl.lock().expect("tl").slog().log().is_open(r),
-        "the live log unchanged"
+    let closes = |log: &Log| -> Vec<aterm_slog::Rec> {
+        all(log)
+            .into_iter()
+            .filter(|x| x.op == aterm_slog::Op::Close)
+            .collect()
+    };
+    let live_close = closes(tl.lock().expect("tl").slog().log());
+    let journaled = closes(&v.log);
+    assert!(!live_close.is_empty(), "the live log closed");
+    assert_eq!(
+        journaled, live_close,
+        "one producer: the journal holds the live log's own quit closes, the records the bus \
+         mirror takes"
     );
     let rig = Rig::new();
     let tl = rig.sessions.add("s-late");
     let _ = cmd(&tl, 1);
     let mut w = rig.writer();
     w.pass();
+    rig.sessions.quit();
     w.finish(rig.clock.mono());
     drop(w);
     assert!(!rig.frames().iter().any(|f| matches!(f, Frame::End { .. })));
@@ -1794,6 +1817,7 @@ fn a_cut_listing_reads_unread_and_never_a_crash() {
         mark(&tl, 1 + i);
         w.pass();
     }
+    rig.sessions.quit();
     w.finish(rig.clock.mono() + QUIT_BUDGET);
     drop(w);
     let segs: Vec<String> = rig
@@ -1986,6 +2010,7 @@ fn a_session_closed_in_the_overlap_gets_its_close_after_a_rollback() {
     w.stood_down();
     w.pass();
     w.pass();
+    rig.sessions.quit();
     w.finish(rig.clock.mono() + QUIT_BUDGET);
     let closes = recs_of(&rig.frames(), "s-closes")
         .iter()
@@ -2006,6 +2031,7 @@ fn the_quit_closes_say_how_long_each_node_lived() {
         .set_clock(crate::session_log::Clock::reading(|| at(4200)));
     let mut w = rig.writer();
     w.pass();
+    rig.sessions.quit();
     w.finish(rig.clock.mono() + QUIT_BUDGET);
     let recs = recs_of(&rig.frames(), "s-dur");
     let dur = |node: Node| {
@@ -2032,6 +2058,7 @@ fn a_quit_while_backing_off_tries_once_more() {
     w.pass();
     assert!(w.wait().is_some(), "backing off");
     rig.fs.fault(None);
+    rig.sessions.quit();
     w.finish(rig.clock.mono() + QUIT_BUDGET);
     assert!(rig.frames().iter().any(|f| matches!(
         f,
@@ -2988,6 +3015,7 @@ fn a_quit_whose_drain_outlasts_its_passes_reads_as_a_crash() {
                 mark(tl, 1 + i);
             }
         }
+        rig.sessions.quit();
         w.finish(rig.clock.mono() + HANG);
         drop(w);
         (rig, names)
@@ -2996,15 +3024,22 @@ fn a_quit_whose_drain_outlasts_its_passes_reads_as_a_crash() {
     let pruned = |v: &View| v.log.holes_why().any(|h| h.2 == GapWhy::Pruned);
     let (rig, names) = run(FINISH_PASSES + 16);
     assert!(!fin(&rig), "an unfinished drain ends nothing");
+    let mut crashed = 0usize;
     for name in &names {
         let v = rig.view(name);
-        assert!(v.crashed, "{name} reads as a crash");
         assert!(!pruned(&v), "{name}: nothing said pruned");
-        assert!(
-            all(&v.log).iter().all(|r| r.out() != Some("app-quit")),
-            "{name}: no quit close"
+        let closed = all(&v.log).iter().any(|r| r.out() == Some("app-quit"));
+        assert_ne!(
+            v.crashed, closed,
+            "{name}: the quit's own close where the drain reached it (a record like any \
+             other), a crash where it did not"
         );
+        crashed += usize::from(v.crashed);
     }
+    assert!(
+        crashed >= 16,
+        "the sessions the drain never reached read as crashes"
+    );
     let (rig, names) = run(FINISH_PASSES / 2);
     assert!(fin(&rig));
     for name in &names {
@@ -3016,6 +3051,39 @@ fn a_quit_whose_drain_outlasts_its_passes_reads_as_a_crash() {
     }
 }
 
+/// A QUIT'S `#fin` FOLLOWS ONLY THE HOST'S OWN CLOSES (fix unit Q1): the writer builds no close.
+/// A finish over a session the quit did not close journals no close of it and ends nothing, so
+/// its chain reads as a crash; the host's close (`session_log::close_timeline_at_quit`) is what a
+/// clean quit's chain holds ([`a_clean_quit_closes_its_journal_and_a_late_one_reads_as_a_crash`]).
+/// NEGATIVE CONTROL, run: a writer that judges a session whole without its close ends this chain.
+#[test]
+fn a_finish_over_a_session_the_quit_did_not_close_ends_nothing() {
+    let rig = Rig::new();
+    let tl = rig.sessions.add("s-open");
+    let _ = cmd(&tl, 1);
+    let mut w = rig.writer();
+    w.pass();
+    assert!(!w.quit_whole(), "an open session holds the #fin back");
+    w.finish(rig.clock.mono() + QUIT_BUDGET);
+    drop(w);
+    assert!(
+        !rig.frames().iter().any(|f| matches!(f, Frame::End { .. })),
+        "no #fin over an open session"
+    );
+    let v = rig.view("s-open");
+    assert!(v.crashed, "its chain reads as a crash");
+    assert!(
+        recs_of(&rig.frames(), "s-open")
+            .iter()
+            .all(|r| r.out() != Some("app-quit")),
+        "the writer built no close"
+    );
+    assert!(
+        tl.lock().expect("tl").slog().log().is_open(Node::SESSION),
+        "and the live log stays open"
+    );
+}
+
 #[test]
 fn a_quit_never_ends_a_chain_over_a_session_behind_its_log() {
     let rig = Rig::new();
@@ -3023,11 +3091,15 @@ fn a_quit_never_ends_a_chain_over_a_session_behind_its_log() {
     let mut w = rig.writer();
     w.pass();
     mark(&tl, 1);
-    assert!(w.quit_lines().is_none(), "a record past the cursor");
+    rig.sessions.quit();
+    assert!(!w.quit_whole(), "records past the cursor");
     w.pass();
-    assert!(w.quit_lines().is_some(), "caught up");
+    assert!(w.quit_whole(), "caught up");
     let guard = tl.lock().expect("tl");
-    assert!(w.quit_lines().is_none(), "busy");
+    assert!(
+        w.quit_whole(),
+        "a session journaled through its close is done: its busy timeline is not read"
+    );
     drop(guard);
     w.finish(rig.clock.mono() + QUIT_BUDGET);
     drop(w);
@@ -3100,6 +3172,7 @@ fn a_malformed_complete_fin_does_not_hide_a_dead_chains_crash() {
     let run = cmd(&tl, 1);
     let mut w = clean.writer();
     w.pass();
+    clean.sessions.quit();
     w.finish(clean.clock.mono() + QUIT_BUDGET);
     drop(w);
     assert!(matches!(clean.frames().last(), Some(Frame::End { .. })));
@@ -3361,7 +3434,7 @@ fn pending_store_retirements_fence_the_final_markers_and_busy_snapshots_retry() 
         writer.pass();
         let (sid, _, expected) = actual_store_retire(&store, 1);
         assert!(
-            writer.quit_lines().is_none(),
+            !writer.quit_whole(),
             "pending unseen retirement fences quit"
         );
         if handing {
@@ -3379,6 +3452,7 @@ fn pending_store_retirements_fence_the_final_markers_and_busy_snapshots_retry() 
         drop(busy);
         writer.pass();
         if !handing {
+            rig.sessions.quit();
             writer.finish(rig.clock.mono() + QUIT_BUDGET);
         }
         assert_eq!(recs_of(&rig.frames(), &sid), expected);
@@ -3600,4 +3674,221 @@ fn help_status_names_exactly_the_log_journal_words_aterm_writes() {
              aterm writes {unnamed:?}"
         );
     }
+}
+
+/// A bridge whose broker gives the quit nothing (fix unit Q1), on the test's clock: nothing it
+/// takes lands, its parks only move the clock (by the slice a live park waits at most), and it
+/// takes no bye. Whether it can land at all is the link's own word ([`Self::lands`]).
+#[cfg(unix)]
+struct SilentBus {
+    lands: fn() -> bool,
+    clock: std::cell::Cell<std::time::Instant>,
+    parks: std::cell::Cell<u32>,
+}
+
+#[cfg(unix)]
+impl crate::fabric_launch::QuitBus for SilentBus {
+    fn now(&self) -> std::time::Instant {
+        self.clock.get()
+    }
+
+    fn lands(&self) -> bool {
+        (self.lands)()
+    }
+
+    fn landings(&self) -> u64 {
+        0
+    }
+
+    fn park(&self, _seen: u64, until: std::time::Instant) {
+        self.parks.set(self.parks.get() + 1);
+        assert!(self.parks.get() < 10_000, "the quit never stopped waiting");
+        let next = self.clock.get() + crate::fabric_launch::QUIT_PARK_SLICE;
+        self.clock.set(next.min(until));
+    }
+
+    fn bye(
+        &self,
+        store: &crate::session_store::Store,
+        word: aterm_types::fabric_grammar::Bye,
+    ) -> bool {
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .say_bye(word);
+        false
+    }
+}
+
+/// What a quit over a [`SilentBus`] did (fix unit Q1): its order, how long it waited on the
+/// test's clock, how many times it parked, and the journal's frames and the session's sid.
+#[cfg(unix)]
+struct SilentQuit {
+    order: crate::fabric_launch::QuitOrder,
+    waited: Duration,
+    parks: u32,
+    frames: Vec<Frame>,
+    sid: String,
+}
+
+/// A live session of the real store, journaled, a mirroring bridge (that said `link <said>`
+/// before the quit, where one is given: `down reason=refused` reports its broker unreachable, a
+/// `mirror …` line its mirror's state), and a quit over a [`SilentBus`], then the journal's
+/// last lines.
+#[cfg(unix)]
+fn quit_over_a_silent_bus(said: Option<&str>) -> SilentQuit {
+    use aterm_types::fabric_grammar::Bye;
+    crate::fabric::with_link_reset(|| {
+        let generation = crate::fabric::next_bridge_generation();
+        crate::fabric::bridge_attached(generation);
+        let hello = crate::fabric::cmd_hello("lane=2 build=x log=turns", Some(generation));
+        assert!(hello.trim_end().ends_with(" log=turns"), "{hello}");
+        let rig = Rig::new();
+        let store = crate::session_store::new_store();
+        let h = crate::session_store::test_handle(1);
+        let sid = h.sid.as_str().to_string();
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(h.clone());
+        {
+            let mut tl = h.ctx.timeline.lock().expect("tl");
+            let now = tl.slog().now();
+            tl.slog_mut().open_session(None, None, now);
+        }
+        let _ = cmd(&h.ctx.timeline, 1);
+        let mut writer = actual_store_writer(&rig, &store, WriterLimits::default());
+        writer.pass();
+        if let Some(said) = said {
+            assert_eq!(
+                crate::fabric::cmd_link(&store, said, Some(generation)),
+                "OK\n",
+                "link {said}"
+            );
+        }
+        let start = std::time::Instant::now();
+        let bus = SilentBus {
+            lands: crate::fabric::mirror_lands_now,
+            clock: std::cell::Cell::new(start),
+            parks: std::cell::Cell::new(0),
+        };
+        let order = crate::fabric_launch::quit_in_order(&store, Bye::Quit, QUIT_BUDGET, &bus);
+        writer.finish(rig.clock.mono() + QUIT_BUDGET);
+        drop(writer);
+        SilentQuit {
+            order,
+            waited: bus.clock.get() - start,
+            parks: bus.parks.get(),
+            frames: rig.frames(),
+            sid,
+        }
+    })
+}
+
+/// The journal's last lines of a [`SilentQuit`] hold its session's own quit close and end
+/// `#fin why=quit`.
+#[cfg(unix)]
+fn journals_the_quit(q: &SilentQuit) {
+    assert_eq!(q.order.closed, 1);
+    assert!(!q.order.taken, "the silent bridge takes no bye");
+    assert!(
+        recs_of(&q.frames, &q.sid)
+            .iter()
+            .any(|r| r.node == Node::SESSION && r.out() == Some("app-quit")),
+        "the journal holds the quit's close"
+    );
+    assert!(
+        q.frames.iter().any(|f| matches!(
+            f,
+            Frame::End {
+                why: EndWhy::Quit,
+                ..
+            }
+        )),
+        "and ends #fin why=quit"
+    );
+}
+
+/// A QUIT WHOSE BROKER NEVER ANSWERS GOES ON WITHIN ITS BUDGET, AND THE JOURNAL HOLDS ITS CLOSES
+/// (fix unit Q1). A mirroring bridge whose broker never lands a take: the quit waits its budget
+/// at most (on the test's clock: the budget plus one park's slice, in a bounded count of parks),
+/// says its bye, and the journal's last lines hold the session's own quit close and end `#fin
+/// why=quit`. NEGATIVE CONTROL, run: a wait without its deadline never stops (its park count's
+/// hang detector fails it).
+#[cfg(unix)]
+#[test]
+fn a_quit_whose_broker_never_answers_goes_on_within_its_budget_and_journals_its_closes() {
+    use crate::fabric_launch::{Landing, QUIT_PARK_SLICE};
+    let q = quit_over_a_silent_bus(None);
+    assert_eq!(q.order.landing, Landing::Missed);
+    assert!(
+        q.waited <= QUIT_BUDGET + QUIT_PARK_SLICE,
+        "within the budget and one slice: {:?}",
+        q.waited
+    );
+    let slices =
+        u32::try_from(QUIT_BUDGET.as_millis() / QUIT_PARK_SLICE.as_millis()).expect("slices");
+    assert!(
+        q.parks <= slices + 1,
+        "a bounded count of parks: {}",
+        q.parks
+    );
+    journals_the_quit(&q);
+}
+
+/// A QUIT OVER A BROKER ITS BRIDGE SAID IS UNREACHABLE WAITS FOR NOTHING, AND THE JOURNAL HOLDS
+/// ITS CLOSES (fix unit Q1). The bridge reported `link down`: the quit's closes cannot land, so
+/// it parks not once and its clock does not move, says its bye, and the journal's last lines
+/// hold the session's own quit close and end `#fin why=quit`. NEGATIVE CONTROL, run: a link
+/// that lands whatever its bridge reported waits out the budget.
+#[cfg(unix)]
+#[test]
+fn a_quit_over_an_unreachable_broker_waits_for_nothing_and_journals_its_closes() {
+    let q = quit_over_a_silent_bus(Some("down reason=refused"));
+    assert_eq!(q.order.landing, crate::fabric_launch::Landing::Unserved);
+    assert_eq!((q.parks, q.waited), (0, Duration::ZERO), "never waited for");
+    journals_the_quit(&q);
+}
+
+/// A QUIT OVER A MIRROR THAT CANNOT LAND WAITS FOR NOTHING, AND THE JOURNAL HOLDS ITS CLOSES (fix
+/// unit Q1). A mirroring bridge whose broker is reachable but whose mirror said it is stopped
+/// (each stop's reason), capped, held by the broker's window or unretained: the quit's closes
+/// cannot land, so it parks not once and its clock does not move, says its bye, and the
+/// journal's last lines hold the session's own quit close and end `#fin why=quit`; the control,
+/// a mirror that said `on`, waits out its budget. NEGATIVE CONTROL, run: a link that lands
+/// whatever its mirror said (`mirror_lands_now` taking any mirror state) waits out the budget
+/// over every one of them.
+#[cfg(unix)]
+#[test]
+fn a_quit_over_a_mirror_that_cannot_land_waits_for_nothing_and_journals_its_closes() {
+    use crate::fabric_launch::Landing;
+    use aterm_types::fabric_grammar::{MirrorReason, MirrorState};
+    let request =
+        |line: String| -> String { line.strip_prefix("link ").expect("a link line").to_string() };
+    let mut said: Vec<String> = MirrorReason::ALL
+        .iter()
+        .map(|r| request(r.request()))
+        .collect();
+    said.extend(
+        [MirrorState::Budget, MirrorState::Unretained]
+            .into_iter()
+            .map(|s| request(s.request())),
+    );
+    for said in &said {
+        let q = quit_over_a_silent_bus(Some(said.as_str()));
+        assert_eq!(q.order.landing, Landing::Unserved, "link {said}");
+        assert_eq!(
+            (q.parks, q.waited),
+            (0, Duration::ZERO),
+            "link {said}: never waited for"
+        );
+        journals_the_quit(&q);
+    }
+    let on = quit_over_a_silent_bus(Some(request(MirrorState::On.request()).as_str()));
+    assert_eq!(
+        on.order.landing,
+        Landing::Missed,
+        "CONTROL: a mirror that runs is waited for"
+    );
+    assert!(on.parks > 0, "CONTROL: it parked");
 }

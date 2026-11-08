@@ -21,6 +21,7 @@ dependencies = [
  "aterm-spec",
  "aterm-spec-anchor",
  "aterm-stamp",
+ "aterm-sysprobe",
  "aterm-tempfile",
  "aterm-toml",
  "aterm-types",
@@ -148,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.179.0"
+version = "0.180.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -1135,6 +1136,7 @@ name = "aterm-lan"
 version = "0.0.0"
 dependencies = [
  "aterm-containment",
+ "aterm-dl",
  "aterm-keeper",
  "aterm-tempfile",
  "aterm-uds",

@@ -3804,11 +3804,6 @@ fn fx_carried_state_desk() -> FxDesk {
         "a row marked away from how it was posted: {:?}",
         carried.messages
     );
-    assert!(
-        carried.messages.iter().any(|m| m.short_title.is_some()),
-        "the lost login's short title: {:?}",
-        carried.messages
-    );
     assert!(!carried.update_health_said.is_empty(), "the warning said");
     let (rows, cols) = (ROWS, COLS * 2 + 1);
     let size = app.frame_px(rows, cols);
@@ -4650,6 +4645,12 @@ const NO_HANDOFF_WRITES_OFF_MACOS: &[(&str, &str)] = &[
 const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     ("control", "Wire.turn_ids"),
     ("manifest", "WindowCarry.presence_row"),
+    // Retired with the message band's short titles, which nothing drew once no window had a band:
+    // the newest recorded release wrote it, so the hold wants it named here until a release's
+    // `fields.toml` omits it. The first one recorded after the field went does; this row then
+    // answers "listed, but no desk reaches it" and generate_handoff_fixtures fails: remove it
+    // then. Older manifests keep the key; the reader skips it.
+    ("manifest", "CarriedMessage.short_title"),
     ("layout", "WindowLayout.presence_row"),
     ("layout", "WindowLayout.maximized"),
     ("layout", "TerminalLeafRestore.held"),

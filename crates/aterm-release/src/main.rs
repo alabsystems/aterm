@@ -70,6 +70,7 @@ mod source_signing;
 mod stage_local;
 
 mod site;
+mod slice_units;
 
 mod tap;
 
@@ -93,6 +94,10 @@ mod trust_oblig;
 mod verify;
 
 fn main() -> std::process::ExitCode {
+    // Cargo's compiler wrapper for a release slice runs nothing else of this tool.
+    if let Some(code) = slice_units::entry(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
+        return std::process::ExitCode::from(code);
+    }
     #[cfg(any(test, debug_assertions))]
     if let Some(result) = interrupt::exec_probe_if_asked() {
         return match result {

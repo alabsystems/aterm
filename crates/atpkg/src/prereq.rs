@@ -558,6 +558,16 @@ fn locate(path_var: Option<&OsStr>, host: &CcHost) -> Result<Located, CcVerdict>
     locate_without_setup_shim(path_var, host, &shims)
 }
 
+/// Literal matches remain meaningful when a directory is absent or unreadable; readable
+/// aliases compare by resolved directory without rewriting the selected invocation path.
+fn same_directory(selected: &Path, known: &Path) -> bool {
+    selected == known
+        || matches!(
+            (std::fs::canonicalize(selected), std::fs::canonicalize(known)),
+            (Ok(selected), Ok(known)) if selected == known
+        )
+}
+
 /// Setup's temporary tools report that installation is needed; they are not compilers.
 /// Look past them before deciding whether the actual compiler is missing or broken.
 fn locate_without_setup_shim(
@@ -570,7 +580,12 @@ fn locate_without_setup_shim(
         .into_iter()
         .flat_map(std::env::split_paths)
         .filter(|dir| dir.is_absolute())
-        .filter(|dir| !setup_shims.contains(&Some(dir.as_path())))
+        .filter(|dir| {
+            !setup_shims
+                .iter()
+                .flatten()
+                .any(|shim| same_directory(dir, shim))
+        })
     {
         let candidate = dir.join("cc");
         match is_executable(&candidate) {
@@ -591,7 +606,7 @@ fn locate_without_setup_shim(
     let is_shim = host
         .shim_dir
         .as_deref()
-        .is_some_and(|shim| cc.parent() == Some(shim));
+        .is_some_and(|shim| cc.parent().is_some_and(|dir| same_directory(dir, shim)));
     if !is_shim {
         return Ok(Located::Plain(cc));
     }
@@ -694,15 +709,15 @@ fn build_probe_in(
         if let Some(sdk) = sdkroot {
             cmd.env("SDKROOT", sdk);
         }
-        crate::doctor::output_bounded_capturing(&mut cmd, host.bound)
+        compiler_output(&mut cmd, cc, host.bound)
     };
     let mut result = run_cc(None, &program);
-    if matches!(&result, Some(out) if !out.status.success())
+    if matches!(&result, Ok(out) if !out.status.success())
         && host.sdkroot().is_none()
         && host
             .shim_dir
             .as_deref()
-            .is_some_and(|shim| cc.parent() == Some(shim))
+            .is_some_and(|shim| cc.parent().is_some_and(|dir| same_directory(dir, shim)))
     {
         let developer_dir = match host.developer_dir() {
             Ok(dir) => dir,
@@ -747,11 +762,8 @@ fn build_probe_in(
         }
     }
     match result {
-        None => CcVerdict::Unanswered {
-            driver: cc.to_path_buf(),
-            bound: host.bound,
-        },
-        Some(out) if out.status.success() => {
+        Err(verdict) => verdict,
+        Ok(out) if out.status.success() => {
             let wrote = match std::fs::symlink_metadata(&program) {
                 Ok(metadata) => is_executable_file(&metadata),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -771,7 +783,7 @@ fn build_probe_in(
                 }
             }
         }
-        Some(out) => CcVerdict::Broken {
+        Ok(out) => CcVerdict::Broken {
             driver: cc.to_path_buf(),
             why: first_stderr_line(&out),
         },
@@ -804,6 +816,24 @@ fn discovery_program(cc: &Path) -> PathBuf {
     cc.parent().unwrap_or(Path::new("/usr/bin")).join("xcrun")
 }
 
+/// Preserve subprocess evidence: only deadline expiry means the compiler did not answer.
+fn compiler_output(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    driver: &Path,
+    bound: Duration,
+) -> Result<std::process::Output, CcVerdict> {
+    aterm_uds::deadline::output_within(cmd, bound).map_err(|error| match error {
+        aterm_uds::deadline::RunError::TimedOut => CcVerdict::Unanswered {
+            driver: driver.to_path_buf(),
+            bound,
+        },
+        error => CcVerdict::Unproven {
+            driver: driver.to_path_buf(),
+            why: format!("compiler process could not be observed: {error}"),
+        },
+    })
+}
+
 /// Run the query within `bound`. A successful version query retains `driver`; discovery
 /// requires one absolute native path. A captured nonzero exit is Broken with the first stderr line.
 fn ask(bin: &Path, driver: &Path, query: CcQuery, host: &CcHost) -> CcVerdict {
@@ -816,7 +846,10 @@ fn ask(bin: &Path, driver: &Path, query: CcQuery, host: &CcHost) -> CcVerdict {
     cmd.args(args);
     host.apply_environment(&mut cmd);
     let output = match query {
-        CcQuery::Version => crate::doctor::output_bounded_capturing(&mut cmd, bound),
+        CcQuery::Version => match compiler_output(&mut cmd, driver, bound) {
+            Ok(out) => Some(out),
+            Err(verdict) => return verdict,
+        },
         CcQuery::Find => {
             use aterm_uds::deadline::{CompleteOutputError, RunError};
             match aterm_uds::deadline::output_until_complete_stdout(
@@ -969,6 +1002,9 @@ mod tests {
             &cc,
             "if [ -n \"$SDKROOT\" ]; then\n  if [ -f \"$0.write-fallback\" ]; then printf fresh > \"$2\"; /bin/chmod +x \"$2\"; fi\n  exit 0\nfi\nprintf stale > \"$2\"\n/bin/chmod +x \"$2\"\n/usr/bin/chflags uchg \"$2\" || exit 2\nexit 1",
         );
+        let alias = root.join("bin-alias");
+        std::os::unix::fs::symlink(&bin, &alias).unwrap();
+        let cc = alias.join("cc");
         let host = CcHost {
             shim_dir: Some(bin),
             default_developer_dir: developer,
@@ -1064,25 +1100,36 @@ mod tests {
         let root = scratch("setup-shim");
         let setup = root.join("clt-shim");
         let inherited = root.join("old-home/clt-shim");
+        let setup_alias = root.join("setup-alias");
+        let inherited_alias = root.join("inherited-alias");
         let apple = root.join("usr-bin");
+        let apple_alias = root.join("apple-alias");
         // These must never run: discovery alone can tell the tools are missing.
         script(&setup.join("cc"), "exit 69");
         script(&inherited.join("cc"), "exit 69");
         script(&apple.join("cc"), "exit 1");
+        std::os::unix::fs::symlink(&setup, &setup_alias).unwrap();
+        std::os::unix::fs::symlink("old-home/clt-shim", &inherited_alias).unwrap();
+        std::os::unix::fs::symlink(&apple, &apple_alias).unwrap();
         let host = CcHost {
             shim_dir: Some(apple.clone()),
             ..plain_host(&root)
         };
-        let path = std::env::join_paths([&inherited, &setup, &apple]).unwrap();
-        assert!(matches!(
-            locate_without_setup_shim(Some(&path), &host, &[Some(&setup), Some(&inherited)]),
-            Err(CcVerdict::NoDeveloperDir)
-        ));
-        // An unmarked PATH compiler retains priority, including its failures.
-        assert!(matches!(
-            locate_without_setup_shim(Some(&path), &host, &[Some(&setup)]),
-            Ok(Located::Plain(cc)) if cc == inherited.join("cc")
-        ));
+        for (setup_entry, inherited_entry, apple_entry) in [
+            (&setup, &inherited, &apple),
+            (&setup_alias, &inherited_alias, &apple_alias),
+        ] {
+            let path = std::env::join_paths([inherited_entry, setup_entry, apple_entry]).unwrap();
+            assert!(matches!(
+                locate_without_setup_shim(Some(&path), &host, &[Some(&setup), Some(&inherited)]),
+                Err(CcVerdict::NoDeveloperDir)
+            ));
+            // An unmarked PATH compiler retains priority, including its failures and aliases.
+            assert!(matches!(
+                locate_without_setup_shim(Some(&path), &host, &[Some(&setup)]),
+                Ok(Located::Plain(cc)) if cc == inherited_entry.join("cc")
+            ));
+        }
     }
 
     /// A fake `cc` that answers `--version` and, asked `-o <out> <src>`, builds: it writes
@@ -1782,6 +1829,57 @@ mod tests {
             build_probe_in(&cc, cc.clone(), None, &host, &next),
             CcVerdict::Ready { driver: cc }
         );
+    }
+
+    #[test]
+    fn a_compiler_launch_refusal_is_unproven_and_repair_can_be_kept() {
+        for phase in ["version", "compile"] {
+            let root = scratch("launch-refused");
+            let bin = root.join("bin");
+            let cc = bin.join("cc");
+            std::fs::create_dir_all(&bin).unwrap();
+            let broken = format!("#!{}\n", root.join("missing-interpreter").display());
+            if phase == "compile" {
+                script(
+                    &cc,
+                    "if [ \"$1\" = --version ]; then /bin/mv \"$0.next\" \"$0\"; echo cc; exit 0; fi\nexit 9",
+                );
+                std::fs::write(bin.join("cc.next"), &broken).unwrap();
+                std::fs::set_permissions(
+                    bin.join("cc.next"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            } else {
+                std::fs::write(&cc, &broken).unwrap();
+                std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let host = plain_host(&root);
+            let path = Some(bin.as_os_str());
+            let refused = probe_with(path, &host);
+            assert!(
+                matches!(&refused, CcVerdict::Unproven { why, .. } if why.contains("could not start")),
+                "{phase}: {refused:?}"
+            );
+            script(
+                &cc,
+                "echo asked >> \"${0%/bin/cc}/asked\"\nif [ \"$1\" = --version ]; then echo cc; else printf x > \"$2\"; /bin/chmod +x \"$2\"; fi",
+            );
+            let cache = CcCache {
+                file: root.join("state/cc"),
+                receipt: root.join("no-receipt"),
+            };
+            let ready = CcVerdict::Ready { driver: cc };
+            assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+            assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+            assert_eq!(
+                std::fs::read_to_string(root.join("asked"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                2
+            );
+        }
     }
 
     /// A compiler that hangs is unknown, not broken, and the probe returns inside its

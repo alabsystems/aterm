@@ -327,6 +327,47 @@ pub fn read_mint_secret_narrowed(path: &str) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_scheduled_local_broker_answers_the_required_hello() {
+        use astream_broker::proto::{
+            decode_request, encode_response, read_frame, write_frame, NonceExt, Request, Response,
+        };
+        use std::os::unix::net::UnixListener;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let path = root.path().join("broker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let started = Instant::now() - Duration::from_secs(6);
+        let (mut conn, _closer) = connect(
+            path.to_str().unwrap(),
+            crate::bridge::ack_remaining(started.elapsed()),
+        )
+        .unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let producer = std::thread::spawn(move || {
+            let request = decode_request(&read_frame(&mut peer).unwrap().unwrap()).unwrap();
+            assert!(matches!(request, Request::Hello));
+            let _ = write_frame(
+                &mut peer,
+                &encode_response(&Response::Nonce {
+                    nonce: vec![0x52; 32],
+                    log: None,
+                    ext: NonceExt::default(),
+                }),
+            );
+        });
+        let actual = conn.hello();
+        producer.join().unwrap();
+        assert_eq!(actual.unwrap(), [0x52; 32]);
+        assert!(matches!(
+            connect(path.to_str().unwrap(), crate::bridge::ack_remaining(Duration::from_secs(61))),
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput || e.kind() == io::ErrorKind::TimedOut
+        ));
+    }
+
     /// A connect's deadline bounds both directions: a `hello` nobody answers and a
     /// post bigger than the socket's buffers to a broker that stopped reading both
     /// fail at it.

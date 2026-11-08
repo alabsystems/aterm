@@ -485,6 +485,16 @@ fn stand_in_drive_until(
     approver: &mut dyn Approver,
     deadline: Deadline<'_>,
 ) -> Drove {
+    stand_in_drive_using(root, script, approver, deadline, drive_until)
+}
+
+fn stand_in_drive_using(
+    root: &Path,
+    script: &str,
+    approver: &mut dyn Approver,
+    deadline: Deadline<'_>,
+    run: impl FnOnce(&Spec<'_>, &mut dyn Approver, Deadline<'_>) -> Drove,
+) -> Drove {
     let tmp = root;
     let staging = tmp.join("sol+1");
     std::fs::create_dir_all(&staging).expect("staging");
@@ -511,7 +521,7 @@ fn stand_in_drive_until(
     ]
     .map(OsString::from)
     .to_vec();
-    drive_until(
+    run(
         &Spec {
             program: &exe,
             lead: &lead,
@@ -1459,36 +1469,103 @@ fn over_ssh_a_codex_browser_sign_in_runs_its_device_route_off_this_machines_desk
 }
 
 #[test]
-fn slow_approver_past_output_grace_still_drains_buffered_signed_in_line() {
-    struct SlowApprover;
-    impl Approver for SlowApprover {
-        fn approve(&mut self, _handoff: &Handoff<'_>) -> Approval {
-            std::thread::sleep(OUTPUT_GRACE + Duration::from_millis(150));
-            Approval::Approved { page: true }
+fn a_native_exit_waits_for_its_delayed_pipe_reader() {
+    for script in ["kimi 0", "kimi-unfinished 0"] {
+        for age in [Duration::from_secs(3), Duration::from_secs(61)] {
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let tmp = aterm_tempfile::tempdir().unwrap();
+            let seen = Seen::default();
+            let (ready, waiting) = std::sync::mpsc::channel();
+            let mut waiting = Some(waiting);
+            let mut ready = Some(ready);
+            let mut readers = Vec::new();
+            let mut observed_exit = 0;
+            let drove = stand_in_drive_using(
+                tmp.path(),
+                script,
+                &mut &seen,
+                Deadline::after(Duration::from_secs(120)),
+                |spec, approver, deadline| {
+                    drive_until_with_readers(
+                        spec,
+                        approver,
+                        deadline,
+                        |work, read| {
+                            // This real stand-in writes its login transcript to stderr (the second reader).
+                            let wait = if readers.len() == 1 {
+                                waiting.take()
+                            } else {
+                                None
+                            };
+                            readers.push(spawn_reader(work, move || {
+                                if let Some(wait) = wait {
+                                    wait.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                                        .expect("the actual child exited");
+                                }
+                                read();
+                            })?);
+                            Ok(())
+                        },
+                        || {
+                            observed_exit += 1;
+                            if observed_exit == 3 && !expired {
+                                ready.take().unwrap().send(()).unwrap();
+                            }
+                            Instant::now()
+                                - if observed_exit == 1 {
+                                    age
+                                } else {
+                                    Duration::ZERO
+                                }
+                        },
+                    )
+                },
+            );
+            // A deliberately expired detector leaves the actual reader gated until this cleanup.
+            if let Some(ready) = ready.take() {
+                ready.send(()).unwrap();
+            }
+            assert_eq!(readers.len(), 2);
+            for reader in readers {
+                reader.join().unwrap();
+            }
+            assert!(observed_exit >= 2, "the wait follows the actual child exit");
+            assert!(
+                tmp.path()
+                    .join("sol+1/credentials/kimi-code.json")
+                    .is_file(),
+                "the native stand-in completed its credential write"
+            );
+            if expired {
+                assert_eq!(observed_exit, 2);
+                assert_eq!(drove.outcome, Outcome::Exited(Some(0)));
+                assert!(
+                    seen.handed.borrow().is_empty(),
+                    "no fabricated handoff from unread output"
+                );
+            } else {
+                assert!(observed_exit >= 3);
+                let expected = if script == "kimi 0" {
+                    Outcome::SignedIn {
+                        email: None,
+                        page: false,
+                    }
+                } else {
+                    Outcome::Exited(Some(0))
+                };
+                assert_eq!(
+                    drove.outcome, expected,
+                    "the actual completion phrase, not exit zero, decides sign-in"
+                );
+                assert_eq!(seen.handed.borrow().len(), 1);
+            }
         }
     }
+}
 
-    // The shipped grace, which this approver outlasts.
-    let _grace = GraceSet::set(OUTPUT_GRACE);
-    let tmp = aterm_tempfile::tempdir().expect("tmp");
-    let drove = stand_in_drive_in(tmp.path(), "kimi 0", &mut SlowApprover);
-    assert_eq!(
-        drove.outcome,
-        Outcome::SignedIn {
-            email: None,
-            page: true,
-        },
-        "buffered `Signed in` line must still be drained when approver exceeds OUTPUT_GRACE"
-    );
-
+#[test]
+fn env_interpreter_handles_options_assignments_and_relative_looking_words() {
     let tmp_ctrl = aterm_tempfile::tempdir().expect("tmp_ctrl");
-    let control = stand_in_drive_in(tmp_ctrl.path(), "kimi-unfinished 0", &mut SlowApprover);
-    assert_eq!(
-        control.outcome,
-        Outcome::Exited(Some(0)),
-        "CONTROL: exit 0 without a completion phrase stays Exited(Some(0))"
-    );
-
     let script = tmp_ctrl.path().join("env-script");
     std::fs::write(&script, b"#!/usr/bin/env -u NODE_OPTIONS -C /tmp node\n").expect("write");
     assert_eq!(env_interpreter(&script).as_deref(), Some("node"));

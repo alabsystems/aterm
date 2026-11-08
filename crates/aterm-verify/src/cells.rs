@@ -643,11 +643,10 @@ fn cell_ended(ctx: &Ctx) -> Option<String> {
     })
 }
 
-/// One cell's row under `label`, then how long it took and what it printed. A COULD NOT RUN row
-/// names its cause (the first line of what the machine said: a spawn error, a full disk, the
-/// run's interrupt, a toolchain's refusal, cut to 240 characters with its fix kept,
-/// [`shortened`]) in the row itself, as the check's terminal line shows only the row: the lines
-/// under it reach the log alone.
+/// One cell's row under `label`, then how long it took and what it printed. Failed rows carry
+/// a bounded diagnostic excerpt, and COULD NOT RUN rows their first cause, because live stage
+/// records show the row before the ordered log can reach the full output. The log retains all
+/// original details; [`shortened`] keeps a cause's fix when it cuts at 240 characters.
 fn record_cell(r: &mut Report, label: &str, took: String, outcome: CellOutcome) {
     match outcome {
         CellOutcome::Unselected => r.pass(format!(
@@ -660,7 +659,21 @@ fn record_cell(r: &mut Report, label: &str, took: String, outcome: CellOutcome) 
         }
         CellOutcome::Skipped { why, fix } => r.skip(format!("{label} — {why} (fix: {fix})")),
         CellOutcome::Failed { status, detail } => {
-            r.fail(format!("{label} — {status}"));
+            let cause = detail.iter().find_map(|text| {
+                let excerpt = crate::findings::excerpt(text, 3);
+                (!excerpt.is_empty()).then(|| {
+                    excerpt
+                        .iter()
+                        .map(String::as_str)
+                        .map(str::trim)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+            });
+            r.fail(match cause {
+                Some(cause) => format!("{label} — {status}: {}", shortened(&cause, 240)),
+                None => format!("{label} — {status}"),
+            });
             r.raw(took);
             r.raw(detail.join("\n"));
         }
@@ -3164,13 +3177,18 @@ mod tests {
         let graph = names(&["gui"]);
         let warning = |code: &str, rendered: &str| {
             format!(
-                r#"{{"reason":"compiler-message","package_id":"path+file:///r/gui#gui@1","message":{{"level":"warning","code":{code},"rendered":"{rendered}"}}}}"#
+                r#"{{"reason":"compiler-message","package_id":"path+file:///r/gui#gui@1","message":{{"level":"warning","code":{code},"rendered":{}}}}}"#,
+                aterm_json::to_string(rendered).unwrap()
             )
         };
-        let dead = "warning: function `launchctl_list` is never used";
+        let message = "warning: function `launchctl_list` is never used";
+        let location = "crates/gui/src/launch.rs:42:5";
+        let dead = format!(
+            "\u{1b}[1m{message}\u{1b}[0m\n  --> {location}\n   |\n42 | fn launchctl_list() {{}}\n"
+        );
         let out = [
-            warning(r#"{"code":"dead_code","explanation":null}"#, dead),
-            warning(r#"{"code":"dead_code","explanation":null}"#, dead),
+            warning(r#"{"code":"dead_code","explanation":null}"#, &dead),
+            warning(r#"{"code":"dead_code","explanation":null}"#, &dead),
             warning(
                 r#"{"code":"unused_imports","explanation":null}"#,
                 "warning: unused import: `HashSet`",
@@ -3191,7 +3209,7 @@ mod tests {
         assert_eq!(
             read.warnings,
             [
-                ("gui".to_string(), dead.to_string()),
+                ("gui".to_string(), dead.clone()),
                 (
                     "gui".to_string(),
                     "warning: unused import: `HashSet`".to_string()
@@ -3231,6 +3249,47 @@ mod tests {
             assert_eq!(red.status.as_deref(), Some(status));
             assert_eq!(red.detail.len(), 2);
             assert!(red.detail[0].contains("launchctl_list"), "{:?}", red.detail);
+            let mut report = Report::new("cells");
+            record_cell(
+                &mut report,
+                "cell linux-arm (aarch64-unknown-linux-gnu)",
+                "1s".into(),
+                CellOutcome::Failed {
+                    status: red.status.unwrap(),
+                    detail: red.detail,
+                },
+            );
+            let (outcome, row) = report.outcomes().next().unwrap();
+            assert_eq!(outcome, Outcome::Fail(Severity::GateFailed));
+            assert!(row.contains(message) && row.contains(location), "{row}");
+            assert!(!row.contains('\u{1b}') && !row.contains('\n'), "{row}");
+            let event = crate::report::stage_event(
+                0,
+                Some(crate::checks::Check::Cells),
+                &report,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                None,
+            );
+            let event: aterm_json::Value =
+                aterm_json::from_str(event.trim_start_matches("verify-event: ")).unwrap();
+            assert_eq!(event["check"].as_str(), Some("cells"));
+            assert_eq!(event["decisions"][0]["detail"].as_str(), Some(row));
+            let result = crate::report::judge(
+                crate::checks::Check::Cells,
+                &[&report],
+                1.0,
+                "",
+                "targo --unverified verify cells --cell linux-arm".into(),
+                None,
+            );
+            let shown = crate::report::render(&result, 5);
+            let first = shown.lines().next().unwrap();
+            assert!(
+                first.contains(message) && first.contains(location),
+                "{shown}"
+            );
+            assert!(report.render().contains(&dead), "full original diagnostic");
         }
         let run = exec::Run {
             case_observations: None,

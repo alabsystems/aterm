@@ -558,11 +558,13 @@ fn withdrawn(s: &Session) -> bool {
 /// quit's relaunch, and when a closed tab is reopened. Only the crash leaves the session's row
 /// as its bridge last wrote it, so the restore counts when a successor names it, the read knows
 /// an incarnation that hosted it, that incarnation ended (its node's row is its will, or says a
-/// later `inc=`), and none that hosted it withdrew it ([`withdrawn`]). A quit withdraws every
-/// session it carried before its node relaunches (the bridge's `withdraw`), whose closes stay in
-/// the journal (`quit_closes`); a reopened tab's successor runs under the closed session's own
-/// incarnation, whose close its mirror still publishes. A read that knows no incarnation that
-/// hosted the session cannot tell a quit from a crash, and takes no restore for one.
+/// later `inc=`), and none that hosted it withdrew it ([`withdrawn`]). A clean quit puts each
+/// session's own `out=app-quit` close on the bus before its bridge's `bye quit` (fix unit Q1),
+/// so its fold holds a close and nothing derives; the bridge's withdrawal of every session it
+/// carried (its `withdraw`, before its node relaunches) covers a quit whose closes missed its
+/// budget; a reopened tab's successor runs under the closed session's own incarnation, whose
+/// close its mirror still publishes. A read that knows no incarnation that hosted the session
+/// cannot tell a quit from a crash, and takes no restore for one.
 fn restore_says_died(r: &Read, node: &str, s: &Session) -> bool {
     let Some(lived) = s.lived_inc else {
         return false;
@@ -875,10 +877,14 @@ const OPEN_LEVELS: [&str; 3] = ["run", "turn", "step"];
 /// The keys of each `sessions` object `aterm fabric brief --json` writes, in its order: the one
 /// list [`session_json`] writes (its values are an array of this list's length, so a key and
 /// its value come together or the build fails) and `aterm fabric --help` prints
-/// ([`crate::fabric::usage`]).
-pub const SESSION_KEYS: [&str; 12] = [
+/// ([`crate::fabric::usage`]). `closed` is the `out=` word of the session's close as the read
+/// folds it, null while it is open (fix unit Q1): `app-quit` for a clean quit's own close on
+/// the bus, `gone` for a close the read derived for a session that died, the session's own
+/// word otherwise, so a program reading the machine form tells a quit from a real end without
+/// the text form.
+pub const SESSION_KEYS: [&str; 13] = [
     "node", "sid", "this", "ep", "need", "detail", "open", "mail_in", "mail_out", "last_seq",
-    "age_s", "partial",
+    "age_s", "partial", "closed",
 ];
 
 /// One session's object of the machine form (a closed schema of ids, closed
@@ -920,6 +926,7 @@ fn session_json(
         J::Num(f.as_of),
         J::opt_n(age_s),
         J::Arr(why.into_iter().map(J::s).collect()),
+        J::opt_s(st.closed.as_ref().map(|c| c.out)),
     ];
     let obj = J::Obj(SESSION_KEYS.into_iter().zip(values).collect());
     Some((obj, partial))

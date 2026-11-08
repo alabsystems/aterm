@@ -520,4 +520,170 @@ mod presses {
         );
         assert!(split.app.structural_invariants_ok());
     }
+
+    #[test]
+    fn split_divider_hover_drag_and_release_with_focused_page() {
+        let mut split = page_beside_terminal();
+        assert!(
+            split
+                .app
+                .focus_pane_in(split.window, crate::pane::FocusDir::Left)
+        );
+        present_mixed(&mut split.app, split.window);
+        let plan_before = split.app.active_visible_leaf_plan(split.window).unwrap();
+        let page_width_before = plan_before.leaf(split.page).unwrap().rect.size.width;
+        let div_col = plan_before.dividers[0].rect.origin.x as u16;
+        let (dx, dy) = split.app.cell_centre_px(split.window, 10, div_col).unwrap();
+
+        split.app.on_cursor_moved(split.window, dx, dy);
+        assert_eq!(
+            split.app.divider_cursor_under_pointer(split.window),
+            Some(aterm_window::window::CursorIcon::ColResize)
+        );
+        assert_eq!(
+            (
+                split.app.windows[&split.window].hover_pointer,
+                split.app.windows[&split.window].native_text_cursor,
+            ),
+            (true, true),
+            "hovering canonical divider while native page is focused sets resize cursor state"
+        );
+
+        split
+            .app
+            .mouse_input_then_fold(split.window, ElementState::Pressed, MouseButton::Left);
+        assert!(
+            split.app.windows[&split.window].divider_drag.is_some(),
+            "pressing canonical divider begins divider drag"
+        );
+
+        let (drag_x, drag_y) = split
+            .app
+            .cell_centre_px(split.window, 10, div_col + 20)
+            .unwrap();
+        split.app.on_cursor_moved(split.window, drag_x, drag_y);
+
+        split
+            .app
+            .mouse_input_then_fold(split.window, ElementState::Released, MouseButton::Left);
+        assert!(
+            split.app.windows[&split.window].divider_drag.is_none(),
+            "releasing left button while native page is focused finishes divider drag"
+        );
+
+        let plan_after = split.app.active_visible_leaf_plan(split.window).unwrap();
+        let page_width_after = plan_after.leaf(split.page).unwrap().rect.size.width;
+        assert!(
+            page_width_after > page_width_before,
+            "dragging canonical divider right widens left page ({page_width_before} -> {page_width_after})"
+        );
+        assert_eq!(
+            split.app.active_native_view(split.window).unwrap().1,
+            split.page
+        );
+        assert!(split.app.structural_invariants_ok());
+    }
+
+    #[test]
+    fn split_terminal_gap_scrollbar_with_focused_page_grabs_and_drags_instead_of_divider() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        app.config.scrollbar = Some(true);
+        let wid = WindowId(0);
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.os_window_for_test = true;
+            ws.rows = 30;
+            ws.cols = 200;
+            ws.metrics.pad = 12;
+        }
+        let left_terminal = app.focused_session_id(wid).unwrap();
+        let term = app.pool.get(left_terminal).unwrap().term.clone();
+        {
+            let mut t = crate::term_lock(&term);
+            for i in 0..400 {
+                t.process(format!("line {i}\r\n").as_bytes());
+            }
+        }
+        app.open_allocation(true).expect("open allocation split");
+        present_mixed(&mut app, wid);
+        let (_, native_view) = app.active_native_view(wid).expect("focused native view");
+
+        let plan = app.active_visible_leaf_plan(wid).unwrap();
+        app.refresh_pane_overlay_for_capture(wid, &plan, std::time::Instant::now());
+        let inputs = app.pane_overlay_inputs(wid, false).expect("inputs");
+        let facts = app.windows[&wid].pane_overlay.facts()[0];
+        assert_eq!(facts.session, left_terminal);
+        let (cw, ch) = inputs.cell;
+        let m = crate::scrollbar::Metrics::for_cell(cw as u32, ch as u32);
+        let lane = crate::scrollbar::lane(
+            (
+                facts.rect.row,
+                facts.rect.col,
+                facts.rect.rows,
+                facts.rect.cols,
+            ),
+            inputs.win_cols,
+            inputs.cell,
+            inputs.pad,
+            m,
+        )
+        .expect("gap lane");
+        assert!(
+            !lane.edge,
+            "left terminal pane uses a gap scrollbar on the divider column"
+        );
+        let (top, len) = crate::scrollbar::thumb(lane, facts.rect.rows as u32, facts.history, 0, m)
+            .expect("thumb");
+        let (sx_bar, sw_bar) = crate::scrollbar::span(lane, m.wide, m);
+        let top_band =
+            app.win_pad_top(wid) + app.win_head(wid) + usize::from(app.chrome_rows(wid)) * ch;
+        let wx = f64::from(sx_bar + sw_bar / 2) + app.win_pad(wid) as f64;
+        let wy = f64::from(top + len / 2) + top_band as f64;
+
+        app.on_cursor_moved(wid, wx, wy);
+        assert_eq!(
+            app.windows[&wid].pane_overlay.hover,
+            Some(left_terminal),
+            "hovering gap scrollbar while native sibling is focused lights the bar"
+        );
+
+        let native_leaf = plan.leaf(native_view).unwrap();
+        let (sx, sy) = app
+            .cell_centre_px(
+                wid,
+                native_leaf.rect.origin.y as u16 + 5,
+                native_leaf.rect.origin.x as u16 + 5,
+            )
+            .unwrap();
+        app.on_cursor_moved(wid, sx, sy);
+        assert_eq!(
+            app.windows[&wid].pane_overlay.hover, None,
+            "moving from terminal scrollbar onto focused native pane clears scrollbar hover"
+        );
+
+        app.on_cursor_moved(wid, wx, wy);
+        assert_eq!(app.windows[&wid].pane_overlay.hover, Some(left_terminal));
+        app.mouse_input_then_fold(wid, ElementState::Pressed, MouseButton::Left);
+        assert!(
+            app.windows[&wid].pane_overlay.drag.is_some(),
+            "pressing gap scrollbar thumb in heterogeneous split grabs thumb"
+        );
+        assert!(
+            app.windows[&wid].divider_drag.is_none(),
+            "gap scrollbar press takes precedence over divider drag"
+        );
+
+        let wy_up = f64::from(lane.top + 4) + top_band as f64;
+        app.on_cursor_moved(wid, wx, wy_up);
+        assert!(
+            crate::term_lock(&term).grid().display_offset() > 0,
+            "dragging gap scrollbar thumb while native sibling is focused scrolls terminal"
+        );
+
+        app.mouse_input_then_fold(wid, ElementState::Released, MouseButton::Left);
+        assert!(app.windows[&wid].pane_overlay.drag.is_none());
+        assert_eq!(app.active_native_view(wid).unwrap().1, native_view);
+        assert!(app.structural_invariants_ok());
+    }
 }

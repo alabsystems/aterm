@@ -146,6 +146,55 @@ pub(crate) struct Remote<'a> {
 pub(crate) enum Pushed {
     Done,
     Rejected(String),
+    /// Another atomic batch prevented this attempt from sending anything.
+    Blocked {
+        intent: agh::IntentId,
+        why: String,
+    },
+}
+
+/// Read the machine diagnostic, never its human `why` or suggested command. Unknown outcomes
+/// without this exact pre-send refusal remain fatal, including older agh diagnostics.
+fn blocking_intent(out: &Output, repo: &str) -> Option<agh::IntentId> {
+    if out.status.code() != Some(13) {
+        return None;
+    }
+    #[derive(serde::Deserialize)]
+    struct Diagnostic {
+        error: Refusal,
+    }
+    #[derive(serde::Deserialize)]
+    struct Refusal {
+        v: u8,
+        exit: u8,
+        kind: String,
+        sub: String,
+        side_effect: String,
+        repo: String,
+        intent: String,
+    }
+    let mut records = out
+        .stderr
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::trim_ascii)
+        .filter(|line| line.starts_with(b"{") || line.starts_with(b"["))
+        .map(aterm_json::from_slice::<Diagnostic>);
+    let diagnostic = records.next()?.ok()?;
+    if records.next().is_some() {
+        return None;
+    }
+    let error = diagnostic.error;
+    if error.v == 1
+        && error.exit == 13
+        && error.kind == "outcome_unknown"
+        && error.sub == "intent_open"
+        && error.side_effect == "none"
+        && error.repo == repo
+    {
+        agh::IntentId::parse(&error.intent)
+    } else {
+        None
+    }
 }
 
 impl<'a> Remote<'a> {
@@ -302,7 +351,7 @@ impl<'a> Remote<'a> {
     }
 
     /// Publish exact local objects, expected ref included. An unknown outcome stops the caller;
-    /// agh's durable intent prevents another batch until its outcome is reconciled.
+    /// only a typed refusal which sent nothing permits observation of the blocking intent.
     pub(crate) fn push(
         &self,
         reference: &str,
@@ -349,6 +398,8 @@ impl<'a> Remote<'a> {
                         let why = why(Tool::Agh, &out);
                         return if out.status.code() == Some(9) {
                             Ok(Pushed::Rejected(why))
+                        } else if let Some(intent) = blocking_intent(&out, slug) {
+                            Ok(Pushed::Blocked { intent, why })
                         } else if out.status.code() == Some(13) {
                             Err(format!(
                                 "{why}; outcome unknown: reconcile agh's intent before another write"
@@ -360,6 +411,44 @@ impl<'a> Remote<'a> {
                 }
                 Ok(Pushed::Done)
             }
+        }
+    }
+
+    /// Observe only the exact foreign journal entry which refused our pre-send attempt. The
+    /// caller owns the deadline; neither journal reads nor superseding writers extend it.
+    pub(crate) fn wait_for_intent(
+        &self,
+        intent: &agh::IntentId,
+        pause: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let Kind::Github(slug) = &self.kind else {
+            return Err("a local remote has no agh intent".into());
+        };
+        let intent = intent.as_str();
+        loop {
+            let args = words(&["intent", "show", slug, intent, "--format", "json"]);
+            let bytes = success(Tool::Agh, (self.run)(Tool::Agh, &args)?)?;
+            #[derive(serde::Deserialize)]
+            struct Intent {
+                id: String,
+                repo: String,
+                op: String,
+                key: String,
+                open: bool,
+            }
+            let doc: Intent = aterm_json::from_slice(&bytes)
+                .map_err(|_| "agh intent returned invalid JSON".to_owned())?;
+            if doc.id != intent
+                || doc.repo != *slug
+                || doc.op != "ref.update-atomic"
+                || doc.key != "atomic refs"
+            {
+                return Err("agh intent identity does not match the refused atomic push".into());
+            }
+            if !doc.open {
+                return Ok(());
+            }
+            pause()?;
         }
     }
 }

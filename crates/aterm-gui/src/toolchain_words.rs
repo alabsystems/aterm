@@ -1228,7 +1228,7 @@ mod tests {
 
     #[test]
     fn every_live_toolchain_row_completes_in_its_finished_form() {
-        use crate::messages_host::assert_completes_in_place as completes;
+        use crate::messages_host::assert_records_its_finished_words as completes;
         completes(
             &announced("installing 2 program(s) (about 1 GB)"),
             "Installed ALab tools",

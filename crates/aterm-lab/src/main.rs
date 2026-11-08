@@ -469,8 +469,8 @@ against a local API stub (Anthropic, Responses, Gemini, Meta or xAI). Most labs 
 
 usage: targo --unverified lab <command> [tag] [args]
        (tag: the first word when it names a lab that is up, else $LAB_TAG or \"lab\" and the word is an argument;
-       up takes one optional tag beside --window, --fabric and --tab-strip; down, ps, crash and sleep take any
-       first word as the tag;
+       up takes one optional tag beside --window, --fabric and --tab-strip; down, ps, crash, relaunch and sleep
+       take any first word as the tag;
        a verb that brings up its own lab defaults to a tag of its own)
   artifact-serve --bind LAN_IP:PORT --peer IP --status NEW_PATH --file NAME=ABSOLUTE_PATH...
                                  serve immutable named snapshots to one peer using a capability stored only in the private status file
@@ -739,6 +739,9 @@ usage: targo --unverified lab <command> [tag] [args]
                                  SIGKILL the lab's own aterm instance and relaunch it on the same state after SECS (default
                                  0; --keep-tree leaves its child processes, for PTY keeper testing; refused on a windowed lab
                                  whose recorded pid may be its window's keeper, so crash an `up --window` lab's)
+  relaunch [tag]                 start the lab's instance again on the same state and socket once it ended by itself
+                                 (`ctl invoke Quit`): refused while it still runs; an `up --fabric` lab's relaunch
+                                 waits for its bridge to connect again, so its bus reads a clean quit's relaunch
   sleep [tag] --for SECS [--hold SECS] [--at-act [--rule RULE] [--within SECS]]
                                  emulate macOS sleep on a LAB_CLOCK=1 lab: SIGSTOP aterm, advance clock offset by SECS,
                                  hold --hold SECS, and SIGCONT (--at-act waits for first CONTINUED journal act)
@@ -1292,6 +1295,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "forever" => forever::cmd_forever(args),
         "look-away" => look_away::cmd_look_away(args),
         "crash" => crash::cmd_crash(args),
+        "relaunch" => crash::cmd_relaunch(args),
         "sleep" => sleep::cmd_sleep(args),
         "workers" => workers::cmd_workers(args),
         "work-overlap" => work_overlap::cmd_work_overlap(args),

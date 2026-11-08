@@ -7,6 +7,7 @@ use crate::{channel, ledger, manifest_out, publish, verify};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use channel::{ChannelRelease, HeadPatchValue};
 use ledger::{Error, Result, RunOut};
@@ -797,7 +798,16 @@ fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
         &mut |d| slept.push(d),
     )
     .expect("a pointer that moves within the bound is proved");
-    assert_eq!(slept, vec![publish::POINTER_PROBE_DELAY; lag]);
+    assert_eq!(
+        &slept[..3],
+        &[
+            Duration::from_millis(250),
+            Duration::from_millis(500),
+            Duration::from_secs(1)
+        ]
+    );
+    assert!(slept.iter().all(|d| *d <= Duration::from_secs(10)));
+    assert_eq!(slept.len(), lag);
 
     let (mut asked, mut slept) = (0, Vec::new());
     let err = publish::prove_pointer_serves(
@@ -817,8 +827,43 @@ fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
             .contains(&format!("names {PREVIOUS}, not {TAG}")),
         "{err}"
     );
-    assert_eq!(asked, publish::POINTER_PROBE_ATTEMPTS as usize);
-    assert_eq!(slept.len(), publish::POINTER_PROBE_ATTEMPTS as usize - 1);
+    assert_eq!(asked, slept.len() + 1);
+    let waited = slept.iter().sum::<Duration>();
+    assert!(waited < publish::POINTER_PROBE_BUDGET);
+    assert!(publish::POINTER_PROBE_BUDGET - waited <= Duration::from_secs(10));
+}
+
+/// NEGATIVE CONTROL: the former ten-second poll gap misses a pointer ready at
+/// one second. No wall-clock latency assertion or real network is involved.
+#[test]
+fn a_pointer_is_proved_as_soon_as_fast_probes_observe_it() {
+    use std::cell::Cell;
+    let mut github = FakeGithub::with_previous_release();
+    let id = github.source_release(true);
+    let (_dir, files, local) = dist();
+    channel::publish_on_channel(&mut FakeChannel::new(&mut github, id, local.clone(), files))
+        .unwrap();
+    let ready = github.pointer();
+    let elapsed = Cell::new(Duration::ZERO);
+    publish::prove_pointer_serves(
+        SLUG,
+        TAG,
+        &local,
+        &mut || {
+            Ok(if elapsed.get() >= Duration::from_secs(1) {
+                ready.clone()
+            } else {
+                PointerProbe::Tag {
+                    tag: PREVIOUS.into(),
+                    location: download_url(PREVIOUS, manifest_out::MANIFEST_ASSET),
+                }
+            })
+        },
+        &mut |url| github.fetch(url),
+        &mut |delay| elapsed.set(elapsed.get() + delay),
+    )
+    .unwrap();
+    assert_eq!(elapsed.get(), Duration::from_millis(1750));
 }
 
 #[test]

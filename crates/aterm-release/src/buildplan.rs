@@ -689,15 +689,6 @@ fn own_slice_pool(temporary: &Path) -> Result<SlicePool, String> {
     })
 }
 
-fn slice_memory_need(triple: &str, native: bool) -> aterm_capacity::Need {
-    aterm_capacity::Need::new(format!("release slice {triple}"))
-        .rank(aterm_capacity::Rank::Release)
-        // Rounded up from the 0.174.0 m3 peaks (41.7 and 22.8 GiB).
-        .mem_gib(if native { 42 } else { 23 })
-        // An unclaimed load cannot turn a memory shortage into admission ALONE.
-        .margin(1)
-}
-
 fn build_slices(
     plan: &BuildPlan,
     take: &Take,
@@ -727,6 +718,14 @@ fn build_slices(
             "upstream stable (+r): --target compat slice",
         ),
     ];
+    // Both slices' claims are this process's: each slice's compilers claim their own memory only
+    // where both slices' last units are on record ([`crate::slice_units::Units::of`]).
+    let at_once = if matches!(plan.sequencing, Sequencing::OneAtATime) {
+        1
+    } else {
+        2
+    };
+    let units = crate::slice_units::Units::live(&slices.map(|(triple, _, _)| triple), at_once);
     let one = |(triple, target, lane): (&'static str, Option<&'static str>, &str),
                admitted: Option<std::sync::mpsc::Sender<()>>| {
         let log = logs.join(format!("{triple}.log"));
@@ -738,11 +737,20 @@ fn build_slices(
             log.display()
         );
         let built = (|| {
-            let memory = aterm_capacity::admit(
-                slice_memory_need(triple, target.is_none()),
-                aterm_capacity::Admit::Wait,
-            )
-            .map_err(|e| e.to_string())?;
+            let units = units.iter().find(|u| u.triple() == triple);
+            let need = crate::slice_units::slice_need(triple, target.is_none(), units);
+            println!(
+                "==> [{triple}] memory: claims {} for {}",
+                aterm_capacity::size(need.mem),
+                if units.is_some_and(crate::slice_units::Units::claims) {
+                    "its driver; each compiler claims its unit's recorded peak, leading"
+                } else {
+                    "its whole build (no record of every slice's last unit yet; its compilers \
+                     record theirs)"
+                }
+            );
+            let memory = aterm_capacity::admit(need, aterm_capacity::Admit::Wait)
+                .map_err(|e| e.to_string())?;
             if let Some(admitted) = admitted {
                 let _ = admitted.send(());
             }
@@ -758,6 +766,7 @@ fn build_slices(
                 build_number: plan.build_number,
                 index_hint: plan.index_hint.as_deref(),
                 static_crt: false,
+                units,
             };
             run_slice_profile(take, &run, Some(&log), None, Some(pool))
         })();
@@ -1118,6 +1127,9 @@ struct ReleaseEnv<'a> {
     rustup_home: Option<OsString>,
     /// [`BuildPlan::index_hint`].
     index_hint: Option<&'a str>,
+    /// A release slice's units and this executable, their compilers' wrapper
+    /// ([`crate::slice_units::Units::env`]); `None` for every other build.
+    units: Option<(&'a crate::slice_units::Units, &'a Path)>,
 }
 
 fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
@@ -1183,6 +1195,9 @@ fn release_env(e: &ReleaseEnv<'_>) -> Vec<(&'static str, OsString)> {
     if cfg!(target_os = "linux") {
         env.push(("CARGO_BUILD_JOBS", "4".into()));
     }
+    if let Some((units, wrapper)) = e.units {
+        env.extend(units.env(wrapper));
+    }
     env
 }
 
@@ -1239,6 +1254,7 @@ pub(crate) fn pilot_build(
                 build_number,
                 index_hint,
                 static_crt: false,
+                units: None,
             },
             Some(&log),
             Some((arm, claim.cores())),
@@ -1398,6 +1414,7 @@ pub(crate) fn pilot_host_checks(
                     .join("instruments.noindex"),
                 rustup_home: None,
                 index_hint,
+                units: None,
             },
         );
         cmd.current_dir(&take.snapshot.src)
@@ -1464,6 +1481,7 @@ fn build_one(
         build_number: plan.build_number,
         index_hint: plan.index_hint.as_deref(),
         static_crt: false,
+        units: None,
     };
     run_slice(take, &run, log)
 }
@@ -1489,6 +1507,7 @@ pub(crate) fn build_static(
         build_number: plan.build_number,
         index_hint: None,
         static_crt: true,
+        units: None,
     };
     run_slice(take, &run, log)?;
     Ok(target_bin(&target_dir, triple, bin))
@@ -1514,6 +1533,7 @@ pub(crate) fn compat_check(repo_root: &Path, commit: &str, log: &Path) -> Result
         build_number: COMPAT_CHECK_EPOCH,
         index_hint: None,
         static_crt: false,
+        units: None,
     };
     run_slice(&take, &run, Some(log)).map_err(|error| format!("{error}\n{}", log_tail(log, 40)))?;
     Ok(format!(
@@ -1538,6 +1558,9 @@ struct SliceRun<'a> {
     index_hint: Option<&'a str>,
     /// Link the C library in ([`cargo_build_args`]); only with a `target`.
     static_crt: bool,
+    /// A release slice's units, whose compilers start under this executable
+    /// ([`crate::slice_units`]); `None` for every other build.
+    units: Option<&'a crate::slice_units::Units>,
 }
 
 fn compat_budget(cmd: &mut Command, held: Option<&str>, jobs: Option<&str>) -> Result<(), String> {
@@ -1596,6 +1619,12 @@ fn run_slice_profile(
         Some(_) => Some(release_rustup_home(&home)?),
         None => None,
     };
+    // A slice's compilers start under this executable ([`crate::slice_units`]).
+    let wrapper = run
+        .units
+        .map(|_| std::env::current_exe())
+        .transpose()
+        .map_err(|e| format!("this executable, the slice's compiler wrapper: {e}"))?;
     let mut cmd = release_build_command(
         &driver_path,
         cargo_build_args(
@@ -1618,6 +1647,7 @@ fn run_slice_profile(
             target_dir: run.target_dir.clone(),
             rustup_home,
             index_hint: run.index_hint,
+            units: run.units.zip(wrapper.as_deref()),
         },
     );
     if let Some((arm, cores)) = arm {
@@ -2978,7 +3008,7 @@ mod tests {
             let ledger = aterm_capacity::Ledger::at(dir.path().join("ledger"));
             let machine =
                 aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(128, gib - 1, 16));
-            let need = super::slice_memory_need("injected", native);
+            let need = crate::slice_units::slice_need("injected", native, None);
             assert_eq!(need.mem, gib << 30);
             assert!(
                 aterm_capacity::admit::try_admit_with(&ledger, &machine, need.clone())
@@ -3755,6 +3785,44 @@ mod tests {
         );
     }
 
+    /// A RELEASE SLICE'S CARGO NAMES THIS EXECUTABLE ITS COMPILER WRAPPER AND GAINS NOTHING
+    /// ELSE: its environment is the build's own plus the wrapper's variables
+    /// ([`crate::slice_units::Units::env`]), which the wrapper removes again from the compiler it
+    /// starts. NEGATIVE CONTROL: a build with no units names no wrapper.
+    #[test]
+    fn a_slices_cargo_names_this_executable_its_compiler_wrapper_and_gains_nothing_else() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let units =
+            crate::slice_units::Units::of(&dir.path().join("units.json"), &[super::ARM64], 1)
+                .remove(0);
+        let wrapper = std::path::Path::new("/r/aterm-release");
+        let env = |units| ReleaseEnv {
+            path: "/t/bin:/usr/bin".into(),
+            home: std::ffi::OsStr::new("/h"),
+            tmp: std::path::Path::new("/private/take/tmp"),
+            cargo_home: "/private/take/cargo".into(),
+            build_number: 4242,
+            short_commit: "0123456789ab",
+            commit: "0123456789abcdef0123456789abcdef01234567",
+            target_dir: "/private/take/target".into(),
+            rustup_home: None,
+            index_hint: None,
+            units,
+        };
+        let plain = release_env(&env(None));
+        let slice = release_env(&env(Some((&units, wrapper))));
+        let mut gained: Vec<_> = slice.into_iter().filter(|kv| !plain.contains(kv)).collect();
+        gained.sort();
+        let mut want = units.env(wrapper);
+        want.sort();
+        assert_eq!(gained, want);
+        assert!(
+            want.iter()
+                .any(|(k, v)| *k == "RUSTC_WRAPPER" && v == wrapper.as_os_str())
+        );
+        assert!(!plain.iter().any(|(k, _)| *k == "RUSTC_WRAPPER"));
+    }
+
     #[test]
     fn the_release_build_enables_no_development_seam() {
         let config = std::path::Path::new("/private/take/.cargo/config.toml");
@@ -3801,6 +3869,7 @@ mod tests {
                 target_dir: "/private/take/target".into(),
                 rustup_home,
                 index_hint,
+                units: None,
             };
             let cmd = release_build_command(
                 std::path::Path::new("/t/bin/targo"),

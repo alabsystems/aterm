@@ -2513,6 +2513,71 @@ fn a_row_is_counted_in_the_cells_the_grid_lays_it_out_in() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Manual throughput observation, with no timing assertion or latency budget.
+#[test]
+#[ignore = "manual measurement of screen layout work"]
+fn screen_layout_work_cost() {
+    use std::hint::black_box;
+    let measured = include_str!("fixtures/claude-2.1.302-model-picker-40col.txt");
+    let screens: [(&str, Vec<&str>); 4] = [
+        (
+            "captured-picker",
+            measured
+                .lines()
+                .filter(|line| !line.starts_with('#'))
+                .collect(),
+        ),
+        (
+            "ascii",
+            vec![
+                "Choose an option below or type a response",
+                "  1. Continue with the current settings",
+                "  2. Review the settings before continuing",
+            ],
+        ),
+        (
+            "mixed",
+            vec![
+                "╭──────────────────────────────────────╮",
+                "│ ❯ Continue with the current settings │",
+                "│   日本語 ❤️ 👨‍👩‍👧 🇯🇵 e\u{301} 👍🏽           │",
+                "╰──────────────────────────────────────╯",
+            ],
+        ),
+        (
+            "unicode",
+            vec!["日本語日本語日本語日本語", "❤️👨‍👩‍👧🇯🇵é\u{301}👍🏽"],
+        ),
+    ];
+    let only = std::env::var("ATERM_LAYOUT_WORKLOAD").ok();
+    assert!(
+        only.as_deref()
+            .is_none_or(|wanted| screens.iter().any(|(label, _)| *label == wanted))
+    );
+    for (label, rows) in screens {
+        if only.as_deref().is_some_and(|wanted| wanted != label) {
+            continue;
+        }
+        let expected: usize = rows.iter().map(|row| super::cells(row)).sum();
+        for round in 0..9 {
+            let start = std::time::Instant::now();
+            let mut total = 0usize;
+            for _ in 0..100_000 {
+                for row in &rows {
+                    total += black_box(super::cells(black_box(row)));
+                }
+            }
+            let elapsed = start.elapsed();
+            assert_eq!(total, expected * 100_000);
+            eprintln!(
+                "screen-layout label={label} round={round} rows={} repeats=100000 elapsed_ns={} checksum={total}",
+                rows.len(),
+                elapsed.as_nanos()
+            );
+        }
+    }
+}
+
 /// `written` and a `|` after it drawn on a row of aterm's grid: the row as the grid reads it back
 /// ([`read_back`]'s read) and the column the marker is painted in.
 fn painted_before_marker(written: &str) -> (String, usize) {

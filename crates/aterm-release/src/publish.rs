@@ -6347,6 +6347,7 @@ pub(crate) fn release_bundle_with_inputs(
 /// Run `targo --unverified ship cut`.
 pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let _timing = crate::cut_timing::Timer::new("cut total");
+    let preflight = crate::cut_timing::Timer::new("cut preflight");
     gates::arm_toolchain_lease();
     let credentials = sign::ReleaseCredentials::resolve(opts.release_credentials.as_deref(), repo)
         .map_err(Error::new)?;
@@ -6395,6 +6396,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             ))
         })?;
         let slug = workspace_channel_slug(&tree)?;
+        drop(preflight);
         return resume_cut(
             ResumePaths {
                 repo,
@@ -6736,6 +6738,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         ),
     );
 
+    drop(preflight);
     let (build, commit) = match kind {
         CutKind::Real => {
             step(
@@ -6794,6 +6797,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             (reserved, verified.reserved.commit.clone())
         }
     };
+    let journal_timing = crate::cut_timing::Timer::new("prepare cut journal");
     let min_build = effective_min_build(opts.min_build, newest_min_build, build)?;
 
     let mut ctx = CutCtx {
@@ -6857,6 +6861,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         ctx.journal = Some(j);
     }
 
+    drop(journal_timing);
     run_pipeline(&mut ctx, t0)
 }
 
@@ -7105,6 +7110,7 @@ fn resume_cut(
     recovered_session: Option<(ReleaseLeaseGuard, PublisherFenceGuard)>,
     credentials: Option<&sign::ReleaseCredentials>,
 ) -> Result<()> {
+    let resume_timing = crate::cut_timing::Timer::new("resume preflight");
     let ResumePaths {
         repo,
         tree,
@@ -7210,6 +7216,7 @@ fn resume_cut(
         journal: Some(journal),
         adopted: false,
     };
+    drop(resume_timing);
     run_pipeline(&mut ctx, t0)
 }
 
@@ -7228,6 +7235,7 @@ fn discard_staged(ctx: &CutCtx) {
 }
 
 fn run_pipeline(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
+    let prepare = crate::cut_timing::Timer::new("pipeline prepare");
     if ctx.linux.is_some()
         && ctx
             .journal
@@ -7251,16 +7259,25 @@ fn run_pipeline(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
     {
         if ctx.lease.is_none() {
             let origin = native_origin(&ctx.repo)?;
-            ctx.lease = Some(acquire_release_lease(&origin, &ctx.commit)?);
+            ctx.lease = Some(crate::cut_timing::measure("acquire release lease", || {
+                acquire_release_lease(&origin, &ctx.commit)
+            })?);
         }
         if ctx.fence.is_none() {
             let git = GitCli::new(&ctx.repo);
             let origin = native_origin(&ctx.repo)?;
-            ctx.fence = Some(acquire_publisher_fence(&git, &origin, &ctx.commit)?);
+            ctx.fence = Some(crate::cut_timing::measure(
+                "acquire publisher fence",
+                || acquire_publisher_fence(&git, &origin, &ctx.commit),
+            )?);
         }
-        revalidate_ctx_signature_policy(ctx)?;
+        crate::cut_timing::measure("revalidate signature policy", || {
+            revalidate_ctx_signature_policy(ctx)
+        })?;
     }
+    drop(prepare);
     let result = run_pipeline_inner(ctx, t0);
+    let _cleanup = crate::cut_timing::Timer::new("pipeline cleanup");
     let fence_release = if let Some(fence) = ctx.fence.take() {
         native_origin(&ctx.repo)
             .and_then(|origin| release_publisher_fence(&origin, &fence))
@@ -7322,11 +7339,12 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
             }
             _ => unreachable!("unknown pipeline step {name}"),
         }
-        ctx.mark(name)?;
+        crate::cut_timing::measure("journal completed step", || ctx.mark(name))?;
     }
 
     match ctx.kind {
         CutKind::Real => {
+            let _tidy = crate::cut_timing::Timer::new("staging cleanup");
             discard_staged(ctx);
             step(
                 "DONE",
@@ -8212,16 +8230,23 @@ fn signed_outputs(
     version: &str,
     build: u64,
 ) -> std::result::Result<SignedOutputs, String> {
+    let _timing = crate::cut_timing::Timer::new("signed output digest reproofs");
     let sized = |path: PathBuf| -> std::result::Result<(String, u64), String> {
         let size = fs::symlink_metadata(&path)
             .map_err(|e| format!("{}: {e}", path.display()))?
             .len();
         Ok((artifact::file_sha256(&path)?, size))
     };
-    let (dmg_sha256, dmg_size) = sized(dist.join(channel::dmg_asset_name(version)))?;
-    let (zip_sha256, zip_size) = sized(dist.join(channel::zip_asset_name(version)))?;
+    let (dmg_sha256, dmg_size) = crate::cut_timing::measure("signed DMG digest", || {
+        sized(dist.join(channel::dmg_asset_name(version)))
+    })?;
+    let (zip_sha256, zip_size) = crate::cut_timing::measure("signed zip digest", || {
+        sized(dist.join(channel::zip_asset_name(version)))
+    })?;
     Ok(SignedOutputs {
-        app_digest: artifact::bundle_digest(&bundle::staged_app_path(dist, build))?,
+        app_digest: crate::cut_timing::measure("signed bundle digest", || {
+            artifact::bundle_digest(&bundle::staged_app_path(dist, build))
+        })?,
         dmg_sha256,
         dmg_size,
         zip_sha256,
@@ -9403,21 +9428,94 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
         let ctx = &*self.ctx;
         let after = release_object_by_id(slug, release_id)?;
         validate_channel_release_capability(after.as_ref(), release_id, &ctx.tag, false)?;
-        prove_client_elects_this_cut(ctx, slug, release_id)?;
-        prove_evergreen_pointer_serves_this_cut(ctx, slug)?;
-        prove_channel_assets_download_anonymously(ctx, slug)
+        crate::cut_timing::measure("public client election", || {
+            prove_client_elects_this_cut(ctx, slug, release_id)
+        })?;
+        crate::cut_timing::measure("evergreen pointer propagation", || {
+            prove_evergreen_pointer_serves_this_cut(ctx, slug)
+        })?;
+        crate::cut_timing::measure("anonymous asset HEADs", || {
+            prove_channel_assets_download_anonymously(ctx, slug)
+        })
     }
 }
 
-const ANON_PROBE_ATTEMPTS: u32 = 10;
+const ANON_PROBE_BUDGET: Duration = Duration::from_secs(60);
 
-const ANON_PROBE_DELAY: Duration = Duration::from_secs(6);
+/// Propagation patience after the head PATCH. A request already in flight may
+/// finish at its own HTTP deadline; no further request starts after this bound.
+pub const POINTER_PROBE_BUDGET: Duration = Duration::from_secs(300);
 
-/// Attempts for the evergreen pointer to name this cut once its head PATCH is sent ([`prove_pointer_serves`]).
-pub const POINTER_PROBE_ATTEMPTS: u32 = 30;
+/// Fast initial probes, then exponential backoff capped at ten seconds. A
+/// changed head resets the gap, never the overall deadline. Tracking requested
+/// sleep also makes injected sleepers a deterministic virtual clock.
+struct PropagationWait {
+    started: Instant,
+    waited: Duration,
+    next: Duration,
+    budget: Duration,
+}
 
-/// Gap between evergreen-pointer attempts.
-pub const POINTER_PROBE_DELAY: Duration = Duration::from_secs(10);
+impl PropagationWait {
+    fn new(budget: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            waited: Duration::ZERO,
+            next: Duration::from_millis(250),
+            budget,
+        }
+    }
+
+    fn wait(&mut self, progress: bool, sleep: &mut dyn FnMut(Duration)) -> bool {
+        let Some(left) = self
+            .budget
+            .checked_sub(self.started.elapsed().max(self.waited))
+            .filter(|d| !d.is_zero())
+        else {
+            return false;
+        };
+        if progress {
+            self.next = Duration::from_millis(250);
+        }
+        let delay = self.next.min(left);
+        // Do not spend the final gap when it cannot lead to another probe.
+        if delay == left {
+            return false;
+        }
+        self.waited += delay;
+        sleep(delay);
+        self.next = (self.next * 2).min(Duration::from_secs(10));
+        self.started.elapsed().max(self.waited) < self.budget
+    }
+}
+
+#[cfg(test)]
+mod propagation_tests {
+    use super::*;
+
+    /// NEGATIVE CONTROLS: fixed long sleeps miss early progress; resetting the
+    /// start on progress makes a flapping pointer wait forever.
+    #[test]
+    fn progress_resets_the_gap_but_never_extends_the_deadline() {
+        let mut wait = PropagationWait::new(Duration::from_secs(60));
+        let mut slept = Vec::new();
+        for _ in 0..6 {
+            assert!(wait.wait(false, &mut |d| slept.push(d)));
+        }
+        assert_eq!(
+            slept,
+            [250, 500, 1000, 2000, 4000, 8000].map(Duration::from_millis)
+        );
+        assert!(wait.wait(true, &mut |d| slept.push(d)));
+        assert_eq!(slept.last(), Some(&Duration::from_millis(250)));
+        while wait.wait(true, &mut |d| slept.push(d)) {}
+        assert!(slept.iter().sum::<Duration>() < Duration::from_secs(60));
+        // Request time consumes the same budget as sleep.
+        let mut expired = PropagationWait::new(Duration::from_secs(60));
+        expired.started -= Duration::from_secs(60);
+        assert!(!expired.wait(true, &mut |_| panic!("expired requests cannot sleep")));
+    }
+}
 
 /// The HTTP status of a refused anonymous probe (403 or 429).
 #[must_use]
@@ -9433,8 +9531,8 @@ pub fn anon_probe_refusal(stderr: &str) -> Option<u16> {
 }
 
 fn anon_probe(args: &[&str]) -> Result<std::process::Output> {
-    let mut last = None;
-    for attempt in 1..=ANON_PROBE_ATTEMPTS {
+    let mut wait = PropagationWait::new(ANON_PROBE_BUDGET);
+    loop {
         let out = command("curl")
             .args(args)
             .env_remove("GH_TOKEN")
@@ -9448,12 +9546,10 @@ fn anon_probe(args: &[&str]) -> Result<std::process::Output> {
         {
             return Ok(out);
         }
-        last = Some(out);
-        if attempt < ANON_PROBE_ATTEMPTS {
-            std::thread::sleep(ANON_PROBE_DELAY);
+        if !wait.wait(false, &mut std::thread::sleep) {
+            return Ok(out);
         }
     }
-    Ok(last.expect("at least one attempt"))
 }
 
 /// What one credential-free, redirect-refusing HEAD of a release asset's download URL says about whether a stranger can download it.
@@ -9525,8 +9621,11 @@ pub fn prove_assets_download_anonymously(
                  anonymous API"
             )));
         }
-        let mut last = AssetHead::NotServed;
-        for attempt in 1..=ANON_PROBE_ATTEMPTS {
+        let mut last;
+        let mut wait = PropagationWait::new(ANON_PROBE_BUDGET);
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
             issued += 1;
             last = classify_asset_head(head(&url));
             match &last {
@@ -9542,8 +9641,8 @@ pub fn prove_assets_download_anonymously(
                     )));
                 }
                 AssetHead::NotServed | AssetHead::Inconclusive(_) => {
-                    if attempt < ANON_PROBE_ATTEMPTS {
-                        sleep(ANON_PROBE_DELAY);
+                    if !wait.wait(false, sleep) {
+                        break;
                     }
                 }
             }
@@ -9554,17 +9653,17 @@ pub fn prove_assets_download_anonymously(
                 return Err(Error::new(format!(
                     "the public channel {slug} does not serve {name} to a client with no \
                      credential: an unauthenticated HEAD of {url} still answered 404 after \
-                     {ANON_PROBE_ATTEMPTS} attempts over ~{}s. The authenticated checks \
+                     {attempts} attempts within a {}s propagation budget. The authenticated checks \
                      passed, so the repository is private (GitHub answers 404 on this host \
                      for one) or the upload never completed. Make {slug} public, then \
                      `{CUT_COMMAND}`.",
-                    u64::from(ANON_PROBE_ATTEMPTS) * ANON_PROBE_DELAY.as_secs(),
+                    ANON_PROBE_BUDGET.as_secs(),
                 )));
             }
             AssetHead::Inconclusive(detail) => {
                 return Err(Error::new(format!(
                     "cannot prove a credential-less client can download {name} from {slug}: \
-                     the last of {ANON_PROBE_ATTEMPTS} unauthenticated HEADs of {url} \
+                     the last of {attempts} unauthenticated HEADs of {url} \
                      answered {detail} — not a redirect into GitHub's release-asset storage. \
                      Check the network, then `{CUT_COMMAND}`."
                 )));
@@ -9647,9 +9746,11 @@ pub fn prove_pointer_serves(
     sleep: &mut dyn FnMut(Duration),
 ) -> Result<Manifest> {
     let asset = manifest_out::MANIFEST_ASSET;
-    let mut last = PointerProbe::NoRelease;
+    let mut last;
     let mut location = None;
-    for attempt in 1..=POINTER_PROBE_ATTEMPTS {
+    let mut wait = PropagationWait::new(POINTER_PROBE_BUDGET);
+    let mut previous_tag = None;
+    loop {
         last = probe()?;
         if let PointerProbe::Tag {
             tag: named,
@@ -9663,8 +9764,13 @@ pub fn prove_pointer_serves(
         if matches!(last, PointerProbe::Refused { .. }) {
             break;
         }
-        if attempt < POINTER_PROBE_ATTEMPTS {
-            sleep(POINTER_PROBE_DELAY);
+        let progress = if let PointerProbe::Tag { tag, .. } = &last {
+            previous_tag.replace(tag.clone()).as_ref() != Some(tag)
+        } else {
+            false
+        };
+        if !wait.wait(progress, sleep) {
+            break;
         }
     }
     let Some(location) = location else {
@@ -11397,12 +11503,16 @@ mod anonymous_readability_tests {
         });
         assert_eq!(out.unwrap(), names.len() as u32 + 2);
         assert_eq!(asked.len(), names.len() + 2);
-        assert_eq!(slept, vec![ANON_PROBE_DELAY; 2]);
+        assert_eq!(
+            slept,
+            vec![Duration::from_millis(250), Duration::from_millis(500)]
+        );
 
         let (out, asked, slept) = run(&names, |_, _| status(404));
         out.expect_err("a channel that never serves is refused");
-        assert_eq!(asked.len(), ANON_PROBE_ATTEMPTS as usize);
-        assert_eq!(slept.len(), ANON_PROBE_ATTEMPTS as usize - 1);
+        assert_eq!(asked.len(), slept.len() + 1);
+        assert!(slept.iter().sum::<Duration>() < ANON_PROBE_BUDGET);
+        assert!(ANON_PROBE_BUDGET - slept.iter().sum::<Duration>() <= Duration::from_secs(10));
     }
 
     #[test]
