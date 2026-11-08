@@ -1086,15 +1086,68 @@ pub(crate) fn escape_scan(
     from: std::time::SystemTime,
     until: std::time::SystemTime,
 ) -> Scan {
+    escape_scan_repeating(
+        s_pid,
+        shell_version,
+        sid,
+        from,
+        until,
+        uid_pids,
+        bsdinfo_uniq,
+        environment_names,
+        stdio_dead,
+    )
+}
+
+/// Keep birth evidence across this scan's retries; reparenting cannot revoke ownership.
+#[cfg(target_os = "macos")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the scan and its injected host reads"
+)]
+fn escape_scan_repeating(
+    s_pid: i32,
+    shell_version: Option<i32>,
+    sid: &str,
+    from: std::time::SystemTime,
+    until: std::time::SystemTime,
+    mut list: impl FnMut(u32) -> Option<Vec<i32>>,
+    mut read_pid: impl FnMut(i32) -> Option<BsdInfoWithUniqId>,
+    mut read_owner: impl FnMut(i32, &str) -> Option<bool>,
+    mut read_stdio_dead: impl FnMut(i32) -> Option<bool>,
+) -> Scan {
+    let records = std::cell::RefCell::new(Vec::<(i32, BsdInfoWithUniqId)>::new());
+    let owned = std::cell::RefCell::new(std::collections::HashSet::new());
     rescan_while_unknown(SCAN_ATTEMPTS, || {
-        escape_scan_since(
+        escape_scan_with_owner(
             s_pid,
             shell_version,
             sid,
             from,
             until,
-            uid_pids,
-            bsdinfo_uniq,
+            &mut list,
+            |pid| {
+                let info = read_pid(pid)?;
+                records.borrow_mut().push((pid, info));
+                Some(info)
+            },
+            |pid, sid| {
+                let marker = read_owner(pid, sid);
+                let records = records.borrow();
+                let (_, child) = records.iter().rev().find(|(p, _)| *p == pid)?;
+                let (_, shell) = records.iter().rev().find(|(p, _)| *p == s_pid)?;
+                let mut owned = owned.borrow_mut();
+                if marker == Some(true)
+                    || owned.contains(&child.p_uniqueid)
+                    || run_lineage(child, shell, shell_version, &records)
+                {
+                    owned.insert(child.p_uniqueid);
+                    Some(true)
+                } else {
+                    marker
+                }
+            },
+            &mut read_stdio_dead,
         )
     })
 }
@@ -1144,7 +1197,7 @@ fn escape_scan_among(
     escape_scan_since(s_pid, None, sid, from, until, list, read_pid)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(test, target_os = "macos"))]
 fn escape_scan_since(
     s_pid: i32,
     shell_version: Option<i32>,
@@ -1172,10 +1225,42 @@ fn environment_names(pid: i32, sid: &str) -> Option<bool> {
     u32::try_from(pid)
         .ok()
         .and_then(atpkg::caller_shell::process_args)
-        .map(|args| {
-            args.env.is_empty()
-                || args.env_var(aterm_types::domain::ENV_PARENT_SESSION_ID) == Some(sid)
-        })
+        .map(|args| args.env_var(aterm_types::domain::ENV_PARENT_SESSION_ID) == Some(sid))
+}
+
+/// Follow birth identities, including a parent retained in the listing after adoption.
+/// A later process using the parent's pid cannot supply this evidence.
+#[cfg(target_os = "macos")]
+fn run_lineage(
+    child: &BsdInfoWithUniqId,
+    shell: &BsdInfoWithUniqId,
+    shell_version: Option<i32>,
+    infos: &[(i32, BsdInfoWithUniqId)],
+) -> bool {
+    let mut child = child;
+    for _ in 0..64 {
+        if child.p_uniqueid == shell.p_uniqueid {
+            return true;
+        }
+        if child.p_uniqueid < shell.p_uniqueid {
+            return false;
+        }
+        if child.p_orig_ppidversion == shell.p_idversion
+            || Some(child.p_orig_ppidversion) == shell_version
+            || child.p_puniqueid == shell.p_uniqueid
+        {
+            return true;
+        }
+        let Some((_, parent)) = infos.iter().find(|(_, parent)| {
+            parent.p_uniqueid < child.p_uniqueid
+                && (child.p_orig_ppidversion == parent.p_idversion
+                    || child.p_puniqueid == parent.p_uniqueid)
+        }) else {
+            return false;
+        };
+        child = parent;
+    }
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -1287,7 +1372,13 @@ fn escape_scan_with_owner(
             }
             None if (exited(p) || list(uid).is_some_and(|pids| !pids.contains(&p)))
                 && !orphans_live(&infos, p, &mut read, &mut list, uid, None) => {}
-            _ => stale = true,
+            _ => {
+                // A stale stranger is no more evidence than an unreadable environment.
+                // SAFETY: `getsid` reads the process table.
+                stale |= unsafe { libc::getsid(p) } == s_pid
+                    || run_lineage(&info, &shell, shell_version, &infos)
+                    || read_owner(p, sid) == Some(true);
+            }
         }
     }
     let mut incomplete = stale || !unsettled.is_empty();
@@ -1314,9 +1405,12 @@ fn escape_scan_with_owner(
             Some(info) => (leader, info),
             None => return LeaderLine::Unknown,
         };
+        if run_lineage(child, &shell, shell_version, &infos) {
+            return LeaderLine::Run;
+        }
         for _ in 0..64 {
             if at == s_pid {
-                return LeaderLine::Run;
+                return LeaderLine::Unknown;
             }
             if child.p_uniqueid < shell.p_uniqueid {
                 return LeaderLine::Outside;
@@ -1349,10 +1443,15 @@ fn escape_scan_with_owner(
         };
         let mut reparented =
             info.pbsd.pbi_ppid == 1 && run_orphan(info.p_uniqueid, info.p_orig_ppidversion);
+        let mut ancestry_unread = false;
         let attached = {
             let mut at = *pid;
             let mut attached = false;
             for _ in 0..64 {
+                if let Some((_, ancestor)) = infos.iter().find(|(p, _)| *p == at) {
+                    reparented |= ancestor.pbsd.pbi_ppid == 1
+                        && run_orphan(ancestor.p_uniqueid, ancestor.p_orig_ppidversion);
+                }
                 let foreign = parent_of(at).is_none();
                 let up = if foreign {
                     short_parent(at)
@@ -1366,8 +1465,14 @@ fn escape_scan_with_owner(
                     }
                     Some(p) if p > 1 => at = p,
                     Some(1) if foreign => {
-                        reparented |= uniq_identifier(at)
-                            .is_some_and(|f| run_orphan(f.p_uniqueid, f.p_orig_ppidversion));
+                        match uniq_identifier(at) {
+                            Some(f) => reparented |= run_orphan(f.p_uniqueid, f.p_orig_ppidversion),
+                            None => ancestry_unread = true,
+                        }
+                        break;
+                    }
+                    None => {
+                        ancestry_unread = true;
                         break;
                     }
                     _ => break,
@@ -1375,11 +1480,21 @@ fn escape_scan_with_owner(
             }
             attached
         };
-        if !(reparented || attached) {
+        if !(reparented || attached || ancestry_unread) {
             continue;
         }
         // SAFETY: `getsid` reads the process table.
         let session = unsafe { libc::getsid(*pid) };
+        // Absence of an environment is no evidence. Establish ownership before late
+        // identity reads: a stranger disappearing or refusing a read cannot taint the run.
+        let lineage = run_lineage(info, &shell, shell_version, &infos);
+        let owned = session == s_pid
+            || (session > 0 && leader_line(session) == LeaderLine::Run)
+            || lineage
+            || read_owner(*pid, sid) == Some(true);
+        if !owned {
+            continue;
+        }
         match read(*pid) {
             Some(now)
                 if now.p_uniqueid == info.p_uniqueid && now.pbsd.pbi_ppid != info.pbsd.pbi_ppid =>
@@ -1415,6 +1530,10 @@ fn escape_scan_with_owner(
             incomplete = true;
             continue;
         }
+        if ancestry_unread {
+            incomplete = true;
+            continue;
+        }
         let left_session = attached && session != s_pid;
         if !(reparented || left_session) {
             continue;
@@ -1445,46 +1564,23 @@ fn escape_scan_with_owner(
                 };
             }
         }
-        let names_sid = in_session
-            || left_session
-            || match read_owner(*pid, sid) {
-                Some(owned) => owned,
-                None => match read(*pid) {
-                    Some(now) => now.p_uniqueid == info.p_uniqueid,
-                    None => {
-                        let older = leads_session.then(|| {
-                            &*older_sessions.get_or_insert_with(|| {
-                                older_sessions_of(&infos, &mut read, shell.p_uniqueid)
-                            })
-                        });
-                        if orphans_live(&infos, *pid, &mut read, &mut list, uid, older)
-                            || (!exited(*pid) && !list(uid).is_some_and(|pids| !pids.contains(pid)))
-                        {
-                            incomplete = true;
-                        }
-                        false
-                    }
-                },
-            };
-        if names_sid {
-            let comm: Vec<u8> = info
-                .pbsd
-                .pbi_comm
-                .iter()
-                .take_while(|c| **c != 0)
-                .map(|c| *c as u8)
-                .collect();
-            aterm_log::info!(
-                "spare gate: escape: pid={pid} ppid={} session={session} \
-                 in_session={in_session} reparented={reparented} attached={attached} \
-                 flags={:#x} stdio={stdio} comm={:?}",
-                info.pbsd.pbi_ppid,
-                info.pbsd.pbi_flags,
-                String::from_utf8_lossy(&comm),
-            );
-            escaped = true;
-            break;
-        }
+        let comm: Vec<u8> = info
+            .pbsd
+            .pbi_comm
+            .iter()
+            .take_while(|c| **c != 0)
+            .map(|c| *c as u8)
+            .collect();
+        aterm_log::info!(
+            "spare gate: escape: pid={pid} ppid={} session={session} \
+             in_session={in_session} reparented={reparented} attached={attached} \
+             lineage={lineage} flags={:#x} stdio={stdio} comm={:?}",
+            info.pbsd.pbi_ppid,
+            info.pbsd.pbi_flags,
+            String::from_utf8_lossy(&comm),
+        );
+        escaped = true;
+        break;
     }
     if !read(s_pid).is_some_and(|now| now.p_uniqueid == shell.p_uniqueid) {
         return shell_unknown(s_pid, "gone");

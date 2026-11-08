@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct History {
     receipt: Value,
-    root: Option<File>,
+    root: Option<Arc<File>>,
     origin: Option<(u64, u64, u32, i64, i64, i64, i64)>,
     files: Vec<HeldFile>,
     directories: Vec<HeldDirectory>,
@@ -234,7 +234,7 @@ impl History {
         }
         let mut history = Self {
             receipt: receipt.clone(),
-            root,
+            root: root.map(Arc::new),
             origin: None,
             files: Vec::new(),
             directories: Vec::new(),
@@ -263,7 +263,7 @@ impl History {
                 return Err(bad("unbounded archived history"));
             }
             if let Some(expected) = protocol.finite.directories.get(name) {
-                let directory = open(root, name, false, true)?;
+                let directory = Arc::new(open(root, name, false, true)?);
                 let origin = directory_origin(&directory)?;
                 if identity(&directory, true)? != *expected {
                     return Err(bad("archived epoch directory was replaced"));
@@ -312,7 +312,7 @@ impl History {
                         captures.insert(ordinal, (capture, stamp.clone()));
                     }
                     history.files.push(HeldFile {
-                        parent: directory.try_clone()?,
+                        parent: Arc::clone(&directory),
                         name: child.into(),
                         file,
                         stamp,
@@ -374,7 +374,7 @@ impl History {
                     }
                 }
                 history.directories.push(HeldDirectory {
-                    parent: root.try_clone()?,
+                    parent: Arc::clone(root),
                     name: name.into(),
                     file: directory,
                     identity: expected.clone(),
@@ -393,7 +393,7 @@ impl History {
                 }
                 protocol.root(name, &body, &stamp)?;
                 history.files.push(HeldFile {
-                    parent: root.try_clone()?,
+                    parent: Arc::clone(root),
                     name: name.into(),
                     file,
                     stamp,
@@ -454,7 +454,11 @@ impl History {
             {
                 return Err(bad("compaction member changed before its known unlink"));
             }
-            fd::unlinkat(&file.parent, file.name.as_str(), fd::AtFlags::empty())?;
+            fd::unlinkat(
+                file.parent.as_ref(),
+                file.name.as_str(),
+                fd::AtFlags::empty(),
+            )?;
             #[cfg(test)]
             boundary("compaction-unlinked")?;
         }
@@ -463,7 +467,11 @@ impl History {
             if identity(&open(root, &directory.name, false, true)?, true)? != directory.identity {
                 return Err(bad("compaction epoch changed before known removal"));
             }
-            fd::unlinkat(root, directory.name.as_str(), fd::AtFlags::REMOVEDIR)?;
+            fd::unlinkat(
+                root.as_ref(),
+                directory.name.as_str(),
+                fd::AtFlags::REMOVEDIR,
+            )?;
         }
         aterm_durable::durable(root)?;
         let claim = identity(root, true)?;

@@ -341,6 +341,9 @@ pub fn claude(args: &[String]) -> i32 {
         println!("{VERSION} (Claude Code fixture of aterm-lab fleet-sim)");
         return 0;
     }
+    if args.first().map(String::as_str) == Some("replay") {
+        return replay(args);
+    }
     if args.first().map(String::as_str) == Some("follow") {
         let Some(file) = args.get(1) else {
             eprintln!("claude (fleet-sim fixture): usage: claude follow <mode file>");
@@ -350,7 +353,7 @@ pub fn claude(args: &[String]) -> i32 {
     }
     let Some(mode) = args.first().and_then(|w| Mode::of(w)) else {
         eprintln!(
-            "claude (fleet-sim fixture): usage: claude busy|question|prompt|idle [<n>] | follow <mode file>"
+            "claude (fleet-sim fixture): usage: claude busy|question|prompt|idle [<n>] | follow <mode file> | replay <ptylog> [--go <file>]"
         );
         return 2;
     };
@@ -396,6 +399,75 @@ fn follow(file: &std::path::Path, args: &[String]) -> i32 {
         };
         screen(followed_mode(file), tick, cols, rows, &cwd, &words)
     })
+}
+
+/// `claude replay <ptylog> [--go <file>]`: a recorded Claude Code session's screen in a private
+/// lab, under the chrome the shipped host draws over Claude Code (the Autopilot switch, the chips
+/// on the composer): it keeps Claude Code's per-process session registry as the other modes do
+/// ([`write_session`]), which is what aterm reads its footer facts by, and plays the recording's
+/// output records (aterm's ptylogs' `<ns> O <hex>` lines) at their times, from when the file `--go`
+/// names appears when given. Its terminal is raw and its input read and dropped, so the lab's keys
+/// reach aterm as the person's typing and leave the recorded screen as it was; past the last record
+/// it holds that screen until its terminal closes.
+fn replay(args: &[String]) -> i32 {
+    let Some(log) = args.get(1) else {
+        eprintln!("claude (fleet-sim fixture): usage: claude replay <ptylog> [--go <file>]");
+        return 2;
+    };
+    let records = match crate::util::read_regular_text(Path::new(log)) {
+        Ok(text) => ptylog_output(&text),
+        Err(e) => {
+            eprintln!("claude (fleet-sim fixture): replay {log}: {e}");
+            return 2;
+        }
+    };
+    let go = args
+        .windows(2)
+        .find(|w| w[0] == "--go")
+        .map(|w| std::path::PathBuf::from(&w[1]));
+    let (prompt, said, tool) = words(0);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| "/".into());
+    let _session = write_session(&cwd, Mode::Idle, &prompt, &said, tool).ok();
+    let _raw = crate::sys::RawMode::enter(0);
+    while go.as_deref().is_some_and(|go| !go.exists()) {
+        if stdin_closed(Duration::from_millis(5)) {
+            return 0;
+        }
+    }
+    let began = Instant::now();
+    let mut out = std::io::stdout().lock();
+    for (at, bytes) in records {
+        loop {
+            let left = at.saturating_sub(began.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            if stdin_closed(left.min(Duration::from_millis(250))) {
+                return 0;
+            }
+        }
+        if out.write_all(&bytes).and_then(|()| out.flush()).is_err() {
+            return 0;
+        }
+    }
+    while !stdin_closed(Duration::from_millis(250)) {}
+    0
+}
+
+/// The output records of an aterm ptylog (`<ns> O <hex>` lines), each at its time from the log's
+/// first record.
+fn ptylog_output(text: &str) -> Vec<(Duration, Vec<u8>)> {
+    let mut first = None;
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, ' ');
+            let ns: u64 = parts.next()?.parse().ok()?;
+            let at = ns.saturating_sub(*first.get_or_insert(ns));
+            let output = parts.next()? == "O";
+            let bytes = aterm_codec::hex::decode_vec(parts.next()?.trim().as_bytes())?;
+            output.then(|| (Duration::from_nanos(at), bytes))
+        })
+        .collect()
 }
 
 /// The row the statusLine printed last, where the stand-in runs one.
@@ -1016,5 +1088,24 @@ mod tests {
     fn the_hostile_index_says_the_hostile_words() {
         assert_eq!(words(HOSTILE).1, HOSTILE_SAID);
         assert_ne!(words(1).1, HOSTILE_SAID);
+    }
+
+    /// A replay plays a ptylog's output records, each at its time from the log's first record
+    /// (an input record's time included), and skips the input records and a line that is no
+    /// record.
+    #[test]
+    fn a_replay_plays_the_output_records_at_their_times() {
+        let log = "1000000000 O 1b5b3f3130343968\n\
+                   1005000000 I 61\n\
+                   no record here\n\
+                   1250000000 O 61\n\
+                   1250000001 O 6\n";
+        assert_eq!(
+            ptylog_output(log),
+            vec![
+                (Duration::ZERO, b"\x1b[?1049h".to_vec()),
+                (Duration::from_millis(250), b"a".to_vec()),
+            ]
+        );
     }
 }

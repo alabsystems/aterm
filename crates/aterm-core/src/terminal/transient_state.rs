@@ -106,6 +106,8 @@ pub(super) struct TransientState {
     pub(super) app_sync_open_mark: Option<(u64, u64)>,
     /// When the screen last changed, and the mark it changed to: the `process_now` of the last batch that ended with the active grid's content generation or screen other than the batch before left them (`Terminal::note_batch_end`).
     pub(super) drawn: Option<(aterm_time::Instant, (u64, u64))>,
+    /// The caret's last moves, each at its batch's clock ([`Terminal::caret_path`](super::Terminal::caret_path)).
+    pub(super) caret_path: super::caret_path::CaretPath,
     /// Logical "now" for the current batch, captured once at the top of [`Terminal::process_at`](super::Terminal::process_at).
     pub(super) process_now: aterm_time::Instant,
     /// Wall-clock epoch milliseconds for the current batch, recorded by OSC 133/633 marks B/C/D; captured with `process_now` so replay reproduces the `command_*_time_ms` values.
@@ -247,6 +249,7 @@ impl TransientState {
             app_sync_closed: None,
             app_sync_open_mark: None,
             drawn: None,
+            caret_path: super::caret_path::CaretPath::default(),
             #[expect(
                 clippy::disallowed_methods,
                 reason = "a seed process_at overwrites before any reader runs"

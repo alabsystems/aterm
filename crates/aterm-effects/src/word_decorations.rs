@@ -318,7 +318,33 @@ pub struct DogCameoFrame {
     pub bob: f32,
     /// The lifecycle envelope's presence, `0..=255`.
     pub alpha: u8,
+    /// The frame's clock: the dog glides between its seats on it ([`WordDecorations::dog_cameo`]).
+    pub now: Instant,
 }
+
+/// Where the typed dog sits against the caret's row ([`WordDecorations::dog_cameo`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DogSeat {
+    /// Centred on the caret's row, behind the caret: where it trails.
+    Behind,
+    /// Flush over the caret's row.
+    Above,
+    /// Flush under the caret's row.
+    Under,
+}
+
+/// The typed dog's place on its visit's last frame: its look (one visit's), its seat, the drawn
+/// top-left (px, before the entry bounce) and the frame's clock.
+#[derive(Clone, Copy, Debug)]
+struct DogPlace {
+    look: crate::dog_cameo::DogLook,
+    seat: DogSeat,
+    at: (f32, f32),
+    drawn: Instant,
+}
+
+/// The typed dog's glide between frames, s: the flying head's follower ([`WordDecorations::PLACE_TAU`]).
+const DOG_PLACE_TAU: f32 = 0.08;
 
 /// Geometry-only inputs for resolving the cursor companion before its local palette is sampled.
 #[derive(Clone, Copy, Debug)]
@@ -362,6 +388,52 @@ thread_local! {
     /// lays a few pixels onto a lettered row is lifted clear over the whole
     /// row, as before.
     pub static HEAD_GRAZE_LIFTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the head's flight to a far caret ([`HEAD_FLIGHT`]): the head is
+    /// placed at the landing on the jump's frame, as before.
+    pub static HEAD_FLIGHT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the typed dog's seat ([`WordDecorations::dog_cameo`]): it is drawn
+    /// centred on the caret's row behind the caret, over whatever lies there, as before.
+    pub static DOG_SEAT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The negative control of the typed dog's keep-off of the word icons
+    /// ([`WordDecorations::dog_cameo`]): its seats are judged by the letters and the caret alone.
+    pub static DOG_ICONS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How long the flying head takes to fly from where it was last drawn to a caret that went far
+/// (a meteor's jump: Enter, a line clear, Home or End; a jump past the follower's two rows): the
+/// time its line fold takes to fly it off one edge and in from the other
+/// ([`crate::kitty_cursor::CURSOR_FOLD_DURATION`]). Drawn at the landing on the jump's own
+/// frame, the head blinked across the screen (49 to 58 cells in one frame at Enter and Ctrl+U).
+pub const HEAD_FLIGHT: Duration = crate::kitty_cursor::CURSOR_FOLD_DURATION;
+
+/// The flying head's flight on one frame ([`HEAD_FLIGHT`]): where it took off (its sprite's
+/// top-left as last drawn), how far through the flight the frame is (`0..1`), and the arc's
+/// height at the middle, px.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeadFlightSample {
+    from: (i32, i32),
+    progress: f32,
+    arc_px: i32,
+}
+
+impl HeadFlightSample {
+    /// Where the head is drawn on this frame of its flight to `to` (the landing's top-left):
+    /// eased out of the take-off and into the landing, along a low arc.
+    #[inline]
+    fn at(self, to: (i32, i32)) -> (i32, i32) {
+        let q = self.progress.clamp(0.0, 1.0);
+        let e = q * q * (3.0 - 2.0 * q);
+        let lerp = |a: i32, b: i32| -> i32 {
+            ((a as f64) + ((b as f64) - (a as f64)) * f64::from(e))
+                .round()
+                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+        };
+        let lift = (self.arc_px as f32 * 4.0 * q * (1.0 - q)).round() as i32;
+        (
+            lerp(self.from.0, to.0),
+            lerp(self.from.1, to.1).saturating_sub(lift),
+        )
+    }
 }
 
 /// One cursor-kitty placement resolved once for palette sampling and sprite emission.
@@ -372,12 +444,35 @@ pub struct KittyCursorPlacement {
     facing_left: bool,
     sampled_at: Option<Instant>,
     drawn: Option<PreparedKittyCursorDraw>,
+    /// The head's flight to this frame's landing, while it flies ([`HEAD_FLIGHT`]).
+    flight: Option<HeadFlightSample>,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct PreparedKittyCursorDraw {
+    /// Where the head rests on this frame: the landing, while it flies.
     rect: CatFootprint,
     settle: Option<(f32, f32)>,
+    /// The flight to `rect`, while the head flies ([`Self::shown`]).
+    flight: Option<HeadFlightSample>,
+}
+
+impl PreparedKittyCursorDraw {
+    /// The rectangle drawn on this frame: [`Self::rect`], or the head's place on its flight to it.
+    #[inline]
+    fn shown(self) -> CatFootprint {
+        match self.flight {
+            Some(flight) => {
+                let (x, y) = flight.at((self.rect.x, self.rect.y));
+                CatFootprint {
+                    x,
+                    y: y.max(0),
+                    ..self.rect
+                }
+            }
+            None => self.rect,
+        }
+    }
 }
 
 impl KittyCursorPlacement {
@@ -389,17 +484,16 @@ impl KittyCursorPlacement {
             facing_left: false,
             sampled_at: None,
             drawn: None,
+            flight: None,
         }
     }
 
-    /// The actual animated body rectangle prepared for this frame, including its follower, pose and fold leg.
+    /// The actual animated body rectangle prepared for this frame, including its follower, pose,
+    /// fold leg and flight.
     #[inline]
     #[must_use]
-    pub const fn drawn_footprint(self) -> Option<CatFootprint> {
-        match self.drawn {
-            Some(draw) => Some(draw.rect),
-            None => None,
-        }
+    pub fn drawn_footprint(self) -> Option<CatFootprint> {
+        self.drawn.map(PreparedKittyCursorDraw::shown)
     }
 
     /// Keep the prepared head off the caret's cell and every lettered cell
@@ -652,6 +746,18 @@ struct KittyCursorActiveFold {
     from_sprite: Option<(i32, i32)>,
 }
 
+/// The flying head's flight to a far caret ([`HEAD_FLIGHT`]): when it took off and its sprite's
+/// top-left as last drawn there.
+#[derive(Clone, Copy, Debug)]
+struct KittyHeadFlight {
+    started: Instant,
+    from: (i32, i32),
+}
+
+/// The height of the flying head's arc at the middle of its flight, cells
+/// ([`HeadFlightSample`]): a fold's hop over the caret's line.
+const HEAD_FLIGHT_ARC: f32 = 0.18;
+
 struct KittyCursorPlacementState {
     key: Option<KittyCursorPlacementKey>,
     last_target: Option<CatFootprint>,
@@ -660,6 +766,7 @@ struct KittyCursorPlacementState {
     settle: Option<(f32, f32)>,
     seen_fold: Option<(Instant, crate::kitty_cursor::CatFoldDirection)>,
     active: Option<KittyCursorActiveFold>,
+    flight: Option<KittyHeadFlight>,
 }
 
 impl KittyCursorPlacementState {
@@ -671,6 +778,7 @@ impl KittyCursorPlacementState {
         settle: None,
         seen_fold: None,
         active: None,
+        flight: None,
     };
 }
 
@@ -1707,6 +1815,8 @@ pub struct WordDecorations {
     pet_depart_tiles: [Option<(u32, Arc<FxArt>, u64)>; PET_DEPART_HOLDS],
     dog_baker: crate::dog_baker::DogBaker,
     dog_last_tile: Option<(Arc<FxArt>, u64, crate::dog_cameo::DogLook)>,
+    /// Where the typed dog was drawn on its visit's last frame ([`Self::dog_cameo`]).
+    dog_place: Option<DogPlace>,
     held_tile_metric: (u16, u16),
     kitty_custom: Option<KittyCustom>,
     kitty_disabled: bool,
@@ -2140,6 +2250,7 @@ impl WordDecorations {
         self.pet_depart_tiles = [const { None }; PET_DEPART_HOLDS];
         self.dog_baker.clear();
         self.dog_last_tile = None;
+        self.dog_place = None;
     }
 
     #[inline]
@@ -2151,6 +2262,7 @@ impl WordDecorations {
         self.pet_last_tile = None;
         self.pet_depart_tiles = [const { None }; PET_DEPART_HOLDS];
         self.dog_last_tile = None;
+        self.dog_place = None;
     }
 
     #[inline]
@@ -2431,34 +2543,50 @@ impl WordDecorations {
             }
             None => true,
         };
+        let settled = |flight: Option<HeadFlightSample>| KittyCursorPlacement {
+            sample: target,
+            leg: KittyCursorPlacementLeg::Settled,
+            facing_left: motion.facing_left,
+            sampled_at: Some(motion.sampled_at),
+            drawn: None,
+            flight,
+        };
         if self.kitty_cursor_placement.key != Some(key) || stale {
             self.kitty_cursor_placement.key = Some(key);
             self.kitty_cursor_placement.last_target = Some(target);
             self.kitty_cursor_placement.last_sprite = None;
             self.kitty_cursor_placement.settle = None;
             self.kitty_cursor_placement.active = None;
+            self.kitty_cursor_placement.flight = None;
             self.kitty_cursor_placement.seen_fold =
                 motion.fold.map(|fold| (fold.started, fold.direction));
-            return Some(KittyCursorPlacement {
-                sample: target,
-                leg: KittyCursorPlacementLeg::Settled,
-                facing_left: motion.facing_left,
-                sampled_at: Some(motion.sampled_at),
-                drawn: None,
-            });
+            return Some(settled(None));
         }
 
         let Some(fold) = motion.fold else {
             self.kitty_cursor_placement.active = None;
+            // A rest more than two rows from the last one (a screen cleared, a prompt drawn
+            // far down) is flown to from where the head was drawn: the follower's glide
+            // spans two rows, and snapped past them the head blinked across the screen.
+            let far = self
+                .kitty_cursor_placement
+                .last_target
+                .is_some_and(|last| (target.y - last.y).abs() > 2 * i32::from(layout.geom.cell_h));
+            if far && self.kitty_cursor_placement.flight.is_none() {
+                #[cfg(test)]
+                let off = HEAD_FLIGHT_OFF.with(std::cell::Cell::get);
+                #[cfg(not(test))]
+                let off = false;
+                if !off {
+                    self.launch_kitty_cursor_flight(motion.sampled_at);
+                }
+            }
             self.kitty_cursor_placement.last_target = Some(target);
-            return Some(KittyCursorPlacement {
-                sample: target,
-                leg: KittyCursorPlacementLeg::Settled,
-                facing_left: motion.facing_left,
-                sampled_at: Some(motion.sampled_at),
-                drawn: None,
-            });
+            let flight = self.kitty_cursor_flight_at(motion.sampled_at, layout.geom.cell_h);
+            return Some(settled(flight));
         };
+        // A line fold flies the head off one edge and in at the other: its own flight.
+        self.kitty_cursor_placement.flight = None;
 
         let fold_id = (fold.started, fold.direction);
         if self.kitty_cursor_placement.seen_fold != Some(fold_id) {
@@ -2482,26 +2610,14 @@ impl WordDecorations {
                 active
             }
             _ => {
-                return Some(KittyCursorPlacement {
-                    sample: target,
-                    leg: KittyCursorPlacementLeg::Settled,
-                    facing_left: motion.facing_left,
-                    sampled_at: Some(motion.sampled_at),
-                    drawn: None,
-                });
+                return Some(settled(None));
             }
         };
         let progress = if fold.progress.is_finite() {
             fold.progress.clamp(0.0, 1.0)
         } else {
             self.kitty_cursor_placement.active = None;
-            return Some(KittyCursorPlacement {
-                sample: target,
-                leg: KittyCursorPlacementLeg::Settled,
-                facing_left: motion.facing_left,
-                sampled_at: Some(motion.sampled_at),
-                drawn: None,
-            });
+            return Some(settled(None));
         };
         let leg = if progress < 0.5 {
             KittyCursorPlacementLeg::Exit {
@@ -2517,11 +2633,57 @@ impl WordDecorations {
             }
         };
         Some(KittyCursorPlacement {
-            sample: target,
             leg,
-            facing_left: motion.facing_left,
-            sampled_at: Some(motion.sampled_at),
-            drawn: None,
+            ..settled(None)
+        })
+    }
+
+    /// The caret went far (a meteor's jump, [`HEAD_FLIGHT`]): the flying head flies there from
+    /// where it was last drawn, starting at `now`, instead of being drawn at the landing on the
+    /// jump's frame. A head not on glass a moment ago (nothing drawn within its fold's time) has
+    /// nowhere to fly from, and is placed afresh where its fade brings it in. Whether it flies.
+    #[inline]
+    pub fn launch_kitty_cursor_flight(&mut self, now: Instant) -> bool {
+        #[cfg(test)]
+        if HEAD_FLIGHT_OFF.with(std::cell::Cell::get) {
+            self.rebase_kitty_cursor_placement();
+            return false;
+        }
+        let state = &self.kitty_cursor_placement;
+        let from = match (state.last_sprite, state.last_emitted_at) {
+            (Some(from), Some(at))
+                if now.saturating_duration_since(at)
+                    < crate::kitty_cursor::CURSOR_FOLD_DURATION =>
+            {
+                from
+            }
+            _ => {
+                self.rebase_kitty_cursor_placement();
+                return false;
+            }
+        };
+        let state = &mut self.kitty_cursor_placement;
+        state.flight = Some(KittyHeadFlight { started: now, from });
+        state.settle = None;
+        state.active = None;
+        true
+    }
+
+    /// The head's flight at `now` ([`Self::launch_kitty_cursor_flight`]), ended once it has
+    /// landed.
+    #[inline]
+    fn kitty_cursor_flight_at(&mut self, now: Instant, cell_h: u16) -> Option<HeadFlightSample> {
+        let flight = self.kitty_cursor_placement.flight?;
+        let progress =
+            now.saturating_duration_since(flight.started).as_secs_f32() / HEAD_FLIGHT.as_secs_f32();
+        if progress >= 1.0 {
+            self.kitty_cursor_placement.flight = None;
+            return None;
+        }
+        Some(HeadFlightSample {
+            from: flight.from,
+            progress,
+            arc_px: (HEAD_FLIGHT_ARC * f32::from(cell_h)).round() as i32,
         })
     }
 
@@ -2620,6 +2782,13 @@ impl WordDecorations {
                 .clamp(i32::MIN as f64, i32::MAX as f64) as i32
         }
         let (sprite_x, sprite_y) = match placement.leg {
+            // The head flies to the landing ([`HeadFlightSample`]): the follower rests there.
+            KittyCursorPlacementLeg::Settled if placement.flight.is_some() => {
+                let ch = f32::from(geom.cell_h);
+                let bob_px = (bob * ch).round() as i32;
+                settle = Some((base_x as f32, (footprint.y - bob_px) as f32));
+                (target_x, target_y)
+            }
             KittyCursorPlacementLeg::Settled => match placement.sampled_at {
                 None => (target_x, target_y),
                 Some(at) => {
@@ -2726,6 +2895,7 @@ impl WordDecorations {
                 h: dest_h,
             },
             settle,
+            flight: placement.flight,
         }
     }
 
@@ -2844,7 +3014,7 @@ impl WordDecorations {
             y: sprite_y,
             w: dest_w,
             h: dest_h,
-        } = draw.rect;
+        } = draw.shown();
         self.kitty_cursor_placement.settle = draw.settle;
         debug_assert_eq!(
             (art.w(), art.h()),
@@ -3577,9 +3747,32 @@ impl WordDecorations {
     const DOG_TRAIL_NUM: i32 = 3;
     const DOG_TRAIL_DEN: i32 = 4;
 
-    /// Emit the typed-word dog cameo ([`crate::dog_cameo`]) as one free sprite just behind the cursor cell, centred on its row.
+    /// Emit the typed-word dog cameo ([`crate::dog_cameo`]) as one free sprite trailing the cursor
+    /// cell: behind it on its row, or flush over or under that row, wherever it covers no letter
+    /// (`ink`, the seat law's probe, [`crate::rainbow_kitty::companion::cell_ink`]) and keeps off
+    /// the caret's cell, as the flying head keeps off them
+    /// ([`KittyCursorPlacement::keep_off_letters`]). A seat stays while it is clear, and the dog
+    /// glides to a new one. Centred on the caret's row whatever lay there, it sat on the letters
+    /// just typed ('agai' of 'again' after 'lazy dog'). With no clear seat beside the caret it
+    /// trails behind it under the letters, which stay drawn over it.
+    ///
+    /// A seat also keeps off the icons the frame's word pass drew (`icons`, grid pixels
+    /// `(x0, x1, y0, y1)` of the window, the canvas's own at `origin` in it): the dog slides along
+    /// its band past an icon it would lie on, towards the caret. Under the row, the dog its own
+    /// word summoned lay on that word's icon, two faces stacked. An icon holds still, so the
+    /// slide keeps the caret's pace.
     #[inline]
-    pub fn dog_cameo(&mut self, frame: DogCameoFrame, free: &mut Vec<FreeSprite>) -> Option<u64> {
+    pub fn dog_cameo<F>(
+        &mut self,
+        frame: DogCameoFrame,
+        free: &mut Vec<FreeSprite>,
+        ink: F,
+        icons: &[(i32, i32, i32, i32)],
+        origin: (i32, i32),
+    ) -> Option<u64>
+    where
+        F: Fn(u16, u16) -> Option<bool>,
+    {
         let DogCameoFrame {
             geom,
             cursor: (crow, ccol),
@@ -3587,6 +3780,7 @@ impl WordDecorations {
             colors,
             bob,
             alpha,
+            now,
         } = frame;
         if alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
@@ -3641,22 +3835,119 @@ impl WordDecorations {
             },
         };
 
+        let (w_px, h_px) = (i32::from(w), i32::from(h));
+        let grid_h = i32::from(geom.rows).saturating_mul(ch);
         let cursor_left = i32::from(ccol).saturating_mul(cw);
         let trail = cw.saturating_mul(Self::DOG_TRAIL_NUM) / Self::DOG_TRAIL_DEN;
         let x = cursor_left
             .saturating_sub(trail)
-            .saturating_sub(i32::from(w))
+            .saturating_sub(w_px)
             .max(0);
-        let rest_top = i32::from(crow) * ch + ch / 2 - i32::from(h) / 2;
-        let intrusion = (x + i32::from(w)) - cursor_left;
-        let rise = if intrusion > 0 {
-            intrusion.min(ch / 2).min(rest_top.max(0))
-        } else {
-            0
+        let row_top = i32::from(crow) * ch;
+        let seat_y = |seat: DogSeat| match seat {
+            DogSeat::Behind => row_top + ch / 2 - h_px / 2,
+            DogSeat::Above => row_top - h_px - 1,
+            DogSeat::Under => row_top + ch + 1,
         };
-        let y = rest_top - rise + (bob * ch as f32).round() as i32;
+        let caret_box = (cursor_left, cursor_left + cw, row_top, row_top + ch);
+        #[cfg(test)]
+        let icons_off = DOG_ICONS_OFF.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let icons_off = false;
+        let icons = if icons_off { &[][..] } else { icons };
+        // The seat's left edge on the band from `y`: the trailing column, slid right past every
+        // word icon the body would lie on there.
+        let slid = |y: i32| -> i32 {
+            let mut sx = x;
+            for _ in 0..=icons.len() {
+                let past = icons
+                    .iter()
+                    .map(|&(x0, x1, y0, y1)| {
+                        (x0 - origin.0, x1 - origin.0, y0 - origin.1, y1 - origin.1)
+                    })
+                    .filter(|&(x0, x1, y0, y1)| {
+                        sx < x1 && sx + w_px > x0 && y < y1 && y + h_px > y0
+                    })
+                    .map(|(_, x1, _, _)| x1)
+                    .max();
+                match past {
+                    Some(x1) => sx = x1,
+                    None => break,
+                }
+            }
+            sx
+        };
+        // Where the seat puts the dog's left edge, when it is clear there: on the grid, off the
+        // caret's cell, off every lettered cell and off the word icons.
+        let clear = |y: i32| -> Option<i32> {
+            if y < 0 || y + h_px > grid_h {
+                return None;
+            }
+            let x = slid(y);
+            if x + w_px > grid_w {
+                return None;
+            }
+            if x < caret_box.1
+                && x + w_px > caret_box.0
+                && y < caret_box.3
+                && y + h_px > caret_box.2
+            {
+                return None;
+            }
+            let (r0, r1) = (y / ch, (y + h_px - 1) / ch);
+            let (c0, c1) = (x / cw, (x + w_px - 1) / cw);
+            (r0..=r1)
+                .all(|r| (c0..=c1).all(|c| ink(r as u16, c as u16) != Some(true)))
+                .then_some(x)
+        };
+        // The visit's own last frame: a dog drawn a moment ago glides on from there.
+        let held = match self.dog_place {
+            Some(p)
+                if p.look == look
+                    && now.saturating_duration_since(p.drawn) < Duration::from_millis(250) =>
+            {
+                Some(p)
+            }
+            _ => None,
+        };
+        #[cfg(test)]
+        let seat_off = DOG_SEAT_OFF.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let seat_off = false;
+        let seat = held
+            .map(|p| p.seat)
+            .into_iter()
+            .chain([DogSeat::Behind, DogSeat::Above, DogSeat::Under])
+            .find_map(|seat| clear(seat_y(seat)).map(|x| (seat, x)));
+        let (seat, seat_x, z) = match seat {
+            _ if seat_off => (DogSeat::Behind, x, FreeZ::OverText),
+            Some((seat, x)) => (seat, x, FreeZ::OverText),
+            None => (DogSeat::Behind, x, FreeZ::UnderText),
+        };
+        let target = (seat_x as f32, seat_y(seat) as f32);
+        let at = match held {
+            Some(p) => {
+                let dt = now
+                    .saturating_duration_since(p.drawn)
+                    .as_secs_f32()
+                    .min(0.1);
+                let k = 1.0 - crate::color_math::exp_f32(-dt * (1.0 / DOG_PLACE_TAU));
+                (
+                    p.at.0 + (target.0 - p.at.0) * k,
+                    p.at.1 + (target.1 - p.at.1) * k,
+                )
+            }
+            None => target,
+        };
+        self.dog_place = Some(DogPlace {
+            look,
+            seat,
+            at,
+            drawn: now,
+        });
+        let y = at.1.round() as i32 + (bob * ch as f32).round() as i32;
         let sprite = FreeSprite {
-            x,
+            x: at.0.round() as i32,
             y,
             w,
             h,
@@ -3665,7 +3956,7 @@ impl WordDecorations {
             tint: 0x00FF_FFFF,
             alpha,
             flip_x: false,
-            z: FreeZ::OverText,
+            z,
         };
         let mut fp = fold_free(FNV64_OFFSET, &sprite);
         free.push(sprite);
@@ -18815,8 +19106,12 @@ mod pet_handoff_emission_tests {
                 colors,
                 bob: 0.0,
                 alpha: 255,
+                now: Instant::now(),
             },
             &mut free,
+            |_, _| Some(false),
+            &[],
+            (0, 0),
         );
         assert!(
             wd_dog_first
@@ -18899,8 +19194,12 @@ mod pet_handoff_emission_tests {
                         colors,
                         bob: 0.0,
                         alpha: 255,
+                        now: Instant::now(),
                     },
                     &mut free,
+                    |_, _| Some(false),
+                    &[],
+                    (0, 0),
                 )
                 .is_none()
         );
@@ -19242,13 +19541,14 @@ mod dog_cameo_emission_tests {
             colors: CatColorKey::default(),
             bob: 0.0,
             alpha: 255,
+            now: Instant::now(),
         };
         let mut free = Vec::new();
         let mut fp = None;
         for frame_i in 0..8 {
             wd.cat_baker_ready = false;
             free.clear();
-            fp = wd.dog_cameo(frame, &mut free);
+            fp = wd.dog_cameo(frame, &mut free, |_, _| Some(false), &[], (0, 0));
             if fp.is_some() {
                 break;
             }
@@ -19266,6 +19566,257 @@ mod dog_cameo_emission_tests {
             s.w
         );
         assert!(s.w > 0 && s.h > 0);
+    }
+
+    /// THE TYPED DOG COVERS NO LETTER (K10-6). Typed after `lazy dog`, the dog was drawn centred
+    /// on the caret's row just behind the caret, over the letters just typed (`agai` of `again`),
+    /// whatever lay there. It now sits where it covers no lettered cell and keeps off the caret's
+    /// cell: behind on the row when that is blank, else flush over or under the row; a seat stays
+    /// while it is clear, and the dog glides to the next. With no clear seat it trails under the
+    /// letters, which are drawn over it.
+    ///
+    /// NEGATIVE CONTROL (`DOG_SEAT_OFF`, the seat as it was): the sprite over row 5's letters,
+    /// drawn over text.
+    #[test]
+    fn the_typed_dog_covers_no_letter() {
+        let geom = EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 24,
+            cols: 80,
+        };
+        let look = crate::dog_cameo::DogLook {
+            breed: crate::dog_glyphs_gen::DOG_HEADS[0],
+            coat: 9,
+        };
+        let t0 = Instant::now();
+        let frame = |cursor: (u16, u16), ms: u64| DogCameoFrame {
+            geom,
+            cursor,
+            look,
+            colors: CatColorKey::default(),
+            bob: 0.0,
+            alpha: 255,
+            now: t0 + Duration::from_millis(ms),
+        };
+        // The lines typed so far: `ink(row)` letters from column 0 on each row.
+        let draw = |wd: &mut WordDecorations, f: DogCameoFrame, ink: &dyn Fn(u16) -> u16| {
+            let mut free = Vec::new();
+            for _ in 0..8 {
+                wd.cat_baker_ready = false;
+                free.clear();
+                if wd
+                    .dog_cameo(f, &mut free, |r, c| Some(c < ink(r)), &[], (0, 0))
+                    .is_some()
+                {
+                    return free.pop().expect("one sprite");
+                }
+            }
+            panic!("the dog tile never landed");
+        };
+        let covers = |s: &FreeSprite, ink: &dyn Fn(u16) -> u16, caret: (u16, u16)| {
+            let (r0, r1) = (s.y.max(0) / 20, (s.y + i32::from(s.h) - 1) / 20);
+            let (c0, c1) = (s.x.max(0) / 10, (s.x + i32::from(s.w) - 1) / 10);
+            (r0..=r1).any(|r| {
+                (c0..=c1).any(|c| c < i32::from(ink(r as u16)) || (r as u16, c as u16) == caret)
+            })
+        };
+        // A shell: the line above typed to column 60, the caret's row to the caret, nothing under.
+        let shell = |r: u16| match r {
+            4 => 60,
+            5 => 40,
+            _ => 0,
+        };
+        DOG_SEAT_OFF.with(|c| c.set(true));
+        let old = draw(&mut WordDecorations::default(), frame((5, 40), 0), &shell);
+        DOG_SEAT_OFF.with(|c| c.set(false));
+        assert!(
+            covers(&old, &shell, (5, 40)) && old.z == FreeZ::OverText,
+            "negative control: the old seat lays the dog over the letters just typed"
+        );
+        let mut wd = WordDecorations::default();
+        let s = draw(&mut wd, frame((5, 40), 0), &shell);
+        assert!(
+            !covers(&s, &shell, (5, 40)),
+            "the dog over the letters at ({}, {}) {}x{}",
+            s.x,
+            s.y,
+            s.w,
+            s.h
+        );
+        assert_eq!(s.z, FreeZ::OverText);
+        assert!(
+            s.x + i32::from(s.w) <= 400,
+            "it still trails behind the caret"
+        );
+        assert!(s.y >= 6 * 20, "under the caret's row: y {}", s.y);
+        // Typed on, the seat under the row is still clear: the dog keeps it.
+        let on = |r: u16| match r {
+            4 => 60,
+            5 => 44,
+            _ => 0,
+        };
+        let s2 = draw(&mut wd, frame((5, 44), 500), &on);
+        assert!(!covers(&s2, &on, (5, 44)));
+        assert_eq!(s2.y, s.y, "the seat under the row is kept");
+        // A row of words appears under the caret's row: the dog glides off them.
+        let crowded = |r: u16| match r {
+            4 => 0,
+            5 => 44,
+            6 | 7 => 80,
+            _ => 0,
+        };
+        let mut seen = Vec::new();
+        for i in 1..=20 {
+            seen.push(draw(&mut wd, frame((5, 44), 500 + 16 * i), &crowded));
+        }
+        let landed = seen.last().expect("frames");
+        assert!(
+            !covers(landed, &crowded, (5, 44)),
+            "it ends clear of the words"
+        );
+        assert!(
+            landed.y < 5 * 20,
+            "over the caret's row now: y {}",
+            landed.y
+        );
+        let worst = seen
+            .windows(2)
+            .map(|w| (w[1].y - w[0].y).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            worst < 2 * 20,
+            "it glides, never jumping {worst} px in a frame"
+        );
+        // Every seat beside the caret lettered: it trails under the letters.
+        let full = |_: u16| 80;
+        let mut wd = WordDecorations::default();
+        let s = draw(&mut wd, frame((5, 40), 0), &full);
+        assert_eq!(s.z, FreeZ::UnderText, "the letters are drawn over it");
+    }
+
+    /// THE TYPED DOG KEEPS OFF ITS WORD'S ICON. The dog its own word summoned (`dog`, typed past
+    /// the summon's keys) took the seat under the caret's row, where the word pass draws that
+    /// word's icon: two dog faces stacked under `dog` for the keys after it. A seat keeps off the
+    /// frame's word icons too: the dog slides along the row under it past the icon, towards the
+    /// caret, and as the caret goes on it trails as before, every frame clear of the icon, the
+    /// letters and the caret, never moving more than a cell in a frame. A pane's dog is judged
+    /// against the icons in the window's grid, at the pane's origin.
+    ///
+    /// NEGATIVE CONTROL (`DOG_ICONS_OFF`, the seat judged by the letters and the caret alone): the
+    /// dog lies on the icon.
+    #[test]
+    fn the_typed_dog_keeps_off_its_words_icon() {
+        let geom = EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 24,
+            cols: 80,
+        };
+        let look = crate::dog_cameo::DogLook {
+            breed: crate::dog_glyphs_gen::DOG_HEADS[0],
+            coat: 9,
+        };
+        let t0 = Instant::now();
+        let frame = |caret: u16, ms: u64| DogCameoFrame {
+            geom,
+            cursor: (5, caret),
+            look,
+            colors: CatColorKey::default(),
+            bob: 0.0,
+            alpha: 255,
+            now: t0 + Duration::from_millis(ms),
+        };
+        // `... lazy dog` typed on row 5 to the caret, the line over it lettered to column 60, and
+        // the word pass's icon for `dog` (columns 36 to 38) on the row under it.
+        let lettered =
+            |caret: u16| move |r: u16, c: u16| Some(r == 4 && c < 60 || r == 5 && c < caret);
+        let icon = (360, 390, 120, 142);
+        let overlaps = |s: &FreeSprite, (x0, x1, y0, y1): (i32, i32, i32, i32)| {
+            s.x < x1 && s.x + i32::from(s.w) > x0 && s.y < y1 && s.y + i32::from(s.h) > y0
+        };
+        let draw = |wd: &mut WordDecorations, f: DogCameoFrame, origin: (i32, i32)| {
+            let shifted = [(
+                icon.0 + origin.0,
+                icon.1 + origin.0,
+                icon.2 + origin.1,
+                icon.3 + origin.1,
+            )];
+            let mut free = Vec::new();
+            for _ in 0..8 {
+                wd.cat_baker_ready = false;
+                free.clear();
+                let caret = f.cursor.1;
+                if wd
+                    .dog_cameo(f, &mut free, lettered(caret), &shifted, origin)
+                    .is_some()
+                {
+                    return free.pop().expect("one sprite");
+                }
+            }
+            panic!("the dog tile never landed");
+        };
+        DOG_ICONS_OFF.with(|c| c.set(true));
+        let old = draw(&mut WordDecorations::default(), frame(40, 0), (0, 0));
+        DOG_ICONS_OFF.with(|c| c.set(false));
+        assert!(
+            overlaps(&old, icon),
+            "negative control: the seat under the row lies on the icon: ({}, {}) {}x{}",
+            old.x,
+            old.y,
+            old.w,
+            old.h
+        );
+        for origin in [(0, 0), (130, 60)] {
+            let mut wd = WordDecorations::default();
+            let mut prev: Option<FreeSprite> = None;
+            for i in 0..60u64 {
+                let caret = 40 + (i / 8) as u16;
+                let s = draw(&mut wd, frame(caret, 16 * i), origin);
+                assert!(
+                    !overlaps(&s, icon),
+                    "origin {origin:?}, frame {i}: the dog on the icon at ({}, {}) {}x{}",
+                    s.x,
+                    s.y,
+                    s.w,
+                    s.h
+                );
+                let letters = (0..24u16).any(|r| {
+                    (0..80u16).any(|c| {
+                        lettered(caret)(r, c) == Some(true)
+                            && overlaps(
+                                &s,
+                                (
+                                    i32::from(c) * 10,
+                                    i32::from(c) * 10 + 10,
+                                    i32::from(r) * 20,
+                                    i32::from(r) * 20 + 20,
+                                ),
+                            )
+                    })
+                });
+                assert!(!letters, "origin {origin:?}, frame {i}: the dog on letters");
+                assert!(
+                    !overlaps(
+                        &s,
+                        (i32::from(caret) * 10, i32::from(caret) * 10 + 10, 100, 120)
+                    ),
+                    "origin {origin:?}, frame {i}: the dog on the caret"
+                );
+                if let Some(p) = prev {
+                    assert!(
+                        (s.x - p.x).abs() <= 10 && (s.y - p.y).abs() <= 10,
+                        "origin {origin:?}, frame {i}: a jump from ({}, {}) to ({}, {})",
+                        p.x,
+                        p.y,
+                        s.x,
+                        s.y
+                    );
+                }
+                prev = Some(s);
+            }
+        }
     }
 
     #[test]
@@ -19292,6 +19843,7 @@ mod dog_cameo_emission_tests {
             },
             bob: 0.0,
             alpha: 255,
+            now: Instant::now(),
         };
         let mut wd = WordDecorations::default();
         fn spend_budget_then(
@@ -19303,16 +19855,22 @@ mod dog_cameo_emission_tests {
             wd.begin_host_frame();
             for f in warm {
                 free.clear();
-                wd.dog_cameo(f, &mut free);
+                wd.dog_cameo(f, &mut free, |_, _| Some(false), &[], (0, 0));
             }
             free.clear();
-            wd.dog_cameo(ask, &mut free)
+            wd.dog_cameo(ask, &mut free, |_, _| Some(false), &[], (0, 0))
         }
         let mut free = Vec::new();
         for accent in [0u8, 1] {
             wd.begin_host_frame();
             free.clear();
-            wd.dog_cameo(frame(look(0), accent), &mut free);
+            wd.dog_cameo(
+                frame(look(0), accent),
+                &mut free,
+                |_, _| Some(false),
+                &[],
+                (0, 0),
+            );
         }
         assert!(
             spend_budget_then(

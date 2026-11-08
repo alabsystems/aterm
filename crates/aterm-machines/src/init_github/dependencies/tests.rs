@@ -24,11 +24,23 @@ pub(in crate::init_github) fn directory(who: &User) -> Stat {
 /// Tracked metadata, independently scripted from the selected worktrees. The fixture
 /// includes an optional entry so acquiring everything in .gitmodules is observable.
 pub(in crate::init_github) fn declarations(sys: &Fake, who: &User, parent: &Path, paths: &[&str]) {
-    sys.on(
-        &local(sys, who, None).arg("--version").display(),
-        Ran::ok("git version fixture with no-lazy-fetch\n"),
-    );
-    let git = || local(sys, who, Some(parent));
+    declarations_with(sys, who, parent, paths, NoLazyFetch::Flag);
+}
+
+/// [`declarations`] as read by a git that keeps reads from fetching lazily the way `off` says.
+/// A git that takes `--no-lazy-fetch` is scripted to say so; one that obeys the variable alone
+/// answers its question by a model the test installs
+/// ([`crate::init_github::git_before_no_lazy_fetch`]).
+fn declarations_with(sys: &Fake, who: &User, parent: &Path, paths: &[&str], off: NoLazyFetch) {
+    if off == NoLazyFetch::Flag {
+        sys.on(
+            &checkout::git(sys, who, None)
+                .args(["--no-lazy-fetch", "--version"])
+                .display(),
+            Ran::ok("git version fixture with no-lazy-fetch\n"),
+        );
+    }
+    let git = || local(sys, who, Some(parent), off);
     sys.on(
         &git()
             .args(["rev-parse", "--verify", "HEAD^{commit}"])
@@ -125,11 +137,19 @@ fn nothing_named(sys: &Fake, git: Cmd) {
 }
 
 pub(in crate::init_github) fn existing(sys: &Fake, who: &User, path: &Path, name: &str, pin: &str) {
-    existing_as(sys, who, path, "alice", name, pin);
+    existing_as(sys, who, path, "alice", name, pin, NoLazyFetch::Flag);
 }
 
-fn existing_as(sys: &Fake, who: &User, path: &Path, owner: &str, name: &str, pin: &str) {
-    let git = || local(sys, who, Some(path));
+fn existing_as(
+    sys: &Fake,
+    who: &User,
+    path: &Path,
+    owner: &str,
+    name: &str,
+    pin: &str,
+    off: NoLazyFetch,
+) {
+    let git = || local(sys, who, Some(path), off);
     let ordinary = || checkout::git(sys, who, Some(path));
     sys.on(
         &ordinary()
@@ -218,18 +238,20 @@ fn download_as(
         name: name.into(),
         declared_url: format!("https://github.com/{owner}/{name}.git"),
     };
-    let ordinary = local(sys, who, None).args(checkout::NO_SIDE_RUNS).args([
-        "-c",
-        "submodule.recurse=false",
-        "-c",
-        "protocol.allow=never",
-        "-c",
-        "protocol.https.allow=always",
-        "-c",
-        "protocol.ssh.allow=always",
-        "-c",
-        "http.followRedirects=false",
-    ]);
+    let ordinary = local(sys, who, None, NoLazyFetch::Flag)
+        .args(checkout::NO_SIDE_RUNS)
+        .args([
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.https.allow=always",
+            "-c",
+            "protocol.ssh.allow=always",
+            "-c",
+            "http.followRedirects=false",
+        ]);
     sys.on(
         &ordinary
             .args(["ls-remote", "--get-url", "--", &dependency.url()])
@@ -238,7 +260,7 @@ fn download_as(
     );
     let stage =
         Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", sequence).join("repo");
-    let command = network(sys, who, None, &dependency)
+    let command = network(sys, who, None, &dependency, NoLazyFetch::Flag)
         .unwrap()
         .budget(BUDGET)
         .args([
@@ -268,10 +290,18 @@ fn download_as(
         &stage.join(".git/fixture"),
         b"complete object database",
     );
-    existing_as(sys, who, &stage, owner, name, PIN);
-    existing_as(sys, who, &parent.join(path), owner, name, PIN);
+    existing_as(sys, who, &stage, owner, name, PIN, NoLazyFetch::Flag);
+    existing_as(
+        sys,
+        who,
+        &parent.join(path),
+        owner,
+        name,
+        PIN,
+        NoLazyFetch::Flag,
+    );
     sys.on(
-        &local(sys, who, Some(&stage))
+        &local(sys, who, Some(&stage), NoLazyFetch::Flag)
             .args(checkout::NO_SIDE_RUNS)
             .args([
                 "-c",
@@ -288,6 +318,10 @@ fn download_as(
 }
 
 fn fixture(paths: &[&str]) -> (Fake, User, Repo, PathBuf) {
+    fixture_with(paths, NoLazyFetch::Flag)
+}
+
+fn fixture_with(paths: &[&str], off: NoLazyFetch) -> (Fake, User, Repo, PathBuf) {
     let mut sys = Fake::root();
     sys.euid = 501;
     let who = user("alice", 501);
@@ -296,7 +330,7 @@ fn fixture(paths: &[&str]) -> (Fake, User, Repo, PathBuf) {
     sys.stat_of(&who.home, directory(&who));
     sys.stat_of(parent.to_str().unwrap(), directory(&who));
     repos::tests::script_existing(&sys, &who, &parent, "parent");
-    declarations(&sys, &who, &parent, paths);
+    declarations_with(&sys, &who, &parent, paths, off);
     let repo = Repo {
         owner: "alice".into(),
         name: "parent".into(),
@@ -332,52 +366,126 @@ fn policy_accepts_only_canonical_nonoverlapping_relative_paths() {
     }
 }
 
+/// A git that refuses `--no-lazy-fetch` and ignores `GIT_NO_LAZY_FETCH` (it fetched the
+/// question's object lazily), or one the question could not be asked of, gets no dependency
+/// work and no ordinary fallback: each entry asks once, and nothing reads the parent.
 #[test]
 fn unsupported_git_refuses_dependency_work_without_an_ordinary_fallback() {
-    let (sys, who, repo, parent) = fixture(&["vendor/library"]);
-    sys.simulate(|_, command| {
-        command
-            .args
+    for answered in [true, false] {
+        let (sys, who, repo, parent) = fixture(&["vendor/library"]);
+        sys.simulate(move |_, command| {
+            if answered {
+                crate::init_github::git_before_no_lazy_fetch(command, false)
+            } else {
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--no-lazy-fetch")
+                    .then(|| Ran::exit(129, "unknown option: --no-lazy-fetch"))
+            }
+        });
+        assert!(matches!(
+            ready(&sys, &who, &parent, &repo),
+            Err(Unready::Git(_))
+        ));
+        let why = repair(&sys, &who, &parent, &repo, &|| Ok(()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            why.contains(if answered {
+                "must support --no-lazy-fetch, or obey GIT_NO_LAZY_FETCH,"
+            } else {
+                "cannot see whether Git obeys GIT_NO_LAZY_FETCH"
+            }) && why.contains("required dependencies stay untouched"),
+            "{why}"
+        );
+        let calls = sys.calls();
+        let asked = |call: &&String| call.ends_with(" --no-lazy-fetch --version");
+        assert_eq!(
+            calls.iter().filter(asked).count(),
+            2,
+            "one capability question at each entry: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|call| asked(&call) || call.contains(".aterm-machines-git-lazy-fetch-")),
+            "nothing but the question ran: {calls:?}"
+        );
+        assert!(sys.stat(&parent.join("vendor/library")).is_err());
+        // A repository selecting no dependencies requires no new Git capability.
+        let unselected = Repo {
+            required_submodules: Vec::new(),
+            ..repo
+        };
+        assert!(ready(&sys, &who, &parent, &unselected).unwrap());
+        repair(&sys, &who, &parent, &unselected, &|| Ok(())).unwrap();
+        assert_eq!(sys.calls(), calls);
+    }
+}
+
+/// A git that refuses `--no-lazy-fetch` but was seen to obey `GIT_NO_LAZY_FETCH` (as Ubuntu
+/// 24.04's 2.43.0 does) inspects and keeps a required dependency with the variable alone: no read
+/// passes the option it would refuse, and every one carries the variable. NEGATIVE CONTROL: the
+/// same work under a git that takes the option passes it on the dependency reads.
+#[test]
+fn a_git_that_obeys_the_variable_alone_reads_dependencies_without_the_option() {
+    for off in [NoLazyFetch::Variable, NoLazyFetch::Flag] {
+        let (sys, who, repo, parent) = fixture_with(&["vendor/library"], off);
+        let path = parent.join("vendor/library");
+        sys.stat_of(parent.join("vendor").to_str().unwrap(), directory(&who));
+        sys.stat_of(path.to_str().unwrap(), directory(&who));
+        sys.stat_of(path.join(".git").to_str().unwrap(), directory(&who));
+        sys.file(
+            path.join("library.rs").to_str().unwrap(),
+            b"recorded source",
+        );
+        existing_as(&sys, &who, &path, "alice", "library", PIN, off);
+        if off == NoLazyFetch::Variable {
+            sys.simulate(|_, command| crate::init_github::git_before_no_lazy_fetch(command, true));
+        }
+        assert!(ready(&sys, &who, &parent, &repo).unwrap(), "{off:?}");
+        repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap();
+        let calls = sys.calls();
+        let reads = calls
             .iter()
-            .any(|arg| arg == "--no-lazy-fetch")
-            .then(|| Ran::exit(129, "unknown option: --no-lazy-fetch"))
-    });
-    assert!(matches!(
-        ready(&sys, &who, &parent, &repo),
-        Err(Unready::Git(_))
-    ));
-    let why = repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap_err();
-    assert!(
-        why.to_string().contains("must support --no-lazy-fetch"),
-        "{why}"
-    );
-    let calls = sys.calls();
-    assert_eq!(
-        calls.len(),
-        2,
-        "one capability probe at each entry: {calls:?}"
-    );
-    assert!(
-        calls
+            .filter(|call| {
+                call.contains(crate::items::github::CLT_GIT)
+                    && !call.ends_with(" --no-lazy-fetch --version")
+                    && !call.contains(".aterm-machines-git-lazy-fetch-")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            reads.iter().any(|call| call
+                .contains(&format!("{} -c core.fsmonitor= rev-list", path.display()))
+                || call.contains(&format!(
+                    "{} --no-lazy-fetch -c core.fsmonitor= rev-list",
+                    path.display()
+                ))),
+            "the dependency's checkout objects were read: {reads:?}"
+        );
+        assert!(
+            reads
+                .iter()
+                .all(|call| call.contains("GIT_NO_LAZY_FETCH=1")),
+            "{reads:?}"
+        );
+        let flagged = reads
             .iter()
-            .all(|call| call.contains("--no-lazy-fetch") && call.ends_with(" --version")),
-        "{calls:?}"
-    );
-    assert!(sys.stat(&parent.join("vendor/library")).is_err());
-    // A repository selecting no dependencies requires no new Git capability.
-    let unselected = Repo {
-        required_submodules: Vec::new(),
-        ..repo
-    };
-    assert!(ready(&sys, &who, &parent, &unselected).unwrap());
-    repair(&sys, &who, &parent, &unselected, &|| Ok(())).unwrap();
-    assert_eq!(sys.calls(), calls);
+            .filter(|call| call.contains("--no-lazy-fetch"))
+            .count();
+        if off == NoLazyFetch::Variable {
+            assert_eq!(flagged, 0, "{reads:?}");
+        } else {
+            assert!(flagged > 0, "control: {reads:?}");
+        }
+    }
 }
 
 #[test]
 fn real_tracked_metadata_and_a_branch_at_the_pin_are_ready_without_moving_user_work() {
     use crate::port::Live;
-    crate::items::github::need_native_git_with_no_lazy_fetch();
+    let off = crate::items::github::need_native_git_barring_lazy_fetch();
     let sys = Live::new();
     let scratch = Scratch::new(&sys, "required-gitlink").unwrap();
     let mut who = user("fixture", sys.euid());
@@ -386,7 +494,7 @@ fn real_tracked_metadata_and_a_branch_at_the_pin_are_ready_without_moving_user_w
     let child = parent.join("vendor/library");
     sys.create_dir_all(&child, 0o700).unwrap();
     let run = |path: &Path, args: &[&str]| {
-        let command = local(&sys, &who, Some(path))
+        let command = local(&sys, &who, Some(path), off)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(checkout::NO_SIDE_RUNS)
@@ -486,7 +594,7 @@ fn real_tracked_metadata_and_a_branch_at_the_pin_are_ready_without_moving_user_w
 fn readiness_runs_no_filter_driver_a_parent_or_a_dependency_names() {
     use crate::port::Live;
     use std::os::unix::fs::PermissionsExt as _;
-    crate::items::github::need_native_git_with_no_lazy_fetch();
+    let off = crate::items::github::need_native_git_barring_lazy_fetch();
     let sys = Live::new();
     let scratch = Scratch::new(&sys, "required-no-filter").unwrap();
     let mut who = user("fixture", sys.euid());
@@ -503,7 +611,7 @@ fn readiness_runs_no_filter_driver_a_parent_or_a_dependency_names() {
     .unwrap();
     std::fs::set_permissions(&driver, std::fs::Permissions::from_mode(0o755)).unwrap();
     let run = |path: &Path, args: &[&str]| {
-        let command = local(&sys, &who, Some(path))
+        let command = local(&sys, &who, Some(path), off)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(checkout::NO_SIDE_RUNS)
@@ -628,7 +736,7 @@ fn readiness_runs_no_filter_driver_a_parent_or_a_dependency_names() {
 #[test]
 fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_transport() {
     use crate::port::Live;
-    crate::items::github::need_native_git_with_no_lazy_fetch();
+    let off = crate::items::github::need_native_git_barring_lazy_fetch();
     let sys = Live::new();
     let scratch = Scratch::new(&sys, "required-offline-pin").unwrap();
     let mut who = user("fixture", sys.euid());
@@ -639,7 +747,7 @@ fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_t
     let run = |path: &Path, args: &[&str]| {
         text(
             &sys,
-            local(&sys, &who, Some(path))
+            local(&sys, &who, Some(path), off)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .args(checkout::NO_SIDE_RUNS)
@@ -747,7 +855,7 @@ fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_t
         b"required preloaded source\n"
     );
     assert!(
-        sys.run_complete_stdout(&local(&sys, &who, Some(&child)).args([
+        sys.run_complete_stdout(&local(&sys, &who, Some(&child), off).args([
             "symbolic-ref",
             "--quiet",
             "HEAD"
@@ -814,7 +922,7 @@ fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_t
     sys.remove(&object_path).unwrap();
     assert!(run(&child, &["status", "--porcelain"]).is_empty());
     assert!(
-        sys.run_complete_stdout(&local(&sys, &who, Some(&child)).args([
+        sys.run_complete_stdout(&local(&sys, &who, Some(&child), off).args([
             "cat-file",
             "-e",
             &format!("{pin}^{{commit}}"),
@@ -823,9 +931,11 @@ fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_t
         .success()
     );
     assert!(
-        !sys.run_complete_stdout(&local(&sys, &who, Some(&child)).args(["cat-file", "-e", &blob]))
-            .unwrap()
-            .success()
+        !sys.run_complete_stdout(
+            &local(&sys, &who, Some(&child), off).args(["cat-file", "-e", &blob])
+        )
+        .unwrap()
+        .success()
     );
     let result = repair(&sys, &who, &parent, &repo, &|| Ok(()));
     assert!(
@@ -850,7 +960,7 @@ fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_t
     // can then finish from that complete local store while SSH remains unavailable.
     read(
         &sys,
-        local(&sys, &who, Some(&child))
+        local(&sys, &who, Some(&child), off)
             .args(["fetch", "--refetch", "--no-recurse-submodules", "--"])
             .arg(&backup)
             .arg(&pin),
@@ -868,7 +978,7 @@ fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_t
 #[test]
 fn partial_parent_metadata_reads_never_fetch_implicitly_but_explicit_fetch_still_works() {
     use crate::port::Live;
-    crate::items::github::need_native_git_with_no_lazy_fetch();
+    let off = crate::items::github::need_native_git_barring_lazy_fetch();
     let sys = Live::new();
     let scratch = Scratch::new(&sys, "required-partial-parent").unwrap();
     let mut who = user("fixture", sys.euid());
@@ -985,7 +1095,7 @@ fn partial_parent_metadata_reads_never_fetch_implicitly_but_explicit_fetch_still
     let guarded_trace = scratch.path().join("guarded.trace.jsonl");
     let guarded = sys
         .run_complete_stdout(
-            &local(&sys, &who, Some(&parent))
+            &local(&sys, &who, Some(&parent), off)
                 .env("GIT_TRACE2_EVENT", guarded_trace.to_string_lossy())
                 .args(query),
         )
@@ -1010,7 +1120,7 @@ fn partial_parent_metadata_reads_never_fetch_implicitly_but_explicit_fetch_still
     // controlled local transport restores the blob and makes metadata readable again.
     read(
         &sys,
-        local(&sys, &who, Some(&parent))
+        local(&sys, &who, Some(&parent), off)
             .args(["fetch", "--refetch", "--no-recurse-submodules", "--"])
             .arg(&backup)
             .arg("HEAD"),
@@ -1018,9 +1128,11 @@ fn partial_parent_metadata_reads_never_fetch_implicitly_but_explicit_fetch_still
     )
     .unwrap();
     assert!(
-        sys.run_complete_stdout(&local(&sys, &who, Some(&parent)).args(["cat-file", "-e", &blob]))
-            .unwrap()
-            .success()
+        sys.run_complete_stdout(
+            &local(&sys, &who, Some(&parent), off).args(["cat-file", "-e", &blob])
+        )
+        .unwrap()
+        .success()
     );
     assert!(!ready(&sys, &who, &parent, &repo).unwrap());
 }
@@ -1171,7 +1283,7 @@ fn dirty_branched_partial_unknown_and_linked_dependencies_stay_unfinished_and_un
                 .then(|| Ran::ok("remote.origin.promisor true\n"))
             });
         }
-        let git = || local(&sys, &who, Some(&path));
+        let git = || local(&sys, &who, Some(&path), NoLazyFetch::Flag);
         nothing_named(&sys, git());
         sys.on(
             &checkout::Programs::default()
@@ -1195,7 +1307,7 @@ fn dirty_branched_partial_unknown_and_linked_dependencies_stay_unfinished_and_un
             },
         );
         sys.on(
-            &local(&sys, &who, Some(&parent))
+            &local(&sys, &who, Some(&parent), NoLazyFetch::Flag)
                 .args([
                     "log",
                     "-1",
@@ -1257,7 +1369,7 @@ fn an_existing_clean_detached_recorded_pin_is_fetched_then_aligned_without_recur
         b"recorded source",
     );
     existing(&sys, &who, &path, "library", OLD);
-    let git = || local(&sys, &who, Some(&path));
+    let git = || local(&sys, &who, Some(&path), NoLazyFetch::Flag);
     nothing_named(&sys, git());
     sys.on(
         &checkout::Programs::default()
@@ -1277,7 +1389,7 @@ fn an_existing_clean_detached_recorded_pin_is_fetched_then_aligned_without_recur
         Ran::exit(1, ""),
     );
     sys.on(
-        &local(&sys, &who, Some(&parent))
+        &local(&sys, &who, Some(&parent), NoLazyFetch::Flag)
             .args([
                 "log",
                 "-1",
@@ -1375,7 +1487,7 @@ fn changed_gitlinks_urls_index_and_off_host_routes_refuse_publication() {
             if sys.calls().iter().any(|call| call.contains(" clone "))
                 && !changed.swap(true, std::sync::atomic::Ordering::SeqCst)
             {
-                let git = local(&sys, &who, Some(&parent));
+                let git = local(&sys, &who, Some(&parent), NoLazyFetch::Flag);
                 match mode {
                     "pin" => {
                         sys.on(
@@ -1414,19 +1526,29 @@ fn changed_gitlinks_urls_index_and_off_host_routes_refuse_publication() {
         if mode == "route" {
             // The existing route fixture is consumed once by setup; this last response
             // becomes the network step's admission and cannot be bypassed by a local URL.
-            let dependency = resolve(&sys, &who, &parent, &repo, "vendor/library").unwrap();
-            let ordinary = local(&sys, &who, None).args(checkout::NO_SIDE_RUNS).args([
-                "-c",
-                "submodule.recurse=false",
-                "-c",
-                "protocol.allow=never",
-                "-c",
-                "protocol.https.allow=always",
-                "-c",
-                "protocol.ssh.allow=always",
-                "-c",
-                "http.followRedirects=false",
-            ]);
+            let dependency = resolve(
+                &sys,
+                &who,
+                &parent,
+                &repo,
+                "vendor/library",
+                NoLazyFetch::Flag,
+            )
+            .unwrap();
+            let ordinary = local(&sys, &who, None, NoLazyFetch::Flag)
+                .args(checkout::NO_SIDE_RUNS)
+                .args([
+                    "-c",
+                    "submodule.recurse=false",
+                    "-c",
+                    "protocol.allow=never",
+                    "-c",
+                    "protocol.https.allow=always",
+                    "-c",
+                    "protocol.ssh.allow=always",
+                    "-c",
+                    "http.followRedirects=false",
+                ]);
             let command = ordinary.args(["ls-remote", "--get-url", "--", &dependency.url()]);
             sys.on(&command.display(), Ran::ok("file:///personal/repository"));
             sys.run_complete_stdout(&command).unwrap();

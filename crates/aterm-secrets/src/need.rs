@@ -25,7 +25,7 @@ pub use crate::client::version::RefusalClaim;
 pub use catalog::{Class, GhProfile, Purpose, Want};
 pub use ledger::{
     FILE as LEDGER, absorb, acknowledge_from_snapshot, list, peek, raise, raise_refused,
-    raise_refused_from_snapshot, retire, satisfied, with_ledger,
+    raise_refused_from_snapshot, retire, satisfied, unneeded_from_snapshot, with_ledger,
 };
 
 use crate::commons::Unavailable;

@@ -1136,40 +1136,41 @@ impl App {
         self.search_apply_current_in(wid);
     }
 
-    /// Invalidate an open find when the focused terminal emits output: any change marks the batch dirty and clears a highlight the output could have moved.
+    /// Invalidate an open find in any window whose focused terminal is `session`: any output change marks the batch dirty and clears a highlight the output could have moved.
     pub(crate) fn search_refresh_for_output(&mut self, session: u64) {
-        let Some(wid) = self.frontmost_window else {
+        if !self.windows.values().any(|ws| ws.search.is_some()) {
             return;
-        };
-        let Some((expected_revision, expected_epoch, expected_content_seq)) = self
+        }
+        let open: Vec<(crate::WindowId, u64, u64, u64)> = self
             .windows
-            .get(&wid)
-            .and_then(|ws| ws.search.as_ref())
-            .map(|search| {
-                (
+            .iter()
+            .filter_map(|(&wid, ws)| {
+                let search = ws.search.as_ref()?;
+                Some((
+                    wid,
                     search.match_absolute_row_revision,
                     search.match_history_renumber_epoch,
                     search.match_content_seq,
-                )
+                ))
             })
-        else {
-            return;
-        };
-        let Some((term, front)) = self.front_shown(wid) else {
-            return;
-        };
-        if front != session {
-            return;
-        }
-        let Ok(term) = term.try_lock() else {
-            return;
-        };
-        let revision_stale = term.absolute_row_revision() != expected_revision
-            || term.grid().history_renumber_epoch() != expected_epoch;
-        let content_stale = term.content_seq() != expected_content_seq;
-        drop(term);
-        if revision_stale || content_stale {
-            self.invalidate_search_results(wid, revision_stale);
+            .collect();
+        for (wid, expected_revision, expected_epoch, expected_content_seq) in open {
+            let Some((term, front)) = self.front_shown(wid) else {
+                continue;
+            };
+            if front != session {
+                continue;
+            }
+            let Ok(term) = term.try_lock() else {
+                continue;
+            };
+            let revision_stale = term.absolute_row_revision() != expected_revision
+                || term.grid().history_renumber_epoch() != expected_epoch;
+            let content_stale = term.content_seq() != expected_content_seq;
+            drop(term);
+            if revision_stale || content_stale {
+                self.invalidate_search_results(wid, revision_stale);
+            }
         }
     }
 
@@ -1734,7 +1735,7 @@ impl App {
             return Some(FindStatus::CLOSED);
         }
         match action {
-            FindAction::Open => self.find_requested(),
+            FindAction::Open => self.find_requested_in(wid),
             FindAction::Type(text) => self.search_edit_in(wid, SearchEdit::Insert(text)),
             FindAction::Edit(edit) => self.search_edit_in(wid, edit),
             FindAction::Step { forward } => self.search_step_in(wid, forward),
@@ -3641,6 +3642,47 @@ mod tests {
             Some(aterm_core::terminal::CustodyTransition::UserSelect),
             "the search jump is a UserSelect producer and must say so — without this \
              the `custody` verb answers a stale transition beside a changed selection"
+        );
+    }
+
+    #[test]
+    fn search_refresh_for_output_invalidates_open_find_in_non_frontmost_window() {
+        let mut app = App::headless_for_test();
+        let w0 = WindowId(0);
+        let w1 = WindowId(1);
+        app.install_window_state(w1, crate::stub_session(99), 24, 80);
+        let s0 = app.front_terminal(w0).expect("w0 terminal").session;
+        let term0 = app.front_terminal(w0).expect("w0 terminal").term.clone();
+        crate::term_lock(&term0).process(b"needle line\r\n");
+
+        app.find_requested_in(w0);
+        set_query(&mut app, w0, "needle");
+        app.search_recompute_in(w0);
+        assert_eq!(
+            app.windows[&w0].search.as_ref().map(|s| s.matches.len()),
+            Some(1)
+        );
+        assert!(
+            !app.windows[&w0]
+                .search
+                .as_ref()
+                .expect("search")
+                .results_dirty
+        );
+        assert!(crate::term_lock(&term0).text_selection().has_selection());
+
+        app.frontmost_window = Some(w1);
+        crate::term_lock(&term0).process(b"more output\r\n");
+        app.search_refresh_for_output(s0);
+
+        let search = app.windows[&w0].search.as_ref().expect("w0 search open");
+        assert!(
+            search.results_dirty,
+            "output on w0's session must mark w0's open find dirty even when w1 is frontmost"
+        );
+        assert!(
+            !crate::term_lock(&term0).text_selection().has_selection(),
+            "stale match selection in w0 must be cleared when output advances row revision"
         );
     }
 }

@@ -1462,6 +1462,66 @@ impl Laid {
         self.check_locked(&transaction)
     }
 
+    pub(crate) fn prepare_gnu_epoch(
+        &mut self,
+        epoch: &crate::retained_gnu::Epoch,
+    ) -> io::Result<()> {
+        let mut transaction = self.transaction()?;
+        self.retry_event(&mut transaction)?;
+        self.check_locked(&transaction)?;
+        let journal = &self
+            .custody
+            .as_ref()
+            .ok_or_else(|| refused("GNU epoch needs original cohort custody"))?
+            .journal;
+        if journal.gnu_matches(epoch.id()) {
+            return Ok(());
+        }
+        let (line, next) = journal.gnu_event("gnu_prepare", epoch.id())?;
+        self.event(&mut transaction, line, next)
+    }
+
+    pub(crate) fn check_gnu_scope_drained(&mut self) -> io::Result<()> {
+        let mut transaction = self.transaction()?;
+        self.retry_event(&mut transaction)?;
+        self.finish_unused(&mut transaction)?;
+        self.check_locked(&transaction)?;
+        if self
+            .custody
+            .as_ref()
+            .ok_or_else(|| refused("GNU epoch needs original cohort custody"))?
+            .journal
+            .native_lifetime()
+            != Lifetime::Drained
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "original native GNU cohort scope has not drained",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retire_gnu_epoch(
+        &mut self,
+        epoch: &crate::retained_gnu::Epoch,
+    ) -> io::Result<()> {
+        self.check_gnu_scope_drained()?;
+        let mut transaction = self.transaction()?;
+        self.retry_event(&mut transaction)?;
+        self.check_locked(&transaction)?;
+        let journal = &self
+            .custody
+            .as_ref()
+            .ok_or_else(|| refused("GNU epoch needs original cohort custody"))?
+            .journal;
+        if journal.gnu_retired(epoch.retirement_id()?) {
+            return Ok(());
+        }
+        let (line, next) = journal.gnu_event("gnu_retire", epoch.retirement_id()?)?;
+        self.event(&mut transaction, line, next)
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -2657,6 +2717,11 @@ pub(super) mod tests {
 
     #[test]
     fn retired_evidence_is_outside_admission_and_missing_archive_is_unknown() {
+        if !aterm_uds::test_binary::isolated_lifecycle(
+            "ledger::cohort_ledger::tests::retired_evidence_is_outside_admission_and_missing_archive_is_unknown",
+        ) {
+            return;
+        }
         let f = Fixture::new();
         let mut references = Vec::new();
         for _ in 0..32 {

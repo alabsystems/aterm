@@ -6,8 +6,8 @@
 //! This owns the claim and its one-use launch state, rather than interpreting a
 //! root outcome or saved closure reference as permission to settle CPU backing.
 //! It does not constrain arbitrary threads or descendants that escape the native
-//! cohort's group. Reusable GNU credits must not be published against these units:
-//! its transport epoch and outstanding borrows require separate lifetime custody.
+//! cohort's group. GNU credits require the separately owned transport epoch
+//! below: its original outstanding bytes must retire before any CPU settles.
 
 use crate::Claim;
 use crate::build_cpu::RetainedLease;
@@ -15,7 +15,10 @@ use crate::cohort::Cohort;
 use crate::cohort::launch::{CohortChild, LaunchError};
 use crate::leadership::{Binding, Fence};
 use aterm_uds::spawnfd::{Child, Command, NotSpawned, Spawned};
+use std::num::NonZeroU32;
 use std::{fmt, io};
+
+pub use crate::retained_gnu::Handoff as GnuHandoff;
 
 fn refused(why: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, why)
@@ -175,6 +178,7 @@ pub struct RetainedCohort {
     cpu: Vec<RetainedLease>,
     cpu_units: usize,
     phase: Phase,
+    gnu: Option<Box<crate::retained_gnu::Epoch>>,
 }
 
 impl RetainedCohort {
@@ -199,6 +203,7 @@ impl RetainedCohort {
                 cpu: vec![cpu],
                 cpu_units: 1,
                 phase: Phase::Ready,
+                gnu: None,
             }),
             Err(error) => Err(BindError {
                 error,
@@ -239,6 +244,7 @@ impl RetainedCohort {
                 cpu_units: cpu.len(),
                 cpu,
                 phase: Phase::Ready,
+                gnu: None,
             }),
             Err(error) => Err(BundleBindError {
                 error,
@@ -280,6 +286,52 @@ impl RetainedCohort {
         self.cpu_units
     }
 
+    /// Recheck this same unused reservation before preparing its original
+    /// scheduler or attempting ARM. This observation neither grants CPU nor
+    /// permits replacing an already bound root's scheduler.
+    ///
+    /// # Errors
+    /// Leadership, memory claim or any retained CPU identity changed, the
+    /// original bundle is incomplete, or launch has already been attempted.
+    pub fn check_unlaunched(&self, fence: &Fence) -> io::Result<()> {
+        self.binding.check(fence)?;
+        fence.check_claim(&self.claim)?;
+        if self.phase != Phase::Ready || self.cpu.len() != self.cpu_units {
+            return Err(refused("original reservation is not unused and complete"));
+        }
+        for lease in &self.cpu {
+            lease.identity()?;
+        }
+        if let Some(epoch) = &self.gnu {
+            epoch.check()?;
+        }
+        Ok(())
+    }
+
+    /// Prepare this original unused cohort's single GNU transport epoch.
+    /// The requested ceiling may reduce the actual retained bundle, and can
+    /// never enlarge it. The root consumes one implicit CPU unit; only the
+    /// paid supplementary units are published as bytes. The cohort owns the
+    /// original transport through launch, cancellation and native closure.
+    ///
+    /// # Errors
+    /// Original unused custody fails, a transport was already prepared, the
+    /// ceiling exceeds the actual retained bundle, or native preparation fails.
+    /// No failure settles a CPU capability or retries an existing epoch.
+    pub fn prepare_gnu(&mut self, fence: &Fence, ceiling: NonZeroU32) -> io::Result<GnuHandoff> {
+        self.check_unlaunched(fence)?;
+        if self.gnu.is_some() || ceiling.get() as usize > self.cpu.len() {
+            return Err(refused(
+                "original GNU epoch already exists or exceeds paid custody",
+            ));
+        }
+        self.gnu = Some(Box::new(crate::retained_gnu::Epoch::fresh()?));
+        let epoch = self.gnu.as_mut().expect("just retained original epoch");
+        self.claim.prepare_gnu_epoch(epoch)?;
+        epoch.open(ceiling)?;
+        epoch.handoff()
+    }
+
     /// Launch this wrapper's single actual child through durable ARM and BIND.
     /// A failed launch is still an attempt; this wrapper cannot launch again.
     ///
@@ -301,12 +353,7 @@ impl RetainedCohort {
         command: &mut Command,
         launch: impl FnOnce(&mut Claim, &mut Command) -> Result<CohortChild, LaunchError>,
     ) -> Result<CohortChild, LaunchError> {
-        self.binding.check(fence).map_err(LaunchError::Refused)?;
-        if self.phase != Phase::Ready {
-            return Err(LaunchError::Refused(refused(
-                "retained cohort launch is one-use",
-            )));
-        }
+        self.check_unlaunched(fence).map_err(LaunchError::Refused)?;
         self.phase = Phase::Unknown;
         let result = launch(&mut self.claim, command);
         self.phase = match &result {
@@ -489,6 +536,15 @@ impl RetainedCohort {
         // check_claim/cohort_bound would reject a legitimate locally pending
         // finish. This privately owned original claim performs retry_event and
         // exact durable closure validation itself before CPU settlement begins.
+        if let Some(epoch) = &mut self.gnu {
+            // A failed original prepare may still own its exact pending
+            // registration. Retry that same event before canceling an
+            // unpublished transport; never reconstruct another epoch.
+            self.claim.prepare_gnu_epoch(epoch)?;
+            self.claim.check_gnu_scope_drained()?;
+            epoch.retire()?;
+            self.claim.retire_gnu_epoch(epoch)?;
+        }
         self.claim.finish_cohort()?;
         if self.cpu.is_empty() {
             return Err(refused("retained CPU settlement capability is missing"));

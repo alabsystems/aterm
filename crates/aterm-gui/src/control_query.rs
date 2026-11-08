@@ -1627,17 +1627,60 @@ fn background_setup_status_only_reads_and_rejects_action_words_before_posting() 
     let reads = std::cell::Cell::new(0);
     let reply = setup_status_over("status", &|| {
         reads.set(reads.get() + 1);
-        Ok(crate::system_state_access::background_setup_fields(&status))
+        Ok(crate::system_state_access::background_setup_fields(
+            &status, false,
+        ))
     });
     assert_eq!(
         reply,
-        "OK schema=2 setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unknown caps_live=unknown\n"
+        "OK schema=2 setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unknown caps_live=unknown busy=0 finished=1 queued=0 changing=0 retrying=0 running=-\n"
     );
     status.observed.clear();
     assert_eq!(
-        crate::system_state_access::background_setup_fields(&status),
-        "setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unread caps_live=unknown"
+        crate::system_state_access::background_setup_fields(&status, false),
+        "setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unread caps_live=unknown busy=0 finished=1 queued=0 changing=0 retrying=0 running=-"
     );
+    let cached = crate::system_state_access::background_setup_fields(&status, false);
+    let pending = crate::system_state_access::background_setup_fields(&status, true);
+    assert_eq!(
+        pending.split(" busy=").next(),
+        cached.split(" busy=").next(),
+        "pending window work changes no readiness evidence"
+    );
+    assert!(pending.split_whitespace().any(|field| field == "busy=1"));
+    for (busy, queued, changing, retrying) in [
+        (true, false, false, false),
+        (false, true, false, false),
+        (false, false, true, false),
+        (false, false, false, true),
+    ] {
+        status.busy = busy;
+        status.queued = queued;
+        status.changing = changing;
+        status.retrying = retrying;
+        status.finished = false;
+        status.running = vec![Setting::Repositories, Setting::CapsLock, Setting::CapsLock];
+        let fields = crate::system_state_access::background_setup_fields(&status, false);
+        for field in [
+            format!("busy={}", u8::from(busy)),
+            format!("queued={}", u8::from(queued)),
+            format!("changing={}", u8::from(changing)),
+            format!("retrying={}", u8::from(retrying)),
+            "finished=0".into(),
+            "running=capslock,repos".into(),
+            "verified=0".into(),
+        ] {
+            assert!(fields.split_whitespace().any(|word| word == field));
+        }
+    }
+    let initial =
+        crate::system_state_access::background_setup_fields(&crate::SetupStatus::default(), false);
+    assert!(
+        initial
+            .split_whitespace()
+            .any(|field| field == "finished=0")
+    );
+    assert!(initial.split_whitespace().any(|field| field == "running=-"));
     assert_eq!(reads.get(), 1);
     for rest in ["", "start", "on", "status now"] {
         assert!(

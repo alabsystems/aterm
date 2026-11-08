@@ -132,6 +132,19 @@ struct Knobs {
     /// A chip of the host's on one row of the screen, `(row, col, cols)`, reserved as the
     /// footer's chips are (a Codex chip on the blank row over its status row); `cols` 0: none.
     row_chip: (u16, u16, u16),
+    /// A starved host's presents ([`Host::next_present`]), from this seed: about ten a second,
+    /// one in five a further 0.3 to 0.7 s late, as a debug build drew them on a machine whose
+    /// load stood at 110 (`z102-ghl-1`). 0: [`Self::present_seed`]'s schedule.
+    starve_seed: u64,
+    /// Stalls of the host's main thread, `(from ms, for ms)`: no present from the first to the
+    /// second, the first after it at its end ([`Host::run_to`]), as a starved machine's
+    /// `MAIN-THREAD STALL`s of 0.9 to 5.6 s held a window's frames back.
+    stalls: &'static [(u64, u64)],
+    /// The one law the pet's brain reverts ([`OldPath`]), a test's negative control.
+    reverted: Option<OldPath>,
+    /// Every key the person presses reaches the pet as `aterm-gui` classes it (Enter, a line
+    /// kill, a paste, an arrow), not only the letters and the deletes.
+    classed_keys: bool,
 }
 
 impl Knobs {
@@ -146,6 +159,10 @@ impl Knobs {
         chrome_from_ms: 0,
         chrome_lag: false,
         present_seed: 0,
+        starve_seed: 0,
+        stalls: &[],
+        reverted: None,
+        classed_keys: false,
         footer_chrome: false,
         footer_whole: false,
         footer_words: MODE_ROW_WORDS,
@@ -178,6 +195,8 @@ struct Shot {
     /// The last column holding a letter on the row over the drawn body's feet row, when any:
     /// the head law slides a stand past them.
     letters_over: Option<u16>,
+    /// The pose `trail status` names after this present ([`PetBrain::pose_name`]).
+    named: &'static str,
 }
 
 struct Host {
@@ -207,6 +226,8 @@ struct Host {
     painted: (Vec<PetRect>, Vec<PetRect>, Option<u64>),
     /// The present schedule's state ([`Knobs::present_seed`]).
     schedule: u64,
+    /// The screen the last present showed, the alternate one or not, for the owner fence.
+    alt_screen: Option<bool>,
 }
 
 impl Host {
@@ -215,6 +236,9 @@ impl Host {
         term.process(b"\x1b]11;#000000\x07");
         let mut owner = CompanionOwner::default();
         owner.set_enabled_seed(true, 0x5EED);
+        if let Some(law) = knobs.reverted {
+            owner.set_pet_old_path(law, true);
+        }
         let now = Instant::now();
         Self {
             term,
@@ -233,7 +257,12 @@ impl Host {
             shots: Vec::new(),
             input: RenderInput::default(),
             painted: (Vec::new(), Vec::new(), None),
-            schedule: knobs.present_seed,
+            schedule: if knobs.starve_seed != 0 {
+                knobs.starve_seed
+            } else {
+                knobs.present_seed
+            },
+            alt_screen: None,
         }
     }
 
@@ -248,6 +277,14 @@ impl Host {
         x ^= x >> 7;
         x ^= x << 17;
         self.schedule = x;
+        if self.knobs.starve_seed != 0 {
+            let late = if x % 100 < 20 {
+                300 + (x >> 24) % 400
+            } else {
+                (x >> 24) % 40
+            };
+            return Duration::from_millis(100 + late);
+        }
         let vsyncs = match x % 100 {
             0..8 => 3,
             8..28 => 2,
@@ -295,7 +332,26 @@ impl Host {
                 self.owner
                     .note_console_input(self.now, PetInputKind::Delete);
             }
-            _ => self.guesses.clear(),
+            // The rest as `aterm-gui`'s press classes name them: Enter, a line kill, a paste
+            // (a run of printable bytes), the arrows and the word jumps.
+            bytes => {
+                self.guesses.clear();
+                if !self.knobs.classed_keys {
+                    return;
+                }
+                let kind = match bytes {
+                    [b'\r'] => Some(PetInputKind::Submit),
+                    [0x15 | 0x17] => Some(PetInputKind::Kill),
+                    [0x1b, b'[', ..] | [0x01 | 0x05] => Some(PetInputKind::Navigate),
+                    [_, _, ..] if bytes.iter().all(|b| (0x20..0x7f).contains(b)) => {
+                        Some(PetInputKind::Paste)
+                    }
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    self.owner.note_console_input(self.now, kind);
+                }
+            }
         }
     }
 
@@ -325,6 +381,12 @@ impl Host {
     fn present(&mut self) {
         if self.hold.withholds(&self.term, self.now) {
             return;
+        }
+        // The shipped host's owner fence (`EffectsPipeline::fence_owner`): the terminal switching
+        // between its main and its alternate screen.
+        let alt = self.term.is_alternate_screen();
+        if self.alt_screen.replace(alt).is_some_and(|was| was != alt) {
+            self.owner.rescreen_owner();
         }
         let prior = self.input.extract_gen;
         let refill = self.term.cell_frame_damage_scoped_into(
@@ -440,7 +502,8 @@ impl Host {
                     style: GlowStyle::RainbowKitty,
                     style_raw_names_pet: true,
                 },
-            ),
+            )
+            .with_caret_path(self.term.caret_path()),
             &mut self.decos,
         );
         let frame = self.owner.tick(tick).pet;
@@ -470,6 +533,7 @@ impl Host {
             caret: (caret.row, caret.col),
             rule,
             letters_over,
+            named: self.owner.brain().pose_name(),
         });
     }
 
@@ -480,6 +544,15 @@ impl Host {
             self.present();
             let next = self.next_present();
             self.vsync += next;
+            let at = self.vsync.saturating_duration_since(self.t0).as_millis() as u64;
+            if let Some(&(from, long)) = self
+                .knobs
+                .stalls
+                .iter()
+                .find(|&&(from, long)| (from..from + long).contains(&at))
+            {
+                self.vsync = self.t0 + Duration::from_millis(from + long);
+            }
         }
         self.now = self.now.max(t);
     }
@@ -4169,6 +4242,807 @@ fn the_cat_rests_by_the_words_the_footer_shows() {
         over.is_empty(),
         "the cat rested over the words aterm lays on the mode row ((take, ms a frame, chrome \
          lag, words), ((first ms, body's left edge, row), ms in all)): {over:?}"
+    );
+}
+
+/// `take` replayed after `lead` ms of the empty main screen its program starts from (the
+/// stand-in's tab before it begins: a cat asleep by its caret at the top-left), on to its ctrl+c
+/// (`through_exit` false) or through the program's exit back to the main screen and 3 s after.
+fn replay_from_the_shell(take: &Take, knobs: Knobs, lead: u64, through_exit: bool) -> Host {
+    let mut events: Vec<(u64, Rec)> = Vec::new();
+    for (ms, ev) in recording(take.src, 1_000_000) {
+        match ev {
+            Rec::In(b) if b.as_slice() == b"\x1b[99;5u" => {
+                if !through_exit {
+                    break;
+                }
+            }
+            ev => events.push((ms + lead, ev)),
+        }
+    }
+    let end = events.last().map_or(lead, |e| e.0);
+    events.push((end + 3_000, Rec::Out(Vec::new())));
+    Host::replay_events(take, knobs, events)
+}
+
+/// The ms the take's program enters (`b"\x1b[?1049h"`) or leaves (`b"\x1b[?1049l"`) the
+/// alternate screen, first occurrence.
+fn screen_switch_ms(take: &Take, switch: &[u8]) -> Option<u64> {
+    recording(take.src, 1_000_000)
+        .into_iter()
+        .find(|(_, ev)| matches!(ev, Rec::Out(b) if b.windows(switch.len()).any(|w| w == switch)))
+        .map(|(ms, _)| ms)
+}
+
+/// A present that drew the cat in sight, and its body's pixel box there ([`drawn_teleports`]).
+type DrawnAt<'a> = (&'a Shot, (i32, i32, i32, i32));
+
+/// The presents within `(from, to)` ms that drew the cat somewhere its legs could not have carried
+/// it from where it was last drawn in sight (at a quarter presence or more, within the last quarter
+/// of a second: a cat that faded out a while ago may fade in elsewhere): its feet half a row or more
+/// off (not carried with the page or the composer's rule its ground moved with), or its middle sideways faster
+/// than the fastest gallop plus a cell (a pose's width), on two presents neither in the air; and any
+/// move of a cell or more by a cat drawn asleep on both. `(ms, action, dx cells, dy rows)`.
+fn drawn_teleports(shots: &[Shot], from: u64, to: u64) -> Vec<(u64, PetAction, f32, f32)> {
+    let mut out = Vec::new();
+    let mut seen: Option<DrawnAt<'_>> = None;
+    for b in shots {
+        let Some(pb) = b.frame.body_px(CW, CH, 400, 200) else {
+            continue;
+        };
+        if let Some((a, pa)) = seen
+            && b.ms >= from
+            && b.ms <= to
+            && b.ms - a.ms < 250
+        {
+            let dt = (b.ms - a.ms) as f32 / 1_000.0;
+            let dx = ((pb.0 + pb.1) - (pa.0 + pa.1)) as f32 / 2.0 / f32::from(CW);
+            let dy = (pb.3 - pa.3) as f32 / f32::from(CH);
+            let carried = b.reason == "content-ride"
+                || match (a.rule, b.rule) {
+                    (Some(ra), Some(rb)) => (dy - (rb as f32 - ra as f32)).abs() < 0.25,
+                    _ => false,
+                };
+            let air = |f: &PetFrame| f.action == PetAction::Leap;
+            let asleep = a.frame.action == PetAction::Sleep && b.frame.action == PetAction::Sleep;
+            if (!air(&a.frame)
+                && !air(&b.frame)
+                && ((dy.abs() >= 0.5 && !carried) || dx.abs() > TOP_SPEED * dt + 1.0))
+                || (asleep && (dx.abs() >= 1.0 || dy.abs() >= 0.5))
+            {
+                out.push((b.ms, b.frame.action, dx, dy));
+            }
+        }
+        if b.frame.alpha >= 64 {
+            seen = Some((b, pb));
+        }
+    }
+    out
+}
+
+/// A CAT ON GLASS NEVER MOVES WITHOUT MOTION WHEN ITS PROGRAM CHANGES SCREENS (r29 K10-1, K10-2).
+/// Claude Code starts on the alternate screen and leaves it on exit, and the host's owner fence
+/// sees its terminal switch screens. It crossfaded the cat as a surface replaced: asleep by the
+/// shell's caret at the top-left, the cat was drawn at the composer, still asleep, the frame
+/// Claude Code's first screen came (the long insert); by the composer, it stood at the shell's
+/// prompt the frame the program left (the composer and the wrap's end). The same glass and grid:
+/// the cat keeps its body, wakes where it sleeps and goes in one trip. Every take, 120 and 60 Hz,
+/// the echo as recorded and 150 ms late, plain and with the harness's chrome: no drawn move further
+/// than its legs carry it in a present from 1 s before each switch to 4 s after.
+///
+/// As Claude Code clears its draft to leave, its composer shrinks under a cat on the second line
+/// of a wrapped draft and lays its top rule, the harness's chrome, over the cat's head; the host
+/// does not carry it there, so the cat hops off it as off chrome laid over it.
+///
+/// NEGATIVE CONTROLS, each run here: [`OldPath::OtherScreenKeepsTheBody`] reverted (the fence as
+/// it was): the long insert's sleeper drawn 57 rows down in one present, and the composer's and
+/// the wrap's cat drawn 34 rows up at the exit; [`OldPath::ChromeOverIsHoppedOff`] reverted: the
+/// wrap's cat put a row down in one present as the draft is cleared.
+#[test]
+fn a_cat_on_glass_travels_to_its_programs_new_screen() {
+    const LEAD: u64 = 30_000;
+    let harness = Knobs {
+        chips: true,
+        brand: true,
+        ..Knobs::SHIPPED
+    };
+    let mut runs: Vec<(usize, Knobs)> = Vec::new();
+    for take in 1..TAKES.len() {
+        for (frame_ms, echo_ms) in [(8u64, 0u64), (16, 0), (8, 150), (16, 150)] {
+            for host in [Knobs::SHIPPED, harness] {
+                runs.push((
+                    take,
+                    Knobs {
+                        frame_ms,
+                        echo_ms,
+                        ..host
+                    },
+                ));
+            }
+        }
+    }
+    // The negative controls: each law reverted on the take that shows it.
+    let controls = [
+        (3usize, OldPath::OtherScreenKeepsTheBody, Knobs::SHIPPED),
+        (
+            2,
+            OldPath::ChromeOverIsHoppedOff,
+            Knobs {
+                frame_ms: 8,
+                ..harness
+            },
+        ),
+    ];
+    for &(take, law, knobs) in &controls {
+        runs.push((
+            take,
+            Knobs {
+                reverted: Some(law),
+                ..knobs
+            },
+        ));
+    }
+    let seen = crate::common::par_map(&runs, |&(take, knobs)| {
+        let t = &TAKES[take];
+        let h = replay_from_the_shell(t, knobs, LEAD, true);
+        let mut bad = Vec::new();
+        for switch in [&b"\x1b[?1049h"[..], &b"\x1b[?1049l"[..]] {
+            if let Some(at) = screen_switch_ms(t, switch) {
+                let at = at + LEAD + knobs.echo_ms;
+                bad.extend(drawn_teleports(&h.shots, at - 1_000, at + 4_000));
+            }
+        }
+        let asleep = h
+            .shots
+            .iter()
+            .filter(|s| s.ms > LEAD - 1_000 && s.ms < LEAD)
+            .all(|s| s.frame.action == PetAction::Sleep);
+        (
+            format!(
+                "{} at {} ms, echo +{} ms, harness {}, reverted {:?}",
+                t.name, knobs.frame_ms, knobs.echo_ms, knobs.brand, knobs.reverted
+            ),
+            knobs.reverted.is_some(),
+            asleep,
+            bad,
+        )
+    });
+    for (label, control, asleep, bad) in seen {
+        assert!(
+            asleep,
+            "{label}: fixture: the cat sleeps by the shell's caret"
+        );
+        if control {
+            assert!(
+                !bad.is_empty(),
+                "{label}: negative control: the reverted law draws the cat across the screen"
+            );
+            continue;
+        }
+        assert!(
+            bad.is_empty(),
+            "{label}: presents drawing the cat further than its legs carry it (ms, action, \
+             cells across, rows down): {bad:?}"
+        );
+    }
+}
+
+/// A pager's session in zsh at 80x24, as a windowed lab ran it (`ls -la`, an `echo`, `less
+/// README.md`, `j` and `q`, then `clear`), its listing's owner and group renamed.
+const PAGER: Take = Take {
+    name: "pager",
+    src: include_str!("fixtures/zsh-pager-2026-11-08.ptylog"),
+    rows: 24,
+    cols: 80,
+};
+
+/// A SCREEN SWITCH EASES THE CAT TO ITS NEW ROWS. Leaving a pager gives the shell's screen back
+/// under a cat kept on glass ([`OldPath::OtherScreenKeepsTheBody`]), and the shell's line of
+/// words over its head fits it to its row (the head law's `ROW_FIT`). The new screen read as
+/// letters printed over a body at rest, which the law fits at once: the cat standing by `less`'s
+/// last line was drawn at half its size the present the shell came back (a windowed lab's body
+/// box went from 80x47 to 43x26 px between two samples 5 ms apart). The new screen is a page the
+/// body is judged on afresh and eased to ([`OldPath::NewScreenEasesTheHead`]): at 120 and 60 Hz,
+/// from 200 ms before the switch to 600 ms after it, no present changes the drawn body's scale
+/// by more than a fifth of its height.
+///
+/// NEGATIVE CONTROL (the law reverted, run here): a present shrinks it by more than a third.
+#[test]
+fn a_screen_switch_eases_the_cat_to_its_new_rows() {
+    let switch = screen_switch_ms(&PAGER, b"\x1b[?1049l").expect("the pager gives the screen back");
+    let mut runs = Vec::new();
+    for frame_ms in [8u64, 16] {
+        for law in [None, Some(OldPath::NewScreenEasesTheHead)] {
+            runs.push(Knobs {
+                frame_ms,
+                classed_keys: true,
+                reverted: law,
+                ..Knobs::SHIPPED
+            });
+        }
+    }
+    let seen = crate::common::par_map(&runs, |&knobs| {
+        let h = Host::replay(&PAGER, knobs);
+        let near: Vec<&Shot> = h
+            .shots
+            .iter()
+            .filter(|s| s.ms + 200 >= switch && s.ms <= switch + 600 && s.frame.alpha > 0)
+            .collect();
+        let worst = near
+            .windows(2)
+            .map(|w| {
+                (
+                    w[1].ms,
+                    (w[1].frame.scale_x - w[0].frame.scale_x)
+                        .abs()
+                        .max((w[1].frame.scale_y - w[0].frame.scale_y).abs()),
+                )
+            })
+            .fold((0, 0.0f32), |a, b| if b.1 > a.1 { b } else { a });
+        (knobs, near.len(), worst)
+    });
+    for (knobs, n, (ms, worst)) in seen {
+        let label = format!(
+            "{} ms presents, reverted {:?}",
+            knobs.frame_ms, knobs.reverted
+        );
+        assert!(
+            n > 10,
+            "{label}: fixture: the cat is on glass across the switch"
+        );
+        if knobs.reverted.is_some() {
+            assert!(
+                worst > 0.33,
+                "{label}: negative control: the new screen fits the cat at once ({worst:.2} at {ms} ms)"
+            );
+            continue;
+        }
+        assert!(
+            worst <= 0.2,
+            "{label}: a present changed the cat's scale by {worst:.2} at {ms} ms (the switch at \
+             {switch} ms)"
+        );
+    }
+}
+
+/// A CAT AT REST GOES ONCE TO WHERE A NEW SCREEN'S CARET RESTS. A pager's exit restores the
+/// shell's cursor to its line's start, and the shell's prompt puts it back a moment later: on a
+/// host whose present fell between the two (a windowed lab, 5 of 5 runs), the cat by `less`'s last
+/// line set off for the seat past the line over that first caret, turned its back on the prompt,
+/// stood so 1.4 s and turned again to walk to it. It now sets off only once the caret has rested
+/// on the new screen ([`OldPath::NewScreenSettlesFirst`]): on the presents that fell between the
+/// two (60 Hz, seeds 1 and 5; 120 Hz, seed 11) and the ones that did not, no present in the 1.5 s
+/// after the switch turns the cat where it does not then go.
+///
+/// NEGATIVE CONTROL (the law reverted, run here): the cat turns its back on the prompt.
+#[test]
+fn a_cat_goes_once_to_where_a_new_screens_caret_rests() {
+    let switch = screen_switch_ms(&PAGER, b"\x1b[?1049l").expect("the pager gives the screen back");
+    let mut runs = Vec::new();
+    for (frame_ms, present_seed) in [(16u64, 0u64), (16, 1), (16, 5), (8, 0), (8, 11)] {
+        for law in [None, Some(OldPath::NewScreenSettlesFirst)] {
+            runs.push(Knobs {
+                frame_ms,
+                present_seed,
+                classed_keys: true,
+                reverted: law,
+                ..Knobs::SHIPPED
+            });
+        }
+    }
+    let seen = crate::common::par_map(&runs, |&knobs| {
+        let h = Host::replay(&PAGER, knobs);
+        let near: Vec<&Shot> = h
+            .shots
+            .iter()
+            .filter(|s| s.ms + 50 >= switch && s.ms <= switch + 1_500 && s.frame.alpha > 0)
+            .collect();
+        // A turn on a present that moved nothing, the body then not going its new way within a
+        // tenth of a second: a turn away.
+        let mut away = Vec::new();
+        for (i, w) in near.windows(2).enumerate() {
+            let (a, b) = (w[0], w[1]);
+            if a.frame.facing_left == b.frame.facing_left
+                || (b.frame.col - a.frame.col).abs() > 0.01
+                || b.frame.action == PetAction::Leap
+            {
+                continue;
+            }
+            let goes = near[i + 1..]
+                .iter()
+                .take_while(|s| s.ms <= b.ms + 100)
+                .any(|s| {
+                    (s.frame.col - b.frame.col) * if b.frame.facing_left { -1.0 } else { 1.0 }
+                        > 0.05
+                });
+            if !goes {
+                away.push((b.ms, b.frame.col, b.frame.facing_left, b.caret));
+            }
+        }
+        (knobs, near.len(), away)
+    });
+    let mut control_turned = false;
+    for (knobs, n, away) in seen {
+        let label = format!(
+            "{} ms presents, seed {}, reverted {:?}",
+            knobs.frame_ms, knobs.present_seed, knobs.reverted
+        );
+        assert!(
+            n > 10,
+            "{label}: fixture: the cat is on glass across the switch"
+        );
+        if knobs.reverted.is_some() {
+            control_turned |= !away.is_empty();
+            continue;
+        }
+        assert!(
+            away.is_empty(),
+            "{label}: the cat turned where it did not go (ms, col, facing left, caret): {away:?}"
+        );
+    }
+    assert!(
+        control_turned,
+        "negative control: set off for the first caret, the cat turns its back on the prompt"
+    );
+}
+
+/// The presents of `starved` that drew the cat at a quarter presence or more where the steady host's
+/// present at the same moment (within 2 ms) did not: more than two cells along its row, or half a
+/// row off, from it. `(far, compared, (ms, cells) of the worst)`.
+fn drawn_apart(steady: &[Shot], starved: &[Shot]) -> (usize, usize, (u64, f32)) {
+    let (mut far, mut n, mut worst) = (0, 0, (0, 0.0f32));
+    let mut j = 0;
+    for s in starved.iter().filter(|s| s.frame.alpha >= 64) {
+        while j + 1 < steady.len() && steady[j + 1].ms <= s.ms {
+            j += 1;
+        }
+        let a = &steady[j];
+        if a.frame.alpha < 64 || s.ms.abs_diff(a.ms) > 2 {
+            continue;
+        }
+        n += 1;
+        let d = (a.frame.col - s.frame.col)
+            .abs()
+            .max(4.0 * (a.frame.row - s.frame.row).abs());
+        far += usize::from(d > 2.0);
+        if d > worst.1 {
+            worst = (s.ms, d);
+        }
+    }
+    (far, n, worst)
+}
+
+/// A STARVED HOST DRAWS THE MOMENT A STEADY ONE DOES (r29 K10-8). On a machine starved for time
+/// a window draws a tenth of a second and more apart; the pet's decisions must be the steady
+/// host's, a late frame only drawing a later moment of them. The brain met a late frame in one
+/// step its motion spent a tenth of a second of, and the caret's moves since the last frame all
+/// at once: its flights stretched, it fell behind the caret, and the moves it caught up with read
+/// as jumps it hopped for. Now it lives the span it missed a sixtieth of a second at a time
+/// ([`OldPath::LateSpanInSteps`]), meeting each of the caret's moves at the time its output batch
+/// made it (the terminal's caret path, [`OldPath::LateCaretAtItsTimes`]). Every take and a
+/// shell's typing, each of four starved schedules (about ten presents a second, one in five a
+/// further 0.3 to 0.7 s late): few of its presents draw the cat apart from where a steady host
+/// draws it at that moment ([`APART_PCT`]).
+///
+/// NEGATIVE CONTROLS, each run here: each law reverted draws it apart half as often again or more
+/// (as run: the span lived in one step, 37 to 64 percent; the caret's moves all at once, 13 to 44).
+#[test]
+fn a_starved_host_draws_the_moment_a_steady_one_does() {
+    let shell = Take {
+        name: "shell",
+        src: "",
+        rows: 24,
+        cols: 80,
+    };
+    let script = || {
+        zsh_line(&[
+            (2_500, "t:ls -la"),
+            (400, "enter"),
+            (1_500, "t:echo the quick brown fox jumps over the lazy dog"),
+            (400, "enter"),
+            (
+                1_500,
+                "t:printf the quick brown fox jumps over the lazy dog and keeps on running far \
+                 past the barn and over the hill",
+            ),
+            (1_000, "cu"),
+            (1_200, "t:cd /tmp"),
+            (400, "enter"),
+            (1_400, "t:echo one two three four five six seven"),
+            (400, "enter"),
+            (2_000, "w"),
+        ])
+    };
+    let mut runs: Vec<(usize, u64, Option<OldPath>)> = Vec::new();
+    for take in 0..=TAKES.len() {
+        for seed in [7u64, 11, 13, 17] {
+            for law in [
+                None,
+                Some(OldPath::LateSpanInSteps),
+                Some(OldPath::LateCaretAtItsTimes),
+            ] {
+                runs.push((take, seed, law));
+            }
+        }
+    }
+    let replay = |take: usize, knobs: Knobs| {
+        if take == TAKES.len() {
+            Host::replay_events(&shell, knobs, script()).shots
+        } else {
+            Host::replay(&TAKES[take], knobs).shots
+        }
+    };
+    let steady: Vec<Vec<Shot>> =
+        crate::common::par_map(&(0..=TAKES.len()).collect::<Vec<_>>(), |&take| {
+            replay(
+                take,
+                Knobs {
+                    frame_ms: 2,
+                    classed_keys: true,
+                    ..Knobs::SHIPPED
+                },
+            )
+        });
+    let seen = crate::common::par_map(&runs, |&(take, seed, law)| {
+        let starved = replay(
+            take,
+            Knobs {
+                starve_seed: seed,
+                classed_keys: true,
+                reverted: law,
+                ..Knobs::SHIPPED
+            },
+        );
+        (take, law, drawn_apart(&steady[take], &starved))
+    });
+    let name = |take: usize| {
+        if take == TAKES.len() {
+            "shell"
+        } else {
+            TAKES[take].name
+        }
+    };
+    for take in 0..=TAKES.len() {
+        let sum = |law: Option<OldPath>| {
+            seen.iter()
+                .filter(|(t, l, _)| *t == take && *l == law)
+                .fold((0, 0), |(f, n), (_, _, (far, m, _))| (f + far, n + m))
+        };
+        let (far, n) = sum(None);
+        assert!(
+            far * 100 <= n * APART_PCT,
+            "{}: {far} of {n} starved presents drew the cat apart from the steady host's: {:?}",
+            name(take),
+            seen.iter()
+                .filter(|(t, l, _)| *t == take && l.is_none())
+                .map(|(_, _, r)| *r)
+                .collect::<Vec<_>>()
+        );
+        for law in [OldPath::LateSpanInSteps, OldPath::LateCaretAtItsTimes] {
+            let (old_far, old_n) = sum(Some(law));
+            assert!(
+                2 * old_far * n > 3 * far * old_n,
+                "{}: negative control: {law:?} reverted drew apart {old_far} of {old_n}, with it \
+                 {far} of {n}",
+                name(take)
+            );
+        }
+    }
+}
+
+/// The share of a starved host's presents, percent, that may draw the cat apart from where a
+/// steady host draws it ([`a_starved_host_draws_the_moment_a_steady_one_does`]). The rest is what
+/// no frame showed the brain: the steady host's moments are its presents', 2 ms apart, the starved
+/// host's steps a sixtieth of a second, and a page a program writes between two late frames (the
+/// long insert's dictation, a chunk every 145 ms) is met as the later frame shows it, its seats
+/// read off the letters there; the caret's own moves are met at their times.
+const APART_PCT: usize = 20;
+
+/// A STALLED HOST DRAWS THE MOMENT A STEADY ONE DOES (r29 K10-8). A starved machine's window did
+/// not only draw late: its main thread stalled outright, drawing nothing for 0.9 to 5.6 s at a
+/// time (a lab under a background QoS logged ten `MAIN-THREAD STALL`s), and a stall of a second
+/// and a half right after an Enter ended with the cat standing at the old prompt's stand where a
+/// steady host's had bounded to the new prompt, and it bounded at the next key instead: a hop
+/// the steady host never made. A frame a stall held back is a late frame like any other, its
+/// span lived through ([`OldPath::StallIsLived`]). Here: a shell's commands, each Enter followed
+/// by a stall of 1.5, 2.6 or 5.5 s, at 120 Hz and on a starved schedule between them: of the
+/// presents in the second and a half after each stall, few draw the cat apart from where a
+/// steady host draws it at that moment ([`APART_PCT`]).
+///
+/// NEGATIVE CONTROL ([`OldPath::StallIsLived`] reverted, run here): a stall over a second met in
+/// one step draws it apart half as often again or more.
+#[test]
+fn a_stalled_host_draws_the_moment_a_steady_one_does() {
+    const STALLS: &[(u64, u64)] = &[(3_575, 1_500), (9_615, 2_600), (14_785, 5_500)];
+    const AFTER_MS: u64 = 1_500;
+    let shell = Take {
+        name: "shell",
+        src: "",
+        rows: 24,
+        cols: 80,
+    };
+    let script = || {
+        zsh_line(&[
+            (2_500, "t:ls -la"),
+            (400, "enter"),
+            (3_000, "t:echo the quick brown fox"),
+            (400, "enter"),
+            (4_000, "t:cd /tmp"),
+            (400, "enter"),
+            (7_000, "t:pwd"),
+            (400, "enter"),
+        ])
+    };
+    let steady = Host::replay_events(
+        &shell,
+        Knobs {
+            frame_ms: 2,
+            classed_keys: true,
+            ..Knobs::SHIPPED
+        },
+        script(),
+    )
+    .shots;
+    let mut runs = Vec::new();
+    for starve_seed in [0u64, 7, 13] {
+        for law in [None, Some(OldPath::StallIsLived)] {
+            runs.push(Knobs {
+                starve_seed,
+                stalls: STALLS,
+                classed_keys: true,
+                reverted: law,
+                ..Knobs::SHIPPED
+            });
+        }
+    }
+    let seen = crate::common::par_map(&runs, |&knobs| {
+        let shots = Host::replay_events(&shell, knobs, script()).shots;
+        let (mut far, mut n) = (0, 0);
+        let mut worst = Vec::new();
+        for &(from, long) in STALLS {
+            let end = from + long;
+            assert!(
+                !shots.iter().any(|s| s.ms > from && s.ms < end),
+                "fixture: the host draws nothing in its stall from {from} ms"
+            );
+            let lo = shots.partition_point(|s| s.ms < end);
+            let hi = shots.partition_point(|s| s.ms <= end + AFTER_MS);
+            let (f, m, w) = drawn_apart(&steady, &shots[lo..hi]);
+            far += f;
+            n += m;
+            worst.push(w);
+        }
+        (knobs.starve_seed, knobs.reverted, far, n, worst)
+    });
+    for (seed, law, far, n, worst) in &seen {
+        if law.is_some() {
+            continue;
+        }
+        let (far, n) = (*far, *n);
+        assert!(
+            n > 0 && far * 100 <= n * APART_PCT,
+            "starve seed {seed}: {far} of {n} presents after a stall drew the cat apart from the \
+             steady host's (worst (ms, cells) after each stall: {worst:?})"
+        );
+        let (_, _, old_far, old_n, old_worst) = seen
+            .iter()
+            .find(|r| r.0 == *seed && r.1.is_some())
+            .expect("the control ran");
+        let (old_far, old_n) = (*old_far, *old_n);
+        assert!(
+            2 * old_far * n > 3 * far * old_n,
+            "starve seed {seed}: negative control: a stall met in one step drew apart {old_far} of \
+             {old_n} ({old_worst:?}), lived {far} of {n}"
+        );
+    }
+}
+
+/// A zsh-like line editor at 80x24 under `~/project % `: `(gap ms, action)`, the actions `t:TEXT`
+/// (typed, a key every 110 ms, each echoed 3 ms on), `p:TEXT` (pasted, echoed whole), `enter`
+/// (the line echoed back as a command's output and a new prompt) and `cu` (ctrl+u: the line
+/// cleared); any other action only waits.
+fn zsh_line(script: &[(u64, &str)]) -> Vec<(u64, Rec)> {
+    let prompt = "~/project % ";
+    let mut ev = vec![(
+        0u64,
+        Rec::Out(format!("\x1b[2J\x1b[H{prompt}").into_bytes()),
+    )];
+    let mut t = 0u64;
+    let mut line = String::new();
+    for &(gap, act) in script {
+        t += gap;
+        if let Some(text) = act.strip_prefix("t:") {
+            for ch in text.chars() {
+                ev.push((t, Rec::In(ch.to_string().into_bytes())));
+                ev.push((t + 3, Rec::Out(ch.to_string().into_bytes())));
+                line.push(ch);
+                t += 110;
+            }
+        } else if let Some(text) = act.strip_prefix("p:") {
+            ev.push((t, Rec::In(text.as_bytes().to_vec())));
+            ev.push((t + 4, Rec::Out(text.as_bytes().to_vec())));
+            line.push_str(text);
+        } else if act == "enter" {
+            ev.push((t, Rec::In(b"\r".to_vec())));
+            let out = format!("\r\n{}\r\n{prompt}", line.trim_start_matches("echo "));
+            ev.push((t + 8, Rec::Out(out.into_bytes())));
+            line.clear();
+        } else if act == "cu" {
+            ev.push((t, Rec::In(vec![0x15])));
+            ev.push((t + 4, Rec::Out(format!("\r\x1b[K{prompt}").into_bytes())));
+            line.clear();
+        }
+    }
+    ev.push((t + 2_000, Rec::Out(Vec::new())));
+    ev
+}
+
+/// `trail status` NAMES THE POSE A PERSON SAW (r29 K10-4). A window's sampler reads the pet's pose
+/// off `trail status` (`PetBrain::pose_name`). It named the brain's own pose, not the still pose a
+/// hold kept on glass over it for its floor, so a sampler timed poses no present drew: a landing, a
+/// perk, a sit, a stand cut 9 to 28 ms after they came. Every present of every take at 120 and 60 Hz
+/// names the pose it drew.
+///
+/// NEGATIVE CONTROL ([`OldPath::NamesTheDrawnPose`] reverted, the brain's own pose named as
+/// before): presents of the takes name another.
+#[test]
+fn the_pose_named_is_the_pose_drawn() {
+    use aterm_effects::pet_glyphs_gen::PET_GLYPHS;
+    let mut old_off = 0;
+    for (take, t) in TAKES.iter().enumerate() {
+        for frame_ms in [8u64, 16] {
+            for reverted in [None, Some(OldPath::NamesTheDrawnPose)] {
+                let shots = replayed(
+                    take,
+                    Knobs {
+                        frame_ms,
+                        reverted,
+                        ..Knobs::SHIPPED
+                    },
+                );
+                let off: Vec<_> = shots
+                    .iter()
+                    .filter(|s| {
+                        s.frame.alpha > 0 && s.named != PET_GLYPHS[s.frame.pose as usize].id
+                    })
+                    .map(|s| (s.ms, s.named, PET_GLYPHS[s.frame.pose as usize].id))
+                    .collect();
+                if reverted.is_some() {
+                    old_off += off.len();
+                    continue;
+                }
+                assert!(
+                    off.is_empty(),
+                    "{} at {frame_ms} ms: {} presents name a pose they did not draw (ms, named, \
+                     drawn): {:?}",
+                    t.name,
+                    off.len(),
+                    &off[..off.len().min(6)]
+                );
+            }
+        }
+    }
+    assert!(
+        old_off > 0,
+        "negative control: the brain's own pose named a pose the hold kept off glass"
+    );
+}
+
+/// THE POSE FLOOR HOLDS WHERE POSES ARE CUT (r29 K10-4). A window's sampler timed poses held 9 to
+/// 28 ms where a caret move cut a pose just put on: a sit cut by the first key after a line clear,
+/// a perk cut by a crouch as a program's writing began, a landing cut by an arrow key, a stand cut
+/// by the leap as a program left its screen, a wake's beat cut by a paste's crouch (most of them
+/// the brain's own pose named under the one a hold kept on glass,
+/// [`the_pose_named_is_the_pose_drawn`]). The four takes ([`no_pose_is_a_one_frame_flash`]) never
+/// cut them there. Here: the Claude takes from the shell they start in through their exit, every
+/// key classed as the app classes it, and a shell whose line is typed, cleared and typed again
+/// after 0.9 to 1.6 s, then pasted and submitted 30 to 400 ms later; 120 and 60 Hz, and a busy
+/// window's late presents. No pose on glass for less than [`POSE_MS`], but for a stride the body
+/// walked across, which is the walk itself, however short a late present made it.
+///
+/// NEGATIVE CONTROL ([`OldPath::StrideKeepsItsFloor`] reverted, run here): the long insert's cat
+/// set off and crouched at once for the dictation's chunk, its stride on glass for one 8 ms present.
+#[test]
+fn the_pose_floor_holds_where_poses_are_cut() {
+    let shell = Take {
+        name: "shell",
+        src: "",
+        rows: 24,
+        cols: 80,
+    };
+    let mut runs = Vec::new();
+    for (frame_ms, present_seed) in [(8u64, 0u64), (16, 0), (16, 3)] {
+        let knobs = Knobs {
+            frame_ms,
+            present_seed,
+            classed_keys: true,
+            ..Knobs::SHIPPED
+        };
+        for t in &TAKES[1..] {
+            runs.push((
+                format!("{} at {frame_ms} ms, seed {present_seed}", t.name),
+                Take { ..*t },
+                knobs,
+                None,
+            ));
+        }
+        for wait in (900u64..=1_600).step_by(70) {
+            runs.push((
+                format!("shell, retyped after {wait} ms, at {frame_ms} ms, seed {present_seed}"),
+                Take { ..shell },
+                knobs,
+                Some(wait),
+            ));
+        }
+    }
+    let seen = crate::common::par_map(&runs, |(label, take, knobs, wait)| {
+        let h = match *wait {
+            Some(wait) => {
+                let script = [
+                    (2_500, "t:echo the quick brown fox jumps over the lazy dog"),
+                    (1_000, "cu"),
+                    (wait, "t:cd /tmp"),
+                    (700, "enter"),
+                    (1_200, "p:echo pasted words of a command line here"),
+                    (30 + (wait - 900) / 2, "enter"),
+                    (2_000, "w"),
+                ];
+                Host::replay_events(take, *knobs, zsh_line(&script))
+            }
+            None => replay_from_the_shell(take, *knobs, 30_000, true),
+        };
+        // A stride the body walked across is the walk itself, however short a late present made
+        // it: kept on a body that stopped, it would be a gait on a still body, and skipped, a
+        // sparse host would draw what a dense one does not.
+        let col = |ms: u64, after: bool| {
+            let mut drawn = h.shots.iter().filter(|s| s.frame.alpha > 0);
+            if after {
+                drawn.find(|s| s.ms >= ms).map(|s| s.frame.col)
+            } else {
+                drawn.rfind(|s| s.ms < ms).map(|s| s.frame.col)
+            }
+        };
+        let flashes: Vec<_> = pose_runs(&h.shots)
+            .into_iter()
+            .filter(|(ms, before, pose, after, dur)| {
+                let walked = pose == "leg"
+                    && matches!(
+                        (col(*ms, false), col(ms + dur, true)),
+                        (Some(a), Some(b)) if (b - a).abs() >= 0.1
+                    );
+                let stand = pose == "pet_stand" || pose == "pet_stand_ear";
+                !walked
+                    && (*dur < POSE_MS
+                        || (stand
+                            && (before == "leg" || after == "leg")
+                            && (*dur as f32) < STRIDE_MS))
+            })
+            .collect();
+        (label.clone(), flashes)
+    });
+    for (label, flashes) in seen {
+        assert!(
+            flashes.is_empty(),
+            "{label}: poses flashed (ms it began, before, pose, after, ms on glass): {:?}",
+            &flashes[..flashes.len().min(6)]
+        );
+    }
+    let control = replay_from_the_shell(
+        &TAKES[3],
+        Knobs {
+            frame_ms: 8,
+            classed_keys: true,
+            reverted: Some(OldPath::StrideKeepsItsFloor),
+            ..Knobs::SHIPPED
+        },
+        30_000,
+        true,
+    );
+    assert!(
+        pose_runs(&control.shots)
+            .iter()
+            .any(|(_, _, pose, after, dur)| pose == "leg" && after == "crouch" && *dur < POSE_MS),
+        "negative control: a stride cut by a crouch flashes for a present"
     );
 }
 

@@ -1686,12 +1686,19 @@ pub const VERBS: &[VerbSpec] = &[
         AnyScopeMeta,
         "setup status: the background coordinator's last published observation",
         "— read-only instance posture, including with no terminal selected. Replies \
-         `OK schema=2 setup=<state> verified=<bits> observed_generation=<n> rows=<subject:standing,...|-> [caps_live=<mapping>]` \
+         `OK schema=2 setup=<state> verified=<bits> observed_generation=<n> rows=<subject:standing,...|-> [caps_live=<mapping>] busy=<0|1> finished=<0|1> queued=<0|1> changing=<0|1> retrying=<0|1> running=<settings|->` \
          with the same `setup=` state as `status`: `done`, `unknown:<rows>`, \
          `pending[:<rows>][;needs:<rows>][;unknown:<rows>]`, or `-` before any observation; \
          `unknown` names settings without a usable cached reading, separately from known work. \
          The row metadata uses fixed public names and standings (`unread` before any reading), \
          never notes or values. The generation counts cached observation changes, not time. \
+         Lifecycle fields are separate from readiness: `busy` includes cached pending window \
+         work; `finished` says the last published run ended, including a Stop, not that it \
+         succeeded or the current request was accepted. `queued` waits for another setup, \
+         `changing` means its saved records were being written, and `retrying` means its worker \
+         still retries. `running` lists fixed public setting names in checklist order, or `-`. \
+         Idle flags before admission prove no readiness, and these fields certify no whole-GUI \
+         or root-password phase settlement. They read only cached state. \
          The optional `caps_live` is `unknown`, `unknown:held=N`, `control`, or \
          `mixed:control=N,other=N,held=N`: cached reported OS/HID mapping composition. Counts \
          are HID services, not physical keyboards; held services supply no Control claim. \

@@ -179,7 +179,7 @@ pub(crate) fn cached_materialization_transition(
 #[test]
 fn cached_materialization_model_conforms_and_rejects_conditional_repair() {
     let model = aterm_models_swarm::cached_materialization_model();
-    aterm_spec::interp::prove_and_catch(&model);
+    assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
     let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
     assert!(faults.is_empty(), "{faults:?}");
     for state in aterm_spec::interp::reachable_states(&model) {
@@ -205,7 +205,7 @@ fn cached_materialization_model_conforms_and_rejects_conditional_repair() {
 #[test]
 fn cached_log_model_conforms_and_rejects_loss_as_progress() {
     let model = aterm_models_swarm::cached_log_model();
-    aterm_spec::interp::prove_and_catch(&model);
+    assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
     let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
     assert!(faults.is_empty(), "{faults:?}");
     for state in aterm_spec::interp::reachable_states(&model) {

@@ -136,7 +136,7 @@ impl TokenVault for FakeVault {
     fn route(&self, _by: Instant) -> Result<WriteRoute, String> {
         Ok(self.route)
     }
-    fn standing(&self, _key: &Key) -> Result<Lookup<Standing>, String> {
+    fn standing(&self, _key: &Key, _by: Instant) -> Result<Lookup<Standing>, String> {
         Ok(match &self.found {
             Answer::Unknown => Lookup::Unknown,
             Answer::Absent => Lookup::Absent,
@@ -231,12 +231,36 @@ pub(in crate::harness) enum VaultOf {
     Contended(ContendedVault),
 }
 
-/// Delegate every operation to the real vault. A live route first proves native
-/// contention with its existing readiness probe, then releases this fixture's writer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VaultRead {
+    Route,
+    Standing,
+}
+
+/// Delegate every operation to the real vault, observing the actual read boundary.
 #[derive(Clone)]
 pub(in crate::harness) struct ContendedVault {
     paths: Paths,
-    release: Rc<dyn Fn()>,
+    before_read: Rc<dyn Fn(VaultRead, Instant) -> Instant>,
+}
+
+fn native_writer_is_busy(paths: &Paths) {
+    let expected = aterm_secrets::client::config(paths)
+        .unwrap()
+        .expect("the configured fixture vault");
+    let native = aterm_secrets::client::observe_materialization::<()>(paths, &expected, || {
+        panic!("the held native writer admits no input read")
+    })
+    .unwrap();
+    assert!(
+        matches!(
+            native,
+            aterm_secrets::client::MaterializationObservation::Blocked(
+                aterm_secrets::client::MaterializationBlocker::LockUnavailable
+            )
+        ),
+        "the actual native lock must be unavailable before releasing its writer"
+    );
 }
 
 impl ContendedVault {
@@ -247,31 +271,12 @@ impl ContendedVault {
 
 impl TokenVault for ContendedVault {
     fn route(&self, by: Instant) -> Result<WriteRoute, String> {
-        if Instant::now() < by {
-            let expected = aterm_secrets::client::config(&self.paths)
-                .map_err(|error| error.to_string())?
-                .expect("the configured fixture vault");
-            let native = aterm_secrets::client::observe_materialization::<()>(
-                &self.paths,
-                &expected,
-                || panic!("the held native writer admits no input read"),
-            )
-            .map_err(|error| error.to_string())?;
-            assert!(
-                matches!(
-                    native,
-                    aterm_secrets::client::MaterializationObservation::Blocked(
-                        aterm_secrets::client::MaterializationBlocker::LockUnavailable
-                    )
-                ),
-                "the actual native lock must be unavailable before releasing its writer"
-            );
-            (self.release)();
-        }
+        let by = (self.before_read)(VaultRead::Route, by);
         self.real().route(by)
     }
-    fn standing(&self, key: &Key) -> Result<Lookup<Standing>, String> {
-        self.real().standing(key)
+    fn standing(&self, key: &Key, by: Instant) -> Result<Lookup<Standing>, String> {
+        let by = (self.before_read)(VaultRead::Standing, by);
+        self.real().standing(key, by)
     }
     fn listed(&self) -> Result<Lookup<Vec<Standing>>, String> {
         self.real().listed()
@@ -868,6 +873,90 @@ fn a_minted_token_is_in_the_vault_and_its_row_holds_every_field() {
 }
 
 #[test]
+fn token_required_standing_waits_for_its_native_vault_writer() {
+    for age in [Duration::from_secs(3), Duration::from_secs(61)] {
+        let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+        let scratch = Scratch::new("standing-writer");
+        let lab = Lab::new();
+        let world = World::new("success", false);
+        let first = Cell::new(true);
+        let held = Rc::new(RefCell::new(None));
+        let release = Rc::clone(&held);
+        let observed = Rc::new(Cell::new(0));
+        let blocked = Rc::clone(&observed);
+        let paths = lab.paths.clone();
+        let host = Host::minting(
+            VaultOf::Contended(ContendedVault {
+                paths: lab.paths.clone(),
+                before_read: Rc::new(move |read, by| {
+                    if read != VaultRead::Standing || !first.replace(false) {
+                        return by;
+                    }
+                    // The real route preflight has finished before this writer takes custody.
+                    *release.borrow_mut() =
+                        Some(aterm_secrets::client::test_hold_state_lock(&paths).unwrap());
+                    native_writer_is_busy(&paths);
+                    let by = by - age;
+                    if Instant::now() < by {
+                        blocked.set(blocked.get() + 1);
+                        drop(release.borrow_mut().take());
+                    }
+                    by
+                }),
+            }),
+            &world,
+        );
+        let table = scratch.store().shared_dir().join(TABLE_FILE);
+        let before = std::fs::read(&table).ok();
+        let _ = notes();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let result = journal::with_keyer(keyer, || {
+            run(
+                &scratch.env(),
+                &host,
+                "work",
+                TokenMode::Make,
+                &mut out,
+                &mut err,
+            )
+        });
+        assert_eq!(held.borrow().is_some(), expired);
+        assert_eq!(observed.get(), usize::from(!expired));
+        drop(held.borrow_mut().take());
+        assert_eq!(
+            Vault(lab.paths.clone())
+                .route(Instant::now() + aterm_spec::wait::MUST_HAPPEN)
+                .unwrap(),
+            WriteRoute::Seated
+        );
+        assert_eq!(host.asked_program.get(), !expired);
+        let written = notes();
+        if expired {
+            assert_eq!(result, ExitCode::from(1));
+            assert_eq!(std::fs::read(&table).ok(), before);
+            assert!(written.is_empty());
+            assert!(matches!(lab.read(), Lookup::Absent));
+            assert!(!claude_token::waiting_here(&lab.paths, &key()).unwrap());
+        } else {
+            assert_eq!(
+                result,
+                ExitCode::SUCCESS,
+                "{} {}",
+                String::from_utf8_lossy(&out),
+                String::from_utf8_lossy(&err)
+            );
+            assert!(lab.holds_the_token());
+            assert_eq!(
+                scratch.table().rows.get(KEY).unwrap().vault,
+                InVault::InVault
+            );
+            assert_eq!(written.len(), 1);
+        }
+    }
+}
+
+#[test]
 fn token_preflight_waits_for_its_native_vault_writer() {
     for age in [Duration::from_secs(3), Duration::from_secs(61)] {
         let expired = age >= aterm_spec::wait::MUST_HAPPEN;
@@ -880,13 +969,18 @@ fn token_preflight_waits_for_its_native_vault_writer() {
         let observed = Rc::new(Cell::new(0));
         let release = Rc::clone(&held);
         let blocked = Rc::clone(&observed);
+        let paths = lab.paths.clone();
         let host = Host::minting(
             VaultOf::Contended(ContendedVault {
                 paths: lab.paths.clone(),
-                release: Rc::new(move || {
-                    assert!(release.borrow().is_some());
-                    blocked.set(blocked.get() + 1);
-                    drop(release.borrow_mut().take());
+                before_read: Rc::new(move |read, by| {
+                    if read == VaultRead::Route && Instant::now() < by {
+                        native_writer_is_busy(&paths);
+                        assert!(release.borrow().is_some());
+                        blocked.set(blocked.get() + 1);
+                        drop(release.borrow_mut().take());
+                    }
+                    by
                 }),
             }),
             &world,
@@ -1165,7 +1259,13 @@ fn every_offered_step_passes_the_preflight() {
         }
         let fake = FakeVault::new(found);
         let row = read_table(&store).unwrap().rows.remove(KEY);
-        let state = TokenState::of(&fake.standing(&key()).unwrap(), row.as_ref(), NOW);
+        let state = TokenState::of(
+            &fake
+                .standing(&key(), Instant::now() + STANDING_LOOK)
+                .unwrap(),
+            row.as_ref(),
+            NOW,
+        );
         assert_eq!(
             state.words().split(' ').next(),
             name.split(' ').next(),
@@ -1220,7 +1320,13 @@ fn every_offered_step_passes_the_preflight() {
         ),
     ] {
         let fake = FakeVault::new(found);
-        let state = TokenState::of(&fake.standing(&key()).unwrap(), None, NOW);
+        let state = TokenState::of(
+            &fake
+                .standing(&key(), Instant::now() + STANDING_LOOK)
+                .unwrap(),
+            None,
+            NOW,
+        );
         assert_eq!(state.offer("work", false), None, "{name}");
     }
 }

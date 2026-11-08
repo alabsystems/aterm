@@ -148,6 +148,11 @@ fn local_items(
     mode: Mode,
     current: Option<Current>,
 ) -> Result<Vec<aterm_machines::model::ItemReport>, String> {
+    if current.is_some()
+        && let Some(rows) = withdrawal_items(sys, ctx, mode, current.clone(), None)?
+    {
+        return Ok(rows);
+    }
     match current {
         None => aterm_machines::init_github::run_initial_repositories(sys, ctx, mode),
         Some(current) => {
@@ -163,6 +168,45 @@ fn local_items(
             )
         }
     }
+}
+
+fn withdrawal_items(
+    sys: &dyn System,
+    ctx: &Ctx,
+    mode: Mode,
+    current: Option<Current>,
+    selected: Option<(
+        &aterm_secrets::client::Paths,
+        &aterm_secrets::client::Config,
+    )>,
+) -> Result<Option<Vec<aterm_machines::model::ItemReport>>, String> {
+    let Ok(Some(withdrawal)) =
+        aterm_machines::init_github::RepositoryCredentialWithdrawal::capture(sys, ctx)
+    else {
+        return Ok(None);
+    };
+    let selected = selected.map(|(paths, config)| (paths.clone(), config.clone()));
+    aterm_machines::init_github::run_repository_credential_withdrawal(
+        sys,
+        ctx,
+        mode,
+        withdrawal,
+        move || {
+            if let Some(current) = &current
+                && !current()?
+            {
+                return Ok(false);
+            }
+            match &selected {
+                Some((paths, expected)) => Ok(aterm_secrets::client::config(paths)
+                    .map_err(|why| why.to_string())?
+                    .as_ref()
+                    == Some(expected)),
+                None => Ok(true),
+            }
+        },
+    )
+    .map(Some)
 }
 
 fn items_current(
@@ -193,6 +237,12 @@ fn items_current(
         return local_items(sys, ctx, mode, current)
             .map(|rows| (!want_token(&rows)).then_some(rows));
     };
+    // This selected vault still admits its current local empty/disabled intent when the
+    // paired credential has not arrived. This path grants no ordinary repository effects.
+    if let Some(rows) = withdrawal_items(sys, ctx, mode, current.clone(), Some((&paths, expected)))?
+    {
+        return Ok(Some(rows));
+    }
     let entries = aterm_machines::init_github::uses_vault_inventory(sys, ctx)?
         .then_some(aterm_machines::init_github::VAULT_INPUT_ENTRIES.as_slice());
     let read = || {
@@ -448,7 +498,7 @@ mod tests {
         let root = aterm_tempfile::tempdir().unwrap();
         let source = root.path().join("team.secrets");
         let home = root.path().join("home");
-        joined_inventory(
+        let paths = joined_inventory(
             &home,
             &source,
             r#"{"schema":2,"account":"alice","repositories":[]}"#,
@@ -470,6 +520,48 @@ mod tests {
                 || call.contains(" clone ")),
             "{:?}",
             sys.calls()
+        );
+        // The selected-vault admission must still reach local cleanup when its default
+        // credential has not arrived. This is an unpublished intent, not delivery proof.
+        aterm_secrets::need::test_alab_policy(&paths);
+        std::fs::write(&source, "github-repositories.json={\"schema\":2,\"account\":\"alice\",\"repositories\":[]}\ntool-other=before\n").unwrap();
+        client::sync(&paths, None).unwrap();
+        sys.remove(&home.join(".secrets/gh_access_token")).unwrap();
+        let pending = aterm_secrets::need::raise(
+            &paths,
+            aterm_secrets::need::Want::Gh(aterm_secrets::need::GhProfile::Dev),
+            aterm_secrets::need::Purpose::AghDev,
+        )
+        .unwrap();
+        assert!(!pending.state.ended());
+        let ledger = paths.dir.join(aterm_secrets::need::LEDGER);
+        let before = std::fs::read(&ledger).unwrap();
+        let planned = items(&sys, &ctx, Some(&plan), Mode::Plan, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(std::fs::read(&ledger).unwrap(), before);
+        let held = run_reading_guarded(&sys, &ctx, Some(&plan), Mode::Apply, || Ok(false)).unwrap();
+        assert!(!held.token);
+        assert_eq!(std::fs::read(&ledger).unwrap(), before);
+        let rows = items(&sys, &ctx, Some(&plan), Mode::Apply, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, aterm_machines::model::Outcome::Changed);
+        let retired = aterm_secrets::need::peek(&paths).unwrap().remove(0);
+        assert_eq!(retired.id, pending.id);
+        assert_eq!(retired.state, aterm_secrets::need::State::Retired);
+        assert_eq!(
+            retired.retired.unwrap().reason,
+            aterm_secrets::need::Reason::NotNeeded
+        );
+        assert!(
+            !sys.calls()
+                .iter()
+                .any(|call| call.contains("credential fill")
+                    || call.contains("/user")
+                    || call.contains(" clone "))
         );
     }
 

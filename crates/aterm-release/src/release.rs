@@ -256,6 +256,8 @@ impl LinuxDecl {
 /// Every `release` flag (cli.rs parses them).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReleaseOptions {
+    /// Build and freeze this clean origin/main checkout without starting a cut.
+    pub prefreeze: bool,
     /// `--bump`: commit the next MINOR on origin/main's tip and start a line at it.
     pub bump: bool,
     /// `--commit <rev>`: start a line at this commit of origin/main.
@@ -3682,8 +3684,8 @@ impl Run<'_> {
             return Ok(match &cand.bump_from {
                 Some(_) => format!(
                     "would commit `release: {} — the version and the lockfile move together` on \
-                     {} (pub-bump-edit, then targo update --workspace --offline, each nested \
-                     lockfile's path crates following; with the harness versions its window \
+                     {} (pub-bump-edit, then exact path-version lockfile rewrites and locked \
+                     offline metadata validation; with the harness versions its window \
                      owes, `ship harness-bump`'s writes) and push it to main",
                     cand.version,
                     short(&self.tip)

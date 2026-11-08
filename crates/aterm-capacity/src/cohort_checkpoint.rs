@@ -1879,6 +1879,11 @@ mod tests {
 
     #[test]
     fn epoch_rotation_bounds_physical_history_without_changing_the_record() {
+        if !aterm_uds::test_binary::isolated_lifecycle(
+            "ledger::cohort_ledger::checkpoint::tests::epoch_rotation_bounds_physical_history_without_changing_the_record",
+        ) {
+            return;
+        }
         let f = Fixture::new();
         for update in 0..256 {
             let mut transaction = f.anchor.lock(&f.backend).unwrap();

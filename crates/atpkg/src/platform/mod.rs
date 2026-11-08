@@ -1652,6 +1652,8 @@ mod probe_shim;
 mod shim_producer;
 pub use native_claude_restart::{NativeClaudeRestart, native_claude_restart};
 #[cfg(unix)]
+pub(crate) use probe_shim::executable as executable_for_current_user;
+#[cfg(unix)]
 pub use probe_shim::{ProbeForwarder, ProbeImage, ProbeShim, probe_shim};
 
 /// The target a Unix shim execs (its first `exec '…' "$@"` line).

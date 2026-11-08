@@ -500,6 +500,7 @@ aterm-models-native = { workspace = true }
 aterm-models-release = { workspace = true }
 aterm-models-render = { workspace = true }
 aterm-models-session = { workspace = true }
+aterm-models-swarm = { workspace = true }
 aterm-models-update = { workspace = true }
 # The corruption seam (`inject_corrupted_warm_block`, a debug build's) the native
 # search's dense-history tests stage a corrupt tiered segment with

@@ -91,8 +91,12 @@ fn z_napper() {
     let Some(dir) = acting() else {
         return;
     };
-    std::fs::write(dir.join("napper.started"), std::process::id().to_string())
-        .expect("said it started");
+    aterm_uds::atomic_file::write(
+        &dir.join("napper.started"),
+        std::process::id().to_string().as_bytes(),
+        0o600,
+    )
+    .expect("said it started");
     if std::env::var_os(LONG_RUNNING).is_some() {
         let event = aterm_json::json!({
             "type": "test", "event": "timeout", "name": "libtest_fixture::z_napper"

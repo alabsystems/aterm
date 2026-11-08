@@ -208,7 +208,7 @@ pub fn swarm_denied_nodes(paths: &Paths) -> crate::Result<Option<Vec<String>>> {
 }
 
 /// One authoritative deny-list observation. Unavailability cannot authorize an empty list.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SwarmDenialSnapshot {
     /// Owned deny-list contents, including an authoritative empty list.
     Available(Vec<String>),
@@ -218,7 +218,7 @@ pub enum SwarmDenialSnapshot {
 
 impl SwarmDenialSnapshot {
     /// A listener retains its previous verdict when the current observation is unavailable.
-    fn into_nodes(self) -> Option<Vec<String>> {
+    pub(super) fn into_nodes(self) -> Option<Vec<String>> {
         match self {
             Self::Available(nodes) => Some(nodes),
             Self::Unavailable(_) => None,

@@ -16522,6 +16522,7 @@ impl App {
         let cursor_fx_presentable = self.cursor_fx_focus(wid, focused, focus_now);
         if !focused {
             self.settle_selection_gesture(wid);
+            self.scrollbar_release(wid);
             self.close_tab_menu(wid);
             self.close_stats_lens(wid);
             if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
@@ -20752,9 +20753,7 @@ impl App {
                 let _ = reply.send(self.session_status_record(session));
             }
             Wake::ReadSetupStatus { reply } => {
-                let _ = reply.send(crate::system_state_access::background_setup_fields(
-                    self.system_state_host.latest_status(),
-                ));
+                let _ = reply.send(self.cached_setup_status_fields());
             }
             Wake::ReadSessionStatuses { reply } => {
                 let _ = reply.send(self.session_statuses_record());

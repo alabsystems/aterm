@@ -4209,6 +4209,16 @@ fn word_journaled(store: &Store, reply: String) -> String {
     durable.settle(reply, bound)
 }
 
+struct MetaRequest<'a> {
+    rest: &'a str,
+    term: &'a Arc<Mutex<Terminal>>,
+    prove: &'a dyn Fn(&str) -> Option<crate::self_claim::Proven>,
+    session: u64,
+    ctx: &'a SessionCtx,
+    store: &'a Store,
+    scope: Scope,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_meta(
     rest: &str,
@@ -4220,21 +4230,65 @@ fn serve_meta(
     scope: Scope,
     on_change: impl FnOnce(),
 ) -> String {
-    let snapshot = control_session::harness_act_reads_counts(rest).then(|| {
+    serve_meta_with_barrier(
+        MetaRequest {
+            rest,
+            term,
+            prove,
+            session,
+            ctx,
+            store,
+            scope,
+        },
+        crate::act_barrier::before_act,
+        on_change,
+    )
+}
+
+fn serve_meta_with_barrier(
+    request: MetaRequest<'_>,
+    before_act: impl FnOnce(&SessionCtx) -> crate::act_barrier::Passage,
+    on_change: impl FnOnce(),
+) -> String {
+    let MetaRequest {
+        rest,
+        term,
+        prove,
+        session,
+        ctx,
+        store,
+        scope,
+    } = request;
+    let reads_counts = control_session::harness_act_reads_counts(rest);
+    let snapshot = if reads_counts {
+        use crate::act_barrier::Passage;
         use aterm_core::terminal::program_state::ProgramStateWord as W;
         // The program wrote its turn's marks before this act: count them first.
-        crate::act_barrier::before_act(ctx);
+        match before_act(ctx) {
+            Passage::Passed | Passage::Unbarriered => {}
+            Passage::Cancelled => return HUNG_UP_REPLY.to_owned(),
+            Passage::Late => return "ERR barrier hang\n".to_owned(),
+            Passage::Gone => return "ERR barrier reader stopped\n".to_owned(),
+        }
+        if caller_hung_up() {
+            return HUNG_UP_REPLY.to_owned();
+        }
         let report = term_lock(term).program_state();
         let left_at_rest = report
             .state
             .is_some_and(|state| matches!(state.state, W::Idle | W::Done | W::Error));
-        control_session::HarnessActSnapshot {
+        Some(control_session::HarnessActSnapshot {
             mark: crate::session_timeline::LandingMark {
                 program_turns: report.turns,
             },
             left_at_rest,
-        }
-    });
+        })
+    } else {
+        None
+    };
+    if reads_counts && caller_hung_up() {
+        return HUNG_UP_REPLY.to_owned();
+    }
     let (resp, changed) =
         control_session::cmd_meta_supervisor(ctx, scope, serving_connection(), prove, rest)
             .or_else(|| {
@@ -4285,10 +4339,26 @@ fn serve_meta_wired(
     post: &mut dyn FnMut(Wake),
 ) -> String {
     serve_meta(rest, term, prove, session, ctx, store, scope, || {
-        for wake in meta_change_wakes(session, ctx.self_id.as_str(), rest) {
-            post(wake);
-        }
+        post_meta_change(session, ctx, rest, post);
     })
+}
+
+#[cfg(test)]
+fn serve_meta_wired_with_barrier(
+    request: MetaRequest<'_>,
+    before_act: impl FnOnce(&SessionCtx) -> crate::act_barrier::Passage,
+    post: &mut dyn FnMut(Wake),
+) -> String {
+    let (session, ctx, rest) = (request.session, request.ctx, request.rest);
+    serve_meta_with_barrier(request, before_act, || {
+        post_meta_change(session, ctx, rest, post);
+    })
+}
+
+fn post_meta_change(session: u64, ctx: &SessionCtx, rest: &str, post: &mut dyn FnMut(Wake)) {
+    for wake in meta_change_wakes(session, ctx.self_id.as_str(), rest) {
+        post(wake);
+    }
 }
 
 fn meta_change_wakes(session: u64, sid: &str, rest: &str) -> Vec<Wake> {
@@ -11385,6 +11455,53 @@ pub(crate) fn meta_wakes_proving_for_test(
     conn: Option<u64>,
     prove: &dyn Fn(&str) -> Option<crate::self_claim::Proven>,
 ) -> (String, Vec<Wake>) {
+    meta_wakes_with_barrier_for_test(
+        MetaRequest {
+            rest,
+            term,
+            prove,
+            session,
+            ctx,
+            store,
+            scope: Scope::Owner,
+        },
+        conn,
+        crate::act_barrier::before_act,
+    )
+}
+
+/// The actual metadata handler with the same native barrier and a fixture's start clock.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) fn meta_wakes_barrier_for_test(
+    store: &Store,
+    term: &Arc<Mutex<Terminal>>,
+    session: u64,
+    ctx: &SessionCtx,
+    rest: &str,
+    conn: Option<u64>,
+    before_act: impl FnOnce(&SessionCtx) -> crate::act_barrier::Passage,
+) -> (String, Vec<Wake>) {
+    meta_wakes_with_barrier_for_test(
+        MetaRequest {
+            rest,
+            term,
+            prove: &|holder| prove_self_claim_for(ctx, holder, -1),
+            session,
+            ctx,
+            store,
+            scope: Scope::Owner,
+        },
+        conn,
+        before_act,
+    )
+}
+
+#[cfg(test)]
+fn meta_wakes_with_barrier_for_test(
+    request: MetaRequest<'_>,
+    conn: Option<u64>,
+    before_act: impl FnOnce(&SessionCtx) -> crate::act_barrier::Passage,
+) -> (String, Vec<Wake>) {
     struct Restore(Option<u64>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -11393,16 +11510,7 @@ pub(crate) fn meta_wakes_proving_for_test(
     }
     let _restore = Restore(SERVING_CONNECTION.with(|s| s.replace(conn)));
     let mut wakes = Vec::new();
-    let reply = serve_meta_wired(
-        rest,
-        term,
-        prove,
-        session,
-        ctx,
-        store,
-        Scope::Owner,
-        &mut |wake| wakes.push(wake),
-    );
+    let reply = serve_meta_wired_with_barrier(request, before_act, &mut |wake| wakes.push(wake));
     (reply, wakes)
 }
 

@@ -376,7 +376,7 @@ fn cc_key(
     };
     let discovery = match located {
         Located::Plain(_) => "unused".to_owned(),
-        Located::Shim(cc) => crate::probe_cache::identity(&discovery_program(cc))?,
+        Located::Shim(cc) => crate::probe_cache::identity(&discovery_program(cc, host))?,
     };
     let developer_dir = host.developer_dir().ok()?;
     let receipt = receipt_key(&cache.receipt)?;
@@ -421,7 +421,7 @@ fn cc_key(
             .unwrap_or_default()
     }
     crate::probe_cache::key([
-        Some("fresh-executable-link-v13".to_owned()),
+        Some("fresh-executable-link-v14".to_owned()),
         Some(kind.to_owned()),
         crate::probe_cache::identity(cc),
         Some(discovery),
@@ -511,7 +511,7 @@ fn probe_located(located: &Located, path_var: Option<&OsStr>, host: &CcHost) -> 
         }
         Located::Shim(cc) => cc,
     };
-    match ask(&discovery_program(cc), cc, CcQuery::Find, host) {
+    match ask(&discovery_program(cc, host), cc, CcQuery::Find, host) {
         CcVerdict::Ready { driver } => build_probe(cc, driver, path_var, host),
         other => other,
     }
@@ -558,14 +558,20 @@ fn locate(path_var: Option<&OsStr>, host: &CcHost) -> Result<Located, CcVerdict>
     locate_without_setup_shim(path_var, host, &shims)
 }
 
-/// Literal matches remain meaningful when a directory is absent or unreadable; readable
-/// aliases compare by resolved directory without rewriting the selected invocation path.
-fn same_directory(selected: &Path, known: &Path) -> bool {
+/// Literal matches remain meaningful when an entry is absent or unreadable; readable aliases
+/// compare by resolved path without rewriting the selected invocation path.
+fn same_path(selected: &Path, known: &Path) -> bool {
     selected == known
         || matches!(
             (std::fs::canonicalize(selected), std::fs::canonicalize(known)),
             (Ok(selected), Ok(known)) if selected == known
         )
+}
+
+fn is_system_shim(cc: &Path, host: &CcHost) -> bool {
+    host.shim_dir.as_deref().is_some_and(|shim| {
+        cc.parent().is_some_and(|dir| same_path(dir, shim)) || same_path(cc, &shim.join("cc"))
+    })
 }
 
 /// Setup's temporary tools report that installation is needed; they are not compilers.
@@ -584,12 +590,19 @@ fn locate_without_setup_shim(
             !setup_shims
                 .iter()
                 .flatten()
-                .any(|shim| same_directory(dir, shim))
+                .any(|shim| same_path(dir, shim))
         })
     {
         let candidate = dir.join("cc");
         match is_executable(&candidate) {
             Ok(true) => {
+                if setup_shims
+                    .iter()
+                    .flatten()
+                    .any(|shim| same_path(&candidate, &shim.join("cc")))
+                {
+                    continue;
+                }
                 found = Some(candidate);
                 break;
             }
@@ -603,11 +616,7 @@ fn locate_without_setup_shim(
         }
     }
     let cc = found.ok_or(CcVerdict::NoDriver)?;
-    let is_shim = host
-        .shim_dir
-        .as_deref()
-        .is_some_and(|shim| cc.parent().is_some_and(|dir| same_directory(dir, shim)));
-    if !is_shim {
+    if !is_system_shim(&cc, host) {
         return Ok(Located::Plain(cc));
     }
     let unread = |why| CcVerdict::Unproven {
@@ -714,10 +723,7 @@ fn build_probe_in(
     let mut result = run_cc(None, &program);
     if matches!(&result, Ok(out) if !out.status.success())
         && host.sdkroot().is_none()
-        && host
-            .shim_dir
-            .as_deref()
-            .is_some_and(|shim| cc.parent().is_some_and(|dir| same_directory(dir, shim)))
+        && is_system_shim(cc, host)
     {
         let developer_dir = match host.developer_dir() {
             Ok(dir) => dir,
@@ -765,7 +771,15 @@ fn build_probe_in(
         Err(verdict) => verdict,
         Ok(out) if out.status.success() => {
             let wrote = match std::fs::symlink_metadata(&program) {
-                Ok(metadata) => is_executable_file(&metadata),
+                Ok(metadata) => match is_executable_file(&program, &metadata) {
+                    Ok(wrote) => wrote,
+                    Err(why) => {
+                        return CcVerdict::Unproven {
+                            driver: resolved,
+                            why,
+                        };
+                    }
+                },
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => {
                     return CcVerdict::Unproven {
@@ -812,8 +826,13 @@ enum CcQuery {
     Find,
 }
 
-fn discovery_program(cc: &Path) -> PathBuf {
-    cc.parent().unwrap_or(Path::new("/usr/bin")).join("xcrun")
+/// A compiler symlink outside the shim directory does not bring an adjacent `xcrun` with it.
+fn discovery_program(cc: &Path, host: &CcHost) -> PathBuf {
+    host.shim_dir
+        .as_deref()
+        .or_else(|| cc.parent())
+        .unwrap_or(Path::new("/usr/bin"))
+        .join("xcrun")
 }
 
 /// Preserve subprocess evidence: only deadline expiry means the compiler did not answer.
@@ -917,7 +936,7 @@ fn discovered_compiler(bytes: &[u8]) -> Option<PathBuf> {
 /// A nonempty regular file this user may execute (never a directory named `cc`).
 fn is_executable(path: &Path) -> Result<bool, String> {
     match std::fs::metadata(path) {
-        Ok(metadata) => Ok(is_executable_file(&metadata)),
+        Ok(metadata) => is_executable_file(path, &metadata),
         Err(error)
             if matches!(
                 error.kind(),
@@ -930,18 +949,23 @@ fn is_executable(path: &Path) -> Result<bool, String> {
     }
 }
 
-fn is_executable_file(meta: &std::fs::Metadata) -> bool {
+fn is_executable_file(path: &Path, meta: &std::fs::Metadata) -> Result<bool, String> {
     if !meta.is_file() || meta.len() == 0 {
-        return false;
+        return Ok(false);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        meta.permissions().mode() & 0o111 != 0
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Ok(false);
+        }
+        crate::platform::executable_for_current_user(path)
+            .ok_or_else(|| format!("could not verify execute access to {}", path.display()))
     }
     #[cfg(not(unix))]
     {
-        true
+        let _ = path;
+        Ok(true)
     }
 }
 
@@ -1003,7 +1027,8 @@ mod tests {
             "if [ -n \"$SDKROOT\" ]; then\n  if [ -f \"$0.write-fallback\" ]; then printf fresh > \"$2\"; /bin/chmod +x \"$2\"; fi\n  exit 0\nfi\nprintf stale > \"$2\"\n/bin/chmod +x \"$2\"\n/usr/bin/chflags uchg \"$2\" || exit 2\nexit 1",
         );
         let alias = root.join("bin-alias");
-        std::os::unix::fs::symlink(&bin, &alias).unwrap();
+        std::fs::create_dir(&alias).unwrap();
+        std::os::unix::fs::symlink(&cc, alias.join("cc")).unwrap();
         let cc = alias.join("cc");
         let host = CcHost {
             shim_dir: Some(bin),
@@ -1104,6 +1129,9 @@ mod tests {
         let inherited_alias = root.join("inherited-alias");
         let apple = root.join("usr-bin");
         let apple_alias = root.join("apple-alias");
+        let setup_file = root.join("setup-file");
+        let inherited_file = root.join("inherited-file");
+        let apple_file = root.join("apple-file");
         // These must never run: discovery alone can tell the tools are missing.
         script(&setup.join("cc"), "exit 69");
         script(&inherited.join("cc"), "exit 69");
@@ -1111,6 +1139,14 @@ mod tests {
         std::os::unix::fs::symlink(&setup, &setup_alias).unwrap();
         std::os::unix::fs::symlink("old-home/clt-shim", &inherited_alias).unwrap();
         std::os::unix::fs::symlink(&apple, &apple_alias).unwrap();
+        for (dir, target) in [
+            (&setup_file, &setup),
+            (&inherited_file, &inherited),
+            (&apple_file, &apple),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::os::unix::fs::symlink(target.join("cc"), dir.join("cc")).unwrap();
+        }
         let host = CcHost {
             shim_dir: Some(apple.clone()),
             ..plain_host(&root)
@@ -1118,6 +1154,7 @@ mod tests {
         for (setup_entry, inherited_entry, apple_entry) in [
             (&setup, &inherited, &apple),
             (&setup_alias, &inherited_alias, &apple_alias),
+            (&setup_file, &inherited_file, &apple_file),
         ] {
             let path = std::env::join_paths([inherited_entry, setup_entry, apple_entry]).unwrap();
             assert!(matches!(
@@ -1330,8 +1367,11 @@ mod tests {
             bound: ANSWER,
             tmp_root: tmp_root.clone(),
         };
+        let alias = root.join("alias-bin");
+        std::fs::create_dir(&alias).unwrap();
+        std::os::unix::fs::symlink(shim.join("cc"), alias.join("cc")).unwrap();
         assert_eq!(
-            probe_with(Some(shim.as_os_str()), &host),
+            probe_with(Some(alias.as_os_str()), &host),
             CcVerdict::NoDeveloperDir
         );
         assert!(!ran.exists(), "the shim was spawned");
@@ -1339,7 +1379,7 @@ mod tests {
 
         script(&clang_dir.join("usr/bin/clang"), "exit 0");
         assert_eq!(
-            probe_with(Some(shim.as_os_str()), &host),
+            probe_with(Some(alias.as_os_str()), &host),
             CcVerdict::Ready {
                 driver: clang_dir.join("usr/bin/cc")
             }
@@ -1882,6 +1922,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compiler_paths_and_output_require_the_probing_users_execute_access() {
+        let root = scratch("output-execute-access");
+        let bin = root.join("bin");
+        let cc = bin.join("cc");
+        script(
+            &cc,
+            "echo asked >> \"$0.asked\"\ncase \"$1\" in --version) echo cc;; -o) printf x > \"$2\"; /bin/chmod \"$(/bin/cat \"$0.mode\")\" \"$2\";; esac",
+        );
+        let mode = bin.join("cc.mode");
+        std::fs::write(&mode, b"001").unwrap();
+        let host = plain_host(&root);
+        let cache = CcCache {
+            file: root.join("state/cc"),
+            receipt: root.join("no-receipt"),
+        };
+        let path = Some(bin.as_os_str());
+        let identity = crate::probe_cache::identity(&cc).unwrap();
+        let first = probe_cached(path, &host, Some(&cache));
+        // SAFETY: geteuid has no arguments and retains no memory. Root may execute any file
+        // with an execute bit; an ordinary owner cannot borrow the others' execute bit.
+        let root_user = unsafe { libc::geteuid() == 0 };
+        if root_user {
+            assert!(matches!(first, CcVerdict::Ready { .. }), "{first:?}");
+        } else {
+            assert!(matches!(first, CcVerdict::Broken { .. }), "{first:?}");
+            assert!(
+                !cache.file.exists(),
+                "an unusable output supplied a cached success"
+            );
+        }
+        std::fs::write(&mode, b"755").unwrap();
+        assert_eq!(crate::probe_cache::identity(&cc).unwrap(), identity);
+        let ready = CcVerdict::Ready { driver: cc.clone() };
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        let runs = || {
+            std::fs::read_to_string(bin.join("cc.asked"))
+                .unwrap()
+                .lines()
+                .count()
+        };
+        assert_eq!(runs(), if root_user { 2 } else { 4 });
+        let before = runs();
+        std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o001)).unwrap();
+        let discovered = probe_with(path, &host);
+        if root_user {
+            assert_eq!(discovered, ready);
+        } else {
+            assert_eq!(discovered, CcVerdict::NoDriver);
+            assert_eq!(
+                runs(),
+                before,
+                "a compiler this user cannot execute was launched"
+            );
+        }
+        std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
+        assert_eq!(runs() - before, if root_user { 4 } else { 2 });
+    }
+
     /// A compiler that hangs is unknown, not broken, and the probe returns inside its
     /// bound. The compiler is a
     /// driver that forks the real work, as `cc` forks `cc1`: the bound's kill ends the
@@ -2397,7 +2499,7 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        // No fact from the preceding query-output policy may retain an old driver spelling.
+        // The preceding execute-access policy's namespace cannot supply a kept fact.
         let current = cc_key(
             &Located::Plain(cc.clone()),
             Some(bin.as_os_str()),
@@ -2406,14 +2508,18 @@ mod tests {
         )
         .unwrap();
         old_keys.push(current.replacen(
+            "fresh-executable-link-v14",
             "fresh-executable-link-v13",
-            "fresh-executable-link-v12",
             1,
         ));
         // The old receipt reader also called an unread receipt absent. Retire that fact
         // even if the receipt really is absent now and all other inputs still match.
         old_keys.push(current.replacen("receipt-v1 absent", "no receipt", 1));
         for (epoch, old_key) in old_keys.into_iter().enumerate() {
+            assert_ne!(
+                old_key, current,
+                "the legacy fixture must not seed the current policy"
+            );
             crate::probe_cache::put(&cache.file, &old_key, &cc.to_string_lossy());
             for calls in [2, 4] {
                 assert!(matches!(

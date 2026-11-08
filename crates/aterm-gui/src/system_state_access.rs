@@ -443,7 +443,9 @@ fn setup_field_with_rows(
 /// verifies no private value; only current native readings cover a requested preference.
 /// `caps_live` separately describes reported OS/HID mappings for service cohorts, not a
 /// physical key-press test or saved Caps readiness; it never contributes a verified bit.
-pub(crate) fn background_setup_fields(status: &SetupStatus) -> String {
+/// Lifecycle fields describe this cached publication, with pending window intent contributing
+/// only to `busy`. A finished run may have stopped or left work; it proves no readiness.
+pub(crate) fn background_setup_fields(status: &SetupStatus, window_pending: bool) -> String {
     let selection = status
         .plan
         .as_ref()
@@ -505,11 +507,27 @@ pub(crate) fn background_setup_fields(status: &SetupStatus) -> String {
         ),
         None => "unknown".to_owned(),
     };
+    let running: Vec<_> = Setting::ALL
+        .into_iter()
+        .filter(|setting| status.running.contains(setting))
+        .map(|setting| Subject::Setting(setting).status_word())
+        .collect();
+    let running = if running.is_empty() {
+        "-".to_owned()
+    } else {
+        running.join(",")
+    };
     format!(
-        "setup={} verified={} observed_generation={} rows={cached} caps_live={caps_live}",
+        "setup={} verified={} observed_generation={} rows={cached} caps_live={caps_live} \
+         busy={} finished={} queued={} changing={} retrying={} running={running}",
         setup_field_with_rows(status, selection, &rows),
         verified.bits(),
         status.observed_generation,
+        u8::from(status.busy || window_pending),
+        u8::from(status.finished),
+        u8::from(status.queued),
+        u8::from(status.changing),
+        u8::from(status.retrying),
     )
 }
 

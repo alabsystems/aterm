@@ -7,8 +7,8 @@
 //! the words a person reads, never a value.
 
 use super::{
-    Act, Ask, Facts, Need, Proof, Purpose, Reason, RefusalClaim, Retirement, State, Wait, Want,
-    act, settle,
+    Act, Ask, Facts, GhProfile, Need, Proof, Purpose, Reason, RefusalClaim, Retirement, State,
+    Wait, Want, act, settle,
 };
 use crate::client::{Paths, toml_str};
 use crate::{Error, fsx};
@@ -24,6 +24,10 @@ const MAX_ROWS: usize = 64;
 
 /// The largest ledger read.
 const MAX_BYTES: usize = 1 << 20;
+
+/// This format requires agh's development consumer to confirm its own delivery. Older
+/// writers reject it rather than automatically fulfilling a migrated request again.
+const FORMAT: i64 = 3;
 
 /// The ledger's lock, released on drop.
 struct Lock(std::fs::File);
@@ -58,7 +62,8 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
     aterm_codec::hex::decode_vec(text.as_bytes())
 }
 
-/// Every row, oldest first. A missing ledger holds none.
+/// Every row, oldest first, interpreting older completion claims without writing them back.
+/// A missing ledger holds none.
 pub(crate) fn load(paths: &Paths) -> crate::Result<Vec<Need>> {
     let path = paths.dir.join(FILE);
     let Some(bytes) = fsx::read_private(&path, MAX_BYTES)? else {
@@ -80,19 +85,19 @@ pub(crate) fn load(paths: &Paths) -> crate::Result<Vec<Need>> {
     let Some(rows) = table.get("need") else {
         return Ok(Vec::new());
     };
-    let (rows, versioned): (&[_], bool) = match rows {
-        aterm_toml::Value::Array(rows) => (rows, false),
-        aterm_toml::Value::Table(container)
-            if container
+    let (rows, format): (&[_], i64) = match rows {
+        aterm_toml::Value::Array(rows) => (rows, 1),
+        aterm_toml::Value::Table(container) => {
+            let format = container
                 .get("format")
                 .and_then(aterm_toml::Value::as_integer)
-                == Some(2) =>
-        {
+                .filter(|format| matches!(*format, 2 | FORMAT))
+                .ok_or_else(damaged)?;
             let rows = match container.get("rows") {
                 None => &[][..],
                 Some(rows) => rows.as_array().ok_or_else(damaged)?.as_slice(),
             };
-            (rows, true)
+            (rows, format)
         }
         _ => return Err(damaged()),
     };
@@ -106,7 +111,7 @@ pub(crate) fn load(paths: &Paths) -> crate::Result<Vec<Need>> {
                 .filter(|key| table.get(key).is_some())
                 .count();
             if present > 1
-                || (!versioned
+                || (format == 1
                     && (table.get("refused_legacy").is_some()
                         || table.get("refused_version").is_some()))
             {
@@ -135,6 +140,19 @@ pub(crate) fn load(paths: &Paths) -> crate::Result<Vec<Need>> {
                     resolved.insert(bytes.clone(), claim);
                 }
                 need.refused = Some(RefusalClaim::Authenticated(resolved[&bytes].clone()));
+            }
+            // Before the consumer was registered, delivery alone could mark agh.dev
+            // fulfilled. No stored field distinguishes that from a real consumer check.
+            // Preserve its identity and evidence, but require confirmation once. A peek
+            // only interprets the old format; an actual ledger mutation publishes FORMAT.
+            if format < FORMAT
+                && need.want == Want::Gh(GhProfile::Dev)
+                && need.purpose == Purpose::AghDev
+                && need.state == State::Fulfilled
+            {
+                need.state = State::Published;
+                need.wait = Wait::Requester;
+                need.line = "published: the development credential awaits its consumer's current check after an older completion record".into();
             }
             Ok(need)
         })
@@ -228,9 +246,9 @@ fn int(n: u64) -> i64 {
 }
 
 fn render(paths: &Paths, rows: &[Need]) -> crate::Result<String> {
-    let mut text = String::from(
+    let mut text = format!(
         "# aterm secrets need ledger (docs/DESIGN-credential-requests-2026-10-27.md).\n\
-         # Written by aterm; names, states and explanations only, never a value.\n\n[need]\nformat = 2\n",
+         # Written by aterm; names, states and explanations only, never a value.\n\n[need]\nformat = {FORMAT}\n",
     );
     for need in rows {
         text.push_str("\n[[need.rows]]\n");
@@ -607,6 +625,49 @@ pub fn satisfied(paths: &Paths, want: &Want, purpose: Purpose) -> crate::Result<
     with_ledger(paths, |rows, facts| satisfy_in(rows, facts, want, purpose))
 }
 
+/// The development consumer found no selected repository work in this exact inventory
+/// snapshot. Retire only its unchanged live request as not needed; this neither accepts a
+/// credential nor changes its refusal floor. The caller must validate the empty selection
+/// and its current account, source and choices through `current`, whose local-read-only
+/// contract is the same as [`raise_refused_from_snapshot`].
+/// # Errors
+/// The inventory snapshot, current admission or expected request ID/floor no longer holds.
+pub fn unneeded_from_snapshot(
+    paths: &Paths,
+    expected: &Need,
+    snapshot: &crate::client::MaterializationSnapshot,
+    current: impl Fn() -> crate::Result<()>,
+) -> crate::Result<()> {
+    if expected.want != Want::Gh(GhProfile::Dev) || expected.purpose != Purpose::AghDev {
+        return Err(Error::new(
+            "the inventory belongs to no development credential request",
+        ));
+    }
+    with_snapshot_ledger(
+        paths,
+        &[crate::entry_class::GITHUB_REPOSITORIES.to_owned()],
+        snapshot,
+        false,
+        false,
+        current,
+        |rows, facts| {
+            let row = rows
+                .iter_mut()
+                .find(|row| row.want == expected.want && row.purpose == expected.purpose)
+                .ok_or_else(|| Error::new("the development credential request changed"))?;
+            if row.id != expected.id || row.refused != expected.refused || row.state.ended() {
+                return Err(Error::new(
+                    "the development credential request or refusal changed",
+                ));
+            }
+            *row = act(row, facts, &Act::Unneeded).ok_or_else(|| {
+                Error::new("the development credential request cannot retire as unneeded")
+            })?;
+            Ok(())
+        },
+    )
+}
+
 /// The consumer accepted its paired credential. An explicit refusal additionally requires
 /// prior provider acceptance at a later signed version or an exact-envelope witness
 /// refinement; ordinary local consumption may retire an unneeded request without claiming
@@ -793,7 +854,8 @@ pub fn absorb(
     })
 }
 
-/// The ledger as it stands, moving nothing and writing nothing: what a status line reads.
+/// The ledger's supported interpretation, writing nothing: what a status line reads. Older
+/// agh.dev completion claims await the consumer check they did not previously require.
 ///
 /// # Errors
 /// The ledger cannot be read.

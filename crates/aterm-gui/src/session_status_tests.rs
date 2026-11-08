@@ -388,7 +388,7 @@ fn the_sweep_owes_a_settle_read_after_a_counted_codex_tabs_screen_moves() {
 fn blank(seq: u64) -> ActivitySample {
     ActivitySample {
         alt_screen: false,
-        content_seq: seq,
+        screen: seq,
         last_output: None,
     }
 }
@@ -428,7 +428,7 @@ fn a_prompt_only_shell_running_a_job_reads_running() {
         ev.shell = shell;
         ev.foreground_job = Some(true);
         fsm.observe(&ev, t0);
-        ev.activity.content_seq = 2;
+        ev.activity.screen = 2;
         ev.activity.last_output = Some(t0 + Duration::from_millis(10));
         settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
         fsm.status().clone()
@@ -480,7 +480,7 @@ fn only_a_prompt_that_never_reported_a_command_yields_to_a_job() {
     ev.shell = prompt_yields_to_job(Some(ShellEvidence::Prompt), true, Some(true));
     ev.foreground_job = Some(true);
     fsm.observe(&ev, t0);
-    ev.activity.content_seq = 2;
+    ev.activity.screen = 2;
     settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
     assert_eq!(fsm.status().phase, Phase::Idle);
     assert_eq!(fsm.status().reasons, vec![Reason::ShellBlock]);
@@ -539,7 +539,7 @@ fn every_phase_is_reachable_and_has_a_wire_spelling() {
     assert_eq!(fsm.status().phase, Phase::Idle);
 
     ev.foreground_job = Some(true);
-    ev.activity.content_seq = 2;
+    ev.activity.screen = 2;
     let t2 = settle(&mut fsm, &ev, t1 + Duration::from_millis(10));
     assert_eq!(fsm.status().phase, Phase::Running);
 
@@ -555,7 +555,7 @@ fn alt_screen_transition_is_a_resync_not_activity() {
     let mut fsm = StatusFsm::new(policy(), t0);
     let mut ev = evidence(ActivitySample {
         alt_screen: false,
-        content_seq: 900,
+        screen: 900,
         last_output: None,
     });
     ev.foreground_job = Some(true);
@@ -563,7 +563,7 @@ fn alt_screen_transition_is_a_resync_not_activity() {
 
     ev.activity = ActivitySample {
         alt_screen: true,
-        content_seq: 3,
+        screen: 3,
         last_output: None,
     };
     settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
@@ -582,7 +582,7 @@ fn executing_names_output_only_movement_as_output_activity() {
     let mut ev = evidence(blank(1));
     ev.shell = Some(ShellEvidence::Executing);
     fsm.observe(&ev, t0);
-    ev.activity.content_seq = 2;
+    ev.activity.screen = 2;
     ev.activity.last_output = Some(t0);
     let t1 = settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
     assert_eq!(fsm.status().phase, Phase::Running);
@@ -602,7 +602,7 @@ fn executing_names_output_only_movement_as_output_activity() {
         "bytes arrived and the grid never moved"
     );
 
-    ev.activity.content_seq = 3;
+    ev.activity.screen = 3;
     ev.activity.last_output = Some(t2 + Duration::from_millis(10));
     fsm.observe(&ev, t2 + Duration::from_millis(10));
     assert_eq!(fsm.status().phase, Phase::Running);
@@ -639,7 +639,7 @@ fn output_that_moves_no_cell_sustains_running_but_never_starts_it() {
         }
 
         let t2 = t1 + Duration::from_secs(61);
-        ev.activity.content_seq = 2;
+        ev.activity.screen = 2;
         ev.activity.last_output = Some(t2);
         fsm.observe(&ev, t2);
         assert_eq!(fsm.owed_wake(), Some(t2 + DWELL), "{case}: the dwell");
@@ -647,6 +647,130 @@ fn output_that_moves_no_cell_sustains_running_but_never_starts_it() {
         assert_eq!(fsm.status().phase, Phase::Running, "{case}");
         assert_eq!(fsm.owed_wake(), Some(t2 + QUIET), "{case}: its retirement");
     }
+}
+
+/// ATERM-KI-1104-20. A program that rewrites rows that read the same (Claude Code at rest, about
+/// every 30 s: `ESC[H ESC[2K` and the same words) moves the grid's content generation, and the
+/// status read that as movement: the tab went quiet, running, quiet again 6 s later, two
+/// revisions and a sweep each time. Movement is now the visible screen's print
+/// ([`screen_print`]), taken through the sweep's own path ([`StatusObserver::screen_print_for`]):
+/// sixty identical rewrites, each moving the generation, publish nothing and owe no sweep, and
+/// the print is taken once per generation. NEGATIVE CONTROLS: a rewrite that changes one spinner
+/// cell, or only a colour, is movement: the dwell is owed and the tab reads running after it.
+#[test]
+fn a_rewrite_of_identical_rows_starts_no_running() {
+    const ID: u64 = 7;
+    let screen = |text: &[u8]| {
+        let mut term = aterm_core::terminal::Terminal::new(24, 80);
+        term.process(b"\x1b[2J\x1b[H\xe2\x9c\xbb Thinking\xe2\x80\xa6\r\n> ");
+        term.process(text);
+        term
+    };
+    let sample = |obs: &mut StatusObserver, term: &aterm_core::terminal::Terminal, at| {
+        let mut ev = evidence(ActivitySample {
+            alt_screen: term.is_alternate_screen(),
+            screen: obs.screen_print_for(ID, screen_clock(term), at, || screen_print(term)),
+            last_output: Some(at),
+        });
+        ev.foreground_job = Some(true);
+        ev
+    };
+    let rewrite = "\x1b[H\x1b[2K\u{273b} Thinking\u{2026}";
+    let t0 = Instant::now();
+    let rest = |term: &aterm_core::terminal::Terminal| {
+        let mut obs = StatusObserver::new(policy(), Duration::ZERO);
+        let ev = sample(&mut obs, term, t0);
+        obs.observe(ID, &ev, t0);
+        let ev = sample(&mut obs, term, t0 + DWELL);
+        obs.observe(ID, &ev, t0 + DWELL);
+        assert_eq!(obs.status(ID).map(|s| s.phase), Some(Phase::Quiet));
+        assert_eq!(obs.next_wake(), None);
+        obs
+    };
+    let mut term = screen(b"");
+    let mut obs = rest(&term);
+    for n in 1..=60u64 {
+        let at = t0 + DWELL + Duration::from_secs(n);
+        let before = term.content_seq();
+        term.process(rewrite.as_bytes());
+        assert!(
+            term.content_seq() > before,
+            "premise: the rewrite moves the generation"
+        );
+        let ev = sample(&mut obs, &term, at);
+        assert!(!obs.observe(ID, &ev, at), "rewrite {n}: nothing to publish");
+        assert_eq!(obs.status(ID).map(|s| s.phase), Some(Phase::Quiet), "{n}");
+        assert_eq!(obs.next_wake(), None, "rewrite {n}: no sweep is owed");
+    }
+    let mut taken = 0;
+    let clock = screen_clock(&term);
+    for _ in 0..3 {
+        obs.screen_print_for(ID, clock, t0, || {
+            taken += 1;
+            0
+        });
+    }
+    assert_eq!(
+        taken, 0,
+        "the generation's print stands: the screen is not read again"
+    );
+    for (what, change) in [
+        ("a spinner cell", "\x1b[H\x1b[2K\u{273d} Thinking\u{2026}"),
+        (
+            "a colour alone",
+            "\x1b[H\x1b[2K\x1b[38;2;1;2;4m\u{273b} Thinking\u{2026}\x1b[0m",
+        ),
+    ] {
+        let mut term = screen(b"");
+        let mut obs = rest(&term);
+        let at = t0 + DWELL + Duration::from_secs(1);
+        term.process(change.as_bytes());
+        let ev = sample(&mut obs, &term, at);
+        obs.observe(ID, &ev, at);
+        assert_eq!(
+            obs.next_wake(),
+            Some(at + DWELL),
+            "CONTROL {what}: the dwell"
+        );
+        let ev = sample(&mut obs, &term, at + DWELL);
+        obs.observe(ID, &ev, at + DWELL);
+        assert_eq!(
+            obs.status(ID).map(|s| s.phase),
+            Some(Phase::Running),
+            "CONTROL {what}"
+        );
+    }
+}
+
+/// A grid swapped in at the generation another grid's print was taken at is read again
+/// ([`screen_clock`]): every grid's generation starts at 1, so the alternate screen a `?1049h`
+/// builds can stand at the main screen's.
+#[test]
+fn a_grid_swapped_in_at_the_same_generation_is_read_again() {
+    const ID: u64 = 9;
+    let mut term = aterm_core::terminal::Terminal::new(24, 80);
+    for _ in 0..8 {
+        term.process(b"main screen\r\n");
+    }
+    let mut obs = StatusObserver::new(policy(), Duration::ZERO);
+    let t0 = Instant::now();
+    let main = obs.screen_print_for(ID, screen_clock(&term), t0, || screen_print(&term));
+    let main_gen = term.content_seq();
+    term.process(b"\x1b[?1049h");
+    while term.content_seq() < main_gen {
+        term.process(b"a");
+    }
+    assert_eq!(
+        term.content_seq(),
+        main_gen,
+        "premise: the alternate screen's generation meets the main screen's"
+    );
+    let alt = obs.screen_print_for(ID, screen_clock(&term), t0, || screen_print(&term));
+    assert_ne!(
+        alt, main,
+        "the alternate screen's own print, not the main screen's"
+    );
+    assert_eq!(alt, screen_print(&term));
 }
 
 #[test]
@@ -824,7 +948,7 @@ fn a_cleared_failure_releases_the_tab_while_a_native_sibling_keeps_its_own_mark(
         .attention = true;
 
     ev.shell = Some(ShellEvidence::Executing);
-    ev.activity.content_seq = 2;
+    ev.activity.screen = 2;
     ev.activity.last_output = Some(t0 + Duration::from_millis(10));
     settle_observer(
         &mut app.session_status,
@@ -1116,7 +1240,7 @@ fn rapid_heuristic_transitions_append_at_most_one_status_event_per_dwell() {
         // candidates alternate every few samples.
         if (at - t0).as_millis() % 300 < 150 {
             seq += 1;
-            ev.activity.content_seq = seq;
+            ev.activity.screen = seq;
             ev.activity.last_output = Some(at);
         }
         if observer.observe(1, &ev, at)
@@ -1160,7 +1284,7 @@ fn an_exited_pane_stays_exited_instead_of_reverting_to_ready() {
     ev.foreground_job = Some(true);
     ev.activity.last_output = Some(t0);
     app.session_status.observe(0, &ev, t0);
-    ev.activity.content_seq += 1;
+    ev.activity.screen += 1;
     settle_observer(&mut app.session_status, 0, &ev, t0);
     assert_eq!(
         app.session_status.status(0).map(|s| s.phase),
@@ -2332,7 +2456,7 @@ fn movement_at_a_prompt_publishes_nothing_and_owes_no_wake() {
             "{shell:?}: a settled prompt parks"
         );
 
-        ev.activity.content_seq = 2;
+        ev.activity.screen = 2;
         let t2 = t1 + Duration::from_millis(10);
         assert!(
             !observer.observe(1, &ev, t2),
@@ -2361,7 +2485,7 @@ fn output_without_movement_arms_the_retire_wake_off_the_freshest_clock() {
     ev.foreground_job = Some(true);
     ev.activity.last_output = Some(t0);
     observer.observe(1, &ev, t0);
-    ev.activity.content_seq = 2;
+    ev.activity.screen = 2;
     ev.activity.last_output = Some(t0 + DWELL);
     let t1 = settle_observer(&mut observer, 1, &ev, t0 + DWELL);
     assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Running));
@@ -2505,7 +2629,7 @@ fn a_refused_sample_still_advances_the_observation_gate() {
     ev.foreground_job = Some(true);
     observer.observe(1, &ev, t0);
     let moved_at = t0 + Duration::from_millis(10);
-    ev.activity.content_seq = 2;
+    ev.activity.screen = 2;
     observer.observe(1, &ev, moved_at);
     observer.observe(1, &ev, moved_at + DWELL);
     assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Running));

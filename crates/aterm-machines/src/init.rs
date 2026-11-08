@@ -1940,7 +1940,36 @@ const PERSON_MARK: &str = "mark ";
 /// # Errors
 /// The record, this login's context or its init.toml cannot be read.
 pub fn owed_clone(sys: &dyn System, state: &Path, now: &Holds) -> Result<OwedClone, String> {
+    if !now.holds(Setting::Repositories)
+        && let Ok(ctx) = repository_context(sys)
+        && crate::init_github::RepositoryCredentialWithdrawal::capture(sys, &ctx)?.is_some()
+    {
+        return Ok(OwedClone::Due(
+            "the default repository credential request is no longer needed".into(),
+        ));
+    }
     owed_clone_with(sys, state, now, None)
+}
+
+/// Run only local credential-request retirement, retaining fresh caller holds at every
+/// ledger boundary. Ordinary repository effects still require the full paired capture.
+/// # Errors
+/// The captured local intent or caller authority changed, or the ledger cannot be saved.
+pub fn withdraw_repository_credential(
+    sys: &dyn System,
+    state: &Path,
+    withdrawal: crate::init_github::RepositoryCredentialWithdrawal,
+    current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
+) -> Result<String, String> {
+    let ctx = repository_context(sys)?;
+    let rows = crate::init_github::run_repository_credential_withdrawal(
+        sys,
+        &ctx,
+        Mode::Apply,
+        withdrawal,
+        current,
+    )?;
+    settle_owed_clone(sys, state, &ctx, &rows)
 }
 
 /// Read default repository debt using inputs captured under the caller's ready vault.
@@ -2303,8 +2332,29 @@ pub fn clone_owed_in_pass(
     work: aterm_secrets::converge::RepositoryWork,
     execution: Option<crate::sync::repository_refresh::Execution>,
 ) -> Result<String, String> {
+    clone_owed_in_pass_with_withdrawal_guard(sys, state, work, execution, None)
+}
+
+/// As [`clone_owed_in_pass`], retaining a caller's independent current-holds check for
+/// any local credential withdrawal discovered while the items are constructed.
+/// # Errors
+/// As [`clone_owed_in_pass`], or the caller withholds a local withdrawal.
+pub fn clone_owed_in_pass_with_withdrawal_guard(
+    sys: &dyn System,
+    state: &Path,
+    work: aterm_secrets::converge::RepositoryWork,
+    execution: Option<crate::sync::repository_refresh::Execution>,
+    withdrawal_current: Option<Box<dyn Fn() -> Result<bool, String> + Send + Sync>>,
+) -> Result<String, String> {
     let ctx = repository_context(sys)?;
-    let items = crate::init_github::items_for_execution(sys, &ctx, None, work, execution)?;
+    let items = crate::init_github::items_for_execution_with_withdrawal_guard(
+        sys,
+        &ctx,
+        None,
+        work,
+        execution,
+        withdrawal_current,
+    )?;
     let bound = crate::engine::bind(
         items
             .iter()

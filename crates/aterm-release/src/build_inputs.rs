@@ -1100,9 +1100,19 @@ struct RootStat {
 /// descendant cannot be resolved (a link loop included), inspected or read, or is a special
 /// file; nesting passes 256 levels or the walk passes [`MAX_ENTRIES`] entries; a real
 /// directory is reached again inside itself, which only a link above it (to the root's parent,
-/// say) can do; or, reading content, a file or directory changed while it was read.
+/// say) can do; a file or directory changed while its content was read; or the walk
+/// was interrupted.
 #[cfg(any(test, target_os = "macos"))]
 fn walk_roots(roots: &[(&str, &Path)], reads: Option<Reads<'_>>) -> Result<Walked, String> {
+    walk_roots_until(roots, reads, &|| crate::interrupt::caught().is_some())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn walk_roots_until(
+    roots: &[(&str, &Path)],
+    reads: Option<Reads<'_>>,
+    stopped: &dyn Fn() -> bool,
+) -> Result<Walked, String> {
     if roots.is_empty() {
         return Err("build input identity has no roots".into());
     }
@@ -1134,6 +1144,7 @@ fn walk_roots(roots: &[(&str, &Path)], reads: Option<Reads<'_>>) -> Result<Walke
             .canonicalize()
             .map_err(|e| format!("resolve build input {}: {e}", root.display()))?;
         let mut sink = Sink {
+            stopped,
             content: content
                 .as_mut()
                 .map(|(digest, reads, buf)| (digest, reads, &mut **buf)),
@@ -1173,6 +1184,7 @@ fn field(digest: &mut aterm_digest::Sha256, bytes: &[u8]) {
 /// recheck, which reads no file), and the root's status digest.
 #[cfg(any(test, target_os = "macos"))]
 struct Sink<'a, 'r> {
+    stopped: &'a dyn Fn() -> bool,
     content: Option<(
         &'a mut aterm_digest::Sha256,
         &'a mut Reads<'r>,
@@ -1207,6 +1219,9 @@ fn walk(
     depth: usize,
     visits: &mut usize,
 ) -> Result<(), String> {
+    if (sink.stopped)() {
+        return Err("build input walk interrupted".into());
+    }
     if depth > 256 {
         return Err(format!(
             "build input nesting exceeds 256 levels: {}",
@@ -1315,6 +1330,9 @@ fn walk(
                 .map_err(|e| format!("read build input {}: {e}", resolved.display()))?;
             let mut content = aterm_digest::Sha256::new();
             loop {
+                if (sink.stopped)() {
+                    return Err("build input hash interrupted".into());
+                }
                 let read = file
                     .read(&mut **buffer)
                     .map_err(|e| format!("read build input {}: {e}", resolved.display()))?;
@@ -1340,6 +1358,51 @@ fn walk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// No latency bound: removing either stop poll lets a cancelled walk complete.
+    #[test]
+    fn an_interrupted_seal_stops_before_entries_and_between_file_chunks() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let file = temp.path().join("input");
+        std::fs::write(&file, vec![7; 256 * 1024]).unwrap();
+        let roots = [("probe", file.as_path())];
+        let run = |stopped: &dyn Fn() -> bool| {
+            walk_roots_until(
+                &roots,
+                Some(Reads {
+                    open: &mut |p| std::fs::File::open(p),
+                    list: &mut list_names,
+                }),
+                stopped,
+            )
+        };
+        let complete = run(&|| false).unwrap();
+        assert!(complete.digest.is_some());
+        assert!(walk_roots_until(&roots, None, &|| true).is_err());
+        let polls = std::cell::Cell::new(0);
+        assert!(
+            run(&|| {
+                polls.set(polls.get() + 1);
+                polls.get() == 4
+            })
+            .is_err()
+        );
+        assert_eq!(polls.get(), 4);
+        // Stop machinery never changes the content identity of a completed take.
+        let ordinary = walk_roots(
+            &roots,
+            Some(Reads {
+                open: &mut |p| std::fs::File::open(p),
+                list: &mut list_names,
+            }),
+        )
+        .unwrap();
+        assert_eq!(complete.digest, ordinary.digest);
+        assert_eq!(complete.roots.len(), ordinary.roots.len());
+        for (a, b) in complete.roots.iter().zip(&ordinary.roots) {
+            assert_eq!((&a.stat, a.entries), (&b.stat, b.entries));
+        }
+    }
 
     /// A call's report reaches the log [`arm`] named (the cutter's transcript, which `release
     /// status` counts its `inputs` events from) line by line, and no file where none was named.

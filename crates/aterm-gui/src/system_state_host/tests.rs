@@ -1874,6 +1874,13 @@ fn detached_apply_reopen_waits_for_its_receipt(accepted: bool) {
     let generation = app.system_state_host.generation;
     app.system_state_host.status_in_flight = true;
     calls();
+    let before_query = app.system_state_host.latest_status.clone();
+    let next_poll = app.system_state_host.next_status;
+    let diagnostic = app.cached_setup_status_fields();
+    assert!(diagnostic.split_whitespace().any(|field| field == "busy=1"));
+    assert_eq!(app.system_state_host.latest_status, before_query);
+    assert_eq!(app.system_state_host.next_status, next_poll);
+    assert!(calls().is_empty(), "a cached query starts no worker read");
 
     app.close_active_native_tab(wid).unwrap();
     assert!(app.native_runtime.app(original).is_none());
@@ -1919,6 +1926,16 @@ fn detached_apply_reopen_waits_for_its_receipt(accepted: bool) {
         indicators(&app, reopened, view).busy,
         "an idle read taken before the receipt resolved cannot release its reservation"
     );
+    // The page still holds its old projected reservation. Only acceptance leaves work
+    // awaiting the worker; a refusal has no pending coordinator action to report.
+    assert!(app.system_state_host.operation.is_none());
+    assert_eq!(app.system_state_host.awaiting_run, accepted);
+    let expected_busy = format!("busy={}", u8::from(accepted));
+    assert!(
+        app.cached_setup_status_fields()
+            .split_whitespace()
+            .any(|field| field == expected_busy)
+    );
     fresh(
         &mut app,
         SetupStatus {
@@ -1927,6 +1944,11 @@ fn detached_apply_reopen_waits_for_its_receipt(accepted: bool) {
         },
     );
     assert!(!indicators(&app, reopened, view).busy);
+    assert!(
+        app.cached_setup_status_fields()
+            .split_whitespace()
+            .any(|field| field == "busy=0")
+    );
     assert_eq!(app.access_revision(), accepted.then_some(4));
     app.act_app(action("system-state/restore")).unwrap();
     assert_eq!(calls(), ["restore"]);

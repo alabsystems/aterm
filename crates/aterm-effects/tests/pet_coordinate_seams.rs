@@ -12,7 +12,7 @@ use aterm_effects::companion::{
 };
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::host::{FrameGeom, HostFrameInput, TerminalFacts};
-use aterm_effects::kitty_pet::{PetAction, PetFrame};
+use aterm_effects::kitty_pet::{OldPath, PetAction, PetFrame};
 use aterm_effects::pet_glyphs_gen::PetGlyphId;
 use aterm_effects::pet_world::{PetPane, PetWorldFacts};
 use aterm_effects::word_decorations::{DecoConfig, WordDecorations};
@@ -631,87 +631,147 @@ fn a_font_step_and_a_live_drag_keep_the_resident_on_glass() {
     }
 }
 
+/// THE OTHER SCREEN IS THE SAME GLASS (r29 K10-1, K10-2). A terminal entering its alternate
+/// screen (a TUI's first screen) and leaving it (the program's exit) keeps the glass and the grid
+/// the cat is drawn on, so the owner fence keeps the body: it never leaves glass, the next frame
+/// draws it where it was, with no ghost, and it travels to the new screen's caret. In the model it
+/// is a [`Regrid`](aterm_models_effects::pet_surface_seam_model) seam (`RegridKeepsTheBody`).
+///
+/// NEGATIVE CONTROL ([`OldPath::OtherScreenKeepsTheBody`] reverted: the fence crossfaded the
+/// switch as a surface replaced): the first frame draws the body at the new caret with a ghost
+/// where it was, a move the model refuses.
 #[test]
-fn an_alt_screen_enter_and_exit_crossfade_instead_of_cutting() {
+fn an_alt_screen_enter_and_exit_keep_the_body_on_glass() {
     let model = pet_surface_seam_model();
-    let shipped = aterm_spec::interp::with_buggy(&model, 1);
     let tui = tui_bytes();
-    for rule in [Rule::Shipping, Rule::Retired] {
+    for reverted in [false, true] {
         let mut h = Host::settled();
+        h.owner
+            .set_pet_old_path(OldPath::OtherScreenKeepsTheBody, reverted);
         for (leg, bytes) in [
             ("enter", tui.as_slice()),
             ("exit", b"\x1b[?1049l".as_slice()),
         ] {
-            let label = format!("{rule:?} {leg}");
+            let label = format!("reverted {reverted}, {leg}");
             let before = h.present();
             assert!(before.frame.on_glass, "{label}: on glass first");
             let mut state = model.init_state();
             step(&model, &mut state, "Draw", &h.owner, &before, Some(&before))
                 .unwrap_or_else(|e| panic!("{label}: {e}"));
             h.term.process(bytes);
-            match rule {
-                Rule::Shipping => h.owner.resight_owner(),
-                Rule::Retired => h.owner.retire_owner(),
-            }
-            let at_seam = project(&state, "Replace", &h.owner, &before, None);
-            conform(&model, &mut state, "Replace", at_seam)
-                .unwrap_or_else(|e| panic!("{label}: the boundary is dark: {e}"));
-            let after = h.shots(Duration::from_millis(600));
-            let post = project(&state, "Tick", &h.owner, &before, Some(&after[0]));
-            if rule == Rule::Retired {
+            h.owner.rescreen_owner();
+            let at_seam = project(&state, "Regrid", &h.owner, &before, None);
+            let after = h.shots(Duration::from_millis(3_000));
+            let post = |state: &State| project(state, "Tick", &h.owner, &before, Some(&after[0]));
+            if reverted {
+                let moved = conform(&model, &mut state, "Regrid", at_seam)
+                    .and_then(|()| conform(&model, &mut state.clone(), "Tick", post(&state)));
                 assert!(
-                    !after[0].frame.on_glass,
-                    "{label}: negative control: the shipped fence cuts the cat"
+                    moved.is_err() && ghost(&after[0]).is_some(),
+                    "{label}: negative control: the crossfade drew the body at the new caret \
+                     and a ghost where it was: {:?}",
+                    after[0]
                 );
-                shipped_step(&shipped, &state, "Tick", &post)
-                    .unwrap_or_else(|e| panic!("{label}: the shipped cut is Buggy: {e}"));
-                assert!(conform(&model, &mut state, "Tick", post).is_err());
-                h.run(Duration::from_secs(3));
                 continue;
             }
-            conform(&model, &mut state, "Tick", post).unwrap_or_else(|e| panic!("{label}: {e}"));
-            let first = after[0];
-            let g = ghost(&first).expect("the old body fades as a ghost");
-            assert_eq!(
-                (g.col, g.row),
-                (before.frame.pet.col, before.frame.pet.row),
-                "{label}: the ghost stands exactly where the body was drawn"
-            );
-            assert_eq!(
-                g.under_ink,
-                leg == "enter",
-                "{label}: beneath the new screen's text, over blank ground"
-            );
+            conform(&model, &mut state, "Regrid", at_seam)
+                .unwrap_or_else(|e| panic!("{label}: the seam keeps the body: {e}"));
+            let tick = post(&state);
+            conform(&model, &mut state, "Tick", tick)
+                .unwrap_or_else(|e| panic!("{label}: the next frame: {e}"));
             assert!(
-                first.sprites >= 2 && (leg != "enter" || first.under_text >= 1),
-                "{label}: both bodies are drawn, the ghost beneath the TUI's text: {first:?}"
+                ghost(&after[0]).is_none(),
+                "{label}: no ghost: {:?}",
+                after[0]
             );
-            assert!(
-                first.frame.pet.alpha > 0 && first.frame.pet.alpha < 64,
-                "{label}: the arriver comes up from its floor: {}",
-                first.frame.pet.alpha
-            );
-            let blank = after.iter().position(|s| !s.frame.on_glass);
-            assert_eq!(blank, None, "{label}: a frame with no cat: {after:?}");
+            let mut prev = before;
+            for shot in &after {
+                assert!(
+                    shot.frame.on_glass
+                        && !(shot.frame.pet.action != PetAction::Leap && jumped(&prev, shot)),
+                    "{label}: off glass, or moved without its legs: {shot:?} after {prev:?}"
+                );
+                prev = *shot;
+            }
             let last = after.last().expect("frames");
-            assert!(
-                ghost(last).is_none() && last.frame.pet.alpha == 255,
-                "{label}: the crossfade completes: {last:?}"
-            );
             let caret = h.term.cursor();
             assert!(
                 (last.frame.pet.row - f32::from(caret.row)).abs() <= 1.0,
-                "{label}: the replacement stands at the new caret's row: {last:?} caret {caret:?}"
+                "{label}: it went to the new caret's row: {last:?} caret {caret:?}"
             );
-            h.run(Duration::from_secs(3));
         }
     }
+}
+
+/// A SURFACE REPLACED UNDER THE BODY CROSSFADES (another terminal under the same glass, as the
+/// hosts' fences resight a pane or a tab they switch to): the boundary is dark, then the old body
+/// fades as a ghost exactly where it was drawn, beneath the new screen's text, while the arriver
+/// comes up from its floor at the new caret, and no frame has no cat. And a surface replaced while
+/// the glass it was drawn on goes away (the window moved) spends no ghost on that glass.
+///
+/// NEGATIVE CONTROL: the resident retired outright at the boundary (`retire_owner`) leaves the
+/// first frame without a cat, which the model refuses.
+#[test]
+fn a_replaced_surface_crossfades_and_spends_no_ghost_on_glass_that_is_gone() {
+    let model = pet_surface_seam_model();
+    let shipped = aterm_spec::interp::with_buggy(&model, 1);
+    {
+        let mut h = Host::settled();
+        let before = h.present();
+        let mut state = model.init_state();
+        step(&model, &mut state, "Draw", &h.owner, &before, Some(&before)).expect("drawn");
+        h.term.process(&tui_bytes());
+        h.owner.retire_owner();
+        let at_seam = project(&state, "Replace", &h.owner, &before, None);
+        conform(&model, &mut state, "Replace", at_seam).expect("the boundary is dark");
+        let after = h.shots(Duration::from_millis(100));
+        let post = project(&state, "Tick", &h.owner, &before, Some(&after[0]));
+        assert!(
+            !after[0].frame.on_glass,
+            "negative control: a retired resident is cut"
+        );
+        shipped_step(&shipped, &state, "Tick", &post).expect("the cut is the model's Buggy tick");
+        assert!(conform(&model, &mut state, "Tick", post).is_err());
+    }
+    let mut h = Host::settled();
+    let before = h.present();
+    let mut state = model.init_state();
+    step(&model, &mut state, "Draw", &h.owner, &before, Some(&before)).expect("drawn");
+    h.term.process(&tui_bytes());
+    h.owner.resight_owner();
+    let at_seam = project(&state, "Replace", &h.owner, &before, None);
+    conform(&model, &mut state, "Replace", at_seam).expect("the boundary is dark");
+    let after = h.shots(Duration::from_millis(600));
+    let post = project(&state, "Tick", &h.owner, &before, Some(&after[0]));
+    conform(&model, &mut state, "Tick", post).expect("the crossfade");
+    let first = after[0];
+    let g = ghost(&first).expect("the old body fades as a ghost");
+    assert_eq!(
+        (g.col, g.row),
+        (before.frame.pet.col, before.frame.pet.row),
+        "the ghost stands exactly where the body was drawn"
+    );
+    assert!(g.under_ink, "beneath the new screen's text");
+    assert!(
+        first.sprites >= 2 && first.under_text >= 1,
+        "both bodies are drawn, the ghost beneath the new screen's text: {first:?}"
+    );
+    assert!(
+        first.frame.pet.alpha > 0 && first.frame.pet.alpha < 64,
+        "the arriver comes up from its floor: {}",
+        first.frame.pet.alpha
+    );
+    assert_eq!(
+        after.iter().position(|s| !s.frame.on_glass),
+        None,
+        "a frame with no cat: {after:?}"
+    );
 
     let mut h = Host::settled();
     let before = h.present();
     let mut state = model.init_state();
     step(&model, &mut state, "Draw", &h.owner, &before, Some(&before)).expect("drawn");
-    h.term.process(&tui);
+    h.term.process(&tui_bytes());
     h.owner.resight_owner();
     let at_seam = project(&state, "Replace", &h.owner, &before, None);
     conform(&model, &mut state, "Replace", at_seam).expect("dark boundary");

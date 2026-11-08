@@ -87,8 +87,10 @@ fn cpu_bundle_releases_only_after_the_original_group_drains() {
         .collect();
     let mut retained = RetainedCohort::new_bundle(&fence, fixture.claim(), leases).unwrap();
     assert_eq!(retained.cpu_units(), 3);
+    retained.check_unlaunched(&fence).unwrap();
     assert!(retained.observation(&fence).is_err());
     let mut leader = Running::new(retained.launch(&fence, &mut cat()).unwrap());
+    assert!(retained.check_unlaunched(&fence).is_err());
     let observation = retained.observation(&fence).unwrap();
     assert_eq!(observation.cpu.len(), 3);
     assert_eq!(observation.memory_bytes, 30 * 1024 * 1024 * 1024);
@@ -109,6 +111,7 @@ fn cpu_bundle_releases_only_after_the_original_group_drains() {
     member.end();
     retained.try_finish(&fence).unwrap();
     assert!(retained.is_settled());
+    assert!(retained.check_unlaunched(&fence).is_err());
     assert!(retained.observation(&fence).is_err());
     assert_eq!(retained.cpu_units(), 3);
     assert!(
@@ -117,6 +120,300 @@ fn cpu_bundle_releases_only_after_the_original_group_drains() {
             .iter()
             .all(|slot| matches!(slot, RetainedSlotState::Available { .. }))
     );
+}
+
+#[test]
+fn original_gnu_epoch_keeps_every_cpu_until_the_actual_borrow_returns() {
+    use std::{
+        fs::File,
+        io::{Read as _, Write as _},
+        os::fd::AsRawFd as _,
+    };
+    let fixture = CohortFixture::new();
+    let pool = cpu_pool_width(&fixture, 3);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let leases = (0..3)
+        .map(|_| pool.try_acquire(owner()).unwrap().unwrap())
+        .collect();
+    let mut retained = RetainedCohort::new_bundle(&fence, fixture.claim(), leases).unwrap();
+    assert!(
+        retained
+            .prepare_gnu(&fence, NonZeroU32::new(4).unwrap())
+            .is_err()
+    );
+    let (descriptions, path) = retained
+        .prepare_gnu(&fence, NonZeroU32::new(3).unwrap())
+        .unwrap()
+        .into_parts();
+    assert!(path.is_absolute());
+    assert!(
+        retained
+            .prepare_gnu(&fence, NonZeroU32::new(3).unwrap())
+            .is_err()
+    );
+    let [read, write] = descriptions;
+    let mut read = File::from(read);
+    let mut write = File::from(write);
+    // SAFETY: read-only query of our original, owned GNU description.
+    let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
+    assert_eq!(flags & libc::O_NONBLOCK, 0);
+    let mut borrowed = [0];
+    read.read_exact(&mut borrowed).unwrap();
+    let mut root = Running::new(retained.launch(&fence, &mut cat()).unwrap());
+    assert!(
+        retained
+            .prepare_gnu(&fence, NonZeroU32::new(1).unwrap())
+            .is_err()
+    );
+    // Even a full return population cannot retire the still-live root.
+    write.write_all(&borrowed).unwrap();
+    assert!(retained.try_finish(&fence).is_err());
+    read.read_exact(&mut borrowed).unwrap();
+    root.end();
+    assert_eq!(
+        retained.try_finish(&fence).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(!retained.is_settled());
+    assert_cpu_denied(&pool);
+    write.write_all(&borrowed).unwrap();
+    retained.try_finish(&fence).unwrap();
+    assert!(retained.is_settled());
+    // SAFETY: same read-only query; retirement uses its own OFD.
+    assert_eq!(
+        unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+        flags & libc::O_NONBLOCK
+    );
+    assert!(
+        pool.snapshot()
+            .unwrap()
+            .iter()
+            .all(|slot| matches!(slot, RetainedSlotState::Available { .. }))
+    );
+}
+
+#[test]
+fn original_gnu_epoch_never_refills_or_frees_a_poisoned_population() {
+    use std::{fs::File, io::Write as _};
+    for invalid in *b"+?" {
+        let fixture = CohortFixture::new();
+        let pool = cpu_pool_width(&fixture, 2);
+        let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+        let leases = (0..2)
+            .map(|_| pool.try_acquire(owner()).unwrap().unwrap())
+            .collect();
+        let mut retained = RetainedCohort::new_bundle(&fence, fixture.claim(), leases).unwrap();
+        let ([read, write], _) = retained
+            .prepare_gnu(&fence, NonZeroU32::new(2).unwrap())
+            .unwrap()
+            .into_parts();
+        let mut write = File::from(write);
+        write.write_all(&[invalid]).unwrap();
+        // The never-launched native claim may close, but an extra or alien
+        // byte cannot authorize even one of the original CPU Free writes.
+        assert_eq!(
+            retained.try_finish(&fence).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(retained.try_finish(&fence).is_err());
+        drop(read);
+        drop(write);
+        drop(retained);
+        assert_cpu_denied(&pool);
+    }
+}
+
+#[test]
+fn original_gnu_epoch_single_cpu_has_no_supplementary_byte() {
+    let fixture = CohortFixture::new();
+    let pool = cpu_pool(&fixture);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let mut retained = RetainedCohort::new(
+        &fence,
+        fixture.claim(),
+        pool.try_acquire(owner()).unwrap().unwrap(),
+    )
+    .unwrap();
+    let (_descriptions, path) = retained
+        .prepare_gnu(&fence, NonZeroU32::new(1).unwrap())
+        .unwrap()
+        .into_parts();
+    retained.try_finish(&fence).unwrap();
+    assert!(retained.is_settled());
+    drop(retained);
+    assert!(!path.exists());
+    assert_settled_cpu_available(&pool).settle().unwrap();
+}
+
+#[test]
+fn original_gnu_epoch_holds_cpu_after_the_actual_borrowing_child_is_reaped() {
+    use std::{
+        fs::File,
+        io::{Read as _, Write as _},
+    };
+    let fixture = CohortFixture::new();
+    let pool = cpu_pool_width(&fixture, 2);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let leases = (0..2)
+        .map(|_| pool.try_acquire(owner()).unwrap().unwrap())
+        .collect();
+    let mut retained = RetainedCohort::new_bundle(&fence, fixture.claim(), leases).unwrap();
+    let ([read, write], _) = retained
+        .prepare_gnu(&fence, NonZeroU32::new(2).unwrap())
+        .unwrap()
+        .into_parts();
+    let mut command = spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/usr/bin/head")));
+    command
+        .args(["-c", "1"])
+        .stdin(Stdio::from(read))
+        .stdout(Stdio::piped());
+    let mut root = Running {
+        owned: retained.launch(&fence, &mut command).unwrap(),
+        input: None,
+    };
+    root.end();
+    let mut actual_borrow = [0];
+    root.owned
+        .child_mut()
+        .stdout
+        .take()
+        .unwrap()
+        .read_exact(&mut actual_borrow)
+        .unwrap();
+    assert_eq!(actual_borrow, [b'+']);
+    assert_eq!(
+        retained.try_finish(&fence).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_cpu_denied(&pool);
+    File::from(write).write_all(&actual_borrow).unwrap();
+    retained.try_finish(&fence).unwrap();
+    assert!(retained.is_settled());
+    assert!(
+        pool.snapshot()
+            .unwrap()
+            .iter()
+            .all(|slot| matches!(slot, RetainedSlotState::Available { .. }))
+    );
+}
+
+#[test]
+fn original_gnu_epoch_rechecks_its_actual_transport_before_arm() {
+    let fixture = CohortFixture::new();
+    let pool = cpu_pool(&fixture);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let mut retained = RetainedCohort::new(
+        &fence,
+        fixture.claim(),
+        pool.try_acquire(owner()).unwrap().unwrap(),
+    )
+    .unwrap();
+    let (_descriptions, path) = retained
+        .prepare_gnu(&fence, NonZeroU32::new(1).unwrap())
+        .unwrap()
+        .into_parts();
+    let original = path.with_file_name("original-credits");
+    std::fs::rename(&path, &original).unwrap();
+    std::fs::write(&path, b"not the original FIFO").unwrap();
+    assert!(matches!(
+        retained.launch(&fence, &mut cat()),
+        Err(LaunchError::Refused(_))
+    ));
+    assert!(retained.try_finish(&fence).is_err());
+    assert_cpu_denied(&pool);
+    std::fs::remove_file(&path).unwrap();
+    std::fs::rename(&original, &path).unwrap();
+    retained.try_finish(&fence).unwrap();
+    assert!(retained.is_settled());
+    assert_settled_cpu_available(&pool).settle().unwrap();
+}
+
+#[test]
+fn original_gnu_pending_state_survives_complete_native_snapshot_compaction() {
+    let fixture = CohortFixture::new();
+    let pool = cpu_pool(&fixture);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let mut retained = RetainedCohort::new(
+        &fence,
+        fixture.claim(),
+        pool.try_acquire(owner()).unwrap().unwrap(),
+    )
+    .unwrap();
+    let _handoff = retained
+        .prepare_gnu(&fence, NonZeroU32::new(1).unwrap())
+        .unwrap();
+    let mut root = Running::new(retained.launch(&fence, &mut cat()).unwrap());
+    let memory = retained.observation(&fence).unwrap().memory;
+    let text = std::fs::read_to_string(
+        fixture
+            .namespace
+            .active()
+            .join(memory.key())
+            .join(format!("{}.claim", memory.marker())),
+    )
+    .unwrap();
+    let (_, original) =
+        crate::cohort_journal::Journal::decode(&text, true, fixture.namespace.nonce()).unwrap();
+    let compact = original.compact(&text).unwrap();
+    let snapshot: aterm_json::Value =
+        aterm_json::from_str(compact.lines().last().unwrap()).unwrap();
+    assert_eq!(snapshot["cohort"]["v"].as_u64(), Some(3));
+    assert_eq!(snapshot["cohort"]["gnu"]["retired"].as_bool(), Some(false));
+    let (_, restored) =
+        crate::cohort_journal::Journal::decode(&compact, true, fixture.namespace.nonce()).unwrap();
+    assert_eq!(restored, original);
+    root.end();
+    assert_eq!(restored.lifetime(), Lifetime::Unknown);
+    retained.try_finish(&fence).unwrap();
+    assert!(retained.is_settled());
+    assert_settled_cpu_available(&pool).settle().unwrap();
+}
+
+#[test]
+fn original_gnu_failed_registration_keeps_its_same_unpublished_owner_for_retry() {
+    let fixture = CohortFixture::new();
+    let pool = cpu_pool(&fixture);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let mut retained = RetainedCohort::new(
+        &fence,
+        fixture.claim(),
+        pool.try_acquire(owner()).unwrap().unwrap(),
+    )
+    .unwrap();
+    fixture.interrupt_next_checkpoint_publication();
+    assert!(
+        retained
+            .prepare_gnu(&fence, NonZeroU32::new(1).unwrap())
+            .is_err()
+    );
+    assert_cpu_denied(&pool);
+    assert!(retained.launch(&fence, &mut cat()).is_err());
+    retained.try_finish(&fence).unwrap();
+    assert!(retained.is_settled());
+    assert_settled_cpu_available(&pool).settle().unwrap();
+}
+
+#[test]
+fn original_gnu_failed_retirement_never_rearms_the_burned_transport() {
+    let fixture = CohortFixture::new();
+    let pool = cpu_pool(&fixture);
+    let fence = Fence::acquire(&fixture.namespace, Instant::now()).unwrap();
+    let mut retained = RetainedCohort::new(
+        &fence,
+        fixture.claim(),
+        pool.try_acquire(owner()).unwrap().unwrap(),
+    )
+    .unwrap();
+    let _handoff = retained
+        .prepare_gnu(&fence, NonZeroU32::new(1).unwrap())
+        .unwrap();
+    fixture.interrupt_next_checkpoint_publication();
+    assert!(retained.try_finish(&fence).is_err());
+    assert_cpu_denied(&pool);
+    assert!(retained.launch(&fence, &mut cat()).is_err());
+    retained.try_finish(&fence).unwrap();
+    assert!(retained.is_settled());
+    assert_settled_cpu_available(&pool).settle().unwrap();
 }
 
 #[test]

@@ -22,6 +22,29 @@ const PROOF_FD: &str = "ATERM_FIRST_LAUNCH_PROOF_FD";
 const PROOF_NONCE: &str = "ATERM_FIRST_LAUNCH_PROOF_NONCE";
 const PROOF_EXE: &str = "ATERM_FIRST_LAUNCH_PROOF_EXE";
 const PROOF_WAIT: Duration = Duration::from_secs(30);
+/// Hang detector for required first-launch custody behind another native writer.
+const CUSTODY_HANG: Duration = Duration::from_secs(60);
+
+fn take_first_launch_custody(path: &Path) -> Result<aterm_update_core::FileLock, String> {
+    take_first_launch_custody_with(path, std::time::Instant::now(), |path, until| {
+        aterm_update_core::FileLock::acquire_within(
+            path,
+            until.saturating_duration_since(std::time::Instant::now()),
+        )
+    })
+}
+
+fn take_first_launch_custody_with(
+    path: &Path,
+    started: std::time::Instant,
+    take: impl FnOnce(&Path, std::time::Instant) -> std::io::Result<aterm_update_core::FileLock>,
+) -> Result<aterm_update_core::FileLock, String> {
+    let until = started + CUSTODY_HANG;
+    if std::time::Instant::now() >= until {
+        return Err("first-launch update custody: the writer wait expired".to_owned());
+    }
+    take(path, until).map_err(|error| format!("first-launch update custody: {error}"))
+}
 
 /// Whether the original waits for a command's status or leaves the installed window running.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -290,11 +313,7 @@ impl NativeHost {
         crate::verify::verify_bundle_policy(&source.app_root, crate::effective_team_id())?;
         let staging =
             crate::paths::Staging::resolve().ok_or("cannot resolve private update custody")?;
-        let lock = aterm_update_core::FileLock::acquire_within(
-            &staging.apply_lock,
-            crate::install::APPLY_LOCK_WAIT,
-        )
-        .map_err(|error| format!("first-launch update custody: {error}"))?;
+        let lock = take_first_launch_custody(&staging.apply_lock)?;
         let running_build = crate::verify::bundle_build_number(&source.app_root)?;
         let mut host = Self {
             facts: Facts {
@@ -776,6 +795,49 @@ impl Fixture {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_first_launch_custody_waits_for_its_native_writer() {
+        for age in [Duration::from_secs(11), Duration::from_secs(61)] {
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let root = aterm_tempfile::tempdir().unwrap();
+            let path = root.path().join("apply.lock");
+            let mut held = Some(aterm_update_core::FileLock::acquire(&path).unwrap());
+            let busy = aterm_update_core::FileLock::acquire_within(&path, Duration::ZERO)
+                .err()
+                .expect("the actual native writer is held");
+            assert_eq!(busy.kind(), std::io::ErrorKind::TimedOut);
+            let mut observed = 0;
+            let result = take_first_launch_custody_with(
+                &path,
+                std::time::Instant::now() - age,
+                |path, until| {
+                    let busy = aterm_update_core::FileLock::acquire_within(path, Duration::ZERO)
+                        .err()
+                        .expect("the callback observes the actual held writer");
+                    assert_eq!(busy.kind(), std::io::ErrorKind::TimedOut);
+                    observed += 1;
+                    drop(held.take());
+                    aterm_update_core::FileLock::acquire_within(
+                        path,
+                        until.saturating_duration_since(std::time::Instant::now()),
+                    )
+                },
+            );
+            assert_eq!(observed, usize::from(!expired));
+            assert_eq!(held.is_some(), expired);
+            assert_eq!(result.is_err(), expired, "{:?}", result.as_ref().err());
+            let busy = aterm_update_core::FileLock::acquire_within(&path, Duration::ZERO)
+                .err()
+                .expect("the original or returned guard retains custody");
+            assert_eq!(busy.kind(), std::io::ErrorKind::TimedOut);
+            drop(result);
+            drop(held);
+            let fresh = take_first_launch_custody(&path).unwrap();
+            drop(fresh);
+            aterm_update_core::FileLock::acquire_within(&path, Duration::ZERO).unwrap();
+        }
+    }
 
     fn signed_bundle(root: &Path, relative: &str, build: u64) -> Bundle {
         let app_root = root.join(relative);

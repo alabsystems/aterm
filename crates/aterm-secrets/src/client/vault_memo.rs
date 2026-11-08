@@ -42,8 +42,20 @@ const MAX_FOLDERS: usize = 16;
 /// # Errors
 /// As [`swarm_denied_nodes`](super::swarm_denied_nodes).
 pub fn swarm_denied_nodes_now(paths: &Paths) -> crate::Result<Option<Vec<String>>> {
-    static MEMO: Memo<Option<Vec<String>>> = Memo::new(inputs);
-    MEMO.read(paths, super::swarm_denied_nodes)
+    Ok(swarm_denial_snapshot_now(paths)?.into_nodes())
+}
+
+/// The same memoized observation as [`swarm_denied_nodes_now`], retaining its typed
+/// unavailable reason. Both APIs share one memo and the same input stamps, lock observations
+/// and refresh serialization. This is a retained observation, not an additional live probe:
+/// unchanged inputs reuse the settled snapshot, including a settled unavailable reason.
+/// Reads made under a writer and read errors are retried on the next call as before.
+///
+/// # Errors
+/// As [`super::swarm_denial_snapshot`].
+pub fn swarm_denial_snapshot_now(paths: &Paths) -> crate::Result<super::SwarmDenialSnapshot> {
+    static MEMO: Memo<super::SwarmDenialSnapshot> = Memo::new(inputs);
+    MEMO.read(paths, super::swarm_denial_snapshot)
 }
 
 /// [`observe_commons`](super::observe_commons), read again only when one of the files it reads
@@ -568,6 +580,105 @@ mod tests {
 
     /// A test's wait for what must happen: a hang detector, not a latency budget.
     const HANG: Duration = Duration::from_secs(60);
+
+    fn signed_denial(home: &std::path::Path, label: &str, denied: &str) -> Paths {
+        let paths = Paths::for_home(home);
+        let source = home.join("fixture.vault");
+        crate::client::create(&paths, source.to_str().unwrap(), None, Some(label)).unwrap();
+        let admin = crate::client::admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &crate::text::Audience::Everyone,
+            crate::client::SWARM_ROSTER_ENTRY,
+            format!("deny_nodes = [\"{denied}\"]\n").as_bytes(),
+        )
+        .unwrap();
+        crate::client::admin_publish(&paths, &admin, &doc).unwrap();
+        paths
+    }
+
+    #[test]
+    fn a_typed_denial_memo_recovers_after_busy_and_failed_reads() {
+        use crate::client::{self, SwarmDenialSnapshot as Snapshot, SwarmDenialUnavailable as Why};
+        struct FailedReads(PathBuf);
+        impl Drop for FailedReads {
+            fn drop(&mut self) {
+                fsx::fail_reads(&self.0, 0);
+            }
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = signed_denial(root.path(), "m60", "m99");
+        // Keep this fault-injected observation independent of the process-wide memo's
+        // bounded eviction as other tests read their own vault folders concurrently.
+        let memo = Memo::<Snapshot>::new(inputs);
+        let now = || memo.read(&paths, client::swarm_denial_snapshot);
+        let expected = Snapshot::Available(vec!["m99".to_owned()]);
+        assert_eq!(now().unwrap(), expected);
+        let failed = FailedReads(paths.cache_file());
+        fsx::fail_reads(&failed.0, usize::MAX);
+        assert!(
+            client::swarm_denial_snapshot(&paths).is_err(),
+            "the read fault is active"
+        );
+        assert_eq!(
+            now().unwrap().into_nodes(),
+            Some(vec!["m99".to_owned()]),
+            "the listener projection preserves the typed memo's settled read"
+        );
+        drop(failed);
+
+        let original = client::load_state(&paths).unwrap();
+        let mut revoked = original.clone();
+        revoked.membership = client::Stored::Revoked;
+        client::save_state(&paths, &revoked).unwrap();
+        assert_eq!(now().unwrap(), Snapshot::Unavailable(Why::Revoked));
+        assert_eq!(now().unwrap().into_nodes(), None);
+        client::save_state(&paths, &original).unwrap();
+        assert_eq!(now().unwrap(), expected);
+
+        let writer = StateLock::take(&paths).unwrap();
+        client::save_state(&paths, &original).unwrap();
+        assert_eq!(now().unwrap(), Snapshot::Unavailable(Why::WriterBusy));
+        drop(writer);
+        assert_eq!(
+            now().unwrap(),
+            expected,
+            "a busy observation is not kept after its writer leaves"
+        );
+
+        let failed = FailedReads(paths.cache_file());
+        fsx::fail_reads(&failed.0, usize::MAX);
+        client::save_state(&paths, &original).unwrap();
+        assert!(now().is_err());
+        drop(failed);
+        assert_eq!(
+            now().unwrap(),
+            expected,
+            "an I/O failure does not poison the memo until another write"
+        );
+    }
+
+    #[test]
+    fn typed_denial_memo_keeps_vaults_separate_and_refuses_an_unapplied_source() {
+        use crate::client::{self, SwarmDenialSnapshot as Snapshot};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let one = signed_denial(&root.path().join("one"), "m60", "m99");
+        let two = signed_denial(&root.path().join("two"), "m61", "m98");
+        let first = Snapshot::Available(vec!["m99".to_owned()]);
+        let second = Snapshot::Available(vec!["m98".to_owned()]);
+        assert_eq!(swarm_denial_snapshot_now(&one).unwrap(), first);
+        assert_eq!(swarm_denial_snapshot_now(&two).unwrap(), second);
+        let original = client::config(&one).unwrap().unwrap();
+        client::save_config(&one, &client::config(&two).unwrap().unwrap()).unwrap();
+        assert!(
+            !matches!(swarm_denial_snapshot_now(&one), Ok(Snapshot::Available(_))),
+            "a replacement source cannot inherit the old source's verified list"
+        );
+        assert!(!matches!(swarm_denied_nodes_now(&one), Ok(Some(_))));
+        assert_eq!(swarm_denial_snapshot_now(&two).unwrap(), second);
+        client::save_config(&one, &original).unwrap();
+        assert_eq!(swarm_denial_snapshot_now(&one).unwrap(), first);
+    }
 
     /// A reader standing in for the vault's: the lines of the vault folder's `records`.
     fn lines(paths: &Paths, reads: &AtomicUsize) -> crate::Result<Option<Vec<String>>> {

@@ -31,14 +31,12 @@ pub(crate) const TAIL_TURNS: usize = 8;
 const WIRE_VERSION: u64 = 1;
 /// The highest turn id a handoff carries: what the manifest can hold (a TOML integer is an `i64`).
 pub(crate) const MAX_TURN_ID: u64 = i64::MAX as u64;
-/// How long the worker waits, over the whole export, for locks other threads hold before it
-/// carries less.
+/// Hang detector for the required ledger and archive pass behind native writers.
 #[cfg(any(unix, test))]
-const LOCK_PATIENCE: Duration = Duration::from_millis(50);
-/// How long the worker waits, over the whole log pass (after every ledger
-/// and terminal was taken), for timelines other threads hold.
+const TURN_LOCK_HANG: Duration = Duration::from_secs(60);
+/// Hang detector for the required log pass after every ledger and terminal was taken.
 #[cfg(any(unix, test))]
-const LOG_LOCK_PATIENCE: Duration = Duration::from_millis(20);
+const LOG_LOCK_HANG: Duration = Duration::from_secs(60);
 /// The most session-log DETAIL (past each log's skeleton) one handoff carries across every session.
 #[cfg(any(unix, test))]
 pub(crate) const MAX_AGGREGATE_LOG_DETAIL: u64 = 2 * 1024 * 1024;
@@ -169,12 +167,12 @@ impl CarryLoss {
         match self {
             Self::LedgerBusy { unvouched } => format!(
                 "update apply: session {local_id}'s turn ledger was held by another thread past \
-                 the export's {LOCK_PATIENCE:?}; it hands off without its ledger, and says every \
+                 the export's {TURN_LOCK_HANG:?}; it hands off without its ledger, and says every \
                  turn id below {unvouched} as one it cannot vouch for"
             ),
             Self::TerminalBusy => format!(
                 "update apply: session {local_id}'s terminal was held by another thread past the \
-                 export's {LOCK_PATIENCE:?}; its archive crosses as counters alone, its rows \
+                 export's {TURN_LOCK_HANG:?}; its archive crosses as counters alone, its rows \
                  counted lost"
             ),
             Self::ArchiveMoved => format!(
@@ -183,7 +181,7 @@ impl CarryLoss {
             ),
             Self::LogBusy => format!(
                 "update apply: session {local_id}'s timeline was held by another thread past the \
-                 log pass's {LOG_LOCK_PATIENCE:?}; it hands off without its session log, which \
+                 log pass's {LOG_LOCK_HANG:?}; it hands off without its session log, which \
                  starts over after a handoff gap"
             ),
             Self::LogNotCarried => format!(
@@ -327,15 +325,36 @@ pub(crate) fn export_noting(
     turn_id_ceiling: u64,
     words: StatusWords,
     logs: bool,
-    mut noted: impl FnMut(u64, CarryLoss),
+    noted: impl FnMut(u64, CarryLoss),
 ) -> Vec<(u64, Vec<u8>)> {
-    let patience = Instant::now() + LOCK_PATIENCE;
+    export_noting_with(
+        sources,
+        turn_id_ceiling,
+        words,
+        logs,
+        noted,
+        Instant::now,
+        || {},
+    )
+}
+
+#[cfg(any(unix, test))]
+fn export_noting_with(
+    sources: &[CarrySource],
+    turn_id_ceiling: u64,
+    words: StatusWords,
+    logs: bool,
+    mut noted: impl FnMut(u64, CarryLoss),
+    mut started: impl FnMut() -> Instant,
+    mut blocked: impl FnMut(),
+) -> Vec<(u64, Vec<u8>)> {
+    let patience = started() + TURN_LOCK_HANG;
     let unvouched = turn_id_ceiling
         .max(crate::control::turn_ids_minted())
         .saturating_add(1);
     let mut taken = Vec::with_capacity(sources.len());
     for source in sources {
-        let (turns, floors) = match patiently(patience, || source.turns.try_lock()) {
+        let (turns, floors) = match patiently(patience, || source.turns.try_lock(), &mut blocked) {
             Some(ledger) => (
                 ledger
                     .records()
@@ -362,7 +381,7 @@ pub(crate) fn export_noting(
             }
         };
         let mut archive = source.head.clone();
-        if let Some(terminal) = patiently(patience, || source.term.try_lock()) {
+        if let Some(terminal) = patiently(patience, || source.term.try_lock(), &mut blocked) {
             // The differ's state, when the freeze had no time for it — only
             // while nothing committed since (then it is the state the freeze
             // would have taken). Without it the adopting engine starts a new
@@ -385,7 +404,7 @@ pub(crate) fn export_noting(
         let core = core_len(&turns, floors, &archive);
         taken.push((source.local_id, turns, floors, archive, core));
     }
-    let log_patience = Instant::now() + LOG_LOCK_PATIENCE;
+    let log_patience = started() + LOG_LOCK_HANG;
     let mut log_takes: Vec<Option<LogTake>> = Vec::with_capacity(sources.len());
     let mut log_priors: Vec<Option<aterm_slog::Prior>> = Vec::with_capacity(sources.len());
     for source in sources {
@@ -395,7 +414,8 @@ pub(crate) fn export_noting(
             .then_some(source.timeline.as_ref())
             .flatten()
             .and_then(|timeline| {
-                let Some(mut tl) = patiently(log_patience, || timeline.try_lock()) else {
+                let Some(mut tl) = patiently(log_patience, || timeline.try_lock(), &mut blocked)
+                else {
                     busy = true;
                     return None;
                 };
@@ -810,12 +830,14 @@ fn row_tiers(turns: &[TurnRecord], archive: &AltArchiveCarry) -> (u64, u64) {
 fn patiently<G>(
     until: Instant,
     mut attempt: impl FnMut() -> Result<G, std::sync::TryLockError<G>>,
+    blocked: &mut impl FnMut(),
 ) -> Option<G> {
     loop {
         match attempt() {
             Ok(guard) => return Some(guard),
             Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
+                blocked();
                 std::thread::sleep(Duration::from_millis(1));
             }
             Err(std::sync::TryLockError::WouldBlock) => return None,

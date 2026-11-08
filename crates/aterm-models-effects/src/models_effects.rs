@@ -1854,7 +1854,10 @@ pub fn cursor_viewport_lifecycle_model() -> Model {
     }
 }
 
-/// Resident cursor-companion coordinate retirement and durable-identity retention model.
+/// Resident cursor-companion coordinate retirement and durable-identity retention model. A pane
+/// or tab owner switch and an unpresentable focus loss retire the resident (a dark boundary); a
+/// screen-buffer switch of the same terminal keeps its body on the glass and grid it is drawn on
+/// (it travels to the new screen's caret, r29 K10-1/K10-2) and drops only its hit target.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_companion_owner_lifecycle_model() -> Model {
@@ -1900,13 +1903,19 @@ pub fn cursor_companion_owner_lifecycle_model() -> Model {
             }
             action ScreenBufferSwitch when (phase == 1) {
                 phase = 7;
-                pet_visible = if Buggy == 1 { pet_visible } else { 0 };
-                hit_target = if Buggy == 1 { hit_target } else { 0 };
+                pet_visible = if Buggy == 1 { 0 } else { pet_visible };
+                hit_target = 0;
             }
 
             invariant RetiringBoundariesAreDark:
-                if phase == 2 || phase == 3 || phase == 4 || phase == 7 {
+                if phase == 2 || phase == 3 || phase == 4 {
                     pet_visible == 0 && hit_target == 0
+                } else {
+                    phase <= 7
+                };
+            invariant ScreenSwitchKeepsTheBody:
+                if phase == 7 {
+                    pet_visible == 1 && hit_target == 0
                 } else {
                     phase <= 7
                 };

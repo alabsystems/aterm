@@ -6141,6 +6141,11 @@ impl crate::App {
         else {
             return false;
         };
+        self.open_network_lens_in(wid)
+    }
+
+    /// Open the Network State lens on `wid`, even with the resource deck hidden.
+    pub(crate) fn open_network_lens_in(&mut self, wid: crate::WindowId) -> bool {
         let Some(frame) = self
             .deck_frame(wid)
             .or_else(|| self.network_lens_frame(wid))

@@ -452,8 +452,8 @@ pub fn prepare(ctx: &Ctx, scene: Scene) -> Result<Launch, ScnErr> {
     Ok(scene.launch())
 }
 
-/// Plays `scene` on a lab whose Claude Code shows its composer: types the first prompt and
-/// waits for the scene's end ([`end_of`]), then a moment more for the loop to settle on it.
+/// Plays `scene` on a lab whose Claude Code shows its composer: types the first prompt as `lab
+/// turn` does ([`Ctx::composer_turn`]; one the composer did not take is an `error`) and waits for the scene's end ([`end_of`]), then a moment more for the loop to settle on it.
 /// What the loop typed, the end's line and (for the placeholder) the composers its continuation
 /// and its done check were typed over go into the summary; a scene that does not reach its end,
 /// a placeholder scene whose acts were not typed over the suggestion, or a go-ahead scene that
@@ -466,7 +466,13 @@ pub fn play(ctx: &mut Ctx, scene: Scene) -> Result<(), ScnErr> {
     let from = ctx.journal().len();
     let watch = scene == Scene::GoAhead;
     let mut needs = NeedsWatch::default();
-    ctx.turn(&scene.prompt())?;
+    if let Some(why) = ctx.composer_turn(&scene.prompt())? {
+        ctx.put(
+            "error",
+            format!("{}: its first prompt: {why}", scene.name()),
+        );
+        return Ok(());
+    }
     let by = now() + scene.within_s();
     let end = loop {
         if watch {

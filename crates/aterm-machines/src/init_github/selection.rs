@@ -26,6 +26,184 @@ pub struct RepositorySelection {
     count: usize,
 }
 
+/// A current local decision that no default repository credential is needed.
+/// This admits only request retirement, never credential or Git effects.
+#[derive(Clone)]
+pub struct RepositoryCredentialWithdrawal {
+    user: User,
+    paths: client::Paths,
+    config: client::Config,
+    empty: Option<RepositorySelection>,
+    request: need::Need,
+}
+
+impl RepositoryCredentialWithdrawal {
+    /// Read-only scheduling for explicit repository opt-out or a ready empty inventory.
+    /// A missing or unreadable inventory does not withdraw repository intent.
+    /// # Errors
+    /// The applicable account, configuration, inventory or request cannot be read safely.
+    pub fn capture(sys: &dyn System, ctx: &Ctx) -> Result<Option<Self>, String> {
+        let [user] = ctx.users.as_slice() else {
+            return Err("repository withdrawal requires exactly one local user".into());
+        };
+        if user.uid == 0 || sys.euid() != user.uid {
+            return Ok(None);
+        }
+        let choice = asked(profile(sys, user)?.and_then(|p| p.github), user)?;
+        if !matches!(choice, Asked::Default | Asked::Off) {
+            return Ok(None);
+        }
+        let paths = client::Paths::for_home(Path::new(&user.home));
+        // Presence admits no ledger read. Disabled and legacy unconfigured paths with
+        // no request file retain their inexpensive, source-independent no-op behavior.
+        match std::fs::symlink_metadata(paths.dir.join(need::LEDGER)) {
+            Err(why) if why.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(why) => return Err(why.to_string()),
+            Ok(_) => {}
+        }
+        repos::admit_destination(sys, user)?;
+        if sys.identity()?.user != *user {
+            return Err("the repository withdrawal account changed".into());
+        }
+        let Some(request) = Self::request(&paths)? else {
+            return Ok(None);
+        };
+        let Some(config) = client::config(&paths).map_err(|why| why.to_string())? else {
+            return Ok(None);
+        };
+        let empty = if matches!(choice, Asked::Default) {
+            let Some(selection) = RepositorySelection::for_user(sys, user)
+                .map_err(|block| block.why)?
+                .filter(|selection| selection.count == 0)
+            else {
+                return Ok(None);
+            };
+            Some(selection)
+        } else {
+            None
+        };
+        let withdrawal = Self {
+            user: user.clone(),
+            paths,
+            config,
+            empty,
+            request,
+        };
+        withdrawal.ensure_current(sys)?;
+        Ok(Some(withdrawal))
+    }
+
+    fn request(paths: &client::Paths) -> Result<Option<need::Need>, String> {
+        need::peek(paths)
+            .map(|rows| rows.into_iter().find(Self::matches))
+            .map_err(|why| why.to_string())
+    }
+
+    fn matches(row: &need::Need) -> bool {
+        row.want == need::Want::Gh(need::GhProfile::Dev)
+            && row.purpose == need::Purpose::AghDev
+            && row.needed
+            && !row.state.ended()
+    }
+
+    pub(super) fn from_empty(
+        sys: &dyn System,
+        selection: RepositorySelection,
+    ) -> Result<Option<Self>, String> {
+        if selection.count != 0 {
+            return Ok(None);
+        }
+        selection.ensure_current(sys)?;
+        let Some(request) = Self::request(&selection.paths)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            user: selection.user.clone(),
+            paths: selection.paths.clone(),
+            config: selection.config.clone(),
+            empty: Some(selection),
+            request,
+        }))
+    }
+
+    pub(super) fn ensure_current(&self, sys: &dyn System) -> Result<(), String> {
+        if sys.stopped().is_some()
+            || sys.euid() != self.user.uid
+            || sys.identity()?.user != self.user
+            || client::config(&self.paths)
+                .map_err(|why| why.to_string())?
+                .as_ref()
+                != Some(&self.config)
+        {
+            return Err("repository withdrawal changed or stopped".into());
+        }
+        if let Some(empty) = &self.empty {
+            empty.ensure_current(sys)
+        } else if matches!(
+            asked(profile(sys, &self.user)?.and_then(|p| p.github), &self.user)?,
+            Asked::Off
+        ) {
+            Ok(())
+        } else {
+            Err("repository setup is no longer explicitly disabled".into())
+        }
+    }
+
+    pub(super) fn pending(&self, sys: &dyn System) -> Result<bool, String> {
+        self.ensure_current(sys)?;
+        match Self::request(&self.paths)? {
+            None => Ok(false),
+            Some(row) if row.id == self.request.id && row.refused == self.request.refused => {
+                Ok(true)
+            }
+            Some(_) => Err("the repository credential request changed".into()),
+        }
+    }
+
+    pub(super) fn belongs_to(&self, user: &User) -> bool {
+        self.user == *user
+    }
+
+    pub(super) fn retire(
+        &self,
+        sys: &dyn System,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        let check = || {
+            current()?;
+            self.ensure_current(sys)
+        };
+        check()?;
+        if let Some(empty) = &self.empty {
+            return need::unneeded_from_snapshot(
+                &self.paths,
+                &self.request,
+                &empty.snapshot,
+                || check().map_err(aterm_secrets::Error::new),
+            )
+            .map_err(|why| why.to_string());
+        }
+        need::with_ledger(&self.paths, |rows, facts| {
+            check().map_err(aterm_secrets::Error::new)?;
+            if let Some(row) = rows
+                .iter_mut()
+                .find(|row| row.id == self.request.id && Self::matches(row))
+            {
+                if row.refused != self.request.refused {
+                    return Err(aterm_secrets::Error::new(
+                        "the repository credential request changed",
+                    ));
+                }
+                if let Some(retired) = need::act(row, facts, &need::Act::Unneeded) {
+                    *row = retired;
+                }
+            }
+            check().map_err(aterm_secrets::Error::new)
+        })
+        .map_err(|why| why.to_string())
+    }
+}
+
 impl RepositorySelection {
     /// Read the default inventory under its ready source, independently of credential delivery.
     /// Explicit profiles and an unconfigured vault retain their existing local policy.

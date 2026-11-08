@@ -4,6 +4,7 @@
 //! The pet driver, [`CompanionOwner`](crate::companion::CompanionOwner): owns a resident pet brain per surface, senses for it, picks its coat, decides custody (pet vs flying head vs idle) and draws it.
 
 use aterm_core::terminal::RenderCell;
+use aterm_core::terminal::caret_path::CARET_PATH_LEN;
 use aterm_render::sprites::FreeSprite;
 use aterm_time::Instant;
 
@@ -567,6 +568,10 @@ pub struct PetFacts<'a> {
     pub pane: Option<(u64, (i32, i32))>,
     /// The room the pet lives in, `None` for a host that has none.
     pub room: Option<RoomFacts>,
+    /// The caret's last moves on its screen, each at its output batch's time, oldest first
+    /// (`Terminal::caret_path`, read with the facts): the brain lives a late frame's span on them
+    /// ([`crate::kitty_pet::PetBrain::note_caret_path`]). None for a host that reads none.
+    pub caret_path: [Option<(Instant, (u16, u16))>; CARET_PATH_LEN],
 }
 
 impl<'a> PetFacts<'a> {
@@ -589,7 +594,19 @@ impl<'a> PetFacts<'a> {
             obscured: false,
             pane: None,
             room: None,
+            caret_path: [None; CARET_PATH_LEN],
         }
+    }
+
+    /// The caret's last moves, read from the terminal with the facts ([`Self::caret_path`]).
+    #[inline]
+    #[must_use]
+    pub const fn with_caret_path(
+        mut self,
+        caret_path: [Option<(Instant, (u16, u16))>; CARET_PATH_LEN],
+    ) -> Self {
+        self.caret_path = caret_path;
+        self
     }
 
     #[inline]
@@ -652,6 +669,9 @@ pub struct PetTick {
     pub completion: Option<(i32, Option<u64>)>,
     /// `(session, serial)`: the task end the room named ([`SessionRoom::landed`]) was on screen in this pane this frame — a present to a focused, unobscured, live surface — so the host marks it cheered and no frame, here or in another window, hands it again.
     pub landed_seen: Option<(u64, u32)>,
+    /// The caret's moves the brain lives a late frame's span on ([`PetFacts::caret_path`]), when
+    /// its caret is the terminal's.
+    caret_path: [Option<(Instant, (u16, u16))>; CARET_PATH_LEN],
 }
 
 impl PetTick {
@@ -759,6 +779,8 @@ struct HiddenRest {
     grid: (u16, u16),
     taken: Option<(u16, u16)>,
     seen: (Option<(u16, u16)>, Instant),
+    /// When the last frame read the caret: a move this frame first sees came after it.
+    read: Instant,
 }
 
 type CaretReading = (Option<(u16, u16)>, bool);
@@ -1010,10 +1032,20 @@ impl CompanionOwner {
         &mut self,
         facts: &TerminalFacts,
         grid: (u16, u16),
-        now: Instant,
+        (now, arrived): (Instant, Option<Instant>),
         present: bool,
         bracketed: bool,
     ) -> Option<(u16, u16)> {
+        // A hidden cursor rests from when it came to its cell ([`PetFacts::caret_path`], the
+        // output batch that left it there), not from the frame that first saw it there: a host
+        // that drew late (a starved machine) took a caret that had long rested a whole frame
+        // later, and the cat set off that much later than on a steady host. A move this frame
+        // first sees came after the last frame read the caret elsewhere, whatever clock its batch
+        // was stamped on.
+        let came = |read: Instant| match arrived {
+            Some(at) if self.pet.times_the_caret() => at.max(read).min(now),
+            _ => now,
+        };
         let surface = (facts.session, facts.alt_screen);
         let rest = match self.latches.hidden_rest {
             Some(mut rest)
@@ -1022,11 +1054,17 @@ impl CompanionOwner {
                     && !facts.cursor_visible
                     && !bracketed =>
             {
-                if rest.taken == facts.caret || rest.seen.0 != facts.caret {
+                if rest.taken == facts.caret {
                     rest.seen = (facts.caret, now);
-                } else if now.saturating_duration_since(rest.seen.1) >= HIDDEN_REST {
+                } else if rest.seen.0 != facts.caret {
+                    rest.seen = (facts.caret, came(rest.read));
+                }
+                if rest.taken != facts.caret
+                    && now.saturating_duration_since(rest.seen.1) >= HIDDEN_REST
+                {
                     rest.taken = facts.caret;
                 }
+                rest.read = now;
                 rest
             }
             _ => HiddenRest {
@@ -1034,6 +1072,7 @@ impl CompanionOwner {
                 grid,
                 taken: facts.caret,
                 seen: (facts.caret, now),
+                read: now,
             },
         };
         if present {
@@ -1054,6 +1093,7 @@ impl CompanionOwner {
             obscured,
             pane,
             room,
+            caret_path,
         } = f;
         let now = host.now;
         let geom = EffectGeom {
@@ -1087,7 +1127,21 @@ impl CompanionOwner {
             }
         } else {
             let reading = (
-                self.rested_caret(facts, grid, now, present, bracketed),
+                self.rested_caret(
+                    facts,
+                    grid,
+                    (
+                        now,
+                        caret_path
+                            .iter()
+                            .flatten()
+                            .next_back()
+                            .filter(|&&(_, cell)| Some(cell) == facts.caret)
+                            .map(|&(at, _)| at),
+                    ),
+                    present,
+                    bracketed,
+                ),
                 facts.cursor_visible,
             );
             if present {
@@ -1235,6 +1289,14 @@ impl CompanionOwner {
             },
             completion,
             landed_seen,
+            // The terminal's path is the brain's caret's only where that caret is the terminal's
+            // live one: not a held write position's last finished caret, not a hidden cursor's
+            // rest the frame has not taken yet.
+            caret_path: if visible && !write_cursor && caret == facts.caret {
+                caret_path
+            } else {
+                [None; CARET_PATH_LEN]
+            },
         }
     }
 
@@ -1312,6 +1374,7 @@ impl CompanionOwner {
     /// The frame's tick, unconditional: `needs_frames()` reads state only the tick advances, so ticking inside the draw gate would freeze it.
     #[inline]
     pub fn tick(&mut self, t: PetTick) -> CompanionFrame {
+        self.pet.note_caret_path(t.caret_path);
         let geom = self.geom;
         let frame_px = PixelFrame {
             origin: t.origin,
@@ -1719,10 +1782,29 @@ impl CompanionOwner {
         self.latches = Latches::default();
     }
 
-    /// [`Self::retire_owner`] with the re-sighting crossfade: what the hosts' owner fences run.
+    /// [`Self::retire_owner`] with the re-sighting crossfade: what the hosts' owner fences run
+    /// for another terminal.
     #[inline]
     pub fn resight_owner(&mut self) {
         self.resight_coordinate_space();
+        self.latches = Latches::default();
+    }
+
+    /// The same terminal switched between its main and its alternate screen (the hosts' owner
+    /// fence): the stream latches re-baseline as for another terminal, so the old screen's
+    /// completion, wrap and caret state are not replayed, and the hit rect goes; the body keeps
+    /// its place on the glass and grid it is drawn on and travels to the new screen's caret
+    /// ([`crate::kitty_pet::PetBrain::rescreen`]). Crossfaded as a surface replaced
+    /// ([`Self::resight_owner`]), the ghost faded where the body was while the body came up at
+    /// the new caret on the same frame: a person saw the cat jump across the screen.
+    #[inline]
+    pub fn rescreen_owner(&mut self) {
+        if !self.pet.keeps_its_body() {
+            self.resight_owner();
+            return;
+        }
+        self.pet.rescreen();
+        self.hit_rect = None;
         self.latches = Latches::default();
     }
 
@@ -2290,6 +2372,7 @@ mod owner_tests {
             obscured: false,
             pane: None,
             room: None,
+            caret_path: [None; CARET_PATH_LEN],
         };
         let built = PetFacts::new(&facts, &host, pet_glow());
         assert!(std::ptr::eq(built.facts, plain.facts) && std::ptr::eq(built.host, plain.host));
@@ -2307,6 +2390,7 @@ mod owner_tests {
             obscured: true,
             pane: Some((7, (8, 9))),
             room: Some(RoomFacts::EMPTY),
+            caret_path: [None; CARET_PATH_LEN],
         };
         let built = PetFacts::new(&facts, &host, GlowOwnership::NONE)
             .with_sing(sing)

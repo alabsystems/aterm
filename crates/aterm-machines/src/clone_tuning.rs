@@ -23,11 +23,12 @@
 //! never touched.
 //!
 //! Every git run here stays on this machine: none fetches an object a partial clone lacks
-//! (`--no-lazy-fetch`, so a git without it tunes nothing). A write runs nothing else: no hook,
-//! whether a hooks folder's or one a config names, no filter driver, and no fsmonitor daemon
-//! ([`quiet`], [`checkout::Programs`]); a clone whose config names a hook or filter aterm cannot
-//! name to turn off is left as it is, and so is one whose config is a link, which git would
-//! write through.
+//! (`GIT_NO_LAZY_FETCH`, and `--no-lazy-fetch` where git takes it: [`Git`], so a git that
+//! neither takes the option nor was seen to obey the variable tunes nothing). A write runs
+//! nothing else: no hook, whether a hooks folder's or one a config names, no filter driver, and
+//! no fsmonitor daemon ([`quiet`], [`checkout::Programs`]); a clone whose config names a hook or
+//! filter aterm cannot name to turn off is left as it is, and so is one whose config is a link,
+//! which git would write through.
 //!
 //! The rules are the hook installers' (`scripts/hooks/_git_client_tuning.sh`):
 //! * A key set in any scope (`git config --show-scope`, read with no `-c`) is kept, and so is an
@@ -50,7 +51,7 @@
 //! person's opt-out and is not set again; a key the declaration drops is unset only while the
 //! repository's own config still holds aterm's value.
 
-use crate::checkout::{self, NO_SIDE_RUNS, NotFetched};
+use crate::checkout::{self, NO_SIDE_RUNS, NoLazyFetch, NotFetched};
 use crate::engine::Place;
 use crate::init::Holds;
 use crate::init_github::{self, VaultClones};
@@ -163,15 +164,15 @@ const NOTHING: &str = "nothing tuned";
 /// # Errors
 /// The context, init profile, inventory or [`RECORD`] cannot be read.
 pub fn read(sys: &dyn System, ctx: &Ctx, state: &Path, holds: &Holds) -> Result<Reading, String> {
-    let (user, tops) = match scope(sys, ctx, holds)? {
+    let (git, tops) = match scope(sys, ctx, holds)? {
         Scope::Out(why) => return Ok(Reading::NotApplicable(why)),
-        Scope::Clones { user, tops } => (user, tops),
+        Scope::Clones { git, tops } => (git, tops),
     };
     let dir = converge_dir(state);
     let Some(record) = Record::read(&dir)? else {
         return Ok(Reading::NotApplicable(newer(&dir)));
     };
-    let clones = plan_all(sys, user, &tops, &record, test_volume(sys, &dir));
+    let clones = plan_all(sys, git, &tops, &record, test_volume(sys, &dir));
     Ok(summary(&clones, sys.machine()))
 }
 
@@ -199,7 +200,7 @@ pub fn apply(sys: &dyn System, ctx: &Ctx, state: &Path, holds: &Holds) -> Result
 
 /// Git's untracked-cache self-test in a scratch repository under a folder: whether it passed
 /// ([`self_test`]).
-type SelfTest<'a> = dyn Fn(&dyn System, &User, &Path) -> Result<bool, String> + 'a;
+type SelfTest<'a> = dyn Fn(&dyn System, Git<'_>, &Path) -> Result<bool, String> + 'a;
 
 /// What [`apply_with`] runs that a test gives in place of the real step.
 struct Seams<'a> {
@@ -219,9 +220,9 @@ fn apply_with(
     holds: &Holds,
     seams: &Seams<'_>,
 ) -> Result<Tuned, String> {
-    let (user, tops) = match scope(sys, ctx, holds)? {
+    let (git, tops) = match scope(sys, ctx, holds)? {
         Scope::Out(why) => return Ok(aside(why)),
-        Scope::Clones { user, tops } => (user, tops),
+        Scope::Clones { git, tops } => (git, tops),
     };
     let dir = converge_dir(state);
     aterm_uds::private_file::ensure_private_dir(&dir)
@@ -244,9 +245,9 @@ fn apply_with(
         return Ok(aside(newer(&dir)));
     };
     let test = test_volume(sys, &dir);
-    let mut clones = plan_all(sys, user, &tops, &record, test);
+    let mut clones = plan_all(sys, git, &tops, &record, test);
     if let Some(dev) = clones.iter().find_map(|clone| clone.pending) {
-        let passed = (seams.self_test)(sys, user, &dir)?;
+        let passed = (seams.self_test)(sys, git, &dir)?;
         record.volumes.insert(
             dev.to_string(),
             Tested {
@@ -255,7 +256,7 @@ fn apply_with(
             },
         );
         record.write(&dir)?;
-        clones = plan_all(sys, user, &tops, &record, test);
+        clones = plan_all(sys, git, &tops, &record, test);
     }
     (seams.planned)();
     let mut done = Vec::new();
@@ -269,7 +270,7 @@ fn apply_with(
         if !clone.differs() {
             continue;
         }
-        let tuning = tune(sys, user, clone, &mut record, &dir, &mut failed)?;
+        let tuning = tune(sys, git, clone, &mut record, &dir, &mut failed)?;
         done.extend(tuning.done);
         held.extend(tuning.held);
     }
@@ -307,7 +308,7 @@ struct Tuning {
 /// The record cannot be written.
 fn tune(
     sys: &dyn System,
-    user: &User,
+    git: Git<'_>,
     clone: &Plan,
     record: &mut Record,
     dir: &Path,
@@ -318,7 +319,7 @@ fn tune(
         if repo.set.is_empty() && repo.unset.is_empty() {
             continue;
         }
-        let quiet = match quiet(sys, user, &repo.path) {
+        let quiet = match quiet(sys, git, &repo.path) {
             Ok(quiet) => quiet,
             Err(why) => {
                 failed.push(format!("{}: {why}", repo.label));
@@ -372,7 +373,7 @@ fn tune(
         }
     }
     let converted = match clone.repos.first() {
-        Some(top) if clone.index.is_some() => convert_index(sys, user, top),
+        Some(top) if clone.index.is_some() => convert_index(sys, git, top),
         _ => Ok(None),
     };
     let done = wrote.then(|| clone.label.clone());
@@ -502,10 +503,10 @@ impl Item for CloneTuning {
     }
 }
 
-/// Which clones are in scope.
+/// Which clones are in scope, and the git that reads them.
 enum Scope<'c> {
     Out(String),
-    Clones { user: &'c User, tops: Vec<PathBuf> },
+    Clones { git: Git<'c>, tops: Vec<PathBuf> },
 }
 
 fn scope<'c>(sys: &dyn System, ctx: &'c Ctx, holds: &Holds) -> Result<Scope<'c>, String> {
@@ -548,27 +549,45 @@ fn scope<'c>(sys: &dyn System, ctx: &'c Ctx, holds: &Holds) -> Result<Scope<'c>,
             sys.machine()
         )));
     }
-    let ran = run(sys, &local(sys, user, None).arg("--version"))?;
-    if let Some(why) = lazy_fetch_guard(&ran, sys.machine())? {
-        return Ok(Scope::Out(why));
-    }
-    Ok(Scope::Clones { user, tops })
+    guarded(sys, user, tops)
 }
 
-/// [`scope`]'s reading of `git --no-lazy-fetch --version`: `None` where git has the option, why
-/// not where git refuses it as unknown (129: an older git, which ignores GIT_NO_LAZY_FETCH), in
-/// the words of a `machine` ([`System::machine`]).
+/// [`scope`] once `tops` holds a clone: the git that reads them, kept from fetching what a
+/// partial clone lacks as this git keeps a read from it ([`NoLazyFetch::of`], asked once, before
+/// any clone is read); or, where it does neither (a git before 2.44 that ignores
+/// `GIT_NO_LAZY_FETCH`), why no clone is in scope, in the words of [`System::machine`].
 ///
 /// # Errors
-/// Git did not run as git (a broken program, a signal).
-fn lazy_fetch_guard(ran: &Ran, machine: &str) -> Result<Option<String>, String> {
-    match ran.status {
-        Some(0) => Ok(None),
-        Some(129) => Ok(Some(format!(
-            "this {machine}'s git has no --no-lazy-fetch (git 2.44 has it), which keeps aterm's \
+/// Git could not be asked ([`NoLazyFetch::of`]).
+fn guarded<'c>(sys: &dyn System, user: &'c User, tops: Vec<PathBuf>) -> Result<Scope<'c>, String> {
+    let Some(off) = NoLazyFetch::of(sys, user)? else {
+        let machine = sys.machine();
+        return Ok(Scope::Out(format!(
+            "this {machine}'s git neither takes --no-lazy-fetch (git 2.44 has it) nor obeys \
+             GIT_NO_LAZY_FETCH (the 2.39.4 security release has it), one of which keeps aterm's \
              reads of a clone on this {machine}"
-        ))),
-        _ => Err(format!("git --version failed: {}", ran.describe())),
+        )));
+    };
+    Ok(Scope::Clones {
+        git: Git { user, off },
+        tops,
+    })
+}
+
+/// The git every run here is ([`Git::local`]): `user`'s, kept from fetching an object a partial
+/// clone lacks the way this git keeps a read from it (`off`, which [`scope`] asks once a pass).
+#[derive(Clone, Copy)]
+struct Git<'u> {
+    user: &'u User,
+    off: NoLazyFetch,
+}
+
+impl Git<'_> {
+    /// [`checkout::git`] in `path` that never fetches an object a partial clone lacks: its
+    /// `GIT_NO_LAZY_FETCH`, and `--no-lazy-fetch` where this git takes it
+    /// ([`NoLazyFetch::git`]), never an option it refuses.
+    fn local(self, sys: &dyn System, path: Option<&Path>) -> Cmd {
+        self.off.git(sys, self.user, path)
     }
 }
 
@@ -845,13 +864,13 @@ fn summary(clones: &[Plan], machine: &str) -> Reading {
 
 fn plan_all(
     sys: &dyn System,
-    user: &User,
+    git: Git<'_>,
     tops: &[PathBuf],
     record: &Record,
     test: Option<u64>,
 ) -> Vec<Plan> {
     tops.iter()
-        .map(|top| plan(sys, user, top, record, test))
+        .map(|top| plan(sys, git, top, record, test))
         .collect()
 }
 
@@ -866,12 +885,12 @@ fn label(user: &User, path: &Path) -> String {
 /// Plan one clone: its declaration, then each of its repositories. A clone with no declaration
 /// still has each key aterm set and its declaration no longer holds unset. A clone that differs
 /// where another git holds a lock it would take is left for the next pass, as a whole.
-fn plan(sys: &dyn System, user: &User, top: &Path, record: &Record, test: Option<u64>) -> Plan {
+fn plan(sys: &dyn System, git: Git<'_>, top: &Path, record: &Record, test: Option<u64>) -> Plan {
     let mut plan = Plan {
-        label: label(user, top),
+        label: label(git.user, top),
         ..Plan::default()
     };
-    let declared = match declaration(sys, user, top) {
+    let declared = match declaration(sys, git, top) {
         Ok(declared) => declared,
         Err(why) => {
             plan.notes
@@ -889,7 +908,7 @@ fn plan(sys: &dyn System, user: &User, top: &Path, record: &Record, test: Option
             .map(|note| format!("{} {note}", plan.label)),
     );
     let mut paths = vec![top.to_path_buf()];
-    submodules(sys, user, top, 0, &mut paths, &mut plan.notes);
+    submodules(sys, git, top, 0, &mut paths, &mut plan.notes);
     let mut withheld = None;
     for (at, path) in paths.iter().enumerate() {
         let superproject = at == 0;
@@ -898,13 +917,13 @@ fn plan(sys: &dyn System, user: &User, top: &Path, record: &Record, test: Option
         } else {
             &declared.submodule
         };
-        match plan_repo(sys, user, path, superproject, keys, record, test) {
+        match plan_repo(sys, git, path, superproject, keys, record, test) {
             Ok(planned) => {
                 plan.pending = plan.pending.or(planned.pending);
                 withheld = withheld.or(planned.withheld);
                 plan.notes.extend(planned.notes);
                 if superproject {
-                    match index_plan(sys, user, top, &declared, &planned.repo) {
+                    match index_plan(sys, git, top, &declared, &planned.repo) {
                         Ok(index) => plan.index = index,
                         Err(why) => plan.notes.push(format!("{}: {why}", planned.repo.label)),
                     }
@@ -912,8 +931,10 @@ fn plan(sys: &dyn System, user: &User, top: &Path, record: &Record, test: Option
                 plan.repos.push(planned.repo);
             }
             Err(why) => {
-                plan.notes
-                    .push(format!("{}: {why}; it is left as it is", label(user, path)));
+                plan.notes.push(format!(
+                    "{}: {why}; it is left as it is",
+                    label(git.user, path)
+                ));
                 if superproject {
                     return plan;
                 }
@@ -929,7 +950,7 @@ fn plan(sys: &dyn System, user: &User, top: &Path, record: &Record, test: Option
     }
     if plan.differs()
         && plan.held.is_none()
-        && let Some(why) = unnamed(sys, user, &plan)
+        && let Some(why) = unnamed(sys, git, &plan)
     {
         plan.notes
             .push(format!("{why}; the clone is left as it is"));
@@ -945,7 +966,7 @@ fn plan(sys: &dyn System, user: &User, top: &Path, record: &Record, test: Option
 
 /// Why a write in one of `plan`'s repositories could run something aterm cannot turn off by
 /// name ([`checkout::Programs::named`]).
-fn unnamed(sys: &dyn System, user: &User, plan: &Plan) -> Option<String> {
+fn unnamed(sys: &dyn System, git: Git<'_>, plan: &Plan) -> Option<String> {
     plan.repos
         .iter()
         .enumerate()
@@ -953,7 +974,7 @@ fn unnamed(sys: &dyn System, user: &User, plan: &Plan) -> Option<String> {
             !repo.set.is_empty() || !repo.unset.is_empty() || (*at == 0 && plan.index.is_some())
         })
         .find_map(|(_, repo)| {
-            checkout::Programs::named(sys, local(sys, user, Some(&repo.path)))
+            checkout::Programs::named(sys, git.local(sys, Some(&repo.path)))
                 .err()
                 .map(|why| format!("{}: {why}", repo.label))
         })
@@ -974,23 +995,17 @@ fn held(sys: &dyn System, plan: &Plan) -> Option<String> {
 }
 
 /// The clone's declaration on origin's default branch as last fetched: absent is an empty one.
-fn declaration(sys: &dyn System, user: &User, top: &Path) -> Result<Declared, String> {
-    let (branch, tip) = checkout::fetched_head_by(sys, &|| local(sys, user, Some(top))).map_err(
-        |why| match why {
+fn declaration(sys: &dyn System, git: Git<'_>, top: &Path) -> Result<Declared, String> {
+    let (branch, tip) =
+        checkout::fetched_head_by(sys, &|| git.local(sys, Some(top))).map_err(|why| match why {
             NotFetched::Unread(unread) => unread.why,
             NotFetched::Unrecorded { .. } => {
                 "records no default branch of origin's as last fetched (refs/remotes/origin/HEAD), \
                  so its declaration cannot be read"
                     .to_owned()
             }
-        },
-    )?;
-    let listed = git_text(
-        sys,
-        user,
-        top,
-        &["ls-tree", "-z", "-l", &tip, "--", DECLARATION],
-    )?;
+        })?;
+    let listed = git_text(sys, git, top, &["ls-tree", "-z", &tip, "--", DECLARATION])?;
     let listed = listed.trim_end_matches('\0');
     if listed.is_empty() {
         return Ok(Declared::default());
@@ -1000,16 +1015,19 @@ fn declaration(sys: &dyn System, user: &User, top: &Path) -> Result<Declared, St
         .split_once('\t')
         .ok_or_else(|| format!("cannot read {what}"))?;
     let fields: Vec<&str> = meta.split_whitespace().collect();
-    let [mode, kind, blob, size] = fields.as_slice() else {
+    let [mode, kind, blob] = fields.as_slice() else {
         return Err(format!("cannot read {what}"));
     };
     if !matches!(*mode, "100644" | "100755") || *kind != "blob" {
         return Err(format!("{what} is not a regular file"));
     }
-    // A partial clone lists a blob it never fetched, with no size: it is read only once here.
+    // A partial clone lists a blob it never fetched. A git kept from fetching by the variable
+    // alone (`NoLazyFetch::Variable`; git 2.43.0, measured) stops (128, "could not fetch ... from
+    // promisor remote") at any read of such a blob, its size included, so this question, whose
+    // every failure reads as absent, comes before any read of its size or contents.
     if !run(
         sys,
-        &local(sys, user, Some(top)).args(["cat-file", "-e", blob]),
+        &git.local(sys, Some(top)).args(["cat-file", "-e", blob]),
     )?
     .success()
     {
@@ -1018,7 +1036,8 @@ fn declaration(sys: &dyn System, user: &User, top: &Path) -> Result<Declared, St
             sys.machine()
         ));
     }
-    let size: u64 = size
+    let size: u64 = git_text(sys, git, top, &["cat-file", "-s", blob])?
+        .trim()
         .parse()
         .map_err(|_| format!("cannot read the size of {what}"))?;
     if size > DECLARATION_MAX {
@@ -1028,7 +1047,7 @@ fn declaration(sys: &dyn System, user: &User, top: &Path) -> Result<Declared, St
     }
     let ran = run(
         sys,
-        &local(sys, user, Some(top)).args([
+        &git.local(sys, Some(top)).args([
             "config",
             "--blob",
             blob,
@@ -1132,7 +1151,7 @@ fn take(
 /// is read and no shell runs.
 fn submodules(
     sys: &dyn System,
-    user: &User,
+    git: Git<'_>,
     repo: &Path,
     depth: usize,
     into: &mut Vec<PathBuf>,
@@ -1145,7 +1164,7 @@ fn submodules(
             notes.push(format!(
                 "{}: its .gitmodules is {} bytes, over the {GITMODULES_MAX} aterm reads, so its \
                  submodules are left as they are",
-                label(user, repo),
+                label(git.user, repo),
                 stat.len
             ));
             return;
@@ -1155,13 +1174,13 @@ fn submodules(
     if depth >= SUBMODULE_DEPTH {
         notes.push(format!(
             "{}: submodules nested past {SUBMODULE_DEPTH} levels are left as they are",
-            label(user, repo)
+            label(git.user, repo)
         ));
         return;
     }
     let Ok(ran) = run(
         sys,
-        &local(sys, user, Some(repo))
+        &git.local(sys, Some(repo))
             .arg("config")
             .arg("--file")
             .arg(&listing)
@@ -1174,7 +1193,7 @@ fn submodules(
     ) else {
         notes.push(format!(
             "{}: cannot read its .gitmodules",
-            label(user, repo)
+            label(git.user, repo)
         ));
         return;
     };
@@ -1184,7 +1203,7 @@ fn submodules(
         _ => {
             notes.push(format!(
                 "{}: cannot read its .gitmodules",
-                label(user, repo)
+                label(git.user, repo)
             ));
             return;
         }
@@ -1206,29 +1225,29 @@ fn submodules(
         {
             notes.push(format!(
                 "{}: its .gitmodules names {path:?}, not a path inside it: left as it is",
-                label(user, repo)
+                label(git.user, repo)
             ));
             continue;
         }
         let sub = repo.join(relative);
-        if !populated(sys, user, repo, relative) {
+        if !populated(sys, git, repo, relative) {
             continue;
         }
         if into.len() >= REPOSITORIES_MAX {
             notes.push(format!(
                 "{}: repositories past {REPOSITORIES_MAX} are left as they are",
-                label(user, repo)
+                label(git.user, repo)
             ));
             return;
         }
         into.push(sub.clone());
-        submodules(sys, user, &sub, depth + 1, into, notes);
+        submodules(sys, git, &sub, depth + 1, into, notes);
     }
 }
 
 /// Whether `relative` under `repo` is a real folder, reached through no link on the way, holding
 /// a repository whose top it is.
-fn populated(sys: &dyn System, user: &User, repo: &Path, relative: &Path) -> bool {
+fn populated(sys: &dyn System, git: Git<'_>, repo: &Path, relative: &Path) -> bool {
     let sub = repo.join(relative);
     match sys.stat(&sub) {
         Ok(stat) if stat.dir && !stat.symlink => {}
@@ -1237,7 +1256,7 @@ fn populated(sys: &dyn System, user: &User, repo: &Path, relative: &Path) -> boo
     if sys.stat(&sub.join(".git")).is_err() {
         return false;
     }
-    let Ok(top) = git_text(sys, user, &sub, &["rev-parse", "--show-toplevel"]) else {
+    let Ok(top) = git_text(sys, git, &sub, &["rev-parse", "--show-toplevel"]) else {
         return false;
     };
     match (
@@ -1284,17 +1303,17 @@ enum Volume {
 /// value.
 fn plan_repo(
     sys: &dyn System,
-    user: &User,
+    git: Git<'_>,
     path: &Path,
     superproject: bool,
     declared: &[&'static str],
     record: &Record,
     test: Option<u64>,
 ) -> Result<Planned, String> {
-    let here = label(user, path);
+    let here = label(git.user, path);
     let dirs = git_text(
         sys,
-        user,
+        git,
         path,
         &[
             "rev-parse",
@@ -1358,10 +1377,10 @@ fn plan_repo(
         if !wanted && !ours {
             continue;
         }
-        let now = scoped(sys, user, path, key)?;
+        let now = scoped(sys, git, path, key)?;
         // aterm's value is the `true` it wrote in the repository's own file: one an included
         // file or another scope gives is somebody else's.
-        let aterms = ours && own_value(sys, user, path, key)?.as_deref() == Some("true");
+        let aterms = ours && own_value(sys, git, path, key)?.as_deref() == Some("true");
         match (wanted, ours) {
             (true, false) if now.is_none() => match volume {
                 Volume::Passed => planned.repo.set.push(key),
@@ -1398,7 +1417,7 @@ fn plan_repo(
 /// `index.version` names another, and the index is at another format.
 fn index_plan(
     sys: &dyn System,
-    user: &User,
+    git: Git<'_>,
     top: &Path,
     declared: &Declared,
     repo: &Repo,
@@ -1406,17 +1425,18 @@ fn index_plan(
     if declared.index != Some(INDEX_VERSION) || repo.unset.contains(&MANY_FILES) {
         return Ok(None);
     }
-    if !repo.set.contains(&MANY_FILES) && !many_files(sys, user, top)? {
+    if !repo.set.contains(&MANY_FILES) && !many_files(sys, git, top)? {
         return Ok(None);
     }
-    index_due(sys, user, top)
+    index_due(sys, git, top)
 }
 
 /// Whether `feature.manyFiles` is in effect in `top`.
-fn many_files(sys: &dyn System, user: &User, top: &Path) -> Result<bool, String> {
+fn many_files(sys: &dyn System, git: Git<'_>, top: &Path) -> Result<bool, String> {
     let ran = run(
         sys,
-        &local(sys, user, Some(top)).args(["config", "--type=bool", "--get", MANY_FILES]),
+        &git.local(sys, Some(top))
+            .args(["config", "--type=bool", "--get", MANY_FILES]),
     )?;
     match ran.status {
         Some(0) => Ok(stdout(&ran) == "true"),
@@ -1427,10 +1447,11 @@ fn many_files(sys: &dyn System, user: &User, top: &Path) -> Result<bool, String>
 
 /// The index's format where it is not [`INDEX_VERSION`] and no explicit `index.version` names
 /// another: read from the index file's header, which takes no lock and writes nothing.
-fn index_due(sys: &dyn System, user: &User, top: &Path) -> Result<Option<u32>, String> {
+fn index_due(sys: &dyn System, git: Git<'_>, top: &Path) -> Result<Option<u32>, String> {
     let explicit = run(
         sys,
-        &local(sys, user, Some(top)).args(["config", "--get", "index.version"]),
+        &git.local(sys, Some(top))
+            .args(["config", "--get", "index.version"]),
     )?;
     match explicit.status {
         Some(0) if stdout(&explicit) != INDEX_VERSION.to_string() => return Ok(None),
@@ -1439,7 +1460,7 @@ fn index_due(sys: &dyn System, user: &User, top: &Path) -> Result<Option<u32>, S
     }
     let index = git_text(
         sys,
-        user,
+        git,
         top,
         &["rev-parse", "--path-format=absolute", "--git-path", "index"],
     )?;
@@ -1459,16 +1480,14 @@ fn index_due(sys: &dyn System, user: &User, top: &Path) -> Result<Option<u32>, S
 
 /// Move the superproject's index to [`INDEX_VERSION`] where it is still due after the writes,
 /// running nothing else ([`quiet`]); `Some(from)` once moved.
-fn convert_index(sys: &dyn System, user: &User, top: &Repo) -> Result<Option<u32>, Wrote> {
-    if top.unset.contains(&MANY_FILES)
-        || !many_files(sys, user, &top.path).map_err(Wrote::Failed)?
-    {
+fn convert_index(sys: &dyn System, git: Git<'_>, top: &Repo) -> Result<Option<u32>, Wrote> {
+    if top.unset.contains(&MANY_FILES) || !many_files(sys, git, &top.path).map_err(Wrote::Failed)? {
         return Ok(None);
     }
-    let Some(from) = index_due(sys, user, &top.path).map_err(Wrote::Failed)? else {
+    let Some(from) = index_due(sys, git, &top.path).map_err(Wrote::Failed)? else {
         return Ok(None);
     };
-    let quiet = quiet(sys, user, &top.path).map_err(Wrote::Failed)?;
+    let quiet = quiet(sys, git, &top.path).map_err(Wrote::Failed)?;
     write(sys, &quiet, &["update-index", "--index-version", "4"])?;
     Ok(Some(from))
 }
@@ -1476,13 +1495,14 @@ fn convert_index(sys: &dyn System, user: &User, top: &Repo) -> Result<Option<u32
 /// The scope and value `key` has in `path`, read with no `-c`: `None` where it is unset.
 fn scoped(
     sys: &dyn System,
-    user: &User,
+    git: Git<'_>,
     path: &Path,
     key: &str,
 ) -> Result<Option<(String, String)>, String> {
     let ran = run(
         sys,
-        &local(sys, user, Some(path)).args(["config", "--show-scope", "--get", key]),
+        &git.local(sys, Some(path))
+            .args(["config", "--show-scope", "--get", key]),
     )?;
     match ran.status {
         Some(0) => {
@@ -1502,13 +1522,14 @@ fn scoped(
 /// The value `key` has in `path`'s own config file, no included file read: `None` where unset.
 fn own_value(
     sys: &dyn System,
-    user: &User,
+    git: Git<'_>,
     path: &Path,
     key: &str,
 ) -> Result<Option<String>, String> {
     let ran = run(
         sys,
-        &local(sys, user, Some(path)).args(["config", "--local", "--no-includes", "--get", key]),
+        &git.local(sys, Some(path))
+            .args(["config", "--local", "--no-includes", "--get", key]),
     )?;
     match ran.status {
         Some(0) => Ok(Some(stdout(&ran))),
@@ -1518,7 +1539,7 @@ fn own_value(
 }
 
 /// Run git's untracked-cache self-test in a scratch repository under `dir`, on its volume.
-fn self_test(sys: &dyn System, user: &User, dir: &Path) -> Result<bool, String> {
+fn self_test(sys: &dyn System, git: Git<'_>, dir: &Path) -> Result<bool, String> {
     let mut scratch = Scratch::new_in(sys, dir, "untracked-cache-test").map_err(|why| {
         format!(
             "cannot make a scratch repository in {}: {why}",
@@ -1528,7 +1549,7 @@ fn self_test(sys: &dyn System, user: &User, dir: &Path) -> Result<bool, String> 
     let at = scratch.path().to_path_buf();
     let init = run(
         sys,
-        &local(sys, user, None)
+        &git.local(sys, None)
             .args(NO_SIDE_RUNS)
             .args(["init", "--quiet", "--template="])
             .arg(&at),
@@ -1542,7 +1563,7 @@ fn self_test(sys: &dyn System, user: &User, dir: &Path) -> Result<bool, String> 
     }
     let tested = run(
         sys,
-        &quiet(sys, user, &at)?.args(["update-index", "--test-untracked-cache"]),
+        &quiet(sys, git, &at)?.args(["update-index", "--test-untracked-cache"]),
     )?;
     let _ = scratch.close();
     verdict(&tested)
@@ -1565,22 +1586,15 @@ fn verdict(tested: &Ran) -> Result<bool, String> {
     }
 }
 
-/// [`checkout::git`] that never fetches an object a partial clone lacks: its variable, and the
-/// option, which an older git refuses ([`scope`] asks it first) where it would ignore the
-/// variable.
-fn local(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
-    checkout::git(sys, user, path).arg("--no-lazy-fetch")
-}
-
-/// [`local`] for a write in `path` that runs nothing else: no hook from a hooks folder and no
+/// [`Git::local`] for a write in `path` that runs nothing else: no hook from a hooks folder and no
 /// fsmonitor daemon ([`NO_SIDE_RUNS`]), no hook or filter driver its config names
 /// ([`checkout::Programs::off`]), and no wait on a `config.lock` another
 /// git took after [`held`] looked (`core.configLockTimeout=0`); with git's messages in English
 /// (`LC_ALL=C`), which [`write`] reads.
-fn quiet(sys: &dyn System, user: &User, path: &Path) -> Result<Cmd, String> {
-    let programs = checkout::Programs::named(sys, local(sys, user, Some(path)))?;
+fn quiet(sys: &dyn System, git: Git<'_>, path: &Path) -> Result<Cmd, String> {
+    let programs = checkout::Programs::named(sys, git.local(sys, Some(path)))?;
     Ok(programs.off(
-        local(sys, user, Some(path))
+        git.local(sys, Some(path))
             .args(NO_SIDE_RUNS)
             .args(["-c", "core.configLockTimeout=0"])
             .env("LC_ALL", "C"),
@@ -1616,11 +1630,8 @@ fn stdout(ran: &Ran) -> String {
 }
 
 /// One git read that must succeed, its standard output.
-fn git_text(sys: &dyn System, user: &User, path: &Path, args: &[&str]) -> Result<String, String> {
-    let ran = run(
-        sys,
-        &local(sys, user, Some(path)).args(args.iter().copied()),
-    )?;
+fn git_text(sys: &dyn System, git: Git<'_>, path: &Path, args: &[&str]) -> Result<String, String> {
+    let ran = run(sys, &git.local(sys, Some(path)).args(args.iter().copied()))?;
     if !ran.success() {
         return Err(format!(
             "git {} failed: {}",

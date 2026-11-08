@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.180.0"
+version = "0.181.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -893,6 +893,7 @@ dependencies = [
  "aterm-models-release",
  "aterm-models-render",
  "aterm-models-session",
+ "aterm-models-swarm",
  "aterm-models-update",
  "aterm-net",
  "aterm-netplace",

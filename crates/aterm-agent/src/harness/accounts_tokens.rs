@@ -62,6 +62,11 @@ const WRITE_TICK: Duration = Duration::from_secs(1);
 /// Hang detector for the required preflight read behind a native vault writer.
 const PREFLIGHT_HANG: Duration = Duration::from_secs(60);
 
+/// Hang detector for the standing required before minting or replacing a token.
+const REQUIRED_STANDING_HANG: Duration = Duration::from_secs(60);
+/// Optional attribution or pre-removal metadata; the authoritative write owns its result.
+const STANDING_LOOK: Duration = Duration::from_secs(2);
+
 /// How long a removal waits for this Mac's vault state.
 const REMOVE_WAIT: Duration = Duration::from_secs(60);
 
@@ -1037,11 +1042,11 @@ pub trait TokenVault {
     /// # Errors
     /// The configuration, the records or this Mac's device key cannot be read.
     fn route(&self, by: Instant) -> Result<WriteRoute, String>;
-    /// The account `key`'s standing ([`claude_token::standing`]).
+    /// The account `key`'s value-free standing through [`claude_token::read`], observed until `by`.
     ///
     /// # Errors
     /// As that call.
-    fn standing(&self, key: &Key) -> Result<Lookup<Standing>, String>;
+    fn standing(&self, key: &Key, by: Instant) -> Result<Lookup<Standing>, String>;
     /// Every token the vault holds, with its standing, in one read ([`claude_token::listed`]):
     /// what a surface that shows several accounts reads.
     ///
@@ -1102,8 +1107,16 @@ impl TokenVault for Vault {
     fn route(&self, by: Instant) -> Result<WriteRoute, String> {
         aterm_secrets::client::write_route(&self.0, by).map_err(|e| e.to_string())
     }
-    fn standing(&self, key: &Key) -> Result<Lookup<Standing>, String> {
-        claude_token::standing(&self.0, key).map_err(|e| e.to_string())
+    fn standing(&self, key: &Key, by: Instant) -> Result<Lookup<Standing>, String> {
+        Ok(
+            match claude_token::read(&self.0, key, by.saturating_duration_since(Instant::now()))
+                .map_err(|error| error.to_string())?
+            {
+                Lookup::Found(read) => Lookup::Found(read.standing),
+                Lookup::Absent => Lookup::Absent,
+                Lookup::Unknown => Lookup::Unknown,
+            },
+        )
     }
     fn listed(&self) -> Result<Lookup<Vec<Standing>>, String> {
         claude_token::listed(&self.0).map_err(|e| e.to_string())
@@ -1361,7 +1374,12 @@ fn run_with_clock(
     let row = read_table(&store)
         .ok()
         .and_then(|mut table| table.rows.remove(account.key.as_str()));
-    let found = match vault.standing(&account.key) {
+    let standing_wait = if matches!(mode, TokenMode::Remove) {
+        STANDING_LOOK
+    } else {
+        REQUIRED_STANDING_HANG
+    };
+    let found = match vault.standing(&account.key, Instant::now() + standing_wait) {
         Ok(found) => found,
         Err(why) => return refuse(err, &format!("the vault could not be read: {why}")),
     };
@@ -1564,10 +1582,12 @@ fn mint(
         }
     };
     let signer = match vault_col {
-        InVault::InVault | InVault::SignedHere => match vault.standing(&account.key) {
-            Ok(Lookup::Found(standing)) => standing.signer,
-            _ => None,
-        },
+        InVault::InVault | InVault::SignedHere => {
+            match vault.standing(&account.key, Instant::now() + STANDING_LOOK) {
+                Ok(Lookup::Found(standing)) => standing.signer,
+                _ => None,
+            }
+        }
         _ => None,
     };
     let recorded = record(store, account, &meta, vault_col.clone(), signer);

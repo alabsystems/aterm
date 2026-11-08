@@ -1694,7 +1694,8 @@ mod tests {
                 "clang",
                 &[dev],
                 "printf '#include <stdio.h>\\nint main(void){puts(\"C-OK\");return 0;}\\n' > hello.c \
-                 && clang -o hello hello.c && ./hello",
+                 && sdk=$(/usr/bin/xcrun --sdk macosx --show-sdk-path) && test -d \"$sdk\" \
+                 && clang -isysroot \"$sdk\" -o hello hello.c && ./hello",
                 "C-OK".into(),
             ),
             (

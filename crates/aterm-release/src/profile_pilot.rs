@@ -15,6 +15,12 @@ pub(crate) enum Arm {
     Thin16Lines,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Trial {
+    pub arm: Arm,
+    pub anatomy: bool,
+}
+
 impl Arm {
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -60,16 +66,23 @@ pub(crate) struct Options {
     arms: Vec<Arm>,
     takes: usize,
     inspect: Option<std::path::PathBuf>,
+    anatomy: bool,
 }
 
 pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, String> {
     let mut args = args;
+    let mut takes_named = false;
     let mut opts = Options {
         arms: Vec::new(),
         takes: 2,
         inspect: None,
+        anatomy: false,
     };
     while let Some(flag) = args.next() {
+        if flag == "--anatomy" {
+            opts.anatomy = true;
+            continue;
+        }
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
             "--arm" => {
@@ -86,10 +99,21 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
                 }
                 opts.arms.push(arm);
             }
-            "--takes" => opts.takes = value.parse().map_err(|_| "invalid --takes")?,
+            "--takes" => {
+                takes_named = true;
+                opts.takes = value.parse().map_err(|_| "invalid --takes")?;
+            }
             "--inspect" => opts.inspect = Some(value.into()),
             _ => return Err(format!("unknown profile-pilot flag {flag}")),
         }
+    }
+    if opts.anatomy {
+        if opts.inspect.is_some() || !opts.arms.is_empty() || takes_named {
+            return Err("--anatomy takes no --arm, --inspect or --takes override".into());
+        }
+        opts.arms.push(Arm::Fat1);
+        opts.takes = 1;
+        return Ok(opts);
     }
     if opts.inspect.is_some() && !opts.arms.is_empty() {
         return Err("--inspect takes no --arm".into());
@@ -164,29 +188,128 @@ pub(crate) fn gui_link_interval(log: &Path, binary: &Path) -> Result<Option<f64>
     Ok(to.duration_since(from).ok().map(|span| span.as_secs_f64()))
 }
 
-/// Observe load while work runs; never wait for a quiet host.
-pub(crate) fn with_load<T>(work: impl FnOnce() -> T) -> (T, Option<f64>) {
-    std::thread::scope(|scope| {
+/// Observe load and new members of this command's process group while work runs.
+/// Initial members (the diagnostic, its shell and supervisors) are excluded. Short-lived
+/// processes between reads can be missed; these samples supplement, never replace, wait4.
+pub(crate) fn with_load<T>(
+    root: &Path,
+    work: impl FnOnce() -> T,
+) -> Result<(T, Option<f64>), String> {
+    use std::io::Write as _;
+    let file = crate::durable::create_fresh(&root.join("build-resources.jsonl"))
+        .map_err(|e| format!("create pilot resource samples: {e}"))?;
+    let (group, initial) = i32::try_from(std::process::id())
+        .ok()
+        .and_then(aterm_uds::process::read_lineage)
+        .and_then(|lineage| {
+            aterm_sysprobe::group_usage(lineage.pgid).map(|members| {
+                (
+                    Some(lineage.pgid),
+                    members
+                        .into_iter()
+                        .map(|member| (member.pid, member.start))
+                        .collect(),
+                )
+            })
+        })
+        .unwrap_or_default();
+    let started = std::time::Instant::now();
+    std::thread::scope(|scope| -> Result<_, String> {
         let (done, receiver) = std::sync::mpsc::channel::<()>();
         let sampler = scope.spawn(move || {
+            let mut file = std::io::BufWriter::new(file);
+            let mut log = None;
+            let mut pending = Vec::new();
+            let mut completed = false;
             let mut maximum: Option<f64> = None;
             loop {
                 if let Some(load) = aterm_sysprobe::load_average() {
                     maximum = Some(maximum.map_or(load[0], |old| old.max(load[0])));
                 }
-                if !matches!(
-                    receiver.recv_timeout(std::time::Duration::from_secs(1)),
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                ) {
+                let members = group.and_then(aterm_sysprobe::group_usage);
+                if log.is_none() {
+                    log = crate::durable::open_regular_file(&root.join("build.log"))
+                        .ok()
+                        .map(std::io::BufReader::new);
+                }
+                let passes = match &mut log {
+                    Some(log) => compiler_passes(log, &mut pending).map_err(|e| e.to_string())?,
+                    None => Vec::new(),
+                };
+                let sample =
+                    resource_sample(started.elapsed().as_secs_f64(), &initial, members, passes);
+                writeln!(file, "{sample}").map_err(|e| e.to_string())?;
+                if completed {
                     break;
                 }
+                completed = !matches!(
+                    receiver.recv_timeout(std::time::Duration::from_secs(1)),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                );
             }
-            maximum
+            file.flush().map_err(|e| e.to_string())?;
+            Ok::<_, String>(maximum)
         });
         let result = work();
         drop(done);
-        (result, sampler.join().unwrap_or(None))
+        Ok((
+            result,
+            sampler
+                .join()
+                .map_err(|_| "pilot resource sampler panicked")??,
+        ))
     })
+}
+
+/// Cargo relays rustc's untracked time-pass diagnostic. Polling its regular log avoids a
+/// compiler/daemon holding an inherited pipe open. The preceding sample interval bounds
+/// when the diagnostic reached the log; subtracting its duration estimates the pass start.
+fn compiler_passes(
+    log: &mut impl std::io::BufRead,
+    pending: &mut Vec<u8>,
+) -> std::io::Result<Vec<aterm_json::Value>> {
+    let mut passes = Vec::new();
+    loop {
+        if log.read_until(b'\n', pending)? == 0 || pending.last() != Some(&b'\n') {
+            break;
+        }
+        if let Some(json) = pending.strip_prefix(b"time: ")
+            && let Ok(text) = std::str::from_utf8(json)
+            && let Ok(pass) = aterm_json::from_str::<aterm_json::Value>(text)
+        {
+            passes.push(pass);
+        }
+        pending.clear();
+    }
+    Ok(passes)
+}
+
+/// Preserve the unit timeline before the successful pilot discards its cold intermediates.
+pub(crate) fn retain_timings(target: &Path, root: &Path) -> Result<(), String> {
+    std::fs::rename(target.join("cargo-timings"), root.join("cargo-timings"))
+        .map_err(|e| format!("retain pilot Cargo timings: {e}"))
+}
+
+fn resource_sample(
+    elapsed: f64,
+    initial: &std::collections::BTreeSet<(u32, u64)>,
+    members: Option<Vec<aterm_sysprobe::MemberUsage>>,
+    compiler_passes: Vec<aterm_json::Value>,
+) -> aterm_json::Value {
+    let members = members.map(|members| {
+        members
+            .into_iter()
+            .filter(|member| !initial.contains(&(member.pid, member.start)))
+            .map(|member| {
+                aterm_json::json!({
+                    "pid": member.pid, "start": member.start, "cpu_ns": member.cpu_ns,
+                    "runnable_ns": member.runnable_ns, "footprint_bytes": member.footprint,
+                    "peak_footprint_bytes": member.peak_footprint,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    aterm_json::json!({"elapsed_s": elapsed, "members": members, "compiler_passes": compiler_passes})
 }
 
 pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
@@ -267,16 +390,38 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             println!("profile-pilot: {} take {} {:?}", arm.name(), n + 1, target);
             let row = if cfg!(target_os = "linux") {
-                buildplan::linux::pilot(&take, arm, &dir, build, hint.as_deref())?
+                buildplan::linux::pilot(
+                    &take,
+                    Trial {
+                        arm,
+                        anatomy: opts.anatomy,
+                    },
+                    &dir,
+                    build,
+                    hint.as_deref(),
+                )?
             } else {
-                buildplan::pilot_build(&take, arm, &dir, target, build, hint.as_deref())?
+                buildplan::pilot_build(
+                    &take,
+                    Trial {
+                        arm,
+                        anatomy: opts.anatomy,
+                    },
+                    &dir,
+                    target,
+                    build,
+                    hint.as_deref(),
+                )?
             };
             let inspection_error = row["inspection"]["error"].as_str().map(str::to_owned);
             println!("profile-pilot-row: {row}");
             rows.push(row);
             let report = aterm_json::json!({"schema": 1, "commit": commit.trim(), "source_digest": take.snapshot.digest, "build_inputs": inputs, "rows": rows,
                 "vm_rows": "not run: Q4 profile runtime qualification is not integrated", "linux_rows": "not run",
-                "library_benches": "pending", "wasm_ceilings": "pending"});
+                "anatomy": opts.anatomy,
+                "reproducibility": if opts.anatomy { "not judged: one take" } else { "pending" },
+                "library_benches": if opts.anatomy { "not run: anatomy only" } else { "pending" },
+                "wasm_ceilings": if opts.anatomy { "not run: anatomy only" } else { "pending" }});
             crate::durable::write_fresh(&root.join("report.json"), report.to_string())
                 .map_err(|e| e.to_string())?;
             if let Some(error) = inspection_error {
@@ -290,6 +435,13 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         && crate::build_inputs::current()? != *before
     {
         return Err("pilot compiler or SDK inputs changed during the comparison".into());
+    }
+    if opts.anatomy {
+        println!(
+            "profile-pilot: anatomy recorded; one take does not judge reproducibility; report {}",
+            root.join("report.json").display()
+        );
+        return Ok(());
     }
     validate(&rows)?;
     // Keep build ABBA uninterrupted by instruments that compete for the CPU.
@@ -673,6 +825,99 @@ fn sections(bytes: &[u8]) -> Result<aterm_json::Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compiler_pass_observations_join_fragmented_lines_and_ignore_other_diagnostics() {
+        let mut pending = Vec::new();
+        let mut first = &b"warning: time: {}\ntime: {\"pass\":\"LLVM_fat"[..];
+        assert!(
+            compiler_passes(&mut first, &mut pending)
+                .unwrap()
+                .is_empty()
+        );
+        let mut second = &b"lto\",\"time\":7.5}\ntime: not json\n"[..];
+        assert_eq!(
+            compiler_passes(&mut second, &mut pending).unwrap(),
+            vec![aterm_json::json!({"pass":"LLVM_fatlto", "time":7.5})]
+        );
+        assert!(pending.is_empty());
+        assert!(
+            compiler_passes(&mut &b""[..], &mut pending)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn anatomy_is_one_baseline_take_without_a_qualification_claim() {
+        let opts = parse(["--anatomy"].into_iter().map(str::to_owned)).unwrap();
+        assert_eq!(order(&opts), vec![(0, Arm::Fat1)]);
+        assert!(opts.anatomy);
+        for flags in [
+            vec!["--takes", "1", "--arm", "fat1"],
+            vec!["--anatomy", "--arm", "fat1-lines"],
+            vec!["--anatomy", "--inspect", "take"],
+            vec!["--anatomy", "--takes", "1"],
+            vec!["--anatomy", "--takes", "2"],
+        ] {
+            assert!(parse(flags.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
+    #[test]
+    fn cargo_timings_survive_retirement_of_the_cold_graph() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let target = dir.path().join("build.noindex");
+        let timings = target.join("cargo-timings");
+        std::fs::create_dir_all(&timings).unwrap();
+        std::fs::write(timings.join("cargo-timing.html"), b"unit timeline").unwrap();
+        retain_timings(&target, dir.path()).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("cargo-timings/cargo-timing.html")).unwrap(),
+            b"unit timeline"
+        );
+        // A missing report is an observation failure, rather than a successful empty report.
+        assert!(retain_timings(&target, dir.path()).is_err());
+    }
+
+    #[test]
+    fn build_samples_exclude_supervisors_and_distinguish_reused_pids() {
+        let member = aterm_sysprobe::MemberUsage {
+            pid: 42,
+            start: 1,
+            cpu_ns: 123,
+            footprint: 456,
+            ..Default::default()
+        };
+        let initial = [(42, 1)].into_iter().collect();
+        let reused = aterm_sysprobe::MemberUsage { start: 2, ..member };
+        let sample = resource_sample(3.0, &initial, Some(vec![member, reused]), vec![]);
+        assert_eq!(sample["members"].as_array().unwrap().len(), 1);
+        assert_eq!(sample["members"][0]["start"].as_u64(), Some(2));
+        assert_eq!(sample["members"][0]["cpu_ns"].as_u64(), Some(123));
+        assert_eq!(sample["members"][0]["footprint_bytes"].as_u64(), Some(456));
+        // A refused read must remain distinguishable from an empty build group.
+        assert!(resource_sample(0.0, &initial, None, vec![])["members"].is_null());
+        assert_eq!(
+            resource_sample(0.0, &initial, Some(vec![]), vec![])["members"],
+            aterm_json::json!([])
+        );
+    }
+
+    #[test]
+    fn build_sampler_retains_observations_and_returns_the_work_result() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (result, _) = with_load(dir.path(), || 17).unwrap();
+        assert_eq!(result, 17);
+        let samples = std::fs::read_to_string(dir.path().join("build-resources.jsonl")).unwrap();
+        assert!(!samples.is_empty());
+        for line in samples.lines() {
+            let row: aterm_json::Value = aterm_json::from_str(line).unwrap();
+            assert!(row["elapsed_s"].as_f64().unwrap() >= 0.0);
+            assert!(row.as_object().unwrap().contains_key("members"));
+        }
+    }
+
     #[test]
     fn symbol_identity_preserves_function_offsets_and_source_locations() {
         let demangle = |_: &str| Ok("module::function".to_owned());

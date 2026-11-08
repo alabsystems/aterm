@@ -761,13 +761,11 @@ pub(crate) fn readiness_transition(state: &State, action: &str) -> State {
 #[test]
 fn typed_claim_readiness_refines_live_state_and_rejects_history_as_admission() {
     let model = aterm_models_harness::account_claim_readiness_model();
-    // The full sweep below checks the committed model as well as every mutant.
+    // The registry-wide non_vacuity test owns the full sweep; keep its primary mutant explicit.
     assert!(
         aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err(),
         "Buggy=1 must violate an invariant"
     );
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{faults:?}");
     let mut evidence = StepEvidence::new("AccountClaimReadiness");
     for state in aterm_spec::interp::reachable_states(&model) {
         if model.action_enabled("Check", &state) {

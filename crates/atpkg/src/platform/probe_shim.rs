@@ -353,7 +353,9 @@ fn is_link(path: &Path) -> Option<bool> {
     }
 }
 
-fn executable(path: &Path) -> Option<bool> {
+/// Kernel execute access to a regular file, following links; unread evidence or differing
+/// real and effective credentials leave the answer unknown.
+pub(crate) fn executable(path: &Path) -> Option<bool> {
     if !regular(path)? {
         return Some(false);
     }

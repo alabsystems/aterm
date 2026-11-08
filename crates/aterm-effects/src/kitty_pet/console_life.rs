@@ -959,10 +959,32 @@ impl PetBrain {
         self.console.source_seq
     }
 
+    /// The console carried the body with the page this tick ([`Self::place_console_body_at_home`]).
+    #[inline]
+    pub(super) fn console_carried(&self) -> bool {
+        self.console.reason == "content-ride"
+    }
+
+    /// A late frame's span carried the body with the page on one of its steps
+    /// ([`PetBrain::live_late_span`]) and the frame found it carried: its reason says so.
+    #[inline]
+    pub(super) fn name_the_spans_carry(&mut self) {
+        if self.console.reason == "quiet" {
+            self.console.reason = "content-ride";
+        }
+    }
+
+    /// The pose the last frame drew (`trail status`'s `pet_pose`): with the still pose a hold
+    /// kept on glass, not the brain's own under it, so a sampler times what a person saw
+    /// ([`OldPath::NamesTheDrawnPose`]). It named the brain's, and a landing the hold kept on
+    /// glass read as on it for 10 ms.
     #[inline]
     #[must_use]
     pub const fn pose_name(&self) -> &'static str {
-        PET_GLYPHS[self.species.skin(self.last_pose) as usize].id
+        if self.old_path(OldPath::NamesTheDrawnPose) {
+            return PET_GLYPHS[self.species.skin(self.last_pose) as usize].id;
+        }
+        PET_GLYPHS[self.drawn_pose as usize].id
     }
 
     /// Clear occupancy is read from the exact cell plane being presented.
@@ -4413,7 +4435,47 @@ impl PetBrain {
             (sense.cell_w, sense.cell_h),
             (sense.cols, sense.rows),
         );
-        self.content_ride(rect).is_some() || self.line_ride(world, rect).is_some()
+        self.console_ride(world, rect).is_some()
+            || self.old_path(OldPath::ChromeOverIsHoppedOff)
+                && (self.content_ride(rect).is_some() || self.line_ride(world, rect).is_some())
+    }
+
+    /// The ride the host's frame pass carries a body at `rect` with
+    /// ([`Self::place_console_body_at_home`]), `dy` rows: its rows moved with the page (a scroll, a
+    /// composer that grew a row up under it, [`Self::content_ride`]) onto ground clear of text, or
+    /// the line its feet stand on moved ([`Self::line_ride`]) onto a stand it may take; `None`
+    /// for no ride, or one onto ground it may not take, which the host does not carry it by. The
+    /// brain leaves a body the host carries to the host ([`Self::console_carries_at`]), so it is
+    /// this ride and no other: a body whose rows moved onto ground it may not take (a composer
+    /// that shrank under the cat on its second line, laying its top rule over the cat's head,
+    /// as Claude Code clears its draft on exit) was left to a host that did not carry it, and the
+    /// host put it on the nearest perch in one frame, a row down ([`OldPath::ChromeOverIsHoppedOff`]).
+    #[inline]
+    pub(super) const fn console_ride(&self, world: &PetWorld, rect: PetRect) -> Option<f32> {
+        if let Some(dy) = self.content_ride(rect) {
+            let ridden = PetRect {
+                row: rect.row + dy,
+                ..rect
+            };
+            return if world.under_text_clear(ridden, CLEARANCE) {
+                Some(dy)
+            } else {
+                None
+            };
+        }
+        // Its feet on the line: judged as a stand, whose margin stops at its soles.
+        let Some(dy) = self.line_ride(world, rect) else {
+            return None;
+        };
+        let ridden = PetRect {
+            row: rect.row + dy,
+            ..rect
+        };
+        if matches!(Self::stand_clearance(world, ridden, false), Some(true)) {
+            Some(dy)
+        } else {
+            None
+        }
     }
 
     /// Whether the console bars the escort from a stand at `desired` (`(col, foot row)`): protected ground under it, or between the body on glass and it ([`Self::console_walled`]).
@@ -4593,31 +4655,14 @@ impl PetBrain {
         } {
             return;
         }
-        if let Some(dy) = self.content_ride(rect) {
+        if let Some(dy) = self.console_ride(world, rect) {
             let ridden = PetFrame {
                 row: frame.row + dy,
                 ..*frame
             };
-            if matches!(body_rect(&ridden, sense), Some(r) if world.under_text_clear(r, CLEARANCE))
-            {
-                self.carry_console_body(frame, ridden, dy);
-                self.console.reason = "content-ride";
-                return;
-            }
-        } else if let Some(dy) = self.line_ride(world, rect) {
-            // Its feet on the line: judged as a stand, whose margin stops at its soles.
-            let ridden = PetFrame {
-                row: frame.row + dy,
-                ..*frame
-            };
-            if matches!(
-                body_rect(&ridden, sense),
-                Some(r) if Self::stand_clearance(world, r, false) == Some(true)
-            ) {
-                self.carry_console_body(frame, ridden, dy);
-                self.console.reason = "content-ride";
-                return;
-            }
+            self.carry_console_body(frame, ridden, dy);
+            self.console.reason = "content-ride";
+            return;
         }
         let Some(safe) = world.nearest_under_text_perch(rect, CLEARANCE, HOME_REACH) else {
             self.console.clipped = true;

@@ -142,13 +142,16 @@ pub(crate) struct Journal {
     armed_once: bool,
     cohort_owned: bool,
     subgroups: Vec<Subgroup>,
+    gnu: Option<(String, bool)>,
 }
 
 impl Journal {
     pub(crate) fn funded_scope(&self, claim: crate::CohortClosureRef) -> crate::FundedScope {
         let mut unresolved = matches!(self.state, State::Armed(_))
             || self.cohort_owned && matches!(self.state, State::Description)
-            || self.armed_once && self.policy == ClosurePolicy::BootOnly;
+            || self.armed_once && self.policy == ClosurePolicy::BootOnly
+            || self.gnu.as_ref().is_some_and(|(_, retired)| !retired)
+                && self.native_lifetime() != Lifetime::Present;
         let mut groups = Vec::new();
         if let State::Bound(_, group) = &self.state {
             groups.push(group.clone());
@@ -215,6 +218,7 @@ impl Journal {
                 armed_once: false,
                 cohort_owned,
                 subgroups: Vec::new(),
+                gnu: None,
             },
         ))
     }
@@ -253,6 +257,7 @@ impl Journal {
             armed_once: false,
             cohort_owned,
             subgroups: Vec::new(),
+            gnu: None,
         };
         head.as_object_mut()
             .ok_or_else(bad)?
@@ -326,6 +331,29 @@ impl Journal {
 
     fn apply(&mut self, event: &Value) -> io::Result<()> {
         let phase = event.get("phase").and_then(Value::as_str).ok_or_else(bad)?;
+        if matches!(phase, "gnu_prepare" | "gnu_retire") {
+            let id = event.get("id").and_then(Value::as_str).ok_or_else(bad)?;
+            if event.as_object().is_none_or(|map| map.len() != 2)
+                || id.len() != 32
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(bad());
+            }
+            match (phase, &mut self.gnu) {
+                ("gnu_prepare", None)
+                    if !self.armed_once && matches!(self.state, State::Description) =>
+                {
+                    self.gnu = Some((id.to_owned(), false));
+                }
+                ("gnu_retire", Some((original, retired))) if original == id && !*retired => {
+                    *retired = true;
+                }
+                _ => return Err(bad()),
+            }
+            return Ok(());
+        }
         if phase == "boot_only" {
             if event.as_object().is_none_or(|map| map.len() != 1)
                 || self.armed_once
@@ -526,6 +554,12 @@ impl Journal {
     }
 
     pub(crate) fn finish(&self) -> io::Result<Option<(String, Self)>> {
+        if self.gnu.as_ref().is_some_and(|(_, retired)| !retired) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "original GNU epoch remains pending",
+            ));
+        }
         match &self.state {
             State::Description => Ok(None),
             State::Bound(key, _) if self.lifetime() == Lifetime::Drained => {
@@ -570,7 +604,34 @@ impl Journal {
     }
 
     pub(crate) fn lifetime(&self) -> Lifetime {
+        let native = self.native_lifetime();
+        if native == Lifetime::Drained && self.gnu.as_ref().is_some_and(|(_, retired)| !retired) {
+            return Lifetime::Unknown;
+        }
+        native
+    }
+
+    pub(crate) fn native_lifetime(&self) -> Lifetime {
         self.lifetime_with(self.holder.scope.ended_or_unknown())
+    }
+
+    pub(crate) fn gnu_event(&self, phase: &str, id: &str) -> io::Result<(String, Self)> {
+        let event = aterm_json::json!({"phase":phase,"id":id});
+        let mut next = self.clone();
+        next.apply(&event)?;
+        Ok((line(&aterm_json::json!({"cohort":event}))?, next))
+    }
+
+    pub(crate) fn gnu_matches(&self, id: &str) -> bool {
+        self.gnu
+            .as_ref()
+            .is_some_and(|(original, _)| original == id)
+    }
+
+    pub(crate) fn gnu_retired(&self, id: &str) -> bool {
+        self.gnu
+            .as_ref()
+            .is_some_and(|(original, retired)| original == id && *retired)
     }
 
     fn lifetime_with(&self, scope: Option<Lifetime>) -> Lifetime {
@@ -648,12 +709,18 @@ impl Journal {
             ClosurePolicy::Group => "group",
             ClosurePolicy::BootOnly => "boot_only",
         };
-        let event = aterm_json::json!({
-            "phase": "snapshot", "v": if common { 2 } else { 1 },
+        let mut event = aterm_json::json!({
+            "phase": "snapshot", "v": if self.gnu.is_some() { 3 } else if common { 2 } else { 1 },
             "policy": {"v": 1, "kind": policy},
             "root": {"key": key.encode(), "captured": root.encode()},
             "subgroups": groups,
         });
+        if let Some((id, retired)) = &self.gnu {
+            event.as_object_mut().ok_or_else(bad)?.insert(
+                "gnu".into(),
+                aterm_json::json!({"id":id,"retired":retired,"common":common}),
+            );
+        }
         let mut compact = ordinary_lines(text).ok_or_else(bad)?;
         compact.push_str(&line(&aterm_json::json!({"cohort": event}))?);
         Ok(compact)
@@ -661,9 +728,31 @@ impl Journal {
 
     fn read_snapshot(&mut self, event: &Value) -> io::Result<()> {
         let version = event.get("v").and_then(Value::as_u64).ok_or_else(bad)?;
-        if event.as_object().is_none_or(|map| map.len() != 5) || !matches!(version, 1 | 2) {
+        if event
+            .as_object()
+            .is_none_or(|map| map.len() != if version == 3 { 6 } else { 5 })
+            || !matches!(version, 1..=3)
+        {
             return Err(bad());
         }
+        let common = if version == 3 {
+            let gnu = event.get("gnu").ok_or_else(bad)?;
+            if gnu.as_object().is_none_or(|map| map.len() != 3) {
+                return Err(bad());
+            }
+            let id = gnu.get("id").and_then(Value::as_str).ok_or_else(bad)?;
+            self.apply(&aterm_json::json!({"phase":"gnu_prepare","id":id}))?;
+            if gnu
+                .get("retired")
+                .and_then(Value::as_bool)
+                .ok_or_else(bad)?
+            {
+                self.apply(&aterm_json::json!({"phase":"gnu_retire","id":id}))?;
+            }
+            gnu.get("common").and_then(Value::as_bool).ok_or_else(bad)?
+        } else {
+            version == 2
+        };
         let policy = ClosurePolicy::decode(event.get("policy").ok_or_else(bad)?).ok_or_else(bad)?;
         if self.policy == ClosurePolicy::BootOnly && policy != ClosurePolicy::BootOnly {
             return Err(bad());
@@ -695,7 +784,7 @@ impl Journal {
                 return Err(bad());
             }
             let mut captured = group.get("captured").ok_or_else(bad)?.clone();
-            let key = if version == 1 {
+            let key = if !common {
                 group.get("key").ok_or_else(bad)?.clone()
             } else {
                 let nonce = group.get("nonce").and_then(Value::as_str).ok_or_else(bad)?;
@@ -937,6 +1026,7 @@ mod compact_snapshot_tests {
             policy: ClosurePolicy::BootOnly,
             cohort_owned: false,
             armed_once: true,
+            gnu: None,
             subgroups: (1..=count)
                 .map(|index| Subgroup {
                     key: birth(index),

@@ -350,29 +350,6 @@ fn await_first_sample(inst: &Instance) -> GateSnapshot {
 
 const VERDICTS: [&str; 2] = ["saw a visible run:", "verified at its hold:"];
 
-fn a_strangers_orphan(log: &str) -> Option<String> {
-    let lines: Vec<&str> = log.lines().collect();
-    let verdict = lines.iter().rposition(|l| {
-        l.contains("saw a visible run: Unclean")
-            || l.contains("verified at its hold: Backoff(\"escaped\")")
-    })?;
-    let escape = lines[..verdict]
-        .iter()
-        .rev()
-        .take_while(|l| !VERDICTS.iter().any(|v| l.contains(v)))
-        .find(|l| l.contains("spare gate: escape:"))?;
-    let word = |key: &str| {
-        escape
-            .split_whitespace()
-            .find_map(|w| w.strip_prefix(key))
-            .map(str::to_owned)
-    };
-    let flags = u32::from_str_radix(word("flags=0x")?.as_str(), 16).ok()?;
-    let terminal_born = flags & 0x80 != 0;
-    (word("in_session=")? == "false" && word("attached=")? == "false" && !terminal_born)
-        .then(|| (*escape).to_owned())
-}
-
 fn an_unsettled_scan(log: &str) -> Option<String> {
     let lines: Vec<&str> = log.lines().collect();
     let verdict = lines
@@ -451,9 +428,6 @@ fn only_a_scan_with_no_verdict_is_the_hosts() {
 fn expect_streak(inst: &Instance, streak: u32, expected: u32) {
     if streak != expected {
         let log = log_through(inst, "saw a visible run:", expected as usize);
-        if let Some(escape) = a_strangers_orphan(&log) {
-            a_stranger_decided_it(&escape);
-        }
         if let Some(line) = an_unsettled_scan(&log) {
             an_unsettled_scan_decided_it(&line, &log);
         }
@@ -464,13 +438,6 @@ fn expect_streak(inst: &Instance, streak: u32, expected: u32) {
         "the actual visible run taught the gate:\n{}",
         gate_log(inst)
     );
-}
-
-fn a_stranger_decided_it(escape: &str) -> ! {
-    aterm_spec::host::could_not_run(format!(
-        "another program's orphan was adopted in a clean run's window, which \
-         the scan counts as it counts the run's own double-fork daemon: {escape}"
-    ))
 }
 
 fn await_learned_spare_ready(inst: &Instance) {
@@ -490,12 +457,6 @@ fn await_learned_spare_ready(inst: &Instance) {
         // Its warm rc is given the hang detector ([`t_ready_file`]), so a T_READY that ran out
         // is no loaded machine's.
         if field(&m, "spare_gate") == Some("backoff") {
-            if field(&m, "spare_discard").is_some_and(|d| d.contains("escaped:"))
-                && let Some(escape) =
-                    a_strangers_orphan(&log_through(inst, "verified at its hold: Backoff", 1))
-            {
-                a_stranger_decided_it(&escape);
-            }
             if field(&m, "spare_discard").is_some_and(|d| d.contains("scan-unknown:")) {
                 let log = log_through(inst, "verified at its hold: Backoff", 1);
                 if let Some(line) = an_unsettled_scan(&log) {

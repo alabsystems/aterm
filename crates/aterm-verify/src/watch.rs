@@ -1215,6 +1215,19 @@ fn seals_match(first: &str, last: &str) -> bool {
     seal(first).is_some() && seal(first) == seal(last)
 }
 
+#[derive(serde::Deserialize)]
+struct StageEvidence {
+    event: String,
+    findings: Vec<String>,
+    decisions: Vec<StageDecision>,
+}
+
+#[derive(serde::Deserialize)]
+struct StageDecision {
+    detail: String,
+    outcome: String,
+}
+
 fn row(id: &str, code: Option<i32>, text: &str) -> Row {
     let outcome = match code {
         Some(0) => "pass",
@@ -1222,43 +1235,33 @@ fn row(id: &str, code: Option<i32>, text: &str) -> Row {
         Some(101) if text.contains("could not compile") => "red",
         _ => "could-not-run",
     };
-    let mut red_items: Vec<String> = if outcome == "red" {
-        text.lines()
-            .filter_map(|l| l.trim().strip_prefix("FAIL").map(|s| s.trim().to_owned()))
-            .collect()
-    } else {
-        vec![]
-    };
+    let mut red_items = Vec::new();
     let mut decisions = Vec::new();
+    let mut stage_evidence = false;
     for line in text
         .lines()
         .filter_map(|l| l.strip_prefix("verify-event: "))
     {
-        if let Ok(event) = aterm_json::from_str::<aterm_json::Value>(line)
-            && let Some(items) = event.get("findings").and_then(aterm_json::Value::as_array)
+        if let Ok(event) = aterm_json::from_str::<StageEvidence>(line)
+            && event.event == "stage-finished"
         {
+            // Stage findings contain proven failures. Aggregate check findings also
+            // contain blocked rows, and human summaries add timing-dependent aliases.
+            stage_evidence = true;
             if outcome == "red" {
-                red_items.extend(
-                    items
-                        .iter()
-                        .filter_map(aterm_json::Value::as_str)
-                        .map(str::to_owned),
-                );
+                red_items.extend(event.findings);
             }
-            if let Some(items) = event.get("decisions").and_then(aterm_json::Value::as_array) {
-                for item in items {
-                    if let (Some(id), Some(outcome)) = (
-                        item.get("detail").and_then(aterm_json::Value::as_str),
-                        item.get("outcome").and_then(aterm_json::Value::as_str),
-                    ) {
-                        decisions.push(Decision {
-                            id: id.into(),
-                            outcome: outcome.into(),
-                        });
-                    }
-                }
-            }
+            decisions.extend(event.decisions.into_iter().map(|item| Decision {
+                id: item.detail,
+                outcome: item.outcome,
+            }));
         }
+    }
+    if outcome == "red" && !stage_evidence {
+        red_items.extend(
+            text.lines()
+                .filter_map(|l| l.trim().strip_prefix("FAIL").map(|s| s.trim().to_owned())),
+        );
     }
     if outcome == "red" && red_items.is_empty() {
         red_items.push(id.into());
@@ -2492,6 +2495,61 @@ mod tests {
             waiter.join().expect("the stage waiter");
         });
     }
+    #[test]
+    fn stage_evidence_keeps_real_failures_without_summary_or_blocked_aliases() {
+        use crate::checks::Check;
+        use crate::ladder::Report;
+
+        for count in [1, crate::report::FINDINGS_SHOWN + 2] {
+            let mut expected: Vec<_> = (0..count).map(|i| format!("compile-target-{i}")).collect();
+            expected.sort();
+            let mut build = Report::new("build");
+            for id in &expected {
+                build.fail(id);
+            }
+            let mut blocked = Report::new("tests");
+            blocked.cannot_run("tests-after-build");
+            let reports = [&build, &blocked];
+            for seconds in [2.0, 900.0] {
+                let result = crate::report::judge(
+                    Check::Test,
+                    &reports,
+                    seconds,
+                    "--workspace",
+                    "rerun-tests".into(),
+                    None,
+                );
+                let mut text = String::new();
+                for (index, report) in reports.iter().enumerate() {
+                    text.push_str(&crate::report::stage_event(
+                        index,
+                        Some(Check::Test),
+                        report,
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        None,
+                    ));
+                }
+                text.push_str(&crate::report::check_event(&result, &reports));
+                text.push_str(&crate::report::render(&result, 8));
+                let captured = row("tree", Some(1), &text);
+                assert_eq!(captured.outcome, "red");
+                assert_eq!(captured.red_items, expected);
+                assert_eq!(captured.decisions.len(), count + 1);
+                assert_eq!(
+                    captured.decisions.last(),
+                    Some(&Decision {
+                        id: "tests-after-build".into(),
+                        outcome: "NOT RUN".into(),
+                    })
+                );
+                let unavailable = row("tree", Some(3), &text);
+                assert_eq!(unavailable.outcome, "could-not-run");
+                assert!(unavailable.red_items.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn partial_or_unavailable_samples_never_become_green() {
         let pass = row("tree", Some(0), "ok tests");

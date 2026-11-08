@@ -209,7 +209,8 @@ pub use steward::{
 pub use subscriber::mend_subscriber;
 pub use vault_memo::{
     DeskInputs, acknowledged_commons_log_now, desk_inputs, local_swarm_roster_for_log_now,
-    swarm_denied_nodes_now, swarm_roster_now_until, trusted_commons_log_now,
+    swarm_denial_snapshot_now, swarm_denied_nodes_now, swarm_roster_now_until,
+    trusted_commons_log_now,
 };
 pub(crate) use vault_memo::{
     local_recipient_denied_under, observe_commons_now, observe_commons_quiet,

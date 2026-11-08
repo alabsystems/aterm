@@ -19,6 +19,13 @@ USAGE
       Build cut-shaped profile arms in fresh roots, without executing the product.
       ARM: fat1, fat1-lines, fat16, fat16-lines, thin16-lines.
       Two takes run in forward/reverse order (ABBA for two arms).
+      Each take retains Cargo's unit timeline in cargo-timings/ and one-second
+      process-group observations in build-resources.jsonl (sampled, not accounting).
+  targo --unverified ship profile-pilot --anatomy
+      One fat1 take per slice with detailed front-end/codegen/link timings.
+      The existing stable compat compiler enables its unstable timing diagnostic
+      with RUSTC_BOOTSTRAP=1 for this measurement only. No runtime or
+      reproducibility judgment; compare sections against a regular take separately.
   targo --unverified ship profile-pilot --inspect RETAINED-TAKE-DIRECTORY
       Recheck a retained take's dSYM and a stripped private copy, without rebuilding.
 
@@ -31,6 +38,13 @@ USAGE
       Only on the owner's explicit instruction to ship the known measurement defect:
       accept the journaled artifact after all other release checks passed.
       Keeps the failed report and its digest; never writes a passing verification.
+
+  targo --unverified ship release --prefreeze
+      After refreshing origin/main and the clean release checkout, build and freeze
+      its cutter before the next cut. Runs at Background priority, yields to Release,
+      and excludes windowed/timed checks. No cut, credentials or publication.
+      For scheduled preparation, invoke the previous cutter.toml's tool.path directly
+      with `release --prefreeze`: the ship alias can compile before parsing this flag.
 
   targo --unverified ship release [--bump | --commit REV [--supersede] | --fix COMMIT...]
                  (--mac-only | --linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
@@ -957,6 +971,7 @@ fn parse_release<'a>(
     };
     while let Some(flag) = it.next() {
         match flag {
+            "--prefreeze" => opts.prefreeze = true,
             "--bump" => opts.bump = true,
             "--supersede" => opts.supersede = true,
             "--commit" => {
@@ -1009,6 +1024,23 @@ fn parse_release<'a>(
             }
             other => return Err(format!("unknown release flag {other:?}")),
         }
+    }
+    if opts.prefreeze
+        && (opts.bump
+            || opts.commit.is_some()
+            || opts.supersede
+            || !opts.fix.is_empty()
+            || opts.dry_run
+            || opts.prepare
+            || opts.qualify
+            || opts.forget
+            || opts.abandon.is_some()
+            || opts.linux.declared()
+            || !opts.linux.workers.is_empty()
+            || !opts.linux.targets.is_empty()
+            || opts.release_credentials.is_some())
+    {
+        return Err("--prefreeze builds only the clean origin/main cutter and takes no cut or credential flags".into());
     }
     if opts.abandon.is_some()
         && (opts.bump
@@ -1415,6 +1447,28 @@ fn repo_root() -> ledger::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefreeze_is_a_standalone_nonpublishing_operation() {
+        let parse = |flags: &[&str]| parse_release(&mut flags.iter().copied());
+        assert!(parse(&["--prefreeze"]).unwrap().prefreeze);
+        assert!(!parse(&["--mac-only"]).unwrap().prefreeze);
+        for flags in [
+            vec!["--bump"],
+            vec!["--commit", "HEAD"],
+            vec!["--fix", "HEAD"],
+            vec!["--prepare"],
+            vec!["--qualify"],
+            vec!["--forget"],
+            vec!["--abandon", "v0.1.0"],
+            vec!["--dry-run"],
+            vec!["--mac-only"],
+            vec!["--release-credentials", "/unused/profile.toml"],
+        ] {
+            let mut args = vec!["--prefreeze"];
+            args.extend(flags);
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
+    }
     #[test]
     fn supersede_requires_an_explicit_commit() {
         let parse = |words: &[&str]| {

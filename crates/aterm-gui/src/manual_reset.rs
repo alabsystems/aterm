@@ -233,9 +233,6 @@ struct OpenLane {
     generation: u64,
     tx: SyncSender<crate::spawn::GatherMsg>,
     poke: Option<crate::act_barrier::Poke>,
-    /// A barrier went [`Passage::Late`](crate::act_barrier::Passage::Late) and the parse stage has
-    /// answered none since ([`ResetLane::answered`]).
-    behind: bool,
 }
 
 impl std::fmt::Debug for ResetLane {
@@ -266,7 +263,6 @@ impl ResetLane {
             generation,
             tx,
             poke,
-            behind: false,
         });
         generation
     }
@@ -298,12 +294,12 @@ impl ResetLane {
     /// holds the answer itself.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) fn ask(&self) -> Option<std::sync::mpsc::Receiver<()>> {
-        self.ask_at().map(|(_, answer)| answer)
+        self.ask_barrier()
     }
 
-    /// Ask for a barrier (`ask` in a test), with the reader generation that took the ask.
+    /// Ask this live reader generation for one barrier (`ask` in a test).
     #[cfg(unix)]
-    fn ask_at(&self) -> Option<(u64, std::sync::mpsc::Receiver<()>)> {
+    fn ask_barrier(&self) -> Option<std::sync::mpsc::Receiver<()>> {
         let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
         let lane = slot.as_mut()?;
         let poke = lane.poke.as_mut()?;
@@ -311,23 +307,7 @@ impl ResetLane {
         poke.asked.push(tx);
         // A full pipe already holds a poke the gather has yet to take.
         aterm_pty::wake(poke.wr);
-        Some((lane.generation, answer))
-    }
-
-    /// The parse stage of generation `generation` answered a barrier: its parser has caught up.
-    #[cfg(unix)]
-    pub(crate) fn answered(&self, generation: u64) {
-        let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(lane) = slot.as_mut().filter(|lane| lane.generation == generation) {
-            lane.behind = false;
-        }
-    }
-
-    /// Whether a barrier went late and the parser has answered none since.
-    #[cfg(all(test, target_os = "macos"))]
-    pub(crate) fn behind_for_test(&self) -> bool {
-        let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-        slot.as_ref().is_some_and(|lane| lane.behind)
+        Some(answer)
     }
 
     /// How many barriers wait for the gather to take them ([`Self::ask`]).
@@ -339,48 +319,77 @@ impl ResetLane {
             .map_or(0, |poke| poke.asked.len())
     }
 
-    /// Wait, at most `patience`, on a barrier (`ask`); while an earlier one is late and
-    /// unanswered, ask none ([`Passage::Behind`](crate::act_barrier::Passage::Behind)). Holds the
-    /// lane's own lock only to ask, so the caller must hold neither the terminal's lock nor the
-    /// timeline's, which the parse stage takes.
+    /// Wait on this act's own barrier, cancelling when its actual caller disconnects.
+    /// Holds the lane's own lock only to ask. The caller must hold neither the
+    /// terminal's lock nor the timeline's, which the parse stage takes.
     pub(crate) fn pass(&self, patience: Duration) -> crate::act_barrier::Passage {
+        self.pass_started(patience, std::time::Instant::now(), || {})
+    }
+
+    /// The same native wait from its original start, observing a live unanswered ask.
+    pub(crate) fn pass_started(
+        &self,
+        patience: Duration,
+        started: std::time::Instant,
+        mut waiting: impl FnMut(),
+    ) -> crate::act_barrier::Passage {
         use crate::act_barrier::Passage;
         #[cfg(unix)]
         {
-            if self.behind_now() {
-                return Passage::Behind;
+            if crate::control::caller_hung_up() {
+                return Passage::Cancelled;
             }
-            let Some((generation, answer)) = self.ask_at() else {
+            let Some(answer) = self.ask_barrier() else {
                 return Passage::Unbarriered;
             };
-            match answer.recv_timeout(patience) {
-                Ok(()) => Passage::Passed,
-                Err(RecvTimeoutError::Timeout) => {
-                    let mut slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-                    // Under the lock [`Self::answered`] takes after it answers: an answer that came
-                    // since is seen here, and one that comes later clears what is set here.
-                    if answer.try_recv().is_ok() {
-                        return Passage::Passed;
-                    }
-                    if let Some(lane) = slot.as_mut().filter(|lane| lane.generation == generation) {
-                        lane.behind = true;
-                    }
-                    Passage::Late
+            let until = started
+                .checked_add(patience)
+                .unwrap_or_else(|| started + Duration::from_secs(365 * 86_400));
+            loop {
+                if crate::control::caller_hung_up() {
+                    return Passage::Cancelled;
                 }
-                Err(RecvTimeoutError::Disconnected) => Passage::Gone,
+                match answer.try_recv() {
+                    Ok(()) => return Passage::Passed,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return Passage::Gone,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+                let remaining = until.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return match answer.try_recv() {
+                        Ok(()) => Passage::Passed,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => Passage::Gone,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => Passage::Late,
+                    };
+                }
+                waiting();
+                if crate::control::caller_hung_up() {
+                    return Passage::Cancelled;
+                }
+                match answer.recv_timeout(crate::control::hangup_park(remaining)) {
+                    Ok(()) => {
+                        return if crate::control::caller_hung_up() {
+                            Passage::Cancelled
+                        } else {
+                            Passage::Passed
+                        };
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return if crate::control::caller_hung_up() {
+                            Passage::Cancelled
+                        } else {
+                            Passage::Gone
+                        };
+                    }
+                }
             }
         }
         #[cfg(not(unix))]
         {
-            let _ = patience;
+            let _ = (patience, started, &mut waiting);
             Passage::Unbarriered
         }
-    }
-
-    #[cfg(unix)]
-    fn behind_now(&self) -> bool {
-        let slot = self.slot.lock().unwrap_or_else(|p| p.into_inner());
-        slot.as_ref().is_some_and(|lane| lane.behind)
     }
 
     /// The barriers asked of generation `generation`'s gather since it last took them (its poke).

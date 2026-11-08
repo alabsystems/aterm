@@ -6,6 +6,7 @@
 use core::f32::consts::TAU;
 use core::time::Duration;
 
+use aterm_core::terminal::caret_path::CARET_PATH_LEN;
 use aterm_lexicon::Trick;
 use aterm_time::Instant;
 
@@ -578,6 +579,22 @@ const COMMIT_STARE: f32 = 0.25;
 /// The air a cat the writing reaches keeps past the cell its next step lands on, cells
 /// ([`PetBrain::writing_clear`]).
 const WRITING_AIR: f32 = 0.25;
+/// The step a late frame's missed span is lived in ([`PetBrain::live_late_span`]): a steady
+/// 60 Hz host's frame.
+const LIVE_STEP: Duration = Duration::from_micros(16_667);
+/// The longest span a late frame is lived through in steps ([`PetBrain::live_late_span`]): a
+/// starved machine's stalls of its main thread (0.9 to 5.6 s, a window under a background QoS)
+/// with room; a host away longer (a hidden window, a sleeping machine) meets the brain where it
+/// was.
+const LATE_SPAN_MAX: Duration = Duration::from_secs(8);
+/// The longest span lived through whose caret the caret's path does not time
+/// ([`PetBrain::live_late_span`]): its caret's move is met at the span's first step, a guess a
+/// longer span only makes worse; and every span's, before a stall was lived through
+/// ([`OldPath::StallIsLived`]).
+const LATE_SPAN_UNTIMED_MAX: Duration = Duration::from_secs(1);
+/// The most of a tick's span its motion spends ([`PetBrain::advance`]): a frame later than this
+/// is lived in steps ([`PetBrain::live_late_span`]).
+const STEP_DT_MAX: Duration = Duration::from_millis(100);
 const POSE_FLOOR: f32 = 2.0 / 60.0;
 const STILL_SECS: f32 = POSE_FLOOR - 0.5 / 60.0;
 
@@ -1869,11 +1886,69 @@ pub enum OldPath {
     /// command's word-cat walked back to the prompt 0.07 of a row up, drawn whole with its box
     /// into the command's line instead of drawn down by the caret (r29 K9-5).
     PlayLandsOffTheRows = 1 << 52,
+    /// A frame a host owed and brought late (a starved machine's 0.1 to 0.7 s gaps) is reached
+    /// through the span it missed, lived a sixtieth of a second at a time ([`PetBrain::tick`]);
+    /// reverted, the span is a single step its motion takes a tenth of a second of, and a flight
+    /// took a second and a half, the cat lagged the caret, and the keys it caught up with read
+    /// as jumps it hopped for.
+    LateSpanInSteps = 1 << 53,
+    /// The span a late frame missed is lived with the caret where its path put it at each step,
+    /// each move at its output batch's time ([`PetBrain::live_late_span`]), and a hidden caret's
+    /// rest is counted from when it came ([`PetBrain::times_the_caret`]); reverted, the caret
+    /// moves the whole way at the span's first step, and a starved host's moves of three to
+    /// seven cells at once, a typist's echoes or a program's writing, read as jumps the cat
+    /// pounced for.
+    LateCaretAtItsTimes = 1 << 54,
+    /// A body on glass keeps its place when its terminal switches between its main and its
+    /// alternate screen, and travels to the new screen's caret ([`PetBrain::keeps_its_body`],
+    /// [`crate::companion::CompanionOwner::rescreen_owner`]): the same glass and the same grid.
+    /// Reverted, the owner fence crossfaded it as a surface replaced: a ghost faded where it was
+    /// and the body came up at the new caret on the fence's own frame, so a cat asleep by the
+    /// shell's caret was drawn at Claude Code's composer the frame its first screen came, still
+    /// asleep, and a cat by the composer stood at the shell's prompt the frame the program left
+    /// (r29 K10-1, K10-2).
+    OtherScreenKeepsTheBody = 1 << 55,
+    /// A run of strides a gather, a perk or a startle cuts within its floor keeps its stride on
+    /// glass that long ([`PetBrain::hold_still_pose`]); reverted, the cut drew the stride for a
+    /// single present: a cat that set off and crouched at once for the long insert's dictation
+    /// chunk flashed one stride at 120 Hz (r29 K10-4).
+    StrideKeepsItsFloor = 1 << 56,
+    /// Chrome the host's frame pass does not carry the body off is hopped off at once: the brain
+    /// leaves to the host only a body its ride carries ([`PetBrain::console_ride`]), and a pounce
+    /// the caret's jump owes does not wait its gather out under the chrome. Reverted, any ride of
+    /// the body's rows left it to the host, lawful or not, and a pending pounce waited: a composer
+    /// that shrank under a cat on its second line as the program cleared its draft laid its top
+    /// rule over the cat's head, the cat perked under it, the host did not carry it, and put it a
+    /// row down in one frame (r29 K10-2).
+    ChromeOverIsHoppedOff = 1 << 57,
+    /// `trail status` names the pose the frame drew ([`PetBrain::pose_name`]); reverted, the
+    /// brain's own under the still pose a hold kept on glass, and a sampler timed poses no
+    /// present drew (r29 K10-4).
+    NamesTheDrawnPose = 1 << 58,
+    /// A frame a stall of the host's main thread held back (0.9 to 5.6 s on a starved machine) is
+    /// a late frame like any other, its span lived through when the caret's path times it
+    /// ([`LATE_SPAN_MAX`]); reverted, a span over a second met the brain in one step: a stall of a second and a half right after an
+    /// Enter ended with the cat at the old prompt, where a steady host's had bounded to the new
+    /// one, and it bounded at the next key instead (r29 K10-8).
+    StallIsLived = 1 << 59,
+    /// A body kept on glass across its terminal's switch of screens is judged by the head law
+    /// on the new screen afresh, eased as a body that comes to letters ([`PetBrain::rescreen`]);
+    /// reverted, the new screen's page read as letters printed over a body at rest, and the
+    /// law took it down or fitted it at once: a cat standing by a pager's last line was drawn at
+    /// half its size the present the pager gave the shell back, under the prompt's line.
+    NewScreenEasesTheHead = 1 << 60,
+    /// A body at rest kept on glass across its terminal's switch of screens sets off only once
+    /// the caret has rested [`SETTLE`] on the new screen ([`PetBrain::rescreen_settling`]);
+    /// reverted, it set off for the first caret the switch showed: a pager's exit restores the
+    /// shell's cursor to its line's start a present before the shell's prompt puts it back, and
+    /// the cat by `less`'s last line turned its back on the prompt for the seat past the line
+    /// above, stood so 1.4 s, and turned again to walk to the prompt.
+    NewScreenSettlesFirst = 1 << 61,
 }
 
 impl OldPath {
     /// Every law.
-    pub const EVERY: [Self; 50] = [
+    pub const EVERY: [Self; 59] = [
         Self::WatchFromTheLine,
         Self::FirstKeysAhead,
         Self::LookAheadAtTopSpeed,
@@ -1924,6 +1999,15 @@ impl OldPath {
         Self::PasteOpensItsOwnBurst,
         Self::SeatHeldAnywhereAhead,
         Self::PlayLandsOffTheRows,
+        Self::LateSpanInSteps,
+        Self::LateCaretAtItsTimes,
+        Self::OtherScreenKeepsTheBody,
+        Self::StrideKeepsItsFloor,
+        Self::ChromeOverIsHoppedOff,
+        Self::NamesTheDrawnPose,
+        Self::StallIsLived,
+        Self::NewScreenEasesTheHead,
+        Self::NewScreenSettlesFirst,
     ];
     /// Every law's bit ([`PetBrain::set_old_paths`], a test seam, so only where it is built).
     #[cfg(any(test, debug_assertions))]
@@ -2379,12 +2463,18 @@ pub struct PetBrain {
     rest_kept: (bool, bool),
     /// [`Self::clock`] of the last caret move ([`Self::hold_still_pose`]).
     moved_at: Option<f64>,
+    /// [`Self::clock`] when the terminal last switched screens under the body
+    /// ([`Self::rescreen`], [`Self::rescreen_settling`]).
+    rescreen_at: Option<f64>,
     still_console: bool,
     /// The still pose on glass ([`Self::still_since`]) is a beat of the sit
     /// ([`Self::hold_still_pose`]).
     still_sat: bool,
     stand_ends_leg: bool,
     drew_leg: bool,
+    /// The run of strides on glass ([`Self::hold_still_pose`]): when its first stride was drawn,
+    /// and the stride and scale drawn last.
+    stride_on: Option<(f64, PetGlyphId, (f32, f32))>,
     console_posed: bool,
     deferred_arc: Option<(f32, f32, f32, f32, FlightKind)>,
 
@@ -2538,6 +2628,14 @@ pub struct PetBrain {
     last_drawn: [f32; PET_DEPARTURES_MAX],
     last_grid: (u16, u16),
     last_pose: PetGlyphId,
+    /// The pose the last frame drew ([`Self::pose_name`]): the brain's own pose with the still
+    /// pose a hold kept on glass over it ([`Self::hold_still_pose`]), and its species' skin.
+    drawn_pose: PetGlyphId,
+    /// The caret's moves since the last frame, at their times ([`Self::note_caret_path`]).
+    caret_path: [Option<(Instant, (u16, u16))>; CARET_PATH_LEN],
+    /// The next visible change the last frame left due, for a brain that asked no frames: the
+    /// deadline a host that draws on demand armed then ([`Self::live_late_span`]).
+    span_due: Option<Instant>,
     last_facing: bool,
     last_stance: Stance,
     adopted_look: Option<AdoptedLook>,
@@ -2725,10 +2823,12 @@ impl PetBrain {
             action_began: false,
             rest_kept: (false, false),
             moved_at: None,
+            rescreen_at: None,
             still_console: false,
             still_sat: false,
             stand_ends_leg: false,
             drew_leg: false,
+            stride_on: None,
             console_posed: false,
             deferred_arc: None,
             gallop_since: None,
@@ -2840,6 +2940,9 @@ impl PetBrain {
             last_drawn: [0.0; PET_DEPARTURES_MAX],
             last_grid: (0, 0),
             last_pose: PetGlyphId::PetSleep0,
+            drawn_pose: PetGlyphId::PetSleep0,
+            caret_path: [None; CARET_PATH_LEN],
+            span_due: None,
             last_facing: false,
             last_stance: Stance::NEUTRAL,
             adopted_look: None,
@@ -4208,6 +4311,10 @@ impl PetBrain {
         let mut ink_spans = std::mem::take(&mut self.ink_spans);
         ink_spans.clear();
         let console = self.console.retired();
+        // A test's negative controls outlive the brain they were set on, as the laws they
+        // revert do.
+        #[cfg(any(test, debug_assertions))]
+        let old_paths = self.old_paths;
         // A cat that waits on its caret's row ahead of its stand for the
         // writing ([`AWAIT_AHEAD`], the first keys' landing ahead) holds the seat it
         // stands on: held at its stand, it came back to the focus that left
@@ -4281,8 +4388,68 @@ impl PetBrain {
             ink_spans,
             console,
             held_stash,
+            #[cfg(any(test, debug_assertions))]
+            old_paths,
             ..Self::default()
         };
+    }
+
+    /// Whether the caret's moves are met at their own times ([`OldPath::LateCaretAtItsTimes`]),
+    /// a hidden one's rest included ([`crate::companion::CompanionOwner::prepare`]); `false`
+    /// only where a test reverts the law.
+    #[inline]
+    #[must_use]
+    pub const fn times_the_caret(&self) -> bool {
+        !self.old_path(OldPath::LateCaretAtItsTimes)
+    }
+
+    /// Whether a body on glass keeps its place across its terminal's switch to its other screen
+    /// ([`OldPath::OtherScreenKeepsTheBody`]); `false` only where a test reverts the law.
+    #[inline]
+    #[must_use]
+    pub const fn keeps_its_body(&self) -> bool {
+        !self.old_path(OldPath::OtherScreenKeepsTheBody)
+    }
+
+    /// The same terminal switched between its main and its alternate screen
+    /// ([`OldPath::OtherScreenKeepsTheBody`]): the glass and the grid are the ones the body is
+    /// drawn on, so it keeps its place, pose and presence, and the caret's move to the new
+    /// screen is a jump it goes to (a sleeper wakes first). Only the facts read off the old
+    /// screen go: its letters' ledger and the pointer over them. The console's seats are the
+    /// old screen's too, and its next reading lets them go ([`Self::begin_console_tick`]). So
+    /// does the page the head law judged the body on ([`Self::ease_head`]): the new screen is
+    /// judged afresh and eased to, as a body comes to letters, not met as letters printed over
+    /// a body at rest, which the law takes down or fits at once
+    /// ([`OldPath::NewScreenEasesTheHead`]).
+    #[inline]
+    pub fn rescreen(&mut self) {
+        self.ink_base = 0;
+        self.ink_spans.clear();
+        self.ink_live = None;
+        self.ink_scrolled = false;
+        self.last_pointer = None;
+        self.pending_pointer_pounce = None;
+        if !self.old_path(OldPath::NewScreenEasesTheHead) {
+            self.sink_seat = None;
+        }
+        if !self.old_path(OldPath::NewScreenSettlesFirst) {
+            self.rescreen_at = Some(self.clock);
+        }
+    }
+
+    /// The terminal switched screens under the body ([`Self::rescreen`]) and the caret has not
+    /// rested [`SETTLE`] since, nor has [`SETTLE_CAP`] passed: the program is still drawing its
+    /// new screen, and the caret it shows is no place to set off for yet.
+    #[inline]
+    const fn rescreen_settling(&self) -> bool {
+        let Some(at) = self.rescreen_at else {
+            return false;
+        };
+        let last = match self.moved_at {
+            Some(moved) if moved > at => moved,
+            _ => at,
+        };
+        ((self.clock - at) as f32) < SETTLE_CAP && ((self.clock - last) as f32) < SETTLE
     }
 
     /// The same surface, re-gridded.
@@ -6367,10 +6534,150 @@ impl PetBrain {
     /// it before what the tick brings ([`Self::keep_rest`]).
     #[inline]
     pub fn tick(&mut self, sense: PetSense) -> PetFrame {
+        let (wrapped, carried) = self.live_late_span(sense);
+        let frame = self.tick_once(PetSense {
+            wrapped: sense.wrapped && !wrapped,
+            ..sense
+        });
+        // The frame's reason names what its span did to the body: the console carried it with
+        // the page on a step of the span, and this frame found it carried.
+        if carried {
+            self.name_the_spans_carry();
+        }
+        // The deadline a host that draws on demand arms on this frame's reading: the next late
+        // frame lives the step it names, not where that frame's reading of the page moves it.
+        self.span_due = if self.asked_frames {
+            None
+        } else {
+            self.next_change_deadline(sense.now)
+        };
+        frame
+    }
+
+    /// The caret's moves since the last frame, each at the time its output batch moved it
+    /// (`aterm_core`'s `Terminal::caret_path`, oldest first), for the next tick's late span
+    /// ([`Self::live_late_span`]); a host that sends none has the span met with its frame's
+    /// caret.
+    #[inline]
+    pub const fn note_caret_path(&mut self, path: [Option<(Instant, (u16, u16))>; CARET_PATH_LEN]) {
+        self.caret_path = path;
+    }
+
+    /// THE SPAN A LATE FRAME MISSED IS LIVED (r29 K10-8). A host the brain asked frames of that
+    /// brings the next one late (a starved machine drew a tenth of a second and more apart, and
+    /// its main thread stalled for seconds) would otherwise reach it in one step, whose motion spends no more than a tenth of a
+    /// second ([`Self::advance`]'s `dt`): its flights took a second and a half, the cat fell
+    /// behind the caret, and the caret's moves it caught up with read as jumps it hopped for, so
+    /// a starved window's cat made decisions a steady one's did not. The span up to this frame
+    /// is lived first a sixtieth of a second at a time ([`LIVE_STEP`]) on what this frame sees,
+    /// with the caret where it stood at each step: where the caret's path put it by then
+    /// ([`Self::note_caret_path`]), each move at its batch's own time, when the path ends at
+    /// this frame's caret; else where this frame sees it from the span's first step, as one
+    /// tick meets it. So the frame draws the moment a steady host's would. A frame no later than
+    /// one tick's motion spends ([`STEP_DT_MAX`]) with no more than one move to meet is that
+    /// tick. A host away longer than [`LATE_SPAN_MAX`] (a hidden window, a sleeping machine) is
+    /// no late frame, nor one away longer than [`LATE_SPAN_UNTIMED_MAX`] whose caret the path
+    /// does not time. A brain that asks no frames is lived on the steps a host that draws on
+    /// demand would have drawn it on: the step its next visible change was due, and the step a
+    /// move of the caret's path came; lived only on the frame, a wake due to end on the way
+    /// ended at the late frame instead, and the cat gathered that much later. Returns whether a
+    /// step took the frame's wrap, which the frame then does not repeat, and whether a step's
+    /// console carried the body with the page ([`Self::place_console_body_at_home`]).
+    #[inline]
+    fn live_late_span(&mut self, sense: PetSense) -> (bool, bool) {
+        let path = core::mem::replace(&mut self.caret_path, [None; CARET_PATH_LEN]);
+        if self.old_path(OldPath::LateSpanInSteps) {
+            return (false, false);
+        }
+        let Some(prev) = self.last_now else {
+            return (false, false);
+        };
+        let mut carried = false;
+        let timed = !self.old_path(OldPath::LateCaretAtItsTimes)
+            && sense.caret.is_some()
+            && path.iter().flatten().next_back().map(|&(_, cell)| cell) == sense.caret;
+        let longest = if timed && !self.old_path(OldPath::StallIsLived) {
+            LATE_SPAN_MAX
+        } else {
+            LATE_SPAN_UNTIMED_MAX
+        };
+        if sense.now.saturating_duration_since(prev) > longest {
+            return (false, false);
+        }
+        // A frame no later than one tick's motion spends, with no more than one of the caret's
+        // moves to meet in it, is the one tick it always was.
+        let moves = if timed {
+            path.iter().flatten().filter(|&&(at, _)| at > prev).count()
+        } else {
+            0
+        };
+        if sense.now.saturating_duration_since(prev) <= STEP_DT_MAX && moves < 2 {
+            return (false, false);
+        }
+        let mut caret = match self.last_caret {
+            Some(c) if timed => Some(c),
+            _ => sense.caret,
+        };
+        let mut wrap_owed = sense.wrapped;
+        let mut t = prev + LIVE_STEP;
+        // A brain that asks no frames is lived where a host that draws on demand draws it: at
+        // the step its next visible change was due ([`Self::next_change_deadline`], as the last
+        // frame left it: this frame's reading of the page came at this frame, and a deadline it
+        // moves earlier is no step that host drew), and at the step a move of the caret's path
+        // came on.
+        let mut lived_to = prev;
+        let mut due = if self.asked_frames {
+            None
+        } else {
+            self.span_due
+        };
+        while sense.now.saturating_duration_since(t) >= LIVE_STEP / 2 {
+            let woken = timed
+                && path
+                    .iter()
+                    .flatten()
+                    .any(|&(at, _)| at > lived_to && at <= t);
+            if !self.asked_frames && !woken && !due.is_some_and(|at| at <= t) {
+                t += LIVE_STEP;
+                continue;
+            }
+            lived_to = t;
+            let was = caret;
+            if timed {
+                caret = path
+                    .iter()
+                    .flatten()
+                    .rfind(|&&(at, _)| at <= t)
+                    .map_or(caret, |&(_, cell)| Some(cell));
+            }
+            // The wrap goes with the step that takes the caret down a row (the first, untimed).
+            let wrapped = wrap_owed
+                && (!timed || matches!((was, caret), (Some((wr, _)), Some((cr, _))) if cr > wr));
+            wrap_owed &= !wrapped;
+            let _ = self.tick_once(PetSense {
+                now: t,
+                caret,
+                wrapped,
+                ..sense
+            });
+            carried |= self.console_carried();
+            due = if self.asked_frames {
+                None
+            } else {
+                self.next_change_deadline(t)
+            };
+            t += LIVE_STEP;
+        }
+        (sense.wrapped && !wrap_owed, carried)
+    }
+
+    #[inline]
+    fn tick_once(&mut self, sense: PetSense) -> PetFrame {
         let at = (self.col, self.row);
         self.aim = None;
         self.writing_wait = None;
         let frame = self.advance(sense);
+        self.drawn_pose = frame.pose;
         self.set_off_owed = false;
         let driven = self.needs_frames();
         self.owe_set_off(at, driven);
@@ -6434,7 +6741,7 @@ impl PetBrain {
                 .clamp(0.0, 5.0),
             None => 0.0,
         };
-        let dt = elapsed.min(0.10);
+        let dt = elapsed.min(STEP_DT_MAX.as_secs_f32());
         let move_dt = if self.asked_frames { dt } else { 0.0 };
         let chrome_hop = core::mem::replace(&mut self.chrome_hop, false);
         self.frame_owed = false;
@@ -7278,45 +7585,56 @@ impl PetBrain {
                 | PetAction::Frolic
                 | PetAction::Droop
         );
-        if self.flight.is_none()
+        let may_leave = self.flight.is_none()
             && (may_evict_action || self.action == PetAction::Land)
             && !self.cheering()
-            && !(self.action.settled() && (self.pending_pounce || self.pending_big_jump))
-            && self.wrap_ahead.is_none()
-            && {
-                // A body the host carries with the rows it rests on (a composer that grows a
-                // row up under the cat on top of its rule) is never hopped off them
-                // ([`OldPath::CarriedBodyHopsOff`]): the rows' move puts the obstruction under it
-                // for the one present before the carry. Hopped off, the cat on top of the
-                // harness's line leapt a row up at each line a program's writing grew the
-                // composer by: four hops on the spot in the long insert's dictation (r29 K9-3).
-                let carried = self.console_carries_at((self.col, self.row), sense);
-                let chrome_over = self.console_yields_at((self.col, self.row), sense) && !carried;
-                let obstructed = self.console_obstructed(sense)
-                    && (!carried || self.old_path(OldPath::CarriedBodyHopsOff));
-                (may_evict_action || chrome_over)
-                    && if chrome_over || obstructed {
-                        true
-                    } else {
-                        // Nor off the words while a program's burst still walks the caret about
-                        // ([`SETTLE`]): the one trip to where it settles is the eviction. Stepped off
-                        // the words its repaint wrote under the cat, the cat was launched at a row the
-                        // caret was leaving. The host's chrome over it is never waited out: the console
-                        // would step the body aside in one present. Nor are the letters a
-                        // program writes along the caret's line under the cat
-                        // ([`Self::writing_laid_under`]): its writing goes on there, and the cat
-                        // goes once to where it will rest, off the writing's way.
-                        (!self.caret_unsettled() || off_writing.is_some())
-                            && (self.ink_overlaps(self.col, self.row, width)
-                                || (was_evicting
-                                    && !self.stream
-                                    && (self.col - target).abs() > f32::EPSILON
-                                    && (self.row - f32::from(cr)).abs() < 0.5
-                                    && self.col < f32::from(cc) + STATION_LEAD
-                                    && self.col + width > f32::from(cc) - STATION_LEAD))
-                    }
+            && self.wrap_ahead.is_none();
+        // A body the host carries with the rows it rests on (a composer that grows a row up
+        // under the cat on top of its rule) is never hopped off them
+        // ([`OldPath::CarriedBodyHopsOff`]): the rows' move puts the obstruction under it for
+        // the one present before the carry. Hopped off, the cat on top of the harness's line
+        // leapt a row up at each line a program's writing grew the composer by: four hops on the
+        // spot in the long insert's dictation (r29 K9-3).
+        let carried = may_leave && self.console_carries_at((self.col, self.row), sense);
+        let chrome_over =
+            may_leave && self.console_yields_at((self.col, self.row), sense) && !carried;
+        // A pounce the caret's jump owes waits out its gather where the cat is, but not under the
+        // host's chrome, which the host would step the body off in one present: the hop off is
+        // the trip ([`OldPath::ChromeOverIsHoppedOff`]). Waited out, a cat by Claude Code's
+        // composer as the program cleared its draft on exit sat a perk under the rule's chrome,
+        // and the host put it a row down in one frame.
+        let pounce_waits = self.action.settled()
+            && (self.pending_pounce || self.pending_big_jump)
+            && (!chrome_over || self.old_path(OldPath::ChromeOverIsHoppedOff));
+        if may_leave && !pounce_waits && {
+            let obstructed = self.console_obstructed(sense)
+                && (!carried || self.old_path(OldPath::CarriedBodyHopsOff));
+            (may_evict_action || chrome_over)
+                && if chrome_over || obstructed {
+                    true
+                } else {
+                    // Nor off the words while a program's burst still walks the caret about
+                    // ([`SETTLE`]): the one trip to where it settles is the eviction. Stepped off
+                    // the words its repaint wrote under the cat, the cat was launched at a row the
+                    // caret was leaving. The host's chrome over it is never waited out: the console
+                    // would step the body aside in one present. Nor are the letters a program
+                    // writes along the caret's line under the cat ([`Self::writing_laid_under`]):
+                    // its writing goes on there, and the cat goes once to where it will rest, off
+                    // the writing's way.
+                    (!self.caret_unsettled() || off_writing.is_some())
+                        && (self.ink_overlaps(self.col, self.row, width)
+                            || (was_evicting
+                                && !self.stream
+                                && (self.col - target).abs() > f32::EPSILON
+                                && (self.row - f32::from(cr)).abs() < 0.5
+                                && self.col < f32::from(cc) + STATION_LEAD
+                                && self.col + width > f32::from(cc) - STATION_LEAD))
+                }
+        } {
+            if chrome_over {
+                self.pending_pounce = false;
+                self.pending_big_jump = false;
             }
-        {
             let watching = self.action == PetAction::Perk
                 && self.watch_heat >= WATCH_GATE
                 && !self.watch_spent;
@@ -8613,6 +8931,15 @@ impl PetBrain {
             }
         }
 
+        // A NEW SCREEN SETTLES BEFORE A CAT AT REST SETS OFF ([`Self::rescreen_settling`]): a
+        // program that switched screens is still drawing its first one, and the caret it shows
+        // may be a passing one (a pager's exit restores the shell's cursor to its line's start a
+        // present before the shell's prompt puts it back). The cat goes once, to where the caret
+        // rests.
+        if self.action.settled() && self.rescreen_settling() {
+            self.speed = 0.0;
+            return self.emit(sense, width);
+        }
         let gap = target - self.col;
         if self.pending_big_jump && self.bound_came_short(target, target_row) {
             self.pending_big_jump = false;
@@ -13438,9 +13765,38 @@ impl PetBrain {
         self.still_held = false;
         if frame.alpha == 0 {
             self.still_since = None;
+            self.stride_on = None;
             return;
         }
         let mut stand = self.is_stand_pose(frame.pose);
+        // A set-off cut by a gather, a perk or a startle within its floor keeps its stride on
+        // glass that long, as a still pose a cut keeps ([`OldPath::StrideKeepsItsFloor`]): a cat
+        // that took one stride and crouched for a program's chunk drew the stride for a single
+        // present (the long insert's dictation, at 120 Hz).
+        let stride = !stand && matches!(frame.action, PetAction::Walk | PetAction::Run);
+        if !stride
+            && matches!(
+                frame.action,
+                PetAction::Crouch | PetAction::Perk | PetAction::Startle
+            )
+            && !self.old_path(OldPath::StrideKeepsItsFloor)
+            && let Some((from, pose, scale)) = self.stride_on
+            && ((self.clock - from) as f32) < STILL_SECS
+        {
+            frame.pose = pose;
+            (frame.scale_x, frame.scale_y) = scale;
+            self.still_held = true;
+            return;
+        }
+        self.stride_on = if stride {
+            let from = match self.stride_on {
+                Some((from, _, _)) => from,
+                None => self.clock,
+            };
+            Some((from, frame.pose, (frame.scale_x, frame.scale_y)))
+        } else {
+            None
+        };
         // A landing's touchdown is a pose on the ground: a backspace's flinch on the
         // landing's first present drew it for a single frame.
         let travelling = !stand
@@ -14411,10 +14767,16 @@ impl PetBrain {
         let mut ink_spans = std::mem::take(&mut self.ink_spans);
         ink_spans.clear();
         let console = self.console.retired();
+        // A test's negative controls outlive the brain they were set on, as the laws they
+        // revert do.
+        #[cfg(any(test, debug_assertions))]
+        let old_paths = self.old_paths;
         Self {
             console,
             ink_spans,
             departure_serial: self.departure_serial,
+            #[cfg(any(test, debug_assertions))]
+            old_paths,
             ..Self::default()
         }
     }

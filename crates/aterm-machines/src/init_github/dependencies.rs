@@ -5,7 +5,7 @@
 //! their identities and exact commits. Optional submodules are never visited.
 
 use super::repos::{self, Repo};
-use crate::checkout::{self, Remote};
+use crate::checkout::{self, NoLazyFetch, Remote};
 use crate::model::User;
 use crate::port::{Cmd, Scratch, System};
 use aterm_json::Value;
@@ -16,31 +16,25 @@ use std::time::Duration;
 
 const BUDGET: Duration = Duration::from_secs(1800);
 
-/// [`checkout::git`] (whose `GIT_NO_LAZY_FETCH` an older git ignores) with `--no-lazy-fetch`,
-/// which an older git refuses ([`require_local_reads`] asks it first), and with no fsmonitor,
-/// for the reads that run without [`checkout::NO_SIDE_RUNS`].
-fn local(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
-    checkout::git(sys, user, path)
-        .arg("--no-lazy-fetch")
-        .args(["-c", "core.fsmonitor="])
+/// [`checkout::git`] that cannot fetch an object lazily, the way `off` says this git keeps it
+/// from doing so ([`NoLazyFetch::git`]: `--no-lazy-fetch` where git takes it, the
+/// `GIT_NO_LAZY_FETCH` it was seen to obey where it refuses the option), with no fsmonitor, for
+/// the reads that run without [`checkout::NO_SIDE_RUNS`].
+fn local(sys: &dyn System, user: &User, path: Option<&Path>, off: NoLazyFetch) -> Cmd {
+    off.git(sys, user, path).args(["-c", "core.fsmonitor="])
 }
 
-fn require_local_reads(sys: &dyn System, user: &User, repo: &Repo) -> Result<(), String> {
-    if repo.required_submodules.is_empty() {
-        return Ok(());
-    }
-    if !supports_local_reads(sys, user)? {
-        return Err("Git must support --no-lazy-fetch to inspect required dependencies safely; required dependencies stay untouched".into());
-    }
-    Ok(())
-}
-
-/// The selected executable must recognize the option; its environment equivalent
-/// alone can be silently ignored by older Git. No repository or object is read.
-pub(super) fn supports_local_reads(sys: &dyn System, user: &User) -> Result<bool, String> {
-    let ran = sys.run_complete_stdout(&local(sys, user, None).arg("--version"))
-        .map_err(|_| "cannot check Git's --no-lazy-fetch capability; required dependencies stay untouched")?;
-    Ok(ran.success())
+/// How this git keeps every read here from fetching lazily ([`NoLazyFetch::of`]), asked before
+/// any repository is read. The variable alone is not taken on trust: an older git ignores it
+/// silently, so a git that refuses the option must have been seen to obey it.
+fn require_local_reads(sys: &dyn System, user: &User) -> Result<NoLazyFetch, String> {
+    NoLazyFetch::of(sys, user)
+        .map_err(|why| format!("{why}; required dependencies stay untouched"))?
+        .ok_or_else(|| {
+            "Git must support --no-lazy-fetch, or obey GIT_NO_LAZY_FETCH, to inspect required \
+             dependencies safely; required dependencies stay untouched"
+                .into()
+        })
 }
 
 /// Admit canonical, bounded relative paths, with no overlaps even on a case-insensitive
@@ -209,10 +203,11 @@ fn resolve(
     parent: &Path,
     repo: &Repo,
     path: &str,
+    off: NoLazyFetch,
 ) -> Result<Dependency, String> {
     directories(sys, user, parent, path)?;
     repos::verify_existing(sys, user, &repo.owner, repo, parent)?;
-    let git = || local(sys, user, Some(parent));
+    let git = || local(sys, user, Some(parent), off);
     let revision = text(
         sys,
         git().args(["rev-parse", "--verify", "HEAD^{commit}"]),
@@ -366,6 +361,7 @@ fn state(
     user: &User,
     parent: &Path,
     dependency: &Dependency,
+    off: NoLazyFetch,
 ) -> Result<State, String> {
     directories(sys, user, parent, &dependency.path)?;
     let path = parent.join(&dependency.path);
@@ -376,7 +372,7 @@ fn state(
         }
         _ => {}
     }
-    let git = || local(sys, user, Some(&path));
+    let git = || local(sys, user, Some(&path), off);
     let metadata = sys
         .stat(&path.join(".git"))
         .map_err(|_| "required dependency has no owned Git metadata; left untouched")?;
@@ -408,11 +404,13 @@ fn state(
         "cannot read required dependency HEAD",
     )?;
     if head.trim() == dependency.pin {
-        return Ok(if checkout_objects(sys, user, &path, &dependency.pin)? {
-            State::Ready
-        } else {
-            State::ObjectsMissing
-        });
+        return Ok(
+            if checkout_objects(sys, user, &path, &dependency.pin, off)? {
+                State::Ready
+            } else {
+                State::ObjectsMissing
+            },
+        );
     }
     if !repos::oid(head.trim()) {
         return Err("cannot read required dependency commit".into());
@@ -449,7 +447,7 @@ fn state(
     }
     let recorded = text(
         sys,
-        local(sys, user, Some(parent)).args([
+        local(sys, user, Some(parent), off).args([
             "log",
             "-1",
             "--format=%H",
@@ -481,12 +479,15 @@ pub(super) fn ready(
     parent: &Path,
     repo: &Repo,
 ) -> Result<bool, Unready> {
-    require_local_reads(sys, user, repo).map_err(Unready::Git)?;
+    if repo.required_submodules.is_empty() {
+        return Ok(true);
+    }
+    let off = require_local_reads(sys, user).map_err(Unready::Git)?;
     let mut ready = true;
     for path in &repo.required_submodules {
         let named = |why: String| Unready::Preserved(format!("{path}: {why}"));
-        let dependency = resolve(sys, user, parent, repo, path).map_err(named)?;
-        ready &= state(sys, user, parent, &dependency).map_err(named)? == State::Ready;
+        let dependency = resolve(sys, user, parent, repo, path, off).map_err(named)?;
+        ready &= state(sys, user, parent, &dependency, off).map_err(named)? == State::Ready;
     }
     Ok(ready)
 }
@@ -496,19 +497,22 @@ fn network(
     user: &User,
     path: Option<&Path>,
     dependency: &Dependency,
+    off: NoLazyFetch,
 ) -> Result<Cmd, String> {
-    let ordinary = local(sys, user, path).args(checkout::NO_SIDE_RUNS).args([
-        "-c",
-        "submodule.recurse=false",
-        "-c",
-        "protocol.allow=never",
-        "-c",
-        "protocol.https.allow=always",
-        "-c",
-        "protocol.ssh.allow=always",
-        "-c",
-        "http.followRedirects=false",
-    ]);
+    let ordinary = local(sys, user, path, off)
+        .args(checkout::NO_SIDE_RUNS)
+        .args([
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.https.allow=always",
+            "-c",
+            "protocol.ssh.allow=always",
+            "-c",
+            "http.followRedirects=false",
+        ]);
     repos::clone_command(
         sys,
         user,
@@ -539,10 +543,16 @@ pub(super) fn complete_storage(sys: &dyn System, user: &User, path: &Path) -> Re
     Ok(())
 }
 
-fn checkout_objects(sys: &dyn System, user: &User, path: &Path, pin: &str) -> Result<bool, String> {
+fn checkout_objects(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    pin: &str,
+    off: NoLazyFetch,
+) -> Result<bool, String> {
     // A commit can exist without its tree or blobs. Walk only this snapshot, with no
     // ancestry or optional gitlinks, and keep object reads unable to start a lazy fetch.
-    sys.run_complete_stdout(&local(sys, user, Some(path)).args([
+    sys.run_complete_stdout(&local(sys, user, Some(path), off).args([
         "rev-list",
         "--objects",
         "--no-walk",
@@ -561,8 +571,9 @@ fn fetch_objects(
     path: &Path,
     dependency: &Dependency,
     current: &(dyn Fn() -> Result<(), String> + Sync),
+    off: NoLazyFetch,
 ) -> Result<(), crate::checkout::AcquisitionFailure> {
-    let command = network(sys, user, Some(path), dependency)?
+    let command = network(sys, user, Some(path), dependency, off)?
         .budget(BUDGET)
         .args([
             "fetch",
@@ -582,7 +593,7 @@ fn fetch_objects(
         "cannot fetch the required dependency's recorded commit",
     )?;
     current()?;
-    if !checkout_objects(sys, user, path, &dependency.pin)? {
+    if !checkout_objects(sys, user, path, &dependency.pin, off)? {
         return Err("required dependency download lacks its checkout objects".into());
     }
     Ok(())
@@ -593,13 +604,14 @@ fn checkout_pin(
     user: &User,
     path: &Path,
     dependency: &Dependency,
+    off: NoLazyFetch,
 ) -> Result<(), String> {
-    if !checkout_objects(sys, user, path, &dependency.pin)? {
+    if !checkout_objects(sys, user, path, &dependency.pin, off)? {
         return Err("required dependency lacks its checkout objects; left untouched".into());
     }
     read(
         sys,
-        local(sys, user, Some(path))
+        local(sys, user, Some(path), off)
             .args(checkout::NO_SIDE_RUNS)
             .args([
                 "-c",
@@ -613,7 +625,7 @@ fn checkout_pin(
     )?;
     let head = text(
         sys,
-        local(sys, user, Some(path)).args(["rev-parse", "--verify", "HEAD^{commit}"]),
+        local(sys, user, Some(path), off).args(["rev-parse", "--verify", "HEAD^{commit}"]),
         "cannot verify required dependency commit",
     )?;
     if head.trim() != dependency.pin {
@@ -635,13 +647,13 @@ pub(super) fn repair(
         return Ok(());
     }
     authorized()?;
-    require_local_reads(sys, user, repo)?;
+    let off = require_local_reads(sys, user)?;
     for path in &repo.required_submodules {
         authorized()?;
-        let dependency = resolve(sys, user, parent, repo, path)?;
+        let dependency = resolve(sys, user, parent, repo, path, off)?;
         let current = || -> Result<(), String> {
             authorized()?;
-            if resolve(sys, user, parent, repo, path)? != dependency {
+            if resolve(sys, user, parent, repo, path, off)? != dependency {
                 return Err(
                     "required dependency's gitlink or tracked URL changed during acquisition"
                         .into(),
@@ -655,7 +667,7 @@ pub(super) fn repair(
         // an existing local URL. Acquisition below uses its separately admitted route.
         read(
             sys,
-            local(sys, user, Some(parent))
+            local(sys, user, Some(parent), off)
                 .args(checkout::NO_SIDE_RUNS)
                 .args([
                     "-c",
@@ -668,13 +680,13 @@ pub(super) fn repair(
             "cannot initialize the selected required submodule",
         )?;
         current()?;
-        match state(sys, user, parent, &dependency)? {
+        match state(sys, user, parent, &dependency, off)? {
             State::Ready => continue,
             State::ObjectsMissing => {
                 current()?;
                 let inner = parent.join(path);
                 complete_storage(sys, user, &inner)?;
-                fetch_objects(sys, user, &inner, &dependency, &current)?;
+                fetch_objects(sys, user, &inner, &dependency, &current, off)?;
             }
             State::Lagging => {
                 current()?;
@@ -682,13 +694,13 @@ pub(super) fn repair(
                 // Inspect availability only in a complete object store: a partial clone's
                 // read could otherwise fetch implicitly, outside the admitted route.
                 complete_storage(sys, user, &inner)?;
-                let available = checkout_objects(sys, user, &inner, &dependency.pin)?;
+                let available = checkout_objects(sys, user, &inner, &dependency.pin, off)?;
                 current()?;
                 if !available {
-                    fetch_objects(sys, user, &inner, &dependency, &current)?;
+                    fetch_objects(sys, user, &inner, &dependency, &current, off)?;
                 }
                 current()?;
-                match state(sys, user, parent, &dependency)? {
+                match state(sys, user, parent, &dependency, off)? {
                     State::Ready => continue,
                     State::Lagging => {}
                     State::Missing | State::ObjectsMissing => {
@@ -700,7 +712,7 @@ pub(super) fn repair(
                 }
                 let moving = || -> Result<(), String> {
                     current()?;
-                    if state(sys, user, parent, &dependency)? != State::Lagging {
+                    if state(sys, user, parent, &dependency, off)? != State::Lagging {
                         return Err(
                             "required dependency changed before checkout; left untouched".into(),
                         );
@@ -711,7 +723,7 @@ pub(super) fn repair(
                     aterm_types::update_boundary::GuardedItem::ClonePublishRename,
                     &moving,
                 )?;
-                checkout_pin(sys, user, &parent.join(path), &dependency)?;
+                checkout_pin(sys, user, &parent.join(path), &dependency, off)?;
             }
             State::Missing => {
                 current()?;
@@ -727,7 +739,7 @@ pub(super) fn repair(
                 current()?;
                 crate::checkout::acquisition_read(
                     sys,
-                    &network(sys, user, None, &dependency)?
+                    &network(sys, user, None, &dependency, off)?
                         .budget(BUDGET)
                         .args([
                             "clone",
@@ -753,17 +765,17 @@ pub(super) fn repair(
                     &clone,
                 )?;
                 complete_storage(sys, user, &clone)?;
-                if !checkout_objects(sys, user, &clone, &dependency.pin)? {
-                    fetch_objects(sys, user, &clone, &dependency, &current)?;
+                if !checkout_objects(sys, user, &clone, &dependency.pin, off)? {
+                    fetch_objects(sys, user, &clone, &dependency, &current, off)?;
                 }
                 current()?;
-                checkout_pin(sys, user, &clone, &dependency)?;
+                checkout_pin(sys, user, &clone, &dependency, off)?;
                 current()?;
                 let _boundary = sys.update_boundary().hold(
                     aterm_types::update_boundary::GuardedItem::ClonePublishRename,
                     &current,
                 )?;
-                if state(sys, user, parent, &dependency)? != State::Missing {
+                if state(sys, user, parent, &dependency, off)? != State::Missing {
                     return Err(
                         "required dependency destination appeared during download; left untouched"
                             .into(),
@@ -798,7 +810,7 @@ pub(super) fn repair(
             }
         }
         current()?;
-        if state(sys, user, parent, &dependency)? != State::Ready {
+        if state(sys, user, parent, &dependency, off)? != State::Ready {
             return Err("required dependency remains outside its recorded gitlink commit".into());
         }
     }

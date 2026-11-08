@@ -304,7 +304,7 @@ fn live(
         foreground_job: Some(true),
         activity: ActivitySample {
             alt_screen: false,
-            content_seq: 1,
+            screen: 1,
             last_output: Some(t0),
         },
     };

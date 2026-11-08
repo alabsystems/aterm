@@ -24,6 +24,7 @@
 mod models_cached_log;
 mod models_cached_materialization;
 mod models_commons_log;
+mod models_denied_cache;
 mod models_envelope_denials;
 mod models_epoch_convergence;
 mod models_fabric_routing;
@@ -49,6 +50,7 @@ pub use models_cached_log::{
 };
 pub use models_cached_materialization::cached_materialization_model;
 pub use models_commons_log::commons_log_model;
+pub use models_denied_cache::fleet_denied_cache_model;
 pub use models_envelope_denials::envelope_denials_model;
 pub use models_epoch_convergence::epoch_convergence_model;
 pub use models_fabric_routing::{

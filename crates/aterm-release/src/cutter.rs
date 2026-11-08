@@ -658,6 +658,24 @@ fn head(git: &dyn GitRunner) -> Option<String> {
     aterm_codec::hex::is_lower(&commit, 40).then_some(commit)
 }
 
+pub(crate) fn declared_sources(text: &str) -> Result<Vec<PathBuf>, String> {
+    let mut paths = BTreeSet::new();
+    for line in text
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let (target, rest) = split_first_escaped(line).ok_or("unreadable compiler dep-info")?;
+        if !target.ends_with(':') {
+            return Err("unknown compiler dep-info rule".into());
+        }
+        paths.extend(split_escaped(rest).into_iter().map(PathBuf::from));
+    }
+    if paths.is_empty() {
+        return Err("empty compiler source dep-info".into());
+    }
+    Ok(paths.into_iter().collect())
+}
+
 fn dep_info_sources(text: &str, target: &Path) -> Option<(PathBuf, Vec<PathBuf>)> {
     let resolved_target = fs::canonicalize(target).ok()?;
     let same = |a: &Path| fs::canonicalize(a).is_ok_and(|a| a == resolved_target);

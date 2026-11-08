@@ -101,8 +101,8 @@ impl CursorGlow {
     }
 
     /// The word icons the last word pass named, grid pixels `(x0, x1, y0, y1)`
-    /// ([`Self::note_word_icon_sprites`]).
-    #[cfg(any(test, debug_assertions))]
+    /// ([`Self::note_word_icon_sprites`]): what the typed dog keeps off
+    /// ([`crate::word_decorations::WordDecorations::dog_cameo`]).
     #[inline]
     #[must_use]
     pub const fn word_icon_boxes(&self) -> &[(i32, i32, i32, i32)] {

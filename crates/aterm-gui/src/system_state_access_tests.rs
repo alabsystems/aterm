@@ -88,7 +88,7 @@ fn fully_observed_setup(selection: Selection, changes: Vec<Observation>) -> Setu
 #[test]
 fn background_workstation_scope_comes_from_selected_current_verified_rows() {
     let scope = |status: &SetupStatus| {
-        let fields = super::background_setup_fields(status);
+        let fields = super::background_setup_fields(status, false);
         let bits = fields
             .split_ascii_whitespace()
             .find_map(|word| word.strip_prefix("verified="))
@@ -133,6 +133,14 @@ fn background_workstation_scope_comes_from_selected_current_verified_rows() {
 
     let full = fully_observed_setup(Selection::all(), Vec::new());
     assert_eq!(scope(&full), Selection::all().workstation());
+    let cached = background_setup_fields(&full, false);
+    let pending = background_setup_fields(&full, true);
+    assert_eq!(
+        cached.split(" busy=").next(),
+        pending.split(" busy=").next(),
+        "cached window intent neither retires nor fabricates a paid reading"
+    );
+    assert!(pending.split_whitespace().any(|field| field == "busy=1"));
     let personal = fully_observed_setup(
         Selection::all(),
         vec![observed(
@@ -351,7 +359,7 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
         ),
         headline
     );
-    let diagnostic = background_setup_fields(&live);
+    let diagnostic = background_setup_fields(&live, false);
     assert!(
         diagnostic
             .split_whitespace()
@@ -363,7 +371,7 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
             .any(|part| part == "verified=0")
     );
     live.caps_live.as_mut().unwrap().held = 1;
-    let mixed = background_setup_fields(&live);
+    let mixed = background_setup_fields(&live, false);
     assert!(
         mixed
             .split_whitespace()

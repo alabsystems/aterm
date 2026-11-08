@@ -88,6 +88,11 @@ fn subgroup_root_death_and_drop_cannot_close_live_registered_groups() {
 
 #[test]
 fn subgroup_unbound_actual_child_can_retry_after_both_leaders_die() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "cohort::launch::subgroup_tests::subgroup_unbound_actual_child_can_retry_after_both_leaders_die",
+    ) {
+        return;
+    }
     let fixture = CohortFixture::new();
     let mut claim = fixture.claim();
     let reference = claim.cohort_closure_ref().unwrap();
@@ -373,6 +378,11 @@ fn subgroup_foreign_root_and_nested_subgroup_cannot_mint_launch_authority() {
 
 #[test]
 fn subgroup_limit_preserves_every_unknown_arm_until_exact_cancellation() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "cohort::launch::subgroup_tests::subgroup_limit_preserves_every_unknown_arm_until_exact_cancellation",
+    ) {
+        return;
+    }
     let fixture = CohortFixture::new();
     let mut claim = fixture.claim();
     let mut root = Running::new(claim.launch_cohort(&mut cat()).unwrap());

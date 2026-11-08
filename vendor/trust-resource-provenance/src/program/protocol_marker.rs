@@ -12,6 +12,7 @@ pub(super) enum Profile {
     WorkloadMember,
     PairedQualification,
     BootstrapFixed,
+    BootstrapGraph,
 }
 impl Profile {
     fn section(self) -> &'static [u8; 16] {
@@ -21,6 +22,7 @@ impl Profile {
             Self::WorkloadMember => b"__trust_member\0\0",
             Self::PairedQualification => b"__trust_pairqual",
             Self::BootstrapFixed => b"__trust_btfix\0\0\0",
+            Self::BootstrapGraph => b"__trust_bgraph\0\0",
         }
     }
     fn magic(self) -> &'static [u8; 16] {
@@ -30,6 +32,7 @@ impl Profile {
             Self::WorkloadMember => b"TRUSTMEMBER00002",
             Self::PairedQualification => b"TRUSTPAIRQUAL002",
             Self::BootstrapFixed => b"TRUSTBTFIX000001",
+            Self::BootstrapGraph => b"TRUSTBGRAPH00001",
         }
     }
     fn fields(self) -> [u64; 6] {
@@ -39,6 +42,7 @@ impl Profile {
             Self::WorkloadMember => [3, 2, 50, 56, 57, 58],
             Self::PairedQualification => [3, 6, 7, 60, 48, 2],
             Self::BootstrapFixed => [1, 1, 1, 1, 0, 0],
+            Self::BootstrapGraph => [3, 71, 72, 73, 74, 1],
         }
     }
 }
@@ -549,5 +553,47 @@ mod tests {
             .is_err()
         );
         // HeldProgram's enclosing validate additionally refuses the changed path.
+    }
+
+    #[test]
+    fn bootstrap_graph_declaration_is_distinct_and_all_bytes_are_required() {
+        use std::io::Write as _;
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(Profile::BootstrapGraph.section(), b"__trust_bgraph\0\0");
+        assert_eq!(Profile::BootstrapGraph.magic(), b"TRUSTBGRAPH00001");
+        assert_eq!(Profile::BootstrapGraph.fields(), [3, 71, 72, 73, 74, 1]);
+        for profile in [
+            Profile::Resolver,
+            Profile::Workload,
+            Profile::WorkloadMember,
+            Profile::PairedQualification,
+            Profile::BootstrapFixed,
+            Profile::BootstrapGraph,
+        ] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&image(profile)).unwrap();
+            let actual = require(
+                &file,
+                Profile::BootstrapGraph,
+                &expected(Profile::BootstrapGraph),
+                deadline,
+            );
+            assert_eq!(actual.is_ok(), matches!(profile, Profile::BootstrapGraph));
+        }
+        for index in 0..64 {
+            let mut bytes = image(Profile::BootstrapGraph);
+            bytes[256 + index] ^= 1;
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&bytes).unwrap();
+            assert!(
+                require(
+                    &file,
+                    Profile::BootstrapGraph,
+                    &expected(Profile::BootstrapGraph),
+                    deadline
+                )
+                .is_err()
+            );
+        }
     }
 }

@@ -261,6 +261,7 @@ pub use telemetry::ReceivedTelemetry;
 mod liveness;
 pub use liveness::HostLifeline;
 
+pub mod bootstrap_graph;
 pub mod paired_qualification;
 pub mod sdk;
 pub mod workload;

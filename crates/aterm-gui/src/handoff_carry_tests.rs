@@ -89,6 +89,95 @@ fn ceiling() -> u64 {
     crate::control::turn_ids_for_handoff()
 }
 
+#[test]
+fn required_carry_waits_for_each_native_writer_without_inventing_loss() {
+    let _own = crate::control::own_turn_ids();
+    for kind in 0..3 {
+        for age in [Duration::from_secs(1), Duration::from_secs(61)] {
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let (term, turns) = session(80);
+            let timeline = timeline_with_log(10);
+            let source = capture_with_log(&term, &turns, &timeline);
+            let baseline = export_logs(std::slice::from_ref(&source));
+            assert!(baseline.1.is_empty());
+            let mut want = decode(&baseline.0[0].1).unwrap();
+            let want_log = want.take_log();
+            let held_turns = std::cell::RefCell::new((kind == 0).then(|| turns.lock().unwrap()));
+            let held_term = std::cell::RefCell::new((kind == 1).then(|| term.lock().unwrap()));
+            let held_log = std::cell::RefCell::new((kind == 2).then(|| timeline.lock().unwrap()));
+            let mut losses = Vec::new();
+            let mut observed = 0;
+            let out = export_noting_with(
+                std::slice::from_ref(&source),
+                ceiling(),
+                StatusWords::Current,
+                true,
+                |id, loss| losses.push((id, loss)),
+                || Instant::now() - age,
+                || {
+                    observed += 1;
+                    assert!(!expired, "an expired wait releases no native writer");
+                    drop(held_turns.borrow_mut().take());
+                    drop(held_term.borrow_mut().take());
+                    drop(held_log.borrow_mut().take());
+                },
+            );
+            assert_eq!(observed, usize::from(!expired));
+            assert_eq!(held_turns.borrow().is_some(), expired && kind == 0);
+            assert_eq!(held_term.borrow().is_some(), expired && kind == 1);
+            assert_eq!(held_log.borrow().is_some(), expired && kind == 2);
+            let mut got = decode(&out[0].1).unwrap();
+            let got_log = got.take_log();
+            if expired {
+                match kind {
+                    0 => {
+                        assert!(
+                            matches!(losses.as_slice(), [(3, CarryLoss::LedgerBusy { unvouched })] if *unvouched > crate::control::turn_ids_minted())
+                        );
+                        assert!(got.turns.is_empty());
+                        assert!(!got.archive.as_ref().unwrap().rows.is_empty());
+                        assert_eq!(got_log, want_log);
+                    }
+                    1 => {
+                        assert_eq!(losses, [(3, CarryLoss::TerminalBusy)]);
+                        assert_eq!(got.turns, want.turns);
+                        assert!(got.archive.as_ref().unwrap().rows.is_empty());
+                        assert_eq!(got_log, want_log);
+                    }
+                    _ => {
+                        assert_eq!(losses, [(3, CarryLoss::LogBusy)]);
+                        assert_eq!(got.turns, want.turns);
+                        assert_eq!(got.archive, want.archive);
+                        assert!(got_log.is_none());
+                    }
+                }
+                drop(held_turns.borrow_mut().take());
+                drop(held_term.borrow_mut().take());
+                drop(held_log.borrow_mut().take());
+                let (fresh, fresh_losses) = export_logs(&[source]);
+                assert!(
+                    fresh_losses.is_empty(),
+                    "a fresh native export still owns the original data"
+                );
+                got = decode(&fresh[0].1).unwrap();
+                assert_eq!(got.take_log(), want_log);
+                assert_eq!(got.turns, want.turns);
+                assert_eq!(got.archive, want.archive);
+                continue;
+            }
+            assert!(
+                losses.is_empty(),
+                "a scheduled native writer {kind} did not lose its carry: {losses:?}"
+            );
+            assert_eq!(got.turns, want.turns);
+            assert_eq!(got.archive, want.archive);
+            assert_eq!(got_log, want_log);
+            assert_eq!(got.unheld_below, want.unheld_below);
+            assert_eq!(got.shed_below, want.shed_below);
+        }
+    }
+}
+
 fn decoded(sources: &[CarrySource]) -> ControlCarry {
     let out = export(sources, ceiling());
     assert_eq!(out.len(), sources.len());
@@ -150,29 +239,30 @@ fn with_no_turn_the_newest_rows_are_carried_up_to_the_cap() {
 
 #[test]
 fn a_busy_lock_or_a_moved_archive_carries_the_counters_only() {
+    let _own = crate::control::own_turn_ids();
+    let expired = |source: CarrySource| {
+        let out = export_noting_with(
+            &[source],
+            ceiling(),
+            StatusWords::Current,
+            true,
+            |_, _| {},
+            || Instant::now() - Duration::from_secs(61),
+            || panic!("the intentionally expired native wait releases no writer"),
+        );
+        decode(&out[0].1).unwrap()
+    };
     let (term, turns) = session(80);
     let last = term.lock().unwrap().alt_archive().last();
 
     let src = capture(&term, &turns, true);
-    let (held_tx, held_rx) = std::sync::mpsc::channel();
-    let (back_tx, back_rx) = std::sync::mpsc::channel::<()>();
-    let holder = {
-        let term = Arc::clone(&term);
-        std::thread::spawn(move || {
-            let _held = term.lock().unwrap();
-            held_tx.send(()).unwrap();
-            back_rx.recv_timeout(Duration::from_secs(60)).is_ok()
-        })
-    };
-    held_rx
-        .recv_timeout(Duration::from_secs(60))
-        .expect("the holder took the lock");
-    let carry = decoded(&[src]);
-    let _ = back_tx.send(());
+    let held = term.lock().unwrap();
+    let carry = expired(src);
     assert!(
-        holder.join().unwrap(),
-        "the export gave the lock up while another thread still kept it"
+        matches!(term.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+        "the expired native observation left its writer held"
     );
+    drop(held);
     let archive = carry.archive.unwrap();
     assert!(archive.rows.is_empty());
     assert_eq!((archive.first, archive.lost), (last + 1, last));
@@ -182,7 +272,11 @@ fn a_busy_lock_or_a_moved_archive_carries_the_counters_only() {
     let src = capture(&term, &turns, true);
     let held = turns.lock().unwrap();
     let floor = crate::control::turn_ids_minted() + 1;
-    let mut carry = decoded(&[src]);
+    let mut carry = expired(src);
+    assert!(matches!(
+        turns.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    ));
     drop(held);
     assert!(carry.turns.is_empty());
     assert!(
@@ -232,7 +326,7 @@ fn a_lock_the_export_gives_up_on_is_said_by_session_and_cause() {
     let (term, turns) = session(80);
     let losses = |src: CarrySource| {
         let mut noted = Vec::new();
-        let out = export_noting(
+        let out = export_noting_with(
             &[src],
             ceiling(),
             StatusWords::Current,
@@ -240,6 +334,8 @@ fn a_lock_the_export_gives_up_on_is_said_by_session_and_cause() {
             |id, loss| {
                 noted.push((id, loss));
             },
+            || Instant::now() - Duration::from_secs(61),
+            || panic!("an explicitly expired native wait releases no writer"),
         );
         assert_eq!(out.len(), 1, "the session still hands off");
         noted
@@ -1221,7 +1317,16 @@ fn the_log_never_costs_the_turn_ledger() {
         capture_with_log(&term, &turns, &free),
     ];
     let held = busy.lock().unwrap();
-    let (out, losses) = export_logs(&sources);
+    let mut losses = Vec::new();
+    let out = export_noting_with(
+        &sources,
+        ceiling(),
+        StatusWords::Current,
+        true,
+        |id, loss| losses.push((id, loss)),
+        || Instant::now() - Duration::from_secs(61),
+        || panic!("the intentional held-log case is already expired"),
+    );
     drop(held);
     assert_eq!(
         losses,

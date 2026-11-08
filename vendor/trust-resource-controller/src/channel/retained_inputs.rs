@@ -11,11 +11,33 @@ impl Channel {
         fds: &[BorrowedFd<'_>],
         deadline: Instant,
     ) -> io::Result<()> {
-        if fds.is_empty() || fds.len() > CHUNK_INPUTS {
+        self.send_named_descriptions(fds, RIGHTS_MARKER, CHUNK_INPUTS, deadline)
+    }
+    pub(crate) fn send_bootstrap_descriptions(
+        &mut self,
+        fds: &[BorrowedFd<'_>],
+        marker: u8,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.send_named_descriptions(
+            fds,
+            marker,
+            crate::bootstrap_graph::DESCRIPTION_COUNT,
+            deadline,
+        )
+    }
+    fn send_named_descriptions(
+        &mut self,
+        fds: &[BorrowedFd<'_>],
+        marker: u8,
+        bound: usize,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        if fds.is_empty() || fds.len() > bound {
             return Err(crate::wire::invalid());
         }
         self.begin()?;
-        jobserver_utils::descriptor_transfer::send(&self.stream, fds, RIGHTS_MARKER, deadline)?;
+        jobserver_utils::descriptor_transfer::send(&self.stream, fds, marker, deadline)?;
         self.poisoned = false;
         Ok(())
     }
@@ -24,12 +46,33 @@ impl Channel {
         count: usize,
         deadline: Instant,
     ) -> io::Result<Vec<OwnedFd>> {
+        self.receive_named_descriptions(count, RIGHTS_MARKER, CHUNK_INPUTS, deadline)
+    }
+    pub(crate) fn receive_bootstrap_descriptions(
+        &mut self,
+        marker: u8,
+        deadline: Instant,
+    ) -> io::Result<Vec<OwnedFd>> {
+        self.receive_named_descriptions(
+            crate::bootstrap_graph::DESCRIPTION_COUNT,
+            marker,
+            crate::bootstrap_graph::DESCRIPTION_COUNT,
+            deadline,
+        )
+    }
+    fn receive_named_descriptions(
+        &mut self,
+        count: usize,
+        marker: u8,
+        bound: usize,
+        deadline: Instant,
+    ) -> io::Result<Vec<OwnedFd>> {
         self.begin()?;
         let (byte, read, valid, rights) = self.retained_message(deadline)?;
         if count == 0
-            || count > CHUNK_INPUTS
+            || count > bound
             || read != 1
-            || byte != RIGHTS_MARKER
+            || byte != marker
             || !valid
             || rights.len() != count
         {
@@ -105,7 +148,7 @@ impl Channel {
                     let length = (*h).cmsg_len as usize;
                     let payload = length.min(remaining) - base;
                     if (*h).cmsg_level == libc::SOL_SOCKET && (*h).cmsg_type == libc::SCM_RIGHTS {
-                        valid &= payload % size_of::<libc::c_int>() == 0;
+                        valid &= payload.is_multiple_of(size_of::<libc::c_int>());
                         let data = libc::CMSG_DATA(h).cast::<libc::c_int>();
                         for index in 0..payload / size_of::<libc::c_int>() {
                             rights.push(OwnedFd::from_raw_fd(data.add(index).read_unaligned()));

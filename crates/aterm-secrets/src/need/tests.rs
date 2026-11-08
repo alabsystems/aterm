@@ -1674,49 +1674,182 @@ fn the_ledger_reads_back_every_field_it_writes() {
     let asked = decided(&posted, &facts, &window).unwrap();
     let offered = decided(&asked, &facts, &Decision::Offered(Unanswered::default())).unwrap();
     assert!(offered.late_offer && offered.proof.is_some_and(|p| p.window_ended));
+    let completed = Need {
+        id: [13; 16],
+        want: Want::Gh(GhProfile::Dev),
+        purpose: Purpose::AghDev,
+        state: State::Fulfilled,
+        wait: Wait::Nobody,
+        asking: false,
+        ask: None,
+        got: true,
+        got_authorized: true,
+        posted: true,
+        record: Some(vec![4, 5, 6]),
+        ..need.clone()
+    };
+    let rejected = Need {
+        id: [14; 16],
+        refused: Some(RefusalClaim::LegacySequence(3)),
+        ..completed.clone()
+    };
+    // A codec specimen only: a public claim's representation is not provider acceptance.
+    let authenticated = Need {
+        id: [15; 16],
+        refused: Some(RefusalClaim::Authenticated(
+            client::version::VersionClaim::new(
+                "codec".into(),
+                [5; 32],
+                Some(client::version::EnvelopeVersion {
+                    seq: 4,
+                    digest: [6; 32],
+                }),
+                None,
+            )
+            .unwrap(),
+        )),
+        ..completed.clone()
+    };
+    let held = Need {
+        id: [16; 16],
+        want: completed.want.clone(),
+        purpose: completed.purpose,
+        ..declined.clone()
+    };
+    let forbidden = Need {
+        id: [17; 16],
+        retired: Some(Retirement {
+            reason: Reason::NotAuthorized,
+            evidence: "policy".into(),
+            note: String::new(),
+            generation: Some(9),
+        }),
+        ..held.clone()
+    };
+    let other_purpose = Need {
+        id: [18; 16],
+        purpose: Purpose::AghRelease,
+        ..completed.clone()
+    };
+    let other_want = Need {
+        id: [19; 16],
+        want: Want::Gh(GhProfile::Release),
+        ..completed.clone()
+    };
+    let awaiting_confirmation = [completed.id, rejected.id, authenticated.id];
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(root.path());
-    let mut rows = vec![need, declined, stood_in, offered];
+    let mut rows = vec![
+        need,
+        declined,
+        stood_in,
+        offered,
+        completed,
+        rejected,
+        held,
+        forbidden,
+        other_purpose,
+        other_want,
+        authenticated,
+    ];
     ledger::save(&paths, &mut rows).unwrap();
     assert_eq!(ledger::load(&paths).unwrap(), rows);
+    assert_eq!(
+        peek(&paths).unwrap(),
+        rows,
+        "format 3 keeps confirmed completions"
+    );
     let file = paths.dir.join(LEDGER);
     let encoded = std::fs::read_to_string(&file).unwrap();
-    let mut table: aterm_toml::Table = aterm_toml::from_str(&encoded).unwrap();
-    let mut legacy_rows = table.remove("need").unwrap().as_table().unwrap()["rows"]
-        .as_array()
-        .unwrap()
-        .clone();
-    for row in &mut legacy_rows {
-        let row = row.as_table_mut().unwrap();
-        if let Some(value) = row.remove("refused_legacy") {
-            row.insert(
-                "refused".into(),
-                aterm_toml::Value::Integer(value.as_str().unwrap().parse().unwrap()),
+    for format in [1, 2] {
+        let mut table: aterm_toml::Table = aterm_toml::from_str(&encoded).unwrap();
+        let mut container = table.remove("need").unwrap().as_table().unwrap().clone();
+        let mut legacy_rows = container
+            .remove("rows")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .clone();
+        let expected = if format == 1 {
+            // v1 cannot encode an authenticated refusal claim.
+            assert!(
+                legacy_rows.pop().unwrap()["refused_version"]
+                    .as_str()
+                    .is_some()
             );
+            for row in &mut legacy_rows {
+                let row = row.as_table_mut().unwrap();
+                if let Some(value) = row.remove("refused_legacy") {
+                    row.insert(
+                        "refused".into(),
+                        aterm_toml::Value::Integer(value.as_str().unwrap().parse().unwrap()),
+                    );
+                }
+            }
+            table.insert("need".into(), aterm_toml::Value::Array(legacy_rows));
+            &rows[..rows.len() - 1]
+        } else {
+            container.insert("format".into(), aterm_toml::Value::Integer(format));
+            container.insert("rows".into(), aterm_toml::Value::Array(legacy_rows));
+            table.insert("need".into(), aterm_toml::Value::Table(container));
+            rows.as_slice()
+        };
+        let legacy = aterm_toml::to_string(&table).unwrap();
+        crate::fsx::write_atomic(&file, legacy.as_bytes(), 0o600).unwrap();
+        let loaded = peek(&paths).unwrap();
+        assert_eq!(loaded.len(), expected.len());
+        for (actual, before) in loaded.iter().zip(expected) {
+            if awaiting_confirmation.contains(&before.id) {
+                assert_eq!(
+                    (actual.state, actual.wait),
+                    (State::Published, Wait::Requester)
+                );
+                let retained = Need {
+                    state: before.state,
+                    wait: before.wait,
+                    line: before.line.clone(),
+                    ..actual.clone()
+                };
+                assert_eq!(
+                    &retained, before,
+                    "all identity and evidence survive migration"
+                );
+            } else {
+                assert_eq!(
+                    actual, before,
+                    "holds and unrelated completions stay unchanged"
+                );
+            }
         }
+        assert_eq!(ledger::load(&paths).unwrap(), loaded);
+        with_ledger(&paths, |_, _| Ok(())).unwrap();
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            legacy.as_bytes(),
+            "reads never publish migration"
+        );
+        with_ledger(&paths, |saved, _| {
+            saved[0].line.push_str(" persisted");
+            Ok(())
+        })
+        .unwrap();
+        let mut written = loaded;
+        written[0].line.push_str(" persisted");
+        assert_eq!(ledger::load(&paths).unwrap(), written);
+        let migrated = std::fs::read_to_string(&file).unwrap();
+        let document: aterm_toml::Table = aterm_toml::from_str(&migrated).unwrap();
+        assert!(
+            document["need"].as_array().is_none(),
+            "v1 readers fail closed"
+        );
+        assert_eq!(
+            document["need"]["format"].as_integer(),
+            Some(3),
+            "v2 readers require format 2"
+        );
     }
-    table.insert("need".into(), aterm_toml::Value::Array(legacy_rows));
-    let legacy = aterm_toml::to_string(&table).unwrap();
-    crate::fsx::write_atomic(&file, legacy.as_bytes(), 0o600).unwrap();
-    assert_eq!(ledger::load(&paths).unwrap(), rows);
-    assert_eq!(
-        std::fs::read(&file).unwrap(),
-        legacy.as_bytes(),
-        "reading a v1 ledger does not migrate it"
-    );
-    with_ledger(&paths, |saved, _| {
-        saved[0].line.push_str(" persisted");
-        Ok(())
-    })
-    .unwrap();
-    rows[0].line.push_str(" persisted");
-    assert_eq!(ledger::load(&paths).unwrap(), rows);
     let migrated = std::fs::read_to_string(&file).unwrap();
     let mut document: aterm_toml::Table = aterm_toml::from_str(&migrated).unwrap();
-    assert!(
-        document["need"].as_array().is_none(),
-        "the old reader's required array shape must fail closed"
-    );
     let mut container = document.remove("need").unwrap();
     container
         .as_table_mut()

@@ -1034,14 +1034,28 @@ fn the_backstop_swallows_only_a_spares_own_wakes() {
 #[cfg(target_os = "macos")]
 #[test]
 fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
+    escaped_daemon(false);
+}
+
+/// A daemon in the run's session remains owned after clearing its whole environment.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_escape_scan_catches_a_daemon_with_a_scrubbed_environment() {
+    escaped_daemon(true);
+}
+
+#[cfg(target_os = "macos")]
+fn escaped_daemon(scrubbed: bool) {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let (shell, sleep) = (fixture_shell(), fixture_sleep());
     let mark = dir.path().join("daemon-pid");
     let release = dir.path().join("release-parent");
-    let child = aterm_uds::spawnfd::command(&shell)
+    let mut command = aterm_uds::spawnfd::command(&shell);
+    command
         .arg("-c")
         .arg(
-            r#"( "$1" 600 & printf '%s\n' "$!" > "$2";
+            r#"( if [ "$4" = scrubbed ]; then "$5" -i "$1" 600 & else "$1" 600 & fi;
+                 printf '%s\n' "$!" > "$2";
                  while [ ! -f "$3" ]; do "$1" 0.01; done ) &
                 wait
                 exec "$1" 600"#,
@@ -1050,6 +1064,10 @@ fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
         .arg(&sleep)
         .arg(&mark)
         .arg(&release)
+        .arg(if scrubbed { "scrubbed" } else { "marked" })
+        .arg(aterm_uds::deadline::stand_in(std::path::Path::new(
+            "/usr/bin/env",
+        )))
         .env_clear()
         .env("HOME", dir.path())
         .env("PATH", "/usr/bin:/bin")
@@ -1057,10 +1075,13 @@ fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
         .current_dir(dir.path())
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .stdout(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .process_group(0)
-        .spawn()
-        .expect("spawn");
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    if scrubbed {
+        command.setsid(true);
+    } else {
+        command.process_group(0);
+    }
+    let child = command.spawn().expect("spawn");
     let mut owned = OwnedEscapeFixture {
         child: Some(child),
         daemon: None,
@@ -1101,6 +1122,13 @@ fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
     let born = std::time::UNIX_EPOCH
         + Duration::from_secs(daemon.pbsd.pbi_start_tvsec)
         + Duration::from_micros(daemon.pbsd.pbi_start_tvusec);
+    if scrubbed {
+        assert_eq!(environment_names(daemon_pid, FIXTURE_SID), Some(false));
+        assert!(
+            atpkg::caller_shell::process_args(daemon_pid as u32)
+                .is_some_and(|args| args.env.is_empty())
+        );
+    }
     let caught = escape_scan(
         shell_pid,
         shell_version,
@@ -1124,6 +1152,79 @@ fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
         |_| Some(vec![shell_pid, daemon_pid]),
         bsdinfo_uniq,
     );
+    let without_marker = |parent_record: BsdInfoWithUniqId| {
+        escape_scan_with_owner(
+            shell_pid,
+            shell_version,
+            FIXTURE_SID,
+            born,
+            born,
+            |_| Some(vec![shell_pid, daemon_pid, parent.pbsd.pbi_pid as i32]),
+            |pid| {
+                if pid == parent.pbsd.pbi_pid as i32 {
+                    Some(parent_record)
+                } else {
+                    bsdinfo_uniq(pid)
+                }
+            },
+            |_, _| Some(false),
+            stdio_dead,
+        )
+    };
+    let retained_parent = without_marker(parent);
+    let unrelated_parent = without_marker(BsdInfoWithUniqId {
+        p_uniqueid: parent.p_uniqueid.wrapping_add(1),
+        p_idversion: parent.p_idversion.wrapping_add(1),
+        ..parent
+    });
+    if !scrubbed {
+        let across_retry = |parent_record| {
+            let mut listings = 0;
+            let mut first_daemon = true;
+            let verdict = escape_scan_repeating(
+                shell_pid,
+                shell_version,
+                FIXTURE_SID,
+                born,
+                born,
+                |_| {
+                    listings += 1;
+                    Some(if listings == 1 {
+                        vec![shell_pid, parent.pbsd.pbi_pid as i32, daemon_pid]
+                    } else {
+                        vec![shell_pid, daemon_pid]
+                    })
+                },
+                |pid| {
+                    if pid == parent.pbsd.pbi_pid as i32 {
+                        Some(parent_record)
+                    } else if pid == daemon_pid && std::mem::take(&mut first_daemon) {
+                        Some(daemon)
+                    } else {
+                        bsdinfo_uniq(pid)
+                    }
+                },
+                |_, _| None,
+                stdio_dead,
+            );
+            (verdict, listings)
+        };
+        assert_eq!(
+            across_retry(parent),
+            (Scan::Escaped, 2),
+            "the retry retains the exited parent's birth evidence without an environment"
+        );
+        assert_eq!(
+            across_retry(BsdInfoWithUniqId {
+                p_uniqueid: parent.p_uniqueid.wrapping_add(1),
+                p_idversion: parent.p_idversion.wrapping_add(1),
+                ..parent
+            })
+            .0,
+            Scan::Clean,
+            "negative control: a different parent's birth supplies no ownership"
+        );
+    }
     owned
         .retire_owned_escape_fixture()
         .expect("reap the fixture child");
@@ -1137,6 +1238,16 @@ fn the_escape_scan_catches_a_daemon_the_session_left_behind() {
     }
     assert_eq!(caught, Scan::Escaped);
     assert_eq!(caught_among, Scan::Escaped);
+    assert_eq!(
+        retained_parent,
+        Scan::Escaped,
+        "the captured birth chain survives a scrubbed environment"
+    );
+    assert_eq!(
+        unrelated_parent,
+        if scrubbed { Scan::Escaped } else { Scan::Clean },
+        "a reused parent pid supplies no birth chain; the run's own session is independent evidence"
+    );
     assert_eq!(
         window_before,
         Scan::Clean,
@@ -1483,10 +1594,11 @@ fn a_daemon_read_before_its_launcher_exited_is_read_again() {
         "a launcher reaped since the listing, settled by a later listing"
     );
     assert_eq!(
-        zombie_not_again,
-        (Scan::Unknown, 2),
+        zombie_not_again.0,
+        Scan::Unknown,
         "a stale record that cannot be read again, its pid still listed"
     );
+    assert!(zombie_not_again.1 >= 2, "the stale identity was relisted");
     assert_eq!(read_live, Scan::Escaped, "the same tree read live");
 }
 
@@ -1642,6 +1754,175 @@ fn adopted_orphan(
         std::thread::sleep(Duration::from_millis(10));
     };
     (owned, pid, adopted)
+}
+
+/// A different shell's empty-environment daemon supplies no evidence of this run.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_strangers_empty_environment_orphan_is_not_our_escape() {
+    stranger_orphan(false);
+}
+
+/// A different shell adopted by launchd is also a stranger after initialization.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_strangers_shell_orphan_is_not_our_escape() {
+    stranger_orphan(true);
+}
+
+#[cfg(target_os = "macos")]
+fn stranger_orphan(shell_orphan: bool) {
+    let dir = aterm_tempfile::tempdir().expect("tempdir");
+    let waits = FixtureWaits::new();
+    let (_shell, shell_pid, _, _) = session_shell(dir.path(), &waits);
+    let mark = dir.path().join("stranger-pid");
+    let release = dir.path().join("stranger-release");
+    let stranger_shell = fixture_shell();
+    let stranger_sleep = fixture_sleep();
+    let launcher = fixture_command(&stranger_shell)
+        .arg("-c")
+        .arg(
+            r#"if [ "$6" = shell ]; then "$4" -i "$5" -c 'kill -STOP "$$"' &
+                else "$4" -i "$1" 600 & fi;
+            printf '%s\n' "$!" > "$2";
+            while [ ! -f "$3" ]; do "$1" 0.01; done"#,
+        )
+        .arg("stranger")
+        .arg(&stranger_sleep)
+        .arg(&mark)
+        .arg(&release)
+        .arg(aterm_uds::deadline::stand_in(std::path::Path::new(
+            "/usr/bin/env",
+        )))
+        .arg(&stranger_shell)
+        .arg(if shell_orphan { "shell" } else { "empty" })
+        .env_remove(aterm_types::domain::ENV_PARENT_SESSION_ID)
+        .setsid(true)
+        .spawn()
+        .expect("spawn the stranger's launcher");
+    let mut owned = OwnedEscapeFixture {
+        child: Some(launcher),
+        daemon: None,
+    };
+    let pid = waits.pid_in(&mark);
+    let before = bsdinfo_uniq(pid).expect("stranger before adoption");
+    let parent = bsdinfo_uniq(before.pbsd.pbi_ppid as i32).expect("stranger's parent");
+    owned.daemon = Some((pid, before.p_uniqueid));
+    std::fs::write(&release, b"go").expect("let the early parent exit");
+    owned
+        .child
+        .as_mut()
+        .unwrap()
+        .wait()
+        .expect("reap stranger's launcher");
+    let expected_image = if shell_orphan {
+        &stranger_shell
+    } else {
+        &stranger_sleep
+    };
+    let (adopted, args) = loop {
+        let now = bsdinfo_uniq(pid).expect("the daemon lives");
+        if now.pbsd.pbi_ppid == 1
+            && (!shell_orphan || now.pbsd.pbi_status == libc::SSTOP)
+            && let Some(args) = atpkg::caller_shell::process_args(pid as u32)
+            && args.exec_path == expected_image.to_string_lossy()
+        {
+            break (now, Some(args));
+        }
+        assert!(Instant::now() < waits.give_up, "stranger never adopted");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    eprintln!(
+        "stranger procargs_read={} env_empty={:?} parent_version={} original_parent={} parent_unique={} original_unique={}",
+        args.is_some(),
+        args.as_ref().map(|a| a.env.is_empty()),
+        parent.p_idversion,
+        adopted.p_orig_ppidversion,
+        parent.p_uniqueid,
+        adopted.p_puniqueid
+    );
+    if shell_orphan {
+        assert_eq!(
+            args.as_ref().expect("bash's process arguments").exec_path,
+            stranger_shell.to_string_lossy(),
+            "the orphan is bash itself"
+        );
+    } else {
+        assert!(args.as_ref().is_some_and(|a| a.env.is_empty()));
+    }
+    let scan = |owner| {
+        escape_scan_with_owner(
+            shell_pid,
+            None,
+            FIXTURE_SID,
+            born_at(&adopted),
+            born_at(&adopted),
+            |_| Some(vec![shell_pid, pid]),
+            bsdinfo_uniq,
+            |_, _| owner,
+            stdio_dead,
+        )
+    };
+    let actual = scan(environment_names(pid, FIXTURE_SID));
+    let unread = scan(None);
+    let named = scan(Some(true));
+    let gone = reaped_pid();
+    let stale = |owner| {
+        let mut first_list = true;
+        let mut first_read = true;
+        escape_scan_with_owner(
+            shell_pid,
+            None,
+            FIXTURE_SID,
+            born_at(&adopted),
+            born_at(&adopted),
+            |_| {
+                Some(if std::mem::take(&mut first_list) {
+                    vec![shell_pid, pid, gone]
+                } else {
+                    vec![shell_pid, pid]
+                })
+            },
+            |p| {
+                if p == pid {
+                    std::mem::take(&mut first_read).then_some(BsdInfoWithUniqId {
+                        pbsd: libc::proc_bsdinfo {
+                            pbi_ppid: gone as u32,
+                            ..adopted.pbsd
+                        },
+                        ..adopted
+                    })
+                } else {
+                    bsdinfo_uniq(p)
+                }
+            },
+            |_, _| owner,
+            stdio_dead,
+        )
+    };
+    let stale_stranger = stale(None);
+    let stale_named = stale(Some(true));
+    owned
+        .retire_owned_escape_fixture()
+        .expect("retire stranger");
+    eprintln!("stranger actual={actual:?} unread={unread:?} named={named:?}");
+    assert_eq!(actual, Scan::Clean);
+    assert_eq!(unread, Scan::Clean);
+    assert_eq!(
+        stale_stranger,
+        Scan::Clean,
+        "an unreadable stranger cannot make the listing stale"
+    );
+    assert_eq!(
+        stale_named,
+        Scan::Unknown,
+        "negative control: the named run's stale identity is undecidable"
+    );
+    assert_eq!(
+        named,
+        Scan::Escaped,
+        "negative control: a run marker proves ownership"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -1936,13 +2217,14 @@ fn a_child_gone_with_its_gone_parent_is_no_stale_record() {
     );
 }
 
-/// A daemon whose parent disappears before its environment read triggers a rescan.
+/// A known ancestor whose identity cannot be confirmed triggers a rescan.
 #[cfg(target_os = "macos")]
 #[test]
-fn a_daemon_under_a_parent_gone_at_its_environment_read_is_read_again() {
+fn a_daemon_under_a_parent_gone_at_its_identity_confirmation_is_read_again() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let waits = FixtureWaits::new();
     let (_shell, shell_pid, _, _) = session_shell(dir.path(), &waits);
+    let shell = bsdinfo_uniq(shell_pid).expect("the shell's birth");
     let (mut owned_daemon, daemon_pid, daemon) = adopted_orphan(dir.path(), &waits);
     let middle_dir = dir.path().join("middle");
     std::fs::create_dir(&middle_dir).expect("the middle's folder");
@@ -1954,6 +2236,10 @@ fn a_daemon_under_a_parent_gone_at_its_environment_read_is_read_again() {
             pbi_start_tvusec: daemon.pbsd.pbi_start_tvusec,
             ..window.pbsd
         },
+        p_uniqueid: daemon.p_uniqueid - 1,
+        p_idversion: daemon.p_orig_ppidversion,
+        p_orig_ppidversion: shell.p_idversion,
+        p_puniqueid: shell.p_uniqueid,
         ..window
     };
     let verdict = scan_reads(
@@ -1971,7 +2257,6 @@ fn a_daemon_under_a_parent_gone_at_its_environment_read_is_read_again() {
                     daemon.p_uniqueid,
                 )),
             ),
-            (middle_pid, Some(middle_record)),
             (middle_pid, Some(middle_record)),
             (middle_pid, None),
         ],
@@ -2080,7 +2365,11 @@ fn a_daemon_below_another_users_process_is_still_the_shells() {
         Scan::Clean,
         "below an orphan older than the shell"
     );
-    assert_eq!(unread, Scan::Clean, "below a parent gone: the line ends");
+    assert_eq!(
+        unread,
+        Scan::Unknown,
+        "the marked daemon's missing ancestry is undecidable"
+    );
 }
 
 /// Escape scans wait until the grace window ends and rate-limit sample scans.
@@ -2626,6 +2915,9 @@ fn an_orphan_born_on_another_terminal_is_no_escape() {
     let version = bsdinfo_uniq(shell_pid)
         .expect("the shell stand-in")
         .p_idversion;
+    let shell_birth = bsdinfo_uniq(shell_pid)
+        .expect("the shell's birth")
+        .p_uniqueid;
     let (mut terminal, orphan, adopted) =
         TerminalSession::new(dir.path(), &waits, OrphanExec::WhileLed);
     let leader = terminal.leader.expect("the leader lives");
@@ -2651,6 +2943,8 @@ fn an_orphan_born_on_another_terminal_is_no_escape() {
         bsdinfo_uniq(p).map(|mut i| {
             if p == leader {
                 i.pbsd.pbi_ppid = shell_pid as u32;
+                i.p_puniqueid = shell_birth;
+                i.p_orig_ppidversion = version;
             }
             i
         })
@@ -2840,16 +3134,21 @@ fn a_late_unreadable_escape_identity_keeps_the_scan_unknown() {
     };
     assert_eq!(scan(0, false, Some(true), Some(true)), Scan::Escaped);
     assert_eq!(scan(0, false, Some(false), Some(true)), Scan::Clean);
-    assert_eq!(scan(0, false, None, Some(true)), Scan::Escaped);
-    for late in [2, 3] {
-        assert_eq!(scan(late, true, None, Some(true)), Scan::Clean);
-        assert_eq!(scan(late, false, None, Some(false)), Scan::Clean);
-    }
-    let uncertain = [
+    assert_eq!(
+        scan(0, false, None, Some(true)),
+        Scan::Clean,
+        "unreadable is not owned"
+    );
+    assert_eq!(scan(2, true, Some(true), Some(true)), Scan::Clean);
+    assert_eq!(scan(2, false, Some(true), Some(false)), Scan::Clean);
+    assert_eq!(
         scan(2, false, None, Some(true)),
-        scan(3, false, None, Some(true)),
-        scan(2, false, None, None),
-        scan(3, false, None, None),
+        Scan::Clean,
+        "a stranger's unreadable identity cannot taint the scan"
+    );
+    let uncertain = [
+        scan(2, false, Some(true), Some(true)),
+        scan(2, false, Some(true), None),
     ];
     assert!(
         uncertain.iter().all(|&s| s == Scan::Unknown),

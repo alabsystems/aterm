@@ -520,6 +520,7 @@ impl Terminal {
         if self.transient.drawn.is_none_or(|(_, seen)| seen != mark) {
             self.transient.drawn = Some((now, mark));
         }
+        self.note_caret_path();
     }
 
     /// When the screen last changed ([`Self::note_batch_end`]); `None` before any batch.

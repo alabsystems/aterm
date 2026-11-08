@@ -1113,6 +1113,25 @@ fn cargo_build_args(
     args
 }
 
+fn anatomy_args(mut args: Vec<OsString>, target: Option<&str>) -> Vec<OsString> {
+    let timings_key = if target.is_some() {
+        "target.x86_64-apple-darwin.rustflags"
+    } else {
+        "target.'cfg(trust_verify)'.rustflags"
+    };
+    // Keep Cargo's global --config values in one argument scope. A post-subcommand config
+    // shadows the pre-subcommand sealed source configs.
+    let at = usize::from(target.is_none());
+    args.splice(
+        at..at,
+        [
+            OsString::from("--config"),
+            format!("{timings_key}=[\"-Ztime-passes\",\"-Ztime-passes-format=json\"]").into(),
+        ],
+    );
+    args
+}
+
 struct ReleaseEnv<'a> {
     /// The lane's toolchain directory first ([`release_tool_path`]).
     path: OsString,
@@ -1223,12 +1242,13 @@ fn pilot_need(arm: crate::profile_pilot::Arm, root: &Path, cores: u32) -> aterm_
 /// Each target is new: a pilot never inherits Cargo intermediates from a cut.
 pub(crate) fn pilot_build(
     take: &Take,
-    arm: crate::profile_pilot::Arm,
+    trial: crate::profile_pilot::Trial,
     root: &Path,
     target: Option<&str>,
     build_number: u64,
     index_hint: Option<&str>,
 ) -> Result<aterm_json::Value, String> {
+    let arm = trial.arm;
     snapshot::private_dir(root, "profile pilot take")?;
     let target_dir = root.join("build.noindex");
     std::fs::create_dir(&target_dir)
@@ -1243,7 +1263,7 @@ pub(crate) fn pilot_build(
     let waiting_s = waiting.elapsed().as_secs_f64();
     let load_before = aterm_sysprobe::load_average();
     let started = Instant::now();
-    let (usage, max_load1) = crate::profile_pilot::with_load(|| {
+    let (usage, max_load1) = crate::profile_pilot::with_load(root, || {
         run_slice_profile(
             take,
             &SliceRun {
@@ -1257,10 +1277,10 @@ pub(crate) fn pilot_build(
                 units: None,
             },
             Some(&log),
-            Some((arm, claim.cores())),
+            Some((trial, claim.cores())),
             None,
         )
-    });
+    })?;
     let usage = usage?;
     let wall = started.elapsed().as_secs_f64();
     take.verify()?;
@@ -1269,6 +1289,8 @@ pub(crate) fn pilot_build(
         None => target_dir.join("release/aterm"),
     };
     let gui_rlib_to_binary_s = crate::profile_pilot::gui_link_interval(&log, &binary)?;
+    // Keep Cargo's unit/metadata dependency timeline readable after retiring the cold graph.
+    crate::profile_pilot::retain_timings(&target_dir, root)?;
     let inspection = crate::profile_pilot::inspect(&binary, root).unwrap_or_else(|error| {
         aterm_json::Value::Object(aterm_json::Map::from([(
             "error".to_string(),
@@ -1344,6 +1366,14 @@ pub(crate) fn pilot_build(
         ("starved_s".to_string(), aterm_json::Value::Null),
         ("inspection".to_string(), inspection),
         ("log".to_string(), aterm_json::json!(log)),
+        (
+            "cargo_timings".to_string(),
+            aterm_json::json!(root.join("cargo-timings/cargo-timing.html")),
+        ),
+        (
+            "resource_samples".to_string(),
+            aterm_json::json!(root.join("build-resources.jsonl")),
+        ),
         ("load_before".to_string(), aterm_json::json!(load_before)),
         (
             "load_after".to_string(),
@@ -1584,7 +1614,7 @@ fn run_slice_profile(
     take: &Take,
     run: &SliceRun<'_>,
     log: Option<&Path>,
-    arm: Option<(crate::profile_pilot::Arm, u32)>,
+    trial: Option<(crate::profile_pilot::Trial, u32)>,
     pool: Option<&aterm_capacity::Jobserver>,
 ) -> Result<BuildUsage, String> {
     let &SliceRun {
@@ -1619,6 +1649,18 @@ fn run_slice_profile(
         Some(_) => Some(release_rustup_home(&home)?),
         None => None,
     };
+    let mut args = cargo_build_args(
+        verb,
+        &take.workspace_config,
+        &take.snapshot.sealed_config,
+        &take.snapshot.src.join("Cargo.toml"),
+        pkg,
+        target,
+        run.static_crt,
+    );
+    if trial.is_some_and(|(trial, _)| trial.anatomy) {
+        args = anatomy_args(args, target);
+    }
     // A slice's compilers start under this executable ([`crate::slice_units`]).
     let wrapper = run
         .units
@@ -1627,15 +1669,7 @@ fn run_slice_profile(
         .map_err(|e| format!("this executable, the slice's compiler wrapper: {e}"))?;
     let mut cmd = release_build_command(
         &driver_path,
-        cargo_build_args(
-            verb,
-            &take.workspace_config,
-            &take.snapshot.sealed_config,
-            &take.snapshot.src.join("Cargo.toml"),
-            pkg,
-            target,
-            run.static_crt,
-        ),
+        args,
         &ReleaseEnv {
             path,
             home: &home,
@@ -1650,9 +1684,20 @@ fn run_slice_profile(
             units: run.units.zip(wrapper.as_deref()),
         },
     );
-    if let Some((arm, cores)) = arm {
+    if let Some((trial, cores)) = trial {
+        let crate::profile_pilot::Trial { arm, anatomy } = trial;
         cmd.envs(arm.environment())
-            .env("CARGO_BUILD_JOBS", cores.to_string());
+            .env("CARGO_BUILD_JOBS", cores.to_string())
+            .arg("--timings");
+        if anatomy {
+            cmd.arg("-Zsection-timings");
+            if target.is_some() {
+                // This enables only rustc's unstable JSON timing diagnostic in the pilot's
+                // existing stable compat compiler. A release never gets it; section identity
+                // against a regular take decides whether this instrument preserves code.
+                cmd.env("RUSTC_BOOTSTRAP", "1");
+            }
+        }
     }
     // A read-only compat check is also used by Background main sampling. Its enclosing cut
     // already holds Release rank when there is one; the compile alone never claims a cut.
@@ -1727,7 +1772,7 @@ fn run_slice_profile(
         .and_then(units_of)
         .inspect_err(|e| println!("==> {pkg}: cannot read Cargo's messages: {e}"))
         .ok();
-    if let Some(log) = log.filter(|_| arm.is_some()) {
+    if let Some(log) = log.filter(|_| trial.is_some()) {
         let retained = log.with_extension("messages.jsonl");
         std::fs::rename(&messages, &retained)
             .map_err(|e| format!("retain pilot Cargo messages {}: {e}", retained.display()))?;
@@ -3624,6 +3669,26 @@ mod tests {
             resolve_release_rustup_shim_dir(&bin.join("rustup"), current_release_uid().unwrap())
                 .unwrap_err();
         assert!(error.contains("not a real regular file"), "{error}");
+    }
+
+    #[test]
+    fn anatomy_keeps_all_sealed_configs_in_cargos_global_scope() {
+        let config = std::path::Path::new("/take/config.toml");
+        let manifest = std::path::Path::new("/take/src/Cargo.toml");
+        for target in [None, Some("x86_64-apple-darwin")] {
+            let args = super::anatomy_args(
+                cargo_build_args("build", config, config, manifest, "aterm", target, false),
+                target,
+            );
+            let cut = args.iter().position(|arg| arg == "build").unwrap();
+            assert_eq!(
+                args[..cut].iter().filter(|arg| *arg == "--config").count(),
+                3
+            );
+            assert!(!args[cut..].iter().any(|arg| arg == "--config"));
+            assert_eq!(args.first().unwrap() == "--unverified", target.is_none());
+            assert!(args.windows(2).any(|pair| pair == ["--bin", "aterm"]));
+        }
     }
 
     #[test]

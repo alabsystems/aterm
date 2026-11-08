@@ -4638,10 +4638,11 @@ fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
             "each held read waits the short settle: {pinned:?}: {requests:#?}"
         );
     }
-    for titles in [[Some("proj")], [None]] {
+    // A title already at rest is read once more after the settle, a title never set once.
+    for (titles, read) in [([Some("proj")], 2), ([None], 1)] {
         let (t, requests, _) = run(&end, &titles);
         assert_eq!((t.phase, &t.screen.rows), (Phase::Idle, &end), "{titles:?}");
-        assert_eq!(reads(&requests), 1, "{titles:?}: {requests:#?}");
+        assert_eq!(reads(&requests), read, "{titles:?}: {requests:#?}");
     }
     // Claude Code's done row is its turn's end drawn: no title is read for it.
     let claude = idle_screen();
@@ -5336,8 +5337,8 @@ fn a_claude_reply_drawn_under_a_status_line_ends_once_its_title_has_rested() {
     );
     assert!(r.took < TITLE_HOLD, "{:?}", r.took);
     assert!(r.noted.is_empty(), "{:#?}", r.noted);
-    // The same reply read first just after a busy read, its title already at rest: the turn
-    // ran in this wait, so the end waits one settle for the frame that draws the last line.
+    // The same reply read first just after a busy read, its title already at rest: the end waits
+    // one settle for the frame that draws the last line.
     let r = title_run(
         vec![busy_screen(), held.clone(), done.clone()],
         &["✳ Claude Code"],
@@ -5352,7 +5353,8 @@ fn a_claude_reply_drawn_under_a_status_line_ends_once_its_title_has_rested() {
     assert_eq!(title_reads(&r.requests), 1, "{:#?}", r.requests);
     // The controls, never held as busy: the finished reply ends at its first read, its done row
     // drawn, whatever the title says; a reply that ends with no done row (`showTurnDuration`
-    // off) ends under its resting title, at once where the wait saw no run.
+    // off) ends under its resting title once a second read agrees, where the wait saw no run too,
+    // since its first read could be the 23 ms before its last line.
     let r = title_run(vec![done.clone()], &["◑ Claude Code"], false);
     assert_eq!(
         (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
@@ -5369,7 +5371,7 @@ fn a_claude_reply_drawn_under_a_status_line_ends_once_its_title_has_rested() {
         "{:#?}",
         r.requests
     );
-    assert_eq!(title_reads(&r.requests), 1, "{:#?}", r.requests);
+    assert_eq!(title_reads(&r.requests), 2, "{:#?}", r.requests);
     assert!(r.took < Duration::from_secs(5), "{:?}", r.took);
     assert!(r.noted.is_empty(), "{:#?}", r.noted);
     // A Claude Code that set no title (`CLAUDE_CODE_DISABLE_TERMINAL_TITLE`) says nothing by it:
@@ -5392,16 +5394,16 @@ fn a_claude_reply_drawn_under_a_status_line_ends_once_its_title_has_rested() {
     );
 }
 
-/// A wait taken up again after a lost connection keeps the run an earlier wait of the turn saw:
-/// the turn read busy, or its reply was held under the running title, a call was lost while the
-/// reply went on drawing under a status line, and the first read back falls between the title's
-/// rest and the frame that draws the reply's last line (its done row comes in that same frame,
-/// so it is not drawn yet either). The turn ends on the done frame, one settle after the title
-/// read at rest, all four NEEDS YOU lines in it. NEGATIVE CONTROLS: an outage before any read of
-/// the turn, or one that took the first title read before it said the turn runs, leaves no run
-/// to keep, and the same frame under the resting title ends the turn at once.
+/// A wait taken up again after a lost connection ends only on a read after its title rests: a call
+/// was lost while the reply went on drawing under a status line, and the first read back falls
+/// between the title's rest and the frame that draws the reply's last line (its done row comes in
+/// that same frame, so it is not drawn yet either). Whether the turn read busy before the outage,
+/// its reply was held under the running title, the outage took the wait's first request or its
+/// first title read, the turn ends on the done frame, one settle after the title read at rest,
+/// all four NEEDS YOU lines in it; and so it does with no status line row drawn, the footer of a
+/// status line whose command printed nothing, which drops `esc to interrupt` all the same.
 #[test]
-fn a_wait_taken_up_again_keeps_the_run_an_earlier_wait_saw() {
+fn a_wait_taken_up_again_ends_only_on_a_read_after_its_title_rests() {
     use aterm_phase::prompt::fixtures::{
         STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_MIDREPLY_2_1_311,
         STATUSLINE_REPLY_DONE_2_1_311, screen,
@@ -5470,25 +5472,143 @@ fn a_wait_taken_up_again_keeps_the_run_an_earlier_wait_saw() {
         "{requests:#?}"
     );
     assert_eq!(needs_said(&turn.screen.rows), 4);
-    // The outage takes the wait's first request (0), its `await gone` before any read.
-    let (turn, requests, log, lost) = run(vec![held.clone(), held.clone(), done.clone()], &rest, 0);
-    assert!(lost.starts_with("await gone "), "CONTROL: {requests:#?}");
-    assert!(log.starts_with("RECONNECT await gone "), "CONTROL: {log}");
-    assert_eq!(
-        (turn.phase, &turn.screen.rows, turn.timed_out),
-        (Phase::Idle, &held, false),
-        "CONTROL: {requests:#?}"
-    );
-    assert_eq!(title_reads(&requests), 1, "CONTROL: {requests:#?}");
-    // The outage takes the first title read (2), before the title said anything of the turn.
-    let (turn, requests, log, lost) = run(vec![mid.clone(), mid, held.clone(), done], &rest, 2);
-    assert_eq!(lost, "title", "CONTROL: {requests:#?}");
-    assert!(log.starts_with("RECONNECT title failed"), "CONTROL: {log}");
-    assert_eq!(
-        (turn.phase, &turn.screen.rows, turn.timed_out),
-        (Phase::Idle, &held, false),
-        "CONTROL: {requests:#?}"
-    );
+    // The outage takes the wait's first request (0), its `await gone` before any read, and then
+    // the first title read (2), before the title said anything of the turn; each arm again with
+    // no status line row drawn.
+    let bare = |rows: &Vec<String>| without_status_line(rows);
+    for (screens, lost_at, lost_is) in [
+        (
+            vec![held.clone(), held.clone(), done.clone()],
+            0,
+            "await gone ",
+        ),
+        (
+            vec![mid.clone(), mid.clone(), held.clone(), done.clone()],
+            2,
+            "title",
+        ),
+    ] {
+        let (turn, requests, log, lost) = run(screens.clone(), &rest, lost_at);
+        assert!(lost.starts_with(lost_is), "{requests:#?}");
+        assert!(log.starts_with("RECONNECT "), "{log}");
+        assert_eq!(
+            (turn.phase, &turn.screen.rows, turn.timed_out),
+            (Phase::Idle, &done, false),
+            "{requests:#?}"
+        );
+        assert_eq!(needs_said(&turn.screen.rows), 4);
+        let (turn, requests, _, lost) = run(screens.iter().map(bare).collect(), &rest, lost_at);
+        assert!(
+            lost.starts_with(lost_is),
+            "no status line row: {requests:#?}"
+        );
+        assert_eq!(
+            (turn.phase, &turn.screen.rows, turn.timed_out),
+            (Phase::Idle, &bare(&done), false),
+            "no status line row: {requests:#?}"
+        );
+        assert_eq!(needs_said(&turn.screen.rows), 4);
+    }
+}
+
+/// `rows`, a status-line reply, with its status line (`  lab status line`) taken out: the same
+/// reply under a footer with no status line.
+fn without_status_line(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .filter(|row| row.trim_end() != "  lab status line")
+        .cloned()
+        .collect()
+}
+
+/// ATERM-KI-1027-3's last hole: a turn whose first read, before any read of it saw it run, falls
+/// in the 23 ms between Claude Code's title resting and the frame that draws its reply's last
+/// line. Under a status line that read shows no busy sign, its title already rests and no done row
+/// is drawn yet, so it was taken for the end and the turn ended on a reply short of its last
+/// NEEDS YOU line. A read at rest under a title at rest now takes one settle and a second read
+/// decides: the turn ends on the finished reply, all four NEEDS YOU lines in it, with the title
+/// sent with the rows or asked for, a log kept or not, the reply's end drawn with no done row
+/// (`showTurnDuration` off), and with the status line's row drawn or not (a configured status line
+/// whose command printed nothing draws none, and Claude Code drops `esc to interrupt` for it all
+/// the same). NEGATIVE CONTROL: the same frames under a title never set, which says nothing, end
+/// at once on the first read, one settle fewer.
+#[test]
+fn a_first_read_under_a_rested_title_waits_for_a_second_read() {
+    use aterm_phase::prompt::fixtures::{
+        STATUSLINE_LAST_LINE_HELD_2_1_311, STATUSLINE_REPLY_DONE_2_1_311, screen,
+    };
+    let held = screen(STATUSLINE_LAST_LINE_HELD_2_1_311);
+    let done = screen(STATUSLINE_REPLY_DONE_2_1_311);
+    let undated: Vec<String> = done
+        .iter()
+        .filter(|row| !row.starts_with("✻ "))
+        .cloned()
+        .collect();
+    let reader = aterm_phase::Program::Claude.reader();
+    assert!(!reader.end_drawn(&held), "fixture guard: no done row");
+    assert!(!reader.end_drawn(&undated), "fixture guard: no done row");
+    assert_eq!(needs_said(&held), 3, "fixture guard");
+    let rest = ["✳ Claude Code"];
+    let settles = |requests: &[String]| {
+        requests
+            .iter()
+            .filter(|r| r.starts_with("await idle "))
+            .count()
+    };
+    for row_drawn in [true, false] {
+        let drawn = |rows: &Vec<String>| {
+            if row_drawn {
+                rows.clone()
+            } else {
+                without_status_line(rows)
+            }
+        };
+        for end in [drawn(&done), drawn(&undated)] {
+            let frames = vec![drawn(&held), end.clone()];
+            let what = format!(
+                "status line row drawn {row_drawn}, done row {}",
+                end != drawn(&undated)
+            );
+            for log in [false, true] {
+                let r = snapshot_run(frames.clone(), &rest, log);
+                assert_eq!(
+                    (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+                    (Phase::Idle, &end, false),
+                    "{what}, log {log}: {:#?}",
+                    r.requests
+                );
+                assert_eq!(needs_said(&r.turn.screen.rows), 4, "{what}");
+                assert!(r.noted.is_empty(), "{what}: {:#?}", r.noted);
+                let c = snapshot_run(frames.clone(), &[""], log);
+                assert_eq!(
+                    (c.turn.phase.clone(), &c.turn.screen.rows),
+                    (Phase::Idle, &frames[0]),
+                    "CONTROL {what}, log {log}: {:#?}",
+                    c.requests
+                );
+                assert_eq!(
+                    settles(&r.requests),
+                    settles(&c.requests) + 1,
+                    "{what}, log {log}: {:#?} against {:#?}",
+                    r.requests,
+                    c.requests
+                );
+            }
+            let r = title_run(frames.clone(), &rest, false);
+            assert_eq!(
+                (r.turn.phase.clone(), &r.turn.screen.rows, r.turn.timed_out),
+                (Phase::Idle, &end, false),
+                "{what}: {:#?}",
+                r.requests
+            );
+            let asked = if reader.end_drawn(&end) { 1 } else { 2 };
+            assert_eq!(
+                title_reads(&r.requests),
+                asked,
+                "{what}: the done row's read needs no title: {:#?}",
+                r.requests
+            );
+        }
+    }
 }
 
 /// [`TITLE_HOLD`] for an idle read under a running title counts from its reply's last change,

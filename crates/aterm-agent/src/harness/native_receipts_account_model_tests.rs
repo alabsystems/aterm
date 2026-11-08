@@ -307,10 +307,8 @@ fn step(state: &State, action: &str, fault: u8, mut evidence: Option<&mut StepEv
 #[test]
 fn account_journal_refines_real_claim_fence_and_retirement_transitions() {
     let model = aterm_models_harness::account_journal_model();
-    // The complete sweep below proves the committed model; keep its primary mutant explicit.
+    // The registry-wide non_vacuity test owns the full sweep; keep its primary mutant explicit.
     assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{faults:?}");
     assert_eq!(ACCOUNT_FRAME, 520);
     assert_eq!(FENCE_FRAME, 524);
     let mut evidence = StepEvidence::new("AccountJournal");

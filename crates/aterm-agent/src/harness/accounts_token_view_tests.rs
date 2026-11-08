@@ -527,7 +527,7 @@ fn the_view_covers_a_rowless_session_login_in_one_read() {
         ) -> Result<aterm_secrets::client::WriteRoute, String> {
             Err("not asked".to_owned())
         }
-        fn standing(&self, _: &Key) -> Result<Lookup<Standing>, String> {
+        fn standing(&self, _: &Key, _: std::time::Instant) -> Result<Lookup<Standing>, String> {
             panic!("the view reads every account in one listed read")
         }
         fn listed(&self) -> Result<Lookup<Vec<Standing>>, String> {
@@ -623,7 +623,7 @@ impl TokenVault for Posting {
     fn route(&self, _: std::time::Instant) -> Result<aterm_secrets::client::WriteRoute, String> {
         Err("not asked".to_owned())
     }
-    fn standing(&self, _: &Key) -> Result<Lookup<Standing>, String> {
+    fn standing(&self, _: &Key, _: std::time::Instant) -> Result<Lookup<Standing>, String> {
         Err("not asked".to_owned())
     }
     fn listed(&self) -> Result<Lookup<Vec<Standing>>, String> {

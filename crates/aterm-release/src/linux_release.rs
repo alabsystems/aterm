@@ -17,18 +17,18 @@ use serde::{Deserialize, Serialize};
 /// writing handoff receipts or executing a release product.
 pub(crate) fn pilot(
     take: &super::Take,
-    arm: crate::profile_pilot::Arm,
+    trial: crate::profile_pilot::Trial,
     root: &Path,
     build: u64,
     hint: Option<&str>,
 ) -> Result<aterm_json::Value, String> {
     if !matches!(
-        arm,
+        trial.arm,
         crate::profile_pilot::Arm::Fat1 | crate::profile_pilot::Arm::Fat1Lines
     ) {
         return Err("Linux profile pilot supports fat1 and fat1-lines".into());
     }
-    super::pilot_build(take, arm, root, None, build, hint)
+    super::pilot_build(take, trial, root, None, build, hint)
 }
 
 #[path = "pin_release.rs"]

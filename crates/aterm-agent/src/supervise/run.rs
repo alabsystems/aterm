@@ -1872,9 +1872,6 @@ struct Looking {
 struct Saw {
     busy: bool,
     live: bool,
-    /// A read saw the turn run: a busy read, output still arriving, or an idle read held under
-    /// the program's running title.
-    ran: bool,
 }
 
 struct BoxAsk {
@@ -4384,10 +4381,7 @@ impl<'a, C: Ctl> Session<'a, C> {
         // same reply does not, so [`TITLE_HOLD`] of the reply unchanged ends it, and the read is
         // taken as its screen shows it.
         let mut title_run_since: Option<(Option<String>, Instant)> = None;
-        // A read of this turn saw it run (`saw.ran`). A wait taken up again keeps the run an
-        // earlier wait saw: `saw` lasts until a look judges the turn, past a lost connection and
-        // past a look the usage panel, an Off park or a reset ended. A title read since found the
-        // program at rest, no busy read after it.
+        // A title read in this wait found the program at rest, with no busy read after it.
         let mut title_rested = false;
         let mut unvouched_since: Option<Instant> = None;
         // The last read held as still starting (its seq), and since when ([`FIRST_FRAME_HANG`]).
@@ -4586,17 +4580,23 @@ impl<'a, C: Ctl> Session<'a, C> {
                 // line Claude Code draws its reply with no busy sign (no `esc to interrupt`, its
                 // spinner row gone once the reply's first line is drawn), and Muse Code shows its
                 // last reply before its run ends. A read under a running title is held and read
-                // again after the short settle. Once a read of the turn saw it run, an end
-                // decides only where a title read earlier in this wait had already rested: Claude
-                // Code rests its title about 23 ms before the frame that draws the reply's last
-                // line, so a screen read just before that flip under a title read just after it is
-                // a reply short of its last line. An end the program drew (Claude Code's done row,
-                // which comes with that last line or after it, or the interrupt a stopped turn
-                // ends on, as `title_live` reads it), a wall, and an end the transcript told
-                // decide as read: the title also runs while the agent's background agents or
-                // workflows do, its turn over. A health wall (Claude Code's critical-memory
-                // banner) is no such wall: the program draws it over a live turn too, and the
-                // restart it asks for waits for the reply's last line like any other end.
+                // again after the short settle. A title at rest vouches for an end only on a read
+                // after it: Claude Code rests its title about 23 ms before the frame that draws
+                // the reply's last line, so a screen read just before that flip under a title read
+                // just after it is a reply short of its last line. That holds for a wait's first
+                // read too (one taken up on a reply already drawing, or after an outage), and the
+                // screen cannot say whether a status line hides the busy sign, since Claude Code
+                // drops `esc to interrupt` for a configured status line even where its command
+                // draws no row. So the first read at rest under a title at rest takes the short
+                // settle and the read after it decides. An end the program drew (Claude Code's
+                // done row, which comes with that last line or after it, or the interrupt a
+                // stopped turn ends on, as `title_live` reads it), a wall, and an end the
+                // transcript told decide as read: the title also runs while the agent's background
+                // agents or workflows do, its turn over. A health wall (Claude Code's
+                // critical-memory banner) is no such wall: the program draws it over a live turn
+                // too, and the restart it asks for waits for the reply's last line like any other
+                // end. A program with no reading of its titles, or a title never set, says nothing
+                // and pays nothing.
                 if matches!(phase, Phase::Idle | Phase::Question)
                     && !transcript_idle
                     && !reader.end_drawn(&screen.rows)
@@ -4619,13 +4619,12 @@ impl<'a, C: Ctl> Session<'a, C> {
                                 if title_held.as_ref().is_none_or(|(held, _)| *held != said) {
                                     title_held = Some((said, self.fx.mono()));
                                 }
-                                saw.ran = true;
                                 title_rested = false;
                                 next = Next::Settle;
                                 footer_seen = false;
                                 continue;
                             }
-                            Some(false) if saw.ran && !title_rested => {
+                            Some(false) if !title_rested => {
                                 title_rested = true;
                                 next = Next::Settle;
                                 footer_seen = false;
@@ -4645,7 +4644,6 @@ impl<'a, C: Ctl> Session<'a, C> {
             if !title_only {
                 title_held = None;
             }
-            saw.ran = true;
             title_rested = false;
             if writing {
                 phase = Phase::Busy;

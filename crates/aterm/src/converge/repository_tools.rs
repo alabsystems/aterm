@@ -904,32 +904,37 @@ mod tests {
         );
 
         // A native Git can be installed yet incapable of the read-only object
-        // operations required by this private inventory. Presence is not readiness.
+        // operations required by this private inventory: one before 2.44, which refuses
+        // `--no-lazy-fetch` and, before the 2.39.4 security release, fetches lazily whatever
+        // GIT_NO_LAZY_FETCH says. Presence is not readiness.
         for path in [
             aterm_machines::items::github::CLT_GIT,
             aterm_machines::items::github::SYSTEM_GIT,
         ] {
             sys.executable(path, b"old native Git");
         }
-        sys.simulate(|_, command| {
-            command
-                .args
-                .iter()
-                .any(|arg| arg == "--no-lazy-fetch")
-                .then(|| {
-                    if [
-                        aterm_machines::items::github::CLT_GIT,
-                        aterm_machines::items::github::SYSTEM_GIT,
-                    ]
-                    .iter()
-                    .any(|path| command.program == std::path::Path::new(path))
-                    {
-                        Ran::exit(129, "unknown option: --no-lazy-fetch")
-                    } else {
-                        Ran::ok("capable Git")
-                    }
-                })
-        });
+        let native = |command: &aterm_machines::port::Cmd| {
+            [
+                aterm_machines::items::github::CLT_GIT,
+                aterm_machines::items::github::SYSTEM_GIT,
+            ]
+            .iter()
+            .any(|path| command.program == std::path::Path::new(path))
+        };
+        let old_native = move |obeys: bool| {
+            move |_: &Fake, command: &aterm_machines::port::Cmd| {
+                if native(command) {
+                    aterm_machines::init_github::git_before_no_lazy_fetch(command, obeys)
+                } else {
+                    command
+                        .args
+                        .iter()
+                        .any(|arg| arg == "--no-lazy-fetch")
+                        .then(|| Ran::ok("capable Git"))
+                }
+            }
+        };
+        sys.simulate(old_native(false));
         inventory(
             sys.as_ref(),
             home.to_str().unwrap(),
@@ -940,6 +945,34 @@ mod tests {
             matches!(item.probe(), Probe::Change { .. }),
             "installed Git must not strand required dependencies when it refuses the safe object-read capability"
         );
+        // One that refuses the option but was seen to obey the variable alone (Ubuntu 24.04's
+        // 2.43.0) is ready as it is, with no managed Git installed for it.
+        sys.simulate(old_native(true));
+        assert!(
+            matches!(item.probe(), Probe::Ok { .. }),
+            "a native Git shown to obey GIT_NO_LAZY_FETCH meets the inventory's requirements"
+        );
+        // A question whose setup failed (a full temporary folder, say) shows nothing about the
+        // Git: the pass says why and asks again, and installs no Git for it.
+        sys.simulate(move |fake, command| {
+            if native(command) && command.args.iter().any(|arg| arg == "init") {
+                return Some(Ran::exit(
+                    128,
+                    "fatal: cannot mkdir promisor.git: No space left on device",
+                ));
+            }
+            old_native(true)(fake, command)
+        });
+        match item.probe() {
+            Probe::Deferred { why } => assert!(
+                why.contains("git init failed") && why.contains("No space left on device"),
+                "{why}"
+            ),
+            probe => {
+                panic!("a probe that could not be set up is not an install instruction: {probe:?}")
+            }
+        }
+        sys.simulate(old_native(false));
         let probes = || {
             sys.calls()
                 .iter()
@@ -966,17 +999,15 @@ mod tests {
         );
         let selected_home = home.clone();
         sys.simulate(move |_, command| {
-            command
-                .args
-                .iter()
-                .any(|arg| arg == "--no-lazy-fetch")
-                .then(|| {
-                    if command.program.starts_with(&selected_home) {
-                        Ran::ok("capable Git")
-                    } else {
-                        Ran::exit(129, "unknown option: --no-lazy-fetch")
-                    }
-                })
+            if command.program.starts_with(&selected_home) {
+                command
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--no-lazy-fetch")
+                    .then(|| Ran::ok("capable Git"))
+            } else {
+                aterm_machines::init_github::git_before_no_lazy_fetch(command, false)
+            }
         });
         online.store(true, Ordering::SeqCst);
         choices.calls.lock().unwrap().clear();

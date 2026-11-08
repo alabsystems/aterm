@@ -55,6 +55,7 @@ mod profile_pilot;
 mod provision;
 mod publish;
 
+mod cutter_inputs;
 mod release;
 mod release_disk;
 mod release_keychain;
@@ -94,6 +95,10 @@ mod trust_oblig;
 mod verify;
 
 fn main() -> std::process::ExitCode {
+    if let Some(code) = aterm_uds::tether::entry() {
+        return code;
+    }
+    cut_timing::image_arrived();
     // Cargo's compiler wrapper for a release slice runs nothing else of this tool.
     if let Some(code) = slice_units::entry(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
         return std::process::ExitCode::from(code);

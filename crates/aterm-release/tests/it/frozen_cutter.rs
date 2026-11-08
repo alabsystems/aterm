@@ -51,6 +51,7 @@ fn a_frozen_cutters_own_child_proves_itself_without_the_freezer_envelope() {
         &commit,
         &binary,
         &release.with_extension("events"),
+        None,
     )
     .unwrap();
     release_tools::publish_cutter(&release, &cutter).unwrap();
@@ -63,6 +64,7 @@ fn a_frozen_cutters_own_child_proves_itself_without_the_freezer_envelope() {
         let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(60)).unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("cutter-image-arrived"), "{mode}: {stderr}");
         assert!(
             stdout.contains(&format!("parent Proved {commit}")),
             "{mode}: {stdout}\n{stderr}"

@@ -4,8 +4,8 @@
 //! THE ACT BARRIER: a harness act a session's program records over the control socket
 //! (`meta set harness_act …`) that reads the session's counts (`control_session::
 //! harness_act_reads_counts`) reads them only once the session's parser holds every byte the
-//! program wrote to its PTY before it. An act whose barrier is not answered within [`PATIENCE`],
-//! or whose reader stops first, is read as it stands, as before the barrier.
+//! program wrote to its PTY before it. An unanswered barrier, a stopped reader or an actual
+//! caller disconnect refuses the act before its counts are read or its effects applied.
 //!
 //! A program writes its turn's end marks (OSC 7501) before it sends the act that closes the turn
 //! (codex-alab's landing waits for its screen to take the turn's end). On a loaded Mac aterm's
@@ -30,20 +30,10 @@
 use std::sync::mpsc::SyncSender;
 use std::time::Duration;
 
-/// How long an act waits for its barrier before it is read without one, as before the barrier.
-///
-/// codex-alab gives a control call 5 s (alab-aterm's `CALL_TIMEOUT`), counted from when the call
-/// queued behind the ones before it on its connection, and past it drops the connection that may
-/// hold its claim. So only the first act a lagging parser leaves unanswered waits this long: the
-/// session's acts after it are read at once ([`Passage::Behind`]) until that parser answers a
-/// barrier again, and a run of acts costs one patience, not one each. A healthy parser answers in
-/// milliseconds.
-#[cfg(not(test))]
-pub(crate) const PATIENCE: Duration = Duration::from_secs(2);
-/// A test's patience is a hang detector, never the 2 s an act waits: a loaded test host can parse
-/// slower than that without anything being wrong.
-#[cfg(test)]
-pub(crate) const PATIENCE: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// Hang detector for a required act barrier. A peer's own connection deadline is
+/// unchanged: actual disconnect cancels this wait and admits no act. Every act
+/// that reads counts requires its own barrier.
+pub(crate) const PATIENCE: Duration = Duration::from_secs(60);
 
 /// What [`ResetLane::pass`](crate::manual_reset::ResetLane::pass) saw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,11 +49,10 @@ pub(crate) enum Passage {
     Unbarriered,
     /// The reader stopped before it answered.
     Gone,
-    /// Not answered within the patience: the session's parser is behind.
+    /// The minute hang detector expired without a parser answer.
     Late,
-    /// Not asked: a barrier before it went [`Passage::Late`], and the parser has answered none
-    /// since.
-    Behind,
+    /// The actual caller disconnected before its act could be admitted.
+    Cancelled,
 }
 
 /// A reader generation's poke: the write end of its gather's poke pipe and who waits on the next
@@ -139,18 +128,18 @@ impl Countdown {
 }
 
 /// Wait, holding no lock, until the session's parser holds what its program wrote before this act
-/// ([`ResetLane::pass`](crate::manual_reset::ResetLane::pass)); an act that cannot is read without
-/// the barrier, and the log says why once per lag.
+/// ([`ResetLane::pass`](crate::manual_reset::ResetLane::pass)). An act whose
+/// barrier does not pass is refused, and no later act bypasses its own barrier.
 pub(crate) fn before_act(ctx: &crate::SessionCtx) -> Passage {
     let passage = ctx.reset_lane.pass(PATIENCE);
     match passage {
-        Passage::Passed | Passage::Unbarriered | Passage::Behind => {}
+        Passage::Passed | Passage::Unbarriered | Passage::Cancelled => {}
         Passage::Gone => aterm_log::info!(
-            "act barrier: @{}: the reader stopped before its parser caught up; the act is read as it stands",
+            "act barrier: @{}: the reader stopped before its parser caught up; the act was not applied",
             ctx.self_id.as_str()
         ),
         Passage::Late => aterm_log::warn!(
-            "act barrier: @{}: the parser did not catch up within {} ms; this act, and the session's acts until it does, are read as they stand",
+            "act barrier: @{}: the parser did not catch up within {} ms; the act was not applied",
             ctx.self_id.as_str(),
             PATIENCE.as_millis()
         ),

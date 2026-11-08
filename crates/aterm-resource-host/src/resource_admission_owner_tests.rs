@@ -1702,3 +1702,183 @@ fn accounted_memory_only_refusal_keeps_original_funded_ancestor_untouched() {
     world.settle();
     world.assert_settled(&original, &original_memory, pid);
 }
+
+// Reproducer for the original GNU epoch/cold-recovery gap. These are real
+// private World memory/CPU authorities, not a fake SDK/Ready/closure receipt.
+// The extra Host journal field is DATA only: current readers ignore it.
+fn cold_gnu_recovery_preserves_original_debt(test: &str, claimed_retired: bool) {
+    use std::io::Read as _;
+    if !aterm_uds::test_binary::isolated_lifecycle(test) {
+        return;
+    }
+    let mut world = World::new();
+    let (binding, memory, client) = world.queue_sleep(HANG);
+    let mut pending = world.owner.pending.pop_front().unwrap();
+    let width = NonZeroU32::new(2).unwrap();
+    let material = world
+        .owner
+        .debt
+        .prepare_recoverable(
+            aterm_capacity::build_cpu::Owner::current(None),
+            width,
+            recovery::context(&binding, &memory, MEMORY, width.get()),
+        )
+        .unwrap();
+    let (parent, leaf) = world.owner.journal.authority(&binding).unwrap();
+    let mut prepared = material.persist(&parent, &leaf).unwrap();
+    world
+        .owner
+        .journal
+        .update(
+            &binding,
+            "prepared",
+            aterm_json::json!({
+                "cpu_mode":"retained_fixed", "cpu_units":2,
+                "memory_bytes":MEMORY, "memory":memory.to_json(),
+                "gnu_epoch":{"version":1,"retired":claimed_retired}
+            }),
+        )
+        .unwrap();
+    let cpu = world
+        .owner
+        .debt
+        .try_reserve_recoverable(&mut prepared, world.owner.pool.slots().get())
+        .unwrap()
+        .unwrap();
+    let mut custody =
+        RetainedCohort::new_bundle(&world.owner.fence, pending.claim.take().unwrap(), cpu).unwrap();
+    let ([read, write], fifo) = custody
+        .prepare_gnu(&world.owner.fence, width)
+        .unwrap()
+        .into_parts();
+    let mut read = File::from(read);
+    let write = File::from(write);
+    let mut actual_borrow = [0];
+    read.read_exact(&mut actual_borrow).unwrap();
+    assert_eq!(actual_borrow, *b"+");
+    // The actual unused memory cohort may close, but its real GNU borrow has
+    // not returned. The live wrapper correctly refuses every CPU Free write.
+    assert!(custody.try_finish(&world.owner.fence).is_err());
+    assert_eq!(world.owner.debt.reserved().unwrap(), 2);
+    let state = world.owner.ledger.reap_cohort_claim(&memory).unwrap();
+    eprintln!("actual memory state before cold restore: {state:?}");
+    drop(custody);
+    drop(prepared); // No live recovery-material issuance lock remains.
+    pending.events.abandon();
+    drop(pending);
+    drop(client);
+    // The offered original FIFO descriptions remain live even if Drop has
+    // removed its namespace. Neither fact is completion/absence authority.
+    use std::os::unix::fs::FileTypeExt as _;
+    assert!(read.metadata().unwrap().file_type().is_fifo());
+    assert!(write.metadata().unwrap().file_type().is_fifo());
+    eprintln!("original FIFO pathname survives Drop: {}", fifo.exists());
+    world.owner.journal = journal::Journal::open(&world.namespace, &world.owner.debt).unwrap();
+    // Both a conservative refusal and a retained-state result are valid;
+    // neither permits recovering the aggregate as reusable CPU.
+    let recovered = world.owner.recover();
+    eprintln!("actual cold restore result: {recovered:?}");
+    assert_eq!(
+        world.owner.debt.reserved().unwrap(),
+        2,
+        "cold restore freed real original CPU while one GNU byte was still borrowed"
+    );
+    assert!(
+        world
+            .owner
+            .debt
+            .try_reserve(aterm_capacity::build_cpu::Owner::current(None), width, 2)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(actual_borrow, *b"+");
+    assert!(
+        !world.owner.journal.outstanding().unwrap().is_empty(),
+        "missing GNU return must not acquire a settled Host tombstone"
+    );
+}
+
+#[test]
+fn cold_gnu_recovery_keeps_the_real_missing_byte_and_original_cpu_debt() {
+    cold_gnu_recovery_preserves_original_debt(
+        "actor::owner::tests::cold_gnu_recovery_keeps_the_real_missing_byte_and_original_cpu_debt",
+        false,
+    );
+}
+
+#[test]
+fn cold_gnu_recovery_cannot_turn_decoded_retired_data_into_epoch_closure() {
+    cold_gnu_recovery_preserves_original_debt(
+        "actor::owner::tests::cold_gnu_recovery_cannot_turn_decoded_retired_data_into_epoch_closure",
+        true,
+    );
+}
+
+#[test]
+fn original_nongnu_cold_restore_still_settles_the_exact_unused_bundle() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::original_nongnu_cold_restore_still_settles_the_exact_unused_bundle",
+    ) {
+        return;
+    }
+    let mut world = World::new();
+    let (binding, memory, client) = world.queue_sleep(HANG);
+    let mut pending = world.owner.pending.pop_front().unwrap();
+    let width = NonZeroU32::new(2).unwrap();
+    let material = world
+        .owner
+        .debt
+        .prepare_recoverable(
+            aterm_capacity::build_cpu::Owner::current(None),
+            width,
+            recovery::context(&binding, &memory, MEMORY, width.get()),
+        )
+        .unwrap();
+    let (parent, leaf) = world.owner.journal.authority(&binding).unwrap();
+    let mut prepared = material.persist(&parent, &leaf).unwrap();
+    world
+        .owner
+        .journal
+        .update(
+            &binding,
+            "prepared",
+            aterm_json::json!({
+                "cpu_mode":"retained_fixed", "cpu_units":2,
+                "memory_bytes":MEMORY, "memory":memory.to_json()
+            }),
+        )
+        .unwrap();
+    let cpu = world
+        .owner
+        .debt
+        .try_reserve_recoverable(&mut prepared, world.owner.pool.slots().get())
+        .unwrap()
+        .unwrap();
+    let custody =
+        RetainedCohort::new_bundle(&world.owner.fence, pending.claim.take().unwrap(), cpu).unwrap();
+    assert_eq!(world.owner.debt.reserved().unwrap(), 2);
+    drop(custody); // No GNU epoch or issued supplementary credit exists.
+    drop(prepared);
+    pending.events.abandon();
+    drop(pending);
+    drop(client);
+    world.owner.journal = journal::Journal::open(&world.namespace, &world.owner.debt).unwrap();
+    assert_eq!(
+        world.owner.ledger.reap_cohort_claim(&memory).unwrap(),
+        CohortClaimState::Closed
+    );
+    world.owner.recover().unwrap();
+    assert_eq!(world.owner.debt.reserved().unwrap(), 0);
+    assert!(world.owner.journal.outstanding().unwrap().is_empty());
+    assert!(!world.owner.journal.fresh(&binding).unwrap());
+    let actual = world
+        .owner
+        .debt
+        .try_reserve(aterm_capacity::build_cpu::Owner::current(None), width, 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actual.len(), 2);
+    for original in actual {
+        original.settle().unwrap();
+    }
+}

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Admitted Git paths and pinned nested-lock replacement for the release bump.
+//! Admitted Git paths and pinned root/nested lock replacement for the release bump.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path};
@@ -364,8 +364,8 @@ mod unix {
         admit(&paths)?;
         for path in &paths {
             let path = Path::new(path);
-            if path.file_name() != Some(OsStr::new("Cargo.lock")) || path.components().count() < 2 {
-                return Err("Git did not name a nested Cargo.lock".into());
+            if path.file_name() != Some(OsStr::new("Cargo.lock")) {
+                return Err("Git did not name a Cargo.lock".into());
             }
         }
         let root = root(repo).map_err(|why| format!("pin repository {repo:?}: {why}"))?;

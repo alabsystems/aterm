@@ -1289,6 +1289,23 @@ impl App {
 
     /// Release every held button whose press went to a session the window no longer shows, then forget it.
     pub(crate) fn settle_hidden_button_owners(&mut self, wid: WindowId) {
+        if self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.pane_overlay.drag)
+            .is_some_and(|d| self.visible_session_rect(wid, d.session).is_none())
+        {
+            self.scrollbar_release(wid);
+        }
+        if self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.pane_overlay.hover)
+            .is_some_and(|h| self.visible_session_rect(wid, h).is_none())
+            && let Some(ws) = self.windows.get_mut(&wid)
+        {
+            ws.pane_overlay.hover = None;
+        }
         let Some((reported, owners)) = self
             .windows
             .get(&wid)

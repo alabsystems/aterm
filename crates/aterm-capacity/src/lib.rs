@@ -98,6 +98,8 @@ pub mod host_protocol;
 pub mod leadership;
 #[cfg(unix)]
 pub mod retained_cohort;
+#[cfg(unix)]
+mod retained_gnu;
 pub use cpu_observation::{CpuExternal, CpuHolder, CpuObservation};
 #[cfg(unix)]
 mod retained_claim;

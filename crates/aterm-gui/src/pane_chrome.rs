@@ -584,16 +584,22 @@ impl PaneOverlay {
         let m = Metrics::for_cell(cw32, ch32);
         let lift = u32::try_from(inputs.chrome_rows * ch).unwrap_or(u32::MAX);
         let mut fading = false;
-        if self
-            .drag
-            .is_some_and(|d| !self.facts.iter().any(|f| f.session == d.session))
-        {
+        if self.drag.is_some_and(|d| {
+            !inputs.scrollbar
+                || !self
+                    .facts
+                    .iter()
+                    .any(|f| f.session == d.session && !f.alt && f.history > 0)
+        }) {
             self.drag = None;
         }
-        if self
-            .hover
-            .is_some_and(|h| !self.facts.iter().any(|f| f.session == h))
-        {
+        if self.hover.is_some_and(|h| {
+            !inputs.scrollbar
+                || !self
+                    .facts
+                    .iter()
+                    .any(|f| f.session == h && !f.alt && f.history > 0)
+        }) {
             self.hover = None;
         }
         let grid = (inputs.win_rows, inputs.win_cols);
@@ -960,7 +966,7 @@ impl App {
             .facts
             .iter()
             .find_map(|f| {
-                if f.alt || f.history == 0 {
+                if f.alt || f.history == 0 || self.visible_session_rect(wid, f.session).is_none() {
                     return None;
                 }
                 let lane = scrollbar::lane(
@@ -1076,19 +1082,18 @@ impl App {
     /// One drag step: put the dragged thumb's top under the pointer, less the
     /// grab, and scroll its pane to the offset that puts it there.
     fn drag_scrollbar(&mut self, wid: WindowId, drag: Drag, x: f64, y: f64) {
-        let Some(inputs) = self.laid_overlay_inputs(wid) else {
+        let Some(inputs) = self.laid_overlay_inputs(wid).filter(|i| i.scrollbar) else {
             return;
         };
         let Some(ws) = self.windows.get(&wid) else {
             return;
         };
-        let Some(facts) = ws
-            .pane_overlay
-            .facts
-            .iter()
-            .copied()
-            .find(|f| f.session == drag.session)
-        else {
+        let Some(facts) = ws.pane_overlay.facts.iter().copied().find(|f| {
+            f.session == drag.session
+                && !f.alt
+                && f.history > 0
+                && self.visible_session_rect(wid, f.session).is_some()
+        }) else {
             return;
         };
         let (cw, ch) = inputs.cell;

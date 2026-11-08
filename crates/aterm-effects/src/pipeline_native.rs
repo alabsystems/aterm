@@ -902,20 +902,28 @@ impl EffectsPipeline {
     }
 
     /// The owner fence, keyed `(terminal identity, alternate screen)`: the first observation
-    /// baselines silently.
+    /// baselines silently. Every change curtains the cursor's marks and forgets the scroll
+    /// baseline. Another terminal is a surface replaced, and the resident crossfades
+    /// ([`CompanionOwner::resight_owner`]); the same terminal switching screens keeps its glass
+    /// and grid, and the resident keeps its body, which travels to the new screen's caret
+    /// ([`CompanionOwner::rescreen_owner`]).
     #[inline]
     pub fn fence_owner(&mut self, current: (u64, bool), now: Instant) -> bool {
-        let changed = matches!(
-            self.cursor_owner_space,
-            Some(previous) if previous != current
-        );
-        self.cursor_owner_space = Some(current);
-        if changed {
+        let Some(previous) = self.cursor_owner_space.replace(current) else {
+            return false;
+        };
+        if previous == current {
+            return false;
+        }
+        self.cursor_scroll_state = None;
+        if previous.0 == current.0 {
+            self.retire_torn_marks(TornBand::Curtain, now);
+            self.companion.rescreen_owner();
+        } else {
             self.resight_torn(now);
-            self.cursor_scroll_state = None;
             self.companion.resight_owner();
         }
-        changed
+        true
     }
 
     /// The cursor family's frame ([`step_cursor_family`]) on this pipeline's engines, with the
@@ -1403,9 +1411,15 @@ impl EffectsPipeline {
         let cat = &mut self.companions.cursor_cat;
         match impulse {
             BodyImpulse::Fly(flight) if !flight.dir.is_vertical() => {
-                self.decos.rebase_kitty_cursor_placement();
+                // The head flies to the landing from where it was drawn, and its beats (the
+                // squint, the squash) land with it ([`crate::word_decorations::HEAD_FLIGHT`]).
+                let flown = self.decos.launch_kitty_cursor_flight(now);
                 self.flying_sky_row = None;
                 if animate {
+                    let flight = match now.checked_add(crate::word_decorations::HEAD_FLIGHT) {
+                        Some(land_at) if flown => companion::Flight { land_at, ..flight },
+                        _ => flight,
+                    };
                     cat.on_meteor(flight, now, cat_frame);
                 }
             }
@@ -1631,18 +1645,29 @@ impl EffectsPipeline {
         drawn
     }
 
-    /// The typed dog's visit.
+    /// The typed dog's visit, kept off the caret's cell, the lettered cells of `cells` (the
+    /// snapshot it is drawn over) and the icons this frame's word pass drew. `origin` is the
+    /// canvas's top-left in the window's grid pixels: a pane's, or `(0, 0)` for the window.
     #[inline]
     pub fn draw_dog(
         &mut self,
         ink: CanvasInk,
         frame: crate::word_decorations::DogCameoFrame,
+        cells: &[Vec<RenderCell>],
+        origin: (i32, i32),
     ) -> Option<u64> {
         let free = match ink {
             CanvasInk::Window => &mut self.free_scratch,
             CanvasInk::Pane => &mut self.pane_free,
         };
-        self.decos.dog_cameo(frame, free)
+        let cols = frame.geom.cols;
+        self.decos.dog_cameo(
+            frame,
+            free,
+            |row, col| crate::rainbow_kitty::companion::cell_ink(cells, row, col, cols),
+            self.cursor.glow.word_icon_boxes(),
+            origin,
+        )
     }
 
     /// Install the window's word channels.
@@ -2410,9 +2435,11 @@ mod flying_head_tests {
         );
     }
 
-    /// §7.2(a): on the teleport frame the placement snaps to the landing, the spine is floored
-    /// at `disp ≥ 0.97` from a cooled head, the whip reads `lead == −0.30` at `t₀`, the eyes
-    /// squint through the flight and 200 ms past arrival, and the squash lands on `t₀ + T`.
+    /// §7.2(a): a head not yet drawn anywhere (nothing to fly from,
+    /// [`a_far_caret_is_flown_to_from_where_the_head_was_drawn`] flies one that was) is placed at
+    /// the landing on the jump's frame, the spine is floored at `disp ≥ 0.97` from a cooled head,
+    /// the whip reads `lead == −0.30` at `t₀`, the eyes squint through the flight and 200 ms past
+    /// arrival, and the squash lands on `t₀ + T`.
     #[test]
     fn the_flying_head_is_at_the_landing_on_frame_zero_and_squashes_on_arrival() {
         let t0 = Instant::now();
@@ -2640,6 +2667,172 @@ mod flying_head_tests {
             EyesFrame::Happy,
             "route_flying_head must refresh cat_frame.pose.eyes on frame 0 of Delight"
         );
+    }
+
+    /// One frame of the host's flying head at `cell`, as `aterm-gui` runs it (route, prepare,
+    /// draw): the rectangle drawn.
+    fn head_frame(
+        fx: &mut EffectsPipeline,
+        cell: (u16, u16),
+        now: Instant,
+    ) -> crate::word_decorations::CatFootprint {
+        let mut frame = fx.companions_mut().cursor_cat.frame(now);
+        let duty = CompanionDuty::FlyingHead { cell };
+        let seat = fx.route_flying_head(duty, &blank(), now, GEOM, &mut frame, true);
+        let layout = KittyCursorLayout {
+            lift: seat.lift,
+            ..layout(cell, &frame)
+        };
+        let motion = fx.companions().cursor_cat.placement_frame(now);
+        let placement = fx
+            .prepare_flying_head(layout, motion, frame.pose, &blank())
+            .expect("the head is placed");
+        fx.draw_flying_head(
+            CanvasInk::Window,
+            crate::word_decorations::KittyCursorFrame {
+                geom: GEOM,
+                cursor: cell,
+                look: layout.look,
+                colors: crate::cat_baker::CatColorKey::default(),
+                bob: frame.bob,
+                lift: layout.lift,
+                alpha: 255,
+                pose: frame.pose,
+                sing: 0.0,
+                notes: [None; crate::kitty_sing::MAX_NOTES],
+            },
+            placement,
+        )
+        .expect("the head is drawn");
+        placement.drawn_footprint().expect("a drawn head")
+    }
+
+    /// The host's flying head drawn at `from` for half a second, then taken to `to` (a meteor's
+    /// jump when `licensed`, else a rest that moved): the rectangles drawn from the last frame at
+    /// `from` on, 16 ms apart, the instant of the jump, and the landing a meteor booked then.
+    fn fly_far(
+        from: (u16, u16),
+        to: (u16, u16),
+        licensed: bool,
+    ) -> (
+        Vec<crate::word_decorations::CatFootprint>,
+        Instant,
+        Option<Instant>,
+    ) {
+        let t0 = Instant::now();
+        let cfg = rainbow_kitty();
+        let frame = Duration::from_millis(16);
+        let mut fx = EffectsPipeline::for_window();
+        let mut out = Vec::new();
+        fx.cursor_mut()
+            .glow
+            .tick(Some(from), t0, &cfg, glow_geom(), &mut out);
+        let cat = &mut fx.companions_mut().cursor_cat;
+        cat.on_collect(t0, KittyLook::for_app("claude"));
+        cat.set_collection_presentable(t0, true);
+        let mut at = t0;
+        let mut drawn = head_frame(&mut fx, from, at);
+        for _ in 0..30 {
+            at += frame;
+            fx.cursor_mut()
+                .glow
+                .tick(Some(from), at, &cfg, glow_geom(), &mut out);
+            drawn = head_frame(&mut fx, from, at);
+        }
+        let jump = at + frame;
+        if licensed {
+            fx.cursor_mut().glow.note_navigation(jump);
+        }
+        let mut path = vec![drawn];
+        let mut booked = None;
+        let mut t = jump;
+        while t <= jump + crate::word_decorations::HEAD_FLIGHT + Duration::from_millis(200) {
+            fx.cursor_mut()
+                .glow
+                .tick(Some(to), t, &cfg, glow_geom(), &mut out);
+            path.push(head_frame(&mut fx, to, t));
+            if t == jump {
+                booked = fx.companions().cursor_cat.land_at();
+            }
+            t += frame;
+        }
+        (path, jump, booked)
+    }
+
+    /// A HEAD ON GLASS FLIES TO A FAR CARET FROM WHERE IT WAS DRAWN (r29 K10-3). Enter and Ctrl+U
+    /// are meteors, and a screen cleared puts the caret more than the two rows the follower
+    /// glides. The head was drawn at the landing on the jump's own frame, so it blinked across
+    /// the screen: 49 to 58 cells in one frame at Enter and Ctrl+U, the old ribbon still fading on
+    /// the line above. Now on the jump's frame it is where it was, each frame after moves it no
+    /// more than a fifth of the way (a 60 Hz frame of the flight's ease), it comes down where it
+    /// rests within the flight's time, and a meteor's squash is booked for that landing.
+    ///
+    /// NEGATIVE CONTROL (`HEAD_FLIGHT_OFF`, the head placed at the landing as before): the whole
+    /// way on one frame, every case.
+    #[test]
+    fn a_far_caret_is_flown_to_from_where_the_head_was_drawn() {
+        let frame_ms = 16u64;
+        let mut minted = 0;
+        let dist = |a: &crate::word_decorations::CatFootprint,
+                    b: &crate::word_decorations::CatFootprint| {
+            (((a.x - b.x).pow(2) + (a.y - b.y).pow(2)) as f32).sqrt()
+        };
+        for (what, from, to, licensed) in [
+            ("Enter", (3u16, 100u16), (5u16, 10u16), true),
+            ("Ctrl+U", (3, 110), (3, 6), true),
+            ("a screen cleared", (20, 30), (1, 4), false),
+        ] {
+            crate::word_decorations::HEAD_FLIGHT_OFF.with(|c| c.set(true));
+            let (old, _, _) = fly_far(from, to, licensed);
+            crate::word_decorations::HEAD_FLIGHT_OFF.with(|c| c.set(false));
+            let old_whole = dist(&old[0], old.last().expect("frames"));
+            let old_worst = old
+                .windows(2)
+                .map(|w| dist(&w[0], &w[1]))
+                .fold(0.0f32, f32::max);
+            assert!(
+                old_worst > 0.8 * old_whole,
+                "{what}: negative control: the head placed at the landing moved {old_worst:.0} of \
+                 {old_whole:.0} px in a frame"
+            );
+
+            let (path, jump, booked) = fly_far(from, to, licensed);
+            let (drawn, rest) = (path[0], *path.last().expect("frames"));
+            let whole = dist(&drawn, &rest);
+            assert!(
+                whole > 300.0,
+                "{what}: precondition: a far jump ({whole} px)"
+            );
+            let steps: Vec<f32> = path.windows(2).map(|w| dist(&w[0], &w[1])).collect();
+            assert!(
+                steps[0] <= 0.25 * whole,
+                "{what}: on the jump's frame the head moved {:.0} of {whole:.0} px: {path:?}",
+                steps[0]
+            );
+            let worst = steps.iter().copied().fold(0.0f32, f32::max);
+            assert!(
+                worst <= 0.2 * whole,
+                "{what}: a frame moved the head {worst:.0} of {whole:.0} px: {steps:?}"
+            );
+            // Down where it rests within the flight's time: the landing's squash and the whip's
+            // spring settle it a few pixels more after.
+            let landed = jump + crate::word_decorations::HEAD_FLIGHT;
+            let landed_at = path
+                .iter()
+                .enumerate()
+                .position(|(i, r)| i > 0 && dist(r, &rest) <= 0.03 * whole)
+                .expect("it comes to rest");
+            assert!(
+                jump + Duration::from_millis(frame_ms * landed_at as u64)
+                    <= landed + Duration::from_millis(frame_ms),
+                "{what}: still flying {landed_at} frames after the jump: {path:?}"
+            );
+            if let Some(booked) = booked.filter(|_| licensed) {
+                minted += 1;
+                assert_eq!(booked, landed, "{what}: the squash lands with the head");
+            }
+        }
+        assert!(minted > 0, "a licensed jump mints a meteor");
     }
 }
 

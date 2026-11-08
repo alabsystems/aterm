@@ -539,7 +539,7 @@ fn group_change_after_unchanged_read_gets_immediate_followup() {
         foreground_job: None,
         activity: super::ActivitySample {
             alt_screen: false,
-            content_seq: 1,
+            screen: 1,
             last_output: None,
         },
     };
@@ -628,7 +628,7 @@ fn a_capped_block_read_owes_a_look_without_delaying_a_handback() {
             foreground_job: None,
             activity: super::ActivitySample {
                 alt_screen: false,
-                content_seq: 1,
+                screen: 1,
                 last_output: None,
             },
         };
@@ -817,7 +817,7 @@ fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
         foreground_job: None,
         activity: super::ActivitySample {
             alt_screen: false,
-            content_seq: 1,
+            screen: 1,
             last_output: None,
         },
     };
@@ -890,7 +890,7 @@ fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
         foreground_job: None,
         activity: super::ActivitySample {
             alt_screen: false,
-            content_seq: 1,
+            screen: 1,
             last_output: None,
         },
     };

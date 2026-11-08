@@ -634,6 +634,11 @@ fn actual_owner_terminal_transfer_and_cold_compaction_follow_the_model() {
 
 #[test]
 fn cold_terminal_conversion_needs_real_group_drain_and_a_fresh_free_guard() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "ledger::cohort_ledger::checkpoint::archive::terminal_model_tests::cold_terminal_conversion_needs_real_group_drain_and_a_fresh_free_guard",
+    ) {
+        return;
+    }
     let world = World::new();
     let mut laid = world.admitted();
     let reference = laid.cohort_closure_ref().unwrap();

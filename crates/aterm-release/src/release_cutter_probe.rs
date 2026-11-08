@@ -23,6 +23,7 @@ fn run(args: &[OsString]) -> Result<(), String> {
             crate::release_tools::FREEZER_ENV,
             crate::release_tools::CONTRACT_ENV,
             crate::release_tools::REFREEZE_ENV,
+            crate::cut_timing::EXEC_PID_ENV,
         ] {
             if std::env::var_os(name).is_some() {
                 return Err(format!("freezer envelope leaked: {name}"));
@@ -55,6 +56,10 @@ fn run(args: &[OsString]) -> Result<(), String> {
         );
         // This is the same command constructor and native exec as exec_cutter, without
         // acquiring release resources or starting any publication work.
+        cmd.env(
+            crate::cut_timing::EXEC_PID_ENV,
+            std::process::id().to_string(),
+        );
         return Err(cmd.exec().to_string());
     }
     if stage != "parent" {

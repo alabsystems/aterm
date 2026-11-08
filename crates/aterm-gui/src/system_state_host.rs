@@ -613,6 +613,11 @@ impl Host {
         &self.latest_status
     }
 
+    /// Window-owned work whose worker publication may not have arrived yet.
+    fn work_pending(&self) -> bool {
+        self.operation.is_some() || self.awaiting_run || self.pending_apply.is_some()
+    }
+
     /// The wake [`App::tick_system_state`] serves: the next status poll (unless one
     /// is in flight — its reply wakes the loop itself), and, only while a run goes on a
     /// shown page, whose lockup moves with it
@@ -1026,10 +1031,7 @@ impl App {
         &self,
         mut status: SetupStatus,
     ) -> (SetupStatus, Option<Access>) {
-        if self.system_state_host.operation.is_some()
-            || self.system_state_host.awaiting_run
-            || self.system_state_host.pending_apply.is_some()
-        {
+        if self.system_state_host.work_pending() {
             status.busy = true;
         }
         // A dev scenario keeps the operation it names (a Restore waiting for another setup), as
@@ -1062,6 +1064,15 @@ impl App {
             status.ready_in = self.system_state_host.ready_in;
         }
         (status, step)
+    }
+
+    /// The same cached worker snapshot and window intent, without the page's permission
+    /// callbacks, a status poll, or any change to the published readiness evidence.
+    pub(crate) fn cached_setup_status_fields(&self) -> String {
+        crate::system_state_access::background_setup_fields(
+            self.system_state_host.latest_status(),
+            self.system_state_host.work_pending(),
+        )
     }
 
     /// Whether what the window says of the status moved since it was last published: macOS's

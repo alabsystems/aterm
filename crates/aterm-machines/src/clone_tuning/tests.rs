@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::items::defaults::tests::{ctx, user};
-use crate::port::Live;
+use crate::port::{Fake, Live};
 use aterm_converge::Outcome;
 use std::cell::Cell;
 use std::sync::Arc;
@@ -21,11 +21,14 @@ struct World {
     state: aterm_tempfile::TempDir,
     sources: aterm_tempfile::TempDir,
     who: User,
+    /// How the fixture's git keeps a read from fetching lazily, as [`scope`] finds it.
+    off: NoLazyFetch,
 }
 
 impl World {
-    /// Over this host's native git, which must have `--no-lazy-fetch`: without it the code tunes
-    /// nothing.
+    /// Over this host's native git, which must keep a read from fetching lazily, through
+    /// `--no-lazy-fetch` or the `GIT_NO_LAZY_FETCH` it was seen to obey: with neither the code
+    /// tunes nothing.
     fn new() -> Self {
         Self::with_program(None)
     }
@@ -35,9 +38,11 @@ impl World {
     }
 
     fn with_program(git: Option<PathBuf>) -> Self {
-        if git.is_none() {
-            crate::items::github::need_native_git_with_no_lazy_fetch();
-        }
+        let off = match git {
+            None => crate::items::github::need_native_git_barring_lazy_fetch(),
+            // git 2.56 or later ([`feature_git`]) takes the option.
+            Some(_) => NoLazyFetch::Flag,
+        };
         let sys = Live::new();
         let home = aterm_tempfile::tempdir().unwrap();
         let state = aterm_tempfile::tempdir().unwrap();
@@ -50,6 +55,7 @@ impl World {
             state,
             sources,
             who,
+            off,
         };
         if let Some(git) = git {
             // Select the admitted managed tool for both the subject and controls,
@@ -81,6 +87,14 @@ impl World {
 
     fn ctx(&self) -> Ctx {
         ctx(std::slice::from_ref(&self.who))
+    }
+
+    /// The git the code reads the fixture's clones with ([`Git`]).
+    fn reads(&self) -> Git<'_> {
+        Git {
+            user: &self.who,
+            off: self.off,
+        }
     }
 
     fn state(&self) -> &Path {
@@ -387,9 +401,9 @@ fn a_clone_found_in_place_converges_to_its_declaration_and_a_second_pass_changes
         world.state(),
         &Holds::NONE,
         &Seams {
-            self_test: &|sys, user, dir| {
+            self_test: &|sys, git, dir| {
                 tests.set(tests.get() + 1);
-                self_test(sys, user, dir)
+                self_test(sys, git, dir)
             },
             planned: &|| {},
             lock_wait: LOCK_WAIT,
@@ -993,7 +1007,10 @@ fn a_partial_clone_s_unfetched_declaration_is_never_fetched() {
         world
             .sys
             .run_complete_stdout(
-                &local(&world.sys, &world.who, Some(&top)).args(["cat-file", "-e", &blob]),
+                &world
+                    .reads()
+                    .local(&world.sys, Some(&top))
+                    .args(["cat-file", "-e", &blob]),
             )
             .unwrap()
             .success()
@@ -1164,7 +1181,7 @@ fn a_repository_off_the_self_test_s_volume_gets_no_cache_key() {
     let dev = test_volume(&world.sys, &dir).unwrap();
     let elsewhere = plan_all(
         &world.sys,
-        &world.who,
+        world.reads(),
         std::slice::from_ref(&top),
         &record,
         Some(dev + 1),
@@ -1178,7 +1195,7 @@ fn a_repository_off_the_self_test_s_volume_gets_no_cache_key() {
         )
     );
     // The control: on the self-test's volume, the same record tunes it.
-    let here = plan_all(&world.sys, &world.who, &[top], &record, Some(dev));
+    let here = plan_all(&world.sys, world.reads(), &[top], &record, Some(dev));
     due(&summary(&here, world.sys.machine()));
 }
 
@@ -1528,25 +1545,202 @@ fn a_clone_whose_config_is_a_link_is_left_as_it_is() {
     assert_eq!(index_format(&world, &top), start);
 }
 
-/// A git that refuses `--no-lazy-fetch` as unknown (129) puts the clones out of scope, said in
-/// the machine's own word; a git that did not run as git is an error; one with the option tunes.
+/// How this git keeps a read from fetching lazily is asked once, before any clone is read
+/// ([`guarded`]): a git that takes `--no-lazy-fetch` reads with it and is asked nothing more; one
+/// that refuses it but was seen to obey `GIT_NO_LAZY_FETCH` reads with the variable alone; one
+/// that does neither puts every clone out of scope, naming both, in the machine's own word; and
+/// one that could not be asked is an error, never a verdict either way.
 #[test]
-fn a_git_without_no_lazy_fetch_tunes_nothing() {
-    assert_eq!(
-        lazy_fetch_guard(&Ran::ok("git version 2.56.0\n"), "machine"),
-        Ok(None)
-    );
+fn a_git_that_neither_takes_the_option_nor_obeys_the_variable_tunes_nothing() {
+    let tops = || vec![PathBuf::from("/Users//alice/trust")];
+    let fake = |linux: bool| {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        sys.linux = linux;
+        (sys, user("alice", 501))
+    };
+    let (sys, who) = fake(false);
+    let asked = checkout::git(&sys, &who, None).args(["--no-lazy-fetch", "--version"]);
+    sys.on(&asked.display(), Ran::ok("git version 2.56.0\n"));
+    let Scope::Clones { git, tops: kept } = guarded(&sys, &who, tops()).unwrap() else {
+        panic!("a git that takes the option reads the clones");
+    };
+    assert_eq!((git.off, kept), (NoLazyFetch::Flag, tops()));
+    assert_eq!(sys.calls(), [asked.display()], "asked nothing more");
+
+    let (sys, who) = fake(false);
+    sys.simulate(|_, command| crate::init_github::git_before_no_lazy_fetch(command, true));
+    let Scope::Clones { git, .. } = guarded(&sys, &who, tops()).unwrap() else {
+        panic!("a git seen to obey the variable reads the clones");
+    };
+    assert_eq!(git.off, NoLazyFetch::Variable);
+
+    for (linux, machine) in [(false, "Mac"), (true, "machine")] {
+        let (sys, who) = fake(linux);
+        sys.simulate(|_, command| crate::init_github::git_before_no_lazy_fetch(command, false));
+        let Scope::Out(why) = guarded(&sys, &who, tops()).unwrap() else {
+            panic!("a git that fetched the question's object lazily reads no clone");
+        };
+        assert_eq!(
+            why,
+            format!(
+                "this {machine}'s git neither takes --no-lazy-fetch (git 2.44 has it) nor obeys \
+                 GIT_NO_LAZY_FETCH (the 2.39.4 security release has it), one of which keeps \
+                 aterm's reads of a clone on this {machine}"
+            )
+        );
+    }
+
+    let (sys, who) = fake(false);
     assert!(
-        lazy_fetch_guard(
-            &Ran::exit(129, "unknown option: --no-lazy-fetch"),
-            "machine"
-        )
-        .unwrap()
-        .is_some_and(|why| {
-            why.starts_with("this machine's git has no --no-lazy-fetch") && !why.contains("Mac")
-        })
+        guarded(&sys, &who, tops()).is_err(),
+        "no answer is no verdict"
     );
-    assert!(lazy_fetch_guard(&Ran::exit(127, "not found"), "machine").is_err());
+}
+
+/// The volume of [`fake_clone`]'s clone.
+const VOLUME: u64 = 7;
+
+/// A fake git over one clone, `$HOME/trust`, as a plan, its writes and git's self-test run it, with
+/// every command it is given, in order: trust's declaration on origin's `main`, none of its keys
+/// set in any scope, no hook or filter named, its index at format 2, on [`VOLUME`]. Under
+/// [`NoLazyFetch::Variable`] it refuses `--no-lazy-fetch` as unknown (129), as a git before 2.44
+/// does; under [`NoLazyFetch::Flag`] it takes it.
+fn fake_clone(off: NoLazyFetch) -> (Fake, User, PathBuf, Arc<Mutex<Vec<Cmd>>>) {
+    const TIP: &str = "1111111111111111111111111111111111111111";
+    const BLOB: &str = "2222222222222222222222222222222222222222";
+    let mut sys = Fake::root();
+    sys.euid = 501;
+    let who = user("alice", 501);
+    let top = Path::new(&who.home).join("trust");
+    let dir = top.join(".git");
+    let id = |ino| FileId {
+        dev: VOLUME,
+        ino,
+        born_ns: None,
+    };
+    sys.file_id_of(&dir, id(2)).file_id_of(&top, id(3));
+    sys.file(dir.join("index").to_str().unwrap(), b"DIRC\0\0\0\x02");
+    let listed = format!("100644 blob {BLOB}\t{DECLARATION}\0");
+    let size = format!("{}\n", TRUST.len());
+    let dirs = format!("{dir}\n{dir}\n", dir = dir.display());
+    let index = format!("{}\n", dir.join("index").display());
+    let given = Arc::new(Mutex::new(Vec::new()));
+    let runs = Arc::clone(&given);
+    sys.simulate(move |_, command| {
+        runs.lock().unwrap().push(command.clone());
+        let args: Vec<String> = command
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        if off == NoLazyFetch::Variable && args.iter().any(|arg| arg == "--no-lazy-fetch") {
+            return Some(Ran::exit(129, "unknown option: --no-lazy-fetch"));
+        }
+        // git's own words, past `-C <path>`, the option and each `-c <setting>`.
+        let mut words = Vec::new();
+        let mut rest = args.iter().map(String::as_str);
+        while let Some(arg) = rest.next() {
+            match arg {
+                "-C" | "-c" => {
+                    rest.next();
+                }
+                "--no-lazy-fetch" => {}
+                word => words.push(word),
+            }
+        }
+        Some(match words.as_slice() {
+            ["symbolic-ref", ..] => Ran::ok("refs/remotes/origin/main\n"),
+            ["rev-parse", "--verify", ..] => Ran::ok(&format!("{TIP}\n")),
+            ["rev-parse", "--path-format=absolute", "--git-dir", ..] => Ran::ok(&dirs),
+            ["rev-parse", "--path-format=absolute", "--git-path", "index"] => Ran::ok(&index),
+            ["ls-tree", ..] => Ran::ok(&listed),
+            ["cat-file", "-s", ..] => Ran::ok(&size),
+            ["config", "--blob", ..] => Ran::ok(
+                "tuning.superproject\ncore.untrackedCache\0tuning.superproject\n\
+                 feature.manyFiles\0tuning.submodule\ncore.untrackedCache\0\
+                 tuning.indexversion\n4\0",
+            ),
+            ["config", "--type=bool", "--get", MANY_FILES] => Ran::ok("true\n"),
+            ["cat-file", "-e", ..]
+            | ["config", "--local", ..]
+            | ["update-index", ..]
+            | ["init", ..] => Ran::ok(""),
+            // Nothing set in any scope, and no hook or filter named.
+            ["config", ..] => Ran::exit(1, ""),
+            _ => return None,
+        })
+    });
+    (sys, who, top, given)
+}
+
+/// Every git run of a plan, its writes and git's self-test carries `GIT_NO_LAZY_FETCH`, and
+/// `--no-lazy-fetch` exactly where git takes it: under [`NoLazyFetch::Variable`] (a git before
+/// 2.44 seen to obey the variable, as Ubuntu 24.04's 2.43.0 is) no run passes the option the git
+/// would refuse, and the clone is planned, tuned and self-tested as under one that takes it.
+/// NEGATIVE CONTROL: under [`NoLazyFetch::Flag`] every run passes it.
+#[test]
+fn a_git_that_obeys_the_variable_alone_tunes_with_no_run_passing_the_option() {
+    for off in [NoLazyFetch::Variable, NoLazyFetch::Flag] {
+        let (sys, who, top, given) = fake_clone(off);
+        let git = Git { user: &who, off };
+        let state = aterm_tempfile::tempdir().unwrap();
+        let dir = converge_dir(state.path());
+        aterm_uds::private_file::ensure_private_dir(&dir).unwrap();
+        let mut record = Record::read(&dir).unwrap().unwrap();
+        record.volumes.insert(
+            VOLUME.to_string(),
+            Tested {
+                passed: true,
+                at_s: 1,
+            },
+        );
+        let clones = plan_all(&sys, git, &[top], &record, Some(VOLUME));
+        assert_eq!(
+            due(&summary(&clones, sys.machine())),
+            "$HOME/trust: core.untrackedCache and feature.manyFiles unset, index format 2",
+            "{off:?}"
+        );
+        let mut failed = Vec::new();
+        let tuning = tune(&sys, git, &clones[0], &mut record, &dir, &mut failed).unwrap();
+        assert_eq!(
+            (tuning.done.as_deref(), failed.as_slice()),
+            (Some("$HOME/trust (index format 2 -> 4)"), &[] as &[String]),
+            "{off:?}"
+        );
+        assert_eq!(self_test(&sys, git, &dir), Ok(true), "{off:?}");
+        let runs = given.lock().unwrap().clone();
+        let shown: Vec<String> = runs.iter().map(Cmd::display).collect();
+        for run in [
+            " config --local core.untrackedCache true",
+            " config --local feature.manyFiles true",
+            " update-index --index-version 4",
+            " update-index --test-untracked-cache",
+        ] {
+            assert!(
+                shown.iter().any(|call| call.ends_with(run)),
+                "{off:?}: {run} in {shown:?}"
+            );
+        }
+        // The value git sees is the last one a command sets.
+        assert!(
+            runs.iter().all(|run| run
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "GIT_NO_LAZY_FETCH")
+                .is_some_and(|(_, value)| value == "1")),
+            "{shown:?}"
+        );
+        let flagged = runs
+            .iter()
+            .filter(|run| run.args.iter().any(|arg| arg == "--no-lazy-fetch"))
+            .count();
+        match off {
+            NoLazyFetch::Variable => assert_eq!(flagged, 0, "{shown:?}"),
+            NoLazyFetch::Flag => assert_eq!(flagged, runs.len(), "control: {shown:?}"),
+        }
+    }
 }
 
 /// The installed Git 2.56 control for named config hooks and config-lock waiting.
@@ -1586,10 +1780,11 @@ fn a_write_never_waits_on_a_config_lock() {
     std::fs::write(top.join(".git/config.lock"), "").unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let who = world.who.clone();
+    let off = world.off;
     let at = top.clone();
     std::thread::spawn(move || {
         let sys = Live::new();
-        let mut quiet = quiet(&sys, &who, &at).unwrap();
+        let mut quiet = quiet(&sys, Git { user: &who, off }, &at).unwrap();
         quiet.program = git;
         tx.send(write(
             &sys,

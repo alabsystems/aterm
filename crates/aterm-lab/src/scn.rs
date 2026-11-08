@@ -456,6 +456,27 @@ impl Ctx {
         Ok(t)
     }
 
+    /// Types `text` as the lab's agent's next turn the way `lab turn` does
+    /// ([`crate::composer_turn::turn`]): into its empty composer, Enter once the text stands there,
+    /// and again where it still stands 5 s on. `None` once the composer took it, else why not.
+    /// [`Ctx::turn`] presses Enter 0.3 s after the text whatever the screen shows: on a loaded
+    /// host a Claude Code 2.1.319 drew that text 1.3 s after it was sent, past the Enter, and it
+    /// stood there unsubmitted (c9-cruise-go-ahead's refused rerecord, 2026-11-08).
+    /// # Errors
+    /// The client could not run, or the run was interrupted.
+    pub fn composer_turn(&mut self, text: &str) -> R<Option<String>> {
+        self.mark(&format!("turn {}: send", py_repr(text)), None);
+        let why = {
+            let door = self.door()?;
+            let agent = door.run().agent();
+            crate::composer_turn::turn(&crate::composer_turn::Target::lab(&door, agent), text)?
+                .why(agent, text)
+        };
+        let how = if why.is_none() { "taken" } else { "not taken" };
+        self.mark(&format!("turn {}: {how}", py_repr(text)), None);
+        Ok(why)
+    }
+
     /// Waits for the turn's done row with no spinner.
     /// # Errors
     /// Interrupted.

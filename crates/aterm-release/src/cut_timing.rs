@@ -12,6 +12,28 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) const EXEC_PID_ENV: &str = "ATERM_RELEASE_EXEC_PID";
+
+fn is_exec_receiver(value: Option<&str>, pid: u32) -> bool {
+    value.and_then(|value| value.parse::<u32>().ok()) == Some(pid)
+}
+
+/// Exec preserves the PID and CPU counters; ordinary children must not report arrival.
+pub(crate) fn image_arrived() {
+    if !is_exec_receiver(
+        std::env::var(EXEC_PID_ENV).ok().as_deref(),
+        std::process::id(),
+    ) {
+        return;
+    }
+    let event = aterm_json::json!({
+        "schema": 1, "event": "cutter-image-arrived", "process_id": std::process::id(),
+        "at_unix_ms": now(),
+        "self_cpu_ns": aterm_sysprobe::jobs::counters_of(std::process::id()).map(|c| c.cpu_ns),
+    });
+    eprintln!("release-event: {event}");
+}
+
 #[derive(Clone, Copy)]
 struct Cost {
     wall: f64,
@@ -112,6 +134,7 @@ impl<'a> Timer<'a> {
             "process_id": std::process::id(), "gate_id": timer.id, "parent_gate_id": timer.parent_id,
             "process_image": image_id(),
             "started_at_unix_ms": timer.at,
+            "self_cpu_ns": timer.cpu.as_ref().map(|c| c.cpu_ns),
         });
         if let Ok(mut sink) = crate::durable::open_append(log, true) {
             let _ = writeln!(sink, "release-event: {event}");
@@ -182,6 +205,14 @@ impl Drop for Timer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arrival_requires_the_execing_pid() {
+        assert!(is_exec_receiver(Some("42"), 42));
+        assert!(!is_exec_receiver(Some("43"), 42));
+        assert!(!is_exec_receiver(Some("invalid"), 42));
+        assert!(!is_exec_receiver(None, 42));
+    }
 
     #[test]
     fn missing_or_regressed_counters_are_not_zero_cpu() {

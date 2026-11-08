@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::{CohortClosureRef, cohort_namespace::Namespace};
+use std::sync::Arc;
 
 #[path = "cohort_archive_slot.rs"]
 mod slot;
@@ -30,23 +31,25 @@ const RECEIPT: &str = "receipt.json";
 const HISTORY: &str = "claim.noindex";
 const COMPACTED: &str = "compacted.json";
 
+// Share the SAME original directory description among its retained members;
+// each file still owns its own original descriptor and all origin checks.
 struct HeldFile {
-    parent: File,
+    parent: Arc<File>,
     name: String,
     file: File,
     stamp: Stamp,
 }
 
 struct HeldDirectory {
-    parent: File,
+    parent: Arc<File>,
     name: String,
-    file: File,
+    file: Arc<File>,
     identity: Value,
     origin: (u64, u64, u32, i64, i64, i64, i64),
 }
 
 struct Inventory {
-    root: File,
+    root: Arc<File>,
     origin: (u64, u64, u32, i64, i64, i64, i64),
     files: Vec<HeldFile>,
     directories: Vec<HeldDirectory>,
@@ -54,15 +57,15 @@ struct Inventory {
 
 impl Inventory {
     fn capture(transaction: &Transaction) -> io::Result<Self> {
-        let root = &transaction.anchor.directory;
-        let origin = directory_origin(root)?;
+        let root = Arc::new(transaction.anchor.directory.try_clone()?);
+        let origin = directory_origin(&root)?;
         let latest = &transaction
             .latest
             .as_ref()
             .ok_or_else(|| bad("terminal has no tip"))?
             .0;
         let mut inventory = Self {
-            root: root.try_clone()?,
+            root: Arc::clone(&root),
             origin,
             files: Vec::new(),
             directories: Vec::new(),
@@ -77,7 +80,7 @@ impl Inventory {
                 continue;
             }
             if matches!(name, HEADER | MUTATION | CLOSED) || name == latest.name {
-                let file = open(root, name, false, false)?;
+                let file = open(&root, name, false, false)?;
                 let (text, stamp) = bytes(&file, MAX_ENTRY)?;
                 if stamp.mode() & 0o111 != 0 {
                     return Err(bad("terminal inventory contains executable data"));
@@ -91,7 +94,7 @@ impl Inventory {
                     ));
                 }
                 inventory.files.push(HeldFile {
-                    parent: root.try_clone()?,
+                    parent: Arc::clone(&root),
                     name: name.into(),
                     file,
                     stamp,
@@ -107,7 +110,7 @@ impl Inventory {
             if name != format!("epoch-{number:016}.noindex") || inventory.directories.len() >= 2 {
                 return Err(bad("unbounded terminal epoch inventory"));
             }
-            let directory = open(root, name, false, true)?;
+            let directory = Arc::new(open(&root, name, false, true)?);
             let before = directory_origin(&directory)?;
             let mut count = 0;
             for child in fd::Dir::read_from(directory.as_fd())? {
@@ -141,7 +144,7 @@ impl Inventory {
                     }
                 }
                 inventory.files.push(HeldFile {
-                    parent: directory.try_clone()?,
+                    parent: Arc::clone(&directory),
                     name: child.into(),
                     file,
                     stamp,
@@ -151,7 +154,7 @@ impl Inventory {
                 return Err(bad("terminal epoch changed across inventory"));
             }
             inventory.directories.push(HeldDirectory {
-                parent: root.try_clone()?,
+                parent: Arc::clone(&root),
                 name: name.into(),
                 identity: identity(&directory, true)?,
                 file: directory,

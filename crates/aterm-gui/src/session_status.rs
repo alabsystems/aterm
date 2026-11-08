@@ -97,6 +97,37 @@ pub(crate) fn native_control_status(
 
 pub(crate) const AGENT_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
+/// The clock a [`screen_print`] is kept against: the active grid's identity and its content
+/// generation. Every grid's generation starts at 1, so a grid swapped in (the alternate screen a
+/// `?1049h` builds, a grid `?47` or `?1047` puts back) can stand at the generation another grid's
+/// print was taken at; the identity tells the two apart.
+pub(crate) fn screen_clock(t: &aterm_core::terminal::Terminal) -> (u64, u64) {
+    (t.grid().instance(), t.content_seq())
+}
+
+/// The visible screen's print: each live row of the active grid, its cells and their attributes
+/// ([`aterm_grid::Grid::live_row_fingerprint`]), folded in order. A row the grid cannot
+/// fingerprint folds in the content generation instead, so a screen that holds one moves with
+/// every write, as the generation does. The viewport's scroll is not read, as the generation
+/// reads none.
+pub(crate) fn screen_print(t: &aterm_core::terminal::Terminal) -> u64 {
+    let grid = t.grid();
+    let mut h = aterm_hash::Fnv1a64::new();
+    for row in 0..t.rows() {
+        match grid.live_row_fingerprint(row) {
+            Some(print) => {
+                h.write_u8(1);
+                h.write_u64_le(print);
+            }
+            None => {
+                h.write_u8(0);
+                h.write_u64_le(t.content_seq());
+            }
+        }
+    }
+    h.finish()
+}
+
 /// Computes the whole-screen FNV-1a hash and extracts the final `tail_rows` of published screen text.
 pub(crate) fn screen_agent_frame(
     text: &crate::frame_memo::ScreenText,
@@ -380,11 +411,14 @@ pub(crate) enum Lifecycle {
     Signalled { signal: u8 },
 }
 
-/// Snapshot of terminal display sequence counter and alt-screen state.
+/// Snapshot of the visible screen and alt-screen state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ActivitySample {
     pub(crate) alt_screen: bool,
-    pub(crate) content_seq: u64,
+    /// The visible screen's print ([`screen_print`]): movement is a visible cell or attribute
+    /// that changed, never a rewrite of rows that read the same, which moves the grid's content
+    /// generation all the same.
+    pub(crate) screen: u64,
     pub(crate) last_output: Option<Instant>,
 }
 
@@ -508,10 +542,10 @@ impl StatusFsm {
     }
 
     fn note_activity(&mut self, sample: &ActivitySample, now: Instant) {
-        let identity = (sample.alt_screen, sample.content_seq);
+        let identity = (sample.alt_screen, sample.screen);
         match self.prior {
-            Some((prior_alt, prior_seq))
-                if prior_alt == sample.alt_screen && sample.content_seq != prior_seq =>
+            Some((prior_alt, prior_screen))
+                if prior_alt == sample.alt_screen && sample.screen != prior_screen =>
             {
                 self.last_movement = Some(now);
             }
@@ -2768,6 +2802,9 @@ struct SessionSlot {
     lifecycle: Option<Lifecycle>,
     failure: FailureMark,
     evented: Option<(Phase, Outcome)>,
+    /// The screen's print and the clock it was taken at ([`screen_clock`],
+    /// [`StatusObserver::screen_print_for`]).
+    screen: Option<((u64, u64), u64)>,
 }
 
 impl SessionSlot {
@@ -2779,6 +2816,7 @@ impl SessionSlot {
             lifecycle: None,
             failure: FailureMark::default(),
             evented: None,
+            screen: None,
         }
     }
 }
@@ -3086,6 +3124,32 @@ impl StatusObserver {
         slot.next_due = due;
         self.note_output(session, now);
         self.next_due_any = Some(self.next_due_any.map_or(due, |min| min.min(due)));
+    }
+
+    /// The print of `session`'s visible screen at `clock` ([`screen_clock`], [`screen_print`]):
+    /// the one taken at that clock, else `print()`'s, kept for the next sweep. A grid moves its
+    /// generation on every write, a rewrite of identical rows included, and never without one, so
+    /// the screen is read only where the active grid or its generation moved.
+    pub(crate) fn screen_print_for(
+        &mut self,
+        session: u64,
+        clock: (u64, u64),
+        now: Instant,
+        print: impl FnOnce() -> u64,
+    ) -> u64 {
+        let policy = self.policy;
+        let slot = self
+            .sessions
+            .entry(session)
+            .or_insert_with(|| SessionSlot::new(policy, now));
+        match slot.screen {
+            Some((at, screen)) if at == clock => screen,
+            _ => {
+                let screen = print();
+                slot.screen = Some((clock, screen));
+                screen
+            }
+        }
     }
 
     /// Folds `evidence` into `session`'s [`StatusFsm`] at `now` and returns whether its status changed.
@@ -3968,6 +4032,9 @@ impl crate::App {
             let completed_block = completed_block(&guard);
             let alt_screen = guard.is_alternate_screen();
             let content_seq = guard.content_seq();
+            let screen =
+                self.session_status
+                    .screen_print_for(id, screen_clock(&guard), now, || screen_print(&guard));
             let generation = crate::control::screen_gen(&guard);
             let resize_probe = crate::resize_ledger::EngineProbe::sample(&guard);
             let detail = executing_detail(&guard, &session.ctx.ran);
@@ -4064,7 +4131,7 @@ impl crate::App {
                 foreground_job,
                 activity: ActivitySample {
                     alt_screen,
-                    content_seq,
+                    screen,
                     last_output,
                 },
             };
@@ -4472,7 +4539,7 @@ impl crate::App {
             foreground_job: None,
             activity: ActivitySample {
                 alt_screen: false,
-                content_seq: 0,
+                screen: 0,
                 last_output: None,
             },
         };

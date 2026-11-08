@@ -512,6 +512,7 @@ fn config_now() -> Option<String> {
 }
 
 /// Cached authoritative swarm `deny_nodes`, retained across transient vault lock / I/O states.
+#[cfg(unix)]
 static DENIED_NODES: Mutex<DeniedCache> = Mutex::new(DeniedCache::new());
 
 /// Why a listener that has never read its deny list refuses a peer it would otherwise admit:
@@ -519,64 +520,128 @@ static DENIED_NODES: Mutex<DeniedCache> = Mutex::new(DeniedCache::new());
 pub(crate) const DENY_LIST_UNREAD: &str =
     "this Mac has not read its deny list yet; try again once it has";
 
-/// The last deny list a listener read, and why it has none yet as it last said so.
+/// The last deny list a listener read, and the unavailable observation last recorded.
+#[cfg(unix)]
 pub(crate) struct DeniedCache {
     list: Option<Arc<[String]>>,
-    /// Why no list has been read yet, as last said: a change of it is said again.
-    unread_said: Option<String>,
+    /// A new cause is recorded once, without changing the retained admission verdict.
+    unavailable_said: Option<DeniedCause>,
 }
 
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum DeniedCause {
+    Unavailable(aterm_secrets::client::SwarmDenialUnavailable),
+    Read(String),
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for DeniedCause {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable(reason) => write!(out, "{reason}"),
+            Self::Read(reason) => out.write_str(reason),
+        }
+    }
+}
+
+#[cfg(unix)]
 impl DeniedCache {
     pub(crate) const fn new() -> Self {
         Self {
             list: None,
-            unread_said: None,
+            unavailable_said: None,
         }
     }
 }
 
 /// The deny list after `observed`, a read of it, and the line to say now, if any: a list read now
-/// is kept in `cache` and answered; a read that gave none (mid-apply, `Ok(None)`) or failed answers
+/// is kept in `cache` and answered; an unavailable or failed read answers
 /// the last list `cache` kept, and `None` while it has kept none, so the caller refuses whom that
 /// unread list might name ([`DENY_LIST_UNREAD`]) rather than read it as naming no one.
 ///
-/// A list that stays unread is a standing cause more often than a moment (a lock another account
-/// owns, a `source.toml` other users can read, a failed apply, this Mac revoked), under which
-/// this Mac turns every peer away: the line names why, once for each new cause, and once more when
-/// a list is read at last, so the log says what keeps this Mac shut and when it opened.
+/// A changed unavailable cause is recorded once, including while retaining a list. Recovery is
+/// recorded once too. These journal observations never change the admission verdict.
+#[cfg(unix)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetDeniedCache",
+        action = "Known",
+        reason = "Model setup chooses the previous verified deny-list state; the conformance harness reconstructs it before the production Observe transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetDeniedCache",
+        action = "Cause",
+        reason = "Model setup chooses the previous recorded diagnostic; the conformance harness reconstructs it before the production Observe transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "FleetDeniedCache",
+        action = "Input",
+        reason = "The vault supplies the next observation; the conformance harness ranges over the bounded input classes before calling production Observe"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "FleetDeniedCache",
+        action = "Observe",
+        project = "fleet_listen::denial_cache_model_tests::project"
+    )
+)]
 fn update_denied_nodes_cache(
     cache: &mut DeniedCache,
-    observed: aterm_secrets::Result<Option<Vec<String>>>,
+    observed: aterm_secrets::Result<aterm_secrets::client::SwarmDenialSnapshot>,
 ) -> (Option<Arc<[String]>>, Option<String>) {
-    let why = match observed {
-        Ok(Some(nodes)) => {
+    use aterm_secrets::client::SwarmDenialSnapshot;
+
+    let cause = match observed {
+        Ok(SwarmDenialSnapshot::Available(nodes)) => {
+            let retained = cache.list.is_some();
             let arc: Arc<[String]> = nodes.into();
             cache.list = Some(Arc::clone(&arc));
-            let said = cache.unread_said.take().map(|_| {
-                "fleet: the deny list is read; Macs that prove the fleet secret are admitted again"
-                    .to_owned()
+            let said = cache.unavailable_said.take().map(|_| {
+                if retained {
+                    "fleet: the deny list is current again"
+                } else {
+                    "fleet: the deny list is read; Macs that prove the fleet secret are admitted again"
+                }
+                .to_owned()
             });
             return (Some(arc), said);
         }
-        _ if cache.list.is_some() => return (cache.list.clone(), None),
-        Ok(None) => "the vault gives none now: a sync applying, a failed or pending apply, or this                      Mac revoked (`aterm secrets sync` says which)"
-            .to_owned(),
-        Err(error) => aterm_log::sanitize_record(&error.to_string()).into_owned(),
+        Ok(SwarmDenialSnapshot::Unavailable(reason)) => DeniedCause::Unavailable(reason),
+        Err(error) => DeniedCause::Read(aterm_codec::tty::one_line(&error.to_string(), 1024)),
     };
-    if cache.unread_said.as_deref() == Some(why.as_str()) {
-        return (None, None);
+    let denied = cache.list.clone();
+    if cache.unavailable_said.as_ref() == Some(&cause) {
+        return (denied, None);
     }
-    let line = format!(
-        "fleet: every Mac that dials this one is turned away, and none is dialed:          {DENY_LIST_UNREAD} ({why})"
-    );
-    cache.unread_said = Some(why);
-    (None, Some(line))
+    let line = if denied.is_some() {
+        format!("fleet: retaining the last verified deny list: {cause}")
+    } else {
+        format!(
+            "fleet: every Mac that dials this one is turned away, and none is dialed: {DENY_LIST_UNREAD} ({cause})"
+        )
+    };
+    cache.unavailable_said = Some(cause);
+    (denied, Some(line))
 }
+
+#[cfg(all(test, unix))]
+#[path = "fleet_denial_model_tests.rs"]
+mod denial_cache_model_tests;
 
 /// Read the verified swarm roster's `deny_nodes`, retaining the last authoritative list when the
 /// local vault is mid-apply or unreadable, and `None` until one was read
 /// ([`update_denied_nodes_cache`]). It is read again only when one of the vault files it reads
-/// changed ([`aterm_secrets::client::swarm_denied_nodes_now`]), so the listener's per-dialer
+/// changed ([`aterm_secrets::client::swarm_denial_snapshot_now`]), so the listener's per-dialer
 /// lookup and each control request cost no vault decrypt. A process that reads no vault (one
 /// under a private state root, [`vault_here`]) has a deny list that names no one; one on the
 /// account's own state whose vault cannot be found has none, and says why.
@@ -593,7 +658,7 @@ fn update_denied_nodes_cache(
 fn denied_nodes_now() -> Option<Arc<[String]>> {
     let observed = match vault_here() {
         Ok(None) => return Some(Arc::from(&[][..])),
-        Ok(Some(paths)) => aterm_secrets::client::swarm_denied_nodes_now(&paths),
+        Ok(Some(paths)) => aterm_secrets::client::swarm_denial_snapshot_now(&paths),
         Err(why) => Err(aterm_secrets::Error::new(why)),
     };
     let (denied, said) = update_denied_nodes_cache(&mut DENIED_NODES.lock_or_recover(), observed);
@@ -4383,7 +4448,7 @@ mod tests {
 
     /// A deny list that stays unread says why, once for each new cause and never again for the
     /// same one (the read runs per dialer and per tick), and says so once more when a list is
-    /// read at last; a failed read after that keeps the list and says nothing.
+    /// read at last; a failed read after that keeps the list and records its new cause once.
     ///
     /// NEGATIVE CONTROL (2026-11-01): with `update_denied_nodes_cache` saying nothing while the
     /// list is unread (the shape before: a standing cause looked like "try again", logged at
@@ -4391,6 +4456,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unread_deny_list_says_why_once_for_each_cause() {
+        use aterm_secrets::client::{
+            SwarmDenialSnapshot as Snapshot, SwarmDenialUnavailable as Why,
+        };
+
         let mut cache = DeniedCache::new();
         let failed = |why: &str| Err(aterm_secrets::Error::new(why.to_owned()));
         let (denied, said) =
@@ -4406,26 +4475,45 @@ mod tests {
             (None, None),
             "the same cause is said once"
         );
-        let said = update_denied_nodes_cache(&mut cache, Ok(None)).1;
+        let said =
+            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Unavailable(Why::WriterBusy))).1;
         assert!(
-            said.is_some_and(|said| said.contains("the vault gives none now")),
+            said.is_some_and(|said| said.contains(&Why::WriterBusy.to_string())),
             "a new cause is said again"
         );
-        let (denied, said) = update_denied_nodes_cache(&mut cache, Ok(Some(Vec::new())));
+        let (denied, said) =
+            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Available(Vec::new())));
         assert!(denied.is_some());
         assert!(
             said.is_some_and(|said| said.contains("admitted again")),
             "a list read at last is said"
         );
-        assert_eq!(
-            update_denied_nodes_cache(&mut cache, failed("transient")).1,
-            None,
-            "a failed read under a kept list says nothing"
+        let (denied, said) = update_denied_nodes_cache(&mut cache, failed("transient"));
+        assert!(
+            denied.is_some(),
+            "a failed read retains the authoritative list"
         );
-        assert_eq!(
-            update_denied_nodes_cache(&mut cache, Ok(Some(Vec::new()))).1,
-            None,
-            "nor does the next list read"
+        assert!(
+            said.is_some_and(|said| said.contains("transient")),
+            "a new retained-list cause is recorded"
+        );
+        assert!(
+            update_denied_nodes_cache(&mut cache, failed("transient"))
+                .1
+                .is_none(),
+            "a repeated failure is quiet"
+        );
+        assert!(
+            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Available(Vec::new())))
+                .1
+                .is_some(),
+            "recovery is recorded once"
+        );
+        assert!(
+            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Available(Vec::new())))
+                .1
+                .is_none(),
+            "an unchanged current list is quiet"
         );
     }
 
@@ -4438,11 +4526,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn denied_nodes_cache_retains_list_while_locked_and_cuts_open_drive() {
+        use aterm_secrets::client::{
+            SwarmDenialSnapshot as Snapshot, SwarmDenialUnavailable as Why,
+        };
+
         let _guard = OPEN_TEST_LOCK.lock_or_recover();
         let mut cache = DeniedCache::new();
         // Never read: a mid-apply read and a failed one leave no list, which the handshake reads
         // as unread and refuses every dialer under, never as a list that names no one.
-        assert!(update_denied_nodes_cache(&mut cache, Ok(None)).0.is_none());
+        assert!(
+            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Unavailable(Why::WriterBusy)))
+                .0
+                .is_none()
+        );
         let failed =
             update_denied_nodes_cache(&mut cache, Err(aterm_secrets::Error::new("wide"))).0;
         assert!(failed.is_none());
@@ -4450,15 +4546,20 @@ mod tests {
 
         let revoked_node = "9a".repeat(16);
         let good_node = "9b".repeat(16);
-        let updated = update_denied_nodes_cache(&mut cache, Ok(Some(vec![revoked_node.clone()])))
-            .0
-            .expect("a list read now");
+        let updated = update_denied_nodes_cache(
+            &mut cache,
+            Ok(Snapshot::Available(vec![revoked_node.clone()])),
+        )
+        .0
+        .expect("a list read now");
         assert_eq!(&*updated, std::slice::from_ref(&revoked_node));
         assert!(!denied_under(Some(&updated), None).unread);
 
-        // Transient lock (`Ok(None)`) or parse error retains the last authoritative deny-list.
+        // A transient lock or parse error retains the last authoritative deny-list.
         assert_eq!(
-            update_denied_nodes_cache(&mut cache, Ok(None)).0.as_deref(),
+            update_denied_nodes_cache(&mut cache, Ok(Snapshot::Unavailable(Why::WriterBusy)))
+                .0
+                .as_deref(),
             Some(std::slice::from_ref(&revoked_node))
         );
         assert_eq!(

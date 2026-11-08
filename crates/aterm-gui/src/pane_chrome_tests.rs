@@ -1836,3 +1836,84 @@ fn a_resting_bar_keeps_its_layer_and_a_moving_one_lays_a_new_one() {
         "CONTROL: a moved thumb lays a new layer"
     );
 }
+
+#[test]
+fn scrollbar_drag_and_hover_settle_on_blur_alt_screen_and_tab_switch() {
+    let mut overlay = PaneOverlay::default();
+    let mut pill = crate::scroll_motion::PillFade::default();
+    let full = cell_box(0, 0, 30, 111);
+    let t0 = Instant::now();
+    let _ = frame(&mut overlay, &mut pill, &[pane(1, full, true, 20, 200)], t0);
+    overlay.drag = Some(super::Drag {
+        session: 1,
+        grab: 4.0,
+    });
+    overlay.hover = Some(1);
+    let mut alt_pane = pane(1, full, true, 0, 200);
+    alt_pane.alt = true;
+    let _ = frame(&mut overlay, &mut pill, &[alt_pane], t0);
+    assert!(
+        overlay.drag.is_none() && overlay.hover.is_none(),
+        "entering the alternate screen drops scrollbar drag and hover"
+    );
+
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.config.scrollbar = Some(true);
+    app.windows.get_mut(&wid).expect("window").metrics.pad = 12;
+    let session = app.front_terminal(wid).expect("front").session;
+    let term = app.pool.get(session).expect("session").term.clone();
+    {
+        let mut t = crate::term_lock(&term);
+        for i in 0..400 {
+            t.process(format!("line {i}\r\n").as_bytes());
+        }
+    }
+    let plan = app.active_visible_leaf_plan(wid).expect("plan");
+    app.refresh_pane_overlay_for_capture(wid, &plan, t0);
+    let facts = app.windows[&wid].pane_overlay.facts()[0];
+    let inputs = app.pane_overlay_inputs(wid, false).expect("inputs");
+    let (cw, ch) = inputs.cell;
+    let m = Metrics::for_cell(cw as u32, ch as u32);
+    let lane = scrollbar::lane(
+        (0, 0, facts.rect.rows, facts.rect.cols),
+        inputs.win_cols,
+        inputs.cell,
+        inputs.pad,
+        m,
+    )
+    .expect("lane");
+    let (top, len) =
+        scrollbar::thumb(lane, facts.rect.rows as u32, facts.history, 0, m).expect("thumb");
+    let (wx, wy) = window_px(
+        &app,
+        wid,
+        f64::from(lane.right) - 3.0,
+        f64::from(top + len / 2),
+    );
+
+    app.windows.get_mut(&wid).expect("window").last_cursor_px = (wx, wy);
+    assert!(app.scrollbar_press(wid));
+    assert!(app.windows[&wid].pane_overlay.drag.is_some());
+    app.on_focus(wid, false);
+    assert!(
+        app.windows[&wid].pane_overlay.drag.is_none(),
+        "window blur releases an in-flight scrollbar thumb drag"
+    );
+
+    app.on_focus(wid, true);
+    app.windows.get_mut(&wid).expect("window").last_cursor_px = (wx, wy);
+    assert!(app.scrollbar_press(wid));
+    assert!(app.windows[&wid].pane_overlay.drag.is_some());
+    app.push_stub_tab(wid, crate::stub_session(1));
+    app.resync_active_or_window(wid);
+    assert!(
+        app.windows[&wid].pane_overlay.drag.is_none()
+            && app.windows[&wid].pane_overlay.hover.is_none(),
+        "switching tabs releases scrollbar drag and hover on the hidden tab's session"
+    );
+    assert!(
+        !app.scrollbar_pointer_motion(wid, wx, wy) && !app.scrollbar_press(wid),
+        "stale overlay facts from the previous tab must not answer pointer events before redraw"
+    );
+}

@@ -15,6 +15,7 @@ mod buffer_api;
 mod builder;
 mod callback_setters;
 mod callbacks;
+pub mod caret_path;
 mod checkpoint;
 mod checkpoint_canon;
 mod checkpoint_heap;

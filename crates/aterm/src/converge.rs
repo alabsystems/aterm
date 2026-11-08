@@ -2154,6 +2154,14 @@ impl Ports for Live {
         let sys = aterm_machines::port::Live::new();
         let ctx = repository_context(&sys)?;
         let paths = vault_paths()?;
+        if !setup_holds().holds(aterm_types::macos_setup::Setting::Repositories)
+            && aterm_machines::init_github::RepositoryCredentialWithdrawal::capture(&sys, &ctx)?
+                .is_some()
+        {
+            return Ok(aterm_machines::init::OwedClone::Due(
+                "the default repository credential request is no longer needed".into(),
+            ));
+        }
         match repository_vault(&paths, &sys, &ctx)? {
             Some(config) => {
                 let Some(captured) = repository_inputs(&paths, &config, &sys, &ctx)? else {
@@ -2189,8 +2197,29 @@ impl Ports for Live {
         let sys = aterm_machines::port::Live::new();
         let ctx = repository_context(&sys)?;
         let paths = vault_paths()?;
+        if setup_holds().holds(aterm_types::macos_setup::Setting::Repositories) {
+            return Err(setup_holds().why(aterm_types::macos_setup::Setting::Repositories));
+        }
+        if let Some(withdrawal) =
+            aterm_machines::init_github::RepositoryCredentialWithdrawal::capture(&sys, &ctx)?
+        {
+            return aterm_machines::init::withdraw_repository_credential(
+                &sys,
+                &state,
+                withdrawal,
+                || Ok(!setup_holds().holds(aterm_types::macos_setup::Setting::Repositories)),
+            );
+        }
         let Some(config) = repository_vault(&paths, &sys, &ctx)? else {
-            return aterm_machines::init::clone_owed_in_pass(&sys, &state, work, execution);
+            return aterm_machines::init::clone_owed_in_pass_with_withdrawal_guard(
+                &sys,
+                &state,
+                work,
+                execution,
+                Some(Box::new(|| {
+                    Ok(!setup_holds().holds(aterm_types::macos_setup::Setting::Repositories))
+                })),
+            );
         };
         let captured =
             repository_inputs(&paths, &config, &sys, &ctx)?.ok_or(REPOSITORIES_SYNCING)?;

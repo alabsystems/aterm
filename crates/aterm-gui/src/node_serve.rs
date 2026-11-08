@@ -3403,7 +3403,7 @@ fn wanted_for_node(cfg: &NodeServeConfig) -> Option<Wanted> {
 }
 
 /// The swarm deny list now, read again only when one of the vault files it reads changed
-/// ([`aterm_secrets::client::swarm_denied_nodes_now`]): the listener asks it for each proved
+/// ([`aterm_secrets::client::swarm_denial_snapshot_now`]): the listener asks it for each proved
 /// dialer and its hand-over, and the watch every tick, so an unchanged vault is never decrypted
 /// again. `cache` keeps the last authoritative list through a mid-apply or failed read, and
 /// `None` until one was read, under which every proved dialer is refused
@@ -3414,8 +3414,10 @@ fn denied_nodes_for(
     cache: &Mutex<DeniedCache>,
 ) -> Option<Arc<[String]>> {
     let observed = match vault_paths {
-        Some(paths) => aterm_secrets::client::swarm_denied_nodes_now(paths),
-        None => Ok(Some(Vec::new())),
+        Some(paths) => aterm_secrets::client::swarm_denial_snapshot_now(paths),
+        None => Ok(aterm_secrets::client::SwarmDenialSnapshot::Available(
+            Vec::new(),
+        )),
     };
     let (denied, said) = update_denied_nodes_cache(
         &mut cache.lock().unwrap_or_else(PoisonError::into_inner),

@@ -8,6 +8,67 @@ use aterm_phase::Program;
 mod account_worker_env;
 
 #[test]
+#[ignore = "owned version child; the native fish parent invokes this exact test"]
+fn owned_fish_version_child() {
+    use std::io::Write as _;
+    let ready = std::env::var_os("ATERM_TEST_FISH_VERSION_READY").expect("owned ready path");
+    std::fs::write(ready, b"the actual fish version fixture ran\n").unwrap();
+    let version = std::env::var("ATERM_TEST_FISH_VERSION_TEXT").expect("owned version text");
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{version}").unwrap();
+    stdout.flush().unwrap();
+    // Finish the stand-in normally before libtest appends its own version-like summary.
+    std::process::exit(0);
+}
+
+#[test]
+fn a_required_fish_version_waits_for_its_native_answer() {
+    for (age, version, expected) in [
+        (6, "fish, version 3.7.1", FishSaid::Version(true)),
+        (61, "fish, version 3.7.1", FishSaid::Nothing),
+        (6, "fish, version 3.3.1", FishSaid::Version(false)),
+        (6, "no version", FishSaid::Nothing),
+    ] {
+        let age = Duration::from_secs(age);
+        let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let ready = root.path().join("native-version");
+        let shell = root.path().join("owned-fish");
+        let calls = std::cell::Cell::new(0);
+        let said = fish_says_started(&shell, Instant::now() - age, |command, deadline| {
+            calls.set(calls.get() + 1);
+            assert_eq!(command.get_program(), shell.as_os_str());
+            assert_eq!(command.get_args().collect::<Vec<_>>(), ["--version"]);
+            let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "task_launch::tests::owned_fish_version_child",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("ATERM_TEST_FISH_VERSION_READY", &ready)
+                .env("ATERM_TEST_FISH_VERSION_TEXT", version);
+            aterm_uds::deadline::output_until_complete_stdout(&mut child, deadline)
+        });
+        if expired {
+            assert!(!ready.exists());
+            assert_eq!(calls.get(), 0, "true expiry starts no version helper");
+        } else {
+            assert_eq!(
+                std::fs::read(&ready).unwrap(),
+                b"the actual fish version fixture ran\n"
+            );
+            assert_eq!(calls.get(), 1);
+        }
+        assert_eq!(
+            said, expected,
+            "only the actual version answer grants worker syntax"
+        );
+    }
+}
+
+#[test]
 fn a_task_frame_is_at_most_64_kib() {
     let claude = spawn_form_word(None, None);
     assert_eq!(

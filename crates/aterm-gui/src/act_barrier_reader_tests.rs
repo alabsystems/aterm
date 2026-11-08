@@ -17,7 +17,9 @@ const IDLE: &[u8] = b"\x1b]7501;state=idle:app=codex\x1b\\";
 const WORKING: &[u8] = b"\x1b]7501;state=working:app=codex\x1b\\";
 
 fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
-    let seen = aterm_spec::wait::within(PATIENCE, Duration::ZERO, || done().then_some(()));
+    let seen = aterm_spec::wait::within(aterm_spec::wait::MUST_HAPPEN, Duration::ZERO, || {
+        done().then_some(())
+    });
     assert!(seen.is_some(), "timed out waiting for {what}");
 }
 
@@ -54,7 +56,7 @@ fn reading(app: &App, id: u64, gate: Option<DeferredReaderGate>) -> (Session, i3
 }
 
 fn close(mut session: Session, slave: i32) {
-    let _ = park_reader(&mut session, Instant::now() + PATIENCE);
+    let _ = park_reader(&mut session, Instant::now() + aterm_spec::wait::MUST_HAPPEN);
     let master = std::mem::replace(&mut session.master, -1);
     aterm_pty::close_fd(slave);
     aterm_pty::close_fd(master);
@@ -131,7 +133,7 @@ fn a_barrier_asked_of_a_reader_that_stops_disconnects() {
     session.reader_stop.store(true, Ordering::Release);
     aterm_pty::wake(session.wake_wr);
     assert_eq!(
-        answer.recv_timeout(PATIENCE),
+        answer.recv_timeout(aterm_spec::wait::MUST_HAPPEN),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
         "a stopped reader answers no barrier, and hangs none"
     );
@@ -147,7 +149,7 @@ fn a_barrier_asked_of_a_reader_that_stops_disconnects() {
 }
 
 #[test]
-fn a_late_barrier_lets_the_sessions_acts_through_until_the_parser_answers_one() {
+fn a_late_barrier_never_bypasses_a_later_acts_own_barrier() {
     let app = App::headless_for_test();
     let gate = DeferredReaderGate::closed();
     let (session, slave) = reading(&app, 99, Some(gate.clone()));
@@ -157,16 +159,12 @@ fn a_late_barrier_lets_the_sessions_acts_through_until_the_parser_answers_one() 
         Passage::Late,
         "a reader behind its gate answers nothing at once"
     );
-    assert!(lane.behind_for_test());
     assert_eq!(
-        lane.pass(PATIENCE),
-        Passage::Behind,
-        "the next act asks no barrier, and waits for none"
+        lane.pass(Duration::ZERO),
+        Passage::Late,
+        "the next act owes its own barrier rather than bypassing an unanswered one"
     );
     gate.release();
-    wait_for("the parser to answer the late barrier", || {
-        !lane.behind_for_test()
-    });
     assert_eq!(
         lane.pass(PATIENCE),
         Passage::Passed,
@@ -175,13 +173,8 @@ fn a_late_barrier_lets_the_sessions_acts_through_until_the_parser_answers_one() 
     close(session, slave);
 }
 
-/// codex-alab's landing turn: its `working` written to the PTY before its `landed@v1` and not yet
-/// read when the act arrives. The landing is marked with that turn counted.
-#[test]
-fn a_landing_is_marked_with_the_turn_its_program_wrote_before_it() {
-    let app = App::headless_for_test();
-    let gate = DeferredReaderGate::closed();
-    let (session, slave) = reading(&app, 98, Some(gate.clone()));
+fn landing(app: &App, id: u64, gate: &DeferredReaderGate) -> (Session, i32) {
+    let (session, slave) = reading(app, id, Some(gate.clone()));
     {
         let mut tl = session.ctx.timeline.lock().unwrap();
         tl.note_foreground_group(4242);
@@ -204,6 +197,16 @@ fn a_landing_is_marked_with_the_turn_its_program_wrote_before_it() {
     )
     .expect("a proof takes a free session");
     program_writes(slave, WORKING);
+    (session, slave)
+}
+
+/// codex-alab's landing turn: its `working` written to the PTY before its `landed@v1` and not yet
+/// read when the act arrives. The landing is marked with that turn counted.
+#[test]
+fn a_landing_is_marked_with_the_turn_its_program_wrote_before_it() {
+    let app = App::headless_for_test();
+    let gate = DeferredReaderGate::closed();
+    let (session, slave) = landing(&app, 98, &gate);
 
     let acted = Arc::new(AtomicBool::new(false));
     let releaser = {
@@ -238,4 +241,129 @@ fn a_landing_is_marked_with_the_turn_its_program_wrote_before_it() {
         "the landing's own turn, written before it, is counted in its mark"
     );
     close(session, slave);
+}
+
+#[test]
+fn an_act_requires_its_native_barrier_before_reading_counts_or_applying_effects() {
+    for age in [Duration::from_secs(3), Duration::from_secs(61)] {
+        let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+        let app = App::headless_for_test();
+        let gate = DeferredReaderGate::closed();
+        let id = if expired { 982 } else { 981 };
+        let (session, slave) = landing(&app, id, &gate);
+        let mut observed = 0;
+        let (reply, wakes) = crate::control::meta_wakes_barrier_for_test(
+            &app.store,
+            &session.term,
+            id,
+            &session.ctx,
+            "set harness_act landed@v1",
+            Some(1),
+            |ctx| {
+                ctx.reset_lane
+                    .pass_started(PATIENCE, Instant::now() - age, || {
+                        observed += 1;
+                        gate.release();
+                    })
+            },
+        );
+        let before = session.ctx.timeline.lock().unwrap().landing_mark();
+        gate.release();
+        wait_for("the actual queued turn to be parsed", || {
+            turns(&session) == 1
+        });
+        let after = session.ctx.timeline.lock().unwrap().landing_mark();
+        let fresh = crate::control::meta_wakes_for_test(
+            &app.store,
+            &session.term,
+            id,
+            &session.ctx,
+            "set harness_act landed@v1",
+            Some(1),
+        )
+        .0;
+        let fresh_mark = session.ctx.timeline.lock().unwrap().landing_mark();
+        close(session, slave);
+        if expired {
+            assert_eq!(reply, "ERR barrier hang\n");
+            assert!(
+                wakes.is_empty(),
+                "no act publishes a change after a true hang"
+            );
+            assert_eq!(observed, 0, "expiry never releases the native reader");
+            assert!(before.is_none());
+            assert!(
+                after.is_none(),
+                "no queued act applies after the reader later catches up"
+            );
+        } else {
+            assert_eq!(reply, "OK\n");
+            assert!(!wakes.is_empty());
+            assert!(observed > 0);
+            assert_eq!(before.map(|mark| mark.program_turns), Some(1));
+            assert_eq!(after.map(|mark| mark.program_turns), Some(1));
+        }
+        assert_eq!(fresh, "OK\n");
+        assert_eq!(fresh_mark.map(|mark| mark.program_turns), Some(1));
+    }
+}
+
+#[test]
+fn an_actual_caller_disconnect_cancels_without_reading_counts_or_applying_an_act() {
+    use std::os::fd::AsRawFd as _;
+    for already_closed in [true, false] {
+        let app = App::headless_for_test();
+        let gate = DeferredReaderGate::closed();
+        let id = if already_closed { 985 } else { 986 };
+        let (session, slave) = landing(&app, id, &gate);
+        let (server, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut peer = Some(peer);
+        if already_closed {
+            drop(peer.take());
+        }
+        let serving = aterm_control::hangup::ServingFd::enter(server.as_raw_fd());
+        let mut observed = 0;
+        let start = if already_closed {
+            Instant::now() - Duration::from_secs(61)
+        } else {
+            Instant::now()
+        };
+        let (reply, wakes) = crate::control::meta_wakes_barrier_for_test(
+            &app.store,
+            &session.term,
+            id,
+            &session.ctx,
+            "set harness_act landed@v1",
+            Some(1),
+            |ctx| {
+                ctx.reset_lane.pass_started(PATIENCE, start, || {
+                    observed += 1;
+                    drop(peer.take());
+                })
+            },
+        );
+        let hung_up = aterm_control::hangup::caller_hung_up();
+        let before = session.ctx.timeline.lock().unwrap().landing_mark();
+        drop(serving);
+        drop(peer.take());
+        drop(server);
+        gate.release();
+        wait_for(
+            "the cancelled act's actual queued turn to be parsed",
+            || turns(&session) == 1,
+        );
+        let after = session.ctx.timeline.lock().unwrap().landing_mark();
+        let fresh_barrier = session.ctx.reset_lane.pass(PATIENCE);
+        close(session, slave);
+        assert!(hung_up, "the served native socket actually closed");
+        assert_eq!(reply, crate::control::HUNG_UP_REPLY);
+        assert!(wakes.is_empty());
+        assert_eq!(observed, usize::from(!already_closed));
+        assert!(before.is_none());
+        assert!(
+            after.is_none(),
+            "the closed caller leaves no act to apply later"
+        );
+        assert_eq!(fresh_barrier, Passage::Passed);
+    }
 }

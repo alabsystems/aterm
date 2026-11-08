@@ -8531,7 +8531,6 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<ReaderJoin, String> {
                         for waiter in asked {
                             let _ = waiter.try_send(());
                         }
-                        reset_lane.answered(lane_generation);
                     }
                 }
             }

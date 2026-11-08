@@ -2364,3 +2364,23 @@ fn no_glass_week_figure_says_left() {
         }
     }
 }
+
+#[test]
+fn choose_fact_act_network_state_opens_lens_on_target_window() {
+    let mut app = crate::App::headless_for_test();
+    let w0 = crate::WindowId(0);
+    let w1 = crate::WindowId(1);
+    app.install_window_state(w1, crate::stub_session(99), 24, 80);
+    app.frontmost_window = Some(w1);
+
+    app.choose_fact_act(w0, 0, super::FactAct::NetworkState);
+    assert_eq!(
+        app.windows[&w0].stats_lens.open.map(|l| l.focus),
+        Some(crate::stats_paint::Instrument::NetworkState),
+        "NetworkState fact action on w0 must open the lens on w0 even when w1 is frontmost"
+    );
+    assert!(
+        app.windows[&w1].stats_lens.open.is_none(),
+        "w1 must not receive w0's NetworkState lens"
+    );
+}

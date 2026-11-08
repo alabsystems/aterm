@@ -540,6 +540,31 @@ impl HeldProgram {
         self.validate(deadline)
     }
 
+    /// Require the distinct in-process Bootstrap graph declaration from this
+    /// SAME held image. Its existence grants no graph, CPU/GNU, manager, SDK,
+    /// execution or retirement authority; actual live enrollment is required.
+    pub fn require_bootstrap_graph_protocol_marker(
+        &self,
+        _expected: &[u8; 64],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.validate(deadline)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        protocol_marker::require(
+            &self.executable.file,
+            protocol_marker::Profile::BootstrapGraph,
+            _expected,
+            deadline,
+        )?;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native Bootstrap graph declarations require macOS arm64",
+        ));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.validate(deadline)
+    }
+
     /// Require the distinct compiler member-original/extra/return declaration
     /// from this same held executable. Generic resource-v3 and root-workload
     /// support are insufficient. This grants no CPU, SDK, GO or proof authority.

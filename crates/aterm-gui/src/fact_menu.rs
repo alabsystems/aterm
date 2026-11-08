@@ -2129,7 +2129,7 @@ impl App {
                 }
             }
             FactAct::NetworkState => {
-                self.open_network_lens();
+                self.open_network_lens_in(wid);
             }
             FactAct::Token => {
                 // The offer as the card showed it, read again at the press: one that no longer

@@ -12432,6 +12432,8 @@ impl App {
                 .get(front_terminal.session)
                 .and_then(|entry| crate::vim_custody::capture(&term, &entry.ctx, false));
             self.refresh_hover_for_frame_locked(id, &term);
+            // The caret's moves since the last frames, read under the caret's lock.
+            let caret_path = term.caret_path();
             drop(term);
             #[cfg(test)]
             redraw_hold_hook::after_terminal_hold();
@@ -12669,7 +12671,8 @@ impl App {
                     self.harness_glass
                         .get(&front_terminal.session)
                         .and_then(crate::harness_glass::SessionGlass::landed),
-                ))),
+                )))
+                .with_caret_path(caret_path),
             );
             mark_end_cheered(&mut self.harness_glass, pet_tick.landed_seen);
             let mut verdict_cue: Option<(bool, bool)> = None;
@@ -12831,7 +12834,9 @@ impl App {
                         } else {
                             ws.fx.companions_mut().dog_cameo.bob(frame_started)
                         };
-                        if let Some(dog_fp) = ws.fx.draw_dog(
+                        // The dog keeps off the letters of the snapshot it is drawn over and the
+                        // frame's word icons.
+                        let dog_fp = ws.fx.draw_dog(
                             aterm_effects::pipeline::CanvasInk::Window,
                             aterm_effects::word_decorations::DogCameoFrame {
                                 geom: effect_geom,
@@ -12840,8 +12845,12 @@ impl App {
                                 colors,
                                 bob,
                                 alpha: dog_alpha,
+                                now: frame_started,
                             },
-                        ) {
+                            &ws.input_scratch.cells,
+                            (0, 0),
+                        );
+                        if let Some(dog_fp) = dog_fp {
                             fp ^= dog_fp.rotate_left(31);
                         }
                         if ws.os_window.is_some() {
@@ -15614,6 +15623,8 @@ impl App {
             ws.fx.companions_mut().dog_cameo.bob(ctx.now)
         };
         ws.fx.clear_pane_sprites();
+        // The dog keeps off the letters of the snapshot it is drawn over and the frame's word
+        // icons, which the word pass drew in the window's grid (the pane's at `place`).
         let fp = ws.fx.draw_dog(
             aterm_effects::pipeline::CanvasInk::Pane,
             aterm_effects::word_decorations::DogCameoFrame {
@@ -15623,7 +15634,10 @@ impl App {
                 colors,
                 bob,
                 alpha,
+                now: ctx.now,
             },
+            &ws.composed_focus_scratch.cells,
+            place.px_shift(),
         );
         ws.fx.place_pane_sprites(place);
         if ws.os_window.is_some() {
@@ -16070,6 +16084,7 @@ impl App {
         let mut focus_epoch = 0u64;
         let mut focus_content_seq = 0u64;
         let mut focus_wrap_serial = 0u64;
+        let mut focus_caret_path = [None; aterm_core::terminal::caret_path::CARET_PATH_LEN];
         let mut focus_cmd_done: Option<(u64, i32)> = None;
         let mut focus_cmd_dur_ms: Option<u64> = None;
         let mut focus_shell_edge = false;
@@ -16209,6 +16224,7 @@ impl App {
                 let cp = term.cursor();
                 focus_cur_pos = (cp.row, cp.col);
                 focus_wrap_serial = term.wrap_serial();
+                focus_caret_path = term.caret_path();
                 focus_vis = term.cursor_visible();
                 focus_frame_unfinished = term.sync_frame_unfinished();
                 focus_sync_end_seq = term.sync_end_seq();
@@ -16693,7 +16709,8 @@ impl App {
                     self.harness_glass
                         .get(&focus)
                         .and_then(crate::harness_glass::SessionGlass::landed),
-                ))),
+                )))
+                .with_caret_path(focus_caret_path),
             );
             mark_end_cheered(&mut self.harness_glass, pet_tick.landed_seen);
             if let Some((code, _)) = pet_tick.completion {

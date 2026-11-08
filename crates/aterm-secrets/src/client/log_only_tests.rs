@@ -121,7 +121,7 @@ pub(crate) fn configured_log_transition(
 #[test]
 fn configured_log_model_conforms_to_native_selection() {
     let model = aterm_models_swarm::configured_log_model();
-    aterm_spec::interp::prove_and_catch(&model);
+    assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
     assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {

@@ -82,6 +82,11 @@ fn cat() -> Command {
 /// (`docs/measured/cohort-capture-at-exit-2026-11-04.md`). The exit has a test's minute to finish.
 #[test]
 fn a_capture_across_a_childs_exit_never_refuses_it() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "cohort::launch::tests::a_capture_across_a_childs_exit_never_refuses_it",
+    ) {
+        return;
+    }
     use std::time::{Duration, Instant};
     for delay in (0..2_000).step_by(20) {
         let fixture = CohortFixture::new();

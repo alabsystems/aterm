@@ -10,6 +10,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
+pub(crate) mod lazy_fetch;
+
+pub(crate) use lazy_fetch::NoLazyFetch;
+
 /// A local read, or one `ls-remote`.
 const READ_BUDGET: Duration = Duration::from_secs(300);
 /// `git fetch origin` of a large history.
@@ -135,10 +139,10 @@ impl Programs {
 /// and an empty `GIT_ASKPASS`, which keeps a person's `core.askPass` from running), no
 /// optional index lock (`GIT_OPTIONAL_LOCKS=0`, so a read never races the person's own git),
 /// and no fetch of an object a partial clone lacks (`GIT_NO_LAZY_FETCH=1`, which git 2.44 and
-/// later and the May 2024 security releases from 2.39.4 on honour, and an older git ignores): a
-/// read of a missing object fails rather than reaching a remote by itself, outside aterm's
-/// credential route. Only a run that must complete a partial clone's worktree, under
-/// [`network`], lifts it ([`lazily`]).
+/// later and the May 2024 security releases from 2.39.4 on honour, and an older git ignores,
+/// which [`NoLazyFetch::of`] tells apart): a read of a missing object fails rather than reaching
+/// a remote by itself, outside aterm's credential route. Only a run that must complete a partial
+/// clone's worktree, under [`network`], lifts it ([`lazily`]).
 pub(crate) fn git(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
     let mut command = Cmd::new(crate::items::github::git_program_for_user(sys, user))
         .as_user(user)

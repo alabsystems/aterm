@@ -372,7 +372,7 @@ pub enum Purpose {
     ReleaseNotary,
     /// An AI account's unattended email-code sign-in route.
     HarnessSignIn,
-    /// agh's dev identity.
+    /// The default repository consumer's development GitHub identity.
     AghDev,
     /// agh's release identity.
     AghRelease,
@@ -415,7 +415,8 @@ impl Purpose {
     }
 
     /// Whether a consumer in this build runs its own check and reports it
-    /// ([`super::satisfied`]): `ship provision`'s deployer-key and notary rows, and the sign-in ladder. Any
+    /// ([`super::satisfied`]): `ship provision`'s deployer-key and notary rows, the sign-in ladder,
+    /// and the default repository consumer. Any
     /// other need (one raised by hand, or for a consumer not wired yet) has no check of its own,
     /// so the vault version that gives this Mac the want's entry is what fulfils it; without
     /// that it would stay published for good.
@@ -423,7 +424,7 @@ impl Purpose {
     pub const fn checks_itself(self) -> bool {
         matches!(
             self,
-            Self::ReleaseSiteKey | Self::ReleaseNotary | Self::HarnessSignIn
+            Self::ReleaseSiteKey | Self::ReleaseNotary | Self::HarnessSignIn | Self::AghDev
         )
     }
 }

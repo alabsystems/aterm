@@ -32,6 +32,40 @@ const FIX2: &str = "2222222222222222222222222222222222222222";
 const N2: &str = "3333333333333333333333333333333333333333";
 const N3: &str = "4444444444444444444444444444444444444444";
 
+/// Offline authority/control seam for the launch instrument. Stop at the boundary:
+/// no qualify branch, signature, stage or publication is started. Real freezing,
+/// bumping and sealing are timed separately by release_steps' opt-in fixture.
+pub(crate) fn prequalify_fixture() -> std::time::Duration {
+    let mut world = World::new();
+    world.versions.insert(TIP.into(), "0.6.0".into());
+    world.stop_at_qualify = true;
+    let start = std::time::Instant::now();
+    let result = world.run(ReleaseOptions {
+        commit: Some(TIP.into()),
+        qualify: true,
+        ..mac()
+    });
+    assert_ne!(
+        result.0, 0,
+        "the fixture must stop at qualify, not finish its branches"
+    );
+    world
+        .qualify_boundary
+        .expect("the controller reached qualify")
+        .duration_since(start)
+}
+
+#[test]
+#[ignore = "explicit credential-free launch measurement"]
+fn measure_bump_launch_to_qualify() {
+    crate::release_steps::measure_bump_launch_to_qualify(prequalify_fixture);
+}
+
+#[test]
+fn offline_launch_stops_at_the_qualification_boundary() {
+    let _ = prequalify_fixture();
+}
+
 /// The hop the fake makes of `fix`.
 fn hop_of(fix: &str) -> String {
     format!("9{}", &fix[1..])
@@ -124,6 +158,8 @@ struct World {
     /// reads it (`release_steps::site_outcome`).
     site: Result<crate::site::Outcome, crate::site::Failure>,
     own_cutter: bool,
+    stop_at_qualify: bool,
+    qualify_boundary: Option<std::time::Instant>,
     cutter_recovery: crate::release_tools::Recovery,
     warming_active: bool,
     unrecorded_hops: BTreeSet<String>,
@@ -314,6 +350,8 @@ impl World {
             after_cut: Ok("the release's shape checked".into()),
             site: Ok(crate::site::Outcome::Synced { deployed: true }),
             own_cutter: true,
+            stop_at_qualify: false,
+            qualify_boundary: None,
             cutter_recovery: crate::release_tools::Recovery::Initial,
             warming_active: false,
             unrecorded_hops: BTreeSet::new(),
@@ -1611,6 +1649,13 @@ impl Backend for World {
         })
     }
     fn qualify_begin(&mut self, _prover: &Prover, export: bool) -> Result<String, Refusal> {
+        if self.stop_at_qualify {
+            self.qualify_boundary = Some(std::time::Instant::now());
+            return Err(Refusal::new(
+                "offline fixture reached qualify",
+                "fixture complete",
+            ));
+        }
         Ok(format!(
             "8 slots of this Mac's 8 cores{}",
             if export {

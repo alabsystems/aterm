@@ -145,7 +145,8 @@ impl PanePlace {
 
     /// Grid-interior pixel shift from pane-local to window-content coords.
     #[inline]
-    const fn px_shift(self) -> (i32, i32) {
+    #[must_use]
+    pub const fn px_shift(self) -> (i32, i32) {
         (
             self.col_off as i32 * self.cell_w as i32,
             self.row_off as i32 * self.cell_h as i32,

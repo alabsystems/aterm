@@ -11,6 +11,7 @@
 )]
 
 pub mod accounting;
+pub mod bootstrap_graph;
 mod context;
 mod helper_fds;
 pub mod linker;

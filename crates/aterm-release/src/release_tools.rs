@@ -15,10 +15,11 @@ pub const RECORD_ENV: &str = "ATERM_RELEASE_TOOL_RECORD";
 pub const FREEZER_ENV: &str = "ATERM_RELEASE_FREEZER_COMMIT";
 pub const CONTRACT_ENV: &str = "ATERM_RELEASE_FREEZER_CONTRACT";
 pub const REFREEZE_ENV: &str = "ATERM_RELEASE_REFROZEN_COMMIT";
-pub const CONTRACT: &str = "cutter.toml/1";
+pub const CONTRACT: &str = "cutter.toml/2";
 const RECORD: &str = "tool.toml";
 const CUTTER_RECORD: &str = "cutter.toml";
 const SCHEMA: u32 = 1;
+const CUTTER_SCHEMA: u32 = 2;
 
 /// Recovery permission only; none of these launch hints is a content proof.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -86,6 +87,8 @@ impl Recovery {
 pub struct Cutter {
     schema: u32,
     pub commit: String,
+    pub built_from: String,
+    pub inputs: Option<crate::cutter_inputs::Inputs>,
     pub tool: Tool,
 }
 
@@ -95,8 +98,15 @@ pub fn cutter_record_path(release: &Path) -> PathBuf {
 
 impl Cutter {
     fn validate(&self, release: &Path) -> Result<(), String> {
-        if self.schema != SCHEMA
+        if self.schema != CUTTER_SCHEMA
             || !aterm_codec::hex::is_lower(&self.commit, 40)
+            || !aterm_codec::hex::is_lower(&self.built_from, 40)
+            || (self.built_from != self.commit && self.inputs.is_none())
+            || self.inputs.as_ref().is_some_and(|inputs| {
+                [&inputs.digest, &inputs.sources, &inputs.seal]
+                    .iter()
+                    .any(|digest| !aterm_codec::hex::is_lower(digest, 64))
+            })
             || !aterm_codec::hex::is_lower(&self.tool.sha256, 64)
             || !release.is_absolute()
             || self.tool.path
@@ -128,14 +138,46 @@ impl Cutter {
 /// # Errors
 /// The proof cannot be read or decoded, its shape or bytes differ, or it names another commit.
 pub fn recorded_cutter(release: &Path, commit: &str) -> Result<Cutter, String> {
-    let text =
-        crate::durable::read_text(&cutter_record_path(release)).map_err(|e| e.to_string())?;
-    let cutter: Cutter = aterm_toml::from_str(&text).map_err(|e| e.to_string())?;
-    cutter.validate(release)?;
+    let cutter = read_cutter(release)?;
     if cutter.commit != commit {
         return Err("the cutter proof names another commit".into());
     }
     Ok(cutter)
+}
+
+fn read_cutter(release: &Path) -> Result<Cutter, String> {
+    let text =
+        crate::durable::read_text(&cutter_record_path(release)).map_err(|e| e.to_string())?;
+    let cutter: Cutter = aterm_toml::from_str(&text).map_err(|e| e.to_string())?;
+    cutter.validate(release)?;
+    Ok(cutter)
+}
+
+/// Adopt only after Cargo checked the new graph and every observed input still matches.
+/// A source edit which produces identical machine code is still a different input.
+pub(crate) fn adopt_cutter(
+    release: &Path,
+    commit: &str,
+    source: &Path,
+    observation: &crate::cutter_inputs::Observation,
+) -> Result<Option<Cutter>, String> {
+    if !observation.all_fresh {
+        return Ok(None);
+    }
+    let Ok(previous) = read_cutter(release) else {
+        return Ok(None);
+    };
+    if previous.inputs.as_ref() != Some(&observation.inputs)
+        || crate::dmg::sha256_file(source)? != previous.tool.sha256
+    {
+        return Ok(None);
+    }
+    let adopted = Cutter {
+        commit: commit.to_owned(),
+        ..previous
+    };
+    adopted.validate(release)?;
+    Ok(Some(adopted))
 }
 
 /// Copy and prove a cutter without waiting for a verifier build. The caller checks clean R
@@ -149,6 +191,7 @@ pub fn stage_cutter(
     commit: &str,
     source: &Path,
     log: &Path,
+    inputs: Option<crate::cutter_inputs::Inputs>,
 ) -> Result<Cutter, String> {
     let digest = {
         let _phase = crate::cut_timing::Timer::start(log, "cutter-source-hash");
@@ -162,8 +205,10 @@ pub fn stage_cutter(
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     real_directory(&root, "frozen-tool root")?;
     let cutter = Cutter {
-        schema: SCHEMA,
+        schema: CUTTER_SCHEMA,
         commit: commit.into(),
+        built_from: commit.into(),
+        inputs,
         tool: Tool {
             path: dir.join("aterm-release"),
             sha256: digest,
@@ -791,6 +836,7 @@ mod tests {
             COMMIT,
             &old.cutter.path,
             &release.with_extension("events"),
+            None,
         )
         .unwrap();
         publish_cutter(&release, &repaired).unwrap();
@@ -809,8 +855,14 @@ mod tests {
         let temp = aterm_tempfile::tempdir().unwrap();
         let release = temp.path().join("release");
         let source = tool_source(temp.path(), "cutter-only", CUTTER_VERSION, 0);
-        let cutter =
-            stage_cutter(&release, COMMIT, &source, &release.with_extension("events")).unwrap();
+        let cutter = stage_cutter(
+            &release,
+            COMMIT,
+            &source,
+            &release.with_extension("events"),
+            None,
+        )
+        .unwrap();
         assert!(!record_path(&release).exists());
         publish_cutter(&release, &cutter).unwrap();
         assert_eq!(recorded_cutter(&release, COMMIT).unwrap(), cutter);
@@ -827,7 +879,89 @@ mod tests {
         std::fs::write(&cutter.tool.path, b"mutated after first exec completed").unwrap();
         assert!(recorded_cutter(&release, COMMIT).is_err());
         assert!(
-            stage_cutter(&release, COMMIT, &source, &release.with_extension("events")).is_err()
+            stage_cutter(
+                &release,
+                COMMIT,
+                &source,
+                &release.with_extension("events"),
+                None
+            )
+            .is_err()
+        );
+    }
+
+    /// Byte equality alone cannot authorize adoption: each digest component, Cargo's
+    /// freshness and the prior immutable copy must independently remain valid.
+    #[test]
+    fn adoption_binds_both_commits_and_rejects_changed_or_unproved_inputs() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let release = temp.path().join("release");
+        let source = tool_source(temp.path(), "adopt-cutter", CUTTER_VERSION, 0);
+        let inputs = crate::cutter_inputs::Inputs {
+            digest: "1".repeat(64),
+            sources: "2".repeat(64),
+            seal: "3".repeat(64),
+        };
+        let original = stage_cutter(
+            &release,
+            COMMIT,
+            &source,
+            &release.with_extension("events"),
+            Some(inputs.clone()),
+        )
+        .unwrap();
+        publish_cutter(&release, &original).unwrap();
+        let next = "b".repeat(40);
+        let mut observation = crate::cutter_inputs::Observation {
+            inputs,
+            all_fresh: true,
+        };
+        let adopted = adopt_cutter(&release, &next, &source, &observation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(adopted.commit, next);
+        assert_eq!(adopted.built_from, COMMIT);
+        assert_eq!(adopted.tool, original.tool);
+        publish_cutter(&release, &adopted).unwrap();
+        assert_eq!(recorded_cutter(&release, &next).unwrap(), adopted);
+        for field in 0..3 {
+            let mut changed = observation.inputs.clone();
+            match field {
+                0 => changed.digest = "4".repeat(64),
+                1 => changed.sources = "4".repeat(64),
+                _ => changed.seal = "4".repeat(64),
+            }
+            let changed = crate::cutter_inputs::Observation {
+                inputs: changed,
+                all_fresh: true,
+            };
+            assert!(
+                adopt_cutter(&release, &"c".repeat(40), &source, &changed)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        observation.all_fresh = false;
+        assert!(
+            adopt_cutter(&release, &next, &source, &observation)
+                .unwrap()
+                .is_none()
+        );
+        observation.all_fresh = true;
+        let different = tool_source(temp.path(), "different-image", CUTTER_VERSION, 1);
+        assert!(
+            adopt_cutter(&release, &next, &different, &observation)
+                .unwrap()
+                .is_none()
+        );
+        let mut unproved = original;
+        unproved.inputs = None;
+        publish_cutter(&release, &unproved).unwrap();
+        observation.all_fresh = true;
+        assert!(
+            adopt_cutter(&release, &next, &source, &observation)
+                .unwrap()
+                .is_none()
         );
     }
 

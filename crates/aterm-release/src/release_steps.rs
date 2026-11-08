@@ -3,6 +3,8 @@
 
 //! Real [`crate::release::Backend`] implementation for `targo --unverified ship release`.
 
+#[cfg(unix)]
+use aterm_uds::spawnfd::Tether as _;
 use aterm_uds::spawnfd::{Command, Stdio, command};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -223,6 +225,7 @@ pub(crate) fn release_state(home: &Path) -> PathBuf {
 
 /// The real backend.
 pub struct Real {
+    prefreeze_claim: Option<aterm_capacity::Claim>,
     pub(crate) build_inputs: fn() -> Result<String, String>,
     /// Keeps this process's build-inputs seal in the release state, its reports also in the
     /// named log ([`crate::build_inputs::arm`]).
@@ -348,10 +351,6 @@ impl Drop for PreparingSign {
             let _ = wait_accounted(&mut child);
         }
     }
-}
-
-fn reusable_cutter(stamp: Option<&crate::cutter::Stamp>, commit: &str, debug: bool) -> bool {
-    !debug && stamp.is_some_and(|stamp| stamp.commit() == commit)
 }
 
 impl Drop for WarmingVerifier {
@@ -671,6 +670,7 @@ impl Real {
         };
         std::fs::create_dir_all(&logs).map_err(|e| format!("create {}: {e}", logs.display()))?;
         Ok(Self {
+            prefreeze_claim: None,
             build_inputs: crate::build_inputs::current,
             arm_inputs: crate::build_inputs::arm,
             handed_inputs: crate::build_inputs::handed_path,
@@ -1024,10 +1024,44 @@ impl Real {
 
     fn configure_child(&self, mut cmd: Command, prover: Option<&Prover>) -> Command {
         cmd.current_dir(&self.repo).stdin(Stdio::null());
+        if let Some(claim) = &self.prefreeze_claim {
+            configure_prefreeze_child(&mut cmd, &claim.record().cover_marker(), claim.cores());
+        }
         if let Some(p) = prover {
             cmd.env("TRUST_STAGE2_BIN", &p.bin);
         }
         cmd
+    }
+
+    /// Resolve every edited lock once, refusing any additional edit the resolver needs.
+    fn validate_bumped_locks(&self, prover: &Prover, locks: &[String]) -> Result<(), String> {
+        for lock in locks {
+            let manifest = self.repo.join(lock).with_file_name("Cargo.toml");
+            let mut cmd = self.child(prover.bin.join("targo"), Some(prover));
+            cmd.args([
+                "metadata",
+                "--locked",
+                "--offline",
+                "--format-version",
+                "1",
+                "--manifest-path",
+            ])
+            .arg(manifest);
+            let (output, accounting) = self
+                .output_accounted(Step::Commit, &mut cmd)
+                .map_err(|e| format!("validate {lock}: {e}"))?;
+            if let Ok(mut log) = crate::durable::open_append(&self.step_log(Step::Commit), true) {
+                let _ = writeln!(log, "lock-bump-validation: {lock}\n{accounting}");
+                let _ = log.write_all(&output.stderr);
+            }
+            if !output.status.success() {
+                return Err(format!(
+                    "locked metadata refused {lock}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn engine_child(&self, engine: &Path, prover: Option<&Prover>) -> Result<Command, Refusal> {
@@ -1102,8 +1136,15 @@ impl Real {
 
     fn publish_command(&self, prover: &Prover) -> Result<Command, Refusal> {
         let mut cmd = self.with_scanners(self.engine_child(&self.engine, Some(prover))?);
-        cmd.args(["publish", "aterm", "--skip-site", "--repo-path"])
-            .arg(&self.repo);
+        cmd.args([
+            "publish",
+            "aterm",
+            "--skip-site",
+            "--release-remote",
+            "https://github.com/alabsystems/aterm.git",
+            "--repo-path",
+        ])
+        .arg(&self.repo);
         if let Ok(exe) = std::env::current_exe() {
             hand_this_cutter(&mut cmd, &exe, crate::cutter::reference());
         }
@@ -2031,7 +2072,7 @@ impl Real {
         prover: &Prover,
         bin: &crate::checkout_bin::Bin,
         profile: &str,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<(PathBuf, Vec<u8>), String> {
         let _phase =
             crate::cut_timing::Timer::start(&self.step_log(self.step), "frozen-tool-build");
         let layout = verify_layout(&self.repo).1;
@@ -2059,7 +2100,8 @@ impl Real {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        crate::checkout_bin::built(&self.repo, bin, &output.stdout)
+        let path = crate::checkout_bin::built(&self.repo, bin, &output.stdout)?;
+        Ok((path, output.stdout))
     }
 
     /// The exact locked-targo line for one frozen tool. The verifier uses the main test graph;
@@ -2112,7 +2154,7 @@ impl Real {
         let cutter = self.frozen_cutter(commit, prover)?.tool.path;
         let verify = match &self.warm_verifier {
             Some(path) => path.clone(),
-            None => self.build_frozen_tool(prover, &FROZEN_VERIFY, "test")?,
+            None => self.build_frozen_tool(prover, &FROZEN_VERIFY, "test")?.0,
         };
         let tools = crate::release_tools::stage(&self.release, commit, &cutter, &verify)?;
         crate::release_tools::clean_at(&self.repo, commit)?;
@@ -2148,19 +2190,54 @@ impl Real {
         {
             return Ok(cutter);
         }
-        // A dep-info proof of this exact candidate already proves the launcher's build. Copy
-        // that image directly rather than asking Cargo to rediscover its unchanged graph.
-        let exact_gate_build = reusable_cutter(
-            crate::cutter::running_stamp().ok(),
-            commit,
-            cfg!(debug_assertions),
-        ) && crate::gates::own_cutter(&self.git(), commit).is_ok();
-        let source = if exact_gate_build {
-            std::env::current_exe().map_err(|e| e.to_string())?
+        // The build supplies both the authoritative freshness decision and the selected
+        // graph. It reuses the same persistent gate units as the launching ship alias.
+        let seal = if cfg!(target_os = "macos") {
+            let _timing = crate::cut_timing::Timer::start(&log, "cutter-inputs-seal");
+            (self.arm_inputs)(&self.state, Some(&self.transcript()));
+            Some((self.build_inputs)()?)
         } else {
-            self.build_frozen_tool(prover, &FROZEN_CUTTER, "gate")?
+            None
         };
-        let cutter = crate::release_tools::stage_cutter(&self.release, commit, &source, &log)?;
+        let (source, output) = self.build_frozen_tool(prover, &FROZEN_CUTTER, "gate")?;
+        let observation = seal.as_deref().and_then(|seal| {
+            let _timing = crate::cut_timing::Timer::start(&log, "cutter-input-graph");
+            match crate::cutter_inputs::capture(&self.repo, &output, seal) {
+                Ok(observation) => Some(observation),
+                Err(why) => {
+                    if let Ok(mut log) = crate::durable::open_append(&log, true) {
+                        let _ = writeln!(log, "cutter adoption unavailable: {why}");
+                    }
+                    None
+                }
+            }
+        });
+        let adopted = observation
+            .as_ref()
+            .map(|inputs| {
+                crate::release_tools::adopt_cutter(&self.release, commit, &source, inputs)
+            })
+            .transpose()?
+            .flatten();
+        let cutter = if let Some(cutter) = adopted {
+            let event = aterm_json::json!({
+                "schema": 1, "event": "cutter-adopted", "commit": commit,
+                "built_from": &cutter.built_from, "inputs": &cutter.inputs,
+            });
+            if let Ok(mut log) = crate::durable::open_append(&log, true) {
+                let _ = writeln!(log, "release-event: {event}");
+            }
+            println!("release-event: {event}");
+            cutter
+        } else {
+            crate::release_tools::stage_cutter(
+                &self.release,
+                commit,
+                &source,
+                &log,
+                observation.map(|observation| observation.inputs),
+            )?
+        };
         {
             let _phase = crate::cut_timing::Timer::start(&log, "cutter-source-recheck");
             crate::release_tools::clean_at(&self.repo, commit)?;
@@ -3964,6 +4041,7 @@ fn scrub_names(cmd: &mut Command, inherited: impl IntoIterator<Item = std::ffi::
                 || name == crate::release_tools::FREEZER_ENV
                 || name == crate::release_tools::CONTRACT_ENV
                 || name == crate::release_tools::REFREEZE_ENV
+                || name == crate::cut_timing::EXEC_PID_ENV
                 || name == PUBLISH_GATE_ENV
                 || name == crate::build_inputs::SEAL_ENV
                 || name == aterm_capacity::DISK_COVER_ENV
@@ -6105,30 +6183,21 @@ impl Backend for Real {
             }
             let mut cmd = self.scrubbed(&edit);
             cmd.arg(&self.repo).args([to, &cur]).current_dir(&self.repo);
+            let edit_timing =
+                crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-version-edit");
             if self.logged(Step::Commit, &mut cmd).code != 0 {
                 return Err(Refusal::new(
                     "bin/pub-bump-edit could not find the version line",
                     "read Cargo.toml's [workspace.package]",
                 ));
             }
-            let targo = prover.bin.join("targo");
-            let mut offline = self.child(&targo, Some(prover));
-            offline.args(["update", "--workspace", "--offline", "-q"]);
-            if self.logged(Step::Commit, &mut offline).code != 0 {
-                let mut online = self.child(&targo, Some(prover));
-                online.args(["update", "--workspace", "-q"]);
-                if self.logged(Step::Commit, &mut online).code != 0 {
-                    undo(self);
-                    return Err(Refusal::new(
-                        "the lockfile refresh failed (targo update --workspace); the bump is undone",
-                        "read the commit step's log",
-                    ));
-                }
-            }
+            drop(edit_timing);
             // A nested workspace (a recorder run read-only in the Linux lane)
             // locks aterm's path crates at the workspace's version too: each
             // moves with the root, or its `--locked` run fails until relocked.
-            let nested = self.git_paths(&["ls-files", "-z", "--", "*/Cargo.lock"]);
+            let nested = self.git_paths(&["ls-files", "-z", "--", "Cargo.lock", "*/Cargo.lock"]);
+            let lock_timing =
+                crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-lockfiles");
             let followed = match bump_nested_locks(&self.repo, nested, from, to) {
                 Ok(followed) => followed,
                 Err(why) => {
@@ -6136,6 +6205,14 @@ impl Backend for Real {
                     return Err(Refusal::new(why, "read the commit step's log"));
                 }
             };
+            if let Err(why) = self.validate_bumped_locks(prover, &followed) {
+                undo(self);
+                return Err(Refusal::new(
+                    why,
+                    "read the commit step's log; the bump is undone",
+                ));
+            }
+            drop(lock_timing);
             let inspected = [
                 &["diff", "--name-only", "-z", "HEAD"][..],
                 &["ls-files", "--others", "--exclude-standard", "-z"][..],
@@ -6405,6 +6482,10 @@ impl Backend for Real {
             return Err(cannot("not started: the release was interrupted".into()));
         }
         let _timing = crate::cut_timing::Timer::start(&self.step_log(self.step), "cutter-exec");
+        command.env(
+            crate::cut_timing::EXEC_PID_ENV,
+            std::process::id().to_string(),
+        );
         let error = command.exec();
         Err(cannot(error.to_string()))
     }
@@ -7391,9 +7472,114 @@ fn adopt_exec_handoffs() -> Result<Option<aterm_capacity::Claim>, String> {
     Ok(Some(claim))
 }
 
+/// A standalone preparation, with no release rank, journal, authority or publication work.
+/// The caller refreshes origin/main and its clean checkout before invoking this verb.
+fn prefreeze(repo: &Path, opts: &crate::release::ReleaseOptions) -> Result<(), String> {
+    #[cfg(not(unix))]
+    {
+        let _ = (repo, opts);
+        Err("pre-freeze requires Unix process groups".into())
+    }
+    #[cfg(unix)]
+    {
+        // The capacity guard cancels its own dedicated group. The parent waits, so a
+        // targo launcher never exits leaving an unowned compiler behind.
+        // SAFETY: getpgrp only reads this process's group.
+        if unsafe { libc::getpgrp() } != std::process::id() as i32 {
+            let mut cmd = command(std::env::current_exe().map_err(|e| e.to_string())?);
+            cmd.args(std::env::args_os().skip(1))
+                .setsid(true)
+                .default_signals()
+                .tether();
+            let status = cmd
+                .spawn()
+                .and_then(|mut child| child.wait())
+                .map_err(|e| e.to_string())?;
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(format!("worker exited {status}"))
+            };
+        }
+        let mut real = Real::new(repo, opts.engine.as_deref(), false, opts.verbose)?;
+        let tip = real
+            .git_out(&["rev-parse", "origin/main"])
+            .ok_or("cannot resolve local origin/main")?;
+        let cutter = prepare_cutter(&mut real, tip.trim())?;
+        println!(
+            "prefrozen: {} {}",
+            cutter.commit,
+            cutter.tool.path.display()
+        );
+        Ok(())
+    }
+}
+
+/// The production preparation path, also exercised by the offline launch instrument.
+#[cfg(unix)]
+fn prepare_cutter(real: &mut Real, tip: &str) -> Result<crate::release_tools::Cutter, String> {
+    if std::env::var_os(aterm_capacity::RELEASE_RUN_ENV).is_some() {
+        return Err("pre-freeze must run outside a cut".into());
+    }
+    // Darwin's published PRIO_DARWIN_PROCESS and PRIO_DARWIN_BG apply the
+    // process-wide background band, inherited by the compiler's descendants.
+    #[cfg(target_os = "macos")]
+    // SAFETY: constant selectors change only this process's scheduling policy.
+    if unsafe { libc::setpriority(4, 0, 0x1000) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    interrupt::install();
+    crate::release_tools::clean_at(&real.repo, tip)?;
+    // The quiet resource excludes windowed/timed checks. Its load ceiling is
+    // deliberately unbounded: this is exclusion, not a quiet-machine measurement.
+    real.prefreeze_claim = Some(
+        aterm_capacity::admit(prefreeze_need(), aterm_capacity::Admit::Preemptible)
+            .map_err(|e| e.to_string())?,
+    );
+    let pid = std::process::id();
+    let started = started_of(pid).ok_or("cannot identify pre-freeze worker")?;
+    std::fs::create_dir_all(&real.release).map_err(|e| e.to_string())?;
+    let _run = crate::release::RunClaim::take(
+        &real.release.join(crate::release::RUNNING_FILE),
+        (pid, &started),
+        &real.logs,
+        &mut started_of,
+    )
+    .map_err(|why| format!("clone already held or unavailable: {why:?}"))?;
+    crate::gates::arm_toolchain_lease();
+    let prover = real.prover(None)?;
+    real.frozen_cutter(tip, &prover)
+}
+
+#[cfg(unix)]
+fn prefreeze_need() -> aterm_capacity::Need {
+    aterm_capacity::Need::new("release cutter pre-freeze")
+        .rank(aterm_capacity::Rank::Background)
+        .mem_gib(26)
+        .cores(aterm_capacity::cores())
+        .covers()
+        .quiet(f64::MAX)
+}
+
+fn configure_prefreeze_child(cmd: &mut Command, cover: &str, cores: u32) {
+    cmd.env_remove(aterm_capacity::RELEASE_RUN_ENV)
+        .env(aterm_capacity::COVER_ENV, cover)
+        .env("BUILD_SLOT_HELD", "1")
+        .env("CARGO_BUILD_JOBS", cores.to_string());
+}
+
 /// Run a release in the clone at `repo`; the exit code.
 #[must_use]
 pub fn run(repo: &Path, opts: &crate::release::ReleaseOptions) -> i32 {
+    if opts.prefreeze {
+        return match prefreeze(repo, opts) {
+            Ok(()) => 0,
+            Err(why) => {
+                eprintln!("release prefreeze: {why}");
+                2
+            }
+        };
+    }
     #[cfg(unix)]
     let inherited_line = match adopt_exec_handoffs() {
         Ok(line) => line,
@@ -7631,6 +7817,8 @@ fn lock_follows_bump(lock: &str, from: &str, to: &str) -> Option<String> {
         .map(std::borrow::Cow::Borrowed)
         .collect();
     let mut moved = false;
+    let mut name = None;
+    let mut renamed = Vec::new();
     let mut version_line: Option<usize> = None;
     let mut sourced = false;
     for i in 0..=lines.len() {
@@ -7640,8 +7828,17 @@ fn lock_follows_bump(lock: &str, from: &str, to: &str) -> Option<String> {
                 let ending = &lines[at][lines[at].trim_end().len()..];
                 lines[at] = std::borrow::Cow::Owned(format!("version = \"{to}\"{ending}"));
                 moved = true;
+                if let Some(name) = name.take() {
+                    renamed.push(name);
+                }
             }
+            name = None;
             sourced = false;
+        } else if let Some(value) = line
+            .strip_prefix("name = \"")
+            .and_then(|s| s.strip_suffix('"'))
+        {
+            name = Some(value.to_owned());
         } else if line
             .strip_prefix("version = \"")
             .and_then(|s| s.strip_suffix('"'))
@@ -7650,6 +7847,21 @@ fn lock_follows_bump(lock: &str, from: &str, to: &str) -> Option<String> {
             version_line = Some(i);
         } else if line.starts_with("source = ") {
             sourced = true;
+        }
+    }
+    // Cargo disambiguates equal package names by version in dependency edges.
+    // A sourced edge includes its source suffix and must retain its old version.
+    for line in &mut lines {
+        let trimmed = line.trim_start();
+        for name in &renamed {
+            if trimmed.trim_end() == format!("\"{name} {from}\",") {
+                *line = std::borrow::Cow::Owned(line.replacen(
+                    &format!("\"{name} {from}\""),
+                    &format!("\"{name} {to}\""),
+                    1,
+                ));
+                break;
+            }
         }
     }
     moved.then(|| lines.concat())
@@ -7673,7 +7885,127 @@ mod engine_tests;
 mod fix_tests;
 
 #[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "only the integration harness supplies the offline controller"
+)]
+pub(crate) fn measure_bump_launch_to_qualify(controller: fn() -> std::time::Duration) {
+    tests::measure_bump_launch_to_qualify(controller);
+}
+
+#[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn prefreeze_reserves_background_build_and_timing_exclusion() {
+        use super::*;
+        let need = prefreeze_need();
+        assert_eq!(need.rank, aterm_capacity::Rank::Background);
+        assert!(need.mem > 0 && need.cores > 0 && need.covers);
+        assert_eq!(need.quiet, Some(f64::MAX));
+        // The ordinary cut path carries Release rank; the preparation must remove it
+        // from every child, retain the admitted build cover and bound compiler jobs.
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
+        let mut cmd = real.child("targo", None);
+        assert!(
+            cmd.get_envs()
+                .any(|(key, val)| key == aterm_capacity::RELEASE_RUN_ENV && val.is_some())
+        );
+        configure_prefreeze_child(&mut cmd, "fixture-cover", 3);
+        let env: std::collections::BTreeMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(
+            env[std::ffi::OsStr::new(aterm_capacity::RELEASE_RUN_ENV)],
+            None
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new(aterm_capacity::COVER_ENV)],
+            Some(std::ffi::OsStr::new("fixture-cover"))
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("CARGO_BUILD_JOBS")],
+            Some(std::ffi::OsStr::new("3"))
+        );
+    }
+
+    /// Real offline resolution is the oracle. Omitting the rewrite must fail locked
+    /// metadata, and an incorrect rewritten version must fail it too.
+    #[cfg(unix)]
+    #[test]
+    fn version_only_lock_rewrite_matches_resolver_bytes() {
+        use super::*;
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let repo = scratch.path().canonicalize().unwrap();
+        for dir in ["leaf/src", "nested/src"] {
+            std::fs::create_dir_all(repo.join(dir)).unwrap();
+            std::fs::write(repo.join(dir).join("lib.rs"), "").unwrap();
+        }
+        let root = "[workspace]\nmembers = [\"leaf\"]\nexclude = [\"nested\"]\nresolver = \"2\"\n[workspace.package]\nversion = \"0.147.0\"\n";
+        std::fs::write(repo.join("Cargo.toml"), root).unwrap();
+        std::fs::write(
+            repo.join("leaf/Cargo.toml"),
+            "[package]\nname = \"bump-leaf\"\nversion.workspace = true\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("nested/Cargo.toml"), "[workspace]\n[package]\nname = \"consumer\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[dependencies]\nbump-leaf = { path = \"../leaf\" }\n").unwrap();
+        let targo = crate::gates::trust_stage2_bin().unwrap().join("targo");
+        let run = |manifest: &Path, args: &[&str]| {
+            let mut cmd = command(&targo);
+            cmd.current_dir(&repo)
+                .args(args)
+                .arg("--manifest-path")
+                .arg(manifest);
+            cmd.output().unwrap()
+        };
+        let locks = ["Cargo.lock", "nested/Cargo.lock"];
+        let mut old = Vec::new();
+        for lock in locks {
+            let manifest = repo.join(lock).with_file_name("Cargo.toml");
+            assert!(
+                run(&manifest, &["update", "--workspace", "--offline"])
+                    .status
+                    .success()
+            );
+            old.push(std::fs::read_to_string(repo.join(lock)).unwrap());
+        }
+        std::fs::write(repo.join("Cargo.toml"), root.replace("0.147.0", "0.148.0")).unwrap();
+        let metadata = ["metadata", "--locked", "--offline", "--format-version", "1"];
+        for lock in locks {
+            assert!(
+                !run(&repo.join(lock).with_file_name("Cargo.toml"), &metadata)
+                    .status
+                    .success(),
+                "unmodified {lock} must be stale"
+            );
+        }
+        assert_eq!(
+            bump_nested_locks(
+                &repo,
+                Ok(locks.map(str::to_owned).to_vec()),
+                "0.147.0",
+                "0.148.0"
+            )
+            .unwrap(),
+            locks
+        );
+        for (lock, original) in locks.iter().zip(&old) {
+            let manifest = repo.join(lock).with_file_name("Cargo.toml");
+            let expected = lock_follows_bump(original, "0.147.0", "0.148.0").unwrap();
+            assert_eq!(std::fs::read_to_string(repo.join(lock)).unwrap(), expected);
+            assert!(run(&manifest, &metadata).status.success());
+            assert!(
+                run(&manifest, &["update", "--workspace", "--offline"])
+                    .status
+                    .success()
+            );
+            assert_eq!(std::fs::read_to_string(repo.join(lock)).unwrap(), expected);
+            std::fs::write(repo.join(lock), expected.replace("0.148.0", "0.149.0")).unwrap();
+            assert!(
+                !run(&manifest, &metadata).status.success(),
+                "wrong version must be refused"
+            );
+        }
+    }
     /// NEGATIVE CONTROLS: waiting at start blocks on sleep; dropping without stopping and
     /// reaping leaves the PID alive. No release executable, signer or credential is used.
     #[cfg(unix)]
@@ -7931,30 +8263,6 @@ mod tests {
         assert!(real.prefetched_origin.is_none());
     }
 
-    #[test]
-    fn only_an_exact_gate_build_can_skip_the_cutter_build() {
-        use super::*;
-        let commit = "a".repeat(40);
-        for stamp in [
-            crate::cutter::Stamp::Built(commit.clone()),
-            crate::cutter::Stamp::Proved(commit.clone()),
-        ] {
-            assert!(reusable_cutter(Some(&stamp), &commit, false));
-            assert!(
-                !reusable_cutter(Some(&stamp), &commit, true),
-                "a debug cutter must rebuild in gate"
-            );
-            assert!(
-                !reusable_cutter(Some(&stamp), &"b".repeat(40), false),
-                "no cross-commit reuse"
-            );
-        }
-        assert!(
-            !reusable_cutter(None, &commit, false),
-            "a missing proof is not reuse authority"
-        );
-    }
-
     /// NEGATIVE CONTROL: omitting settlement, or ending only the direct child, leaves the
     /// output pipe open. EOF proves the owned build and its inherited-pipe descendant ended.
     #[cfg(unix)]
@@ -8024,8 +8332,16 @@ mod tests {
             .expect("A (old two-tool freeze) or B (cutter-only)");
         let temp = aterm_tempfile::tempdir().unwrap();
         let mut real = Real::new(&repo, Some(&repo), false, false).unwrap();
-        real.release = temp.path().join("release");
-        real.logs = temp.path().join("logs");
+        real.release = std::env::var_os("ATERM_RELEASE_FREEZE_STATE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| temp.path().join("release"));
+        assert!(real.release.is_absolute(), "fixture state must be absolute");
+        if std::env::var_os("ATERM_RELEASE_FREEZE_STATE").is_some() {
+            real.state = real.release.join("fixture-state");
+        }
+        real.logs = std::env::var_os("ATERM_RELEASE_FREEZE_LOGS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| temp.path().join("logs"));
         std::fs::create_dir_all(&real.logs).unwrap();
         let commit = real.head();
         let prover = real.prover(None).unwrap();
@@ -8035,7 +8351,8 @@ mod tests {
             let phase = std::time::Instant::now();
             let cutter = real
                 .build_frozen_tool(&prover, &FROZEN_CUTTER, "gate")
-                .unwrap();
+                .unwrap()
+                .0;
             println!(
                 "freeze-phase cutter_build_ms={}",
                 phase.elapsed().as_millis()
@@ -8043,7 +8360,8 @@ mod tests {
             let phase = std::time::Instant::now();
             let verifier = real
                 .build_frozen_tool(&prover, &FROZEN_VERIFY, "test")
-                .unwrap();
+                .unwrap()
+                .0;
             println!(
                 "freeze-phase verifier_build_ms={}",
                 phase.elapsed().as_millis()
@@ -8059,17 +8377,155 @@ mod tests {
             );
         } else {
             assert_eq!(sample, "B");
-            real.frozen_cutter(&commit, &prover).unwrap();
+            let cutter = real.frozen_cutter(&commit, &prover).unwrap();
+            println!("freeze-proof {}", aterm_json::to_string(&cutter).unwrap());
         }
         println!(
             "freeze-sample mode={sample} elapsed_ms={}",
             start.elapsed().as_millis()
         );
         let log = std::fs::read_to_string(real.step_log(real.step)).unwrap_or_default();
-        for line in log
-            .lines()
-            .filter(|line| line.starts_with("release-event: "))
-        {
+        for line in log.lines().filter(|line| {
+            line.starts_with("release-event: ") || line.starts_with("cutter adoption unavailable:")
+        }) {
+            println!("{line}");
+        }
+    }
+
+    /// Full local launch instrument: real two-freeze/bump/seal work, with the existing
+    /// authority seam stopping at qualify. The caller owns a clean disposable branch;
+    /// restore its base between ABBA takes. No real release authority is contacted.
+    pub(super) fn measure_bump_launch_to_qualify(controller: fn() -> std::time::Duration) {
+        use super::*;
+        let repo = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let git = GitCli::new(&repo);
+        let branch = crate::ledger::git_ok(&git, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap();
+        assert!(branch.stdout_utf8().trim().starts_with("freeze-fixture-"));
+        let base = crate::ledger::git_ok(&git, &["rev-parse", "HEAD"])
+            .unwrap()
+            .stdout_utf8()
+            .trim()
+            .to_owned();
+        crate::release_tools::clean_at(&repo, &base).unwrap();
+        let mode = std::env::var("ATERM_RELEASE_LAUNCH_SAMPLE").expect("before or after");
+        assert!(mode == "before" || mode == "after" || mode == "prepare");
+        let state = PathBuf::from(
+            std::env::var_os("ATERM_RELEASE_FREEZE_STATE").expect("private fixture state"),
+        );
+        assert!(state.is_absolute());
+        let editor =
+            PathBuf::from(std::env::var_os("ATERM_RELEASE_BUMP_EDITOR").expect("pub-bump-edit"));
+        assert!(editor.is_absolute());
+        let preparation_start = std::time::Instant::now();
+        let preparation_timing = crate::cut_timing::Timer::new("launch-fixture-preparation");
+        let mut real = Real::new(&repo, Some(&repo), false, false).unwrap();
+        real.state = state.join("seal");
+        real.logs = state.join(format!("logs-{mode}-{}", std::process::id()));
+        real.release = state.join(if mode == "prepare" { "after" } else { &mode });
+        std::fs::create_dir_all(&real.logs).unwrap();
+        if mode == "prepare" {
+            #[cfg(unix)]
+            prepare_cutter(&mut real, &base).unwrap();
+            return;
+        }
+        let prover = real.prover(None).unwrap();
+        let freeze = |real: &Real, commit: &str| real.frozen_cutter(commit, &prover).unwrap();
+        if mode == "after" {
+            // A separate process runs the actual Background preparation, then exits.
+            // The measured cut retains its default QoS and inherits no resource cover.
+            // Libtest has no tether entry; this opt-in instrument owns and waits for
+            // its setsid child rather than detaching it.
+            let mut cmd = command(std::env::current_exe().unwrap());
+            cmd.args(std::env::args_os().skip(1))
+                .env("ATERM_RELEASE_LAUNCH_SAMPLE", "prepare");
+            #[cfg(unix)]
+            cmd.setsid(true).default_signals();
+            assert!(cmd.spawn().unwrap().wait().unwrap().success());
+        }
+        let preparation_s = preparation_start.elapsed().as_secs_f64();
+        drop(preparation_timing);
+        let start = std::time::Instant::now();
+        let _launch_timing = crate::cut_timing::Timer::new("launch-fixture-cut");
+        freeze(&real, &base);
+        let version = real.version_at("HEAD").unwrap();
+        let parts: Vec<u64> = version.split('.').map(|s| s.parse().unwrap()).collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[2], 0);
+        let next = format!("{}.{}.0", parts[0], parts[1] + 1);
+        let mut edit = real.child(&editor, None);
+        edit.arg(&repo).args([&next, &version]);
+        assert_eq!(real.logged(Step::Commit, &mut edit).code, 0);
+        let bump_start = std::time::Instant::now();
+        let lock_timing = crate::cut_timing::Timer::new("launch-fixture-lockfiles");
+        if mode == "before" {
+            let mut lock = real.child(prover.bin.join("targo"), Some(&prover));
+            lock.args(["update", "--workspace", "--offline", "-q"]);
+            assert_eq!(real.logged(Step::Commit, &mut lock).code, 0);
+            bump_nested_locks(
+                &repo,
+                real.git_paths(&["ls-files", "-z", "--", "*/Cargo.lock"]),
+                &version,
+                &next,
+            )
+            .unwrap();
+        } else {
+            let changed = bump_nested_locks(
+                &repo,
+                real.git_paths(&["ls-files", "-z", "--", "Cargo.lock", "*/Cargo.lock"]),
+                &version,
+                &next,
+            )
+            .unwrap();
+            real.validate_bumped_locks(&prover, &changed).unwrap();
+        }
+        let locks_s = bump_start.elapsed().as_secs_f64();
+        drop(lock_timing);
+        crate::ledger::git_ok(
+            &git,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qam",
+                "Fixture runtime identity bump",
+            ],
+        )
+        .unwrap();
+        let bumped = real.head();
+        assert_ne!(bumped, base);
+        let cutter = freeze(&real, &bumped);
+        if mode == "after" {
+            assert!(
+                cutter.inputs.is_some(),
+                "the fixture needs complete graph evidence"
+            );
+            assert_ne!(
+                cutter.built_from, bumped,
+                "the bump must adopt, not stage a new proof"
+            );
+        }
+        // This is the real seal work formerly done by step 1. The authority seam below
+        // models controller checks; its wall time is explicitly not service latency.
+        real.seal_inputs().unwrap();
+        let controller = controller();
+        println!(
+            "release-event: {}",
+            aterm_json::json!({
+                "schema":1,"event":"launch-fixture-to-qualify","sample":mode,
+                "execution_s": start.elapsed().as_secs_f64(),
+                "preparation_s": preparation_s,"locks_s":locks_s,
+                "controller_s": controller.as_secs_f64(),"authority":"offline-test-seam",
+                "base":base,"commit":bumped,"built_from":cutter.built_from,"inputs":cutter.inputs,
+            })
+        );
+        let log = std::fs::read_to_string(real.step_log(real.step)).unwrap();
+        for line in log.lines().filter(|line| {
+            line.starts_with("release-event: ") || line.starts_with("cutter adoption unavailable:")
+        }) {
             println!("{line}");
         }
     }
@@ -10096,6 +10552,13 @@ mod tests {
             publish.get_args().any(|a| a == "--skip-site"),
             "the site follows the cut, not the promote"
         );
+        let args: Vec<_> = publish.get_args().collect();
+        assert!(args.windows(2).any(|pair| {
+            pair == [
+                "--release-remote",
+                "https://github.com/alabsystems/aterm.git",
+            ]
+        }));
         let envs: Vec<_> = publish.get_envs().collect();
         assert!(envs.contains(&engine), "{envs:?}");
         assert!(
@@ -11539,6 +12002,7 @@ not json
     /// registry crate that happens to share the old version where it was.
     #[test]
     fn a_nested_lock_follows_the_bump_in_its_path_crates_only() {
+        use super::lock_follows_bump;
         let lock = "version = 4\n\n[[package]]\nname = \"aterm-font\"\nversion = \"0.147.0\"\n\
                     dependencies = [\n \"aterm-hash\",\n]\n\n[[package]]\nname = \"lookalike\"\n\
                     version = \"0.147.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
@@ -11564,6 +12028,13 @@ not json
         assert_eq!(
             lock_follows_bump(crlf, "0.147.0", "0.148.0").as_deref(),
             Some("[[package]]\r\nname = \"aterm-uds\"\r\nversion = \"0.148.0\"\r\n")
+        );
+        let ambiguous = "[[package]]\nname = \"leaf\"\nversion = \"0.147.0\"\n\n[[package]]\nname = \"user\"\nversion = \"0.0.0\"\ndependencies = [\n \"leaf 0.147.0\",\n \"leaf 0.147.0 (registry+https://example.invalid/index)\",\n]\n";
+        assert_eq!(
+            lock_follows_bump(ambiguous, "0.147.0", "0.148.0").unwrap(),
+            ambiguous
+                .replacen("version = \"0.147.0\"", "version = \"0.148.0\"", 1)
+                .replacen("\"leaf 0.147.0\"", "\"leaf 0.148.0\"", 1)
         );
     }
 }

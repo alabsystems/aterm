@@ -3932,6 +3932,13 @@ fn pane_and_tab_owner_switches_retire_only_coordinate_bound_companions() {
     );
 }
 
+/// A screen-buffer switch of the same terminal (a TUI's first screen, its exit) keeps the
+/// resident's body on glass, the glass and grid it is drawn on (r29 K10-1/K10-2: it travels to
+/// the new screen's caret), and retires only what the old screen owned: the hit target, the
+/// flying head's flight and fold, the completion latch. The species, the song and its notes
+/// survive. NEGATIVE CONTROL: the switch crossfaded as a surface replaced
+/// (`OldPath::OtherScreenKeepsTheBody` reverted) is the model's Buggy=1 switch, dark at the
+/// boundary.
 #[test]
 fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and_song() {
     let mut app = App::headless_for_test();
@@ -3971,10 +3978,20 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
         ws.fx.companions_mut().sing_riff_bar = Some(7);
     }
 
-    for (sequence, expected_alt) in [
-        (b"\x1b[?1049h\x1b[20;70H".as_slice(), true),
-        (b"\x1b[?1049l".as_slice(), false),
+    for (sequence, expected_alt, reverted) in [
+        (b"\x1b[?1049h\x1b[20;70H".as_slice(), true, false),
+        (b"\x1b[?1049l".as_slice(), false, false),
+        (b"\x1b[?1049h\x1b[20;70H".as_slice(), true, true),
     ] {
+        app.windows
+            .get_mut(&wid)
+            .expect("test window")
+            .fx
+            .companion_mut()
+            .set_pet_old_path(
+                aterm_effects::kitty_pet::OldPath::OtherScreenKeepsTheBody,
+                reverted,
+            );
         materialize_resident_pet(&mut app, wid, now);
         earn_flying_cursor_cat(&mut app, wid, now);
         {
@@ -4018,6 +4035,16 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
         ));
 
         let retired = project_cursor_companion_owner_lifecycle(&model, &app, wid, 7);
+        if reverted {
+            assert_eq!(
+                aterm_spec::interp::with_buggy(&model, 1)
+                    .successors("ScreenBufferSwitch", &materialized),
+                vec![retired.clone()],
+                "negative control: the crossfaded switch is the Buggy=1 switch"
+            );
+            assert!(!model.check_invariant("ScreenSwitchKeepsTheBody", &retired));
+            continue;
+        }
         assert_cursor_companion_owner_transition(
             &model,
             "ScreenBufferSwitch",
@@ -4026,7 +4053,8 @@ fn screen_buffer_switches_retire_coordinates_and_preserve_companion_identity_and
         );
         let ws = &app.windows[&wid];
         assert!(
-            !ws.fx.companion().brain().is_active() && !ws.fx.companion().brain().needs_frames()
+            ws.fx.companion().brain().is_active(),
+            "the body stays on glass across the switch"
         );
         assert_eq!(
             ws.fx.companion().brain().species(),

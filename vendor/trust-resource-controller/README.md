@@ -1,5 +1,13 @@
 # Native resource member controller
 
+The Bootstrap graph codec/client is an engineering overlay from Trust commit
+`14b8b87ef8fcb6b6f246ac080ce8f054e89bec75`, based on published commit
+`5d40370f4cf13387956ae26456ea9e2eec514ecb`. It adds bounded support,
+enrollment, output attachment and SDK query exchanges. These data exchanges
+do not enable Bootstrap execution: the original Host resource, SDK, output
+and graph closure owners still require integration and qualification. Existing
+consumer observation-deadline and fixture-deadline overlays are preserved.
+
 The canonical metadata implementation was recovered from the maintained aterm
 source at `77bd657741` after its advertised vendor commits could not be resolved
 through the Trust repository's commit API. Metadata request role `3` and the

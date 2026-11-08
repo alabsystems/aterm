@@ -127,14 +127,68 @@ pub(super) fn item(
     unasked: bool,
     work: RepositoryWork,
     execution: Option<Execution>,
+    withdrawal_current: Option<Box<dyn Fn() -> Result<bool, String> + Send + Sync>>,
 ) -> Box<dyn Item> {
     Box::new(NativeRepositories {
         after,
         unasked,
         work,
         execution,
+        local_current: withdrawal_current,
         ..NativeRepositories::new(user.clone(), None)
     })
+}
+
+pub(super) fn withdrawal_item(
+    user: &User,
+    withdrawal: super::RepositoryCredentialWithdrawal,
+    current: Option<Box<dyn Fn() -> Result<bool, String> + Send + Sync>>,
+) -> Box<dyn Item> {
+    Box::new(NativeRepositories {
+        local_withdrawal: Some(withdrawal),
+        local_current: current,
+        ..NativeRepositories::new(user.clone(), None)
+    })
+}
+
+pub(super) fn run_withdrawal(
+    sys: &dyn System,
+    ctx: &Ctx,
+    mode: Mode,
+    withdrawal: super::RepositoryCredentialWithdrawal,
+    current: Box<dyn Fn() -> Result<bool, String> + Send + Sync>,
+) -> Result<Vec<ItemReport>, String> {
+    let [user] = ctx.users.as_slice() else {
+        return Err("repository withdrawal requires exactly one local user".into());
+    };
+    if !withdrawal.belongs_to(user) {
+        return Err("the repository withdrawal belongs to another account".into());
+    }
+    let item = NativeRepositories {
+        local_withdrawal: Some(withdrawal),
+        local_current: Some(current),
+        ..NativeRepositories::new(user.clone(), None)
+    };
+    let bound = crate::engine::bind(
+        [(
+            &item as &dyn Item,
+            Place {
+                layer: Layer::Workstation,
+                class: Class::Install,
+                requires: Requires::Account,
+                remedy: Remedy::Command("aterm init".into()),
+            },
+        )],
+        sys,
+        ctx,
+    );
+    if mode == Mode::Apply {
+        let mut journal = sys.journal()?;
+        aterm_converge::run(&bound, mode, journal.as_mut())
+    } else {
+        aterm_converge::run(&bound, mode, &mut aterm_converge::ReadOnly)
+    }
+    .map_err(|why| why.to_string())
 }
 
 fn run_with(
@@ -147,6 +201,17 @@ fn run_with(
     let [user] = ctx.users.as_slice() else {
         return Err("initial repository setup requires exactly one local user".into());
     };
+    // Candidate observation cannot replace the ordinary Native blocker's typed report.
+    // Only a successful local withdrawal reading bypasses the paired repository stage.
+    if let Ok(Some(withdrawal)) = super::RepositoryCredentialWithdrawal::capture(sys, ctx) {
+        // Preserve the enclosing caller's independent holds even though an empty selection
+        // cannot satisfy the ordinary paired token capture.
+        let current: Box<dyn Fn() -> Result<bool, String> + Send + Sync> = match captured {
+            Some(captured) => captured.current,
+            None => Box::new(|| Ok(true)),
+        };
+        return run_withdrawal(sys, ctx, mode, withdrawal, current);
+    }
     if mode == Mode::Apply {
         // What a clone killed mid-way left (design §6.5): never a clone still running.
         repos::sweep_staging(sys, user);
@@ -208,6 +273,9 @@ struct NativeRepositories {
     selection: Mutex<Option<super::RepositorySelection>>,
     aside: Mutex<Option<StoodAside>>,
     acknowledge: Mutex<bool>,
+    withdrawal: Mutex<Option<super::RepositoryCredentialWithdrawal>>,
+    local_withdrawal: Option<super::RepositoryCredentialWithdrawal>,
+    local_current: Option<Box<dyn Fn() -> Result<bool, String> + Send + Sync>>,
 }
 
 /// What one step read for the next ([`NativeRepositories::carried`]).
@@ -582,6 +650,9 @@ impl NativeRepositories {
             selection: Mutex::new(None),
             aside: Mutex::new(None),
             acknowledge: Mutex::new(false),
+            withdrawal: Mutex::new(None),
+            local_withdrawal: None,
+            local_current: None,
         }
     }
 
@@ -641,12 +712,28 @@ impl Item for NativeRepositories {
             .acknowledge
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = false;
+        let withdrawal = self
+            .withdrawal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         // What the last apply's clones made of their hook installers: whatever this read says,
         // the switch turned off since included, its row says that too.
         let hooks = std::mem::take(&mut *self.hooks.lock().unwrap_or_else(PoisonError::into_inner));
         let read = (|| -> Probe {
             self.reading.set(None);
+            if let Some(withdrawal) = &self.local_withdrawal {
+                return self.withdrawal_probe(sys, withdrawal.clone());
+            }
+            if let Some(withdrawal) = withdrawal {
+                return self.withdrawal_probe(sys, withdrawal);
+            }
             if matches!(super::settings_managed(sys, &self.user), Ok(false)) {
+                match super::RepositoryCredentialWithdrawal::capture(sys, _ctx) {
+                    Ok(Some(withdrawal)) => return self.withdrawal_probe(sys, withdrawal),
+                    Err(why) => return Probe::Blocked { why },
+                    Ok(None) => {}
+                }
                 return Probe::NotApplicable {
                     why: "repository setup is disabled in init.toml's [github] table".into(),
                 };
@@ -664,6 +751,14 @@ impl Item for NativeRepositories {
                             return Probe::Blocked { why };
                         }
                         if selection.count() == 0 {
+                            match super::RepositoryCredentialWithdrawal::from_empty(sys, selection)
+                            {
+                                Ok(Some(withdrawal)) => {
+                                    return self.withdrawal_probe(sys, withdrawal);
+                                }
+                                Err(why) => return Probe::Blocked { why },
+                                Ok(None) => {}
+                            }
                             return Probe::NotApplicable {
                             why: "the private inventory selects no repositories; GitHub sign-in was not checked".into(),
                         };
@@ -730,6 +825,11 @@ impl Item for NativeRepositories {
                 }
             };
             let Some(lookups) = lookups else {
+                match super::RepositoryCredentialWithdrawal::capture(sys, _ctx) {
+                    Ok(Some(withdrawal)) => return self.withdrawal_probe(sys, withdrawal),
+                    Err(why) => return Probe::Blocked { why },
+                    Ok(None) => {}
+                }
                 return Probe::NotApplicable {
                     why: "the private inventory selects no repositories; GitHub sign-in was not checked"
                         .into(),
@@ -834,7 +934,9 @@ impl Item for NativeRepositories {
     }
 
     fn refresh_changes(&self, sys: &dyn System, _ctx: &Ctx) -> bool {
-        self.work == RepositoryWork::Refresh && matches!(configuration(sys, &self.user), Ok(None))
+        self.local_withdrawal.is_none()
+            && self.work == RepositoryWork::Refresh
+            && matches!(configuration(sys, &self.user), Ok(None))
     }
 
     fn apply_guarded(
@@ -844,8 +946,22 @@ impl Item for NativeRepositories {
         authorized: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<(), String> {
         authorized()?;
-        self.ensure_current(sys)?;
         *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        let withdrawal = self
+            .withdrawal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(withdrawal) = withdrawal {
+            return withdrawal.retire(sys, &|| {
+                authorized()?;
+                self.withdrawal_current()
+            });
+        }
+        if self.local_withdrawal.is_some() {
+            return Err("the local credential withdrawal was not admitted by its probe".into());
+        }
+        self.ensure_current(sys)?;
         let selection = self
             .selection
             .lock()
@@ -923,6 +1039,49 @@ impl Item for NativeRepositories {
 }
 
 impl NativeRepositories {
+    fn withdrawal_current(&self) -> Result<(), String> {
+        if let Some(current) = &self.local_current
+            && !current()?
+        {
+            return Err(
+                "repository credential withdrawal is held by the current setup choices".into(),
+            );
+        }
+        if let Some(captured) = &self.captured
+            && !(captured.current)()?
+        {
+            return Err("the captured repository source no longer admits local withdrawal".into());
+        }
+        Ok(())
+    }
+
+    fn withdrawal_probe(
+        &self,
+        sys: &dyn System,
+        withdrawal: super::RepositoryCredentialWithdrawal,
+    ) -> Probe {
+        let pending = self
+            .withdrawal_current()
+            .and_then(|()| withdrawal.pending(sys));
+        match pending {
+            Ok(true) => {
+                *self
+                    .withdrawal
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(withdrawal);
+                Probe::Change {
+                    from: "the default repository credential request is no longer needed".into(),
+                    to: "retire the request without checking GitHub sign-in".into(),
+                }
+            }
+            Ok(false) => Probe::Ok {
+                now: "no repository credential request remains to retire; GitHub sign-in was not checked"
+                    .into(),
+            },
+            Err(why) => Probe::Blocked { why },
+        }
+    }
+
     fn acknowledge_credential(
         &self,
         sys: &dyn System,
@@ -1692,10 +1851,11 @@ pub(super) mod tests {
             .stat_of(child.join(".git").to_str().unwrap(), stat(false, 0o600));
         required_repository(&sys, &item.user, "parent", &["vendor/library"]);
         existing(&sys, &item.user, &child, "library", PIN);
+        // The Command Line Tools' git is one before 2.44 that ignores GIT_NO_LAZY_FETCH.
         sys.simulate(|_, command| {
-            (command.program == Path::new(crate::items::github::CLT_GIT)
-                && command.args.iter().any(|arg| arg == "--no-lazy-fetch"))
-            .then(|| Ran::exit(129, "unknown option: --no-lazy-fetch"))
+            (command.program == Path::new(crate::items::github::CLT_GIT))
+                .then(|| crate::init_github::git_before_no_lazy_fetch(command, false))
+                .flatten()
         });
         let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         let pending = run(&sys, &ctx, Mode::Apply).unwrap();
@@ -2536,6 +2696,72 @@ pub(super) mod tests {
                 .is_err(),
             "old selection cannot request for a new inventory"
         );
+        let ledger_file = cold.paths.dir.join(aterm_secrets::need::LEDGER);
+        let pending_bytes = std::fs::read(&ledger_file).unwrap();
+        assert!(matches!(
+            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+            OwedClone::Due(_)
+        ));
+        let mut stopped = Holds::NONE;
+        stopped.stopped = Some("you stopped setup in System State".into());
+        assert!(matches!(
+            crate::init::owed_clone(&cold.sys, debt.path(), &stopped).unwrap(),
+            OwedClone::Waiting(_) | OwedClone::Held(_)
+        ));
+        run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Plan,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&ledger_file).unwrap(), pending_bytes);
+        let withdrawal =
+            super::super::RepositoryCredentialWithdrawal::capture(&cold.sys, &cold.ctx)
+                .unwrap()
+                .unwrap();
+        let withheld = run_withdrawal(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Apply,
+            withdrawal.clone(),
+            Box::new(|| Ok(false)),
+        )
+        .unwrap();
+        assert_eq!(stage(&withheld).outcome, crate::model::Outcome::Blocked);
+        assert_eq!(std::fs::read(&ledger_file).unwrap(), pending_bytes);
+        let local = NativeRepositories {
+            local_withdrawal: Some(withdrawal),
+            ..NativeRepositories::new(cold.who.clone(), None)
+        };
+        assert!(matches!(
+            local.probe(&cold.sys, &cold.ctx),
+            Probe::Change { .. }
+        ));
+        assert!(
+            local
+                .apply_guarded(&cold.sys, &cold.ctx, &|| Err("late Stop".into()))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&ledger_file).unwrap(), pending_bytes);
+        aterm_uds::atomic_file::write(&cold.source, inventory_only.as_bytes(), 0o600).unwrap();
+        client::sync(&cold.paths, None).unwrap();
+        metadata(
+            &cold.sys,
+            &cold.who,
+            aterm_json::json!([repository("alice", "parent", 1)]),
+        );
+        assert!(
+            local
+                .apply_guarded(&cold.sys, &cold.ctx, &|| Ok(()))
+                .is_err(),
+            "an empty selection cannot retire intent after the inventory becomes nonempty"
+        );
+        assert_eq!(std::fs::read(&ledger_file).unwrap(), pending_bytes);
+        aterm_uds::atomic_file::write(&cold.source, empty_only.as_bytes(), 0o600).unwrap();
+        client::sync(&cold.paths, None).unwrap();
+        metadata(&cold.sys, &cold.who, aterm_json::json!([]));
         let empty_rows = run_with(
             &cold.sys,
             &cold.ctx,
@@ -2546,7 +2772,8 @@ pub(super) mod tests {
         .unwrap();
         assert_eq!(
             stage(&empty_rows).outcome,
-            crate::model::Outcome::NotApplicable
+            crate::model::Outcome::Changed,
+            "{empty_rows:?}"
         );
         assert!(matches!(
             crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
@@ -2554,11 +2781,184 @@ pub(super) mod tests {
         ));
         let after_empty = aterm_secrets::need::peek(&cold.paths).unwrap();
         assert_eq!(after_empty[0].id, rearmed_id);
-        assert_ne!(
-            after_empty[0].state,
-            aterm_secrets::need::State::Fulfilled,
-            "empty work is no credential-consumer success"
+        assert_eq!(after_empty[0].state, aterm_secrets::need::State::Retired);
+        assert_eq!(
+            after_empty[0].retired.as_ref().unwrap().reason,
+            aterm_secrets::need::Reason::NotNeeded
         );
+        // Re-enabling the same nonempty intent raises a fresh request. Unknown inventory
+        // cannot withdraw it; explicit opt-out can, without a credential or native command.
+        aterm_uds::atomic_file::write(&cold.source, inventory_only.as_bytes(), 0o600).unwrap();
+        client::sync(&cold.paths, None).unwrap();
+        metadata(
+            &cold.sys,
+            &cold.who,
+            aterm_json::json!([repository("alice", "parent", 1)]),
+        );
+        run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        let reenabled = aterm_secrets::need::peek(&cold.paths).unwrap().remove(0);
+        assert_ne!(reenabled.id, rearmed_id);
+        assert!(!reenabled.state.ended());
+        let reenabled_bytes = std::fs::read(&ledger_file).unwrap();
+        let inventory_file = super::super::inventory::file(&cold.who.home);
+        cold.sys
+            .file(inventory_file.to_str().unwrap(), b"not-json")
+            .stat_of(
+                inventory_file.to_str().unwrap(),
+                Stat {
+                    len: 8,
+                    ..stat(false, 0o600)
+                },
+            );
+        assert!(
+            super::super::RepositoryCredentialWithdrawal::capture(&cold.sys, &cold.ctx).is_err()
+        );
+        let unknown_rows = run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Plan,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(stage(&unknown_rows).outcome, crate::model::Outcome::Blocked);
+        assert!(
+            super::super::items_for_execution(
+                &cold.sys,
+                &cold.ctx,
+                None,
+                RepositoryWork::Repair,
+                None
+            )
+            .is_ok(),
+            "unknown cleanup intent must not abort construction of other setup groups"
+        );
+        assert_eq!(std::fs::read(&ledger_file).unwrap(), reenabled_bytes);
+        metadata(
+            &cold.sys,
+            &cold.who,
+            aterm_json::json!([repository("alice", "parent", 1)]),
+        );
+        let allow_withdrawal = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let allowed = Arc::clone(&allow_withdrawal);
+        let guarded_items = super::super::items_for_execution_with_withdrawal_guard(
+            &cold.sys,
+            &cold.ctx,
+            None,
+            RepositoryWork::Repair,
+            None,
+            Some(Box::new(move || {
+                Ok(allowed.load(std::sync::atomic::Ordering::SeqCst))
+            })),
+        )
+        .unwrap();
+        let guarded_native = guarded_items
+            .iter()
+            .find(|item| item.id().starts_with("init.github.native@"))
+            .unwrap();
+        let profile = Path::new(&cold.who.home).join(".config/aterm/init.toml");
+        let disabled = b"[github]\nenabled=false\n";
+        cold.sys.file(profile.to_str().unwrap(), disabled).stat_of(
+            profile.to_str().unwrap(),
+            Stat {
+                len: disabled.len() as u64,
+                ..stat(false, 0o600)
+            },
+        );
+        assert!(matches!(
+            guarded_native.probe(&cold.sys, &cold.ctx),
+            Probe::Change { .. }
+        ));
+        allow_withdrawal.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            guarded_native
+                .apply_guarded(&cold.sys, &cold.ctx, &|| Ok(()))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&ledger_file).unwrap(), reenabled_bytes);
+        let rows = run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Plan,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "local withdrawal does not add a keychain stage"
+        );
+        assert_eq!(std::fs::read(&ledger_file).unwrap(), reenabled_bytes);
+        let changed_choice = NativeRepositories::new(cold.who.clone(), None);
+        assert!(matches!(
+            changed_choice.probe(&cold.sys, &cold.ctx),
+            Probe::Change { .. }
+        ));
+        cold.sys.remove(&profile).unwrap();
+        assert!(
+            changed_choice
+                .apply_guarded(&cold.sys, &cold.ctx, &|| Ok(()))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&ledger_file).unwrap(), reenabled_bytes);
+        cold.sys.file(profile.to_str().unwrap(), disabled).stat_of(
+            profile.to_str().unwrap(),
+            Stat {
+                len: disabled.len() as u64,
+                ..stat(false, 0o600)
+            },
+        );
+        let off_rows = run_with(
+            &cold.sys,
+            &cold.ctx,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            None,
+        )
+        .unwrap();
+        assert_eq!(off_rows.len(), 1);
+        assert_eq!(stage(&off_rows).outcome, crate::model::Outcome::Changed);
+        assert!(matches!(
+            changed_choice.probe(&cold.sys, &cold.ctx),
+            Probe::Ok { .. }
+        ));
+        let withdrawn = aterm_secrets::need::peek(&cold.paths).unwrap().remove(0);
+        assert_eq!(withdrawn.id, reenabled.id);
+        assert_eq!(withdrawn.state, aterm_secrets::need::State::Retired);
+        assert_eq!(
+            withdrawn.retired.as_ref().unwrap().reason,
+            aterm_secrets::need::Reason::NotNeeded
+        );
+        let config_file = cold.paths.dir.join("source.toml");
+        let config_bytes = std::fs::read(&config_file).unwrap();
+        aterm_uds::atomic_file::write(&config_file, b"not toml [", 0o600).unwrap();
+        assert!(client::config(&cold.paths).is_err());
+        assert!(
+            super::super::items_for_execution(
+                &cold.sys,
+                &cold.ctx,
+                None,
+                RepositoryWork::Repair,
+                None
+            )
+            .unwrap()
+            .is_empty(),
+            "disabled setup without an active request needs no vault-source admission"
+        );
+        aterm_uds::atomic_file::write(&config_file, &config_bytes, 0o600).unwrap();
+        cold.sys.remove(&profile).unwrap();
+        assert!(matches!(
+            crate::init::owed_clone(&cold.sys, debt.path(), &Holds::NONE).unwrap(),
+            OwedClone::Waiting(_)
+        ));
 
         // The plain-file fixture has no release policy by default; a credential intent
         // records the existing policy refusal rather than claiming automatic delivery.
@@ -6813,7 +7213,9 @@ pub(super) mod tests {
     fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
         let (sys, bare) = bare();
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&bare.user));
-        match item(&bare.user, None, true, RepositoryWork::Refresh, None).probe(&sys, &context) {
+        match item(&bare.user, None, true, RepositoryWork::Refresh, None, None)
+            .probe(&sys, &context)
+        {
             Probe::NotApplicable { why } => {
                 assert!(why.contains("~/.secrets/gh_access_token"), "{why}");
                 assert!(why.contains("on this Mac yet"), "{why}");
@@ -6835,20 +7237,25 @@ pub(super) mod tests {
             aterm_json::json!([repository("alice", "ready", 1)]),
         );
         assert!(matches!(
-            item(&bare.user, None, false, RepositoryWork::Refresh, None).probe(&sys, &context),
+            item(&bare.user, None, false, RepositoryWork::Refresh, None, None)
+                .probe(&sys, &context),
             Probe::Blocked { .. }
         ));
         // On Linux the row names the machine, not a Mac.
         let (mut linux, _) = self::bare();
         linux.linux = true;
-        match item(&bare.user, None, true, RepositoryWork::Refresh, None).probe(&linux, &context) {
+        match item(&bare.user, None, true, RepositoryWork::Refresh, None, None)
+            .probe(&linux, &context)
+        {
             Probe::NotApplicable { why } => assert!(why.contains("on this machine yet"), "{why}"),
             other => panic!("{other:?}"),
         }
         // So does an init.toml `[github]` account's step, whose token file is not there yet
         // (with the distribution's git there, so the step reaches the token).
         linux.executable(crate::items::github::SYSTEM_GIT, b"synthetic git");
-        match item(&bare.user, None, false, RepositoryWork::Refresh, None).probe(&linux, &context) {
+        match item(&bare.user, None, false, RepositoryWork::Refresh, None, None)
+            .probe(&linux, &context)
+        {
             Probe::Person { how, .. } => {
                 assert!(how.contains("is not on this machine yet"), "{how}");
             }

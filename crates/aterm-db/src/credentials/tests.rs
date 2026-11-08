@@ -1354,6 +1354,92 @@ fn a_request_reaches_the_custodian_and_the_vault_gives_it_to_the_requester_alone
         .unwrap()
         .unwrap();
     assert_eq!(accepted.state, State::Fulfilled);
+
+    // Reuse the first real two-writer world for the repository consumer's protocol. An
+    // unrelated signed publication may retry the same value; delivery cannot accept it.
+    let source = &lab.paths[0];
+    let recipient = &lab.paths[1];
+    let admin = client::admin_open(source).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(
+        &Audience::Everyone,
+        "gh_access_token",
+        b"fixture-development-value",
+    )
+    .unwrap();
+    client::admin_publish(source, &admin, &doc).unwrap();
+    for paths in &lab.paths {
+        client::sync(paths, None).unwrap();
+    }
+    let paired_gh = || {
+        let config = client::config(recipient).unwrap().unwrap();
+        client::with_materialization_ready_for_entries(
+            recipient,
+            &config,
+            &["gh_access_token"],
+            || Ok(()),
+        )
+        .unwrap()
+        .unwrap()
+        .snapshot
+    };
+    let want = Want::Gh(need::GhProfile::Dev);
+    let purpose = Purpose::AghDev;
+    let refused = need::raise_refused_from_snapshot(
+        recipient,
+        want.clone(),
+        purpose,
+        &paired_gh(),
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(refused.state, State::Local);
+    assert_eq!(pass_at(recipient, now).unwrap().posted, 1);
+    let posted = need::peek(recipient)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == refused.id)
+        .unwrap();
+    assert_eq!(posted.state, State::Open);
+    assert!(posted.posted && posted.record.is_some());
+    repair_commons(&lab, 3);
+    let admin = client::admin_open(source).unwrap();
+    let mut doc = admin.doc.clone();
+    doc.set_entry(&Audience::Everyone, "retry-marker", b"later")
+        .unwrap();
+    client::admin_publish(source, &admin, &doc).unwrap();
+    for paths in &lab.paths {
+        client::sync(paths, None).unwrap();
+    }
+    let copied = custodian_pass_at(source, now).unwrap().unwrap();
+    let key = request_key(&observe(recipient).unwrap().observer, &refused.id);
+    assert!(
+        copied.published.iter().any(|(id, _)| *id == key),
+        "{copied:?}"
+    );
+    repair_commons(&lab, 3);
+    assert!(pass_at(recipient, now).unwrap().decided > 0);
+    let delivered = need::list(recipient)
+        .unwrap()
+        .into_iter()
+        .find(|row| row.id == refused.id)
+        .unwrap();
+    assert_eq!(
+        delivered.state,
+        State::Published,
+        "an actual attested delivery cannot replace the AghDev consumer's check"
+    );
+    assert!(delivered.got && delivered.refused.is_some());
+    assert_eq!(
+        std::fs::read(recipient.home.join(".secrets/gh_access_token")).unwrap(),
+        b"fixture-development-value"
+    );
+    // This is the abstract ledger consumer boundary, not a GitHub authentication claim.
+    // The existing Native fixture separately exercises actual parsed 200/401/Unknown.
+    let accepted = need::acknowledge_from_snapshot(recipient, &delivered, &paired_gh(), || Ok(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(accepted.state, State::Fulfilled);
 }
 
 /// A requester posts at most 16 live requests, the most the table counts from one Mac; a 17th

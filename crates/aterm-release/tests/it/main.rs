@@ -69,6 +69,9 @@ mod cut_timing;
 #[path = "../../src/cutter.rs"]
 #[allow(dead_code)]
 mod cutter;
+#[path = "../../src/cutter_inputs.rs"]
+#[allow(dead_code)]
+mod cutter_inputs;
 #[path = "../../src/dev_app.rs"]
 #[allow(dead_code)]
 mod dev_app;

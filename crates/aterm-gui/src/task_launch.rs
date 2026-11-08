@@ -46,12 +46,10 @@ const FIRST_PROMPT_LOOK: Duration = Duration::from_secs(1);
 /// between its ticks.
 pub(crate) const PROMPT_SETTLE: Duration = Duration::from_millis(250);
 
-/// How long a fish's `--version` is waited for ([`fish_says`]). A unit test's fish is its own
-/// stand-in, which answers, so there it is the hang detector.
-#[cfg(not(test))]
-const VERSION_WAIT: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const VERSION_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// Bound for the optional background version observation.
+const VERSION_OBSERVE_WAIT: Duration = Duration::from_secs(5);
+/// Hang detector for the version answer required to launch a fish worker.
+const VERSION_HANG: Duration = Duration::from_secs(60);
 
 fn no_frame(form: &str) -> String {
     format!(
@@ -2819,7 +2817,7 @@ enum FishSaid {
     /// It named its version: whether that takes `$(…)`.
     Version(bool),
     /// It named none (it did not start, did not answer within
-    /// [`VERSION_WAIT`], or said something else): not known to be old.
+    /// the observation bound, or said something else): not known to be old.
     Nothing,
 }
 
@@ -2862,7 +2860,11 @@ pub(crate) fn fish_known_old(shell: &Path) -> bool {
     let started = std::thread::Builder::new()
         .name("aterm-fish-version".to_string())
         .spawn(move || {
-            let said = fish_says(&asked.0);
+            let said = fish_says_until(
+                &asked.0,
+                Instant::now() + VERSION_OBSERVE_WAIT,
+                aterm_uds::deadline::output_until_complete_stdout,
+            );
             remember_fish(asked, said);
         });
     if started.is_err() {
@@ -2907,11 +2909,38 @@ fn fish_answer(shell: &Path) -> bool {
 }
 
 fn fish_says(shell: &Path) -> FishSaid {
+    fish_says_started(
+        shell,
+        Instant::now(),
+        aterm_uds::deadline::output_until_complete_stdout,
+    )
+}
+
+fn fish_says_started(
+    shell: &Path,
+    started: Instant,
+    run: impl FnOnce(
+        &mut aterm_uds::spawnfd::Command,
+        Instant,
+    ) -> Result<std::process::Output, aterm_uds::deadline::CompleteOutputError>,
+) -> FishSaid {
+    fish_says_until(shell, started + VERSION_HANG, run)
+}
+
+fn fish_says_until(
+    shell: &Path,
+    deadline: Instant,
+    run: impl FnOnce(
+        &mut aterm_uds::spawnfd::Command,
+        Instant,
+    ) -> Result<std::process::Output, aterm_uds::deadline::CompleteOutputError>,
+) -> FishSaid {
+    if Instant::now() >= deadline {
+        return FishSaid::Nothing;
+    }
     let mut cmd = aterm_uds::spawnfd::command(shell);
     cmd.arg("--version");
-    let Ok(output) =
-        aterm_uds::deadline::output_until_complete_stdout(&mut cmd, Instant::now() + VERSION_WAIT)
-    else {
+    let Ok(output) = run(&mut cmd, deadline) else {
         return FishSaid::Nothing;
     };
     if output.stdout.len() > 4096 {

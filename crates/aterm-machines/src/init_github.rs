@@ -31,7 +31,7 @@ pub use checkout_inputs::RepositoryCheckoutMetadata;
 pub use credentials::{sync_vault_git_credentials, vault_git_credentials};
 pub use native::InitialRepositoryInputs;
 pub(crate) use native::{automatic_inventory_counts, automatic_inventory_counts_captured};
-pub use selection::RepositorySelection;
+pub use selection::{RepositoryCredentialWithdrawal, RepositorySelection};
 pub use source::{
     RepositoryControlPaths, RepositoryInputMark, RepositoryInputPathCache, RepositoryRefreshCursor,
     repository_checkout_watch_paths, repository_input_control_watch_paths, repository_input_mark,
@@ -50,16 +50,24 @@ pub fn git_installed(sys: &dyn System) -> bool {
     repos::git_installed(sys)
 }
 
+/// A test double's git before 2.44 answering [`git_ready_for_inventory`]'s capability question:
+/// it refuses `--no-lazy-fetch`, and its read shows whether it `obeys` `GIT_NO_LAZY_FETCH`
+/// ([`crate::checkout::lazy_fetch::before_the_option`]).
+#[cfg(any(test, debug_assertions))]
+pub use crate::checkout::lazy_fetch::before_the_option as git_before_no_lazy_fetch;
+
 /// Whether the selected private inventory's Git requirements are met. Unlike the
 /// metadata-only [`git_installed`], this may ask the selected executable whether
-/// it supports safe local object reads when required dependencies need them.
+/// it supports safe local object reads when required dependencies need them
+/// ([`crate::checkout::NoLazyFetch::of`]: `--no-lazy-fetch`, or `GIT_NO_LAZY_FETCH` it was
+/// seen to obey, in a scratch folder of its own).
 /// Call outside the materialization lock, with source admission checked again
 /// before using the result. This reading grants no package or credential authority.
 ///
 /// # Errors
 /// The current account, default profile or private inventory cannot be admitted,
-/// or the capability probe cannot run. Missing or insufficient Git returns false when the
-/// selected inventory needs it.
+/// or the capability probe cannot run or be set up. Missing or insufficient Git returns false
+/// when the selected inventory needs it.
 pub fn git_ready_for_inventory(sys: &dyn System, ctx: &Ctx) -> Result<bool, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("repository Git requires exactly one local user".into());
@@ -84,7 +92,7 @@ pub fn git_ready_for_inventory(sys: &dyn System, ctx: &Ctx) -> Result<bool, Stri
     {
         return Ok(true);
     }
-    dependencies::supports_local_reads(sys, user)
+    crate::checkout::NoLazyFetch::of(sys, user).map(|off| off.is_some())
 }
 
 /// Whether repository setup uses the private vault inventory rather than an explicit profile.
@@ -167,6 +175,20 @@ pub fn run_initial_repositories(
     mode: crate::model::Mode,
 ) -> Result<Vec<crate::model::ItemReport>, String> {
     native::run(sys, ctx, mode)
+}
+
+/// Retire only a captured local repository credential intent. No helper, Git or keychain
+/// stage is admitted. The caller must freshly recheck its Stop and repository holds.
+/// # Errors
+/// The captured choice, account, inventory, caller authority or request changed.
+pub fn run_repository_credential_withdrawal(
+    sys: &dyn System,
+    ctx: &Ctx,
+    mode: crate::model::Mode,
+    withdrawal: RepositoryCredentialWithdrawal,
+    current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
+) -> Result<Vec<crate::model::ItemReport>, String> {
+    native::run_withdrawal(sys, ctx, mode, withdrawal, Box::new(current))
 }
 
 const INPUT_MAX: usize = 64 * 1024;
@@ -332,22 +354,71 @@ pub(crate) fn items_for_execution(
     work: aterm_secrets::converge::RepositoryWork,
     execution: Option<crate::sync::repository_refresh::Execution>,
 ) -> Result<Vec<Box<dyn Item>>, String> {
+    items_for_execution_with_withdrawal_guard(sys, ctx, secrets, work, execution, None)
+}
+
+pub(crate) fn items_for_execution_with_withdrawal_guard(
+    sys: &dyn System,
+    ctx: &Ctx,
+    secrets: Option<&str>,
+    work: aterm_secrets::converge::RepositoryWork,
+    execution: Option<crate::sync::repository_refresh::Execution>,
+    withdrawal_current: Option<Box<dyn Fn() -> Result<bool, String> + Send + Sync>>,
+) -> Result<Vec<Box<dyn Item>>, String> {
     let [user] = ctx.users.as_slice() else {
         return Err("aterm init GitHub requires exactly one local user".into());
     };
+    let withdrawal = RepositoryCredentialWithdrawal::capture(sys, ctx);
+    let withdrawal_unread = withdrawal.is_err();
+    if let Ok(Some(withdrawal)) = withdrawal {
+        return Ok(vec![native::withdrawal_item(
+            user,
+            withdrawal,
+            withdrawal_current,
+        )]);
+    }
     let profile = profile(sys, user)?.unwrap_or_default();
     let config = match asked(profile.github, user)? {
-        Asked::Off => return Ok(Vec::new()),
+        Asked::Off => {
+            // A failed cleanup observation is a Native blocker, not a failure to build
+            // every other setup group and not permission to retire an unknown intent.
+            return Ok(if withdrawal_unread {
+                vec![native::item(
+                    user,
+                    secrets.map(str::to_owned),
+                    false,
+                    work,
+                    execution,
+                    withdrawal_current,
+                )]
+            } else {
+                Vec::new()
+            });
+        }
         Asked::Default => {
             return Ok(vec![
                 keychain::item(user),
-                native::item(user, secrets.map(str::to_owned), true, work, execution),
+                native::item(
+                    user,
+                    secrets.map(str::to_owned),
+                    true,
+                    work,
+                    execution,
+                    withdrawal_current,
+                ),
             ]);
         }
         Asked::Scoped(_) => {
             return Ok(vec![
                 keychain::item(user),
-                native::item(user, secrets.map(str::to_owned), false, work, execution),
+                native::item(
+                    user,
+                    secrets.map(str::to_owned),
+                    false,
+                    work,
+                    execution,
+                    withdrawal_current,
+                ),
             ]);
         }
         Asked::Profile(config) => config,

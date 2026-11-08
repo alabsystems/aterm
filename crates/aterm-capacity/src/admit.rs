@@ -2313,6 +2313,27 @@ impl Claim {
         Ok(())
     }
 
+    #[cfg(unix)]
+    pub(crate) fn prepare_gnu_epoch(
+        &mut self,
+        epoch: &crate::retained_gnu::Epoch,
+    ) -> io::Result<()> {
+        self.laid.prepare_gnu_epoch(epoch)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn check_gnu_scope_drained(&mut self) -> io::Result<()> {
+        self.laid.check_gnu_scope_drained()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn retire_gnu_epoch(
+        &mut self,
+        epoch: &crate::retained_gnu::Epoch,
+    ) -> io::Result<()> {
+        self.laid.retire_gnu_epoch(epoch)
+    }
+
     /// Whether this actual captured token is the durably bound observation. This supplies no
     /// new spawn or signalling authority and does not infer drain from a reused holder pid.
     #[cfg(unix)]
