@@ -8922,7 +8922,7 @@ fn complete_theme_choice(app: &mut App) -> crate::native_config_service::ConfigS
 }
 
 #[test]
-fn palette_explicit_default_stays_dark_after_save_on_a_light_os() {
+fn palette_default_stays_dark_after_save_on_a_light_os() {
     use crate::control_theme::PreviewHold;
 
     let mut app = App::headless_for_test();
@@ -8943,14 +8943,12 @@ fn palette_explicit_default_stays_dark_after_save_on_a_light_os() {
     assert_eq!(preview, aterm_render::Theme::from(&chosen));
     app.enqueue_theme_choice("Default");
     assert_eq!(app.native_config_pending.len(), 1, "one choice write");
+    // Default is what no theme draws on every appearance, a light one too: the choice takes the
+    // theme out of the file, as Settings' picker does, and still draws the dark Default.
     let saved = complete_theme_choice(&mut app);
-    assert_eq!(
-        saved.config.theme.as_deref(),
-        Some("Default"),
-        "the explicit choice is not an unset"
-    );
-    assert!(saved.text.contains("theme = \"Default\""), "{}", saved.text);
-    assert_eq!(app.config.theme.as_deref(), Some("Default"));
+    assert_eq!(saved.config.theme, None);
+    assert!(!saved.text.contains("theme ="), "{}", saved.text);
+    assert_eq!(app.config.theme, None);
     assert!(app.theme_preview.is_none());
     assert_eq!(app.installed_colors.id, "Default");
     assert_eq!(app.theme, preview, "the saved choice keeps its preview");
@@ -8970,25 +8968,9 @@ fn palette_explicit_default_stays_dark_after_save_on_a_light_os() {
         }
     }
 
-    let (reply, unset) = complete_control_theme_field(&mut app, None);
-    assert_eq!(reply, Ok("removed: theme; now Default".to_string()));
+    let (reply, unset) = complete_control_theme_field(&mut app, Some("Default"));
+    assert_eq!(reply, Ok("theme: unchanged".to_string()));
     assert_eq!(unset.config.theme, None);
-    assert!(!unset.text.contains("theme ="), "{}", unset.text);
-    app.config = (*unset.config).clone();
-    app.install_resolved_colors(crate::app_colorscheme::ThemeChange::ConfigReload);
-    assert_eq!(app.installed_colors.id, "Default");
-    assert_eq!(app.theme, preview);
-    assert_eq!(
-        app.session_factory
-            .terminal_config
-            .as_ref()
-            .and_then(|tc| tc.color_scheme),
-        Some(aterm_types::Appearance::Dark)
-    );
-    assert_eq!(
-        crate::term_lock(&app.pool.get(0).unwrap().term).default_background(),
-        chosen.background
-    );
 }
 
 #[test]
@@ -9359,12 +9341,9 @@ fn palette_theme_choice_is_one_write_and_lands_without_a_flash() {
 
     app.enqueue_theme_choice("Default");
     let snapshot = complete_theme_choice(&mut app);
-    assert!(
-        snapshot.text.contains("theme = \"Default\""),
-        "{}",
-        snapshot.text
-    );
-    assert_eq!(app.config.theme.as_deref(), Some("Default"));
+    assert!(!snapshot.text.contains("theme ="), "{}", snapshot.text);
+    assert_eq!(snapshot.revision, revision + 2, "one write each");
+    assert_eq!(app.config.theme, None);
     assert_eq!(app.installed_colors.id, "Default");
 }
 

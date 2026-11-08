@@ -7,6 +7,19 @@ use std::io::{self, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::process::ExitCode;
 
+mod timing;
+
+/// Encodes one row's execution boundaries without giving the runner a JSON dependency.
+pub type EventEncoder = fn(&str, &str, u64, u64, f64, Option<f64>) -> [String; 2];
+
+/// Optional caller-owned event encoding and CPU instrumentation. The runner is also
+/// mounted by dependency-free acceptance benches, which request no telemetry.
+#[derive(Clone, Copy)]
+pub struct Telemetry {
+    pub cpu: fn() -> Option<u64>,
+    pub events: EventEncoder,
+}
+
 pub enum Outcome {
     #[cfg_attr(
         not(target_os = "macos"),
@@ -62,9 +75,19 @@ impl Counts {
 }
 
 #[allow(dead_code, reason = "count matrices use run_classified instead")]
-pub fn run<R>(target: &str, rows: &[(&str, R)], mut take: impl FnMut(&R) -> Outcome) -> ExitCode {
+pub fn run<R>(target: &str, rows: &[(&str, R)], take: impl FnMut(&R) -> Outcome) -> ExitCode {
+    run_with_telemetry(target, rows, take, None)
+}
+
+#[allow(dead_code, reason = "only conformance matrices request row telemetry")]
+pub fn run_with_telemetry<R>(
+    target: &str,
+    rows: &[(&str, R)],
+    mut take: impl FnMut(&R) -> Outcome,
+    telemetry: Option<Telemetry>,
+) -> ExitCode {
     run_selected(target, rows, |selected, out| {
-        run_into(target, selected, |row| take(*row), out)
+        run_into(target, selected, |row| take(*row), telemetry, out)
     })
 }
 
@@ -90,6 +113,17 @@ pub fn run_classified<R: Sync>(
     kind: impl Fn(&R) -> Kind + Sync,
     take: impl Fn(&R) -> Outcome + Sync,
 ) -> ExitCode {
+    run_classified_with_telemetry(target, rows, kind, take, None)
+}
+
+#[allow(dead_code, reason = "only conformance matrices request row telemetry")]
+pub fn run_classified_with_telemetry<R: Sync>(
+    target: &str,
+    rows: &[(&str, R)],
+    kind: impl Fn(&R) -> Kind + Sync,
+    take: impl Fn(&R) -> Outcome + Sync,
+    telemetry: Option<Telemetry>,
+) -> ExitCode {
     let together = match std::env::var("ATERM_MEASURE_COUNT_MODE").as_deref() {
         Ok("sequential") | Err(std::env::VarError::NotPresent) => false,
         Ok("together") => true,
@@ -105,6 +139,7 @@ pub fn run_classified<R: Sync>(
             |row| kind(*row),
             |row| take(*row),
             together,
+            telemetry,
             out,
         )
     })
@@ -122,10 +157,11 @@ fn run_scheduled_into<R: Sync>(
     kind: impl Fn(&R) -> Kind + Sync,
     take: impl Fn(&R) -> Outcome + Sync,
     together: bool,
+    telemetry: Option<Telemetry>,
     out: &mut dyn Write,
 ) -> io::Result<Counts> {
     if !together {
-        return run_into(target, rows, take, out);
+        return run_into(target, rows, take, telemetry, out);
     }
     let (mut headless, mut windows, mut timing) = (Vec::new(), Vec::new(), Vec::new());
     for (i, (_, row)) in rows.iter().enumerate() {
@@ -146,14 +182,14 @@ fn run_scheduled_into<R: Sync>(
         for (i, row) in headless {
             let send = send.clone();
             scope.spawn(move || {
-                let _ = send.send((i, measured(|| take(row))));
+                let _ = send.send((i, measured(|| take(row), telemetry)));
             });
         }
         if !windows.is_empty() {
             let send = send.clone();
             scope.spawn(move || {
                 for (i, row) in windows {
-                    let _ = send.send((i, measured(|| take(row))));
+                    let _ = send.send((i, measured(|| take(row), telemetry)));
                 }
             });
         }
@@ -167,21 +203,37 @@ fn run_scheduled_into<R: Sync>(
         Ok(())
     })?;
     for (i, row) in timing {
-        report_row(target, rows[i].0, measured(|| take(row)), &mut counts, out)?;
+        report_row(
+            target,
+            rows[i].0,
+            measured(|| take(row), telemetry),
+            &mut counts,
+            out,
+        )?;
     }
     report_summary(target, &counts, out)?;
     Ok(counts)
 }
 
-fn measured(take: impl FnOnce() -> Outcome) -> Outcome {
-    catch_unwind(AssertUnwindSafe(take)).unwrap_or_else(|panic| {
-        let why = panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .unwrap_or("non-string panic");
-        Outcome::Fail(format!("measurement panicked: {why}"))
-    })
+fn measured(
+    take: impl FnOnce() -> Outcome,
+    telemetry: Option<Telemetry>,
+) -> (Outcome, timing::Timing, Option<Telemetry>) {
+    let cpu = telemetry.map_or((|| None) as fn() -> Option<u64>, |t| t.cpu);
+    let (outcome, timing) = timing::measure(
+        || {
+            catch_unwind(AssertUnwindSafe(take)).unwrap_or_else(|panic| {
+                let why = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic");
+                Outcome::Fail(format!("measurement panicked: {why}"))
+            })
+        },
+        cpu,
+    );
+    (outcome, timing, telemetry)
 }
 
 fn run_selected<R>(
@@ -256,6 +308,7 @@ fn run_into<R>(
     target: &str,
     rows: &[(&str, R)],
     mut take: impl FnMut(&R) -> Outcome,
+    telemetry: Option<Telemetry>,
     out: &mut dyn Write,
 ) -> io::Result<Counts> {
     let mut counts = Counts {
@@ -263,7 +316,13 @@ fn run_into<R>(
         ..Counts::default()
     };
     for (name, row) in rows {
-        report_row(target, name, measured(|| take(row)), &mut counts, out)?;
+        report_row(
+            target,
+            name,
+            measured(|| take(row), telemetry),
+            &mut counts,
+            out,
+        )?;
     }
     report_summary(target, &counts, out)?;
     Ok(counts)
@@ -272,10 +331,23 @@ fn run_into<R>(
 fn report_row(
     target: &str,
     name: &str,
-    result: Outcome,
+    result: (Outcome, timing::Timing, Option<Telemetry>),
     counts: &mut Counts,
     out: &mut dyn Write,
 ) -> io::Result<()> {
+    let (result, timing, telemetry) = result;
+    if let Some(telemetry) = telemetry {
+        for event in (telemetry.events)(
+            target,
+            name,
+            timing.started,
+            timing.ended,
+            timing.seconds,
+            timing.cpu_s,
+        ) {
+            writeln!(out, "{event}")?;
+        }
+    }
     let (status, detail) = match result {
         Outcome::Pass(detail) => {
             counts.passed += 1;
@@ -388,6 +460,7 @@ mod tests {
                     _ => unreachable!(),
                 },
                 together,
+                None,
                 &mut tape,
             )
             .unwrap();
@@ -469,6 +542,7 @@ mod tests {
                 Outcome::Pass(row.to_string())
             },
             true,
+            None,
             &mut output,
         )
         .unwrap();
@@ -491,6 +565,7 @@ mod tests {
                 Outcome::Pass(row.to_string())
             },
             false,
+            None,
             &mut output,
         )
         .unwrap();
@@ -506,6 +581,16 @@ mod tests {
     #[test]
     fn every_row_runs_once_in_order_and_a_finding_outweighs_a_refusal() {
         use super::*;
+
+        let telemetry = Telemetry {
+            cpu: || Some(7),
+            events: |target, row, start, end, seconds, cpu| {
+                [
+                    format!("started {target}::{row} {start}"),
+                    format!("finished {target}::{row} {end} {seconds} {cpu:?}"),
+                ]
+            },
+        };
 
         let rows = [
             ("pass", 0),
@@ -529,6 +614,7 @@ mod tests {
                     _ => unreachable!(),
                 }
             },
+            Some(telemetry),
             &mut output,
         )
         .unwrap();
@@ -546,6 +632,18 @@ mod tests {
         );
         assert_eq!(counts.exit_code(), 1);
         let output = String::from_utf8(output).unwrap();
+        let events: Vec<_> = output
+            .lines()
+            .filter(|line| line.starts_with("started ") || line.starts_with("finished "))
+            .collect();
+        assert_eq!(events.len(), 2 * rows.len());
+        let (pairs, remainder) = events.as_chunks::<2>();
+        assert!(remainder.is_empty());
+        for ((name, _), pair) in rows.iter().zip(pairs) {
+            assert!(pair[0].starts_with(&format!("started fixture::{name} ")));
+            assert!(pair[1].starts_with(&format!("finished fixture::{name} ")));
+            assert!(pair[1].ends_with("Some(0.0)"));
+        }
         assert!(output.contains("measure row: fixture::panic FAIL\nmeasurement panicked:"));
         assert!(output.contains("measure row: fixture::unasked UNANSWERED\nno such verb"));
         assert!(
@@ -564,6 +662,7 @@ mod tests {
             "empty",
             &[] as &[(&str, ())],
             |_| unreachable!(),
+            None,
             &mut output,
         )
         .unwrap();
@@ -573,6 +672,7 @@ mod tests {
             "refused",
             &rows,
             |_| Outcome::CouldNotRun("no display".into()),
+            None,
             &mut output,
         )
         .unwrap();
@@ -582,6 +682,7 @@ mod tests {
             "passed",
             &rows,
             |_| Outcome::Pass("measured".into()),
+            None,
             &mut output,
         )
         .unwrap();
@@ -591,6 +692,7 @@ mod tests {
             "unanswered",
             &rows,
             |_| Outcome::Unanswered("no such field".into()),
+            None,
             &mut output,
         )
         .unwrap();
@@ -600,6 +702,7 @@ mod tests {
             "undecided",
             &rows,
             |_| Outcome::Undecided("interval too wide".into()),
+            None,
             &mut output,
         )
         .unwrap();
@@ -620,6 +723,7 @@ mod tests {
                     Outcome::Undecided("interval too wide".into())
                 }
             },
+            None,
             &mut output,
         )
         .unwrap();

@@ -536,6 +536,37 @@ fn a_cut_signs_only_its_releases_verified_bundle() {
     c.bundle().err().expect("changed bytes");
 }
 
+/// Private preparation keeps every build proof while allowing missing verification records.
+/// NEGATIVE CONTROLS: requiring READY here prevents the overlap; weakening the ordinary cut
+/// gate makes `bundle` succeed before `verify`; omitting the build identity admits changed bytes.
+#[test]
+fn private_preparation_needs_built_bytes_but_the_claim_still_needs_verified_bytes() {
+    let c = Clone::new();
+    let prepared = || {
+        crate::publish::release_bundle_with_inputs(
+            &Git::new(&c.repo),
+            &c.repo,
+            &c.source,
+            VERSION,
+            &format!("/stage2/bin trustc {}", compilers().trustc),
+            || Ok(compilers().inputs),
+            false,
+        )
+    };
+    assert!(c.bundle().is_err());
+    assert_eq!(prepared().unwrap().complete, c.complete);
+    c.verify(&c.complete.macho_sha256);
+    assert!(c.bundle().is_ok());
+    let store = artifact::store(&c.repo).unwrap();
+    fs::write(
+        c.complete.app(&store).join("Contents/MacOS/aterm"),
+        b"other bytes",
+    )
+    .unwrap();
+    assert!(prepared().is_err());
+    assert!(c.bundle().is_err());
+}
+
 /// A journal that has not signed yet must name the measured bytes it will sign.
 #[test]
 fn an_unsigned_journal_names_the_bytes_it_will_sign() {

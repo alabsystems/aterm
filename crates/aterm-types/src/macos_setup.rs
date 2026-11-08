@@ -770,6 +770,19 @@ pub fn placeholder_held_by_a_live_run(stamp: &[u8], started: impl Fn(u32) -> Opt
     start != 0 && started(pid) == Some(start)
 }
 
+/// A current live mapping diagnostic for HID services, not physical keyboard counts.
+/// It supplies no saved-preference readiness, setup completion or effect authority.
+/// It describes reported OS mapping composition, never an observed physical key press.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveKeyboardMapping {
+    /// Services whose effective Caps output is left or right Control.
+    pub control: usize,
+    /// Services with an explicit effective non-Control choice.
+    pub explicit_other: usize,
+    /// Held services whose mapping the activation receipt does not attest.
+    pub held: usize,
+}
+
 /// One read-only observation of one row. `now` is `None` when nothing could be
 /// read; a guessed value is never shown.
 #[derive(Clone, Debug, PartialEq, Eq)]

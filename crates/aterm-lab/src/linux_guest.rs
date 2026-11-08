@@ -186,7 +186,6 @@ pub const DEV_LIBRARIES: &[&str] = &[
     "libegl-dev",
     "libgl-dev",
     "libvulkan-dev",
-    "libcurl4-openssl-dev",
     "libpcre2-dev",
     "libexpat1-dev",
     "zlib1g-dev",
@@ -196,10 +195,11 @@ pub const DEV_LIBRARIES: &[&str] = &[
 pub const MESA: &[&str] = &["libgl1-mesa-dri", "libegl-mesa0", "mesa-vulkan-drivers"];
 
 /// The guest's own tools: the build, the display servers, the second X client of the clipboard round trip, the baseline's input and probe tools (xdotool's XTEST keys and pointer, xset and xrdb, xdpyinfo, wayland-info, wl-clipboard's second Wayland client, ibus as the XIM server, GNOME Shell, whose IBus bridge is the one input method that reaches Mutter's text-input-v3, and pipewire, without which Mutter has no screencast, the space RemoteDesktop places a finger in), the session bus and the accessibility bus, Orca with speech-dispatcher (whose dummy output module answers speech with no audio device) and x11-utils' xev (the window an Orca row has Mutter frame before aterm-gui starts, [`crate::linux_a11y::FRAMES_PRIMER`]) and xdg-desktop-portal with its GTK backend (the Settings portal aterm's motion read asks), the GPU probes, fonts (a stock Ubuntu desktop's: Noto CJK and Noto Color Emoji are the CJK and colour faces aterm-render's script and emoji tests need, and without them those answer COULD NOT RUN), the x86_64 cross toolchain with its libc, zsh and fish, the shells aterm integrates beside bash, whose integration tests run each one and cannot run without it (apt's fish, 3.7 on noble, is the fish floor lane, docs/DESIGN-init-system-2026-10-20.md §6.2: the guest never takes the pinned 4.9.3 `verify provision` builds on macOS; pwsh, the fourth, is [`PWSH`], Microsoft's release archive held to its sha256), the build tools [`BASH_INSTALL`] needs beyond build-essential (patch, which applies GNU's official patches, autotools-dev's `config.guess` and `config.sub`, which know aarch64 where 3.2's own do not, and bison, which 3.2's 2006 build files need), unzip, which `verify provision` unpacks the browser lane's pinned browsers with, sway (headless wlroots: the one lane compositor that grants server-side decorations and offers cursor-shape-v1 and a virtual pointer, for `linux edges`), grim (its screenshot, for the shadow margin's pixels), GStreamer's pipewire source and PNG encoder (a frame of Mutter's screencast, the pixels a Mutter CPU row is held to), ibus-libpinyin (a CJK engine with a preedit, for XIM), xtrace (a proxy display that logs an X11 client's requests, for the baseline's `x11.wire.*` lines, [`crate::linux_xwire`]), and python3 and openssl, the install_sh tests' floor for install.sh's embedded verifier (Python 3.11+, OpenSSL 3: docs/DESIGN-init-system-2026-10-20.md §6.1 row 14).
-/// GNU Git source packaging also needs `patchelf` for ELF relocation and `xz-utils` for its pinned source archive.
+/// GNU Git source packaging also needs `patchelf` for ELF relocation, `xz-utils` for its pinned source archive, and the native curl development package. Ubuntu's curl development packages share an architecture-specific `/usr/bin/curl-config`, so they cannot be co-installed here.
 pub const TOOLS: &[&str] = &[
     "build-essential",
     "pkg-config",
+    "libcurl4-openssl-dev",
     "patchelf",
     "xz-utils",
     "ca-certificates",
@@ -585,6 +585,12 @@ pub fn provision_plan_for(web2: Option<String>, x86_64: bool) -> Vec<Step> {
     .map(str::to_string)
     .collect::<Vec<_>>();
     install.extend(packages_for(x86_64));
+    if x86_64 {
+        // The previous shared-header plan installed this foreign instance.
+        // Replace it through apt's normal transaction, without force-overwrite
+        // or autoremove; foreign runtime libraries remain outside this removal.
+        install.push("libcurl4-openssl-dev:amd64-".into());
+    }
     let rust = [
         "rustup",
         "toolchain",
@@ -1583,6 +1589,44 @@ mod tests {
             Arch::X86_64.bin_dir("/t"),
             "/t/x86_64-unknown-linux-gnu/debug"
         );
+    }
+
+    #[test]
+    fn curl_development_is_native_and_old_foreign_headers_are_replaced_by_apt() {
+        for x86_64 in [false, true] {
+            let packages = packages_for(x86_64);
+            assert!(packages.iter().any(|name| name == "libcurl4-openssl-dev"));
+            assert!(
+                !packages
+                    .iter()
+                    .any(|name| name == "libcurl4-openssl-dev:amd64")
+            );
+            let plan = provision_plan_for(None, x86_64);
+            let install = plan
+                .iter()
+                .find(|step| step.label == "apt-get install")
+                .unwrap();
+            assert!(
+                install
+                    .argv
+                    .iter()
+                    .any(|word| word == "libcurl4-openssl-dev")
+            );
+            assert_eq!(
+                install
+                    .argv
+                    .iter()
+                    .any(|word| word == "libcurl4-openssl-dev:amd64-"),
+                x86_64
+            );
+            assert!(
+                !install
+                    .argv
+                    .iter()
+                    .any(|word| word == "--autoremove" || word == "--auto-remove")
+            );
+            assert!(!install.argv.iter().any(|word| word == "libcurl4t64:amd64-"));
+        }
     }
 
     #[test]

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The shared alignment against real CLT git, in scratch repositories of a scratch home.
+//! The shared alignment against this host's real native git, in scratch repositories of a
+//! scratch home.
 
 use super::*;
 use crate::items::defaults::tests::user;
@@ -109,7 +110,7 @@ pub(crate) fn manifest(origin: &Path) -> String {
 
 impl<'a> Repos<'a> {
     pub(crate) fn new(live: &'a Live, label: &str) -> Self {
-        crate::items::github::need_clt_git();
+        crate::items::github::need_native_git();
         let home = Scratch::new(live, label).unwrap();
         let mut who = user("fixture", live.euid());
         who.home = home.path().to_string_lossy().into_owned();
@@ -589,6 +590,46 @@ fn align_runs_no_hook_and_fetches_from_origin_alone() {
         [(true, false, false, false), (false, true, true, true)],
         "(by init, submodule fetched, post-merge ran, reference-transaction ran)"
     );
+}
+
+/// An fsmonitor hook the checkout's `core.fsmonitor` names never runs while [`align`] reads,
+/// fetches and fast-forwards it: each run that can start it carries an empty `core.fsmonitor`
+/// ([`NO_SIDE_RUNS`]).
+/// The control: a plain merge in the same checkout runs it.
+#[test]
+fn align_runs_no_fsmonitor_hook_the_checkout_names() {
+    let live = Live::new();
+    let repos = Repos::new(&live, "checkout-fsmonitor");
+    let home = PathBuf::from(&repos.who.home);
+    let marker = home.join("fsmonitor-ran");
+    let hook = home.join("fsmonitor");
+    aterm_tempfile::stand_in(
+        &hook,
+        &format!("#!/bin/sh\necho \"$1\" >> '{}'\n", marker.display()),
+    )
+    .unwrap();
+    repos.g(
+        &repos.work,
+        &["config", "core.fsmonitor", &hook.to_string_lossy()],
+    );
+    let tip = repos.advance("two.txt", "two\n");
+    let moved = align(&live, &repos.who, &repos.work, &repos.admitted()).unwrap();
+    assert!(matches!(moved, Stands::Behind { by: 1, .. }), "{moved:?}");
+    assert_eq!(repos.head(&repos.work), tip);
+    assert!(
+        !marker.exists(),
+        "the hook ran: {:?}",
+        std::fs::read_to_string(&marker)
+    );
+    // The control: a plain merge there runs it.
+    let three = repos.advance("three.txt", "three\n");
+    repos.g(&repos.work, &["fetch", "--quiet", "origin"]);
+    repos.g(
+        &repos.work,
+        &["merge", "--ff-only", "--quiet", "origin/main"],
+    );
+    assert_eq!(repos.head(&repos.work), three);
+    assert!(marker.exists(), "control: a plain merge runs the hook");
 }
 
 #[test]

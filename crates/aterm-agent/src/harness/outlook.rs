@@ -38,7 +38,7 @@ use super::accounts::{
     self, Advice, Class, Condition, Me, Mode, Mover, Point, Roster, State, StayWhy, TapRead,
     WindowRead,
 };
-use super::quota_view::{Burn, Chart, GAP_MARK, HANDOFF_MARK, RESET_MARK, Role};
+use super::quota_view::{Burn, CELL_PLACES, Chart, GAP_MARK, HANDOFF_MARK, RESET_MARK, Role};
 
 /// The week's pace looks back this far ([`Demand::week`]).
 pub const WEEK_LOOKBACK_S: i64 = 24 * 3600;
@@ -3687,6 +3687,10 @@ pub enum CardRow {
         cells: Vec<(char, CardInk)>,
         /// Its caption.
         spoken: String,
+        /// Its midnights' ticks (§1.4, §2.2): each one's place from the row's left edge
+        /// ([`CELL_PLACES`] a cell), in a cell that takes one ([`Chart::ticks`]). Only the work
+        /// row has any; the day axis and the legend keep no clock.
+        ticks: Vec<i64>,
     },
     /// One roster row's item, with its burn-up lane where the card draws one: the GUI keeps its
     /// act, its check and its place, and draws the lane on the row under it, so an item and its
@@ -3713,6 +3717,9 @@ pub struct CardLane {
     pub cells: Vec<(char, CardInk)>,
     /// Its caption.
     pub spoken: String,
+    /// Its midnights' ticks, on the work row's clock: each one's place from the lane's left edge
+    /// ([`CELL_PLACES`] a cell), in a cell that takes one, up to its reset ([`Chart::ticks`]).
+    pub ticks: Vec<i64>,
 }
 
 impl CardRow {
@@ -3822,9 +3829,9 @@ struct Item {
     name: String,
     figure: String,
     plan: String,
-    /// The words after the plan, widest first (`out ~Sat 03:00 · ↺ Wed 18:00`, `out ~Sat 03:00`).
+    /// The words after the plan, widest first (`out ~Sat 02:00 · ↺ Wed 09:00`, `out ~Sat 02:00`).
     tail: Vec<String>,
-    /// Its run-out's compact words, widest first (`out ~Sat 03:00`, `out ~Sat`); empty when its
+    /// Its run-out's compact words, widest first (`out ~Sat 02:00`, `out ~Sat`); empty when its
     /// week is not projected out.
     out: Vec<String>,
     /// The words-only form (`main 75% ↺ Sat`).
@@ -4001,7 +4008,9 @@ impl Outlook {
     /// midnight's weekday from the cell that holds it, while the labels keep a blank between
     /// them. The `▕` column holds no label: a past midnight whose label would reach it starts
     /// its label at the first cell after `▕`, still in the day it began (now lies in it), unless
-    /// that crowds out the next day's label, which stands at its own midnight.
+    /// that crowds out the next day's label, which stands at its own midnight. No label passes
+    /// the axis's end. A midnight whose label is not laid keeps its ticks on the work row and
+    /// the lanes ([`Chart::ticks`]) with no label over them.
     fn card_axis(&self, chart: &Chart, k: u8) -> CardRow {
         let s = DAY / i64::from(k);
         let lead = WORK_WORD.len();
@@ -4046,16 +4055,20 @@ impl Outlook {
         CardRow::Plot {
             cells,
             spoken: format!("Days across the work row: {}.", said.join(", ")),
+            ticks: Vec::new(),
         }
     }
 
-    /// The work row at `k` cells a day (§1.4): `work`, then the quota view's chart.
+    /// The work row at `k` cells a day (§1.4): `work`, then the quota view's chart, with its
+    /// midnights' ticks.
     fn card_work(&self, chart: &Chart, tab: &str, movable: bool, k: u8) -> CardRow {
         let mut drawn = Vec::new();
         chart.cells(k, &mut drawn);
         let mut cells: Vec<(char, CardInk)> =
             WORK_WORD.chars().map(|c| (c, CardInk::Axis)).collect();
         cells.extend(drawn.iter().map(|c| (c.glyph(), CardInk::of(c.role()))));
+        let mut ticks = Vec::new();
+        chart.ticks(k, WORK_WORD.len(), &drawn, &mut ticks);
         let said = self.card_work_said(tab, movable);
         CardRow::Plot {
             cells,
@@ -4067,6 +4080,7 @@ impl Outlook {
                     &said
                 }
             ),
+            ticks,
         }
     }
 
@@ -4117,6 +4131,7 @@ impl Outlook {
             (cells.len() <= room).then(|| CardRow::Plot {
                 cells,
                 spoken: LEGEND_SPOKEN.into(),
+                ticks: Vec::new(),
             })
         })
     }
@@ -4244,9 +4259,12 @@ impl Outlook {
                     l.cells(k, self.as_of, &mut cells);
                     let mut drawn = lead.clone();
                     drawn.extend(cells.iter().map(|c| (c.glyph(), CardInk::of(c.role()))));
+                    let mut ticks = Vec::new();
+                    view.chart.ticks(k, WORK_WORD.len(), &cells, &mut ticks);
                     CardLane {
                         cells: drawn,
                         spoken: self.lane_said(l),
+                        ticks,
                     }
                 });
                 Some((item, lane))
@@ -4341,6 +4359,14 @@ fn first_fit(cands: Vec<String>, room: usize) -> String {
         .unwrap_or_default()
 }
 
+/// Keeps the ticks of `ticks` that stand on a row cut to `room` cells.
+fn within(ticks: &mut Vec<i64>, room: usize) {
+    let end = i64::try_from(room)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(CELL_PLACES);
+    ticks.retain(|&place| place < end);
+}
+
 fn fit_card_row(row: CardRow, room: usize) -> CardRow {
     let cut = |text: String, room: usize| -> String {
         if super::footer::text_width(&text) <= room {
@@ -4381,12 +4407,22 @@ fn fit_card_row(row: CardRow, room: usize) -> CardRow {
             spoken,
             lane: lane.map(|mut lane| {
                 lane.cells.truncate(room);
+                within(&mut lane.ticks, room);
                 lane
             }),
         },
-        CardRow::Plot { mut cells, spoken } => {
+        CardRow::Plot {
+            mut cells,
+            spoken,
+            mut ticks,
+        } => {
             cells.truncate(room);
-            CardRow::Plot { cells, spoken }
+            within(&mut ticks, room);
+            CardRow::Plot {
+                cells,
+                spoken,
+                ticks,
+            }
         }
         CardRow::Rule => CardRow::Rule,
     }

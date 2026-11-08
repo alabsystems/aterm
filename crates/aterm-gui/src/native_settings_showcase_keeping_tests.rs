@@ -6917,27 +6917,18 @@ fn work_walks() -> Vec<WorkWalk> {
     let untouched = |window| Some(Then::Untouched(window));
     let mocha = || nord(Keyboard::On(MOCHA));
     let latte = || on(Keyboard::Row("Catppuccin Latte"), "GitHub Light");
+    // A reload warning beside a status says its message in its share of the dock, where it said
+    // only "Reload": a list measured once more for the opened frame.
     vec![
         (
             nord(Keyboard::Filter),
             at((300, 360), 2, true, true),
             vec![
-                (None, [1, 3, 3, 1, 2]),
+                (None, [1, 4, 3, 1, 2]),
                 (redraw, [1, 0, 3, 1, 1]),
                 (redraw, [1, 0, 3, 1, 1]),
                 (redraw, [1, 0, 3, 1, 1]),
-                (step(Again), [1, 2, 3, 1, 2]),
-                (redraw, [1, 0, 3, 1, 1]),
-            ],
-        ),
-        (
-            nord(Keyboard::Filter),
-            at((300, 360), 2, true, true),
-            vec![
-                (None, [1, 3, 3, 1, 2]),
-                (redraw, [1, 0, 3, 1, 1]),
-                (untouched((299, 360)), [1, 3, 3, 1, 2]),
-                (untouched((300, 360)), [1, 2, 3, 1, 2]),
+                (step(Again), [1, 3, 3, 1, 2]),
                 (redraw, [1, 0, 3, 1, 1]),
             ],
         ),
@@ -6945,10 +6936,21 @@ fn work_walks() -> Vec<WorkWalk> {
             nord(Keyboard::Filter),
             at((300, 360), 2, true, true),
             vec![
-                (None, [1, 3, 3, 1, 2]),
-                (step(Window((299, 360))), [1, 3, 3, 1, 2]),
-                (step(Window((298, 360))), [1, 3, 3, 1, 2]),
-                (step(Window((297, 360))), [1, 3, 3, 1, 2]),
+                (None, [1, 4, 3, 1, 2]),
+                (redraw, [1, 0, 3, 1, 1]),
+                (untouched((299, 360)), [1, 4, 3, 1, 2]),
+                (untouched((300, 360)), [1, 3, 3, 1, 2]),
+                (redraw, [1, 0, 3, 1, 1]),
+            ],
+        ),
+        (
+            nord(Keyboard::Filter),
+            at((300, 360), 2, true, true),
+            vec![
+                (None, [1, 4, 3, 1, 2]),
+                (step(Window((299, 360))), [1, 4, 3, 1, 2]),
+                (step(Window((298, 360))), [1, 4, 3, 1, 2]),
+                (step(Window((297, 360))), [1, 4, 3, 1, 2]),
                 (redraw, [1, 0, 3, 1, 1]),
                 (redraw, [1, 0, 3, 1, 1]),
             ],
@@ -7043,7 +7045,9 @@ fn work_walks() -> Vec<WorkWalk> {
             on(Keyboard::Row("Catppuccin Latte"), "GitHub Light"),
             at((300, 360), 2, true, true),
             vec![
-                (None, [1, 2, 3, 1, 2]),
+                // The reload warning's words read as text where they scroll, no second live
+                // status: a list measured once more.
+                (None, [1, 3, 3, 1, 2]),
                 (step(Window((299, 360))), [2, 4, 3, 1, 5]),
             ],
         ),
@@ -7667,7 +7671,8 @@ fn work_walks() -> Vec<WorkWalk> {
         (
             on(Keyboard::Row("GitHub Light"), "Dracula"),
             at((303, 942), 2, true, true),
-            vec![(None, [1, 2, 1, 1, 2])],
+            // The reload warning's words read as text where they scroll: a list measured once more.
+            vec![(None, [1, 3, 1, 1, 2])],
         ),
         // R2's give-way tries a rung lending its toolbar only where the rung's panel lends it.
         (
@@ -7681,14 +7686,17 @@ fn work_walks() -> Vec<WorkWalk> {
             at((1_577, 1_054), 2, true, true),
             vec![
                 (None, [1, 2, 0, 1, 2]),
-                (step(Window((293, 903))), [1, 1, 1, 1, 2]),
+                // The reload warning's words read as text where they scroll, no second live
+                // status: a list measured once more here, and a page more where the status
+                // arrives.
+                (step(Window((293, 903))), [1, 2, 1, 1, 2]),
                 (step(Status), [1, 2, 0, 0, 1]),
                 (step(Press(PALETTE_SLOT)), [1, 2, 0, 0, 2]),
                 (step(Window((294, 903))), [1, 2, 0, 0, 2]),
                 (step(Press(PALETTE_SLOT)), [1, 0, 0, 0, 1]),
                 (step(Window((294, 902))), [1, 2, 0, 0, 1]),
                 (step(Window((293, 902))), [1, 2, 0, 0, 2]),
-                (step(Status), [2, 0, 3, 2, 2]),
+                (step(Status), [3, 2, 3, 2, 3]),
                 (step(Window((2_493, 793))), [2, 3, 0, 2, 4]),
             ],
         ),
@@ -7866,6 +7874,8 @@ fn a_colour_well_pressed_on_the_sheet_lays_its_least_list_once_a_width() {
 }
 
 /// First frames drawn whole by eb53a9b243 and by 2dbd55ec43 or here: control (`true`) or landing.
+/// (A reload warning beside a long status in a 215x318 window at 1x says its message where it
+/// said only "Reload", and the landing under them is the next screen's.)
 const FIRST_WHOLE: [(Keyboard, &str, bool, &str); 13] = [
     (Keyboard::Filter, "Nord", false, "230x420@1+status"),
     (Keyboard::Filter, "Tokyo Night", false, "230x420@1+status"),
@@ -7905,8 +7915,8 @@ const FIRST_WHOLE: [(Keyboard, &str, bool, &str); 13] = [
         false,
         "215x342@1 215x390@1 215x414@1 215x438@1 215x462@1 244x440@1 215x390@1+status \
          215x414@1+status 215x438@1+status 215x462@1+status 215x462@1+warning \
-         215x510@1+warning 215x318@1+warning+status 215x414@1+warning+status \
-         215x438@1+warning+status 215x534@1+warning+status 215x558@1+warning+status",
+         215x510@1+warning 215x414@1+warning+status 215x438@1+warning+status \
+         215x534@1+warning+status 215x558@1+warning+status",
     ),
     (Keyboard::On(IMPORT), "GitHub Light", false, "215x318@1"),
     (Keyboard::On(MOCHA), "Nord", false, "215x318@1"),
@@ -7923,9 +7933,9 @@ const FIRST_WHOLE: [(Keyboard, &str, bool, &str); 13] = [
         false,
         "215x342@1 215x390@1 215x414@1 215x438@1 215x462@1 215x390@1+status \
          215x414@1+status 215x438@1+status 215x462@1+status 215x462@1+warning \
-         215x510@1+warning 215x318@1+warning+status 215x414@1+warning+status \
-         215x438@1+warning+status 215x534@1+warning+status 215x558@1+warning+status \
-         179x726@2+status 179x750@2+status 188x726@2+status 188x750@2+status",
+         215x510@1+warning 215x414@1+warning+status 215x438@1+warning+status \
+         215x534@1+warning+status 215x558@1+warning+status 179x726@2+status \
+         179x750@2+status 188x726@2+status 188x750@2+status",
     ),
 ];
 

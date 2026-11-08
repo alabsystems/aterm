@@ -8,6 +8,9 @@
 mod quiet;
 #[cfg(unix)]
 mod support;
+#[cfg(unix)]
+#[path = "support/telemetry.rs"]
+mod telemetry;
 
 #[cfg(unix)]
 mod measuring {
@@ -52,7 +55,15 @@ mod measuring {
             &["ATERM_AOS_BIN", "ATERM_PAINT_BIN"],
             aterm_tempfile::bin_exe("fake-tui"),
         );
-        support::run("aos", ROWS, |row| take(&rig, row))
+        support::run_with_telemetry(
+            "aos",
+            ROWS,
+            |row| take(&rig, row),
+            Some(support::Telemetry {
+                cpu: super::telemetry::cpu,
+                events: super::telemetry::events,
+            }),
+        )
     }
 }
 

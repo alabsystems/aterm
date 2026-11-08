@@ -433,12 +433,13 @@ mod tests {
         );
     }
 
-    /// Against a real git in a scratch HOME (no system file read): the replacement leaves the
-    /// file's other settings as they were, and the revert the read gave puts the block back. No
-    /// lookup runs while the file names the keychain's helper.
+    /// Against this host's real native git in a scratch HOME (no system file read), with the
+    /// block an earlier `aterm init` wrote here ([`script::written_helper`]): the replacement
+    /// leaves the file's other settings as they were, and the revert the read gave puts the block
+    /// back. No lookup runs while the file names the block's helper.
     #[test]
     fn the_pass_keeps_the_persons_settings_and_its_revert_puts_the_block_back() {
-        crate::items::github::need_clt_git();
+        crate::items::github::need_native_git();
         let live = Live::new();
         let mut scratch = Scratch::new(&live, "github-auto-sync").unwrap();
         let home = scratch.path().to_owned();
@@ -446,7 +447,10 @@ mod tests {
         who.home = home.to_string_lossy().into_owned();
         let git = Git::isolated();
         let gitconfig = home.join(".gitconfig");
-        let block = "[credential \"https://github.com\"]\n\thelper =\n\thelper = osxkeychain\n\tusername = alice\n\tuseHttpPath = false\n[user]\n\tname = Preserved\n";
+        let written = format!("helper = {}\n", script::written_helper(&live));
+        let block = format!(
+            "[credential \"https://github.com\"]\n\thelper =\n\t{written}\tusername = alice\n\tuseHttpPath = false\n[user]\n\tname = Preserved\n"
+        );
         live.write_file(&gitconfig, block.as_bytes(), 0o600)
             .unwrap();
         let found = git
@@ -457,12 +461,12 @@ mod tests {
         git.replace_keychain_block(&live, &who, &found, &helper, &|| Ok(()))
             .unwrap();
         let after = std::fs::read_to_string(&gitconfig).unwrap();
-        assert!(!after.contains("osxkeychain"), "{after}");
+        assert!(!after.contains(&written), "{after}");
         assert!(after.contains("name = Preserved"), "{after}");
         assert_eq!(git.keychain_block(&live, &who, &|| true).unwrap(), None);
         let commands = found.revert().replace(
             "git config",
-            &format!("{} config", crate::items::github::CLT_GIT),
+            &format!("{} config", crate::items::github::need_native_git()),
         );
         let ran = live
             .run_complete_stdout(

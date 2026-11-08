@@ -258,8 +258,6 @@ pub(crate) fn script_local(sys: &Fake, alice: &User, url: &str, branch: bool, st
             .off(checkout::git(sys, alice, Some(path)))
             .args(checkout::NO_SIDE_RUNS)
             .args([
-                "-c",
-                "core.fsmonitor=false",
                 "status",
                 "--porcelain=v1",
                 "-z",
@@ -1789,30 +1787,40 @@ fn doctor_tools(targo: Option<Targo>) -> WorkspaceTools {
     }
 }
 
-/// DOCTOR'S TOOLS READ OF A LOCK NAMING CRATES THIS MAC HAS NOT DOWNLOADED IS BLOCKED, naming
-/// what fetches them: cargo under `--offline` refuses the download, in either of the two ways
-/// it says so, and doctor reads [`NOT_DOWNLOADED`]. Negative control: init's read of the same
-/// answer (it runs without `--offline`, so such a refusal is not its own) is the plain "did not
-/// finish".
+/// DOCTOR'S TOOLS READ OF A LOCK NAMING CRATES THIS MACHINE HAS NOT DOWNLOADED IS BLOCKED,
+/// naming what fetches them: cargo under `--offline` refuses the download, in either of the two
+/// ways it says so, and doctor reads [`not_downloaded`], in a Mac's words on a Mac and a
+/// machine's elsewhere. Negative control: init's read of the same answer (it runs without
+/// `--offline`, so such a refusal is not its own) is the plain "did not finish".
 #[test]
 fn doctor_reads_an_offline_refusal_of_the_checkout_s_lock_as_blocked() {
-    for said in [
-        "error: failed to download `aterm-fixture v1.0.0`\n\nCaused by:\n  attempting to make \
-         an HTTP request, but --offline was specified\n",
-        "error: no matching package named `aterm-fixture` found\nnote: offline mode \
-         (--offline) can sometimes cause surprising resolution failures\n",
+    for (said, linux) in [
+        (
+            "error: failed to download `aterm-fixture v1.0.0`\n\nCaused by:\n  attempting to \
+             make an HTTP request, but --offline was specified\n",
+            false,
+        ),
+        (
+            "error: no matching package named `aterm-fixture` found\nnote: offline mode \
+             (--offline) can sometimes cause surprising resolution failures\n",
+            true,
+        ),
     ] {
-        let (sys, alice) = alice_with(None);
+        let (mut sys, alice) = alice_with(None);
+        sys.linux = linux;
         script_local(&sys, &alice, ORIGIN, true, "");
         sys.on(DOCTOR_CHECK, Ran::exit(101, said));
         sys.on(CHECK, Ran::exit(101, said));
         let ctx = ctx(std::slice::from_ref(&alice));
-        assert_eq!(
-            doctor_tools(Some(found_targo())).probe(&sys, &ctx),
-            Probe::Blocked {
-                why: NOT_DOWNLOADED.into()
-            },
-            "{said}"
+        let doctor = doctor_tools(Some(found_targo())).probe(&sys, &ctx);
+        let word = if linux {
+            "this machine has"
+        } else {
+            "this Mac has"
+        };
+        assert!(
+            matches!(&doctor, Probe::Blocked { why } if why.starts_with("the checkout's lock names crates") && why.contains(word)),
+            "{said}: {doctor:?}"
         );
         let init = tools(Some(found_targo())).probe(&sys, &ctx);
         assert!(

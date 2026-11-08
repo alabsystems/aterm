@@ -49,6 +49,8 @@ mod resource_proxy_intake;
 mod resource_telemetry;
 #[cfg(unix)]
 mod runtime;
+#[cfg(unix)]
+mod runtime_input_transport;
 #[cfg(target_os = "macos")]
 mod subgroup_delegation;
 #[cfg(all(unix, not(target_os = "macos")))]

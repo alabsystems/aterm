@@ -395,6 +395,12 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
         Some("native-context") if hello["version"].as_u64() == Some(3) => {
             crate::resource_context::serve(stream, peer, &hello, deadline, crate::actor::context)
         }
+        Some("runtime-input-retention-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::runtime_input_transport::serve(stream, peer, &hello, deadline)
+        }
+        Some("runtime-input-retention-support-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::runtime_input_transport::support(stream, peer, &hello, deadline)
+        }
         Some("native-context-sdk-v1") if hello["version"].as_u64() == Some(3) => {
             crate::resource_context::serve_sdk(
                 stream,

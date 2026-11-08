@@ -2500,6 +2500,153 @@ fn the_day_axis_labels_the_cell_that_holds_each_midnight() {
     }
 }
 
+/// A clock that springs forward over a local midnight, as Santiago's does: −4 h until Sun 8 Nov
+/// begins (04:00 UTC), then −3 h, so that day has no 00:00 and begins at 01:00 on the new offset.
+const SPRING: i64 = (T5 + 3 * D).div_euclid(D) * D + 4 * H;
+
+fn springs(t: i64) -> i64 {
+    if t < SPRING { -4 * H } else { -3 * H }
+}
+
+/// The instant a card tick's `place` (from its row's left edge) stands for, on a row whose chart
+/// starts after the work row's word at `per_day` cells a day around `now`: the inverse of the
+/// placement, read from the cells' spans (§2.2), so a place off its midnight's sub-cell place
+/// reads as another instant. `None` in the word's cells and in the `▕` cell, which holds no time.
+fn instant_of(place: i64, per_day: u8, now: i64) -> Option<i64> {
+    use crate::harness::quota_view::CELL_PLACES;
+    let k = i64::from(per_day);
+    let s = D / k;
+    let cell = place.div_euclid(CELL_PLACES) - i64::try_from(WORK_WORD.len()).ok()?;
+    let into = place.rem_euclid(CELL_PLACES) * s / CELL_PLACES;
+    if (0..k).contains(&cell) {
+        Some(now - D + cell * s + into)
+    } else if cell > k {
+        Some(now + (cell - k - 1) * s + into)
+    } else {
+        None
+    }
+}
+
+/// Whether a card cell may hold a midnight's tick (§2.2): one that draws a level (a measured
+/// step, the projected line, a lane's out line), `┄` or nothing; never a name, `→`, `↺`, `▕`,
+/// `╳` or `$`.
+fn takes_tick(cell: (char, CardInk)) -> bool {
+    use crate::harness::quota_view::Cell;
+    cell.0 == ' '
+        || matches!(cell.1, CardInk::Read | CardInk::Ahead | CardInk::Track)
+        || cell == (Cell::Out.glyph(), CardInk::Warn)
+}
+
+/// THE CARD'S MIDNIGHTS TICK WHERE THE WORK ROW AND THE LANES DRAW A LEVEL (§1.4, §2.2): on case
+/// (c)'s card at 60 and 44 cells (6 and 4 cells a day), on clocks that put each midnight at
+/// another place in its cell (UTC, +05:30, +09:45) and on one that springs forward over midnight
+/// ([`springs`]), the work row and every lane hold, for each local midnight whose cell draws a
+/// level, `┄` or nothing, one tick at exactly that midnight's place, and nothing else: no tick in
+/// a cell that holds a name, `→`, `↺`, `▕`, `╳` or `$`, and none past a lane's `↺`; the spring
+/// day's tick stands where that day begins, an hour after the 00:00 it never had; the axis and
+/// the legend have none. Negative controls: the card with no ticks (as S6 drew it) misses every
+/// midnight; ticks at every midnight's cell, whatever it holds, strike `→alt1` and the lanes'
+/// `↺`; a tick at its cell's left edge reads as an earlier instant; a spring day placed at the
+/// 00:00 it never had reads as Saturday 23:00.
+#[test]
+fn the_cards_midnights_tick_where_a_level_is_drawn() {
+    use crate::harness::quota_view::CELL_PLACES;
+    /// A clock's name and its offset from UTC at an instant.
+    type Clock = (&'static str, fn(i64) -> i64);
+    /// A drawn row's name, cells and midnights' tick places.
+    type Drawn<'a> = (String, &'a [(char, CardInk)], &'a [i64]);
+    let clocks: [Clock; 4] = [
+        ("UTC", |_| 0),
+        ("+05:30", |_| 5 * H + 30 * MIN),
+        ("+09:45", |_| 9 * H + 45 * MIN),
+        ("spring", springs),
+    ];
+    let (mut ticks, mut skipped, mut letters, mut spring, mut past_reset) = (0, 0, 0, 0, 0);
+    for (clock, offset) in clocks {
+        let mut fx = crate::harness::quota_scenes::case_c();
+        fx.offset = offset;
+        let out = fx.outlook();
+        let view = out.quota("main", None, true);
+        for room in [60, 44] {
+            let k = card_per_day(room);
+            let rows = out.card_rows("main", None, true, room, None);
+            let mut drawn: Vec<Drawn<'_>> = Vec::new();
+            for row in &rows {
+                match row {
+                    CardRow::Plot { cells, ticks, .. } if is_work(row) => {
+                        drawn.push(("work".into(), cells, ticks));
+                    }
+                    CardRow::Plot { ticks, .. } => {
+                        assert!(ticks.is_empty(), "{clock} {room}: {}", row_text(row));
+                    }
+                    CardRow::Account { label, lane, .. } => {
+                        let lane = lane.as_ref().expect("a lane");
+                        drawn.push((label.clone(), &lane.cells, &lane.ticks));
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                drawn.len(),
+                4,
+                "{clock} {room}: the work row and three lanes"
+            );
+            for (name, cells, places) in drawn {
+                let what = format!("{clock} {room} {name}");
+                let text: String = cells.iter().map(|c| c.0).collect();
+                // Each tick: a midnight's own instant, in a cell that takes one.
+                let at: Vec<i64> = places
+                    .iter()
+                    .map(|&place| {
+                        let cell = usize::try_from(place / CELL_PLACES).expect("a cell");
+                        assert!(
+                            takes_tick(cells[cell]),
+                            "{what}: a tick over {:?} in {text}",
+                            cells[cell].0
+                        );
+                        instant_of(place, k, out.as_of)
+                            .unwrap_or_else(|| panic!("{what}: a tick at {place} holds no time"))
+                    })
+                    .collect();
+                let mut want = Vec::new();
+                for &m in &view.chart.midnights {
+                    let s = D / i64::from(k);
+                    let cell = WORK_WORD.len()
+                        + usize::try_from(if m < out.as_of {
+                            (m - (out.as_of - D)) / s
+                        } else {
+                            i64::from(k) + 1 + (m - out.as_of) / s
+                        })
+                        .expect("a cell");
+                    match cells.get(cell) {
+                        Some(&c) if takes_tick(c) => want.push(m),
+                        Some(&(ch, _)) => {
+                            skipped += 1;
+                            letters += usize::from(ch.is_alphanumeric() || ch == HANDOFF_MARK);
+                        }
+                        None => past_reset += 1,
+                    }
+                }
+                assert_eq!(at, want, "{what}: {text}");
+                ticks += at.len();
+                if clock == "spring" {
+                    assert!(!at.contains(&(SPRING - H)), "{what}: no tick at Sat 23:00");
+                    spring += usize::from(at.contains(&SPRING));
+                }
+            }
+        }
+    }
+    assert!(
+        ticks > 0 && spring > 0,
+        "{ticks} ticks, {spring} on the spring day"
+    );
+    assert!(
+        skipped > 0 && letters > 0 && past_reset > 0,
+        "the cases hold midnights in a letter's or a mark's cell ({letters} of {skipped}) and \
+         past a lane's reset ({past_reset})"
+    );
+}
+
 /// A 5-HOUR WALL IS NOT A SPENT WEEK: `me` hit its 5-hour limit five minutes ago (it resets in
 /// 100 minutes) with 58% of its week used. The policy moves the work to `alt1` at the wall, and
 /// `me`'s week stays a figure of now, so the work comes back to it and the week stops where B's

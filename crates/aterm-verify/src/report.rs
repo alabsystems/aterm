@@ -324,6 +324,7 @@ pub(crate) fn running_driver() -> Option<&'static str> {
 /// A stage admitted to execute, paired with its completion by the run-local index.
 #[must_use]
 pub fn stage_started(index: usize, title: &str) -> String {
+    let at = aterm_time::unix_millis();
     format!(
         "verify-event: {}\n",
         aterm_json::json!({
@@ -331,7 +332,10 @@ pub fn stage_started(index: usize, title: &str) -> String {
             "event": "stage-started",
             "stage_index": index,
             "stage": title,
-            "started_at_unix_ms": aterm_time::unix_millis(),
+            "started_at_unix_ms": at,
+            "at_unix_ms": at,
+            "seconds": 0.0,
+            "cpu_s": null,
         })
     )
 }
@@ -350,6 +354,7 @@ pub fn stage_event(
     execution: Duration,
     cpu: Option<crate::memory::ObservedCpu>,
 ) -> String {
+    let at = aterm_time::unix_millis();
     let decisions: Vec<_> = report
         .outcomes()
         .map(|(outcome, label)| aterm_json::json!({"outcome": word(outcome), "detail": label}))
@@ -361,7 +366,10 @@ pub fn stage_event(
             "event": "stage-finished",
             "stage_index": index,
             "stage": report.title,
-            "ended_at_unix_ms": aterm_time::unix_millis(),
+            "ended_at_unix_ms": at,
+            "at_unix_ms": at,
+            "seconds": execution.as_secs_f64(),
+            "cpu_s": cpu.map(|cpu| Duration::from_nanos(cpu.nanoseconds).as_secs_f64()),
             "waiting_s": waiting.as_secs_f64(),
             "execution_s": execution.as_secs_f64(),
             "child_cpu": cpu.map(|cpu| aterm_json::json!({
@@ -374,6 +382,47 @@ pub fn stage_event(
             "findings": report.findings().into_iter().map(|f| f.id).collect::<Vec<_>>(),
         })
     )
+}
+
+/// One stage's compile or drive boundary. CPU is the child's sampled process-group
+/// lower bound, with the same scope as the parent stage, never elapsed wall time.
+#[must_use]
+pub(crate) fn row_event(
+    stage: &str,
+    row: &str,
+    finished: Option<(Duration, Option<crate::exec::TreeUsage>)>,
+) -> String {
+    let (seconds, usage) = finished.unwrap_or_default();
+    format!(
+        "verify-event: {}",
+        aterm_json::json!({
+            "schema": 1,
+            "event": if finished.is_some() { "row-finished" } else { "row-started" },
+            "stage": stage, "row": row, "at_unix_ms": aterm_time::unix_millis(),
+            "seconds": seconds.as_secs_f64(),
+            "cpu_s": usage.map(|u| u.cpu.as_secs_f64()),
+            "cpu_scope": "sampled-child-process-groups",
+            "cpu_coverage": "lower-bound",
+        })
+    )
+}
+
+/// The measuring harness owns these execution timestamps. Its output is buffered,
+/// so keep them when copying row events into the verifier's durable event stream.
+#[must_use]
+pub(crate) fn measurement_events(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let json = line.strip_prefix("verify-event: ")?;
+            let value: aterm_json::Value = aterm_json::from_str(json).ok()?;
+            matches!(
+                value["event"].as_str(),
+                Some("measure-row-started" | "measure-row-finished")
+            )
+            .then(|| line.to_owned())
+        })
+        .collect()
 }
 
 /// One check's result: what its stages' rows add up to.
@@ -1335,6 +1384,9 @@ mod tests {
         assert_eq!(event["stage_index"].as_u64(), Some(7));
         assert_eq!(event["stage"].as_str(), Some("compile \"helper\""));
         assert!(event["started_at_unix_ms"].as_u64().is_some());
+        assert_eq!(event["at_unix_ms"], event["started_at_unix_ms"]);
+        assert_eq!(event["seconds"].as_f64(), Some(0.0));
+        assert!(event["cpu_s"].is_null());
         assert!(event.get("decisions").is_none());
         assert!(event.get("outcome").is_none());
     }
@@ -1356,14 +1408,62 @@ mod tests {
         assert_eq!(event["waiting_s"].as_f64(), Some(12.0));
         assert_eq!(event["stage_index"].as_u64(), Some(7));
         assert_eq!(event["execution_s"].as_f64(), Some(3.0));
+        assert_eq!(event["seconds"].as_f64(), Some(3.0));
+        assert_eq!(event["at_unix_ms"], event["ended_at_unix_ms"]);
         // When it ended, so a release's timeline dates a stage's red where it happened.
         assert!(
             event["ended_at_unix_ms"].as_u64().is_some_and(|ms| ms > 0),
             "{event}"
         );
         assert!(event["child_cpu"].is_null());
+        assert!(event["cpu_s"].is_null());
         assert_eq!(event["decisions"][0]["outcome"].as_str(), Some("FAIL"));
         assert_eq!(event["decisions"][1]["outcome"].as_str(), Some("NOT RUN"));
+    }
+
+    #[test]
+    fn row_events_keep_wall_cpu_and_unread_cpu_distinct() {
+        let read = |line: String| {
+            aterm_json::from_str::<aterm_json::Value>(line.strip_prefix("verify-event: ").unwrap())
+                .unwrap()
+        };
+        let start = read(row_event("objc drives", "ime", None));
+        assert_eq!(start["event"].as_str(), Some("row-started"));
+        assert_eq!(start["seconds"].as_f64(), Some(0.0));
+        assert!(start["cpu_s"].is_null());
+        let end = read(row_event(
+            "objc drives",
+            "ime",
+            Some((
+                Duration::from_secs(3),
+                Some(crate::exec::TreeUsage {
+                    cpu: Duration::from_secs(2),
+                    ..Default::default()
+                }),
+            )),
+        ));
+        assert_eq!(end["event"].as_str(), Some("row-finished"));
+        assert_eq!(end["seconds"].as_f64(), Some(3.0));
+        assert_eq!(end["cpu_s"].as_f64(), Some(2.0));
+        assert_eq!(end["stage"].as_str(), Some("objc drives"));
+        assert_eq!(end["row"].as_str(), Some("ime"));
+        assert!(end["at_unix_ms"].as_u64().is_some());
+        let absent = read(row_event(
+            "objc drives",
+            "ime",
+            Some((Duration::from_secs(3), None)),
+        ));
+        assert!(absent["cpu_s"].is_null());
+    }
+
+    #[test]
+    fn only_measurement_row_events_are_forwarded_with_original_timestamps() {
+        let row =
+            "verify-event: {\"event\":\"measure-row-finished\",\"at_unix_ms\":123,\"seconds\":2}";
+        let text = format!(
+            "ordinary output\nverify-event: broken\nverify-event: {{\"event\":\"stage-finished\"}}\n{row}\n"
+        );
+        assert_eq!(measurement_events(&text), [row]);
     }
 
     #[test]

@@ -184,7 +184,16 @@ pub(crate) fn trail_color_note(style_raw: &str, block: bool, cursor_color_pinned
 pub(crate) fn color_value_is_valid(key: &str, raw: &str) -> bool {
     let raw = raw.trim();
     aterm_types::scheme::parse_hex(raw).is_some()
-        || (key == EDIT_CURSOR_TRAIL_COLOR && raw.eq_ignore_ascii_case(TRAIL_COLOR_CURSOR))
+        || (key == EDIT_CURSOR_TRAIL_COLOR && names_trail_color_cursor(raw))
+}
+
+/// Whether `raw` asks `cursor_trail_color` for the cursor's own colour: the file's word
+/// ([`TRAIL_COLOR_CURSOR`]) or the words its row shows for it ([`TRAIL_COLOR_CURSOR_LABEL`]),
+/// so what a person reads in the field is what they can type back.
+pub(crate) fn names_trail_color_cursor(raw: &str) -> bool {
+    let raw = raw.trim();
+    raw.eq_ignore_ascii_case(TRAIL_COLOR_CURSOR)
+        || raw.eq_ignore_ascii_case(TRAIL_COLOR_CURSOR_LABEL)
 }
 
 /// What a `cursor_trail_color` value says, read as a web page's setting is ([`aterm_effects::cursor_fx::TrailColor::parse`]).
@@ -1353,8 +1362,13 @@ pub(crate) fn theme_follow_system_value(
     {
         return raw.to_string();
     }
+    // The one theme it wrote may since read as no value at all (Default, which a write removes).
+    let still_kept = |always: &str| {
+        raw.is_some_and(|raw| raw.trim().eq_ignore_ascii_case(always.trim()))
+            || (theme_is_unset(raw) && theme_is_unset(Some(always)))
+    };
     if let Some(kept) = kept
-        && raw.is_some_and(|raw| raw.trim().eq_ignore_ascii_case(kept.always.trim()))
+        && still_kept(&kept.always)
         && theme_mode(Some(&kept.pair)) == ThemeMode::FollowSystem
     {
         return kept.pair.clone();
@@ -1377,12 +1391,19 @@ pub(crate) fn theme_with_side(
     }
 }
 
-/// Whether a configured `theme` value draws what an unset one does (Default, on every appearance).
+/// Whether a configured `theme` value draws what an unset one does (Default, on every appearance):
+/// a value naming no theme, or the one name [`aterm_types::scheme::UNSET_THEME`], which no theme
+/// file shadows (a built-in always wins). A pair naming Default on both sides is not one: it
+/// turns Follow system on.
 pub(crate) fn theme_is_unset(raw: Option<&str>) -> bool {
+    use aterm_types::scheme::ThemeSelector;
     let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
         return true;
     };
-    selector_unset(&aterm_types::scheme::ThemeSelector::parse(raw).0)
+    match ThemeSelector::parse(raw).0 {
+        ThemeSelector::Single(name) => name.eq_ignore_ascii_case(aterm_types::scheme::UNSET_THEME),
+        selector => selector_unset(&selector),
+    }
 }
 
 /// Whether `selector` names no theme for either side.
@@ -1756,6 +1777,11 @@ pub(crate) enum PrefsEditError {
         key: String,
         range: String,
     },
+    /// A value the file keeps only in another state, which nothing would read now.
+    NotKept {
+        key: String,
+        why: &'static str,
+    },
 }
 
 impl std::fmt::Display for PrefsEditError {
@@ -1775,6 +1801,7 @@ impl std::fmt::Display for PrefsEditError {
             PrefsEditError::OutOfRange { key, range } => {
                 write!(f, "invalid value for {key}: must be {range}")
             }
+            PrefsEditError::NotKept { key, why } => write!(f, "{key} {why}"),
         }
     }
 }
@@ -1828,7 +1855,7 @@ pub(crate) fn apply_prefs_edits(
             }
         }
     }
-    keep_cursor_style_before_off(&cursor_before, &mut doc, edits);
+    keep_cursor_style_before_off(&cursor_before, &mut doc, edits)?;
     keep_classic_mono_color(&cursor_before, &mut doc, edits);
 
     Ok(doc.to_string())
@@ -1899,24 +1926,44 @@ fn style_draws(style: &str) -> bool {
         .is_some()
 }
 
+/// THE STYLE BEFORE OFF IS A STYLE THAT DRAWS, KEPT WHILE THE CURSOR STYLE IS OFF: Cursor
+/// Styles marks it there, and nothing reads it while a style draws (a later Off writes the style
+/// it replaces over it). A write of it while a style draws is refused, and one naming no style
+/// that draws (`off`) is no value.
 fn keep_cursor_style_before_off(
     before: &CursorStyleFacts,
     doc: &mut aterm_toml::edit::DocumentMut,
     edits: &[(&str, Option<String>)],
-) {
+) -> Result<(), PrefsEditError> {
+    let after = CursorStyleFacts::of(doc);
     if edits
         .iter()
         .any(|(key, _)| *key == EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF)
     {
-        return;
+        let written = doc
+            .get(EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF)
+            .and_then(aterm_toml::edit::Item::as_str)
+            .map(str::to_string);
+        match written {
+            Some(style) if !style_draws(&style) => {
+                doc.remove(EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF);
+            }
+            Some(_) if style_draws(after.drawn()) => {
+                return Err(PrefsEditError::NotKept {
+                    key: EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF.to_string(),
+                    why: "is kept only while Cursor style is Off",
+                });
+            }
+            _ => {}
+        }
+        return Ok(());
     }
-    let after = CursorStyleFacts::of(doc);
     if after == *before {
-        return;
+        return Ok(());
     }
     if style_draws(after.drawn()) {
         doc.remove(EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF);
-        return;
+        return Ok(());
     }
     let kept = if style_draws(before.drawn()) {
         Some(before.drawn())
@@ -1937,6 +1984,7 @@ fn keep_cursor_style_before_off(
     {
         doc[EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF] = item;
     }
+    Ok(())
 }
 
 fn fold_retired_cursor_trail(
@@ -1999,12 +2047,13 @@ pub(crate) fn typed_toml_item(
     typed_item(key, raw)
 }
 
-/// The value that means unset. A number's is the one its placeholder marks
-/// "(default)", or "(automatic)" where the platform chooses it: an explicit
-/// font size equal to the automatic one resolves, scales and draws exactly as
-/// no `font_px` does.
+/// The value that means unset. A number's is the one its unset placeholder
+/// names before the word it adds: "(default)", "(automatic)" where the
+/// platform chooses it, or what it does there ("0 (off)", "1 (solid)"). An
+/// explicit font size equal to the automatic one resolves, scales and draws
+/// exactly as no `font_px` does, and an opacity of 1 as no `background_opacity`.
 pub(crate) fn unset_literal(field: &EditField) -> Option<String> {
-    if field.key == "ai" || field.key.starts_with("ai.") {
+    if ai_key(field.key) {
         return None;
     }
     let placeholder = field.placeholder.trim();
@@ -2012,7 +2061,12 @@ pub(crate) fn unset_literal(field: &EditField) -> Option<String> {
         .strip_suffix(" (default)")
         .or_else(|| {
             matches!(field.kind, EditKind::Float | EditKind::Integer)
-                .then(|| placeholder.strip_suffix(" (automatic)"))
+                .then(|| {
+                    placeholder
+                        .strip_suffix(')')
+                        .and_then(|rest| rest.rsplit_once(" ("))
+                        .map(|(number, _mark)| number)
+                })
                 .flatten()
         })
         .map(str::trim);
@@ -2040,8 +2094,27 @@ pub(crate) fn unset_literal(field: &EditField) -> Option<String> {
     }
 }
 
-/// Whether `value` is `field`'s [`unset_literal`].
+/// The `ai` table's keys, whose value equal to aterm's own choice still says something: an
+/// explicit value is kept over the layer under it, so none has a value that means unset.
+fn ai_key(key: &str) -> bool {
+    key == "ai" || key.starts_with("ai.")
+}
+
+/// Whether `value` is `field`'s [`unset_literal`], or for the theme any value that draws what no
+/// theme does ([`theme_is_unset`]): the built-in Default in any spelling ("default" too), never a
+/// malformed selector, which keeps its diagnostic. (The theme has no literal of its own: Manual
+/// adds an absent `theme` for a name to be typed, never as "Default".) A text or colour key also
+/// takes its row's words for no value as none ([`spells_no_value_words`]).
 pub(crate) fn is_unset_literal(field: &EditField, value: &str) -> bool {
+    if field.kind == EditKind::Theme {
+        return aterm_types::scheme::ThemeSelector::parse(value)
+            .1
+            .is_empty()
+            && theme_is_unset(Some(value));
+    }
+    if spells_no_value_words(field, value) {
+        return true;
+    }
     let Some(literal) = unset_literal(field) else {
         return false;
     };
@@ -2074,6 +2147,93 @@ pub(crate) fn is_unset_literal(field: &EditField, value: &str) -> bool {
     }
 }
 
+/// The font keys whose row offers aterm's own choice, "Automatic", for no font of their own.
+const AUTOMATIC_FONT_KEYS: &[&str] = &[
+    EDIT_FONT_FAMILY,
+    EDIT_FONT_FAMILY_BOLD,
+    EDIT_FONT_FAMILY_ITALIC,
+    EDIT_FONT_FAMILY_BOLD_ITALIC,
+    EDIT_SYMBOL_FONT,
+    EDIT_EMOJI_FONT,
+    EDIT_FALLBACK_FONTS,
+];
+
+/// Whether `value` is the words font key `key`'s row shows for no font of its own: "Automatic",
+/// or "Automatic (SF Mono)" naming the face aterm picks; where the theme names one, its picker's
+/// "Use theme's (Menlo)" or the row's "Menlo (from theme Studio)". No font goes by them, so a
+/// writer takes them as that row's no-value choice does, as no value: written, they named a font
+/// that does not resolve.
+pub(crate) fn font_words_mean_unset(key: &str, value: &str) -> bool {
+    if !AUTOMATIC_FONT_KEYS.contains(&key) {
+        return false;
+    }
+    let value = value.trim();
+    let after = |word: &str| {
+        value
+            .get(..word.len())
+            .filter(|head| head.eq_ignore_ascii_case(word))
+            .and_then(|_| value.get(word.len()..))
+            .map(str::trim_start)
+    };
+    let parenthesized = |rest: &str| rest.starts_with('(') && rest.ends_with(')');
+    after("Automatic").is_some_and(|rest| rest.is_empty() || parenthesized(rest))
+        || after("Use theme's").is_some_and(parenthesized)
+        || value
+            .strip_suffix(')')
+            .and_then(|head| head.rsplit_once(" (from theme "))
+            .is_some_and(|(font, theme)| !font.trim().is_empty() && !theme.trim().is_empty())
+}
+
+/// Whether `value` spells the words unset text, colour or number field `field` shows for no
+/// value of its own, its [`EditField::placeholder`], which `ctl settings unset` answers too:
+/// "Platform", "No image", "none", "Theme", "builtin only", a number's "theme-derived", read
+/// without what follows them (" (default)", a face it names, an " — e.g. …" hint). No reader
+/// takes them as that: written, they named a shell called "Platform", a wallpaper file "No
+/// image", a shell argument "none", and a number refused them. A colour's or a number's words
+/// count only where they are no value of their own: the trail color's "Cursor color" is one,
+/// which a later style keeps, and a number is its [`unset_literal`]'s to judge.
+fn spells_no_value_words(field: &EditField, value: &str) -> bool {
+    let numeric = matches!(field.kind, EditKind::Float | EditKind::Integer);
+    if field.seed.is_some()
+        || ai_key(field.key)
+        || !(numeric || matches!(field.kind, EditKind::Text | EditKind::Color))
+        || (field.kind == EditKind::Color && color_value_is_valid(field.key, value))
+        || (numeric && value.trim().parse::<f64>().is_ok())
+    {
+        return false;
+    }
+    let words = bare_words(&field.placeholder);
+    !words.is_empty() && bare_words(value).eq_ignore_ascii_case(words)
+}
+
+/// `text`'s words without what a row adds after them: an " — e.g. …" hint, then everything
+/// from its first parenthesis on, such as a " (default)" mark or the face aterm draws in
+/// "Automatic (SF Mono)".
+fn bare_words(text: &str) -> &str {
+    let text = text.trim();
+    let text = text
+        .split_once(" \u{2014} ")
+        .map_or(text, |(words, _hint)| words);
+    text.split_once(" (")
+        .map_or(text, |(words, _)| words)
+        .trim()
+}
+
+/// Whether collection key `key` written from `value` holds no entry: `[]`, or text whose
+/// entries are all blank, which every reader takes as no list at all.
+fn written_list_is_empty(key: &str, value: &str) -> bool {
+    use aterm_toml::edit::Value;
+    typed_item(key, value)
+        .ok()
+        .is_some_and(|item| match item.as_value() {
+            Some(Value::Array(array)) => array.is_empty(),
+            Some(Value::String(text)) => {
+                text.value().split(',').all(|entry| entry.trim().is_empty())
+            }
+            _ => false,
+        })
+}
+
 /// Whether each edit in `edits` sets a value equivalent to unsetting the key.
 pub(crate) fn unset_equivalent_edits(
     existing_toml: &str,
@@ -2087,6 +2247,9 @@ pub(crate) fn unset_equivalent_edits(
             let Some(value) = value.as_deref() else {
                 return false;
             };
+            if font_words_mean_unset(key, value) {
+                return true;
+            }
             let without: Vec<(&str, Option<String>)> = edits
                 .iter()
                 .enumerate()
@@ -2105,6 +2268,9 @@ pub(crate) fn unset_equivalent_edits(
             }
             if theme_sets_type_key(&config, themes, key) {
                 return false;
+            }
+            if manual_collection_key(key) && written_list_is_empty(key, value) {
+                return true;
             }
             editable_fields(&config)
                 .iter()
@@ -2475,7 +2641,7 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
     let trimmed = raw.trim();
     let structured = if key == EDIT_PALETTE_OVERRIDES {
         Some(structured_value(trimmed).ok_or_else(bad)?)
-    } else if LIST_KEYS.contains(&key) && trimmed.starts_with('[') {
+    } else if manual_collection_key(key) && trimmed.starts_with('[') {
         trimmed
             .parse::<Value>()
             .ok()
@@ -2637,7 +2803,7 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
             if !color_value_is_valid(key, trimmed) {
                 return Err(bad());
             }
-            if trimmed.eq_ignore_ascii_case(TRAIL_COLOR_CURSOR) {
+            if key == EDIT_CURSOR_TRAIL_COLOR && names_trail_color_cursor(trimmed) {
                 Value::from(TRAIL_COLOR_CURSOR)
             } else {
                 Value::from(trimmed)
@@ -2654,6 +2820,20 @@ pub(crate) struct EditField {
     pub(crate) kind: EditKind,
     pub(crate) seed: Option<String>,
     pub(crate) placeholder: String,
+}
+
+impl EditField {
+    /// The text this field's text box holds for its saved value: the value, in the words its
+    /// row reads elsewhere (the trail color's cursor word as [`TRAIL_COLOR_CURSOR_LABEL`], as
+    /// its placeholder and its color wheel say it), empty while unset.
+    pub(crate) fn seed_text(&self) -> std::borrow::Cow<'_, str> {
+        let seed = self.seed.as_deref().unwrap_or_default();
+        if self.key == EDIT_CURSOR_TRAIL_COLOR && names_trail_color_cursor(seed) {
+            std::borrow::Cow::Borrowed(TRAIL_COLOR_CURSOR_LABEL)
+        } else {
+            std::borrow::Cow::Borrowed(seed)
+        }
+    }
 }
 
 fn configured_str(field: Option<&str>) -> Option<String> {
@@ -3435,7 +3615,9 @@ impl ApplicationTiming {
             Self::NewSessions => "Applies to new sessions",
             Self::WhenAtermClosesOrRestarts => "Applies when aterm closes or restarts",
             Self::NextToolsCheck => "Applies at the next ALab tools check",
-            Self::DailyLaunchApply => "Applies once a day, at a new window or session",
+            // A start claims the day's apply (aterm's own, or an `aterm` terminal session's);
+            // a window a running aterm opens claims nothing.
+            Self::DailyLaunchApply => "Applies once a day, when aterm starts",
             Self::NextCargoRun => "Applies to the next cargo or rustc run",
             Self::NewTextOnly => "Applies to new text only",
             Self::EnablingNeedsNewWindow => "Turning it on may need a new window",
@@ -7663,6 +7845,34 @@ auto_apply = true # hands off
         }
         let config: Config = aterm_toml::from_str(&off).unwrap();
         assert_eq!(config.cursor_trail_style_raw(), "off");
+
+        // Written itself: kept while the style is Off, refused while one draws (it wrote the
+        // default style into the file, where nothing read it), and `off` is no style at all.
+        let chosen = write(&off, &[(BEFORE_OFF, set("rainbow kitty"))]);
+        assert_eq!(
+            read(&chosen, BEFORE_OFF).as_deref(),
+            Some(super::DEFAULT_CURSOR_TRAIL_STYLE)
+        );
+        assert_eq!(
+            read(&write(&off, &[(BEFORE_OFF, set("off"))]), BEFORE_OFF),
+            None
+        );
+        let unset_draws = crate::app_config::DEFAULT_DECORATIVE_EFFECTS.then_some("");
+        for drawn in ["cursor_trail_style = \"comet\"\n"]
+            .into_iter()
+            .chain(unset_draws)
+        {
+            let refused = apply_prefs_edits(drawn, &[(BEFORE_OFF, set("rainbow kitty"))])
+                .expect_err("a style draws");
+            assert!(
+                matches!(refused, super::PrefsEditError::NotKept { .. }),
+                "{refused}"
+            );
+            assert_eq!(
+                read(&write(drawn, &[(BEFORE_OFF, set("off"))]), BEFORE_OFF),
+                None
+            );
+        }
     }
 
     #[test]

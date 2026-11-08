@@ -1042,7 +1042,11 @@ mod tests {
 
     pub(super) fn serial() -> std::sync::MutexGuard<'static, ()> {
         static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
-        SERIAL.get_or_init(Mutex::default).lock().unwrap()
+        // A test that failed holding it says so itself; its siblings still run.
+        SERIAL
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(super) fn fixture() -> (

@@ -681,6 +681,87 @@ pub struct MainReader {
 }
 
 impl MainReader {
+    /// Compile the proposed fixture tree at the last fetched main tip, returning
+    /// its commit identity for the warm-up log.
+    ///
+    /// # Errors
+    /// Returns fixture preview construction, preparation or compilation failures.
+    pub fn prebuild_fixtures(
+        &mut self,
+        targo: &Path,
+        tip: &str,
+        staged: &Staged,
+        pins: &Pins,
+        run: &mut dyn FnMut(&mut Command) -> std::io::Result<Output>,
+    ) -> Result<String> {
+        let git = crate::ledger::GitCli::new(&self.repo);
+        let tip = rev_parse(&git, &format!("{tip}^{{commit}}"))?;
+        let preview = fixture_preview(&git, &tip, staged, pins)?;
+        self.prebuild(targo, &preview, run)?;
+        Ok(preview)
+    }
+
+    /// Warm main's reader lane without recording answers or issuing a verdict.
+    /// The eventual preview still goes through Cargo on its exact tree.
+    ///
+    /// # Errors
+    /// Returns workspace preparation, compile launch or compile failures.
+    pub fn prebuild(
+        &mut self,
+        targo: &Path,
+        revision: &str,
+        run: &mut dyn FnMut(&mut Command) -> std::io::Result<Output>,
+    ) -> Result<()> {
+        let tree = self.prepare(revision)?;
+        let mut compile = self.compile_command(targo, &tree);
+        let output = run(&mut compile).map_err(|e| Error::new(e.to_string()))?;
+        if !output.status.success() {
+            return Err(Error::new(format!(
+                "main reader prebuild failed: {}",
+                crate::gates::build_error_lines(&String::from_utf8_lossy(&output.stderr))
+            )));
+        }
+        Ok(())
+    }
+
+    fn prepare(&self, revision: &str) -> Result<PathBuf> {
+        if let Some(binary) = &self.last_binary {
+            check_execution_hold(&self.scratch, binary)?;
+        }
+        let tree = self.scratch.join("main");
+        let git = crate::ledger::GitCli::new(&self.repo);
+        let local = crate::ledger::GitCli::new(&tree);
+        if tree.join(".git").exists() {
+            git_ok(&local, &["checkout", "--force", "--detach", revision])?;
+            git_ok(&local, &["clean", "-ffdx"])?;
+        } else {
+            git_ok(
+                &git,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    &tree.to_string_lossy(),
+                    revision,
+                ],
+            )?;
+        }
+        git_ok(
+            &local,
+            &["submodule", "update", "--init", "--recursive", "--force"],
+        )?;
+        Ok(tree)
+    }
+
+    fn compile_command(&self, targo: &Path, tree: &Path) -> Command {
+        let (target, layout) = crate::release_steps::verify_layout(&self.repo);
+        let mut compile = crate::gates::aterm_gui_lib_compile(targo, tree, &target);
+        if let Some(layout) = layout {
+            compile.arg("--config").arg(layout);
+        }
+        compile
+    }
+
     /// Lease the clone's persistent, isolated reader workspace.
     ///
     /// # Errors
@@ -761,25 +842,7 @@ impl MainReader {
         let mut answers = Err("main reader did not record answers".to_string());
         let mut inputs = None;
         let result = (|| -> Result<String> {
-            if let Some(binary) = &self.last_binary {
-                check_execution_hold(&self.scratch, binary)?;
-            }
-            let tree = self.scratch.join("main");
-            let git = crate::ledger::GitCli::new(&self.repo);
-            let tree_arg = tree.to_string_lossy().into_owned();
-            let local = crate::ledger::GitCli::new(&tree);
-            if tree.join(".git").exists() {
-                // This workspace is exclusively ours. Discard previous generated
-                // answers and interrupted runs before judging the new preview.
-                git_ok(&local, &["checkout", "--force", "--detach", preview])?;
-                git_ok(&local, &["clean", "-ffdx"])?;
-            } else {
-                git_ok(&git, &["worktree", "add", "--detach", &tree_arg, preview])?;
-            }
-            git_ok(
-                &local,
-                &["submodule", "update", "--init", "--recursive", "--force"],
-            )?;
+            let tree = self.prepare(preview)?;
             // Metadata covers normal, build and dev edges, including transitive
             // dependencies. Failure only disables reuse; it never supplies a verdict.
             if tree.join("Cargo.toml").is_file() {
@@ -803,11 +866,7 @@ impl MainReader {
             }
             // The stable source path keeps its own lane across releases; no live
             // directory is shared with the cut and no cross-root seeding is needed.
-            let (target, layout) = crate::release_steps::verify_layout(&self.repo);
-            let mut compile = crate::gates::aterm_gui_lib_compile(targo, &tree, &target);
-            if let Some(layout) = layout {
-                compile.arg("--config").arg(layout);
-            }
+            let mut compile = self.compile_command(targo, &tree);
             let compile_start = std::time::Instant::now();
             let compiled =
                 run(&mut compile).map_err(|e| Error::new(format!("main reader compile: {e}")))?;
@@ -1199,11 +1258,7 @@ pub fn land(
                 desks: found.desks,
             });
         }
-        let pending = Reading {
-            answers: Err("main reader has not run".into()),
-            checks: "NOT RUN".into(),
-        };
-        let (preview, _) = fixture_commit(git, &tip, staged, pins, &pending)?;
+        let preview = fixture_preview(git, &tip, staged, pins)?;
         let reading = read_main(&preview);
         let (mut commit, answers) = fixture_commit(git, &tip, staged, pins, &reading)?;
         let checked = preview;
@@ -1306,6 +1361,14 @@ pub fn land(
             tip = next;
         }
     }
+}
+
+fn fixture_preview(git: &dyn GitRunner, tip: &str, staged: &Staged, pins: &Pins) -> Result<String> {
+    let pending = Reading {
+        answers: Err("main reader has not run".into()),
+        checks: "NOT RUN".into(),
+    };
+    fixture_commit(git, tip, staged, pins, &pending).map(|(preview, _)| preview)
 }
 
 #[cfg(all(test, unix))]

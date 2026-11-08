@@ -3066,8 +3066,13 @@ fn least_window_faults(scale: f32) -> LeastFaults {
                 {
                     continue;
                 }
+                // An entry's head whose whole title is taller than the window is drawn a screen
+                // of lines at a time, as the step law holds it; its title is never cut to fit.
+                let head = key.starts_with("settings/messages/row/") && key.ends_with("/title");
                 if tall > height + 0.5 {
-                    toolbar_faults.push(format!("{context}: {key} is {tall}pt"));
+                    if !head {
+                        toolbar_faults.push(format!("{context}: {key} is {tall}pt"));
+                    }
                 } else if !whole {
                     toolbar_faults.push(format!("{context}: {key} ({tall}pt) is never whole"));
                 }
@@ -3735,12 +3740,23 @@ fn a_least_windows_messages_of_days_are_whole() {
                 least_window_walk(&mut runtime, instance, view, &cx, &event, &mut |_, _, _| {
                     false
                 });
+            // A head taller than the list (its whole title on more lines than the room holds) is
+            // drawn through, a screen of its lines at a time; every other is whole.
             let never: Vec<String> = log
                 .entries
                 .iter()
                 .map(|entry| format!("settings/messages/row/{}/title", entry.id))
                 .filter_map(|key| match walk.controls.get(&key) {
                     Some(seen) if seen.whole => None,
+                    Some(seen)
+                        if seen.tall > walk.room + 0.5
+                            && bands_cover(
+                                &seen.bands,
+                                seen.tall - crate::native_ui::LIST_PEEK_MIN,
+                            ) =>
+                    {
+                        None
+                    }
                     Some(seen) => Some(format!("{key} ({}pt)", seen.tall)),
                     None => Some(format!("{key} (never drawn)")),
                 })
@@ -3870,6 +3886,15 @@ fn a_least_windows_message_head_fits_one_screen_where_its_lines_do() {
     // room under its last line making it two screens; without that room it is 132pt, one.
     at_each_text_scale(&[2.0], "message head", |_| {
         let (mut runtime, instance, view) = super::setup_with_messages();
+        // A title one line holds: a longer one takes the lines it needs, its head then taller
+        // than the list and drawn through ([`a_least_windows_message_head_fills_the_screens_it_takes`]).
+        let mut log = super::sample_messages();
+        for entry in &mut log.entries {
+            if entry.id == 40 {
+                entry.title = "Crashed".to_string();
+            }
+        }
+        assert!(runtime.replace_settings_messages(log, 8));
         let cx = view_cx_at(164.0, 140.0);
         let mut head = None;
         for _ in 0..12 {
@@ -3902,15 +3927,17 @@ fn a_least_windows_message_head_fits_one_screen_where_its_lines_do() {
 
 #[test]
 fn a_least_windows_message_head_fills_the_screens_it_takes() {
-    // A HEAD NO SCREEN HOLDS FILLS THE SCREENS IT TAKES: at 2x in the least windows an entry's
-    // head (its mark, its time, its title) takes two screens of two lines; cut to one line, its
-    // title stood alone on the second over a line of nothing ("aterm…"). Every screen of an
-    // entry's head shows two lines of it.
+    // A HEAD NO SCREEN HOLDS IS DRAWN THROUGH A SCREEN OF LINES AT A TIME: at 2x in the least
+    // windows an entry's head (its mark, its time, its whole title) takes the screens its lines
+    // take; cut to one line, its title stood alone on the second over a line of nothing
+    // ("aterm…"). Every screen of an entry's head shows a whole line of it, and every line of its
+    // title is whole on some screen.
     at_each_text_scale(&[2.0], "message head screens", |_| {
         for (width, height) in [(164.0, 96.0), (164.0, 98.0)] {
             let (mut runtime, instance, view) = super::setup_with_messages();
             let cx = view_cx_at(width, height);
             let mut shown = 0;
+            let mut title_lines = BTreeMap::<String, bool>::new();
             for _ in 0..30 {
                 let compiled = compile_settings_view(&runtime, instance, view, &cx);
                 let lines = compiled
@@ -3928,6 +3955,16 @@ fn a_least_windows_message_head_fills_the_screens_it_takes() {
                                 || matches!(&node.content, UiContent::Text(text) if !text.text.trim().is_empty()))
                     })
                     .count();
+                for node in &compiled.paint {
+                    let key = node.key.as_str();
+                    if key.starts_with("settings/messages/row/")
+                        && (key.ends_with("/label") || key.contains("/label/line-"))
+                        && matches!(&node.content, UiContent::Text(text) if !text.text.trim().is_empty())
+                    {
+                        let seen = title_lines.entry(key.to_string()).or_insert(false);
+                        *seen |= node.clip == node.rect;
+                    }
+                }
                 if compiled
                     .paint
                     .iter()
@@ -3935,7 +3972,7 @@ fn a_least_windows_message_head_fills_the_screens_it_takes() {
                 {
                     shown += 1;
                     assert!(
-                        lines >= 2,
+                        lines >= 1,
                         "{width}x{height}: a screen of an entry's head shows {lines} line(s)"
                     );
                 }
@@ -3944,6 +3981,15 @@ fn a_least_windows_message_head_fills_the_screens_it_takes() {
                     .unwrap();
             }
             assert!(shown >= 10, "{width}x{height}: {shown} screens of entries");
+            let cut: Vec<&String> = title_lines
+                .iter()
+                .filter(|(_, whole)| !**whole)
+                .map(|(key, _)| key)
+                .collect();
+            assert!(
+                cut.is_empty(),
+                "{width}x{height}: title lines never whole: {cut:?}"
+            );
         }
     });
 }

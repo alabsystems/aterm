@@ -410,7 +410,7 @@ pub trait FxSliceSink<'a> {
     fn slice(&mut self, s: FxSlice, band: usize);
 }
 
-/// Slice every layer `select` takes against `f`: per item, its draw rect (its box ∩ its clip ∩ the layer clip ∩ the frame, minus every occluder) cut at the cell-row bands, handing `sink` each slice whose band `band_open` admits.
+/// Slice every layer `select` takes against `f`: per item, its draw rect (its box ∩ its clip ∩ the layer clip ∩ the frame, minus every occluder but the layer's own chrome, [`FxLayer::chrome`]) cut at the cell-row bands, handing `sink` each slice whose band `band_open` admits.
 pub fn slice_layers<'a>(
     f: &FxFrame,
     layers: &'a [FxLayer],
@@ -451,7 +451,7 @@ pub fn slice_layers<'a>(
             if draw.is_empty() {
                 continue;
             }
-            subtract_occluders(draw, occluders, slicer);
+            subtract_occluders(draw, occluders, layer.chrome, slicer);
             if slicer.pieces.is_empty() || !sink.item(layer, item, origin) {
                 continue;
             }
@@ -875,8 +875,14 @@ const fn item_place(item: &FxItem, (lx, ly): (i64, i64)) -> ((i64, i64), Area) {
     }
 }
 
-/// `draw` minus every occluder, as disjoint pieces in `scratch.pieces`.
-fn subtract_occluders(draw: Area, occluders: &[PxRect], scratch: &mut FxSlicer) {
+/// `draw` minus every occluder but `own` (the chrome the layer stands on, [`FxLayer::chrome`]),
+/// as disjoint pieces in `scratch.pieces`.
+fn subtract_occluders(
+    draw: Area,
+    occluders: &[PxRect],
+    own: Option<PxRect>,
+    scratch: &mut FxSlicer,
+) {
     scratch.pieces.clear();
     if occluders.is_empty() {
         scratch.pieces.push(draw);
@@ -889,6 +895,10 @@ fn subtract_occluders(draw: Area, occluders: &[PxRect], scratch: &mut FxSlicer) 
             scratch.pieces.push(r);
             continue;
         };
+        if own == Some(o) {
+            scratch.stack.push((r, i + 1));
+            continue;
+        }
         let cut = r.intersect(Area::of(o, 0, 0));
         if cut.is_empty() {
             scratch.stack.push((r, i + 1));

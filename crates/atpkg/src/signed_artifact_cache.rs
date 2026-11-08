@@ -211,7 +211,7 @@ impl<'a> SignedArtifactCache<'a> {
         document_cap: usize,
         signature_cap: usize,
     ) -> Option<(Vec<u8>, Vec<u8>)> {
-        let access = CacheAccess::open(self, false).ok()?;
+        let access = CacheAccess::open(self, Access::Read).ok()?;
         let reference = access.read_ref(key_digest, REF_CAP).ok()?;
         let object_digest = reference_object_digest(&reference, key_digest)?;
         let cap = OBJECT_MAGIC
@@ -294,11 +294,13 @@ impl<'a> SignedArtifactCache<'a> {
                 held_document == document && held_signature == signature
             })
         {
+            #[cfg(unix)]
+            self.repair_shared_directories(key_digest)?;
             return Ok(());
         }
         let object = encode_object(key_digest, document, signature)?;
         let object_digest = crate::tree::sha256_bytes(&object);
-        let access = CacheAccess::open(self, true)?;
+        let access = CacheAccess::open(self, Access::Store)?;
         access.write_object(&object_digest, &object)?;
         let reference = format!("{REF_HEADER}\n{key_digest}\n{object_digest}\n");
         access.write_ref(key_digest, reference.as_bytes())?;
@@ -319,7 +321,7 @@ impl<'a> SignedArtifactCache<'a> {
         roster_sig_cap: usize,
     ) -> Option<crate::select::Candidate> {
         let key_digest = key.digest();
-        let access = CacheAccess::open(self, false).ok()?;
+        let access = CacheAccess::open(self, Access::Read).ok()?;
         let reference = access.read_ref(&key_digest, REF_CAP).ok()?;
         let object_digest = reference_object_digest(&reference, &key_digest)?;
         let caps = [index_cap, index_sig_cap, roster_cap, roster_sig_cap];
@@ -390,16 +392,54 @@ impl<'a> SignedArtifactCache<'a> {
                     && held.roster_sig == candidate.roster_sig
             })
         {
+            #[cfg(unix)]
+            self.repair_shared_directories(&key_digest)?;
             return Ok(());
         }
         let object = encode_index_object(&key_digest, parts)?;
         let object_digest = crate::tree::sha256_bytes(&object);
-        let access = CacheAccess::open(self, true)?;
+        let access = CacheAccess::open(self, Access::Store)?;
         access.write_object(&object_digest, &object)?;
         let reference = format!("{REF_HEADER}\n{key_digest}\n{object_digest}\n");
         access.write_ref(&key_digest, reference.as_bytes())?;
         Ok(())
     }
+
+    /// An exact warm store repairs only its used shared directory chain. It reads
+    /// the bounded ref again for the actual object shard, without copying or
+    /// republishing payload bytes. A load never enters this write path.
+    #[cfg(unix)]
+    fn repair_shared_directories(&self, key_digest: &str) -> std::io::Result<()> {
+        if self.layout.is_system_prefix() {
+            let access = CacheAccess::open(self, Access::Repair)?;
+            let reference = access.read_ref(key_digest, REF_CAP)?;
+            let object_digest =
+                reference_object_digest(&reference, key_digest).ok_or_else(invalid_digest)?;
+            let key_shard = key_digest.get(..2).ok_or_else(invalid_digest)?;
+            let object_shard = object_digest.get(..2).ok_or_else(invalid_digest)?;
+            descend(
+                &access.namespace,
+                &["refs", key_shard],
+                false,
+                access.shared,
+            )?;
+            descend(
+                &access.namespace,
+                &["objects", "sha256", object_shard],
+                false,
+                access.shared,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Access {
+    Read,
+    Store,
+    #[cfg(unix)]
+    Repair,
 }
 
 /// Descriptor-confined access to one cache namespace. On Unix every descendant is opened one
@@ -416,12 +456,13 @@ struct CacheAccess<'a> {
 }
 
 impl<'a> CacheAccess<'a> {
-    fn open(cache: &'a SignedArtifactCache<'a>, create: bool) -> std::io::Result<Self> {
+    fn open(cache: &'a SignedArtifactCache<'a>, access: Access) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
 
             let shared = cache.layout.is_system_prefix();
+            let create = matches!(access, Access::Store);
             if create {
                 cache.layout.ensure_dir(&cache.layout.prefix)?;
             }
@@ -431,7 +472,15 @@ impl<'a> CacheAccess<'a> {
                     libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
                 )
                 .open(&cache.layout.prefix)?;
-            let namespace = descend(&prefix, &[ROOT, VERSION], create, shared)?;
+            if shared && matches!(access, Access::Repair) {
+                normalize_shared_directory(&prefix)?;
+            }
+            let namespace = descend(
+                &prefix,
+                &[ROOT, VERSION],
+                create,
+                shared && !matches!(access, Access::Read),
+            )?;
             Ok(Self {
                 namespace,
                 shared,
@@ -440,7 +489,7 @@ impl<'a> CacheAccess<'a> {
         }
         #[cfg(not(unix))]
         {
-            let _ = create;
+            let _ = access;
             Ok(Self { cache })
         }
     }
@@ -559,8 +608,21 @@ fn descend(
             }
             Err(error) => return Err(error),
         };
+        if shared {
+            normalize_shared_directory(&current)?;
+        }
     }
     Ok(current)
+}
+
+/// Normalize only a system writer's held `O_DIRECTORY|O_NOFOLLOW` descriptor.
+#[cfg(unix)]
+fn normalize_shared_directory(directory: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    if directory.metadata()?.permissions().mode() & 0o7777 != 0o755 {
+        aterm_dirfd::fchmod(directory, aterm_dirfd::Mode::from_bits(0o755))?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1147,7 +1209,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn storing_identical_verified_bytes_keeps_object_and_ref_inodes() {
-        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let (_dir, layout) = fixture("idempotent");
         let cache = SignedArtifactCache::for_layout(&layout);
@@ -1173,7 +1235,22 @@ mod tests {
             )
         };
         let before = identities();
+        assert!(!layout.is_system_prefix());
+        let mode = std::fs::metadata(cache.root())
+            .unwrap()
+            .permissions()
+            .mode();
+        let flushes = aterm_durable::seam::Recording::start();
         store();
+        assert!(flushes.take().is_empty());
+        assert_eq!(flushes.take_plain(), 0);
+        assert_eq!(
+            std::fs::metadata(cache.root())
+                .unwrap()
+                .permissions()
+                .mode(),
+            mode
+        );
         assert_eq!(
             identities(),
             before,
@@ -1184,43 +1261,140 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_system_prefix_keeps_every_cache_component_readable() {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let (_dir, layout) = fixture("system-prefix");
         crate::store::system_shape::force(&layout.prefix);
         let cache = SignedArtifactCache::for_layout(&layout);
-        cache
-            .store_verified(
-                &key(),
-                b"signed manifest",
-                b"detached signature",
-                DOCUMENT_CAP,
-                SIGNATURE_CAP,
-            )
-            .unwrap();
-        let (reference, object) = paths(&cache);
-        for directory in [
-            cache.root(),
-            cache.root().join("objects"),
-            cache.root().join("objects/sha256"),
-            object.parent().unwrap().to_path_buf(),
-            cache.root().join("refs"),
-            reference.parent().unwrap().to_path_buf(),
-        ] {
+        let index_key = SignedIndexKey::release("github:owner/index", "atpkg-index-3").unwrap();
+        let candidate = index_candidate("atpkg-index-3", 3);
+        for index in [false, true] {
+            let store = || {
+                if index {
+                    cache.store_verified_index(
+                        &index_key,
+                        &candidate,
+                        DOCUMENT_CAP,
+                        SIGNATURE_CAP,
+                        ROSTER_CAP,
+                        SIGNATURE_CAP,
+                    )
+                } else {
+                    cache.store_verified(
+                        &key(),
+                        b"signed manifest",
+                        b"detached signature",
+                        DOCUMENT_CAP,
+                        SIGNATURE_CAP,
+                    )
+                }
+                .unwrap();
+            };
+            store();
+            let (reference, object) = if index {
+                let reference = cache.ref_path(&index_key.digest()).unwrap();
+                let object = cache.object_path_for_index(&index_key).unwrap();
+                (reference, object)
+            } else {
+                paths(&cache)
+            };
+            let directories = [
+                layout.prefix.clone(),
+                layout.prefix.join(ROOT),
+                cache.root(),
+                cache.root().join("objects"),
+                cache.root().join("objects/sha256"),
+                object.parent().unwrap().to_path_buf(),
+                cache.root().join("refs"),
+                reference.parent().unwrap().to_path_buf(),
+            ];
+            let files = [&reference, &object];
+            let _held = files.map(|path| std::fs::File::open(path).unwrap());
+            let before_bytes = files.map(|path| std::fs::read(path).unwrap());
+            let file_identity = || {
+                files.map(|path| {
+                    let metadata = std::fs::metadata(path).unwrap();
+                    (metadata.dev(), metadata.ino())
+                })
+            };
+            let before_identity = file_identity();
+            for directory in &directories {
+                assert_eq!(
+                    std::fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
+                    0o755,
+                    "{} remains traversable by the system store's readers",
+                    directory.display()
+                );
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            if index {
+                let loaded = cache
+                    .load_index(
+                        &index_key,
+                        DOCUMENT_CAP,
+                        SIGNATURE_CAP,
+                        ROSTER_CAP,
+                        SIGNATURE_CAP,
+                    )
+                    .unwrap();
+                assert_eq!(candidate_parts(&loaded), candidate_parts(&candidate));
+            } else {
+                assert_eq!(
+                    cache.load(&key(), DOCUMENT_CAP, SIGNATURE_CAP),
+                    Some((b"signed manifest".to_vec(), b"detached signature".to_vec()))
+                );
+            }
+            for directory in &directories {
+                assert_eq!(
+                    std::fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
+                    0o700,
+                    "a read-only load does not repair permissions"
+                );
+            }
+            store();
             assert_eq!(
-                std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
-                0o755,
-                "{} remains traversable by the system store's readers",
-                directory.display()
+                file_identity(),
+                before_identity,
+                "warm repair retains both files"
             );
-        }
-        for file in [reference, object] {
-            assert_eq!(
-                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-                0o644,
-                "{} remains readable by the system store's readers",
-                file.display()
+            assert_eq!(files.map(|path| std::fs::read(path).unwrap()), before_bytes);
+            for directory in &directories {
+                assert_eq!(
+                    std::fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
+                    0o755,
+                    "a future store repairs its used shared directories"
+                );
+            }
+            for file in files {
+                assert_eq!(
+                    std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o644,
+                    "{} remains readable by the system store's readers",
+                    file.display()
+                );
+            }
+            let directory_versions = || {
+                directories.each_ref().map(|path| {
+                    let metadata = std::fs::metadata(path).unwrap();
+                    (
+                        metadata.dev(),
+                        metadata.ino(),
+                        metadata.ctime(),
+                        metadata.ctime_nsec(),
+                    )
+                })
+            };
+            let before = directory_versions();
+            let flushes = aterm_durable::seam::Recording::start();
+            store();
+            assert!(
+                flushes.take().is_empty(),
+                "a healthy warm store needs no flush"
             );
+            assert_eq!(flushes.take_plain(), 0);
+            assert_eq!(directory_versions(), before, "healthy modes need no chmod");
+            assert_eq!(file_identity(), before_identity);
         }
     }
 

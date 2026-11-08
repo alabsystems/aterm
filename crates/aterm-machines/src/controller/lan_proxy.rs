@@ -346,11 +346,14 @@ mod tests {
         accepted.read_exact(&mut heard).unwrap();
         assert_eq!(&heard, b"SSH-2.0-x\r\n");
 
-        drop(listener);
-        let why = fdpass("127.0.0.1", port, Duration::from_secs(60), &ours).unwrap_err();
+        // Nobody listens on the port the passed connection holds, and while it holds it no other
+        // test can bind it, as a sibling running alongside could take the listener's own port
+        // once dropped.
+        let unheard = passed.local_addr().unwrap().port();
+        let why = fdpass("127.0.0.1", unheard, Duration::from_secs(60), &ours).unwrap_err();
         assert_eq!(
             why,
-            format!("ssh: connect to host 127.0.0.1 port {port}: Connection refused")
+            format!("ssh: connect to host 127.0.0.1 port {unheard}: Connection refused")
         );
         assert!(why.contains(super::super::ssh::CONNECTION_REFUSED), "{why}");
     }

@@ -3541,27 +3541,29 @@ pub(crate) fn scrub_overlay_row_band(
     // pushed above cuts every fx layer at the band.
 }
 
-/// The card is on top: a menu card the host painted into the frame's cells at `card` (frame cells, row 0 the strip's first row), after the overlays were published, takes its cells back from every overlay that would paint over them.
+/// The card is on top: a menu card the host painted into the frame's cells at `card` (frame cells, row 0 the strip's first row), after the overlays were published, takes its cells back from every overlay that would paint over them. Returns the card's occluder (window pixels), which a layer of the card's own names as its chrome ([`aterm_core::render::FxLayer::chrome`]); `None` for an empty card, which pushes none. The occluders pushed before it, by chrome the card now covers, lose its rect ([`trim_under`]).
 pub(crate) fn scrub_overlay_card(
     input: &mut RenderInput,
     card: crate::tab_menu::MenuRect,
     (cell_w, cell_h): (usize, usize),
     (pad, grid_top): (usize, usize),
-) {
+) -> Option<aterm_core::render::PxRect> {
     if card.w == 0 || card.h == 0 {
-        return;
+        return None;
     }
     let edge = |origin: usize, cells: usize, size: usize| {
         i32::try_from(origin.saturating_add(cells.saturating_mul(size)))
             .unwrap_or(i32::MAX - 1)
             .min(i32::MAX - 1)
     };
-    input.fx_occluders.push(aterm_core::render::PxRect::new(
+    let occluder = aterm_core::render::PxRect::new(
         edge(pad, card.col, cell_w),
         edge(grid_top, card.row, cell_h),
         edge(pad, card.col + card.w, cell_w),
         edge(grid_top, card.row + card.h, cell_h),
-    ));
+    );
+    trim_under(&mut input.fx_occluders, occluder, &input.fx_layers);
+    input.fx_occluders.push(occluder);
     let rows = card.row..card.row + card.h;
     let cols = card.col..card.col + card.w;
     let on_card = |row: usize, col: usize| rows.contains(&row) && cols.contains(&col);
@@ -3632,7 +3634,46 @@ pub(crate) fn scrub_overlay_card(
         .rain_add
         .retain(|q| !(tag_in(q.row) && meets_x(q.x, q.w, 0)));
     // The companions' and the rain's fx layers need no cut: the card's
-    // occluder, pushed above, cuts every fx layer at its box.
+    // occluder, pushed above, cuts every fx layer at its box but the card's own.
+    Some(occluder)
+}
+
+/// Chrome painted under a card is hidden where the card stands: each of `occluders` (those
+/// pushed before the card's, by a find bar's or a settings panel's band, a split's find region,
+/// a card under this one) loses `card`'s rect, kept as the pieces of it around that rect. A
+/// layer standing on the card ([`aterm_core::render::FxLayer::chrome`]) is then cut only by
+/// chrome painted over it, pushed after; every other layer is cut there by the card's own
+/// occluder all the same, so it draws as before. An occluder a layer of `layers` already stands
+/// on keeps its whole rect, which names that chrome: this card still cuts that layer.
+fn trim_under(
+    occluders: &mut Vec<aterm_core::render::PxRect>,
+    card: aterm_core::render::PxRect,
+    layers: &[aterm_core::render::FxLayer],
+) {
+    use aterm_core::render::PxRect;
+    let mut trimmed = false;
+    for i in 0..occluders.len() {
+        let o = occluders[i];
+        let cut = o.intersect(card);
+        if cut.is_empty() || layers.iter().any(|layer| layer.chrome == Some(o)) {
+            continue;
+        }
+        occluders[i] = PxRect::EMPTY;
+        trimmed = true;
+        occluders.extend(
+            [
+                PxRect::new(o.x0, o.y0, o.x1, cut.y0),
+                PxRect::new(o.x0, cut.y1, o.x1, o.y1),
+                PxRect::new(o.x0, cut.y0, cut.x0, cut.y1),
+                PxRect::new(cut.x1, cut.y0, o.x1, cut.y1),
+            ]
+            .into_iter()
+            .filter(|piece| !piece.is_empty()),
+        );
+    }
+    if trimmed {
+        occluders.retain(|o| !o.is_empty());
+    }
 }
 
 /// [`scrub_overlay_card`]'s chrome rule, run once the card's cells are in `cells`.

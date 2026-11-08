@@ -1349,7 +1349,7 @@ fn the_cards_rows_fit_speak_and_keep_roster_order() {
             assert_eq!(item_labels(&rows), ["me", "alt1", "pool1"], "{what}");
             for row in &rows {
                 match row {
-                    MenuRow::Plot { cells, spoken } => {
+                    MenuRow::Plot { cells, spoken, .. } => {
                         assert!(cells.len() <= room, "{what}: a plot of {}", cells.len());
                         assert!(!spoken.trim().is_empty(), "{what}: an uncaptioned plot");
                         assert_eq!(box_drawing(spoken), None, "{what}: {spoken:?}");

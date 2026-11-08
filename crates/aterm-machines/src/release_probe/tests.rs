@@ -46,10 +46,9 @@ fn writer_routes_reject_secret_userinfo_foreign_hosts_and_other_repositories() {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn fixture(config: &str) -> (aterm_tempfile::TempDir, Ordinary, PathBuf) {
     use std::os::unix::fs::PermissionsExt as _;
-    crate::items::github::need_clt_git();
+    crate::items::github::need_native_git();
     let root = aterm_tempfile::tempdir().unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let home = root.path().join("home");
@@ -64,7 +63,6 @@ fn fixture(config: &str) -> (aterm_tempfile::TempDir, Ordinary, PathBuf) {
     (root, git, scratch)
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn existing_same_repository_ssh_rewrite_is_preserved_without_a_network_call() {
     let config = "[url \"git@github.com:fixture/\"]\n insteadOf = https://github.com/fixture/\n";
@@ -91,7 +89,6 @@ fn existing_same_repository_ssh_rewrite_is_preserved_without_a_network_call() {
     );
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn a_foreign_fetch_rewrite_and_custom_ssh_command_are_not_repaired_or_run() {
     for config in [
@@ -116,7 +113,6 @@ fn a_foreign_fetch_rewrite_and_custom_ssh_command_are_not_repaired_or_run() {
     }
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn revocation_before_the_git_child_preserves_a_retryable_unstarted_result() {
     let (_root, git, scratch) = fixture("");
@@ -139,7 +135,6 @@ fn revocation_before_the_git_child_preserves_a_retryable_unstarted_result() {
     assert!(std::fs::read_dir(&scratch).unwrap().next().is_none());
 }
 
-#[cfg(target_os = "macos")]
 #[test]
 fn scratch_symlinks_and_unrelated_files_are_left_unchanged() {
     use std::os::unix::fs::symlink;

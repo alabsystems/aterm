@@ -441,6 +441,8 @@ fn setup_field_with_rows(
 
 /// The background check's coherent cached evidence. A finished plan or a held group alone
 /// verifies no private value; only current native readings cover a requested preference.
+/// `caps_live` separately describes reported OS/HID mappings for service cohorts, not a
+/// physical key-press test or saved Caps readiness; it never contributes a verified bit.
 pub(crate) fn background_setup_fields(status: &SetupStatus) -> String {
     let selection = status
         .plan
@@ -488,8 +490,23 @@ pub(crate) fn background_setup_fields(status: &SetupStatus) -> String {
     } else {
         cached.join(",")
     };
+    // Counts are HID services (a physical keyboard may expose several), not devices.
+    // This paid live evidence never changes the saved setting's row or verified bit.
+    let caps_live = match status.caps_live {
+        Some(live) if live.control > 0 && live.explicit_other == 0 && live.held == 0 => {
+            "control".to_owned()
+        }
+        Some(live) if live.control == 0 && live.explicit_other == 0 => {
+            format!("unknown:held={}", live.held)
+        }
+        Some(live) => format!(
+            "mixed:control={},other={},held={}",
+            live.control, live.explicit_other, live.held
+        ),
+        None => "unknown".to_owned(),
+    };
     format!(
-        "setup={} verified={} observed_generation={} rows={cached}",
+        "setup={} verified={} observed_generation={} rows={cached} caps_live={caps_live}",
         setup_field_with_rows(status, selection, &rows),
         verified.bits(),
         status.observed_generation,

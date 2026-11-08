@@ -924,10 +924,12 @@ fn log_observation_is_current(
     remembered: Option<[u8; 32]>,
     lock: &crate::client::StateLock,
 ) -> Result<bool> {
-    let Some(identity) = crate::client::read_identity(paths)? else {
+    // The recipient alone answers a quiet check, kept while the identity file stands; the
+    // identity itself is read only to judge the log afresh.
+    let Some(local) = crate::client::identity_recipient(paths)? else {
         return Ok(false);
     };
-    if recipient.is_some_and(|expected| expected != identity.recipient()) {
+    if recipient.is_some_and(|expected| expected != local) {
         return Ok(false);
     }
     let Some((log, heads_digest)) = crate::client::trusted_commons_log_now(paths, trust)? else {
@@ -935,6 +937,12 @@ fn log_observation_is_current(
     };
     if remembered == Some(commons_log_state_digest(paths, heads_digest)?) {
         return Ok(true);
+    }
+    let Some(identity) = crate::client::read_identity(paths)? else {
+        return Ok(false);
+    };
+    if recipient.is_some_and(|expected| expected != identity.recipient()) {
+        return Ok(false);
     }
     Ok(
         current_from_loaded_log(paths, trust, &identity, &log, heads_digest, lock)?

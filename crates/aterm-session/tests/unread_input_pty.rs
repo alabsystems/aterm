@@ -241,11 +241,62 @@ fn a_key_driven_and_read_during_a_look_leaves_it_unread() {
     }
 }
 
+/// The program at `slave` reads `n` bytes, each a `p`.
+fn read_ps(slave: i32, n: usize) {
+    for _ in 0..n {
+        assert_eq!(read_byte(slave), b'p');
+    }
+}
+
+/// Leaves the kernel no room for more of `master`'s input until [`open_kernel`]: how many bytes
+/// it took first. Linux stops the master's output (`TCOOFF`): a first `EAGAIN` there is no full
+/// queue, as its pty takes a write into a work queue's buffers and takes more once that queue
+/// runs (3.5 KiB more on this 6.17 kernel). macOS puts a write on the slave's queue as it is
+/// made, so `p`s are written until it takes no more.
+fn close_kernel(master: i32) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `master` is the test's live pty master and TCOOFF a valid action.
+        assert_eq!(unsafe { libc::tcflow(master, libc::TCOOFF) }, 0);
+        0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let chunk = [b'p'; 256];
+        let mut filled = 0;
+        loop {
+            // SAFETY: a bounded write from a live stack buffer to the test's live master.
+            let r = unsafe { libc::write(master, chunk.as_ptr().cast(), chunk.len()) };
+            match usize::try_from(r) {
+                Ok(n) => filled += n,
+                Err(_) => {
+                    assert_eq!(
+                        std::io::Error::last_os_error().kind(),
+                        std::io::ErrorKind::WouldBlock,
+                        "the kernel's room ran out"
+                    );
+                    return filled;
+                }
+            }
+        }
+    }
+}
+
+/// Gives the kernel room for `master`'s input again after [`close_kernel`].
+fn open_kernel(master: i32) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: as in `close_kernel`; TCOON resumes what TCOOFF stopped.
+    assert_eq!(unsafe { libc::tcflow(master, libc::TCOON) }, 0);
+    #[cfg(not(target_os = "linux"))]
+    let _ = master;
+}
+
 /// Bytes the sink still holds in its spill keep the look unread though the slave's queue is
 /// empty: the program read every byte the kernel took while the drainer, parked waiting for the
 /// kernel's room with the spill's lock let go, holds the rest. The look reads the spill's length
-/// (the lock is free), not a lock it could not take. Control: once the drainer writes them and
-/// the program reads them, the look is read.
+/// (the lock is free), not a lock it could not take. The kernel is left no room before the paste
+/// ([`close_kernel`]), so the paste spills on every host. Control: once the drainer writes them
+/// and the program reads them, the look is read.
 #[test]
 fn a_byte_left_in_the_spill_keeps_the_look_unread() {
     const FRAME: usize = 4000;
@@ -274,6 +325,7 @@ fn a_byte_left_in_the_spill_keeps_the_look_unread() {
             }
         });
     }
+    let filled = close_kernel(master);
     armed.store(true, Ordering::SeqCst);
     assert_eq!(
         sink.write_frame_nonparking(&[b'p'; FRAME])
@@ -283,17 +335,16 @@ fn a_byte_left_in_the_spill_keeps_the_look_unread() {
     at_write
         .recv_timeout(MUST_HAPPEN)
         .expect("the drainer parked for the kernel's room");
-    let mut read = 0;
-    while let Some(n) = sink.unread_input().filter(|n| *n > 0) {
-        for _ in 0..n {
-            assert_eq!(read_byte(slave), b'p');
-        }
-        read += n;
-    }
+    let spilled = sink
+        .input_backlog()
+        .and_then(|backlog| backlog.spilled)
+        .expect("PRECONDITION: the spill's length reads while the drainer is parked");
     assert!(
-        read < FRAME,
-        "PRECONDITION: the kernel took part of the paste"
+        (1..=FRAME).contains(&spilled),
+        "PRECONDITION: the paste spilled: {spilled}"
     );
+    // Every byte the kernel took: what it took before it was closed and the part of the paste.
+    read_ps(slave, filled + FRAME - spilled);
     assert_eq!(
         sink.unread_input(),
         Some(0),
@@ -307,11 +358,9 @@ fn a_byte_left_in_the_spill_keeps_the_look_unread() {
     let look = sink.input_look();
     assert!(look.known, "PRECONDITION: a look that can tell");
     assert!(!look.read, "bytes left in the spill keep the look unread");
+    open_kernel(master);
     go.send(()).expect("the drainer goes on");
-    while read < FRAME {
-        assert_eq!(read_byte(slave), b'p');
-        read += 1;
-    }
+    read_ps(slave, spilled);
     assert!(sink.wait_egress_drained_to_kernel());
     within(MUST_HAPPEN, Duration::from_millis(1), || {
         sink.input_look().read.then_some(())

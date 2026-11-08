@@ -507,7 +507,6 @@ pub enum Code3 {
 /// One objc driver: an `[[example]]` that owns `fn main`, because libtest cannot host AppKit (every `#[test]` body runs off the main thread, where `EventLoop` construction panics).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ObjcDrive {
-    pub package: &'static str,
     pub example: &'static str,
     pub code3: Code3,
     /// How a death with no exit status (a signal the driver did not trap) reads.
@@ -516,10 +515,10 @@ pub struct ObjcDrive {
     pub pass: &'static str,
 }
 
-/// The objc drivers the `objc drives` stage builds and runs, in order — every row on every macOS run, whatever the scope, and every row after a failure.
+/// The objc drivers built together, then run in order on macOS regardless of
+/// scope. A build failure runs none; a runtime failure does not hide later rows.
 pub const OBJC_DRIVES: [ObjcDrive; 7] = [
     ObjcDrive {
-        package: "aterm-gui",
         example: "objc_live_class_audit",
         code3: Code3::WeakerPassOk(
             "every registered row agrees — and at least one was checked against THIS FORK'S OWN DECLARATION, not this host's runtime, because its AppKit does not register the protocol that declares it (the auditor's part F and VERDICT lines name each one; exit 3)",
@@ -528,7 +527,6 @@ pub const OBJC_DRIVES: [ObjcDrive; 7] = [
         pass: "every row the registered WinitWindowDelegate and WinitView hold agrees with the runtime's own authority, and each class claims the protocols its rows come from",
     },
     ObjcDrive {
-        package: "aterm-gui",
         example: "objc_ime_drive",
         code3: Code3::WeakerPassOk(
             "a composition ran through the ported WinitView's NSTextInputClient rows, and with Option as Alt, each Option chord arrived as its bare key — but the same chords WITHOUT Option as Alt did not all compose here (macOS did not make the drive the active app, or this layout's Option chords are not the U.S. dead keys), so whether Option as Alt stops each dead key was NOT measured (exit 3)",
@@ -537,14 +535,12 @@ pub const OBJC_DRIVES: [ObjcDrive; 7] = [
         pass: "a composition ran through the ported WinitView's NSTextInputClient rows — preedit, cursor conversion, commit and the candidate-window rectangle — and with Option as Alt, no U.S. Option dead key (E, U, I, N, `) started a composition where the same key without it did, and Option+B arrived as b, not ∫",
     },
     ObjcDrive {
-        package: "aterm-gui",
         example: "objc_toolbar_drive",
         code3: Code3::Hung,
         no_status: Severity::CouldNotRun,
         pass: "the real tab strip answered every question — every state its drawing matrix names, and all four declared classes read off live objects against the runtime's own authority — and the menu bar's real status item held This Mac as its glance counts it, and listed a box that stopped its agent above an older report whose row's tip says its program carries on meanwhile, and a landing's Done for you row and worker row whose tips say what aterm checked",
     },
     ObjcDrive {
-        package: "aterm-gui",
         example: "objc_window_drive",
         code3: Code3::None,
         // A death by a signal is a crash in the window code the drive runs: a finding. Closing an answered NSAlert's glass child window at exit (aterm 0.110.0 on macOS 27.2) died by SIGSEGV in the exit turn's pool pop.
@@ -552,14 +548,12 @@ pub const OBJC_DRIVES: [ObjcDrive; 7] = [
         pass: "the real window answered every question — title, style mask, geometry, limits, theme, drag-and-drop, close and fullscreen — and the exit, in the turn a click answered a real NSAlert, closed only winit's own window and none of the alert's",
     },
     ObjcDrive {
-        package: "aterm-gui",
         example: "objc_event_drive",
         code3: Code3::AbortFinding,
         no_status: Severity::GateFailed,
         pass: "every NSEvent-taking WinitView row and sendEvent: survived a real NSEvent of every type AppKit can deliver; the exception control was contained and the panic control aborted",
     },
     ObjcDrive {
-        package: "aterm-gui",
         example: "objc_frame_clock_drive",
         code3: Code3::Hung,
         // A death by a signal is a crash in the link's callback or AppKit's window teardown while the drive held them: a finding. (A link left uninvalidated did not crash it at the desk, 2026-10-27 and 2026-10-28: no tick came after the close. On 2026-10-28 the drive's weak reference, still loading the link after the close, caught it, exit 1.)
@@ -567,7 +561,6 @@ pub const OBJC_DRIVES: [ObjcDrive; 7] = [
         pass: "a real window's display link ran the deck's clock: by the link's own timestamps its ticks each named a period the screen runs, targeted the coming vsync (the median tick's and the best tick's lead both positive) and never stalled LINK_SILENCE, and the clock's hang detector never tripped; paused, the CADisplayLink said so (-isPaused) and fired nothing while the clock's detector tripped on real time and timed the window as one with no link, and the restarted link's first tick resumed the clock; the link ticked while the main run loop ran in NSEventTrackingRunLoopMode; and closing the window invalidated every link its view made (a weak reference to each CADisplayLink, which its run loop retains until -invalidate, loaded nil after the close, and no tick fired for a vsync after it)",
     },
     ObjcDrive {
-        package: "aterm-gui",
         example: "objc_confirm_drive",
         code3: Code3::Hung,
         no_status: Severity::CouldNotRun,
@@ -575,23 +568,26 @@ pub const OBJC_DRIVES: [ObjcDrive; 7] = [
     },
 ];
 
-/// `targo --unverified build --profile test -q -p <package> --example <example>` — one driver's own build, in the main target ([`MAIN_PROFILE`]).
+/// Build the seven explicit driver targets in one invocation. They share their
+/// dependency graph and profile; each remains a separate main-thread process.
 #[must_use]
-pub fn objc_drive_build_args(drive: &ObjcDrive) -> Vec<String> {
-    [
+pub fn objc_drives_build_args() -> Vec<String> {
+    let mut args: Vec<String> = [
         "--unverified",
         "build",
         MAIN_PROFILE[0],
         MAIN_PROFILE[1],
         "-q",
         "-p",
-        drive.package,
-        "--example",
-        drive.example,
+        "aterm-gui",
     ]
     .into_iter()
     .map(String::from)
-    .collect()
+    .collect();
+    for drive in &OBJC_DRIVES {
+        args.extend(["--example".to_owned(), drive.example.to_owned()]);
+    }
+    args
 }
 
 /// Extracts the last `NOT RUN — <reason>` clause an objc driver printed to its transcript.
@@ -736,10 +732,60 @@ fn run_child(
     cmd: &Cmd,
     decide: impl FnOnce(&mut Report, &exec::Run, &str),
 ) -> bool {
-    let out = exec::run(cmd, ctx.exec_env());
+    let out = run_row(ctx, &r.title, label, cmd);
+    for event in crate::report::measurement_events(&out.output) {
+        crate::event_log::emit(ctx.events.as_ref(), &event);
+    }
     r.raw(out.output.as_str());
     decide(r, &out, label);
     out.ok
+}
+
+fn run_row(ctx: &Ctx, stage: &str, row: &str, cmd: &Cmd) -> exec::Run {
+    let began = std::time::Instant::now();
+    crate::event_log::emit(
+        ctx.events.as_ref(),
+        &crate::report::row_event(stage, row, None),
+    );
+    let run = exec::run(cmd, ctx.exec_env());
+    crate::event_log::emit(
+        ctx.events.as_ref(),
+        &crate::report::row_event(stage, row, Some((began.elapsed(), run.usage))),
+    );
+    run
+}
+
+/// A native step whose child lives across several calls, such as the GUI smoke.
+/// Its CPU is the increment in the enclosing stage's sampled process-group meter.
+#[cfg(unix)]
+pub(crate) fn native_row<T>(
+    ctx: &Ctx,
+    r: &mut Report,
+    row: &str,
+    run: impl FnOnce(&mut Report) -> T,
+) -> T {
+    let stage = r.title.clone();
+    let began = std::time::Instant::now();
+    let meter = crate::memory::current();
+    let before = meter.as_ref().and_then(|m| m.observed_cpu());
+    let event = crate::report::row_event(&stage, row, None);
+    r.raw(crate::event_log::emit(ctx.events.as_ref(), &event));
+    let result = run(r);
+    let usage = meter
+        .as_ref()
+        .and_then(|m| m.observed_cpu())
+        .and_then(|after| {
+            after
+                .nanoseconds
+                .checked_sub(before.map_or(0, |b| b.nanoseconds))
+                .map(|ns| exec::TreeUsage {
+                    cpu: std::time::Duration::from_nanos(ns),
+                    ..Default::default()
+                })
+        });
+    let event = crate::report::row_event(&stage, row, Some((began.elapsed(), usage)));
+    r.raw(crate::event_log::emit(ctx.events.as_ref(), &event));
+    result
 }
 
 /// One pure compile call ([`run_compile`]): its run, its compiler stdout apart from its
@@ -765,20 +811,47 @@ pub(crate) fn step_of(r: &Report) -> &str {
 fn run_compile(ctx: &Ctx, step: &str, call: &str, cmd: &Cmd) -> Compile {
     let cmd = crate::compile_account::with_message_format(cmd.clone());
     let began = std::time::Instant::now();
+    crate::event_log::emit(
+        ctx.events.as_ref(),
+        &crate::report::row_event(step, call, None),
+    );
     let exec::MachineRun { run, stdout } = exec::run_machine(&cmd, ctx.exec_env(), Some(step));
+    let ended = std::time::Instant::now();
+    crate::event_log::emit(
+        ctx.events.as_ref(),
+        &crate::report::row_event(
+            step,
+            call,
+            Some((ended.saturating_duration_since(began), run.usage)),
+        ),
+    );
+    // The stage's meter read each compiler of this call while it ran: date them, and how many
+    // ran at once over the call's wall, dated on the meter's own clock
+    // ([`crate::memory::Meter::unit_spans`], [`crate::memory::Meter::unix_ms`]).
+    let meter = crate::memory::current();
+    let spans = meter
+        .as_ref()
+        .map(|meter| meter.unit_spans(began, ended))
+        .unwrap_or_default();
+    let overlap = meter
+        .as_ref()
+        .and_then(|meter| Some((meter.unix_ms(began)?, meter.unix_ms(ended)?)))
+        .and_then(|(from, to)| crate::compile_account::Overlap::of(&spans, from, to));
     let account = crate::compile_account::Account::of(
         step,
         call,
         stdout.as_deref().ok(),
         run.usage,
-        began.elapsed(),
-    );
+        ended.saturating_duration_since(began),
+    )
+    .overlapping(overlap);
     crate::event_log::emit(ctx.events.as_ref(), &account.event());
     let events = stdout
         .as_deref()
         .map(|output| crate::report::compile_unit_events(call, output))
         .unwrap_or_default()
         .into_iter()
+        .chain(crate::compile_account::span_events(call, &spans))
         .map(|event| {
             let stamped = crate::event_log::emit(ctx.events.as_ref(), &event);
             stamped.trim_end_matches('\n').to_owned()
@@ -2350,7 +2423,7 @@ fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
         ));
         return;
     }
-    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
+    let out = run_row(ctx, &r.title, REDRAW_CONFORMANCE_BIN, &Cmd::new(&bin));
     r.record_driven(&out, "aterm-redraw-conformance", |code, _| {
         redraw_outcome(code)
     });
@@ -2365,6 +2438,15 @@ fn objc_drives(ctx: &Ctx, r: &mut Report) {
         r.skip("objc drives (no targo)");
         return;
     }
+    if !build_to_drive(
+        ctx,
+        r,
+        objc_drives_build_args(),
+        "targo build -p aterm-gui (all seven objc drivers)".to_owned(),
+        "objc drives",
+    ) {
+        return;
+    }
     for drive in &OBJC_DRIVES {
         objc_drive(ctx, r, drive);
     }
@@ -2372,15 +2454,6 @@ fn objc_drives(ctx: &Ctx, r: &mut Report) {
 
 fn objc_drive(ctx: &Ctx, r: &mut Report, drive: &ObjcDrive) {
     let name = drive.example;
-    if !build_to_drive(
-        ctx,
-        r,
-        objc_drive_build_args(drive),
-        format!("targo build -p {} --example {name}", drive.package),
-        name,
-    ) {
-        return;
-    }
     let bin = main_example(ctx, name);
     if !is_executable_file(&bin) {
         r.cannot_run(format!(
@@ -2389,7 +2462,7 @@ fn objc_drive(ctx: &Ctx, r: &mut Report, drive: &ObjcDrive) {
         ));
         return;
     }
-    let out = exec::run(&Cmd::new(&bin), ctx.exec_env());
+    let out = run_row(ctx, &r.title, name, &Cmd::new(&bin));
     r.record_driven(&out, name, |code, transcript| {
         objc_drive_outcome_with_transcript(drive, code, transcript)
     });
@@ -4502,15 +4575,12 @@ mod tests {
             .demoted,
             "tippy"
         );
-        for args in [
-            redraw_conformance_build_args(),
-            objc_drive_build_args(&OBJC_DRIVES[0]),
-        ] {
+        for args in [redraw_conformance_build_args(), objc_drives_build_args()] {
             assert!(main_build_cmd(&c, args.clone()).demoted, "{args:?}");
         }
         for argv in [
             redraw_conformance_build_args(),
-            objc_drive_build_args(&OBJC_DRIVES[0]),
+            objc_drives_build_args(),
             spec_check_cmd(&c).argv()[1..].to_vec(),
         ] {
             assert!(argv.windows(2).any(|w| w == MAIN_PROFILE), "{argv:?}");
@@ -5427,11 +5497,73 @@ mod tests {
             main_example(&c, OBJC_DRIVES[0].example),
             PathBuf::from("/repo/target/debug/examples/objc_live_class_audit")
         );
-        let build = main_build_cmd(&c, objc_drive_build_args(&OBJC_DRIVES[0]));
+        let build = main_build_cmd(&c, objc_drives_build_args());
         assert!(
             !build.envs.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"),
             "the main target, inherited"
         );
+    }
+
+    #[test]
+    fn objc_build_selects_every_driver_once_in_one_invocation() {
+        let args = objc_drives_build_args();
+        let examples: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "--example")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(examples, OBJC_DRIVES.map(|drive| drive.example));
+        assert_eq!(args.iter().filter(|arg| *arg == "build").count(), 1);
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "--examples" || arg == "--features")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_rows_keep_results_and_report_only_their_cpu_increment() {
+        let c = ctx(Scope::workspace());
+        let meter = crate::memory::Meter::new();
+        let member = |cpu_ns| aterm_sysprobe::MemberUsage {
+            pid: 7,
+            start: 1,
+            cpu_ns,
+            ..Default::default()
+        };
+        meter.book(7, &[member(2_000_000_000)]);
+        let _held = crate::memory::metering(Some(meter.clone()));
+        let mut report = Report::new("native fixture");
+        let result = native_row(&c, &mut report, "planted failure", |r| {
+            meter.book(7, &[member(5_000_000_000)]);
+            r.fail("negative control");
+            17
+        });
+        assert_eq!(result, 17);
+        assert!(
+            report
+                .outcomes()
+                .any(|(o, _)| o == Outcome::Fail(Severity::GateFailed))
+        );
+        let rows = |report: &Report| {
+            report
+                .render()
+                .lines()
+                .filter_map(|line| line.strip_prefix("verify-event: "))
+                .map(|json| aterm_json::from_str::<aterm_json::Value>(json).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let events = rows(&report);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event"].as_str(), Some("row-started"));
+        assert_eq!(events[1]["event"].as_str(), Some("row-finished"));
+        assert_eq!(events[1]["row"].as_str(), Some("planted failure"));
+        assert_eq!(events[1]["cpu_s"].as_f64(), Some(3.0));
+        let _unmetered = crate::memory::metering(None);
+        let mut report = Report::new("unmetered fixture");
+        native_row(&c, &mut report, "unread", |_| ());
+        assert!(rows(&report)[1]["cpu_s"].is_null());
     }
 
     #[test]

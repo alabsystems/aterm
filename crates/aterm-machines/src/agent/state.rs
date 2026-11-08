@@ -211,16 +211,27 @@ pub fn running(sys: &dyn System, layout: &Layout, run: &str) -> bool {
 }
 
 /// How long a take, hand-off or release of the run lock waits for `state/run.lock.guard`.
-#[cfg(not(test))]
-const GUARD_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
-/// A unit test's is the one-minute hang detector (`aterm_spec::wait::MUST_HAPPEN`, which this
-/// crate does not depend on): its only holders are the test's own takers, which release it, and
-/// a loaded machine can keep one's durable create past 30 s.
-#[cfg(test)]
 const GUARD_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn guard(sys: &dyn System, layout: &Layout) -> Result<Box<dyn std::any::Any>, String> {
-    sys.exclusive(&layout.lock_guard(), GUARD_LIMIT)
+    guard_started(sys, layout, std::time::Instant::now())
+}
+
+fn guard_started(
+    sys: &dyn System,
+    layout: &Layout,
+    started: std::time::Instant,
+) -> Result<Box<dyn std::any::Any>, String> {
+    let remaining = GUARD_LIMIT
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| {
+            format!(
+                "{}: required run-lock guard did not finish",
+                layout.lock_guard().display()
+            )
+        })?;
+    sys.exclusive(&layout.lock_guard(), remaining)
         .map_err(|e| format!("{}: {e}", layout.lock_guard().display()))
 }
 
@@ -396,6 +407,57 @@ mod tests {
 
     fn layout() -> Layout {
         Layout { root: "/A".into() }
+    }
+
+    #[test]
+    fn a_scheduled_run_guard_does_not_refuse_the_next_valid_taker() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let layout = Layout {
+            root: dir.path().to_path_buf(),
+        };
+        std::fs::create_dir_all(layout.state()).unwrap();
+        let live = crate::port::Live::new();
+        drop(
+            guard_started(
+                &live,
+                &layout,
+                std::time::Instant::now() - std::time::Duration::from_secs(31),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            take_lock(&live, &layout, "1-1", std::process::id()).unwrap(),
+            Lock::Taken
+        );
+        let record = holder(&live, &layout).unwrap();
+        assert_eq!(record.pid, std::process::id());
+        assert_eq!(record.run, "1-1");
+        assert_eq!(record.start, started(&live, std::process::id()));
+        let held = live
+            .exclusive(&layout.lock_guard(), std::time::Duration::from_secs(60))
+            .unwrap();
+        assert!(
+            guard_started(
+                &live,
+                &layout,
+                std::time::Instant::now() - std::time::Duration::from_secs(61)
+            )
+            .is_err()
+        );
+        assert_eq!(holder(&live, &layout).unwrap(), record);
+        drop(held);
+        let changed = Holder {
+            run: "2-2".into(),
+            ..record.clone()
+        };
+        release_holder(&live, &layout, &changed).unwrap();
+        assert_eq!(holder(&live, &layout).unwrap(), record);
+        release_holder(&live, &layout, &record).unwrap();
+        assert!(holder(&live, &layout).is_none());
+        assert_eq!(
+            take_lock(&live, &layout, "2-2", std::process::id()).unwrap(),
+            Lock::Taken
+        );
     }
 
     #[test]

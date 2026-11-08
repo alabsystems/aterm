@@ -2040,6 +2040,7 @@ fn a_readers_cancel_identity_tracks_its_exact_timer_when_the_face_stays() {
             laid: None,
             generation: 0,
             rest: PointerRest::at_open(None),
+            ticks: CardTicks::default(),
         };
         let heard = menu.a11y_epoch();
         menu.highlight = Some(2);
@@ -3348,5 +3349,525 @@ fn the_card_border_is_the_static_arc() {
     assert_eq!(
         plain[3][0].ch, '\u{251c}',
         "no palette: a rule meets the border"
+    );
+}
+
+/// Case (c)'s Accounts card (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4) on `fx`'s
+/// clock at `room` cells, as the window lays it: `main`'s pane, every account listed, a card as
+/// wide as its rows ask and as tall.
+fn case_c_card(
+    fx: &aterm_agent::harness::quota_scenes::Fx,
+    room: usize,
+) -> (
+    aterm_agent::harness::quota_view::QuotaView,
+    Vec<MenuRow>,
+    MenuRect,
+) {
+    use crate::fact_menu::{FactMenuFacts, SessionWeek, account_menu_rows_from};
+    let out = std::sync::Arc::new(fx.outlook());
+    let (accounts, pool_unpinned) = account_menu_rows_from(
+        &fx.roster,
+        &fx.state,
+        &fx.enrolled,
+        true,
+        Some("main"),
+        None,
+        SessionWeek::default(),
+        fx.now,
+    );
+    let facts = FactMenuFacts {
+        title: "Accounts \u{b7} tab 1".into(),
+        spoken: "Accounts, tab 1".into(),
+        room,
+        accounts,
+        pool_unpinned,
+        outlook: Some(std::sync::Arc::clone(&out)),
+        account_row: Some("main".into()),
+        movable: true,
+        cli: Some(aterm_agent::harness::accounts::Cli::Claude),
+        ..FactMenuFacts::default()
+    };
+    let rows = crate::fact_menu::rows(Fact::Account, &facts);
+    let rect = MenuRect {
+        row: 3,
+        col: 2,
+        w: content_width(&rows) + CHROME_W,
+        h: rows.len() + 2,
+    };
+    (out.quota("main", None, true), rows, rect)
+}
+
+/// A CARD'S MIDNIGHT TICKS STAND AT THEIR MIDNIGHTS' PIXELS, UNDER THEIR DAYS' LABELS (§1.4,
+/// §2.2): on case (c)'s card at 60 and 44 cells (6 and 4 cells a day), with cells 8 by 16 and 7
+/// by 15 device pixels, on clocks that put each midnight at another place in its cell (UTC,
+/// +05:30, +09:45) and on one that springs forward over midnight, each tick on the work row and
+/// the lanes is one pixel wide at the foot of its painted row, a quarter of the cell tall, at
+/// `x` = the card's text column plus the midnight's own offset from the row's left edge at the
+/// row's grain, floored to the pixel; the painted cell under it draws a level, `┄` or nothing,
+/// never a name, `→`, `↺`, `▕` or `╳`; every midnight whose painted cell draws one has its tick;
+/// and each tick of a midnight ahead stands under that day's label on the axis row, where the
+/// label fits before the axis's end. Negative
+/// controls: a card whose plots carry no ticks lays none; the ticks laid from the card's own
+/// border column (no text offset) stand a column early, under no label.
+#[test]
+fn a_cards_midnight_ticks_stand_at_their_midnights_pixels() {
+    use aterm_agent::harness::quota_scenes::{D, H, MIN, case_c};
+    use aterm_agent::harness::quota_view::{GAP_MARK, HANDOFF_MARK, NOW_MARK, RESET_MARK};
+    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    /// A clock's name and its offset from UTC at an instant.
+    type Clock = (&'static str, fn(i64) -> i64);
+    let theme = aterm_render::Theme {
+        fg: 0x0020_2020,
+        bg: 0x00F8_F8F4,
+        cursor: 0x0000_0000,
+        selection: 0x00CC_CCEE,
+    };
+    let clocks: [Clock; 4] = [
+        ("UTC", |_| 0),
+        ("+05:30", |_| 5 * H + 30 * MIN),
+        ("+09:45", |_| 9 * H + 45 * MIN),
+        ("spring", |t| {
+            let spring = (case_c().now + 3 * D).div_euclid(D) * D + 4 * H;
+            if t < spring { -4 * H } else { -3 * H }
+        }),
+    ];
+    let (mut laid, mut under_label, mut skipped) = (0, 0, 0);
+    let mut out = Vec::new();
+    for (clock, offset) in clocks {
+        let mut fx = case_c();
+        fx.offset = offset;
+        for room in [60, 44] {
+            let (view, rows, rect) = case_c_card(&fx, room);
+            let k = aterm_agent::harness::outlook::card_per_day(room);
+            let s = D / i64::from(k);
+            let now = view.chart.now;
+            let painted = paint(
+                rect,
+                &rows,
+                MenuViewport::default(),
+                None,
+                theme,
+                Some(CardPalette::Cruise),
+            );
+            let (text_start, _) = text_span(rect.w, &rows);
+            // The rows on the work row's clock (it and the lanes), by their painted rows, and the
+            // axis row above the work row.
+            let clocked: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| {
+                    matches!(r, MenuRow::Plot { spoken, .. }
+                        if spoken.starts_with("Work,") || spoken.contains("'s week, "))
+                })
+                .map(|(i, _)| 1 + i)
+                .collect();
+            assert_eq!(
+                clocked.len(),
+                4,
+                "{clock} {room}: the work row and three lanes"
+            );
+            let work = rows
+                .iter()
+                .position(
+                    |r| matches!(r, MenuRow::Plot { spoken, .. } if spoken.starts_with("Work,")),
+                )
+                .map(|i| 1 + i)
+                .expect("the work row");
+            let axis: String = painted[work - 1].iter().map(|c| c.ch).collect();
+            let MenuRow::Plot {
+                cells: axis_cells, ..
+            } = &rows[work - 2]
+            else {
+                panic!("{clock} {room}: the axis over the work row")
+            };
+            for (cw, ch) in [(8u16, 16u16), (7, 15)] {
+                let what = format!("{clock} {room} {cw}x{ch}");
+                plot_ticks(rect, &rows, MenuViewport::default(), (cw, ch), &mut out);
+                let (cw_, ch_) = (i64::from(cw), i32::from(ch));
+                // The midnights' pixels from a drawn row's left edge, read off the instants.
+                let x_of = |m: i64| -> i64 {
+                    let lead = i64::try_from(aterm_agent::harness::outlook::WORK_WORD.len())
+                        .expect("cells");
+                    if m < now {
+                        lead * cw_ + (m - (now - D)) * cw_ / s
+                    } else {
+                        (lead + i64::from(k) + 1) * cw_ + (m - now) * cw_ / s
+                    }
+                };
+                let left = i64::try_from(text_start).expect("a column") * cw_;
+                let mut want = Vec::new();
+                for &r in &clocked {
+                    for &m in &view.chart.midnights {
+                        let x = left + x_of(m);
+                        let col = usize::try_from(x / cw_).expect("a column");
+                        let glyph = painted[r][col].ch;
+                        let line = |c: char| {
+                            ('\u{2581}'..='\u{2588}').contains(&c)
+                                || ('\u{1fb76}'..='\u{1fb7b}').contains(&c)
+                                || c == '\u{2594}'
+                                || c == '\u{2504}'
+                        };
+                        // The row's own cells: a lane ends at its reset, past it the card's ground.
+                        let MenuRow::Plot { cells, .. } = &rows[r - 1] else {
+                            unreachable!()
+                        };
+                        if col - text_start >= cells.len() {
+                            continue;
+                        }
+                        if glyph == ' ' || line(glyph) {
+                            let y = i32::try_from(r).expect("a row") * ch_ + ch_ - ch_ / 4;
+                            want.push((i32::try_from(x).expect("px"), y));
+                            // A label that would pass the axis's end is not laid (§1.4).
+                            if r == work && m >= now && col - text_start + 3 <= axis_cells.len() {
+                                let local = (m + offset(m)).div_euclid(D).rem_euclid(7);
+                                let day = WEEKDAYS[usize::try_from(local).expect("a day")];
+                                assert_eq!(
+                                    axis.chars().skip(col).take(3).collect::<String>(),
+                                    day,
+                                    "{what}: the tick at {x} under its label in {axis:?}"
+                                );
+                                under_label += 1;
+                            }
+                        } else {
+                            assert!(
+                                glyph.is_alphanumeric()
+                                    || [HANDOFF_MARK, RESET_MARK, NOW_MARK, GAP_MARK, '$']
+                                        .contains(&glyph),
+                                "{what}: a midnight in {glyph:?}"
+                            );
+                            skipped += 1;
+                        }
+                    }
+                }
+                let got: Vec<(i32, i32)> = out.iter().map(|t| (t.x, t.y)).collect();
+                assert_eq!(got, want, "{what}");
+                assert!(
+                    out.iter().all(|t| (t.w, t.h) == (1, ch / 4) && t.ink == 0),
+                    "{what}: one pixel wide, a quarter of the cell tall"
+                );
+                laid += out.len();
+            }
+        }
+    }
+    assert!(
+        laid > 0 && under_label > 0,
+        "{laid} ticks, {under_label} under labels"
+    );
+    assert!(
+        skipped > 0,
+        "the cards hold midnights in a letter's or a mark's cell"
+    );
+}
+
+/// A CARD'S TICKS ARE ONE LAYER WHILE IT IS OPEN, SEALED ONCE, AND GONE ONCE IT CLOSES (§1.4):
+/// with case (c)'s card open over a Claude Code pane, a frame lays one layer of the card's ticks
+/// over the glyphs, at the card's corner and clipped to it, its rects [`plot_ticks`]' for the
+/// painted card; the layer stands on the card (its chrome is the occluder the card pushed, which
+/// cuts every other layer), so the renderer's slicing, through the frame's occluders, draws
+/// every pixel of every tick; a frame at rest hands on the same content, and refilling the
+/// ticks allocates nothing; a closed card leaves no tick behind. Negative controls: a card that
+/// never lays its layer fails the first; one whose layer stands on no chrome draws no tick
+/// (the card's own occluder cuts them all, as the Day and Night captures first showed); one
+/// that seals its ticks anew each frame fails the rest.
+#[test]
+fn a_cards_ticks_are_one_layer_while_it_is_open_and_cost_nothing_at_rest() {
+    use aterm_agent::harness::quota_scenes::case_c;
+    let (mut app, wid, session, _host) = claude_app();
+    frame(&mut app, wid);
+    app.open_front_autopilot_menu()
+        .expect("the chip is on the glass");
+    let (_, rows, _) = case_c_card(&case_c(), 60);
+    app.autopilot_menu.as_mut().expect("open").rows = rows;
+    frame(&mut app, wid);
+    let id = crate::claude_footer::quota::card_tick_id(session);
+    let ours = |app: &App| -> Vec<FxLayer> {
+        app.windows[&wid]
+            .input_scratch
+            .fx_layers
+            .iter()
+            .filter(|l| l.id == id)
+            .cloned()
+            .collect()
+    };
+    let first = ours(&app);
+    assert_eq!(first.len(), 1, "one layer of ticks");
+    let layer = &first[0];
+    let menu = app.autopilot_menu.as_ref().expect("open");
+    let rect = menu.rect.expect("painted");
+    let (cw, ch) = app
+        .glass_grid(wid)
+        .map_or_else(|| app.win_cell_size(wid), |g| g.cell());
+    let cell = (
+        u16::try_from(cw).expect("a cell"),
+        u16::try_from(ch).expect("a cell"),
+    );
+    let mut want = Vec::new();
+    plot_ticks(rect, &menu.rows, menu.viewport, cell, &mut want);
+    assert!(!want.is_empty(), "the card's rows in view hold ticks");
+    let laid: Vec<FxRect> = layer
+        .content
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            aterm_core::render::FxItem::Rect(r) => Some(*r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(laid, want);
+    let px = |cells: usize, side: usize| i32::try_from(cells * side).expect("px");
+    assert_eq!(layer.offset, (px(rect.col, cw), px(rect.row, ch)));
+    assert_eq!(
+        (layer.slot, layer.space, layer.blend),
+        (FxSlot::Over, FxSpace::Grid, FxBlend::Exact)
+    );
+    assert_eq!(
+        (layer.clip.x0, layer.clip.y0),
+        (px(rect.col, cw), px(rect.row, ch))
+    );
+    let track = card_inks(app.overlay_card_theme(wid), None).1.track();
+    assert!(
+        layer.content.palette().iter().all(|ink| ink.color == track),
+        "the track ink"
+    );
+    let scratch = &app.windows[&wid].input_scratch;
+    let occluder = layer.chrome.expect("the ticks stand on the card");
+    assert!(
+        scratch.fx_occluders.contains(&occluder),
+        "the card's own occluder, {occluder:?}, in {:?}",
+        scratch.fx_occluders
+    );
+    let (pad, grid_top) = (app.win_pad(wid), app.win_pad_top(wid) + app.win_head(wid));
+    let fx = aterm_render::FxFrame {
+        w: 2 * pad + scratch.cols * cw,
+        h: grid_top + scratch.cells.len() * ch + pad,
+        pad,
+        grid_top,
+        cell_h: ch,
+        rows: scratch.cells.len(),
+    };
+    let ticks: std::collections::BTreeSet<(usize, usize)> = want
+        .iter()
+        .flat_map(|r| {
+            let x = usize::try_from(i64::from(r.x) + i64::from(layer.offset.0)).expect("x");
+            let y = usize::try_from(i64::from(r.y) + i64::from(layer.offset.1)).expect("y");
+            (0..usize::from(r.h))
+                .flat_map(move |dy| (0..usize::from(r.w)).map(move |dx| (x + dx, y + dy)))
+        })
+        .map(|(x, y)| (pad + x, grid_top + y))
+        .collect();
+    let drawn = |layer: &FxLayer| sliced(&fx, layer, &scratch.fx_occluders);
+    assert_eq!(
+        drawn(layer),
+        ticks,
+        "every tick pixel is drawn through the frame's occluders"
+    );
+    let bare = FxLayer {
+        chrome: None,
+        ..layer.clone()
+    };
+    assert!(
+        drawn(&bare).is_empty(),
+        "on no chrome, the card's occluder cuts every tick"
+    );
+    frame(&mut app, wid);
+    let again = ours(&app);
+    assert_eq!(again.len(), 1, "still one layer");
+    assert!(
+        Arc::ptr_eq(&again[0].content, &layer.content),
+        "a frame at rest seals no new content"
+    );
+    let menu = app.autopilot_menu.as_mut().expect("open");
+    let (content, allocations) = crate::work_counts::allocations_in(|| {
+        menu.ticks
+            .content((rect, &menu.rows, menu.viewport), cell, track)
+    });
+    assert_eq!(
+        allocations, 0,
+        "refilling the ticks at rest allocates nothing"
+    );
+    assert!(content.is_some_and(|c| Arc::ptr_eq(&c, &layer.content)));
+    assert!(app.close_autopilot_menu(), "closed");
+    frame(&mut app, wid);
+    assert!(ours(&app).is_empty(), "no tick once the card is gone");
+}
+
+/// The window pixels the renderer's slicing draws of `layer` in `fx` through `occluders`.
+fn sliced(
+    fx: &aterm_render::FxFrame,
+    layer: &FxLayer,
+    occluders: &[aterm_core::render::PxRect],
+) -> std::collections::BTreeSet<(usize, usize)> {
+    struct Px<'o>(&'o mut std::collections::BTreeSet<(usize, usize)>);
+    impl<'a> aterm_render::FxSliceSink<'a> for Px<'_> {
+        fn item(
+            &mut self,
+            _: &'a FxLayer,
+            _: &'a aterm_core::render::FxItem,
+            _: (i64, i64),
+        ) -> bool {
+            true
+        }
+
+        fn slice(&mut self, s: aterm_render::FxSlice, _: usize) {
+            for y in s.y0..s.y1 {
+                for x in s.x0..s.x1 {
+                    self.0.insert((x, y));
+                }
+            }
+        }
+    }
+    let mut out = std::collections::BTreeSet::new();
+    aterm_render::slice_layers(
+        fx,
+        std::slice::from_ref(layer),
+        occluders,
+        |_| true,
+        |_| true,
+        &mut aterm_render::FxSlicer::default(),
+        &mut Px(&mut out),
+    );
+    out
+}
+
+/// A CARD'S TICKS MOVE WITHOUT MOVING ITS ITEMS' READER IDENTITIES (§1.4): the outlook replays
+/// once a minute with a new now, and every midnight's place moves with it while, between
+/// readings, no cell or caption does. Case (c)'s Accounts card ten minutes after its readings
+/// (its resets fall on cell edges at the readings' own instant, so the first minute moves a
+/// lane's `↺`), open with its `alt1` item lit, rebuilt a minute later takes the fresh ticks and
+/// asks for a frame (its repaint key moves), but keeps its generation,
+/// its painted place, its highlight and its accessibility epoch, so a focused item keeps its
+/// AccessKit node and a reader's activation sent under the epoch still lands. Control: a rebuild
+/// that changes what the card shows (case (c) four hours on) moves the epoch. NEGATIVE CONTROL
+/// (run once, restored): hashing the ticks into a row's identity, as the ticks' first cut did,
+/// moves the epoch on the minute's rebuild and fails.
+#[cfg(a11y_tree)]
+#[test]
+fn a_cards_ticks_move_with_the_clock_and_keep_its_items_reader_identities() {
+    use aterm_agent::harness::quota_scenes::{H, MIN, case_c};
+    let at = |later: i64| {
+        let mut fx = case_c();
+        fx.now += later;
+        case_c_card(&fx, 60)
+    };
+    let (_, rows, rect) = at(10 * MIN);
+    let alt1 = rows
+        .iter()
+        .position(|row| matches!(row, MenuRow::Item { label, .. } if label.contains("alt1")))
+        .expect("the alt1 item");
+    let mut menu = AutopilotMenu {
+        owner: MenuOwner::Fact(Fact::Account),
+        wid: WindowId(0),
+        session: 7,
+        focus: Some(7),
+        anchor: (20, 0),
+        rows,
+        spoken: "Accounts, tab 1".into(),
+        cancels: None,
+        highlight: Some(alt1),
+        viewport: MenuViewport::default(),
+        page_rows: rect.h.saturating_sub(2),
+        wheel_residual: 0.0,
+        wheel_residual_x: 0.0,
+        rect: Some(rect),
+        laid: None,
+        generation: 3,
+        rest: PointerRest::at_open(None),
+        ticks: CardTicks::default(),
+    };
+    let ticks = |rows: &[MenuRow]| -> Vec<Vec<i64>> {
+        rows.iter()
+            .filter_map(|row| match row {
+                MenuRow::Plot { ticks, .. } => Some(ticks.to_vec()),
+                _ => None,
+            })
+            .collect()
+    };
+    let (heard, painted) = (menu.a11y_epoch(), menu.fingerprint());
+    let (_, fresh, _) = at(11 * MIN);
+    assert_ne!(
+        ticks(&fresh),
+        ticks(&menu.rows),
+        "the minute moved the midnights' places"
+    );
+    assert!(
+        same_but_ticks(&menu.rows, &fresh),
+        "and nothing the card shows or says"
+    );
+    assert!(
+        menu.refresh_rows(fresh.clone(), "Accounts, tab 1".into(), None),
+        "moved ticks are painted anew"
+    );
+    assert_eq!(menu.rows, fresh, "the card holds the fresh ticks");
+    assert_ne!(menu.fingerprint(), painted, "its repaint key moved");
+    assert_eq!(
+        menu.a11y_epoch(),
+        heard,
+        "the items keep their reader identities"
+    );
+    assert_eq!(
+        (menu.generation, menu.rect, menu.highlight),
+        (3, Some(rect), Some(alt1)),
+        "the rows under the pointer, the card's place and the lit item stay"
+    );
+    assert!(
+        !menu.refresh_rows(fresh, "Accounts, tab 1".into(), None),
+        "the same rows again ask for nothing"
+    );
+    let (_, moved, _) = at(4 * H);
+    assert!(
+        !same_but_ticks(&menu.rows, &moved),
+        "CONTROL: four hours on, the card shows more than its ticks moved"
+    );
+    menu.refresh_rows(moved, "Accounts, tab 1".into(), None);
+    assert_ne!(
+        menu.a11y_epoch(),
+        heard,
+        "CONTROL: a changed card's epoch moves"
+    );
+}
+
+/// A ROW'S WIDTH IS ITS TEXT'S, COUNTED WITHOUT BUILDING IT: over case (c)'s card and rows of
+/// every kind (a name in quotes, an item behind a glyph narrower and one wider than its column,
+/// a setter's note under its floor, a gap), [`row_width`] is the cells of the row's text, an
+/// item's check included and a setter's floor kept, and reading a whole card's width allocates
+/// nothing. Negative control: the width read off [`MenuRow::text`], as every frame read it
+/// before the card's ticks, allocates once a row.
+#[test]
+fn a_rows_width_is_its_texts_counted_without_building_it() {
+    use aterm_agent::harness::quota_scenes::case_c;
+    let (_, mut rows, _) = case_c_card(&case_c(), 60);
+    let item = |glyph: &'static str, label: &str| MenuRow::Item {
+        glyph,
+        label: label.into(),
+        spoken: label.into(),
+        act: MenuAct::Settings,
+        enabled: true,
+        checked: false,
+    };
+    rows.extend([
+        MenuRow::Name("caf\u{e9} \u{4e2d}".into()),
+        item("\u{2386}", "main  75%"),
+        item("\u{1f600}\u{1f600}\u{1f600}", "wide"),
+        MenuRow::SetBy {
+            text: "set 14:05".into(),
+            floor: 20,
+        },
+        MenuRow::Gap(7),
+    ]);
+    for row in &rows {
+        let text = display_cells(&row.text());
+        let want = match row {
+            MenuRow::Item { .. } => text + CHECK_CELLS,
+            MenuRow::SetBy { floor, .. } => text.max(*floor),
+            MenuRow::Gap(cells) => *cells,
+            _ => text,
+        };
+        assert_eq!(row_width(row), want, "{row:?}");
+    }
+    let (width, allocations) = crate::work_counts::allocations_in(|| content_width(&rows));
+    assert_eq!(allocations, 0, "a card's width allocates nothing");
+    assert_eq!(
+        width,
+        TRAFFIC_MAX_CONTENT.min(rows.iter().map(row_width).max().unwrap_or(0))
     );
 }

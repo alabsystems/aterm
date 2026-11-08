@@ -3,7 +3,10 @@
 
 //! In-grid popup menu for the Autopilot chip and composer-rule facts (`crate::fact_menu`).
 
+use std::sync::Arc;
+
 use aterm_agent::supervise::Autopilot;
+use aterm_core::render::{FxBlend, FxContent, FxLayer, FxRect, FxSlot, FxSpace, PxRect};
 use aterm_core::terminal::RenderCell;
 use aterm_effects::glass_inks::{GlassInks, field};
 use aterm_effects::harness_card::CardPalette;
@@ -88,10 +91,15 @@ pub(crate) enum MenuRow {
     Rule,
     /// Blank placeholder preserving row positions after a choice disappears.
     Gap(usize),
-    /// A drawn row (a chart, a bar, a strip) with the caption a screen reader is told for it.
+    /// A drawn row (a chart, a bar, a strip) with the caption a screen reader is told for it,
+    /// and, on a row with a clock (the Accounts card's work row and lanes), its midnights'
+    /// ticks: each one's place from the row's left edge
+    /// ([`aterm_agent::harness::quota_view::CELL_PLACES`] a cell), drawn by [`plot_ticks`]. The
+    /// ticks move with the clock and are paint, not the row's reader identity (its `Hash`).
     Plot {
         cells: Box<[PlotCell]>,
         spoken: String,
+        ticks: Box<[i64]>,
     },
     Item {
         glyph: &'static str,
@@ -126,12 +134,24 @@ impl MenuRow {
         }
     }
 
-    /// A drawn row of `cells` a screen reader is told as `spoken`.
+    /// A drawn row of `cells` a screen reader is told as `spoken`, with no clock.
     #[must_use]
     pub(crate) fn plot(cells: impl Into<Box<[PlotCell]>>, spoken: impl Into<String>) -> Self {
+        Self::plot_ticked(cells, spoken, Box::default())
+    }
+
+    /// A drawn row of `cells` a screen reader is told as `spoken`, its midnights' ticks at
+    /// `ticks` ([`MenuRow::Plot`]).
+    #[must_use]
+    pub(crate) fn plot_ticked(
+        cells: impl Into<Box<[PlotCell]>>,
+        spoken: impl Into<String>,
+        ticks: impl Into<Box<[i64]>>,
+    ) -> Self {
         Self::Plot {
             cells: cells.into(),
             spoken: spoken.into(),
+            ticks: ticks.into(),
         }
     }
 
@@ -456,13 +476,41 @@ fn same_choice(a: &MenuRow, b: &MenuRow) -> bool {
     }
 }
 
+/// Whether `shown` and `fresh` are the same rows but for their drawn rows' midnights' ticks
+/// ([`MenuRow::Plot`]): the same cells and captions, so the items a pointer presses and a reader
+/// is told are unchanged. The ticks are measured from the chart's now, so they move at each
+/// replay of the outlook (once a minute) while nothing the card says moves.
+fn same_but_ticks(shown: &[MenuRow], fresh: &[MenuRow]) -> bool {
+    shown.len() == fresh.len()
+        && shown.iter().zip(fresh).all(|pair| match pair {
+            (
+                MenuRow::Plot { cells, spoken, .. },
+                MenuRow::Plot {
+                    cells: fresh_cells,
+                    spoken: fresh_spoken,
+                    ..
+                },
+            ) => cells == fresh_cells && spoken == fresh_spoken,
+            (shown, fresh) => shown == fresh,
+        })
+}
+
+/// The cells `row` takes: its text's ([`MenuRow::text`]), counted without building it, since a
+/// text's cells are the sum of its characters' ([`display_cells`]); a card's width is read every
+/// frame it is painted ([`side_pad`]) and laid ([`plot_ticks`]), and so allocates nothing.
 fn row_width(row: &MenuRow) -> usize {
     match row {
         MenuRow::Gap(cells) => *cells,
         MenuRow::Plot { cells, .. } => cells.len(),
-        MenuRow::Item { .. } => display_cells(&row.text()) + CHECK_CELLS,
-        MenuRow::SetBy { floor, .. } => display_cells(&row.text()).max(*floor),
-        _ => display_cells(&row.text()),
+        MenuRow::Item { glyph, label, .. } => {
+            display_cells(glyph).max(GLYPH_CELLS) + display_cells(label) + CHECK_CELLS
+        }
+        MenuRow::SetBy { text, floor } => display_cells(text).max(*floor),
+        MenuRow::Header(text) | MenuRow::Note { text, .. } => display_cells(text),
+        MenuRow::Name(name) => {
+            display_cells("\u{201c}") + display_cells(name) + display_cells("\u{201d}")
+        }
+        MenuRow::Rule => 0,
     }
 }
 
@@ -733,6 +781,103 @@ const fn unpack(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
+/// The card's colours and the glass's inks on them ([`paint`]): a fact card the glass opens
+/// stands on the pane's own ground, the ground the inks are solved on; with no palette, on the
+/// band's grey.
+fn card_inks(
+    theme: Theme,
+    palette: Option<CardPalette>,
+) -> (crate::tab_menu::MenuColors, GlassInks) {
+    let c = match palette {
+        Some(_) => crate::tab_menu::glass_menu_colors(theme),
+        None => crate::tab_menu::menu_colors(theme),
+    };
+    let inks = GlassInks::of(
+        palette,
+        pack(c.card_bg),
+        theme.fg & 0x00FF_FFFF,
+        pack(c.rule),
+    );
+    (c, inks)
+}
+
+/// The card columns a row's text (and a drawn row's cells) take in a card `w` cells wide:
+/// inside the border and the side pad.
+fn text_span(w: usize, rows: &[MenuRow]) -> (usize, usize) {
+    let pad = side_pad(w, rows);
+    (1 + pad, w.saturating_sub(1 + pad))
+}
+
+/// The midnights' ticks on the card's visible drawn rows (§1.4, §2.2) into `out` (cleared
+/// first), in pixels from the card's top left corner at cells `cell` device pixels: each
+/// [`MenuRow::Plot`]'s ticks on the row it is painted on, from the card's text column as
+/// [`paint_plot`] lays its cells, and none past the text's end, as line E lays its own
+/// ([`crate::claude_footer::quota::push_ticks`]).
+pub(crate) fn plot_ticks(
+    rect: MenuRect,
+    rows: &[MenuRow],
+    viewport: MenuViewport,
+    cell: (u16, u16),
+    out: &mut Vec<FxRect>,
+) {
+    out.clear();
+    let (text_start, text_end) = text_span(rect.w, rows);
+    let room = text_end.saturating_sub(text_start);
+    let left = i32::try_from(text_start)
+        .unwrap_or(i32::MAX)
+        .saturating_mul(i32::from(cell.0));
+    let visible = viewport.range(rows.len(), rect.h.saturating_sub(2));
+    for (r, row) in rows
+        .iter()
+        .enumerate()
+        .take(visible.end)
+        .skip(visible.start)
+        .map(|(i, row)| (1 + i - visible.start, row))
+        .take_while(|&(r, _)| r + 1 < rect.h)
+    {
+        let MenuRow::Plot { ticks, .. } = row else {
+            continue;
+        };
+        let from = out.len();
+        let top = i32::try_from(r)
+            .unwrap_or(i32::MAX)
+            .saturating_mul(i32::from(cell.1));
+        crate::claude_footer::quota::push_ticks(out, ticks, (top, room), cell);
+        for tick in &mut out[from..] {
+            tick.x = tick.x.saturating_add(left);
+        }
+    }
+}
+
+/// An open card's midnights' ticks ([`plot_ticks`]): this frame's rects, refilled in place,
+/// and the content sealed of them, which a frame whose ticks have not moved hands on again, so
+/// a card at rest seals and allocates nothing for them.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CardTicks {
+    rects: Vec<FxRect>,
+    content: Option<Arc<FxContent>>,
+}
+
+impl CardTicks {
+    /// The content of the ticks of `rows` on a card at `rect` ([`plot_ticks`]) in `track`: the
+    /// last frame's where they and the ink are unchanged.
+    fn content(
+        &mut self,
+        (rect, rows, viewport): (MenuRect, &[MenuRow], MenuViewport),
+        cell: (u16, u16),
+        track: u32,
+    ) -> Option<Arc<FxContent>> {
+        plot_ticks(rect, rows, viewport, cell, &mut self.rects);
+        let same = self.content.as_deref().map_or(self.rects.is_empty(), |c| {
+            crate::claude_footer::quota::draws_ticks(c, &self.rects, track)
+        });
+        if !same {
+            self.content = crate::claude_footer::quota::tick_content(&self.rects, track);
+        }
+        self.content.clone()
+    }
+}
+
 /// Render the menu card into `rect.h` rows of `rect.w` cells, wearing `palette`'s glass
 /// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4, §4.1): a fact card the glass opens
 /// wears its pane's Autopilot palette on the pane's own ground ([`crate::tab_menu::glass_menu_colors`],
@@ -750,23 +895,13 @@ pub(crate) fn paint(
     theme: Theme,
     palette: Option<CardPalette>,
 ) -> Vec<Vec<RenderCell>> {
-    let c = match palette {
-        Some(_) => crate::tab_menu::glass_menu_colors(theme),
-        None => crate::tab_menu::menu_colors(theme),
-    };
+    let (c, inks) = card_inks(theme, palette);
     let w = rect.w;
-    let pad = side_pad(w, rows);
-    let text_start = 1 + pad;
-    let text_end = w.saturating_sub(1 + pad);
+    let (text_start, text_end) = text_span(w, rows);
     let cell = crate::chrome_band::cell;
     let visible = viewport.range(rows.len(), rect.h.saturating_sub(2));
     let glass = CardGlass {
-        inks: GlassInks::of(
-            palette,
-            pack(c.card_bg),
-            theme.fg & 0x00FF_FFFF,
-            pack(c.rule),
-        ),
+        inks,
         rows: (visible.len() + 2).min(rect.h),
         arc: palette.is_some(),
     };
@@ -957,6 +1092,8 @@ pub(crate) struct AutopilotMenu {
     pub(crate) laid: Option<crate::app_mouse::GlassGrid>,
     pub(crate) generation: u64,
     pub(crate) rest: PointerRest,
+    /// The midnights' ticks on its drawn rows as the last frame laid them.
+    pub(crate) ticks: CardTicks,
 }
 
 /// Last pointer position and hovered choice recorded while the menu is open.
@@ -1030,7 +1167,11 @@ impl AutopilotMenu {
                 && rest.choice == self.choice_at(i))
     }
 
-    /// Rebuild menu rows in place, returning whether visible rows changed.
+    /// Rebuild menu rows in place, returning whether the card must be painted again. Rows that
+    /// differ from the shown ones only in their midnights' ticks ([`same_but_ticks`]) are taken
+    /// as they are, with no new generation: the rows under the pointer, the highlight, the
+    /// card's place and the items' reader identities ([`Self::a11y_epoch`]) all stay, and only
+    /// the ticks are painted anew ([`Self::fingerprint`]).
     pub(crate) fn refresh_rows(
         &mut self,
         fresh: Vec<MenuRow>,
@@ -1043,6 +1184,10 @@ impl AutopilotMenu {
         let laid = kept.unwrap_or(fresh);
         if self.rows == laid {
             return false;
+        }
+        if same_but_ticks(&self.rows, &laid) {
+            self.rows = laid;
+            return true;
         }
         self.spoken = spoken;
         let lit = self.highlight.and_then(|i| self.rows.get(i));
@@ -1130,6 +1275,13 @@ impl AutopilotMenu {
         self.anchor.hash(&mut h);
         self.highlight.hash(&mut h);
         self.rows.hash(&mut h);
+        // The midnights' ticks, which a row's identity leaves out ([`MenuRow`]'s `Hash`), are
+        // painted: a frame whose ticks moved repaints.
+        for row in &self.rows {
+            if let MenuRow::Plot { ticks, .. } = row {
+                ticks.hash(&mut h);
+            }
+        }
         self.viewport.hash(&mut h);
         self.page_rows.hash(&mut h);
         h.finish() | 1
@@ -1145,7 +1297,11 @@ impl std::hash::Hash for MenuRow {
             Self::Rule => 2u8.hash(h),
             Self::Gap(cells) => (4u8, cells).hash(h),
             Self::SetBy { text, floor } => (6u8, text, floor).hash(h),
-            Self::Plot { cells, spoken } => (7u8, cells, spoken).hash(h),
+            // A drawn row is what it shows in cells and what a reader is told of it. Its
+            // midnights' ticks, measured from the chart's now, move at every replay of the
+            // outlook while nothing it says moves ([`same_but_ticks`]), so they stay out of the
+            // reader identity ([`AutopilotMenu::a11y_epoch`]); the repaint key hashes them.
+            Self::Plot { cells, spoken, .. } => (7u8, cells, spoken).hash(h),
             Self::Item {
                 label,
                 act,
@@ -1328,6 +1484,7 @@ impl App {
             laid: None,
             generation: 0,
             rest: PointerRest::at_open(px),
+            ticks: CardTicks::default(),
         });
         self.request_menu_frame(wid);
     }
@@ -1517,6 +1674,14 @@ impl App {
         };
         let ((cw, ch), pad) = (self.win_cell_size(wid), self.win_pad(wid));
         let grid_top = self.win_pad_top(wid) + self.win_head(wid);
+        // The ticks' cell, as line E's: the laid grid's where there is one.
+        let cell = {
+            let (w, h) = self.glass_grid(wid).map_or((cw, ch), |g| g.cell());
+            (
+                u16::try_from(w).unwrap_or(u16::MAX),
+                u16::try_from(h).unwrap_or(u16::MAX),
+            )
+        };
         let pane = self.autopilot_menu_pane(wid, session);
         let menu = self.autopilot_menu.as_ref()?;
         let ws = self.windows.get(&wid)?;
@@ -1583,7 +1748,7 @@ impl App {
             }
         }
         crate::claude_card::cut_out(&mut ws.claude_card, &mut ws.input_scratch, rect, cw, pad);
-        crate::app_render::scrub_overlay_card(
+        let occluder = crate::app_render::scrub_overlay_card(
             &mut ws.input_scratch,
             rect,
             (cw, ch),
@@ -1594,6 +1759,38 @@ impl App {
         for (r, row) in painted.iter().enumerate().take(on_frame) {
             ws.claude_card
                 .paint_marks(&mut ws.input_scratch, rect.row + r, rect.col, row);
+        }
+        // The midnights' ticks on its drawn rows (§1.4), over the cells just painted and
+        // clipped to the card's rows on the frame, standing on the card as its own (its
+        // occluder, which cuts every other layer, does not cut them); stripped with the marks.
+        if let Some(menu) = self.autopilot_menu.as_mut()
+            && let Some(content) = menu.ticks.content(
+                (rect, &menu.rows, menu.viewport),
+                cell,
+                card_inks(theme, palette).1.track(),
+            )
+        {
+            let px = |cells: usize, side: u16| {
+                i32::try_from(cells)
+                    .unwrap_or(i32::MAX)
+                    .saturating_mul(i32::from(side))
+            };
+            let mut layer = FxLayer::new(
+                crate::claude_footer::quota::card_tick_id(session),
+                content,
+                FxSlot::Over,
+                FxSpace::Grid,
+                FxBlend::Exact,
+            );
+            layer.offset = (px(rect.col, cell.0), px(rect.row, cell.1));
+            layer.clip = PxRect::new(
+                px(rect.col, cell.0),
+                px(rect.row, cell.1),
+                px(rect.col + rect.w, cell.0),
+                px(rect.row + rect.h.min(on_frame), cell.1),
+            );
+            layer.chrome = occluder;
+            ws.claude_card.paint_layer(&mut ws.input_scratch, layer);
         }
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         if let Some(menu) = self.autopilot_menu.as_mut() {

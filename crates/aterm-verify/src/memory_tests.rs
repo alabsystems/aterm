@@ -1306,31 +1306,50 @@ fn a_book_keeps_a_metered_stages_peak_for_its_next_run() {
 /// How many times [`counted_reader`] was asked, by pid.
 static READS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
-fn counted_reader(pid: u32) -> Option<crate::unitgraph::UnitName> {
-    READS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .push(pid);
-    (pid != 3).then(|| crate::unitgraph::UnitName {
-        package: "aterm-gui".to_owned(),
-        kind: if pid == 1 {
-            "aterm_gui test"
-        } else {
-            "aterm_gui lib"
-        }
-        .to_owned(),
+/// Pid 3 compiles no unit; pid 6 reads as nothing once (a read between Cargo's fork and its
+/// exec) and then as `aterm_grid lib`; pid 8 reads as an `aterm_gui lib` compiler once (a linker
+/// that compiler started, read before its exec) and then as nothing; pid 9 reads as
+/// `aterm_term lib`'s admission wrapper once (the compiler that wrapper started, read before its
+/// exec) and then as that compiler; pid 4 is an `aterm_gui lib` compiler unreadable after its
+/// first read; pid 7 is `aterm_gui lib`'s admission wrapper; pid 5 compiles `aterm_cell lib`;
+/// pid 1 `aterm_gui test`; every other pid `aterm_gui lib`.
+fn counted_reader(pid: u32) -> Named {
+    let earlier = {
+        let mut reads = READS.lock().unwrap_or_else(PoisonError::into_inner);
+        reads.push(pid);
+        reads.iter().filter(|&&p| p == pid).count() - 1
+    };
+    let (package, kind, wrapper) = match (pid, earlier) {
+        (3, _) | (6, 0) | (8, 1..) => return Named::Nothing,
+        (4, 1..) => return Named::Unread,
+        (1, _) => ("aterm-gui", "aterm_gui test", false),
+        (5, _) => ("aterm-cell", "aterm_cell lib", false),
+        (6, _) => ("aterm-grid", "aterm_grid lib", false),
+        (9, e) => ("aterm-term", "aterm_term lib", e == 0),
+        (7, _) => ("aterm-gui", "aterm_gui lib", true),
+        _ => ("aterm-gui", "aterm_gui lib", false),
+    };
+    Named::Unit(UnitRead {
+        unit: crate::unitgraph::UnitName {
+            package: package.to_owned(),
+            kind: kind.to_owned(),
+        },
+        wrapper,
     })
 }
 
-/// A METER THAT ATTRIBUTES READS EACH HEAVY COMPILER ONCE: a member is read for its unit the first
-/// time its footprint reaches the floor (1 GiB), and never again however often it is booked; its
-/// unit's peak is the most it held, its lifetime peak included; a light member is never read; a
-/// member that compiles no unit (pid 3) is read once and books nothing; two compilers of one unit
-/// keep the most of them. A command line names its unit by `--crate-name`, `--test` or
-/// `--crate-type`, and `CARGO_PKG_NAME`. NEGATIVE CONTROL: with the floor ignored by hand, the
-/// light member was read.
+/// A METER THAT ATTRIBUTES READS EVERY MEMBER AT EVERY READ, TAKES IT FOR WHAT ITS LAST READABLE
+/// READ NAMED, AND KEEPS ONLY HEAVY COMPILERS' PEAKS: a unit's peak is the most its compiler
+/// held, its lifetime peak included, where that reaches the floor (1 GiB); two compilers of one
+/// unit keep the most of them; a read that cannot read a member leaves its name. NEGATIVE
+/// CONTROLS: the light compiler (pid 5) is named, yet its unit keeps no peak; the wrapper (pid 7)
+/// holds more than its unit's compilers, yet its unit's peak is theirs; the linker misnamed at
+/// its first read (pid 8) holds 5 GiB, yet `aterm_gui lib` keeps its compilers' 3 GiB, where a
+/// first name kept for good would give it 5; the compiler misnamed as its wrapper at its first
+/// read (pid 9) keeps its 2 GiB peak, where that name kept would keep none; the member that
+/// compiles nothing (pid 3) holds 5 GiB and keeps no peak.
 #[test]
-fn a_meter_reads_each_heavy_compiler_once_for_its_unit() {
+fn a_meter_names_each_member_by_its_last_readable_read_and_keeps_heavy_peaks() {
     let m = |pid: u32, start: u64, footprint: u64, peak: u64| aterm_sysprobe::MemberUsage {
         pid,
         start,
@@ -1339,23 +1358,40 @@ fn a_meter_reads_each_heavy_compiler_once_for_its_unit() {
         ..aterm_sysprobe::MemberUsage::default()
     };
     let meter = Meter::attributing(counted_reader, UNIT_FLOOR);
-    meter.book(9, &[m(1, 5, GIB / 2, GIB / 2), m(2, 5, 2 * GIB, 2 * GIB)]);
+    meter.book(
+        9,
+        &[
+            m(1, 5, GIB / 2, GIB / 2),
+            m(2, 5, 2 * GIB, 2 * GIB),
+            m(7, 5, 4 * GIB, 4 * GIB),
+            m(6, 5, GIB / 8, GIB / 8),
+            m(3, 5, GIB / 8, GIB / 8),
+            m(8, 5, GIB / 8, GIB / 8),
+            m(9, 5, GIB / 8, GIB / 8),
+        ],
+    );
     meter.book(
         9,
         &[
             m(1, 5, 4 * GIB, 6 * GIB),
             m(2, 5, GIB, 2 * GIB),
             m(3, 5, 5 * GIB, 5 * GIB),
+            m(6, 5, 2 * GIB, 2 * GIB),
+            m(8, 5, 5 * GIB, 5 * GIB),
+            m(9, 5, 2 * GIB, 2 * GIB),
         ],
     );
-    meter.book(
-        9,
-        &[
-            m(1, 5, 5 * GIB, 6 * GIB),
-            m(4, 6, 3 * GIB, 3 * GIB),
-            m(5, 7, GIB / 4, GIB / 4),
-        ],
-    );
+    for _ in 0..3 {
+        meter.book(
+            9,
+            &[
+                m(1, 5, 5 * GIB, 6 * GIB),
+                m(4, 6, 3 * GIB, 3 * GIB),
+                m(5, 7, GIB / 4, GIB / 4),
+                m(3, 5, GIB / 8, GIB / 8),
+            ],
+        );
+    }
     let peaks: Vec<(String, u64)> = meter
         .unit_peaks()
         .into_iter()
@@ -1364,19 +1400,135 @@ fn a_meter_reads_each_heavy_compiler_once_for_its_unit() {
     assert_eq!(
         peaks,
         [
+            ("aterm_grid lib".to_owned(), 2 * GIB),
             ("aterm_gui lib".to_owned(), 3 * GIB),
-            ("aterm_gui test".to_owned(), 6 * GIB)
+            ("aterm_gui test".to_owned(), 6 * GIB),
+            ("aterm_term lib".to_owned(), 2 * GIB),
         ]
     );
     let mut reads = READS.lock().unwrap_or_else(PoisonError::into_inner).clone();
     reads.sort_unstable();
     assert_eq!(
         reads,
-        [1, 2, 3, 4],
-        "each heavy member once, the light one never"
+        [
+            1, 1, 1, 1, 1, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 7, 8, 8, 9, 9
+        ],
+        "every member at every read that found it"
     );
     assert!(Meter::new().unit_peaks().is_empty());
+}
 
+/// A COMPILER'S SPAN IS ITS FIRST AND LAST READ, ITS UNIT'S WRAPPER THE ONE FIRST READ BEFORE
+/// IT: a wrapper read at 0 s and its compiler read at 2 s, 4 s and 5 s span 2–5 s queued from
+/// 0 s, with the CPU of the compiler's last read and the most it held; a second wrapper of the
+/// same unit read after that compiler started is no wrapper of it. A meter that does not attribute
+/// has no span. NEGATIVE CONTROLS: a window that starts after a compiler's first read leaves it
+/// out; a compiler read once (pid 3, at 4 s) has no span.
+#[test]
+fn a_compilers_span_is_its_reads_and_its_wrapper_the_one_before_it() {
+    fn reader(pid: u32) -> Named {
+        Named::Unit(UnitRead {
+            unit: crate::unitgraph::UnitName {
+                package: "aterm-gui".to_owned(),
+                kind: "aterm_gui lib".to_owned(),
+            },
+            wrapper: pid >= 10,
+        })
+    }
+    let m = |pid: u32, cpu_s: u64, footprint: u64| aterm_sysprobe::MemberUsage {
+        pid,
+        start: 1,
+        cpu_ns: cpu_s * 1_000_000_000,
+        footprint,
+        ..aterm_sysprobe::MemberUsage::default()
+    };
+    let meter = Meter::attributing(reader, UNIT_FLOOR);
+    let t0 = std::time::Instant::now();
+    let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+    meter.book_at(1, &[m(10, 0, GIB / 16)], at(0));
+    meter.book_at(1, &[m(10, 0, GIB / 16), m(2, 1, GIB)], at(2));
+    meter.book_at(
+        1,
+        &[m(2, 3, 3 * GIB), m(11, 0, GIB / 16), m(3, 1, GIB)],
+        at(4),
+    );
+    meter.book_at(1, &[m(2, 4, 2 * GIB)], at(5));
+    let spans = meter.unit_spans(at(0), at(5));
+    assert_eq!(spans.len(), 1, "{spans:?}");
+    let s = &spans[0];
+    assert_eq!(s.unit.kind, "aterm_gui lib");
+    let queued = s.queued_at_unix_ms.expect("its wrapper was read");
+    assert_eq!(s.started_at_unix_ms - queued, 2_000);
+    assert_eq!(s.ended_at_unix_ms - s.started_at_unix_ms, 3_000);
+    assert!((s.cpu_s - 4.0).abs() < 1e-9, "{s:?}");
+    assert_eq!(s.peak_bytes, 3 * GIB);
+    assert!(meter.unit_spans(at(3), at(5)).is_empty());
+    assert!(Meter::new().unit_spans(at(0), at(5)).is_empty());
+    assert_eq!(
+        meter.unix_ms(at(5)).zip(meter.unix_ms(at(2))),
+        Some((s.ended_at_unix_ms, s.started_at_unix_ms)),
+        "the meter dates a window on the clock that dated its spans"
+    );
+    assert_eq!(Meter::new().unix_ms(at(0)), None);
+}
+
+/// A `KERN_PROCARGS2` answer of a process exec'd from `exec` with `argv` and `env`.
+fn procargs(exec: &str, argv: &[&str], env: &[&str]) -> Vec<u8> {
+    let mut buf = i32::try_from(argv.len()).unwrap().to_ne_bytes().to_vec();
+    buf.extend(exec.as_bytes());
+    buf.extend([0, 0, 0]);
+    for word in argv.iter().chain(env) {
+        buf.extend(word.as_bytes());
+        buf.push(0);
+    }
+    buf.push(0);
+    buf
+}
+
+/// THE ADMISSION WRAPPER IS A PROCESS EXEC'D FROM THIS VERY EXECUTABLE, naming its unit as the
+/// compiler it starts does. NEGATIVE CONTROLS: a compiler whose environment carries the
+/// wrapper's marker (a probe a build script runs, which inherits it from Cargo) is no wrapper;
+/// with this executable unknown nothing is one; a command line naming no unit names nothing.
+#[test]
+fn the_wrapper_is_the_process_running_this_executable() {
+    let compile = ["rustc", "--crate-name", "aterm_gui", "--crate-type", "lib"];
+    let env = ["CARGO_PKG_NAME=aterm-gui", "ATERM_VERIFY_UNIT_WRAPPER=1"];
+    let read = |exec: &str, argv: &[&str], own: Option<&str>| {
+        let buf = procargs(exec, argv, &env);
+        let args = aterm_sysprobe::procargs::parse(&buf).expect("parses");
+        named(&args, own.map(Path::new))
+    };
+    let unit = |wrapper| {
+        Named::Unit(UnitRead {
+            unit: crate::unitgraph::UnitName {
+                package: "aterm-gui".to_owned(),
+                kind: "aterm_gui lib".to_owned(),
+            },
+            wrapper,
+        })
+    };
+    let mut wrapped = vec!["/bin/verify"];
+    wrapped.extend(compile);
+    assert_eq!(
+        read("/bin/verify", &wrapped, Some("/bin/verify")),
+        unit(true)
+    );
+    assert_eq!(
+        read("/tc/rustc", &compile, Some("/bin/verify")),
+        unit(false)
+    );
+    assert_eq!(read("/bin/verify", &wrapped, None), unit(false));
+    assert_eq!(
+        read("/bin/cargo", &["cargo", "build"], Some("/bin/verify")),
+        Named::Nothing
+    );
+}
+
+/// A COMMAND LINE NAMES ITS UNIT by `--crate-name`, `--test` or `--crate-type`, and
+/// `CARGO_PKG_NAME`. NEGATIVE CONTROLS: a command with no crate name, and a compiler whose
+/// environment names no package, name none.
+#[test]
+fn a_command_line_names_its_unit() {
     let words = |w: &[&str]| w.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
     let env = words(&["HOME=/h", "CARGO_PKG_NAME=aterm-gui"]);
     assert_eq!(

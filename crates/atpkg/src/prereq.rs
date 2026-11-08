@@ -1835,6 +1835,8 @@ mod tests {
     /// the exact old receipt must not retrieve a success made against the new toolchain.
     #[test]
     fn a_receipt_changed_during_the_probe_leaves_no_stale_verdict() {
+        use std::os::unix::fs::MetadataExt as _;
+
         for phase in ["version", "compile"] {
             let root = scratch("changing-receipt");
             let bin = root.join("bin");
@@ -1853,7 +1855,7 @@ mod tests {
             std::fs::write(&receipt, b"old").unwrap();
             std::fs::write(&next, b"new").unwrap();
             std::fs::write(root.join("change"), phase.as_bytes()).unwrap();
-            let before = crate::probe_cache::identity(&receipt).unwrap();
+            let before = std::fs::metadata(&receipt).unwrap();
             let cache = CcCache {
                 file: root.join("state/cc"),
                 receipt: receipt.clone(),
@@ -1865,7 +1867,22 @@ mod tests {
             assert!(matches!(current, CcVerdict::Ready { .. }), "{current:?}");
             std::fs::rename(&receipt, &next).unwrap();
             std::fs::rename(&saved, &receipt).unwrap();
-            assert_eq!(crate::probe_cache::identity(&receipt).unwrap(), before);
+            let restored = std::fs::metadata(&receipt).unwrap();
+            assert_eq!(
+                (
+                    restored.dev(),
+                    restored.ino(),
+                    restored.len(),
+                    restored.modified().unwrap()
+                ),
+                (
+                    before.dev(),
+                    before.ino(),
+                    before.len(),
+                    before.modified().unwrap()
+                ),
+            );
+            assert_eq!(std::fs::read(&receipt).unwrap(), b"old");
             let direct = probe_with(path, &host);
             let cached = probe_cached(path, &host, Some(&cache));
             assert!(

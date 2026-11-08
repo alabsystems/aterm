@@ -19,6 +19,8 @@ use std::{
 
 #[path = "resource_admission_owner.rs"]
 mod owner;
+pub(super) use owner::runtime_inputs::Attachment as RuntimeInputsAttachment;
+pub(super) use owner::runtime_inputs::Preparing as RuntimeInputsPreparing;
 pub(super) use owner::workload::MemberOriginalCustody as WorkloadMemberOriginal;
 pub(super) use owner::workload::ReadyCustody as WorkloadReady;
 pub(super) use owner::workload::{WorkerCustody, WorkerOffer, WorkerReturn};
@@ -50,6 +52,17 @@ fn unavailable() -> io::Error {
 
 enum Message {
     Wake,
+    RuntimeInputsBegin {
+        peer: Peer,
+        request: Box<trust_resource_controller::runtime_input_retention::Request>,
+        reply: SyncSender<io::Result<RuntimeInputsPreparing>>,
+    },
+    RuntimeInputsRetain {
+        preparing: Box<RuntimeInputsAttachment>,
+        descriptions: Vec<std::os::fd::OwnedFd>,
+        transport: std::os::fd::OwnedFd,
+        reply: SyncSender<io::Result<trust_resource_controller::ContextReply>>,
+    },
     WorkloadOutputLocks {
         peer: Peer,
         session: String,
@@ -495,6 +508,32 @@ pub(super) fn workload_output_locks(
     })?;
     receive_reply(read).map_err(|_| unavailable())?
 }
+pub(super) fn runtime_inputs_begin(
+    peer: Peer,
+    request: trust_resource_controller::runtime_input_retention::Request,
+) -> io::Result<RuntimeInputsPreparing> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::RuntimeInputsBegin {
+        peer,
+        request: Box::new(request),
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn runtime_inputs_retain(
+    preparing: RuntimeInputsAttachment,
+    descriptions: Vec<std::os::fd::OwnedFd>,
+    transport: std::os::fd::OwnedFd,
+) -> io::Result<trust_resource_controller::ContextReply> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::RuntimeInputsRetain {
+        preparing: Box::new(preparing),
+        descriptions,
+        transport,
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
 pub(super) fn metadata_binding(value: &aterm_json::Value) -> io::Result<Binding> {
     owner::members::binding_role(value, "sealed-metadata-v1")
 }
@@ -650,6 +689,25 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
         };
         if let Some(message) = message {
             match message {
+                Message::RuntimeInputsBegin {
+                    peer,
+                    request,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.runtime_inputs_begin(peer, *request));
+                }
+                Message::RuntimeInputsRetain {
+                    preparing,
+                    descriptions,
+                    transport,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.runtime_inputs_retain(
+                        *preparing,
+                        descriptions,
+                        transport,
+                    ));
+                }
                 Message::WorkloadOutputLocks {
                     peer,
                     session,

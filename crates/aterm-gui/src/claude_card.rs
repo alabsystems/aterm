@@ -875,15 +875,8 @@ impl WindowCards {
         let Ok(row) = u16::try_from(frame_row) else {
             return;
         };
-        for (k, cell) in cells.iter().enumerate() {
-            if cell.wide || cell.script != aterm_core::terminal::Script::Normal {
-                continue;
-            }
-            if let Some(icon) = BandIcon::glass_mark(cell.ch)
-                && let Ok(col) = u16::try_from(col + k)
-            {
-                self.paint_icon(scratch, row, ChromeIcon { col, icon });
-            }
+        for icon in glass_marks(col, cells) {
+            self.paint_icon(scratch, row, icon);
         }
     }
 
@@ -1064,6 +1057,24 @@ fn withdraw_icons(rasters: &mut [ChromeRaster], ours: &[(u16, ChromeIcon)]) {
             raster.icons.remove(k);
         }
     }
+}
+
+/// The glass marks among `cells`, written from frame column `col`, that
+/// [`WindowCards::paint_marks`] draws: each full-size, narrow cell whose
+/// character is a glass mark ([`BandIcon::glass_mark`]), as the chrome icon
+/// drawn in place of its font's glyph; a cell in small script keeps its glyph.
+pub(crate) fn glass_marks(
+    col: usize,
+    cells: &[RenderCell],
+) -> impl Iterator<Item = ChromeIcon> + '_ {
+    cells.iter().enumerate().filter_map(move |(k, cell)| {
+        if cell.wide || cell.script != aterm_core::terminal::Script::Normal {
+            return None;
+        }
+        let icon = BandIcon::glass_mark(cell.ch)?;
+        let col = u16::try_from(col + k).ok()?;
+        Some(ChromeIcon { col, icon })
+    })
 }
 
 /// Clip card ink, stars, and panel light out of an overlay menu `rect`.

@@ -1940,4 +1940,40 @@ mod tests {
             }
         }
     }
+
+    /// LINE D'S STROKED MARKS REACH THEIR FULL INK AT EVERY MEASURED 1X FACE: `⌂`, `⎇` and `⎆`
+    /// each lay at least one pixel at full coverage, as the filled `◆` does, so the darkest
+    /// pixel of each is its cell's own ink (on line D `GlassInks::mark`, floored to 4.5:1 on
+    /// paper) and never a blend of it into the ground. A review read these three at 1.8:1 to
+    /// 2.3:1 on Day at 1x beside `◆`'s 4.5:1; that capture's scene drew their font glyphs, not
+    /// these icons. NEGATIVE CONTROL (run once, restored): an outline band centred on the
+    /// shape's edge, `d.abs() - t / 2` in [`Shape::mark_outline`], lays `⌂` with no pixel at
+    /// full coverage and fails.
+    #[test]
+    fn the_stroked_marks_reach_full_ink_on_every_small_face() {
+        for (name, [cw, ch, baseline, cap, stem, head, disc]) in
+            SMALLEST_FACES.into_iter().chain(SMALL_FACES)
+        {
+            let (cw, ch) = (cw as usize, ch as usize);
+            let m = IconMetrics {
+                baseline,
+                cap,
+                stem,
+                head,
+                disc,
+            };
+            for icon in [
+                BandIcon::Diamond,
+                BandIcon::House,
+                BandIcon::Fork,
+                BandIcon::Enter,
+            ] {
+                let peak = band_icon_coverage(icon, cw, ch, m, false)
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0);
+                assert_eq!(peak, 255, "{name} {cw}x{ch} {icon:?}: its darkest pixel");
+            }
+        }
+    }
 }

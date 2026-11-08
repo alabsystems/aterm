@@ -46,9 +46,10 @@ impl UniversalControlState {
     }
 }
 
-/// When the default policy turns Universal Control off on its own: one daily slot that the
-/// first window or terminal session claims ([`launch_apply_due`]) — not every window.
-const DAILY_OFF: &str = "aterm turns it off once a day, at the first window or terminal session";
+/// When the default policy turns Universal Control off on its own: one daily slot that an aterm
+/// start claims, the app's or a terminal session's ([`launch_apply_due`]) — never a window a
+/// running aterm opens.
+const DAILY_OFF: &str = "aterm turns it off once a day, when it starts";
 
 impl UniversalControlState {
     /// Fully disabled: both keys true.
@@ -360,7 +361,7 @@ impl RosettaPosture {
             (Self::Missing, true) => (
                 Level::Warn,
                 "Rosetta 2 is not installed — x86_64 programs cannot run on this Mac; aterm \
-                 installs it once a day, at the first window or terminal session, as you and \
+                 installs it once a day, when it starts, as you and \
                  with no password, unless [machine] rosetta = false"
                     .to_string(),
             ),

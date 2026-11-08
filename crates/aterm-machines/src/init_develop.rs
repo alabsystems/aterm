@@ -890,7 +890,7 @@ impl Item for Submodules {
         if needs.update {
             let ran = sys
                 .run_complete_stdout(
-                    &checkout::network(sys, &self.user, Some(&self.path))
+                    &checkout::lazily(checkout::network(sys, &self.user, Some(&self.path)))
                         .budget(LONG_BUDGET)
                         .args(checkout::NO_SIDE_RUNS)
                         .args([
@@ -1006,9 +1006,14 @@ fn offline_refused(stderr: &[u8]) -> bool {
     said.contains("--offline was specified") || said.contains("offline mode (--offline)")
 }
 
-const NOT_DOWNLOADED: &str = "the checkout's lock names crates this Mac has not downloaded, and \
-                              aterm doctor reads no network (cargo --offline): `aterm init \
-                              --develop` fetches them";
+/// Why doctor's read stops where cargo `--offline` refused a download, in the words of a
+/// `machine` ([`System::machine`]).
+fn not_downloaded(machine: &str) -> String {
+    format!(
+        "the checkout's lock names crates this {machine} has not downloaded, and aterm doctor \
+         reads no network (cargo --offline): `aterm init --develop` fetches them"
+    )
+}
 
 /// What a `verify provision` run said.
 fn said(stderr: &[u8]) -> String {
@@ -1098,7 +1103,7 @@ impl Item for WorkspaceTools {
                 why: STALE_LOCK.into(),
             },
             _ if self.reader == Reader::Doctor && offline_refused(&ran.stderr) => Probe::Blocked {
-                why: NOT_DOWNLOADED.into(),
+                why: not_downloaded(sys.machine()),
             },
             _ => Probe::Unusable {
                 why: format!(

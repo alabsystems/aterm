@@ -10,7 +10,7 @@ use aterm_net::{
     lan::{Multicast, Scope},
 };
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, Write as _},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     os::fd::AsFd as _,
@@ -21,13 +21,38 @@ use std::{
 const GROUP: Ipv4Addr = Ipv4Addr::new(239, 255, 31, 85);
 const PORT: u16 = 41385;
 const MAGIC: &[u8; 8] = b"aterm-m1";
+const READY_MAGIC: &[u8; 8] = b"aterm-r1";
 const NONCE: usize = 16;
 const REQUEST: usize = MAGIC.len() + NONCE;
 const RESPONSE: usize = REQUEST + 2 + NodeKey::LEN;
+const READY: usize = READY_MAGIC.len() + NONCE + 8;
 const MAX_LINKS: usize = 8;
 const MAX_PEERS: usize = 64;
 const REFRESH: Duration = Duration::from_secs(1);
 const RETRANSMIT: Duration = Duration::from_millis(100);
+
+fn contained() -> bool {
+    cfg!(test)
+        || std::env::var_os(aterm_types::world::MARKER).is_some()
+        || std::env::var_os("CI").is_some()
+        || std::env::var_os(aterm_secrets::discover::LAB_MEMBER_SERVICE_ENV).is_some()
+}
+
+fn announcement(incarnation: &[u8; NONCE], generation: u64) -> [u8; READY] {
+    let mut wire = [0; READY];
+    wire[..READY_MAGIC.len()].copy_from_slice(READY_MAGIC);
+    wire[READY_MAGIC.len()..READY_MAGIC.len() + NONCE].copy_from_slice(incarnation);
+    wire[READY_MAGIC.len() + NONCE..].copy_from_slice(&generation.to_be_bytes());
+    wire
+}
+
+fn ready_token(wire: &[u8]) -> Option<[u8; NONCE + 8]> {
+    (wire.len() == READY && wire.starts_with(READY_MAGIC)).then(|| {
+        wire[READY_MAGIC.len()..]
+            .try_into()
+            .expect("fixed ready length")
+    })
+}
 
 /// An untrusted address and claimed public key, checked by the later handshake.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,11 +141,7 @@ pub(crate) struct Probe {
 impl Probe {
     /// A lab's private service never reaches the live LAN.
     pub(crate) fn start(within: Duration) -> io::Result<Self> {
-        if cfg!(test)
-            || std::env::var_os(aterm_types::world::MARKER).is_some()
-            || std::env::var_os("CI").is_some()
-            || std::env::var_os(aterm_secrets::discover::LAB_MEMBER_SERVICE_ENV).is_some()
-        {
+        if contained() {
             return Self::on(Vec::new(), within);
         }
         Self::on(links(&sources(), PORT, Scope::Lan), within)
@@ -217,6 +238,121 @@ impl Probe {
                 return Ok(Vec::new());
             }
         }
+    }
+}
+
+/// An owned passive receiver of untrusted member availability hints. Hearing one only
+/// owes a fresh ordinary solicitation; it supplies no address, identity or admission.
+pub(crate) struct Arrivals {
+    network: Network,
+    paths: Option<aterm_secrets::client::Paths>,
+    active: Vec<(Ipv4Addr, Multicast)>,
+    seen: VecDeque<[u8; NONCE + 8]>,
+}
+
+impl Arrivals {
+    pub(crate) fn start(paths: &aterm_secrets::client::Paths) -> io::Result<Self> {
+        Self::on(
+            Network {
+                scope: Scope::Lan,
+                port: PORT,
+                sources: Box::new(|| if contained() { Vec::new() } else { sources() }),
+                #[cfg(test)]
+                ready: None,
+            },
+            Some(paths.clone()),
+        )
+    }
+
+    fn on(network: Network, paths: Option<aterm_secrets::client::Paths>) -> io::Result<Self> {
+        let mut result = Self {
+            network,
+            paths,
+            active: Vec::new(),
+            seen: VecDeque::new(),
+        };
+        result.refresh()?;
+        Ok(result)
+    }
+
+    fn refresh(&mut self) -> io::Result<()> {
+        if let Some(paths) = &self.paths
+            && let Err(error) = aterm_secrets::client::refuse_lab_member_browse(paths)
+        {
+            self.active.clear();
+            return Err(io::Error::other(error));
+        }
+        let current = (self.network.sources)();
+        self.active
+            .retain(|(source, link)| current.contains(source) && link.recheck().is_ok());
+        for source in current {
+            if self.active.len() >= MAX_LINKS {
+                break;
+            }
+            if !self.active.iter().any(|(held, _)| *held == source) {
+                self.active
+                    .extend(links(&[source], self.network.port, self.network.scope));
+            }
+        }
+        if self.active.is_empty() && !contained() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no native member arrival socket was admitted on this network",
+            ));
+        }
+        Ok(())
+    }
+
+    fn fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+        self.active.iter().map(|(_, link)| link.as_fd()).collect()
+    }
+
+    fn poll(&mut self) -> io::Result<bool> {
+        if self.active.is_empty() {
+            return Ok(false);
+        }
+        let interests: Vec<_> = self
+            .active
+            .iter()
+            .map(|(_, link)| {
+                aterm_uds::ready::Watch::new(link.as_fd(), aterm_uds::ready::Interest::Read)
+            })
+            .collect();
+        let ready = aterm_uds::ready::any_interests_now(&interests)?;
+        let mut arrived = false;
+        for index in ready {
+            for _ in 0..MAX_PEERS {
+                let Some((wire, _)) = self.active[index].1.receive()? else {
+                    break;
+                };
+                let Some(token) = ready_token(&wire) else {
+                    continue;
+                };
+                if self.seen.contains(&token) {
+                    continue;
+                }
+                if self.seen.len() == MAX_PEERS {
+                    self.seen.pop_front();
+                }
+                self.seen.push_back(token);
+                arrived = true;
+            }
+        }
+        Ok(arrived)
+    }
+}
+
+impl aterm_secrets::client::MemberArrivals for Arrivals {
+    fn refresh(&mut self) -> io::Result<()> {
+        Self::refresh(self)
+    }
+
+    fn fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+        Self::fds(self)
+    }
+
+    fn poll(&mut self) -> io::Result<bool> {
+        Self::poll(self)
     }
 }
 
@@ -370,9 +506,11 @@ impl Responder {
         network: Network,
     ) -> io::Result<Self> {
         let (reader, writer) = std::io::pipe()?;
+        let mut incarnation = [0; NONCE];
+        aterm_uds::rand::fill(&mut incarnation)?;
         let task = thread::Builder::new()
             .name("aterm-member-lan".into())
-            .spawn(move || serve(reader, port, key, allowed, network))?;
+            .spawn(move || serve(reader, port, key, incarnation, allowed, network))?;
         Ok(Self {
             port,
             key,
@@ -397,6 +535,7 @@ fn serve(
     stop: std::io::PipeReader,
     port: u16,
     key: NodeKey,
+    incarnation: [u8; NONCE],
     allowed: impl Fn() -> bool,
     network: Network,
 ) {
@@ -409,6 +548,7 @@ fn serve(
     let mut sockets = Vec::new();
     let mut refresh = Instant::now();
     let mut replies = ReplyWindow::new(Instant::now());
+    let mut generation = 0_u64;
     loop {
         let now = Instant::now();
         if now >= refresh {
@@ -416,17 +556,41 @@ fn serve(
             sockets.retain(|(source, link): &(Ipv4Addr, Multicast)| {
                 current.contains(source) && link.recheck().is_ok()
             });
+            let mut announcements = Vec::new();
             if allowed() {
-                for source in current {
+                'sources: for source in current {
                     if sockets.len() >= MAX_LINKS {
                         break;
                     }
                     if !sockets.iter().any(|(held, _)| *held == source) {
-                        sockets.extend(links(&[source], network.port, network.scope));
+                        for link in links(&[source], network.port, network.scope) {
+                            let Some(next) = generation.checked_add(1) else {
+                                return;
+                            };
+                            generation = next;
+                            if !allowed() {
+                                sockets.clear();
+                                announcements.clear();
+                                break 'sources;
+                            }
+                            announcements.push((sockets.len(), generation));
+                            sockets.push(link);
+                        }
                     }
                 }
             } else {
                 sockets.clear();
+            }
+            // Finish every potentially blocking bind before announcing any attachment.
+            // Each newly bound allowed link emits once; healthy refreshes emit nothing.
+            for (index, generation) in announcements {
+                if !allowed() {
+                    sockets.clear();
+                    break;
+                }
+                let _ = sockets[index]
+                    .1
+                    .send(&announcement(&incarnation, generation));
             }
             refresh = now + REFRESH;
             #[cfg(test)]
@@ -560,6 +724,17 @@ mod tests {
         let mut unknown = ask;
         unknown[0] ^= 1;
         assert!(response(&unknown, 7100, key).is_none());
+
+        let ready = announcement(&nonce, 1);
+        assert!(ready_token(&ready).is_some());
+        assert!(ready_token(&ready[..READY - 1]).is_none());
+        let mut extended = ready.to_vec();
+        extended.push(0);
+        assert!(ready_token(&extended).is_none());
+        assert!(ready_token(&ask).is_none());
+        assert!(ready_token(&reply).is_none());
+        assert!(hint(&ready, source, &nonce).is_none());
+        assert!(response(&ready, 7100, key).is_none());
     }
 
     /// A later reply carries the original nonce. Starting another solicitation cannot
@@ -659,7 +834,26 @@ mod tests {
     fn native_solicitation_reaches_the_member_handshake_without_dns() {
         let reservation = Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).unwrap();
         let discovery_port = reservation.port();
-        let client = links(&[Ipv4Addr::LOCALHOST], discovery_port, Scope::Loopback);
+        let mut arrivals = Arrivals::on(
+            Network {
+                scope: Scope::Loopback,
+                port: discovery_port,
+                sources: Box::new(|| vec![Ipv4Addr::LOCALHOST]),
+                ready: None,
+            },
+            None,
+        )
+        .unwrap();
+        // A real bounded solicitation first misses: no responder exists yet. The receiver
+        // remains owned after that probe, and a later bind must wake it through the wire.
+        let mut missed = Probe::on(
+            links(&[Ipv4Addr::LOCALHOST], discovery_port, Scope::Loopback),
+            RETRANSMIT,
+        )
+        .unwrap();
+        assert!(missed.first().unwrap().is_empty());
+        drop(missed);
+        assert!(!arrivals.poll().unwrap());
         let identity = |seed| {
             let provisional =
                 NodeIdentity::from_seed("00000000000000000000000000000000", &[seed; 32]).unwrap();
@@ -688,7 +882,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bound.recv_timeout(HANG).unwrap(), 1);
-        let hints = probe_on(client, HANG).unwrap();
+        let until = Instant::now() + HANG;
+        while !arrivals.poll().unwrap() {
+            assert!(
+                Instant::now() < until,
+                "the late member announced no arrival"
+            );
+            aterm_uds::ready::any_until(&arrivals.fds(), until).unwrap();
+        }
+        assert!(!arrivals.poll().unwrap());
+        let hints = probe_on(
+            links(&[Ipv4Addr::LOCALHOST], discovery_port, Scope::Loopback),
+            HANG,
+        )
+        .unwrap();
         assert_eq!(
             hints,
             [Hint {
@@ -748,6 +955,18 @@ mod tests {
 
     #[test]
     fn sharing_hold_opens_no_discovery_socket_and_owner_drop_wakes_the_worker() {
+        let mut inert = Arrivals::on(
+            Network {
+                scope: Scope::Loopback,
+                port: 0,
+                sources: Box::new(Vec::new),
+                ready: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(inert.fds().is_empty());
+        assert!(!inert.poll().unwrap());
         let (ready, bound) = std::sync::mpsc::channel();
         let responder = Responder::start_on(
             7100,

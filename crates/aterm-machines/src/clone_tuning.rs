@@ -22,7 +22,7 @@
 //! hold of GitHub repositories none is in scope, and a folder the inventory does not name is
 //! never touched.
 //!
-//! Every git run here stays on this Mac: none fetches an object a partial clone lacks
+//! Every git run here stays on this machine: none fetches an object a partial clone lacks
 //! (`--no-lazy-fetch`, so a git without it tunes nothing). A write runs nothing else: no hook,
 //! whether a hooks folder's or one a config names, no filter driver, and no fsmonitor daemon
 //! ([`quiet`], [`checkout::Programs`]); a clone whose config names a hook or filter aterm cannot
@@ -172,7 +172,7 @@ pub fn read(sys: &dyn System, ctx: &Ctx, state: &Path, holds: &Holds) -> Result<
         return Ok(Reading::NotApplicable(newer(&dir)));
     };
     let clones = plan_all(sys, user, &tops, &record, test_volume(sys, &dir));
-    Ok(summary(&clones))
+    Ok(summary(&clones, sys.machine()))
 }
 
 /// Tune every clone in scope as [`read`] plans it: run the self-test first where one is owed,
@@ -516,9 +516,10 @@ fn scope<'c>(sys: &dyn System, ctx: &'c Ctx, holds: &Holds) -> Result<Scope<'c>,
         return Ok(Scope::Out(holds.why(Setting::Repositories)));
     }
     if !init_github::git_installed(sys) {
-        return Ok(Scope::Out(
-            "no git on this Mac reads a clone's settings yet".into(),
-        ));
+        return Ok(Scope::Out(format!(
+            "no git on this {} reads a clone's settings yet",
+            sys.machine()
+        )));
     }
     let tops = match init_github::vault_clones(sys, ctx)? {
         VaultClones::Off => {
@@ -534,35 +535,39 @@ fn scope<'c>(sys: &dyn System, ctx: &'c Ctx, holds: &Holds) -> Result<Scope<'c>,
             ));
         }
         VaultClones::NoInventory => {
-            return Ok(Scope::Out(
-                "no repository inventory from the Secrets vault is on this Mac".into(),
-            ));
+            return Ok(Scope::Out(format!(
+                "no repository inventory from the Secrets vault is on this {}",
+                sys.machine()
+            )));
         }
         VaultClones::Present(tops) => tops,
     };
     if tops.is_empty() {
-        return Ok(Scope::Out(
-            "no clone of the vault's repository inventory is on this Mac".into(),
-        ));
+        return Ok(Scope::Out(format!(
+            "no clone of the vault's repository inventory is on this {}",
+            sys.machine()
+        )));
     }
-    if let Some(why) = lazy_fetch_guard(&run(sys, &local(sys, user, None).arg("--version"))?)? {
-        return Ok(Scope::Out(why.into()));
+    let ran = run(sys, &local(sys, user, None).arg("--version"))?;
+    if let Some(why) = lazy_fetch_guard(&ran, sys.machine())? {
+        return Ok(Scope::Out(why));
     }
     Ok(Scope::Clones { user, tops })
 }
 
 /// [`scope`]'s reading of `git --no-lazy-fetch --version`: `None` where git has the option, why
-/// not where git refuses it as unknown (129: an older git, which ignores GIT_NO_LAZY_FETCH).
+/// not where git refuses it as unknown (129: an older git, which ignores GIT_NO_LAZY_FETCH), in
+/// the words of a `machine` ([`System::machine`]).
 ///
 /// # Errors
 /// Git did not run as git (a broken program, a signal).
-fn lazy_fetch_guard(ran: &Ran) -> Result<Option<&'static str>, String> {
+fn lazy_fetch_guard(ran: &Ran, machine: &str) -> Result<Option<String>, String> {
     match ran.status {
         Some(0) => Ok(None),
-        Some(129) => Ok(Some(
-            "this Mac's git has no --no-lazy-fetch (git 2.44 has it), which keeps aterm's reads \
-             of a clone on this Mac",
-        )),
+        Some(129) => Ok(Some(format!(
+            "this {machine}'s git has no --no-lazy-fetch (git 2.44 has it), which keeps aterm's \
+             reads of a clone on this {machine}"
+        ))),
         _ => Err(format!("git --version failed: {}", ran.describe())),
     }
 }
@@ -799,7 +804,7 @@ fn and_list(keys: &[&str]) -> String {
     }
 }
 
-fn summary(clones: &[Plan]) -> Reading {
+fn summary(clones: &[Plan], machine: &str) -> Reading {
     let differing: Vec<String> = clones
         .iter()
         .filter(|clone| clone.held.is_none() && clone.differs())
@@ -820,7 +825,7 @@ fn summary(clones: &[Plan]) -> Reading {
     }
     let declaring = clones.iter().filter(|clone| clone.declares).count();
     let mut now = format!(
-        "{} vault clone{} on this Mac, each as it declares",
+        "{} vault clone{} on this {machine}, each as it declares",
         clones.len(),
         if clones.len() == 1 { "" } else { "s" }
     );
@@ -1009,7 +1014,8 @@ fn declaration(sys: &dyn System, user: &User, top: &Path) -> Result<Declared, St
     .success()
     {
         return Err(format!(
-            "{what} has not been fetched to this Mac (a partial clone's)"
+            "{what} has not been fetched to this {} (a partial clone's)",
+            sys.machine()
         ));
     }
     let size: u64 = size
@@ -1559,17 +1565,16 @@ fn verdict(tested: &Ran) -> Result<bool, String> {
     }
 }
 
-/// [`checkout::git`] that never fetches an object a partial clone lacks: the option, which an
-/// older git refuses ([`scope`] asks it first), and the variable.
+/// [`checkout::git`] that never fetches an object a partial clone lacks: its variable, and the
+/// option, which an older git refuses ([`scope`] asks it first) where it would ignore the
+/// variable.
 fn local(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
-    checkout::git(sys, user, path)
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .arg("--no-lazy-fetch")
+    checkout::git(sys, user, path).arg("--no-lazy-fetch")
 }
 
-/// [`local`] for a write in `path` that runs nothing else: no hook from a hooks folder
-/// ([`NO_SIDE_RUNS`]), no hook or filter driver its config names
-/// ([`checkout::Programs::off`]), no fsmonitor daemon, and no wait on a `config.lock` another
+/// [`local`] for a write in `path` that runs nothing else: no hook from a hooks folder and no
+/// fsmonitor daemon ([`NO_SIDE_RUNS`]), no hook or filter driver its config names
+/// ([`checkout::Programs::off`]), and no wait on a `config.lock` another
 /// git took after [`held`] looked (`core.configLockTimeout=0`); with git's messages in English
 /// (`LC_ALL=C`), which [`write`] reads.
 fn quiet(sys: &dyn System, user: &User, path: &Path) -> Result<Cmd, String> {
@@ -1577,12 +1582,7 @@ fn quiet(sys: &dyn System, user: &User, path: &Path) -> Result<Cmd, String> {
     Ok(programs.off(
         local(sys, user, Some(path))
             .args(NO_SIDE_RUNS)
-            .args([
-                "-c",
-                "core.fsmonitor=false",
-                "-c",
-                "core.configLockTimeout=0",
-            ])
+            .args(["-c", "core.configLockTimeout=0"])
             .env("LC_ALL", "C"),
     ))
 }

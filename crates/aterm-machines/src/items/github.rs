@@ -278,25 +278,49 @@ pub fn git_program_for_user(sys: &dyn System, user: &User) -> PathBuf {
 }
 
 fn program_or_default(sys: &dyn System, installed: Option<PathBuf>) -> PathBuf {
-    installed.unwrap_or_else(|| {
-        if sys.macos() {
-            CLT_GIT.into()
-        } else {
-            SYSTEM_GIT.into()
-        }
-    })
+    installed.unwrap_or_else(|| native_git(sys).into())
 }
 
-/// For a test that runs the real [`CLT_GIT`], as the code it checks does: COULD NOT RUN
-/// on a host without it (a Mac before the Command Line Tools; any other unix, where `aterm
-/// init` runs the distribution's [`SYSTEM_GIT`] instead), never a spawn error read as a defect.
+/// The native git [`installed_git_without_atpkg`] looks for first: [`CLT_GIT`] on a Mac,
+/// [`SYSTEM_GIT`] elsewhere.
+fn native_git(sys: &dyn System) -> &'static str {
+    if sys.macos() { CLT_GIT } else { SYSTEM_GIT }
+}
+
+/// For a test that runs this host's real native git, as the code it checks does with no managed
+/// build: the path of the one [`installed_git_without_atpkg`] looks for first ([`CLT_GIT`] on a
+/// Mac, [`SYSTEM_GIT`] elsewhere), which [`git_program`] then runs, or COULD NOT RUN on a host
+/// without it (a Mac before the Command Line Tools, a distribution with no git installed), never
+/// a spawn error read as a defect.
 #[cfg(test)]
-pub(crate) fn need_clt_git() {
-    if !Path::new(CLT_GIT).is_file() {
+pub(crate) fn need_native_git() -> &'static str {
+    let git = native_git(&crate::port::Live::new());
+    if !Path::new(git).is_file() {
         aterm_uds::host::could_not_run(format!(
-            "no {CLT_GIT} here (the Command Line Tools' git, which this code runs)"
+            "no {git} here (this host's native git, which this code runs)"
         ));
     }
+    git
+}
+
+/// [`need_native_git`] for a test of code that reads a clone only through `--no-lazy-fetch` (git
+/// 2.44 and later) and does nothing without it: COULD NOT RUN where this host's native git
+/// refuses the option.
+#[cfg(test)]
+pub(crate) fn need_native_git_with_no_lazy_fetch() -> &'static str {
+    let git = need_native_git();
+    let live = crate::port::Live::new();
+    let run = |args: &[&str]| {
+        live.run_complete_stdout(&crate::port::Cmd::new(git).args(args.iter().copied()))
+    };
+    if !run(&["--no-lazy-fetch", "--version"]).is_ok_and(|ran| ran.success()) {
+        let version = run(&["--version"]).map_or_else(|_| String::new(), |ran| ran.out());
+        aterm_uds::host::could_not_run(format!(
+            "{git} ({}) has no --no-lazy-fetch, which this code needs (git 2.44 has it)",
+            version.trim()
+        ));
+    }
+    git
 }
 
 /// The item git's settings wait for.

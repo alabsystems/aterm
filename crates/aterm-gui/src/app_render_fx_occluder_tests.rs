@@ -3,6 +3,7 @@
 
 //! Host chrome surface fx-occluder composition tests.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use aterm_core::render::{
@@ -477,7 +478,8 @@ fn the_live_frame_after_the_answer_carries_no_cut() {
 
 /// The scrubs' occluders, exactly: a band is its frame rows full width (the
 /// pads beside it included) at `grid_top + row·ch`; a card is its cell box at
-/// `(pad, grid_top)`; an empty band pushes nothing.
+/// `(pad, grid_top)`, and the band pushed before it, which it covers in part,
+/// keeps the pieces of its rows around that box; an empty band pushes nothing.
 #[test]
 fn the_scrubs_push_their_window_pixel_occluders() {
     let mut input = RenderInput::empty();
@@ -498,10 +500,133 @@ fn the_scrubs_push_their_window_pixel_occluders() {
     assert_eq!(
         input.fx_occluders,
         vec![
-            PxRect::new(i32::MIN, 11 + 2 * 17, i32::MAX, 11 + 4 * 17),
+            PxRect::new(i32::MIN, 11 + 3 * 17, i32::MAX, 11 + 4 * 17),
+            PxRect::new(i32::MIN, 11 + 2 * 17, 5 + 2 * 9, 11 + 3 * 17),
+            PxRect::new(5 + 5 * 9, 11 + 2 * 17, i32::MAX, 11 + 3 * 17),
             PxRect::new(5 + 2 * 9, 11 + 17, 5 + 5 * 9, 11 + 3 * 17),
         ]
     );
+}
+
+/// A CARD STANDS OVER THE CHROME PUSHED BEFORE IT (§1.4): a find bar's band
+/// pushed before a card that covers part of it, and a band pushed after it
+/// (chrome painted over the card). A layer standing on the card
+/// ([`FxLayer::chrome`], the card's ticks) draws every pixel of the card but
+/// those under the band over it, the find bar's rows included; a layer on no
+/// chrome is cut by exactly the three chromes' rects, as before the trim. A
+/// second card over the first, the first's own layer already laid, leaves the
+/// first's occluder whole: that layer still stands on its card, and the
+/// second card cuts it. NEGATIVE CONTROL (run once, restored): without the
+/// trim (`trim_under`), the find bar's band cuts the card's own layer on the
+/// rows it shares with the card, and the first assertion fails.
+#[test]
+fn a_card_stands_over_the_chrome_pushed_before_it() {
+    let (pad, grid_top, (cw, ch)) = (5usize, 11usize, (9usize, 17usize));
+    let frame = aterm_render::FxFrame {
+        w: 2 * pad + 12 * cw,
+        h: grid_top + 9 * ch + pad,
+        pad,
+        grid_top,
+        cell_h: ch,
+        rows: 9,
+    };
+    let bands = aterm_render::RowBands::new(grid_top, ch);
+    let card = crate::tab_menu::MenuRect {
+        row: 1,
+        col: 2,
+        w: 6,
+        h: 5,
+    };
+    let mut input = RenderInput::empty();
+    super::scrub_overlay_row_band(&mut input, 0..3, bands);
+    let find = input.fx_occluders[0];
+    let own = super::scrub_overlay_card(&mut input, card, (cw, ch), (pad, grid_top))
+        .expect("the card's occluder");
+    super::scrub_overlay_row_band(&mut input, 4..5, bands);
+    let over = *input.fx_occluders.last().expect("the band over the card");
+    let fill = Arc::new(FxContent::new(
+        vec![FxItem::Rect(FxRect {
+            x: 0,
+            y: 0,
+            w: u16::try_from(frame.w).expect("w"),
+            h: u16::try_from(frame.h).expect("h"),
+            ink: 0,
+        })],
+        vec![FxInk::over(0x00_c0_a0_80, 255); 2],
+    ));
+    let layer = |chrome: Option<PxRect>| {
+        let mut layer = FxLayer::new(
+            9,
+            Arc::clone(&fill),
+            FxSlot::Over,
+            FxSpace::Window,
+            FxBlend::Exact,
+        );
+        layer.chrome = chrome;
+        layer
+    };
+    let drawn = |layer: &FxLayer, occluders: &[PxRect]| {
+        let base = 0x0001_0203u32;
+        let mut px = vec![base; frame.w * frame.h];
+        aterm_render::fx::paint_layers(&mut px, &frame, std::slice::from_ref(layer), occluders);
+        move |x: usize, y: usize| px[y * frame.w + x] != base
+    };
+    let at = |o: PxRect, x: usize, y: usize| {
+        o.overlaps(PxRect::at(
+            i32::try_from(x).expect("x"),
+            i32::try_from(y).expect("y"),
+            1,
+            1,
+        ))
+    };
+    let (ticks, plain) = (
+        drawn(&layer(Some(own)), &input.fx_occluders),
+        drawn(&layer(None), &input.fx_occluders),
+    );
+    let mut shared = 0;
+    for y in 0..frame.h {
+        for x in 0..frame.w {
+            let (on_card, under, above) = (at(own, x, y), at(find, x, y), at(over, x, y));
+            assert_eq!(
+                ticks(x, y),
+                if on_card { !above } else { !under && !above },
+                "({x}, {y}): the card's own layer stands over the find bar, under the band"
+            );
+            assert_eq!(
+                plain(x, y),
+                !(on_card || under || above),
+                "({x}, {y}): every other layer is cut as before"
+            );
+            shared += usize::from(on_card && under && !above);
+        }
+    }
+    assert!(shared > 0, "the card and the find bar share drawn rows");
+
+    input.fx_layers.push(layer(Some(own)));
+    let second = crate::tab_menu::MenuRect {
+        row: 3,
+        col: 5,
+        w: 5,
+        h: 4,
+    };
+    let top = super::scrub_overlay_card(&mut input, second, (cw, ch), (pad, grid_top))
+        .expect("the second card's occluder");
+    assert!(
+        input.fx_occluders.contains(&own),
+        "the first card's occluder, which its layer stands on, stays whole"
+    );
+    let first = drawn(&layer(Some(own)), &input.fx_occluders);
+    for y in 0..frame.h {
+        for x in 0..frame.w {
+            if at(own, x, y) {
+                assert_eq!(
+                    first(x, y),
+                    !at(over, x, y) && !at(top, x, y),
+                    "({x}, {y}): the first card's layer, under the card over it"
+                );
+            }
+        }
+    }
 }
 
 /// A compose frame starts free of fx: the fill clears the layers (each

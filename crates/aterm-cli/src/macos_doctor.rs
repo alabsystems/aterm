@@ -41,7 +41,8 @@ pub use initial::{
     retry_parked_setup_stages, run_initial_input_pass, run_initial_setup_pass,
     set_aside_unreadable_setup, set_aside_unreadable_setup_observing, setup_is_newer,
     setup_ledger_environment, setup_records_held, take_back_setup_interrupted,
-    validate_initial_setup_plan, vault_config_unread, with_initial_setup_vault_sync,
+    validate_initial_setup_plan, vault_config_unread, with_current_input_scope,
+    with_initial_setup_vault_sync,
 };
 #[cfg(any(test, debug_assertions))]
 pub use initial::{

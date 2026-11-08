@@ -9125,9 +9125,17 @@ fn pickers_list_the_default_once_and_name_what_they_do_not_offer() {
             setting_choice_label(prefs::EDIT_WINDOW_THEME, "auto")
         )
     );
+    // Too narrow for its line, a default's row wraps its words whole rather than cutting its name
+    // before "(default)" ("Match…(default)").
     let narrow = painted(&window.options[0], 100.0);
     assert!(
-        narrow.ends_with(" (default)") && narrow.contains('\u{2026}'),
+        narrow.ends_with("(default)")
+            && !narrow.contains('\u{2026}')
+            && painted_words(&narrow)
+                == format!(
+                    "{} (default)",
+                    setting_choice_label(prefs::EDIT_WINDOW_THEME, "auto")
+                ),
         "{narrow}"
     );
     let picker = ChoicePicker::new(
@@ -17982,6 +17990,107 @@ fn unset_text_setting_semantics_report_the_effective_default_while_paint_stays_q
     assert_eq!(control.spec.visual_value.as_deref(), Some(""));
 }
 
+#[test]
+fn a_trail_color_saved_as_the_cursors_reads_cursor_color_in_its_field() {
+    // Adjust Classic's Trail color field painted the file's word "cursor" where its placeholder,
+    // the classic mono spelling and the color wheel all say "Cursor color".
+    let service = VersionedConfigService::new(
+        "cursor_trail_style = \"classic\"\ncursor_trail_color = \"cursor\"\n".to_string(),
+    )
+    .unwrap();
+    let mut state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+    let key = prefs::EDIT_CURSOR_TRAIL_COLOR;
+    let index = state.field_index_of(key).expect("trail color field");
+    let field = &state.legacy.fields[index];
+    let row = setting_row(&state, index, field, false, SettingsWidth::Medium);
+    let compiled = UiTree::new(row)
+        .compile(LogicalRect::new(0.0, 0.0, 720.0, 120.0))
+        .unwrap();
+    let control = UiKey::new(format!("settings/control/{key}"));
+    let paint = compiled
+        .paint
+        .iter()
+        .find(|node| node.key == control)
+        .expect("paint text field");
+    let UiContent::TextField(text_field) = &paint.content else {
+        panic!("the trail color is a text field")
+    };
+    assert_eq!(
+        text_field.spec.visual_value.as_deref(),
+        Some(prefs::TRAIL_COLOR_CURSOR_LABEL)
+    );
+
+    // Its text box opens on the same words, which are no draft, and they write the file's word.
+    state.navigate(SettingsRoute::CursorStyles);
+    state.open_text_entry(key, None);
+    assert_eq!(
+        state
+            .field_inputs
+            .get(key)
+            .map(|input| input.value().to_string()),
+        Some(prefs::TRAIL_COLOR_CURSOR_LABEL.to_string())
+    );
+    assert!(!state.field_has_unsaved_draft(key));
+    assert_eq!(
+        crate::native_config_service::written_value(key, prefs::TRAIL_COLOR_CURSOR_LABEL)
+            .as_deref(),
+        Some(prefs::TRAIL_COLOR_CURSOR)
+    );
+    // The preview reads the box's words as the colour they write.
+    let spec = renderer_preview_spec(
+        &state,
+        100,
+        crate::native_app::ViewMotionCx::default(),
+        13.0,
+        1.0,
+    )
+    .expect("a preview");
+    assert_eq!(
+        spec.cursor.color,
+        aterm_effects::cursor_fx::TrailColor::Cursor
+    );
+}
+
+#[test]
+fn an_unavailable_theme_says_why_in_words_for_its_own_sides() {
+    // One theme on both appearances read 'Theme unavailable for appearance; built-in Default
+    // fallback active (both "NoSuchThemeAbc": …)', the side label "both" printed for no pair.
+    let feedback = |theme: &str| {
+        let service =
+            VersionedConfigService::new(format!("theme = \"{theme}\"\n")).expect("config");
+        let state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+        registered_value_unavailability(&state, None, prefs::EDIT_THEME)
+            .map(|note| note.feedback)
+            .unwrap_or_default()
+    };
+    let reason = "no built-in or loaded custom theme by that name";
+    // One theme: the status names it already ("Color theme set to NoSuchThemeAbc"), so its note
+    // says why, and no side.
+    let one = feedback("NoSuchThemeAbc");
+    assert!(
+        one.to_lowercase().contains(reason)
+            && !one.contains("NoSuchThemeAbc")
+            && !one.contains("both"),
+        "{one}"
+    );
+    // One side of a pair names that side and its theme, never the side that draws.
+    let light = feedback("dark:Nord,light:NoSuchThemeAbc");
+    assert!(
+        light.contains("NoSuchThemeAbc")
+            && light.to_lowercase().contains("light")
+            && !light.to_lowercase().contains("dark")
+            && !light.contains("Nord")
+            && !light.contains("both"),
+        "{light}"
+    );
+    let both = feedback("dark:NoSuchDark,light:NoSuchLight");
+    assert!(
+        both.contains("NoSuchDark") && both.contains("NoSuchLight") && !both.contains("both"),
+        "{both}"
+    );
+    assert_eq!(feedback("Nord"), "");
+}
+
 fn injected_font_families() -> Arc<aterm_render::font_catalog::MonospaceFamilies> {
     Arc::new(aterm_render::font_catalog::MonospaceFamilies {
         automatic: Some("SF Mono".to_string()),
@@ -23867,9 +23976,13 @@ fn leaving_serious_mode_keeps_an_old_classic_mono_in_the_cursor_color() {
         None
     );
     assert_eq!(color_submission_error(trail_color, Some(" Cursor ")), None);
+    assert_eq!(
+        color_submission_error(trail_color, Some(" cursor COLOR ")),
+        None
+    );
     assert!(
         color_submission_error(trail_color, Some("cursr"))
-            .is_some_and(|refusal| refusal.contains("or cursor for the cursor's color"))
+            .is_some_and(|refusal| refusal.contains("or Cursor color;"))
     );
 
     let ConfigPatchResult::Applied { snapshot, .. } = service.undo(undo) else {
@@ -32332,7 +32445,6 @@ fn the_tag_chips_wrap_as_one_aligned_balanced_block() {
 #[test]
 fn technical_details_never_show_the_more_lines_marker_alone() {
     let body = |technical: &[&str]| MessagesBody {
-        name: Vec::new(),
         meta: vec!["Today 21:40 \u{00b7} config".to_string()],
         sentence: vec!["Misspelled setting".to_string()],
         technical: technical.iter().map(|l| (*l).to_string()).collect(),
@@ -36054,6 +36166,149 @@ fn theme_rows_carry_a_colour_strip_and_a_contrast_sentence() {
     );
 }
 
+/// A PICKER'S TILE NAMES ITS CHOICE WHOLE (N97): a theme's name one line of its tile cannot hold
+/// wraps between its words and its row grows by the lines, at 1x, 1.5x and 2x in narrow windows,
+/// every tile whole on the screen that reveals it, none ending in an ellipsis, the theme files'
+/// cells after them too. Negative controls: at 2x in a 283x502 view the Color theme picker
+/// painted "Catppuccin…" for Catppuccin Mocha and "Default…" for Default Light; at 1.5x in
+/// 234x400 and 2x in 283x516 its last cells read "Open themes…" and "Browse all…".
+#[test]
+fn a_picker_tile_names_its_choice_whole() {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "picker names", |scale| {
+        for (width, height) in [(283.0, 502.0), (300.0, 420.0), (360.0, 600.0)] {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let (runtime, instance, view) =
+                theme_picker_runtime(crate::app_config::ThemeCatalog::empty());
+            let count = open_theme_picker(&runtime, view).options.len();
+            assert!(count > 8, "{context}: the built-in themes");
+            let cx = view_cx_at(width, height);
+            let prefix = format!("settings/choice/{}/", prefs::EDIT_THEME);
+            let mut whole = std::collections::BTreeSet::new();
+            for index in 0..count {
+                open_theme_picker(&runtime, view).reveal(index);
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                for node in &compiled.paint {
+                    let Some(at) = node
+                        .key
+                        .as_str()
+                        .strip_prefix(prefix.as_str())
+                        .and_then(|at| at.parse::<usize>().ok())
+                    else {
+                        continue;
+                    };
+                    let UiContent::Button(control) = &node.content else {
+                        continue;
+                    };
+                    let visual = control.spec.visual_label.clone().unwrap_or_default();
+                    assert!(
+                        !visual.contains('\u{2026}')
+                            && painted_words(&visual) == control.spec.label,
+                        "{context}: option {at} {:?} paints {visual:?}",
+                        control.spec.label
+                    );
+                    if !node.peek
+                        && node.clip.y <= node.rect.y + 0.5
+                        && node.clip.bottom() >= node.rect.bottom() - 0.5
+                    {
+                        whole.insert(at);
+                    }
+                }
+                let cut = narrow::cut_words(&compiled, &[prefix.as_str()]);
+                assert!(cut.is_empty(), "{context}: {cut:#?}");
+            }
+            let never: Vec<usize> = (0..count).filter(|at| !whole.contains(at)).collect();
+            assert!(
+                never.is_empty(),
+                "{context}: options never whole: {never:?}"
+            );
+            // The theme files' cells after the options say their words whole as the options do.
+            let shown = open_theme_picker(&runtime, view).shown.len();
+            let actions = open_theme_picker(&runtime, view).trailing.get();
+            for ordinal in 0..actions {
+                open_theme_picker(&runtime, view).scroll_to(Some(shown + ordinal));
+                let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                let key = ChoicePicker::action_key(ordinal);
+                let node = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == key && !node.peek)
+                    .unwrap_or_else(|| panic!("{context}: {key} is drawn"));
+                let UiContent::Button(control) = &node.content else {
+                    panic!("{context}: {key} is a button");
+                };
+                let visual = control.spec.visual_label.clone().unwrap_or_default();
+                assert_eq!(
+                    painted_words(&visual),
+                    theme_action_visual(ordinal),
+                    "{context}: {key} paints {visual:?}"
+                );
+                assert!(
+                    node.clip.y <= node.rect.y + 0.5
+                        && node.clip.bottom() >= node.rect.bottom() - 0.5,
+                    "{context}: {key} is whole on the screen that reveals it"
+                );
+                // Its authored words end in an ellipsis where they open a sheet ("Import a
+                // theme…"), so only the painter's overflow says they are cut.
+                let over: Vec<String> = compiled
+                    .paint_audit_lines()
+                    .into_iter()
+                    .filter(|line| {
+                        line.starts_with(&format!("paint-text key=\"{key}\""))
+                            && line.contains(" overflow=true ")
+                    })
+                    .collect();
+                assert!(over.is_empty(), "{context}: {over:#?}");
+            }
+        }
+    });
+}
+
+/// A NAME THE PICKER'S LEAST LIST HOLDS TAKES NOTHING FROM THE PREVIEW: at 1.5x in a 234x400
+/// window "Catppuccin Mocha" takes two lines, a tile the least list's two rows hold whole, so its
+/// host keeps the picker no room past its least form and the Appearance preview its own; only a
+/// name taller than those rows (a theme file's long name, on many lines) is kept room for.
+/// Negative control: kept room for every line past a tile's first, the host shrank the preview
+/// at 1.5x in 234x400 from 108pt to its least, 82pt, a box saying "Theme: Default" over nothing.
+#[test]
+fn a_picker_keeps_room_only_for_a_tile_its_least_list_cannot_hold() {
+    at_each_text_scale(&[1.5], "picker room", |_| {
+        let long = theme_catalog_with(
+            "long-name",
+            &[(
+                "harbour-lights-at-dusk-over-the-misty-water-of-the-old-northern-bay.conf",
+                MY_THEME,
+            )],
+        );
+        for (themes, kept) in [
+            (crate::app_config::ThemeCatalog::empty(), false),
+            (long, true),
+        ] {
+            let (runtime, instance, view) = theme_picker_runtime(themes);
+            let cx = view_cx_at(234.0, 400.0);
+            let _ = compile_settings_view(&runtime, instance, view, &cx);
+            let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                unreachable!();
+            };
+            let picker = open_theme_picker(&runtime, view);
+            let tallest = (0..picker.options.len())
+                .map(|index| picker.option_lines(index, 1, false))
+                .max()
+                .unwrap_or(1);
+            let room = picker_taller_tile(state, SettingsWidth::Compact, cx.viewport);
+            if kept {
+                assert!(
+                    picker_tile_height(tallest) > picker_least_rows(),
+                    "premise: a name of {tallest} lines is taller than the least rows"
+                );
+                assert!(room > 0.0, "a {tallest}-line tile is kept room");
+            } else {
+                assert_eq!(tallest, 2, "premise: Catppuccin Mocha takes two lines");
+                assert_eq!(room, 0.0, "a two-line tile takes no room from the preview");
+            }
+        }
+    });
+}
+
 #[test]
 fn a_theme_name_finds_the_theme_control_and_seeds_the_picker_filter() {
     let themes = theme_catalog_with("search", &[("harbour.conf", MY_THEME)]);
@@ -38682,7 +38937,7 @@ fn the_theme_picker_heads_its_sections_in_the_list() {
     assert_eq!(headings, ["dark", "light"]);
     let picker = open_theme_picker(&runtime, view);
     for row in picker.rows() {
-        if let PickerRow::Cells(cells) = row {
+        if let PickerRow::Cells(cells, _) = row {
             let sections: std::collections::BTreeSet<_> = cells
                 .map(|position| picker.cell_section(position))
                 .collect();
@@ -38927,7 +39182,7 @@ fn a_theme_picker_scrolled_into_a_section_names_it() {
             let picker = open_theme_picker(&runtime, view);
             assert!(picker.headed(), "{width}x{height}: a headed picker");
             let rows = picker.rows();
-            inside |= matches!(rows[picker.window(&rows).start], PickerRow::Cells(_));
+            inside |= matches!(rows[picker.window(&rows).start], PickerRow::Cells(..));
             let top = compiled
                 .paint
                 .iter()
@@ -38977,7 +39232,7 @@ fn a_theme_picker_scrolled_into_a_section_names_it() {
         .map_or(rows.len(), |n| heading + 1 + n);
     let fits_whole = picker.rows_fitting(&rows, heading) >= section_end - heading;
     assert_eq!(
-        matches!(rows[picker.window(&rows).start], PickerRow::Cells(_)),
+        matches!(rows[picker.window(&rows).start], PickerRow::Cells(..)),
         !fits_whole,
         "the window starts inside the Light section unless the whole section fits \
          under its heading (rows {heading}..{section_end}, window {:?})",
@@ -40374,6 +40629,32 @@ fn the_keyword_toys_say_why_they_are_off_and_how_to_turn_them_on() {
         "{}",
         node.label
     );
+    // Each row's tag paints why; the line under them paints what a press does, never the tags'
+    // "Word effects off in aterm.toml" a third time.
+    let painted = off
+        .paint
+        .iter()
+        .find_map(|node| match &node.content {
+            UiContent::Text(spec)
+                if node.key.as_str() == "settings/top/playful-effects/word-effects-off/visual" =>
+            {
+                Some(spec.text.clone())
+            }
+            _ => None,
+        })
+        .expect("the line is painted");
+    assert!(
+        !painted.is_empty() && !painted.contains("Word effects off"),
+        "{painted}"
+    );
+    let tags = off
+        .paint
+        .iter()
+        .filter(|node| {
+            matches!(&node.content, UiContent::Text(spec) if spec.text.contains("Word effects off"))
+        })
+        .count();
+    assert_eq!(tags, 2, "one tag on each word effect's row");
     assert!(
         top("").semantic(&status).is_none(),
         "nothing to say by default"

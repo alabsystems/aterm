@@ -400,9 +400,10 @@ pub(crate) fn token_read(sys: &dyn System, ctx: &Ctx) -> Result<Option<TokenRead
     let read = sys.read_owned_file(&path, user.uid, INPUT_MAX, true);
     let unusable = match &read {
         Err(why) if why.kind() != io::ErrorKind::NotFound => Some(format!(
-            "the GitHub token at {} is on this Mac but cannot be used ({why}): it must be a \
+            "the GitHub token at {} is on this {} but cannot be used ({why}): it must be a \
              regular file of yours, not a link, that only you can read, of at most {} KiB",
             path.display(),
+            sys.machine(),
             INPUT_MAX / 1024
         )),
         _ => None,
@@ -762,7 +763,7 @@ fn read_token(sys: &dyn System, user: &User, config: &Github) -> Result<Secret, 
                     format!(
                         "the GitHub token file ({}) is not on this {} yet",
                         config.token_file.display(),
-                        if sys.macos() { "Mac" } else { "machine" }
+                        sys.machine()
                     )
                 } else {
                     "GitHub token source must be an owned private regular file (0600), without \

@@ -119,6 +119,64 @@ fn current_and_historical_key_callbacks_retain_the_vault_observation() {
     );
 }
 
+/// This Mac's recipient is kept for the identity it was read from ([`client::identity_recipient`]):
+/// while the identity file stands it is opened no more, and an identity put in its place answers
+/// its own recipient.
+/// NEGATIVE CONTROL (2026-11-08): a recipient kept for any identity answers the one put in its
+/// place with the first one's.
+#[test]
+fn a_kept_recipient_is_the_recipient_of_the_identity_its_file_holds() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = client::Paths::for_home(root.path());
+    let first = client::machine_identity(&paths).unwrap();
+    let path = paths.dir.join("identity");
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        assert_eq!(
+            client::identity_recipient(&paths).unwrap(),
+            Some(first.recipient())
+        );
+        let reads = crate::fsx::reads_of(&path);
+        assert_eq!(
+            client::identity_recipient(&paths).unwrap(),
+            Some(first.recipient())
+        );
+        assert_eq!(crate::fsx::reads_of(&path), reads, "opened while it stood");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(client::identity_recipient(&paths).unwrap(), None);
+        let second = client::machine_identity(&paths).unwrap();
+        assert_ne!(second.recipient(), first.recipient());
+        assert_eq!(
+            client::identity_recipient(&paths).unwrap(),
+            Some(second.recipient()),
+            "the identity put in the first one's place"
+        );
+    });
+}
+
+/// A warm access's quiet check opens this Mac's identity no more while the vault stands: it
+/// compares the recipient kept for the identity file ([`client::identity_recipient`]) and reads
+/// the identity only to judge a changed log afresh.
+/// NEGATIVE CONTROL (2026-11-08): with the identity read before the check's quiet answer, as on
+/// main before this law, two checks open it twice (`left: 2`).
+#[test]
+fn a_warm_access_check_opens_no_identity_while_the_vault_stands() {
+    let vault = Vault::new();
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    let identity = vault.paths.dir.join("identity");
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        assert!(access.is_current(&vault.journal));
+        let reads = crate::fsx::reads_of(&identity);
+        for _ in 0..2 {
+            assert!(access.is_current(&vault.journal));
+        }
+        assert_eq!(
+            crate::fsx::reads_of(&identity) - reads,
+            0,
+            "a quiet check opened the identity"
+        );
+    });
+}
+
 #[test]
 fn a_failed_vault_read_cannot_poison_commons_access_without_an_input_change() {
     struct ReadFault(std::path::PathBuf);

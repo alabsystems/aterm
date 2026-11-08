@@ -687,7 +687,7 @@ impl Item for NativeRepositories {
                     Ok(None) => {}
                     Err(block) => {
                         self.reading.set(block.wait.map(Reading::Waits));
-                        return block.probe(self.unasked, sys.macos());
+                        return block.probe(self.unasked, sys.machine());
                     }
                 }
             }
@@ -726,7 +726,7 @@ impl Item for NativeRepositories {
                 Err(block) => {
                     // Why it cannot go on, where this probe decided it: System State's note.
                     self.reading.set(block.wait.map(Reading::Waits));
-                    return block.probe(self.unasked, sys.macos());
+                    return block.probe(self.unasked, sys.machine());
                 }
             };
             let Some(lookups) = lookups else {
@@ -1232,14 +1232,15 @@ impl Block {
     /// The probe's answer for this block (System State design §3.6): a person's step where only
     /// their act ends the wait ([`Wait::kind`]), so its row needs them and no pass retries it,
     /// else a wait that ends by itself. For `aterm init`'s default (`unasked`), a machine the
-    /// vault wrote no token to has no stage to run, which asks nobody anything; `mac` names it.
-    fn probe(self, unasked: bool, mac: bool) -> Probe {
+    /// vault wrote no token to has no stage to run, which asks nobody anything; `machine` names
+    /// it ([`System::machine`]).
+    fn probe(self, unasked: bool, machine: &str) -> Probe {
         match self.wait {
             Some(Wait::Token) if unasked => Probe::NotApplicable {
                 why: format!(
                     "no GitHub token on this {} yet: the ALab vault's sync writes ~/{} \
                      (init.toml [github] token_file names another)",
-                    if mac { "Mac" } else { "machine" },
+                    machine,
                     super::TOKEN_FILE
                 ),
             },
@@ -1513,6 +1514,22 @@ pub(super) mod tests {
             .stat_of(path, stat(false, 0o600));
     }
 
+    /// [`source`] at `user`'s synced token file, owned by `user`: a live account, in a test whose
+    /// git runs for real, is not the fixtures' 501.
+    fn owned_source(sys: &Fake, user: &User) {
+        let path = Path::new(&user.home).join(crate::init_github::TOKEN_FILE);
+        let path = path.to_str().unwrap();
+        source(sys, path);
+        sys.stat_of(
+            path,
+            Stat {
+                uid: user.uid,
+                gid: user.gid,
+                ..stat(false, 0o600)
+            },
+        );
+    }
+
     /// `user`'s account on `sys` listing one repository of hers, `name`, already a worktree in
     /// `~`, with her synced token and aterm's route handing it back, and the git `sys` runs (the
     /// distribution's on Linux): the stage init runs with no init.toml, converged.
@@ -1601,6 +1618,8 @@ pub(super) mod tests {
         );
     }
 
+    /// `user`'s private repository inventory from the vault, listing `repositories`, owned by
+    /// `user`.
     fn metadata(sys: &Fake, user: &User, repositories: aterm_json::Value) {
         let path = super::super::inventory::file(&user.home);
         let bytes = aterm_json::to_vec(&aterm_json::json!({
@@ -1610,6 +1629,8 @@ pub(super) mod tests {
         sys.file(path.to_str().unwrap(), &bytes).stat_of(
             path.to_str().unwrap(),
             Stat {
+                uid: user.uid,
+                gid: user.gid,
                 len: bytes.len() as u64,
                 ..stat(false, 0o600)
             },
@@ -5366,12 +5387,48 @@ pub(super) mod tests {
     /// origin refs still describe the old commit. Only the transport port substitutes
     /// this private bare origin; the item admits the normal private GitHub identity.
     /// Independent stores overlap within four lanes, while source withdrawal,
-    /// storage replacement and offline failures stop queued work without moving it.
+    /// storage replacement and offline failures stop queued work without moving it, and so
+    /// does a checkout made a partial clone after its first read (`late partial`): the
+    /// storage is read again before the fetch. Its reads of the remote's tip before that never
+    /// fetch it lazily, where git honours `GIT_NO_LAZY_FETCH` (2.44 and later, and the May 2024
+    /// security releases from 2.39.4 on, which distributions carry to older versions): no
+    /// promisor pack appears, though origin is reachable (its URL rewritten to the local origin).
+    /// The fake models this host and selects its native git, which the real runs use.
+    /// A git before 2.44, which refuses `--no-lazy-fetch` (a stand-in over that git, so on
+    /// every host), refreshes a clean checkout alike: nothing the refresh runs carries the
+    /// option, and it leaves a partial clone, the one git could fetch lazily in, as it is.
+    /// NEGATIVE CONTROLS: the stand-in does refuse the option, and a refresh that read storage
+    /// with it (as before 2026-11-08) leaves the clean checkout behind.
     #[test]
     fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
         use crate::port::Live;
+        let git = crate::items::github::need_native_git();
+        // A git before 2.44 as git 2.43 is one: `--no-lazy-fetch` is an unknown option (129).
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let old_git = scratch.path().join("old-git");
+        aterm_tempfile::stand_in(
+            &old_git,
+            &format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = --no-lazy-fetch ]; then\n    \
+                 echo 'unknown option: --no-lazy-fetch' >&2\n    exit 129\n  fi\ndone\n\
+                 exec '{git}' \"$@\"\n"
+            ),
+        )
+        .unwrap();
+        let refused = Live::new()
+            .run_complete_stdout(
+                &crate::port::Cmd::new(&old_git).args(["--no-lazy-fetch", "--version"]),
+            )
+            .unwrap();
+        assert_eq!(
+            refused.status,
+            Some(129),
+            "control: the stand-in is a git before 2.44"
+        );
         for case in [
             "clean",
+            "old git",
+            "old git partial",
             "dirty",
             "topic",
             "recorded",
@@ -5379,6 +5436,7 @@ pub(super) mod tests {
             "partial",
             "retargeted",
             "late retargeted",
+            "late partial",
             "changed source",
             "late recorded",
             "unchanged develop",
@@ -5416,7 +5474,7 @@ pub(super) mod tests {
                 "shallow" => {
                     std::fs::write(repos.work.join(".git/shallow"), format!("{before}\n")).unwrap()
                 }
-                "partial" => {
+                "partial" | "old git partial" => {
                     repos.g(
                         &repos.work,
                         &["config", "extensions.partialClone", "origin"],
@@ -5435,6 +5493,7 @@ pub(super) mod tests {
 
             let mut sys = Fake::root();
             sys.euid = repos.who.uid;
+            sys.linux = !live.macos();
             sys.logged_in(&repos.who)
                 .stat_of(
                     &repos.who.home,
@@ -5444,7 +5503,7 @@ pub(super) mod tests {
                         ..stat(true, 0o700)
                     },
                 )
-                .executable(crate::items::github::CLT_GIT, b"selected fixture git")
+                .executable(git, b"selected fixture git")
                 .stat_of(
                     repos.work.to_str().unwrap(),
                     Stat {
@@ -5467,13 +5526,7 @@ pub(super) mod tests {
                 }
             }
             script::launcher(&sys, &repos.who);
-            source(
-                &sys,
-                Path::new(&repos.who.home)
-                    .join(super::super::TOKEN_FILE)
-                    .to_str()
-                    .unwrap(),
-            );
+            owned_source(&sys, &repos.who);
             metadata(
                 &sys,
                 &repos.who,
@@ -5506,6 +5559,24 @@ pub(super) mod tests {
             }
             script::lookups_hold(&sys, &repos.who, GITHUB, &repos.who.name, TOKEN);
             script::alike(&sys, &repos.who);
+            // Whether this git honours `GIT_NO_LAZY_FETCH`: a read it bars, in a partial clone of
+            // origin that lacks the tip, fetches nothing.
+            let honours_no_lazy_fetch = case == "late partial" && {
+                let probe = Path::new(&repos.who.home).join("lazy-probe");
+                repos.init(&probe, false);
+                let origin = repos.origin.to_string_lossy();
+                repos.g(&probe, &["remote", "add", "origin", &origin]);
+                repos.g(&probe, &["config", "extensions.partialClone", "origin"]);
+                !live
+                    .run_complete_stdout(
+                        &crate::checkout::git(&live, &repos.who, Some(&probe))
+                            .env("GIT_NO_LAZY_FETCH", "1")
+                            .args(["cat-file", "-e", &tip]),
+                    )
+                    .unwrap()
+                    .success()
+            };
+            let old = case.starts_with("old git").then(|| old_git.clone());
             let paths = works.clone();
             let bare = repos.origin.clone();
             let inventory = super::super::inventory::file(&repos.who.home);
@@ -5519,6 +5590,9 @@ pub(super) mod tests {
                     .iter()
                     .find(|path| command.args.iter().any(|arg| arg == path.as_os_str()))?;
                 let mut command = command.clone();
+                if let Some(old) = &old {
+                    command.program = old.clone();
+                }
                 let remote = command.args.iter().any(|arg| arg == "--symref");
                 if remote {
                     if multiple {
@@ -5589,6 +5663,26 @@ pub(super) mod tests {
                         ]))
                         .unwrap();
                     assert!(changed.success());
+                }
+                if case == "late partial" && command.args.iter().any(|arg| arg == "--symref") {
+                    let live = Live::new();
+                    let name = work.file_name().unwrap().to_str().unwrap();
+                    for setting in [
+                        ["extensions.partialClone".to_owned(), "origin".to_owned()],
+                        [
+                            format!("url.{}.insteadOf", bare.display()),
+                            format!("https://github.com/{}/{name}.git", who.name),
+                        ],
+                    ] {
+                        let changed = live
+                            .run_complete_stdout(
+                                &crate::checkout::git(&live, &who, Some(work))
+                                    .arg("config")
+                                    .args(setting),
+                            )
+                            .unwrap();
+                        assert!(changed.success());
+                    }
                 }
                 if case == "changed source" && command.args.iter().any(|arg| arg == "--symref") {
                     sys.file(
@@ -5699,7 +5793,10 @@ pub(super) mod tests {
                 }
                 continue;
             }
-            if matches!(case, "changed source" | "late recorded" | "late retargeted") {
+            if matches!(
+                case,
+                "changed source" | "late recorded" | "late retargeted" | "late partial"
+            ) {
                 assert_eq!(
                     stage(&applied).outcome,
                     crate::model::Outcome::Failed,
@@ -5712,6 +5809,20 @@ pub(super) mod tests {
                         .all(|call| !call.contains(" fetch ") && !call.contains(" merge "))
                 );
                 assert_eq!(repos.head(&repos.work), before);
+                if case == "late partial" && honours_no_lazy_fetch {
+                    let promisor: Vec<_> = std::fs::read_dir(repos.work.join(".git/objects/pack"))
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .filter(|entry| entry.path().extension() == Some("promisor".as_ref()))
+                        .map(|entry| entry.path())
+                        .collect();
+                    assert_eq!(
+                        promisor,
+                        Vec::<std::path::PathBuf>::new(),
+                        "a read fetched lazily"
+                    );
+                }
                 continue;
             }
             assert_eq!(
@@ -5721,13 +5832,22 @@ pub(super) mod tests {
             );
             assert_eq!(
                 repos.head(&repos.work),
-                if matches!(case, "clean" | "unchanged develop") || multiple {
+                if matches!(case, "clean" | "old git" | "unchanged develop") || multiple {
                     tip.clone()
                 } else {
                     before.clone()
                 },
-                "default Apply must refresh acquired clean code"
+                "{case}: default Apply must refresh acquired clean code"
             );
+            if case.starts_with("old git") {
+                assert!(
+                    sys.calls()
+                        .iter()
+                        .all(|call| !call.contains("--no-lazy-fetch")),
+                    "{case}: {:?}",
+                    sys.calls()
+                );
+            }
             if multiple {
                 assert_eq!(
                     gate.0.lock().unwrap().1,
@@ -5738,7 +5858,7 @@ pub(super) mod tests {
                     assert!(repos.status(path).is_empty());
                 }
             }
-            if !matches!(case, "clean" | "unchanged develop") && !multiple {
+            if !matches!(case, "clean" | "old git" | "unchanged develop") && !multiple {
                 assert!(
                     sys.calls().iter().all(|call| !call.contains("--symref")
                         && !call.contains(" fetch ")
@@ -5764,6 +5884,8 @@ pub(super) mod tests {
         use crate::port::Live;
         use crate::sync::repository_refresh::{Execution, RepositoryPass, observe};
         use aterm_secrets::converge::{RefreshRequest, RepositoryRequest};
+        // The fake models this host and selects its native git, which the real runs use.
+        let git = crate::items::github::need_native_git();
 
         let live = Live::new();
         let repos = crate::checkout::tests::Repos::new(&live, "native-shared-refresh");
@@ -5786,6 +5908,7 @@ pub(super) mod tests {
 
         let mut sys = Fake::root();
         sys.euid = repos.who.uid;
+        sys.linux = !live.macos();
         sys.logged_in(&repos.who)
             .stat_of(
                 &repos.who.home,
@@ -5795,7 +5918,7 @@ pub(super) mod tests {
                     ..stat(true, 0o700)
                 },
             )
-            .executable(crate::items::github::CLT_GIT, b"selected fixture git")
+            .executable(git, b"selected fixture git")
             .stat_of(
                 repos.work.to_str().unwrap(),
                 Stat {
@@ -5808,13 +5931,7 @@ pub(super) mod tests {
             sys.stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
         }
         script::launcher(&sys, &repos.who);
-        source(
-            &sys,
-            Path::new(&repos.who.home)
-                .join(super::super::TOKEN_FILE)
-                .to_str()
-                .unwrap(),
-        );
+        owned_source(&sys, &repos.who);
         metadata(
             &sys,
             &repos.who,

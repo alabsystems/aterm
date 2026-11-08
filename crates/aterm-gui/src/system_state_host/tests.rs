@@ -5051,6 +5051,7 @@ fn a_read_that_met_a_write_keeps_the_page_and_the_windows_own_admission() {
             detail: None,
         }],
         observed_generation: 41,
+        caps_live: None,
         observed_vault_url: admitted.plan.as_ref().map(|plan| plan.vault_url.clone()),
         running: vec![Setting::CapsLock],
     };

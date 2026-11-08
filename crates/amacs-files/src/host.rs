@@ -2066,10 +2066,23 @@ pub enum AdvisoryLockRefusal {
 
 /// THE bounded advisory-lock retry for this crate and aterm-gui.
 pub fn acquire_advisory_lock_within(
-    mut lock_file: File,
+    lock_file: File,
     budget: std::time::Duration,
 ) -> Result<HeldAdvisoryLock, AdvisoryLockRefusal> {
-    let deadline = std::time::Instant::now().checked_add(budget);
+    acquire_advisory_lock_within_clock(lock_file, budget, std::time::Instant::now)
+}
+
+/// The same native advisory-lock wait, with its monotonic clock supplied by the caller.
+///
+/// # Errors
+/// [`AdvisoryLockRefusal::Busy`] when a held lock outlasts the budget, or
+/// [`AdvisoryLockRefusal::Failed`] for another native lock error.
+pub fn acquire_advisory_lock_within_clock(
+    mut lock_file: File,
+    budget: std::time::Duration,
+    mut now: impl FnMut() -> std::time::Instant,
+) -> Result<HeldAdvisoryLock, AdvisoryLockRefusal> {
+    let deadline = now().checked_add(budget);
     let mut backoff = std::time::Duration::from_millis(1);
     loop {
         match HeldAdvisoryLock::try_lock_keeping(lock_file) {
@@ -2079,9 +2092,8 @@ pub fn acquire_advisory_lock_within(
             }
             Err((refused, std::fs::TryLockError::WouldBlock)) => {
                 lock_file = refused;
-                let remaining = deadline.map_or(budget, |deadline| {
-                    deadline.saturating_duration_since(std::time::Instant::now())
-                });
+                let remaining =
+                    deadline.map_or(budget, |deadline| deadline.saturating_duration_since(now()));
                 if remaining.is_zero() {
                     return Err(AdvisoryLockRefusal::Busy);
                 }

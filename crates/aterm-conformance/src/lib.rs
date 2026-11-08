@@ -19,6 +19,10 @@ pub mod measuring_quiet;
 #[path = "../benches/support/mod.rs"]
 pub mod measuring_runner;
 
+#[cfg(all(test, unix))]
+#[path = "../benches/support/telemetry.rs"]
+pub mod measuring_telemetry;
+
 use aterm_core::terminal::Terminal;
 
 /// A terminal under test you feed bytes into and read the screen out of.

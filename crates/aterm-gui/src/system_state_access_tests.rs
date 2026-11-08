@@ -12,7 +12,9 @@ use aterm_types::macos_setup::{
     Access, AccessOutcome, Observation, Plan, Selection, Setting, Standing, Subject,
 };
 
-use super::{JOIN_PENDING_KEY, RETIRED_KEYS, StepsReach, menu_line, setup_field};
+use super::{
+    JOIN_PENDING_KEY, RETIRED_KEYS, StepsReach, background_setup_fields, menu_line, setup_field,
+};
 use crate::status_item::SystemStateLine;
 use crate::{App, InitialSetupPermissionPolicy, SetupStatus};
 
@@ -319,6 +321,55 @@ fn setup_field_requires_current_evidence_after_the_plan_finishes() {
         .find(|row| row.subject == fda)
         .unwrap() = observed(fda, Standing::Unknown, None);
     assert_eq!(setup_field(&missing), "pending:repos;unknown:fda");
+
+    let mut caps = Selection::none();
+    caps.set(Setting::CapsLock, true);
+    let mut live = status(
+        caps,
+        vec![observed(
+            Subject::Setting(Setting::CapsLock),
+            Standing::Unknown,
+            None,
+        )],
+    );
+    let headline = crate::system_state::headline(
+        &live,
+        &crate::system_state::rows(&live, caps),
+        live.plan.as_ref(),
+    );
+    live.caps_live = Some(aterm_types::macos_setup::LiveKeyboardMapping {
+        control: 2,
+        explicit_other: 0,
+        held: 0,
+    });
+    assert_eq!(setup_field(&live), "unknown:capslock");
+    assert_eq!(
+        crate::system_state::headline(
+            &live,
+            &crate::system_state::rows(&live, caps),
+            live.plan.as_ref()
+        ),
+        headline
+    );
+    let diagnostic = background_setup_fields(&live);
+    assert!(
+        diagnostic
+            .split_whitespace()
+            .any(|part| part == "caps_live=control")
+    );
+    assert!(
+        diagnostic
+            .split_whitespace()
+            .any(|part| part == "verified=0")
+    );
+    live.caps_live.as_mut().unwrap().held = 1;
+    let mixed = background_setup_fields(&live);
+    assert!(
+        mixed
+            .split_whitespace()
+            .any(|part| part == "caps_live=mixed:control=2,other=0,held=1")
+    );
+    assert_eq!(setup_field(&live), "unknown:capslock");
 }
 
 #[test]

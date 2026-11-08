@@ -299,6 +299,8 @@ pub struct SetupReadings {
     pub observed: Vec<aterm_types::macos_setup::Observation>,
     /// Change notification for the readings, independent of stage activity.
     pub observed_generation: u64,
+    /// Current live HID-service evidence; no saved-setting readiness is inferred.
+    pub caps_live: Option<aterm_types::macos_setup::LiveKeyboardMapping>,
     /// The source described by the vault and repository readings.
     pub observed_vault_url: Option<String>,
     /// The settings whose stage is running now.
@@ -309,6 +311,7 @@ impl SetupReadings {
     fn overlay(self, status: &mut SetupStatus) {
         status.observed = self.observed;
         status.observed_generation = self.observed_generation;
+        status.caps_live = self.caps_live;
         status.observed_vault_url = self.observed_vault_url;
         status.running = self.running;
     }

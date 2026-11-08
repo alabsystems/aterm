@@ -70,10 +70,9 @@ where
 }
 
 /// What a file is now, followed through links: its path as resolved, device, inode, length and
-/// modification time to the nanosecond, plus Unix mode and ownership. The resolved path's native
-/// bytes are encoded without lossy conversion. This is metadata identity,
-/// not a content digest:
-/// an in-place rewrite preserving length and modification time can retain it.
+/// modification time to the nanosecond, plus Unix mode, ownership and change timestamp.
+/// The resolved path's native bytes are encoded without lossy conversion. This is metadata
+/// identity, not a content digest: a mutation retaining every observed field can retain it.
 #[must_use]
 pub fn identity(path: &Path) -> Option<String> {
     let real = std::fs::canonicalize(path).ok()?;
@@ -93,18 +92,20 @@ pub(crate) fn metadata_identity(path: &Path, meta: &std::fs::Metadata) -> Option
     let node = {
         use std::os::unix::fs::MetadataExt as _;
         format!(
-            "{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}",
             meta.dev(),
             meta.ino(),
             meta.mode(),
             meta.uid(),
-            meta.gid()
+            meta.gid(),
+            meta.ctime(),
+            meta.ctime_nsec()
         )
     };
     #[cfg(not(unix))]
     let node = String::new();
     Some(format!(
-        "native-path-v1:{} {node} {} {modified}",
+        "native-path-v2:{} {node} {} {modified}",
         aterm_codec::hex::encode_lower(path.as_os_str().as_encoded_bytes()),
         meta.len()
     ))
@@ -159,10 +160,25 @@ fn read_admitted(file: &Path) -> Option<String> {
     if bytes.len() > MAX_PROBE_CACHE_BYTES {
         return None;
     }
-    String::from_utf8(bytes).ok()
+    let text = String::from_utf8(bytes).ok()?;
+    let mut keys = std::collections::BTreeSet::new();
+    for line in text.split_inclusive('\n') {
+        let line = line.strip_suffix('\n')?;
+        let (key, value) = line.split_once(RECORD)?;
+        if key.is_empty()
+            || line.contains('\r')
+            || value.contains(RECORD)
+            || !keys.insert(key)
+            || keys.len() > ENTRIES
+        {
+            return None;
+        }
+    }
+    Some(text)
 }
 
-/// The reading `file` keeps under exactly `key`.
+/// The reading `file` keeps under exactly `key`. An incomplete, malformed, duplicate-key or
+/// over-capacity file is a miss; its records are not carried into the next rewrite.
 #[must_use]
 pub fn get(file: &Path, key: &str) -> Option<String> {
     if key.is_empty() {
@@ -254,6 +270,97 @@ pub fn put(file: &Path, key: &str, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_same_size_rewrite_with_restored_mtime_retires_a_reading() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = crate::testdir::dir("atpkg-probe-cache-rewrite-");
+        let bin = dir.join("compiler");
+        std::fs::write(&bin, b"old!").unwrap();
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let restore = || {
+            std::fs::File::options()
+                .write(true)
+                .open(&bin)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(modified))
+                .unwrap();
+        };
+        restore();
+        let before = std::fs::metadata(&bin).unwrap();
+        let old = identity(&bin).unwrap();
+        let cache = dir.join("doctor/readings");
+        put(&cache, &old, "old answer");
+        std::fs::write(&bin, b"new!").unwrap();
+        restore();
+        let after = std::fs::metadata(&bin).unwrap();
+        assert_eq!(
+            (
+                before.dev(),
+                before.ino(),
+                before.mode(),
+                before.uid(),
+                before.gid(),
+                before.len(),
+                before.modified().unwrap()
+            ),
+            (
+                after.dev(),
+                after.ino(),
+                after.mode(),
+                after.uid(),
+                after.gid(),
+                after.len(),
+                after.modified().unwrap()
+            )
+        );
+        assert_ne!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec()),
+            "the filesystem must report this fixture's mutation"
+        );
+        let current = identity(&bin).unwrap();
+        assert_eq!(
+            get(&cache, &current),
+            None,
+            "served the answer from before the rewrite"
+        );
+        put(&cache, &current, "new answer");
+        assert_eq!(get(&cache, &current).as_deref(), Some("new answer"));
+        assert_eq!(identity(&bin).unwrap(), current);
+    }
+
+    #[test]
+    fn malformed_cache_records_are_misses_and_a_new_answer_repairs_them() {
+        let dir = crate::testdir::dir("atpkg-probe-cache-records-");
+        let file = dir.join("doctor/readings");
+        put(&file, "k", "old");
+        let good = format!("k{RECORD}old\n");
+        let too_many = (0..=ENTRIES)
+            .map(|n| format!("k{n}{RECORD}v\n"))
+            .collect::<String>();
+        for bad in [
+            format!("k{RECORD}partial"),
+            format!("{good}k{RECORD}different\n"),
+            format!("{good}{good}"),
+            format!("{good}{RECORD}empty-key\n"),
+            format!("{good}other{RECORD}two{RECORD}values\n"),
+            format!("k{RECORD}old\r\n"),
+            format!("{good}unfinished"),
+            format!("{good}{too_many}"),
+        ] {
+            std::fs::write(&file, &bad).unwrap();
+            assert_eq!(get(&file, "k"), None, "accepted malformed cache {bad:?}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), bad);
+            put(&file, "fresh", "answer");
+            assert_eq!(get(&file, "fresh").as_deref(), Some("answer"));
+            assert_eq!(get(&file, "k"), None, "retained a malformed old file");
+        }
+        put(&file, "empty", "");
+        assert_eq!(get(&file, "empty"), Some(String::new()));
+        assert_eq!(get(&file, "fresh").as_deref(), Some("answer"));
+    }
 
     #[test]
     fn cache_writes_fit_the_read_limit_without_partial_records() {

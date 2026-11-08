@@ -12,7 +12,14 @@ fn a_frozen_cutters_own_child_proves_itself_without_the_freezer_envelope() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let source = root.join("source");
-    crate::ledger::testing::init(&source, &[]);
+    // The fixture commits under its own identity: a test's scratch HOME has none.
+    crate::ledger::testing::init(
+        &source,
+        &[
+            ("user.name", "Test"),
+            ("user.email", "test@example.invalid"),
+        ],
+    );
     let git = GitCli::new(&source);
     std::fs::write(source.join("README"), "fixture release\n").unwrap();
     git_ok(&git, &["add", "README"]).unwrap();
@@ -39,7 +46,13 @@ fn a_frozen_cutters_own_child_proves_itself_without_the_freezer_envelope() {
     // A failed first exec must retain the copied Mach-O and its directory for assessment.
     // stage_cutter proves successful --version output through EOF before cleanup is safe.
     let retained = dir.keep();
-    let cutter = release_tools::stage_cutter(&release, &commit, &binary).unwrap();
+    let cutter = release_tools::stage_cutter(
+        &release,
+        &commit,
+        &binary,
+        &release.with_extension("events"),
+    )
+    .unwrap();
     release_tools::publish_cutter(&release, &cutter).unwrap();
     for mode in ["proved", "scrubbed", "foreign", "envelope"] {
         let mut cmd = aterm_uds::spawnfd::command(&binary);

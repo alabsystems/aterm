@@ -15,7 +15,7 @@ use crate::port::KeyboardPrefix;
 use crate::port::{
     Cmd, KeyboardMapChange, KeyboardServiceObservation, KeyboardServiceState, System,
 };
-use aterm_types::macos_setup::{Selection, Setting};
+use aterm_types::macos_setup::{LiveKeyboardMapping, Selection, Setting};
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -358,6 +358,54 @@ impl KeyboardAttachmentReceipt {
                     AttachmentState::Kept(_) => true,
                 }
         })
+    }
+
+    /// Project only a complete, current passive cohort matching this actual final probe.
+    /// Kept identities attest no mapping; an unknown, duplicate or missing service supplies
+    /// no diagnostic. This never reads preferences or infers saved Caps readiness.
+    #[must_use]
+    pub fn live_mapping(
+        &self,
+        observations: &[KeyboardServiceObservation],
+    ) -> Option<LiveKeyboardMapping> {
+        if observations.is_empty()
+            || observations.len() != self.0.len()
+            || observations.len() > 4096
+        {
+            return None;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = LiveKeyboardMapping {
+            control: 0,
+            explicit_other: 0,
+            held: 0,
+        };
+        for observation in observations {
+            if observation.unread().is_some() || !seen.insert(observation.registry()) {
+                return None;
+            }
+            match self
+                .0
+                .iter()
+                .find(|state| state.registry() == observation.registry())?
+            {
+                AttachmentState::Managed(state) | AttachmentState::Unmanaged(state) => {
+                    if !observation.matches(state) {
+                        return None;
+                    }
+                    if matches!(
+                        state.caps_lock(),
+                        keyboard::LEFT_CONTROL | keyboard::RIGHT_CONTROL
+                    ) {
+                        out.control += 1;
+                    } else {
+                        out.explicit_other += 1;
+                    }
+                }
+                AttachmentState::Kept(_) => out.held += 1,
+            }
+        }
+        Some(out)
     }
 
     /// Forget services that disappeared from the current cohort.
@@ -2167,6 +2215,20 @@ pub(crate) mod tests {
         let observed = sys.keyboard_service_observations().unwrap();
         assert_eq!(receipt.registries(), [2]);
         assert!(receipt.matches(&observed[0]));
+        assert_eq!(
+            receipt.live_mapping(&observed),
+            Some(LiveKeyboardMapping {
+                control: 1,
+                explicit_other: 0,
+                held: 0,
+            })
+        );
+        assert!(receipt.live_mapping(&[]).is_none());
+        assert!(
+            receipt
+                .live_mapping(&[observed[0].clone(), observed[0].clone()])
+                .is_none()
+        );
         assert_eq!(sys.calls()[..calls.len()], calls);
         assert_eq!(&sys.calls()[calls.len()..], &["keyboard-service-ids"]);
 
@@ -2177,12 +2239,71 @@ pub(crate) mod tests {
             !receipt.matches(&reset[0]),
             "same identity, different native map"
         );
+        assert!(receipt.live_mapping(&reset).is_none());
         let unknown_dump = composite_keyboard_dump(&[(1, &[], &[]), (2, &native, &user_map)], true)
             .replace("UserKeyMapping", "UnknownMapping");
         sys.simulate(move |_, _| Some(Ran::ok(&unknown_dump)));
         let unknown = sys.keyboard_service_observations().unwrap();
         assert!(unknown[0].unread().is_some());
         assert!(!receipt.matches(&unknown[0]));
+        assert!(receipt.live_mapping(&unknown).is_none());
+
+        // One physical/composite model can expose several HID services. Preserve an
+        // explicit non-Control choice beside the genuinely verified Control service.
+        let mut explicit = attachment(&who, 65534, 169);
+        explicit.registries = vec![1];
+        let get = explicit
+            .inner
+            .command()
+            .args(["--get", "UserKeyMapping"])
+            .display();
+        let mixed_dump = composite_keyboard_dump(
+            &[
+                (1, &[(keyboard::CAPS_LOCK, option)], &[]),
+                (2, &verified_native, &user_map),
+            ],
+            true,
+        );
+        let second_user = hid_user_row(2, &user_map);
+        let users = format!(
+            "{}{}",
+            hid_user_row(1, &[]),
+            second_user.strip_prefix("RegistryID Key Value\n").unwrap()
+        );
+        sys.simulate(move |_, cmd| {
+            if cmd.display() == get {
+                Some(Ran::ok(&users))
+            } else if cmd.args.first().and_then(|arg| arg.to_str()) == Some("dump") {
+                Some(Ran::ok(&mixed_dump))
+            } else {
+                None
+            }
+        });
+        assert!(matches!(
+            explicit.probe(&sys, &context),
+            Probe::NotApplicable { .. }
+        ));
+        sys.keyboard_services = Some(Ok(vec![1, 2]));
+        let current = sys.keyboard_service_observations().unwrap();
+        let mut mixed = receipt;
+        mixed.merge(explicit.verified().unwrap());
+        assert_eq!(
+            mixed.live_mapping(&current),
+            Some(LiveKeyboardMapping {
+                control: 1,
+                explicit_other: 1,
+                held: 0,
+            })
+        );
+        mixed.merge(explicit.kept_receipt(&explicit.observed_services()));
+        assert_eq!(
+            mixed.live_mapping(&current),
+            Some(LiveKeyboardMapping {
+                control: 1,
+                explicit_other: 0,
+                held: 1,
+            })
+        );
         assert_eq!(sys.keyboard_changes().len(), 1, "passive reads never write");
     }
 
@@ -2210,6 +2331,11 @@ pub(crate) mod tests {
             (None, vec![(caps, caps)], vec![]),
             (None, vec![], vec![(caps, caps)]),
             (None, vec![(caps, option)], vec![]),
+            (
+                None,
+                vec![(caps, option)],
+                vec![(caps, keyboard::LEFT_CONTROL)],
+            ),
         ] {
             let item = attachment(&who, 65534, 169);
             let mut sys = Fake::root();
@@ -2250,7 +2376,17 @@ pub(crate) mod tests {
             sys.logged_in(&who);
             sys.keyboard_services = Some(Ok(vec![2]));
             let receipt = item.verified().unwrap();
-            assert!(receipt.matches(&sys.keyboard_service_observations().unwrap()[0]));
+            let current = sys.keyboard_service_observations().unwrap();
+            assert!(receipt.matches(&current[0]));
+            assert_eq!(
+                receipt.live_mapping(&current),
+                Some(LiveKeyboardMapping {
+                    control: 0,
+                    explicit_other: 1,
+                    held: 0,
+                }),
+                "a user Caps entry cannot bypass the earlier native output"
+            );
             item.apply(&sys, &context).unwrap();
             assert!(
                 item.verified().is_none(),

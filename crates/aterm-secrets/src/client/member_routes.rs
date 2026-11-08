@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A pending subscriber can reach a member when its LAN changes or its broker arrives,
+//! A pending subscriber can reach a member when its LAN changes, its broker arrives or a
+//! native member responder becomes ready,
 //! even while its vault request is held in a long poll. This worker invokes the authenticated
 //! member callback; it provides no discovery, proof or admission authority of its own.
 
-use super::{MembersAsked, Paths, ask_members_if_due, swarm_lets};
+use super::{
+    MemberArrivals, MembersAsked, Paths, ask_members_if_due, ask_members_pause, swarm_lets,
+};
 use crate::converge::{Last, RunnerRetry};
 use std::os::fd::BorrowedFd;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -31,19 +34,19 @@ pub(super) enum ProjectionEvent {
 }
 
 /// What the worker waits on: whether a change of network came within `most`. A wait may end
-/// early with none (`also` ready); the worker then runs no round for it.
+/// early with none (`also` ready); the worker reads those sources separately.
 pub(super) trait Changes: Send {
     /// Check retained observation custody before another readiness source is consumed.
     fn check(&self) -> std::io::Result<()> {
         Ok(())
     }
-    fn wait(&mut self, most: Duration, also: Option<BorrowedFd<'_>>) -> bool;
+    fn wait(&mut self, most: Duration, also: &[BorrowedFd<'_>]) -> bool;
     fn reset(&mut self) {}
 }
 
 #[cfg(test)]
 impl<F: FnMut(Duration) -> bool + Send> Changes for F {
-    fn wait(&mut self, most: Duration, _also: Option<BorrowedFd<'_>>) -> bool {
+    fn wait(&mut self, most: Duration, _also: &[BorrowedFd<'_>]) -> bool {
         self(most)
     }
 }
@@ -92,32 +95,135 @@ impl Changes for NativeChanges {
     }
 
     /// A change of network ends the wait as one; `also`'s readiness and the deadline end it as
-    /// none. Messages that name no change never end it
-    /// ([`crate::network::RouteChanges::wait_beside`]). When the route socket or poll(2) fails,
+    /// none. Messages that name no change never end it. When the route socket or poll(2) fails,
     /// the rest of the wait is spent on `also` alone, as a failed socket would poll ready again
     /// at once; the next wait hears the socket again, so a failure that passes (a read's error,
     /// a poll(2) that could not allocate) never leaves the worker deaf to later changes.
-    fn wait(&mut self, most: Duration, also: Option<BorrowedFd<'_>>) -> bool {
-        let deadline = Instant::now().checked_add(most);
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Ok(route) = &self.route {
-            match route.wait_beside(most, also) {
-                aterm_uds::network::RouteWake::Change => return true,
-                aterm_uds::network::RouteWake::Also | aterm_uds::network::RouteWake::Timeout => {
-                    return false;
-                }
-                aterm_uds::network::RouteWake::Failed => {}
-            }
-        }
-        let Some(deadline) = deadline else {
+    fn wait(&mut self, most: Duration, also: &[BorrowedFd<'_>]) -> bool {
+        let immediate = most.is_zero();
+        let Some(deadline) = Instant::now().checked_add(most) else {
             std::thread::sleep(most);
             return false;
         };
-        match also {
-            Some(fd) if aterm_uds::ready::any_until(&[fd], deadline).is_ok() => {}
-            _ => std::thread::sleep(deadline.saturating_duration_since(Instant::now())),
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let mut route = self.route.as_ref().ok();
+        loop {
+            let fds = also.to_vec();
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            let fds = {
+                let mut fds = fds;
+                if let Some(route) = route {
+                    use std::os::fd::AsFd as _;
+                    fds.push(route.as_fd());
+                }
+                fds
+            };
+            if fds.is_empty() {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                return false;
+            }
+            let ready = if immediate {
+                let interests: Vec<_> = fds
+                    .iter()
+                    .map(|fd| aterm_uds::ready::Watch::new(*fd, aterm_uds::ready::Interest::Read))
+                    .collect();
+                aterm_uds::ready::any_interests_now(&interests)
+            } else {
+                aterm_uds::ready::any_until(&fds, deadline)
+            };
+            let Ok(ready) = ready else {
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                if route.take().is_some() {
+                    // Retry only the retained additional descriptors, at the same
+                    // deadline. A second poll failure is waited out, never spun.
+                    continue;
+                }
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                return false;
+            };
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if ready.contains(&also.len()) {
+                match route.and_then(crate::network::RouteChanges::read_waiting) {
+                    Some(true) => return true,
+                    Some(false) => {}
+                    None => route = None,
+                }
+            }
+            if immediate || ready.is_empty() || ready.iter().any(|index| *index < also.len()) {
+                return false;
+            }
         }
-        false
+    }
+}
+
+#[derive(Default)]
+struct NativeArrivals {
+    source: Option<Box<dyn MemberArrivals>>,
+    retry: RunnerRetry,
+    error: Option<String>,
+}
+
+impl NativeArrivals {
+    fn failed(&mut self, error: std::io::Error, now: u64, log: &dyn Fn(&str)) {
+        self.source = None;
+        self.retry.reaped(Last::Failed, now);
+        let why = error.to_string();
+        if self.error.as_ref() != Some(&why) {
+            log(&format!("native member readiness waits: {why}"));
+            self.error = Some(why);
+        }
+    }
+
+    /// Return whether listening custody was newly established. Source failures
+    /// retain their own ordinary retry without stopping route/projection work.
+    fn maintain(
+        &mut self,
+        paths: &Paths,
+        open: &dyn Fn(&Paths) -> std::io::Result<Box<dyn MemberArrivals>>,
+        refresh: bool,
+        now: u64,
+        log: &dyn Fn(&str),
+    ) -> bool {
+        if let Some(source) = &mut self.source {
+            if refresh && let Err(error) = source.refresh() {
+                self.failed(error, now, log);
+            }
+            return false;
+        }
+        if refresh {
+            self.retry = RunnerRetry::default();
+        }
+        if self
+            .retry
+            .remaining(now)
+            .is_some_and(|left| !left.is_zero())
+        {
+            return false;
+        }
+        self.retry.started();
+        match open(paths) {
+            Ok(source) => {
+                self.source = Some(source);
+                self.retry.reaped(Last::Ended, now);
+                self.error = None;
+                true
+            }
+            Err(error) => {
+                self.failed(error, now, log);
+                false
+            }
+        }
+    }
+
+    fn poll(&mut self, now: u64, log: &dyn Fn(&str)) -> bool {
+        match self.source.as_mut().map(|source| source.poll()) {
+            Some(Ok(arrived)) => arrived,
+            Some(Err(error)) => {
+                self.failed(error, now, log);
+                false
+            }
+            None => false,
+        }
     }
 }
 
@@ -189,10 +295,14 @@ struct Listener<C> {
     switch: crate::swarm::Switch,
     held: bool,
     due: Option<Instant>,
+    /// A fresh ask begun at or after this observed edge already covers it.
+    edge: Option<Instant>,
     last: Option<Instant>,
     /// When the observer next looks with no change or arrival ([`LOOK`] after its last look).
     look: Instant,
     recovered: bool,
+    arrivals: NativeArrivals,
+    clock: Instant,
     #[cfg(target_os = "macos")]
     broker: aterm_uds::lan::Arrivals,
     #[cfg(target_os = "macos")]
@@ -206,9 +316,12 @@ impl<C: Changes> Listener<C> {
             switch: crate::swarm::Switch::new(&paths.home),
             held: false,
             due: None,
+            edge: None,
             last: None,
             look: Instant::now() + LOOK,
             recovered: false,
+            arrivals: NativeArrivals::default(),
+            clock: Instant::now(),
             #[cfg(target_os = "macos")]
             broker: aterm_uds::lan::Arrivals::new(),
             #[cfg(target_os = "macos")]
@@ -220,15 +333,75 @@ impl<C: Changes> Listener<C> {
         self.changed.reset();
         self.switch = crate::swarm::Switch::new(&paths.home);
         self.held = false;
-        self.due = Some(Instant::now());
+        let now = Instant::now();
+        self.due = Some(now);
+        self.edge = Some(now);
         self.last = None;
         self.look = Instant::now();
         self.recovered = true;
+        self.arrivals = NativeArrivals::default();
         #[cfg(target_os = "macos")]
         {
             self.broker = aterm_uds::lan::Arrivals::new();
             self.broker_error = None;
         }
+    }
+
+    fn maintain_arrivals(
+        &mut self,
+        paths: &Paths,
+        callbacks: Option<&super::MemberCallbacks>,
+        asking: bool,
+        refresh: bool,
+        log: &dyn Fn(&str),
+    ) -> bool {
+        let Some(callbacks) = callbacks else {
+            return false;
+        };
+        if !asking {
+            self.arrivals = NativeArrivals::default();
+            return false;
+        }
+        let was_held = self.held;
+        if !swarm_lets(&mut self.switch, &mut self.held, "member discovery", log) {
+            // An unreadable switch is a hold too. No dormant socket survives it.
+            self.arrivals = NativeArrivals::default();
+            return false;
+        }
+        let opened = self.arrivals.maintain(
+            paths,
+            &callbacks.arrivals,
+            refresh,
+            elapsed(self.clock),
+            log,
+        );
+        if opened || was_held {
+            // Listen before probing. A peer may already have announced itself
+            // while the first attachment or the previous sharing episode was absent.
+            let now = Instant::now();
+            self.due = Some(now);
+            self.edge = Some(now);
+        }
+        true
+    }
+
+    fn asking(&mut self, paths: &Paths, members: &Mutex<MembersAsked>, log: &dyn Fn(&str)) -> bool {
+        let mut members = members.lock().unwrap_or_else(PoisonError::into_inner);
+        if members.at.is_none() || members.on.is_none() {
+            return false;
+        }
+        let was_held = self.held;
+        if !swarm_lets(&mut self.switch, &mut self.held, "member discovery", log)
+            || !members.still_asking(paths)
+        {
+            return false;
+        }
+        if was_held {
+            let now = Instant::now();
+            self.due = Some(now);
+            self.edge = Some(now);
+        }
+        true
     }
 
     fn round(
@@ -240,6 +413,12 @@ impl<C: Changes> Listener<C> {
         project: &(dyn Fn(ProjectionEvent) + Sync),
         ending: &AtomicBool,
     ) -> std::io::Result<()> {
+        if ending.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let callbacks = super::ASK_MEMBERS.get();
+        let asking = callbacks.is_some() && self.asking(paths, members, log);
+        self.maintain_arrivals(paths, callbacks, asking, false, log);
         // Do not consume a broker generation while this round cannot observe routes.
         // The ordinary retry owns reopening, and reset owes one current observation
         // because a move may already have happened before the subscription returned.
@@ -256,22 +435,44 @@ impl<C: Changes> Listener<C> {
         } else {
             self.broker.wait_for(wait)
         };
-        #[cfg(target_os = "macos")]
-        let route = self.changed.wait(wait, self.broker.watch_fd());
-        #[cfg(not(target_os = "macos"))]
-        let route = self.changed.wait(wait, None);
+        let route = {
+            let fds = self
+                .arrivals
+                .source
+                .as_ref()
+                .map_or_else(Vec::new, |source| source.fds());
+            if fds.len() > 8 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "native member readiness exceeds its attachment bound",
+                ));
+            }
+            #[cfg(target_os = "macos")]
+            let fds = {
+                let mut fds = fds;
+                if let Some(broker) = self.broker.watch_fd() {
+                    fds.push(broker);
+                }
+                fds
+            };
+            self.changed.wait(wait, &fds)
+        };
         #[cfg(target_os = "macos")]
         let broker_ready = before | broker_arrived(&mut self.broker, &mut self.broker_error, log);
         #[cfg(not(target_os = "macos"))]
         let broker_ready = false;
-        if route || broker_ready {
-            self.due.get_or_insert_with(|| {
-                self.last
-                    .map_or_else(Instant::now, |at| (at + REST).max(Instant::now()))
-            });
-        }
         if ending.load(Ordering::Acquire) {
             return Ok(());
+        }
+        let asking = callbacks.is_some() && self.asking(paths, members, log);
+        let native_ready =
+            self.maintain_arrivals(paths, callbacks, asking, route || broker_ready, log)
+                && self.arrivals.poll(elapsed(self.clock), log);
+        if route || broker_ready || native_ready {
+            let now = Instant::now();
+            self.edge = Some(now);
+            self.due
+                .get_or_insert_with(|| self.last.map_or(now, |at| (at + REST).max(now)));
         }
         if broker_ready {
             project(ProjectionEvent::BrokerReady);
@@ -281,7 +482,8 @@ impl<C: Changes> Listener<C> {
         // the routing table, and a wait that ends early must not turn into a round. A reset
         // looks at once.
         let now = Instant::now();
-        if route || broker_ready || now >= self.look {
+        let periodic = now >= self.look;
+        if route || broker_ready || native_ready || periodic {
             self.look = now + LOOK;
             project(ProjectionEvent::Maintenance);
             // The projection owns its sharing observation and retained activation debt.
@@ -293,18 +495,35 @@ impl<C: Changes> Listener<C> {
                 project(ProjectionEvent::Observe);
             }
         }
-        if self.due.is_none_or(|at| at > Instant::now()) {
+        let changed = self.due.is_some_and(|at| at <= Instant::now());
+        if !changed && !periodic {
             return Ok(());
         }
-        self.due = None;
         // The round and route worker share both the backoff and the actual ask.
         // Re-read sharing after waiting for a round's bounded proof to finish.
         let mut members = members.lock().unwrap_or_else(PoisonError::into_inner);
+        let forced = changed
+            && self
+                .edge
+                .is_none_or(|edge| members.at.is_none_or(|at| at < edge));
+        if changed {
+            self.due = None;
+            self.edge = None;
+        }
+        if !forced
+            && !members
+                .at
+                .is_some_and(|at| at.elapsed() >= ask_members_pause(members.asks))
+        {
+            return Ok(());
+        }
         if !ending.load(Ordering::Acquire)
             && swarm_lets(&mut self.switch, &mut self.held, "member discovery", log)
         {
-            members.at = None;
-            members.asks = 0;
+            if forced {
+                members.at = None;
+                members.asks = 0;
+            }
             let before = admitted(paths);
             ask_members_if_due(paths, &mut members, ask, log);
             let progressed = !before && admitted(paths);
@@ -642,7 +861,7 @@ mod wait_tests {
         });
         struct PanicsWhileResetting;
         impl Changes for PanicsWhileResetting {
-            fn wait(&mut self, _: Duration, _: Option<BorrowedFd<'_>>) -> bool {
+            fn wait(&mut self, _: Duration, _: &[BorrowedFd<'_>]) -> bool {
                 panic!("injected readiness failure before shutdown");
             }
             fn reset(&mut self) {
@@ -672,6 +891,121 @@ mod wait_tests {
             },
         );
         assert_eq!(returned, 17);
+
+        struct Inert(Arc<std::sync::atomic::AtomicUsize>);
+        impl MemberArrivals for Inert {
+            fn refresh(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn fds(&self) -> Vec<BorrowedFd<'_>> {
+                Vec::new()
+            }
+            fn poll(&mut self) -> std::io::Result<bool> {
+                Ok(false)
+            }
+        }
+        impl Drop for Inert {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let opened = std::sync::atomic::AtomicUsize::new(0);
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let open = |_: &Paths| -> std::io::Result<Box<dyn MemberArrivals>> {
+            if opened.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+            }
+            Ok(Box::new(Inert(Arc::clone(&dropped))))
+        };
+        let first = crate::converge::FIRST_RETRY_MS;
+        let mut native = NativeArrivals::default();
+        assert!(!native.maintain(&paths, &open, false, 0, &|_| {}));
+        assert!(!native.maintain(&paths, &open, false, first - 1, &|_| {}));
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        assert!(native.maintain(&paths, &open, false, first, &|_| {}));
+        assert!(!native.maintain(&paths, &open, false, first * 100, &|_| {}));
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            2,
+            "healthy custody is retained"
+        );
+        assert!(!native.poll(first * 100, &|_| {}));
+
+        let config = paths.home.join(".config/aterm/aterm.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = false\n");
+        let forbidden = super::super::MemberCallbacks {
+            ask: |_| panic!("readiness never authenticates a member"),
+            arrivals: |_| panic!("held or healthy custody opens no new source"),
+        };
+        let mut listener = Listener::new(&paths, |_: Duration| false);
+        listener.arrivals = native;
+        assert!(!listener.maintain_arrivals(&paths, Some(&forbidden), true, false, &|_| {}));
+        assert!(listener.arrivals.source.is_none());
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "Off releases the owner");
+        crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = true\n");
+        let permitted = super::super::MemberCallbacks {
+            ask: forbidden.ask,
+            arrivals: |_| {
+                Ok(Box::new(Inert(Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ))))
+            },
+        };
+        assert!(listener.maintain_arrivals(&paths, Some(&permitted), true, false, &|_| {}));
+        assert!(listener.arrivals.source.is_some());
+        assert!(listener.due.is_some(), "On owes a fresh ordinary ask");
+        assert!(listener.maintain_arrivals(&paths, Some(&forbidden), true, false, &|_| {}));
+        assert!(!listener.maintain_arrivals(&paths, Some(&forbidden), false, false, &|_| {}));
+        assert!(
+            listener.arrivals.source.is_none(),
+            "asking ended before a new read"
+        );
+        assert!(listener.maintain_arrivals(&paths, Some(&permitted), true, false, &|_| {}));
+        crate::fsx::write_owned_in_place(&config, "[swarm]\nenabled = 'unknown'\n");
+        assert!(!listener.maintain_arrivals(&paths, Some(&forbidden), true, false, &|_| {}));
+        assert!(
+            listener.arrivals.source.is_none(),
+            "unreadable policy holds too"
+        );
+
+        aterm_uds::lan::seam_here(
+            aterm_uds::lan::Seam {
+                socket: Some(paths.home.join("absent-broker.sock")),
+                ..aterm_uds::lan::Seam::default()
+            },
+            || {
+                let edge = Instant::now();
+                let started = Instant::now();
+                let members = Mutex::new(MembersAsked {
+                    at: Some(started),
+                    asks: 1,
+                    ..MembersAsked::default()
+                });
+                let mut listener = Listener::new(&paths, |_: Duration| false);
+                listener.due = Some(edge);
+                listener.edge = Some(edge);
+                listener.look = started + Duration::from_secs(60);
+                // The main round won the shared ask after this observed edge.
+                // Servicing it must not reset the completed ask or read private
+                // waiting state again, even though the callback itself is current.
+                listener
+                    .round(
+                        &paths,
+                        &members,
+                        &|_| panic!("this edge is already covered by the fresh ask"),
+                        &|_| {},
+                        &|_| panic!("no new observation is due"),
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                let asked = members.lock().unwrap();
+                assert_eq!(asked.at, Some(started));
+                assert_eq!(asked.asks, 1);
+                assert!(listener.due.is_none());
+                assert!(listener.edge.is_none());
+            },
+        );
     }
 }
 
@@ -862,6 +1196,28 @@ mod tests {
     /// the observer's own pace ([`LOOK`]), which only a wake that brought neither keeps.
     #[test]
     fn a_change_or_an_arrival_looks_before_the_next_wait() {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsFd as _;
+            use std::os::unix::net::UnixDatagram;
+            let (route, routes) = UnixDatagram::pair().unwrap();
+            let mut routes = Some(routes);
+            let mut changes = NativeChanges::opening(move || {
+                Ok(crate::network::RouteChanges::over(
+                    routes.take().unwrap().into(),
+                ))
+            });
+            let (broker, _broker_sender) = UnixDatagram::pair().unwrap();
+            let (native, sender) = UnixDatagram::pair().unwrap();
+            // A non-route kernel message cannot hide a ready native descriptor
+            // beside the existing broker descriptor. The actual reader owns bytes.
+            route.send(&[0; 24]).unwrap();
+            sender.send(b"owned native readiness").unwrap();
+            assert!(!changes.wait(HANG, &[broker.as_fd(), native.as_fd()]));
+            let mut bytes = [0; 64];
+            let read = native.recv(&mut bytes).unwrap();
+            assert_eq!(&bytes[..read], b"owned native readiness");
+        }
         assert_eq!(
             looks_before_the_second_wait(false, true),
             1,
@@ -937,7 +1293,7 @@ mod tests {
         beginning.recv_timeout(HANG).expect("the flood begins");
         let most = Duration::from_millis(300);
         let began = Instant::now();
-        let changed = changes.wait(most, Some(quiet.as_fd()));
+        let changed = changes.wait(most, &[quiet.as_fd()]);
         let waited = began.elapsed();
         flooding.store(false, Ordering::Release);
         let sent = floods.recv_timeout(HANG).expect("the flood ends");
@@ -965,7 +1321,7 @@ mod tests {
         let most = Duration::from_millis(300);
         for _ in 0..2 {
             let began = Instant::now();
-            assert!(!changes.wait(most, Some(quiet.as_fd())));
+            assert!(!changes.wait(most, &[quiet.as_fd()]));
             assert!(
                 began.elapsed() >= most,
                 "a failed socket ended the wait after {:?}",
@@ -999,7 +1355,7 @@ mod tests {
             open: Box::new(crate::network::RouteChanges::open),
         };
         let (quiet, _writer) = std::io::pipe().expect("a broker descriptor nobody writes");
-        assert!(!changes.wait(Duration::from_millis(300), Some(quiet.as_fd())));
+        assert!(!changes.wait(Duration::from_millis(300), &[quiet.as_fd()]));
         assert!(
             witness.take_error().expect("the socket's error").is_none(),
             "the premise: the failed wait read the refusal"
@@ -1019,7 +1375,7 @@ mod tests {
             )
             .expect("an address change told");
         assert!(
-            changes.wait(HANG, Some(quiet.as_fd())),
+            changes.wait(HANG, &[quiet.as_fd()]),
             "a change after one failed read was not heard"
         );
     }
@@ -1037,7 +1393,7 @@ mod tests {
         let (mut changes, _kernel) = stand_in();
         let began = Instant::now();
         assert!(
-            !changes.wait(HANG, Some(ready.as_fd())),
+            !changes.wait(HANG, &[ready.as_fd()]),
             "an arrival is no change of network"
         );
         assert!(
@@ -1052,12 +1408,33 @@ mod tests {
         };
         let began = Instant::now();
         assert!(
-            !failed.wait(HANG, Some(ready.as_fd())),
+            !failed.wait(HANG, &[ready.as_fd()]),
             "an arrival is no change of network"
         );
         assert!(
             began.elapsed() < HANG,
             "a ready broker descriptor was waited out beside a failed route socket"
         );
+
+        let (mut queued, kernel) = stand_in();
+        let change: Vec<u8> = [24_u32, 1, 1, 1, 37, 1]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect();
+        kernel.send(&change).unwrap();
+        assert!(
+            queued.wait(Duration::ZERO, &[ready.as_fd()]),
+            "a queued route change is consumed even when another edge is already due"
+        );
+        assert!(
+            !queued.wait(Duration::ZERO, &[ready.as_fd()]),
+            "the route was drained and the broker still owns its unread bytes"
+        );
+        let unrelated: Vec<u8> = [24_u32, 1, 1, 3, 37, 1]
+            .into_iter()
+            .flat_map(u32::to_ne_bytes)
+            .collect();
+        kernel.send(&unrelated).unwrap();
+        assert!(!queued.wait(Duration::ZERO, &[]));
     }
 }

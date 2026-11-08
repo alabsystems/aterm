@@ -5,7 +5,7 @@
 
 use super::*;
 
-const FILE: &str = "alab-join-pending";
+pub(super) const FILE: &str = "alab-join-pending";
 const INTENT: &[u8] = b"ALAB-JOIN-1\n";
 const NATIVE_ONLY: &[u8] = b"ALAB-JOIN-NATIVE-1\n";
 

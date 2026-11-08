@@ -272,13 +272,14 @@ impl Git {
         }
     }
 
-    /// For a test against a real git: the Command Line Tools' git with no system configuration
-    /// (`GIT_CONFIG_NOSYSTEM=1`), so the tools' own `credential.helper = osxkeychain` is read
-    /// nowhere the run looks.
+    /// For a test against a real git: this host's native git
+    /// ([`crate::items::github::need_native_git`]) with no system configuration
+    /// (`GIT_CONFIG_NOSYSTEM=1`), so no system file's helper (on a Mac, the Command Line Tools'
+    /// own `credential.helper = osxkeychain`) is read anywhere the run looks.
     #[cfg(test)]
     pub(crate) fn isolated() -> Self {
         Self {
-            program: PathBuf::from(crate::items::github::CLT_GIT),
+            program: PathBuf::from(crate::items::github::need_native_git()),
             env: vec![("GIT_CONFIG_NOSYSTEM".into(), "1".into())],
         }
     }
@@ -1057,6 +1058,16 @@ pub(crate) mod script {
     /// The git selected for this account, including a ready managed build ([`Git::for_user`]).
     fn host(sys: &Fake, user: &User) -> Git {
         Git::for_user(sys, user)
+    }
+
+    /// The helper github.com's section of the block an earlier `aterm init` wrote names on the
+    /// host `sys` is: `osxkeychain` on a Mac, `store` elsewhere.
+    pub(crate) fn written_helper(sys: &dyn crate::port::System) -> &'static str {
+        if sys.macos() {
+            super::OSXKEYCHAIN
+        } else {
+            super::STORE
+        }
     }
 
     /// CLT git's own configuration file, which names `osxkeychain` for every host.
@@ -2367,7 +2378,7 @@ mod tests {
     /// git's prompt back and reads nothing, and no helper runs in either.
     #[test]
     fn a_persons_askpass_never_answers_a_pinned_lookup() {
-        crate::items::github::need_clt_git();
+        crate::items::github::need_native_git();
         let live = Live::new();
         let mut scratch = Scratch::new(&live, "git-askpass").unwrap();
         let home = scratch.path().to_owned();
@@ -2467,12 +2478,12 @@ mod tests {
         held
     }
 
-    /// Run `revert`, a block's journaled commands, with the Command Line Tools' git and no system
+    /// Run `revert`, a block's journaled commands, with this host's native git and no system
     /// file.
     fn put_back(live: &Live, who: &User, revert: &str) {
         let commands = revert.replace(
             "git config",
-            &format!("{} config", crate::items::github::CLT_GIT),
+            &format!("{} config", crate::items::github::need_native_git()),
         );
         let ran = live
             .run_complete_stdout(
@@ -2485,9 +2496,10 @@ mod tests {
         assert!(ran.success(), "{ran:?}");
     }
 
-    /// A real CLT git in a scratch HOME (no system file read): aterm's route keeps every helper
+    /// A real native git in a scratch HOME (no system file read): aterm's route keeps every helper
     /// a file names from running, a keychain stand-in among them, and asks its own alone, which
-    /// answers. The keychain block an earlier `aterm init` wrote to `~/.gitconfig`, beside the
+    /// answers. The keychain block an earlier `aterm init` wrote on this host to `~/.gitconfig`
+    /// ([`script::written_helper`]: `osxkeychain`'s on a Mac, `store`'s elsewhere), beside the
     /// person's own sections, is found from the settings alone and replaced: its three settings
     /// go, github.com and gist.github.com get the reset and aterm's helper, every other section
     /// stays, and the person's own git then asks aterm's helper and not the generic keychain
@@ -2496,12 +2508,12 @@ mod tests {
     /// is compared here, never handed to git: no program, argument, variable or standard input
     /// the route spawned holds it. Negative controls: the stand-in runs for the person's own git
     /// before the replacement; a helper of someone else's under the block's keys keeps the file
-    /// as it is; and a run that does hand git the token is caught. The block's literal
-    /// `osxkeychain` is only ever read here, never run: no unrouted lookup runs while it is in
-    /// the file.
+    /// as it is (and on a Mac, `osxkeychain` still in effect is reported; `store` is no
+    /// keychain); and a run that does hand git the token is caught. The block's literal helper
+    /// is only ever read here, never run: no unrouted lookup runs while it is in the file.
     #[test]
     fn the_keychain_block_gives_way_to_atermss_route_and_no_keychain_helper_runs() {
-        crate::items::github::need_clt_git();
+        crate::items::github::need_native_git();
         let live = Live::new();
         let mut scratch = Scratch::new(&live, "git-keychain-block").unwrap();
         let home = scratch.path().to_owned();
@@ -2600,8 +2612,11 @@ mod tests {
         assert!(!fill(b"protocol=https\nhost=github.com\n\n"));
         assert!(stand_in_ran(&home), "control: the person's own git runs it");
 
-        // The block init wrote, beside the person's own sections.
-        let block = "[credential \"https://github.com\"]\n\thelper = \n\thelper = osxkeychain\n\tusername = alice\n\tuseHttpPath = false\n";
+        // The block init wrote on this host, beside the person's own sections.
+        let written = format!("helper = {}\n", script::written_helper(&live));
+        let block = format!(
+            "[credential \"https://github.com\"]\n\thelper = \n\t{written}\tusername = alice\n\tuseHttpPath = false\n"
+        );
         let theirs = "[user]\n\tname = Alice\n[url \"https://alabsystems@github.com/alabsystems/\"]\n\tpushInsteadOf = https://github.com/alabsystems/\n";
         live.write_file(&gitconfig, format!("{block}{theirs}").as_bytes(), 0o600)
             .unwrap();
@@ -2618,7 +2633,7 @@ mod tests {
             .unwrap();
         let after = std::fs::read_to_string(&gitconfig).unwrap();
         assert!(
-            !after.contains("osxkeychain")
+            !after.contains(&written)
                 && !after.contains("useHttpPath")
                 && !after.contains("username"),
             "{after}"
@@ -2673,25 +2688,27 @@ mod tests {
         live.write_file(&gitconfig, foreign.as_bytes(), 0o600)
             .unwrap();
         assert_eq!(git.keychain_block(&live, &who, &|| true).unwrap(), None);
-        assert!(
+        assert_eq!(
             git.keychain_in_effect(&live, &who).is_some(),
-            "the keychain helper is still in effect, and reported"
+            live.macos(),
+            "on a Mac the keychain helper is still in effect, and reported"
         );
         assert_eq!(std::fs::read_to_string(&gitconfig).unwrap(), foreign);
         scratch.close().unwrap();
     }
 
     /// `git config --global` writes `~/.config/git/config` where that file is there and
-    /// `~/.gitconfig` is not. A real CLT git in such a scratch HOME (no system file read) writes
-    /// the block that way, as an earlier `aterm init` did. It is found in that file and replaced
+    /// `~/.gitconfig` is not. A real native git in such a scratch HOME (no system file read) writes
+    /// the block that way, as an earlier `aterm init` did on this host
+    /// ([`script::written_helper`]). It is found in that file and replaced
     /// there, no `~/.gitconfig` appears, the person's own git then asks aterm's helper, and the
     /// revert puts it back. A block in each file goes in one pass and comes back with one revert.
     /// Negative control: the vault's section in that file is no block, and stays byte for byte
-    /// beside a block replaced in `~/.gitconfig`. The block's literal `osxkeychain` is only ever
-    /// read here, never run: the one unrouted lookup runs with no file naming it.
+    /// beside a block replaced in `~/.gitconfig`. The block's literal helper is only ever read
+    /// here, never run: the one unrouted lookup runs with no file naming it.
     #[test]
     fn a_block_in_the_xdg_file_alone_gives_way_in_that_file() {
-        crate::items::github::need_clt_git();
+        crate::items::github::need_native_git();
         let live = Live::new();
         let mut scratch = Scratch::new(&live, "git-keychain-xdg").unwrap();
         let home = scratch.path().to_owned();
@@ -2715,10 +2732,12 @@ mod tests {
         ));
         let git = Git::isolated();
         let block = || git.keychain_block(&live, &who, &|| true).unwrap();
+        let helper = script::written_helper(&live);
+        let written = format!("helper = {helper}\n");
 
         for (key, value) in [
             (HELPER, ""),
-            (HELPER, OSXKEYCHAIN),
+            (HELPER, helper),
             (USERNAME, "alice"),
             (USE_PATH, "false"),
         ] {
@@ -2730,7 +2749,7 @@ mod tests {
                 .unwrap();
             assert!(ran.success(), "{ran:?}");
         }
-        assert!(text(&xdg).contains(OSXKEYCHAIN), "{}", text(&xdg));
+        assert!(text(&xdg).contains(&written), "{}", text(&xdg));
         assert!(!gitconfig.exists(), "--global wrote the other file");
 
         let found = block().expect("the block in the XDG file");
@@ -2743,7 +2762,7 @@ mod tests {
             .unwrap();
         let after = text(&xdg);
         assert!(
-            !after.contains(OSXKEYCHAIN)
+            !after.contains(&written)
                 && !after.contains("usehttppath")
                 && !after.contains("username")
                 && after.contains("[credential \"https://gist.github.com\"]"),
@@ -2775,12 +2794,8 @@ mod tests {
         assert_eq!(both.replacements.len(), 2, "{both:?}");
         git.replace_keychain_block(&live, &who, &both, &ours, &|| Ok(()))
             .unwrap();
-        assert!(!text(&xdg).contains(OSXKEYCHAIN), "{}", text(&xdg));
-        assert!(
-            !text(&gitconfig).contains(OSXKEYCHAIN),
-            "{}",
-            text(&gitconfig)
-        );
+        assert!(!text(&xdg).contains(&written), "{}", text(&xdg));
+        assert!(!text(&gitconfig).contains(&written), "{}", text(&gitconfig));
         assert_eq!(block(), None);
         put_back(&live, &who, both.revert());
         assert_eq!(block().as_ref(), Some(&both));
@@ -2797,26 +2812,30 @@ mod tests {
         git.replace_keychain_block(&live, &who, &beside, &ours, &|| Ok(()))
             .unwrap();
         assert_eq!(text(&xdg), vault);
-        assert!(
-            !text(&gitconfig).contains(OSXKEYCHAIN),
-            "{}",
-            text(&gitconfig)
-        );
+        assert!(!text(&gitconfig).contains(&written), "{}", text(&gitconfig));
         scratch.close().unwrap();
     }
 
-    /// A real CLT git in a scratch HOME whose `~/.gitconfig` holds what `gh auth setup-git`
+    /// A real native git in a scratch HOME whose `~/.gitconfig` holds what `gh auth setup-git`
     /// wrote for an `aterm init` before 2026-10-22 (GitHub CLI's helper for github.com and
     /// gist.github.com, each after the empty reset), beside the person's `[user]`: the settings
     /// read finds both sections as the block and asks no helper (the spawn record holds that
     /// read alone, and the gh the block names does not exist, so a run of it could only fail);
     /// the replacement leaves aterm's helper for both hosts and the person's `[user]`, and
     /// aterm's helper then answers. Negative control: GitHub CLI's helper inside a command of
-    /// someone else's is in effect and not the block, and the file stays as it is.
+    /// someone else's is in effect and not the block, and the file stays as it is. Only on a
+    /// Mac: no `aterm init` ran gh elsewhere, so off a Mac those sections are a person's own,
+    /// as the settings tests above hold.
     #[test]
     fn the_block_gh_setup_git_wrote_gives_way_to_atermss_route() {
-        crate::items::github::need_clt_git();
         let live = Live::new();
+        if !live.macos() {
+            aterm_uds::host::could_not_run(
+                "not a Mac: only an `aterm init` on a Mac ran `gh auth setup-git`, whose block \
+                 this replaces; elsewhere its sections are a person's own",
+            );
+        }
+        crate::items::github::need_native_git();
         let mut scratch = Scratch::new(&live, "git-gh-block").unwrap();
         let home = scratch.path().to_owned();
         let mut who = user("fixture", live.euid());
@@ -2883,7 +2902,7 @@ mod tests {
         scratch.close().unwrap();
     }
 
-    /// [`scope`] and [`Git::keychain_in_effect`] agree with a real CLT git (no system file read,
+    /// [`scope`] and [`Git::keychain_in_effect`] agree with a real native git (no system file read,
     /// a scratch HOME) about which lookups a `credential.<url>.helper` reaches: a keychain
     /// stand-in under each hard spelling of the table above runs for both a host-wide lookup and
     /// a clone's that names an account and a path (`Every`), for one of them (`Part`), or for
@@ -2894,7 +2913,7 @@ mod tests {
     /// that holds no credential setting.
     #[test]
     fn the_url_matcher_agrees_with_what_git_runs_for_a_github_lookup() {
-        crate::items::github::need_clt_git();
+        crate::items::github::need_native_git();
         let live = Live::new();
         let mut scratch = Scratch::new(&live, "git-url-matcher").unwrap();
         let home = scratch.path().to_owned();

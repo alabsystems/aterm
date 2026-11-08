@@ -26,6 +26,7 @@ jobserver_utils = { workspace = true }
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }
+aterm-toolchain = { workspace = true }
 # The `kind=admission` rows the queue's memory admissions write, as its tests read them
 # (`aterm_capacity::telemetry::capture`). aterm-capacity already links it.
 aterm-telemetry = { workspace = true }

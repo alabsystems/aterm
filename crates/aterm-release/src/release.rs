@@ -1279,8 +1279,20 @@ pub struct BuildWork {
     pub fixtures: bool,
 }
 
+/// An already-started private packaging child. Its stop also follows it into step 7's graph.
+/// Dropping an unfinished child must stop and reap it.
+pub trait PendingSign: Send {
+    fn stop(&self) -> BranchStop;
+    fn finish(self: Box<Self>) -> Ran;
+}
+
 /// Everything the release asks of the world — git, the engine, the records, the children, the clock, the owner's aterm.
 pub trait Backend {
+    fn prepare_sign(
+        &mut self,
+        args: &[String],
+        prover: &Prover,
+    ) -> Result<Box<dyn PendingSign>, Refusal>;
     fn now(&mut self) -> u64;
     fn hms(&mut self, epoch: u64) -> String;
     fn sleep(&mut self, secs: u64);
@@ -1469,7 +1481,13 @@ pub trait Backend {
     /// tools and the source's signing tools prepared. The sign branch needs none of them.
     fn publish_begin(&mut self, prover: &Prover) -> Result<(), Refusal>;
     fn source_publication(&mut self, c: &Candidate) -> Result<(), Refusal>;
-    fn cut(&mut self, args: &[String], prover: &Prover) -> Ran;
+    fn cut(
+        &mut self,
+        args: &[String],
+        prover: &Prover,
+        candidate: &Candidate,
+        reserved: Option<&Reservation>,
+    ) -> Ran;
     /// Discard the copy step 7 signed of build `build` of `version` from the clone's `dist/`
     /// ([`crate::publish::discard_signed`]); what could not be removed.
     fn discard_signed(&mut self, version: &str, build: u64) -> Vec<String>;
@@ -1571,6 +1589,7 @@ struct Run<'b> {
     /// A dry run audits once.
     dry_audit: Option<Vec<Finding>>,
     last: String,
+    early_sign: Option<Box<dyn PendingSign>>,
 }
 
 /// Run a release with `b`.
@@ -1614,6 +1633,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
         waited: 0,
         dry_audit: None,
         last: String::new(),
+        early_sign: None,
     };
     let went = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run.go()));
     let code = match went {
@@ -1635,6 +1655,7 @@ pub fn run_with(b: &mut dyn Backend, opts: &ReleaseOptions, home: &Path) -> Outc
             1
         }
     };
+    run.discard_early_sign();
     run.b.stop_tools();
     Outcome {
         code,
@@ -2706,6 +2727,7 @@ impl Run<'_> {
     }
 
     fn checks(&mut self) -> Result<String, Halt> {
+        let _phase = crate::cut_timing::Timer::start(&self.b.log_path(Step::Checks), "checks");
         let mut notes: Vec<String> = Vec::new();
 
         if self.dry {
@@ -3019,6 +3041,8 @@ impl Run<'_> {
     /// remote tip; `--fix` refreshes source refs before admission, and step 1 refreshes and
     /// proves the candidate's ancestry before a product build or staging begins.
     fn prepare_candidate(&mut self) -> Flow {
+        let _timing =
+            crate::cut_timing::Timer::start(&self.b.log_path(Step::Checks), "launch-prelude");
         if let Some(refusal) = self.claim_refused.take() {
             return self.refuse_hard(refusal);
         }
@@ -5226,7 +5250,8 @@ impl Run<'_> {
     }
 
     /// Step 5: the bundle half of `verify release` on the bundle step 4 built — appkit and
-    /// measure, both timed, so never beside the release's own load — then its records' verdict.
+    /// measure, beside private signing and notary work that executes no release product.
+    /// The signed copy's windowed self-check stays in step 7, after this run ends.
     fn bundle(&mut self) -> Flow {
         let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
             return Ok(());
@@ -5236,8 +5261,11 @@ impl Run<'_> {
         let words = self.facts.checks.line().to_owned();
         if self.dry {
             self.finish(&format!(
-                "would run `{}` in the clone ({words})",
-                half_command(&run, Some("<the bundle step 4 built>"))
+                "would run `{}` in the clone ({words}){}",
+                half_command(&run, Some("<the bundle step 4 built>")),
+                if self.opts.qualify || self.opts.prepare { "" } else {
+                    "; beside it cut --sign-prepare privately signs and notarizes without product executions; step 7 joins it after READY"
+                }
             ));
             return Ok(());
         }
@@ -5271,11 +5299,37 @@ impl Run<'_> {
         let log = self.b.log_path(Step::Bundle);
         self.say(&format!("        runs: {}", half_command(&run, Some(&app))));
         self.say(&format!("        log: {}", log.display()));
+        let prepare = !self.opts.qualify && !self.opts.prepare;
+        let mut sign = self.sign_args();
+        sign[1] = "--sign-prepare".into();
+        if prepare {
+            let log = self
+                .b
+                .branches()
+                .side_log(Side::Sign)
+                .with_file_name("05-sign-prepare.log");
+            self.say(&format!(
+                "        private sign: targo --unverified ship {}; no product executions; \
+                 log: {}",
+                sign.join(" "),
+                log.display()
+            ));
+            self.early_sign = match self.b.prepare_sign(&sign, &p) {
+                Ok(child) => Some(child),
+                Err(refusal) => return self.refuse(refusal),
+            };
+        }
         let ran = self
             .b
             .branches()
             .verify(&c, &p, &run, Some(&artifact), &BranchStop::default());
         self.refresh();
+        if !self.facts.checks.complete() || ran.is_err() || self.b.branches().interrupted() {
+            self.discard_early_sign();
+        }
+        if let Some(refusal) = self.facts.checks.fail_refusal(&c.commit) {
+            return self.refuse(refusal);
+        }
         let ran = match ran {
             Ok(ran) => ran,
             Err(refusal) => return self.refuse(refusal),
@@ -5284,9 +5338,6 @@ impl Run<'_> {
             let words = self.facts.checks.line().to_owned();
             self.finish(&words);
             return Ok(());
-        }
-        if let Some(refusal) = self.facts.checks.fail_refusal(&c.commit) {
-            return self.refuse(refusal.detail(ran.detail));
         }
         let refusal = self.unrecorded(&c, &run, Some(&app), ran);
         self.refuse(refusal)
@@ -5305,6 +5356,19 @@ impl Run<'_> {
             ))?;
         }
         Ok(())
+    }
+
+    fn discard_early_sign(&mut self) {
+        let Some(child) = self.early_sign.take() else {
+            return;
+        };
+        child.stop().fire();
+        let _ = child.finish();
+        let n = self.reservation().map_or(0, |r| r.build);
+        let version = self.version();
+        for why in self.b.discard_signed(&version, n) {
+            self.say(&format!("        discard early signature: {why}"));
+        }
     }
 
     fn ready(&mut self) -> Flow {
@@ -5411,7 +5475,7 @@ impl Run<'_> {
                         sign.join(" "),
                         br.side_log(Side::Sign).display()
                     ));
-                    Ok(run_sides(&*br, &p, source, &sign))
+                    Ok(run_sides(&*br, &p, source, &sign, self.early_sign.take()))
                 }
                 Err(e) => Err(Refusal::new(
                     format!("cannot open step 7's gate {}: {e}", gate.path().display()),
@@ -5668,7 +5732,8 @@ impl Run<'_> {
             log.display(),
             args.join(" ")
         ));
-        let ran = self.b.cut(&args, &p);
+        let reserved = self.reservation();
+        let ran = self.b.cut(&args, &p, &c, reserved.as_ref());
         self.refresh();
         if let Some(cut) = self.facts.cut.clone()
             && cut.finished
@@ -6362,9 +6427,19 @@ fn side_event(br: &dyn Branches, side: Side, phase: &str, at: u64, seconds: u64)
 /// nothing is public; where the source's push began first, the source finishes, public ahead of
 /// its binary. A COULD NOT RUN stops nothing. Every start, push and end is decided and told in
 /// one order ([`BranchStop::in_order`]). Returns once every side it started ended.
-fn run_sides(br: &dyn Branches, p: &Prover, source: bool, sign: &[String]) -> Sides {
+fn run_sides(
+    br: &dyn Branches,
+    p: &Prover,
+    source: bool,
+    sign: &[String],
+    early: Option<Box<dyn PendingSign>>,
+) -> Sides {
     let first = BranchStop::default();
-    let stops: [BranchStop; 2] = [first.beside(), first.beside()];
+    let mut sign_stop = early
+        .as_ref()
+        .map_or_else(|| first.beside(), |child| child.stop());
+    sign_stop.told = std::sync::Arc::clone(&first.told);
+    let stops: [BranchStop; 2] = [first.beside(), sign_stop];
     let stop_of = |s: Side| &stops[s as usize];
     let gate = br.publish_gate();
     let mut sides = Sides::default();
@@ -6384,6 +6459,12 @@ fn run_sides(br: &dyn Branches, p: &Prover, source: bool, sign: &[String]) -> Si
             );
         }
         start_side(s, br, &tx, Side::Sign, stop_of(Side::Sign), move |stop| {
+            if let Some(child) = early {
+                let ran = child.finish();
+                if ran.code != 0 {
+                    return SideNote::Sign(ran);
+                }
+            }
             SideNote::Sign(br.sign(sign, p, stop))
         });
         drop(tx);

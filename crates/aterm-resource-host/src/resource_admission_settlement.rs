@@ -22,6 +22,19 @@ impl ClosedRoot {
             && self.leader_serial == job.child.cohort().leader_serial()
             && self.birth == job.root_birth
     }
+
+    pub(super) fn matches_original(
+        &self,
+        binding: &Binding,
+        group: i32,
+        leader_serial: u64,
+        birth: u64,
+    ) -> bool {
+        self.binding == *binding
+            && self.group == group
+            && self.leader_serial == leader_serial
+            && self.birth == birth
+    }
 }
 
 /// Keep the one original result on its owning Job. Failed or repeated attempts
@@ -31,6 +44,7 @@ pub(super) fn settle(job: &mut Job, fence: &Fence, journal: &journal::Journal) -
         || !job.reaped
         || !job.members.is_empty()
         || !job.loans.is_empty()
+        || !job.runtime_inputs.preparation_finished()
         || job
             .workload
             .as_ref()
@@ -57,6 +71,7 @@ pub(super) fn settle(job: &mut Job, fence: &Fence, journal: &journal::Journal) -
         leader_serial,
         birth,
     };
+    job.runtime_inputs.release(&closed)?;
     job.closed = Some(closed);
     Ok(())
 }

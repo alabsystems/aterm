@@ -24,6 +24,8 @@ struct World {
 }
 
 impl World {
+    /// Over this host's native git, which must have `--no-lazy-fetch`: without it the code tunes
+    /// nothing.
     fn new() -> Self {
         Self::with_program(None)
     }
@@ -34,7 +36,7 @@ impl World {
 
     fn with_program(git: Option<PathBuf>) -> Self {
         if git.is_none() {
-            crate::items::github::need_clt_git();
+            crate::items::github::need_native_git_with_no_lazy_fetch();
         }
         let sys = Live::new();
         let home = aterm_tempfile::tempdir().unwrap();
@@ -96,13 +98,15 @@ impl World {
             .unwrap()
     }
 
-    /// A plain git, nothing turned off, in `at`: the control that a stand-in hook or filter is
-    /// live.
+    /// A plain git, nothing turned off (a lazy fetch included), in `at`: the control that a
+    /// stand-in hook or filter, or a partial clone's origin, is live.
     fn plain(&self, at: &Path, args: &[&str]) -> String {
         let ran = self
             .sys
             .run_complete_stdout(
-                &checkout::git(&self.sys, &self.who, Some(at)).args(args.iter().copied()),
+                &checkout::git(&self.sys, &self.who, Some(at))
+                    .env("GIT_NO_LAZY_FETCH", "0")
+                    .args(args.iter().copied()),
             )
             .unwrap();
         assert!(ran.success(), "git {args:?}: {}", ran.describe());
@@ -439,7 +443,10 @@ fn a_clone_found_in_place_converges_to_its_declaration_and_a_second_pass_changes
     let after = world.read();
     assert_eq!(
         current(&after),
-        "1 vault clone on this Mac, each as it declares"
+        format!(
+            "1 vault clone on this {}, each as it declares",
+            world.sys.machine()
+        )
     );
     assert_eq!(world.tuned(), "nothing tuned");
     assert_eq!(
@@ -692,8 +699,11 @@ fn a_failed_self_test_withholds_the_cache_keys_and_is_kept() {
     assert_eq!(index_format(&world, &top), start);
     assert_eq!(
         current(&world.read()),
-        "1 vault clone on this Mac, each as it declares; $HOME/trust: no untracked cache: git's \
-         untracked-cache self-test failed on its volume"
+        format!(
+            "1 vault clone on this {}, each as it declares; $HOME/trust: no untracked cache: git's \
+             untracked-cache self-test failed on its volume",
+            world.sys.machine()
+        )
     );
     assert_eq!(
         world.tuned(),
@@ -714,10 +724,13 @@ fn a_key_removed_after_aterm_set_it_is_not_set_again() {
     world.ok(&top, &["config", "--unset", "core.untrackedCache"]);
     assert_eq!(
         current(&world.read()),
-        "1 vault clone on this Mac, each as it declares; $HOME/trust: core.untrackedCache no longer \
-         holds the true aterm set in its own config; aterm does not set it again (while \
-         feature.manyFiles is on, the untracked cache stays on unless core.untrackedCache is \
-         false)"
+        format!(
+            "1 vault clone on this {}, each as it declares; $HOME/trust: core.untrackedCache no \
+             longer holds the true aterm set in its own config; aterm does not set it again \
+             (while feature.manyFiles is on, the untracked cache stays on unless \
+             core.untrackedCache is false)",
+            world.sys.machine()
+        )
     );
     assert_eq!(world.tuned(), "nothing tuned");
     assert_eq!(world.local(&top, "core.untrackedCache"), "");
@@ -749,8 +762,11 @@ fn a_key_the_declaration_drops_is_unset_only_while_it_holds_aterms_value() {
     // declares feature.manyFiles, so the person's false is their opt-out.
     assert_eq!(
         current(&world.read()),
-        "1 vault clone on this Mac, each as it declares; $HOME/trust: feature.manyFiles no longer \
-         holds the true aterm set in its own config; aterm does not set it again"
+        format!(
+            "1 vault clone on this {}, each as it declares; $HOME/trust: feature.manyFiles no longer \
+             holds the true aterm set in its own config; aterm does not set it again",
+            world.sys.machine()
+        )
     );
     world.ok(
         &top,
@@ -855,7 +871,10 @@ fn a_folder_the_inventory_does_not_name_is_never_touched() {
     world.kept_self_test(true);
     assert_eq!(
         current(&world.read()),
-        "1 vault clone on this Mac, each as it declares (0 declare tuning)"
+        format!(
+            "1 vault clone on this {}, each as it declares (0 declare tuning)",
+            world.sys.machine()
+        )
     );
     world.apply().unwrap();
     for repo in [&other, &plain] {
@@ -933,7 +952,8 @@ fn a_partial_clone_s_unfetched_declaration_is_never_fetched() {
         &["config", "uploadpack.allowAnySHA1InWant", "true"],
     );
     let top = world.home.path().join("trust");
-    world.ok(
+    // Its checkout fetches the blobs it lacks.
+    world.plain(
         world.home.path(),
         &[
             "clone",
@@ -981,17 +1001,18 @@ fn a_partial_clone_s_unfetched_declaration_is_never_fetched() {
     assert!(!here(&world), "the filtered fetch left the blob on origin");
     let now = world.read();
     assert!(
-        current(&now).contains(
-            "$HOME/trust: its scripts/git-clone.gitconfig on main has not been fetched to this Mac \
-             (a partial clone's), so nothing there changed"
-        ),
+        current(&now).contains(&format!(
+            "$HOME/trust: its scripts/git-clone.gitconfig on main has not been fetched to this {} \
+             (a partial clone's), so nothing there changed",
+            world.sys.machine()
+        )),
         "{now:?}"
     );
     world.tuned();
     assert!(!here(&world), "nothing aterm ran fetched it");
     assert_eq!(world.local(&top, "feature.manyFiles"), "");
     // The control: a git that may fetch a missing object does, from that origin.
-    world.ok(&top, &["cat-file", "-e", &blob]);
+    world.plain(&top, &["cat-file", "-e", &blob]);
     assert!(here(&world), "a lazy fetch reaches origin");
 }
 
@@ -1149,13 +1170,16 @@ fn a_repository_off_the_self_test_s_volume_gets_no_cache_key() {
         Some(dev + 1),
     );
     assert_eq!(
-        current(&summary(&elsewhere)),
-        "1 vault clone on this Mac, each as it declares; $HOME/trust: no untracked cache: it is not \
-         on the volume of aterm's own state, where git's untracked-cache self-test runs"
+        current(&summary(&elsewhere, world.sys.machine())),
+        format!(
+            "1 vault clone on this {}, each as it declares; $HOME/trust: no untracked cache: it is \
+             not on the volume of aterm's own state, where git's untracked-cache self-test runs",
+            world.sys.machine()
+        )
     );
     // The control: on the self-test's volume, the same record tunes it.
     let here = plan_all(&world.sys, &world.who, &[top], &record, Some(dev));
-    due(&summary(&here));
+    due(&summary(&here, world.sys.machine()));
 }
 
 /// The doctor's row reads System State's holds at its apply as well as its probe: a hold set
@@ -1399,8 +1423,8 @@ fn only_git_s_own_self_test_verdict_is_kept() {
 /// set is kept as the person's, and its self-tests run again.
 #[test]
 fn an_older_aterm_s_record_is_read_afresh() {
-    let world = World::new();
-    let dir = converge_dir(world.state());
+    let state = aterm_tempfile::tempdir().unwrap();
+    let dir = converge_dir(state.path());
     aterm_uds::private_file::ensure_private_dir(&dir).unwrap();
     aterm_uds::private_file::write_private(
         &dir,
@@ -1504,17 +1528,25 @@ fn a_clone_whose_config_is_a_link_is_left_as_it_is() {
     assert_eq!(index_format(&world, &top), start);
 }
 
-/// A git that refuses `--no-lazy-fetch` as unknown (129) puts the clones out of scope, said; a
-/// git that did not run as git is an error; one with the option tunes.
+/// A git that refuses `--no-lazy-fetch` as unknown (129) puts the clones out of scope, said in
+/// the machine's own word; a git that did not run as git is an error; one with the option tunes.
 #[test]
 fn a_git_without_no_lazy_fetch_tunes_nothing() {
-    assert_eq!(lazy_fetch_guard(&Ran::ok("git version 2.56.0\n")), Ok(None));
-    assert!(
-        lazy_fetch_guard(&Ran::exit(129, "unknown option: --no-lazy-fetch"))
-            .unwrap()
-            .is_some_and(|why| why.contains("no --no-lazy-fetch"))
+    assert_eq!(
+        lazy_fetch_guard(&Ran::ok("git version 2.56.0\n"), "machine"),
+        Ok(None)
     );
-    assert!(lazy_fetch_guard(&Ran::exit(127, "not found")).is_err());
+    assert!(
+        lazy_fetch_guard(
+            &Ran::exit(129, "unknown option: --no-lazy-fetch"),
+            "machine"
+        )
+        .unwrap()
+        .is_some_and(|why| {
+            why.starts_with("this machine's git has no --no-lazy-fetch") && !why.contains("Mac")
+        })
+    );
+    assert!(lazy_fetch_guard(&Ran::exit(127, "not found"), "machine").is_err());
 }
 
 /// The installed Git 2.56 control for named config hooks and config-lock waiting.

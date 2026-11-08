@@ -357,15 +357,26 @@ pub fn gui_typing_smoke(ctx: &Ctx, r: &mut Report) {
         r.cannot_run("gui smoke: mktemp");
         return;
     };
-    if let Ready::Up { ctl: ctl_bin } = bring_up(ctx, r, &mut sb, bundle) {
+    let ready = crate::stages::native_row(ctx, r, "launch and listen", |r| {
+        bring_up(ctx, r, &mut sb, bundle)
+    });
+    if let Ready::Up { ctl: ctl_bin } = ready {
         let subject = crate::stages::Subject::of(ctx, bundle);
-        typing_burst(ctx, r, &mut sb, &ctl_bin);
+        crate::stages::native_row(ctx, r, "typing burst", |r| {
+            typing_burst(ctx, r, &mut sb, &ctl_bin);
+        });
         if !ctx.cursor_pacing {
-            aos_release_step(ctx, r, &mut sb, &ctl_bin, &subject);
-            settings_hardware_key_step(ctx, r, &mut sb, &ctl_bin, &subject);
+            crate::stages::native_row(ctx, r, "release AOS", |r| {
+                aos_release_step(ctx, r, &mut sb, &ctl_bin, &subject);
+            });
+            crate::stages::native_row(ctx, r, "Settings hardware keys", |r| {
+                settings_hardware_key_step(ctx, r, &mut sb, &ctl_bin, &subject);
+            });
         }
     }
-    sb.teardown(r, ctx.exec_env().stage_groups);
+    crate::stages::native_row(ctx, r, "teardown", |r| {
+        sb.teardown(r, ctx.exec_env().stage_groups);
+    });
 }
 
 /// The server's answer in what the bundle's `aterm-ctl` printed: a refusal goes to stderr

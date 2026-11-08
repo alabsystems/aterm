@@ -418,8 +418,20 @@ fn a_changed_row_offers_reset_on_its_own_page() {
     );
     assert_eq!(lab.text(), "scrollback_lines = 5000\n");
 
-    for route in [SettingsRoute::Appearance, SettingsRoute::Modified] {
-        let mut lab = Lab::new("theme = \"dark:Default,light:Default Light\"\n");
+    // Follow system on is a change from no theme whatever its slots hold: its row offers the
+    // whole setting's Reset beside a slot's own (with a Dark slot changed it had only the slot's,
+    // so returning the theme to its default took two presses).
+    for (route, source) in [SettingsRoute::Appearance, SettingsRoute::Modified]
+        .into_iter()
+        .flat_map(|route| {
+            [
+                "theme = \"dark:Default,light:Default Light\"\n",
+                "theme = \"dark:Nord,light:Default Light\"\n",
+            ]
+            .map(|source| (route, source))
+        })
+    {
+        let mut lab = Lab::new(source);
         lab.state_mut().navigate(route);
         let compiled = lab.compile(1_200.0, 1_400.0);
         if route == SettingsRoute::Appearance {
@@ -436,7 +448,7 @@ fn a_changed_row_offers_reset_on_its_own_page() {
             "{route:?}: Reset follows the switch"
         );
         lab.commit(&format!("settings/reset/{}", prefs::EDIT_THEME), None);
-        assert_eq!(lab.text(), "", "{route:?}");
+        assert_eq!(lab.text(), "", "{route:?} {source}");
     }
 }
 
@@ -1675,6 +1687,47 @@ fn every_unset_choice_and_switch_reads_now_as_its_row_says() {
 }
 
 #[test]
+fn a_word_effect_pressed_on_top_says_it_turned_on() {
+    // Under Serious Mode, pressing Sparkle words said "All word effects reset to its default ·
+    // Serious Mode off": the master switch's name, for the row the press did not touch, and
+    // never that Sparkle words turned on.
+    for (source, pressed, name, serious) in [
+        (
+            "serious_mode = true\n",
+            SPARKLE_WORDS_KEY,
+            "Sparkle words",
+            true,
+        ),
+        (
+            "serious_mode = true\n",
+            KEYWORD_KITTIES_KEY,
+            "Keyword kitties",
+            true,
+        ),
+        (
+            "[sparkle_words]\nenabled = false\n",
+            SPARKLE_WORDS_KEY,
+            "Sparkle words",
+            false,
+        ),
+    ] {
+        let mut lab = Lab::new(source);
+        lab.state_mut().navigate(SettingsRoute::Home);
+        lab.commit(&format!("settings/set/{pressed}"), None);
+        let status = lab.state().feedback.clone().unwrap_or_default();
+        assert!(
+            status.starts_with(&format!("{name} turned on"))
+                && status.contains("Serious Mode off") == serious,
+            "{source}: {status}"
+        );
+        assert!(
+            !status.contains("All word effects") && !status.contains(" its "),
+            "{source}: {status}"
+        );
+    }
+}
+
+#[test]
 fn a_reset_that_leaves_a_keyword_toy_held_off_says_it_is_still_off() {
     let source = "[sparkle_words]\nenabled = false\n[sparkle_words.feline]\nenabled = false\n";
     let mut lab = Lab::new(source);
@@ -1683,7 +1736,7 @@ fn a_reset_that_leaves_a_keyword_toy_held_off_says_it_is_still_off() {
     assert!(!lab.text().contains("feline"), "{}", lab.text());
     let status = lab.state().feedback.clone().unwrap_or_default();
     assert!(
-        status.starts_with("Keyword kitties reset to its default")
+        status.starts_with("Keyword kitties reset to default")
             && status.contains("Still Off: all word effects are switched off in aterm.toml")
             && !status.contains("turned on")
             && !status.to_lowercase().contains("inactive"),

@@ -165,7 +165,7 @@ pub fn with_message_format(mut cmd: crate::exec::Cmd) -> crate::exec::Cmd {
 /// them; its [`Units`] (`None`: its stdout was not read, or the call does not report them); its
 /// tree's usage (`None`: unread, [`crate::exec::Run::usage`]); its wall; and the bytes of the
 /// files it wrote ([`output_bytes`] of [`Artifacts::written`]; `None` where its units are).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Account {
     pub step: String,
     pub call: String,
@@ -173,6 +173,131 @@ pub struct Account {
     pub usage: Option<crate::exec::TreeUsage>,
     pub wall: Duration,
     pub output_bytes: Option<u64>,
+    /// How many of its compilers ran at once, where its stage's meter read them
+    /// ([`Account::overlapping`]).
+    pub overlap: Option<Overlap>,
+}
+
+/// HOW MANY OF A CALL'S COMPILERS RAN AT ONCE, from the spans its stage's reads gave them
+/// ([`crate::memory::UnitSpan`]), over the call's wall: the average (their spans' lengths summed
+/// over the wall), the least count it ran at or under for 95% of the wall, and the most at one
+/// read; and of the units waiting for memory in their admission wrapper, the average and the
+/// most at once, with their waits summed. Each date is a read, half a second apart at most: a
+/// compiler read once or between two reads is missing, and each counted span is short by up to
+/// a read on either end, so the compilers' figures bound the truth from below; a wait runs from
+/// its wrapper's first read to its compiler's, each late by up to a read, so it is within one
+/// read of the truth either way.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Overlap {
+    /// The compilers whose spans were read.
+    pub timed: usize,
+    pub avg: f64,
+    pub p95: u32,
+    pub max: u32,
+    pub waiting_avg: f64,
+    pub waiting_max: u32,
+    /// The units' waits for memory summed, seconds.
+    pub waited_s: f64,
+}
+
+/// One count's share of a window: how long the window ran at each count of open spans, the most
+/// open at one instant, and the open spans' lengths summed, ms ([`Overlap::of`]).
+fn levels(
+    spans: impl Iterator<Item = (u64, u64)>,
+    from: u64,
+    to: u64,
+) -> (Vec<(u32, u64)>, u32, u64) {
+    let mut edges: Vec<(u64, i32)> = Vec::new();
+    let mut summed = 0_u64;
+    for (start, end) in spans {
+        if end < start || end < from || start > to {
+            continue;
+        }
+        let (start, end) = (start.max(from), end.min(to));
+        summed += end - start;
+        edges.push((start, 1));
+        edges.push((end, -1));
+    }
+    // An opening sorts before a closing at the same instant, so a span one read saw counts.
+    edges.sort_unstable_by_key(|&(at, step)| (at, -step));
+    let (mut open, mut most, mut at) = (0_i32, 0_i32, from);
+    let mut time = std::collections::BTreeMap::<u32, u64>::new();
+    for (edge, step) in edges {
+        *time.entry(open.unsigned_abs()).or_default() += edge - at;
+        at = edge;
+        open += step;
+        most = most.max(open);
+    }
+    *time.entry(open.unsigned_abs()).or_default() += to - at;
+    (time.into_iter().collect(), most.unsigned_abs(), summed)
+}
+
+impl Overlap {
+    /// The overlap of `spans` over the window `from_ms..to_ms` (ms since the Unix epoch, on the
+    /// clock that dated them: [`crate::memory::Meter::unix_ms`]), each span cut to it and one
+    /// wholly outside it left out; `None` for a window of no length or no span.
+    #[must_use]
+    pub fn of(spans: &[crate::memory::UnitSpan], from_ms: u64, to_ms: u64) -> Option<Overlap> {
+        if to_ms <= from_ms || spans.is_empty() {
+            return None;
+        }
+        let wall = (to_ms - from_ms) as f64;
+        let (time, max, summed) = levels(
+            spans
+                .iter()
+                .map(|s| (s.started_at_unix_ms, s.ended_at_unix_ms)),
+            from_ms,
+            to_ms,
+        );
+        let mut covered = 0_u64;
+        let p95 = time
+            .iter()
+            .find(|&&(_, ms)| {
+                covered += ms;
+                covered as f64 >= 0.95 * wall
+            })
+            .map_or(max, |&(count, _)| count);
+        let waits = || {
+            spans
+                .iter()
+                .filter_map(|s| s.queued_at_unix_ms.map(|q| (q, s.started_at_unix_ms)))
+        };
+        let (_, waiting_max, waited) = levels(waits(), from_ms, to_ms);
+        let unclamped: u64 = waits().map(|(q, st)| st.saturating_sub(q)).sum();
+        Some(Overlap {
+            timed: spans.len(),
+            avg: summed as f64 / wall,
+            p95,
+            max,
+            waiting_avg: waited as f64 / wall,
+            waiting_max,
+            waited_s: unclamped as f64 / 1000.0,
+        })
+    }
+}
+
+/// `verify-event: {"schema":1,"event":"compile-unit-timed",…}` for each span of call `call`:
+/// its unit by the name the memory book keys it by, its wait and its compile dated, its CPU and
+/// its peak, and the reads' period, so a reader knows the dates' grain.
+#[must_use]
+pub fn span_events(call: &str, spans: &[crate::memory::UnitSpan]) -> Vec<String> {
+    spans
+        .iter()
+        .map(|s| {
+            format!(
+                "verify-event: {}",
+                aterm_json::json!({
+                    "schema": 1, "event": "compile-unit-timed", "call": call,
+                    "package": s.unit.package, "unit": s.unit.kind,
+                    "queued_at_unix_ms": s.queued_at_unix_ms,
+                    "started_at_unix_ms": s.started_at_unix_ms,
+                    "ended_at_unix_ms": s.ended_at_unix_ms,
+                    "cpu_s": s.cpu_s, "peak_bytes": s.peak_bytes,
+                    "read_every_ms": crate::exec::READ_USAGE_EVERY.as_millis(),
+                })
+            )
+        })
+        .collect()
 }
 
 impl Account {
@@ -193,7 +318,15 @@ impl Account {
             usage,
             wall,
             output_bytes: read.map(|a| output_bytes(&a.written)),
+            overlap: None,
         }
+    }
+
+    /// This account with its compilers' overlap ([`Overlap`]).
+    #[must_use]
+    pub fn overlapping(mut self, overlap: Option<Overlap>) -> Account {
+        self.overlap = overlap;
+        self
     }
 
     /// `compile <step>/<call>: F fresh / C compiled, X CPU-s, Y starved-s, W wall, P peak, B out`;
@@ -232,8 +365,15 @@ impl Account {
             || "out unread".to_owned(),
             |b| format!("{} out", aterm_capacity::size(b)),
         );
+        let overlap = self.overlap.map_or_else(String::new, |o| {
+            format!(
+                "; compilers at once {:.1} avg, {} p95, {} most ({} read); waiting for memory \
+                 {:.1} avg, {} most, {:.1} unit-s",
+                o.avg, o.p95, o.max, o.timed, o.waiting_avg, o.waiting_max, o.waited_s
+            )
+        });
         format!(
-            "compile {}/{}: {units}, {cpu}, {starved}, {} wall, {peak}, {out}",
+            "compile {}/{}: {units}, {cpu}, {starved}, {} wall, {peak}, {out}{overlap}",
             self.step,
             self.call,
             crate::report::duration(self.wall.as_secs_f64())
@@ -260,6 +400,11 @@ impl Account {
                 "wall_s": self.wall.as_secs_f64(),
                 "peak_bytes": self.usage.map(|u| u.peak_bytes),
                 "output_bytes": self.output_bytes,
+                "compilers": self.overlap.map(|o| aterm_json::json!({
+                    "timed": o.timed, "avg": o.avg, "p95": o.p95, "max": o.max,
+                    "waiting_avg": o.waiting_avg, "waiting_max": o.waiting_max,
+                    "waited_s": o.waited_s,
+                })),
             })
         )
     }

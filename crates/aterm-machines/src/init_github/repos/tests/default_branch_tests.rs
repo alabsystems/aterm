@@ -7,7 +7,7 @@ use super::*;
 /// The fresh remote advertisement still binds the checkout's actual branch and commit.
 #[test]
 fn a_real_new_checkout_uses_the_advertised_default_and_refuses_a_later_remote_change() {
-    crate::items::github::need_clt_git();
+    crate::items::github::need_native_git();
     let sys = Live::new();
     let home = Scratch::new(&sys, "github-default-branch").unwrap();
     let mut who = user("fixture", sys.euid());

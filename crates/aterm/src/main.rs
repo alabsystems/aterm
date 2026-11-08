@@ -800,9 +800,12 @@ fn front_door_main(
     // port's `ask` (aterm-secrets cannot dial it itself), with the ask the Secrets stage
     // registers below.
     #[cfg(unix)]
-    aterm_secrets::client::on_ask_members(|paths| {
-        aterm_agent::members_cli::ask_members(&paths.home).map_err(aterm_secrets::Error::new)
-    });
+    aterm_secrets::client::on_ask_members(
+        |paths| {
+            aterm_agent::members_cli::ask_members(&paths.home).map_err(aterm_secrets::Error::new)
+        },
+        aterm_agent::members_cli::member_arrivals,
+    );
     #[cfg(unix)]
     aterm_secrets::client::on_native_bootstrap(|paths, current| {
         aterm_agent::members_cli::bootstrap_from_members(paths, current)
@@ -7940,6 +7943,7 @@ static OBSERVE_QUEUE: std::sync::Mutex<ObserveQueue> = std::sync::Mutex::new(Obs
 struct ObservedRows {
     rows: Vec<aterm_types::macos_setup::Observation>,
     generation: u64,
+    caps_live: Option<(u64, aterm_types::macos_setup::LiveKeyboardMapping)>,
     /// The vault source the Secrets and Repositories readings share; a reading for another
     /// source clears both before adding its rows.
     vault_url: Option<String>,
@@ -7957,6 +7961,7 @@ struct ObservedRows {
 static OBSERVED_ROWS: std::sync::Mutex<ObservedRows> = std::sync::Mutex::new(ObservedRows {
     rows: Vec::new(),
     generation: 0,
+    caps_live: None,
     vault_url: None,
     plan: None,
     choices: 0,
@@ -7970,7 +7975,10 @@ fn retire_observed_rows(
 ) -> bool {
     let before = rows.rows.len();
     rows.rows.retain(|row| !subjects.contains(&row.subject));
-    let changed = rows.rows.len() != before;
+    let live_retired = subjects.contains(&aterm_types::macos_setup::Subject::Setting(
+        aterm_types::macos_setup::Setting::CapsLock,
+    )) && rows.caps_live.take().is_some();
+    let changed = rows.rows.len() != before || live_retired;
     if changed {
         rows.generation += 1;
     }
@@ -8021,6 +8029,92 @@ fn invalidate_workstation_observations() {
 fn invalidate_input_observations() {
     use aterm_types::macos_setup::{Setting, Subject};
     invalidate_setup_observations(&[Subject::Setting(Setting::CapsLock)]);
+}
+
+/// The observation fence captured before a Window's existing input sample. The accepted
+/// revision is supplied by that sample's canonical scope, not by a finished setup marker.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct CapsLiveScope {
+    choices: u64,
+    started: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl CapsLiveScope {
+    fn current(&self, activity: &SetupActivity, rows: &ObservedRows) -> bool {
+        use aterm_types::macos_setup::{Setting, Subject};
+        let caps = Subject::Setting(Setting::CapsLock);
+        self.choices == rows.choices
+            && !activity.subjects.contains(&caps)
+            && !activity.input_readback
+            && activity
+                .touched
+                .iter()
+                .all(|(subject, epoch)| *subject != caps || *epoch <= self.started)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_caps_live_scope() -> Option<CapsLiveScope> {
+    let activity = SETUP_ACTIVITY.lock().ok()?;
+    let rows = OBSERVED_ROWS.lock().ok()?;
+    Some(CapsLiveScope {
+        choices: rows.choices,
+        started: activity.epoch,
+    })
+}
+
+/// Publish only from the sampler, after releasing its actor lock. The fast path performs
+/// no canonical/private read and no wake for an unchanged diagnostic. A new positive fact
+/// uses the existing profile/current-revision guard; cache mutation takes only observation
+/// locks, never filesystem, console or native readers.
+#[cfg(target_os = "macos")]
+fn publish_caps_live(
+    scope: Option<CapsLiveScope>,
+    live: Option<(u64, aterm_types::macos_setup::LiveKeyboardMapping)>,
+) {
+    let Some(scope) = scope else {
+        return;
+    };
+    if let Ok(activity) = SETUP_ACTIVITY.lock()
+        && let Ok(rows) = OBSERVED_ROWS.lock()
+        && (!scope.current(&activity, &rows) || rows.caps_live == live)
+    {
+        return;
+    }
+    let changed = if let Some((revision, _)) = live {
+        aterm_cli::macos_doctor::with_current_input_scope(revision, setup_stop_requested, || {
+            replace_caps_live(scope, live)
+        })
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| replace_caps_live(scope, None))
+    } else {
+        replace_caps_live(scope, None)
+    };
+    if changed {
+        publish_setup_readings();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn replace_caps_live(
+    scope: CapsLiveScope,
+    live: Option<(u64, aterm_types::macos_setup::LiveKeyboardMapping)>,
+) -> bool {
+    let Ok(activity) = SETUP_ACTIVITY.lock() else {
+        return false;
+    };
+    let Ok(mut rows) = OBSERVED_ROWS.lock() else {
+        return false;
+    };
+    if !scope.current(&activity, &rows) || rows.caps_live == live {
+        return false;
+    }
+    rows.caps_live = live;
+    rows.generation += 1;
+    true
 }
 
 /// Queue a read-only reading of `subjects` on its own worker, never the setup
@@ -8921,6 +9015,7 @@ fn add_setup_readings(status: &mut aterm_gui::SetupStatus) {
     let readings = setup_readings();
     status.observed = readings.observed;
     status.observed_generation = readings.observed_generation;
+    status.caps_live = readings.caps_live;
     status.observed_vault_url = readings.observed_vault_url;
     status.running = readings.running;
 }
@@ -8944,6 +9039,7 @@ fn setup_readings() -> aterm_gui::SetupReadings {
         return aterm_gui::SetupReadings {
             observed,
             observed_generation: rows.generation,
+            caps_live: rows.caps_live.map(|(_, live)| live),
             observed_vault_url: rows.vault_url.clone(),
             running,
         };
@@ -14301,6 +14397,22 @@ mod initial_setup_result_tests {
                 && row.standing == Standing::InPlace
                 && row.now.as_deref() == Some("Control")
         }));
+        use aterm_machines::port::System as _;
+        let aterm_machines::init::KeyboardAttachmentActivation::Verified(live_receipt) =
+            aterm_machines::init::activate_keyboard_attachments(
+                &native,
+                &[41, 42],
+                &|_| false,
+                &|| true,
+                &|| panic!("the actual completed mapping needs no native mutation"),
+            )
+            .unwrap()
+        else {
+            panic!("the canonical final probe must cover both native services");
+        };
+        let live_mapping = live_receipt
+            .live_mapping(&native.keyboard_service_observations().unwrap())
+            .unwrap();
         let paid_commands = native.calls();
         for withdrawal in [
             "none",
@@ -14323,7 +14435,24 @@ mod initial_setup_result_tests {
                 let mut rows = OBSERVED_ROWS.lock().unwrap();
                 rows.plan = Some(plan.clone());
                 rows.rows = vec![Observation::unknown(caps), vault.clone()];
+                rows.caps_live = None;
             }
+            let live_scope = capture_caps_live_scope().unwrap();
+            assert!(replace_caps_live(live_scope, Some((1, live_mapping))));
+            assert_eq!(setup_readings().caps_live, Some(live_mapping));
+            let generation = setup_readings().observed_generation;
+            publish_caps_live(Some(live_scope), Some((1, live_mapping)));
+            assert_eq!(
+                setup_readings().observed_generation,
+                generation,
+                "an unchanged healthy diagnostic owes no publication"
+            );
+            assert!(
+                setup_readings()
+                    .observed
+                    .iter()
+                    .any(|row| row.subject == caps && row.standing == Standing::Unknown)
+            );
             OBSERVE_QUEUE.lock().unwrap().next = None;
             let stage_subject = if withdrawal == "scope" {
                 Subject::Setting(Setting::Dock)
@@ -14343,6 +14472,7 @@ mod initial_setup_result_tests {
                     running: true,
                     readback: &aterm_cli::macos_doctor::WorkstationReadback::EMPTY,
                 });
+                assert_eq!(setup_readings().caps_live.is_some(), withdrawal == "scope");
                 assert!(
                     !OBSERVED_ROWS
                         .lock()
@@ -14376,6 +14506,10 @@ mod initial_setup_result_tests {
                     && row.standing == Standing::InPlace
                     && row.now.as_deref() == Some("Control")
             });
+            assert!(
+                !replace_caps_live(live_scope, Some((1, live_mapping))),
+                "an old live sample cannot cross its setting's stage/choice/Stop fence"
+            );
             let admitted = matches!(
                 withdrawal,
                 "none" | "refresh" | "forced" | "invalidated" | "failed"

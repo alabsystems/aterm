@@ -72,6 +72,9 @@ mod resource_telemetry;
 #[cfg(unix)]
 #[path = "../src/runtime.rs"]
 mod runtime;
+#[cfg(unix)]
+#[path = "../src/runtime_input_transport.rs"]
+mod runtime_input_transport;
 #[cfg(target_os = "macos")]
 #[path = "../src/subgroup_delegation.rs"]
 mod subgroup_delegation;

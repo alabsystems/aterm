@@ -222,7 +222,7 @@ mod tests {
             "OK schema=2 setup=pending verified=0",
             "OK schema=2 setup=pending:repos verified=0",
             "OK schema=2 setup=done;asking:vault;offered:lan verified=0",
-            "OK schema=2 setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unknown",
+            "OK schema=2 setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unknown caps_live=control",
             "OK schema=2 setup=pending;unknown:capslock verified=0",
             "OK schema=2 setup=pending:repos;unknown:capslock verified=0",
         ] {
@@ -244,7 +244,7 @@ mod tests {
         );
         assert_eq!(
             observation(
-                "OK schema=2 setup=unknown:dock verified=1 observed_generation=7 rows=capslock:in-place,dock:unknown"
+                "OK schema=2 setup=unknown:dock verified=1 observed_generation=7 rows=capslock:in-place,dock:unknown caps_live=mixed:control=1,other=0,held=1"
             ),
             WorkstationObservation::Complete(caps),
             "unrelated unread rows do not taint a verified requested setting"

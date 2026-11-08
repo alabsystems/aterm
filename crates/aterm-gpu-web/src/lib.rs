@@ -2603,9 +2603,9 @@ mod tests {
         }
         fn layer_value_eq(x: &FxLayer, y: &FxLayer) -> bool {
             (
-                x.id, x.slot, x.space, x.blend, x.bloom, x.knock, x.offset, x.clip,
+                x.id, x.slot, x.space, x.blend, x.bloom, x.knock, x.offset, x.clip, x.chrome,
             ) == (
-                y.id, y.slot, y.space, y.blend, y.bloom, y.knock, y.offset, y.clip,
+                y.id, y.slot, y.space, y.blend, y.bloom, y.knock, y.offset, y.clip, y.chrome,
             ) && content_value_eq(&x.content, &y.content)
         }
         if a.fx_layers.len() != b.fx_layers.len()

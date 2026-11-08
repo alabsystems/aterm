@@ -18,7 +18,14 @@ fn an_unfetched_fix_is_fetched_before_admission_and_other_fixes_still_refuse() {
     let temp = aterm_tempfile::tempdir().unwrap();
     let root = temp.path();
     let seed = root.join("seed");
-    crate::ledger::testing::init(&seed, &[]);
+    // The fixture commits under its own identity: a test's scratch HOME has none.
+    crate::ledger::testing::init(
+        &seed,
+        &[
+            ("user.name", "Test"),
+            ("user.email", "test@example.invalid"),
+        ],
+    );
     std::fs::write(seed.join("README"), "base\n").unwrap();
     git(&seed, &["add", "README"]);
     git(&seed, &["commit", "-qm", "base"]);

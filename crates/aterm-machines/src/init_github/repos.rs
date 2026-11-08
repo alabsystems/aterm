@@ -670,13 +670,21 @@ fn refresh_one(
     if !crate::checkout::tracks_origin(sys, user, path, &branch) {
         return Ok(None);
     }
+    // At each of align's checks (its start, before its fetch, before its merge): what this
+    // read admitted still holds, the storage included (a partial clone made since would fetch
+    // lazily in the merge).
+    // [`refresh_existing`] names the repository on each failure line; these say what changed.
     let admitted = || {
         current()?;
         if !crate::checkout::tracks_origin(sys, user, path, &branch) {
-            return Err(format!(
-                "~/{}: upstream tracking changed during refresh; work preserved",
-                repo.name
-            ));
+            return Err("upstream tracking changed during refresh; work preserved".to_owned());
+        }
+        if super::dependencies::complete_storage(sys, user, path).is_err() {
+            return Err(
+                "its object storage changed during refresh (now shallow, partial or \
+                        borrowed, or unreadable); work preserved"
+                    .to_owned(),
+            );
         }
         Ok(())
     };
@@ -1016,6 +1024,29 @@ fn git_read(sys: &dyn System, user: &User, path: &Path, args: &[&str]) -> Result
     )
 }
 
+/// Whether the repository at `path` borrows objects from another store: its
+/// `objects/info/alternates` is there, or what is at that path cannot be read. The path git
+/// computes reads no object, so no lazy fetch can start: the read runs on every git, with no
+/// `--no-lazy-fetch`, which a git before 2.44 refuses.
+///
+/// # Errors
+/// git could not name the path.
+pub(super) fn alternate_store(sys: &dyn System, user: &User, path: &Path) -> Result<bool, String> {
+    let alternates = git_read(
+        sys,
+        user,
+        path,
+        &["rev-parse", "--git-path", "objects/info/alternates"],
+    )?;
+    let alternates = Path::new(alternates.trim());
+    let alternates = if alternates.is_absolute() {
+        alternates.to_owned()
+    } else {
+        path.join(alternates)
+    };
+    Ok(!matches!(sys.stat(&alternates), Err(error) if error.kind() == io::ErrorKind::NotFound))
+}
+
 pub(super) fn verify_existing(
     sys: &dyn System,
     user: &User,
@@ -1072,16 +1103,27 @@ pub(super) fn verify_existing(
     Ok(())
 }
 
+/// The keys that make a repository a partial clone, one a read of an object it lacks fetches
+/// lazily: `extensions.partialclone`, and a promisor remote's `promisor` or
+/// `partialclonefilter`, whatever its name.
+const PARTIAL_KEYS: &str =
+    r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$";
+
+/// The listing [`verify_integrity`] runs: `git`, a command already in the repository, asked for
+/// [`PARTIAL_KEYS`] in the C locale, where git's regular expressions match bytes (under a UTF-8
+/// locale, the account's, `.` matches no byte that is not UTF-8, so a promisor remote named in
+/// such bytes would go unlisted while git still fetched through it).
+pub(super) fn partial_listing(git: Cmd) -> Cmd {
+    git.env("LC_ALL", "C")
+        .args(["config", "--get-regexp", PARTIAL_KEYS])
+}
+
 pub(super) fn verify_integrity(sys: &dyn System, user: &User, path: &Path) -> Result<(), String> {
     if git_read(sys, user, path, &["rev-parse", "--is-shallow-repository"])?.trim() != "false" {
         return Err("the new clone is shallow; not published".into());
     }
     let partial = sys
-        .run_complete_stdout(&git(sys, user, Some(path)).args([
-            "config",
-            "--get-regexp",
-            "^(extensions\\.partialclone|remote\\..*\\.(promisor|partialclonefilter))$",
-        ]))
+        .run_complete_stdout(&partial_listing(git(sys, user, Some(path))))
         .map_err(|_| "cannot inspect partial-clone configuration")?;
     if partial.status != Some(1) || !partial.stdout.is_empty() || !partial.stderr.is_empty() {
         return Err(
@@ -1702,19 +1744,7 @@ fn clone_one_with(
         "GitHub clone failed; existing destination left untouched",
     )?;
     verify_existing(sys, user, owner, repo, &clone)?;
-    let alternates = git_read(
-        sys,
-        user,
-        &clone,
-        &["rev-parse", "--git-path", "objects/info/alternates"],
-    )?;
-    let alternates = Path::new(alternates.trim());
-    let alternates = if alternates.is_absolute() {
-        alternates.to_owned()
-    } else {
-        clone.join(alternates)
-    };
-    if !matches!(sys.stat(&alternates), Err(error) if error.kind() == io::ErrorKind::NotFound) {
+    if alternate_store(sys, user, &clone)? {
         return Err("the new clone depends on an alternate object store; not published".into());
     }
     verify_new(sys, user, repo, &clone, &source)?;
@@ -2236,13 +2266,7 @@ pub(super) mod tests {
             );
         }
         sys.on(
-            &git(sys, who, Some(path))
-                .args([
-                    "config",
-                    "--get-regexp",
-                    "^(extensions\\.partialclone|remote\\..*\\.(promisor|partialclonefilter))$",
-                ])
-                .display(),
+            &partial_listing(git(sys, who, Some(path))).display(),
             Ran::exit(1, ""),
         );
     }
@@ -2276,8 +2300,6 @@ pub(super) mod tests {
                 .off(git(sys, who, Some(path)))
                 .args(crate::checkout::NO_SIDE_RUNS)
                 .args([
-                    "-c",
-                    "core.fsmonitor=false",
                     "status",
                     "--porcelain=v1",
                     "-z",
@@ -2345,7 +2367,7 @@ pub(super) mod tests {
                             }
                         }
                         "rev-list --count HEAD --not --remotes=origin" => Ran::ok("0\n"),
-                        "-c core.hooksPath=/dev/null -c maintenance.auto=false fetch --quiet --no-recurse-submodules origin" =>
+                        "-c core.hooksPath=/dev/null -c core.fsmonitor= -c maintenance.auto=false fetch --quiet --no-recurse-submodules origin" =>
                         {
                             state.1 = true;
                             Ran::ok("")
@@ -2357,7 +2379,7 @@ pub(super) mod tests {
                         line if line == format!("rev-list --count {A}..{B}") => Ran::ok("1\n"),
                         line if line
                             == format!(
-                                "-c core.hooksPath=/dev/null -c maintenance.auto=false -c submodule.recurse=false merge --ff-only --no-autostash --quiet {B}"
+                                "-c core.hooksPath=/dev/null -c core.fsmonitor= -c maintenance.auto=false -c submodule.recurse=false merge --ff-only --no-autostash --quiet {B}"
                             ) =>
                         {
                             state.0 = B.to_owned();
@@ -3281,9 +3303,103 @@ pub(super) mod tests {
         );
     }
 
+    /// A promisor remote whose name is not UTF-8 makes a partial clone as any other does, and
+    /// [`verify_integrity`] refuses it: [`partial_listing`] reads the config in the C locale.
+    /// Under the account's UTF-8 locale git's `.` matches no such byte, the remote went unlisted
+    /// and the check passed. The controls: a repository with no promisor passes; this one's
+    /// remote is live (a read of an object the repository lacks, lazy fetches allowed, fetches it
+    /// from there); and the same listing under the account's own locale misses it (a COULD NOT
+    /// RUN where it does not, a host whose git matches those bytes there or lacks the locale).
+    #[test]
+    fn a_promisor_remote_named_in_bytes_that_are_not_utf8_is_refused() {
+        use std::io::Write as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        crate::items::github::need_native_git();
+        let sys = Live::new();
+        let home = Scratch::new(&sys, "github-promisor-bytes").unwrap();
+        let mut who = user("fixture", sys.euid());
+        who.home = home.path().to_string_lossy().into_owned();
+        let run = |at: Option<&Path>, args: &[&str]| {
+            text(
+                &sys,
+                &git(&sys, &who, at)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .args(crate::checkout::NO_SIDE_RUNS)
+                    .args([
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                    ])
+                    .args(args.iter().copied()),
+                "isolated local Git fixture failed",
+            )
+            .unwrap()
+        };
+        let source = home.path().join("source");
+        let repo = home.path().join("repo");
+        run(
+            None,
+            &["init", "--quiet", "--template=", source.to_str().unwrap()],
+        );
+        sys.write_file(&source.join("code"), b"only the source has this\n", 0o600)
+            .unwrap();
+        run(Some(&source), &["add", "--", "code"]);
+        run(Some(&source), &["commit", "--quiet", "-m", "fixture"]);
+        let blob = run(Some(&source), &["rev-parse", "HEAD:code"]);
+        let blob = blob.trim();
+        run(
+            None,
+            &["init", "--quiet", "--template=", repo.to_str().unwrap()],
+        );
+        assert_eq!(
+            verify_integrity(&sys, &who, &repo),
+            Ok(()),
+            "control: a repository with no promisor passes"
+        );
+        let mut config = std::fs::File::options()
+            .append(true)
+            .open(repo.join(".git/config"))
+            .unwrap();
+        config.write_all(b"[remote \"\xff\"]\n\turl = ").unwrap();
+        config.write_all(source.as_os_str().as_bytes()).unwrap();
+        config.write_all(b"\n\tpromisor = true\n").unwrap();
+        drop(config);
+        let unlisted = sys
+            .run_complete_stdout(&git(&sys, &who, Some(&repo)).args([
+                "config",
+                "--get-regexp",
+                PARTIAL_KEYS,
+            ]))
+            .unwrap();
+        if unlisted.status != Some(1) {
+            aterm_uds::host::could_not_run(format!(
+                "git under this account's locale lists the remote named in bytes that are not \
+                 UTF-8 ({}), so the C locale changes nothing here",
+                unlisted.describe()
+            ));
+        }
+        let refused = verify_integrity(&sys, &who, &repo).unwrap_err();
+        assert!(refused.contains("partial"), "{refused}");
+        // The control: git fetches through that remote what the repository lacks.
+        let fetched = text(
+            &sys,
+            &git(&sys, &who, Some(&repo))
+                .env("GIT_NO_LAZY_FETCH", "0")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args(crate::checkout::NO_SIDE_RUNS)
+                .args(["cat-file", "-t", blob]),
+            "a read that may fetch lazily",
+        )
+        .unwrap();
+        assert_eq!(fetched, "blob\n");
+    }
+
     #[test]
     fn matching_real_dirty_worktree_on_an_alternate_branch_is_only_read() {
-        crate::items::github::need_clt_git();
+        crate::items::github::need_native_git();
         let sys = Live::new();
         let home = Scratch::new(&sys, "github-repo-fixture").unwrap();
         let mut who = user("fixture", sys.euid());

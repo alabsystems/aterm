@@ -155,13 +155,7 @@ fn existing_as(sys: &Fake, who: &User, path: &Path, owner: &str, name: &str, pin
         Ran::ok("false\n"),
     );
     sys.on(
-        &ordinary()
-            .args([
-                "config",
-                "--get-regexp",
-                "^(extensions\\.partialclone|remote\\..*\\.(promisor|partialclonefilter))$",
-            ])
-            .display(),
+        &super::super::repos::partial_listing(ordinary()).display(),
         Ran::exit(1, ""),
     );
     sys.on(
@@ -189,7 +183,7 @@ fn existing_as(sys: &Fake, who: &User, path: &Path, owner: &str, name: &str, pin
         Ran::ok(""),
     );
     sys.on(
-        &git()
+        &ordinary()
             .args(["rev-parse", "--git-path", "objects/info/alternates"])
             .display(),
         Ran::ok(".git/objects/info/alternates\n"),
@@ -383,7 +377,7 @@ fn unsupported_git_refuses_dependency_work_without_an_ordinary_fallback() {
 #[test]
 fn real_tracked_metadata_and_a_branch_at_the_pin_are_ready_without_moving_user_work() {
     use crate::port::Live;
-    crate::items::github::need_clt_git();
+    crate::items::github::need_native_git_with_no_lazy_fetch();
     let sys = Live::new();
     let scratch = Scratch::new(&sys, "required-gitlink").unwrap();
     let mut who = user("fixture", sys.euid());
@@ -492,7 +486,7 @@ fn real_tracked_metadata_and_a_branch_at_the_pin_are_ready_without_moving_user_w
 fn readiness_runs_no_filter_driver_a_parent_or_a_dependency_names() {
     use crate::port::Live;
     use std::os::unix::fs::PermissionsExt as _;
-    crate::items::github::need_clt_git();
+    crate::items::github::need_native_git_with_no_lazy_fetch();
     let sys = Live::new();
     let scratch = Scratch::new(&sys, "required-no-filter").unwrap();
     let mut who = user("fixture", sys.euid());
@@ -634,7 +628,7 @@ fn readiness_runs_no_filter_driver_a_parent_or_a_dependency_names() {
 #[test]
 fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_transport() {
     use crate::port::Live;
-    crate::items::github::need_clt_git();
+    crate::items::github::need_native_git_with_no_lazy_fetch();
     let sys = Live::new();
     let scratch = Scratch::new(&sys, "required-offline-pin").unwrap();
     let mut who = user("fixture", sys.euid());
@@ -874,7 +868,7 @@ fn an_existing_complete_dependency_reaches_its_preloaded_pin_without_a_working_t
 #[test]
 fn partial_parent_metadata_reads_never_fetch_implicitly_but_explicit_fetch_still_works() {
     use crate::port::Live;
-    crate::items::github::need_clt_git();
+    crate::items::github::need_native_git_with_no_lazy_fetch();
     let sys = Live::new();
     let scratch = Scratch::new(&sys, "required-partial-parent").unwrap();
     let mut who = user("fixture", sys.euid());

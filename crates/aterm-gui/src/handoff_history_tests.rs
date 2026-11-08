@@ -200,6 +200,85 @@ fn scrolled_back_adoption(dir: &Path) -> (Arc<Mutex<Terminal>>, AdoptedHistory) 
     (successor, adopted)
 }
 
+#[test]
+fn a_required_history_import_waits_for_its_native_reflow() {
+    for age in [Duration::from_secs(6), Duration::from_secs(61)] {
+        let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let (term, mut adopted) = scrolled_back_adoption(dir.path());
+        let expected = adopted.reserve();
+        assert!(expected > 0);
+        let claim = adopted
+            .claim
+            .expect("the adopted screen reserves the carry");
+        let mut pending = Some(
+            term.lock()
+                .unwrap()
+                .resize_offloading_scrollback(8, 33)
+                .expect("the actual retained history is detached for reflow"),
+        );
+        let mut observations = 0;
+        let result = import_with_clock(&term, adopted.carry.take().unwrap(), claim, false, || {
+            observations += 1;
+            if observations == 2 && !expired {
+                let reflowed = pending.take().unwrap().reflow();
+                assert!(
+                    term.lock()
+                        .unwrap()
+                        .finish_resize_offload(reflowed)
+                        .is_none()
+                );
+            }
+            std::time::Instant::now()
+                - if observations == 1 {
+                    age
+                } else {
+                    Duration::ZERO
+                }
+        });
+        if expired {
+            assert!(
+                pending.is_some(),
+                "expiry must not pretend that the native reflow finished"
+            );
+            assert!(
+                result
+                    .as_ref()
+                    .is_err_and(|why| why.contains("a scrollback rewrap was in flight")),
+                "{result:?}"
+            );
+            let reflowed = pending.take().unwrap().reflow();
+            assert!(
+                term.lock()
+                    .unwrap()
+                    .finish_resize_offload(reflowed)
+                    .is_none()
+            );
+        } else {
+            assert!(
+                matches!(result, Ok(Imported::Retained { kept, .. }) if kept == expected),
+                "a completed native reflow must keep the entire verified carry: {result:?}"
+            );
+            assert!(pending.is_none());
+        }
+        assert!(
+            observations >= 2,
+            "the product observed the actual transient refusal"
+        );
+        let t = term.lock().unwrap();
+        assert!(t.older_history_claim_holds(claim));
+        assert_eq!(
+            t.history_cols(),
+            33,
+            "the carry was rebuilt for the actual new width"
+        );
+        assert_eq!(
+            history(&t).iter().any(|line| line.starts_with("line0")),
+            !expired
+        );
+    }
+}
+
 fn receive(dir: &Path, crossed: &Crossed) -> (Arc<Mutex<Terminal>>, ImportReport) {
     let mut adopted = open_sidecar(dir, &crossed.manifest.sessions[0]);
     assert!(
@@ -1521,18 +1600,13 @@ fn a_pending_viewport_restore_keeps_no_pty_master_open() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let (successor, mut adopted) = scrolled_back_adoption(dir.path());
     adopted.watch_input(&input);
-    drop(sink);
-    let mut hup = libc::pollfd {
-        fd: pipe[0],
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    assert_eq!(
-        unsafe { libc::poll(&raw mut hup, 1, 5_000) },
-        1,
-        "no EOF in 5 s"
-    );
     let mut byte = [0u8; 1];
+    // SAFETY: the pipe's read descriptor is live and byte is a writable one-byte buffer.
+    let held_read = unsafe { libc::read(pipe[0], byte.as_mut_ptr().cast(), 1) };
+    let held_error = std::io::Error::last_os_error();
+    assert_eq!(held_read, -1, "the live sink keeps the pipe open");
+    assert_eq!(held_error.kind(), std::io::ErrorKind::WouldBlock);
+    drop(sink);
     let n = unsafe { libc::read(pipe[0], byte.as_mut_ptr().cast(), 1) };
     assert_eq!(
         n, 0,

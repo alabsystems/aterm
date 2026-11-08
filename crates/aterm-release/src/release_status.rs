@@ -254,6 +254,7 @@ fn read_events(reader: impl Read) -> std::io::Result<Events> {
                                 | "compile-unit-dispatched"
                                 | "compile-unit-finished"
                                 | "compile-unit-message-unavailable"
+                                | "compile-unit-timed"
                                 | "inputs"
                                 | "handed"
                                 | "continued"
@@ -989,6 +990,31 @@ mod tests {
         let events = read_events(text.as_bytes()).unwrap();
         assert_eq!((events.rejected_lines, events.count), (0, 3), "{lines:#?}");
         assert!(events.first_failure.is_none());
+    }
+
+    /// A compile's timed units (`compile-unit-timed`, one per compiler its stage's reads dated)
+    /// are events of the run. NEGATIVE CONTROL: without them among the known events each is a
+    /// rejected line and the run's observations are incomplete.
+    #[test]
+    fn a_compiles_timed_units_are_events_of_the_run() {
+        let span = aterm_verify::memory::UnitSpan {
+            unit: aterm_verify::unitgraph::UnitName {
+                package: "aterm-gui".to_owned(),
+                kind: "aterm_gui test".to_owned(),
+            },
+            queued_at_unix_ms: Some(1),
+            started_at_unix_ms: 2,
+            ended_at_unix_ms: 3,
+            cpu_s: 1.0,
+            peak_bytes: 4,
+        };
+        let text: String =
+            aterm_verify::compile_account::span_events("test", &[span.clone(), span])
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect();
+        let events = read_events(text.as_bytes()).unwrap();
+        assert_eq!((events.rejected_lines, events.count), (0, 2), "{text}");
     }
 
     /// A check's `check-finished` line (A19's record source) is an event of the run, and a

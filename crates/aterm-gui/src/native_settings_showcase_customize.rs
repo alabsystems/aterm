@@ -291,8 +291,9 @@ pub(super) fn customize_row(
             if !editing {
                 text.spec.visual_value = Some(String::new());
             }
-            if let Some([r, g, b]) = shown {
-                text.spec.placeholder = Some(format!("#{r:02x}{g:02x}{b:02x}"));
+            if let Some(rgb) = shown {
+                // The theme's colour as the wheel, the palette slots and a typed value spell it.
+                text.spec.placeholder = Some(super::super::color_picker::hex(rgb));
             } else if let (false, SemanticValue::Text(words)) = (editing, &text.value) {
                 text.spec.placeholder = Some(words.clone());
             }

@@ -1373,15 +1373,74 @@ pub(crate) fn read_identity(paths: &Paths) -> crate::Result<Option<Identity>> {
 /// line that is not one).
 const LAB_LINE: &str = "# aterm lab identity: ";
 
+/// The most bytes an identity file holds that a read of it takes.
+const IDENTITY_MAX: usize = 16 << 10;
+
 /// This machine's age identity and its lab mark, read together from one read of
 /// `~/.config/aterm/secrets/identity`: the mark is a line starting [`LAB_LINE`], written when the
 /// identity was made ([`install_identity`]).
 pub(crate) fn read_identity_marked(
     paths: &Paths,
 ) -> crate::Result<Option<(Identity, Option<crate::LabMark>)>> {
-    let Some(bytes) = fsx::read_private(&paths.identity_file(), 16 << 10)? else {
+    let Some(bytes) = fsx::read_private(&paths.identity_file(), IDENTITY_MAX)? else {
         return Ok(None);
     };
+    identity_marked_in(paths, &bytes).map(Some)
+}
+
+/// The recipient of this machine's age identity ([`read_identity`]), `None` where there is none,
+/// kept for the digest of the bytes it was parsed from. The identity file's digest is kept while
+/// the file stands ([`fsx::private_digest`]), so a check that compares this Mac's recipient opens
+/// the secret only when the file changed. Only digests and recipients are kept, never the key.
+pub(crate) fn identity_recipient(paths: &Paths) -> crate::Result<Option<Recipient>> {
+    type Kept = std::sync::Mutex<std::collections::VecDeque<([u8; 32], Recipient)>>;
+    #[cfg(not(test))]
+    static RECIPIENTS: Kept = std::sync::Mutex::new(std::collections::VecDeque::new());
+    #[cfg(test)]
+    std::thread_local! {
+        /// A test thread's own recipients, so one test's asks never let go of another's.
+        static THREAD_RECIPIENTS: Kept =
+            const { std::sync::Mutex::new(std::collections::VecDeque::new()) };
+    }
+    /// The identities whose recipients are kept, the oldest let go first.
+    const KEPT: usize = 8;
+    let recipient_in = |kept: &Kept| -> crate::Result<Option<Recipient>> {
+        let path = paths.identity_file();
+        let Some(digest) = fsx::private_digest(&path, IDENTITY_MAX)? else {
+            return Ok(None);
+        };
+        if let Ok(kept) = kept.lock()
+            && let Some((_, recipient)) = kept.iter().find(|(of, _)| *of == digest)
+        {
+            return Ok(Some(*recipient));
+        }
+        let Some(bytes) = fsx::read_private(&path, IDENTITY_MAX)? else {
+            return Ok(None);
+        };
+        let recipient = identity_marked_in(paths, &bytes)?.0.recipient();
+        let parsed = aterm_digest::Sha256::digest(bytes.as_slice());
+        if let Ok(mut kept) = kept.lock() {
+            kept.retain(|(of, _)| *of != parsed);
+            if kept.len() >= KEPT {
+                kept.pop_front();
+            }
+            kept.push_back((parsed, recipient));
+        }
+        Ok(Some(recipient))
+    };
+    #[cfg(not(test))]
+    {
+        recipient_in(&RECIPIENTS)
+    }
+    #[cfg(test)]
+    THREAD_RECIPIENTS.with(recipient_in)
+}
+
+/// The identity and lab mark `bytes`, the identity file's, hold ([`read_identity_marked`]).
+fn identity_marked_in(
+    paths: &Paths,
+    bytes: &SecretBytes,
+) -> crate::Result<(Identity, Option<crate::LabMark>)> {
     let text = bytes
         .as_str()
         .ok_or_else(|| Error::new("identity: not UTF-8"))?;
@@ -1400,7 +1459,7 @@ pub(crate) fn read_identity_marked(
             paths.identity_file().display()
         ))
     })?;
-    Ok(Some((identity, mark)))
+    Ok((identity, mark))
 }
 
 /// Read this machine's age identity from `~/.config/aterm/secrets/identity` without creating one.
@@ -7680,25 +7739,48 @@ struct Hearing<'a> {
 /// heard it.
 type AskMembers<'a> = &'a dyn Fn(&Paths) -> crate::Result<usize>;
 
-/// The ask this process's subscriber runs ([`on_ask_members`]); unset, it reaches nobody and
-/// says so.
-static ASK_MEMBERS: std::sync::OnceLock<fn(&Paths) -> crate::Result<usize>> =
-    std::sync::OnceLock::new();
+/// A passive, owned native readiness source. Packets only wake an ordinary member
+/// ask; this source provides no peer identity, proof or admission authority.
+pub trait MemberArrivals: Send {
+    /// Refresh attachments after activation, a route change or a broker arrival.
+    /// A healthy source is not refreshed on the observer's periodic looks.
+    /// # Errors
+    /// No permitted attachment could be opened or retained.
+    fn refresh(&mut self) -> std::io::Result<()>;
+    /// At most eight descriptors, borrowed until the listener's wait ends.
+    fn fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>>;
+    /// Drain a bounded ready batch, coalescing duplicate untrusted hints.
+    /// # Errors
+    /// An attached socket could not be read or its custody was withdrawn.
+    fn poll(&mut self) -> std::io::Result<bool>;
+}
+
+struct MemberCallbacks {
+    ask: fn(&Paths) -> crate::Result<usize>,
+    arrivals: fn(&Paths) -> std::io::Result<Box<dyn MemberArrivals>>,
+}
+
+/// The ask and its passive native readiness source share one registration.
+static ASK_MEMBERS: std::sync::OnceLock<MemberCallbacks> = std::sync::OnceLock::new();
 
 /// Ask ALab's members on the LAN with `ask` (`aterm members join`'s, over the fleet port's
 /// `ask` op, which aterm-secrets cannot dial itself) while this Mac waits to be let into the
-/// ALab vault ([`ask_members_if_due`]). The first call wins.
-pub fn on_ask_members(ask: fn(&Paths) -> crate::Result<usize>) {
-    let _ = ASK_MEMBERS.set(ask);
+/// ALab vault ([`ask_members_if_due`]). Its owned passive source is retained only after
+/// ordinary asking established that wait. The first call wins.
+pub fn on_ask_members(
+    ask: fn(&Paths) -> crate::Result<usize>,
+    arrivals: fn(&Paths) -> std::io::Result<Box<dyn MemberArrivals>>,
+) {
+    let _ = ASK_MEMBERS.set(MemberCallbacks { ask, arrivals });
 }
 
 /// How long a Mac waiting to be let into ALab waits at least before asking its members again,
 /// after `asks` asks in a row: 20 seconds, then 1, 2, 4 and 8 minutes, then every 15. An ask goes
-/// at the top of a subscriber round, which a waiting Mac's long poll holds about 25 seconds, so
-/// the second ask comes on the round after the first: a member on the home ALab LAN lets the Mac
-/// in on its first ask (`client::readmit`), and the second follows one that missed (a member busy
-/// with a vault pass, or a connection its listener's watchdog cut) about half a minute later,
-/// while a round that fails and naps 5 seconds asks no more often. A member keeps one row per
+/// at the top of a subscriber round or when its existing readiness worker sees that this
+/// deadline is due. The worker checks at its ordinary local-observation pace, so the vault's
+/// roughly 25-second long poll cannot postpone a due ask. A member on the home ALab LAN lets
+/// the Mac in on its first ask (`client::readmit`); a member busy with a vault pass, or a
+/// connection its listener's watchdog cut, can answer the next. A member keeps one row per
 /// asking Mac (`members::desk`), so an ask again shows nothing new there.
 fn ask_members_pause(asks: u32) -> Duration {
     const SECONDS: [u64; 6] = [20, 60, 120, 240, 480, 900];
@@ -7722,6 +7804,9 @@ struct MembersAsked {
     on: Option<(Option<String>, u64)>,
     /// How this Mac's network is read: [`crate::network::default_route`], or a test's.
     network: fn() -> Option<String>,
+    /// Positive asking custody only, at the exact inputs the ordinary predicate read.
+    /// It paces a passive hint source, never a proof or an admission effect.
+    waiting: Option<vault_memo::InputStamps>,
 }
 
 impl Default for MembersAsked {
@@ -7732,11 +7817,48 @@ impl Default for MembersAsked {
             asks: 0,
             on: None,
             network: crate::network::default_route,
+            waiting: None,
         }
     }
 }
 
 impl MembersAsked {
+    fn ended(&mut self) {
+        self.at = None;
+        self.asks = 0;
+        self.on = None;
+        self.waiting = None;
+    }
+
+    /// No prior ordinary ask means no native receiver and no private read. While
+    /// asking, only changed inputs re-evaluate the same ordinary waiting predicate.
+    /// A later intent is first observed by an ordinary subscriber round; reopening
+    /// then owes a fresh ask to cover readiness announced before the receiver armed.
+    fn still_asking(&mut self, paths: &Paths) -> bool {
+        if self.at.is_none() || self.on.is_none() {
+            self.waiting = None;
+            return false;
+        }
+        let Some(before) = member_waiting_inputs(paths) else {
+            self.waiting = None;
+            return false;
+        };
+        if self.waiting.as_ref() == Some(&before) {
+            return true;
+        }
+        self.waiting = None;
+        if member_waiting(paths).is_none() {
+            self.ended();
+            return false;
+        }
+        if Some(&before) == member_waiting_inputs(paths).as_ref() {
+            self.waiting = Some(before);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Keep the join request's time this subscriber's own ask again moved it to (`requested`,
     /// read after [`ask_again_if_due`]), so that move is not taken for a person's Join.
     fn asked_again(&mut self, requested: Option<u64>) {
@@ -7744,6 +7866,46 @@ impl MembersAsked {
             *kept = requested;
         }
     }
+}
+
+fn member_waiting_inputs(paths: &Paths) -> Option<vault_memo::InputStamps> {
+    vault_memo::stamp_inputs(paths, |paths| {
+        let mut inputs = vault_memo::inputs(paths)?;
+        inputs.extend([
+            handover::allowed_file(paths),
+            paths.dir.join(alab_join::FILE),
+        ]);
+        Some(inputs)
+    })
+}
+
+struct MemberWaiting {
+    requested: u64,
+    bootstrap: bool,
+}
+
+/// The one eligibility predicate for ordinary asking and its passive native hints.
+fn member_waiting(paths: &Paths) -> Option<MemberWaiting> {
+    let config = self::config(paths)
+        .ok()
+        .flatten()
+        .filter(|config| matches!(config.source, Source::Url(_)) && alab_vault(config));
+    let state = load_state(paths).ok();
+    let bootstrap = alab_join::pending(paths);
+    // A seatless recipient asks with the same keys until a seat binds it.
+    let waiting = config.as_ref().is_some_and(|config| {
+        state
+            .as_ref()
+            .is_some_and(|state| state.membership == Stored::Pending)
+            && (!holds_allowed(paths)
+                || log_entries::trusted_configured_log(paths, config)
+                    .is_ok_and(|log| log.is_some()))
+    }) || seat_ask::asks_for_seat(paths)
+        || bootstrap;
+    state.filter(|_| waiting).map(|state| MemberWaiting {
+        requested: state.requested,
+        bootstrap,
+    })
 }
 
 /// Ask ALab's members on the LAN to show this Mac's request with `ask` while it waits to be let
@@ -7776,28 +7938,9 @@ fn ask_members_if_due_with_native(
     native: &dyn Fn(&Paths) -> crate::Result<NativeAdmission>,
     log: &dyn Fn(&str),
 ) {
-    let config = self::config(paths)
-        .ok()
-        .flatten()
-        .filter(|config| matches!(config.source, Source::Url(_)) && alab_vault(config));
-    let state = load_state(paths).ok();
-    let bootstrap = alab_join::pending(paths);
-    // A seatless recipient (its locker opened, no seat binds it) asks as a waiting Mac does, with
-    // the same keys, until a seat binds it (one-mesh S1, `seat_ask`).
-    let waiting = config.as_ref().is_some_and(|config| {
-        state
-            .as_ref()
-            .is_some_and(|state| state.membership == Stored::Pending)
-            && (!holds_allowed(paths)
-                || log_entries::trusted_configured_log(paths, config)
-                    .is_ok_and(|log| log.is_some()))
-    }) || seat_ask::asks_for_seat(paths)
-        || bootstrap;
-    let Some(state) = state.filter(|_| waiting) else {
+    let Some(waiting) = member_waiting(paths) else {
         // A wait that begins again starts its pauses over.
-        asked.at = None;
-        asked.asks = 0;
-        asked.on = None;
+        asked.ended();
         return;
     };
     // A read with no default route (the Wi-Fi not joined yet after a wake), or one whose gateway
@@ -7807,7 +7950,7 @@ fn ask_members_if_due_with_native(
         .or_else(|| asked.on.as_ref().and_then(|(was, _)| was.clone()));
     let moved = asked.on.as_ref().is_some_and(|(was, requested)| {
         (network.is_some() && network != *was)
-            || (state.requested != 0 && state.requested != *requested)
+            || (waiting.requested != 0 && waiting.requested != *requested)
     });
     if moved {
         asked.at = None;
@@ -7821,8 +7964,8 @@ fn ask_members_if_due_with_native(
     }
     asked.at = Some(Instant::now());
     asked.asks = asked.asks.saturating_add(1);
-    asked.on = Some((network, state.requested));
-    let said = if bootstrap {
+    asked.on = Some((network, waiting.requested));
+    let said = if waiting.bootstrap {
         match native(paths) {
             Ok(NativeAdmission::Admitted) => "native bootstrap admitted this Mac".to_owned(),
             Ok(NativeAdmission::Uncertain) => {
@@ -7861,7 +8004,7 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
     let standing = StandingBrowse::default();
     let found = PeerDiscovery::watching(&bell, &standing);
     let ask = |paths: &Paths| match ASK_MEMBERS.get() {
-        Some(ask) => ask(paths),
+        Some(callbacks) => (callbacks.ask)(paths),
         None => Err(Error::new("this program cannot reach ALab's members")),
     };
     let hold = || standing.stop();

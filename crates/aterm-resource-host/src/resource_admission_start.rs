@@ -267,6 +267,7 @@ impl Owner {
             completion: None,
             launched: false,
             closed: None,
+            runtime_inputs: runtime_inputs::State::default(),
             settlement_at: None,
         };
         if prepared.is_ok()

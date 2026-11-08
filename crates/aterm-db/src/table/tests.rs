@@ -944,6 +944,40 @@ fn a_vault_writer_at_a_store_open_is_busy_not_stale_membership() {
     session.context(scope).unwrap();
 }
 
+/// A vault writer that takes the state lock between a session open's custody check and its read
+/// of the home's access makes the open busy, which a reader observes again, not "Commons
+/// membership is not ready for table access", a repair cause nothing retries. The lock is taken
+/// after the custody check: held across the whole open, `revalidate_custody` is already busy, so
+/// a test of that shape passes with or without the fix.
+/// NEGATIVE CONTROL (2026-11-08): with `with_generation` reading `access_in`, the held lock reads
+/// as not-ready membership.
+#[test]
+fn a_vault_writer_at_a_session_open_is_busy_not_unready_membership() {
+    let lab = Lab::with_foundation(&[Role::Writer]);
+    client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
+    let bootstrap = lab.bootstrap(0);
+    bootstrap
+        .revalidate_custody()
+        .expect("CONTROL: custody holds with no writer");
+    let journal = Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).unwrap();
+    let writer = client::test_hold_state_lock(&lab.paths[0]).unwrap();
+    let refused = Session::with_generation(
+        &bootstrap,
+        journal,
+        None,
+        Some(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+    )
+    .err()
+    .expect("a held state lock opens no session");
+    drop(writer);
+    assert!(refused.is_busy(), "{refused}");
+    assert!(
+        !refused.to_string().contains("not ready for table access"),
+        "{refused}"
+    );
+    Session::observe(&bootstrap).expect("the session opens once the writer is gone");
+}
+
 /// Under a log, with no generation, a read's currency is the log's answer, and a scope is held to
 /// the journal's trust. A session with a generation asks that generation, whose check can wait.
 ///

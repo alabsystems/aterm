@@ -928,10 +928,15 @@ pub struct FxLayer {
     pub offset: (i32, i32),
     /// The layer's clip in `space` (a pane box).
     pub clip: PxRect,
+    /// The host chrome the layer is drawn on, as the occluder that chrome pushed names it
+    /// (window pixels, [`RenderInput::fx_occluders`](crate::render::RenderInput::fx_occluders)):
+    /// that occluder does not cut the layer and every other one does, so a menu card's own
+    /// marks stand over the card that hides every other layer. `None`: every occluder cuts it.
+    pub chrome: Option<PxRect>,
 }
 
 impl FxLayer {
-    /// A layer at offset `(0, 0)`, unclipped, without bloom or knock-out.
+    /// A layer at offset `(0, 0)`, unclipped, without bloom or knock-out, on no chrome.
     ///
     /// # Panics (debug)
     /// When the content cannot be drawn under `blend`, or a [`FxBlend::Linear`] layer asks for
@@ -963,6 +968,7 @@ impl FxLayer {
             knock: false,
             offset: (0, 0),
             clip: PxRect::EVERYWHERE,
+            chrome: None,
         }
     }
 
@@ -989,6 +995,7 @@ impl PartialEq for FxLayer {
             && self.knock == other.knock
             && self.offset == other.offset
             && self.clip == other.clip
+            && self.chrome == other.chrome
     }
 }
 
@@ -1455,7 +1462,7 @@ mod tests {
             ..base.clone()
         };
         assert_ne!(base, twin, "equal bytes in a new Arc are a change");
-        let variants: [fn(&mut FxLayer); 8] = [
+        let variants: [fn(&mut FxLayer); 9] = [
             |l| l.id += 1,
             |l| l.slot = FxSlot::Over,
             |l| l.space = FxSpace::Grid,
@@ -1464,6 +1471,7 @@ mod tests {
             |l| l.knock = true,
             |l| l.offset.1 += 1,
             |l| l.clip = PxRect::new(0, 0, 1, 1),
+            |l| l.chrome = Some(PxRect::new(0, 0, 1, 1)),
         ];
         for (i, change) in variants.iter().enumerate() {
             let mut other = base.clone();

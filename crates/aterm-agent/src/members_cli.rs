@@ -777,6 +777,16 @@ impl MemberDiscovery for NativeMembers {
     }
 }
 
+/// Own passive native member availability hints for the subscriber's existing readiness
+/// worker. They wake an ordinary authenticated ask and never supply membership evidence.
+///
+/// # Errors
+/// The live member browse is refused by lab isolation, the identity cannot be read, or the
+/// native arrival source cannot be opened.
+pub fn member_arrivals(paths: &Paths) -> std::io::Result<Box<dyn client::MemberArrivals>> {
+    Ok(Box::new(crate::lan_members::Arrivals::start(paths)?))
+}
+
 /// One owned numeric round. Explicit addresses and supplied complete sets need no
 /// solicitation; a live probe keeps its nonce and sockets across authentication.
 enum NumericMembers {

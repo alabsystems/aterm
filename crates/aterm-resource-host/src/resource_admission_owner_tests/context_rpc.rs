@@ -7,8 +7,10 @@
 
 use super::*;
 use aterm_capacity::host_executable::Store as ImageStore;
+use aterm_toolchain::record_lock::RecordLock;
 use aterm_uds::{CtlListener, deadline, spawnfd};
 use std::fs;
+use std::os::fd::AsFd;
 use trust_resource_controller::{self as control, client::Client};
 use trust_resource_provenance::Store as ReadStore;
 
@@ -120,13 +122,45 @@ fn host() {
                         assert_eq!(peer.birth, birth);
                         let held = world.owner.debt.reserved().unwrap();
                         assert_eq!(held, 1);
-                        crate::resource_context::serve(
-                            &stream,
-                            peer,
-                            &hello,
-                            end,
-                            |peer, query| world.owner.context(peer, &query),
-                        )
+                        match hello["role"].as_str() {
+                            Some("native-context") => crate::resource_context::serve(
+                                &stream,
+                                peer,
+                                &hello,
+                                end,
+                                |peer, query| world.owner.context(peer, &query),
+                            ),
+                            Some(control::runtime_input_retention::SUPPORT_ROLE) => {
+                                crate::runtime_input_transport::support_with(
+                                    &stream,
+                                    peer,
+                                    &hello,
+                                    end,
+                                    |peer, query| world.owner.context(peer, &query),
+                                )
+                            }
+                            Some(control::runtime_input_retention::PURPOSE) => {
+                                let owner = std::cell::RefCell::new(&mut world.owner);
+                                crate::runtime_input_transport::serve_with(
+                                    &stream,
+                                    peer,
+                                    &hello,
+                                    end,
+                                    |peer, request| {
+                                        owner.borrow_mut().runtime_inputs_begin(peer, request)
+                                    },
+                                    |peer, query| owner.borrow_mut().context(peer, &query),
+                                    |preparing, descriptions, transport| {
+                                        owner.borrow_mut().runtime_inputs_retain(
+                                            preparing,
+                                            descriptions,
+                                            transport,
+                                        )
+                                    },
+                                )
+                            }
+                            other => panic!("unexpected actual native context role {other:?}"),
+                        }
                         .unwrap();
                         assert_eq!(world.owner.debt.reserved().unwrap(), held);
                         lookups += 1;
@@ -150,12 +184,21 @@ fn host() {
             std::thread::sleep(POLL);
         }
     }
-    assert_eq!(lookups, 2);
+    assert_eq!(lookups, 4);
     let Event::Finished { outcome, .. } = read_event(&events, &binding) else {
         panic!("actual context root supplied no terminal fact")
     };
     assert_eq!(outcome, Outcome::Exit(0));
     world.assert_settled(&binding, &memory, pid);
+    // The client closed every original input and its observation owner while
+    // the Host was still active. Only actual original settlement closes the
+    // Host's shared output-lock copy.
+    let released = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path.join("runtime-output/lock"))
+        .unwrap();
+    drop(RecordLock::try_lock(released, 0).unwrap());
     fs::remove_file(socket).unwrap();
 }
 
@@ -175,6 +218,7 @@ fn client() {
         binding,
         call_attempt: [61; 16],
     };
+    let original_query = query.clone();
     let reply = caller.context(&query, until).unwrap();
     let pid = std::process::id();
     let birth = process::read_birth(i32::try_from(pid).unwrap()).unwrap().0;
@@ -196,5 +240,111 @@ fn client() {
     assert_eq!(
         denied.delivery,
         control::client::Delivery::ContextUnavailable
+    );
+    runtime_input_handoff(&caller, &path, original_query, until);
+}
+
+fn runtime_input_handoff(
+    caller: &Client,
+    path: &std::path::Path,
+    mut query: control::ContextQuery,
+    until: Instant,
+) {
+    use control::runtime_input_retention as inputs;
+    query.call_attempt = [63; 16];
+    let support = caller
+        .runtime_input_support(
+            &inputs::SupportQuery {
+                query: query.clone(),
+            },
+            until,
+        )
+        .unwrap();
+    assert!(support.observation().context.sdk.is_none());
+    let runtime = path.join("runtime-inputs");
+    let output = path.join("runtime-output");
+    fs::create_dir(&runtime).unwrap();
+    fs::create_dir(&output).unwrap();
+    let mut observed = vec![super::runtime_inputs::input(
+        inputs::Kind::RuntimeRoot,
+        &runtime,
+        b"",
+    )];
+    let mut originals = vec![File::open(&runtime).unwrap()];
+    for index in 0..12 {
+        let logical = format!("d{index}");
+        let directory = runtime.join(&logical);
+        fs::create_dir(&directory).unwrap();
+        observed.push(super::runtime_inputs::input(
+            inputs::Kind::RuntimeDirectory,
+            &directory,
+            logical.as_bytes(),
+        ));
+        originals.push(File::open(directory).unwrap());
+    }
+    for index in 0..156 {
+        let logical = format!("d{}/input{index}", index % 12);
+        let file = runtime.join(&logical);
+        fs::write(&file, format!("actual input {index}")).unwrap();
+        observed.push(super::runtime_inputs::input(
+            inputs::Kind::RuntimeFile,
+            &file,
+            logical.as_bytes(),
+        ));
+        originals.push(File::open(file).unwrap());
+    }
+    observed.push(super::runtime_inputs::input(
+        inputs::Kind::OutputRoot,
+        &output,
+        b"",
+    ));
+    originals.push(File::open(&output).unwrap());
+    let lock_path = output.join("lock");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+        .unwrap();
+    // Explicitly convert the SAME actual lock to close-only custody before
+    // offering a copy. Ordinary LOCK_UN Drop would unlock the Host's copy.
+    let lock = RecordLock::try_lock(lock, 0).unwrap().into_close_only();
+    observed.push(super::runtime_inputs::input(
+        inputs::Kind::OutputLock,
+        &lock_path,
+        b"lock",
+    ));
+    originals.push(File::from(lock.try_clone_fd().unwrap()));
+    drop(lock);
+    assert_eq!(observed.len(), 171);
+    assert_eq!(originals.len(), 171);
+    query.call_attempt = [64; 16];
+    let request = inputs::Request {
+        query,
+        transfer: [65; 16],
+        inputs: observed,
+    };
+    let retained = caller
+        .retain_runtime_inputs(
+            &request,
+            &originals.iter().map(AsFd::as_fd).collect::<Vec<_>>(),
+            until,
+        )
+        .unwrap();
+    assert_eq!(retained.request().inputs.len(), 171);
+    assert!(retained.observation().context.sdk.is_none());
+    drop(originals);
+    drop(retained);
+    let contender = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .unwrap();
+    assert!(
+        matches!(
+            RecordLock::try_lock(contender, 0),
+            Err(std::fs::TryLockError::WouldBlock)
+        ),
+        "closing original inputs and Retained observation released Host custody before root settlement"
     );
 }

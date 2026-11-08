@@ -576,7 +576,7 @@ fn typed_between_lettered_rows(
 /// where there is one, the companion coming up beside it, and the typing scene's line typed at
 /// 60 ms a key from 1 s, keys through the console, every frame's coat read, its letters judged
 /// against their own readings where `letters` says ([`Replay::own`]); and the replay's cell
-/// height.
+/// height. Each of `above` and `below` fits the grid's row ([`words_apart`]).
 fn typed_under_a_lettered_row(
     style: &str,
     look: Look,
@@ -585,6 +585,12 @@ fn typed_under_a_lettered_row(
     old: &[OldPath],
     letters: bool,
 ) -> (Vec<Judged>, i32) {
+    for line in [above, below] {
+        assert!(
+            line.chars().count() <= usize::from(COLS),
+            "fixture: {line:?} fits the grid's {COLS} columns: a longer row wraps onto the next"
+        );
+    }
     let mut r = Replay::new(style, look, TrailColor::Automatic);
     r.coat = true;
     r.letters = letters;
@@ -603,6 +609,26 @@ fn typed_under_a_lettered_row(
     let mut ev = vec![(0, Ev::Out(page.into_bytes()))];
     ev.extend(typed(TYPING_TEXT, TYPING_FROM, 60));
     (r.run(&ev, 1_600), ch)
+}
+
+/// `words` a `gap` of blank cells apart after `lead` blank cells, as many of them as the grid's
+/// row holds ([`COLS`]): a longer row wraps, and its tail lands on the row under it, the
+/// prompt's under a row above it. The look ahead's control row, two gaps of seven cells in
+/// (Linux's 13 x 29 px cell, a body 6.25 cells across), ran 10 cells past the grid's 72: its
+/// `yz` landed on the prompt's row under the cat's stand by the caret, so the cat sat two rows
+/// under the prompt, under no letter, and the control never met one (on the gallery's 14 x 26
+/// px cell the two cells past the grid fell under the prompt's `$ `).
+fn words_apart(lead: usize, words: &[&str], gap: usize) -> String {
+    let mut row = " ".repeat(lead);
+    for (i, word) in words.iter().enumerate() {
+        let sep = if i == 0 { 0 } else { gap };
+        if row.chars().count() + sep + word.chars().count() > usize::from(COLS) {
+            break;
+        }
+        row.push_str(&" ".repeat(sep));
+        row.push_str(word);
+    }
+    row
 }
 
 /// The letters of row `row` judged from `from` ms that read under their bar, the lower of
@@ -718,18 +744,21 @@ const TYPING_FROM: u64 = 1_000;
 /// (186 frames under `gjpqy`, 73 under the sentence, measured by ink).
 ///
 /// Under ragged output above (words the body's width apart, rounded up to a cell, a long
-/// listing's columns as far apart, words 24 cells apart), the gaps wider than the body: the
-/// law reads the row above as far past the body, either side, as its ease can take it
-/// ([`OldPath::HeadLooksAhead`]; reverted alone, the box of the cat getting going out of the
-/// gap it rests in meets the next word's first letters: the ragged words two gaps' width in,
-/// so the stand by the prompt's caret lies in a gap), at the speed the run can reach in the
-/// ease and past a stand the writing carries on ([`OldPath::LookAheadAtTopSpeed`]; reverted
-/// alone, under words 24 cells apart, the first 24 cells in, the cat speeding up off the first
-/// keys meets `efgh` before its sink is done, r24 K7-1), and once drawn down the body stays
-/// down across a gap wider than that ([`OldPath::HeadHeldAcrossGaps`]; reverted alone, under
-/// words 24 cells apart it rises whole in the gap, its box past the prompt row's top, and is
-/// drawn down again at the next word). Review9fix round 3's review:
-/// 13 of 211 frames on the row above's letters, at its columns 10-12, 20 and 30-32.
+/// listing's columns as far apart, words 24 cells apart, each row as many words as the grid's
+/// row holds, [`words_apart`]), the gaps wider than the body: the law reads the row above as
+/// far past the body, either side, as its ease can take it ([`OldPath::HeadLooksAhead`];
+/// reverted alone, the box of the cat getting going out of the gap it rests in meets the next
+/// word's first letters: the ragged words two gaps' width in, so the stand by the prompt's
+/// caret lies in a gap; 6 frames on `abcd` under Linux's 13 x 29 px cell), at the speed the run
+/// can reach in the ease and past a stand the writing carries on
+/// ([`OldPath::LookAheadAtTopSpeed`]; reverted alone, under words 24 cells apart, the first 24
+/// cells in, the cat speeding up off the first keys meets `efgh` before its sink is done, r24
+/// K7-1), and once drawn down the body stays down across a gap wider than that
+/// ([`OldPath::HeadHeldAcrossGaps`]; reverted alone, under words 24 cells apart it rises whole
+/// in the gap, its box past the prompt row's top, and is drawn down again at the next word).
+/// Each look ahead's scene is replayed with every law kept as well, and there no frame's box
+/// meets a glyph's cell in the row above. Review9fix round 3's review: 13 of 211 frames on the
+/// row above's letters, at its columns 10-12, 20 and 30-32.
 #[test]
 fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
     let gj = "gjpqy ".repeat(12);
@@ -738,12 +767,17 @@ fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
     // on the gallery's 14 x 26 px cells (a body 5.2 cells across) and seven under Linux's
     // bundled JetBrains Mono's 13 x 29 (6.25 across), where six held no body.
     let cell = Replay::new("off", DARK, TrailColor::Automatic).cell;
-    let gap = " ".repeat(art_cols(cell.0 as u16, cell.1 as u16).ceil() as usize);
-    let ragged = ["abcd", "efgh", "ijkl", "mnop", "qrst", "uvwx", "yz"].join(&gap);
-    let listing = ["ls -la", "total 48", "drwxr-xr-x", "staff", "Oct 29"].join(&gap);
-    let wide = format!("abcd{0}efgh{0}ijkl", " ".repeat(24));
-    let gapped = format!("{gap}{gap}{ragged}");
-    let wide_gapped = format!("{0}efgh{0}ijkl", " ".repeat(24));
+    let gap = art_cols(cell.0 as u16, cell.1 as u16).ceil() as usize;
+    let words = ["abcd", "efgh", "ijkl", "mnop", "qrst", "uvwx", "yz"];
+    let ragged = words_apart(0, &words, gap);
+    let listing = words_apart(
+        0,
+        &["ls -la", "total 48", "drwxr-xr-x", "staff", "Oct 29"],
+        gap,
+    );
+    let wide = words_apart(0, &["abcd", "efgh", "ijkl"], 24);
+    let gapped = words_apart(2 * gap, &words, gap);
+    let wide_gapped = words_apart(24, &["efgh", "ijkl"], 24);
     let from = 600;
     for rows in [
         (gj.as_str(), ""),
@@ -796,33 +830,31 @@ fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
         rises_past_the_row(&held, from, 4, ch, line_end(&wide)) > 0,
         "negative control (the hold): the box never rose past the row once held"
     );
-    let (late, _) = typed_under_a_lettered_row(
-        "rainbow kitty pet",
-        DARK,
-        4,
-        (gapped.as_str(), ""),
-        &[OldPath::HeadLooksAhead],
-        false,
-    );
-    assert!(
-        boxes_on_glyphs(&late, from, 3..=3) > 0,
-        "negative control (the look ahead): the box never met the next word's letters: {:?}",
-        sum(&late, from)
-    );
-    let (short, _) = typed_under_a_lettered_row(
-        "rainbow kitty pet",
-        DARK,
-        4,
-        (&wide_gapped, ""),
-        &[OldPath::LookAheadAtTopSpeed],
-        false,
-    );
-    assert!(
-        boxes_on_glyphs(&short, from, 3..=3) > 0,
-        "negative control (the look ahead at the run's top speed): the box never met the next \
-         word's letters: {:?}",
-        sum(&short, from)
-    );
+    for (scene, law, what) in [
+        (&gapped, OldPath::HeadLooksAhead, "the look ahead"),
+        (
+            &wide_gapped,
+            OldPath::LookAheadAtTopSpeed,
+            "the look ahead at the run's top speed",
+        ),
+    ] {
+        let boxed = |old: &[OldPath]| {
+            let (judged, _) =
+                typed_under_a_lettered_row("rainbow kitty pet", DARK, 4, (scene, ""), old, false);
+            (boxes_on_glyphs(&judged, from, 3..=3), sum(&judged, from))
+        };
+        let (kept, s) = boxed(&[]);
+        assert_eq!(
+            kept, 0,
+            "{what}'s scene under {scene:?}, every law kept: frames whose box meets a glyph's \
+             cell in the row above: {s:?}"
+        );
+        let (old, s) = boxed(&[law]);
+        assert!(
+            old > 0,
+            "negative control ({what}): the box never met the next word's letters: {s:?}"
+        );
+    }
 }
 
 /// THE COMPANION'S BOX KEEPS OFF A LETTERED ROW ABOVE A PROMPT ON THE GRID'S LAST ROW (review9fix

@@ -17,6 +17,7 @@ pub use check::{check_initial_setup, check_initial_setup_observed};
 pub use input_activation::input_setup_scope_at;
 pub use input_activation::{
     InputServiceSet, InputSetupScope, activate_input_attachments, input_setup_scope,
+    with_current_input_scope,
 };
 pub use input_pass::{
     InitialInputPass, PendingInputAdmission, initial_setup_input_park_mark,

@@ -1820,6 +1820,182 @@ mod tests {
     }
 
     #[test]
+    fn a_list_key_takes_a_list_and_an_empty_one_is_no_value() {
+        // `fallback_fonts []` wrote the string "[]", which the font list read as one fallback font
+        // named "[]".
+        for key in [
+            crate::prefs::EDIT_FALLBACK_FONTS,
+            crate::prefs::EDIT_FONT_VARIATION,
+        ] {
+            let mut service =
+                VersionedConfigService::new(format!("{key} = [\"wght=450\"]\n")).unwrap();
+            let base = service.snapshot().revision;
+            service.patch(edit(base, key, ExpectedValue::Any, Some("[]")));
+            assert_eq!(service.value(key).unwrap(), None, "{key} []");
+            assert_eq!(&*service.snapshot().text, "", "{key} []");
+
+            let base = service.snapshot().revision;
+            service.patch(edit(
+                base,
+                key,
+                ExpectedValue::Any,
+                Some("[\"Alpha Mono\", \"Beta Sans\"]"),
+            ));
+            let config = crate::app_config::Config::parse(&service.snapshot().text).unwrap();
+            let list = if key == crate::prefs::EDIT_FALLBACK_FONTS {
+                config.fallback_fonts
+            } else {
+                config.font_variation
+            };
+            assert_eq!(
+                list.map(|list| list.0),
+                Some(vec!["Alpha Mono".to_string(), "Beta Sans".to_string()]),
+                "{key}: {}",
+                service.snapshot().text
+            );
+        }
+        for key in crate::prefs::LIST_KEYS {
+            let mut service = VersionedConfigService::new(String::new()).unwrap();
+            let base = service.snapshot().revision;
+            assert!(
+                matches!(
+                    service.patch(edit(base, key, ExpectedValue::Any, Some("[]"))),
+                    ConfigPatchResult::Unchanged { .. }
+                ),
+                "{key} []"
+            );
+        }
+        // Over a theme's own fallback list, an empty one is a value: it takes the theme's away.
+        let studio = {
+            let text = "foreground = #e0e0e0\nbackground = #101418\nfallback_fonts = Menlo\n";
+            let parsed = aterm_types::scheme::parse_theme_str(text).expect("a theme");
+            crate::app_config::ThemeCatalog::from_parsed([("Studio".to_string(), parsed)])
+        };
+        let mut service =
+            VersionedConfigService::new_with_themes("theme = \"Studio\"\n".into(), studio).unwrap();
+        let base = service.snapshot().revision;
+        service.patch(edit(
+            base,
+            crate::prefs::EDIT_FALLBACK_FONTS,
+            ExpectedValue::Any,
+            Some("[]"),
+        ));
+        assert_eq!(
+            service
+                .value(crate::prefs::EDIT_FALLBACK_FONTS)
+                .unwrap()
+                .as_deref(),
+            Some("[]")
+        );
+    }
+
+    #[test]
+    fn a_rows_words_for_no_value_are_never_written_as_one() {
+        // `ctl settings unset shell` answered "now Platform (default)", and `ctl settings set
+        // shell Platform` wrote shell = "Platform", a shell that does not exist; "none" wrote
+        // shell_args = ["none"] (an argument), "No image" a wallpaper file of that name, and a
+        // colour's "Theme" was refused as no colour.
+        use crate::prefs::EditKind;
+        let fields = crate::prefs::editable_fields(&crate::app_config::Config::default());
+        let mut checked = 0;
+        for field in &fields {
+            if !matches!(field.kind, EditKind::Text | EditKind::Color)
+                || field.key.starts_with("ai.")
+                || crate::prefs::config_asset_source_key(field.key)
+            {
+                continue;
+            }
+            let shown = field.placeholder.trim();
+            let bare = shown.split(" \u{2014} ").next().unwrap_or(shown);
+            let bare = bare.split(" (").next().unwrap_or(bare).trim();
+            for words in [shown, bare] {
+                let mut service = VersionedConfigService::new(String::new()).unwrap();
+                let base = service.snapshot().revision;
+                let result = service.patch(edit(base, field.key, ExpectedValue::Any, Some(words)));
+                let written = service.value(field.key).unwrap();
+                assert!(
+                    !matches!(result, ConfigPatchResult::Rejected { .. })
+                        && written
+                            .as_deref()
+                            .is_none_or(|written| !written.eq_ignore_ascii_case(words)),
+                    "{} = {words:?}: {result:?}, wrote {written:?}",
+                    field.key
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 20, "only {checked} text and colour keys");
+    }
+
+    #[test]
+    fn an_unset_rows_words_typed_back_on_ctl_write_nothing() {
+        // `ctl settings unset window_theme` answered "now Auto (default)", and setting those words
+        // back was refused (an exact option kept its mark) while bidi's "Auto (default)" was taken;
+        // a switch's "On (default)" and a number's "12 px (default)" were refused too.
+        use crate::prefs::EditKind;
+        let service = VersionedConfigService::new(String::new()).unwrap();
+        let snapshot = service.snapshot();
+        let fields = crate::prefs::editable_fields(&snapshot.config);
+        let mut checked = std::collections::BTreeMap::<&str, usize>::new();
+        let mut written = Vec::new();
+        for field in &fields {
+            // The theme's words are a_default_value_is_written_as_a_removal's; an asset's key is
+            // written only through Manual.
+            if field.key.starts_with("ai.")
+                || field.kind == EditKind::Theme
+                || crate::prefs::config_asset_source_key(field.key)
+            {
+                continue;
+            }
+            let Some(now) =
+                crate::native_settings::effective_value_words(&snapshot, field.key, true, None)
+            else {
+                continue;
+            };
+            // What a row is held to ("…; Off while Serious Mode …") is no part of its value.
+            let words = now
+                .split_once("; ")
+                .map_or(now.as_str(), |(words, _)| words);
+            // A choice with nothing chosen (the style before Off) has no word that writes it;
+            // a refusal names the choices it takes.
+            if words == "none (default)" && matches!(field.kind, EditKind::Enum { .. }) {
+                continue;
+            }
+            let typed = crate::native_settings::control_input_value(field, words);
+            let mut service = VersionedConfigService::new(String::new()).unwrap();
+            let base = service.snapshot().revision;
+            let result = typed.clone().map(|typed| {
+                service.patch(edit(base, field.key, ExpectedValue::Any, Some(&typed)))
+            });
+            if !matches!(result, Ok(ConfigPatchResult::Unchanged { .. })) {
+                let outcome = match result {
+                    Ok(ConfigPatchResult::Rejected { message, .. }) => {
+                        format!("refused: {message}")
+                    }
+                    Ok(_) => format!("wrote {:?}", service.snapshot().text),
+                    Err(refusal) => refusal,
+                };
+                written.push(format!("{} = {words:?}: {outcome}", field.key));
+            }
+            *checked
+                .entry(match field.kind {
+                    EditKind::Enum { .. } => "choice",
+                    EditKind::Bool => "switch",
+                    EditKind::Float | EditKind::Integer => "number",
+                    _ => "text",
+                })
+                .or_default() += 1;
+        }
+        assert!(written.is_empty(), "{written:#?}");
+        assert!(
+            ["choice", "switch", "number", "text"]
+                .iter()
+                .all(|kind| checked.get(kind).is_some_and(|count| *count > 5)),
+            "{checked:?}"
+        );
+    }
+
+    #[test]
     fn a_default_value_is_written_as_a_removal() {
         let fields = crate::prefs::editable_fields(&crate::app_config::Config::default());
         let mut checked = 0;
@@ -1853,10 +2029,45 @@ mod tests {
         ));
         assert_eq!(&*service.snapshot().text, "bidi = \"disabled\"\n");
 
+        // The built-in Default, in any spelling, draws what no theme does on every appearance (a
+        // theme file cannot shadow it), as Settings' picker removes the key for it; a pair naming
+        // it on both sides turns Follow system on, and stays.
+        for (value, kept) in [
+            ("Default", None),
+            ("default", None),
+            (
+                "dark:Default,light:Default",
+                Some("dark:Default,light:Default"),
+            ),
+            ("Nord", Some("Nord")),
+        ] {
+            let mut service = VersionedConfigService::new("theme = \"Nord\"\n".into()).unwrap();
+            let base = service.snapshot().revision;
+            service.patch(edit(base, "theme", ExpectedValue::Any, Some(value)));
+            assert_eq!(service.value("theme").unwrap().as_deref(), kept, "{value}");
+        }
+        // A font row's no-value words (Automatic, or the theme's font as its picker and row say
+        // it) name no font: written, they named one that does not resolve.
+        for (key, value, kept) in [
+            ("font_family", "Automatic (SF Mono)", None),
+            ("font_family", "automatic", None),
+            ("emoji_font", "Automatic (Apple Color Emoji)", None),
+            ("fallback_fonts", "Automatic", None),
+            ("font_family", "Use theme's (Menlo)", None),
+            ("symbol_font", "Symbols Nerd Font (from theme Studio)", None),
+            ("font_family", "Automatic Mono", Some("Automatic Mono")),
+            ("shell", "Automatic", Some("Automatic")),
+        ] {
+            let mut service = VersionedConfigService::new(format!("{key} = \"Menlo\"\n")).unwrap();
+            let base = service.snapshot().revision;
+            service.patch(edit(base, key, ExpectedValue::Any, Some(value)));
+            assert_eq!(
+                service.value(key).unwrap().as_deref(),
+                kept,
+                "{key} = {value}"
+            );
+        }
         let mut service = VersionedConfigService::new(String::new()).unwrap();
-        let base = service.snapshot().revision;
-        service.patch(edit(base, "theme", ExpectedValue::Any, Some("Default")));
-        assert_eq!(service.value("theme").unwrap().as_deref(), Some("Default"));
         let base = service.snapshot().revision;
         service.patch(edit(base, "window_theme", ExpectedValue::Any, Some("dark")));
         assert_eq!(

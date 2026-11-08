@@ -1252,7 +1252,7 @@ pub(super) fn palette_reset(
     out
 }
 
-/// Spoken label for a `palette_overrides.<index>` key (`"Palette colour 4, blue"`).
+/// Spoken label for a `palette_overrides.<index>` key (`"Palette color 4, blue"`).
 pub(super) fn palette_slot_name(key: &str) -> Option<String> {
     let index_str = key
         .strip_prefix(prefs::EDIT_PALETTE_OVERRIDES)?
@@ -1264,7 +1264,7 @@ pub(super) fn palette_slot_name(key: &str) -> Option<String> {
 }
 
 fn hex_of(color: aterm_types::Rgb) -> String {
-    format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
+    super::color_picker::hex([color.r, color.g, color.b])
 }
 
 /// The ANSI slot names, for a palette chip's spoken label.

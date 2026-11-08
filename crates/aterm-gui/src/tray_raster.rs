@@ -3103,20 +3103,34 @@ pub(crate) fn ui_measures_whole<T>(measure: impl FnOnce() -> T) -> (T, bool) {
 
 /// Face-aware proportional measure.
 pub(crate) fn ui_text_width_for(face: TextFace, s: &str, px: f32) -> f32 {
+    with_fonts(|fonts| ui_text_width_in(fonts, face, s, px))
+}
+
+/// [`ui_text_width_for`] of each of `texts`, in one visit to the font store: a list measuring a
+/// line of each of its many entries (the Messages log's titles, up to its ring's 512) measures
+/// them together rather than entering the store once each.
+pub(crate) fn ui_text_widths_for(face: TextFace, texts: &[&str], px: f32) -> Vec<f32> {
     with_fonts(|fonts| {
-        if let Some(font) = fonts.ui_font(face)
-            && let Some(width) = fonts.measures.width(face, font, px, s)
-        {
-            return width;
-        }
-        let font = fonts.ui_font(face).cloned();
-        let (width, _, whole) = ui_text_width_walk(fonts, face, s, px, 0.0);
-        match font.as_ref() {
-            Some(font) if whole => fonts.measures.keep_width(face, font, px, s, width),
-            _ => UI_MEASURE_PARTIAL.with(|partial| partial.set(true)),
-        }
-        width
+        texts
+            .iter()
+            .map(|text| ui_text_width_in(fonts, face, text, px))
+            .collect()
     })
+}
+
+fn ui_text_width_in(fonts: &mut ChromeFonts, face: TextFace, s: &str, px: f32) -> f32 {
+    if let Some(font) = fonts.ui_font(face)
+        && let Some(width) = fonts.measures.width(face, font, px, s)
+    {
+        return width;
+    }
+    let font = fonts.ui_font(face).cloned();
+    let (width, _, whole) = ui_text_width_walk(fonts, face, s, px, 0.0);
+    match font.as_ref() {
+        Some(font) if whole => fonts.measures.keep_width(face, font, px, s, width),
+        _ => UI_MEASURE_PARTIAL.with(|partial| partial.set(true)),
+    }
+    width
 }
 
 /// The installed font [`ui_text_width_for`] measures `face` in, or `None` with no UI face installed

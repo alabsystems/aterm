@@ -127,11 +127,42 @@ pub(super) fn read_scoped(path: &Path, uid: u32, max: usize, private: bool) -> i
     read_admitted(file, uid, max, private)
 }
 
-/// Unix platforms without macOS's no-follow-any opener walk from an owned root descriptor.
-/// Each component is opened relative to the previous descriptor with O_NOFOLLOW; replacing
-/// a parent name cannot redirect the next open away from the directory already held.
+/// How [`walk`] holds each folder on the way: on Linux as a path (`O_PATH`), which needs only
+/// the search permission a plain open needs there, so a folder its owner may search but not
+/// list (a home under a 0711 folder) is passed as `open` passes it; elsewhere opened to read.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const HELD: libc::c_int = libc::O_PATH;
+#[cfg(all(
+    any(not(target_os = "macos"), test),
+    not(any(target_os = "linux", target_os = "android"))
+))]
+const HELD: libc::c_int = libc::O_RDONLY | libc::O_NONBLOCK;
+
+/// Unix platforms without macOS's no-follow-any opener walk from an owned root descriptor
+/// ([`walk`]); the last component is opened to read, never as a controlling terminal.
 #[cfg(any(not(target_os = "macos"), test))]
 pub(super) fn open_components(path: &Path) -> io::Result<std::fs::File> {
+    walk(path, libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY)
+}
+
+/// [`open_components`] for a caller that only `fstat`s what is at `path` or looks names up
+/// under it: the last component is held as each folder on the way is ([`HELD`]), so a scope
+/// its owner may search but not list is read as on macOS (`O_EVTONLY`), and a link there
+/// answers `ELOOP` as it does when opened to read.
+#[cfg(not(target_os = "macos"))]
+pub(super) fn hold_components(path: &Path) -> io::Result<std::fs::File> {
+    let held = walk(path, HELD | libc::O_NOCTTY)?;
+    if held.metadata()?.file_type().is_symlink() {
+        return Err(io::Error::from_raw_os_error(libc::ELOOP));
+    }
+    Ok(held)
+}
+
+/// Each component opened relative to the previous descriptor with O_NOFOLLOW, each folder on
+/// the way held as [`HELD`] says and the last with `last`; replacing a parent name cannot
+/// redirect the next open away from the directory already held.
+#[cfg(any(not(target_os = "macos"), test))]
+fn walk(path: &Path, last: libc::c_int) -> io::Result<std::fs::File> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     use std::os::unix::ffi::OsStrExt as _;
@@ -145,21 +176,19 @@ pub(super) fn open_components(path: &Path) -> io::Result<std::fs::File> {
     }
     let mut directory = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .custom_flags(HELD | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open("/")?;
     while let Some(part) = parts.next() {
         let std::path::Component::Normal(name) = part else {
             return Err(io::ErrorKind::InvalidInput.into());
         };
         let name = CString::new(name.as_bytes())?;
-        let flags = libc::O_RDONLY
-            | libc::O_NOFOLLOW
+        let flags = libc::O_NOFOLLOW
             | libc::O_CLOEXEC
-            | libc::O_NONBLOCK
             | if parts.peek().is_some() {
-                libc::O_DIRECTORY
+                HELD | libc::O_DIRECTORY
             } else {
-                0
+                last
             };
         // SAFETY: directory owns this live descriptor; name is a component-only C string.
         // The returned descriptor is newly owned and no borrowed fd survives reassignment.
@@ -283,6 +312,39 @@ mod tests {
         assert!(open_components(&file).is_err());
         assert!(open_components(Path::new("relative/control")).is_err());
         assert!(open_components(&root.join("selected/../saved/control")).is_err());
+    }
+
+    /// A folder on the way that may be searched but not listed (`--x`, as a home under a 0711
+    /// folder) is passed, as a plain open passes it: the walk holds it as a path (`O_PATH`).
+    /// The control: that folder cannot be opened to read, as the walk opened each before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_folder_on_the_way_that_may_only_be_searched_is_passed() {
+        use std::io::Read as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        aterm_uds::host::could_not_run_as_root("a search-only folder");
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let root = scratch.path().canonicalize().unwrap();
+        let folder = root.join("search-only");
+        std::fs::create_dir(&folder).unwrap();
+        let file = folder.join("control");
+        std::fs::write(&file, b"owned control").unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o100)).unwrap();
+        let walked = open_components(&file).map(|mut file| {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let listed = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(&folder);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            listed.map(drop).map_err(|error| error.kind()),
+            Err(io::ErrorKind::PermissionDenied),
+            "control: the folder cannot be opened to read"
+        );
+        assert_eq!(walked.unwrap().unwrap(), b"owned control");
     }
 
     #[test]

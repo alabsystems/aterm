@@ -21,7 +21,8 @@
 //! (its tab switched back to, the pane scrolled back to the bottom, a sibling split closed) is
 //! not at its first frame. The row's cells are in the glass's tokens by role, its chart's
 //! letters in the hue of their column, its local midnights ticks of one device pixel at the
-//! foot of the cells that draw a level ([`tick_content`]); its lead, chart and tail are each a
+//! foot of the cells that draw a level ([`push_ticks`], which the Accounts card's work row and
+//! lanes share, [`crate::autopilot_menu`]); its lead, chart and tail are each a
 //! hit of [`Fact::Account`], the chart's naming the column under the pointer
 //! ([`RowPart::Chart`]). Lit, the lead and the tail are underlined and the chart's inks lift.
 
@@ -30,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aterm_agent::harness::outlook::Offsets;
-use aterm_agent::harness::quota_view::{Chart, QuotaLine, QuotaView, Role};
+use aterm_agent::harness::quota_view::{CELL_PLACES, QuotaLine, QuotaView, Role};
 use aterm_agent::harness::tap;
 use aterm_core::render::{FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace};
 use aterm_core::terminal::{RenderCell, Script, UnderlineStyle};
@@ -131,7 +132,7 @@ pub(super) struct QuotaKey {
     pub(super) blank: RenderCell,
     /// The pointer or the keyboard is on the account, which lights the whole row.
     pub(super) lit: bool,
-    /// The device pixels of a cell, for the midnights' hairlines.
+    /// The device pixels of a cell, for the midnights' ticks.
     pub(super) cell: (u16, u16),
 }
 
@@ -161,7 +162,7 @@ pub(super) struct QuotaRow {
     line: QuotaLine,
     key: Option<QuotaKey>,
     cells: Vec<RenderCell>,
-    /// The midnights' hairlines over the chart ([`tick_content`]).
+    /// The midnights' ticks over the chart ([`push_ticks`]).
     ticks: Option<Arc<FxContent>>,
 }
 
@@ -179,15 +180,23 @@ impl QuotaRow {
         }
     }
 
-    /// The row composed from `key` and `view` ([`compose_cells`], [`tick_content`]).
-    fn compose(&mut self, key: QuotaKey, view: &QuotaView) {
+    /// The row composed from `key` ([`compose_cells`]), its midnights' ticks over its chart
+    /// ([`push_ticks`]) in the track ink.
+    fn compose(&mut self, key: QuotaKey) {
         if self.key == Some(key) {
             return;
         }
         #[cfg(test)]
         crate::work_counts::footer_rule_composed();
         compose_cells(&self.line, &key, &mut self.cells);
-        self.ticks = tick_content(&view.chart, &self.line, key.cell, key.glass.track());
+        let mut ticks = Vec::new();
+        push_ticks(
+            &mut ticks,
+            &self.line.ticks,
+            (0, self.line.chart.len()),
+            key.cell,
+        );
+        self.ticks = tick_content(&ticks, key.glass.track());
         self.key = Some(key);
     }
 
@@ -297,87 +306,81 @@ fn compose_cells(line: &QuotaLine, key: &QuotaKey, out: &mut Vec<RenderCell>) {
     out.resize(key.cells.max(out.len()), blank);
 }
 
-/// The local midnights inside `line`'s chart of `chart`, each as its chart cell (from the chart's
-/// first) and its exact place in device pixels from the chart's left edge at `cw` pixels a cell:
-/// a past cell spans `1/k` of a day before `▕`, a future one after it. Nothing with no chart.
-fn midnights_placed<'a>(
-    chart: &'a Chart,
-    line: &'a QuotaLine,
-    cw: i64,
-) -> impl Iterator<Item = (usize, i64)> + 'a {
-    const DAY: i64 = 86_400;
-    let k = i64::from(line.per_day);
-    chart.midnights.iter().filter_map(move |&t| {
-        if k == 0 {
-            return None;
-        }
-        let (cell, x) = if t < chart.now {
-            let n = (t - (chart.now - DAY)) * k;
-            if n < 0 {
-                return None;
-            }
-            (n / DAY, n * cw / DAY)
-        } else if t < chart.now + 7 * DAY {
-            let n = (t - chart.now) * k;
-            (k + 1 + n / DAY, (k + 1) * cw + n * cw / DAY)
-        } else {
-            return None;
-        };
-        let cell = usize::try_from(cell).ok()?;
-        (cell < line.chart.len()).then_some((cell, x))
-    })
-}
-
-/// Whether a midnight's tick may stand in a chart cell holding `glyph` in `role`: one that draws
-/// a level (measured or projected), `┄` or nothing, never a letter or a mark (a name, `→`, `↺`,
-/// `╳`, `$`), which a line of ink would strike through.
-const fn ticks_over(glyph: char, role: Role) -> bool {
-    glyph == ' ' || matches!(role, Role::Mark | Role::Line | Role::Track)
-}
-
-/// The local midnights inside `line`'s chart of `chart` as ticks one device pixel wide at the foot
-/// of a cell `cw` by `ch` pixels, a quarter of it tall, in `track` (§1.3, §2.2), each at its
-/// exact place within its cell ([`midnights_placed`]) where that cell draws a level
-/// ([`ticks_over`]). A tick, not a full-height hairline: only `▕` stands a whole cell high, so
-/// now never reads as one more midnight, and no tick meets a `▔` at a cell's head to read as
-/// `T`. `None` with no chart or no tick.
-fn tick_content(
-    chart: &Chart,
-    line: &QuotaLine,
+/// A drawn row's midnights' ticks (§1.3, §1.4, §2.2: line E's chart, the Accounts card's work
+/// row and lanes) into `out`: one at each of `places` (from the row's left edge,
+/// [`CELL_PLACES`] a cell, each in a cell that takes one, [`Chart::ticks`]) that falls before the
+/// row's `room`-th cell, one device pixel wide at the foot of a cell `cw` by `ch` pixels on the
+/// row whose top is `top`, a quarter of the cell tall, at its exact place. A tick, not a
+/// full-height hairline: only `▕` stands a whole cell high, so now never reads as one more
+/// midnight, and no tick meets a `▔` at a cell's head to read as `T`; on a card lane, whose top
+/// quarter stays clear under its item's words, a tick at the foot stands a cell's height from
+/// them. Nothing in a cell of no size.
+///
+/// [`Chart::ticks`]: aterm_agent::harness::quota_view::Chart::ticks
+pub(crate) fn push_ticks(
+    out: &mut Vec<FxRect>,
+    places: &[i64],
+    (top, room): (i32, usize),
     (cw, ch): (u16, u16),
-    track: u32,
-) -> Option<Arc<FxContent>> {
-    if line.per_day == 0
-        || line.chart.is_empty()
-        || chart.midnights.is_empty()
-        || cw == 0
-        || ch == 0
-    {
-        return None;
+) {
+    if cw == 0 || ch == 0 {
+        return;
     }
     let h = (ch / 4).max(1);
-    let items: Vec<FxItem> = midnights_placed(chart, line, i64::from(cw))
-        .filter(|&(cell, _)| {
-            let (glyph, role, _) = line.cells[line.chart.start + cell];
-            ticks_over(glyph, role)
-        })
-        .filter_map(|(_, x)| i32::try_from(x).ok())
-        .map(|x| {
-            FxItem::Rect(FxRect {
+    let end = i64::try_from(room)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(CELL_PLACES);
+    let y = top.saturating_add(i32::from(ch - h));
+    out.extend(
+        places
+            .iter()
+            .filter(|&&place| (0..end).contains(&place))
+            .filter_map(|&place| i32::try_from(place * i64::from(cw) / CELL_PLACES).ok())
+            .map(|x| FxRect {
                 x,
-                y: i32::from(ch - h),
+                y,
                 w: 1,
                 h,
                 ink: 0,
-            })
-        })
-        .collect();
-    (!items.is_empty()).then(|| Arc::new(FxContent::new(items, vec![FxInk::over(track, 255); 2])))
+            }),
+    );
 }
 
-/// The stable FX layer id of `session`'s quota row's hairlines.
+/// `ticks` ([`push_ticks`]) as a layer's content in `track`, the glass's track ink (§1.3);
+/// `None` with no tick.
+pub(crate) fn tick_content(ticks: &[FxRect], track: u32) -> Option<Arc<FxContent>> {
+    (!ticks.is_empty()).then(|| {
+        Arc::new(FxContent::new(
+            ticks.iter().map(|&r| FxItem::Rect(r)).collect(),
+            vec![FxInk::over(track, 255); 2],
+        ))
+    })
+}
+
+/// Whether `content` draws `ticks` in `track` as [`tick_content`] seals them, so a frame whose
+/// ticks have not moved hands the content on and seals none.
+pub(crate) fn draws_ticks(content: &FxContent, ticks: &[FxRect], track: u32) -> bool {
+    content
+        .palette()
+        .iter()
+        .all(|ink| *ink == FxInk::over(track, 255))
+        && content.items().len() == ticks.len()
+        && content
+            .items()
+            .iter()
+            .zip(ticks)
+            .all(|(item, tick)| matches!(item, FxItem::Rect(r) if r == tick))
+}
+
+/// The stable FX layer id of `session`'s quota row's ticks.
 const fn tick_id(session: u64) -> u64 {
     layer_id(session ^ 0x7175_6f74_612d_7469)
+}
+
+/// The stable FX layer id of the ticks on the drawn rows of `session`'s open card
+/// ([`crate::autopilot_menu`]).
+pub(crate) const fn card_tick_id(session: u64) -> u64 {
+    layer_id(session ^ 0x6361_7264_2d74_6963)
 }
 
 /// One pane's quota row, as the write puts it on the glass.
@@ -399,7 +402,7 @@ pub(super) struct QuotaWrite {
     pub(super) per_day: u8,
     /// The tail's first cell.
     pub(super) tail: usize,
-    /// The midnights' hairlines, placed.
+    /// The midnights' ticks, placed.
     pub(super) ticks: Option<FxLayer>,
 }
 
@@ -484,7 +487,7 @@ impl PaneFooter {
     }
 
     /// The quota row laid on `span` composed in `glass` on `blank`'s pane, lit or not, its
-    /// hairlines placed for `session`'s pane `pane` at frame row `frame_row`: the write
+    /// ticks placed for `session`'s pane `pane` at frame row `frame_row`: the write
     /// [`QuotaWrite`] puts on the glass, its cells kept here ([`QuotaRow::cells`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn compose_quota_row(
@@ -497,7 +500,7 @@ impl PaneFooter {
         cell: (u16, u16),
         clip: aterm_core::render::PxRect,
     ) -> Option<QuotaWrite> {
-        let view = self.shown.quota_view()?;
+        self.shown.quota_view()?;
         let line = &self.quota.line;
         let key = QuotaKey {
             laid: (self.view_gen, span.room),
@@ -514,7 +517,7 @@ impl PaneFooter {
             line.per_day,
             line.tail.start,
         );
-        self.quota.compose(key, view);
+        self.quota.compose(key);
         let col = region.col_off + INDENT;
         let px = |cells: usize, side: u16| {
             i32::try_from(cells)

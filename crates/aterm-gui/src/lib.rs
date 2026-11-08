@@ -4684,7 +4684,12 @@ fn try_shift_window_absolute_effects_y(input: &mut RenderInput, delta: i32) -> b
         .iter()
         .filter(|layer| layer.space == aterm_core::render::FxSpace::Window)
         .all(|layer| layer.offset.1.checked_add(delta).is_some() && rect_ok(&layer.clip))
-        && input.fx_occluders.iter().all(rect_ok);
+        && input.fx_occluders.iter().all(rect_ok)
+        && input
+            .fx_layers
+            .iter()
+            .filter_map(|l| l.chrome.as_ref())
+            .all(rect_ok);
     let valid = input
         .cursor_glow_add
         .iter()
@@ -4738,6 +4743,8 @@ fn try_shift_window_absolute_effects_y(input: &mut RenderInput, delta: i32) -> b
             layer.offset.1 += delta;
             layer.clip = layer.clip.translate(0, delta);
         }
+        // The chrome a layer of any space stands on is its occluder's rect, in window pixels.
+        layer.chrome = layer.chrome.map(|o| o.translate(0, delta));
     }
     for occluder in &mut input.fx_occluders {
         *occluder = occluder.translate(0, delta);

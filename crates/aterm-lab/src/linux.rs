@@ -2163,7 +2163,9 @@ fn provision(up: &Up) -> Result<Option<f64>, Fail> {
                 "provisioning step '{}' failed ({}):\n{}",
                 s.label,
                 out.status(),
-                out.tail(15)
+                // Package managers can print the actionable error before a
+                // long unpack/configure tail. Preserve the driver's output.
+                out.tail(usize::MAX)
             )));
         }
     }
@@ -3590,6 +3592,30 @@ mod tests {
             stale.calls().iter().any(|c| matches!(c, Call::Shell { argv, stdin: Some(t), .. } if argv.last().map(String::as_str) == Some(guest::STAMP) && *t == format!("{want}\n"))),
             "the stamp is the plan's"
         );
+    }
+
+    #[test]
+    fn a_failed_provisioning_step_keeps_the_error_before_its_progress_tail() {
+        let diagnostic = "dpkg: actionable package failure before later progress";
+        let output = format!(
+            "{diagnostic}\n{}",
+            (0..64)
+                .map(|n| format!("later package progress {n}\n"))
+                .collect::<String>()
+        );
+        let guest = Guest::new().answer(&["apt-get", "install"], Answer::Exited(100, output));
+        let fail = provision(&up_on(&guest, true)).unwrap_err();
+        assert_eq!(fail.code, NOT_RUN);
+        let message = fail.msg.unwrap_or_default();
+        assert!(message.contains("provisioning step 'apt-get install' failed (exit 100)"));
+        assert!(message.contains(diagnostic), "{message}");
+        assert!(message.contains("later package progress 63"), "{message}");
+        assert!(!guest.calls().iter().any(|call| matches!(
+            call,
+            Call::Shell { argv, .. }
+                if argv.first().is_some_and(|word| word == "rustup")
+                    || (argv[0] == "sudo" && argv.iter().any(|word| word == guest::STAMP))
+        )));
     }
 
     #[test]

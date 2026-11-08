@@ -667,8 +667,8 @@ pub struct Ctx {
     /// names ([`disk::keep_used`]): a unit of the main lane's build directory written since is one
     /// some compile of the run built.
     pub began: std::time::SystemTime,
-    /// What names a test compile's heavy compiler for its unit's record ([`memory::read_unit`]
-    /// but in a test).
+    /// What names each compiler of a test compile or a lint for its unit, its span and, where it
+    /// is heavy, its unit's record ([`memory::read_unit`] but in a test).
     pub unit_reader: memory::UnitReader,
     /// The release's pool this run adopted from [`EnvSnapshot::release_pool`] ([`run_cli`]):
     /// the test run's share, its binaries' charges held in its tokens
@@ -1751,7 +1751,13 @@ fn measured(
         ),
         Err(e) => format!("memory: peaked {size}, not kept: {e}"),
     };
-    match book.keep_units(&key.checkout, &meter.unit_peaks()) {
+    // The book's unit rows are the test compile's: a lint's compilers hold other peaks.
+    let unit_peaks = if spec.id == plan::StageId::TestCompile {
+        meter.unit_peaks()
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    match book.keep_units(&key.checkout, &unit_peaks) {
         Ok(kept) if !kept.is_empty() => {
             let heaviest: Vec<String> = kept
                 .iter()
@@ -2072,9 +2078,11 @@ fn staged(
         (report, Instant::now(), held.unwrap_or_default(), None)
     };
     // Every child can contribute CPU observations; only metered stages keep memory
-    // records, and compiler-unit attribution still requires the memory book.
+    // records. The test compile's and the lint's meters attribute each compiler to its unit,
+    // which dates their compile lines' spans; only the test compile's keeps unit peaks, and only
+    // into the memory book ([`measured`]).
     let meter = Some({
-        if ctx.memory.is_some() && spec.id == plan::StageId::TestCompile {
+        if matches!(spec.id, plan::StageId::TestCompile | plan::StageId::Tippy) {
             memory::Meter::attributing(ctx.unit_reader, memory::UNIT_FLOOR)
         } else {
             memory::Meter::new()

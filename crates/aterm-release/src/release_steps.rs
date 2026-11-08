@@ -305,6 +305,51 @@ struct WarmingVerifier {
     stderr: PathBuf,
 }
 
+/// The packaging child started at bundle, owned across READY and joined by step 7's sign.
+struct PreparingSign {
+    child: Option<aterm_uds::spawnfd::Child>,
+    _forwarded: Forwarded,
+    stop: BranchStop,
+    cmd: Command,
+    log: PathBuf,
+    file: std::fs::File,
+    from: u64,
+    started: Option<u64>,
+}
+
+impl crate::release::PendingSign for PreparingSign {
+    fn stop(&self) -> BranchStop {
+        self.stop.clone()
+    }
+
+    fn finish(mut self: Box<Self>) -> Ran {
+        let mut child = self.child.take().expect("one packaging child");
+        let waited = wait_accounted(&mut child);
+        let code = waited
+            .as_ref()
+            .map_or(-1, |(status, _)| status.code().unwrap_or(-1));
+        let usage = waited.ok().and_then(|(_, usage)| usage);
+        let _ = writeln!(
+            self.file,
+            "{}",
+            step_child_event(Step::Bundle, &self.cmd, self.started, now_ms(), code, usage,)
+        );
+        Ran {
+            code,
+            detail: tail_since(&self.log, 8, self.from),
+        }
+    }
+}
+
+impl Drop for PreparingSign {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            self.stop.fire();
+            let _ = wait_accounted(&mut child);
+        }
+    }
+}
+
 fn reusable_cutter(stamp: Option<&crate::cutter::Stamp>, commit: &str, debug: bool) -> bool {
     !debug && stamp.is_some_and(|stamp| stamp.commit() == commit)
 }
@@ -579,6 +624,7 @@ impl Real {
         dry: bool,
         verbose: bool,
     ) -> Result<Self, String> {
+        let _timing = crate::cut_timing::Timer::new("release-backend-init");
         let home = std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
             .map(PathBuf::from)
@@ -737,6 +783,34 @@ impl Real {
         self.spawn_stoppable(self.step, cmd, None)
     }
 
+    fn start_preparing_sign(&self, mut cmd: Command) -> Result<PreparingSign, String> {
+        let log = self
+            .step_log(Step::Bundle)
+            .with_file_name("05-sign-prepare.log");
+        let mut file = crate::durable::open_append(&log, true).map_err(|e| e.to_string())?;
+        let from = file.metadata().map_err(|e| e.to_string())?.len();
+        writeln!(file, "$ {cmd:?}").map_err(|e| e.to_string())?;
+        cmd.stdin(Stdio::null())
+            .stdout(file.try_clone().map_err(|e| e.to_string())?)
+            .stderr(file.try_clone().map_err(|e| e.to_string())?);
+        let stop = BranchStop::default();
+        let started = now_ms();
+        let (child, forwarded) = self
+            .spawn_stoppable(Step::Bundle, &mut cmd, Some((&stop, interrupt::SIGTERM)))
+            .map_err(|e| e.to_string())?;
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        Ok(PreparingSign {
+            child: Some(child),
+            _forwarded: forwarded,
+            stop,
+            cmd,
+            log,
+            file,
+            from,
+            started,
+        })
+    }
+
     /// [`Real::spawn_forwarded`] for a child of `step` (noted as that step's while it runs), which
     /// a branch's `stop` ends too (sent its signal, then `SIGKILL`); none starts once that stop
     /// fired.
@@ -793,11 +867,21 @@ impl Real {
         step: Step,
         cmd: &mut Command,
     ) -> std::io::Result<(std::process::Output, String)> {
+        self.output_accounted_with_stop(step, cmd, None)
+    }
+
+    fn output_accounted_with_stop(
+        &self,
+        step: Step,
+        cmd: &mut Command,
+        stop: Option<&BranchStop>,
+    ) -> std::io::Result<(std::process::Output, String)> {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let started_at_unix_ms = now_ms();
-        let (mut child, forwarded) = self.spawn_forwarded(cmd)?;
+        let (mut child, forwarded) =
+            self.spawn_stoppable(step, cmd, stop.map(|stop| (stop, interrupt::SIGTERM)))?;
         let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
             std::thread::spawn(move || {
                 let mut bytes = Vec::new();
@@ -1783,6 +1867,7 @@ impl Real {
     }
 
     fn main_to(&mut self, rev: &str) -> Result<(), Refusal> {
+        let _timing = crate::cut_timing::Timer::start(&self.step_log(self.step), "source-checkout");
         let head = self.head();
         let ancestor = |s: &mut Self, a: &str, b: &str| s.is_ancestor(a, b);
         let mut cmd = command(aterm_uds::os_path!("git"));
@@ -1947,16 +2032,24 @@ impl Real {
         bin: &crate::checkout_bin::Bin,
         profile: &str,
     ) -> Result<PathBuf, String> {
+        let _phase =
+            crate::cut_timing::Timer::start(&self.step_log(self.step), "frozen-tool-build");
         let layout = verify_layout(&self.repo).1;
         let args = Self::frozen_tool_args(&self.repo, bin, profile, layout.as_deref());
         let mut command = self.child(prover.bin.join("targo"), Some(prover));
         command.args(&args).current_dir(&self.repo);
-        let output = self
-            .output_forwarded(&mut command)
+        let (output, accounting) = self
+            .output_accounted(self.step, &mut command)
             .map_err(|e| format!("{} build: {e}", bin.what))?;
         if let Ok(mut log) = crate::durable::open_append(&self.step_log(self.step), true) {
             let _ = log.write_all(&output.stdout);
             let _ = log.write_all(&output.stderr);
+            let _ = writeln!(log, "{accounting}");
+            let _ = writeln!(
+                log,
+                "{}",
+                frozen_build_event(bin.package, profile, layout.as_deref(), &output.stdout)
+            );
         }
         if !output.status.success() {
             return Err(format!(
@@ -2045,7 +2138,11 @@ impl Real {
         commit: &str,
         prover: &Prover,
     ) -> Result<crate::release_tools::Cutter, String> {
-        crate::release_tools::clean_at(&self.repo, commit)?;
+        let log = self.step_log(self.step);
+        {
+            let _phase = crate::cut_timing::Timer::start(&log, "cutter-source-check");
+            crate::release_tools::clean_at(&self.repo, commit)?;
+        }
         if crate::release_tools::Recovery::read(commit) != crate::release_tools::Recovery::Refreeze
             && let Ok(cutter) = crate::release_tools::recorded_cutter(&self.release, commit)
         {
@@ -2063,9 +2160,15 @@ impl Real {
         } else {
             self.build_frozen_tool(prover, &FROZEN_CUTTER, "gate")?
         };
-        let cutter = crate::release_tools::stage_cutter(&self.release, commit, &source)?;
-        crate::release_tools::clean_at(&self.repo, commit)?;
-        crate::release_tools::publish_cutter(&self.release, &cutter)?;
+        let cutter = crate::release_tools::stage_cutter(&self.release, commit, &source, &log)?;
+        {
+            let _phase = crate::cut_timing::Timer::start(&log, "cutter-source-recheck");
+            crate::release_tools::clean_at(&self.repo, commit)?;
+        }
+        {
+            let _phase = crate::cut_timing::Timer::start(&log, "cutter-record-publish");
+            crate::release_tools::publish_cutter(&self.release, &cutter)?;
+        }
         Ok(cutter)
     }
 
@@ -2791,9 +2894,20 @@ impl Real {
         log: &Path,
         cmd: &mut Command,
     ) -> std::io::Result<std::process::Output> {
+        self.captured_with_stop(step, prover, log, cmd, None)
+    }
+
+    fn captured_with_stop(
+        &self,
+        step: Step,
+        prover: &Prover,
+        log: &Path,
+        cmd: &mut Command,
+        stop: Option<&BranchStop>,
+    ) -> std::io::Result<std::process::Output> {
         scrub_fixture_command(cmd);
         cmd.env("TRUST_STAGE2_BIN", &prover.bin);
-        let (out, record) = self.output_accounted(step, cmd)?;
+        let (out, record) = self.output_accounted_with_stop(step, cmd, stop)?;
         append_output(log, &out);
         if let Ok(mut file) = crate::durable::open_append(log, true) {
             let _ = writeln!(file, "{record}");
@@ -3616,6 +3730,39 @@ fn wait_accounted(
         Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok((child.wait()?, None)),
         Err(e) => Err(e),
     }
+}
+
+/// Cargo's artifact units, including build-script executables, counted once per reported
+/// artifact. Build-script execution messages are not compiler units. Missing freshness is
+/// unknown rather than evidence that a unit compiled.
+fn frozen_build_event(package: &str, profile: &str, layout: Option<&str>, output: &[u8]) -> String {
+    let (mut fresh, mut compiled, mut unknown) = (0u64, 0u64, 0u64);
+    for line in output.split(|byte| *byte == b'\n') {
+        let Ok(row) = aterm_json::from_slice::<aterm_json::Value>(line) else {
+            continue;
+        };
+        if row["reason"].as_str() != Some("compiler-artifact") {
+            continue;
+        }
+        match row["fresh"].as_bool() {
+            Some(true) => fresh += 1,
+            Some(false) => compiled += 1,
+            None => unknown += 1,
+        }
+    }
+    format!(
+        "release-event: {}",
+        aterm_json::json!({
+            "schema": 1,
+            "event": "frozen-tool-compile",
+            "package": package,
+            "profile": profile,
+            "build_layout": layout,
+            "fresh_units": fresh,
+            "compiled_units": compiled,
+            "unknown_units": unknown,
+        })
+    )
 }
 
 /// The `step-child-finished` record a step's child leaves in its step log: when it ran, how it
@@ -5115,6 +5262,24 @@ fn hms_local(epoch: u64, offset_at: impl FnOnce(i64) -> Option<i64>) -> String {
 }
 
 impl Backend for Real {
+    fn prepare_sign(
+        &mut self,
+        args: &[String],
+        prover: &Prover,
+    ) -> Result<Box<dyn crate::release::PendingSign>, Refusal> {
+        let start = || -> Result<PreparingSign, String> {
+            self.start_preparing_sign(self.cut_command(args, prover)?)
+        };
+        start()
+            .map(|pending| Box::new(pending) as Box<dyn crate::release::PendingSign>)
+            .map_err(|why| {
+                Refusal::new(
+                    format!("early signer did not start: {why}"),
+                    "read the packaging log, then resume the release",
+                )
+                .could_not_run()
+            })
+    }
     fn now(&mut self) -> u64 {
         now()
     }
@@ -5405,6 +5570,8 @@ impl Backend for Real {
     }
 
     fn prover(&mut self, journaled: Option<&str>) -> Result<Prover, String> {
+        let _phase =
+            crate::cut_timing::Timer::start(&self.step_log(self.step), "prover-resolution");
         let explicit = std::env::var_os("TRUST_STAGE2_BIN").filter(|v| !v.is_empty());
         let (cand, source) = if let Some(dir) = explicit {
             (PathBuf::from(dir), "TRUST_STAGE2_BIN".to_string())
@@ -5465,6 +5632,7 @@ impl Backend for Real {
     /// run never comes here, and seals lazily, keeping none. Off macOS a release has no
     /// build-inputs identity to seal.
     fn seal_inputs(&mut self) -> Result<(), String> {
+        let _phase = crate::cut_timing::Timer::start(&self.step_log(self.step), "inputs-seal");
         if cfg!(target_os = "macos") {
             (self.arm_inputs)(&self.state, Some(&self.transcript()));
             (self.build_inputs)()?;
@@ -5881,6 +6049,8 @@ impl Backend for Real {
     }
 
     fn sync(&mut self) -> Result<String, Refusal> {
+        let _timing =
+            crate::cut_timing::Timer::start(&self.step_log(self.step), "engine-and-submodule-sync");
         self.engine_sync()?;
         self.submodule_sync(Step::Sync)?;
         let head = self
@@ -5894,6 +6064,7 @@ impl Backend for Real {
     }
 
     fn bump(&mut self, from: &str, to: &str, prover: &Prover) -> Result<String, Refusal> {
+        let _timing = crate::cut_timing::Timer::start(&self.step_log(self.step), "version-bump");
         let origin = crate::publish::native_origin(&self.repo).map_err(|why| {
             Refusal::new(
                 "cannot bind the native source origin to this workspace",
@@ -6233,6 +6404,7 @@ impl Backend for Real {
         if interrupt::caught().is_some() {
             return Err(cannot("not started: the release was interrupted".into()));
         }
+        let _timing = crate::cut_timing::Timer::start(&self.step_log(self.step), "cutter-exec");
         let error = command.exec();
         Err(cannot(error.to_string()))
     }
@@ -6742,9 +6914,71 @@ impl Backend for Real {
     fn discard_signed(&mut self, version: &str, build: u64) -> Vec<String> {
         crate::publish::discard_signed(&self.repo.join("dist"), version, build)
     }
-    fn cut(&mut self, args: &[String], prover: &Prover) -> Ran {
+    fn cut(
+        &mut self,
+        args: &[String],
+        prover: &Prover,
+        candidate: &Candidate,
+        reserved: Option<&Reservation>,
+    ) -> Ran {
         match self.cut_command(args, prover) {
-            Ok(mut cmd) => self.logged(Step::Cut, &mut cmd),
+            Ok(mut cmd) => {
+                let real = &*self;
+                with_reader_prebuild(
+                    move |stop| {
+                        let started = std::time::Instant::now();
+                        let log = real.logs.join("main-reader-prebuild.log");
+                        // This is only a cache warm-up of the proposed fixture tree.
+                        // Fixture landing still compiles its exact preview, including
+                        // any movement of main, and never consumes a prebuild verdict.
+                        let result = reserved
+                            .ok_or_else(|| "no reservation for fixture prebuild".to_string())
+                            .and_then(|reserved| {
+                                let pins = fixture_pins(candidate, reserved);
+                                let root =
+                                    fixture_root(&real.repo).map_err(|why| format!("{why:?}"))?;
+                                let staged = crate::fixtures::staged(&root, &pins)
+                                    .ok_or_else(|| "no staged fixtures for prebuild".to_string())?;
+                                crate::fixtures::MainReader::new(&real.repo)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|mut reader| {
+                                        reader
+                                            .prebuild_fixtures(
+                                                &prover.bin.join("targo"),
+                                                "origin/main",
+                                                &staged,
+                                                &pins,
+                                                &mut |cmd| {
+                                                    with_reader_cargo(
+                                                        real.pool.as_ref().map(|pool| &pool.jobs),
+                                                        stop,
+                                                        cmd,
+                                                        |cmd| {
+                                                            real.captured_with_stop(
+                                                                Step::Cut,
+                                                                prover,
+                                                                &log,
+                                                                cmd,
+                                                                Some(stop),
+                                                            )
+                                                        },
+                                                    )
+                                                },
+                                            )
+                                            .map_err(|e| e.to_string())
+                                    })
+                            });
+                        if let Ok(mut file) = crate::durable::open_append(&log, true) {
+                            let _ = writeln!(
+                                file,
+                                "prebuild {:.3}s: {result:?}; no verdict",
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                    },
+                    || real.logged(Step::Cut, &mut cmd),
+                )
+            }
             Err(why) => Ran {
                 code: -1,
                 detail: vec![format!("not started: {why}")],
@@ -6819,6 +7053,35 @@ impl Backend for Real {
         let release = self.github_read(&format!("repos/{slug}/releases/latest"))?;
         Ok(release["tag_name"].as_str().map(str::to_string))
     }
+}
+
+fn with_reader_cargo<T>(
+    pool: Option<&aterm_capacity::Jobserver>,
+    stop: &BranchStop,
+    cmd: &mut Command,
+    run: impl FnOnce(&mut Command) -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    // This child is Cargo itself, so attach the GNU client and retain its
+    // implicit token through capture and its pipe drains.
+    let _implicit = pool
+        .map(|pool| pool.attach_cargo(cmd, &|| stop.fired() || interrupt::caught().is_some()))
+        .transpose()?;
+    run(cmd)
+}
+
+fn with_reader_prebuild(
+    prebuild: impl FnOnce(&BranchStop) + Send,
+    cut: impl FnOnce() -> Ran,
+) -> Ran {
+    let stop = BranchStop::default();
+    std::thread::scope(|scope| {
+        scope.spawn(|| prebuild(&stop));
+        let verdict = cut();
+        if verdict.code != 0 {
+            stop.fire();
+        }
+        verdict
+    })
 }
 
 fn notice(verb: &[&str], line: &str) -> Result<String, String> {
@@ -7411,6 +7674,49 @@ mod fix_tests;
 
 #[cfg(test)]
 mod tests {
+    /// NEGATIVE CONTROLS: waiting at start blocks on sleep; dropping without stopping and
+    /// reaping leaves the PID alive. No release executable, signer or credential is used.
+    #[cfg(unix)]
+    #[test]
+    fn early_packaging_child_is_owned_until_join_or_cancel() {
+        use super::*;
+        use crate::release::PendingSign as _;
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let real = Real::new(dir.path(), Some(dir.path()), true, false).unwrap();
+        for cancel in [false, true] {
+            let mut cmd = command("/bin/sleep");
+            cmd.arg("60");
+            let mut pending = real.start_preparing_sign(cmd).unwrap();
+            let pid = pending.child.as_ref().unwrap().id();
+            assert!(
+                pending
+                    .child
+                    .as_mut()
+                    .unwrap()
+                    .try_wait()
+                    .unwrap()
+                    .is_none()
+            );
+            if cancel {
+                drop(pending);
+            } else {
+                pending.stop().fire();
+                let ran = Box::new(pending).finish();
+                assert_ne!(ran.code, 0);
+                assert!(
+                    ran.detail
+                        .iter()
+                        .any(|line| line.contains("step-child-finished"))
+                );
+            }
+            // SAFETY: signal zero only queries this test child's PID after it was reaped.
+            assert_ne!(
+                unsafe { libc::kill(libc::pid_t::try_from(pid).unwrap(), 0) },
+                0
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn release_signal_disposition_probe() {
@@ -7484,6 +7790,75 @@ mod tests {
             );
         }
         println!("\nDETACHED_SIGNALS_CHECKED");
+    }
+
+    #[test]
+    fn reader_cargo_holds_its_implicit_job_through_success_and_failure() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let pool = aterm_capacity::Jobserver::new(&dir.path().join("reader.jobs"), 1).unwrap();
+        for fail in [false, true] {
+            let stop = super::BranchStop::default();
+            let mut cmd = super::command("targo");
+            let result = super::with_reader_cargo(Some(&pool), &stop, &mut cmd, |cmd| {
+                assert!(
+                    pool.try_acquire().unwrap().is_none(),
+                    "implicit job is charged"
+                );
+                for name in ["MAKEFLAGS", "CARGO_MAKEFLAGS"] {
+                    assert!(cmd.get_envs().any(|(key, value)| {
+                        key == name && value == Some(std::ffi::OsStr::new(&pool.flags()))
+                    }));
+                }
+                if fail {
+                    Err(std::io::Error::other("compile failed"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), fail);
+            assert!(
+                pool.try_acquire().unwrap().is_some(),
+                "compile returned its job"
+            );
+        }
+        let stop = super::BranchStop::default();
+        stop.fire();
+        let token = pool.try_acquire().unwrap().unwrap();
+        let mut ran = false;
+        let result =
+            super::with_reader_cargo(Some(&pool), &stop, &mut super::command("targo"), |_| {
+                ran = true;
+                Ok(())
+            });
+        assert!(result.is_err());
+        assert!(!ran, "cancelled warm-up never starts Cargo");
+        drop(token);
+    }
+
+    #[test]
+    fn reader_prebuild_overlaps_cut_and_preserves_its_verdict() {
+        let (started, began) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let stopped = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let warm_stop = std::sync::Arc::clone(&stopped);
+        let timeout = std::time::Duration::from_secs(60);
+        let verdict = super::with_reader_prebuild(
+            move |stop| {
+                *warm_stop.lock().unwrap() = Some(stop.clone());
+                started.send(()).unwrap();
+                released.recv_timeout(timeout).unwrap();
+            },
+            || {
+                began.recv_timeout(timeout).unwrap();
+                release.send(()).unwrap();
+                super::Ran {
+                    code: 37,
+                    detail: Vec::new(),
+                }
+            },
+        );
+        assert_eq!(verdict.code, 37);
+        assert!(stopped.lock().unwrap().as_ref().unwrap().fired());
     }
 
     #[test]
@@ -7690,6 +8065,13 @@ mod tests {
             "freeze-sample mode={sample} elapsed_ms={}",
             start.elapsed().as_millis()
         );
+        let log = std::fs::read_to_string(real.step_log(real.step)).unwrap_or_default();
+        for line in log
+            .lines()
+            .filter(|line| line.starts_with("release-event: "))
+        {
+            println!("{line}");
+        }
     }
 
     pub(super) fn bind_native_engine_fixture(repo: &Path, bare: &Path) {
@@ -10776,6 +11158,36 @@ mod tests {
         );
         assert_eq!(ran.code, 0, "{ran:?}");
         assert!(!active_after_return, "the output pump survived the return");
+    }
+
+    /// NEGATIVE CONTROLS: treating build-script executions or arbitrary JSON as artifacts
+    /// overcounts compiled units; treating absent freshness as false claims an unobserved
+    /// compile. A fresh build-script executable is still a compiler unit.
+    #[test]
+    fn frozen_compile_counts_only_artifacts_with_observed_freshness() {
+        let output =
+            br#"{"reason":"compiler-artifact","fresh":true,"target":{"kind":["custom-build"]}}
+{"reason":"compiler-artifact","fresh":false}
+{"reason":"compiler-artifact"}
+{"reason":"build-script-executed","fresh":false}
+{"fresh":false}
+not json
+"#;
+        let line = frozen_build_event(
+            "aterm-release",
+            "gate",
+            Some("build.build-dir='fixture'"),
+            output,
+        );
+        let event: aterm_json::Value =
+            aterm_json::from_str(line.strip_prefix("release-event: ").unwrap()).unwrap();
+        assert_eq!(event["fresh_units"].as_u64(), Some(1));
+        assert_eq!(event["compiled_units"].as_u64(), Some(1));
+        assert_eq!(event["unknown_units"].as_u64(), Some(1));
+        assert_eq!(
+            event["build_layout"].as_str(),
+            Some("build.build-dir='fixture'")
+        );
     }
 
     /// Each step child leaves one `step-child-finished` record after its output: its exit, when

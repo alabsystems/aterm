@@ -1825,9 +1825,10 @@ enum StripFact {
     Community,
     /// The theme the trial replaces ("was Default").
     Was(String),
-    /// The person's colors, drawn on every theme
-    /// ("1 custom color on every theme").
-    Note(String),
+    /// The person's colors, drawn on every theme: said whole ("1 custom
+    /// color on every theme"), and painted short ("1 custom color") where
+    /// line 2 holds only that.
+    Note { said: String, short: String },
     /// Why the theme cannot be drawn, or why the trial ended.
     Error(String),
 }
@@ -1867,7 +1868,7 @@ fn spoken_facts(headline: String, type_words: Option<&str>, facts: &[StripFact])
             StripFact::Side(_) => {}
             StripFact::Community => sentence.push_str(", a Community theme"),
             StripFact::Was(theme) => sentence.push_str(&format!(", was {theme}")),
-            StripFact::Note(note) => sentence.push_str(&format!(", {note}")),
+            StripFact::Note { said, .. } => sentence.push_str(&format!(", {said}")),
             StripFact::Error(error) => sentence.push_str(&format!("; {error}")),
         }
     }
@@ -1876,16 +1877,28 @@ fn spoken_facts(headline: String, type_words: Option<&str>, facts: &[StripFact])
 
 /// Line 2: the facts in their short forms, ` · ` between them.
 fn painted_facts(facts: &[StripFact]) -> String {
+    painted_fact_words(facts).join(" \u{b7} ")
+}
+
+/// Each fact's short form, in order ([`painted_facts`]).
+fn painted_fact_words(facts: &[StripFact]) -> Vec<String> {
     facts
         .iter()
-        .map(|fact| match fact {
-            StripFact::Side(side) => format!("for {side}"),
-            StripFact::Community => "Community".to_string(),
-            StripFact::Was(theme) => format!("was {theme}"),
-            StripFact::Note(words) | StripFact::Error(words) => words.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join(" \u{b7} ")
+        .filter_map(|fact| painted_fact_forms(fact).into_iter().next())
+        .collect()
+}
+
+/// The forms line 2 paints a fact in, fullest first, each whole: the
+/// person's colors say "on every theme" where line 2 holds it, and their
+/// count alone where it holds only that.
+fn painted_fact_forms(fact: &StripFact) -> Vec<String> {
+    match fact {
+        StripFact::Side(side) => vec![format!("for {side}")],
+        StripFact::Community => vec!["Community".to_string()],
+        StripFact::Was(theme) => vec![format!("was {theme}")],
+        StripFact::Note { said, short } => vec![said.clone(), short.clone()],
+        StripFact::Error(words) => vec![words.clone()],
+    }
 }
 
 /// The strip and its height at a width, shared while [`BlocksShared`] is open.
@@ -1996,7 +2009,13 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                     );
                 let facts: Vec<StripFact> = match &showcase.error {
                     Some(error) => vec![StripFact::Error(error.clone())],
-                    None => note.into_iter().map(StripFact::Note).collect(),
+                    None => note
+                        .into_iter()
+                        .map(|said| StripFact::Note {
+                            said,
+                            short: custom_colors(overrides),
+                        })
+                        .collect(),
                 };
                 StripWords {
                     spoken: spoken_facts(headline, None, &facts),
@@ -2029,7 +2048,12 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
                         .into_iter()
                         .chain(following.then_some(StripFact::Side(appearance_label(side))))
                         .chain([StripFact::Was(in_use.clone())])
-                        .chain(override_note(&state.showcase_colors()).map(StripFact::Note))
+                        .chain(override_note(&state.showcase_colors()).map(|said| {
+                            StripFact::Note {
+                                said,
+                                short: custom_colors(overrides),
+                            }
+                        }))
                         .collect(),
                 };
                 if showcase.keep_more && split {
@@ -2195,11 +2219,57 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
     } else {
         line_one
     };
+    // LINE 2 IS NEVER CUT, AND SPANS THE STRIP: the buttons stand on line
+    // 1's band alone, so line 2 reaches under them to the strip's end; an
+    // error wraps between its words on as many of line 2's bands as it
+    // takes, the strip growing by a band for each line past the first.
+    // Fitted to one band in the title's column, an error that a Keep could
+    // not save read "Color theme was not saved: config…" at 2x in a 584pt
+    // window, why only in the dock's scroller and the Status label, and a
+    // trial's facts "for Dark · was Default · 2 custom…" beside an empty band
+    // under Revert and Keep.
+    let detail_style = if danger {
+        StyleRef::Danger
+    } else {
+        StyleRef::Quiet
+    };
+    let detail_band = strip_height() - line_one;
+    let measure = |line: &str| text_width(line, SemanticRole::Status, detail_style);
+    // Its other facts stand on line 2's one band, each whole in the fullest of its forms that fits
+    // after the ones before it ("2 custom colors" where "2 custom colors on every theme" does
+    // not); the first that fits in none is left to the Status's sentence with the rest, so neither
+    // moving from theme to theme, nor a trial starting, nor a custom color changes the strip's
+    // height. Wrapped onto bands of their own, they stood a band taller under one custom color
+    // than under none at 1x in a 934pt window, or every strip kept that band empty.
+    let detail_lines = if !two_lines {
+        Vec::new()
+    } else if danger {
+        wrap_to_box(&detail, width, &measure)
+    } else {
+        let mut shown = String::new();
+        for fact in &words.facts {
+            let joined = painted_fact_forms(fact)
+                .into_iter()
+                .map(|form| {
+                    if shown.is_empty() {
+                        form
+                    } else {
+                        format!("{shown} \u{b7} {form}")
+                    }
+                })
+                .find(|joined| measure(joined) <= width + crate::native_ui::TEXT_FIT_SLACK);
+            let Some(joined) = joined else {
+                break;
+            };
+            shown = joined;
+        }
+        (!shown.is_empty()).then_some(shown).into_iter().collect()
+    };
     // The words keep line 2's band only where a line 2 can show, in every
     // state alike.
     let words_height = title_height
         + if detail_line {
-            strip_height() - line_one
+            detail_band * detail_lines.len().max(1) as f32
         } else {
             0.0
         };
@@ -2210,27 +2280,63 @@ fn build_strip_node(state: &SettingsViewState, width: f32) -> (UiNode, f32) {
         title_height,
         name_lines,
     )];
-    if two_lines {
-        lines.push(
+    let detail_text = |key: String, text: String| {
+        UiNode::new(
+            key,
+            UiContent::Text(TextSpec {
+                text,
+                role: SemanticRole::Status,
+                style: detail_style,
+            }),
+        )
+        .layout(
+            Layout::default()
+                .width(Length::Fill)
+                .height(Length::Fixed(detail_band)),
+        )
+        .paint_only()
+    };
+    // Beside the buttons, line 2 reaches past the title's column under them.
+    let reach = Insets {
+        right: if stacked {
+            0.0
+        } else {
+            (width - title_room).max(0.0)
+        },
+        ..Insets::default()
+    };
+    match detail_lines.len() {
+        0 => {}
+        1 => lines.extend(detail_lines.into_iter().map(|line| {
+            let mut node = detail_text("settings/showcase/status/detail".to_string(), line);
+            node.layout = node.layout.outdent(reach);
+            node
+        })),
+        count => lines.push(
             UiNode::new(
                 "settings/showcase/status/detail",
-                UiContent::Text(TextSpec {
-                    text: fit_text(&detail, SemanticRole::Status, StyleRef::Quiet, title_room),
-                    role: SemanticRole::Status,
-                    style: if danger {
-                        StyleRef::Danger
-                    } else {
-                        StyleRef::Quiet
-                    },
-                }),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
             )
             .layout(
-                Layout::default()
+                Layout::column()
                     .width(Length::Fill)
-                    .height(Length::Fixed(strip_height() - line_one)),
+                    .height(Length::Fixed(detail_band * count as f32))
+                    .outdent(reach),
             )
-            .paint_only(),
-        );
+            .paint_only()
+            .children(
+                detail_lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        detail_text(
+                            format!("settings/showcase/status/detail/line-{index}"),
+                            line,
+                        )
+                    })
+                    .collect(),
+            ),
+        ),
     }
     let texts = UiNode::new(
         "settings/showcase/status/text",

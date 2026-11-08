@@ -1381,16 +1381,9 @@ fn a_fields_value_is_whole_where_its_row_can_grow() {
                     .find(|node| node.key == key)
                     .map(|node| node.rect)
                     .expect("the field's rect");
-                if path {
-                    assert!(
-                        bare(&shown).ends_with(&bare("/login-zsh"))
-                            && (lines <= 2 || shown.starts_with('\u{2026}')),
-                        "{context}: {shown:?}"
-                    );
-                } else {
-                    assert_eq!(bare(&shown), bare(value), "{context}: {shown:?}");
-                    assert!(!shown.contains('\u{2026}'), "{context}: {shown:?}");
-                }
+                // A path wraps whole between its components as words do, where the row can grow.
+                assert_eq!(bare(&shown), bare(value), "{context}: {shown:?}");
+                assert!(!shown.contains('\u{2026}'), "{context}: {shown:?}");
                 if width >= 744.0 && !path {
                     assert_eq!(lines, 1, "{context}: one line holds it: {shown:?}");
                 }
@@ -1839,8 +1832,6 @@ fn messages_keeps_its_words_with_a_log() {
                     }
                     let mut whole = std::collections::BTreeSet::new();
                     let mut edged = std::collections::BTreeSet::new();
-                    let mut head_cut = false;
-                    let mut name = std::collections::BTreeMap::new();
                     let key_of =
                         |line: &str| line.split('"').nth(1).unwrap_or_default().to_string();
                     super::scroll_messages_through(
@@ -1852,14 +1843,6 @@ fn messages_keeps_its_words_with_a_log() {
                         |screen, k| {
                             let cut = cut_words(screen, &["settings/messages/"])
                                 .into_iter()
-                                .filter(|line| {
-                                    let head_title = line
-                                        .starts_with("paint-text key=\"settings/messages/row/")
-                                        && (line.contains("/label\"")
-                                            || line.contains("/label/line-"));
-                                    head_cut |= head_title && line.contains("/row/40/");
-                                    !head_title
-                                })
                                 .filter(|line| !line.contains(" more lines)\""))
                                 .filter(|line| {
                                     let edge = line.contains("clip-truncated=true");
@@ -1883,29 +1866,8 @@ fn messages_keeps_its_words_with_a_log() {
                                     whole.insert(key_of(&line));
                                 }
                             }
-                            for node in &screen.paint {
-                                if let Some(index) = node
-                                    .key
-                                    .as_str()
-                                    .strip_prefix("settings/messages/row/40/name/")
-                                    .and_then(|index| index.parse::<usize>().ok())
-                                    && let UiContent::Text(text) = &node.content
-                                {
-                                    name.insert(index, text.text.clone());
-                                }
-                            }
                         },
                     );
-                    if open && head_cut {
-                        let title = super::sample_messages()
-                            .entries
-                            .iter()
-                            .find(|entry| entry.id == 40)
-                            .map(|entry| entry.title.clone())
-                            .unwrap_or_default();
-                        let said = name.values().cloned().collect::<Vec<_>>().join("\n");
-                        assert_eq!(painted_words(&said), title, "{context}: the open title");
-                    }
                     let entry = open.then(|| "settings/messages/row/40/copy".to_string());
                     for key in reach
                         .iter()
@@ -3771,6 +3733,11 @@ fn wallpaper_keeps_its_status_and_its_buttons() {
     });
 }
 
+/// A PATH FIELD KEEPS ITS FILE NAME, AND ITS WHOLE PATH WHERE ITS LINES FIT (N54): the Fleet
+/// document's path wraps whole between its components in the lines its field has, at every
+/// narrow width at 1x and 2x; only a path longer than the field's most lines takes a form with an
+/// ellipsis, its file's name kept. Negative control: held to two lines, a home folder's
+/// `/Users//someone/.config/aterm/ai-fleet.toml` read `/Users/…/aterm/ai-fleet.toml` at 2x.
 #[test]
 fn a_path_field_keeps_its_file_name() {
     let long = "/Volumes/Work Disk/Shared Configuration/profiles/someone/settings/aterm";
@@ -3811,25 +3778,30 @@ fn a_path_field_keeps_its_file_name() {
                         seen = true;
                         whole |= node.clip.height >= node.rect.height - 0.5;
                         let painted = painted_text(node).unwrap_or_default();
+                        let joined = painted.replace('\n', "");
+                        let path = std::path::Path::new(folder)
+                            .join("ai-fleet.toml")
+                            .display()
+                            .to_string();
+                        assert!(joined.ends_with("ai-fleet.toml"), "{context}: {painted:?}");
+                        // The whole path (the home folder said as ~) where its lines fit the
+                        // field's most, as a home folder's does at every width; else a form that
+                        // keeps the file name.
+                        let said = path
+                            .strip_prefix(home)
+                            .map_or_else(|| path.clone(), |rest| format!("~{rest}"));
+                        let bare = |text: &str| {
+                            text.chars()
+                                .filter(|c| !c.is_whitespace())
+                                .collect::<String>()
+                        };
                         assert!(
-                            painted.replace('\n', "").ends_with("ai-fleet.toml"),
-                            "{context}: {painted:?}"
-                        );
-                        assert!(
-                            painted.lines().count() <= 2 || painted.starts_with("\u{2026}/ai"),
+                            bare(&joined) == bare(&said)
+                                || (folder == long && joined.contains('\u{2026}')),
                             "{context}: {painted:?}"
                         );
                         let value = screen.semantic(&key).map(|node| node.value.clone());
-                        assert_eq!(
-                            value,
-                            Some(SemanticValue::Text(
-                                std::path::Path::new(folder)
-                                    .join("ai-fleet.toml")
-                                    .display()
-                                    .to_string()
-                            )),
-                            "{context}"
-                        );
+                        assert_eq!(value, Some(SemanticValue::Text(path)), "{context}");
                     },
                 );
                 assert!(seen, "{context}: the field is drawn");
@@ -4358,7 +4330,7 @@ fn a_cjk_message_title_is_painted_at_every_narrow_width() {
                 }
                 assert!(runtime.replace_settings_messages(messages, 8));
                 let cx = view_cx_at(width, height);
-                let mut seen = 0;
+                let mut lines = std::collections::BTreeMap::<String, String>::new();
                 super::scroll_messages_through(
                     &mut runtime,
                     instance,
@@ -4383,17 +4355,7 @@ fn a_cjk_message_title_is_painted_at_every_narrow_width() {
                                 _ => None,
                             })
                             .collect();
-                        if painted.is_empty() {
-                            return;
-                        }
-                        seen += 1;
                         painted.sort();
-                        let shown: String = painted.iter().map(|(_, line)| line.as_str()).collect();
-                        let stem = shown.trim_end_matches('\u{2026}');
-                        assert!(
-                            title.starts_with(stem) && !stem.is_empty(),
-                            "{context} screen {k}: {shown:?} is not the title"
-                        );
                         for (_, line) in painted.iter().skip(1) {
                             let first = line.chars().next().unwrap_or(' ');
                             assert!(
@@ -4401,13 +4363,381 @@ fn a_cjk_message_title_is_painted_at_every_narrow_width() {
                                 "{context} screen {k}: a title line starts with {first:?}: {painted:?}"
                             );
                         }
+                        lines.extend(painted);
                         let spilled = spilled_nodes(screen, &["settings/messages/row/40/"]);
                         assert!(spilled.is_empty(), "{context} screen {k}: {spilled:#?}");
                     },
                 );
-                assert!(seen > 0, "{context}: the title is painted on some screen");
+                let mut keyed: Vec<(usize, String)> = lines
+                    .into_iter()
+                    .map(|(key, line)| {
+                        let index = key
+                            .rsplit_once("/line-")
+                            .and_then(|(_, index)| index.parse().ok())
+                            .unwrap_or(0);
+                        (index, line)
+                    })
+                    .collect();
+                keyed.sort();
+                let shown: String = keyed.into_iter().map(|(_, line)| line).collect();
+                assert_eq!(shown, title, "{context}: the screens paint the title whole");
             }
         }
+    });
+}
+
+/// AN ENTRY'S TITLE IS NEVER CUT IN THE LIST (N48, N22, N61, N108): on one row and stacked alike,
+/// at 1x, 1.5x and 2x in the windows the sweep found titles cut and at each least view, every
+/// entry's title is painted whole over the screens that show its head, each of its lines whole
+/// on some screen, none ending in an ellipsis. Negative control: at 1x in a 444x292 window a head
+/// on one row painted "macOS's program check is…" (269.8pt of title in a 206pt column); at 2x in
+/// 444x264, "Claude…", "Codex CLI…" and "macOS's…".
+#[test]
+fn a_message_title_is_whole_in_the_list() {
+    const TITLES: [&str; 4] = [
+        "macOS's program check is holding 4 programs",
+        "Claude Code is not installed",
+        "Codex CLI is not installed",
+        "Muse Code is not installed",
+    ];
+    at_each_text_scale(&[1.0, 1.5, 2.0], "whole message titles", |scale| {
+        let sizes = [
+            (444.0, 292.0),
+            (318.0, 348.0),
+            (444.0, 264.0),
+            (584.0, 348.0),
+            (1_074.0, 992.0),
+            (1_564.0, 180.0),
+            least_view(scale),
+        ];
+        for (width, height) in sizes {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let (mut runtime, instance, view) = super::setup_with_messages();
+            let mut messages = super::sample_messages();
+            for (entry, title) in messages
+                .entries
+                .iter_mut()
+                .filter(|entry| entry.tag == "config")
+                .zip(TITLES)
+            {
+                entry.title = title.to_string();
+            }
+            let titles: std::collections::BTreeMap<u64, String> = messages
+                .entries
+                .iter()
+                .map(|entry| (entry.id, entry.title.clone()))
+                .collect();
+            assert!(runtime.replace_settings_messages(messages, 8));
+            let cx = view_cx_at(width, height);
+            // Each entry's title lines by index: the words, and whether a screen showed it whole.
+            let mut seen = std::collections::BTreeMap::<
+                u64,
+                std::collections::BTreeMap<usize, (String, bool)>,
+            >::new();
+            super::scroll_messages_through(&mut runtime, instance, view, &cx, 1, |screen, k| {
+                for node in &screen.paint {
+                    let Some((id, line)) = node
+                        .key
+                        .as_str()
+                        .strip_prefix("settings/messages/row/")
+                        .and_then(|rest| rest.split_once("/label"))
+                    else {
+                        continue;
+                    };
+                    let (Ok(id), UiContent::Text(text)) = (id.parse::<u64>(), &node.content) else {
+                        continue;
+                    };
+                    if node.peek {
+                        continue;
+                    }
+                    let index = line
+                        .strip_prefix("/line-")
+                        .and_then(|index| index.parse().ok())
+                        .unwrap_or(0);
+                    assert!(
+                        !text.text.contains('\u{2026}'),
+                        "{context} screen {k}: entry {id} paints {:?}",
+                        text.text
+                    );
+                    let whole = node.clip.y <= node.rect.y + 0.5
+                        && node.clip.bottom() >= node.rect.bottom() - 0.5;
+                    let slot = seen
+                        .entry(id)
+                        .or_default()
+                        .entry(index)
+                        .or_insert_with(|| (text.text.clone(), false));
+                    assert_eq!(
+                        slot.0, text.text,
+                        "{context} screen {k}: entry {id} line {index}"
+                    );
+                    slot.1 |= whole;
+                }
+                let cut = cut_words(screen, &["settings/messages/row/"]);
+                assert!(cut.is_empty(), "{context} screen {k}: {cut:#?}");
+            });
+            assert_eq!(
+                seen.keys().copied().collect::<Vec<_>>(),
+                titles.keys().copied().collect::<Vec<_>>(),
+                "{context}: every entry's head is painted on some screen"
+            );
+            for (id, lines) in seen {
+                let shown = lines
+                    .values()
+                    .map(|(line, _)| line.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert_eq!(shown, titles[&id], "{context}: entry {id}'s title");
+                for (index, (line, whole)) in lines {
+                    assert!(
+                        whole,
+                        "{context}: entry {id}'s line {index} {line:?} is never whole"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// EVERY TITLE UNDER A STACKED HEAD'S MARK STANDS ON ONE EDGE: at 2x in a 318pt window, where
+/// the heads stack, a title of one line paints its words from the edge a wrapped title's lines
+/// do. Negative control: a one-line title was a text padded by the gap, and a text's padding
+/// paints nothing, so "aterm 0.91.0 is ready" stood 8pt left of "aterm closed unexpectedly / last
+/// time" over it.
+#[test]
+fn a_stacked_head_sets_every_title_on_one_edge() {
+    at_each_text_scale(&[2.0], "title edges", |_| {
+        let (mut runtime, instance, view) = super::setup_with_messages();
+        let mut log = super::sample_messages();
+        log.entries.truncate(6);
+        assert!(runtime.replace_settings_messages(log, 8));
+        let cx = view_cx_at(318.0, 544.0);
+        // Each entry's first title line's left edge, and whether its title took more lines.
+        let mut edges = std::collections::BTreeMap::<u64, f32>::new();
+        let mut wrapped = std::collections::BTreeSet::<u64>::new();
+        super::scroll_messages_through(&mut runtime, instance, view, &cx, 1, |screen, _| {
+            for node in &screen.paint {
+                let Some((id, line)) = node
+                    .key
+                    .as_str()
+                    .strip_prefix("settings/messages/row/")
+                    .and_then(|rest| rest.split_once("/label"))
+                else {
+                    continue;
+                };
+                let (Ok(id), UiContent::Text(_)) = (id.parse::<u64>(), &node.content) else {
+                    continue;
+                };
+                if node.peek {
+                    continue;
+                }
+                match line {
+                    "" | "/line-0" => {
+                        edges.insert(id, node.rect.x);
+                    }
+                    _ => {
+                        wrapped.insert(id);
+                    }
+                }
+            }
+        });
+        assert!(
+            !wrapped.is_empty() && edges.keys().any(|id| !wrapped.contains(id)),
+            "titles of one line and of more: {edges:?} {wrapped:?}"
+        );
+        let first = edges.values().next().copied().unwrap_or_default();
+        assert!(
+            edges.values().all(|x| (x - first).abs() < 0.5),
+            "every title starts on one edge: {edges:?}, wrapped {wrapped:?}"
+        );
+    });
+}
+
+/// A NARROW 2X FILTERS CARD TAKES ITS TIGHTER FORMS BEFORE IT STACKS (N12): at 2x in a 318pt
+/// window the severity chips stand side by side on the ends the painter keeps, and the count takes
+/// Copy All beside it, Open Log Folder under them, so the card leaves the list room under it.
+/// Negative control: All · 8 stacked over the Problems chip, and the count stood on a line of
+/// its own over Copy All over Open Log Folder: a 339pt card, no entry on the first screen until
+/// the window was 712pt tall.
+#[test]
+fn a_narrow_filters_card_takes_its_tighter_forms() {
+    at_each_text_scale(&[2.0], "tighter filters", |_| {
+        // A log of eight, as the sweep's: counts of one digit.
+        let (mut runtime, instance, view) = super::setup_with_messages();
+        let mut log = super::sample_messages();
+        log.entries.truncate(8);
+        let config = log
+            .entries
+            .iter()
+            .filter(|entry| entry.tag == "config")
+            .count();
+        for (tag, count) in &mut log.tags {
+            if tag == "config" {
+                *count = config;
+            }
+        }
+        assert!(runtime.replace_settings_messages(log, 8));
+        let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(318.0, 544.0));
+        let rect = |key: &str| {
+            compiled
+                .semantic(&UiKey::new(key))
+                .map(|node| node.rect)
+                .unwrap_or_else(|| panic!("{key} is drawn"))
+        };
+        let (all, warn) = (
+            rect("settings/messages/filter/all"),
+            rect("settings/messages/filter/warn"),
+        );
+        assert!(
+            (all.y - warn.y).abs() < 0.5,
+            "the chips stand side by side: {all:?} {warn:?}"
+        );
+        let (status, copy) = (
+            rect("settings/messages/status"),
+            rect("settings/messages/copy-all"),
+        );
+        assert!(
+            status.y < copy.bottom() && copy.y < status.bottom(),
+            "Copy All stands beside the count: {status:?} {copy:?}"
+        );
+        let folder = rect("settings/messages/open-folder");
+        assert!(
+            folder.y >= copy.bottom() - 0.5,
+            "Open Log Folder under them: {folder:?}"
+        );
+    });
+}
+
+/// THE DISCARD QUESTION LEAVES THE PAGE ROOM (N39): at each least view, with "Discard the
+/// draft?" open over Messages, the question's Cancel and Discard stand side by side, their brief
+/// whole forms where their full words do not fit, and every Messages control is whole on some
+/// screen under it, none cut by the list's edge, the page's thumb saying it scrolls. Negative control: at 2x the question stacked
+/// Cancel over Discard Draft, leaving Messages a 40pt sliver in which Copy All (41.6pt) and the
+/// filter chips (52pt) were never whole.
+#[test]
+fn the_discard_question_leaves_messages_room() {
+    let reach = [
+        "settings/messages/copy-all",
+        "settings/messages/open-folder",
+        "settings/messages/filter/all",
+        "settings/messages/filter/warn",
+    ];
+    at_each_text_scale(&[1.0, 1.5, 2.0], "the discard question", |scale| {
+        let (width, height) = least_view(scale);
+        let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+        let (mut runtime, instance, view) = super::setup_with_messages();
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.field_inputs.insert(
+                prefs::EDIT_SYMBOL_FONT.to_string(),
+                crate::native_text_input::TextInputState::new("xyz".to_string()),
+            );
+            state.draft_discard_confirmation = true;
+        }
+        let cx = view_cx_at(width, height);
+        let mut whole = std::collections::BTreeSet::new();
+        let (mut asked, mut thumbs) = (0, 0);
+        super::scroll_messages_through(&mut runtime, instance, view, &cx, 1, |screen, k| {
+            thumbs += screen
+                .paint
+                .iter()
+                .filter(|node| node.key.as_str() == "settings/messages/section/thumb")
+                .count();
+            let rect = |key: &str| screen.semantic(&UiKey::new(key)).map(|node| node.rect);
+            if let (Some(cancel), Some(discard)) = (
+                rect("settings/drafts/discard-cancel"),
+                rect("settings/drafts/discard-all"),
+            ) {
+                asked += 1;
+                assert!(
+                    (cancel.y - discard.y).abs() < 0.5,
+                    "{context} screen {k}: Cancel {cancel:?} and Discard {discard:?} stand on one line"
+                );
+            }
+            // An entry's head taller than the list's room is drawn a screen of lines at a time,
+            // its lines whole: only words cut otherwise than by the list's edge are faults.
+            let cut = cut_words(screen, &["settings/messages/"])
+                .into_iter()
+                .filter(|line| !line.contains("clip-truncated=true"))
+                .collect::<Vec<_>>();
+            assert!(cut.is_empty(), "{context} screen {k}: {cut:#?}");
+            for node in &screen.paint {
+                if node.key.as_str().starts_with("settings/messages/")
+                    && !node.peek
+                    && node.clip.y <= node.rect.y + 0.5
+                    && node.clip.bottom() >= node.rect.bottom() - 0.5
+                {
+                    whole.insert(node.key.as_str().to_string());
+                }
+            }
+        });
+        assert!(asked > 0, "{context}: the question is asked");
+        assert!(thumbs > 0, "{context}: the scrolling page shows its thumb");
+        for key in reach {
+            assert!(
+                whole.contains(key),
+                "{context}: {key} is whole on some screen"
+            );
+        }
+    });
+}
+
+/// A SPLIT ROW'S CAPTION SAYS ITS ROW'S NAME WHOLE (N100, N52): on every screen of every page at
+/// each scale's least view (and at 1.5x in a 234x236 window), a caption over a row's control says
+/// the name in a whole form, the row parted smaller so its lines fit, never cut with an ellipsis.
+/// Negative controls: at 1.5x in 234x236 Harness's Default autopilot read "Default…" over Cruise,
+/// Land and Off; at 2x in the least window Security's Secure Keyboard Entry caption ended on
+/// "keystroke…"; and at 1x in the least window Modified read "Check for updates…" and "Keep ALab
+/// tools up to…", its rows parted for the 72pt list under a pinned summary the page then listed.
+#[test]
+fn a_split_row_s_caption_says_its_name_whole() {
+    const SOURCE: &str = "agents_auto_prime = false\n[update]\nenabled = false\n\
+                          auto_apply = false\n[packages]\nenabled = false\n";
+    let scales: Vec<f32> = LEAST_VIEWS.iter().map(|(scale, _)| *scale).collect();
+    at_each_text_scale(&scales, "row captions", |scale| {
+        let mut sizes = vec![least_view(scale)];
+        if (scale - 1.5).abs() < 0.01 {
+            sizes.push((234.0, 236.0));
+        }
+        let captions = std::sync::atomic::AtomicUsize::new(0);
+        on_workers(&SettingsRoute::ALL, "row captions", |&route| {
+            for &(width, height) in &sizes {
+                let context = format!("{scale}\u{d7} {width}\u{d7}{height} {route:?}");
+                let (mut runtime, instance, view) = every_page_runtime_over(SOURCE);
+                go_to_route(&mut runtime, instance, view, route);
+                each_screen(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &view_cx_at(width, height),
+                    |screen, top| {
+                        for node in &screen.paint {
+                            let key = node.key.as_str();
+                            if !key.starts_with("settings/row-caption/") {
+                                continue;
+                            }
+                            let UiContent::Text(text) = &node.content else {
+                                continue;
+                            };
+                            if text.text.is_empty() {
+                                continue;
+                            }
+                            captions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            assert!(
+                                !text.text.contains('\u{2026}'),
+                                "{context} stop {top}: {key} reads {:?}",
+                                text.text
+                            );
+                        }
+                    },
+                );
+            }
+        });
+        assert!(
+            captions.into_inner() > 0,
+            "{scale}\u{d7}: some split row names its control"
+        );
     });
 }
 

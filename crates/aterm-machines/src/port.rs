@@ -1482,6 +1482,12 @@ pub trait System: Sync {
         cfg!(target_os = "macos")
     }
 
+    /// The word a reading names this machine by, after "this": "Mac" on macOS ([`Self::macos`]),
+    /// "machine" elsewhere.
+    fn machine(&self) -> &'static str {
+        if self.macos() { "Mac" } else { "machine" }
+    }
+
     /// Read `clients`' rows from the macOS system TCC `access` table (`clients = &[]` checks
     /// that the table opens and reads), in this process with no lock or subprocess.
     fn tcc_access(&self, _clients: &[&str]) -> Result<Vec<crate::items::person::TccRow>, String> {
@@ -2242,17 +2248,37 @@ impl System for Live {
         scoped_metadata::directories(path, uid, names)
     }
 
-    /// Opened by [`aterm_uds::nofollow::open_reader_with_identity`] (`O_NOFOLLOW_ANY | O_NONBLOCK`,
-    /// then `fstat`), so a link on `path` answers `ELOOP` and a FIFO is refused without waiting;
-    /// `Unsupported` off macOS.
+    /// Opened without following a link anywhere on `path`, then `fstat`. On macOS by
+    /// [`aterm_uds::nofollow::open_reader_with_identity`] (`O_NOFOLLOW_ANY | O_NONBLOCK`), so a
+    /// link on `path` answers `ELOOP`; elsewhere one component at a time from `/`
+    /// ([`read_owned_file::open_components`], so `path` must be absolute: each folder on the way
+    /// `O_DIRECTORY | O_NOFOLLOW`, held as a path on Linux, and the end `O_NOFOLLOW |
+    /// O_NONBLOCK`), so a link at its end answers `ELOOP` and a folder link on its way `ENOTDIR`,
+    /// and anything but a regular file is refused. A FIFO is refused without waiting either way.
     fn read_head(&self, path: &Path, max: usize) -> io::Result<Vec<u8>> {
-        let (fd, id) = aterm_uds::nofollow::open_reader_with_identity(path)?;
-        let cap = usize::try_from(id.size)
+        #[cfg(target_os = "macos")]
+        let (file, size) = {
+            let (fd, id) = aterm_uds::nofollow::open_reader_with_identity(path)?;
+            (std::fs::File::from(fd), id.size)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let (file, size) = {
+            let file = read_owned_file::open_components(path)?;
+            let meta = file.metadata()?;
+            if !meta.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ));
+            }
+            (file, meta.len())
+        };
+        let cap = usize::try_from(size)
             .unwrap_or(max)
             .min(max)
             .saturating_add(1);
         let mut bytes = Vec::with_capacity(cap);
-        let mut reader = std::io::Read::take(std::fs::File::from(fd), max as u64);
+        let mut reader = std::io::Read::take(file, max as u64);
         std::io::Read::read_to_end(&mut reader, &mut bytes)?;
         Ok(bytes)
     }
@@ -6031,14 +6057,32 @@ mod tests {
     /// [`Live::read_head`] reads at most `max` bytes of a regular file, and refuses a link at the
     /// end of the path or on its way (a program linked out of its bundle, a bundle under a linked
     /// folder), so it reads nothing outside the folders the path names, and refuses a FIFO at
-    /// once, never waiting for a writer. NEGATIVE CONTROLS (scratch): a plain
-    /// `std::fs::File::open` in place of `open_reader` reads through both links and waits on the
-    /// FIFO until the one-minute detector fails; `O_NONBLOCK` alone in its place reads the FIFO
-    /// as an empty file; reading with no `take` fails the 512-byte assertion.
-    #[cfg(target_os = "macos")]
+    /// once, never waiting for a writer, by this host's refusals (macOS's `ELOOP` and `EFTYPE`;
+    /// elsewhere `ELOOP` at the end, `ENOTDIR` on the way, and no regular file). NEGATIVE
+    /// CONTROLS (scratch): on macOS, a plain `std::fs::File::open` in place of `open_reader` reads
+    /// through both links and waits on the FIFO until the one-minute detector fails, and
+    /// `O_NONBLOCK` alone in its place reads the FIFO as an empty file; on Linux, a plain
+    /// `std::fs::File::open` in place of `open_components` reads through the link at the end;
+    /// reading with no `take` fails the 512-byte assertion.
     #[test]
     fn read_head_reads_a_bounded_head_of_a_regular_file_alone() {
         use std::os::unix::ffi::OsStrExt as _;
+        #[cfg(target_os = "macos")]
+        let refused_link =
+            |_at_the_end: bool, error: &io::Error| aterm_uds::nofollow::is_link(error);
+        #[cfg(target_os = "macos")]
+        let not_regular = aterm_uds::nofollow::not_regular;
+        #[cfg(not(target_os = "macos"))]
+        let refused_link = |at_the_end: bool, error: &io::Error| {
+            error.raw_os_error()
+                == Some(if at_the_end {
+                    libc::ELOOP
+                } else {
+                    libc::ENOTDIR
+                })
+        };
+        #[cfg(not(target_os = "macos"))]
+        let not_regular = |error: &io::Error| error.kind() == io::ErrorKind::InvalidInput;
         let temp = aterm_tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let live = Live::new();
@@ -6050,10 +6094,11 @@ mod tests {
         std::fs::create_dir(root.join("real")).unwrap();
         std::fs::write(root.join("real/program"), b"#!/bin/zsh\n").unwrap();
         std::os::unix::fs::symlink(root.join("real"), root.join("folder")).unwrap();
-        for linked in ["linked", "folder/program"] {
+        for (linked, at_the_end) in [("linked", true), ("folder/program", false)] {
             let read = live.read_head(&root.join(linked), 512);
             assert!(
-                read.as_ref().is_err_and(aterm_uds::nofollow::is_link),
+                read.as_ref()
+                    .is_err_and(|error| refused_link(at_the_end, error)),
                 "{linked}: {read:?}"
             );
         }
@@ -6064,7 +6109,7 @@ mod tests {
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let read = Live::new().read_head(&fifo, 512);
-            let _ = send.send(read.map_err(|e| aterm_uds::nofollow::not_regular(&e)));
+            let _ = send.send(read.map_err(|e| not_regular(&e)));
         });
         assert_eq!(
             receive

@@ -985,6 +985,60 @@ fn save_as_success_retires_only_its_unchanged_submitted_drafts() {
 }
 
 #[test]
+fn a_palette_slot_spells_its_colour_as_the_wheel_does() {
+    // Customize's slot field opened on '#bf616a' while the color wheel and every color row said
+    // '#BF616A': two formatters, one in small letters.
+    let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/palette/1",
+        None,
+    );
+    let state = state(&runtime, view);
+    let shown = state.showcase_colors().scheme.ansi[1];
+    let words = format!("#{:02X}{:02X}{:02X}", shown.r, shown.g, shown.b);
+    assert!(words.chars().any(|c| c.is_ascii_alphabetic()), "{words}");
+    assert_eq!(
+        state
+            .showcase
+            .slot
+            .as_ref()
+            .map(|slot| slot.input.value().to_string()),
+        Some(words)
+    );
+}
+
+#[test]
+fn customize_colour_rows_spell_the_themes_colour_as_the_wheel_does() {
+    // With nothing of its own, Customize's Foreground row painted Nord's colour as '#d8dee9'
+    // while its color wheel, the palette slots and a typed value read '#D8DEE9'.
+    let (_service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
+    let _ = act(
+        &mut runtime,
+        instance,
+        view,
+        "settings/showcase/customize",
+        None,
+    );
+    let compiled = compile_settings_view(&runtime, instance, view, &view_cx_at(1_284.0, 1_400.0));
+    let control = UiKey::new(format!("settings/control/{}", prefs::EDIT_FOREGROUND));
+    let painted = compiled
+        .paint
+        .iter()
+        .find(|node| node.key == control)
+        .and_then(|node| match &node.content {
+            UiContent::TextField(field) => field.spec.placeholder.clone(),
+            _ => None,
+        });
+    let shown = state(&runtime, view).showcase_colors().scheme.foreground;
+    let words = format!("#{:02X}{:02X}{:02X}", shown.r, shown.g, shown.b);
+    assert!(words.chars().any(|c| c.is_ascii_alphabetic()), "{words}");
+    assert_eq!(painted, Some(words));
+}
+
+#[test]
 fn save_as_retires_only_the_exact_submitted_sparse_slot_input() {
     for newer_input in [false, true] {
         let (mut service, mut runtime, instance, view) = themes_view("theme = \"Nord\"\n");
@@ -4179,6 +4233,151 @@ fn a_failed_pack_add_keeps_the_trial() {
     assert!(config_patches(&listed).is_empty());
 }
 
+/// THE STRIP'S LINE 2 IS NEVER CUT (N101): an error a Keep could not save wraps between its
+/// words on as many of line 2's bands as it takes, each line inside the strip, at 1x and 2x
+/// wherever line 2 shows. Negative control: at 2x in a 584pt window line 2 painted "Color theme
+/// was not saved: config…", fitted to one band.
+#[test]
+fn the_strip_says_a_failed_save_whole() {
+    const ERROR: &str = "Color theme was not saved: aterm.toml is not a valid aterm \
+                         configuration (line 3, expected a value); fix it in Manual";
+    super::at_each_text_scale(&[1.0, 2.0], "the strip's error", |scale| {
+        // Tall enough that the strip stands on the first screen under the demo.
+        for (width, height) in [(584.0, 900.0), (744.0, 900.0), (1_095.0, 900.0)] {
+            let context = format!("{scale}\u{d7} {width}\u{d7}{height}");
+            let (_service, mut runtime, instance, view) = themes_view("theme = \"Dracula\"\n");
+            let Some(AppViewState::Settings(settings)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            settings.showcase.error = Some(ERROR.to_string());
+            let compiled =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(width, height));
+            let mut lines: Vec<(usize, String, crate::native_ui::LogicalRect)> = compiled
+                .paint
+                .iter()
+                .filter_map(|node| {
+                    let rest = node
+                        .key
+                        .as_str()
+                        .strip_prefix("settings/showcase/status/detail")?;
+                    let index = if rest.is_empty() {
+                        0
+                    } else {
+                        rest.strip_prefix("/line-")?.parse().ok()?
+                    };
+                    match &node.content {
+                        UiContent::Text(text) => Some((index, text.text.clone(), node.rect)),
+                        _ => None,
+                    }
+                })
+                .collect();
+            lines.sort_by_key(|(index, _, _)| *index);
+            let shown = lines
+                .iter()
+                .map(|(_, line, _)| line.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(shown, ERROR, "{context}: line 2 says the error whole");
+            let strip = compiled
+                .semantic(&UiKey::new("settings/showcase/status"))
+                .map(|node| node.rect)
+                .unwrap_or_else(|| panic!("{context}: the strip"));
+            for (index, line, rect) in &lines {
+                assert!(
+                    rect.y >= strip.y - 0.01 && rect.bottom() <= strip.bottom() + 0.01,
+                    "{context}: line {index} {line:?} at {rect:?} stands outside the strip {strip:?}"
+                );
+            }
+            let unfit = compiled.fit_failures();
+            assert!(unfit.is_empty(), "{context}: {unfit:#?}");
+        }
+    });
+}
+
+/// LINE 2 SPANS THE STRIP, ITS FACTS WHOLE: beside the title, the buttons take line 1's band
+/// alone, so a trial's facts stand on line 2 the strip wide, under Revert and Keep too, each
+/// whole, and the strip stands as tall trying as idle. Negative controls: at 2x in a 584pt
+/// window, measured against the title's column, line 2 read "for Dark · was Default · 2
+/// custom…" over the empty band under the buttons; kept whole there, it dropped "2 custom
+/// colors on every theme". Where the strip is too narrow for every fact in its full form (at 2x
+/// in a 444pt window, 498pt of facts in a 412pt strip), the person's colors take their short
+/// whole form, "2 custom colors"; with no short form they were dropped.
+#[test]
+fn the_strip_says_a_trials_facts_the_strip_wide() {
+    const SOURCE: &str = "theme = \"dark:Default,light:Solarized Light\"\n\
+                          foreground = \"#fafafa\"\ncursor_color = \"#22ff00\"\n";
+    const FACTS: &str = "for Dark \u{b7} was Default \u{b7} 2 custom colors on every theme";
+    const SHORT: &str = "for Dark \u{b7} was Default \u{b7} 2 custom colors";
+    super::at_each_text_scale(&[1.0, 2.0], "a trial's facts", |scale| {
+        for width in [444.0, 584.0, 744.0, 1_095.0] {
+            // At 2x in a 444pt window the facts take more than its 412pt strip in their full forms.
+            let said = if scale > 1.5 && width < 500.0 {
+                SHORT
+            } else {
+                FACTS
+            };
+            let context = format!("{scale}\u{d7} {width}pt");
+            let mut cx = view_cx_at(width, 900.0);
+            cx.motion.system_dark = true;
+            let (_service, mut runtime, instance, view) = themes_view(SOURCE);
+            {
+                let Some(AppViewState::Settings(shown)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                shown.presented_motion.set(cx.motion);
+            }
+            list_at_top(&mut runtime, view);
+            let idle = compile_settings_view(&runtime, instance, view, &cx)
+                .semantic(&UiKey::new(STATUS))
+                .map(|node| node.rect)
+                .unwrap_or_else(|| panic!("{context}: the idle strip"));
+            let nord = card_action(&runtime, view, "Nord");
+            let _ = act(&mut runtime, instance, view, &nord, None);
+            list_at_top(&mut runtime, view);
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let strip = compiled
+                .semantic(&UiKey::new(STATUS))
+                .map(|node| node.rect)
+                .unwrap_or_else(|| panic!("{context}: the strip"));
+            assert!(
+                (strip.height - idle.height).abs() < 0.01,
+                "{context}: the strip stands {} idle and {} trying",
+                idle.height,
+                strip.height
+            );
+            let detail = compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == "settings/showcase/status/detail")
+                .unwrap_or_else(|| panic!("{context}: line 2"));
+            let UiContent::Text(text) = &detail.content else {
+                panic!("{context}: line 2 is one band of words");
+            };
+            if scale > 1.5 && width < 600.0 && width > 500.0 {
+                let keep = compiled
+                    .paint
+                    .iter()
+                    .find(|node| node.key.as_str() == "settings/showcase/keep")
+                    .map(|node| node.rect)
+                    .unwrap_or_else(|| panic!("{context}: Keep"));
+                assert!(
+                    detail.rect.right() > keep.x + 0.01,
+                    "{context}: line 2 {:?} stands only beside the buttons {keep:?}",
+                    detail.rect
+                );
+            }
+            assert!(
+                detail.rect.right() <= strip.right() + 0.01,
+                "{context}: line 2 {:?} runs past the strip {strip:?}",
+                detail.rect
+            );
+            assert_eq!(text.text, said, "{context}: line 2 says every fact whole");
+            let unfit = compiled.fit_failures();
+            assert!(unfit.is_empty(), "{context}: {unfit:#?}");
+        }
+    });
+}
+
 #[test]
 fn match_system_keep_writes_only_the_chosen_side() {
     let (_service, mut runtime, instance, view) =
@@ -6381,7 +6580,7 @@ fn colour_rows_are_one_line_with_one_field_column() {
         let bg = dracula.background;
         assert!(
             line.contains(&format!(
-                "painted=\"#{:02x}{:02x}{:02x}\"",
+                "painted=\"#{:02X}{:02X}{:02X}\"",
                 bg.r, bg.g, bg.b
             )),
             "{width}x{height}: the focused field paints the theme's hex: {line}"

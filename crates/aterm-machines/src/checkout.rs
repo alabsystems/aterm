@@ -15,13 +15,18 @@ const READ_BUDGET: Duration = Duration::from_secs(300);
 /// `git fetch origin` of a large history.
 const FETCH_BUDGET: Duration = Duration::from_secs(1800);
 /// Nothing else runs under a git that changes a ref or a worktree, for this one run (no
-/// configuration is written): no repository hook (a hook directory that does not exist), and no
-/// automatic maintenance. A merge or a fetch otherwise ends by starting `git maintenance run
-/// --auto --detach`, whose fork can still hold the run's stdout in its process group when git
-/// exits, and a drain that sees it refuses the run's output ([`System::run_complete_stdout`]).
-pub(crate) const NO_SIDE_RUNS: [&str; 4] = [
+/// configuration is written): no repository hook (a hook directory that does not exist), no
+/// fsmonitor hook or daemon `core.fsmonitor` names (a merge's index update and a status each
+/// start one; set empty, which every git reads as none, where `false` names a hook program to
+/// git 2.16 to 2.35), and no automatic maintenance. A merge or a fetch otherwise ends by
+/// starting `git maintenance run --auto --detach`, whose fork can still hold the run's stdout
+/// in its process group when git exits, and a drain that sees it refuses the run's output
+/// ([`System::run_complete_stdout`]).
+pub(crate) const NO_SIDE_RUNS: [&str; 6] = [
     "-c",
     "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=",
     "-c",
     "maintenance.auto=false",
 ];
@@ -31,7 +36,7 @@ pub(crate) const NO_SIDE_RUNS: [&str; 4] = [
 const PROGRAM_KEYS: &str = r"^(hook|filter)\..*\.[^.]+$";
 
 /// What a repository's config names that a git command there can start by itself, beyond what
-/// [`NO_SIDE_RUNS`] and `-c core.fsmonitor=false` stop: each hook (`hook.<name>.*`) and each
+/// [`NO_SIDE_RUNS`] stops: each hook (`hook.<name>.*`) and each
 /// filter driver (`filter.<driver>.*`), whose `clean` runs whenever git hashes a worktree file an
 /// attributes file assigns it to (a `status` or `diff` of a stat-dirty file, an index rewrite of
 /// a racily clean one), in any scope the config reads, the empty name included.
@@ -127,14 +132,20 @@ impl Programs {
 
 /// The installed git for `user` ([`crate::items::github::git_program_for_user`]: their managed
 /// build, else native Git), in `path` when given, with no prompt (`GIT_TERMINAL_PROMPT=0`,
-/// and an empty `GIT_ASKPASS`, which keeps a person's `core.askPass` from running) and no
-/// optional index lock (`GIT_OPTIONAL_LOCKS=0`, so a read never races the person's own git).
+/// and an empty `GIT_ASKPASS`, which keeps a person's `core.askPass` from running), no
+/// optional index lock (`GIT_OPTIONAL_LOCKS=0`, so a read never races the person's own git),
+/// and no fetch of an object a partial clone lacks (`GIT_NO_LAZY_FETCH=1`, which git 2.44 and
+/// later and the May 2024 security releases from 2.39.4 on honour, and an older git ignores): a
+/// read of a missing object fails rather than reaching a remote by itself, outside aterm's
+/// credential route. Only a run that must complete a partial clone's worktree, under
+/// [`network`], lifts it ([`lazily`]).
 pub(crate) fn git(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
     let mut command = Cmd::new(crate::items::github::git_program_for_user(sys, user))
         .as_user(user)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .budget(READ_BUDGET);
     if let Some(path) = path {
         command = command.arg("-C").arg(path);
@@ -142,10 +153,16 @@ pub(crate) fn git(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
     command
 }
 
+/// `command`, a [`network`] run that writes a worktree, free to fetch what a partial clone
+/// lacks (a merge's or a submodule checkout's blobs) through the route it carries.
+pub(crate) fn lazily(command: Cmd) -> Cmd {
+    command.env("GIT_NO_LAZY_FETCH", "0")
+}
+
 /// [`git`] for a run that reaches a remote, or may (a partial clone's merge fetches what it
-/// lacks): aterm's own credential route rides on it ([`crate::git_credential::pinned`]), so no
-/// helper a file names runs for any host, the login keychain's least of all, whatever the
-/// person's git settings say.
+/// lacks, [`lazily`]): aterm's own credential route rides on it
+/// ([`crate::git_credential::pinned`]), so no helper a file names runs for any host, the login
+/// keychain's least of all, whatever the person's git settings say.
 pub(crate) fn network(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
     crate::git_credential::pinned(
         git(sys, user, path),
@@ -567,8 +584,6 @@ fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<
     let status = run(
         sys,
         &programs.off(git()).args(NO_SIDE_RUNS).args([
-            "-c",
-            "core.fsmonitor=false",
             "status",
             "--porcelain=v1",
             "-z",
@@ -1021,7 +1036,7 @@ pub(crate) fn align_guarded(
     let merge = run(
         sys,
         &programs
-            .off(network(sys, user, Some(path)))
+            .off(lazily(network(sys, user, Some(path))))
             .budget(FETCH_BUDGET)
             .args(NO_SIDE_RUNS)
             .args([

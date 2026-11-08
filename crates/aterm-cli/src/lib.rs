@@ -872,9 +872,10 @@ const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         password (`softwareupdate --install-rosetta`); false never\n\
      \x20                         does. An Intel Mac ignores it.\n\
      \x20 The table is applied by `aterm pkg machine apply`, which aterm runs once a day\n\
-     \x20 at the first window or interactive terminal session, and by a package pass\n\
-     \x20 (update, seed, install) when the table changed since it was last applied. With\n\
-     \x20 [packages] enabled = false no pass runs, so an edit waits for the daily apply.\n\
+     \x20 when it starts (the app, or an interactive terminal session; a window a running\n\
+     \x20 aterm opens does not), and by a package pass (update, seed, install) when the\n\
+     \x20 table changed since it was last applied. With [packages] enabled = false no\n\
+     \x20 pass runs, so an edit waits for the daily apply.\n\
      \x20 `aterm pkg machine` reads the measured state. Settings ▸ Security sets the\n\
      \x20 keys, shows that state and, while something is unapplied, offers Apply Now.\n\
      \x20 An apply is refused, and says so, under a redirected $HOME (`defaults` writes\n\

@@ -2330,9 +2330,16 @@ mod tests {
             );
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt as _;
+                use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
                 let control = home.join("prior-creation-policy");
-                drop(crate::platform::open_create_write(&control, 0o644).unwrap());
+                drop(
+                    std::fs::OpenOptions::new()
+                        .mode(0o644)
+                        .create_new(true)
+                        .write(true)
+                        .open(&control)
+                        .unwrap(),
+                );
                 assert_eq!(
                     std::fs::metadata(destination).unwrap().permissions().mode() & 0o777,
                     std::fs::metadata(control).unwrap().permissions().mode() & 0o777,

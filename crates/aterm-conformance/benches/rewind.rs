@@ -8,6 +8,9 @@
 mod quiet;
 #[cfg(unix)]
 mod support;
+#[cfg(unix)]
+#[path = "support/telemetry.rs"]
+mod telemetry;
 
 #[cfg(unix)]
 mod measuring {
@@ -138,7 +141,7 @@ mod measuring {
             &["ATERM_REWIND_BIN", "ATERM_PAINT_BIN"],
             aterm_tempfile::bin_exe("fake-tui"),
         );
-        support::run_classified(
+        support::run_classified_with_telemetry(
             "rewind",
             ROWS,
             |row| match row {
@@ -152,6 +155,10 @@ mod measuring {
                 _ => support::Kind::Timing,
             },
             |row| take(&rig, row),
+            Some(support::Telemetry {
+                cpu: super::telemetry::cpu,
+                events: super::telemetry::events,
+            }),
         )
     }
 

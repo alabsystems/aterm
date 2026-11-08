@@ -970,6 +970,7 @@ fn a_reader_hears_the_row_in_words() {
 /// through.
 #[test]
 fn no_midnight_strikes_a_letter() {
+    use aterm_agent::harness::quota_view::CELL_PLACES;
     use aterm_core::render::{FxItem, FxRect};
     let (cw, ch) = (8u16, 16u16);
     let mut struck = 0;
@@ -980,22 +981,23 @@ fn no_midnight_strikes_a_letter() {
             if !view.lay(room, &mut line) {
                 continue;
             }
-            let placed: Vec<(usize, i64)> =
-                super::midnights_placed(&view.chart, &line, i64::from(cw)).collect();
+            let placed: Vec<(usize, i64)> = view.chart.midnights_at(line.per_day).collect();
             let over = |cell: usize| {
                 let (glyph, role, _) = line.cells[line.chart.start + cell];
-                super::ticks_over(glyph, role)
+                glyph == ' ' || matches!(role, Role::Mark | Role::Line | Role::Track)
             };
             let kept: Vec<i64> = placed
                 .iter()
                 .filter(|&&(cell, _)| over(cell))
-                .map(|&(_, x)| x)
+                .map(|&(_, place)| place * i64::from(cw) / CELL_PLACES)
                 .collect();
             if (name, room) == ("c", 66) {
                 struck += placed.len() - kept.len();
             }
-            let rects: Vec<FxRect> = super::tick_content(&view.chart, &line, (cw, ch), 0x0088_8888)
-                .map_or_else(Vec::new, |content| {
+            let mut laid = Vec::new();
+            super::push_ticks(&mut laid, &line.ticks, (0, line.chart.len()), (cw, ch));
+            let rects: Vec<FxRect> =
+                super::tick_content(&laid, 0x0088_8888).map_or_else(Vec::new, |content| {
                     content
                         .items()
                         .iter()

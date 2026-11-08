@@ -1572,8 +1572,9 @@ fn parts(view: &QuotaView, line: &QuotaLine) -> Parts {
 /// shows; (3) no figure shows without its name; (4) each narrower room's parts are a subset of a
 /// wider one's (names, phrases, a full phrase only where the wider is full) and its chart is
 /// never finer; (5) no rung is finer than 12 cells a day. The design's mocks hold their rungs at
-/// 166, 96 and 66 cells: (a) R1, R3, R6; (b) and (c) R2, R5, R7. Negative control: a T2 that
-/// keeps phrase 1 over phrase 2 drops case (b)'s stop from 77 cells down (invariant 2).
+/// 166, 96 and 66 cells: (a) R1, R3, R6; (b) R2, R5, R7; case (c)'s, R2, R5, R7 too, are
+/// `case_c_lays_r2_r5_r7`'s. Negative control: a T2 that keeps phrase 1 over phrase 2 drops
+/// case (b)'s stop from 77 cells down (invariant 2).
 #[test]
 fn the_quota_ladder_keeps_its_invariants() {
     for (name, view) in scenarios() {
@@ -1683,21 +1684,73 @@ fn the_quota_ladder_keeps_its_invariants() {
         )
     );
     assert_eq!(rung(case_b(), 66), (s("main 63%"), 4, s(stop)));
-    let (lead, per_day, _) = rung(case_c(), 166);
-    assert_eq!(
-        (lead.as_str(), per_day),
-        ("main 75% \u{b7} alt1 80% \u{b7} alt2 90%", 8)
-    );
-    let (lead, per_day, _) = rung(case_c(), 96);
-    assert_eq!((lead.as_str(), per_day), ("main 75% +2", 6));
-    let (lead, per_day, tail) = rung(case_c(), 66);
-    assert_eq!((lead.as_str(), per_day), ("main 75% +2", 4));
-    assert!(tail.starts_with('\u{2573}'), "{tail}");
     let (lead, per_day, tail) = rung(case_d(), 66);
     assert_eq!(
         (lead.as_str(), per_day, tail.as_str()),
         ("main", 0, NO_FIGURE_FULL)
     );
+}
+
+/// CASE (C) LAYS R2, R5 AND R7 (§1.3 (c), §2.4) at 166, 96 and 66 cells, R2 by one cell: its 30
+/// lead cells, 65 chart cells at 8 a day and 36 tail cells take 135 with the two gaps, and R1's
+/// 97 chart cells take 167. R2's T0 says phrase 1 in its short words, because main is full
+/// before its reset (§2.3): the rotation leaves it at its low mark ~Fri 08:00, comes back to it
+/// once alt1 is low too and alt2 is out (~Sat 02:00), and it fills ~Sat 04:00, so no run of main
+/// holds its reset. Every account is out once the three weeks' 25 + 20 + 10 points are
+/// spent at 36% a day, 36 h 40 min from now (Sat 05:40), said `~Sat 05:00` at the hour's grain
+/// of a start a day or more ahead (§3.2). Negative controls: R2 laid with T1, as R3 is, says
+/// `↺ Sat 10:00 · ╳ ~Sat 05:00` at 166 cells under the same lead at 8 cells a day; phrase 1 read
+/// off main's curve where the work first leaves it (97.5%) says the design's first mock's
+/// `~98% by ↺ Sat 10:00`.
+#[test]
+fn case_c_lays_r2_r5_r7() {
+    let view = case_c().outlook().quota("main", None, true);
+    let stop = "\u{2573} ~Sat 05:00";
+    let reset = "\u{21ba} Sat 10:00";
+    let rungs = [
+        (
+            166,
+            "main 75% \u{b7} alt1 80% \u{b7} alt2 90%",
+            8,
+            format!("{reset} \u{b7} {stop}\u{2013}Sat 10:00"),
+        ),
+        (96, "main 75% +2", 6, format!("{reset} \u{b7} {stop}")),
+        (66, "main 75% +2", 4, stop.to_owned()),
+    ];
+    for (room, lead, per_day, tail) in rungs {
+        let line = laid(&view, room).unwrap();
+        assert_eq!(
+            (
+                line.text_of(&line.lead).as_str(),
+                line.per_day,
+                line.text_of(&line.tail)
+            ),
+            (lead, per_day, tail),
+            "at {room}"
+        );
+    }
+    assert_eq!(laid(&view, 166).unwrap().cells.len(), 135);
+    assert_eq!(laid(&view, 167).unwrap().per_day, 12);
+    let main: Vec<_> = view
+        .chart
+        .runs
+        .iter()
+        .filter(|r| r.label == "main" && r.from < SAT7)
+        .map(|r| {
+            let (first, last) = (r.knots.first().unwrap(), r.knots.last().unwrap());
+            (first.t - T5, first.x10, last.t - T5, last.x10)
+        })
+        .collect();
+    assert_eq!(
+        main,
+        [
+            (0, Some(750), 15 * H, Some(975)),
+            (33 * H + 20 * MIN, Some(975), 35 * H, Some(1000)),
+        ]
+    );
+    let own = view.tail.own.as_ref().unwrap();
+    assert_eq!((own.by_reset, own.reset.as_str()), (None, "Sat 10:00"));
+    assert_eq!(view.chart.stops, [(T5 + 36 * H + 40 * MIN, SAT7, false)]);
 }
 
 /// A PAUSED RECOVERY SHOWS NO FORECAST (moved from the footer's outlook tests): a pane whose

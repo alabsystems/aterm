@@ -144,8 +144,16 @@ pub fn recorded_cutter(release: &Path, commit: &str) -> Result<Cutter, String> {
 /// # Errors
 /// The root or commit is invalid, storage or copying fails, a directory or source is a
 /// symlink, the copied bytes differ, or the exact successful first exec cannot be proved.
-pub fn stage_cutter(release: &Path, commit: &str, source: &Path) -> Result<Cutter, String> {
-    let digest = crate::dmg::sha256_file(source)?;
+pub fn stage_cutter(
+    release: &Path,
+    commit: &str,
+    source: &Path,
+    log: &Path,
+) -> Result<Cutter, String> {
+    let digest = {
+        let _phase = crate::cut_timing::Timer::start(log, "cutter-source-hash");
+        crate::dmg::sha256_file(source)?
+    };
     let root = release.join("tools");
     let dir = root.join(&digest);
     if !release.is_absolute() || !aterm_codec::hex::is_lower(commit, 40) {
@@ -164,6 +172,7 @@ pub fn stage_cutter(release: &Path, commit: &str, source: &Path) -> Result<Cutte
     match std::fs::symlink_metadata(&dir) {
         Ok(_) => cutter.validate(release)?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let _phase = crate::cut_timing::Timer::start(log, "cutter-copy-sync");
             let stage = aterm_tempfile::Builder::new()
                 .prefix(".cutter-")
                 .tempdir_in(&root)
@@ -175,8 +184,14 @@ pub fn stage_cutter(release: &Path, commit: &str, source: &Path) -> Result<Cutte
         }
         Err(error) => return Err(error.to_string()),
     }
-    cutter.validate(release)?;
-    prove_exec(&cutter.tool.path, CUTTER_VERSION)?;
+    {
+        let _phase = crate::cut_timing::Timer::start(log, "cutter-copy-hash");
+        cutter.validate(release)?;
+    }
+    {
+        let _phase = crate::cut_timing::Timer::start(log, "cutter-first-exec");
+        prove_exec(&cutter.tool.path, CUTTER_VERSION)?;
+    }
     Ok(cutter)
 }
 
@@ -655,6 +670,25 @@ mod tests {
 
     const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    #[test]
+    fn a_local_phase_is_recorded_when_its_operation_returns_an_error() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let log = temp.path().join("events");
+        let operation = || -> Result<(), ()> {
+            let _phase = crate::cut_timing::Timer::start(&log, "failed-operation");
+            Err(())
+        };
+        assert!(operation().is_err());
+        let text = std::fs::read_to_string(&log).unwrap();
+        let line = text.lines().last().unwrap();
+        let event: aterm_json::Value =
+            aterm_json::from_str(line.trim().strip_prefix("release-event: ").unwrap()).unwrap();
+        assert_eq!(event["event"].as_str(), Some("cut-gate-finished"));
+        assert_eq!(event["gate"].as_str(), Some("failed-operation"));
+        assert!(event["execution_s"].as_f64().is_some());
+        assert!(event.get("outcome").is_none(), "telemetry is no verdict");
+    }
+
     /// NEGATIVE CONTROLS: the old tool.toml path must not veto repair; own-writer failures
     /// and a second failure must not repair; a marker for a prior candidate cannot veto R.
     #[test]
@@ -752,7 +786,13 @@ mod tests {
         let (release, _, _, old) = staged_fixture(temp.path());
         publish(&release, &old).unwrap();
         assert!(proved_cutter(&old.cutter.path, &record_path(&release)).is_err());
-        let repaired = stage_cutter(&release, COMMIT, &old.cutter.path).unwrap();
+        let repaired = stage_cutter(
+            &release,
+            COMMIT,
+            &old.cutter.path,
+            &release.with_extension("events"),
+        )
+        .unwrap();
         publish_cutter(&release, &repaired).unwrap();
         assert_eq!(
             proved_cutter(&repaired.tool.path, &cutter_record_path(&release)).unwrap(),
@@ -769,7 +809,8 @@ mod tests {
         let temp = aterm_tempfile::tempdir().unwrap();
         let release = temp.path().join("release");
         let source = tool_source(temp.path(), "cutter-only", CUTTER_VERSION, 0);
-        let cutter = stage_cutter(&release, COMMIT, &source).unwrap();
+        let cutter =
+            stage_cutter(&release, COMMIT, &source, &release.with_extension("events")).unwrap();
         assert!(!record_path(&release).exists());
         publish_cutter(&release, &cutter).unwrap();
         assert_eq!(recorded_cutter(&release, COMMIT).unwrap(), cutter);
@@ -785,7 +826,9 @@ mod tests {
         }
         std::fs::write(&cutter.tool.path, b"mutated after first exec completed").unwrap();
         assert!(recorded_cutter(&release, COMMIT).is_err());
-        assert!(stage_cutter(&release, COMMIT, &source).is_err());
+        assert!(
+            stage_cutter(&release, COMMIT, &source, &release.with_extension("events")).is_err()
+        );
     }
 
     fn tool_source(dir: &Path, name: &str, version: &str, exit: i32) -> PathBuf {

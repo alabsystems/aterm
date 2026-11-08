@@ -19,6 +19,7 @@ pub(crate) struct Timer<'a> {
     start: Instant,
     at: u64,
     cpu: Option<aterm_sysprobe::jobs::Counters>,
+    log: Option<std::path::PathBuf>,
 }
 
 impl<'a> Timer<'a> {
@@ -28,7 +29,23 @@ impl<'a> Timer<'a> {
             start: Instant::now(),
             at: now(),
             cpu: aterm_sysprobe::jobs::counters_of(std::process::id()),
+            log: None,
         }
+    }
+
+    /// Keep the same event in the operation's log, including when an error unwinds it.
+    pub(crate) fn start(log: &std::path::Path, name: &'a str) -> Self {
+        use std::io::Write as _;
+        let mut timer = Self::new(name);
+        timer.log = Some(log.to_owned());
+        let event = aterm_json::json!({
+            "schema": 1, "event": "cut-gate-started", "gate": name,
+            "started_at_unix_ms": timer.at,
+        });
+        if let Ok(mut sink) = crate::durable::open_append(log, true) {
+            let _ = writeln!(sink, "release-event: {event}");
+        }
+        timer
     }
 }
 
@@ -61,16 +78,20 @@ impl Drop for Timer<'_> {
             "  timing     {}: wall {:.3}s · self CPU {}s · child CPU {}s (inclusive)",
             self.name, wall, own, child
         );
-        println!(
-            "release-event: {}",
-            aterm_json::json!({
-                "schema": 1, "event": "cut-gate-finished", "gate": self.name,
-                "started_at_unix_ms": self.at, "ended_at_unix_ms": now(),
-                "execution_s": wall, "self_cpu_s": own,
-                "child_cpu": {"scope": "reaped-child-and-waited-descendants", "observed_s": child},
-                "inclusive": true
-            })
-        );
+        let event = aterm_json::json!({
+            "schema": 1, "event": "cut-gate-finished", "gate": self.name,
+            "started_at_unix_ms": self.at, "ended_at_unix_ms": now(),
+            "execution_s": wall, "self_cpu_s": own,
+            "child_cpu": {"scope": "reaped-child-and-waited-descendants", "observed_s": child},
+            "inclusive": true
+        });
+        println!("release-event: {event}");
+        if let Some(path) = &self.log {
+            use std::io::Write as _;
+            if let Ok(mut log) = crate::durable::open_append(path, true) {
+                let _ = writeln!(log, "release-event: {event}");
+            }
+        }
     }
 }
 

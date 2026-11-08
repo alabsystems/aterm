@@ -1686,13 +1686,17 @@ pub const VERBS: &[VerbSpec] = &[
         AnyScopeMeta,
         "setup status: the background coordinator's last published observation",
         "— read-only instance posture, including with no terminal selected. Replies \
-         `OK schema=2 setup=<state> verified=<bits> observed_generation=<n> rows=<subject:standing,...|->` \
+         `OK schema=2 setup=<state> verified=<bits> observed_generation=<n> rows=<subject:standing,...|-> [caps_live=<mapping>]` \
          with the same `setup=` state as `status`: `done`, `unknown:<rows>`, \
          `pending[:<rows>][;needs:<rows>][;unknown:<rows>]`, or `-` before any observation; \
          `unknown` names settings without a usable cached reading, separately from known work. \
          The row metadata uses fixed public names and standings (`unread` before any reading), \
          never notes or values. The generation counts cached observation changes, not time. \
-         Only `verified` supplies already-confirmed private settings. `done` may carry \
+         The optional `caps_live` is `unknown`, `unknown:held=N`, `control`, or \
+         `mixed:control=N,other=N,held=N`: cached reported OS/HID mapping composition. Counts \
+         are HID services, not physical keyboards; held services supply no Control claim. \
+         This field verifies no physical keypress or saved Caps readiness and sets no \
+         `verified` bits. Use `verified` for confirmed private-setting readiness. `done` may carry \
          `;asking:<rows>` for automatic work still continuing and `;offered:<rows>` for grants \
          which hold nothing back. Starts no probe or setup, requests no permission, changes \
          no focus and counts as no input.",

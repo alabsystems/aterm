@@ -248,7 +248,7 @@ fn transition_by(
 #[test]
 fn terminal_publication_refines_host_drain_and_real_astream_journal() {
     let model = aterm_models_harness::terminal_publication_model();
-    aterm_spec::interp::prove_and_catch(&model);
+    assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
     assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     let mut evidence = StepEvidence::new("TerminalPublication");
     for state in aterm_spec::interp::reachable_states(&model) {

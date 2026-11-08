@@ -11,6 +11,7 @@ const UNIT_BOOK: &str = "ATERM_VERIFY_UNIT_BOOK";
 const UNIT_RUN: &str = "ATERM_VERIFY_UNIT_RUN";
 const WRAPPER: &str = "ATERM_VERIFY_UNIT_WRAPPER";
 const UNIT_LABEL: &str = "verify compiler unit ";
+
 const REFUSED: &str = "aterm-verify: compiler admission: ";
 
 #[derive(Clone)]

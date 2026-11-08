@@ -16,11 +16,13 @@ use std::time::Duration;
 
 const BUDGET: Duration = Duration::from_secs(1800);
 
+/// [`checkout::git`] (whose `GIT_NO_LAZY_FETCH` an older git ignores) with `--no-lazy-fetch`,
+/// which an older git refuses ([`require_local_reads`] asks it first), and with no fsmonitor,
+/// for the reads that run without [`checkout::NO_SIDE_RUNS`].
 fn local(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {
     checkout::git(sys, user, path)
-        .env("GIT_NO_LAZY_FETCH", "1")
         .arg("--no-lazy-fetch")
-        .args(["-c", "core.fsmonitor=false"])
+        .args(["-c", "core.fsmonitor="])
 }
 
 fn require_local_reads(sys: &dyn System, user: &User, repo: &Repo) -> Result<(), String> {
@@ -517,21 +519,21 @@ fn network(
     )
 }
 
+/// That the repository at `path` holds its whole history in its own store: not shallow, with no
+/// partial-clone or promisor configuration ([`repos::verify_integrity`]), so no git it runs can
+/// fetch a missing object lazily, and with no alternate object store
+/// ([`repos::alternate_store`]). Each read here runs on any git, so the default refresh, which
+/// checks storage this way, needs no `--no-lazy-fetch` (none of its commands carries one).
+///
+/// # Errors
+/// The repository is shallow, partial or a promisor's, or borrows an alternate store, or a read
+/// fails.
 pub(super) fn complete_storage(sys: &dyn System, user: &User, path: &Path) -> Result<(), String> {
     repos::verify_integrity(sys, user, path)
         .map_err(|_| "required dependency has shallow or partial history; left untouched")?;
-    let alternates = text(
-        sys,
-        local(sys, user, Some(path)).args(["rev-parse", "--git-path", "objects/info/alternates"]),
-        "cannot inspect required dependency object storage",
-    )?;
-    let alternates = Path::new(alternates.trim());
-    let alternates = if alternates.is_absolute() {
-        alternates.to_owned()
-    } else {
-        path.join(alternates)
-    };
-    if !matches!(sys.stat(&alternates), Err(error) if error.kind() == io::ErrorKind::NotFound) {
+    if repos::alternate_store(sys, user, path)
+        .map_err(|_| "cannot inspect required dependency object storage")?
+    {
         return Err("required dependency uses an alternate object store; left untouched".into());
     }
     Ok(())

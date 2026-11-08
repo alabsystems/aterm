@@ -215,6 +215,7 @@ pub(crate) fn fx_layer(out: &mut impl Words, l: &FxLayer) {
         knock,
         offset: (ox, oy),
         clip,
+        chrome,
     } = l;
     out.put("id", *id);
     out.group("content", |f| fx_content(f, content));
@@ -226,6 +227,10 @@ pub(crate) fn fx_layer(out: &mut impl Words, l: &FxLayer) {
     out.put("offset.x", signed(*ox));
     out.put("offset.y", signed(*oy));
     out.group("clip", |f| px_rect(f, *clip));
+    // Named only when set, so a layer on no chrome keeps the words it always had.
+    if let Some(chrome) = chrome {
+        out.group("chrome", |f| px_rect(f, *chrome));
+    }
 }
 
 fn fx_content(out: &mut impl Words, c: &FxContent) {

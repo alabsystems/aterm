@@ -546,14 +546,19 @@ const THEME_FILES_HEADING: &str = "Theme files";
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PickerRow {
     Heading(&'static str),
-    Cells(std::ops::Range<usize>),
+    /// A row of tiles, the slots in the range, and the most lines a tile's words take there
+    /// ([`picker_row_height`]).
+    Cells(std::ops::Range<usize>, usize),
 }
 
+/// The picker's rows of `count` slots, `columns` to a row, each section headed where `headed`,
+/// each row as tall as the most lines `lines` says its tiles' words take.
 fn picker_rows(
     count: usize,
     columns: usize,
     headed: bool,
     section: impl Fn(usize) -> Option<&'static str>,
+    lines: impl Fn(std::ops::Range<usize>) -> usize,
 ) -> Vec<PickerRow> {
     let columns = columns.max(1);
     let mut rows = Vec::new();
@@ -573,7 +578,7 @@ fn picker_rows(
         let mut first = start;
         while first < end {
             let last = (first + columns).min(end);
-            rows.push(PickerRow::Cells(first..last));
+            rows.push(PickerRow::Cells(first..last, lines(first..last).max(1)));
             first = last;
         }
         start = end;
@@ -589,11 +594,20 @@ fn picker_heading_height() -> f32 {
     group_heading_label_height()
 }
 
+/// A ROW OF TILES IS AS TALL AS ITS WORDS: a tile's name that one line cannot hold wraps between
+/// its words onto the lines it takes, and its row grows by them ([`choice_option_lines`]), as the
+/// Themes chooser's rows do. Fitted to one line, the Color theme picker read "Catppuccin…" for
+/// Catppuccin Mocha at 2x in a 283pt window, and "Default…" for Default Light.
 fn picker_row_height(row: &PickerRow) -> f32 {
     match row {
         PickerRow::Heading(_) => picker_heading_height(),
-        PickerRow::Cells(_) => scaled_control_height(),
+        PickerRow::Cells(_, lines) => picker_tile_height(*lines),
     }
+}
+
+/// How tall a picker's tile stands whose words take `lines` lines.
+fn picker_tile_height(lines: usize) -> f32 {
+    crate::native_ui::native_button_height_for_lines(lines.max(1), scaled_control_height())
 }
 
 fn picker_rows_height(rows: &[PickerRow], gap: f32) -> f32 {
@@ -649,7 +663,7 @@ fn picker_flush_seat(
         let cut = (top - tops[first]).max(0.0);
         let shown = match rows[first] {
             PickerRow::Heading(_) => cut <= 0.5,
-            PickerRow::Cells(_) => drawn(first, cut),
+            PickerRow::Cells(..) => drawn(first, cut),
         };
         shown.then_some(first)
     };
@@ -721,6 +735,9 @@ struct ChoicePicker {
     themes: Option<ThemePickerExtras>,
     trailing: Cell<usize>,
     slot: Option<aterm_types::Appearance>,
+    /// How wide the rows set their tiles' words, the list's scroll gutter kept whether or not it
+    /// scrolls, so a row's lines never depend on what they decide ([`choice_option_lines`]).
+    words: Cell<PickerMeasure>,
 }
 
 impl ChoicePicker {
@@ -810,6 +827,7 @@ impl ChoicePicker {
             themes,
             trailing: Cell::new(0),
             slot: None,
+            words: Cell::new(PickerMeasure::new(f32::INFINITY)),
         }
     }
 
@@ -964,11 +982,24 @@ impl ChoicePicker {
     }
 
     fn rows(&self) -> Vec<PickerRow> {
+        let columns = self.columns.get();
         picker_rows(
             self.slots(),
-            self.columns.get(),
+            columns,
             self.headed(),
             |position| self.cell_section(position),
+            |cells| {
+                let one = cells.len() == 1;
+                cells
+                    .map(|position| match self.shown.get(position) {
+                        Some(&index) => {
+                            self.option_lines(index, columns, one && self.spans_row(position))
+                        }
+                        None => self.action_lines(position - self.shown.len(), columns),
+                    })
+                    .max()
+                    .unwrap_or(1)
+            },
         )
     }
 
@@ -985,7 +1016,62 @@ impl ChoicePicker {
                     Some(THEME_FILES_HEADING)
                 }
             },
+            |cells| {
+                let one = cells.len() == 1;
+                cells
+                    .map(|index| {
+                        if index < options {
+                            self.option_lines(index, columns, one && self.option_spans(index))
+                        } else {
+                            self.action_lines(index - options, columns)
+                        }
+                    })
+                    .max()
+                    .unwrap_or(1)
+            },
         )
+    }
+
+    /// Whether option `index` takes its row alone, across the list ([`ThemeSection::spans_row`]).
+    fn option_spans(&self, index: usize) -> bool {
+        self.headed()
+            && self.options[index]
+                .theme
+                .as_ref()
+                .is_some_and(|theme| theme.section.spans_row())
+    }
+
+    /// The width a tile sets its words for, `columns` tiles to a row of the rows' words width
+    /// ([`ChoicePicker::words`]), or the row's whole width where it `spans` it.
+    fn tile_words(&self, columns: usize, spans: bool) -> f32 {
+        let rows = self.words.get().get();
+        let columns = columns.max(1);
+        if spans || columns == 1 {
+            rows
+        } else {
+            (rows - self.gap.get().get() * (columns - 1) as f32) / columns as f32
+        }
+    }
+
+    /// How many lines option `index` sets its words on, on a tile `columns` to a row, or spanning
+    /// it ([`choice_option_lines`]).
+    fn option_lines(&self, index: usize, columns: usize, spans: bool) -> usize {
+        choice_option_lines(
+            &self.options[index],
+            (self.tile_words(columns, spans), index == self.selected),
+            self.fonts,
+        )
+        .len()
+    }
+
+    /// How many lines the theme files cell `ordinal` sets its words on, on a tile `columns` to a
+    /// row ([`theme_action_lines`]).
+    fn action_lines(&self, ordinal: usize, columns: usize) -> usize {
+        theme_action_lines(
+            ordinal,
+            choice_option_text_width(self.tile_words(columns, false), false),
+        )
+        .len()
     }
 
     fn carried_heading(&self, rows: &[PickerRow], first: usize) -> Option<&'static str> {
@@ -993,7 +1079,7 @@ impl ChoicePicker {
             return None;
         }
         match rows.get(first)? {
-            PickerRow::Cells(cells) => self
+            PickerRow::Cells(cells, _) => self
                 .cell_section(cells.start)
                 .filter(|heading| section_captioned(heading)),
             PickerRow::Heading(_) => None,
@@ -1044,7 +1130,7 @@ impl ChoicePicker {
         rows[self.window(&rows)]
             .iter()
             .filter_map(|row| match row {
-                PickerRow::Cells(cells) => Some(cells.clone()),
+                PickerRow::Cells(cells, _) => Some(cells.clone()),
                 PickerRow::Heading(_) => None,
             })
             .flatten()
@@ -1076,7 +1162,7 @@ impl ChoicePicker {
     fn sections_of(&self, rows: &[PickerRow]) -> Vec<ThemeSection> {
         let mut sections = Vec::new();
         for position in rows.iter().flat_map(|row| match row {
-            PickerRow::Cells(cells) => cells.clone(),
+            PickerRow::Cells(cells, _) => cells.clone(),
             PickerRow::Heading(_) => 0..0,
         }) {
             if let Some(section) = self
@@ -1147,7 +1233,7 @@ impl ChoicePicker {
         let leading = old[self.offset.get().min(old.len())..]
             .iter()
             .find_map(|row| match row {
-                PickerRow::Cells(cells) => Some(cells.start),
+                PickerRow::Cells(cells, _) => Some(cells.start),
                 PickerRow::Heading(_) => None,
             });
         self.columns.set(columns.max(1));
@@ -1173,7 +1259,7 @@ impl ChoicePicker {
         let cells: Vec<usize> = all
             .iter()
             .enumerate()
-            .filter(|(_, row)| matches!(row, PickerRow::Cells(_)))
+            .filter(|(_, row)| matches!(row, PickerRow::Cells(..)))
             .map(|(index, _)| index)
             .collect();
         let Some(last) = cells.len().checked_sub(1) else {
@@ -1189,7 +1275,7 @@ impl ChoicePicker {
 
     fn row_of(rows: &[PickerRow], position: usize) -> Option<usize> {
         rows.iter().position(|row| match row {
-            PickerRow::Cells(cells) => cells.contains(&position),
+            PickerRow::Cells(cells, _) => cells.contains(&position),
             PickerRow::Heading(_) => false,
         })
     }
@@ -1223,7 +1309,7 @@ impl ChoicePicker {
     fn page_rows(&self) -> usize {
         let rows = self.rows();
         self.window(&rows)
-            .filter(|row| matches!(rows[*row], PickerRow::Cells(_)))
+            .filter(|row| matches!(rows[*row], PickerRow::Cells(..)))
             .count()
             .max(1)
     }
@@ -1242,7 +1328,7 @@ impl ChoicePicker {
             .rows()
             .into_iter()
             .filter_map(|row| match row {
-                PickerRow::Cells(cells) => Some(cells),
+                PickerRow::Cells(cells, _) => Some(cells),
                 PickerRow::Heading(_) => None,
             })
             .collect();
@@ -2092,7 +2178,7 @@ impl SettingsViewState {
             };
             let previous_seed = self
                 .field_by_key(key)
-                .and_then(|field| field.seed.as_deref())
+                .map(EditField::seed_text)
                 .unwrap_or_default();
             let is_draft = input.value() != previous_seed || input.preedit().is_some();
             let authoritative_changed = self.raw_value(key) != raw_values.get(key).cloned();
@@ -2100,7 +2186,7 @@ impl SettingsViewState {
                 retained_inputs.insert(
                     key.clone(),
                     crate::native_text_input::TextInputState::new(
-                        next_field.seed.clone().unwrap_or_default(),
+                        next_field.seed_text().into_owned(),
                     ),
                 );
             } else {
@@ -2625,7 +2711,7 @@ impl SettingsViewState {
     fn open_text_entry(&mut self, key: &str, typed: Option<&str>) {
         let seed = self
             .field_by_key(key)
-            .and_then(|field| field.seed.clone())
+            .map(|field| field.seed_text().into_owned())
             .unwrap_or_default();
         self.clear_field_edit();
         match typed {
@@ -3038,12 +3124,7 @@ impl SettingsViewState {
             .and_then(|focus| focus.as_str().strip_prefix("settings/control/"))
             .and_then(|key| self.field_by_key(key))
             .filter(|field| self.row_takes_text(field))
-            .map(|field| {
-                (
-                    field.key.to_string(),
-                    field.seed.clone().unwrap_or_default(),
-                )
-            });
+            .map(|field| (field.key.to_string(), field.seed_text().into_owned()));
         let Some((key, seed)) = text_key else {
             self.clear_field_edit();
             return;
@@ -3272,7 +3353,7 @@ impl SettingsViewState {
         let Some(field) = self.field_by_key(key) else {
             return false;
         };
-        input.value() != field.seed.as_deref().unwrap_or_default() || input.preedit().is_some()
+        input.value() != field.seed_text() || input.preedit().is_some()
     }
 
     fn unsaved_field_draft_count(&self) -> usize {
@@ -4236,7 +4317,7 @@ impl SettingsApp {
             // only while it shows its exact field.
             return true;
         }
-        let seed = field.seed.clone().unwrap_or_default();
+        let seed = field.seed_text().into_owned();
         let input = view
             .field_inputs
             .entry(key.to_string())
@@ -5011,7 +5092,7 @@ impl SettingsApp {
                 } else {
                     let seed = view
                         .field_by_key(key)
-                        .and_then(|field| field.seed.clone())
+                        .map(|field| field.seed_text().into_owned())
                         .unwrap_or_default();
                     view.field_inputs
                         .entry(key.to_string())
@@ -5366,9 +5447,7 @@ impl SettingsApp {
             {
                 view.editing_field = Some(key.to_string());
                 view.field_inputs.entry(key.to_string()).or_insert_with(|| {
-                    crate::native_text_input::TextInputState::new(
-                        field.seed.clone().unwrap_or_default(),
-                    )
+                    crate::native_text_input::TextInputState::new(field.seed_text().into_owned())
                 });
                 if font_picker_key(key) {
                     view.text_entry = Some(key.to_string());
@@ -7633,11 +7712,63 @@ fn change_words(
             },
         )
     };
+    let after = |key: &str| {
+        patch
+            .edits
+            .iter()
+            .find(|edit| edit.key == key)
+            .map_or_else(|| view.raw_value(key), |edit| edit.value.clone())
+    };
+    let shown_words = |row: &str, raw: &dyn Fn(&str) -> Option<String>| {
+        matches!(
+            row,
+            SPARKLE_WORDS_KEY | KEYWORD_KITTIES_KEY | prefs::EDIT_TRAIL_SOUNDS
+        )
+        .then(|| {
+            let flag = |key: &str, fallback: bool| {
+                raw(key)
+                    .and_then(|value| value.trim().parse::<bool>().ok())
+                    .unwrap_or(fallback)
+            };
+            if top_effect_shown_by(row, top_effects_show_authored(view), &flag) {
+                "On".to_string()
+            } else {
+                "Off".to_string()
+            }
+        })
+    };
     let mut rows: Vec<String> = Vec::new();
     for edit in &patch.edits {
         let row = row_of(&edit.key);
         if before(&edit.key) != edit.value && !rows.contains(&row) {
             rows.push(row);
+        }
+    }
+    // TOP'S TWO WORD EFFECTS ARE THREE KEYS, the master switch and each one's own: a press that
+    // writes them says the rows a person sees change, Sparkle words or Keyword kitties, never
+    // the master's own name (pressing Sparkle words under Serious Mode said "All word effects
+    // reset to its default").
+    let toys = [SPARKLE_WORDS_KEY, KEYWORD_KITTIES_KEY];
+    let writes = |key: &str| patch.edits.iter().any(|edit| edit.key == key);
+    let top_toy_press = writes(SPARKLE_MASTER_KEY) && toys.into_iter().any(writes);
+    if top_toy_press {
+        let toy_key = |row: &String| row == SPARKLE_MASTER_KEY || toys.contains(&row.as_str());
+        let at = rows.iter().position(toy_key).unwrap_or(rows.len());
+        let seen: Vec<String> = toys
+            .into_iter()
+            .filter(|toy| shown_words(toy, &before) != shown_words(toy, &after))
+            .map(str::to_string)
+            .collect();
+        let written: Vec<String> = rows
+            .iter()
+            .filter(|row| toys.contains(&row.as_str()))
+            .cloned()
+            .collect();
+        rows.retain(|row| !toy_key(row));
+        let shown = if seen.is_empty() { written } else { seen };
+        let at = at.min(rows.len());
+        for (offset, row) in shown.into_iter().enumerate() {
+            rows.insert(at + offset, row);
         }
     }
     if rows.is_empty() {
@@ -7684,10 +7815,11 @@ fn change_words(
                     .any(|edit| row_of(&edit.key) == *row && pin(edit))
         });
         if rows.is_empty()
-            && let Some(edit) = patch
-                .edits
-                .iter()
-                .find(|edit| edit.key != prefs::EDIT_SERIOUS_MODE && !pin(edit))
+            && let Some(edit) = patch.edits.iter().find(|edit| {
+                edit.key != prefs::EDIT_SERIOUS_MODE
+                    && !pin(edit)
+                    && !(top_toy_press && edit.key == SPARKLE_MASTER_KEY)
+            })
         {
             rows.push(row_of(&edit.key));
         }
@@ -7707,37 +7839,12 @@ fn change_words(
             briefs: Default::default(),
         };
     }
-    let after = |key: &str| {
-        patch
-            .edits
-            .iter()
-            .find(|edit| edit.key == key)
-            .map_or_else(|| view.raw_value(key), |edit| edit.value.clone())
-    };
     let mut status = Vec::new();
     let mut undone = Vec::new();
     let mut redone = Vec::new();
     // Each row as its value beside its name, and as its value before its name.
     let mut was_named = Vec::new();
     let mut now_named = Vec::new();
-    let shown_words = |row: &str, raw: &dyn Fn(&str) -> Option<String>| {
-        matches!(
-            row,
-            SPARKLE_WORDS_KEY | KEYWORD_KITTIES_KEY | prefs::EDIT_TRAIL_SOUNDS
-        )
-        .then(|| {
-            let flag = |key: &str, fallback: bool| {
-                raw(key)
-                    .and_then(|value| value.trim().parse::<bool>().ok())
-                    .unwrap_or(fallback)
-            };
-            if top_effect_shown_by(row, top_effects_show_authored(view), &flag) {
-                "On".to_string()
-            } else {
-                "Off".to_string()
-            }
-        })
-    };
     for row in &rows {
         let name = row_name(view, row);
         let was = shown_words(row, &before).unwrap_or_else(|| row_words(view, row, &before));
@@ -7749,7 +7856,7 @@ fn change_words(
             // The file changed but the switch reads as it did (a Reset that
             // leaves it held Off): said so, never "turned on".
             if after(row).is_none() {
-                format!("{name} reset to its default")
+                format!("{name} reset to default")
             } else {
                 format!("{name} saved")
             }
@@ -9491,11 +9598,13 @@ fn semantic_value_for_field(
 /// A value typed for `field` on `aterm ctl settings set`, as the writer takes it.
 pub(crate) fn control_input_value(field: &EditField, value: &str) -> Result<String, String> {
     match field.kind {
-        EditKind::Bool => Ok(match value.trim().to_ascii_lowercase().as_str() {
-            "on" => "true".to_string(),
-            "off" => "false".to_string(),
-            _ => value.to_string(),
-        }),
+        EditKind::Bool => Ok(
+            match without_default_mark(value).to_ascii_lowercase().as_str() {
+                "on" => "true".to_string(),
+                "off" => "false".to_string(),
+                _ => value.to_string(),
+            },
+        ),
         EditKind::Enum { options } => {
             let token = choice_token_for_words(field, value).unwrap_or_else(|| value.to_string());
             if prefs::typed_toml_item(field.key, &token).is_ok() {
@@ -9524,26 +9633,61 @@ pub(crate) fn control_input_value(field: &EditField, value: &str) -> Result<Stri
                 value.trim()
             ))
         }
+        EditKind::Float | EditKind::Integer => {
+            Ok(number_for_reading(field.key, value).unwrap_or_else(|| value.to_string()))
+        }
         _ => Ok(value.to_string()),
     }
+}
+
+/// The number `words` read as for `key` ([`prefs::numeric_reading`]: "12 px", "60%", "1.2×"),
+/// with or without the mark an unset row adds (" (default)", " (automatic)"), as `ctl settings
+/// unset` answers them: a person typing back what they read writes that number.
+fn number_for_reading(key: &str, words: &str) -> Option<String> {
+    let words = without_default_mark(words);
+    let words = words.strip_suffix(" (automatic)").unwrap_or(words).trim();
+    if words.parse::<f64>().is_ok() {
+        return Some(words.to_string());
+    }
+    let end = words
+        .find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+')))
+        .unwrap_or(words.len());
+    let token = &words[..end];
+    let number = token
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())?;
+    // A share of one reads as a percentage of it ("60%" is 0.6); a symbol after the number
+    // itself reads as it is ("12 px", or a chance's "5%").
+    let share = number / 100.0;
+    [(number, token.to_string()), (share, share.to_string())]
+        .into_iter()
+        .find(|(value, shown)| {
+            prefs::numeric_reading(key, *value, shown)
+                .is_some_and(|reading| reading.eq_ignore_ascii_case(words))
+        })
+        .map(|(_, shown)| shown)
+}
+
+/// `words` without the " (default)" mark an unset row's value carries ("Auto (default)").
+fn without_default_mark(words: &str) -> &str {
+    let words = words.trim();
+    words.strip_suffix(" (default)").unwrap_or(words).trim()
 }
 
 fn choice_token_for_words(field: &EditField, words: &str) -> Option<String> {
     let EditKind::Enum { options } = field.kind else {
         return None;
     };
-    let words = words.trim();
-    let words = words.strip_suffix(" (default)").unwrap_or(words).trim();
-    if options
-        .iter()
-        .any(|option| option.eq_ignore_ascii_case(words))
-    {
-        return None;
-    }
+    // The " (default)" mark an unset row adds (`ctl settings unset` answers "now Auto
+    // (default)") names that choice too, whether its words are a label or the option itself: an
+    // exact option that kept the mark was taken as it was typed and refused.
+    let words = without_default_mark(words);
     options
         .iter()
         .find(|option| {
-            setting_choice_label(field.key, option).eq_ignore_ascii_case(words)
+            option.eq_ignore_ascii_case(words)
+                || setting_choice_label(field.key, option).eq_ignore_ascii_case(words)
                 || segment_label(field.key, option).eq_ignore_ascii_case(words)
         })
         .map(|option| (*option).to_string())
@@ -10580,6 +10724,14 @@ fn field_text(state: &SettingsViewState, key: &str, fallback: &str) -> String {
                 let draft = draft.trim();
                 return if draft.is_empty() {
                     fallback.trim().to_string()
+                } else if key == prefs::EDIT_CURSOR_TRAIL_COLOR
+                    && prefs::names_trail_color_cursor(draft)
+                {
+                    // The box holds the row's words for the cursor's colour ("Cursor color",
+                    // its [`EditField::seed_text`]); the value they write is the file's word.
+                    // (An unset row's placeholder words below are no value: under a classic
+                    // mono style they say "Cursor color" for what that style draws.)
+                    prefs::TRAIL_COLOR_CURSOR.to_string()
                 } else {
                     draft.to_string()
                 };
@@ -13314,6 +13466,28 @@ impl BarButton {
             _ => self.visual.clone(),
         }
     }
+
+    /// The button's words in `form`.
+    fn words_as(&self, form: BarWords) -> String {
+        match form {
+            BarWords::Qualified => self.words(true),
+            BarWords::Plain => self.words(false),
+            BarWords::Brief => self
+                .brief
+                .map_or_else(|| self.visual.clone(), str::to_string),
+        }
+    }
+}
+
+/// The words a bar's buttons say on one line, fullest first ([`bar_button_fit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BarWords {
+    /// Each with what qualifies it ("Review in Modified").
+    Qualified,
+    /// Each its plain words ("Discard Draft").
+    Plain,
+    /// Each its brief whole form where it has one ("Discard").
+    Brief,
 }
 
 struct DraftBar {
@@ -13457,35 +13631,48 @@ fn reset_all_buttons(view: &SettingsViewState) -> Vec<BarButton> {
 
 #[derive(Clone, Debug, PartialEq)]
 enum BarFit {
-    Row { qualified: bool, widths: Vec<f32> },
-    Shared,
+    Row { words: BarWords, widths: Vec<f32> },
+    Shared { words: BarWords },
     Stacked,
 }
 
+/// HOW A BAR'S BUTTONS STAND: on one line, hugging their words (qualified where those fit, else
+/// plain) or sharing it, and only where neither their plain nor their brief whole forms fit one
+/// line, one over another. Stacked while their brief forms fit side by side, Discard the draft?'s
+/// Cancel over Discard Draft left the page a 40pt sliver at 2x in the least window, shorter than
+/// any of its controls.
 fn bar_button_fit(buttons: &[BarButton], room: f32) -> BarFit {
     let gaps = 8.0 * buttons.len() as f32;
     let qualifies = buttons.iter().any(|button| button.qualifier.is_some());
-    for qualified in [true, false] {
-        if !qualified && !qualifies {
-            break;
-        }
+    let briefs = buttons.iter().any(|button| button.brief.is_some());
+    let share = (room - gaps) / buttons.len().max(1) as f32;
+    let forms = [BarWords::Qualified, BarWords::Plain, BarWords::Brief]
+        .into_iter()
+        .filter(|form| match form {
+            BarWords::Qualified => qualifies,
+            BarWords::Plain => true,
+            BarWords::Brief => briefs,
+        });
+    for words in forms {
         let widths: Vec<f32> = buttons
             .iter()
-            .map(|button| page_button_width(&button.words(qualified), f32::INFINITY))
+            .map(|button| page_button_width(&button.words_as(words), f32::INFINITY))
             .collect();
         if widths.iter().sum::<f32>() + gaps <= room + 0.01 {
-            return BarFit::Row { qualified, widths };
+            return BarFit::Row { words, widths };
+        }
+        let fits_share = |button: &BarButton| {
+            crate::native_ui::native_button_label_width(&button.words_as(words)) + 24.0
+                <= share + 0.01
+        };
+        if words != BarWords::Qualified
+            && share >= scaled_control_height()
+            && buttons.iter().all(fits_share)
+        {
+            return BarFit::Shared { words };
         }
     }
-    let share = (room - gaps) / buttons.len().max(1) as f32;
-    let fits_share = |button: &BarButton| {
-        crate::native_ui::native_button_label_width(&button.words(false)) + 24.0 <= share + 0.01
-    };
-    if share >= scaled_control_height() && buttons.iter().all(fits_share) {
-        BarFit::Shared
-    } else {
-        BarFit::Stacked
-    }
+    BarFit::Stacked
 }
 
 fn bar_actions_height(buttons: &[BarButton], room: f32) -> f32 {
@@ -13499,7 +13686,7 @@ fn bar_actions_height(buttons: &[BarButton], room: f32) -> f32 {
                 .max(scaled_control_height())
                 + 8.0 * (rows - 1.0)
         }
-        BarFit::Row { .. } | BarFit::Shared => scaled_control_height(),
+        BarFit::Row { .. } | BarFit::Shared { .. } => scaled_control_height(),
     }
 }
 
@@ -13527,21 +13714,14 @@ fn bar_actions(key: &str, label: &str, buttons: &[BarButton], room: f32) -> UiNo
             .paint_only(),
         );
     }
-    let qualified = matches!(
-        fit,
-        BarFit::Row {
-            qualified: true,
-            ..
-        }
-    );
     children.extend(buttons.iter().enumerate().map(|(index, button)| {
         let (width, height, words) = match &fit {
-            BarFit::Row { widths, .. } => (
+            BarFit::Row { widths, words } => (
                 Length::Fixed(widths[index]),
                 Length::Fill,
-                button.words(qualified),
+                button.words_as(*words),
             ),
-            BarFit::Shared => (Length::Fill, Length::Fill, button.words(qualified)),
+            BarFit::Shared { words } => (Length::Fill, Length::Fill, button.words_as(*words)),
             BarFit::Stacked => {
                 let (words, height) = stacked_bar_button(button, room);
                 (Length::Fill, Length::Fixed(height), words)
@@ -14473,11 +14653,18 @@ fn status_words_node_styled(
             .height(Length::Fixed(shown)),
     )
     .paint_only();
+    // The keyboard's stop over a reload warning's words reads them, and is no live region of its
+    // own: the warning that holds them announces them once. Its words scrolling in the dock, the
+    // warning spoke twice, its words' stop a second live status beside its own.
     let stop = UiNode::new(
         words_key,
         UiContent::Custom(crate::native_ui::AuditedCustomNode {
             audit_id: crate::native_ui::MESSAGES_SCROLL_AUDIT,
-            role: SemanticRole::Status,
+            role: if key.starts_with(WARNING_KEY) {
+                SemanticRole::Text
+            } else {
+                SemanticRole::Status
+            },
             label: feedback.to_string(),
             paint: None,
             action: None,
@@ -14646,11 +14833,9 @@ fn compact_dock_laid(
         0.0
     };
     let watcher_width = if watcher {
-        watcher_share.min(
-            compact_watch_words(state, watcher_share).map_or(watcher_share, |words| {
-                status_words_width(&words).ceil() + 1.0
-            }),
-        )
+        watcher_share.min(compact_watch_words(state).map_or(watcher_share, |words| {
+            status_words_width(&words).ceil() + 1.0
+        }))
     } else {
         0.0
     };
@@ -14674,7 +14859,7 @@ fn compact_dock_laid(
             BarFit::Row { widths, .. } => {
                 Some(widths.iter().sum::<f32>() + 8.0 * buttons.len() as f32)
             }
-            BarFit::Shared | BarFit::Stacked => None,
+            BarFit::Shared { .. } | BarFit::Stacked => None,
         },
     };
     let toolbar_width = (viewport.width - 20.0).max(0.0);
@@ -15452,20 +15637,19 @@ fn undo_button_label(state: &SettingsViewState) -> &'static str {
     }
 }
 
-fn compact_watch_words(state: &SettingsViewState, visual_width: f32) -> Option<String> {
+/// THE DOCKED RELOAD WARNING SAYS ITS MESSAGE AT EVERY WIDTH: its words wrap on the dock's lines
+/// and the rest scroll there to the wheel and the keyboard, as every docked status's do
+/// ([`status_words_node_styled`]). Shortened by the dock's width to "Reload warning" under 220pt
+/// and "Reload" under 110pt, it dropped what was wrong and how to fix it at every least view, the
+/// message only in the Status label.
+fn compact_watch_words(state: &SettingsViewState) -> Option<String> {
     let status = state.config_watch_status.as_ref()?;
-    Some(if visual_width < 110.0 {
-        "Reload".to_string()
-    } else if visual_width < 220.0 {
-        "Reload warning".to_string()
-    } else {
-        format!("Reload warning: {status}")
-    })
+    Some(format!("Reload warning: {status}"))
 }
 
 fn compact_watch_status(state: &SettingsViewState, visual_width: f32) -> Option<UiNode> {
     let status = state.config_watch_status.as_ref()?;
-    let preferred = compact_watch_words(state, visual_width)?;
+    let preferred = compact_watch_words(state)?;
     Some(
         UiNode::new(
             "settings/config-watch-status",
@@ -20098,8 +20282,12 @@ fn picker_list_least(themed: bool) -> f32 {
         picker_heading_height() + gap
     } else {
         0.0
-    }) + 2.0 * scaled_control_height()
-        + gap
+    }) + picker_least_rows()
+}
+
+/// The room a picker's least list keeps for its rows: two one-line tiles and the gap between.
+fn picker_least_rows() -> f32 {
+    2.0 * scaled_control_height() + 6.0
 }
 
 fn choice_picker_floor(themed: bool, width: SettingsWidth) -> f32 {
@@ -20109,6 +20297,50 @@ fn choice_picker_floor(themed: bool, width: SettingsWidth) -> f32 {
         24.0
     };
     padding + scaled_control_height() + 6.0 + picker_list_least(themed)
+}
+
+/// How much taller than its least list's rows ([`picker_least_rows`]) the open picker's tallest
+/// tile stands, its words wrapped in the one column its narrowest list gives them
+/// ([`choice_option_lines`]): the room its host keeps the list over its least form, so a name of
+/// many lines is whole there. A NAME THE LEAST LIST HOLDS TAKES NOTHING FROM THE PREVIEW: kept for
+/// every line past a tile's first, the room under "Catppuccin / Mocha" shrank the Appearance
+/// preview to its least at 1.5x in a 234x400 window, its specimen gone, though the list's two
+/// rows held the two-line tile whole.
+fn picker_taller_tile(
+    state: &SettingsViewState,
+    width: SettingsWidth,
+    viewport: LogicalRect,
+) -> f32 {
+    let Some(picker) = state.choice_picker.as_ref() else {
+        return 0.0;
+    };
+    let content = settings_page_content_width(
+        viewport.width,
+        width,
+        PageLayout::shown(state).maximum(width),
+    );
+    let words = (content - 24.0 - 10.0).max(0.0);
+    let actions = if picker.themes.is_some() {
+        THEME_PICKER_ACTION_CELLS
+    } else {
+        0
+    };
+    ((0..picker.options.len())
+        .map(|index| {
+            choice_option_lines(
+                &picker.options[index],
+                (words, index == picker.selected),
+                picker.fonts,
+            )
+            .len()
+        })
+        .chain((0..actions).map(|ordinal| {
+            theme_action_lines(ordinal, choice_option_text_width(words, false)).len()
+        }))
+        .map(picker_tile_height)
+        .fold(0.0, f32::max)
+        - picker_least_rows())
+    .max(0.0)
 }
 
 const fn picker_host_preview_height(least: f32, natural: f32, room: f32) -> f32 {
@@ -20233,6 +20465,9 @@ fn choice_picker_card(
         - gap
         - (theme_rows + usize::from(no_match)) as f32 * (row_height + gap))
         .max(0.0);
+    picker
+        .words
+        .set(PickerMeasure::new((inner_width - 10.0).max(0.0)));
     let columns = (max_columns.min(2)..=max_columns)
         .find(|columns| picker_rows_height(&picker.unfiltered_rows(*columns), gap) <= room + 0.5)
         .unwrap_or(max_columns);
@@ -20248,19 +20483,18 @@ fn choice_picker_card(
     let scrolls = window.len() < rows.len();
 
     let rows_width = (inner_width - if scrolls { 10.0 } else { 0.0 }).max(0.0);
-    let tile_width = (rows_width - gap * columns.saturating_sub(1) as f32) / columns as f32;
     let row_node = |row: usize, cells: &PickerRow| match cells {
         PickerRow::Heading(heading) => picker_heading_node(picker, heading),
-        PickerRow::Cells(cells) => {
+        PickerRow::Cells(cells, lines) => {
             let spans = cells.len() == 1 && picker.spans_row(cells.start);
-            let width = if spans { rows_width } else { tile_width };
+            let words = picker.tile_words(columns, spans);
             let mut tiles = cells
                 .clone()
                 .map(|position| match picker.shown.get(position) {
                     Some(index) => PickerCell::Option(*index),
                     None => PickerCell::Action(position - picker.shown.len()),
                 })
-                .map(|cell| picker_cell_node(state, picker, cell, width))
+                .map(|cell| picker_cell_node(state, picker, cell, words))
                 .collect::<Vec<_>>();
             for spacer in cells.len()..if spans { 1 } else { columns } {
                 tiles.push(
@@ -20275,26 +20509,32 @@ fn choice_picker_card(
                 format!("settings/choice-row/{}/{row}", picker.key),
                 UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
             )
-            .layout(Layout::row().height(Length::Fixed(row_height)).gap(gap))
+            .layout(
+                Layout::row()
+                    .height(Length::Fixed(picker_tile_height(*lines)))
+                    .gap(gap),
+            )
             .children(tiles)
         }
     };
     // A LIST TOO SHORT FOR A CAPTION OVER A ROW draws its window's rows alone: where the room
     // cannot hold a section's heading over its first row drawn, a caption would stand over
     // nothing to choose. The rows keep their sections and the spoken name says them.
-    let heading_over_row = picker_heading_height() + gap + row_height;
+    let first_cells = window
+        .clone()
+        .find(|row| matches!(rows[*row], PickerRow::Cells(..)));
+    let heading_over_row = picker_heading_height()
+        + gap
+        + first_cells.map_or(row_height, |row| picker_row_height(&rows[row]));
     let captions = rows_height + 0.5 >= heading_over_row
-        || window
-            .clone()
-            .find(|row| matches!(rows[*row], PickerRow::Cells(_)))
-            .is_some_and(|row| {
-                picker_row_drawn(
-                    &row_node(row, &rows[row]),
-                    row_height,
-                    0.0,
-                    heading_over_row - rows_height,
-                )
-            });
+        || first_cells.is_some_and(|row| {
+            picker_row_drawn(
+                &row_node(row, &rows[row]),
+                picker_row_height(&rows[row]),
+                0.0,
+                heading_over_row - rows_height,
+            )
+        });
     // THE WINDOW'S ROWS ARE WHOLE AND LIVE, under the heading a window scrolled into a section
     // carries, so a section's choices are never on screen without its name. The rows after the
     // window are drawn on to the list's bottom as its PEEK, a picture fading out and never live
@@ -20317,12 +20557,19 @@ fn choice_picker_card(
                 rows_height,
                 gap,
                 |row| match row {
-                    PickerRow::Cells(cells) => picker
+                    PickerRow::Cells(cells, _) => picker
                         .cell_section(cells.start)
                         .filter(|heading| picker.headed() && section_captioned(heading)),
                     PickerRow::Heading(_) => None,
                 },
-                |row, cut| picker_row_drawn(&row_node(row, &rows[row]), row_height, cut, 0.0),
+                |row, cut| {
+                    picker_row_drawn(
+                        &row_node(row, &rows[row]),
+                        picker_row_height(&rows[row]),
+                        cut,
+                        0.0,
+                    )
+                },
             )
         })
         .flatten();
@@ -20344,7 +20591,7 @@ fn choice_picker_card(
                 rows[window.clone()]
                     .iter()
                     .enumerate()
-                    .filter(|(_, cells)| matches!(cells, PickerRow::Cells(_)))
+                    .filter(|(_, cells)| matches!(cells, PickerRow::Cells(..)))
                     .map(|(row, cells)| row_node(row, cells)),
             );
             (window.clone(), None)
@@ -20689,14 +20936,87 @@ fn compact_landscape_choice_page(
     Some(vec![choice])
 }
 
-fn choice_option_button(option: &ChoiceOption, text_width: f32, fonts: bool) -> ButtonSpec {
-    let visual = if option.value.is_none() && option.theme.is_none() && !option.free_text && !fonts
-    {
-        reset_row_visual(&option.label, text_width.max(0.0))
+/// The forms an option's words take, longest first: its label (with why it needs attention
+/// where it does), and a default's row its short form ("No blur (default)" for "Use default (No
+/// blur)").
+fn choice_option_forms(option: &ChoiceOption, fonts: bool) -> Vec<String> {
+    if let Some(reason) = option.disabled_reason() {
+        return vec![format!("{} \u{2014} {reason}", option.label)];
+    }
+    let reset = option.value.is_none() && option.theme.is_none() && !option.free_text && !fonts;
+    let short = reset
+        .then(|| {
+            option
+                .label
+                .strip_prefix("Use default (")
+                .and_then(|rest| rest.strip_suffix(')'))
+        })
+        .flatten()
+        .map(|name| format!("{name} (default)"));
+    std::iter::once(option.label.clone()).chain(short).collect()
+}
+
+/// The room a tile `tile_width` wide sets option `option`'s words in: what its check leaves where
+/// it is the `selected` one (choosing another closes the picker, so no row rewraps under the
+/// pointer), and beside the Open file a theme that needs attention keeps where the tile holds
+/// both ([`choice_option_node`]).
+fn choice_option_room(option: &ChoiceOption, tile_width: f32, selected: bool) -> f32 {
+    let text = choice_option_text_width(tile_width, selected);
+    let open = native_button_width_for("Open file");
+    if option.disabled_reason().is_some() && text - open - 6.0 >= 96.0 {
+        text - open - 6.0
     } else {
-        crate::native_ui::fit_native_button_label(&option.label, text_width.max(0.0))
-    };
+        text
+    }
+}
+
+/// An option's words on the lines a tile `tile_width` wide sets them on: the first of its forms
+/// one line holds ([`choice_option_forms`]), else its shortest wrapped between its words, every
+/// word whole, a word wider than the room broken with a hyphen; never cut with an ellipsis. Its
+/// row stands as tall as its lines ([`picker_row_height`]).
+fn choice_option_lines(
+    option: &ChoiceOption,
+    (tile_width, selected): (f32, bool),
+    fonts: bool,
+) -> Vec<String> {
+    choice_option_lines_in(
+        option,
+        choice_option_room(option, tile_width, selected),
+        fonts,
+    )
+}
+
+/// [`choice_option_lines`] in `room`.
+fn choice_option_lines_in(option: &ChoiceOption, room: f32, fonts: bool) -> Vec<String> {
+    tile_lines(&choice_option_forms(option, fonts), room)
+}
+
+/// A picker tile's words in `room`, of `forms` (fullest first): the first form one line holds,
+/// else the shortest wrapped between its words, every word whole, a word wider than the room
+/// broken with a hyphen; never cut with an ellipsis.
+fn tile_lines(forms: &[String], room: f32) -> Vec<String> {
+    let width = crate::native_ui::native_button_label_width;
+    if let Some(form) = forms
+        .iter()
+        .find(|form| width(form) <= room + crate::native_ui::TEXT_FIT_SLACK)
+    {
+        return vec![form.clone()];
+    }
+    let shortest = forms.last().cloned().unwrap_or_default();
+    let lines = wrap_to_box(&shortest, room.max(1.0), &width);
+    if lines.is_empty() {
+        vec![shortest]
+    } else {
+        lines
+    }
+}
+
+fn choice_option_button(option: &ChoiceOption, text_width: f32, fonts: bool) -> ButtonSpec {
+    let visual = choice_option_lines_in(option, text_width.max(0.0), fonts).join("\n");
     let mut button = ButtonSpec::new(option.label.clone()).visual_label(visual);
+    if let Some(reason) = option.disabled_reason() {
+        button.label = format!("{} \u{2014} {reason}", option.label);
+    }
     if let Some(theme) = option.theme.as_ref() {
         button = button.description(match &theme.description {
             Some(description) => format!("{}. {description}", theme.summary),
@@ -20709,27 +21029,8 @@ fn choice_option_button(option: &ChoiceOption, text_width: f32, fonts: bool) -> 
     button
 }
 
-fn reset_row_visual(label: &str, text_width: f32) -> String {
-    let width = crate::native_ui::native_button_label_width;
-    if width(label) <= text_width {
-        return label.to_string();
-    }
-    let Some(name) = label.strip_suffix(" (default)").or_else(|| {
-        label
-            .strip_prefix("Use default (")
-            .and_then(|rest| rest.strip_suffix(')'))
-    }) else {
-        return crate::native_ui::fit_native_button_label(label, text_width);
-    };
-    let tail = " (default)";
-    let shown = crate::native_ui::fit_native_button_label(name, text_width - width(tail));
-    if shown.trim_end_matches('\u{2026}').is_empty() {
-        // Not even a letter of the name fits beside the note.
-        return crate::native_ui::fit_native_button_label(label, text_width);
-    }
-    format!("{shown}{tail}")
-}
-
+/// A picker's tile for option `index`, its words set for a tile `tile_width` wide
+/// ([`ChoicePicker::tile_words`]).
 fn choice_option_node(
     state: &SettingsViewState,
     picker: &ChoicePicker,
@@ -20738,7 +21039,6 @@ fn choice_option_node(
 ) -> UiNode {
     let option = &picker.options[index];
     let selected = index == picker.selected;
-    let text_width = choice_option_text_width(tile_width, selected);
     let key = format!("settings/choice/{}/{index}", picker.key);
     let focused = state
         .common
@@ -20747,23 +21047,15 @@ fn choice_option_node(
         .is_some_and(|focus| focus.as_str() == key);
     let disabled = option.disabled_reason().is_some();
     let open_width = native_button_width_for("Open file");
-    let with_open = disabled && text_width - open_width - 6.0 >= 96.0;
-    let button_text_width = if with_open {
-        text_width - open_width - 6.0
-    } else {
-        text_width
-    };
-    let mut spec = choice_option_button(option, button_text_width, picker.fonts);
+    let with_open =
+        disabled && choice_option_text_width(tile_width, selected) - open_width - 6.0 >= 96.0;
+    let mut spec = choice_option_button(
+        option,
+        choice_option_room(option, tile_width, selected),
+        picker.fonts,
+    );
     if selected {
         spec = spec.trailing_icon(ButtonIcon::Check);
-    }
-    if let Some(reason) = option.disabled_reason() {
-        let words = format!("{} \u{2014} {reason}", option.label);
-        spec.visual_label = Some(crate::native_ui::fit_native_button_label(
-            &words,
-            button_text_width.max(0.0),
-        ));
-        spec.label = words;
     }
     let button = UiNode::new(
         key.clone(),
@@ -21071,16 +21363,32 @@ fn picker_heading_node(picker: &ChoicePicker, heading: &str) -> UiNode {
     )
 }
 
+/// The words a theme picker's theme files cell `ordinal` paints.
+const fn theme_action_visual(ordinal: usize) -> &'static str {
+    match ordinal {
+        0 => "Open themes folder",
+        1 => "Import a theme\u{2026}",
+        _ => "Browse all themes\u{2026}",
+    }
+}
+
+/// THE THEME FILES CELLS SAY THEIR WORDS WHOLE, AS THE OPTIONS OVER THEM DO: cell `ordinal`'s
+/// words on the lines `room` sets them on, wrapped between their words, its row growing by them
+/// ([`tile_lines`]). Fitted to one line, they read "Open themes…" and "Browse all…" at 1.5x in a
+/// 234x400 window and at 2x in 283x516, the options above them whole.
+fn theme_action_lines(ordinal: usize, room: f32) -> Vec<String> {
+    tile_lines(&[theme_action_visual(ordinal).to_string()], room)
+}
+
 fn theme_action_cell_node(state: &SettingsViewState, ordinal: usize, text_width: f32) -> UiNode {
     let key = ChoicePicker::action_key(ordinal);
-    let (label, visual, enabled) = match ordinal {
-        0 => ("Open themes folder", "Open themes folder", true),
+    let (label, enabled) = match ordinal {
+        0 => ("Open themes folder", true),
         1 => (
             "Import a theme from another terminal\u{2026}",
-            "Import a theme\u{2026}",
             crate::menu::local_file_picker_available(),
         ),
-        _ => ("Browse all themes", "Browse all themes\u{2026}", true),
+        _ => ("Browse all themes", true),
     };
     let action = if key == THEMES_BROWSE_KEY {
         route_action(SettingsRoute::Themes)
@@ -21096,10 +21404,8 @@ fn theme_action_cell_node(state: &SettingsViewState, ordinal: usize, text_width:
         key,
         UiContent::Button(
             Control::new(
-                ButtonSpec::new(label).visual_label(crate::native_ui::fit_native_button_label(
-                    visual,
-                    text_width.max(0.0),
-                )),
+                ButtonSpec::new(label)
+                    .visual_label(theme_action_lines(ordinal, text_width.max(0.0)).join("\n")),
                 action,
             )
             .state(ControlState {
@@ -21113,16 +21419,18 @@ fn theme_action_cell_node(state: &SettingsViewState, ordinal: usize, text_width:
     .layout(Layout::default().width(Length::Fill).height(Length::Fill))
 }
 
+/// A picker's cell, its words set for a tile `words` wide ([`ChoicePicker::tile_words`]), as its
+/// row measures them.
 fn picker_cell_node(
     state: &SettingsViewState,
     picker: &ChoicePicker,
     cell: PickerCell,
-    tile_width: f32,
+    words: f32,
 ) -> UiNode {
     match cell {
-        PickerCell::Option(index) => choice_option_node(state, picker, index, tile_width),
+        PickerCell::Option(index) => choice_option_node(state, picker, index, words),
         PickerCell::Action(ordinal) => {
-            theme_action_cell_node(state, ordinal, choice_option_text_width(tile_width, false))
+            theme_action_cell_node(state, ordinal, choice_option_text_width(words, false))
         }
     }
 }
@@ -21574,7 +21882,20 @@ fn top_music_suppression_node(status: MusicStatus, text_width: f32) -> (UiNode, 
     (node, height)
 }
 
-fn top_word_effects_off_node() -> UiNode {
+/// The Playful effects card's line under its word effects while the master switch holds them
+/// off. Each row's own tag already paints why ("Word effects off in aterm.toml"), so it paints
+/// what a press does, which no row paints: the longest wording that fits `text_width`.
+fn top_word_effects_off_node(text_width: f32) -> UiNode {
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
+    let fits = |text: &&str| {
+        crate::tray_raster::ui_text_width_for(face, text, px)
+            <= text_width + crate::native_ui::TEXT_FIT_SLACK
+    };
+    let wordings = ["Turning one on leaves the other off", "Each turns on alone"];
+    let painted = wordings
+        .into_iter()
+        .find(fits)
+        .unwrap_or(wordings[wordings.len() - 1]);
     UiNode::new(
         "settings/top/playful-effects/word-effects-off",
         UiContent::Group(GroupSpec {
@@ -21595,12 +21916,7 @@ fn top_word_effects_off_node() -> UiNode {
         UiNode::new(
             "settings/top/playful-effects/word-effects-off/visual",
             UiContent::Text(TextSpec {
-                text: if settings_text_scale() > 1.25 {
-                    "Word effects off"
-                } else {
-                    "Word effects off in aterm.toml"
-                }
-                .to_string(),
+                text: painted.to_string(),
                 role: SemanticRole::Status,
                 style: StyleRef::Quiet,
             }),
@@ -22298,16 +22614,10 @@ fn theme_mode_row(
     width: SettingsWidth,
     text_width: f32,
 ) -> UiNode {
-    let own =
-        |name: &str, side| name.eq_ignore_ascii_case(crate::app_config::default_pair_side(side));
-    let at_own_pair = following && state.is_explicit(prefs::EDIT_THEME) && {
-        let (dark, light) = prefs::theme_slots(
-            state.raw_value(prefs::EDIT_THEME).as_deref(),
-            &state.assets.themes,
-        );
-        own(&dark, aterm_types::Appearance::Dark) && own(&light, aterm_types::Appearance::Light)
-    };
-    let reset = at_own_pair.then(|| {
+    // Following is a change from no theme (Default on every appearance) whatever the slots
+    // hold, so this row offers the whole setting's Reset beside any slot's own.
+    let changed = following && state.is_explicit(prefs::EDIT_THEME);
+    let reset = changed.then(|| {
         let action = format!("settings/reset/{}", prefs::EDIT_THEME);
         row_trailing_button(
             action.clone(),
@@ -22563,7 +22873,10 @@ fn top_cards(
     ));
     if !field_bool(state, SPARKLE_MASTER_KEY, true) && !serious_mode_active(state, None, cx.motion)
     {
-        playful_rows.push((top_word_effects_off_node(), page_subtitle_height()));
+        playful_rows.push((
+            top_word_effects_off_node(text_width),
+            page_subtitle_height(),
+        ));
     }
     let playful = top_split_card(
         "playful-effects",
@@ -24680,6 +24993,7 @@ fn top_settings_page(
                     - used
                     - gap
                     - choice_picker_floor(themed, width)
+                    - picker_taller_tile(state, width, cx.viewport)
             };
             let natural = renderer_preview_height(width).min(132.0);
             if let Some(mut preview) = top_preview(
@@ -26233,6 +26547,20 @@ fn settings_fields_page(
     width: SettingsWidth,
     packages: &PackagesProjection,
 ) -> Vec<UiNode> {
+    settings_fields_page_seated(state, modified_only, cx, width, packages, false)
+}
+
+/// [`settings_fields_page`], its summary (Modified's count and Reset All, a search's count) the
+/// list's first stop from the start where `listed_first`, else pinned over the list wherever
+/// the list under it holds every stop.
+fn settings_fields_page_seated(
+    state: &SettingsViewState,
+    modified_only: bool,
+    cx: &ViewCx<'_>,
+    width: SettingsWidth,
+    packages: &PackagesProjection,
+    listed_first: bool,
+) -> Vec<UiNode> {
     let text = folded_search(state);
     let query = SearchQuery::of(state, &text);
     let global_search = !query.is_empty();
@@ -26447,9 +26775,10 @@ fn settings_fields_page(
             .choice_picker
             .as_ref()
             .is_some_and(|picker| picker.themes.is_some());
+        let taller = picker_taller_tile(state, width, cx.viewport);
         let room_under = |out: &[UiNode]| {
             let used: f32 = out.iter().map(|node| fixed_height(node) + gap).sum();
-            body - used - gap - choice_picker_floor(themed, width)
+            body - used - gap - choice_picker_floor(themed, width) - taller
         };
         let mut preview = preview_for(renderer_preview_height(width));
         if let Some(preview) = preview.as_mut() {
@@ -26566,11 +26895,33 @@ fn settings_fields_page(
         )
         .children(vec![count, reset_all])
     });
+    // This page's place, and what a reveal under way holds pinned there ([`PinnedPlace`]).
+    let here = PinnedPlace {
+        route: state.route,
+        viewport: cx.viewport,
+        scale: settings_text_scale(),
+        chrome: state.page_chrome.get(),
+        summary_listed: false,
+        preview: None,
+    };
+    let held = state.pinned_place.get().filter(|place| {
+        place.same_place(&here)
+            && state.page_reveal.is_some()
+            && state
+                .scroll_record
+                .borrow()
+                .as_ref()
+                .is_some_and(|record| record.same_context(state))
+    });
     // A summary the body does not hold, or one that would take more of it than it leaves the
     // list, is the list's first stop rather than pinned ([`list_summary`]), so it is whole on
-    // some screen however short the window.
-    let starves = used + summary_height > body + 0.01
+    // some screen however short the window; so is one the rows found listed (below), or one a
+    // reveal holds listed, laid out so from the start.
+    let starves = listed_first
+        || held.is_some_and(|place| place.summary_listed)
+        || used + summary_height > body + 0.01
         || summary_height > body - used - summary_height - gap + 0.01;
+    let listed_from_start = starves && summary.is_some();
     let (summary, listed_summary) = match summary {
         Some(node) if starves => (None, Some(node)),
         summary => (summary, None),
@@ -26986,41 +27337,19 @@ fn settings_fields_page(
         .as_ref()
         .and_then(|key| plan.stop_holding(key).or_else(|| plan.stop_of(key)))
         .map_or(0.0, |stop| plan.span(stop..stop + 1));
-    let here = PinnedPlace {
-        route: state.route,
-        viewport: cx.viewport,
-        scale: settings_text_scale(),
-        chrome: state.page_chrome.get(),
-        summary_listed: false,
-        preview: None,
-    };
-    let held = state.pinned_place.get().filter(|place| {
-        place.same_place(&here)
-            && state.page_reveal.is_some()
-            && state
-                .scroll_record
-                .borrow()
-                .as_ref()
-                .is_some_and(|record| record.same_context(state))
-    });
-    let summary_listed = held
+    let listed_late = held
         .map(|place| place.summary_listed)
         .filter(|listed| *listed || revealed <= body - used + 0.01)
         .unwrap_or(body - used < tallest - 0.01);
-    let summary = match summary {
-        Some(node) if summary_listed => {
-            used -= summary_height + gap;
-            list_summary(
-                &mut plan,
-                &mut stops,
-                0,
-                (node, summary_height),
-                (body - used, gap),
-            );
-            None
-        }
-        summary => summary,
-    };
+    // THE ROWS ARE PARTED IN THE ROOM THE LIST GETS: a summary the list under it is too short for
+    // is listed, leaving the rows the room they were parted short of under it, so the page is laid
+    // out again with the summary listed from the start. Parted under the pinned summary, Modified's
+    // rows were split for a 72pt list in the least window at 1x and their captions cut to "Check
+    // for updates…" and "Keep ALab tools up to…" over the 148pt list the screens showed.
+    if summary.is_some() && listed_late {
+        return settings_fields_page_seated(state, modified_only, cx, width, packages, true);
+    }
+    let summary_listed = listed_from_start || (summary.is_none() && listed_late);
     let mut placed_preview = None;
     if let (Some(mut preview), Some(floor)) = (preview, preview_floor) {
         let natural = fixed_height(&preview);
@@ -27949,48 +28278,77 @@ fn theme_value_unavailability(state: &SettingsViewState, raw: &str) -> Option<Ef
         ));
     }
 
-    let parts = selector
+    // Each name the value writes that draws nothing, with the side it serves (none for one theme
+    // on both): the status follows "Color theme set to <value>", so one theme's says only why.
+    let failures = selector
         .named_sides()
         .into_iter()
-        .map(|(side, name)| {
-            let side = match side {
-                None => "both",
-                Some(aterm_types::Appearance::Dark) => "dark",
-                Some(aterm_types::Appearance::Light) => "light",
-            };
-            (side, name)
-        })
-        .collect::<Vec<_>>();
-    let failures = parts
-        .into_iter()
         .filter_map(|(side, name)| {
-            state
-                .assets
-                .themes
-                .resolve(name)
-                .err()
-                .map(|reason| format!("{side} {name:?}: {reason}"))
+            let reason = state.assets.themes.resolve(name).err()?;
+            Some((side, name, reason))
         })
         .collect::<Vec<_>>();
-    (!failures.is_empty()).then(|| {
-        let scope = if failures.len() == 1 {
-            "appearance"
-        } else {
-            "appearances"
-        };
-        EffectDisclosure::new(
-            EffectNoteKind::Unavailable,
-            format!(
-                "The configured theme is unavailable for {scope} ({}); each affected side uses the built-in Default theme",
-                failures.join("; ")
-            ),
-            "Theme unavailable: Default fallback active",
-            format!(
-                "Theme unavailable for {scope}; built-in Default fallback active ({})",
-                failures.join("; ")
-            ),
+    let theme_of = |side: aterm_types::Appearance, name: &str| {
+        format!(
+            "{} theme {name}",
+            crate::update_words::capitalize_first(appearance_word(side))
         )
-    })
+    };
+    let (semantic, feedback) = match failures.as_slice() {
+        [] => return None,
+        [(None, name, reason)] => (
+            format!(
+                "The configured theme {name:?} is unavailable ({reason}); the built-in Default theme draws instead"
+            ),
+            format!(
+                "{}; Default draws instead",
+                crate::update_words::capitalize_first(reason)
+            ),
+        ),
+        [(Some(side), name, reason)] => (
+            format!(
+                "The configured {} theme {name:?} is unavailable ({reason}); the built-in Default theme draws in {} mode instead",
+                appearance_word(*side),
+                appearance_word(*side)
+            ),
+            format!(
+                "{} unavailable ({reason}); Default draws in {} mode instead",
+                theme_of(*side, name),
+                appearance_word(*side)
+            ),
+        ),
+        both => {
+            let sides = || {
+                both.iter()
+                    .filter_map(|(side, name, reason)| Some(((*side)?, *name, reason.as_str())))
+            };
+            let reasons = sides()
+                .map(|(side, name, reason)| {
+                    format!("{} theme {name:?}: {reason}", appearance_word(side))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let names = sides()
+                .map(|(side, name, _)| format!("{} theme {name}", appearance_word(side)))
+                .collect::<Vec<_>>()
+                .join(" and ");
+            (
+                format!(
+                    "The configured themes are unavailable ({reasons}); the built-in Default theme draws instead"
+                ),
+                format!(
+                    "{} unavailable; Default draws instead",
+                    crate::update_words::capitalize_first(&names)
+                ),
+            )
+        }
+    };
+    Some(EffectDisclosure::new(
+        EffectNoteKind::Unavailable,
+        semantic,
+        "Theme unavailable: Default fallback active",
+        feedback,
+    ))
 }
 
 fn registered_value_unavailability(
@@ -34730,6 +35088,10 @@ impl SettingsViewState {
         let automatic = bare.ends_with(" (automatic)");
         let bare = bare.strip_suffix(" (automatic)").unwrap_or(bare).trim();
         let words = match field.kind {
+            // The style Cursor Styles marks as the one before Off, which an unset key still
+            // names under the retired `cursor_trail = false`; none while a style draws.
+            _ if key == prefs::EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF => cursor_style_before_off(self)
+                .map_or_else(String::new, |style| cursor_style_name(&style)),
             EditKind::Bool => if bare.parse::<bool>().unwrap_or(false) {
                 "On"
             } else {
@@ -34817,9 +35179,8 @@ fn setting_row_parts(
     let screen_only_search = first_token_is(prefs::EDIT_SEARCH_HISTORY_LINES, "0");
     let echo_always = first_token_is(prefs::EDIT_PREDICTIVE_ECHO, "always");
     let retained_input = state.field_inputs.get(field.key);
-    let has_draft = retained_input.is_some_and(|input| {
-        input.value() != field.seed.as_deref().unwrap_or_default() || input.preedit().is_some()
-    });
+    let has_draft = retained_input
+        .is_some_and(|input| input.value() != field.seed_text() || input.preedit().is_some());
     let environment_override = state.environment_override(field.key);
     let bounded_numeric_disclosure =
         bounded_numeric_disclosure(state, field, environment_override.is_some());
@@ -35110,7 +35471,7 @@ fn setting_row_parts(
         }
         EditKind::Float | EditKind::Integer | EditKind::Text | EditKind::Color => {
             let field_text = retained_input.map_or_else(
-                || field.seed.clone().unwrap_or_default(),
+                || field.seed_text().into_owned(),
                 |input| input.projection().text,
             );
             let semantic_text = if field_text.trim().is_empty() {
@@ -35693,13 +36054,11 @@ fn field_placeholder_lines(placeholder: &str, width: f32, swatch: bool) -> (Stri
     let fitted = crate::native_ui::fit_native_field_placeholder(placeholder, width, swatch);
     let plain = crate::native_ui::plain_placeholder(placeholder);
     let path = crate::native_ui::reads_as_path(placeholder);
-    let drops_words = if path {
-        fitted.ends_with('\u{2026}')
-    } else {
-        fitted != placeholder
-            && fitted != plain
-            && placeholder.strip_suffix(" (default)") != Some(fitted.as_str())
-    };
+    // A path cut in its middle drops the folders that tell it apart as surely as words cut at
+    // their end, so it wraps whole on the field's lines as words do ([`path_placeholder_lines`]).
+    let drops_words = fitted != placeholder
+        && fitted != plain
+        && placeholder.strip_suffix(" (default)") != Some(fitted.as_str());
     if !drops_words {
         return (fitted, 1);
     }
@@ -35713,7 +36072,7 @@ fn field_placeholder_lines(placeholder: &str, width: f32, swatch: bool) -> (Stri
         return (String::new(), 1);
     }
     let lines = if path {
-        path_placeholder_lines(placeholder, room, &measure)
+        path_placeholder_lines(placeholder, room, &measure, field_lines_most())
     } else {
         word_placeholder_lines(&plain, room, &measure, field_lines_most())
     };
@@ -35779,7 +36138,7 @@ fn field_value_lines(value: &str, room: f32) -> (String, usize) {
         return (value.to_string(), 1);
     }
     let lines = if crate::native_ui::reads_as_path(value) {
-        path_placeholder_lines(value, room, &measure)
+        path_placeholder_lines(value, room, &measure, field_lines_most())
     } else {
         word_placeholder_lines(value, room, &measure, field_lines_most())
     };
@@ -35807,21 +36166,35 @@ fn unset_field_words(state: &SettingsViewState, field: &EditField) -> Option<Str
     Some(field_placeholder(state, &unset).0)
 }
 
-fn path_placeholder_lines(path: &str, room: f32, measure: &dyn Fn(&str) -> f32) -> Vec<String> {
+/// A PATH WRAPS WHOLE BETWEEN ITS COMPONENTS ON THE LINES ITS FIELD HAS, as a field's words do
+/// ([`word_placeholder_lines`]): only where the whole path takes more than the field's most lines
+/// ([`field_lines_most`], two at least) does it take the first of its shorter forms that holds
+/// them ([`crate::native_ui::path_forms`]: its components whole either side of an ellipsis, its
+/// file's name kept), and last the file's name alone. Held to two lines in every window, the AI
+/// CLIs page's Fleet document read `/private/…/cfg/aterm/ai-fleet.toml`, the folders that tell
+/// one document from another dropped, where Manual wrapped its path whole.
+fn path_placeholder_lines(
+    path: &str,
+    room: f32,
+    measure: &dyn Fn(&str) -> f32,
+    most: usize,
+) -> Vec<String> {
+    let most = most.max(2);
+    let whole = wrap_to_box(path, room, measure);
+    FIELD_LINES_WANTED.with(|wanted| wanted.set(wanted.get().map(|was| was.max(whole.len()))));
+    if whole.len() <= most {
+        return whole;
+    }
     let start = crate::native_ui::path_name_start(path);
     let tail = format!(
         "{}{}",
         crate::native_ui::TEXT_FIELD_ELLIPSIS,
         &path[start.saturating_sub(1)..]
     );
-    std::iter::once(path.to_string())
-        .chain(
-            crate::native_ui::path_forms(path)
-                .into_iter()
-                .map(|(form, _, _)| form),
-        )
-        .map(|form| wrap_to_box(&form, room, measure))
-        .find(|lines| lines.len() <= 2)
+    crate::native_ui::path_forms(path)
+        .into_iter()
+        .map(|(form, _, _)| wrap_to_box(&form, room, measure))
+        .find(|lines| lines.len() <= most)
         .unwrap_or_else(|| wrap_to_box(&tail, room, measure))
 }
 
@@ -36118,8 +36491,8 @@ fn color_submission_error(field: &EditField, raw: Option<&str>) -> Option<String
     .then(|| {
         let takes = if field.key == prefs::EDIT_CURSOR_TRAIL_COLOR {
             format!(
-                "a hex color like #D0D0D0, or {} for the cursor's color",
-                prefs::TRAIL_COLOR_CURSOR
+                "a hex color like #D0D0D0, or {}",
+                prefs::TRAIL_COLOR_CURSOR_LABEL
             )
         } else {
             "a hex color like #D0D0D0".to_string()
@@ -39709,8 +40082,19 @@ fn messages_count_line(
         &["Open Log Folder", "Log Folder", "Folder"],
     );
     let beside = words_w + copy_w + folder_w + 16.0 <= content_width;
+    // WHERE THE BUTTONS DO NOT STAND SIDE BY SIDE, THE COUNT TAKES COPY ALL BESIDE IT, Open Log
+    // Folder under them, rather than standing on a line of its own over each button on its own:
+    // the card's three lines stood 139pt at 2x in a 318pt window, and its first screen showed no
+    // message under the filters until the window was 712pt tall.
+    let pair = copy_w + folder_w + 8.0 <= content_width + crate::native_ui::TEXT_FIT_SLACK;
+    let lead_copy = !beside
+        && !pair
+        && words.is_some()
+        && words_w + copy_w + 8.0 <= content_width + crate::native_ui::TEXT_FIT_SLACK;
     let status_w = if beside {
         (content_width - copy_w - folder_w - 16.0).max(24.0)
+    } else if lead_copy {
+        (content_width - copy_w - 8.0).max(24.0)
     } else {
         content_width
     };
@@ -39756,7 +40140,36 @@ fn messages_count_line(
         )
         .layout(Layout::default().width(Length::Fill).height(Length::Fill))
     };
-    let button_rows = if copy_w + folder_w + 8.0 <= content_width {
+    let line_h = messages_line_height();
+    if lead_copy {
+        let mut status = status;
+        status.layout.height = Length::Fixed(status_lines as f32 * line_h);
+        let lead_h = (status_lines as f32 * line_h).max(copy_h);
+        let children = vec![
+            row("settings/messages/report", vec![status, copy], lead_h),
+            row(
+                "settings/messages/report/folder",
+                vec![spacer("settings/messages/report/folder-spacer"), folder],
+                folder_h,
+            ),
+        ];
+        let height = children.iter().map(fixed_height).sum::<f32>() + 6.0;
+        return (
+            UiNode::new(
+                "settings/messages/header",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::column()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(height))
+                    .gap(6.0),
+            )
+            .children(children),
+            height,
+        );
+    }
+    let button_rows = if pair {
         vec![row(
             "settings/messages/report",
             vec![spacer("settings/messages/report/spacer"), copy, folder],
@@ -39776,7 +40189,6 @@ fn messages_count_line(
             ),
         ]
     };
-    let line_h = messages_line_height();
     let mut status = status;
     status.layout.height = Length::Fixed(status_lines as f32 * line_h);
     // A LINE THAT SAYS NOTHING TAKES NO ROOM: with no count or note to say, the line kept for
@@ -39824,7 +40236,29 @@ fn messages_severity_segments(
             filter.warn_only,
         ),
     ];
-    let widths: Vec<f32> = segments.iter().map(|(_, l, _)| measure(l)).collect();
+    let mut widths: Vec<f32> = segments.iter().map(|(_, l, _)| measure(l)).collect();
+    // THE SEGMENTS' ROOMY ENDS GIVE WAY BEFORE THEY STACK: where both do not stand side by side
+    // with their roomy ends, they do with the ends the painter keeps (each label still on one
+    // line), so the card is a line of chips shorter. Stacked at once, "All · 8" over "Problems ·
+    // 3" at 2x in a 318pt window helped leave no message on the first screen under the filters
+    // until the window was 712pt tall.
+    let snug = |label: &str| {
+        let line =
+            crate::tray_raster::ui_text_width_for(crate::widget::TextFace::UiBold, label, px).max(
+                crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, label, px),
+            );
+        let width = (line + 20.0).ceil() + 1.0;
+        (messages_chip_words(label, width).1 == 1).then_some(width)
+    };
+    if widths.iter().sum::<f32>() + 6.0 > content_width
+        && let Some(snug) = segments
+            .iter()
+            .map(|(_, label, _)| snug(label))
+            .collect::<Option<Vec<f32>>>()
+            .filter(|snug| snug.iter().sum::<f32>() + 6.0 <= content_width)
+    {
+        widths = snug;
+    }
     let total: f32 = widths.iter().sum::<f32>() + 6.0;
     let stacked = total > content_width;
     let mut stacked_h = 2.0 + 6.0;
@@ -40115,10 +40549,9 @@ struct MessagesLead {
     gap: f32,
     stacked: bool,
     when_lines: usize,
-    title_lines: usize,
     /// Whether a stacked head keeps the room under its last line that sets a row's height
-    /// ([`messages_head_height`]); not where that room would make it taller than the list's
-    /// ([`messages_plan_opening`]).
+    /// ([`messages_head_height`]); not where that room would make the log's tallest head taller
+    /// than the list's ([`messages_plan_opening`]).
     trailing_room: bool,
 }
 
@@ -40130,15 +40563,23 @@ impl MessagesLead {
         compact: bool,
         content_width: f32,
     ) -> Self {
-        Self::measure_local(visible, clock, &|_| clock.offset_s, compact, content_width)
+        Self::measure_local(
+            visible,
+            &MessagesTitles::of(visible),
+            clock,
+            &|_| clock.offset_s,
+            (compact, content_width, None),
+        )
     }
 
+    /// The lead for `visible`'s heads in a page `content_width` wide, whose list holds a head
+    /// `room` tall where it says.
     fn measure_local(
         visible: &[&MessageView],
+        titles: &MessagesTitles<'_>,
         clock: MessagesClock,
         offset_for: &dyn Fn(u64) -> i64,
-        compact: bool,
-        content_width: f32,
+        (compact, content_width, room): (bool, f32, Option<f32>),
     ) -> Self {
         let scale = settings_text_scale();
         let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Quiet);
@@ -40175,7 +40616,6 @@ impl MessagesLead {
             gap: 8.0,
             stacked: false,
             when_lines: 0,
-            title_lines: 1,
             trailing_room: true,
         };
         if lead.title_x() + MESSAGES_CHEVRON_END > content_width * 0.6 {
@@ -40185,41 +40625,61 @@ impl MessagesLead {
             let own = whens.iter().map(|when| width(when)).fold(0.0_f32, f32::max) + 4.0;
             lead.when = lead.when.min(own);
         }
-        lead.stacked = lead.title_x() + MESSAGES_CHEVRON_END > content_width * 0.6;
-        if lead.stacked {
-            // EACH TIME TAKES THE MOST WORDS THAT HOLD ONE LINE ([`messages_when_words`]): beside
-            // the mark where every entry's whole words fit there, else under it, on fewer words
-            // where its whole ones would wrap. An unheaded log's past days on their header's
-            // words, "Sun, 18 Oct" two lines at 2x in a 178x152 window, made every entry's head
-            // a line taller than the list's room, none of them whole.
-            let beside = lead.when_beside(content_width);
-            let under = messages_stacked_width(content_width, lead);
-            if whens.iter().any(|when| width(when) > beside + 0.01) {
-                lead.when_lines = visible
-                    .iter()
-                    .map(|entry| {
-                        let forms =
-                            clock.when_forms_at(entry.at_unix_ms, offset_for(entry.at_unix_ms));
-                        let when = messages_when_words(&forms, under, &width);
-                        wrap_to_box(&when, under, &width).len()
-                    })
-                    .max()
-                    .unwrap_or(1)
-                    .max(1);
-            }
-            let (ppx, pface) =
-                crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-            let primary = |line: &str| crate::tray_raster::ui_text_width_for(pface, line, ppx);
-            let titles: std::collections::BTreeSet<&str> =
-                visible.iter().map(|entry| entry.title.as_str()).collect();
-            lead.title_lines = titles
-                .into_iter()
-                .map(|title| wrap_to_box(title, under, &primary).len())
+        // A HEAD ON ONE ROW LEAVES ITS TITLE TWO FIFTHS OF THE ROW, AND IS LAID OUT SO ONLY WHERE
+        // ITS TITLES TAKE NO MORE ROOM THERE THAN UNDER A STACKED HEAD'S MARK: every title wraps
+        // whole in the room its form gives it ([`messages_title_lines`]), so the form whose heads
+        // stand shorter in all leads (a head on one row whose title holds its line is the
+        // shortest a head stands). A head on one row cut its title to its line, so entries read
+        // "Claude…", "Codex CLI…" and "macOS's…" at 2x in a 444pt window, a 166pt column beside
+        // "8 min ago", none told apart without opening each.
+        let columns_wide = lead.title_x() + MESSAGES_CHEVRON_END > content_width * 0.6;
+        if !columns_wide && titles.hold_one_line(lead, content_width) {
+            return lead;
+        }
+        let mut stacked = Self {
+            stacked: true,
+            ..lead
+        };
+        // EACH TIME TAKES THE MOST WORDS THAT HOLD ONE LINE ([`messages_when_words`]): beside
+        // the mark where every entry's whole words fit there, else under it, on fewer words
+        // where its whole ones would wrap. An unheaded log's past days on their header's
+        // words, "Sun, 18 Oct" two lines at 2x in a 178x152 window, made every entry's head
+        // a line taller than the list's room, none of them whole.
+        let beside = stacked.when_beside(content_width);
+        let under = messages_stacked_width(content_width, stacked);
+        if whens.iter().any(|when| width(when) > beside + 0.01) {
+            stacked.when_lines = visible
+                .iter()
+                .map(|entry| {
+                    let forms = clock.when_forms_at(entry.at_unix_ms, offset_for(entry.at_unix_ms));
+                    let when = messages_when_words(&forms, under, &width);
+                    wrap_to_box(&when, under, &width).len()
+                })
                 .max()
                 .unwrap_or(1)
                 .max(1);
         }
-        lead
+        // The form whose every head a screen holds leads, where only one does (a stacked head
+        // giving up the room under its last line where the tallest needs it,
+        // [`messages_plan_opening`]): a title on two lines in a column left one head on one row
+        // taller than a short window's list, where stacked every head was whole.
+        let held = |lead: Self| {
+            let tight = Self {
+                trailing_room: !lead.stacked,
+                ..lead
+            };
+            room.is_none_or(|room| titles.tallest(tight, content_width) <= room + 0.01)
+        };
+        let (one_row_held, stacked_held) = (held(lead), held(stacked));
+        if columns_wide
+            || (stacked_held && !one_row_held)
+            || (stacked_held == one_row_held
+                && titles.total(stacked, content_width) + 0.01 < titles.total(lead, content_width))
+        {
+            stacked
+        } else {
+            lead
+        }
     }
 
     fn title_x(self) -> f32 {
@@ -40276,35 +40736,106 @@ fn messages_stacked_width(content_width: f32, lead: MessagesLead) -> f32 {
     (content_width - lead.gap - MESSAGES_STACKED_END).max(24.0)
 }
 
-fn messages_head_title(
-    entry: &MessageView,
-    lead: MessagesLead,
-    content_width: f32,
-) -> (Vec<String>, bool) {
-    if !lead.stacked {
-        let title_w = (content_width - lead.title_x() - MESSAGES_CHEVRON_END).max(24.0);
-        let shown = crate::native_ui::fit_native_text_label(&entry.title, title_w);
-        let cut = shown != entry.title;
-        return (vec![shown], cut);
+/// How wide a head laid out as `lead` sets its title: under a stacked head's mark, the row's
+/// width; on one row, the column after its time (and its tag).
+fn messages_title_room(lead: MessagesLead, content_width: f32) -> f32 {
+    if lead.stacked {
+        messages_stacked_width(content_width, lead)
+    } else {
+        (content_width - lead.title_x() - MESSAGES_CHEVRON_END).max(24.0)
     }
-    let under = messages_stacked_width(content_width, lead);
+}
+
+/// AN ENTRY'S TITLE IS NEVER CUT: its lines in a head laid out as `lead`, every word whole,
+/// wrapped in the room its form gives it ([`messages_title_room`]), a word wider than that broken
+/// with a hyphen. A head grows by the lines its title takes ([`messages_head_height`]), and one
+/// taller than the list's room is held a screen of lines at a time ([`messages_tall_parts`]).
+/// Cut to one line, or to the lines a screen held, titles read "Claude Code is not…" and "Codex
+/// CLI is not…" at 1x in a 318pt window, what each message said lost.
+fn messages_title_lines(title: &str, lead: MessagesLead, content_width: f32) -> Vec<String> {
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-    let mut lines = wrap_to_box_from(
-        &entry.title,
-        under,
-        &|line| crate::tray_raster::ui_text_width_for(face, line, px),
-        "-",
-    );
-    if lines.len() <= lead.title_lines {
-        return (lines.into_iter().map(|(_, line)| line).collect(), false);
+    let measure = |line: &str| crate::tray_raster::ui_text_width_for(face, line, px);
+    let room = messages_title_room(lead, content_width);
+    if measure(title) <= room + crate::native_ui::TEXT_FIT_SLACK {
+        return vec![title.to_string()];
     }
-    let rest = lines
-        .split_off(lead.title_lines - 1)
-        .first()
-        .map_or("", |(at, _)| &entry.title[*at..]);
-    let mut lines: Vec<String> = lines.into_iter().map(|(_, line)| line).collect();
-    lines.push(crate::native_ui::fit_native_text_label(rest, under));
-    (lines, true)
+    let lines = wrap_to_box(title, room, &measure);
+    if lines.is_empty() {
+        vec![String::new()]
+    } else {
+        lines
+    }
+}
+
+/// THE LOG'S TITLES, each distinct one with how wide it is set whole on one line and how many
+/// entries it titles, measured in one visit to the font store
+/// ([`crate::tray_raster::ui_text_widths_for`]): what a head's height asks of a title that holds
+/// one line, so a plan over the log's 512 entries measures each title once, and wraps only those
+/// wider than their room ([`messages_title_lines`]).
+struct MessagesTitles<'a> {
+    titles: std::collections::BTreeMap<&'a str, (f32, usize)>,
+}
+
+impl<'a> MessagesTitles<'a> {
+    fn of(entries: &[&'a MessageView]) -> Self {
+        let mut counts: std::collections::BTreeMap<&'a str, usize> =
+            std::collections::BTreeMap::new();
+        for &entry in entries {
+            *counts.entry(entry.title.as_str()).or_default() += 1;
+        }
+        let distinct: Vec<&str> = counts.keys().copied().collect();
+        let (px, face) =
+            crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
+        let widths = crate::tray_raster::ui_text_widths_for(face, &distinct, px);
+        Self {
+            titles: counts
+                .into_iter()
+                .zip(widths)
+                .map(|((title, count), width)| (title, (width, count)))
+                .collect(),
+        }
+    }
+
+    /// Whether every title holds one line in a head laid out as `lead`.
+    fn hold_one_line(&self, lead: MessagesLead, content_width: f32) -> bool {
+        let room = messages_title_room(lead, content_width) + crate::native_ui::TEXT_FIT_SLACK;
+        self.titles.values().all(|(width, _)| *width <= room)
+    }
+
+    /// How many lines `title` takes in a head laid out as `lead` ([`messages_title_lines`]).
+    fn lines(&self, title: &str, lead: MessagesLead, content_width: f32) -> usize {
+        match self.titles.get(title) {
+            Some((width, _))
+                if *width
+                    <= messages_title_room(lead, content_width)
+                        + crate::native_ui::TEXT_FIT_SLACK =>
+            {
+                1
+            }
+            _ => messages_title_lines(title, lead, content_width).len(),
+        }
+    }
+
+    /// The height of a head titled `title` laid out as `lead` ([`messages_head_height`]).
+    fn head(&self, title: &str, lead: MessagesLead, content_width: f32) -> f32 {
+        messages_head_height(lead, self.lines(title, lead, content_width))
+    }
+
+    /// How tall the log's heads laid out as `lead` stand in all.
+    fn total(&self, lead: MessagesLead, content_width: f32) -> f32 {
+        self.titles
+            .iter()
+            .map(|(title, (_, count))| *count as f32 * self.head(title, lead, content_width))
+            .sum()
+    }
+
+    /// The log's tallest head laid out as `lead`.
+    fn tallest(&self, lead: MessagesLead, content_width: f32) -> f32 {
+        self.titles
+            .keys()
+            .map(|title| self.head(title, lead, content_width))
+            .fold(messages_head_height(lead, 1), f32::max)
+    }
 }
 
 /// The height of a head's first row: a stacked head's, which holds the severity mark (and its
@@ -40319,14 +40850,18 @@ fn messages_head_first_row(lead: MessagesLead) -> f32 {
     }
 }
 
-fn messages_head_height(lead: MessagesLead) -> f32 {
+/// The height of a head laid out as `lead` whose title takes `title_lines` lines: on one row,
+/// the row's, each line past the first a line taller (the row's room over and under its lines);
+/// stacked, its first row over its time's and its title's lines.
+fn messages_head_height(lead: MessagesLead, title_lines: usize) -> f32 {
     let row_h = messages_row_height();
-    if !lead.stacked {
-        return row_h;
-    }
     let line_h = messages_line_height();
+    let title_lines = title_lines.max(1);
+    if !lead.stacked {
+        return row_h + (title_lines - 1) as f32 * line_h;
+    }
     messages_head_first_row(lead)
-        + (lead.when_lines + lead.title_lines) as f32 * line_h
+        + (lead.when_lines + title_lines) as f32 * line_h
         + if lead.trailing_room {
             (row_h - line_h) / 2.0
         } else {
@@ -40334,17 +40869,24 @@ fn messages_head_height(lead: MessagesLead) -> f32 {
         }
 }
 
-/// Where a line ends in a head laid out for `lead`, down from its top: a screen that holds part of
-/// a head taller than it ends at one ([`messages_tall_parts`]).
-fn messages_head_lines(lead: MessagesLead) -> Vec<f32> {
-    if !lead.stacked {
-        return vec![messages_head_height(lead)];
-    }
+/// Where a line ends in a head laid out for `lead` whose title takes `title_lines` lines, down
+/// from its top: a screen that holds part of a head taller than it ends at one
+/// ([`messages_tall_parts`]).
+fn messages_head_lines(lead: MessagesLead, title_lines: usize) -> Vec<f32> {
     let line_h = messages_line_height();
+    let title_lines = title_lines.max(1);
+    let height = messages_head_height(lead, title_lines);
+    if !lead.stacked {
+        let over = (messages_row_height() - line_h) / 2.0;
+        return (1..title_lines)
+            .map(|line| over + line as f32 * line_h)
+            .chain([height])
+            .collect();
+    }
     let first = messages_head_first_row(lead);
-    (0..=lead.when_lines + lead.title_lines)
+    (0..=lead.when_lines + title_lines)
         .map(|line| first + line as f32 * line_h)
-        .chain([messages_head_height(lead)])
+        .chain([height])
         .collect()
 }
 
@@ -40360,7 +40902,18 @@ fn messages_head_node(
     MESSAGES_ROWS_BUILT.with(|rows| rows.set(rows.get() + 1));
     let now_unix_ms = clock.now_unix_ms;
     let key = format!("settings/messages/row/{}", entry.id);
-    let row_h = messages_head_first_row(lead);
+    let lines = messages_title_lines(&entry.title, lead, content_width);
+    let title_lines = lines.len();
+    // A head on one row whose title takes more than a line sets its mark, time and tag on the
+    // title's first line, the row's room over and under its lines, so a screen that ends where a
+    // line of it ends cuts nothing of it ([`messages_head_lines`]).
+    let lined = !lead.stacked && lines.len() > 1;
+    let over = (messages_row_height() - messages_line_height()) / 2.0;
+    let row_h = if lined {
+        messages_line_height()
+    } else {
+        messages_head_first_row(lead)
+    };
     let title_key = format!("{key}/title");
     let button = UiNode::new(
         title_key.clone(),
@@ -40368,7 +40921,11 @@ fn messages_head_node(
             Control::new(
                 ButtonSpec {
                     description: Some(messages_description(entry, now_unix_ms)),
-                    chevron_row: lead.stacked.then(|| row_h.round() as u16),
+                    chevron_row: if lined {
+                        Some(messages_row_height().round() as u16)
+                    } else {
+                        lead.stacked.then(|| row_h.round() as u16)
+                    },
                     ..ButtonSpec::new(entry.title.clone()).visual_label(String::new())
                 },
                 ActionId::new(title_key),
@@ -40494,18 +41051,12 @@ fn messages_head_node(
                 ),
             );
         }
-        let (lines, _) = messages_head_title(entry, lead, content_width);
-        let title = if let [line] = lines.as_slice() {
-            let mut title = text(
-                format!("{key}/label"),
-                line.clone(),
-                StyleRef::Primary,
-                Length::Fixed(under + lead.gap),
-                line_h,
-            );
-            title.layout.padding = pad;
-            title
-        } else {
+        // EVERY TITLE UNDER THE MARK STANDS ON ONE EDGE: its lines, one or many, in a column inset
+        // by the gap, as the time's lines under the mark are. A title of one line painted as a
+        // text padded by the gap drew from the card's edge (the padding of a text paints
+        // nothing), 8pt left of a wrapped title's lines, so "Disk cleanup is off" stood out from
+        // "Couldn't save settings / changes" over it at 2x in a 318pt window.
+        children.push(
             UiNode::new(
                 format!("{key}/label"),
                 UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -40513,7 +41064,7 @@ fn messages_head_node(
             .layout(
                 Layout::column()
                     .width(Length::Fixed(under + lead.gap))
-                    .height(Length::Fixed(lead.title_lines as f32 * line_h))
+                    .height(Length::Fixed(title_lines as f32 * line_h))
                     .padding(pad),
             )
             .paint_only()
@@ -40531,9 +41082,8 @@ fn messages_head_node(
                         )
                     })
                     .collect(),
-            )
-        };
-        children.push(title);
+            ),
+        );
         UiNode::new(
             format!("{key}/lead"),
             UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -40542,7 +41092,7 @@ fn messages_head_node(
         .paint_only()
         .children(children)
     } else {
-        let title_w = (content_width - lead.title_x() - MESSAGES_CHEVRON_END).max(24.0);
+        let title_w = messages_title_room(lead, content_width);
         let mut children = vec![
             mark,
             text(
@@ -40562,14 +41112,42 @@ fn messages_head_node(
                 row_h,
             ));
         }
-        let (title, _) = messages_head_title(entry, lead, content_width);
-        children.push(text(
-            format!("{key}/label"),
-            title.concat(),
-            StyleRef::Primary,
-            Length::Fixed(title_w),
-            row_h,
-        ));
+        let line_h = messages_line_height();
+        children.push(if let [line] = lines.as_slice() {
+            text(
+                format!("{key}/label"),
+                line.clone(),
+                StyleRef::Primary,
+                Length::Fixed(title_w),
+                row_h,
+            )
+        } else {
+            UiNode::new(
+                format!("{key}/label"),
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+            )
+            .layout(
+                Layout::column()
+                    .width(Length::Fixed(title_w))
+                    .height(Length::Fixed(title_lines as f32 * line_h)),
+            )
+            .paint_only()
+            .children(
+                lines
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        text(
+                            format!("{key}/label/line-{index}"),
+                            line,
+                            StyleRef::Primary,
+                            Length::Fill,
+                            line_h,
+                        )
+                    })
+                    .collect(),
+            )
+        });
         UiNode::new(
             format!("{key}/lead"),
             UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
@@ -40578,6 +41156,11 @@ fn messages_head_node(
             Layout::row()
                 .width(Length::Fill)
                 .height(Length::Fill)
+                .padding(if lined {
+                    Insets::symmetric(0.0, over)
+                } else {
+                    Insets::default()
+                })
                 .gap(lead.gap),
         )
         .paint_only()
@@ -40590,14 +41173,13 @@ fn messages_head_node(
     .layout(
         Layout::default()
             .width(Length::Fill)
-            .height(Length::Fixed(messages_head_height(lead))),
+            .height(Length::Fixed(messages_head_height(lead, title_lines))),
     )
     .children(vec![button, visual])
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct MessagesBody {
-    name: Vec<String>,
     meta: Vec<String>,
     sentence: Vec<String>,
     technical: Vec<String>,
@@ -40713,7 +41295,6 @@ impl MessagesBody {
             footer.last_mut().expect("a row").push(button);
         }
         Self {
-            name: Vec::new(),
             meta: wrapped_copy_lines(&meta, qpx, text_width),
             sentence,
             technical,
@@ -40747,7 +41328,7 @@ impl MessagesBody {
                 .map(|row| messages_footer_row_height(row))
                 .sum()
         };
-        (self.name.len() + self.meta.len() + self.sentence.len()) as f32 * line
+        (self.meta.len() + self.sentence.len()) as f32 * line
             + MESSAGES_FOOTER_GAP
             + footer
             + (rows - 1.0) * 6.0
@@ -40845,15 +41426,6 @@ fn messages_body_node(
         )
     };
     let mut children: Vec<UiNode> = Vec::new();
-    for (index, words) in body.name.iter().enumerate() {
-        children.push(line(
-            format!("{key}/name/{index}"),
-            words.clone(),
-            SemanticRole::Text,
-            StyleRef::Primary,
-            line_h,
-        ));
-    }
     for (index, words) in body.meta.iter().enumerate() {
         children.push(line(
             format!("{key}/meta/{index}"),
@@ -41884,52 +42456,36 @@ fn messages_plan_opening(
         (whole - header_h - gap, gap)
     };
     let all: Vec<&MessageView> = messages.entries.iter().collect();
-    // The lead laid out for `clock` (the log's, `log_clock`, measures its column), its stacked
-    // title as many lines as leave the head room under its day; and that day's height.
+    // The lead laid out for `clock` (the log's, `log_clock`, measures its column), and that
+    // day's height.
     let offset_for = |ms| messages.offset_for(ms);
+    let titles = MessagesTitles::of(&all);
     let fitted = |clock: MessagesClock, log_clock: MessagesClock| {
-        let mut lead =
-            MessagesLead::measure_local(&all, log_clock, &offset_for, compact, content_width);
         let day = if clock.sections_local(visible, &offset_for).is_some() {
             messages_day_height()
         } else {
             0.0
         };
-        if lead.stacked {
-            let held = |lead: MessagesLead| {
-                messages_head_height(lead) <= room - 2.0 * MESSAGES_LIST_PAD - day + 0.01
-            };
-            let wrapped = lead.title_lines;
-            while lead.title_lines > 1 && !held(lead) {
-                lead.title_lines -= 1;
-            }
-            // AN ENTRY'S HEAD FITS ONE SCREEN WHERE ITS LINES DO: still taller than the room,
-            // it gives up the room under its last line, so a screen holds it whole rather than
-            // a part of it each (its mark, time and one line of title at 2x in a 164x140
-            // window: 140pt over a 132pt list, 132pt without that room).
-            let tight = MessagesLead {
-                trailing_room: false,
-                ..lead
-            };
-            if !held(lead) && held(tight) {
-                lead = tight;
-            } else if !held(lead) {
-                // A HEAD NO SCREEN HOLDS FILLS THE SCREENS IT TAKES: stepped through a screen of
-                // lines at a time, its title takes the lines its last screen has room for, up to
-                // all of them. Cut to one line, the head's last screen showed that line alone
-                // over a line of nothing (2x in a 164x96 window: "aterm…" under each entry's
-                // mark and time, the next entry too tall to start under it).
-                let line_h = messages_line_height();
-                let per = (((room - 2.0 * MESSAGES_LIST_PAD - day) / line_h + 0.01).floor()
-                    as usize)
-                    .max(1);
-                let lines = 1 + lead.when_lines + lead.title_lines;
-                lead = MessagesLead {
-                    title_lines: (lines.div_ceil(per) * per - 1 - lead.when_lines)
-                        .clamp(lead.title_lines, wrapped.max(lead.title_lines)),
-                    ..tight
-                };
-            }
+        let mut lead = MessagesLead::measure_local(
+            &all,
+            &titles,
+            log_clock,
+            &offset_for,
+            (
+                compact,
+                content_width,
+                Some(room - 2.0 * MESSAGES_LIST_PAD - day),
+            ),
+        );
+        // AN ENTRY'S HEAD FITS ONE SCREEN WHERE ITS LINES DO: where the log's tallest stacked
+        // head is taller than the room, heads give up the room under their last line, so a
+        // screen holds such a head whole rather than a part of it each (its mark, time and one
+        // line of title at 2x in a 164x140 window: 140pt over a 132pt list, 132pt without that
+        // room), and one no screen holds ends on its last line ([`messages_tall_parts`]).
+        if lead.stacked
+            && titles.tallest(lead, content_width) > room - 2.0 * MESSAGES_LIST_PAD - day + 0.01
+        {
+            lead.trailing_room = false;
         }
         (lead, day)
     };
@@ -41953,17 +42509,18 @@ fn messages_plan_opening(
     // past entry's time says its day as its header would ("Yesterday", "Fri, 16 Oct",
     // [`MessagesClock::when`]); its open body says its day and hour.
     let most = if compact { room } else { room.max(whole) };
-    let clock =
-        if day > 0.0 && messages_head_height(lead) + day + 2.0 * MESSAGES_LIST_PAD > most + 0.01 {
-            let unheaded = |clock: MessagesClock| MessagesClock {
-                headed: false,
-                ..clock
-            };
-            lead = fitted(unheaded(clock), unheaded(log_clock)).0;
-            unheaded(clock)
-        } else {
-            clock
+    let clock = if day > 0.0
+        && titles.tallest(lead, content_width) + day + 2.0 * MESSAGES_LIST_PAD > most + 0.01
+    {
+        let unheaded = |clock: MessagesClock| MessagesClock {
+            headed: false,
+            ..clock
         };
+        lead = fitted(unheaded(clock), unheaded(log_clock)).0;
+        unheaded(clock)
+    } else {
+        clock
+    };
     let mut plan = MessagesPlan {
         compact,
         scrolls: compact,
@@ -41997,14 +42554,9 @@ fn messages_plan_opening(
                 messages.offset_for(entry.began_unix_ms),
                 messages.now_unix_ms,
             );
-            if messages_head_title(entry, plan.lead, content_width).1 {
-                let (px, face) =
-                    crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Primary);
-                body.name = wrap_to_box(&entry.title, body_width, &|line| {
-                    crate::tray_raster::ui_text_width_for(face, line, px)
-                });
-            }
-            let card = messages_head_height(plan.lead) + day_h + 2.0 * MESSAGES_LIST_PAD;
+            let card = titles.head(&entry.title, plan.lead, content_width)
+                + day_h
+                + 2.0 * MESSAGES_LIST_PAD;
             if !compact && body.height() > room - card {
                 plan.scrolls = true;
                 room = whole;
@@ -42013,18 +42565,27 @@ fn messages_plan_opening(
             body.fit(room - card);
             (entry.id, body)
         });
-    let head = messages_head_height(plan.lead);
+    let title_lines: Vec<usize> = visible
+        .iter()
+        .map(|entry| titles.lines(&entry.title, plan.lead, content_width))
+        .collect();
+    let heads: Vec<f32> = title_lines
+        .iter()
+        .map(|lines| messages_head_height(plan.lead, *lines))
+        .collect();
     plan.heights = visible
         .iter()
-        .map(|entry| match &plan.body {
+        .zip(&heads)
+        .map(|(entry, head)| match &plan.body {
             Some((id, body)) if *id == entry.id => head + body.height(),
-            _ => head,
+            _ => *head,
         })
         .collect();
     if !compact
         && !plan.scrolls
         && !visible.is_empty()
-        && head + day_h + 2.0 * MESSAGES_LIST_PAD > room + 0.01
+        && heads.iter().copied().fold(0.0_f32, f32::max) + day_h + 2.0 * MESSAGES_LIST_PAD
+            > room + 0.01
     {
         plan.scrolls = true;
         plan.room = whole;
@@ -42042,7 +42603,6 @@ fn messages_plan_opening(
     // one's head over its body's blocks, any other's head alone (a stacked head at 2x in a 98pt
     // window, 140pt). The day over it gives way at a screen's top ([`MessagesPlan::day_before`]).
     let room = plan.room - 2.0 * MESSAGES_LIST_PAD;
-    let head_lines = messages_head_lines(plan.lead);
     plan.talls = visible
         .iter()
         .enumerate()
@@ -42061,7 +42621,11 @@ fn messages_plan_opening(
                         None,
                     )
                 });
-            let blocks: Vec<(f32, Vec<f32>)> = std::iter::once((head, head_lines.clone()))
+            let head = (
+                heads[entry],
+                messages_head_lines(plan.lead, title_lines[entry]),
+            );
+            let blocks: Vec<(f32, Vec<f32>)> = std::iter::once(head)
                 .chain(body.iter().flat_map(|node| {
                     node.children.iter().map(|child| {
                         let height = fixed_height(child);
@@ -42160,6 +42724,13 @@ fn messages_page(
         .flatten()
         .filter(|id| selected == Some(*id))
         .zip(state.feedback.as_deref());
+    // A PAGE WHOSE FILTERS SCROLL WITH ITS LIST SAYS SO WITH ONE THUMB, the page's, in its gutter,
+    // over its stops from the filters to the log's end, as every scrolling page says: the list's
+    // own thumb, over its entries alone, stood only where the list showed, so a screen of the
+    // filters (at 2x in the least window, under Discard the draft? too) showed nothing that said
+    // the log went on under it.
+    let page_thumb = (plan.scrolls && limit > 0)
+        .then(|| (top, view.header.len() + view.rows.len(), plan.stops()));
     let list = (!shown.is_empty()).then(|| {
         let (card, height) = messages_list_node(
             &shown,
@@ -42168,7 +42739,11 @@ fn messages_page(
             selected,
             entry_note,
         );
-        messages_scroll_node(card, height, view.rows.clone(), visible.len())
+        if plan.scrolls {
+            card
+        } else {
+            messages_scroll_node(card, height, view.rows.clone(), visible.len())
+        }
     });
     let MessagesPlan {
         compact,
@@ -42235,20 +42810,54 @@ fn messages_page(
                 messages_page_subtitle(messages)
             },
         );
-        out.push(
-            UiNode::new(
-                "settings/messages/section",
-                UiContent::Group(GroupSpec::new(aterm_messages::page::HEADING)),
+        let list = UiNode::new(
+            "settings/messages/section",
+            UiContent::Group(GroupSpec {
+                label: Some(aterm_messages::page::HEADING.to_string()),
+                role: SemanticRole::List,
+                style: StyleRef::Plain,
+            }),
+        )
+        .layout(
+            Layout::column()
+                .width(Length::Fill)
+                .height(Length::Fixed(section))
+                .gap(gap)
+                .clipped(),
+        )
+        .children(children);
+        out.push(match page_thumb {
+            Some((first, held, stops)) => UiNode::new(
+                "settings/messages/section/scroll",
+                UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
             )
             .layout(
-                Layout::column()
+                Layout::default()
                     .width(Length::Fill)
-                    .height(Length::Fixed(section))
-                    .gap(gap)
-                    .clipped(),
+                    .height(Length::Fixed(section)),
             )
-            .children(children),
-        );
+            .children(vec![
+                list,
+                UiNode::new(
+                    "settings/messages/section/thumb",
+                    UiContent::Custom(crate::native_ui::AuditedCustomNode {
+                        audit_id: crate::native_ui::MESSAGES_SCROLL_AUDIT,
+                        role: SemanticRole::Group,
+                        label: String::new(),
+                        paint: Some(format!("{first},{held},{stops}")),
+                        action: None,
+                        focusable: false,
+                        focused: false,
+                        focus_visible: false,
+                        progress: None,
+                        motion: None,
+                    }),
+                )
+                .layout(Layout::default().width(Length::Fill).height(Length::Fill))
+                .paint_only(),
+            ]),
+            None => list,
+        });
         return out;
     }
     let (mut out, _) = pinned_heading(

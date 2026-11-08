@@ -143,7 +143,7 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
 #[test]
 fn typed_observations_refine_live_identity_and_durable_history() {
     let model = aterm_models_harness::account_host_observation_model();
-    aterm_spec::interp::prove_and_catch(&model);
+    assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
     let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
     assert!(faults.is_empty(), "{faults:?}");
     let mut evidence = StepEvidence::new("AccountHostObservation");

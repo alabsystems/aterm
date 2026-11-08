@@ -258,6 +258,7 @@ fn paint_with(layouts: &mut Layouts, input: &mut RenderInput, cell: (usize, usiz
         {
             *cell = *composed;
         }
+        paint_marks(input, frame_row);
         input
             .fx_layers
             .extend(top.mark.iter().chain(top.ring.iter()).cloned());
@@ -347,6 +348,7 @@ fn paint_chip_and_effort_samples(
     {
         *out = *cell;
     }
+    paint_marks(input, base + 23);
     paint_effort_sample(&mut layouts.footers[8], input, (blank, rule), base);
 }
 
@@ -404,6 +406,7 @@ fn paint_effort_sample(
     {
         *out = *cell;
     }
+    paint_marks(input, base + 26);
     let mode = if footer.shown().effort.is_some() {
         Some(mode)
     } else {
@@ -522,6 +525,7 @@ fn paint_quota_samples(
         {
             *out = *composed;
         }
+        paint_marks(input, d);
         let quota::Claim::Laid(span) = claim else {
             continue;
         };
@@ -550,7 +554,42 @@ fn paint_quota_samples(
         {
             *out = *composed;
         }
+        paint_marks(input, d + 1);
         input.fx_layers.extend(write.ticks);
+    }
+}
+
+/// Draws the glass marks among frame row `row`'s cells as the live footer's write does
+/// ([`crate::claude_card::WindowCards::paint_marks`], which takes every row the footer writes but
+/// a vendor's mode row): each `●`, `◆`, `⌂`, `⎇`, `⎆` of a composed row is its chrome icon, whole
+/// strokes in its own cell in the cell's own ink ([`GlassInks::mark`] on line D), and not its
+/// font's glyph, which a fallback face draws as a thin outline that reads pale at 1x.
+fn paint_marks(input: &mut RenderInput, row: usize) {
+    let (Some(cells), Ok(at)) = (input.cells.get(row), u16::try_from(row)) else {
+        return;
+    };
+    let icons: Vec<aterm_core::render::ChromeIcon> =
+        crate::claude_card::glass_marks(0, cells).collect();
+    if icons.is_empty() {
+        return;
+    }
+    match input
+        .chrome_rasters
+        .iter_mut()
+        .find(|raster| raster.row == at)
+    {
+        Some(raster) => raster.icons.extend(icons),
+        None => input.chrome_rasters.push(aterm_core::render::ChromeRaster {
+            row: at,
+            ground: Arc::from(Vec::new()),
+            rail: Arc::from(Vec::new()),
+            rail_h: 0,
+            clear_rail: false,
+            own: Vec::new(),
+            split: None,
+            rings: Vec::new(),
+            icons,
+        }),
     }
 }
 
@@ -780,5 +819,60 @@ mod tests {
             paint(&mut input, (7, 14));
             assert_eq!(input, painted, "a second frame does not duplicate sprites");
         }
+    }
+
+    /// THE SCENE DRAWS ITS GLASS MARKS AS A LIVE PANE DOES: every glass mark a composed row
+    /// holds (line D's `⎆ ◆ ⌂ ⎇`, a top rule's `●`) is drawn as its chrome icon in its own cell,
+    /// as the live footer's write draws it (`WindowCards::paint_marks`), and no other cell is.
+    /// The first Day captures read line D's `⎆ ⌂ ⎇` at 1.8:1 to 2.3:1 against `◆`'s 4.5:1: the
+    /// scene drew them from a fallback face's thin outlines, which no live pane shows, while
+    /// the icons stand in the cell's own ink, whole strokes. NEGATIVE CONTROL (run once,
+    /// restored): a scene that lays no marks leaves them to the font (a top rule's `●` first)
+    /// and fails.
+    #[test]
+    fn the_private_scene_draws_its_glass_marks_as_icons() {
+        use aterm_core::render::BandIcon;
+        let mut term = aterm_core::terminal::Terminal::new(40, 250);
+        term.process(b"\x1b]10;#202020\x07\x1b]11;#ffffff\x07x");
+        let mut input = term.cell_frame(40, 250);
+        input.grid_bot_row = input.rows;
+        paint(&mut input, (7, 14));
+        let mut drawn = 0;
+        for (r, cells) in input.cells.iter().enumerate() {
+            let icons = input
+                .chrome_raster(r)
+                .map_or(&[][..], |raster| &raster.icons);
+            for (c, cell) in cells.iter().enumerate() {
+                let mark = BandIcon::glass_mark(cell.ch)
+                    .filter(|_| !cell.wide && cell.script == aterm_core::terminal::Script::Normal);
+                let icon = icons
+                    .iter()
+                    .find(|i| usize::from(i.col) == c)
+                    .map(|i| i.icon);
+                assert_eq!(icon, mark, "row {r} col {c} {:?}", cell.ch);
+                drawn += usize::from(icon.is_some());
+            }
+        }
+        let line_d = input.grid_top_row + 38;
+        for ch in ['\u{2386}', '\u{25c6}', '\u{2302}', '\u{2387}'] {
+            let col = input.cells[line_d]
+                .iter()
+                .position(|cell| cell.ch == ch)
+                .unwrap_or_else(|| panic!("{ch:?} on line D"));
+            assert_eq!(
+                input
+                    .chrome_raster(line_d)
+                    .and_then(|raster| raster.icon_at(col)),
+                BandIcon::glass_mark(ch),
+                "line D's {ch:?} is its icon"
+            );
+        }
+        assert!(
+            input
+                .chrome_raster(input.grid_top_row + 2)
+                .is_some_and(|raster| !raster.icons.is_empty()),
+            "a top rule's `●` is its icon"
+        );
+        assert!(drawn > 4, "{drawn} marks drawn");
     }
 }

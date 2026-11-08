@@ -8,6 +8,9 @@
 mod quiet;
 #[cfg(unix)]
 mod support;
+#[cfg(unix)]
+#[path = "support/telemetry.rs"]
+mod telemetry;
 
 #[cfg(unix)]
 mod measuring {
@@ -357,7 +360,15 @@ mod measuring {
             }
         };
         let rig = Rig::release(&["ATERM_PAINT_BIN"], aterm_tempfile::bin_exe("fake-tui"));
-        support::run("paint", &rows, |row| take(&rig, row))
+        support::run_with_telemetry(
+            "paint",
+            &rows,
+            |row| take(&rig, row),
+            Some(support::Telemetry {
+                cpu: super::telemetry::cpu,
+                events: super::telemetry::events,
+            }),
+        )
     }
 
     /// The rows each `--row <name>` among the arguments names, in matrix order, or every row

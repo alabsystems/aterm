@@ -63,6 +63,8 @@ mod recipe;
 mod recovery;
 #[path = "resource_admission_resolver_root.rs"]
 mod resolver_root;
+#[path = "resource_admission_runtime_inputs.rs"]
+pub(super) mod runtime_inputs;
 #[path = "resource_admission_sdk.rs"]
 mod sdk;
 #[path = "resource_admission_settlement.rs"]
@@ -178,6 +180,7 @@ struct Job {
     metadata_sdk: Option<std::sync::Arc<sdk::Keeper>>,
     resolver: Option<resolver_root::Preparation>,
     compiler: Option<compiler::Selection>,
+    runtime_inputs: runtime_inputs::State,
     events: job::Events,
     custody: Custody,
     child: aterm_capacity::cohort::launch::CohortChild,

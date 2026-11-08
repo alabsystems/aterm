@@ -65,6 +65,10 @@ pub const CREDITS_MARK: char = '$';
 pub const UNKNOWN_MARK: char = '\u{2504}';
 /// `⧗`: the work waits at a limit now.
 pub const WAIT_MARK: char = '\u{29d7}';
+/// A drawn row's places a cell ([`Chart::midnights_at`]): a midnight's place is its offset from
+/// the row's left edge in 86 400ths of a cell, so every grain of §2.2 (2 to 8 hours a cell) holds
+/// it to the second, and a renderer `cw` pixels a cell puts it at `place · cw / CELL_PLACES`.
+pub const CELL_PLACES: i64 = DAY;
 
 const SEP: &str = " \u{b7} ";
 
@@ -125,7 +129,8 @@ pub struct Chart {
     pub marks: Vec<(i64, Mark)>,
     /// From here the future is not projected (`┄`): a lean, a cut replay, or no projection.
     pub unknown_from: Option<i64>,
-    /// Each local midnight inside the span (for the GUI's hairlines).
+    /// Each local midnight inside the span: the instant each local day begins, for the ticks of
+    /// line E's chart and the card's work row and lanes ([`Chart::midnights_at`]).
     pub midnights: Vec<i64>,
 }
 
@@ -230,6 +235,17 @@ impl Cell {
             Cell::Name(_) => Role::Value,
         }
     }
+
+    /// A midnight's tick may stand in it (§2.2): it draws a level (a measured step, the projected
+    /// line, a lane's out line), `┄` or nothing, never a letter or a mark (a name, `→`, `↺`, `╳`,
+    /// `$`, `▕`), which a line of ink would strike through.
+    #[must_use]
+    pub const fn ticks(self) -> bool {
+        matches!(
+            self,
+            Cell::Blank | Cell::Read(_) | Cell::Ahead(_) | Cell::Unknown | Cell::Out
+        )
+    }
 }
 
 /// One account's own vendor week for the card: read, then projected, ending at its reset.
@@ -281,6 +297,9 @@ pub struct QuotaLine {
     pub tail: Range<usize>,
     /// The chart's cells a day (0 where none is drawn), for [`Chart::span_of`].
     pub per_day: u8,
+    /// The midnights' ticks over the chart ([`Chart::ticks`]): each one's place from the chart's
+    /// left edge ([`CELL_PLACES`] a cell), in a cell that takes one.
+    pub ticks: Vec<i64>,
 }
 
 impl QuotaLine {
@@ -307,6 +326,7 @@ impl QuotaLine {
         self.chart = 0..0;
         self.tail = 0..0;
         self.per_day = 0;
+        self.ticks.clear();
     }
 
     fn put(&mut self, text: &str, role: Role, bold: bool) {
@@ -617,6 +637,41 @@ impl Chart {
             let j = i - i64::try_from(k).ok()? - 1;
             Some((self.now + j * s, self.now + (j + 1) * s))
         }
+    }
+
+    /// Each local midnight inside the chart at `per_day` cells a day ([`Chart::cells`]), as its
+    /// cell and its exact place from the chart's left edge ([`CELL_PLACES`] a cell): a past cell
+    /// spans `1/per_day` of the day before `▕`, a future one as much after it, and `▕` holds no
+    /// time. Where the clocks spring forward over midnight the day begins at the change
+    /// ([`Chart::midnights`]). None at 0.
+    pub fn midnights_at(&self, per_day: u8) -> impl Iterator<Item = (usize, i64)> + '_ {
+        let k = i64::from(per_day);
+        self.midnights.iter().filter_map(move |&t| {
+            let place = if t < self.now {
+                (t - (self.now - DAY)) * k
+            } else {
+                (k + 1) * CELL_PLACES + (t - self.now) * k
+            };
+            let cell = place.div_euclid(CELL_PLACES);
+            (k > 0 && place >= 0 && cell < 8 * k + 1)
+                .then(|| usize::try_from(cell).ok().map(|cell| (cell, place)))
+                .flatten()
+        })
+    }
+
+    /// The midnights' ticks (§2.2) on a row whose cells from its `lead`-th are `cells`, drawn at
+    /// `per_day` cells a day on this chart's clock (the chart itself, or a card lane on it,
+    /// [`Burn::cells`]), into `out` (cleared first): each midnight's place from the row's left
+    /// edge ([`Chart::midnights_at`]) where its cell takes a tick ([`Cell::ticks`]), so none
+    /// past the row's last cell (a lane ends at its reset).
+    pub fn ticks(&self, per_day: u8, lead: usize, cells: &[Cell], out: &mut Vec<i64>) {
+        out.clear();
+        let lead = i64::try_from(lead).unwrap_or(0) * CELL_PLACES;
+        out.extend(
+            self.midnights_at(per_day)
+                .filter(|&(cell, _)| cells.get(cell).is_some_and(|c| c.ticks()))
+                .map(|(_, place)| lead + place),
+        );
     }
 
     /// Marks into `into` each future cell a stop `[from, to)` covers at least half of, or, where
@@ -1232,7 +1287,7 @@ impl Outlook {
     }
 
     /// The Accounts card's verdict line for the pane whose account is `tab` and its `view`
-    /// (§1.4): `╳ out ~Sat 03:00–Sat 10:00, then main`, widest form first, in the tail's own
+    /// (§1.4): `╳ out ~Sat 05:00–Sat 10:00, then main`, widest form first, in the tail's own
     /// grammar (§2.3) with what the card has room to add (who is out, who carries the work
     /// after). A tab the rotation cannot move (`movable` false) has no verdict, as its row has
     /// none: the card says its reset, as the tail does, and that nothing is projected; a refused
@@ -2173,6 +2228,7 @@ impl QuotaView {
                 );
                 out.chart = from..out.cells.len();
                 out.per_day = per_day;
+                self.chart.ticks(per_day, 0, &chart, &mut out.ticks);
             }
             if self.tail.own.is_some() || self.tail.verdict.is_some() {
                 out.gap();
@@ -2259,7 +2315,7 @@ impl QuotaView {
     /// hand-off (`~Fri 08:00 · the work moves from main (98%) to alt1`; `(out)` for a fill the
     /// projection reaches, never 100%; a move where a wall lifts at a named account's reset said
     /// at that reset exactly, `Sat 10:00 · the work moves to main`), and a name after it the
-    /// same; a `╳` its stop (`~Sat 03:00–Sat 10:00 · every account out until main's reset`); a
+    /// same; a `╳` its stop (`~Sat 05:00–Sat 10:00 · every account out until main's reset`); a
     /// `$` its span on credits; a `↺` the reset; `┄` that nothing is projected there. `None` for
     /// the now cell, which holds no time, and past the chart's end: the row's own title stands.
     #[must_use]

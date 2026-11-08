@@ -346,7 +346,7 @@ fn named(name: &str) -> Repo {
 /// without the gitlink rule, the dependency's installer runs.
 #[test]
 fn the_installer_a_real_clone_carries_runs_in_it_and_says_what_it_did() {
-    crate::items::github::need_clt_git();
+    crate::items::github::need_native_git();
     let sys = Live::new();
     let mut home = Scratch::new(&sys, "github-hook-installer").unwrap();
     let mut who = user("me", sys.euid());

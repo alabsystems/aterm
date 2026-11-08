@@ -137,7 +137,9 @@ pub(super) fn color_key(state: &SettingsViewState, key: &str) -> Option<&'static
         .map(|field| field.key)
 }
 
-fn hex(rgb: [u8; 3]) -> String {
+/// A colour as Settings writes and shows it, `#RRGGBB` in capitals: the wheel, its fields and
+/// the Themes page's palette slots spell one colour one way.
+pub(super) fn hex(rgb: [u8; 3]) -> String {
     format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
 }
 
@@ -258,7 +260,7 @@ pub(super) fn color_target_hsv(state: &SettingsViewState, target: ColorTarget) -
 
 struct ColorSubject {
     target: ColorTarget,
-    /// "Foreground color wheel", "Colour wheel for palette colour 3, yellow".
+    /// "Foreground color wheel", "Color wheel for palette color 3, yellow".
     wheel_label: String,
     /// "Foreground brightness".
     brightness_label: String,
@@ -288,10 +290,10 @@ impl ColorSubject {
             }
             ColorTarget::Slot(index) => {
                 let name = super::showcase_page::SLOT_NAMES.get(index)?;
-                let slot = format!("palette colour {index}, {name}");
+                let slot = format!("palette color {index}, {name}");
                 Some(Self {
                     target,
-                    wheel_label: format!("Colour wheel for {slot}"),
+                    wheel_label: format!("Color wheel for {slot}"),
                     brightness_label: format!("Brightness of {slot}"),
                     card_label: format!("Choose {slot}"),
                     words: target_now(state, target).map_or_else(String::new, hex),

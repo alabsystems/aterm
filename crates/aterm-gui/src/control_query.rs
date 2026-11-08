@@ -1631,12 +1631,12 @@ fn background_setup_status_only_reads_and_rejects_action_words_before_posting() 
     });
     assert_eq!(
         reply,
-        "OK schema=2 setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unknown\n"
+        "OK schema=2 setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unknown caps_live=unknown\n"
     );
     status.observed.clear();
     assert_eq!(
         crate::system_state_access::background_setup_fields(&status),
-        "setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unread"
+        "setup=unknown:capslock verified=0 observed_generation=7 rows=capslock:unread caps_live=unknown"
     );
     assert_eq!(reads.get(), 1);
     for rest in ["", "start", "on", "status now"] {

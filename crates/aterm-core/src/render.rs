@@ -1228,7 +1228,7 @@ pub struct RenderInput {
     pub rain_add: Vec<RainHalo>,
     /// Retained fx layers ([`FxLayer`]).
     pub fx_layers: Vec<FxLayer>,
-    /// Host chrome painted over every fx layer, in window pixels (a find bar's band, a menu card).
+    /// Host chrome painted over every fx layer but its own ([`FxLayer::chrome`]), in window pixels (a find bar's band, a menu card).
     pub fx_occluders: Vec<PxRect>,
     /// Arts a GPU renderer should make resident ahead of the frame that draws them (the card's arts when a drawer image is published).
     pub fx_prefetch: Vec<std::sync::Arc<FxArt>>,
@@ -2186,6 +2186,8 @@ impl RenderInput {
             };
             layer.offset.1 = layer.offset.1.saturating_add(d);
             layer.clip = layer.clip.translate(0, d);
+            // The chrome a layer stands on is named by its occluder, which moves in window pixels.
+            layer.chrome = layer.chrome.map(|o| o.translate(0, fx_window_dy));
         }
         for o in &mut self.fx_occluders {
             *o = o.translate(0, fx_window_dy);
@@ -4767,6 +4769,7 @@ mod fx_input_tests {
         let mut grid = FxLayer::new(2, c.clone(), FxSlot::Under, FxSpace::Grid, FxBlend::Exact);
         grid.offset = (5, 7);
         grid.clip = PxRect::new(0, 0, 40, 30);
+        grid.chrome = Some(PxRect::new(0, 10, 50, 20));
         let unclipped = FxLayer::new(3, c.clone(), FxSlot::Glow, FxSpace::Window, FxBlend::Exact);
         RenderInput {
             rows: 4,
@@ -4869,6 +4872,11 @@ mod fx_input_tests {
                 f.fx_occluders,
                 vec![PxRect::new(0, 10 + wdy, 50, 20 + wdy)],
                 "{pixels:?}: occluders"
+            );
+            assert_eq!(
+                f.fx_layers[1].chrome.as_slice(),
+                f.fx_occluders.as_slice(),
+                "{pixels:?}: a layer's chrome moves with its occluder"
             );
             assert!(
                 Arc::ptr_eq(&f.fx_layers[0].content, &c),

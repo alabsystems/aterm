@@ -1046,6 +1046,91 @@ fn fx_occluders_compose() {
     );
 }
 
+/// A CHROME'S OWN LAYER STANDS OVER ITS OCCLUDER AND UNDER THE REST: a layer whose
+/// [`FxLayer::chrome`] names one occluder (a menu card's ticks over the card) draws where only
+/// that occluder stands, and every other occluder (chrome over the card) still cuts it; the
+/// same layer on no chrome is cut by all three. Negative control: an occluder subtraction that
+/// ignores the layer's chrome leaves the card's own rect dark.
+#[test]
+fn a_chromes_own_layer_stands_over_its_occluder_and_under_the_rest() {
+    let f = FxFrame {
+        w: 60,
+        h: 50,
+        pad: 2,
+        grid_top: 4,
+        cell_h: 9,
+        rows: 5,
+    };
+    let content = Arc::new(FxContent::new(
+        vec![FxItem::Rect(FxRect {
+            x: 0,
+            y: 0,
+            w: 60,
+            h: 50,
+            ink: 0,
+        })],
+        vec![FxInk::over(0x00_c0_a0_80, 255); 2],
+    ));
+    let occluders = [
+        PxRect::new(0, 4, 60, 13),
+        PxRect::new(30, 10, 55, 40),
+        PxRect::new(5, 30, 35, 45),
+    ];
+    let card = occluders[1];
+    let base = vec![0x0001_0203u32; f.w * f.h];
+    let mut scratch = FxScratch::default();
+    let mut run = |chrome: Option<PxRect>| {
+        let mut layer = FxLayer::new(
+            9,
+            content.clone(),
+            FxSlot::Over,
+            FxSpace::Window,
+            FxBlend::Exact,
+        );
+        layer.chrome = chrome;
+        let mut px = base.clone();
+        draw_layers(
+            &mut px,
+            &f,
+            &[layer],
+            &occluders,
+            FxSlot::Over,
+            FxBlend::Exact,
+            None,
+            &mut scratch,
+        );
+        px
+    };
+    let (own, none) = (run(Some(card)), run(None));
+    let mut on_card = 0;
+    for y in 0..f.h {
+        for x in 0..f.w {
+            let hit = |o: &PxRect| o.overlaps(PxRect::at(x as i32, y as i32, 1, 1));
+            let i = y * f.w + x;
+            let others = occluders.iter().filter(|o| **o != card).any(hit);
+            if others {
+                assert_eq!(own[i], base[i], "({x}, {y}): chrome over the card cuts it");
+            } else {
+                assert_eq!(
+                    own[i], 0x00_c0_a0_80,
+                    "({x}, {y}): drawn, the card's own rect included"
+                );
+                on_card += usize::from(hit(&card));
+            }
+            if occluders.iter().any(hit) {
+                assert_eq!(
+                    none[i], base[i],
+                    "({x}, {y}): on no chrome, every occluder cuts it"
+                );
+            }
+        }
+    }
+    assert!(
+        on_card > 0,
+        "the card's own rect reaches pixels no other occluder covers"
+    );
+}
+
 #[test]
 fn fx_extremes_never_panic() {
     let mut rng = Rng(0x1357_9bdf_2468_ace0);
@@ -1476,6 +1561,7 @@ fn fx_mixed_content_draws_nothing() {
             knock: false,
             offset: (0, 0),
             clip: PxRect::EVERYWHERE,
+            chrome: None,
         };
         let mut px = base.clone();
         draw_layers(

@@ -88,9 +88,9 @@ const ROW_CAPTION: &str = "settings/row-caption/";
 /// [`row_parts`] of `row`, and, A ROW SPLIT ACROSS STOPS NAMES ITS CONTROL WHERE ITS NAME IS NOT:
 /// for a stacked setting row, each part after the first that holds the row's own control and
 /// none of its name, and that no screen holds with the name (the room a screen gives the row's
-/// parts, `shared`), leads with a caption of the row's name, on as many of its lines as a list
-/// `room` tall holds over the part, the last ended early with an ellipsis where they do not all
-/// fit, so a screen that shows the control says what it sets. Split from its name, a switch or a
+/// parts, `shared`), leads with a caption of the row's name, whole, in the fullest of its forms
+/// whose lines a list `room` tall holds over the part (the row parted smaller so they do), so a
+/// screen that shows the control says what it sets. Split from its name, a switch or a
 /// segment stood alone on a screen the keyboard landed on, nothing saying what it set (Keyboard
 /// & Input at 2x in 164x98: Copy on select's switch; Appearance at 178x152: Auto, Light and
 /// Dark). The name stays whole on the part before; a screen says it once
@@ -131,22 +131,40 @@ pub(super) fn named_row_parts(
         }) && !holds(node, &|key| key.starts_with(&label))
     };
     let line = super::row_caption_line_height();
-    let lines = super::row_name_lines(&name, width);
-    // `node` led by a caption of the row's name on as many of its lines as the room holds over
-    // it: each line of the caption and the gap under it take a line of the name, as the name's
-    // lines do over its control. Unchanged where it alone fills the room: a caption over it would
-    // leave a control of it on no screen whole.
+    // The forms a caption says the row's name in, each on the lines it takes, fullest first: the
+    // name, and where it ends in words in parentheses that explain it, the name before them
+    // ("Secure Keyboard Entry" for "Secure Keyboard Entry (block keystroke snooping)").
+    let forms: Vec<Vec<String>> = std::iter::once(name.as_str())
+        .chain(caption_short_name(&name))
+        .map(|form| super::row_name_lines(form, width))
+        .collect();
+    // `node` led by a caption of the row's name in the fullest of its forms whose lines the room
+    // holds over it: each line of the caption and the gap under it take a line of the name, as
+    // the name's lines do over its control. Unchanged where it alone fills the room: a caption
+    // over it would leave a control of it on no screen whole.
     let captioned = |(mut node, height): (UiNode, f32), at: usize| -> (UiNode, f32) {
-        let held = (((room - height) / line + 0.01).floor().max(0.0) as usize).min(lines.len());
+        let held = ((room - height) / line + 0.01).floor().max(0.0) as usize;
         if held == 0 {
             return (node, height);
         }
-        let mut shown: Vec<String> = lines[..held].to_vec();
-        if held < lines.len()
-            && let Some(last) = shown.last_mut()
-        {
-            *last = crate::native_ui::fit_native_text_label(&lines[held - 1..].join(" "), width);
-        }
+        let shown: Vec<String> = match forms.iter().find(|lines| lines.len() <= held) {
+            Some(lines) => lines.clone(),
+            // Where no form of the name fits over the part, its list too short for its lines over
+            // the control (only in a window under the least view): the lines that fit, the last
+            // ended early, a line of the name being what every least view holds over a control.
+            None => {
+                let lines = forms.last().map_or(&[][..], Vec::as_slice);
+                let mut shown = lines[..held.min(lines.len())].to_vec();
+                if let Some(last) = shown.last_mut() {
+                    *last = crate::native_ui::fit_native_text_label(
+                        &lines[held.min(lines.len()) - 1..].join(" "),
+                        width,
+                    );
+                }
+                shown
+            }
+        };
+        let held = shown.len().max(1);
         let key = format!("{ROW_CAPTION}{setting}/part-{at}");
         let tall = (held as f32 * line - node.layout.gap).max(0.8 * line);
         let caption = UiNode::new(
@@ -205,17 +223,40 @@ pub(super) fn named_row_parts(
             })
             .collect()
     };
-    // Parted so a line of the name fits over each part that wants it, where the room is short of
-    // that as the row parts at `limit`.
-    let short = |parts: &[(UiNode, f32)]| {
+    // PARTED SO A WHOLE FORM OF THE NAME FITS OVER EACH PART THAT WANTS IT: where the room is
+    // short of a form's lines over a part as the row parts at `limit`, the row parts smaller by
+    // them (the name's, else its short form's), and where no form fits so, by a line. Parted for a
+    // line alone, a caption cut the rest of the name with an ellipsis, and "Default…" over
+    // Cruise, Land and Off read as a value (Harness's Default autopilot at 1.5x in a 234x236
+    // window).
+    let short = |parts: &[(UiNode, f32)], held: usize| {
         parts
             .iter()
             .zip(wanting(parts))
-            .any(|((_, height), wants)| wants && height + line > room + 0.01)
+            .any(|((_, height), wants)| wants && height + held as f32 * line > room + 0.01)
     };
     let mut parts = row_parts(row.clone(), limit, most, gap);
-    if short(&parts) {
-        parts = row_parts(row, (limit - line).max(1.0), (most - line).max(1.0), gap);
+    let parted = |held: usize| {
+        let less = held as f32 * line;
+        row_parts(
+            row.clone(),
+            (limit - less).max(1.0),
+            (most - less).max(1.0),
+            gap,
+        )
+    };
+    let whole = forms.iter().map(Vec::len).find_map(|held| {
+        if !short(&parts, held) {
+            return Some(None);
+        }
+        let smaller = parted(held);
+        (!short(&smaller, held)).then_some(Some(smaller))
+    });
+    match whole {
+        Some(Some(smaller)) => parts = smaller,
+        Some(None) => {}
+        None if short(&parts, 1) => parts = parted(1),
+        None => {}
     }
     let wants = wanting(&parts);
     // A part past the first that holds the row's words alone, its name and its controls on the
@@ -242,6 +283,14 @@ pub(super) fn named_row_parts(
             }
         })
         .collect()
+}
+
+/// A row's name before the words in parentheses that end it and explain it, where it has them:
+/// the whole short form a caption says where the name with them does not fit
+/// ([`named_row_parts`]).
+fn caption_short_name(name: &str) -> Option<&str> {
+    let open = name.strip_suffix(')')?.rfind(" (")?;
+    Some(name[..open].trim_end()).filter(|short| !short.is_empty())
 }
 
 /// The end of the key of a mark that a row's part holds only the row's words

@@ -97,8 +97,12 @@ pub struct SetupStatus {
     /// The vault source the Secrets and Repositories readings describe.
     /// Unknown sources never supply those rows to a review.
     pub observed_vault_url: Option<String>,
-    /// Raised each time `observed` changes, so a publication can be compared cheaply.
+    /// Raised each time an observed row or live keyboard diagnostic changes, so a
+    /// publication can be compared cheaply.
     pub observed_generation: u64,
+    /// Current HID-service mappings, independently of the saved Caps setting's readiness.
+    /// This diagnostic grants no setup completion or permission to change a setting.
+    pub caps_live: Option<aterm_types::macos_setup::LiveKeyboardMapping>,
     /// The settings whose stage the running pass is executing now.
     pub running: Vec<Setting>,
     /// The access step whose macOS gesture is up or about to start, filled by

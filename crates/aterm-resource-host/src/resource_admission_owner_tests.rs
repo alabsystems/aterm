@@ -1339,6 +1339,9 @@ fn known_member_attempt_never_receives_a_new_no_child_refusal() {
 #[path = "resource_admission_owner_tests/member_native.rs"]
 mod member_native;
 #[cfg(target_os = "macos")]
+#[path = "resource_admission_owner_tests/runtime_inputs.rs"]
+mod runtime_inputs;
+#[cfg(target_os = "macos")]
 pub(super) fn member_fixture(
     args: &[OsString],
     gnu: Option<[std::os::fd::OwnedFd; 2]>,

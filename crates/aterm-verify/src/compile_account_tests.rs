@@ -176,6 +176,15 @@ fn the_compile_line_and_event_agree_and_never_print_an_unread_zero() {
         usage: Some(usage),
         wall: Duration::from_secs(12),
         output_bytes: Some(5 << 20),
+        overlap: Some(super::Overlap {
+            timed: 3,
+            avg: 1.6,
+            p95: 3,
+            max: 3,
+            waiting_avg: 0.4,
+            waiting_max: 1,
+            waited_s: 6.0,
+        }),
     };
     let line = full.line();
     // The wall and the sizes read as the run's formatters write them everywhere.
@@ -190,6 +199,8 @@ fn the_compile_line_and_event_agree_and_never_print_an_unread_zero() {
         &wall,
         &peak,
         &out,
+        "compilers at once 1.6 avg, 3 p95, 3 most (3 read)",
+        "waiting for memory 0.4 avg, 1 most, 6.0 unit-s",
     ] {
         assert!(line.contains(said), "{said:?} in {line}");
     }
@@ -210,6 +221,12 @@ fn the_compile_line_and_event_agree_and_never_print_an_unread_zero() {
     assert_eq!(e["wall_s"].as_f64(), Some(12.0));
     assert_eq!(e["peak_bytes"].as_u64(), Some(3 << 30));
     assert_eq!(e["output_bytes"].as_u64(), Some(5 << 20));
+    assert_eq!(e["compilers"]["timed"].as_u64(), Some(3));
+    assert_eq!(e["compilers"]["avg"].as_f64(), Some(1.6));
+    assert_eq!(e["compilers"]["p95"].as_u64(), Some(3));
+    assert_eq!(e["compilers"]["max"].as_u64(), Some(3));
+    assert_eq!(e["compilers"]["waiting_max"].as_u64(), Some(1));
+    assert_eq!(e["compilers"]["waited_s"].as_f64(), Some(6.0));
 
     let unread = Account::of("lint", "tippy -p a", None, None, Duration::from_secs(2));
     let line = unread.line();
@@ -231,8 +248,98 @@ fn the_compile_line_and_event_agree_and_never_print_an_unread_zero() {
         "waited_s",
         "peak_bytes",
         "output_bytes",
+        "compilers",
     ] {
         assert!(e[field].is_null(), "{field}: {e}");
     }
+    assert!(!line.contains("compilers at once"), "{line}");
     assert_eq!(e["wall_s"].as_f64(), Some(2.0));
+}
+
+/// A span of unit `kind`, queued and run at the given ms.
+fn span(kind: &str, queued: Option<u64>, started: u64, ended: u64) -> crate::memory::UnitSpan {
+    crate::memory::UnitSpan {
+        unit: crate::unitgraph::UnitName {
+            package: "p".to_owned(),
+            kind: kind.to_owned(),
+        },
+        queued_at_unix_ms: queued,
+        started_at_unix_ms: started,
+        ended_at_unix_ms: ended,
+        cpu_s: 1.5,
+        peak_bytes: 7,
+    }
+}
+
+/// THE OVERLAP OF A CALL'S COMPILERS IS TIME-WEIGHTED OVER ITS WALL, EACH SPAN CUT TO IT:
+/// spans of 0–10 s, 5–10 s and 5–6 s over a 10 s window ran 1.6 at once on average, 3 at most,
+/// and 3 at the 95th percentile of the wall (one second of it at 3); a unit queued 1–5 s waited
+/// alone, 0.4 on average, and the waits sum unclamped (2 s before the window and 4 s inside). The
+/// percentile is of time, not of edges: 95 s at one compiler and 5 s at four gives a p95 of 1
+/// and a most of 4. NEGATIVE CONTROLS: a window of no length and a call with no span have no
+/// overlap, never a zero one; three spans wholly before the window change nothing, where clamped
+/// onto its edge they would open beside the first and make a most of 4.
+#[test]
+fn a_calls_overlap_is_time_weighted_over_its_wall() {
+    let spans = [
+        span("a lib", Some(0), 2_000, 12_000),
+        span("b lib", Some(3_000), 7_000, 12_000),
+        span("c lib", None, 7_000, 8_000),
+    ];
+    let o = super::Overlap::of(&spans, 2_000, 12_000).expect("an overlap");
+    assert_eq!(o.timed, 3);
+    assert!((o.avg - 1.6).abs() < 1e-9, "{o:?}");
+    assert_eq!((o.p95, o.max), (3, 3), "{o:?}");
+    assert!((o.waiting_avg - 0.4).abs() < 1e-9, "{o:?}");
+    assert_eq!(o.waiting_max, 1, "{o:?}");
+    assert!((o.waited_s - 6.0).abs() < 1e-9, "{o:?}");
+
+    let skewed = [
+        span("a lib", None, 0, 100_000),
+        span("b lib", None, 0, 5_000),
+        span("c lib", None, 0, 5_000),
+        span("d lib", None, 0, 5_000),
+    ];
+    let o = super::Overlap::of(&skewed, 0, 100_000).expect("an overlap");
+    assert_eq!((o.p95, o.max), (1, 4), "{o:?}");
+
+    let mut early = spans.to_vec();
+    early.extend((0..3).map(|_| span("d lib", None, 0, 1_000)));
+    let o = super::Overlap::of(&early, 2_000, 12_000).expect("an overlap");
+    assert!((o.avg - 1.6).abs() < 1e-9, "{o:?}");
+    assert_eq!((o.p95, o.max), (3, 3), "{o:?}");
+
+    assert_eq!(super::Overlap::of(&spans, 5_000, 5_000), None);
+    assert_eq!(super::Overlap::of(&[], 0, 1_000), None);
+}
+
+/// EACH SPAN IS ONE `compile-unit-timed` EVENT naming its unit as the memory book keys it, its
+/// dates, CPU and peak, and the reads' period. NEGATIVE CONTROL: a span with no wrapper read has
+/// a null queue date, never 0.
+#[test]
+fn each_span_is_one_timed_unit_event() {
+    let events = super::span_events(
+        "targo test --no-run",
+        &[
+            span("a lib", Some(10), 20, 30),
+            span("b test", None, 40, 50),
+        ],
+    );
+    let read = |line: &str| -> aterm_json::Value {
+        aterm_json::from_str(line.strip_prefix("verify-event: ").expect("prefixed")).expect("json")
+    };
+    let (a, b) = (read(&events[0]), read(&events[1]));
+    assert_eq!(events.len(), 2);
+    assert_eq!(a["event"].as_str(), Some("compile-unit-timed"));
+    assert_eq!(a["call"].as_str(), Some("targo test --no-run"));
+    assert_eq!(a["package"].as_str(), Some("p"));
+    assert_eq!(a["unit"].as_str(), Some("a lib"));
+    assert_eq!(a["queued_at_unix_ms"].as_u64(), Some(10));
+    assert_eq!(a["started_at_unix_ms"].as_u64(), Some(20));
+    assert_eq!(a["ended_at_unix_ms"].as_u64(), Some(30));
+    assert_eq!(a["cpu_s"].as_f64(), Some(1.5));
+    assert_eq!(a["peak_bytes"].as_u64(), Some(7));
+    assert_eq!(a["read_every_ms"].as_u64(), Some(500));
+    assert!(b["queued_at_unix_ms"].is_null(), "{b}");
+    assert_eq!(b["unit"].as_str(), Some("b test"));
 }

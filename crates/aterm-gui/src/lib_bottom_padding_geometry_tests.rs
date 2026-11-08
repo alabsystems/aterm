@@ -334,6 +334,8 @@ fn gpu_effect_shift_moves_window_fx_and_occluders_and_restores_exactly() {
     let mut grid = fx_rect_layer(3, (0, 0, 30, 9), FxSpace::Grid);
     grid.offset = (1, 2);
     grid.clip = PxRect::new(0, 0, 50, 40);
+    // A menu card's own layer: Grid space, standing on the card's occluder (window pixels).
+    grid.chrome = Some(PxRect::new(0, 8, 40, 20));
     input.fx_layers = vec![window, open, grid];
     input.fx_occluders = vec![
         PxRect::new(0, 8, 40, 20),
@@ -351,8 +353,12 @@ fn gpu_effect_shift_moves_window_fx_and_occluders_and_restores_exactly() {
         "unbounded stays unbounded"
     );
     assert_eq!(
-        input.fx_layers[2], original.fx_layers[2],
-        "Grid follows grid_top"
+        input.fx_layers[2],
+        aterm_core::render::FxLayer {
+            chrome: Some(PxRect::new(0, 15, 40, 27)),
+            ..original.fx_layers[2].clone()
+        },
+        "Grid follows grid_top; the chrome it stands on moves with its occluder"
     );
     assert_eq!(
         input.fx_occluders,
@@ -361,6 +367,7 @@ fn gpu_effect_shift_moves_window_fx_and_occluders_and_restores_exactly() {
             PxRect::new(i32::MIN, i32::MIN, i32::MAX, 37),
         ]
     );
+    assert_eq!(input.fx_layers[2].chrome, Some(input.fx_occluders[0]));
     assert!(try_shift_window_absolute_effects_y(&mut input, -7));
     assert_eq!(input, original, "+crop/-crop must restore every byte");
 
@@ -369,6 +376,11 @@ fn gpu_effect_shift_moves_window_fx_and_occluders_and_restores_exactly() {
     let before = edge.clone();
     assert!(!try_shift_window_absolute_effects_y(&mut edge, 5));
     assert_eq!(edge, before, "preflight rejects without partial mutation");
+    let mut chrome = original.clone();
+    chrome.fx_layers[2].chrome = Some(PxRect::new(0, 8, 40, i32::MAX - 3));
+    let before = chrome.clone();
+    assert!(!try_shift_window_absolute_effects_y(&mut chrome, 5));
+    assert_eq!(chrome, before, "a chrome at the edge is preflighted too");
 }
 
 #[test]

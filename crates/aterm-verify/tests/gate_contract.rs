@@ -511,15 +511,15 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
 }
 
 #[test]
-fn the_objc_drives_run_every_row_after_a_failure() {
+fn objc_drives_build_once_and_keep_runtime_failures_separate() {
     if !cfg!(target_os = "macos") {
         return;
     }
     let [first, second, ..] = stages::OBJC_DRIVES;
     let repo = FakeRepo::new();
     repo.with_stage2_body(&format!(
-        "case \"$*\" in *{}*) {COMPILE_RED} ;; esac\nexit 0",
-        first.example
+        "case \"$*\" in *{}*{}*) exit 0 ;; *) {COMPILE_RED} ;; esac",
+        first.example, second.example
     ));
     repo.driver_stub(&objc_stub(second.example), 1);
     let ctx = repo.ctx_with_windows(&land(), Scope::workspace());
@@ -532,17 +532,30 @@ fn the_objc_drives_run_every_row_after_a_failure() {
     let ladder = r.render();
     assert_eq!(
         t.gate_failures.len(),
-        2,
-        "the build and the finding: {ladder}"
+        1,
+        "one shared build, then the runtime finding: {ladder}"
     );
     let passed = labels_with(&ladder, "ok");
-    for drive in &stages::OBJC_DRIVES[2..] {
+    for drive in stages::OBJC_DRIVES
+        .iter()
+        .filter(|drive| drive.example != second.example)
+    {
         assert!(
             passed.iter().any(|l| l.starts_with(drive.example)),
-            "{} ran after the failures: {ladder}",
+            "{} ran despite another driver's runtime failure: {ladder}",
             drive.example
         );
     }
+
+    // A failed shared build must not run any of the executable stubs already on
+    // disk. Reverting to per-driver builds also breaks the two-target control above.
+    repo.with_stage2_body(COMPILE_RED);
+    let r = stages::run_stage(&ctx, &spec);
+    let t = tally(std::slice::from_ref(&r));
+    let ladder = r.render();
+    assert_eq!(t.gate_failures.len(), 1, "{ladder}");
+    assert_eq!(t.could_not_run.len(), 1, "{ladder}");
+    assert!(labels_with(&ladder, "ok").is_empty(), "{ladder}");
 }
 
 const COMPILE_RED: &str = "echo 'error[E0425]: cannot find value `gone` in this scope' >&2; \

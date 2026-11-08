@@ -469,12 +469,19 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), b"complete new bytes");
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt as _;
+                use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
                 let expected_mode = if matches!(policy, Publication::Private) {
                     expected_mode
                 } else {
                     let control = root.join("prior-creation-policy");
-                    drop(crate::platform::open_create_write(&control, expected_mode).unwrap());
+                    drop(
+                        std::fs::OpenOptions::new()
+                            .mode(expected_mode)
+                            .create_new(true)
+                            .write(true)
+                            .open(&control)
+                            .unwrap(),
+                    );
                     std::fs::metadata(control).unwrap().permissions().mode() & 0o777
                 };
                 assert_eq!(

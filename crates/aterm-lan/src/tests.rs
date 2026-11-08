@@ -592,7 +592,17 @@ fn an_admitted_native_request_survives_scheduling_delay() {
                 ..
             })
         ));
-        let reply = reader.frame(&client, deadline).unwrap();
+        // The stale request's broker refuses before it reads, so it closes with this client's
+        // hello and request unread in its queue: macOS reads that close as the end, Linux as a
+        // reset (`unix_release_sock` resets a peer whose close dropped bytes).
+        let reply = match reader.frame(&client, deadline) {
+            Err(error)
+                if !expected_socket && error.kind() == std::io::ErrorKind::ConnectionReset =>
+            {
+                None
+            }
+            read => read.unwrap(),
+        };
         let received = reader.take_fd();
         let acknowledged = if received.is_some() {
             wire::took(&client).is_ok()

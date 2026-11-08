@@ -1370,16 +1370,19 @@ fn units_stage(_: &Ctx, spec: &StageSpec) -> Report {
 }
 
 /// The units stand-in's compilers by pid: 11 aterm-gui's lib-test, 12 its lib, 13 a light one.
-fn units_reader(pid: u32) -> Option<crate::unitgraph::UnitName> {
+fn units_reader(pid: u32) -> crate::memory::Named {
     let kind = match pid {
         11 => "aterm_gui test",
         12 => "aterm_gui lib",
         13 => "aterm_grid lib",
-        _ => return None,
+        _ => return crate::memory::Named::Nothing,
     };
-    Some(crate::unitgraph::UnitName {
-        package: if pid == 13 { "aterm-grid" } else { "aterm-gui" }.to_owned(),
-        kind: kind.to_owned(),
+    crate::memory::Named::Unit(crate::memory::UnitRead {
+        unit: crate::unitgraph::UnitName {
+            package: if pid == 13 { "aterm-grid" } else { "aterm-gui" }.to_owned(),
+            kind: kind.to_owned(),
+        },
+        wrapper: false,
     })
 }
 

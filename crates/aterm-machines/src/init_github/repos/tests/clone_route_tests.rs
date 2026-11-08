@@ -20,7 +20,7 @@ fn repo() -> Repo {
 }
 
 fn isolated<'s>(sys: &'s Live, config: &str) -> (Scratch<'s>, User, Cmd) {
-    crate::items::github::need_clt_git();
+    crate::items::github::need_native_git();
     let scratch = Scratch::new(sys, "github-clone-route").unwrap();
     let mut who = user("fixture", sys.euid());
     who.home = scratch.path().to_string_lossy().into_owned();

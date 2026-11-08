@@ -48,7 +48,7 @@ const LAST_LOOK_CHUNKS: usize = 2;
 pub(crate) const FORK_EXPORT_WAIT: Duration = Duration::from_secs(2);
 /// Share of [`FORK_EXPORT_WAIT`] allocated to held panes after handed sessions finish.
 pub(crate) const FORK_HELD_WAIT: Duration = Duration::from_millis(500);
-const IMPORT_PATIENCE: Duration = Duration::from_secs(5);
+const IMPORT_HANG: Duration = Duration::from_secs(60);
 const IMPORT_RETRY: Duration = Duration::from_millis(25);
 
 fn header(cols: u16) -> [u8; HEADER_LEN] {
@@ -2127,6 +2127,16 @@ pub(crate) fn import(
     claim: OlderHistoryClaim,
     held_pane: bool,
 ) -> Result<Imported, String> {
+    import_with_clock(term, carry, claim, held_pane, std::time::Instant::now)
+}
+
+fn import_with_clock(
+    term: &Mutex<Terminal>,
+    carry: HistoryCarry,
+    claim: OlderHistoryClaim,
+    held_pane: bool,
+    mut now: impl FnMut() -> std::time::Instant,
+) -> Result<Imported, String> {
     if !locked(term, |t| t.older_history_claim_holds(claim)) {
         return Ok(Imported::Cleared);
     }
@@ -2142,7 +2152,7 @@ pub(crate) fn import(
             line.clear_hyperlinks();
         }
     }
-    let deadline = std::time::Instant::now() + IMPORT_PATIENCE;
+    let deadline = now() + IMPORT_HANG;
     loop {
         let cols = locked(term, |t| t.history_cols());
         let older = OlderHistory::build(&lines, from_cols, cols);
@@ -2165,8 +2175,8 @@ pub(crate) fn import(
             Err(OlderHistoryRefusal::NoTieredStore(_)) => {
                 return Err("the pane keeps no history store to import into".to_string());
             }
-            Err(refusal) if std::time::Instant::now() >= deadline => {
-                return Err(format!("{refusal} for {} s", IMPORT_PATIENCE.as_secs()));
+            Err(refusal) if now() >= deadline => {
+                return Err(format!("{refusal} for {} s", IMPORT_HANG.as_secs()));
             }
             Err(_) => std::thread::sleep(IMPORT_RETRY),
         }

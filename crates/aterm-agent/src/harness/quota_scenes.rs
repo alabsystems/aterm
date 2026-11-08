@@ -190,9 +190,9 @@ pub const SAT14: i64 = SAT7 + 7 * D;
 
 /// Mon 9 Nov 09:00: case (c)'s `alt1` week resets.
 pub const MON9: i64 = T5 + 3 * D + 16 * H;
-/// Wed 11 Nov 09:00: case (c)'s `alt2` week resets. (The design's table says 18:00, but a week
-/// that resets 6 d 1 h ahead began inside the pace's 24-hour lookback, so its 90% would count
-/// as a day's rise; 09:00 keeps the design's 36% a day.)
+/// Wed 11 Nov 09:00: case (c)'s `alt2` week resets. (The design's first table said 18:00, but a
+/// week that resets 6 d 1 h ahead began inside the pace's 24-hour lookback, so its 90% would
+/// count as a day's rise, 100% a day; 09:00 keeps the design's 36% a day.)
 pub const WED9: i64 = T5 + 5 * D + 16 * H;
 
 /// Case (a): one Max 20x account at 40% of its week at Thu 17:00, its reset Sat 10:00, read here
@@ -227,8 +227,9 @@ pub fn case_b() -> Fx {
 
 /// Case (c): `main` at 75% (resets Sat 10:00), `alt1` at 80% (Mon 09:00) and `alt2` at 90% (Wed
 /// 09:00), all Max 20x and read now, at 36% a day (`main` read from 39% a day before): the work
-/// moves main → alt1 → alt2, every account is out from early Saturday until main's reset, then
-/// main carries, then alt1.
+/// moves main → alt1 → alt2 as main and alt1 reach their low mark, and once alt2 is out back to
+/// main and alt1 for their last points; every account is out from Sat 05:40, when the three
+/// weeks' 55 points are spent, until main's reset, then main carries, then alt1 (§1.3 (c)).
 pub fn case_c() -> Fx {
     let mut fx = Fx::new(&[
         ("main", Class::Preferred),

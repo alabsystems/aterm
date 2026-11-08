@@ -779,6 +779,15 @@ fn measure_main_fixture_reader() {
         .unwrap()
         .to_path_buf();
     let git = Git::new(&repo);
+    let mut run = |cmd: &mut Command| {
+        if cmd.get_args().any(|arg| arg == "--no-run")
+            && let Some(dir) = std::env::var_os("ATERM_MEASURE_READER_BUILD_DIR")
+        {
+            cmd.arg("--config")
+                .arg(format!("build.build-dir={:?}", PathBuf::from(dir)));
+        }
+        cmd.output()
+    };
     let before = std::env::var("ATERM_MEASURE_MAIN_BASE").unwrap_or_else(|_| "HEAD".into());
     let corpus = crate::ledger::git_ok(
         &git,
@@ -822,6 +831,14 @@ fn measure_main_fixture_reader() {
     .unwrap()
     .stdout_utf8();
     let mut reader = fixtures::MainReader::new(&repo).unwrap();
+    if std::env::var_os("ATERM_MEASURE_MAIN_PREBUILD").is_some() {
+        let started = std::time::Instant::now();
+        let result = reader.prebuild(&targo(), preview.trim(), &mut run);
+        println!(
+            "prebuild: {:.3}s {result:?}",
+            started.elapsed().as_secs_f64()
+        );
+    }
     let reading = reader.read(
         &targo(),
         preview.trim(),
@@ -829,11 +846,14 @@ fn measure_main_fixture_reader() {
             version: version.clone(),
             ..pins(7)
         },
-        &mut |cmd| cmd.output(),
+        &mut run,
     );
     println!("cold: {}", reading.checks);
     assert!(reading.answers.is_ok(), "{}", reading.checks);
     assert!(reading.checks.starts_with("PASS"), "{}", reading.checks);
+    if std::env::var_os("ATERM_MEASURE_MAIN_ONCE").is_some() {
+        return;
+    }
     // Reopen on current main, possibly many commits later. Rebuild the preview
     // from that tip's own corpus rather than carrying the older tree's answers.
     let corpus = fs::read_to_string(repo.join(fixtures::SHIPPED_STATE_CORPUS)).unwrap();
@@ -868,14 +888,115 @@ fn measure_main_fixture_reader() {
     .stdout_utf8();
     drop(reader);
     let mut reader = fixtures::MainReader::new(&repo).unwrap();
+    if std::env::var_os("ATERM_MEASURE_MAIN_PREBUILD").is_some() {
+        let started = std::time::Instant::now();
+        let result = reader.prebuild(&targo(), moved.trim(), &mut run);
+        println!(
+            "prebuild: {:.3}s {result:?}",
+            started.elapsed().as_secs_f64()
+        );
+    }
     let reading = reader.read(
         &targo(),
         moved.trim(),
         &Pins { version, ..pins(7) },
-        &mut |cmd| cmd.output(),
+        &mut run,
     );
     println!("changed tip, warm source: {}", reading.checks);
     assert!(reading.checks.starts_with("PASS"), "{}", reading.checks);
+}
+
+#[test]
+fn prebuild_fixture_tree_is_the_tree_landing_then_judges() {
+    let o = Origin::new();
+    let runs = Cell::new(0);
+    let staged = fixtures::stage(
+        &targo(),
+        &o.work,
+        &o.stage_root(),
+        &pins(7),
+        &mut generator(&["history", "twelve-panes"], &runs),
+    )
+    .unwrap();
+    let base = git(&o.work, &["rev-parse", "origin/main^{tree}"]);
+    let mut warmed = None;
+    fixtures::MainReader::new(&o.work)
+        .unwrap()
+        .prebuild_fixtures(&targo(), "origin/main", &staged, &pins(7), &mut |cmd| {
+            warmed = Some(git(
+                cmd.get_current_dir().unwrap(),
+                &["rev-parse", "HEAD^{tree}"],
+            ));
+            Ok(Output {
+                status: exit(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        })
+        .unwrap();
+    let warmed = warmed.unwrap();
+    assert_ne!(warmed, base, "bare main omits the staged fixture inputs");
+    let mut judged = false;
+    fixtures::land(
+        &Git::new(&o.work),
+        &native(&o),
+        &staged,
+        &pins(7),
+        &mut |preview| {
+            judged = true;
+            assert_eq!(
+                git(&o.work, &["rev-parse", &format!("{preview}^{{tree}}")]),
+                warmed
+            );
+            reader(&staged)(preview)
+        },
+    )
+    .unwrap();
+    assert!(judged);
+}
+
+#[test]
+fn prebuild_never_supplies_another_trees_binary_or_hides_the_preview_compile_red() {
+    for prebuild_success in [true, false] {
+        let o = Origin::new();
+        let mut reader = fixtures::MainReader::new(&o.work).unwrap();
+        let mut warmed = false;
+        let result = reader.prebuild(&targo(), "HEAD", &mut |cmd| {
+            warmed = true;
+            assert!(cmd.get_args().any(|arg| arg == "--no-run"));
+            Ok(Output {
+                status: exit(if prebuild_success { 0 } else { 1 }),
+                stdout: Vec::new(),
+                stderr: b"warm-up error".to_vec(),
+            })
+        });
+        assert!(warmed);
+        assert_eq!(result.is_ok(), prebuild_success);
+        fs::write(o.work.join("reader-input"), "preview only").unwrap();
+        git(&o.work, &["add", "reader-input"]);
+        git(&o.work, &["commit", "-m", "change preview reader inputs"]);
+        let preview = git(&o.work, &["rev-parse", "HEAD"]);
+        let mut compiled = false;
+        let reading = reader.read(&targo(), preview.trim(), &pins(7), &mut |cmd| {
+            compiled = true;
+            assert_eq!(
+                fs::read_to_string(cmd.get_current_dir().unwrap().join("reader-input")).unwrap(),
+                "preview only"
+            );
+            Ok(Output {
+                status: exit(1),
+                stdout: Vec::new(),
+                stderr: b"error: preview compile negative control".to_vec(),
+            })
+        });
+        assert!(compiled, "prebuild must never replace the preview compile");
+        assert!(reading.answers.is_err());
+        assert!(
+            reading.checks.contains("preview compile negative control"),
+            "{}",
+            reading.checks
+        );
+    }
 }
 
 #[test]

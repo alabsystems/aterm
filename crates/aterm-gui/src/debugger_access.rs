@@ -236,8 +236,11 @@ pub(crate) fn try_change_lock(config_path: &Path) -> LockTry {
     take_change_lock(config_path, Duration::ZERO)
 }
 
-/// How long [`take_change_lock`] waits out a busy lock.
+/// How long record observations and marker cleanup wait behind a sibling writer.
 pub(crate) const CHANGE_LOCK_PATIENCE: Duration = Duration::from_secs(1);
+
+/// Hang detector for an admitted change waiting for its predecessor's native lock.
+const REQUIRED_CHANGE_HANG: Duration = Duration::from_secs(60);
 
 fn change_lock_patience() -> Duration {
     #[cfg(test)]
@@ -253,7 +256,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// This test thread's change-lock patience until the guard drops.
+/// This test thread's record-observation lock budget until the guard drops.
 #[cfg(test)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct PatienceForTest(Option<Duration>);
@@ -274,6 +277,14 @@ impl Drop for PatienceForTest {
 /// Take the change lock beside `config_path`, waiting out a busy lock for up to `patience`
 /// ([`acquire_advisory_lock_within`](crate::native_document_host::acquire_advisory_lock_within)).
 pub(crate) fn take_change_lock(config_path: &Path, patience: Duration) -> LockTry {
+    take_change_lock_with_clock(config_path, patience, std::time::Instant::now)
+}
+
+fn take_change_lock_with_clock(
+    config_path: &Path,
+    patience: Duration,
+    now: impl FnMut() -> std::time::Instant,
+) -> LockTry {
     let Some(path) = marker_path(config_path, CHANGE_LOCK) else {
         return LockTry::Unavailable(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -282,7 +293,9 @@ pub(crate) fn take_change_lock(config_path: &Path, patience: Duration) -> LockTr
     };
     #[cfg(unix)]
     {
-        use crate::native_document_host::{AdvisoryLockRefusal, acquire_advisory_lock_within};
+        use crate::native_document_host::{
+            AdvisoryLockRefusal, acquire_advisory_lock_within_clock,
+        };
         use std::os::unix::fs::OpenOptionsExt as _;
         let opened = std::fs::OpenOptions::new()
             .read(true)
@@ -296,7 +309,7 @@ pub(crate) fn take_change_lock(config_path: &Path, patience: Duration) -> LockTr
             Ok(file) => file,
             Err(error) => return LockTry::Unavailable(error),
         };
-        match acquire_advisory_lock_within(file, patience) {
+        match acquire_advisory_lock_within_clock(file, patience, now) {
             Ok(held) => LockTry::Held(ChangeLock { _held: held }),
             Err(AdvisoryLockRefusal::Busy) => LockTry::Busy,
             Err(AdvisoryLockRefusal::Failed(error)) => LockTry::Unavailable(error),
@@ -304,7 +317,7 @@ pub(crate) fn take_change_lock(config_path: &Path, patience: Duration) -> LockTr
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, patience);
+        let _ = (path, patience, now);
         LockTry::Unavailable(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "debugger access is a macOS setting",
@@ -1009,6 +1022,14 @@ impl Drop for WorkerGone {
     }
 }
 
+/// Run a debugger change using the native clock.
+pub(crate) fn run_devtools_job<R>(job: DevtoolsJob, run: R)
+where
+    R: FnOnce(DebuggerChange, ProbeGate, Box<dyn FnOnce(DevtoolsChild) + '_>) -> DevtoolsChangeRun,
+{
+    run_devtools_job_with_clock(job, run, std::time::Instant::now)
+}
+
 /// The worker's body, with the change runner injected (live:
 /// `aterm_containment::consent::run_devtools_change`; in tests,
 /// `devtools_change_with_for_test`).
@@ -1052,8 +1073,11 @@ impl Drop for WorkerGone {
         project = "aterm_gui::debugger_access::conformance::project"
     )
 )]
-pub(crate) fn run_devtools_job<R>(job: DevtoolsJob, run: R)
-where
+fn run_devtools_job_with_clock<R>(
+    job: DevtoolsJob,
+    run: R,
+    mut now: impl FnMut() -> std::time::Instant,
+) where
     R: FnOnce(DebuggerChange, ProbeGate, Box<dyn FnOnce(DevtoolsChild) + '_>) -> DevtoolsChangeRun,
 {
     let _gone = WorkerGone {
@@ -1064,7 +1088,9 @@ where
     let (change, id) = (job.change, job.job);
     let config_path = job.config_path.as_deref();
     let (slot, wake) = (&job.slot, &job.wake);
-    let lock = match config_path.map(|path| take_change_lock(path, change_lock_patience())) {
+    let lock = match config_path
+        .map(|path| take_change_lock_with_clock(path, REQUIRED_CHANGE_HANG, &mut now))
+    {
         None => None,
         Some(LockTry::Held(lock)) => Some(lock),
         Some(LockTry::Busy) => {
@@ -2268,7 +2294,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_worker_holds_the_lock_publishes_the_child_then_the_result_and_leaves_the_marker() {
-        let _patience = patience_for_test(Duration::ZERO);
         let dir = scratch("worker");
         let config = dir.join("aterm.toml");
         let slot = Arc::new(ChangeSlot::default());
@@ -2332,7 +2357,20 @@ mod tests {
         slot.arm(5);
         let mut blocked = job(DebuggerChange::On, 5, &slot);
         blocked.config_path = Some(config.clone());
-        run_devtools_job(blocked, |_, _, _| panic!("nothing runs under a held lock"));
+        let mut clock_reads = 0;
+        run_devtools_job_with_clock(
+            blocked,
+            |_, _, _| panic!("nothing runs under a held lock"),
+            || {
+                clock_reads += 1;
+                std::time::Instant::now()
+                    - if clock_reads == 1 {
+                        Duration::from_secs(61)
+                    } else {
+                        Duration::ZERO
+                    }
+            },
+        );
         let refused = slot.take(5);
         assert_eq!(refused.refused, Some(WorkerRefusal::PeerChanging));
         assert!(refused.gone && refused.spawned.is_none() && refused.result.is_none());
@@ -2357,6 +2395,83 @@ mod tests {
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_debugger_change_waits_for_its_native_predecessor() {
+        for age in [Duration::from_secs(2), Duration::from_secs(61)] {
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let dir = scratch("required-writer");
+            let config = dir.join("aterm.toml");
+            let LockTry::Held(held) = try_change_lock(&config) else {
+                panic!("native predecessor");
+            };
+            let mut held = Some(held);
+            let slot = Arc::new(ChangeSlot::default());
+            slot.arm(11);
+            let mut request = job(DebuggerChange::On, 11, &slot);
+            request.config_path = Some(config.clone());
+            let ran = std::cell::Cell::new(false);
+            let mut observed = 0;
+            run_devtools_job_with_clock(
+                request,
+                |change, gate, on_spawn| {
+                    assert_eq!((change, gate), (DebuggerChange::On, ProbeGate::on()));
+                    assert!(matches!(try_change_lock(&config), LockTry::Busy));
+                    on_spawn(child(177));
+                    let marker = read_debugger_marker(&config, CHANGE_MARKER)
+                        .and_then(|text| ChangeMarker::parse(&text))
+                        .unwrap();
+                    assert_eq!(marker.child, child(177));
+                    ran.set(true);
+                    DevtoolsChangeRun::Exited {
+                        code: Some(0),
+                        stdout_head: String::new(),
+                        stderr_head: String::new(),
+                    }
+                },
+                || {
+                    observed += 1;
+                    if observed == 2 && !expired {
+                        drop(held.take());
+                    }
+                    std::time::Instant::now() - if observed == 1 { age } else { Duration::ZERO }
+                },
+            );
+            if expired {
+                assert!(
+                    matches!(try_change_lock(&config), LockTry::Busy),
+                    "expiry leaves the real predecessor held"
+                );
+                assert!(!dir.join(CHANGE_MARKER).exists());
+            }
+            drop(held);
+            let read = slot.take(11);
+            if expired {
+                assert_eq!(read.refused, Some(WorkerRefusal::PeerChanging));
+                assert!(!ran.get());
+                assert!(read.spawned.is_none() && read.result.is_none());
+            } else {
+                assert_eq!(
+                    read.refused, None,
+                    "a released native predecessor is not a peer changing access"
+                );
+                assert!(ran.get());
+                assert_eq!(read.spawned, Some(child(177)));
+                assert!(matches!(
+                    read.result,
+                    Some(DevtoolsChangeRun::Exited { code: Some(0), .. })
+                ));
+            }
+            assert!(read.gone);
+            assert!(
+                observed >= 2,
+                "the reader observed native contention before release"
+            );
+            assert!(matches!(try_change_lock(&config), LockTry::Held(_)));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]
@@ -3783,23 +3898,24 @@ pub(crate) mod conformance {
             );
             let fault = self.fault;
             let shared = Arc::clone(&env);
-            let patience = PATIENCE_FOR_TEST.with(std::cell::Cell::get);
+            let peer_holds_lock = self.peer.is_some();
             let handle = std::thread::Builder::new()
                 .name("rig-consent-devtools".into())
                 .spawn(move || {
-                    let _patience = patience.map(patience_for_test);
                     let env = shared;
-                    run_devtools_job(job, |change, _gate, on_spawn| {
-                        let recheck = || {
-                            let world = env.world.load(Ordering::SeqCst);
-                            env.log
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .push(Event::Read(world));
-                            scripted(denorm(world, env.change))
-                        };
-                        let spawn =
-                            |argv: &[&str]| {
+                    let mut first_clock_read = true;
+                    run_devtools_job_with_clock(
+                        job,
+                        |change, _gate, on_spawn| {
+                            let recheck = || {
+                                let world = env.world.load(Ordering::SeqCst);
+                                env.log
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .push(Event::Read(world));
+                                scripted(denorm(world, env.change))
+                            };
+                            let spawn = |argv: &[&str]| {
                                 env.log.lock().unwrap_or_else(|p| p.into_inner()).push(
                                     Event::Spawn(argv.iter().map(|a| (*a).to_string()).collect()),
                                 );
@@ -3810,14 +3926,24 @@ pub(crate) mod conformance {
                                 set_alive(child.pid, false);
                                 exit
                             };
-                        if fault == Fault::SkipRecheck {
-                            spawn(&change_argv(change))
-                        } else {
-                            aterm_containment::consent::devtools_change_with_for_test(
-                                change, recheck, spawn,
-                            )
-                        }
-                    });
+                            if fault == Fault::SkipRecheck {
+                                spawn(&change_argv(change))
+                            } else {
+                                aterm_containment::consent::devtools_change_with_for_test(
+                                    change, recheck, spawn,
+                                )
+                            }
+                        },
+                        || {
+                            let first = std::mem::replace(&mut first_clock_read, false);
+                            std::time::Instant::now()
+                                - if first && peer_holds_lock {
+                                    Duration::from_secs(61)
+                                } else {
+                                    Duration::ZERO
+                                }
+                        },
+                    );
                     env.stage.store(2, Ordering::SeqCst);
                 })
                 .expect("the harness's worker thread");

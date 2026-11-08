@@ -3273,6 +3273,9 @@ fn the_landing_is_on_record_with_how_long_the_update_took() {
     let mut app = App::headless_for_test();
     app.update_verified = update_words::carried_verification(ms, 7, now, wall);
     app.post_update_landed("9.9.9", 7, 0);
+    // The landing reads its own clock: the span is the 42 s carried, which the carry's cut to
+    // the millisecond can make a second more, plus however long this test took to get there.
+    let late = now.elapsed().as_secs();
     assert_eq!(
         update_row(&app),
         None,
@@ -3290,8 +3293,11 @@ fn the_landing_is_on_record_with_how_long_the_update_took() {
     let said = took(&app);
     assert_eq!(said.len(), 1, "{said:?}");
     assert!(
-        said[0] == "installed 42 s after the download"
-            || said[0] == "installed 43 s after the download",
+        (42..=43 + late).any(|secs| said[0]
+            == format!(
+                "installed {} after the download",
+                update_words::span_words(std::time::Duration::from_secs(secs))
+            )),
         "{said:?}"
     );
     let mut disk = App::headless_for_test();

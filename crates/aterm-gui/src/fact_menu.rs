@@ -494,8 +494,10 @@ fn outlook_rows(
         );
     }
     let mut legend_last = card.last().is_some_and(CardRow::is_legend);
-    let plot = |cells: Vec<(char, aterm_agent::harness::outlook::CardInk)>, spoken: String| {
-        MenuRow::plot(
+    let plot = |cells: Vec<(char, aterm_agent::harness::outlook::CardInk)>,
+                spoken: String,
+                ticks: Vec<i64>| {
+        MenuRow::plot_ticked(
             cells
                 .into_iter()
                 .map(|(ch, ink)| PlotCell {
@@ -505,6 +507,7 @@ fn outlook_rows(
                 })
                 .collect::<Vec<_>>(),
             spoken,
+            ticks,
         )
     };
     let mut out = Vec::with_capacity(card.len() + 1);
@@ -527,7 +530,11 @@ fn outlook_rows(
                     autopilot_menu::NoteTone::Label
                 },
             }),
-            CardRow::Plot { cells, spoken } => out.push(plot(cells, spoken)),
+            CardRow::Plot {
+                cells,
+                spoken,
+                ticks,
+            } => out.push(plot(cells, spoken, ticks)),
             CardRow::Rule => out.push(MenuRow::Rule),
             CardRow::Account {
                 label,
@@ -545,7 +552,7 @@ fn outlook_rows(
                 placed.push(acct.account.as_str());
                 out.push(account_item(fact, acct, text, spoken));
                 if let Some(lane) = lane {
-                    out.push(plot(lane.cells, lane.spoken));
+                    out.push(plot(lane.cells, lane.spoken, lane.ticks));
                 }
             }
         }
@@ -1834,6 +1841,7 @@ impl App {
             laid: None,
             generation: 0,
             rest: PointerRest::at_open(px),
+            ticks: crate::autopilot_menu::CardTicks::default(),
         });
         if fact == Fact::Account {
             self.account_menu_read

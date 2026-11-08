@@ -39,6 +39,8 @@ pub struct CutOptions {
     /// `--sign`: sign, notarize and package a byte copy of the release's verified bundle under
     /// its reserved number, privately, and keep the record the claim adopts ([`run_cut_sign`]).
     pub sign: bool,
+    /// Private packaging half only: no product executions and no adoptable record.
+    pub sign_prepare: bool,
 }
 
 /// Which cut flavor is running — decided once, checked per step.
@@ -6209,6 +6211,18 @@ pub(crate) fn verified_release_bundle_with_inputs(
     toolchain: &str,
     inputs: impl FnOnce() -> std::result::Result<String, String>,
 ) -> Result<VerifiedBundle> {
+    release_bundle_with_inputs(operator, repo, source, version, toolchain, inputs, true)
+}
+
+pub(crate) fn release_bundle_with_inputs(
+    operator: &dyn GitRunner,
+    repo: &Path,
+    source: &str,
+    version: &str,
+    toolchain: &str,
+    inputs: impl FnOnce() -> std::result::Result<String, String>,
+    require_verified: bool,
+) -> Result<VerifiedBundle> {
     let refuse = |why: String| {
         Error::new(format!(
             "{why} — a cut (a dry run too) signs only the bundle its \
@@ -6313,11 +6327,16 @@ pub(crate) fn verified_release_bundle_with_inputs(
             "the compiler or SDK bytes changed since this bundle was built".into(),
         ));
     }
-    let (yes, line) =
-        gates::verified_with_inputs(operator, source, &complete.macho_sha256, || Ok(inputs))?;
-    if !yes {
-        return Err(refuse(format!("NOTHING SHIPS UNVERIFIED: {line}")));
-    }
+    let line = if require_verified {
+        let (yes, line) =
+            gates::verified_with_inputs(operator, source, &complete.macho_sha256, || Ok(inputs))?;
+        if !yes {
+            return Err(refuse(format!("NOTHING SHIPS UNVERIFIED: {line}")));
+        }
+        line
+    } else {
+        "built bytes re-proved; private preparation only, verification still required".into()
+    };
     Ok(VerifiedBundle {
         reserved: reserved.ledger(),
         complete,
@@ -6897,7 +6916,9 @@ fn sign_beside_journal(existing: Option<&JournalHeader>, path: &Path) -> Result<
 /// journal (R, the reservation, the bundle), never from the publication engine, so it runs
 /// beside `pub publish`: it claims nothing, pushes nothing, uploads nothing, takes no release
 /// lock and no publisher fence, and leaves the Linux workers to the claim. A standing record of
-/// these bytes is adopted as it is.
+/// these bytes is adopted as it is. `--sign-prepare` uses the built bundle before verification
+/// ends, executes no product, and writes only a prepared record. After verification `--sign`
+/// re-proves it, runs the local self-check and writes the record the claim may adopt.
 pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
     gates::arm_toolchain_lease();
     let credentials = sign::ReleaseCredentials::resolve(opts.release_credentials.as_deref(), repo)
@@ -6934,7 +6955,15 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
     );
     let toolchain = gates::cut_toolchain()
         .map_err(|e| Error::new(format!("the cut cannot name its prover: {e}")))?;
-    let verified = verified_release_bundle(&operator, repo, &source, &version, &toolchain)?;
+    let verified = release_bundle_with_inputs(
+        &operator,
+        repo,
+        &source,
+        &version,
+        &toolchain,
+        crate::build_inputs::current,
+        !opts.sign_prepare,
+    )?;
     step("gate", &verified.line);
     let parent = rev_parse(&git, &format!("{}^1", verified.reserved.commit))?;
     if parent != source {
@@ -6998,34 +7027,67 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
         journal: None,
         adopted: false,
     };
-    let source = signing_source(&ctx)?;
+    let source = signing_source_with_verification(&ctx, !opts.sign_prepare)?;
     if adopted_copy(&ctx, &source)?.is_none() {
-        let signed = sign_copy(&ctx, &source)?;
+        let signed = match prepared_copy(&ctx, &source)? {
+            Some(signed) => signed,
+            None => sign_copy(&ctx, &source)?,
+        };
         prove_bundle_on_disk(&ctx)?;
-        let apple_note = selfcheck_local(&ctx, aterm_update_core::pins::APPLE_TEAM_ID)?;
-        step(
-            "selfcheck",
-            &format!(
-                "binary == plist == {} · codesign --verify --deep --strict ok{apple_note}",
-                ctx.build
-            ),
-        );
         let record = SignedRecord {
             format: SIGNED_FORMAT,
             key: signed_key(&ctx, &source.complete)?,
             outputs: signed_outputs(&ctx.dist, &ctx.version, ctx.build).map_err(Error::new)?,
         };
         outputs_as_signed(&record.outputs, &signed)?;
-        write_signed_record(&ctx.dist, &record)?;
+        finish_private_copy(&ctx.dist, &record, opts.sign_prepare, || {
+            let apple_note = selfcheck_local(&ctx, aterm_update_core::pins::APPLE_TEAM_ID)?;
+            step(
+                "selfcheck",
+                &format!(
+                    "binary == plist == {} · codesign --verify --deep --strict ok{apple_note}",
+                    ctx.build
+                ),
+            );
+            Ok(())
+        })?;
     }
     println!(
-        "\nDONE cut --sign v{} (build {}) in {}s — signed privately; the claim adopts it ({})",
+        "\nDONE cut {} v{} (build {}) in {}s — private record ({})",
+        if opts.sign_prepare {
+            "--sign-prepare"
+        } else {
+            "--sign"
+        },
         ctx.version,
         ctx.build,
         t0.elapsed().as_secs(),
-        signed_record_path(&ctx.dist, ctx.build).display()
+        if opts.sign_prepare {
+            prepared_record_path(&ctx.dist, ctx.build)
+        } else {
+            signed_record_path(&ctx.dist, ctx.build)
+        }
+        .display()
     );
     Ok(())
+}
+
+/// Only the checked phase may create the record the claim adopts. The reproof after the
+/// callback also refuses a self-check that changed any output it executed or inspected.
+fn finish_private_copy(
+    dist: &Path,
+    record: &SignedRecord,
+    prepare: bool,
+    selfcheck: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    signed_copy_stands(record, &record.key, dist).map_err(Error::new)?;
+    if prepare {
+        return write_copy_record(&prepared_record_path(dist, record.key.build), record);
+    }
+    selfcheck()?;
+    signed_copy_stands(record, &record.key, dist).map_err(Error::new)?;
+    write_signed_record(dist, record)?;
+    forget_copy_record(&prepared_record_path(dist, record.key.build))
 }
 
 struct ResumePaths<'a> {
@@ -7641,7 +7703,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
     Ok(())
 }
 
-/// The verified bundle a cut signs a copy of: its COMPLETE record in the release cache, that
+/// The built bundle a cut signs a copy of: its COMPLETE record in the release cache, that
 /// cache, its executable's digest, and R, the commit its `verify release` records are of.
 struct SigningSource {
     complete: artifact::Complete,
@@ -7654,6 +7716,10 @@ struct SigningSource {
 /// built as this cut's version, number and commit, and every check's record of R stands for its
 /// executable (NOTHING SHIPS UNVERIFIED).
 fn signing_source(ctx: &CutCtx) -> Result<SigningSource> {
+    signing_source_with_verification(ctx, true)
+}
+
+fn signing_source_with_verification(ctx: &CutCtx, require_verified: bool) -> Result<SigningSource> {
     let _timing = crate::cut_timing::Timer::new("signing source reproof");
     let (Some(key), Some(macho_sha256)) = (ctx.artifact.clone(), ctx.macho_sha256.clone()) else {
         return Err(Error::new(
@@ -7695,14 +7761,16 @@ fn signing_source(ctx: &CutCtx) -> Result<SigningSource> {
         )));
     }
     let published = rev_parse(&GitCli::new(&ctx.tree), &format!("{}^1", ctx.commit))?;
-    let (yes, line) = gates::verified(&GitCli::new(&ctx.repo), &published, &macho_sha256)?;
-    if !yes {
-        return Err(Error::new(format!(
-            "NOTHING SHIPS UNVERIFIED: {line} — refusing to sign build {}",
-            ctx.build
-        )));
+    if require_verified {
+        let (yes, line) = gates::verified(&GitCli::new(&ctx.repo), &published, &macho_sha256)?;
+        if !yes {
+            return Err(Error::new(format!(
+                "NOTHING SHIPS UNVERIFIED: {line} — refusing to sign build {}",
+                ctx.build
+            )));
+        }
+        step("gate", &line);
     }
-    step("gate", &line);
     Ok(SigningSource {
         complete,
         store,
@@ -7738,7 +7806,7 @@ fn sign_copy(ctx: &CutCtx, source: &SigningSource) -> Result<SignedCopy> {
     step(
         "bundle",
         &format!(
-            "the VERIFIED bundle, byte for byte: {} → {} — executable sha256 {}… (archs [{}] · \
+            "the built bundle, byte for byte: {} → {} — executable sha256 {}… (archs [{}] · \
              {}) · Short={} CFBundleVersion={}",
             complete.app(store).display(),
             app.display(),
@@ -7912,6 +7980,33 @@ fn adopted_copy(ctx: &CutCtx, source: &SigningSource) -> Result<Option<SignedCop
     let Some(record) = standing_record(record, &key, &ctx.dist)? else {
         return Ok(None);
     };
+    place_signed_copy(ctx, source, &record).map(Some)
+}
+
+/// A prepared copy has passed no runtime checks. Only `cut --sign`, after verification,
+/// may promote it to the signed record the claim reads. Mismatched bytes refuse here.
+fn prepared_copy(ctx: &CutCtx, source: &SigningSource) -> Result<Option<SignedCopy>> {
+    let Some(record) = prepared_record(&ctx.dist, &signed_key(ctx, &source.complete)?)? else {
+        return Ok(None);
+    };
+    place_signed_copy(ctx, source, &record).map(Some)
+}
+
+fn prepared_record(dist: &Path, key: &SignedKey) -> Result<Option<SignedRecord>> {
+    let path = prepared_record_path(dist, key.build);
+    let Some(record) = read_copy_record(&path).map_err(Error::new)? else {
+        return Ok(None);
+    };
+    signed_copy_stands(&record, key, dist)
+        .map_err(|why| Error::new(format!("early signature refused: {why}")))?;
+    Ok(Some(record))
+}
+
+fn place_signed_copy(
+    ctx: &CutCtx,
+    source: &SigningSource,
+    record: &SignedRecord,
+) -> Result<SignedCopy> {
     artifact::place_records(&source.complete.dir(&source.store), &ctx.dist, &ctx.version)
         .map_err(Error::new)?;
     let app = ctx.app_path();
@@ -7923,7 +8018,7 @@ fn adopted_copy(ctx: &CutCtx, source: &SigningSource) -> Result<Option<SignedCop
             "the copy `cut --sign` signed{} of these verified bytes, every digest re-proved: \
              {} (bundle {}…) · DMG sha256 {}… · zip sha256 {}… — nothing is signed or notarized \
              again",
-            if key.identity.is_some() {
+            if record.key.identity.is_some() {
                 ", notarized and stapled"
             } else {
                 ""
@@ -7935,12 +8030,12 @@ fn adopted_copy(ctx: &CutCtx, source: &SigningSource) -> Result<Option<SignedCop
         ),
     );
     stage_twins_and_sidecars(ctx, &dmg, &outputs.dmg_sha256, &zip, &outputs.zip_sha256)?;
-    Ok(Some(SignedCopy {
+    Ok(SignedCopy {
         app,
         dmg,
         dmg_sha256: outputs.dmg_sha256.clone(),
         zip_sha256: outputs.zip_sha256.clone(),
-    }))
+    })
 }
 
 /// The record `cut --sign` keeps of the copy it signed, in that copy's staging directory
@@ -8003,14 +8098,21 @@ fn signed_record_path(dist: &Path, build: u64) -> PathBuf {
         .join(SIGNED_RECORD)
 }
 
+fn prepared_record_path(dist: &Path, build: u64) -> PathBuf {
+    signed_record_path(dist, build).with_file_name("prepared.toml")
+}
+
 /// Build `build`'s signed record in `dist/`: `Ok(None)` without one, `Err` naming why one is
 /// there and unreadable.
 fn read_signed_record(
     dist: &Path,
     build: u64,
 ) -> std::result::Result<Option<SignedRecord>, String> {
-    let path = signed_record_path(dist, build);
-    match crate::durable::read_regular_text(&path, 1 << 20) {
+    read_copy_record(&signed_record_path(dist, build))
+}
+
+fn read_copy_record(path: &Path) -> std::result::Result<Option<SignedRecord>, String> {
+    match crate::durable::read_regular_text(path, 1 << 20) {
         Ok(text) => aterm_toml::from_str(&text)
             .map(Some)
             .map_err(|e| format!("{} does not parse: {e}", path.display())),
@@ -8021,9 +8123,13 @@ fn read_signed_record(
 
 fn write_signed_record(dist: &Path, record: &SignedRecord) -> Result<()> {
     let path = signed_record_path(dist, record.key.build);
+    write_copy_record(&path, record)
+}
+
+fn write_copy_record(path: &Path, record: &SignedRecord) -> Result<()> {
     let text = aterm_toml::to_string(record)
         .map_err(|e| Error::new(format!("serialize the signed record: {e}")))?;
-    crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o644)
+    crate::durable::write_atomic_durable(path, text.as_bytes(), 0o644)
         .map_err(|e| Error::new(format!("write {}: {e}", path.display())))
 }
 
@@ -8069,8 +8175,11 @@ fn outputs_as_signed(outputs: &SignedOutputs, signed: &SignedCopy) -> Result<()>
 }
 
 fn forget_signed_record(dist: &Path, build: u64) -> Result<()> {
-    let path = signed_record_path(dist, build);
-    match fs::remove_file(&path) {
+    forget_copy_record(&signed_record_path(dist, build))
+}
+
+fn forget_copy_record(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::new(format!("remove {}: {e}", path.display()))),
@@ -8216,6 +8325,9 @@ pub(crate) fn signed_copy_stands(
 pub(crate) fn discard_signed(dist: &Path, version: &str, build: u64) -> Vec<String> {
     let mut left = Vec::new();
     if let Err(error) = forget_signed_record(dist, build) {
+        left.push(error.to_string());
+    }
+    if let Err(error) = forget_copy_record(&prepared_record_path(dist, build)) {
         left.push(error.to_string());
     }
     if let Err(why) = bundle::discard_staged_app(dist, build) {
@@ -11731,6 +11843,82 @@ mod signed_copy_tests {
         let mut old = record.clone();
         old.format = SIGNED_FORMAT + 1;
         assert!(signed_copy_stands(&old, &key(), &dist).is_err());
+    }
+
+    /// NEGATIVE CONTROLS: writing signed.toml during preparation makes it adoptable before
+    /// READY; executing the callback then overlaps the bundle's windowed checks.
+    #[test]
+    fn early_packaging_cannot_be_adopted_until_its_local_check_passes() {
+        let (_dir, dist, record) = signed_dist();
+        forget_signed_record(&dist, BUILD).unwrap();
+        finish_private_copy(&dist, &record, true, || {
+            panic!("windowed check before READY")
+        })
+        .unwrap();
+        assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
+        assert_eq!(
+            prepared_record(&dist, &record.key).unwrap(),
+            Some(record.clone())
+        );
+
+        // An interrupted self-check creates no adoptable record. The same prepared bytes
+        // survive and can be checked on resume without another signing operation.
+        assert!(
+            finish_private_copy(&dist, &record, false, || Err(Error::new("interrupted"))).is_err()
+        );
+        assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
+        assert_eq!(
+            prepared_record(&dist, &record.key).unwrap(),
+            Some(record.clone())
+        );
+        finish_private_copy(&dist, &record, false, || Ok(())).unwrap();
+        assert_eq!(read_signed_record(&dist, BUILD).unwrap(), Some(record));
+        assert!(!prepared_record_path(&dist, BUILD).exists());
+    }
+
+    /// NEGATIVE CONTROL: skipping the prepared key or output comparison admits different
+    /// bytes after interruption. A changed executable key must refuse, never sign anew.
+    #[test]
+    fn prepared_bytes_refuse_a_changed_executable_and_discard_on_bundle_red() {
+        let (_dir, dist, record) = signed_dist();
+        forget_signed_record(&dist, BUILD).unwrap();
+        finish_private_copy(&dist, &record, true, || panic!("no self-check")).unwrap();
+        let mut changed = record.key.clone();
+        changed.macho_sha256 = "other executable".into();
+        assert!(
+            prepared_record(&dist, &changed)
+                .unwrap_err()
+                .0
+                .contains("executable")
+        );
+        fs::write(
+            bundle::staged_app_path(&dist, BUILD).join("Contents/MacOS/aterm"),
+            b"changed",
+        )
+        .unwrap();
+        assert!(prepared_record(&dist, &record.key).is_err());
+        assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
+        assert!(discard_signed(&dist, VERSION, BUILD).is_empty());
+        assert!(prepared_record(&dist, &record.key).unwrap().is_none());
+        assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
+    }
+
+    #[test]
+    fn selfcheck_cannot_certify_outputs_that_changed_while_it_ran() {
+        let (_dir, dist, record) = signed_dist();
+        forget_signed_record(&dist, BUILD).unwrap();
+        assert!(
+            finish_private_copy(&dist, &record, false, || {
+                fs::write(
+                    dist.join(channel::dmg_asset_name(VERSION)),
+                    b"different dmg",
+                )
+                .unwrap();
+                Ok(())
+            })
+            .is_err()
+        );
+        assert!(read_signed_record(&dist, BUILD).unwrap().is_none());
     }
 
     /// A RECORD THAT CANNOT BE READ IS NO RECORD OF THESE BYTES: the claim removes it and signs

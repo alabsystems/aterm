@@ -5465,24 +5465,34 @@ fn every_status_line(lab: &mut Lab, width: f32, height: f32, prefix: &str) -> Ve
 
 /// THE RELOAD WARNING WRAPS AS EVERY STATUS DOES: its bar under the page sets the warning on
 /// the lines it takes, and its form docked in the compact toolbar on the row's lines, the rest
-/// scrolling there to the wheel; neither cuts it to one line with an ellipsis, as
-/// `fit_native_status_label` did to both while every other status wrapped.
+/// scrolling there to the wheel, alone in the dock or beside a status, at every least view too;
+/// neither cuts it to one line with an ellipsis, as `fit_native_status_label` did to both while
+/// every other status wrapped, nor drops its message: docked under 220pt it said only "Reload
+/// warning" at the 1x, 1.5x and 2x least views (under 110pt, "Reload").
 #[test]
 fn the_reload_warning_wraps_as_every_status_does() {
     const WARNING: &str = "aterm.toml reload rejected: the file is not a valid aterm \
                            configuration. Fix it in Manual; the running settings remain active.";
-    at_each_text_scale(&[1.0, 2.0], "reload warning", |scale| {
+    at_each_text_scale(&[1.0, 1.5, 2.0], "reload warning", |scale| {
         let mut wrapped = 0;
-        for (width, height) in [
+        let sizes = [
             (444.0, 572.0),
             (584.0, 348.0),
             (864.0, 292.0),
             (1_074.0, 684.0),
-        ] {
-            let context = format!("{width}x{height} at {scale}x");
+            least_view(scale),
+        ];
+        for ((width, height), beside) in sizes
+            .into_iter()
+            .flat_map(|size| [(size, false), (size, true)])
+        {
+            let context = format!("{width}x{height} at {scale}x beside a status: {beside}");
             let mut lab = Lab::new("");
             lab.state_mut().navigate(SettingsRoute::Terminal);
             lab.state_mut().config_watch_status = Some(WARNING.to_string());
+            if beside {
+                lab.state_mut().feedback = Some("Saved.".to_string());
+            }
             let compiled = lab.compile(width, height);
             let docked = compiled
                 .semantic(&UiKey::new("settings/status-dock"))
@@ -5522,7 +5532,8 @@ fn the_reload_warning_wraps_as_every_status_does() {
                 }
             }
             let every = lines.into_values().collect::<Vec<_>>();
-            let shown = every.join(" ");
+            // A word wider than a narrow share breaks with a hyphen at its line's end.
+            let shown = every.join("\n").replace("-\n", "");
             let bare = |text: &str| text.split_whitespace().collect::<String>();
             let words = if docked {
                 format!("Reload warning: {WARNING}")

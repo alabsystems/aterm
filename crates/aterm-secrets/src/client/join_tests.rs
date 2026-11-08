@@ -3455,33 +3455,76 @@ fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
 }
 
 /// A newly installed broker ends the member backoff while the route is unchanged
-/// and the subscriber's real vault long-poll remains held.
+/// and the subscriber's real vault long-poll remains held. If the peer itself
+/// starts later, the existing member retry also runs beside that same long poll.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_broker_arrival_asks_pending_members_without_a_route_change() {
+    use crate::members::{desk, join, joiner};
     use aterm_uds::lan::wire::{self, Frame, Reader};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let server = serve_holding(&root.path().join("store"), Duration::from_secs(600));
-    let (_admin, mb, alab) = waiting_for_alab(root.path(), &server);
+    let (admin, mb, alab) = waiting_for_alab(root.path(), &server);
+    let desk = std::sync::Mutex::new(desk::Desk::new(
+        desk::Local::of(&admin).unwrap().expect("real member desk"),
+    ));
     let socket = root.path().join("broker.sock");
+    let peer_socket = root.path().join("member.sock");
     let asks = std::sync::atomic::AtomicUsize::new(0);
+    let heard = std::sync::atomic::AtomicUsize::new(0);
+    let missed = std::sync::atomic::AtomicUsize::new(0);
+    let make_due = AtomicBool::new(false);
     let stop = AtomicBool::new(false);
     let broker_stop = AtomicBool::new(false);
     let (tick, ticks) = mpsc::channel();
     let (handled, handling) = mpsc::channel();
+    let (looked, looking) = mpsc::channel();
     let observed = std::thread::scope(|scope| {
         let mut server = EndServer(Some(server));
         let _ends = StopsOnDrop(&stop);
         let _ends_broker = StopsOnDrop(&broker_stop);
         let me = &mb;
         let asks = &asks;
+        let heard = &heard;
+        let missed = &missed;
+        let desk = &desk;
+        let make_due = &make_due;
         let stop = &stop;
         let subscriber_socket = socket.clone();
+        let member_socket = peer_socket.clone();
         let subscriber = scope.spawn(move || {
             crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab.clone()));
-            let ask = |_: &Paths| Ok(asks.fetch_add(1, Ordering::SeqCst));
+            let ask = |paths: &Paths| {
+                let device = crate::commons::bootstrap::Device::open(paths)?
+                    .expect("the waiting Mac's device");
+                let joining = joiner::Joining {
+                    records_bound: crate::crossing::RecordsBound::uncrossed(),
+                    device: &device,
+                    node: [7; 32],
+                    name: "late-member".into(),
+                    model: "inert member startup fixture".into(),
+                };
+                let dial = |_: &str| -> crate::Result<Box<dyn join::Stream>> {
+                    let stream = UnixStream::connect(&member_socket).inspect_err(|error| {
+                        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+                        missed.fetch_add(1, Ordering::SeqCst);
+                    })?;
+                    stream.set_read_timeout(Some(HANG_DETECTOR))?;
+                    stream.set_write_timeout(Some(HANG_DETECTOR))?;
+                    Ok(Box::new(stream))
+                };
+                let (answers, failures) =
+                    join::ask_all_admitted(&dial, &joining, &["owned-member".into()], &|| Ok(()));
+                assert_eq!(answers.len() + failures.len(), 1);
+                for answer in &answers {
+                    assert!(matches!(answer.signed, joiner::Signed::Verified));
+                }
+                asks.fetch_add(1, Ordering::SeqCst);
+                heard.fetch_add(answers.len(), Ordering::SeqCst);
+                Ok(answers.len())
+            };
             let hearing = Hearing {
                 members: std::sync::Mutex::new(MembersAsked {
                     at: Some(Instant::now()),
@@ -3498,12 +3541,28 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
                 },
                 || {
                     let mut consumed = false;
+                    let members = &hearing.members;
                     member_routes::while_hearing(
                         me,
                         &hearing.members,
                         &ask,
                         &|_| {},
-                        &|_| {},
+                        &|event| {
+                            if matches!(event, member_routes::ProjectionEvent::Maintenance) {
+                                let adjusted = make_due.swap(false, Ordering::SeqCst);
+                                if adjusted {
+                                    let mut asked = members.lock().unwrap();
+                                    // Advance only the existing retry's scheduling boundary.
+                                    // No route, broker or peer-readiness notification is sent.
+                                    asked.at = Some(
+                                        Instant::now()
+                                            - ask_members_pause(asked.asks)
+                                            - Duration::from_secs(1),
+                                    );
+                                }
+                                looked.send(adjusted).unwrap();
+                            }
+                        },
                         move |most| {
                             crate::envelope::TEST_RETIRED
                                 .with(|cell| *cell.borrow_mut() = Some(alab.clone()));
@@ -3541,6 +3600,7 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
         listener.set_nonblocking(true).expect("bounded accept");
         let ending = &broker_stop;
         let broker = scope.spawn(move || {
+            let mut answered = false;
             while !ending.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
@@ -3556,7 +3616,7 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
                             },
                         )
                         .expect("broker answers");
-                        return true;
+                        answered = true;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(1));
@@ -3564,14 +3624,57 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
                     Err(error) => panic!("private broker accept: {error}"),
                 }
             }
-            false
+            answered
         });
         tick.send(()).expect("observe the broker's arrival");
         handling
             .recv_timeout(HANG_DETECTOR)
             .expect("turn completed");
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            missed.load(Ordering::SeqCst),
+            1,
+            "the peer was not listening"
+        );
+        assert_eq!(heard.load(Ordering::SeqCst), 0);
+        assert_eq!(server.0.as_ref().unwrap().waiting(), 1);
+        let peer = UnixListener::bind(&peer_socket).expect("the peer starts later");
+        peer.set_nonblocking(true).unwrap();
+        let member = scope.spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                match peer.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(HANG_DETECTOR)).unwrap();
+                        stream.set_write_timeout(Some(HANG_DETECTOR)).unwrap();
+                        assert!(
+                            desk::serve(desk, &mut stream, "127.0.0.2".parse().unwrap(), &|_| {
+                                panic!("an ask hands no admission bundle")
+                            })
+                            .unwrap()
+                            .is_none()
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("private member accept: {error}"),
+                }
+            }
+        });
+        make_due.store(true, Ordering::SeqCst);
+        // A second periodic maintenance boundary follows the completed due round.
+        // The same broker remains bound; no route event or HTTP answer intervenes.
+        while !looking.recv_timeout(HANG_DETECTOR).unwrap() {}
+        looking.recv_timeout(HANG_DETECTOR).unwrap();
         let observed = (
             asks.load(Ordering::SeqCst),
+            heard.load(Ordering::SeqCst),
+            desk.lock()
+                .unwrap()
+                .rows(aterm_time::Instant::now())
+                .iter()
+                .any(|row| row.name == "late-member"),
             server.0.as_ref().unwrap().waiting(),
         );
         stop.store(true, Ordering::SeqCst);
@@ -3581,13 +3684,16 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
             .join()
             .expect("subscriber ended")
             .expect("cleanly");
+        member.join().expect("member ended");
         (observed, broker.join().expect("broker ended"))
     });
     assert_eq!(
-        observed.0.0, 1,
-        "broker availability must end the old member backoff"
+        observed.0.0, 2,
+        "broker availability and the later due retry both ask beside HTTP"
     );
-    assert_eq!(observed.0.1, 1, "the vault long-poll stays held");
+    assert_eq!(observed.0.1, 1, "the later peer answered a signed ask");
+    assert!(observed.0.2, "the real member desk heard that ask");
+    assert_eq!(observed.0.3, 1, "the vault long-poll stays held");
     assert!(observed.1, "the arriving broker answered a real hello");
 }
 
@@ -4112,6 +4218,7 @@ fn a_waiting_mac_asks_alabs_members_less_often_until_a_member_allows_it() {
         network: || Some("home".to_owned()),
         ..MembersAsked::default()
     };
+    assert!(!asked.still_asking(&mb), "no ordinary asking custody yet");
     crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
     ask_members_if_due(&mb, &mut asked, &ask, &log);
     assert_eq!(
@@ -4119,9 +4226,69 @@ fn a_waiting_mac_asks_alabs_members_less_often_until_a_member_allows_it() {
         0,
         "another vault's waiting Mac asks no ALab member"
     );
+    assert!(!asked.still_asking(&mb), "a foreign vault owns no receiver");
     crate::envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = Some(alab));
     ask_members_if_due(&mb, &mut asked, &ask, &log);
     assert_eq!(count(), 1, "it asks as it starts waiting");
+    assert!(asked.still_asking(&mb));
+    assert!(
+        asked.waiting.is_some(),
+        "the same predicate retained its inputs"
+    );
+    assert!(
+        asked.still_asking(&mb),
+        "unchanged inputs retain asking custody"
+    );
+    let mut scoped = MembersAsked::default();
+    ask_members_if_due(&mb, &mut scoped, &ask_nobody, &|_| {});
+    assert!(scoped.still_asking(&mb));
+    let records = mb.records_file();
+    assert_eq!(
+        std::fs::symlink_metadata(&records).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound,
+        "this pending recipient holds no membership records yet"
+    );
+    let started = scoped.at;
+    let on = scoped.on.clone();
+    std::fs::create_dir(&records).unwrap();
+    assert!(
+        member_waiting_inputs(&mb).is_none(),
+        "an incomplete records layout is unjudged"
+    );
+    assert!(!scoped.still_asking(&mb));
+    assert_eq!(scoped.at, started);
+    assert_eq!(scoped.on, on);
+    std::fs::remove_dir(&records).unwrap();
+    assert!(
+        scoped.still_asking(&mb),
+        "safe metadata recovers without another HTTP round"
+    );
+    let configured = config(&mb).unwrap().unwrap();
+    let mut foreign = configured.clone();
+    foreign.source = Source::Path(root.path().join("private.vault"));
+    save_config(&mb, &foreign).unwrap();
+    assert!(
+        !scoped.still_asking(&mb),
+        "a changed private source withdraws custody"
+    );
+    assert!(scoped.waiting.is_none());
+    save_config(&mb, &configured).unwrap();
+    ask_members_if_due(&mb, &mut scoped, &ask_nobody, &|_| {});
+    assert!(scoped.still_asking(&mb), "a new ordinary wait can rearm");
+    let pending = load_state(&mb).unwrap();
+    let mut settled = pending.clone();
+    settled.membership = Stored::In;
+    save_state(&mb, &settled).unwrap();
+    assert!(
+        !scoped.still_asking(&mb),
+        "settling withdraws active custody"
+    );
+    save_state(&mb, &pending).unwrap();
+    ask_members_if_due(&mb, &mut scoped, &ask_nobody, &|_| {});
+    assert!(
+        scoped.still_asking(&mb),
+        "a later pending state is not cached out"
+    );
     ask_members_if_due(&mb, &mut asked, &ask, &log);
     assert_eq!(count(), 1, "and not again within 20 seconds");
     for (asks, seconds) in [(1, 20), (2, 60), (3, 120), (4, 240), (5, 480), (6, 900)] {
@@ -4168,7 +4335,15 @@ fn a_waiting_mac_asks_alabs_members_less_often_until_a_member_allows_it() {
     let mut theirs = MembersAsked::default();
     ask_members_if_due(&admin, &mut theirs, &ask, &log);
     assert_eq!(count(), 9, "a Mac that is in asks nobody");
+    assert!(
+        !theirs.still_asking(&admin),
+        "a healthy member owns no receiver"
+    );
     super::handover::test_hand_allowed(&admin, &mb, "mb");
+    assert!(
+        !asked.still_asking(&mb),
+        "Allowed withdraws custody before another round"
+    );
     passed(&mut asked);
     ask_members_if_due(&mb, &mut asked, &ask, &log);
     assert_eq!(count(), 9, "a Mac a member allowed asks nobody");

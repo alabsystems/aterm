@@ -646,14 +646,40 @@ impl Reader {
 /// absent, or that the reader refused is read again at the next ask. Only digests are kept,
 /// never a file's bytes.
 fn digest_while_seen(path: &Path, reader: Reader) -> crate::Result<Option<[u8; 32]>> {
-    static DIGESTS: KeptDigests = std::sync::Mutex::new(std::collections::VecDeque::new());
-    digest_while_seen_in(
-        &DIGESTS,
-        std::time::SystemTime::now(),
-        path,
-        reader,
-        |path| reader.digest(path),
-    )
+    let now = std::time::SystemTime::now();
+    #[cfg(not(test))]
+    {
+        static DIGESTS: KeptDigests = std::sync::Mutex::new(std::collections::VecDeque::new());
+        digest_while_seen_in(&DIGESTS, now, path, reader, |path| reader.digest(path))
+    }
+    #[cfg(test)]
+    THREAD_DIGESTS.with(|kept| {
+        digest_while_seen_in(kept, now + ASKED_LATER.get(), path, reader, |path| {
+            reader.digest(path)
+        })
+    })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// A test thread's own [`digest_while_seen`] digests, so one test's asks never let go of
+    /// another's.
+    static THREAD_DIGESTS: KeptDigests =
+        const { std::sync::Mutex::new(std::collections::VecDeque::new()) };
+    /// How much later than the clock this thread's asks of [`digest_while_seen`] are
+    /// ([`as_if_later`]).
+    static ASKED_LATER: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// Run `f` with each digest this thread asks ([`digest_while_seen`]) asked `by` later than the
+/// clock: a test's files have stood settled ([`SETTLED_NS`]) without its waiting.
+#[cfg(test)]
+pub(crate) fn as_if_later<T>(by: std::time::Duration, f: impl FnOnce() -> T) -> T {
+    let was = ASKED_LATER.replace(by);
+    let out = f();
+    ASKED_LATER.set(was);
+    out
 }
 
 /// The digests [`digest_while_seen`] keeps, each with the path, the reader and the [`Seen`] it

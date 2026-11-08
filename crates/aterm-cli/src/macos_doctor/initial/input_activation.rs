@@ -176,6 +176,37 @@ fn activate_at<T>(
     invalidate: &dyn Fn(),
     work: impl FnOnce(&kept::Kept, &dyn Fn() -> bool) -> Result<T, String>,
 ) -> Result<Option<T>, String> {
+    with_current_at(root, expected, stopped, invalidate, |continues| {
+        let kept = kept::Kept::load(root)?;
+        work(&kept, continues)
+    })
+}
+
+/// Publish an already-paid input diagnostic under the same profile/current-revision guard
+/// as attachment activation. This reads only setup authority, never preferences or HID.
+///
+/// # Errors
+/// This account's scope, setup lock or current records cannot be resolved.
+pub fn with_current_input_scope<T>(
+    expected: u64,
+    stopped: impl Fn(u64) -> bool,
+    work: impl FnOnce() -> T,
+) -> Result<Option<T>, String> {
+    ensure_person_scope()?;
+    with_current_at(&state_root()?, expected, &stopped, &|| {}, |_| {
+        // The authority read can block; honor an immediate Stop again after it.
+        Ok((!stopped(expected)).then(work))
+    })
+    .map(Option::flatten)
+}
+
+fn with_current_at<T>(
+    root: &Path,
+    expected: u64,
+    stopped: &dyn Fn(u64) -> bool,
+    invalidate: &dyn Fn(),
+    work: impl FnOnce(&dyn Fn() -> bool) -> Result<T, String>,
+) -> Result<Option<T>, String> {
     let Some(_lock) = HeldLock::try_take(root)? else {
         return Ok(None);
     };
@@ -190,8 +221,7 @@ fn activate_at<T>(
     if !continues() {
         return Ok(None);
     }
-    let kept = kept::Kept::load(root)?;
-    work(&kept, &continues).map(Some)
+    work(&continues).map(Some)
 }
 
 #[cfg(test)]
@@ -920,6 +950,15 @@ mod tests {
         );
         drop(held);
         assert_eq!(
+            with_current_at(root, 7, &|_| false, &invalidate, |current| {
+                assert!(HeldLock::try_take(root)?.is_none());
+                assert!(current());
+                Ok(7)
+            })
+            .unwrap(),
+            Some(7)
+        );
+        assert_eq!(
             activate_at::<bool>(root, 7, &|_| false, &invalidate, |_, go| {
                 assert!(HeldLock::try_take(root)?.is_none());
                 assert!(go());
@@ -930,6 +969,13 @@ mod tests {
             Some(false)
         );
         assert_eq!(invalidated.get(), 1, "an observed Stop retires the reading");
+        assert_eq!(
+            with_current_at::<()>(root, 7, &|_| false, &|| {}, |_| {
+                panic!("a stopped revision cannot publish paid live evidence")
+            })
+            .unwrap(),
+            None
+        );
         assert!(HeldLock::try_take(root).unwrap().is_some());
     }
 }

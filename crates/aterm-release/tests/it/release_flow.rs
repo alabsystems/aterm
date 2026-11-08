@@ -218,6 +218,9 @@ struct World {
     sign_code: i32,
     /// The build whose copy `cut --sign` signed privately and kept the record of.
     signed: Option<u64>,
+    prepared_signature: Option<u64>,
+    prepare_code: i32,
+    early_overlap: bool,
     /// How step 7's two sides meet.
     sides: SideOrder,
     /// Step 7 runs the source this run ([`Backend::publish_begin`] readied it): the sign's order
@@ -361,6 +364,9 @@ impl World {
             keep_build_on_test_red: false,
             sign_code: 0,
             signed: None,
+            prepared_signature: None,
+            prepare_code: 0,
+            early_overlap: false,
             sides: SideOrder::SourceFirst,
             source_runs: false,
             adopted: 0,
@@ -387,6 +393,7 @@ impl World {
     fn run(&mut self, args: ReleaseOptions) -> (i32, String) {
         self.out.clear();
         self.source_runs = false;
+        let _ = std::fs::remove_file(self.dir.path().join("publish-entered"));
         let home = self.dir.path().to_path_buf();
         let outcome = run_with(self, &args, &home);
         (outcome.code, outcome.last)
@@ -741,6 +748,12 @@ impl Branches for WorldBranches<'_> {
     ) -> Result<Ran, Refusal> {
         let tree = run.half == Half::Tree;
         self.world().verify_called(run);
+        if !tree && self.world().early_overlap {
+            assert!(
+                self.world().prepared_signature.is_some(),
+                "preparation started before bundle"
+            );
+        }
         if tree {
             self.mark("tree");
             self.after_starts(&[Branch::Build, Branch::Export]);
@@ -1054,7 +1067,52 @@ impl World {
     }
 }
 
+struct FakePreparingSign {
+    code: i32,
+    stop: BranchStop,
+    gate: PathBuf,
+}
+
+impl crate::release::PendingSign for FakePreparingSign {
+    fn stop(&self) -> BranchStop {
+        self.stop.clone()
+    }
+    fn finish(self: Box<Self>) -> Ran {
+        assert!(
+            self.stop.fired() || self.gate.exists(),
+            "the early child is joined only at step 7, after READY, or during cancellation"
+        );
+        ran(self.code)
+    }
+}
+
 impl Backend for World {
+    fn prepare_sign(
+        &mut self,
+        args: &[String],
+        _prover: &Prover,
+    ) -> Result<Box<dyn crate::release::PendingSign>, Refusal> {
+        assert_eq!(args[..2], ["cut", "--sign-prepare"]);
+        self.calls.push("cut --sign-prepare".into());
+        let code = if self.interrupt_at("cut --sign-prepare") {
+            1
+        } else {
+            self.prepare_code
+        };
+        if code == 0 {
+            self.prepared_signature = self.journal().and_then(|j| j.reserved).map(|r| r.build);
+        }
+        Ok(Box::new(FakePreparingSign {
+            code,
+            stop: BranchStop::default(),
+            gate: self.dir.path().join("publish-entered"),
+        }))
+    }
+    fn entered(&mut self, step: Step) {
+        if step == Step::Publish {
+            std::fs::write(self.dir.path().join("publish-entered"), b"READY passed").unwrap();
+        }
+    }
     fn fleet_supersession(
         &mut self,
         _version: &str,
@@ -1590,7 +1648,13 @@ impl Backend for World {
             ))
         }
     }
-    fn cut(&mut self, args: &[String], _p: &Prover) -> Ran {
+    fn cut(
+        &mut self,
+        args: &[String],
+        _p: &Prover,
+        _candidate: &Candidate,
+        _reserved: Option<&Reservation>,
+    ) -> Ran {
         self.calls.push(format!("cut {}", args[3..].join(" ")));
         let resuming = args.iter().any(|a| a == "--resume");
         let Some(reserved) = self.journal().and_then(|j| j.reserved) else {
@@ -1653,6 +1717,9 @@ impl Backend for World {
         self.calls.push(format!("discard-signed {version} {build}"));
         if self.signed == Some(build) {
             self.signed = None;
+        }
+        if self.prepared_signature == Some(build) {
+            self.prepared_signature = None;
         }
         Vec::new()
     }
@@ -1993,8 +2060,10 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
         .iter()
         .map(String::as_str)
         .filter(|c| {
-            !matches!(*c, "audit" | "lease" | "seal-inputs" | "cut-gates")
-                && !c.starts_with("ls-remote")
+            !matches!(
+                *c,
+                "audit" | "lease" | "seal-inputs" | "cut-gates" | "cut --sign-prepare"
+            ) && !c.starts_with("ls-remote")
         })
         .collect();
     let graph = order
@@ -4095,7 +4164,9 @@ fn a_source_red_stops_the_sign_and_nothing_is_claimed() {
     assert_eq!(side_phases(&w, "sign"), ["started", "stopped"]);
     assert_eq!(w.count("cut --sign"), 0, "{:?}", w.calls);
     assert!(
-        !w.calls.iter().any(|c| c.starts_with("cut ")),
+        !w.calls
+            .iter()
+            .any(|c| c.starts_with("cut ") && c != "cut --sign-prepare"),
         "nothing claimed: {:?}",
         w.calls
     );
@@ -4285,6 +4356,52 @@ fn a_sign_that_could_not_run_is_resumed_by_the_sign_alone() {
     assert_eq!(code, 0, "{last}");
     assert_eq!((w.count("publish"), w.count("cut --sign")), (0, 1));
     assert!(w.cut.as_ref().is_some_and(|cut| cut.finished));
+}
+
+/// The fake child starts before bundle and joins in step 7. NEGATIVE CONTROL: preparing
+/// after bundle fails its assertion; promoting before READY leaves signed state
+/// after the red. Neither defect can be hidden by a fast fake signer.
+#[test]
+fn early_signature_overlaps_bundle_and_a_bundle_red_discards_it() {
+    for red in [false, true] {
+        let mut w = World::new();
+        w.early_overlap = true;
+        if red {
+            w.verify_half = Some(Half::Bundle);
+            w.verify_code = 1;
+            w.verify_passes = false;
+        }
+        let (code, last) = w.run(bump());
+        assert_eq!(code, i32::from(red), "{last}");
+        assert_eq!(w.count("cut --sign-prepare"), 1);
+        if red {
+            assert!(last.starts_with("REFUSED at 5/10 bundle"), "{last}");
+            assert!(w.prepared_signature.is_none() && w.signed.is_none());
+            assert!(w.published.is_empty() && w.cut.is_none());
+            assert_eq!(w.count("cut --sign"), 0);
+            assert_eq!(w.adopted, 0);
+        } else {
+            assert_eq!((w.adopted, w.resigned), (1, 0));
+        }
+    }
+}
+
+#[test]
+fn early_sign_failure_and_interruption_never_publish_or_adopt() {
+    for interrupted in [false, true] {
+        let mut w = World::new();
+        w.sides = SideOrder::SignFirst;
+        if interrupted {
+            w.signal_at = Some("cut --sign-prepare");
+        } else {
+            w.prepare_code = 1;
+        }
+        let (code, last) = w.run(bump());
+        assert_eq!(code, if interrupted { 130 } else { 1 }, "{last}");
+        assert!(w.prepared_signature.is_none() && w.signed.is_none());
+        assert!(w.published.is_empty() && w.cut.is_none());
+        assert_eq!(w.adopted, 0);
+    }
 }
 
 #[test]

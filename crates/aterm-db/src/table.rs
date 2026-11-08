@@ -927,6 +927,9 @@ impl<'a> Session<'a> {
         Self::with_generation(bootstrap, journal, generation, deadline)
     }
 
+    /// Open the session on `journal`'s access. A vault writer that holds the state lock at this
+    /// moment is busy, which a reader observes again, not membership that is not ready, which
+    /// nothing retries.
     fn with_generation(
         bootstrap: &'a Bootstrap,
         journal: Journal,
@@ -934,7 +937,7 @@ impl<'a> Session<'a> {
         deadline: Option<std::time::Instant>,
     ) -> Result<Self> {
         let access = bootstrap
-            .access_in(&journal)
+            .access_observed_in(&journal)
             .map_err(failure)?
             .ok_or_else(|| {
                 Error::repair(

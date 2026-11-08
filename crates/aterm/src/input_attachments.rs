@@ -7,6 +7,7 @@ use aterm_cli::macos_doctor::{InputServiceSet, InputSetupScope};
 use aterm_machines::init::{KeyboardAttachmentActivation, KeyboardAttachmentReceipt};
 use aterm_machines::port::KeyboardServiceObservation;
 use aterm_secrets::converge::{Last, RunnerRetry};
+use aterm_types::macos_setup::LiveKeyboardMapping;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -16,6 +17,7 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 struct Keeper {
     settled: Option<(u64, KeyboardAttachmentReceipt)>,
+    live: Option<(u64, LiveKeyboardMapping)>,
     attempted: Option<(u64, Vec<KeyboardServiceObservation>)>,
     retry: RunnerRetry,
 }
@@ -23,6 +25,7 @@ struct Keeper {
 #[derive(Default)]
 struct Inputs {
     keeper: Keeper,
+    live: Option<(u64, LiveKeyboardMapping)>,
     pending: Option<(u64, InputServiceSet)>,
     seen: Option<Sample>,
 }
@@ -226,6 +229,7 @@ impl Inputs {
         pending_changed: &dyn Fn(),
         invalidated: &dyn Fn(),
     ) -> Result<bool, String> {
+        self.live = None;
         if !at_console {
             self.observe(InputSetupScope::Inactive, None, None, invalidated);
             self.keeper = Keeper::default();
@@ -268,6 +272,9 @@ impl Inputs {
                 let result = self
                     .keeper
                     .round(now_ms, Some(revision), || Ok(observed), activate);
+                if result.is_ok() {
+                    self.live = self.keeper.live;
+                }
                 if matches!(result, Ok(true))
                     && let Some((_, receipt)) = &self.keeper.settled
                     && let Some(seen) = &mut self.seen
@@ -423,6 +430,7 @@ impl Keeper {
         services: impl FnOnce() -> Result<Vec<KeyboardServiceObservation>, String>,
         activate: impl FnOnce(u64, &[u64]) -> Result<Option<KeyboardAttachmentActivation>, String>,
     ) -> Result<bool, String> {
+        self.live = None;
         let Some(revision) = revision else {
             *self = Self::default();
             return Ok(false);
@@ -450,6 +458,9 @@ impl Keeper {
         if changed.is_empty() {
             if let Some((_, receipt)) = &mut self.settled {
                 receipt.retain(&registries);
+                self.live = receipt
+                    .live_mapping(&current.1)
+                    .map(|live| (revision, live));
             }
             self.attempted = None;
             return Ok(false);
@@ -484,6 +495,13 @@ impl Keeper {
             } else {
                 verified.retain(&registries);
                 self.settled = Some((revision, verified));
+            }
+            // The sample preceded activation. An own write cannot certify that before-image;
+            // the existing next passive round will match the verified final receipt.
+            if let Some((_, receipt)) = &self.settled {
+                self.live = receipt
+                    .live_mapping(&self.attempted.as_ref().expect("attempted cohort").1)
+                    .map(|live| (revision, live));
             }
             return Ok(true);
         }
@@ -623,6 +641,9 @@ fn spawn_worker(
                 if matches!(notifications.pending, PendingOwner::Window(_)) {
                     super::maintain_observation_dispatch();
                 }
+                let live_scope = matches!(notifications.pending, PendingOwner::Window(_))
+                    .then(super::capture_caps_live_scope)
+                    .flatten();
                 let mut actor = actor.lock().unwrap_or_else(PoisonError::into_inner);
                 let Actor {
                     inputs,
@@ -687,6 +708,7 @@ fn spawn_worker(
                     super::wake_setup_facts,
                 );
                 let result = observed.and_then(|changed| owned.map(|()| changed));
+                let live = result.as_ref().ok().and(inputs.live);
                 match result {
                     Ok(true) => {
                         if needs_observation.get() {
@@ -702,6 +724,9 @@ fn spawn_worker(
                     Err(_) => {}
                 }
                 drop(actor);
+                if matches!(notifications.pending, PendingOwner::Window(_)) {
+                    super::publish_caps_live(live_scope, live);
+                }
                 std::thread::sleep(Duration::from_secs(2));
             }
         },
@@ -1948,6 +1973,10 @@ mod tests {
             1,
             "the missing requested cohort retired the old fact"
         );
+        assert!(
+            keeper.live.is_none(),
+            "unseen native coverage supplies no live diagnostic"
+        );
         available.store(true, Ordering::SeqCst);
         assert!(
             !keeper
@@ -1982,6 +2011,10 @@ mod tests {
         );
         assert_eq!(changed[0].registry, REGISTRY);
         assert_eq!(changed[0].native, Some(vec![(CAPS_LOCK, LEFT_CONTROL)]));
+        assert!(
+            keeper.live.is_none(),
+            "a setter's before-image is not its verified live state"
+        );
         assert!(sys.calls().iter().all(|call| {
             !call.contains("defaults") || (!call.contains(" write ") && !call.contains(" delete "))
         }));
@@ -1994,6 +2027,17 @@ mod tests {
                     |_, _| panic!("verified cohort settles")
                 )
                 .unwrap()
+        );
+        assert_eq!(
+            keeper.live,
+            Some((
+                7,
+                LiveKeyboardMapping {
+                    control: 1,
+                    explicit_other: 0,
+                    held: 0,
+                }
+            ))
         );
         assert!(matches!(
             aterm_machines::init::activate_keyboard_attachments(
@@ -2075,6 +2119,18 @@ mod tests {
         };
         assert!(round(&mut inputs, 6000, false).unwrap());
         assert_eq!(
+            inputs.live,
+            Some((
+                7,
+                LiveKeyboardMapping {
+                    control: 1,
+                    explicit_other: 0,
+                    held: 0,
+                }
+            )),
+            "an actual final-probe no-op preserves its known matching passive state"
+        );
+        assert_eq!(
             sys.keyboard_changes().len(),
             2,
             "the initial receipt is a no-op"
@@ -2082,15 +2138,21 @@ mod tests {
         written_before_reset.store(2, Ordering::SeqCst);
         writes_before.set(2);
         assert!(round(&mut inputs, 6001, false).unwrap());
+        assert!(inputs.live.is_none());
         assert_eq!(sys.keyboard_changes().len(), 3);
         positive_readback.set(true);
         assert!(!round(&mut inputs, 6002, false).unwrap());
+        assert!(inputs.live.is_some());
         assert!(
             positive_readback.get(),
             "our verified write is not new drift"
         );
         written_before_reset.store(3, Ordering::SeqCst);
         assert!(!round(&mut inputs, 6003, true).unwrap());
+        assert!(
+            inputs.live.is_none(),
+            "held repair retains retry custody, not a positive diagnostic"
+        );
         assert!(
             !positive_readback.get(),
             "a reset to the old before-image retires the newer fact even while repair is held"
@@ -2100,5 +2162,31 @@ mod tests {
             3,
             "held repair writes nothing"
         );
+        inputs
+            .round(
+                false,
+                6004,
+                || panic!("away console reads no scope"),
+                || panic!("away console reads no IDs"),
+                || panic!("away console reads no maps"),
+                |_, _| panic!("away console never activates"),
+                &|| {},
+                &invalidate,
+            )
+            .unwrap();
+        assert!(inputs.live.is_none());
+        inputs
+            .round(
+                true,
+                6005,
+                || Ok(InputSetupScope::Inactive),
+                || panic!("withdrawn scope reads no IDs"),
+                || panic!("withdrawn scope reads no maps"),
+                |_, _| panic!("withdrawn scope never activates"),
+                &|| {},
+                &invalidate,
+            )
+            .unwrap();
+        assert!(inputs.live.is_none());
     }
 }

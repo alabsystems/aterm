@@ -156,6 +156,10 @@ USAGE
                            number, and kept for the claim, which adopts it when
                            every digest still matches; nothing claimed or
                            published. Combines only with --release-credentials
+        --sign-prepare     private signing, notarization and packaging beside the
+                           bundle checks; executes no product and writes only a
+                           prepared record. --sign checks it after READY before
+                           the claim can adopt it. Same credential profile
         --resume           re-enter the journaled cut (dist/cut-state.toml) at
                            its first incomplete step
         --abandon vX.Y.Z   withdraw an unpublished cut: its own draft deleted, or
@@ -1152,6 +1156,10 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             "--dry-run" => opts.dry_run = true,
             "--resume" => opts.resume = true,
             "--sign" => opts.sign = true,
+            "--sign-prepare" => {
+                opts.sign = true;
+                opts.sign_prepare = true;
+            }
             "--linux-artifacts" | "--linux-worker" | "--mac-only" | "--linux-target" => {
                 LinuxFlags {
                     artifacts: &mut opts.linux_artifacts,

@@ -55,7 +55,7 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::plan::{Lane, StageId, StageSpec};
@@ -73,20 +73,64 @@ pub use aterm_capacity::book::Key;
 /// The record's file under this user's aterm state directory ([`Book::live`]).
 pub const RECORD: &str = aterm_capacity::book::VERIFY_RECORD;
 
+/// What a live process of a compile is, by its command line ([`UnitReader`]): the unit it
+/// compiles, and whether it is the compile's admission wrapper for that unit, waiting for or
+/// running its compiler, rather than the compiler itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnitRead {
+    /// The unit ([`unit_of`]).
+    pub unit: crate::unitgraph::UnitName,
+    /// Whether it runs this very executable, which a compile names as its admission wrapper
+    /// ([`crate::compile_width`]); the wrapper's marker cannot say so, as Cargo and every build
+    /// script it starts carry it too.
+    pub wrapper: bool,
+}
+
+/// One read of a live process's command line ([`UnitReader`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Named {
+    /// It compiles this unit, or waits to as its admission wrapper.
+    Unit(UnitRead),
+    /// It compiles no unit.
+    Nothing,
+    /// Its arguments could not be read: it ended first, or is another user's.
+    Unread,
+}
+
 /// The unit a live compiler process compiles ([`UnitReader`]): its command line's `--crate-name`,
 /// `--test` or `--crate-type`, and its environment's `CARGO_PKG_NAME`, which cargo sets for every
-/// compiler it starts ([`crate::unitgraph::UnitName`]). `None` for a process that is not one, or
-/// one whose arguments could not be read (it ended first, or is another user's).
+/// compiler it starts ([`crate::unitgraph::UnitName`]), and whether it is the admission wrapper
+/// ([`UnitRead::wrapper`]: it runs `own`, this executable).
 #[must_use]
-pub fn read_unit(pid: u32) -> Option<crate::unitgraph::UnitName> {
-    let buf = aterm_sysprobe::procargs::read(pid)?;
-    let args = aterm_sysprobe::procargs::parse(&buf)?;
-    unit_of(
-        args.argv
-            .iter()
-            .map(|a| String::from_utf8_lossy(a).into_owned()),
-        args.env().map(|e| String::from_utf8_lossy(e).into_owned()),
+pub fn read_unit(pid: u32) -> Named {
+    static OWN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let Some(buf) = aterm_sysprobe::procargs::read(pid) else {
+        return Named::Unread;
+    };
+    let Some(args) = aterm_sysprobe::procargs::parse(&buf) else {
+        return Named::Unread;
+    };
+    named(
+        &args,
+        OWN.get_or_init(|| std::env::current_exe().ok()).as_deref(),
     )
+}
+
+/// [`read_unit`]'s reading of one process's arguments `args`, where `own` is this executable.
+#[must_use]
+pub fn named(args: &aterm_sysprobe::procargs::ProcArgs2<'_>, own: Option<&Path>) -> Named {
+    let env = args.env().map(|e| String::from_utf8_lossy(e).into_owned());
+    let argv = args
+        .argv
+        .iter()
+        .map(|a| String::from_utf8_lossy(a).into_owned());
+    match unit_of(argv, env) {
+        Some(unit) => Named::Unit(UnitRead {
+            unit,
+            wrapper: own.is_some_and(|own| own.as_os_str().as_encoded_bytes() == args.exec_path),
+        }),
+        None => Named::Nothing,
+    }
 }
 
 /// [`read_unit`]'s reading of a command line `argv` and environment `env` (`KEY=value` words).
@@ -207,22 +251,66 @@ struct Held {
     started: bool,
 }
 
-/// What names a compiler process for its unit's record ([`Meter::attributing`]): read once per
-/// process, `None` for one that compiles no unit or could not be read.
-pub type UnitReader = fn(u32) -> Option<crate::unitgraph::UnitName>;
+/// What names a process of a compile for its unit ([`Meter::attributing`]).
+pub type UnitReader = fn(u32) -> Named;
 
-/// The footprint at which a stage's member is read for the unit it compiles
-/// ([`Meter::attributing`]): 1 GiB, so a run reads the few heavy compilers, not every one.
+/// The least peak a unit's record keeps ([`Meter::unit_peaks`]): 1 GiB, so the record holds the
+/// few heavy compilers, not every one.
 pub const UNIT_FLOOR: u64 = 1 << 30;
+
+/// One process of an attributing meter, by pid and start ([`Units::seen`]).
+#[derive(Debug)]
+struct Seen {
+    /// What its last readable read found it to be (`None`: no unit, or never readable).
+    read: Option<UnitRead>,
+    /// The first and the last read that found it.
+    first: std::time::Instant,
+    last: std::time::Instant,
+    /// The CPU its last read found, ns.
+    cpu_ns: u64,
+    /// The most it held, its lifetime peak included.
+    most: u64,
+}
 
 /// What a meter that attributes peaks to units holds ([`Meter::attributing`]).
 #[derive(Debug)]
 struct Units {
     reader: UnitReader,
     floor: u64,
-    /// Each member read so far, by pid and start: the unit it compiles (`None`: it compiles
-    /// none, or could not be read) and the most it held.
-    seen: std::collections::BTreeMap<(u32, u64), (Option<crate::unitgraph::UnitName>, u64)>,
+    /// The meter's birth, on both clocks, so a read's time can be dated ([`UnitSpan`]).
+    born: (std::time::Instant, std::time::SystemTime),
+    /// Each member read so far, by pid and start.
+    seen: std::collections::BTreeMap<(u32, u64), Seen>,
+}
+
+/// ONE UNIT'S COMPILE AS THE STAGE'S READS SAW IT ([`Meter::unit_spans`]): its compiler's first
+/// and last read, half a second apart at most from its true start and end, the CPU its last read
+/// found, and the most it held; and the first read of its admission wrapper, when one was read,
+/// so its wait for memory is the time between ([`crate::compile_width`]). A compiler that started
+/// and ended between two reads has no span: the spans are what the reads saw, never a complete
+/// list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UnitSpan {
+    /// The unit.
+    pub unit: crate::unitgraph::UnitName,
+    /// When its admission wrapper was first read, ms since the Unix epoch.
+    pub queued_at_unix_ms: Option<u64>,
+    /// When its compiler was first read, ms since the Unix epoch.
+    pub started_at_unix_ms: u64,
+    /// When its compiler was last read, ms since the Unix epoch.
+    pub ended_at_unix_ms: u64,
+    /// The CPU its compiler's last read found, seconds.
+    pub cpu_s: f64,
+    /// The most its compiler held, bytes.
+    pub peak_bytes: u64,
+}
+
+/// `at` in ms since the Unix epoch, dated from `born`, one instant on both clocks
+/// ([`Meter::unix_ms`]).
+fn unix_ms_of(born: (std::time::Instant, std::time::SystemTime), at: std::time::Instant) -> u64 {
+    (born.1 + at.saturating_duration_since(born.0))
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// CPU actually observed in a stage's child process groups. Short-lived descendants
@@ -237,8 +325,8 @@ pub struct ObservedCpu {
 
 /// A STAGE'S RESOURCE METER: what its children's clocks read of their process groups
 /// ([`Meter::book`]), each group's footprint summed over its members, the stage's held together;
-/// and, for a meter that attributes them ([`Meter::attributing`]), each heavy compiler's peak by
-/// the unit it compiles.
+/// and, for a meter that attributes them ([`Meter::attributing`]), each compiler's span and each
+/// heavy compiler's peak by the unit it compiles.
 #[derive(Debug, Default)]
 pub struct Meter {
     held: Mutex<Held>,
@@ -255,9 +343,13 @@ impl Meter {
         Arc::new(Meter::default())
     }
 
-    /// A meter that also attributes peaks to units: a member whose footprint reaches `floor` is
-    /// read once by `reader` for the unit it compiles ([`read_unit`] live), and the most it held
-    /// is that unit's ([`Meter::unit_peaks`]).
+    /// A meter that also attributes its members to units: each member is read by `reader` for
+    /// the unit it compiles ([`read_unit`] live) at every read that finds it, and is what its
+    /// last readable read named. A member read between its fork and its exec still shows its
+    /// parent's command line (a linker a compiler starts reads as that compiler, a compiler its
+    /// wrapper starts as that wrapper); its exec settles it, and a later read corrects the first.
+    /// Each compiler's reads date its span ([`Meter::unit_spans`]); the most a compiler held is
+    /// its unit's peak where it reaches `floor` ([`Meter::unit_peaks`]).
     #[must_use]
     pub fn attributing(reader: UnitReader, floor: u64) -> Arc<Meter> {
         Arc::new(Meter {
@@ -267,26 +359,90 @@ impl Meter {
             units: Some(Mutex::new(Units {
                 reader,
                 floor,
+                born: (std::time::Instant::now(), std::time::SystemTime::now()),
                 seen: std::collections::BTreeMap::new(),
             })),
         })
     }
 
-    /// The most each unit's compiler held, by its name: the heavy ones the meter read
-    /// ([`Meter::attributing`]), each once at most (the most of two compilers of one unit).
+    /// The most each unit's compiler held, by its name, where that reached the meter's floor
+    /// ([`Meter::attributing`]): the heavy units, each once at most (the most of two compilers of
+    /// one unit). A wrapper's footprint is never its unit's.
     #[must_use]
     pub fn unit_peaks(&self) -> std::collections::BTreeMap<crate::unitgraph::UnitName, u64> {
         let mut out = std::collections::BTreeMap::new();
         if let Some(units) = &self.units {
             let units = units.lock().unwrap_or_else(PoisonError::into_inner);
-            for (name, peak) in units.seen.values() {
-                if let Some(name) = name {
-                    let e = out.entry(name.clone()).or_insert(0);
-                    *e = (*e).max(*peak);
+            for seen in units.seen.values() {
+                if let Some(read) = &seen.read
+                    && !read.wrapper
+                    && seen.most >= units.floor
+                {
+                    let e = out.entry(read.unit.clone()).or_insert(0);
+                    *e = (*e).max(seen.most);
                 }
             }
         }
         out
+    }
+
+    /// `at` in ms since the Unix epoch on the meter's clock: its birth's wall time and the
+    /// monotonic time since, so every date it gives shares one clock (a sleep of the Mac, which
+    /// that clock does not count, puts its dates behind the wall by its length). `None` for a
+    /// meter that does not attribute ([`Meter::new`]).
+    #[must_use]
+    pub fn unix_ms(&self, at: std::time::Instant) -> Option<u64> {
+        let units = self.units.as_ref()?;
+        let units = units.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(unix_ms_of(units.born, at))
+    }
+
+    /// Each compiler the meter read at two reads at least whose first read falls in `from..=to`,
+    /// as a span of its unit ([`UnitSpan`]), ordered by start: its unit's wrapper is the one of
+    /// that unit first read at or before the compiler, each wrapper given to one compiler at
+    /// most. A compiler read once has no length, and may be a process its fork window misnamed.
+    /// Empty for a meter that does not attribute ([`Meter::new`]).
+    #[must_use]
+    pub fn unit_spans(&self, from: std::time::Instant, to: std::time::Instant) -> Vec<UnitSpan> {
+        let Some(units) = &self.units else {
+            return Vec::new();
+        };
+        let units = units.lock().unwrap_or_else(PoisonError::into_inner);
+        let unix_ms = |at| unix_ms_of(units.born, at);
+        let inside = |seen: &&Seen| seen.first >= from && seen.first <= to;
+        let mut wrappers: std::collections::BTreeMap<&crate::unitgraph::UnitName, Vec<_>> =
+            std::collections::BTreeMap::new();
+        let mut compilers = Vec::new();
+        for seen in units.seen.values().filter(inside) {
+            match &seen.read {
+                Some(read) if read.wrapper => {
+                    wrappers.entry(&read.unit).or_default().push(seen.first);
+                }
+                Some(read) if seen.last > seen.first => compilers.push((seen, &read.unit)),
+                Some(_) | None => {}
+            }
+        }
+        compilers.sort_by_key(|(seen, _)| seen.first);
+        for queued in wrappers.values_mut() {
+            queued.sort_unstable();
+        }
+        compilers
+            .into_iter()
+            .map(|(seen, unit)| {
+                let queued = wrappers.get_mut(unit).and_then(|queued| {
+                    let at = queued.iter().rposition(|&q| q <= seen.first)?;
+                    Some(queued.remove(at))
+                });
+                UnitSpan {
+                    unit: unit.clone(),
+                    queued_at_unix_ms: queued.map(unix_ms),
+                    started_at_unix_ms: unix_ms(seen.first),
+                    ended_at_unix_ms: unix_ms(seen.last),
+                    cpu_s: std::time::Duration::from_nanos(seen.cpu_ns).as_secs_f64(),
+                    peak_bytes: seen.most,
+                }
+            })
+            .collect()
     }
 
     /// A child of the stage started, and its clock books into this meter: a stage none of whose
@@ -352,14 +508,25 @@ impl Meter {
         drop(h);
         if let Some(units) = &self.units {
             let mut units = units.lock().unwrap_or_else(PoisonError::into_inner);
+            let reader = units.reader;
             for m in members {
                 let most = m.footprint.max(m.peak_footprint);
-                if let Some(seen) = units.seen.get_mut(&(m.pid, m.start)) {
-                    seen.1 = seen.1.max(most);
-                } else if most >= units.floor {
-                    let name = (units.reader)(m.pid);
-                    units.seen.insert((m.pid, m.start), (name, most));
+                let seen = units.seen.entry((m.pid, m.start)).or_insert(Seen {
+                    read: None,
+                    first: now,
+                    last: now,
+                    cpu_ns: 0,
+                    most: 0,
+                });
+                match reader(m.pid) {
+                    Named::Unit(read) => seen.read = Some(read),
+                    Named::Nothing => seen.read = None,
+                    Named::Unread => {}
                 }
+                seen.first = seen.first.min(now);
+                seen.last = seen.last.max(now);
+                seen.cpu_ns = seen.cpu_ns.max(m.cpu_ns);
+                seen.most = seen.most.max(most);
             }
         }
     }

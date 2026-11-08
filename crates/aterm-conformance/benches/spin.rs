@@ -8,6 +8,9 @@
 mod quiet;
 #[cfg(unix)]
 mod support;
+#[cfg(unix)]
+#[path = "support/telemetry.rs"]
+mod telemetry;
 
 #[cfg(unix)]
 mod measuring {
@@ -233,13 +236,17 @@ mod measuring {
                 kept
             })
             .collect();
-        support::run_classified(
+        support::run_classified_with_telemetry(
             "spin",
             &rows,
             |row| support::Kind::Count {
                 windowed: row.scene.windowed(),
             },
             |row| take(&rig, row),
+            Some(support::Telemetry {
+                cpu: super::telemetry::cpu,
+                events: super::telemetry::events,
+            }),
         )
     }
 }
