@@ -1174,6 +1174,7 @@ fn inode(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().ino()
 }
 
+#[cfg(unix)]
 fn plant_beat(path: &Path, t: i64) {
     std::fs::OpenOptions::new()
         .append(true)
@@ -1183,6 +1184,7 @@ fn plant_beat(path: &Path, t: i64) {
         .unwrap();
 }
 
+#[cfg(unix)]
 fn has_beat(path: &Path, t: i64) -> bool {
     rows_at(path)
         .iter()

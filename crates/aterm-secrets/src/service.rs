@@ -75,8 +75,8 @@ pub const LOGINCTL_PATHS: [&str; 3] = [
 #[cfg(not(target_os = "macos"))]
 const LINGER_DIR: &str = "/var/lib/systemd/linger";
 
-/// How long one `launchctl` or `systemctl` call may take before it is called hung.
-const CHILD_HANG: Duration = Duration::from_secs(30);
+/// A minute hang detector for a required local service-manager action or observation.
+const CHILD_HANG: Duration = Duration::from_secs(60);
 
 /// Timeout waiting for launchd to forget a booted-out job ([`install`]).
 #[cfg(any(target_os = "macos", all(test, unix)))]
@@ -1275,7 +1275,15 @@ pub fn write_unit(
 
 /// One child run under [`CHILD_HANG`], its stdin `/dev/null`.
 fn run(program: &Path, argv: &[String]) -> crate::Result<std::process::Output> {
-    run_until(program, argv, Instant::now() + CHILD_HANG)
+    run_at(program, argv, Instant::now())
+}
+
+fn run_at(
+    program: &Path,
+    argv: &[String],
+    started: Instant,
+) -> crate::Result<std::process::Output> {
+    run_until(program, argv, started + CHILD_HANG)
 }
 
 fn run_until(
@@ -3026,6 +3034,18 @@ pub fn daemon_state_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn required_service_action_waits_for_a_scheduled_child() {
+        let argv = ["-c".into(), "printf ready".into()];
+        let program = Path::new("/bin/sh");
+        let out = run_at(program, &argv, Instant::now() - Duration::from_secs(31))
+            .expect("required service action completes");
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"ready");
+        assert!(run_at(program, &argv, Instant::now() - Duration::from_secs(61)).is_err());
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

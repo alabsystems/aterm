@@ -3,6 +3,8 @@
 
 //! Deterministic corpora and helpers shared across `verify perf` benchmark harnesses.
 
+pub mod allocator;
+
 /// Generate a trigram-diverse corpus of `lines` with a rotating 40-glyph body.
 #[must_use]
 pub fn rotating_corpus(lines: usize) -> Vec<u8> {

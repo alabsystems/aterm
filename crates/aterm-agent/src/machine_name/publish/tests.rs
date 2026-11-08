@@ -218,7 +218,7 @@ fn publish_writes_the_policy_then_the_fleet_name_then_asks_macos_once() {
         ));
     };
     let mut fake = FakeNames::new(names([Some("m184"), Some("m184"), None]), &during);
-    fake.after = Some(names([Some("m59"); 3]));
+    fake.after = Some(names([Some("m59"), Some("m59-2"), Some("m59")]));
     assert_eq!(
         publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
         Ok(())
@@ -237,7 +237,7 @@ fn publish_writes_the_policy_then_the_fleet_name_then_asks_macos_once() {
             &scratch.state,
             &scratch.config,
             &name,
-            Some(&names([Some("m59"); 3]))
+            Some(&names([Some("m59"), Some("m59-2"), Some("m59")]))
         ),
         Ok(Publication::Current)
     );
@@ -248,7 +248,7 @@ fn names_macos_already_reads_ask_for_nothing() {
     let scratch = fresh();
     chosen(&scratch.state, 59);
     let policy = Policy::read(&scratch.config, num(59)).expect("a policy");
-    let fake = FakeNames::new(names([Some("m59"); 3]), &nothing);
+    let fake = FakeNames::new(names([Some("m59"), Some("m59-2"), Some("m59")]), &nothing);
     assert_eq!(
         publish(&scratch.state, &scratch.config, &policy, Some(&fake)),
         Ok(())
@@ -257,6 +257,38 @@ fn names_macos_already_reads_ask_for_nothing() {
     assert_eq!(
         read_primary_name(&scratch.state).expect("reads"),
         Some("m59".to_owned())
+    );
+
+    let calls = RefCell::new(Vec::new());
+    let failed = set_system_names(
+        num(59),
+        |field| {
+            calls.borrow_mut().push(format!("get {field}"));
+            Some(
+                match field {
+                    "ComputerName" => "drift",
+                    "LocalHostName" => "m59-2",
+                    "HostName" => "m59",
+                    _ => unreachable!(),
+                }
+                .to_owned(),
+            )
+        },
+        |field, number| {
+            calls.borrow_mut().push(format!("set {field} {number}"));
+            true
+        },
+    );
+    assert!(failed.is_empty());
+    assert_eq!(
+        *calls.borrow(),
+        [
+            "get ComputerName",
+            "set ComputerName m59",
+            "get LocalHostName",
+            "get HostName"
+        ],
+        "the actual root producer repairs one slot without resetting Bonjour"
     );
 }
 
@@ -590,7 +622,7 @@ fn publication_says_what_a_chosen_number_still_owes() {
         ]))
     );
     let published = policy_text("[font]\nsize = 14\n", "m59").expect("a policy");
-    let now = names([Some("m59"); 3]);
+    let now = names([Some("m59"), Some("m59-2"), Some("m59")]);
     assert_eq!(
         publication_of(Some(&published), Some("m59"), &name, Some(&now)),
         Ok(Publication::Current)

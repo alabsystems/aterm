@@ -3134,7 +3134,7 @@ impl ScrollPlan {
     /// room, where nothing follows ([`Self::last_screen`]), and a status's bar that took room from
     /// the list, or gave the room kept for it back, seated it anew, flush with the room's end:
     /// the switch pressed went down under the pointer by what the screen had left unfilled
-    /// (Security at 206x420: Desktop notifications from aterm, 51pt).
+    /// (Security at 206x420: Desktop notifications from aterm, a row since removed, 51pt).
     fn hold_fits(&self, seat: Seat) -> bool {
         if self.seat_fits(seat) {
             return true;

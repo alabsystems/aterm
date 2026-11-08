@@ -6292,7 +6292,8 @@ static NEEDS_GENERATION: Mutex<u64> = Mutex::new(0);
 static NEEDS_MOVED: std::sync::Condvar = std::sync::Condvar::new();
 
 /// How long a needs pusher waits for the generation to move before it builds its row again
-/// anyway, writing it only where it changed: the backstop for a change no herald saw.
+/// anyway, writing it only where it changed: the backstop for a change `NeedAges::observe` did
+/// not see.
 #[cfg(unix)]
 const NEEDS_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -6305,8 +6306,8 @@ const NEEDS_HANDSHAKE: std::time::Duration = aterm_net::fleet::HANDSHAKE_WITHIN;
 const NEEDS_HANDSHAKE: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// Say this window's needs may have moved (a session's published need, hold, wait, agent class
-/// or task, as the herald saw it move, `App::herald_session`): every needs pusher builds its row
-/// again and writes it where it changed. Never waits on a pusher.
+/// or task, as `NeedAges::observe` saw it move, `App::age_session_need`): every needs pusher
+/// builds its row again and writes it where it changed. Never waits on a pusher.
 pub(crate) fn needs_moved() {
     let mut generation = NEEDS_GENERATION
         .lock()

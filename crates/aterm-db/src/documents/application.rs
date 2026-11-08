@@ -364,10 +364,7 @@ pub(crate) fn peek_catalog_within(
     )>,
 > {
     let paths = crate::generation::observed_generation_until(paths, read_by)?;
-    if Bootstrap::cached(&paths)
-        .map_err(crate::table::failure)?
-        .is_none()
-    {
+    if !commons_here(&paths)? {
         return Ok(None);
     }
     let (bootstrap, journal) =
@@ -402,10 +399,7 @@ pub(crate) fn peek_declaration(
     deadline: std::time::Instant,
 ) -> Result<Option<Declaration>> {
     let paths = crate::generation::observed_generation_until(paths, deadline)?;
-    if Bootstrap::cached(&paths)
-        .map_err(crate::table::failure)?
-        .is_none()
-    {
+    if !commons_here(&paths)? {
         return Ok(None);
     }
     let (bootstrap, journal) = Bootstrap::established_with_journal_until(&paths, deadline)
@@ -426,6 +420,22 @@ pub(crate) fn peek_declaration(
                 .any(|declaration| declaration.actor != me)
         }),
     }))
+}
+
+/// Whether this Mac holds Commons custody at `paths`, as [`Bootstrap::cached`] says, except that
+/// a vault writer holding the state lock at this moment is busy, which a read observes again,
+/// never "no Commons here": a peek that took it for absence answered as if no table were here.
+fn commons_here(paths: &Paths) -> Result<bool> {
+    use aterm_secrets::commons::{Unavailable, bootstrap::Availability};
+    match Bootstrap::observe(paths).map_err(crate::table::failure)? {
+        Availability::Available(_) => Ok(true),
+        Availability::Unavailable(Unavailable::Busy) => Err(aterm_secrets::Error::of_kind(
+            aterm_secrets::ErrorKind::VaultBusy,
+            "this Mac's vault is busy: a vault writer holds its state lock",
+        )
+        .into()),
+        Availability::Unavailable(_) => Ok(false),
+    }
 }
 
 fn pass_current(deadline: std::time::Instant) -> Result<()> {

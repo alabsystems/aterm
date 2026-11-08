@@ -230,6 +230,7 @@ pub(crate) trait Kernel {
     fn process(&self, pid: u32) -> Option<Process>;
     fn foreground(&self, master: i32) -> Option<u32>;
     fn watch(&self, process: &Process) -> Option<Box<dyn DeathWitness>>;
+    /// Whether `group` can no longer act ([`cohort_gone`] ships).
     fn group_gone(&self, group: u32) -> Option<bool>;
 }
 
@@ -251,25 +252,113 @@ impl Kernel for System {
     }
 
     fn group_gone(&self, group: u32) -> Option<bool> {
-        #[cfg(unix)]
-        {
-            let group = i32::try_from(group).ok().filter(|group| *group > 1)?;
-            // SAFETY: positive representable group, negated to address only that cohort;
-            // signal zero observes existence without delivering a signal to any process.
-            if unsafe { libc::kill(-group, 0) } == 0 {
-                Some(false)
-            } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                Some(true)
-            } else {
-                None
-            }
+        cohort_gone(group)
+    }
+}
+
+/// The system's keep-awake, which [`cohort_gone`] lets outlive its group's other members.
+#[cfg(any(target_os = "macos", test))]
+const KEEP_AWAKE: &str = "/usr/bin/caffeinate";
+
+/// Whether process group `group` can no longer act, the shipping `group_gone` of every native
+/// kernel: the kernel finds none of it (`ESRCH`), or on macOS each member left is an orphaned
+/// keep-awake ([`keeps_group`]). Claude Code holds one (`caffeinate -i -t 300`) in its own group
+/// while it works, and a kill of Claude leaves it there for up to five minutes, past every native
+/// plan's deadline: it runs nothing but its timer. `None` when the kernel cannot say.
+pub(crate) fn cohort_gone(group: u32) -> Option<bool> {
+    #[cfg(unix)]
+    {
+        let group = i32::try_from(group).ok().filter(|group| *group > 1)?;
+        // SAFETY: positive representable group, negated to address only that cohort;
+        // signal zero observes existence without delivering a signal to any process.
+        if unsafe { libc::kill(-group, 0) } != 0 {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ESRCH) => Some(true),
+                Some(libc::EPERM) => Some(false),
+                _ => None,
+            };
         }
-        #[cfg(not(unix))]
+        #[cfg(target_os = "macos")]
         {
-            let _ = group;
-            None
+            darwin_cohort_idle(group, &mut || {})
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Some(false)
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = group;
+        None
+    }
+}
+
+/// macOS: whether every member of `group`, which signal zero found, is an orphaned keep-awake
+/// ([`member_keeps`]). A listing and the reads of its members are no one snapshot: a listed member
+/// read as gone may have forked first, its child in the group and unlisted. So the group is idle
+/// only when a second listing, taken after the reads, names no pid the first did not and each
+/// member it names still reads idle; any later child needs a parent in the group then, and each is
+/// a keep-awake read twice. `between` runs between the first listing and the reads: a test's
+/// interleaving, nothing in [`cohort_gone`].
+#[cfg(target_os = "macos")]
+fn darwin_cohort_idle(group: i32, between: &mut dyn FnMut()) -> Option<bool> {
+    let listed = darwin_listing(group)?;
+    between();
+    if listed.iter().any(|&pid| member_keeps(group, pid)) {
+        return Some(false);
+    }
+    let again = darwin_listing(group)?;
+    Some(
+        again
+            .iter()
+            .all(|&pid| listed.contains(&pid) && !member_keeps(group, pid)),
+    )
+}
+
+/// macOS: the members of `group`, empty once signal zero no longer finds it, `None` when the kernel
+/// cannot say. libproc answers a listing it refuses with no pid, as it does a group that ended, so
+/// an empty listing counts only after that second look; one that fills
+/// [`crate::foreground_handback::DARWIN_GROUP_MEMBERS_MAX`] may be cut short.
+#[cfg(target_os = "macos")]
+fn darwin_listing(group: i32) -> Option<Vec<libc::pid_t>> {
+    let listed = crate::foreground_handback::darwin_group_members(group)?;
+    if listed.len() >= crate::foreground_handback::DARWIN_GROUP_MEMBERS_MAX {
+        return None;
+    }
+    if listed.is_empty() {
+        // SAFETY: as in `cohort_gone`: signal zero to the same positive group delivers nothing.
+        let found = unsafe { libc::kill(-group, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH);
+        return (!found).then(Vec::new);
+    }
+    Some(listed)
+}
+
+/// Whether the listed member `pid` of `group` keeps it alive ([`keeps_group`]). One the kernel no
+/// longer finds, or finds in another group, left it; one it finds and cannot read keeps it.
+#[cfg(target_os = "macos")]
+fn member_keeps(group: i32, pid: i32) -> bool {
+    let Some(info) = aterm_uds::process::read_short_info(pid) else {
+        return aterm_uds::process::process_presence(pid)
+            != aterm_uds::process::ProcessPresence::Absent;
+    };
+    if i32::try_from(info.pbsi_pgid).ok() != Some(group) {
+        return false;
+    }
+    keeps_group(
+        info.pbsi_ppid,
+        aterm_uds::process::read_process_path(pid).as_deref(),
+    )
+}
+
+/// Whether a member of a group whose other work is to be proven over keeps it alive: every member
+/// does but an orphaned keep-awake, [`KEEP_AWAKE`] reparented to launchd once the process that ran
+/// it died. A keep-awake whose parent lives, or one that runs a command (that command is a member
+/// of its own), keeps it.
+#[cfg(any(target_os = "macos", test))]
+fn keeps_group(parent: u32, path: Option<&std::path::Path>) -> bool {
+    parent != 1 || path != Some(std::path::Path::new(KEEP_AWAKE))
 }
 
 /// Capacity belongs to the owned witness, even if an external Arc/Weak race outlives its

@@ -76,7 +76,7 @@ impl Selection {
 pub(super) fn select(request: &Submission, resolved: &Path) -> io::Result<Option<Selection>> {
     no_loader_overrides(&request.env)?;
     no_cli_overrides(&request.argv[1..])?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = native_inputs::deadline(Instant::now());
     let layout = atpkg::store::resolve_configured()
         .ok_or_else(|| refused("configured compiler store unavailable"))?;
     let cwd = PathBuf::from(OsString::from_vec(request.cwd.clone()));

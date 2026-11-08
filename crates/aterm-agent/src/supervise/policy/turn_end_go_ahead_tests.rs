@@ -1966,10 +1966,13 @@ fn an_hour_from_a_turns_end_is_booked_once_and_seeded_after_a_restart() {
 
 /// The loop's step at a point under `cfg` (`Session::decide_to_act_now`, then
 /// `Session::turn_end_execute`): the decision judged for the lines its go-ahead answers, the
-/// refusal read off the exception the loop raises, then any act recorded as submitted.
-fn judged_under(
+/// refusal read off the exception the loop raises, then any act recorded as submitted, on
+/// `reread`: the point read again for the loop's books (`Session::turn_end_reread`), which runs
+/// no whole-turn read, so it can hold less of the turn than `r`.
+fn judged_reread(
     st: &mut TurnEndState,
     r: &TurnEndReading,
+    reread: &TurnEndReading,
     now: Instant,
     cfg: &SupervisorConfig,
 ) -> TurnEndAction {
@@ -1979,8 +1982,18 @@ fn judged_under(
         && exception_for(st, r, cfg, now).is_some_and(|e| e.refuses());
     let verdict = st.go_ahead_verdict(&a, r, cfg, refused, now);
     st.go_ahead_judged(verdict);
-    st.acted(&a, r, now);
+    st.acted(&a, reread, now);
     a
+}
+
+/// [`judged_reread`] with the act recorded on the reading it was decided on.
+fn judged_under(
+    st: &mut TurnEndState,
+    r: &TurnEndReading,
+    now: Instant,
+    cfg: &SupervisorConfig,
+) -> TurnEndAction {
+    judged_reread(st, r, r, now, cfg)
 }
 
 /// [`judged_under`] the default policy.
@@ -2916,20 +2929,31 @@ fn acks(a: &TurnEndAction) -> bool {
 fn until_judged(
     st: &mut TurnEndState,
     r: &TurnEndReading,
+    now: Instant,
+) -> (TurnEndAction, Instant) {
+    until_judged_reread(st, r, r, now)
+}
+
+/// [`until_judged`], each act recorded on `reread` ([`judged_reread`]).
+fn until_judged_reread(
+    st: &mut TurnEndState,
+    r: &TurnEndReading,
+    reread: &TurnEndReading,
     mut now: Instant,
 ) -> (TurnEndAction, Instant) {
-    let same = TurnEndReading {
+    let unworked = |r: &TurnEndReading| TurnEndReading {
         worked: None,
         ..r.clone()
     };
-    let mut a = judged(st, r, now);
+    let (same, same_reread) = (unworked(r), unworked(reread));
+    let mut a = judged_reread(st, r, reread, now, &cfg());
     for _ in 0..10 {
         let TurnEndAction::WaitUntil { until, .. } = a else {
             break;
         };
         assert!(st.shown_needs().is_empty(), "through the wait: {a:?}");
         now = until;
-        a = judged(st, &same, now);
+        a = judged_reread(st, &same, &same_reread, now, &cfg());
     }
     (a, now)
 }
@@ -3153,4 +3177,288 @@ fn the_park_judges_a_wrapped_need_on_all_of_its_words() {
         None,
         "the whole line parks nothing: {rows:#?}"
     );
+}
+
+// THE GO-AHEAD COUNTS AND ANSWERS BY ITS DECISION'S PARK (DESIGN-harness-autopilot §15.6): the
+// loop records each act on the point read again (`Session::turn_end_reread`), which runs no
+// whole-turn read, so where the turn opens above the screen it holds none of the turn's earlier
+// messages. The act is counted, and answers exactly the lines its decision judged
+// ([`TurnEndState::go_ahead_judged`]), whatever that reread parks.
+
+/// A park: in an earlier message of a turn read whole from the history above the screen, or in
+/// the last message the screen shows.
+const EARLIER_PARK: &str = "NEEDS YOU: say \"rerun the checks\" so I can build and test my branch \
+                            and push it to main.";
+
+/// The turn's last words the screen shows.
+const SHOWN_LAST: &str = "Fetched main again; nothing moved.";
+
+/// THE GO-AHEAD COUNTS ON THE PARK ITS DECISION READ ([`GO_AHEAD_ACTS`]): the agent parks in an
+/// earlier message of a turn read whole from the history above the screen, and parks again after
+/// every act. The reread holds the screen alone, which parks nothing, yet every go-ahead its
+/// decision typed is one of its count: after [`GO_AHEAD_ACTS`] the go-ahead is spent, its refusal
+/// is raised and no more goes, as for a park the reread holds. CONTROL: the reread holds the turn
+/// too.
+#[test]
+fn a_park_the_reread_does_not_hold_is_bounded_as_one_it_does() {
+    let screen = land(idle(SHOWN_LAST, Some(3 * MIN)));
+    let whole = TurnEndReading {
+        turn_said: Some(EARLIER_PARK.to_string()),
+        ..screen.clone()
+    };
+    assert!(
+        whole.go_ahead().is_some() && screen.go_ahead().is_none(),
+        "the turn read whole parks, the screen alone does not"
+    );
+    // Each case's acts, whether the go-ahead was spent, and whether the person was told now.
+    let mut seen = Vec::new();
+    for (how, reread) in [
+        ("CONTROL: the reread holds the turn too", &whole),
+        ("the reread holds the screen alone", &screen),
+    ] {
+        let mut st = TurnEndState::default();
+        let mut now = t0();
+        let a = judged_reread(&mut st, &whole, reread, now, &cfg());
+        assert_eq!(a.rule_id(), Some(RULE_LAND), "{how}: {a:?}");
+        let mut acts = Vec::new();
+        for _ in 0..GO_AHEAD_ACTS {
+            now += 5 * MIN;
+            let (a, then) = until_judged_reread(&mut st, &whole, reread, now);
+            now = then;
+            acts.push(a.rule_id());
+        }
+        // Past the bound the go-ahead is refused, and the policy changes its approach: each
+        // decision is taken as it comes.
+        now += 5 * MIN;
+        let told = exception_for(&st, &whole, &cfg(), now)
+            == Some(crate::supervise::policy::exception::Exception::refuses_go_ahead());
+        let spent = st.go_ahead_spent(now);
+        for _ in 0..3 {
+            acts.push(judged_reread(&mut st, &whole, reread, now, &cfg()).rule_id());
+            now += 5 * MIN;
+        }
+        seen.push((how, acts, spent, told));
+    }
+    for (how, acts, spent, told) in &seen {
+        let go_aheads = acts.iter().filter(|r| **r == Some(RULE_GO_AHEAD)).count();
+        assert!(
+            go_aheads == GO_AHEAD_ACTS as usize && *spent && *told,
+            "{how}: {go_aheads} go-aheads (the bound is {GO_AHEAD_ACTS}), spent {spent}, told \
+             {told}; every case: {seen:#?}"
+        );
+    }
+}
+
+/// A PERSON'S NEED THE DECISION READ STAYS UP, WHATEVER THE REREAD PARKS (§15.6: the lines held
+/// off the menu bar are exactly the decision's [`go_ahead::Park::needs`]): the turn, read whole
+/// from the history above the screen, holds an earlier message the screen does not (the agent
+/// cannot push without the person's token), which makes the last message's push line a person's;
+/// the decision's park answers its rerun line alone and tells the agent to act on none of its
+/// others. The reread holds the screen alone and so parks the push line too; the go-ahead answers
+/// only the lines its decision read, so the push line shows from the decision on, and still shows
+/// after a reply that names no need. CONTROL: the act recorded on the decision's own reading.
+#[test]
+fn a_persons_need_the_decision_read_stays_up_whatever_the_reread_parks() {
+    const TOKEN: &str = "I can't push to main without your GitHub token.";
+    const RERUN: &str = "say \"rerun the checks\" so I can build and test my branch.";
+    const PUSH: &str = "say \"go\" so I can push my branch to main.";
+    const NEXT: &str = "Built and tested the branch; the checks pass.";
+    let last = format!("Built the branch.\nNEEDS YOU: {RERUN}\nNEEDS YOU: {PUSH}");
+    let screen = land(idle(&last, Some(3 * MIN)));
+    let decided = TurnEndReading {
+        turn_said: Some(TOKEN.to_string()),
+        ..screen.clone()
+    };
+    let park = decided.go_ahead().expect("the decision's reading parks");
+    assert!(
+        park.needs == [RERUN] && park.others,
+        "the token sentence makes the push line a person's: {park:?}"
+    );
+    assert_eq!(
+        screen.go_ahead().map(|p| p.needs),
+        Some(vec![RERUN.to_string(), PUSH.to_string()]),
+        "the reread, without the turn's earlier message, parks the push line too"
+    );
+    let next = land(idle(NEXT, Some(3 * MIN)));
+    for (how, reread) in [
+        ("CONTROL: recorded on the decision's reading", &decided),
+        ("recorded on the reread", &screen),
+    ] {
+        let mut st = TurnEndState::default();
+        let a = judged_reread(&mut st, &decided, reread, t0(), &cfg());
+        assert_eq!(a.rule_id(), Some(RULE_LAND), "{how}: {a:?}");
+        let (a, now) = until_judged_reread(&mut st, &decided, reread, t0() + 4 * MIN);
+        let text = go_ahead_text(&a);
+        assert!(text.contains(GO_AHEAD_OTHERS), "{how}: {text}");
+        assert_eq!(
+            st.shown_needs(),
+            [PUSH],
+            "{how}: after the go-ahead the menu bar shows {:?} (standing {:?})",
+            st.shown_needs(),
+            st.standing_needs()
+        );
+        let a = judged(&mut st, &next, now + 10 * MIN);
+        assert!(!is_go_ahead(&a), "{how}: {a:?}");
+        assert_eq!(
+            st.shown_needs(),
+            [PUSH],
+            "{how}: after a reply that names no need the menu bar shows {:?} (standing {:?})",
+            st.shown_needs(),
+            st.standing_needs()
+        );
+    }
+}
+
+/// THE GO-AHEAD A RESTART TYPES IN ITS PLACE ANSWERS THE LINES ITS DECISION READ: a park read
+/// while an account move ahead of the wall is advised decides the move with the go-ahead as its
+/// `otherwise`, which the loop types where the move waits for a quiet moment or is not made
+/// (`Session::restart_agent`). The decision judges that go-ahead, so its line is off the menu bar
+/// from the decision, the act typed answers it, and a reply that names no need keeps it off. A
+/// move made types no go-ahead, so the line is back. CONTROL: the go-ahead decided with no move.
+#[test]
+fn the_go_ahead_a_restart_types_in_its_place_answers_the_lines_its_decision_read() {
+    const NEXT: &str = "Rebuilding the branch now; the suite runs next.";
+    let plain = idle(INCIDENT, Some(3 * MIN));
+    let moving = advised(&plain, "work-2");
+    for (how, r) in [("CONTROL: no move", &plain), ("the move deferred", &moving)] {
+        let mut st = TurnEndState::default();
+        let a = judged(&mut st, r, t0());
+        let typed = match &a {
+            TurnEndAction::Restart { .. } => otherwise_of(&a).clone(),
+            other => other.clone(),
+        };
+        assert!(is_go_ahead(&typed), "{how}: {a:?}");
+        assert!(
+            st.shown_needs().is_empty(),
+            "{how}: from the decision the menu bar shows {:?}",
+            st.shown_needs()
+        );
+        if matches!(a, TurnEndAction::Restart { .. }) {
+            st.acted(&typed, r, t0());
+        }
+        assert!(
+            st.shown_needs().is_empty() && st.needs_answered() == 1,
+            "{how}: after the go-ahead the menu bar shows {:?}",
+            st.shown_needs()
+        );
+        let a = judged(&mut st, &idle(NEXT, Some(3 * MIN)), t0() + 10 * MIN);
+        assert!(!is_go_ahead(&a), "{how}: {a:?}");
+        assert!(
+            st.shown_needs().is_empty(),
+            "{how}: after a reply that names no need the menu bar shows {:?}",
+            st.shown_needs()
+        );
+    }
+    let mut st = TurnEndState::default();
+    let a = judged(&mut st, &moving, t0());
+    let TurnEndAction::Restart { why, .. } = &a else {
+        panic!("the move: {a:?}");
+    };
+    st.restarted(why, true, &moving, t0());
+    assert_eq!(
+        st.shown_needs(),
+        st.standing_needs(),
+        "a move made types no go-ahead: its line is back"
+    );
+    assert_eq!(st.needs_answered(), 0);
+}
+
+/// How the act a point decided went ([`the_act_its_line_left_unsent_sends_answers_the_lines_its_decision_read`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Went {
+    /// Its Enter went with it.
+    AtOnce,
+    /// Its line was left in the composer, and the next decision's Enter sent it.
+    LeftThenSent,
+    /// Its line was left, and the next decision's Enter sent a draft not the loop's own.
+    AnotherDraft,
+}
+
+/// THE ACT ITS LINE LEFT UNSENT SENDS ANSWERS THE LINES ITS DECISION READ: the loop typed the
+/// go-ahead (Cruise) or Land's instruction over a park, and its Enter did not go (the line left
+/// in the composer), so the lines were put back (`Session::turn_end_execute`). The next decision
+/// on the point reads the draft and sends it (`TurnEndAction::Submit` of the act's rule), and the
+/// loop books the line sent as the act that wrote it. That decision judges the act, so the line
+/// is off the menu bar from it, and the act booked answers it, the go-ahead counting once, though
+/// the point read again for the books holds no turn read whole above the screen: on the screen,
+/// and in an earlier message of a turn read whole from the history above it. CONTROLS: the act's
+/// Enter goes the first time; an Enter that sent a draft not the loop's own, booked as itself,
+/// answers nothing, and the loop puts the lines back.
+#[test]
+fn the_act_its_line_left_unsent_sends_answers_the_lines_its_decision_read() {
+    let screen = idle(SHOWN_LAST, Some(3 * MIN));
+    let above = TurnEndReading {
+        turn_said: Some(EARLIER_PARK.to_string()),
+        ..screen.clone()
+    };
+    let shown = idle(&format!("{SHOWN_LAST}\n{EARLIER_PARK}"), Some(3 * MIN));
+    let cases = [
+        ("on the screen", &shown, &shown),
+        ("above the screen", &above, &screen),
+    ];
+    for (rule, mode) in [
+        (RULE_GO_AHEAD, Autopilot::Cruise),
+        (RULE_LAND, Autopilot::Land),
+    ] {
+        for (went, (where_, r, reread)) in [Went::AtOnce, Went::LeftThenSent, Went::AnotherDraft]
+            .into_iter()
+            .flat_map(|went| cases.map(|case| (went, case)))
+        {
+            let how = format!("{rule} {where_}, {went:?}");
+            let (r, reread) = (under(mode, r.clone()), under(mode, reread.clone()));
+            let mut st = TurnEndState::default();
+            let now = t0();
+            st.observe(&r, now);
+            let typed = decide_turn_end(&st, &r, &cfg(), now);
+            assert_eq!(typed.rule_id(), Some(rule), "{how}: {typed:?}");
+            st.go_ahead_judged(st.go_ahead_verdict(&typed, &r, &cfg(), false, now));
+            let booked = if went == Went::AtOnce {
+                typed
+            } else {
+                // The line left in the composer: the lines are back until its Enter is decided.
+                assert!(
+                    st.go_ahead_unwritten(),
+                    "{how}: the decision held its lines"
+                );
+                let r = TurnEndReading {
+                    composer: Composer::Typed,
+                    ..r.clone()
+                };
+                st.observe(&r, now);
+                let enter = decide_turn_end(&st, &r, &cfg(), now);
+                assert!(
+                    matches!(enter, TurnEndAction::Submit { rule_id } if rule_id == rule),
+                    "{how}: {enter:?}"
+                );
+                st.go_ahead_judged(st.go_ahead_verdict(&enter, &r, &cfg(), false, now));
+                assert!(
+                    st.shown_needs().is_empty(),
+                    "{how}: from the Enter's decision the menu bar shows {:?}",
+                    st.shown_needs()
+                );
+                if went == Went::LeftThenSent {
+                    typed
+                } else {
+                    enter
+                }
+            };
+            // The act booked, recorded on the point read again; then the loop's put-back of the
+            // lines of an act not submitted.
+            st.acted(&booked, &reread, now);
+            let _ = st.go_ahead_unwritten();
+            let answers = went != Went::AnotherDraft;
+            assert!(
+                st.shown_needs().is_empty() == answers
+                    && st.needs_answered() == usize::from(answers),
+                "{how}: after the act the menu bar shows {:?} (standing {:?})",
+                st.shown_needs(),
+                st.standing_needs()
+            );
+            assert_eq!(
+                !st.go_ahead_untried(&r, now),
+                answers && rule == RULE_GO_AHEAD,
+                "{how}: the go-ahead counts once, Land's instruction never"
+            );
+        }
+    }
 }

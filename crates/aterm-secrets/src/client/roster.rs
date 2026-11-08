@@ -217,17 +217,11 @@ fn observe_roster<T>(
                 return Ok(Observed::Unseen);
             }
             let value = read(RosterObservation::Standalone)?;
-            Ok(
-                if matches!(
-                    StateLock::observe_classified(paths)?,
-                    StateObservation::Absent
-                ) && config(paths)?.is_none()
-                {
-                    Observed::Read(value)
-                } else {
-                    Observed::Unseen
-                },
-            )
+            Ok(match StateLock::observe_classified(paths)? {
+                StateObservation::Absent if config(paths)?.is_none() => Observed::Read(value),
+                StateObservation::Busy => Observed::Busy,
+                StateObservation::Absent | StateObservation::Held(_) => Observed::Unseen,
+            })
         }
     }
 }

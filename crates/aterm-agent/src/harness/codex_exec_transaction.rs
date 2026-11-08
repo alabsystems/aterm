@@ -19,6 +19,7 @@ pub enum Stage {
 pub struct Transaction {
     source_generation: i32,
     stage: Stage,
+    execution_granted: bool,
 }
 
 impl Transaction {
@@ -27,6 +28,7 @@ impl Transaction {
         Self {
             source_generation,
             stage: Stage::Armed,
+            execution_granted: false,
         }
     }
 
@@ -54,6 +56,7 @@ impl Transaction {
             return false;
         }
         self.stage = Stage::Executing;
+        self.execution_granted = true;
         true
     }
 
@@ -91,7 +94,35 @@ impl Transaction {
         self.stage = Stage::Cancelled;
         true
     }
+
+    /// Cancel new admission and report whether Go may already have been sent.
+    /// A receipt's prospective write marker is not this live grant history.
+    /// The history survives cancellation and a lost reply; this result alone
+    /// proves neither process termination nor reclaimable account rights.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ExecRevocation",
+            action = "NextCase",
+            reason = "The conformance fixture chooses reachable transaction and prospective receipt states."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ExecRevocation",
+            action = "Revoke",
+            project = "aterm_agent::harness::codex_exec_handoff::transaction::revocation_tests::revocation_transition"
+        )
+    )]
+    pub fn revoke(&mut self) -> bool {
+        self.cancel() && self.execution_granted
+    }
 }
+
+#[cfg(test)]
+#[path = "codex_exec_revocation_tests.rs"]
+mod revocation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -124,13 +155,15 @@ mod tests {
 
     #[test]
     fn exec_transaction_cancellation_prevents_every_later_admission() {
-        for stage in 0..3 {
+        for stage in 0..4 {
             let mut tx = Transaction::new(10);
             if stage > 0 {
                 assert!(tx.reserve(10));
-                assert!(tx.execute(10));
             }
             if stage > 1 {
+                assert!(tx.execute(10));
+            }
+            if stage > 2 {
                 assert!(tx.load(11));
             }
             assert!(tx.cancel());

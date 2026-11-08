@@ -3,10 +3,11 @@
 
 //! Manual cached literal-query work and allocation measurement, separate from timing floors.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::System;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use aterm_bench::allocator::{Observed, Observer};
 use aterm_bench::{linkheavy_corpus, replog_corpus, rotating_corpus};
 use aterm_core::search::SearchDirection;
 use aterm_core::terminal::TerminalBuilder;
@@ -16,37 +17,26 @@ static BYTES: AtomicU64 = AtomicU64::new(0);
 
 struct Counting;
 
-fn note(bytes: usize) {
-    CALLS.fetch_add(1, Ordering::Relaxed);
-    BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-}
-
-// SAFETY: every operation forwards the caller's pointer and layout to System unchanged;
-// the counters use only nonallocating atomic arithmetic.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note(layout.size());
-        // SAFETY: forwarding the caller's layout unchanged.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        note(size);
-        // SAFETY: ptr and layout came from System through this allocator.
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: ptr and layout came from System through this allocator.
-        unsafe { System.dealloc(ptr, layout) }
+// SAFETY: the callback uses only nonallocating, nonpanicking atomic arithmetic.
+unsafe impl Observer for Counting {
+    fn requested(&self, bytes: usize) {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 }
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOC: Observed<System, Counting> = Observed::new(System, Counting);
+
+#[derive(Clone, Copy)]
+struct Work {
+    instructions: u64,
+    cpu_time: u64,
+    cycles: u64,
+}
 
 #[cfg(target_os = "macos")]
-fn instructions() -> Option<u64> {
+fn snapshot() -> Option<Work> {
     let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
     let pid = libc::c_int::try_from(std::process::id()).ok()?;
     // SAFETY: info is writable for the requested rusage_info_v4 flavor.
@@ -57,12 +47,20 @@ fn instructions() -> Option<u64> {
             info.as_mut_ptr().cast::<libc::rusage_info_t>(),
         )
     };
+    if rc != 0 {
+        return None;
+    }
     // SAFETY: zeroed at creation, so initialized whatever the call did.
-    (rc == 0).then(|| unsafe { info.assume_init() }.ri_instructions)
+    let info = unsafe { info.assume_init() };
+    Some(Work {
+        instructions: info.ri_instructions,
+        cpu_time: info.ri_user_time.saturating_add(info.ri_system_time),
+        cycles: info.ri_cycles,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn instructions() -> Option<u64> {
+fn snapshot() -> Option<Work> {
     None
 }
 
@@ -107,7 +105,7 @@ fn main() {
                     }
                     let before_calls = CALLS.load(Ordering::Relaxed);
                     let before_bytes = BYTES.load(Ordering::Relaxed);
-                    let before = instructions();
+                    let before = snapshot();
                     if access == "terminal" {
                         for _ in 0..REPEATS {
                             let result = term
@@ -135,7 +133,12 @@ fn main() {
                             black_box(result);
                         }
                     }
-                    let work = before.zip(instructions()).map(|(a, b)| b.saturating_sub(a));
+                    let samples = before.zip(snapshot());
+                    let work = samples.map(|(a, b)| b.instructions.saturating_sub(a.instructions));
+                    let cpu_time = samples.map(|(a, b)| b.cpu_time.saturating_sub(a.cpu_time));
+                    let cycles = samples
+                        .filter(|(a, b)| a.cycles != 0 && b.cycles >= a.cycles)
+                        .map(|(a, b)| b.cycles - a.cycles);
                     let calls = CALLS.load(Ordering::Relaxed) - before_calls;
                     let bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
                     assert_eq!(
@@ -149,7 +152,7 @@ fn main() {
                         .expect("literal query");
                     assert_eq!(actual, expected, "measurement must not mutate results");
                     println!(
-                        "search_query shape={shape} query={query_shape} direction={direction:?} access={access} repeats={REPEATS} matches={count} instructions={work:?} allocation_calls={calls} allocated_bytes={bytes}"
+                        "search_query shape={shape} query={query_shape} direction={direction:?} access={access} repeats={REPEATS} matches={count} instructions={work:?} allocation_calls={calls} allocated_bytes={bytes} cpu_time={cpu_time:?} cycles={cycles:?}"
                     );
                 }
             }

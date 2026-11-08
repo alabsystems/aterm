@@ -731,14 +731,11 @@ fn monitor(ctx: &Arc<crate::SessionCtx>, op: &Arc<Mutex<Operation>>) -> bool {
                         || ctx.human_input.seq() != op.human_seq
                         || authority != op.authority
                         || !ctx.native_policy.quota_rotation_enabled();
-                    if revoked && !matches!(op.tx.stage(), Stage::Cancelled | Stage::Consumed(_)) {
-                        let unexecuted = !op.receipt.launch_attempted;
-                        op.tx.cancel();
-                        // No Go was issued: the source may still be draining its turn.
-                        // A timeout cannot kill it in the middle of that durable write.
-                        if !unexecuted {
-                            op.terminate = true;
-                        }
+                    // A prior client cancellation retains any issued Go. An
+                    // ungranted source may still be writing its checkpoint;
+                    // revocation alone cannot interrupt that durable write.
+                    if revoked && op.tx.revoke() {
+                        op.terminate = true;
                     }
                     let retired =
                         (op.tx.stage() == Stage::Cancelled && !op.receipt.revoked).then(|| {

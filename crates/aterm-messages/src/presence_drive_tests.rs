@@ -40,7 +40,7 @@ struct TestDesk {
     wins: BTreeMap<u32, Win>,
     facts: RefCell<HashMap<u64, TFacts>>,
     supervisors: HashMap<u64, Instant>,
-    herald_at: Option<Instant>,
+    recheck_at: Option<Instant>,
     log: RefCell<Vec<String>>,
 }
 
@@ -52,7 +52,7 @@ impl TestDesk {
             wins: BTreeMap::new(),
             facts: RefCell::new(HashMap::new()),
             supervisors: HashMap::new(),
-            herald_at: None,
+            recheck_at: None,
             log: RefCell::new(Vec::new()),
         }
     }
@@ -138,8 +138,8 @@ impl Desk for TestDesk {
         self.supervisors.get(&session).copied()
     }
 
-    fn herald_deadline(&self, _now: Instant) -> Option<Instant> {
-        self.herald_at
+    fn next_need_recheck(&self, _now: Instant) -> Option<Instant> {
+        self.recheck_at
     }
 
     fn projecting(&mut self, w: u32) {
@@ -150,12 +150,12 @@ impl Desk for TestDesk {
         self.note(format!("restamp {windows:?}"));
     }
 
-    fn herald(&mut self, session: u64) {
-        self.note(format!("herald {session}"));
+    fn publish_and_age_need(&mut self, session: u64) {
+        self.note(format!("publish_and_age_need {session}"));
     }
 
-    fn herald_owed(&mut self, _now: Instant) {
-        self.note("herald-owed".to_string());
+    fn run_need_rechecks(&mut self, _now: Instant) {
+        self.note("run_need_rechecks".to_string());
     }
 
     fn lapse_supervisor(&mut self, session: u64) {
@@ -263,7 +263,7 @@ fn a_hundred_verdict_flips_ask_only_for_a_restamp() {
         .borrow()
         .iter()
         .filter(|l| {
-            !["restamp", "sense", "herald", "projecting"]
+            !["restamp", "sense", "publish_and_age_need", "projecting"]
                 .iter()
                 .any(|p| l.starts_with(p))
         })
@@ -289,11 +289,15 @@ fn a_refresh_that_moved_nothing_restamps_nothing() {
     d.log.borrow_mut().clear();
     drive::refresh_session(&mut d, 1);
     assert_eq!(d.took("restamp"), 0);
-    assert_eq!(d.took("herald"), 1, "the publication rides every refresh");
+    assert_eq!(
+        d.took("publish_and_age_need"),
+        1,
+        "the publication rides every refresh"
+    );
 }
 
-/// A quiet desk and a published need arm nothing; supervisor lapses and herald deadlines fold
-/// into the deadline, and a lapse fires on tick.
+/// A quiet desk and a published need arm nothing; supervisor lapses and need recheck deadlines
+/// fold into the deadline, and a lapse fires on tick.
 #[test]
 fn a_need_arms_no_deadline_and_the_lapses_fold_in() {
     let mut d = desk(vec![vec![1], vec![2]]);
@@ -305,9 +309,9 @@ fn a_need_arms_no_deadline_and_the_lapses_fold_in() {
     d.supervisors.insert(1, t0 + Duration::from_secs(9));
     drive::refresh_session(&mut d, 1);
     assert_eq!(drive::deadline(&d, t0), Some(t0 + Duration::from_secs(9)));
-    d.herald_at = Some(t0 + Duration::from_secs(3));
+    d.recheck_at = Some(t0 + Duration::from_secs(3));
     assert_eq!(drive::deadline(&d, t0), Some(t0 + Duration::from_secs(3)));
-    d.herald_at = None;
+    d.recheck_at = None;
     let lapse = t0 + Duration::from_secs(9);
     d.now = lapse;
     drive::tick(&mut d, lapse);

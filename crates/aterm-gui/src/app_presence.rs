@@ -18,7 +18,7 @@ pub(crate) use aterm_messages::presence::chip_of_attention;
 #[derive(Default, Debug)]
 pub(crate) struct PresenceTable {
     table: drive::Table<presence::Native>,
-    pub(crate) herald: crate::status_item::Herald,
+    pub(crate) need_ages: crate::status_item::NeedAges,
 }
 
 impl PresenceTable {
@@ -28,7 +28,7 @@ impl PresenceTable {
 
     pub(crate) fn retire(&mut self, session: u64) {
         self.table.retire(session);
-        self.herald.retire(session);
+        self.need_ages.retire(session);
     }
 }
 
@@ -619,7 +619,7 @@ impl App {
         self.except_replace(aterm_messages::exceptions::Family::ApiOutage, &entries);
     }
 
-    /// Every session's need published again (and its herald and chrome refreshed).
+    /// Every session's need published again (and its age and chrome refreshed).
     pub(crate) fn publish_needs_all(&mut self) {
         let sessions: Vec<u64> = self.pool.iter().map(|session| session.id).collect();
         for session in sessions {
@@ -1711,7 +1711,7 @@ impl Desk for App {
         Some(now + Duration::from_micros(at_us.saturating_sub(now_us)) + Duration::from_millis(1))
     }
 
-    fn herald_deadline(&self, now: Instant) -> Option<Instant> {
+    fn next_need_recheck(&self, now: Instant) -> Option<Instant> {
         self.need_recheck_deadline(now)
     }
 
@@ -1726,14 +1726,14 @@ impl Desk for App {
         self.refresh_tab_chrome_windows(windows);
     }
 
-    fn herald(&mut self, session: u64) {
+    fn publish_and_age_need(&mut self, session: u64) {
         if self.publish_need(session) {
             self.harness_screen_moved();
         }
-        self.herald_session(session);
+        self.age_session_need(session);
     }
 
-    fn herald_owed(&mut self, _now: Instant) {
+    fn run_need_rechecks(&mut self, _now: Instant) {
         self.need_rechecks_due();
     }
 
@@ -2330,8 +2330,8 @@ mod tests {
             }
         }
         successor.refresh_presence_all_windows();
-        successor.herald_session(first);
-        successor.herald_session(second);
+        successor.age_session_need(first);
+        successor.age_session_need(second);
         assert_eq!(
             behind(&successor, wid),
             [ChipLevel::Off, ChipLevel::Done],

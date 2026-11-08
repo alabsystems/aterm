@@ -252,8 +252,37 @@ fn the_in_process_checks_refuse_a_root_that_is_not_an_aterm_checkout() {
 fn a_skip_fails_nothing_except_under_release() {
     let repo = FakeRepo::new();
     repo.with_stage2("exit 0");
+    // Export is the successful arm, so satisfy its real mainline prerequisite. Only lint skips
+    // for the absent targo-tippy; missing Git history must not add another skip to this fixture.
+    for args in [
+        vec!["init", "-q"],
+        vec![
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+        vec!["update-ref", "refs/remotes/origin/main", "HEAD"],
+    ] {
+        let mut git = aterm_uds::fixture_git::git();
+        git.current_dir(&repo.root).args(&args);
+        let out = aterm_uds::deadline::output_within(&mut git, std::time::Duration::from_secs(60))
+            .expect("fixture Git completes");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     let (dev, code) = repo.run(&[Check::Lint, Check::Export], Scope::workspace());
     assert_eq!(code, exit::PASS, "{dev}");
+    assert_eq!(labels_with(&dev, "ok").len(), 1, "{dev}");
     assert_eq!(labels_with(&dev, "skip").len(), 1, "{dev}");
     let ctx = repo
         .ctx(&[Check::Lint, Check::Export], Scope::workspace())

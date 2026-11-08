@@ -7334,6 +7334,15 @@ fn org_off() -> Credits {
     })
 }
 
+/// The window-full line of the own row with [`org_off`]'s credits, carrying no reset offer.
+fn org_off_full() -> Vec<WindowFull> {
+    vec![WindowFull {
+        label: OWN.to_string(),
+        reason: "org_level_disabled".to_string(),
+        grants: None,
+    }]
+}
+
 #[test]
 fn credits_are_an_episode_and_its_line_is_once_a_day() {
     let dir = tmp("credits");
@@ -7587,7 +7596,7 @@ fn a_limit_rows_word_on_credits_is_the_newest_word_on_them() {
 #[test]
 fn the_week_nearly_used_with_credits_off_is_a_line_and_nothing_else_is() {
     let r = own_row();
-    let line = [(OWN.to_string(), "org_level_disabled".to_string())];
+    let line = org_off_full();
     let full = |credits: Option<Credits>, screens: &[UsageSaid]| {
         let dir = tmp("window-full");
         let store = Store::at(dir.path());
@@ -7649,12 +7658,116 @@ fn the_week_nearly_used_with_credits_off_is_a_line_and_nothing_else_is() {
     );
 }
 
+/// THE WINDOW-FULL LINE CARRIES THE ACCOUNT'S RESET OFFER ONLY WHILE IT STANDS AND ONLY OF A KIND
+/// THAT GIVES THE WEEK BACK, AND THE OFFER DECIDES NOTHING: a weekly, full or Fable offer with one
+/// left or more and its use-by instant ahead (or none read) is carried as the state holds it; none
+/// left, a use-by instant reached, a 5-hour offer (it refills the five-hour window alone) or one
+/// whose kind was never named carries none; and with or without one, the accounts on the line and
+/// their reasons are the ones without any offer.
+#[test]
+fn windows_full_carries_a_standing_offer_of_the_week_and_no_other() {
+    use aterm_phase::ResetKind;
+    let r = own_row();
+    let reset = NOW + 3 * DAY;
+    let full = |credits: Credits, offer: Option<(Option<ResetKind>, u32, Option<i64>)>| {
+        let dir = tmp("window-full-offer");
+        let store = Store::at(dir.path());
+        set_credits(&store, OWN, credits);
+        record_usage(
+            &store,
+            &r,
+            "s-1",
+            &stored(),
+            &warned(NOW, true, 92, Some(reset)),
+            NOW,
+        );
+        if let Some((kind, left, use_by)) = offer {
+            let mut note = None;
+            store
+                .transact_within(&LOCK_LADDER, NOW + MIN, &mut note, |state| {
+                    assert!(note_offer(
+                        state,
+                        OWN,
+                        kind,
+                        left,
+                        use_by,
+                        NOW + MIN,
+                        NOW + MIN
+                    ));
+                    Ok(Vec::new())
+                })
+                .expect("noted");
+        }
+        let now = NOW + 2 * MIN;
+        let state = store.load(now).expect("ours").0;
+        let held = state.account(OWN).offer;
+        (windows_full(&r, &state, now), held)
+    };
+    let selection = |lines: &[WindowFull]| -> Vec<(String, String)> {
+        lines
+            .iter()
+            .map(|l| (l.label.clone(), l.reason.clone()))
+            .collect()
+    };
+    let (bare, none_held) = full(org_off(), None);
+    assert_eq!(bare, org_off_full(), "the control: no offer is held");
+    assert_eq!(none_held, None);
+    let now = NOW + 2 * MIN;
+    for (offer, why) in [
+        (
+            (Some(ResetKind::Weekly), 1, Some(NOW + 2 * DAY)),
+            "a weekly reset",
+        ),
+        (
+            (Some(ResetKind::Full), 2, None),
+            "a full reset with no use-by read",
+        ),
+        (
+            (Some(ResetKind::Fable), 1, Some(now + 1)),
+            "a Fable reset a second before its use-by",
+        ),
+    ] {
+        let (lines, held) = full(org_off(), Some(offer));
+        assert!(held.is_some(), "{why}: the offer is on record");
+        assert_eq!(selection(&lines), selection(&bare), "{why}: the same line");
+        assert_eq!(lines[0].grants, held, "{why}: carried as held");
+    }
+    for (offer, why) in [
+        (
+            (Some(ResetKind::Weekly), 0, Some(NOW + 2 * DAY)),
+            "none left",
+        ),
+        (
+            (Some(ResetKind::Weekly), 1, Some(now)),
+            "its use-by instant",
+        ),
+        (
+            (Some(ResetKind::Weekly), 1, Some(NOW - DAY)),
+            "a passed use-by",
+        ),
+        (
+            (Some(ResetKind::Session), 3, Some(NOW + 2 * DAY)),
+            "a 5-hour reset",
+        ),
+        ((None, 2, None), "a kindless offer"),
+    ] {
+        let (lines, held) = full(org_off(), Some(offer));
+        assert!(held.is_some(), "{why}: the offer is still on record");
+        assert_eq!(lines, bare, "{why}: carries none");
+    }
+    let (lines, _) = full(
+        Credits::On(NOW - HOUR),
+        Some((Some(ResetKind::Weekly), 1, Some(NOW + 2 * DAY))),
+    );
+    assert!(lines.is_empty(), "an offer adds no account: {lines:?}");
+}
+
 #[test]
 fn a_limit_reset_refills_the_walled_window_and_no_other() {
     let r = own_row();
     let week_end = NOW + 3 * DAY;
     let session_end = NOW + 2 * HOUR;
-    let line = [(OWN.to_string(), "org_level_disabled".to_string())];
+    let line = org_off_full();
     let refilled = |done: &ResetDone<'_>, until: i64, at: i64| {
         let reset = match done {
             ResetDone::Lifted => Some(until),
@@ -7932,10 +8045,7 @@ fn a_warning_drawn_before_a_reset_says_nothing_after_it() {
         record_usage(&store, &r, "s-b", &stored(), &read_now, NOW + 10 * MIN).as_str(),
         "usage"
     );
-    assert_eq!(
-        full(NOW + 10 * MIN),
-        [(OWN.to_string(), "org_level_disabled".to_string())]
-    );
+    assert_eq!(full(NOW + 10 * MIN), org_off_full());
 }
 
 #[test]
@@ -7943,7 +8053,7 @@ fn credits_seen_in_use_after_the_row_that_said_them_off_end_its_line() {
     let dir = tmp("credits-back-on");
     let store = Store::at(dir.path());
     let r = own_row();
-    let line = [(OWN.to_string(), "org_level_disabled".to_string())];
+    let line = org_off_full();
     let full = |now: i64| windows_full(&r, &store.load(now).expect("ours").0, now);
     let usage = |s: UsageSaid| record_usage(&store, &r, "s-1", &stored(), &s, s.at + 5);
     let wall = |sid: &str, row: &StandingWall, now: i64| {
@@ -8001,7 +8111,7 @@ fn each_window_keeps_its_own_word() {
     set_credits(&store, OWN, org_off());
     let usage = |s: UsageSaid| record_usage(&store, &r, "s-1", &stored(), &s, s.at);
     let full = |now: i64| windows_full(&r, &store.load(now).expect("ours").0, now);
-    let line = [(OWN.to_string(), "org_level_disabled".to_string())];
+    let line = org_off_full();
     let (week_end, session_end) = (NOW + 2 * DAY, NOW + 3 * HOUR);
     usage(warned(NOW, true, 89, Some(week_end)));
     assert!(full(NOW).is_empty(), "under the bar");
@@ -8036,7 +8146,7 @@ fn the_lines_week_is_the_warnings_word_never_a_samples() {
     let week_end = NOW + 4 * DAY;
     let usage = |s: UsageSaid| record_usage(&store, &r, "s-1", &stored(), &s, s.at);
     let full = |now: i64| windows_full(&r, &store.load(now).expect("ours").0, now);
-    let line = [(OWN.to_string(), "org_level_disabled".to_string())];
+    let line = org_off_full();
     let edit = |now: i64, f: &dyn Fn(&mut State) -> Vec<Event>| {
         let mut note = None;
         store
@@ -10691,6 +10801,7 @@ fn weeks_said_ends_a_no_reset_wall_with_the_week_an_earlier_read_named() {
             several: false,
             api_key_seen: false,
             tap: Tap::On,
+            limit_reset: false,
             spend: None,
             prices_as_of: None,
             login: None,

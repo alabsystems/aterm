@@ -3993,7 +3993,7 @@ fn a_linux_install_waiting_for_a_start_is_a_notice_and_its_end_takes_it_down() {
         .band_on_screen_for_test = true;
     assert!(
         !app.note_update_health(aterm_update::INSTALL_AWAITS_START_TITLE, body),
-        "no banner is owed"
+        "the wait for a start is no health warning"
     );
     let row = app
         .messages

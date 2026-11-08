@@ -733,21 +733,28 @@ pub(crate) fn observed_selection_within(
     observe_generation(&observed_generation_until(paths, read_by)?, read_by, wait)
 }
 
-/// The home [`observed_selection_within`] selects, named by its selections alone: no
-/// predecessor is observed yet, so this says which home a read opens, never that it may. A
-/// reader opens that home's established custody and then observes it
-/// ([`observe_generation`]), so the observation it keeps is no older than that custody's wait.
+/// The home [`observed_selection_within`] selects, named by its completed selections alone: a
+/// succession still preserving old records refuses here, as observing it would, so no reader
+/// opens a candidate before it is complete. No predecessor is observed yet, so this says which
+/// home a read opens, never that it may. A reader opens that home's established custody and then
+/// observes it ([`observe_generation`]), so the observation it keeps is no older than that
+/// custody's wait.
 pub(crate) fn observed_generation_until(paths: &Paths, read_by: Instant) -> Result<Paths> {
     // Ordinary recovery may repair local files; a public observation uses
     // only established custody, including every predecessor in the chain.
     let mut selected = paths.clone();
     for depth in 0..=MAX_GENERATIONS {
         within(read_by)?;
-        if Selection::read(&selected)?.is_none() {
+        let Some(selection) = Selection::read(&selected)? else {
             break;
-        }
+        };
         if depth == MAX_GENERATIONS {
             return Err(fail());
+        }
+        if selection.complete != Some(seal(&selected)?) {
+            return Err(Error::new(
+                "Commons writer succession is still preserving old records",
+            ));
         }
         selected = candidate(&selected);
     }

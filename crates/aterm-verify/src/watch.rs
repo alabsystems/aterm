@@ -69,7 +69,11 @@ fn background_status(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt as _;
     match (status.code(), status.signal()) {
         (Some(code), _) => code,
-        (None, Some(signal)) if signal == libc::SIGINT || signal == libc::SIGTERM => 75,
+        (None, Some(signal))
+            if signal == libc::SIGHUP || signal == libc::SIGINT || signal == libc::SIGTERM =>
+        {
+            75
+        }
         (None, _) => crate::exit::COULD_NOT_RUN,
     }
 }
@@ -125,7 +129,8 @@ fn now() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
 
-/// The lane controller. An internal sample verb is always launched in its own process group.
+/// The lane controller. An internal sample bootstrap is always launched in its own process group;
+/// it replaces itself with the verifier built from the sampled head before orchestration begins.
 pub fn run(args: &[String], cwd: &Path) -> i32 {
     if args.first().is_some_and(|s| s == "--install") {
         return match options(&args[1..], cwd).and_then(|o| service::install(&o, cwd)) {
@@ -147,6 +152,19 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
                 Ok(false) => 75,
                 Err(why) => {
                     eprintln!("watch sample: {why}");
+                    3
+                }
+            },
+            None => 2,
+        };
+    }
+    if args.first().is_some_and(|s| s == "--sample-ready") {
+        return match args.get(1) {
+            Some(result) => match sample_ready(cwd, Path::new(result)) {
+                Ok(true) => 0,
+                Ok(false) => 75,
+                Err(why) => {
+                    eprintln!("watch sampled-head runner: {why}");
                     3
                 }
             },
@@ -416,6 +434,79 @@ fn sample_command(program: &Path) -> aterm_uds::spawnfd::Command {
     cmd
 }
 
+fn candidate_path(root: &Path) -> PathBuf {
+    root.join(".ubd/target.noindex/debug")
+        .join(format!("aterm-verify{}", std::env::consts::EXE_SUFFIX))
+}
+
+struct SampleExec {
+    program: PathBuf,
+    cwd: PathBuf,
+    args: Vec<std::ffi::OsString>,
+    removed: Vec<String>,
+    added: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+}
+
+impl SampleExec {
+    fn ready(root: &Path, result: &Path, stage2: &Path, path: &std::ffi::OsStr) -> Self {
+        Self {
+            program: candidate_path(root),
+            cwd: root.to_owned(),
+            args: vec![
+                "watch".into(),
+                "--sample-ready".into(),
+                result.as_os_str().to_owned(),
+            ],
+            removed: sample_removed_env(),
+            added: vec![
+                ("TRUST_STAGE2_BIN".into(), stage2.as_os_str().to_owned()),
+                ("PATH".into(), path.to_owned()),
+                (
+                    "CARGO_TARGET_DIR".into(),
+                    root.join(".ubd/target.noindex").into_os_string(),
+                ),
+            ],
+        }
+    }
+
+    fn exec(self) -> std::io::Error {
+        let here = match std::env::current_dir().and_then(fs::canonicalize) {
+            Ok(here) => here,
+            Err(error) => return error,
+        };
+        let cwd = match fs::canonicalize(&self.cwd) {
+            Ok(cwd) => cwd,
+            Err(error) => return error,
+        };
+        if here != cwd {
+            return std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "sample exec is in {}, expected {}",
+                    here.display(),
+                    cwd.display()
+                ),
+            );
+        }
+        let inherited: Vec<_> = std::env::vars_os()
+            .filter(|(name, _)| {
+                let name = name.to_string_lossy();
+                !self.removed.iter().any(|removed| {
+                    removed
+                        .strip_suffix('*')
+                        .map_or(name == removed.as_str(), |prefix| name.starts_with(prefix))
+                })
+            })
+            .collect();
+        let mut command = aterm_uds::spawnfd::transparent(&self.program);
+        command.args(&self.args).env_exactly(inherited);
+        for (name, value) in self.added {
+            command.env(name, value);
+        }
+        command.exec()
+    }
+}
+
 fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
     if !git(root, &["status", "--porcelain"])?.is_empty() {
         return Err("watch workspace is dirty; preserving its work".into());
@@ -434,6 +525,8 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
     let result = root.join(".git/watch-result.toml");
     let _ = fs::remove_file(&result);
     let log = root.join(".git/watch-sample.log");
+    // This controller may be long-lived. It launches only the tiny bootstrap in its own image;
+    // that bootstrap builds and execs this sampled head's verifier before any row is run.
     let mut cmd = sample_command(&std::env::current_exe().map_err(|e| e.to_string())?);
     cmd.current_dir(root)
         .args(["watch", "--sample"])
@@ -487,13 +580,11 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
         return Err(format!("sample exited {status}; see .git/watch-sample.log"));
     }
     let text = fs::read_to_string(result).map_err(|e| e.to_string())?;
-    record.rows = aterm_toml::from_str::<Sample>(&text)
-        .map_err(|e| e.to_string())?
-        .rows;
+    let sample = aterm_toml::from_str::<Sample>(&text).map_err(|e| e.to_string())?;
+    apply_sample(record, sample);
     if let Some(inputs) = record.rows.iter().find(|r| r.id == "inputs") {
         record.inputs = format!("compiler-pin={}\n{}", record.inputs, inputs.log);
     }
-    record.state = verdict(&record.rows).into();
     if let Err(why) = attribute(root, record)
         && let Some(row) = record.rows.last_mut()
     {
@@ -501,6 +592,13 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
             .push_str(&format!("\nsuspect attribution unavailable: {why}"));
     }
     Ok(())
+}
+
+fn apply_sample(record: &mut Record, sample: Sample) {
+    // The sampled-head image owns verdict semantics. The long-lived controller owns only the
+    // lease and append; recomputing here would silently restore its stale rules.
+    record.state = sample.state;
+    record.rows = sample.rows;
 }
 
 fn stop_sample(child: &mut aterm_uds::spawnfd::Child) -> Result<(), String> {
@@ -522,6 +620,7 @@ fn stop_sample(child: &mut aterm_uds::spawnfd::Child) -> Result<(), String> {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Sample {
+    state: String,
     rows: Vec<Row>,
 }
 
@@ -583,18 +682,44 @@ fn stage_need(id: &str, cores: u32) -> aterm_capacity::Need {
         .covers()
 }
 
-/// The already-built candidate verifier for the tree row. It starts directly, so it, not a
+fn candidate_build_command(
+    root: &Path,
+    targo: &Path,
+    stage2: &Path,
+    path: &std::ffi::OsStr,
+    cores: u32,
+    marker: &str,
+) -> crate::exec::Cmd {
+    crate::exec::Cmd::new(targo)
+        .args([
+            "--unverified",
+            "build",
+            "--locked",
+            "--profile",
+            "test",
+            "-p",
+            "aterm-verify",
+            "--bin",
+            "aterm-verify",
+        ])
+        .env("TRUST_STAGE2_BIN", stage2)
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", root.join(".ubd/target.noindex"))
+        .env("CARGO_BUILD_JOBS", cores.to_string())
+        .env("BUILD_SLOT_HELD", "1")
+        .env(aterm_capacity::COVER_ENV, marker)
+}
+
+/// The already-built sampled-head verifier for the tree row. It starts directly, so it, not a
 /// `targo run` wrapper, leads the cancellable process group and owns its Background claims.
 fn tree_command(
     root: &Path,
+    program: &Path,
     args: &[&str],
     stage2: &Path,
     path: &std::ffi::OsStr,
 ) -> crate::exec::Cmd {
-    let binary = root
-        .join(".ubd/target.noindex/debug")
-        .join(format!("aterm-verify{}", std::env::consts::EXE_SUFFIX));
-    crate::exec::Cmd::new(binary)
+    crate::exec::Cmd::new(program)
         .args(args.iter().copied())
         .env("TRUST_STAGE2_BIN", stage2)
         .env("PATH", path)
@@ -625,6 +750,135 @@ fn sample_removed_env() -> Vec<String> {
 
 fn sample(root: &Path, result: &Path) -> Result<bool, String> {
     use aterm_capacity::Machine as _;
+    crate::exec::group::kill_on_interrupt();
+    // This is the long-lived controller's only sampled work. Build the sampled head's verifier
+    // while this process leads the controller-owned group, then replace this image in place so
+    // every row, seal and verdict rule comes from the head being judged.
+    let next = {
+        let claim = match aterm_capacity::admit(
+            aterm_capacity::Need::new("verify watch sample bootstrap"),
+            aterm_capacity::Admit::Preemptible,
+        ) {
+            Ok(claim) => claim,
+            Err(aterm_capacity::Error::Stopped { .. }) => return Ok(false),
+            Err(why) => return Err(why.to_string()),
+        };
+        if claim.should_yield().map_err(|e| e.to_string())? {
+            return Ok(false);
+        }
+        let env = crate::EnvSnapshot::capture();
+        let tools = crate::preflight(&env, root)?;
+        let prefix = aterm_toolchain::atpkg_prefix(&env.home, env.xdg_config_home.as_deref());
+        let lease = aterm_toolchain::lease::hold_for(
+            &prefix,
+            &tools.stage2_dir,
+            "verify watch sampled-head bootstrap",
+            aterm_toolchain::lease::DEFAULT_WAIT,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        if let aterm_toolchain::lease::Hold::NotTaken(_, why) = &lease {
+            return Err(format!("compiler lease: {why}"));
+        }
+        let scratch = root.join(".git/watch-exec");
+        fs::create_dir_all(&scratch).map_err(|e| e.to_string())?;
+        let removed = sample_removed_env();
+        let removed_refs: Vec<&str> = removed.iter().map(String::as_str).collect();
+        let admitted_at = Instant::now();
+        let stage_claim = match aterm_capacity::admit(
+            stage_need("candidate", aterm_capacity::cores()),
+            aterm_capacity::Admit::Preemptible,
+        ) {
+            Ok(claim) => claim,
+            Err(aterm_capacity::Error::Stopped { .. }) => return Ok(false),
+            Err(why) => return Err(why.to_string()),
+        };
+        let admission_waiting_s = admitted_at.elapsed().as_secs_f64();
+        let granted_cores = stage_claim.cores();
+        let marker = stage_claim.record().cover_marker();
+        let direct_path = tools.path_with_stage2_first(&env.path);
+        let cmd = candidate_build_command(
+            root,
+            &tools.targo,
+            &tools.stage2_dir,
+            &direct_path,
+            granted_cores,
+            &marker,
+        );
+        let began = Instant::now();
+        let ran = crate::exec::run(
+            &cmd,
+            crate::exec::ExecEnv {
+                cwd: root,
+                path: &env.path,
+                scratch: &scratch,
+                child_ceiling: None,
+                remove_env: &removed_refs,
+                add_env: &[],
+                stage_groups: None,
+                host: &crate::exec::LiveHost,
+            },
+        );
+        fs::write(root.join(".git/watch-candidate.log"), &ran.output).map_err(|e| e.to_string())?;
+        if ran.code == Some(75) || crate::exec::group::stopping() {
+            return Ok(false);
+        }
+        if !ran.ok {
+            let mut row = row("tree", ran.code, &ran.output);
+            if let Some(why) = ran.environment_failure() {
+                row.outcome = "could-not-run".into();
+                row.red_items.clear();
+                row.log.push_str(&format!("\n{why}"));
+            }
+            row.log = format!(
+                "sampled-head verifier build: granted_cores={granted_cores} \
+             admission_waiting_s={admission_waiting_s} load1={:?} elapsed_s={}\n{}",
+                aterm_capacity::Live.read(None).load1,
+                began.elapsed().as_secs_f64(),
+                row.log
+            );
+            write_sample(result, vec![row])?;
+            return Ok(true);
+        }
+        // Returning only inert argv/env data makes this scope the cleanup proof: the stage claim,
+        // compiler lease and lifecycle claim are all dropped before an exec can skip destructors.
+        SampleExec::ready(
+            root,
+            result,
+            &tools.stage2_dir,
+            &tools.path_with_stage2_first(&env.path),
+        )
+    };
+    if foreground_waiting(root)? {
+        return Ok(false);
+    }
+    if !crate::exec::group::default_interrupts_for_exec() {
+        return Ok(false);
+    }
+    let error = next.exec();
+    crate::exec::group::kill_on_interrupt();
+    Err(format!(
+        "could not replace the bootstrap with the sampled-head verifier: {error}"
+    ))
+}
+
+fn write_sample(result: &Path, rows: Vec<Row>) -> Result<(), String> {
+    let state = verdict(&rows).to_owned();
+    let text = aterm_toml::to_string(&Sample { state, rows }).map_err(|e| e.to_string())?;
+    fs::write(result, text).map_err(|e| e.to_string())
+}
+
+fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
+    use aterm_capacity::Machine as _;
+    let current = fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let expected = fs::canonicalize(candidate_path(root)).map_err(|e| e.to_string())?;
+    if current != expected {
+        return Err(format!(
+            "sampled-head runner is {}, expected {}",
+            current.display(),
+            expected.display()
+        ));
+    }
     crate::exec::group::kill_on_interrupt();
     // The zero-resource claim gives a release authority to end the whole sample group even
     // between stages. Resource ownership belongs to each stage, where memory and CPU are one
@@ -669,85 +923,33 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
             return Ok(false);
         }
         let admitted_at = Instant::now();
-        let mut stage_claim = Some(
-            match aterm_capacity::admit(
-                stage_need(id, aterm_capacity::cores()),
-                aterm_capacity::Admit::Preemptible,
-            ) {
-                Ok(claim) => claim,
-                Err(aterm_capacity::Error::Stopped { .. }) => return Ok(false),
-                Err(why) => return Err(why.to_string()),
-            },
-        );
+        let stage_claim = if id == "tree" {
+            None
+        } else {
+            Some(
+                match aterm_capacity::admit(
+                    stage_need(id, aterm_capacity::cores()),
+                    aterm_capacity::Admit::Preemptible,
+                ) {
+                    Ok(claim) => claim,
+                    Err(aterm_capacity::Error::Stopped { .. }) => return Ok(false),
+                    Err(why) => return Err(why.to_string()),
+                },
+            )
+        };
         let admission_waiting_s = admitted_at.elapsed().as_secs_f64();
         let granted_cores = stage_claim.as_ref().map_or(0, aterm_capacity::Claim::cores);
-        let mut cmd = crate::exec::Cmd::new(&tools.targo);
-        let package = if args[0] == "ship" {
-            "aterm-release"
-        } else {
-            "aterm-verify"
-        };
-        if id == "tree" {
-            cmd = cmd.args([
-                "--unverified",
-                "build",
-                "--locked",
-                "--profile",
-                "test",
-                "-p",
-                package,
-                "--bin",
-                package,
-            ]);
-        } else {
-            cmd = cmd
-                .args([
-                    "--unverified",
-                    "run",
-                    "--locked",
-                    "--profile",
-                    "test",
-                    "-p",
-                    package,
-                    "--",
-                ])
-                .args(args[1..].iter().copied());
-        }
-        let stage_marker = stage_claim
-            .as_ref()
-            .map(|held| held.record().cover_marker())
-            .ok_or("watch stage has no resource claim")?;
-        cmd = cmd
-            .env("TRUST_STAGE2_BIN", &tools.stage2_dir)
-            .env("PATH", tools.path_with_stage2_first(&env.path))
-            .env("CARGO_TARGET_DIR", root.join(".ubd/target.noindex"))
-            .env("CARGO_BUILD_JOBS", granted_cores.to_string())
-            .env("BUILD_SLOT_HELD", "1")
-            .env(aterm_capacity::COVER_ENV, stage_marker);
         let log = root.join(format!(".git/watch-{id}.log"));
         let began = Instant::now();
-        let mut ran = crate::exec::run(
-            &cmd,
-            crate::exec::ExecEnv {
-                cwd: root,
-                path: &env.path,
-                scratch: &scratch,
-                child_ceiling: None,
-                remove_env: &removed_refs,
-                add_env: &[],
-                stage_groups: None,
-                host: &crate::exec::LiveHost,
-            },
-        );
-        if id == "tree" && ran.ok {
-            let build_output = std::mem::take(&mut ran.output);
-            // The candidate verifier owns each tree stage's combined memory/CPU claim. Drop the
-            // tool-build envelope before entering it, so no parent retains cores around those
-            // admissions.
-            drop(stage_claim.take());
+        let ran = if id == "tree" {
+            // The sampled-head verifier was built once by the bootstrap and is this process's
+            // own image. Its nested tree verifier owns each combined memory/CPU claim, so the
+            // sample retains no outer cores around those admissions.
+            assert!(stage_claim.is_none());
             let direct_path = tools.path_with_stage2_first(&env.path);
-            let direct = tree_command(root, &args[1..], &tools.stage2_dir, &direct_path);
-            ran = crate::exec::run(
+            let current = std::env::current_exe().map_err(|e| e.to_string())?;
+            let direct = tree_command(root, &current, &args[1..], &tools.stage2_dir, &direct_path);
+            let mut ran = crate::exec::run(
                 &direct,
                 crate::exec::ExecEnv {
                     cwd: root,
@@ -760,8 +962,47 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
                     host: &crate::exec::LiveHost,
                 },
             );
-            ran.output.insert_str(0, &build_output);
-        }
+            if let Ok(build_output) = fs::read_to_string(root.join(".git/watch-candidate.log")) {
+                ran.output.insert_str(0, &build_output);
+            }
+            ran
+        } else {
+            let stage_marker = stage_claim
+                .as_ref()
+                .map(|held| held.record().cover_marker())
+                .ok_or("watch stage has no resource claim")?;
+            let cmd = crate::exec::Cmd::new(&tools.targo)
+                .args([
+                    "--unverified",
+                    "run",
+                    "--locked",
+                    "--profile",
+                    "test",
+                    "-p",
+                    "aterm-release",
+                    "--",
+                ])
+                .args(args[1..].iter().copied())
+                .env("TRUST_STAGE2_BIN", &tools.stage2_dir)
+                .env("PATH", tools.path_with_stage2_first(&env.path))
+                .env("CARGO_TARGET_DIR", root.join(".ubd/target.noindex"))
+                .env("CARGO_BUILD_JOBS", granted_cores.to_string())
+                .env("BUILD_SLOT_HELD", "1")
+                .env(aterm_capacity::COVER_ENV, stage_marker);
+            crate::exec::run(
+                &cmd,
+                crate::exec::ExecEnv {
+                    cwd: root,
+                    path: &env.path,
+                    scratch: &scratch,
+                    child_ceiling: None,
+                    remove_env: &removed_refs,
+                    add_env: &[],
+                    stage_groups: None,
+                    host: &crate::exec::LiveHost,
+                },
+            )
+        };
         fs::write(&log, &ran.output).map_err(|e| e.to_string())?;
         if ran.code == Some(75) || crate::exec::group::stopping() {
             return Ok(false);
@@ -795,8 +1036,7 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
             break;
         }
     }
-    let text = aterm_toml::to_string(&Sample { rows }).map_err(|e| e.to_string())?;
-    fs::write(result, text).map_err(|e| e.to_string())?;
+    write_sample(result, rows)?;
     Ok(true)
 }
 
@@ -1204,6 +1444,10 @@ mod tests {
     fn a_rehomed_candidates_signal_remains_a_cancellation() {
         use std::os::unix::process::ExitStatusExt as _;
         assert_eq!(
+            background_status(std::process::ExitStatus::from_raw(libc::SIGHUP)),
+            75
+        );
+        assert_eq!(
             background_status(std::process::ExitStatus::from_raw(libc::SIGINT)),
             75
         );
@@ -1218,6 +1462,117 @@ mod tests {
         assert_eq!(
             background_status(std::process::ExitStatus::from_raw(libc::SIGKILL)),
             crate::exit::COULD_NOT_RUN
+        );
+    }
+    #[test]
+    fn an_exec_handoff_leaves_each_interrupt_at_its_default_disposition() {
+        const CHILD: &str = "ATERM_VERIFY_EXEC_INTERRUPT_HANDOFF_TEST";
+        const TEST: &str =
+            "watch::tests::an_exec_handoff_leaves_each_interrupt_at_its_default_disposition";
+        if std::env::var_os(CHILD).is_some() {
+            crate::exec::group::kill_on_interrupt();
+            assert!(crate::exec::group::default_interrupts_for_exec());
+            for signal in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+                // SAFETY: setting one valid signal to SIG_DFL; the returned disposition is the
+                // one the production handoff left there, and this keeps the same disposition.
+                let previous = unsafe { libc::signal(signal, libc::SIG_DFL) };
+                assert_eq!(previous, libc::SIG_DFL, "signal {signal}");
+            }
+            return;
+        }
+        let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--test-threads=1"])
+            .env(CHILD, "1");
+        let output = aterm_uds::deadline::output_until(
+            &mut command,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .expect("the disposition probe must finish before the hang detector");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    #[test]
+    fn the_sample_bootstrap_execs_the_sampled_head_image() {
+        const MODE: &str = "ATERM_VERIFY_SAMPLE_EXEC_TEST_MODE";
+        const CANDIDATE: &str = "ATERM_VERIFY_SAMPLE_EXEC_TEST_CANDIDATE";
+        const TEST: &str = "watch::tests::the_sample_bootstrap_execs_the_sampled_head_image";
+        match std::env::var(MODE).as_deref() {
+            Ok("candidate") => {
+                let pid = i32::try_from(std::process::id()).unwrap();
+                // SAFETY: the integer queries name this process.
+                let (group, session) = unsafe { (libc::getpgrp(), libc::getsid(0)) };
+                println!(
+                    "sampled-head-image={} topology={pid}:{group}:{session}",
+                    std::env::current_exe().unwrap().display(),
+                );
+                return;
+            }
+            Ok("controller") => {
+                let next = SampleExec {
+                    program: PathBuf::from(std::env::var_os(CANDIDATE).expect("candidate path")),
+                    cwd: std::env::current_dir().expect("current directory"),
+                    args: ["--exact", TEST, "--nocapture"]
+                        .map(std::ffi::OsString::from)
+                        .into(),
+                    removed: Vec::new(),
+                    added: vec![(MODE.into(), "candidate".into())],
+                };
+                panic!("sampled-head exec failed: {}", next.exec());
+            }
+            _ => {}
+        }
+
+        let mut scratch = aterm_uds::deadline::KeptUntilRan::new(
+            aterm_tempfile::tempdir().expect("scratch").keep(),
+        );
+        let name = std::env::current_exe()
+            .expect("test binary")
+            .file_name()
+            .expect("test binary name")
+            .to_owned();
+        let controller = scratch.path().join("controller").join(&name);
+        let candidate = scratch.path().join("candidate").join(&name);
+        fs::create_dir_all(controller.parent().unwrap()).unwrap();
+        fs::create_dir_all(candidate.parent().unwrap()).unwrap();
+        let source = std::env::current_exe().expect("test binary");
+        aterm_uds::deadline::ad_hoc_copy(&source, &controller);
+        aterm_uds::deadline::ad_hoc_copy(&source, &candidate);
+        let mut command = sample_command(&controller);
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(MODE, "controller")
+            .env(CANDIDATE, &candidate);
+        let output = aterm_uds::deadline::output_until(
+            &mut command,
+            Instant::now() + Duration::from_secs(60),
+        )
+        .expect("the exec proof must finish before the hang detector");
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let proof = format!("sampled-head-image={}", candidate.display());
+        assert!(text.contains(&proof), "{text}");
+        let topology = text
+            .split("topology=")
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .expect("candidate topology proof");
+        let ids: Vec<_> = topology.split(':').collect();
+        assert_eq!(ids.len(), 3, "{text}");
+        assert_eq!(ids[0], ids[1], "the exec changed process group: {text}");
+        assert_eq!(ids[0], ids[2], "the exec changed session: {text}");
+        scratch.ran();
+        assert!(output.status.success(), "{text}");
+        assert!(
+            !text.contains(&format!("sampled-head-image={}", controller.display())),
+            "the stale controller image handled sample-ready: {text}"
         );
     }
     #[test]
@@ -1647,9 +2002,46 @@ mod tests {
         assert!(stage_should_yield(Path::new("/sample"), &[row]));
     }
     #[test]
-    fn the_tree_stage_runs_the_candidate_verifier_without_an_outer_slot() {
+    fn the_sampled_verifier_is_built_once_then_reused_without_an_outer_slot() {
+        let ready = SampleExec::ready(
+            Path::new("/repo"),
+            Path::new("/repo/.git/result"),
+            Path::new("/trust/bin"),
+            std::ffi::OsStr::new("/trust/bin:/usr/bin"),
+        );
+        let candidate = candidate_path(Path::new("/repo"));
+        assert_eq!(ready.program, candidate);
+        assert_eq!(
+            ready.args,
+            ["watch", "--sample-ready", "/repo/.git/result"].map(std::ffi::OsString::from)
+        );
+        let build = candidate_build_command(
+            Path::new("/repo"),
+            Path::new("/trust/bin/targo"),
+            Path::new("/trust/bin"),
+            std::ffi::OsStr::new("/trust/bin:/usr/bin"),
+            7,
+            "claim",
+        );
+        assert_eq!(
+            build.argv(),
+            [
+                "/trust/bin/targo",
+                "--unverified",
+                "build",
+                "--locked",
+                "--profile",
+                "test",
+                "-p",
+                "aterm-verify",
+                "--bin",
+                "aterm-verify",
+            ]
+            .map(str::to_owned)
+        );
         let command = tree_command(
             Path::new("/repo"),
+            &candidate,
             &["release", "--tree", "--background"],
             Path::new("/trust/bin"),
             std::ffi::OsStr::new("/trust/bin:/usr/bin"),
@@ -1782,6 +2174,43 @@ mod tests {
             row("tree", Some(1), "  FAIL -p agh --lib jq_all").red_items,
             ["-p agh --lib jq_all"]
         );
+    }
+    #[test]
+    fn the_controller_accepts_the_sampled_heads_verdict_without_recomputing_it() {
+        let rows = [
+            "inputs",
+            "stable-x86_64",
+            "tree",
+            "export",
+            "cut",
+            "inputs-end",
+        ]
+        .map(|id| row(id, Some(0), "ok"))
+        .into();
+        let mut record = Record {
+            commit: "commit".into(),
+            tree: "tree".into(),
+            host: "host".into(),
+            verifier: "old-controller".into(),
+            inputs: String::new(),
+            token: "token".into(),
+            state: "judging".into(),
+            started: 1,
+            updated: 1,
+            lease_until: 2,
+            rows: Vec::new(),
+        };
+        apply_sample(
+            &mut record,
+            Sample {
+                // Deliberately disagree with the old controller's `verdict(&rows)` result. A
+                // mutation that recomputes here turns this pass and is caught.
+                state: "red".into(),
+                rows,
+            },
+        );
+        assert_eq!(record.state, "red");
+        assert_eq!(record.rows.len(), 6);
     }
     #[test]
     fn changed_or_missing_input_seals_cannot_qualify_a_sample() {

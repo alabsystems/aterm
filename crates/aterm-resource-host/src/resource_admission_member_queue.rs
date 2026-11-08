@@ -604,7 +604,7 @@ impl Owner {
                                 )
                             } else {
                                 let input: io::Result<metadata::Preparation> = (|| {
-                                    let deadline = Instant::now() + Duration::from_secs(30);
+                                    let deadline = native_inputs::deadline(Instant::now());
                                     if let Some(request) = &pending.linker {
                                         let held = job
                                             .metadata_sdk
@@ -663,7 +663,7 @@ impl Owner {
                                         if let Some(pause) = pause {
                                             pause.wait()?;
                                         }
-                                        input?.run(Instant::now() + Duration::from_secs(30))
+                                        input?.run(native_inputs::deadline(Instant::now()))
                                     });
                                 match worker {
                                     Ok(worker) => {

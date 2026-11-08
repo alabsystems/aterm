@@ -206,6 +206,8 @@ mod models_native_noexec_recovery;
 pub use models_native_noexec_recovery::native_noexec_recovery_model;
 mod models_receipt_acknowledgement;
 pub use models_receipt_acknowledgement::receipt_acknowledgement_model;
+mod models_exec_revocation;
+pub use models_exec_revocation::exec_revocation_model;
 mod models_receipt_creation;
 pub use models_receipt_creation::receipt_creation_model;
 mod models_receipt_index;

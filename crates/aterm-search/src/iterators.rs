@@ -147,6 +147,14 @@ impl<'a> CandidateSource<'a> {
 
 /// Merge compressed lists monotonically, retaining the unmatched value in each cursor.
 fn next_intersection(cursors: &mut [PostingCursor<'_>], backward: bool) -> Option<u32> {
+    // One positioned list is already the intersection; no alignment is needed.
+    if let [cursor] = cursors {
+        return if backward {
+            cursor.next_back()
+        } else {
+            cursor.next()
+        };
+    }
     let mut target = cursors.first()?.peek(backward)?;
     'align: loop {
         for cursor in cursors.iter_mut() {

@@ -109,17 +109,6 @@ pub const FABRIC_IO_WAIT: (&str, Duration) = (
     Duration::from_secs(DEADLINE.as_secs() / 2),
 );
 
-/// How long `aterm fabric on` waits for the broker a test's stand-in launchd or systemd started
-/// to answer (`ATERM_FABRIC_BIND_DEADLINE_MS`, the product's 5 s), for a command whose property
-/// is not latency: the stand-in starts a debug `aterm link broker` on the test's loaded machine,
-/// which can take past 5 s to bind. Half of [`DEADLINE`], so an `on` whose broker never binds
-/// says so before the harness's bound on the command ([`output_within`]) ends the test. Set by
-/// [`prepare_gui_environment`] and [`scratch_spawnfd`].
-pub const BIND_WAIT: (&str, Duration) = (
-    "ATERM_FABRIC_BIND_DEADLINE_MS",
-    Duration::from_secs(DEADLINE.as_secs() / 2),
-);
-
 /// How long a test's bridge reads a broker subscription with nothing arriving before it takes
 /// the link for dead: its live read deadline seam (`ATERM_LINK_LIVE_DEADLINE_MS`; astream's
 /// `IDLE_MARK_DEADLINE`, 30 s, in the product) set to the hang detector, beside [`ACK_WAIT`]
@@ -422,13 +411,7 @@ pub fn prepare_gui_environment(cmd: &mut Command) {
 
 /// The bounds every child of a test has in place of the product's ([`prepare_gui_environment`],
 /// [`scratch_spawnfd`]).
-const TEST_WAITS: [(&str, Duration); 5] = [
-    STALE_HORIZON,
-    ACK_WAIT,
-    LIVE_WAIT,
-    FABRIC_IO_WAIT,
-    BIND_WAIT,
-];
+const TEST_WAITS: [(&str, Duration); 4] = [STALE_HORIZON, ACK_WAIT, LIVE_WAIT, FABRIC_IO_WAIT];
 
 /// The sleep every instance a test starts reads in its hosted harness loops
 /// ([`aterm_types::domain::ENV_DEBUG_HOST_SLEEP`]), set where [`TEST_WAITS`] are: none, a host

@@ -583,13 +583,31 @@ fn tree_any(
     Some(false)
 }
 
-/// macOS: list the group (`proc_listpgrppids`), then read each member's
+/// macOS: list the group ([`darwin_group_members`]), then read each member's
 /// status ([`darwin_member_status`], `PROC_PIDT_SHORTBSDINFO`).
 #[cfg(target_os = "macos")]
 fn darwin_group_has_stopped_member(pgid: i32) -> bool {
+    /// `SSTOP` from `<sys/proc.h>`.
+    const SSTOP: u32 = aterm_uds::process::BsdShortInfo::SSTOP;
+    darwin_group_members(pgid).is_some_and(|pids| {
+        pids.into_iter()
+            .any(|pid| darwin_member_status(pid) == Some((SSTOP, pgid)))
+    })
+}
+
+/// Cap on the members [`darwin_group_members`] lists for one group.
+#[cfg(target_os = "macos")]
+pub(crate) const DARWIN_GROUP_MEMBERS_MAX: usize = 4096;
+
+/// macOS: the positive pids of group `pgid` (`proc_listpgrppids`), the first
+/// [`DARWIN_GROUP_MEMBERS_MAX`] of a group that has that many or more. Empty both for a group with
+/// no member and for a listing libproc refused, which it answers with no pid; `None` only for a
+/// negative answer.
+#[cfg(target_os = "macos")]
+pub(crate) fn darwin_group_members(pgid: i32) -> Option<Vec<libc::pid_t>> {
     // SAFETY (declaration): libproc in libSystem exports this with exactly this signature
-    // (`<libproc.h>`): a pgid, a buffer of `buffersize` bytes, and the number of pids written, or
-    // -1.
+    // (`<libproc.h>`): a pgid, a buffer of `buffersize` bytes, and the number of pids written (0
+    // also when it refuses the listing).
     unsafe extern "C" {
         fn proc_listpgrppids(
             pgrpid: libc::pid_t,
@@ -597,30 +615,20 @@ fn darwin_group_has_stopped_member(pgid: i32) -> bool {
             buffersize: libc::c_int,
         ) -> libc::c_int;
     }
-    /// `SSTOP` from `<sys/proc.h>`.
-    const SSTOP: u32 = aterm_uds::process::BsdShortInfo::SSTOP;
-    /// Cap on members inspected for a single foreground job.
-    const MAX_MEMBERS: usize = 4096;
     let mut capacity = 64_usize;
     let pids = loop {
         let mut pids: Vec<libc::pid_t> = vec![0; capacity];
-        let Ok(bytes) = libc::c_int::try_from(capacity * std::mem::size_of::<libc::pid_t>()) else {
-            return false;
-        };
+        let bytes = libc::c_int::try_from(capacity * std::mem::size_of::<libc::pid_t>()).ok()?;
         // SAFETY: `pids` holds exactly `bytes` bytes and outlives the call, which writes at most that many and answers how many pids it wrote.
         let n = unsafe { proc_listpgrppids(pgid, pids.as_mut_ptr().cast(), bytes) };
-        let Ok(n) = usize::try_from(n) else {
-            return false;
-        };
-        if n < capacity || capacity >= MAX_MEMBERS {
+        let n = usize::try_from(n).ok()?;
+        if n < capacity || capacity >= DARWIN_GROUP_MEMBERS_MAX {
             pids.truncate(n.min(capacity));
             break pids;
         }
         capacity *= 4;
     };
-    pids.into_iter()
-        .filter(|pid| *pid > 0)
-        .any(|pid| darwin_member_status(pid) == Some((SSTOP, pgid)))
+    Some(pids.into_iter().filter(|pid| *pid > 0).collect())
 }
 
 /// macOS: one process's `(p_stat, pgid)`, `None` when it cannot be read (it exited).

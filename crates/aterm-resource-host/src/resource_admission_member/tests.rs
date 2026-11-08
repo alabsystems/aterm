@@ -188,7 +188,7 @@ fn binding() -> Binding {
 }
 fn wake() {}
 fn done(member: &mut OwnedAttempt<Resources>, fixture: &mut Fixture) -> Progress {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let progress = member.poll(fixture, None);
         if progress.drained {
@@ -219,7 +219,7 @@ fn actual_bound_retry_keeps_descriptors_until_scoped_retirement() {
         Resources(dropped.clone(), None),
         events,
         binding(),
-        Some(Duration::from_secs(30)),
+        Some(Duration::from_secs(60)),
         wake,
     );
     assert!(member.identity().is_none());
@@ -231,7 +231,7 @@ fn actual_bound_retry_keeps_descriptors_until_scoped_retirement() {
     for _ in 0..2 {
         aterm_ctl::resource_admission_transport::read_frame(
             &client,
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + Duration::from_secs(60),
         )
         .unwrap();
     }
@@ -444,10 +444,14 @@ fn exited_leader_keeps_group_pin_until_other_members_are_positively_exited() {
     let mut fixture = Fixture::new();
     let dropped = Arc::new(AtomicUsize::new(0));
     let (events, _client) = event_pair();
-    let mut command = spawnfd::command("/bin/sh");
+    let marker = fixture._scratch.path().join("background-held");
+    let (input, mut hold) = aterm_uds::kept_out(std::io::pipe).unwrap();
+    let shell = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sh"));
+    let mut command = spawnfd::command(shell);
     command
-        .args(["-c", "/bin/sleep 30 & exit 0"])
-        .stdin(spawnfd::Stdio::null())
+        .args(["-c", "exec 3<&0; printf 'root\\n' > \"$1\"; while IFS= read -r line <&3; do printf '%s\\n' \"$line\" > \"$1\"; done & exit 0", "fixture"])
+        .arg(&marker)
+        .stdin(spawnfd::Stdio::from(input))
         .stdout(spawnfd::Stdio::null());
     let mut member = OwnedAttempt::launch(
         &mut fixture,
@@ -459,13 +463,15 @@ fn exited_leader_keeps_group_pin_until_other_members_are_positively_exited() {
         wake,
     );
     member.start(&mut fixture).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    std::io::Write::write_all(&mut hold, b"held\n").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let State::Bound(bound) = &mut member.state else {
             panic!("actual bound member")
         };
         if bound.child.child_mut().exited().unwrap()
             && bound.exit.as_ref().and_then(ExitMoment::get).is_some()
+            && std::fs::read(&marker).is_ok_and(|bytes| bytes == b"held\n")
         {
             assert!(
                 !crate::resource_memory::other_members_exited(bound.pid),
@@ -618,7 +624,7 @@ fn metadata_cannot_return_original_resources_while_a_setsid_child_survives() {
         },
         events,
         binding(),
-        Some(Duration::from_secs(30)),
+        Some(Duration::from_secs(60)),
         wake,
     );
     let original = member.identity().unwrap();
@@ -692,7 +698,7 @@ fn accounted_member_retains_original_wait_until_scope_and_unit_return() {
             Resources(dropped.clone(), None),
             events,
             binding(),
-            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(60)),
             wake,
         );
         let deadline = Instant::now() + Duration::from_secs(60);

@@ -11,7 +11,7 @@ use aterm_db::accounts::proposals::{Proposals, Snapshot};
 use aterm_db::database::Change;
 use aterm_net::lan::{Multicast, Scope};
 use aterm_secrets::client::{self, JoinOptions, JoinPassword, Paths};
-use aterm_secrets::commons::bootstrap::Bootstrap;
+use aterm_secrets::commons::{bootstrap::Bootstrap, journal::Journal};
 use aterm_types::network_state::Visibility;
 use aterm_uds::spawnfd::{Child, Stdio};
 use std::io::Write as _;
@@ -149,6 +149,30 @@ impl Drop for Node {
     fn drop(&mut self) {
         aterm_uds::deadline::kill_within(&mut self.0, HANG);
     }
+}
+
+fn stop_hosts(node: Node, window: &mut Instance, out: &Path, name: &str) -> Result<(), Fail> {
+    let node_pid = node.0.id();
+    let window_pid = window.aterm_pid();
+    let window = window.stop();
+    let node = node.stop();
+    let saved = save(
+        out,
+        name,
+        &aterm_json::json!({
+            "stopped": window.is_ok() && node.is_ok(),
+            "window_pid": window_pid,
+            "window_stopped": window.is_ok(),
+            "window_error": window.as_ref().err(),
+            "node_pid": node_pid,
+            "node": node.as_ref().ok(),
+            "node_error": node.as_ref().err().map(|error| aterm_json::json!({
+                "code": error.code, "message": error.msg.as_deref(), "signal": error.stopped,
+            })),
+        }),
+    );
+    crate::instance::after_stop(node.map(|_| ()), window)?;
+    saved
 }
 
 fn start_window(
@@ -429,10 +453,14 @@ pub fn cmd(args: &[String]) -> Res {
         None
     };
     let before = Bootstrap::required(&paths[1]).map_err(fail)?;
-    if before.witness().map_err(fail)?.is_some()
+    let before_journal =
+        Journal::read_existing(before.journal_dir(), before.trust()).map_err(fail)?;
+    before.revalidate_custody().map_err(fail)?;
+    // No signed binding witness or membership log grants this device admission. Do not ask
+    // it to decrypt the existing roster: an unadmitted device has no key for that payload.
+    if before.witness_in(&before_journal).map_err(fail)?.is_some()
         || before.log_witness().map_err(fail)?.is_some()
         || before.is_log_backed().map_err(fail)?
-        || before.access().is_ok_and(|access| access.is_some())
         || paths[1].records_file().exists()
         || paths[1].dir.join("commons/tables").exists()
     {
@@ -457,6 +485,7 @@ pub fn cmd(args: &[String]) -> Res {
             "suppressed": suppressed,
         }),
     )?;
+    drop(before_journal);
     drop(before);
 
     let mut node = Node::start(&source, &aterm, port, "node.log")?;
@@ -507,8 +536,7 @@ pub fn cmd(args: &[String]) -> Res {
     application.received(&paths[0], &configs[0], &rows, &out, "table-reverse.json")?;
     let (reverse, reverse_value) = publish(&paths[1], 2, "reverse")?;
     received(&paths[0], reverse, "reverse", &reverse_value, &out)?;
-    drop(window);
-    drop(node);
+    stop_hosts(node, &mut window, &out, "before-offline-cleanup.json")?;
 
     let (after_restart, after_restart_value) = publish(&paths[0], 3, "after-restart")?;
     let (generic_after_restart, value) = application.write(&paths[0], "after-restart")?;
@@ -554,7 +582,7 @@ pub fn cmd(args: &[String]) -> Res {
     conflict.received(&paths[0], &out, "conflict-source-final.json")?;
     conflict.received(&paths[1], &out, "conflict-recipient-final.json")?;
     image(&window, &out, "restarted.png")?;
-    let (node, window, peer_cycle) = if matches!(mode, Mode::PeerCycle { .. }) {
+    let (node, mut window, peer_cycle) = if matches!(mode, Mode::PeerCycle { .. }) {
         peer_cycle::Cycle {
             source: &source,
             recipient: &restarted,
@@ -604,29 +632,35 @@ pub fn cmd(args: &[String]) -> Res {
         save(&out, "observed-live.json", &observed)?;
         image(&window, &out, "observed.png")?;
     }
-    save(
-        &out,
-        "result.json",
-        &aterm_json::json!({
-            "passed": true,
-            "ordinary_window": true,
-            "ordinary_node_serve": true,
-            "loopback_only": true,
-            "log_backed": log_backed,
-            "genesis": genesis.map(|signed| aterm_codec::hex::encode_lower(&signed.digest)),
-            "application_table": application.id(),
-            "application_rows": rows.len(),
-            "fresh_table_after_startup": true,
-            "forward": aterm_codec::hex::encode_lower(&forward),
-            "reverse": aterm_codec::hex::encode_lower(&reverse),
-            "after_restart": aterm_codec::hex::encode_lower(&after_restart),
-            "offline_conflict": conflict.summary(),
-            "peer_cycle": peer_cycle,
-            "local_follower": local_follower,
-            "runtime_constructed_by_lab": false,
-            "repair_driven_by_lab": false,
-        }),
-    )?;
+    let mut result = aterm_json::json!({
+        "passed": false,
+        "application_passed": true,
+        "ordinary_window": true,
+        "ordinary_node_serve": true,
+        "loopback_only": true,
+        "log_backed": log_backed,
+        "genesis": genesis.map(|signed| aterm_codec::hex::encode_lower(&signed.digest)),
+        "application_table": application.id(),
+        "application_rows": rows.len(),
+        "fresh_table_after_startup": true,
+        "forward": aterm_codec::hex::encode_lower(&forward),
+        "reverse": aterm_codec::hex::encode_lower(&reverse),
+        "after_restart": aterm_codec::hex::encode_lower(&after_restart),
+        "offline_conflict": conflict.summary(),
+        "peer_cycle": peer_cycle,
+        "local_follower": local_follower,
+        "runtime_constructed_by_lab": false,
+        "repair_driven_by_lab": false,
+    });
+    save(&out, "application-result.json", &result)?;
+    let stopped = stop_hosts(node, &mut window, &out, "final-cleanup.json");
+    result
+        .as_object_mut()
+        .expect("result is an object")
+        .insert("passed".into(), aterm_json::json!(stopped.is_ok()));
+    let saved = save(&out, "result.json", &result);
+    stopped?;
+    saved?;
     println!("commons-startup PASS output={}", out.display());
     Ok(0)
 }

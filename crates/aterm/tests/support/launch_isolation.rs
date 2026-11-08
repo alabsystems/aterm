@@ -64,12 +64,6 @@ pub const HOST_SLEEP: &str = aterm_types::domain::ENV_DEBUG_HOST_SLEEP;
 /// host held past the shipped 250 ms read its folder as one that did not answer.
 pub const FOLDER_CHECK_WITHIN: &str = "ATERM_DEBUG_FOLDER_CHECK_WITHIN_MS";
 
-/// The development seam setting, in milliseconds, how long an instance's control verb waits for
-/// its main thread's reply (`aterm-gui`'s `control_media::MAIN_THREAD_REPLY_SEAM`): [`apply`] sets
-/// it to the hang detector, since a test's instance runs on its own machine and its main thread
-/// answers, and a loaded host that held a reply past the shipped 30 s failed the verb.
-pub const MAIN_REPLY_WITHIN: &str = "ATERM_DEBUG_MAIN_REPLY_WITHIN_MS";
-
 /// Config disabling automatic update, package, and agent supervisor lanes ([`HARNESS_OFF`]).
 /// Its `[packages] enabled = false` is also atpkg's no to unattended installs
 /// (`atpkg::adoption::unattended_install_off`), so a worker spawned in a world built on it runs the
@@ -238,10 +232,6 @@ pub fn apply(cmd: &mut Command, root: &Path) {
         .env(HOST_SLEEP, "none")
         .env(
             FOLDER_CHECK_WITHIN,
-            aterm_spec::wait::MUST_HAPPEN.as_millis().to_string(),
-        )
-        .env(
-            MAIN_REPLY_WITHIN,
             aterm_spec::wait::MUST_HAPPEN.as_millis().to_string(),
         );
     #[cfg(unix)]

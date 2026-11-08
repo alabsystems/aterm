@@ -123,6 +123,8 @@ pub(crate) fn prep_name(image: &str, prep: &Prep) -> String {
 pub const USAGE: &str = "\
 targo --unverified lab mac <verb> — the macOS guest lane: a disposable tart VM (Apple's Virtualization framework)
   provision     locate Tart or fetch the pinned version when absent; no app build, image pull, VM clone or boot
+  commons-startup --aterm FILE --record NEW_DIR [--image REF]
+                the existing guarded Commons startup component in one disposable guest; see `mac commons-startup --help`
   dmg [--image REF] [--fda] [--keep]
                 the disk-image acceptance in a fresh guest: atpkg's, aterm-containment's, aterm-uds' and
                 aterm-update's dmg_acceptance benches, built here with --no-run (nothing is attached on this
@@ -151,6 +153,7 @@ pub const CLEAN_USAGE: &str = "\
 pub fn cmd_mac(args: &[String]) -> Res {
     match args.first().map(String::as_str) {
         Some("provision") => cmd_provision(&args[1..]),
+        Some("commons-startup") => crate::mac_commons_startup::cmd(&args[1..]),
         Some("dmg") => cmd_dmg(&args[1..]),
         Some("nux") => crate::mac_nux::cmd_nux(&args[1..]),
         Some("runtime") => crate::mac_runtime::run(&args[1..]),

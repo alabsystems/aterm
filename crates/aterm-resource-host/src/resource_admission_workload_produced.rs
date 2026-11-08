@@ -223,7 +223,7 @@ fn validate(job: &mut Job, peer: Peer, request: &wire::Registration) -> io::Resu
         + job
             .timeout
             .ok_or_else(|| refused("registration root deadline unavailable"))?)
-    .min(Instant::now() + Duration::from_secs(30));
+    .min(native_inputs::deadline(Instant::now()));
     if Instant::now() >= deadline {
         return Err(io::ErrorKind::TimedOut.into());
     }

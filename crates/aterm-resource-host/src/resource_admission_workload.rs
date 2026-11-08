@@ -30,6 +30,18 @@ pub(crate) use produced::RegistrationPending;
 
 pub(super) const PRIMARY_TARGET: i32 = 6;
 
+pub(super) fn compiler_input(
+    sdk: &sdk::Keeper,
+    root_deadline: Instant,
+    started: Instant,
+) -> io::Result<(
+    Arc<trust_resource_provenance::program::HeldProgram>,
+    Instant,
+)> {
+    let deadline = root_deadline.min(native_inputs::deadline(started));
+    Ok((sdk.workload_compiler(deadline)?, deadline))
+}
+
 pub(super) fn purpose(request: &aterm_types::resource_admission::Submission) -> bool {
     request
         .argv
@@ -583,8 +595,7 @@ impl Owner {
             + job
                 .timeout
                 .ok_or_else(|| refused("original workload deadline unavailable"))?;
-        let deadline = root_deadline.min(Instant::now() + Duration::from_secs(2));
-        let compiler = sdk.workload_compiler(deadline)?;
+        let (compiler, deadline) = compiler_input(sdk, root_deadline, Instant::now())?;
         let mut compiler_sha = [0; 32];
         if !aterm_codec::hex::decode_into(
             compiler.observation().executable.sha256.as_bytes(),

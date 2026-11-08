@@ -4,11 +4,12 @@
 //! Manual allocation-traffic comparison for grid row and frame preparation.
 //! Fixture entry points stay separate so inlining into one main does not couple sibling measurements.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::System;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+use aterm_bench::allocator::{Observed, Observer};
 use aterm_core::scrollback::Scrollback;
 use aterm_core::terminal::Terminal;
 
@@ -17,34 +18,16 @@ static BYTES: AtomicU64 = AtomicU64::new(0);
 
 struct Counting;
 
-fn note(bytes: usize) {
-    CALLS.fetch_add(1, Ordering::Relaxed);
-    BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
-}
-
-// SAFETY: every operation forwards the caller's pointer and layout to System unchanged;
-// the counters use only nonallocating atomic arithmetic.
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note(layout.size());
-        // SAFETY: forwarding the caller's layout unchanged.
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        note(size);
-        // SAFETY: ptr and layout came from System through this allocator.
-        unsafe { System.realloc(ptr, layout, size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        // SAFETY: ptr and layout came from System through this allocator.
-        unsafe { System.dealloc(ptr, layout) }
+// SAFETY: the callback uses only nonallocating, nonpanicking atomic arithmetic.
+unsafe impl Observer for Counting {
+    fn requested(&self, bytes: usize) {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
     }
 }
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOC: Observed<System, Counting> = Observed::new(System, Counting);
 
 #[cfg(target_os = "macos")]
 fn instructions() -> Option<u64> {

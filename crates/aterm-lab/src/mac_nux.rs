@@ -6717,7 +6717,42 @@ pub fn cmd_nux(args: &[String]) -> Res {
         .filter(|i| !i.is_empty())
         .unwrap_or_else(|| crate::mac::IMAGE.to_owned());
     let ask = parse(args, image)?;
+    let runnable: Vec<_> = ask
+        .scenarios
+        .iter()
+        .copied()
+        .filter(|scenario| scenario.not_run().is_none())
+        .collect();
+    if runnable.is_empty() {
+        let mut rows = Vec::new();
+        for &scenario in &ask.scenarios {
+            for _ in 0..ask.repeat {
+                stop::check()?;
+                let row = Row::refused(
+                    scenario,
+                    &not_run(scenario.not_run().expect("no selected row can run")),
+                );
+                println!("{}", table("", std::slice::from_ref(&row)).trim());
+                rows.push(row);
+            }
+        }
+        return finish_nux(
+            &ask,
+            "### lab mac nux\n\nNo guest or artifacts prepared: no selected row can run.",
+            &rows,
+        );
+    }
+    let reads_tree = runnable.iter().any(|s| s.reads_tree());
+    let prep = crate::mac::Prep {
+        fda: false,
+        no_clt: ask.no_clt,
+        // The reader reads dialogs, and the tree rows' helper a window's tree, through the person
+        // base's Accessibility grant.
+        person: (ask.person || ask.reader || reads_tree).then(|| GUEST_HELPER.to_owned()),
+        lan_allow: runnable.contains(&Scenario::LanAllowed),
+    };
     let tart = crate::mac::tart_to_run()?;
+    pull_room(&tart, &ask.image, &crate::mac::prep_name(&ask.image, &prep))?;
     crate::mac::report_ended_lanes(&tart);
     let runs = paths().state.join("mac-nux");
     std::fs::create_dir_all(&runs).map_err(|e| format!("{}: {e}", runs.display()))?;
@@ -6735,11 +6770,10 @@ pub fn cmd_nux(args: &[String]) -> Res {
     crate::util::copy_regular_file(&install, share.join("install.sh"))
         .map_err(|e| format!("{}: {e}", install.display()))?;
     build_helper(&share)?;
-    let reads_tree = ask.scenarios.iter().any(|s| s.reads_tree());
     if reads_tree {
         reveal::stage(&share)?;
     }
-    let app = if ask.scenarios.iter().any(|s| s.needs_app()) {
+    let app = if runnable.iter().any(|s| s.needs_app()) {
         Some(stage_app(
             ask.app.as_deref(),
             run,
@@ -6749,15 +6783,6 @@ pub fn cmd_nux(args: &[String]) -> Res {
     } else {
         None
     };
-    let prep = crate::mac::Prep {
-        fda: false,
-        no_clt: ask.no_clt,
-        // The reader reads dialogs, and the tree rows' helper a window's tree, through the person
-        // base's Accessibility grant.
-        person: (ask.person || ask.reader || reads_tree).then(|| GUEST_HELPER.to_owned()),
-        lan_allow: ask.scenarios.contains(&Scenario::LanAllowed),
-    };
-    pull_room(&tart, &ask.image, &crate::mac::prep_name(&ask.image, &prep))?;
     let base =
         crate::mac::prepared_base_with(&tart, &ask.image, &prep, run, &share, &mut || Ok(()))?;
     let load = host_load();
@@ -6808,7 +6833,7 @@ pub fn cmd_nux(args: &[String]) -> Res {
             String::new()
         },
         app.as_ref().map_or_else(
-            || if ask.scenarios.iter().all(|s| s.reads_tree()) {
+            || if runnable.iter().all(|s| s.reads_tree()) {
                 "none: the tree rows run this checkout's debug aterm and lab".to_owned()
             } else {
                 "a public release (install.sh)".to_owned()
@@ -6816,13 +6841,18 @@ pub fn cmd_nux(args: &[String]) -> Res {
             |a| format!("{} {} ({})", a.id, a.version, a.how)
         ),
     );
-    let text = table(&head, &rows);
+    finish_nux(&ask, &head, &rows)
+}
+
+/// Publish the same table, record and exit classification even when no guest can run.
+fn finish_nux(ask: &Ask, head: &str, rows: &[Row]) -> Res {
+    let text = table(head, rows);
     println!("\n{text}");
     if let Some(file) = &ask.record {
         record(file, &format!("\n{text}"))?;
         println!("mac nux: appended to {}", file.display());
     }
-    Ok(exit_code(&rows))
+    Ok(exit_code(rows))
 }
 
 #[path = "mac_nux_advert.rs"]

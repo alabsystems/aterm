@@ -1448,15 +1448,19 @@ impl Real {
     pub(crate) fn export_gate(&mut self, scratch: &Scratch, r: &str) -> (Outcome, Option<PathBuf>) {
         self.scanner_tools = None;
         let not_run = |why: Refusal| (Outcome::CouldNotRun(why), None);
-        if !self.is_ancestor(r, "refs/remotes/origin/main") {
-            return not_run(Refusal::new(
-                format!(
-                    "{} is not on origin/main (as this clone last fetched it) — the engine \
-                     stages only mainline commits, so unpushed work is not judged",
-                    short(r)
-                ),
-                "push it (or `git fetch origin`, when it is there already), then run it again",
-            ));
+        if let Err(why) = aterm_census::export::mainline::require(r, |args| {
+            let mut git = crate::ledger::object_git(&self.repo);
+            git.args(args);
+            aterm_uds::deadline::output_within(&mut git, aterm_census::export::mainline::READ_WAIT)
+                .map(|out| {
+                    (
+                        out.status.code(),
+                        String::from_utf8_lossy(&out.stderr).into_owned(),
+                    )
+                })
+                .map_err(|error| error.to_string())
+        }) {
+            return not_run(Refusal::new(why.why(r), why.remedy()));
         }
         if let Err(why) = self.prepare_prerequisites() {
             return not_run(why);
@@ -6626,6 +6630,30 @@ mod tests {
         let (outcome, code) = export("HEAD");
         assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{outcome:?}");
         assert_eq!(code, 3);
+        git(
+            &repo,
+            &["push", "-q", "origin", "HEAD:refs/heads/export-feature"],
+        );
+        git(&repo, &["fetch", "-q", "origin"]);
+        let branch = checked_with(&repo, &opts("HEAD", &engine), |real| {
+            real.prerequisite_acquire = |_, _| panic!("a feature commit acquires no export tools");
+            real.checkout_build = |_, _, _| panic!("a feature commit builds no export tools");
+        })
+        .unwrap();
+        assert!(matches!(
+            branch.gates.last().map(|gate| &gate.outcome),
+            Some(Outcome::CouldNotRun(_))
+        ));
+        assert_eq!(
+            branch.exit_code(),
+            3,
+            "a feature branch push is not mainline"
+        );
+        let mut unread = Real::new(&repo, Some(&engine), true, false).unwrap();
+        unread.prerequisite_acquire = |_, _| panic!("unread ancestry acquires no export tools");
+        let (outcome, _) =
+            unread.export_gate(&Scratch::read_only(&repo).unwrap(), "no-such-commit");
+        assert!(matches!(outcome, Outcome::CouldNotRun(_)), "{outcome:?}");
         let found = checked_with(&repo, &opts("HEAD~1", &root.join("none")), |real| {
             real.prerequisite_acquire = crate::managed_prerequisites::simulated;
         })

@@ -2222,7 +2222,7 @@ fn a_relaunch_and_upgrade_claim_leaves_the_boxes_to_the_person() {
 fn a_box_raises_one_menu_row_per_transition() {
     let (mut app, sid) = app_with_stub();
     let now = i64::try_from(aterm_time::unix_secs().expect("the wall clock")).expect("i64");
-    app.presence.herald.adopt(
+    app.presence.need_ages.adopt(
         sid,
         crate::status_item::StatusCarry {
             need: Some((aterm_types::needs::NeedWord::Approval, 1_000)),

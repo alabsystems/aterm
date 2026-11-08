@@ -1860,7 +1860,9 @@ impl App {
             project = "aterm_gui::messages_host::carried_health_conformance::project"
         )
     )]
-    /// Routes an legacy `(title, body)` update-health warning to [`Self::note_update_health_as`].
+    /// Routes a legacy `(title, body)` update-health warning to [`Self::note_update_health_as`], and
+    /// returns whether it posted a warning: false for the Linux lane's wait for a start and its end,
+    /// a recovery, a restatement, and a kind already said this launch.
     pub(crate) fn note_update_health(&mut self, title: &str, body: &str) -> bool {
         // The Linux lane's wait for a start is no health warning of any kind.
         if title == aterm_update::INSTALL_AWAITS_START_TITLE {
@@ -1898,7 +1900,8 @@ impl App {
         )
     }
 
-    /// Posts or records an update-health warning of `kind` once per launch until healed.
+    /// Posts or records an update-health warning of `kind` once per launch until healed, and returns
+    /// whether it posted one: false when `kind` was already said this launch.
     pub(crate) fn note_update_health_as(
         &mut self,
         kind: update_words::HealthKind,

@@ -10,7 +10,7 @@ use super::{
         registry::{MACHINE, MACHINE_FACTS, MODEL},
         tests::{apply, machine_of},
     },
-    run::Passes,
+    run::{Passes, Registrar, evidence, news, table_at},
     *,
 };
 use crate::{
@@ -1236,9 +1236,11 @@ fn a_pass_stays_within_the_quota() {
 
 /// Rounds wake passes, and passes rest: the first round passes (and defers, no evidence yet), the
 /// next is at rest without reading the host, a round that left nothing to fetch of the registry
-/// passes at once and births, and another table's evidence is no evidence.
+/// passes at once and births, and another table's evidence is no evidence. The registry's table
+/// is read only for a wake with a drained table before the evidence is heard.
 /// NEGATIVE CONTROL: with `news` always false, the evidence round is at rest: `` turn(..) `` is
-/// `None`.
+/// `None`; with `turn` reading `self.table` before it calls `news`, the first `tables.get()`
+/// assertion fails.
 #[test]
 fn rounds_wake_passes_and_only_the_registrys_evidence_ends_a_rest() {
     let lab = Lab::new(&[Role::Writer]);
@@ -1250,16 +1252,29 @@ fn rounds_wake_passes_and_only_the_registrys_evidence_ends_a_rest() {
     let table = registry.table().unwrap().unwrap();
     let reads = std::rc::Rc::new(std::cell::Cell::new(0));
     let counted = reads.clone();
-    let mut passes = Passes::new(paths, lab_config(&lab, 0), move || {
-        counted.set(counted.get() + 1);
-        Some(probe())
-    });
+    let tables = std::rc::Rc::new(std::cell::Cell::new(0));
+    let looked = tables.clone();
+    let mut read_table = table_at(&paths);
+    let mut passes = Passes::new(
+        paths,
+        lab_config(&lab, 0),
+        move || {
+            counted.set(counted.get() + 1);
+            Some(probe())
+        },
+        move || {
+            looked.set(looked.get() + 1);
+            read_table()
+        },
+    );
     let at = Instant::now();
     let nothing = BTreeSet::new();
     let first = passes.turn(&nothing, at, NOW).unwrap().unwrap();
     assert_eq!(first.outcome, Outcome::Deferred);
     assert!(passes.turn(&nothing, at, NOW).is_none());
+    assert_eq!(tables.get(), 0, "no table drained, no read");
     assert!(passes.turn(&BTreeSet::from([[9; 32]]), at, NOW).is_none());
+    assert_eq!(tables.get(), 1);
     assert_eq!(reads.get(), 1);
     let heard = passes
         .turn(&BTreeSet::from([table]), at, NOW)
@@ -1277,7 +1292,9 @@ fn rounds_wake_passes_and_only_the_registrys_evidence_ends_a_rest() {
         heard.outcome
     );
     assert_eq!(reads.get(), 2);
+    assert_eq!(tables.get(), 2);
     assert!(passes.turn(&BTreeSet::from([table]), at, NOW).is_none());
+    assert_eq!(tables.get(), 2, "evidence heard, no read");
     let rested = at + super::run::PASS_EVERY;
     let later = passes.turn(&nothing, rested, NOW).unwrap().unwrap();
     assert_eq!(later.outcome, Outcome::Unchanged);
@@ -1451,9 +1468,222 @@ fn a_real_drained_round_wakes_the_registrar_and_it_registers() {
             .contains_key(&uuid)
     );
 }
+/// The registry's table, a read of custody and the catalog, is read for a pass only while no
+/// evidence was heard and a round drained a table, and only a drained table that is the
+/// registry's is news.
+/// NEGATIVE CONTROL: with `news` reading `table()` before it looks at `heard`, the first row's
+/// `unread` panics.
+#[test]
+fn a_pass_reads_the_registrys_table_only_until_its_evidence_is_heard() {
+    const HELD: [u8; 32] = [1; 32];
+    const OTHER: [u8; 32] = [2; 32];
+    let unread =
+        || -> Option<[u8; 32]> { panic!("the registry's table is read only before evidence") };
+    assert!(!news(true, &BTreeSet::from([HELD]), unread), "heard before");
+    assert!(!news(false, &BTreeSet::new(), unread), "nothing drained");
+    assert!(news(false, &BTreeSet::from([OTHER, HELD]), || Some(HELD)));
+    assert!(
+        !news(false, &BTreeSet::from([OTHER]), || Some(HELD)),
+        "another table"
+    );
+    assert!(
+        !news(false, &BTreeSet::from([HELD]), || None),
+        "no registry here"
+    );
+}
+
+/// A scope is one of the registry's generations only where it is that generation's table under
+/// its own trust: each generation's is, under any trust, and the catalog's, another
+/// application's, and a registry table's id under another generation number are not.
+/// NEGATIVE CONTROL: with `is_generation` comparing only `scope.table()`, the renumbered scope
+/// is judged a generation and the `renumbered` assertion fails.
+#[test]
+fn only_a_registry_generations_table_is_one() {
+    use aterm_secrets::commons::journal::Trust;
+    for trust in [
+        Trust {
+            network: [3; 16],
+            authority: [4; 32],
+            genesis: [5; 32],
+        },
+        Trust {
+            network: [6; 16],
+            authority: [7; 32],
+            genesis: [8; 32],
+        },
+    ] {
+        for compiled in crate::att::REGISTRY.chain() {
+            let scope = compiled.descriptor(trust).unwrap().scope;
+            assert!(Registry::is_generation(scope), "{}", compiled.name());
+            let renumbered =
+                crate::table::Scope::new(trust, *scope.table(), scope.generation() + 1).unwrap();
+            assert!(!Registry::is_generation(renumbered), "renumbered");
+        }
+        assert!(
+            !Registry::is_generation(crate::catalog::scope(trust)),
+            "the catalog"
+        );
+        let other = crate::catalog::Descriptor::application(trust, "aterm.lab", "tables", 1)
+            .unwrap()
+            .scope;
+        assert!(!Registry::is_generation(other), "another application");
+    }
+}
+
+/// A quiet round of the table `scope` names, from a peer that holds two of its operations, with
+/// the peer's matching inventory as its witness.
+fn quiet_round(scope: crate::table::Scope) -> crate::runtime::RepairRound {
+    use crate::replica::{InventoryObservation, InventorySummary, MatchingInventory, Report};
+    let at = Instant::now();
+    let before = InventoryObservation {
+        scope,
+        local_actor: [5; 48],
+        peer_actor: [6; 48],
+        control_observation: [7; 64],
+        inventory: InventorySummary {
+            count: 2,
+            fingerprint: [8; 32],
+        },
+        observed_at_ms: 200,
+        sampled_at: at,
+    };
+    let after = InventoryObservation {
+        sampled_at: at + std::time::Duration::from_secs(1),
+        ..before
+    };
+    let mut report = Report {
+        table: Some(scope.digest()),
+        scope: Some(scope),
+        local_known: Some(before.inventory),
+        peer_known: Some(before.inventory),
+        local_offered: Some(before.inventory),
+        ..Report::default()
+    };
+    report.matching_inventory = MatchingInventory::from_observations(&report, before, after);
+    let mut round = crate::runtime::RepairRound::completed_with(report);
+    round.actor = Some(before.peer_actor);
+    assert!(round.matching_inventory().is_some());
+    assert_eq!(round.drained_table(), Some(scope.digest()));
+    round
+}
+
+/// Real rounds: each round a pair of scratch Macs repairs over loopback names its table's scope,
+/// and of the two tables they drain only the registry's reaches a pass. Given the peer's actor,
+/// as the runtime gives it, a quiet round carries its witness, and the witness's scope is the
+/// registry's generation exactly where the round's table is the registry's. A round whose report
+/// names no scope is handed on as drained.
+/// NEGATIVE CONTROL: with `evidence` answering `drained_table()` whatever its scope, the other
+/// table's drained rounds are evidence and the `another table` assertion fails.
+#[test]
+fn only_a_drained_registry_table_is_handed_to_a_pass() {
+    use crate::runtime::RepairRound;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    name_macs(&lab);
+    let first = Registry::at(lab.paths[0].clone());
+    first.open().unwrap();
+    first.seed().unwrap();
+    let reports = crate::table::tests::repair_commons_reports(&lab, 12);
+    let table = Registry::at(lab.paths[1].clone()).table().unwrap().unwrap();
+    let (mut registry_rounds, mut other_rounds, mut witnessed) = (0, 0, 0);
+    let mut unnamed = None;
+    for report in reports.iter().flatten() {
+        assert_eq!(
+            report.scope.map(|scope| scope.digest()),
+            report.table,
+            "a round names its table's scope"
+        );
+        let mut round = RepairRound::completed_with(*report);
+        if let Some(witness) = report.matching_inventory {
+            round.actor = Some(witness.peer_actor());
+        }
+        if let Some(witness) = round.matching_inventory() {
+            assert_eq!(
+                Registry::is_generation(witness.scope()),
+                report.table == Some(table)
+            );
+            witnessed += 1;
+        }
+        match round.drained_table() {
+            Some(drained) if drained == table => {
+                assert_eq!(evidence(&round), Some(table));
+                registry_rounds += 1;
+            }
+            Some(_) => {
+                assert_eq!(evidence(&round), None, "another table");
+                other_rounds += 1;
+                unnamed.get_or_insert(round);
+            }
+            None => assert_eq!(evidence(&round), None),
+        }
+    }
+    assert!(registry_rounds > 0, "no round drained the registry");
+    assert!(other_rounds > 0, "no round drained another table");
+    assert!(witnessed > 0, "no real round carried a witness");
+    let mut unnamed = unnamed.unwrap();
+    if let Some(report) = unnamed.application.as_mut() {
+        report.scope = None;
+    }
+    assert_eq!(
+        evidence(&unnamed),
+        unnamed.drained_table(),
+        "no scope named"
+    );
+}
+
+/// The registrar's own thread: a quiet round of another table brings its pass no read of the
+/// registry's table, and the registry's next quiet round brings one, which is news.
+/// NEGATIVE CONTROL: with `Registrar::round` handing on `round.drained_table()` in place of
+/// `evidence(round)`, the first pass reads the registry's table and `assert_eq!(reads(), 0)`
+/// fails.
+#[test]
+fn a_registrar_reads_the_registrys_table_only_for_a_round_that_may_be_it() {
+    use aterm_secrets::commons::journal::Trust;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let lab = Lab::new(&[Role::Writer]);
+    name_macs(&lab);
+    let trust = Trust {
+        network: [1; 16],
+        authority: [2; 32],
+        genesis: [3; 32],
+    };
+    let registry = crate::att::REGISTRY.descriptor(trust).unwrap().scope;
+    let other = crate::catalog::scope(trust);
+    let count = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&count);
+    let reads = || count.load(Ordering::SeqCst);
+    let (sent, heard) = std::sync::mpsc::channel();
+    let registrar = Registrar::start_with(
+        lab.paths[0].clone(),
+        lab_config(&lab, 0),
+        || Some(probe()),
+        move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Some(registry.digest())
+        },
+        move |pass: &Result<Registered>| {
+            let _ = sent.send(pass.is_ok());
+        },
+    )
+    .unwrap();
+    let hang = std::time::Duration::from_secs(60);
+    registrar.round(&quiet_round(other));
+    assert!(heard.recv_timeout(hang).is_ok(), "the first round's pass");
+    assert_eq!(reads(), 0);
+    registrar.round(&quiet_round(registry));
+    assert!(
+        heard.recv_timeout(hang).is_ok(),
+        "the registry's round is news"
+    );
+    assert_eq!(reads(), 1);
+    drop(registrar);
+}
+
 /// A transient host-probe failure (`gather() == None`) does not spend `heard` or start the
 /// six-hour rest window, so the next round when the Mac can state itself still registers.
-/// NEGATIVE CONTROL: with `Passes::turn` setting `self.heard |= heard` and `self.last = Some(now)`
+/// NEGATIVE CONTROL: with `Passes::turn` setting `self.heard |= news` and `self.last = Some(now)`
 /// before `(self.gather)()?`, the second `turn` returns `None` for the next six hours.
 #[test]
 fn a_transient_empty_probe_does_not_spend_evidence_or_start_rest() {
@@ -1465,14 +1695,20 @@ fn a_transient_empty_probe_does_not_spend_evidence_or_start_rest() {
     registry.seed().unwrap();
     let table = registry.table().unwrap().unwrap();
     let mut ready = false;
-    let mut passes = Passes::new(paths, lab_config(&lab, 0), move || {
-        if !ready {
-            ready = true;
-            None
-        } else {
-            Some(probe())
-        }
-    });
+    let read_table = table_at(&paths);
+    let mut passes = Passes::new(
+        paths,
+        lab_config(&lab, 0),
+        move || {
+            if !ready {
+                ready = true;
+                None
+            } else {
+                Some(probe())
+            }
+        },
+        read_table,
+    );
     let at = Instant::now();
     let drained = BTreeSet::from([table]);
     assert!(passes.turn(&drained, at, NOW).is_none());

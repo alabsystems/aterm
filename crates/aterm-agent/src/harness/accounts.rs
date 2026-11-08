@@ -5321,7 +5321,7 @@ impl Sample {
 }
 
 /// Limit-reset offer observed at a usage wall.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Offer {
     /// The kind `left` counts, where one was read.
     pub kind: Option<ResetKind>,
@@ -13656,10 +13656,38 @@ pub fn credits_noted(roster: &Roster, state: &State, now: i64) -> Vec<String> {
         .collect()
 }
 
-/// Returns `(label, reason)` pairs in roster order for accounts with a nearly full weekly window
-/// and credits off.
+/// An account whose weekly window is nearly full with credits off ([`windows_full`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WindowFull {
+    /// The roster label.
+    pub label: String,
+    /// The reason the credits word gave for being off (`out_of_credits`, `org_level_disabled`).
+    pub reason: String,
+    /// The limit resets the account was last seen to have ([`Account::offer`]), while that
+    /// record stands and only of a kind that gives the week back ([`gives_week_back`]): at least
+    /// one left, and its use-by instant, where one was read, not yet passed. It is the record as
+    /// last seen, dated by its `at`, never a count read now.
+    pub grants: Option<Offer>,
+}
+
+/// Whether a reset of `kind` gives back use of the weekly window: a weekly reset refills it, a
+/// full reset refills it with the five-hour window, and a Fable reset returns what Fable used of
+/// it. A 5-hour reset refills the five-hour window alone, and an offer whose kind was never named
+/// cannot be said to give the week anything.
+const fn gives_week_back(kind: Option<ResetKind>) -> bool {
+    matches!(
+        kind,
+        Some(ResetKind::Weekly | ResetKind::Full | ResetKind::Fable)
+    )
+}
+
+/// THE ACCOUNTS WHOSE WEEKLY WINDOW IS NEARLY FULL WITH CREDITS OFF, in roster order: S5's warning
+/// on the week at [`WINDOW_FULL_PCT`] or more with its reset over [`WINDOW_FULL_AHEAD_S`] off, and
+/// the credits word off. Each carries the account's standing reset offer of a kind that gives the
+/// week back ([`WindowFull::grants`]), which decides nothing here: an offer neither adds an account
+/// nor drops one.
 #[must_use]
-pub fn windows_full(roster: &Roster, state: &State, now: i64) -> Vec<(String, String)> {
+pub fn windows_full(roster: &Roster, state: &State, now: i64) -> Vec<WindowFull> {
     roster
         .rows
         .iter()
@@ -13672,8 +13700,15 @@ pub fn windows_full(roster: &Roster, state: &State, now: i64) -> Vec<(String, St
                 return None;
             }
             let (pct, end) = account.warned_week.as_ref()?.figure(WEEK_WINDOW_S, now)?;
-            (pct >= WINDOW_FULL_PCT && end.saturating_sub(now) > WINDOW_FULL_AHEAD_S)
-                .then(|| (row.label.clone(), off.reason.clone()))
+            (pct >= WINDOW_FULL_PCT && end.saturating_sub(now) > WINDOW_FULL_AHEAD_S).then(|| {
+                WindowFull {
+                    label: row.label.clone(),
+                    reason: off.reason.clone(),
+                    grants: account.offer.clone().filter(|o| {
+                        o.left > 0 && o.use_by.is_none_or(|by| by > now) && gives_week_back(o.kind)
+                    }),
+                }
+            })
         })
         .collect()
 }

@@ -1068,6 +1068,7 @@ impl App {
                         message_reporters::accounts_window_full_entry(
                             &full,
                             self.harness_policy.get().policy.usage_credits,
+                            &|t| crate::presence::local_offset_at(t).unwrap_or(0),
                         ),
                     ),
                 ];

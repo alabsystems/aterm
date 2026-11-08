@@ -143,7 +143,7 @@ impl Owner {
             + job
                 .timeout
                 .ok_or_else(|| refused("original phase deadline missing"))?)
-        .min(Instant::now() + Duration::from_secs(2));
+        .min(native_inputs::deadline(Instant::now()));
         ready._output.validate(deadline)?;
         if let Some(output) = &state.output {
             output.validate(&ready._output, deadline)?

@@ -927,20 +927,29 @@ mod run {
     }
 
     /// One pass's decisions, apart from the thread that waits for rounds.
-    pub(super) struct Passes<G> {
+    pub(super) struct Passes<G, T> {
         paths: Paths,
         config: PathBuf,
         gather: G,
+        table: T,
         heard: bool,
         last: Option<Instant>,
     }
 
-    impl<G: FnMut() -> Option<Probe>> Passes<G> {
-        pub(super) fn new(paths: Paths, config: PathBuf, gather: G) -> Self {
+    /// The registry's table here, as [`Passes`] reads it: [`super::super::Registry::table`].
+    pub(super) fn table_at(paths: &Paths) -> impl FnMut() -> Option<Digest> + Send + 'static {
+        let registry = super::super::Registry::at(paths.clone());
+        move || registry.table().ok().flatten()
+    }
+
+    impl<G: FnMut() -> Option<Probe>, T: FnMut() -> Option<Digest>> Passes<G, T> {
+        /// `gather` reads this Mac, and `table` the registry's table here ([`table_at`]).
+        pub(super) fn new(paths: Paths, config: PathBuf, gather: G, table: T) -> Self {
             Self {
                 paths,
                 config,
                 gather,
+                table,
                 heard: false,
                 last: None,
             }
@@ -954,14 +963,7 @@ mod run {
             now: Instant,
             now_ms: u64,
         ) -> Option<Result<Registered>> {
-            let registry = super::super::Registry::at(self.paths.clone());
-            let heard = !drained.is_empty()
-                && registry
-                    .table()
-                    .ok()
-                    .flatten()
-                    .is_some_and(|table| drained.contains(&table));
-            let news = heard && !self.heard;
+            let news = news(self.heard, drained, &mut self.table);
             let rested = self
                 .last
                 .is_none_or(|last| now.saturating_duration_since(last) >= PASS_EVERY);
@@ -969,10 +971,36 @@ mod run {
                 return None;
             }
             let probe = (self.gather)()?;
-            self.heard |= heard;
+            self.heard |= news;
             self.last = Some(now);
+            let registry = super::super::Registry::at(self.paths.clone());
             Some(registry.register(&self.config, &probe, self.heard, now_ms))
         }
+    }
+
+    /// Whether `drained` brings the first evidence that a peer holds the registry: none was
+    /// `heard` before, and the registry's table here (`table`) is one of `drained`. `table` reads
+    /// custody and the catalog, so it is read only while no evidence was heard and a round
+    /// drained a table.
+    pub(super) fn news(
+        heard: bool,
+        drained: &BTreeSet<Digest>,
+        table: impl FnOnce() -> Option<Digest>,
+    ) -> bool {
+        !heard && !drained.is_empty() && table().is_some_and(|table| drained.contains(&table))
+    }
+
+    /// The table `round` drained that may be the registry's: none where its report names that
+    /// table's scope ([`crate::replica::Report::scope`]) and the scope is none of the registry's
+    /// generations ([`super::super::Registry::is_generation`]), which then needs no read to say.
+    pub(super) fn evidence(round: &RepairRound) -> Option<Digest> {
+        let table = round.drained_table()?;
+        let scope = round.application.as_ref().and_then(|report| report.scope);
+        scope
+            .is_none_or(|scope| {
+                scope.digest() != table || super::super::Registry::is_generation(scope)
+            })
+            .then_some(table)
     }
 
     #[derive(Default)]
@@ -1002,12 +1030,24 @@ mod run {
             gather: impl FnMut() -> Option<Probe> + Send + 'static,
             report: impl Fn(&Result<Registered>) + Send + 'static,
         ) -> Result<Self> {
+            let table = table_at(&paths);
+            Self::start_with(paths, config, gather, table, report)
+        }
+
+        /// [`Self::start`], its passes reading the registry's table with `table`.
+        pub(super) fn start_with(
+            paths: Paths,
+            config: PathBuf,
+            gather: impl FnMut() -> Option<Probe> + Send + 'static,
+            table: impl FnMut() -> Option<Digest> + Send + 'static,
+            report: impl Fn(&Result<Registered>) + Send + 'static,
+        ) -> Result<Self> {
             let shared = Arc::new((Mutex::new(Wake::default()), Condvar::new()));
             let state_handle = shared.clone();
             let worker = thread::Builder::new()
                 .name("alab-register".into())
                 .spawn(move || {
-                    let mut passes = Passes::new(paths, config, gather);
+                    let mut passes = Passes::new(paths, config, gather, table);
                     let mut drained = BTreeSet::new();
                     loop {
                         let (lock, wake) = &*state_handle;
@@ -1038,12 +1078,14 @@ mod run {
             })
         }
 
-        /// Hear one completed repair round.
+        /// Hear one completed repair round, and hand on the table it drained that may be the
+        /// registry's ([`evidence`]).
         pub fn round(&self, round: &RepairRound) {
+            let drained = evidence(round);
             let (lock, wake) = &*self.shared;
             if let Ok(mut state) = lock.lock() {
                 state.pending = true;
-                state.drained.extend(round.drained_table());
+                state.drained.extend(drained);
                 wake.notify_one();
             }
         }

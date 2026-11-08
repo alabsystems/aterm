@@ -2026,8 +2026,8 @@ fn a_successor_homes_read_observes_its_predecessor_once() {
 
 /// A generation check whose deadline has passed says it ran out of time, not that the generation
 /// is unavailable or changed: it learned nothing about the generation, and given time the same
-/// reads pass. Every deadline gate goes through `within`; this asks each entry readers and
-/// writers call.
+/// reads pass. Every deadline gate goes through `within`; this asks the first gate of each entry
+/// readers and writers call.
 /// NEGATIVE CONTROL: with `within` refusing as `fail()` again, every assertion fails.
 #[test]
 fn a_spent_deadline_is_out_of_time_not_a_changed_generation() {
@@ -2053,12 +2053,12 @@ fn a_spent_deadline_is_out_of_time_not_a_changed_generation() {
     assert_eq!(observed_paths_until(&original, given_time).unwrap(), next);
 }
 
-/// A fleet label's registry read ([`crate::alab::Registry::view_until`]) reads the generation of
-/// the registry under its own `read_by`, so a read out of time says so rather than reading the
-/// first generation in place of the one this Mac's catalog names; given time, it reads the
-/// registry a successor home imported.
-/// NEGATIVE CONTROL: with `Handle::at_until` taking the generation from `current`, which reads
-/// the first generation when the catalog cannot be read, the spent read is answered.
+/// A fleet label's registry read ([`crate::alab::Registry::view_until`]) reads the registry's
+/// generation as its first stage, under its own `read_by`: a spent read refuses there, as out of
+/// time; given time, it reads the registry a successor home imported.
+/// NEGATIVE CONTROL: with `Handle::at_until` taking the generation from `current`, which swallows
+/// the spent bound, the read refuses only later, at its pass gate
+/// (`application pass deadline expired`).
 #[test]
 fn a_successor_homes_registry_reads_under_its_own_bound() {
     let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
@@ -2127,4 +2127,59 @@ fn a_vault_writer_during_a_check_is_busy_not_a_changed_generation() {
             .all(|(_, held, busy, after, _)| *held && *busy && *after),
         "(point, writer held, check busy, next check passes, check): {outcomes:?}"
     );
+}
+
+/// A read of a successor home whose succession is still preserving old records refuses, as
+/// observing it always did, rather than naming the candidate: so a peek never opens the
+/// candidate's custody before it is complete or answers as if no table were there
+/// (`registry: not imported`).
+/// NEGATIVE CONTROL: with `observed_generation_until` following a selection that is not complete,
+/// it names the candidate and the declaration peek answers `None`.
+#[test]
+fn a_pending_succession_refuses_a_read_rather_than_naming_its_candidate() {
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    data(&lab);
+    let _selection = reserved(&lab);
+    move_admitted_candidate(&mut lab);
+    let given_time = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let pending = observed_generation_until(&original, given_time)
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        pending,
+        "Commons writer succession is still preserving old records"
+    );
+    let declared = crate::documents::application::peek_declaration(
+        &original,
+        |bootstrap| Descriptor::application(bootstrap.trust(), "recovery-test", "records", 1),
+        given_time,
+    );
+    assert_eq!(declared.err().unwrap().to_string(), pending);
+}
+
+/// A fleet label's registry generation ([`crate::att::current_within`]) is the read's to answer:
+/// a vault writer that holds the selected home's state lock makes the lookup busy, which the read
+/// observes again ([`crate::att::Handle::at_until`]), rather than reading the first generation in
+/// place of the one this Mac's catalog names; once the writer is gone it reads the catalog's.
+/// NEGATIVE CONTROL: with the catalog peek taking a busy vault for no Commons here
+/// (`Bootstrap::cached`), the lookup answers the first generation while the writer holds.
+#[test]
+fn a_busy_vault_keeps_a_labels_registry_generation_busy_not_the_first() {
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    crate::alab::Registry::at(original.clone()).open().unwrap();
+    let mut selection = reserved(&lab);
+    let next = move_admitted_candidate(&mut lab);
+    import(&mut selection).unwrap();
+    let given_time = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let writer = client::test_hold_state_lock(&next).unwrap();
+    let busy = crate::att::current_within(&original, &crate::att::REGISTRY, given_time)
+        .err()
+        .unwrap();
+    drop(writer);
+    assert!(busy.is_busy(), "{busy}");
+    let current = crate::att::current_within(&original, &crate::att::REGISTRY, given_time).unwrap();
+    assert_eq!(current.generation, crate::att::REGISTRY.generation);
 }

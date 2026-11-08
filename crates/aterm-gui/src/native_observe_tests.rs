@@ -1267,3 +1267,143 @@ fn sealed_native_outcomes_keep_exact_foreign_authority_without_granting_passive_
             .is_none()
     );
 }
+
+#[test]
+fn only_an_orphaned_system_keep_awake_outlives_its_group() {
+    let keep_awake = Some(std::path::Path::new(KEEP_AWAKE));
+    assert!(
+        !keeps_group(1, keep_awake),
+        "launchd adopted it: its runner died"
+    );
+    assert!(keeps_group(4242, keep_awake), "its runner lives");
+    for other in [
+        "/bin/sleep",
+        "/private/tmp/caffeinate",
+        "/usr/bin/caffeinate2",
+    ] {
+        assert!(keeps_group(1, Some(std::path::Path::new(other))), "{other}");
+    }
+    assert!(keeps_group(1, None), "an unread image keeps the group");
+}
+
+/// A group whose leader exited, leaving `leftover` in it adopted by launchd.
+#[cfg(target_os = "macos")]
+fn orphaned_in_a_group(leftover: &str) -> (u32, i32) {
+    let out = aterm_uds::deadline::output_until(
+        aterm_uds::spawnfd::command("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "{leftover} </dev/null >/dev/null 2>&1 & echo $$ $!"
+            ))
+            .process_group(0),
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+    )
+    .expect("the group's leader runs and exits");
+    let out = String::from_utf8(out.stdout).expect("utf-8");
+    let mut pids = out
+        .split_whitespace()
+        .map(|n| n.parse::<i32>().expect("a pid"));
+    let (leader, left) = (pids.next().expect("leader"), pids.next().expect("leftover"));
+    // `$!` names the forked shell, which runs the leftover's own image only once its exec lands.
+    let program = leftover.split_whitespace().next().expect("a program");
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the leftover's exec", || {
+        (aterm_uds::process::read_process_path(left).as_deref()
+            == Some(std::path::Path::new(program)))
+        .then_some(())
+    });
+    assert_eq!(
+        aterm_uds::process::read_short_info(left).map(|info| (info.pbsi_pgid, info.pbsi_ppid)),
+        Some((leader.unsigned_abs(), 1)),
+        "{leftover} is left in its group, adopted by launchd"
+    );
+    (leader.unsigned_abs(), left)
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_group_left_holding_only_its_keep_awake_is_gone_and_one_left_working_is_not() {
+    struct Kill(i32);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            // SAFETY: a positive pid this test started; SIGKILL ends only that process.
+            unsafe { libc::kill(self.0, libc::SIGKILL) };
+        }
+    }
+    let (group, left) = orphaned_in_a_group("/usr/bin/caffeinate -i -t 60");
+    let _keep_awake = Kill(left);
+    assert_eq!(
+        cohort_gone(group),
+        Some(true),
+        "its keep-awake runs nothing"
+    );
+    let (group, left) = orphaned_in_a_group("/bin/sleep 60");
+    let _sleep = Kill(left);
+    assert_eq!(
+        cohort_gone(group),
+        Some(false),
+        "a sleep is work the group still runs"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_member_that_forks_and_goes_while_its_group_is_read_leaves_the_group_live() {
+    struct Kill(Option<i32>);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                // SAFETY: a positive pid this test started; SIGKILL ends only that process.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+    let (reader, mut writer) = std::io::pipe().expect("a pipe");
+    // The leader exits at once, leaving its member blocked on a line from the pipe (fd 3: an
+    // asynchronous list's stdin is /dev/null); given one, the member starts a sleep in the group
+    // and exits.
+    let out = aterm_uds::deadline::output_until_from(
+        aterm_uds::spawnfd::command("/bin/sh")
+            .arg("-c")
+            .arg(
+                "exec 3<&0; { read _ <&3; /bin/sleep 60 </dev/null >/dev/null 2>&1 & } \
+                 </dev/null >/dev/null 2>&1 & echo $$ $!",
+            )
+            .process_group(0),
+        aterm_uds::spawnfd::Stdio::from(std::os::fd::OwnedFd::from(reader)),
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .expect("the group's leader runs and exits");
+    let out = String::from_utf8(out.stdout).expect("utf-8");
+    let mut pids = out
+        .split_whitespace()
+        .map(|n| n.parse::<i32>().expect("a pid"));
+    let (group, member) = (pids.next().expect("leader"), pids.next().expect("member"));
+    let mut sleep = Kill(None);
+    // What a probe descheduled between its listing and its reads sees: the listed member forks
+    // and is reaped by launchd before it is read.
+    let mut between = || {
+        std::io::Write::write_all(&mut writer, b"\n").expect("the member's line");
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the member's reap", || {
+            (aterm_uds::process::process_presence(member)
+                == aterm_uds::process::ProcessPresence::Absent)
+                .then_some(())
+        });
+        sleep.0 = Some(aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the member's sleep in the group",
+            || {
+                crate::foreground_handback::darwin_group_members(group)?
+                    .into_iter()
+                    .find(|&pid| {
+                        aterm_uds::process::read_process_path(pid).as_deref()
+                            == Some(std::path::Path::new("/bin/sleep"))
+                    })
+            },
+        ));
+    };
+    assert_eq!(
+        darwin_cohort_idle(group, &mut between),
+        Some(false),
+        "the member's sleep is still in its group"
+    );
+}

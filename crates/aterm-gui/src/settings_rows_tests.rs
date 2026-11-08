@@ -5863,9 +5863,10 @@ fn a_press_on_any_screen_of_a_narrow_list_moves_nothing() {
     // whole, pressed, stands where it was, uncovered, through "Applying…" and the status it
     // brings. On the list's last screen, which may end short of the room, the status's bar seated
     // the screen anew flush with the room's end and moved the switch pressed down (Security at
-    // 206x420: Desktop notifications from aterm, 51pt; Sound at 290x420 with 2x text: Terminal
-    // bell sound, 50pt); and a segment in a part of its segmented control split across stops
-    // was lost once chosen (Cursor & Motion at 164x292: Motion's Reduce motion, 49pt).
+    // 206x420: Desktop notifications from aterm, a row since removed, 51pt; Sound at 290x420
+    // with 2x text: Terminal bell sound, 50pt); and a segment in a part of its segmented
+    // control split across stops was lost once chosen (Cursor & Motion at 164x292: Motion's
+    // Reduce motion, 49pt).
     const WINDOWS: [(SettingsRoute, f32, f32, f32); 5] = [
         (SettingsRoute::CursorMotion, 164.0, 292.0, 1.0),
         (SettingsRoute::WindowTabs, 164.0, 420.0, 1.0),

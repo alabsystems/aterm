@@ -216,14 +216,14 @@ impl Recipe {
                 &selected.target,
             )?;
             if resolver {
-                sdk.require_resolver_protocol(Instant::now() + Duration::from_secs(30))?;
+                sdk.require_resolver_protocol(native_inputs::deadline(Instant::now()))?;
             }
             if workload {
-                sdk.require_workload_protocol(Instant::now() + Duration::from_secs(30))?;
+                sdk.require_workload_protocol(native_inputs::deadline(Instant::now()))?;
                 // Still in the paid Preparing worker, before any Root GO or
                 // project/configuration. Capture the compiler/runtime once;
                 // Ready and each graph member reuse its original held inputs.
-                sdk.capture_workload_compiler(Instant::now() + Duration::from_secs(30))?;
+                sdk.capture_workload_compiler(native_inputs::deadline(Instant::now()))?;
             }
             for (key, value) in sdk.runtime_environment()? {
                 environment.retain(|(old, _)| old != &key);
@@ -281,13 +281,7 @@ impl Recipe {
                 .envs(environment.iter().map(|(key, value)| (key, value)))
                 .current_dir(&cwd)
                 .stderr(spawnfd::Stdio::null());
-            if let Ok(output) = aterm_uds::deadline::output_until_complete_stdout_with_limit(
-                &mut probe,
-                Instant::now() + Duration::from_secs(2),
-                8192,
-            ) && output.status.success()
-                && let Ok(capability) = aterm_json::from_slice::<aterm_json::Value>(&output.stdout)
-            {
+            if let Some(capability) = read_capability(&mut probe, Instant::now()) {
                 let words = arguments
                     .iter()
                     .map(|word| word.to_str())
@@ -358,6 +352,16 @@ impl Recipe {
             .start_suspended(true);
         command
     }
+}
+
+fn read_capability(probe: &mut spawnfd::Command, started: Instant) -> Option<aterm_json::Value> {
+    let deadline = started + Duration::from_secs(60);
+    let output =
+        aterm_uds::deadline::output_until_complete_stdout_with_limit(probe, deadline, 8192).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    aterm_json::from_slice(&output.stdout).ok()
 }
 
 fn service_environment(
@@ -563,6 +567,32 @@ fn managed_artifact_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn an_actual_native_capability_read_survives_scheduling_delay() {
+        const BODY: &str = r#"{"version":3,"cpu_workers":true,"memory_custody":"resource-inspect-v3","worker_argument":"--resource-worker-v3","subgroup_custody":"host-owned-v3","subgroup_argument":"--resource-subgroups-v3"}"#;
+        let program = aterm_uds::deadline::stand_in(Path::new("/usr/bin/printf"));
+        let mut command = spawnfd::command(program);
+        command.args(["%s", BODY]);
+        let mut capability =
+            read_capability(&mut command, Instant::now() - Duration::from_secs(3)).unwrap();
+        assert!(targo(&capability, &[Some("--unverified"), Some("build")]));
+        capability.as_object_mut().unwrap().insert(
+            "subgroup_custody".into(),
+            aterm_json::Value::String("foreign".into()),
+        );
+        assert!(!targo(&capability, &[Some("--unverified"), Some("build")]));
+        assert!(read_capability(&mut command, Instant::now() - Duration::from_secs(61)).is_none());
+        let program = aterm_uds::deadline::stand_in(Path::new("/usr/bin/printf"));
+        let mut malformed = spawnfd::command(program);
+        malformed.args(["%s", "{"]);
+        assert!(read_capability(&mut malformed, Instant::now()).is_none());
+        let program = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+        let mut failed = spawnfd::command(program);
+        failed.args(["-c", "printf '%s' \"$1\"; exit 7", "fixture", BODY]);
+        assert!(read_capability(&mut failed, Instant::now()).is_none());
+    }
     #[test]
     fn malformed_metadata_purpose_cannot_fall_back_to_a_legacy_preparation_probe() {
         let mut request = Submission {

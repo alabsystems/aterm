@@ -3202,7 +3202,8 @@ mod bound_control {
 use bound_control::publish_discovery;
 use bound_control::{BoundControl, publish_when_committed};
 
-const HANDOFF_BIND_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// A minute hang detector for a committed predecessor's exit and safe socket reuse.
+const HANDOFF_BIND_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn bind_control_listener(
     plan: &control_auth::SocketPlan,
@@ -3211,24 +3212,24 @@ fn bind_control_listener(
     parent_owns_peer: impl Fn(u32) -> bool,
     identity: Option<&crate::control_socket_identity::SocketIdentity>,
 ) -> Option<BoundControl> {
-    bind_control_listener_within(
+    bind_control_listener_with_wait(
         plan,
         handoff_gate,
         parent_exited,
         parent_owns_peer,
         identity,
-        HANDOFF_BIND_WAIT,
+        || (std::time::Instant::now(), HANDOFF_BIND_HANG),
         control_auth::connect_socket_nonblocking,
     )
 }
 
-fn bind_control_listener_within(
+fn bind_control_listener_with_wait(
     plan: &control_auth::SocketPlan,
     handoff_gate: Option<&crate::spawn::DeferredReaderGate>,
     mut parent_exited: impl FnMut(std::time::Instant) -> bool,
     parent_owns_peer: impl Fn(u32) -> bool,
     identity: Option<&crate::control_socket_identity::SocketIdentity>,
-    handoff_wait: std::time::Duration,
+    wait: impl FnOnce() -> (std::time::Instant, std::time::Duration),
     mut dial: impl FnMut(&str) -> std::io::Result<CtlStream>,
 ) -> Option<BoundControl> {
     let sock_path = plan.sock_path.clone();
@@ -3238,7 +3239,7 @@ fn bind_control_listener_within(
         if !gate.wait_until_released(&AtomicBool::new(false)) {
             return None;
         }
-        let now = std::time::Instant::now();
+        let (now, handoff_wait) = wait();
         let deadline = now
             .checked_add(handoff_wait)
             .unwrap_or_else(|| now + std::time::Duration::from_secs(86_400 * 365));

@@ -380,10 +380,11 @@ fn the_stamped_hover_follows_a_first_tell_beside_a_standing_entry() {
 
 /// A TAIL THAT ALONE MOVED RESTAMPS THE HOVER: a rewrite from `carrying on` to `waits on you` keeps
 /// the need's words, and a write that lands between a refresh's publication and its read of the
-/// facts (`drive::refresh_session`: `herald`, then `sense`) has that refresh absorb the new entry
-/// under the old verdict, so the write's own wake publishes a need that differs from the slot's by
-/// its key alone. That wake stamps the strip before it publishes, with the old tail, so only the
-/// refresh's own restamp can carry the new one. CONTROL: once published, a refresh moves nothing.
+/// facts (`drive::refresh_session`: `publish_and_age_need`, then `sense`) has that refresh absorb
+/// the new entry under the old verdict, so the write's own wake publishes a need that differs
+/// from the slot's by its key alone. That wake stamps the strip before it publishes, with the old
+/// tail, so only the refresh's own restamp can carry the new one. CONTROL: once published, a
+/// refresh moves nothing.
 #[test]
 fn the_stamped_hover_follows_a_tail_that_alone_moved() {
     use aterm_messages::presence::drive::Desk;

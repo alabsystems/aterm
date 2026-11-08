@@ -483,7 +483,7 @@ impl member::MemberResources for Resources {
         };
         inputs
             .held
-            .validate(Instant::now() + Duration::from_secs(2))?;
+            .validate(native_inputs::deadline(Instant::now()))?;
         let observed = inputs.held.observation();
         let file=|file:&trust_resource_provenance::program::FileObservation|->io::Result<MetadataFile>{
             let mut sha256=[0;32];

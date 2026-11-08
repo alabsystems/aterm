@@ -923,6 +923,27 @@ fn read_batches_refuse_membership_or_custody_changes_before_returning() {
     }
 }
 
+/// A vault writer that holds the state lock while a session judges a table's context (each store
+/// open asks it, outside a read batch's source reads) makes the context busy, which a read
+/// observes again (`att::reopened`), not "stale membership", which nothing retries: the access is
+/// log-backed, so its currency reads the vault.
+/// NEGATIVE CONTROL: with `context` asking `Access::is_current` again, the held lock reads as
+/// stale membership.
+#[test]
+fn a_vault_writer_at_a_store_open_is_busy_not_stale_membership() {
+    let lab = Lab::with_foundation(&[Role::Writer]);
+    client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    assert!(session.is_log_backed(), "CONTROL: the seeded log backs it");
+    let scope = Scope::fresh(session.journal.trust()).unwrap();
+    let writer = client::test_hold_state_lock(&lab.paths[0]).unwrap();
+    let busy = session.context(scope).unwrap_err();
+    drop(writer);
+    assert!(busy.is_busy(), "{busy}");
+    session.context(scope).unwrap();
+}
+
 /// Under a log, with no generation, a read's currency is the log's answer, and a scope is held to
 /// the journal's trust. A session with a generation asks that generation, whose check can wait.
 ///

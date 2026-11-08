@@ -1108,7 +1108,14 @@ impl<'a> Session<'a> {
         if self.generation.is_some() {
             self.generation_guard(false)?;
         }
-        if scope.trust != self.journal.trust() || !self.access.is_current(&self.journal) {
+        // A store open asks this outside a read batch's source reads, so a vault writer can hold
+        // the state lock: that is busy, which a read observes again, not stale membership.
+        if scope.trust != self.journal.trust()
+            || !self
+                .access
+                .is_current_observed(&self.journal)
+                .map_err(failure)?
+        {
             return Err(Error::new(
                 "table has another trust context or stale membership",
             ));

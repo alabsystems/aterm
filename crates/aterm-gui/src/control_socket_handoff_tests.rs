@@ -30,6 +30,70 @@ fn leave(plan: &control_auth::SocketPlan) {
     let _ = std::fs::remove_file(&plan.token_path);
 }
 
+#[test]
+fn a_scheduled_committed_predecessor_releases_the_control_socket() {
+    if !crate::test_alone::alone() {
+        return;
+    }
+    for (elapsed, expected) in [(3, true), (61, false)] {
+        let (_dir, plan) = fixture();
+        let (parent, token) = bind_control_listener(&plan, None, |_| true, |_| false, None)
+            .unwrap()
+            .into_parts();
+        let identity =
+            crate::control_socket_identity::SocketIdentity::capture(&plan, &parent, token.as_str())
+                .unwrap();
+        let before = std::fs::read(&plan.token_path).unwrap();
+        let gate = crate::spawn::DeferredReaderGate::closed();
+        gate.release();
+        let mut parent = Some(parent);
+        let mut asked = 0;
+        let successor = bind_control_listener_with_wait(
+            &plan,
+            Some(&gate),
+            |deadline| {
+                asked += 1;
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                drop(parent.take());
+                true
+            },
+            |pid| pid == std::process::id(),
+            Some(&identity),
+            || {
+                (
+                    std::time::Instant::now() - Duration::from_secs(elapsed),
+                    HANDOFF_BIND_HANG,
+                )
+            },
+            control_auth::connect_socket_nonblocking,
+        );
+        assert_eq!(asked, 1);
+        assert_eq!(successor.is_some(), expected, "elapsed={elapsed}");
+        if let Some(successor) = successor {
+            let (successor, new_token) = successor.into_parts();
+            assert_ne!(new_token.as_str(), token.as_str());
+            assert_eq!(
+                control_auth::read_token(&plan.sock_path).as_deref(),
+                Some(new_token.as_str())
+            );
+            let client = CtlStream::connect(&plan.sock_path).unwrap();
+            let (accepted, _) = successor.accept().unwrap();
+            control_auth::peer_check(&accepted).unwrap();
+            drop((client, accepted, successor));
+        } else {
+            assert_eq!(std::fs::read(&plan.token_path).unwrap(), before);
+            let client = CtlStream::connect(&plan.sock_path).unwrap();
+            let (accepted, _) = parent.as_ref().unwrap().accept().unwrap();
+            control_auth::peer_check(&accepted).unwrap();
+            drop((client, accepted));
+        }
+        drop(parent.take());
+        leave(&plan);
+    }
+}
+
 fn step(model: &Model, state: &mut BTreeMap<&'static str, i64>, action: &'static str) {
     let successors = model.successors(action, state);
     assert_eq!(successors.len(), 1, "{action} is not admitted at {state:?}");
@@ -110,7 +174,7 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
         let asked = parent_asked.clone();
         let dialed = parent_dialed.clone();
         std::thread::spawn(move || {
-            let result = bind_control_listener_within(
+            let result = bind_control_listener_with_wait(
                 &plan,
                 Some(&gate),
                 |deadline: std::time::Instant| {
@@ -121,7 +185,7 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
                 },
                 |pid| pid == std::process::id(),
                 Some(&identity),
-                MUST_HAPPEN,
+                || (std::time::Instant::now(), MUST_HAPPEN),
                 |path: &str| {
                     let stream = control_auth::connect_socket_nonblocking(path);
                     let Ok(held) = &stream else { return stream };
@@ -245,7 +309,7 @@ fn failed_candidate_and_unrelated_live_owner_keep_socket_and_token() {
     assert!(model.successors("Bind", &state).is_empty());
     let (mut asked, mut dialed) = (0, 0);
     assert!(
-        bind_control_listener_within(
+        bind_control_listener_with_wait(
             &plan,
             Some(&gate),
             |_| {
@@ -254,7 +318,7 @@ fn failed_candidate_and_unrelated_live_owner_keep_socket_and_token() {
             },
             |pid| pid == std::process::id(),
             Some(&identity),
-            Duration::ZERO,
+            || (std::time::Instant::now(), Duration::ZERO),
             |path: &str| {
                 dialed += 1;
                 control_auth::connect_socket_nonblocking(path)

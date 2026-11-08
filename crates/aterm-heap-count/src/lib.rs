@@ -23,9 +23,9 @@ thread_local! {
 /// Threads inside [`allocations_in`] now: while none is, an allocation skips the thread-local read.
 static COUNTING_THREADS: AtomicUsize = AtomicUsize::new(0);
 
-struct CountingAlloc;
+struct CountingAlloc<A = System>(A);
 
-impl CountingAlloc {
+impl<A> CountingAlloc<A> {
     #[inline]
     fn note() {
         if COUNTING_THREADS.load(Ordering::Relaxed) == 0 {
@@ -52,41 +52,44 @@ impl CountingAlloc {
     }
 }
 
-// SAFETY: every method forwards to `System` with the caller's layout and
+// SAFETY: every method forwards to the inner allocator with the caller's layout and
 // pointer unchanged; the count beside it never allocates.
-unsafe impl GlobalAlloc for CountingAlloc {
+unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAlloc<A> {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         Self::note();
         // SAFETY: forwarded with the caller's layout.
-        unsafe { System.alloc(layout) }
+        unsafe { self.0.alloc(layout) }
     }
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         Self::note();
         // SAFETY: forwarded with the caller's layout.
-        unsafe { System.alloc_zeroed(layout) }
+        unsafe { self.0.alloc_zeroed(layout) }
     }
 
     #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         Self::note();
-        Self::note_freed(layout.size().saturating_sub(size));
         // SAFETY: forwarded with the caller's pointer, layout and size.
-        unsafe { System.realloc(ptr, layout, size) }
+        let next = unsafe { self.0.realloc(ptr, layout, size) };
+        if !next.is_null() {
+            Self::note_freed(layout.size().saturating_sub(size));
+        }
+        next
     }
 
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         Self::note_freed(layout.size());
         // SAFETY: forwarded with the caller's pointer and layout.
-        unsafe { System.dealloc(ptr, layout) }
+        unsafe { self.0.dealloc(ptr, layout) }
     }
 }
 
 #[global_allocator]
-static ALLOCATOR: CountingAlloc = CountingAlloc;
+static ALLOCATOR: CountingAlloc = CountingAlloc(System);
 
 /// Run `f` and say how many heap allocations (and reallocations) it made on this thread.
 pub fn allocations_in<R>(f: impl FnOnce() -> R) -> (R, usize) {
@@ -119,6 +122,54 @@ mod tests {
     use std::hint::black_box;
 
     use super::*;
+
+    struct RefuseRealloc;
+
+    // SAFETY: allocations and deallocations forward unchanged to System. A failed reallocation
+    // returns null without touching the original allocation, as required by GlobalAlloc.
+    unsafe impl GlobalAlloc for RefuseRealloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: forwarding the caller's layout.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: forwarding the caller's pointer and layout.
+            unsafe { System.dealloc(ptr, layout) };
+        }
+
+        unsafe fn realloc(&self, _ptr: *mut u8, _layout: Layout, _size: usize) -> *mut u8 {
+            std::ptr::null_mut()
+        }
+    }
+
+    #[test]
+    fn failed_reallocations_count_requests_but_free_no_bytes() {
+        let allocator = CountingAlloc(RefuseRealloc);
+        let layout = Layout::from_size_align(1_000, 8).unwrap();
+        // SAFETY: allocate a real block, keep ownership across both refused reallocations, read
+        // only initialized bytes within it, then deallocate it exactly once with its old layout.
+        unsafe {
+            let ptr = allocator.alloc(layout);
+            assert!(!ptr.is_null());
+            ptr.write_bytes(0xa5, 1_000);
+            for size in [100, 2_000] {
+                let (next, requests) = allocations_in(|| allocator.realloc(ptr, layout, size));
+                assert!(next.is_null());
+                assert_eq!(requests, 1);
+                let (next, freed) = bytes_freed_in(|| allocator.realloc(ptr, layout, size));
+                assert!(next.is_null());
+                assert_eq!(freed, 0);
+                assert!(
+                    std::slice::from_raw_parts(ptr, 1_000)
+                        .iter()
+                        .all(|b| *b == 0xa5)
+                );
+            }
+            let ((), freed) = bytes_freed_in(|| allocator.dealloc(ptr, layout));
+            assert_eq!(freed, 1_000);
+        }
+    }
 
     /// An allocation and a reallocation each count one, a free none, and a thread counting finds
     /// only its own.

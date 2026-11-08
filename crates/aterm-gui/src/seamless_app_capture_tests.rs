@@ -2192,9 +2192,12 @@ fn a_standing_need_and_a_read_done_cross_the_update() {
         .unwrap_or_else(PoisonError::into_inner)
         .set("attention", Some("wedged on CI".to_string()));
     app.publish_need(0);
-    app.herald_session(0);
-    let need_since = app.presence.herald.need_since(0);
-    assert!(need_since.is_some(), "PRECONDITION: the herald saw the ask");
+    app.age_session_need(0);
+    let need_since = app.presence.need_ages.need_since(0);
+    assert!(
+        need_since.is_some(),
+        "PRECONDITION: the need ages saw the ask"
+    );
     let since_ms = ctx
         .timeline
         .lock()

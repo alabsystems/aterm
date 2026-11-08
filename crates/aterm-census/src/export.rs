@@ -9,6 +9,7 @@ use std::borrow::Cow;
 
 use aterm_regex::Regex;
 
+pub mod mainline;
 pub mod plaintext;
 
 /// The export's allowlist, relative to the checkout.

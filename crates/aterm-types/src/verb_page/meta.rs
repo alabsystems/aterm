@@ -162,8 +162,8 @@ pub(crate) const PAGE: Page = Page {
                 para(
                     "SUPERVISOR: `meta set supervisor <holder> [ttl=<1..600000>]` / `meta unset \
                      supervisor [holder=<holder>]` (Owner-only; `ERR busy supervisor=<holder>` \
-                     while another holds it) quiets menu-bar and desktop alerts while the \
-                     supervisor handles prompts (`supervisor_proven=1`: a direct foreground \
+                     while another holds it) quiets menu-bar alerts while the supervisor \
+                     handles prompts (`supervisor_proven=1`: a direct foreground \
                      `codex-alab@<pid>` connection, or a contract 3 claim).",
                 ),
                 para(

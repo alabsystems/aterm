@@ -255,6 +255,8 @@ mod look_away;
 #[cfg(target_os = "macos")]
 mod mac;
 #[cfg(target_os = "macos")]
+mod mac_commons_startup;
+#[cfg(target_os = "macos")]
 mod mac_nux;
 #[cfg(target_os = "macos")]
 mod mac_nux_guest;
@@ -1080,6 +1082,7 @@ Outside any lab (no jail, no stub):
                                  run <cmd> behind a PTY delaying chunks by RTT/2 each way (default 100 ms)
   mac dmg [--image REF] [--fda] [--keep] | mac nux [--app PATH] [--scenario ROW,...] [--standard-user]
       [--person | --reader] [--no-clt | --vanilla] [--repeat N] [--record [FILE]] | mac provision | mac clean
+  mac commons-startup --aterm FILE --record NEW_DIR [--image REF]
                                  the macOS tart guest lane, each run in a fresh clone of a kept SIP-on base: `dmg`, the
                                  dmg_acceptance benches; `nux`, what a person meets on a new Mac (init, doctor, first
                                  launch, terminal and app launch, vault, a vault of the guest's own, successor,

@@ -253,6 +253,13 @@ pub fn configs_after_subcommand<T: AsRef<OsStr> + Clone>(args: &[T]) -> Vec<T> {
 /// slice: `aterm_release::buildplan::cargo_build_args` is the slices' only argv source and names
 /// none of it, and neither its sealed config nor the workspace's `.cargo/config.toml` carries a
 /// `[resolver]` table, so a shipped binary keeps the features its own package selects.
+///
+/// Only aterm's own checks take it: verify's main lane over this checkout, which tests every
+/// selection as `--workspace` does, and the `verify` alias. A placement never does
+/// ([`with_build_dir`], and atpkg's shim block): the words change which units a build compiles,
+/// so a typed `targo --unverified test -p X` under them builds and tests X against features
+/// its own package never selects (in Trust, 538 units became 757, 38 of them compiler crates,
+/// 2026-11-07), and a build directory must never change what is built.
 pub const TEST_GRAPH_FLAG: &str = "-Zfeature-unification";
 
 /// The test graph's `--config`: `resolver.feature-unification = "workspace"`, read under
@@ -277,14 +284,9 @@ pub fn with_test_graph(args: &[String]) -> Vec<String> {
         .iter()
         .take_while(|a| a.as_str() != "--")
         .any(|a| a == TEST_GRAPH_FLAG);
-    match subcommand_at(args).filter(|_| !chosen) {
-        Some(verb) => insert_test_graph(args, verb),
-        None => args.to_vec(),
-    }
-}
-
-/// `args` with the test graph around its subcommand at `verb` ([`with_test_graph`]).
-fn insert_test_graph(args: &[String], verb: usize) -> Vec<String> {
+    let Some(verb) = subcommand_at(args).filter(|_| !chosen) else {
+        return args.to_vec();
+    };
     let mut out = Vec::with_capacity(args.len() + 3);
     out.extend_from_slice(&args[..verb]);
     out.extend(TEST_GRAPH_CONFIG.map(str::to_owned));
@@ -481,11 +483,6 @@ pub fn unresolved_directory(args: &[String], m: &Machine<'_>) -> bool {
 /// Decide the build-cache placement ([`BuildDir::Cache`], [`BuildDir::Target`]).
 #[must_use]
 pub fn decide(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<BuildDir> {
-    decide_line(args, tool, m).map(|(dir, _)| dir)
-}
-
-/// [`decide`], with the line it read.
-fn decide_line(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<(BuildDir, Line)> {
     let home = m
         .home
         .filter(|h| h.is_absolute() && !h.as_os_str().as_encoded_bytes().ends_with(b"/"))?;
@@ -534,13 +531,12 @@ fn decide_line(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<(BuildDir
             return None;
         }
         if line.cache && cache_writable(home, &root, m) {
-            return Some((BuildDir::Cache(cache), line));
+            return Some(BuildDir::Cache(cache));
         }
         if in_noindex(cwd) {
             return None;
         }
-        let dir = line.place(format!("{{workspace-root}}/target/{TARGET_BUILD_LEAF}"));
-        return Some((dir, line));
+        return Some(line.place(format!("{{workspace-root}}/target/{TARGET_BUILD_LEAF}")));
     };
     let target = target.to_str()?;
     if target.is_empty() {
@@ -558,40 +554,25 @@ fn decide_line(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<(BuildDir
     {
         return None;
     }
-    let dir = line.place(format!("{target}/{TARGET_BUILD_LEAF}"));
-    Some((dir, line))
+    Some(line.place(format!("{target}/{TARGET_BUILD_LEAF}")))
 }
 
 /// `args` with the `--config` [`decide`] adds, or `None` when it adds none. That pair leads (a
-/// shim's front strips it there); a dev `build`/`b`, or a `test`, `t` or `bench` that `targo`
-/// runs also gets the test graph around that verb ([`with_test_graph`]: its `--config` before
-/// the verb, beside this one,
-/// so neither drops the other), unless it names `-Zfeature-unification` itself, so a narrow test
-/// build shares the workspace one's units. Never for [`Tool::Cargo`], which
-/// refuses `-Z`, nor for an alias, whose own words are its business.
+/// shim's front strips it there), and every other word stays as typed: the pair says where the
+/// build's intermediates go, never which units it builds, so the call resolves exactly the unit
+/// graph it resolves unplaced (features included: no [`TEST_GRAPH_CONFIG`] or
+/// [`TEST_GRAPH_FLAG`] is added, whatever the verb or profile).
 #[must_use]
 pub fn with_build_dir(args: &[String], tool: Tool, m: &Machine<'_>) -> Option<Vec<String>> {
-    let (dir, line) = decide_line(args, tool, m)?;
-    let (BuildDir::Cache(value) | BuildDir::Target(value)) = dir else {
+    let (BuildDir::Cache(value) | BuildDir::Target(value)) = decide(args, tool, m)? else {
         return None;
     };
     let at = usize::from(tool == Tool::Cargo && args.first().is_some_and(|a| a.starts_with('+')));
-    let rest = match line.verb_at {
-        Some(verb)
-            if tool == Tool::Targo
-                && !line.unified
-                && (matches!(args[at + verb].as_str(), "test" | "t" | "bench")
-                    || line.dev_profile && matches!(args[at + verb].as_str(), "build" | "b")) =>
-        {
-            insert_test_graph(&args[at..], verb)
-        }
-        _ => args[at..].to_vec(),
-    };
-    let mut out = Vec::with_capacity(at + 2 + rest.len());
+    let mut out = Vec::with_capacity(args.len() + 2);
     out.extend_from_slice(&args[..at]);
     out.push("--config".to_owned());
     out.push(value);
-    out.extend(rest);
+    out.extend_from_slice(&args[at..]);
     Some(out)
 }
 
@@ -632,12 +613,6 @@ struct Line {
     manifest_path: Option<String>,
     /// A verb cargo does not build by itself, which builds only as an alias that does.
     alias: Option<String>,
-    /// Where the verb is in the line read, when one was.
-    verb_at: Option<usize>,
-    /// A `-Zfeature-unification` before `--`, outside any flag's value.
-    unified: bool,
-    /// A dev/test profile, which shares the test graph; release and custom builds keep theirs.
-    dev_profile: bool,
 }
 
 impl Line {
@@ -653,16 +628,11 @@ impl Line {
                 && (!v.starts_with('/') || p.starts_with(home))
         };
         let mut verb = (tool == Tool::Tippy).then_some("tippy");
-        let mut verb_at = None;
         let mut unverified = false;
-        let mut unified = false;
-        let mut dev_profile = true;
         let mut target_dir = None;
         let mut manifest_path = None;
-        let mut words = args.iter().map(String::as_str).enumerate();
-        while let Some((at, a)) = words.next() {
-            // A flag's value is the next word.
-            let mut it = (&mut words).map(|(_, v)| v);
+        let mut it = args.iter().map(String::as_str);
+        while let Some(a) = it.next() {
             let ok = match a {
                 "--" => break,
                 "--unverified" => {
@@ -675,14 +645,6 @@ impl Line {
                     manifest_ok(v)
                 }),
                 "--target-dir" => it.next().map(|v| target_dir = Some(v.to_owned())).is_some(),
-                "--release" | "-r" => {
-                    dev_profile = false;
-                    true
-                }
-                "--profile" => it.next().is_some_and(|v| {
-                    dev_profile = matches!(v, "dev" | "test");
-                    true
-                }),
                 "-Z" | "--color" | "--explain" => verb.is_some() || it.next().is_some(),
                 _ => {
                     if let Some(v) = a.strip_prefix("--config=") {
@@ -693,16 +655,11 @@ impl Line {
                     } else if let Some(v) = a.strip_prefix("--target-dir=") {
                         target_dir = Some(v.to_owned());
                         true
-                    } else if let Some(v) = a.strip_prefix("--profile=") {
-                        dev_profile = matches!(v, "dev" | "test");
-                        true
                     } else if a.starts_with("-C") {
                         false
                     } else {
-                        unified |= a == TEST_GRAPH_FLAG;
                         if !a.starts_with('-') && verb.is_none() {
                             verb = Some(a);
-                            verb_at = Some(at);
                         }
                         true
                     }
@@ -726,9 +683,6 @@ impl Line {
             target_dir,
             manifest_path,
             alias,
-            verb_at,
-            unified,
-            dev_profile,
         })
     }
 

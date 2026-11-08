@@ -2613,6 +2613,26 @@ pub mod group {
         }
     }
 
+    /// Hand an in-place exec a race-free interrupt boundary once this image has no live stage
+    /// groups. A signal the old handlers already took makes this return `false`; after every
+    /// disposition is default, a signal in the remaining exec gap ends the process instead of
+    /// being consumed into this image's soon-to-disappear atomics. The new image installs its
+    /// own handlers immediately. When exec fails, the caller must call [`kill_on_interrupt`]
+    /// again before doing more work.
+    #[must_use]
+    pub fn default_interrupts_for_exec() -> bool {
+        if !cfg!(any(target_os = "macos", target_os = "linux")) || stopping() {
+            return !stopping();
+        }
+        for sig in [SIGHUP, SIGINT, SIGTERM] {
+            // SAFETY: SIG_DFL is a valid disposition and `sig` is one of the three constants.
+            unsafe {
+                signal(sig, SIG_DFL);
+            }
+        }
+        !stopping()
+    }
+
     /// The interrupt the run will die of once it has reported; 0 while there is none.
     #[cfg(test)]
     pub(crate) fn pending() -> i32 {

@@ -2,15 +2,16 @@
 // Copyright 2026 Andrew Yates
 
 //! Per-machine Claude Code account stats view ([`Missing`], [`super::accounts::State`],
-//! [`Account::windows`], [`accounts::sample_window`], [`super::profile`], [`super::spend`],
-//! [`super::accounts::login_state`], [`merge_fig`]).
+//! [`Account::windows`], [`Account::offer`], [`accounts::sample_window`], [`super::profile`],
+//! [`super::spend`], [`super::accounts::login_state`], [`merge_fig`]).
 
 use std::fmt::Write as _;
 
 use aterm_json::{Map, Value};
+use aterm_phase::ResetKind;
 
 use super::accounts::{
-    self, Account, Credits, SESSION_LIMIT, SESSION_WINDOW_S, SOURCE_SAMPLE, WEEK_LIMIT,
+    self, Account, Credits, Offer, SESSION_LIMIT, SESSION_WINDOW_S, SOURCE_SAMPLE, WEEK_LIMIT,
     WEEK_WINDOW_S, WeekSaid, WindowFig, WindowSaid, merge_fig,
 };
 use super::profile::{self, Bucket, NoProfile, Profile};
@@ -25,6 +26,10 @@ pub const SOURCE_WALL: &str = "wall";
 
 /// [`WindowFig::source`] of Claude Code's warning that a window is filling.
 pub const SOURCE_WARNING: &str = "warning";
+
+/// The `resets` figure's source: the harness's limit reset, which records the offer from an exact
+/// confirmation or a spent line read whole ([`accounts::note_offer`], the resets spec's R22).
+pub const SOURCE_LIMIT_RESET: &str = "limit-reset";
 
 /// THE MODEL FAMILY A PER-MODEL WEEK'S DOLLARS ARE SUMMED FOR
 /// ([`spend::Spend::sum`], the catalog family of each message's model):
@@ -81,6 +86,14 @@ pub enum Missing {
     Profile(NoProfile),
     /// The accounts state could not be read.
     StateUnread,
+    /// The `resets` figure only: the harness's limit reset is on ([`Look::limit_reset`]) and the
+    /// accounts state holds no offer of the account ([`Account::offer`]): the program has read no
+    /// exact confirmation and no spent line of it (the resets spec's R22).
+    NoGrantRead,
+    /// The `resets` figure only: no offer is held and the harness's limit reset, the one program
+    /// that records one ([`accounts::note_offer`]), is off ([`Look::limit_reset`]). A reset a person
+    /// takes records none.
+    LimitResetOff,
 }
 
 impl Missing {
@@ -98,6 +111,8 @@ impl Missing {
             Missing::NoRow => "no-row",
             Missing::Profile(why) => why.word(),
             Missing::StateUnread => "state-unread",
+            Missing::NoGrantRead => "no-grant-read",
+            Missing::LimitResetOff => "limit-reset-off",
         }
     }
 
@@ -116,6 +131,11 @@ impl Missing {
             Missing::NoRow => "no row in the /usage seen",
             Missing::Profile(_) => "the profile could not be read",
             Missing::StateUnread => "the accounts state could not be read",
+            Missing::NoGrantRead => "no offer read yet",
+            Missing::LimitResetOff => {
+                "not read: only the harness's limit reset ([harness] limit_reset) records an \
+                 offer, and it is off"
+            }
         }
     }
 }
@@ -161,6 +181,11 @@ pub struct Look<'a> {
     pub api_key_seen: bool,
     /// [`Tap`].
     pub tap: Tap,
+    /// Whether the harness's limit reset is on for Claude Code
+    /// (`SupervisorConfig::limit_reset_on`): the one program that records a limit-reset offer
+    /// ([`accounts::note_offer`]), so with it off and no offer held the `resets` figure says
+    /// [`Missing::LimitResetOff`].
+    pub limit_reset: bool,
     /// [`SpendLook`]; `None` where no Claude directory is known.
     pub spend: Option<SpendLook<'a>>,
     /// The price table's date.
@@ -631,6 +656,7 @@ pub fn home_windows(
         several: false,
         api_key_seen: false,
         tap,
+        limit_reset: false,
         spend: None,
         prices_as_of: None,
         login: None,
@@ -863,6 +889,7 @@ fn missing_text(win: &Win, look: &Look<'_>, tz_at: &dyn Fn(i64) -> i64) -> Strin
         (Some(Missing::NoRow), _) => "the /usage seen on this home has no row for it".to_owned(),
         (Some(Missing::StateUnread), _) => "the accounts state could not be read".to_owned(),
         (Some(Missing::Profile(why)), _) => format!("profile: {}", why.word()),
+        (Some(m @ (Missing::NoGrantRead | Missing::LimitResetOff)), _) => m.phrase().to_owned(),
         (None, _) => String::new(),
         (Some(other), None) => other.word().to_owned(),
     }
@@ -958,6 +985,67 @@ fn dollars_part(name: &str, figure: &spend::Figure, whose: spend::Attribution) -
         }
     }
     part
+}
+
+/// The limit-reset offer the view reads: the one the accounts state holds of the account the
+/// profile names ([`Look::record`]), as last seen, which only [`accounts::note_offer`] records
+/// (the resets spec's R22).
+fn held_offer<'a>(look: &Look<'a>) -> Option<&'a Offer> {
+    look.record().and_then(|a| a.offer.as_ref())
+}
+
+/// Whether a held offer's use-by instant has passed: then it is `void`, else `current`. An offer
+/// with no use-by read is never `void`: its `as_of` dates it.
+fn offer_passed(offer: &Offer, now: i64) -> bool {
+    offer.use_by.is_some_and(|by| by <= now)
+}
+
+/// Why the `resets` figure is empty, where no offer is held: the state could not be read (every
+/// window's word then), the harness's limit reset is off, or it has recorded none.
+fn resets_missing(look: &Look<'_>) -> Option<Missing> {
+    if held_offer(look).is_some() {
+        None
+    } else if look.state_unread {
+        Some(Missing::StateUnread)
+    } else if look.limit_reset {
+        Some(Missing::NoGrantRead)
+    } else {
+        Some(Missing::LimitResetOff)
+    }
+}
+
+/// The `resets` row: the resets left of the offer as last seen, of their kind where it was
+/// named; the use-by instant the confirmation drew, on the local clock at that instant with the
+/// time to it, or `passed` from that instant on; and the windows' `as of <age> (<source>,
+/// <machine>)`. With no offer, `—  <why>` ([`resets_missing`]).
+fn resets_row(look: &Look<'_>, tz_at: &dyn Fn(i64) -> i64) -> String {
+    let Some(offer) = held_offer(look) else {
+        let why = resets_missing(look).map_or("", Missing::phrase);
+        return format!("  {:<6} {DASH}  {why}\n", "resets");
+    };
+    let mut row = match offer.kind {
+        Some(kind) => format!("{} {} left", offer.left, kind.word()),
+        None => format!("{} left", offer.left),
+    };
+    if let Some(by) = offer.use_by {
+        let at = clock_local(by, look.now, tz_at);
+        if offer_passed(offer, look.now) {
+            let _ = write!(row, "{DOT}use by {at}, passed");
+        } else {
+            let _ = write!(
+                row,
+                "{DOT}use by {at} (in {})",
+                span(by.saturating_sub(look.now))
+            );
+        }
+    }
+    let _ = write!(
+        row,
+        "{DOT}as of {} ({SOURCE_LIMIT_RESET}, {})",
+        span(look.now.saturating_sub(offer.at)),
+        machine_word(&offer.by, look)
+    );
+    format!("  {:<6} {row}\n", "resets")
 }
 
 /// Render the plain-text view of `look`.
@@ -1061,6 +1149,7 @@ pub fn text_local(look: &Look<'_>, view: &View, tz_at: &dyn Fn(i64) -> i64) -> S
             );
         }
     }
+    out.push_str(&resets_row(look, tz_at));
     let used = match look.sessions {
         Ok(0) => "here (no session now)".to_owned(),
         Ok(1) => "here (1 session)".to_owned(),
@@ -1326,7 +1415,7 @@ pub fn json(look: &Look<'_>, view: &View, aterm: &str) -> String {
         "credits".to_owned(),
         p.map_or(Value::Null, |p| credits_json(look, p)),
     );
-    a.insert("resets".to_owned(), Value::Null);
+    a.insert("resets".to_owned(), resets_json(look));
     a.insert(
         "spend".to_owned(),
         look.spend.map_or(Value::Null, |s| {
@@ -1400,6 +1489,45 @@ pub fn json(look: &Look<'_>, view: &View, aterm: &str) -> String {
     );
     doc.insert("accounts".to_owned(), Value::Array(vec![Value::Object(a)]));
     aterm_json::to_string(&Value::Object(doc)).unwrap_or_default()
+}
+
+/// THE `resets` OBJECT: the limit-reset offer the accounts state holds of the account, as last
+/// seen ([`held_offer`]), never one read now. `use_by` is the deadline the confirmation drew
+/// (`use by <day> at <time>`, placed in its zone), an instant like every other in the document,
+/// and `state` is `void` from it on; `as_of` dates the count. The next-available date is never
+/// read, so `next_available_at` is null. With no offer held, every value is null, never 0, and
+/// `missing` says why ([`resets_missing`]).
+fn resets_json(look: &Look<'_>) -> Value {
+    let offer = held_offer(look);
+    let mut o = Map::new();
+    o.insert("left".to_owned(), Value::from(offer.map(|g| g.left)));
+    o.insert(
+        "kind".to_owned(),
+        Value::from(offer.and_then(|g| g.kind).map(ResetKind::word)),
+    );
+    put_time(&mut o, "use_by", offer.and_then(|g| g.use_by));
+    put_time(&mut o, "next_available_at", None);
+    put_time(&mut o, "as_of", offer.map(|g| g.at));
+    o.insert(
+        "source".to_owned(),
+        Value::from(offer.map(|_| SOURCE_LIMIT_RESET)),
+    );
+    o.insert("by".to_owned(), Value::from(offer.map(|g| g.by.clone())));
+    o.insert(
+        "state".to_owned(),
+        Value::from(offer.map(|g| {
+            if offer_passed(g, look.now) {
+                "void"
+            } else {
+                "current"
+            }
+        })),
+    );
+    o.insert(
+        "missing".to_owned(),
+        resets_missing(look).map_or(Value::Null, reason),
+    );
+    Value::Object(o)
 }
 
 /// The `credits` object: the word Claude Code keeps, and the money its

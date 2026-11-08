@@ -532,6 +532,22 @@ fn each_os_gets_the_bare_number_where_it_addresses_and_the_long_form_where_it_de
         for (slot, value) in os_slots(os, n(999_999), &facts, true) {
             assert!(value.len() <= slot.limit(), "{slot:?} {value}");
             assert!(rule_v2_allows(&value), "{slot:?} {value}");
+            assert!(slot.accepts_projection(&value, &value));
+            assert_eq!(
+                slot.accepts_projection("m8", "m8-2"),
+                slot == OsSlot::MacLocalHostName,
+                "only the Bonjour slot accepts a numbered alias: {slot:?}"
+            );
         }
+    }
+    for alias in ["m8-2", "m8-10", "m8-4294967295"] {
+        assert!(OsSlot::MacLocalHostName.accepts_projection("m8", alias));
+    }
+    for alias in ["m8-+2", "m8-02", "m8-1", "m8-4294967296", "m8-2.local"] {
+        assert!(!OsSlot::MacLocalHostName.accepts_projection("m8", alias));
+    }
+    for target in ["8", "M8", "m08", " m8", "m8 "] {
+        assert!(!OsSlot::MacLocalHostName.accepts_projection(target, &format!("{target}-2")));
+        assert!(OsSlot::MacLocalHostName.accepts_projection(target, target));
     }
 }

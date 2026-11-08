@@ -1965,11 +1965,60 @@ pub fn export_outcome(code: Option<i32>, transcript: &str) -> (Outcome, String) 
 }
 
 fn export(ctx: &Ctx, r: &mut Report) {
+    export_with(ctx, r, |cmd| exec::run(cmd, ctx.exec_env()));
+}
+
+fn export_mainline(ctx: &Ctx) -> Result<(), aterm_census::export::mainline::Refusal> {
+    aterm_census::export::mainline::require(
+        ctx.head_at_start.as_deref().unwrap_or("HEAD"),
+        |args| {
+            let mut git = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+            git.current_dir(&ctx.root)
+                .env("PATH", &ctx.path_env)
+                .arg("--no-optional-locks")
+                .stdin(aterm_uds::spawnfd::Stdio::null());
+            // Match the producer's object-only Git read, independently of inherited Git
+            // redirects, replace refs or a partial clone's lazy network fetch.
+            for (key, _) in std::env::vars_os() {
+                if key.as_encoded_bytes().starts_with(b"GIT_") {
+                    git.env_remove(key);
+                }
+            }
+            git.args(args)
+                .env("GIT_NO_REPLACE_OBJECTS", "1")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .env("GIT_TERMINAL_PROMPT", "0");
+            aterm_uds::deadline::output_within(&mut git, aterm_census::export::mainline::READ_WAIT)
+                .map(|out| {
+                    (
+                        out.status.code(),
+                        String::from_utf8_lossy(&out.stderr).into_owned(),
+                    )
+                })
+                .map_err(|error| error.to_string())
+        },
+    )
+}
+
+/// Resolve the cheap local prerequisite before starting the potentially uncached producer.
+fn export_with(ctx: &Ctx, r: &mut Report, producer: impl FnOnce(&Cmd) -> exec::Run) {
     if !ctx.tools.have_targo() {
         r.skip("export guards (no targo)");
         return;
     }
-    let out = exec::run(&export_cmd(ctx), ctx.exec_env());
+    let revision = ctx.head_at_start.as_deref().unwrap_or("HEAD");
+    if let Err(why) = export_mainline(ctx) {
+        r.raw(why.why(revision));
+        r.skip(format!(
+            "{EXPORT_LABEL}: not judged here — fix: {}",
+            why.remedy()
+        ));
+        return;
+    }
+    let out = producer(&export_cmd(ctx));
     r.raw(out.output.as_str());
     let (outcome, label) = export_outcome(out.code, &out.output);
     if r.child_could_not_run(&out, &label) {
@@ -3875,12 +3924,15 @@ mod tests {
         assert!(!plain.within(&wide), "the control: {:?}", plain.names());
     }
 
-    /// The real checkout's dev dependency graph must be contained in its verified test graph.
-    /// Negative controls drop workspace feature unification and change the test profile's
-    /// debuginfo: both must introduce different units. A newly feature-flipped dev dependency
-    /// fails the unmutated comparison too, even when the narrow/wide fixture still passes.
+    /// The real checkout's dev build of `aterm`, as the shim's rule places it, resolves exactly
+    /// the unit graph the typed build does (TARGO-MEMBER-FEATURE-SCOPE-1), and that graph's
+    /// dependency units are all in the typed `targo test -p aterm`'s: one profile, and one
+    /// dependency shape in the manifests (B21), with no words chosen for it. CONTROLS: the
+    /// workspace's feature unification around the build (verify's own lanes' words) and a test
+    /// profile with debuginfo each build units the test graph lacks. A newly feature-flipped dev
+    /// dependency fails the unmutated comparison.
     #[test]
-    fn dev_build_reuses_the_verified_workspace_dependencies() {
+    fn dev_build_reuses_the_typed_test_builds_dependencies() {
         use aterm_toolchain::build_cache::{
             Machine, Tool, read_config, with_build_dir, with_test_graph,
         };
@@ -3944,19 +3996,27 @@ mod tests {
         let test = ["--unverified", "test", "-p", "aterm"]
             .map(str::to_owned)
             .to_vec();
-        let verified = graph(with_test_graph(&test));
+        let tested = graph(test.clone());
         let dev = graph(with_build_dir(&build, Tool::Targo, &machine).unwrap());
-        let shared = verified.ids();
+        assert_eq!(
+            dev.ids(),
+            graph(build.clone()).ids(),
+            "placement changed the graph"
+        );
+        let shared = tested.ids();
         let missing: Vec<_> = dev
             .units
             .iter()
             .filter(|u| !shared.contains(&u.id) && !u.target_kinds.iter().any(|k| k == "bin"))
             .collect();
         assert!(missing.is_empty(), "dev/test dependency drift: {missing:?}");
-        assert!(!graph(build).within(&verified), "feature negative control");
-        let mut changed = with_test_graph(&test);
+        assert!(
+            !graph(with_test_graph(&build)).within(&tested),
+            "feature control"
+        );
+        let mut changed = test;
         changed.splice(0..0, ["--config".into(), "profile.test.debug=true".into()]);
-        assert!(!dev.within(&graph(changed)), "profile negative control");
+        assert!(!dev.within(&graph(changed)), "profile control");
     }
 
     #[test]
@@ -5001,6 +5061,112 @@ mod tests {
                 export_outcome(code, "").0,
                 Outcome::Fail(Severity::CouldNotRun)
             );
+        }
+
+        #[cfg(unix)]
+        {
+            use aterm_census::export::mainline;
+            let dir = aterm_tempfile::tempdir().expect("private Git fixture");
+            let root = dir.path();
+            let repo = root.join("repo");
+            let origin = root.join("origin.git");
+            std::fs::create_dir(&repo).unwrap();
+            let git = |cwd: &std::path::Path, args: &[&str]| {
+                let mut cmd = aterm_uds::fixture_git::git();
+                cmd.current_dir(cwd)
+                    .args([
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@example.invalid",
+                        "-c",
+                        "commit.gpgsign=false",
+                    ])
+                    .args(args);
+                let out =
+                    aterm_uds::deadline::output_within(&mut cmd, mainline::READ_WAIT).unwrap();
+                assert!(
+                    out.status.success(),
+                    "git {args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                String::from_utf8_lossy(&out.stdout).trim().to_owned()
+            };
+            git(
+                root,
+                &[
+                    "init",
+                    "-q",
+                    "--bare",
+                    "-b",
+                    "main",
+                    origin.to_str().unwrap(),
+                ],
+            );
+            git(&repo, &["init", "-q", "-b", "main"]);
+            git(
+                &repo,
+                &["remote", "add", "origin", origin.to_str().unwrap()],
+            );
+            git(&repo, &["commit", "-q", "--allow-empty", "-m", "main"]);
+            git(&repo, &["push", "-q", "origin", "HEAD:main"]);
+            git(&repo, &["fetch", "-q", "origin"]);
+            let main = git(&repo, &["rev-parse", "HEAD"]);
+            let scratch = root.join("capture");
+            std::fs::create_dir(&scratch).unwrap();
+            let mut c = Ctx::new(
+                repo.clone(),
+                Scope::workspace(),
+                EnvSnapshot::default(),
+                scratch,
+            );
+            c.path_env = std::env::var_os("PATH").unwrap_or_default();
+            c.tools.targo = PathBuf::from("/bin/sh");
+            c.tools.refused = None;
+            c.tools.lock_refusal = None;
+            let starts = std::cell::Cell::new(0);
+            let producer = |_: &Cmd| {
+                starts.set(starts.get() + 1);
+                exec::run(
+                    &Cmd::new("/bin/sh").args(["-c", "printf 'export producer ran\\n'"]),
+                    c.exec_env(),
+                )
+            };
+            let mut ready = Report::new("mainline export");
+            export_with(&c, &mut ready, producer);
+            assert_eq!(starts.get(), 1, "the eligible export producer actually ran");
+            assert_eq!(ready.outcomes().next().unwrap().0, Outcome::Ok);
+            git(&repo, &["commit", "-q", "--allow-empty", "-m", "feature"]);
+            git(&repo, &["push", "-q", "origin", "HEAD:refs/heads/feature"]);
+            git(&repo, &["fetch", "-q", "origin"]);
+            assert!(matches!(
+                export_mainline(&c),
+                Err(mainline::Refusal::NotOnMain)
+            ));
+            let mut feature = Report::new("pushed feature export");
+            export_with(&c, &mut feature, producer);
+            assert_eq!(starts.get(), 1, "a pushed feature branch starts no build");
+            assert_eq!(feature.outcomes().next().unwrap().0, Outcome::Skip);
+            git(&repo, &["push", "-q", "origin", "HEAD:main"]);
+            git(&repo, &["update-ref", mainline::REF, &main]);
+            assert!(
+                matches!(export_mainline(&c), Err(mainline::Refusal::NotOnMain)),
+                "only the locally fetched ref qualifies"
+            );
+            git(&repo, &["fetch", "-q", "origin"]);
+            let mut fetched = Report::new("fetched mainline export");
+            export_with(&c, &mut fetched, producer);
+            assert_eq!(starts.get(), 2);
+            assert_eq!(fetched.outcomes().next().unwrap().0, Outcome::Ok);
+            git(&repo, &["update-ref", "-d", mainline::REF]);
+            assert!(
+                matches!(export_mainline(&c), Err(mainline::Refusal::Unread(_))),
+                "an absent ref is not a nonancestor finding"
+            );
+            let mut unread = Report::new("unread mainline export");
+            export_with(&c, &mut unread, producer);
+            assert_eq!(starts.get(), 2, "unread ancestry starts no build");
+            assert_eq!(unread.outcomes().next().unwrap().0, Outcome::Skip);
         }
     }
 

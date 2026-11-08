@@ -323,7 +323,10 @@ pub fn name_by_rule(
             |ran| crate::items::names::read_scutil(&ran),
         );
         current()?;
-        if now == Read::Value(label.clone()) {
+        if let Read::Value(now) = &now
+            && aterm_types::machine_name::OsSlot::from_macos_preference(pref)
+                .is_some_and(|slot| slot.accepts_projection(&label, now))
+        {
             continue;
         }
         run_ok(
@@ -1031,5 +1034,40 @@ mod tests {
             none.calls()
         );
         assert!(name_by_rule(&sys, "Mac-mini", &|| Ok(())).is_err());
+
+        for (number, expected) in [
+            ("m183", vec!["ComputerName"]),
+            ("m184", vec!["ComputerName", "LocalHostName"]),
+        ] {
+            let sys = Fake::root();
+            sys.stat_of(ADMITTED_NAME_RULE, rule_stat(0, 0o440));
+            for (field, value) in [
+                ("ComputerName", "drift"),
+                ("LocalHostName", "m183-2"),
+                ("HostName", number),
+            ] {
+                sys.on(&format!("/usr/sbin/scutil --get {field}"), Ran::ok(value));
+                sys.on(
+                    &format!("/usr/bin/sudo -n /usr/sbin/scutil --set {field} {number}"),
+                    Ran::ok(""),
+                );
+            }
+            assert_eq!(name_by_rule(&sys, number, &|| Ok(())).unwrap(), expected);
+            let writes: Vec<_> = sys
+                .calls()
+                .into_iter()
+                .filter(|call| call.contains(" --set "))
+                .collect();
+            assert_eq!(
+                writes,
+                expected
+                    .iter()
+                    .map(|field| format!(
+                        "/usr/bin/sudo -n /usr/sbin/scutil --set {field} {number}"
+                    ))
+                    .collect::<Vec<_>>(),
+                "a repair of another slot must preserve an accepted Bonjour alias"
+            );
+        }
     }
 }

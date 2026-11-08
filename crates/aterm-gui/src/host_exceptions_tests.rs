@@ -1481,6 +1481,24 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     assert_eq!(glass(&app), before);
 }
 
+/// One account on the window-full line, with the reset offer it carries.
+fn nearly_full(
+    label: &str,
+    reason: &str,
+    grants: Option<aterm_agent::harness::accounts::Offer>,
+) -> aterm_agent::harness::accounts::WindowFull {
+    aterm_agent::harness::accounts::WindowFull {
+        label: label.to_string(),
+        reason: reason.to_string(),
+        grants,
+    }
+}
+
+/// The local clock of these entries: UTC.
+const fn utc(_: i64) -> i64 {
+    0
+}
+
 /// The account's usage lines (`HostNote::Accounts`) mark nothing on the glass: credits carrying an
 /// account's sessions are one `harness.accounts.credits` line, raised once and ended when nothing
 /// names it; the week nearly used with credits off is one `harness.accounts.window-full` line whose
@@ -1497,7 +1515,7 @@ fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
             credits: credits.iter().map(|l| l.to_string()).collect(),
             window_full: full
                 .iter()
-                .map(|(l, why)| (l.to_string(), why.to_string()))
+                .map(|(l, why)| nearly_full(l, why, None))
                 .collect(),
             due: Vec::new(),
             none_soon: false,
@@ -1577,21 +1595,203 @@ fn the_accounts_usage_lines_follow_what_the_host_says_and_mark_nothing() {
         2
     );
     assert!(step(&mut app, HostNote::Accounts(AccountsSaid::Nothing)).is_empty());
-    let spent = [("main".to_string(), "out_of_credits".to_string())];
-    let off = [("main".to_string(), String::new())];
+    let spent = [nearly_full("main", "out_of_credits", None)];
+    let off = [nearly_full("main", "", None)];
     for entry in [
         mr::accounts_credits_entry(&["main".to_string(), "work-2".to_string()]),
-        mr::accounts_window_full_entry(&spent, true),
-        mr::accounts_window_full_entry(&off, true),
-        mr::accounts_window_full_entry(&spent, false),
-        mr::accounts_window_full_entry(&off, false),
+        mr::accounts_window_full_entry(&spent, true, &utc),
+        mr::accounts_window_full_entry(&off, true, &utc),
+        mr::accounts_window_full_entry(&spent, false, &utc),
+        mr::accounts_window_full_entry(&off, false, &utc),
     ] {
         let entry = entry.expect("an entry");
         assert_eq!(entry.family(), Family::Accounts);
         assert!(entry.message().is_ok(), "{:?}", entry.message().err());
     }
     assert!(mr::accounts_credits_entry(&[]).is_none());
-    assert!(mr::accounts_window_full_entry(&[], false).is_none());
+    assert!(mr::accounts_window_full_entry(&[], false, &utc).is_none());
+}
+
+/// THE WINDOW-FULL LINE NAMES THE LIMIT RESETS LEFT ONLY WHERE AN OFFER STANDS, AS A FACT AS LAST
+/// SEEN: one detail line after `Nearly used: …`, by label, count, kind where one was named, the
+/// day the count was seen and the use-by day where one was read, that holds no slash command and
+/// asks nothing. The entry's key, title, reason, step, severity, resurfacing, log line and
+/// restatement are those it has with no offer, and with none its detail is exactly the one it had
+/// before resets were named. A change of the offer alone changes words only: within
+/// `RESTATE_QUIET` of the entry's last statement the digest keeps the one entry as it stood, and
+/// a post after that updates the same entry in place, never a new one.
+#[test]
+fn the_window_full_line_names_the_resets_left_only_where_an_offer_stands() {
+    use crate::messages_host::wall_stamp_now;
+    use aterm_agent::harness::accounts::Offer;
+    use aterm_messages::PostOutcome;
+    use aterm_messages::need::Need;
+    use aterm_phase::ResetKind;
+    const NOV_12: i64 = 1_794_441_600 + 12 * 3600;
+    let offer = |kind: Option<ResetKind>, left: u32, use_by: Option<i64>| Offer {
+        kind,
+        left,
+        use_by,
+        at: NOV_12 - 30 * 86_400,
+        by: "3f9a1b2c4d5e6f70".to_string(),
+    };
+    let words = |entry: &Entry| {
+        let msg = entry
+            .message()
+            .unwrap_or_else(|fault| panic!("{}: {fault:?}", entry.key()));
+        let Need::Later(ask) = msg.need() else {
+            panic!("{}: an entry is a Later ask", entry.key());
+        };
+        let fixed = (
+            entry.key(),
+            msg.title.clone(),
+            msg.severity,
+            ask.why_words(),
+            ask.then().words().to_string(),
+            ask.resurface(),
+            ask.restates_at_once(),
+            entry.log_line_text().map(str::to_string),
+        );
+        (fixed, msg.detail[2..].to_vec())
+    };
+    let cedar = offer(Some(ResetKind::Weekly), 1, Some(NOV_12));
+    for usage_credits in [false, true] {
+        for reason in ["org_level_disabled", "out_of_credits"] {
+            let bare = [
+                nearly_full("main", reason, None),
+                nearly_full("cedar", "", None),
+            ];
+            let entry = |full: &[_]| {
+                mr::accounts_window_full_entry(full, usage_credits, &utc).expect("an entry")
+            };
+            let (fixed, more) = words(&entry(&bare));
+            assert_eq!(
+                more,
+                ["Nearly used: main, cedar"],
+                "the control: no offer, no line"
+            );
+            assert_eq!(fixed.0, mr::ACCOUNTS_WINDOW_FULL_KEY);
+            assert!(!fixed.6, "not restated at once");
+            for (grants, line) in [
+                (
+                    vec![None, Some(cedar.clone())],
+                    "Limit resets left: cedar 1 weekly (seen Oct 13, use by Nov 12)",
+                ),
+                (
+                    vec![
+                        Some(offer(Some(ResetKind::Full), 2, None)),
+                        Some(cedar.clone()),
+                    ],
+                    "Limit resets left: main 2 full (seen Oct 13), cedar 1 weekly (seen Oct 13, use by Nov 12)",
+                ),
+                (
+                    vec![Some(offer(Some(ResetKind::Fable), 3, None)), None],
+                    "Limit resets left: main 3 fable (seen Oct 13)",
+                ),
+                (
+                    vec![Some(offer(None, 2, None)), None],
+                    "Limit resets left: main 2 (seen Oct 13)",
+                ),
+            ] {
+                let full: Vec<_> = bare
+                    .iter()
+                    .zip(grants)
+                    .map(|(f, grants)| nearly_full(&f.label, &f.reason, grants))
+                    .collect();
+                let (with, more) = words(&entry(&full));
+                assert_eq!(with, fixed, "{line}: the same entry");
+                assert_eq!(more, ["Nearly used: main, cedar", line]);
+                assert!(!line.contains('/'), "{line}: no slash command");
+                let lower = line.to_lowercase();
+                for verb in ["take", "run", "type", "press", "spend", "claim", "open"] {
+                    assert!(
+                        !lower.split([' ', ',', ':', '(', ')']).any(|w| w == verb),
+                        "{line}: {verb}"
+                    );
+                }
+                assert!(
+                    lower.matches("use").count() == lower.matches("use by").count(),
+                    "{line}: `use` only in the vendor's use-by day"
+                );
+            }
+        }
+    }
+    let shifted = mr::accounts_window_full_entry(
+        &[nearly_full("cedar", "", Some(cedar.clone()))],
+        false,
+        &|_| -13 * 3600,
+    )
+    .expect("an entry");
+    assert_eq!(
+        words(&shifted).1[1],
+        "Limit resets left: cedar 1 weekly (seen Oct 12, use by Nov 11)",
+        "the local day"
+    );
+
+    let mut app = App::headless_for_test();
+    let said = |grants: Option<Offer>| {
+        HostNote::Accounts(AccountsSaid::Listed {
+            signed_out: Vec::new(),
+            credits: Vec::new(),
+            window_full: vec![nearly_full("cedar", "org_level_disabled", grants)],
+            due: Vec::new(),
+            none_soon: false,
+            wrong: Vec::new(),
+            no_sign_in: Vec::new(),
+            clock: None,
+        })
+    };
+    let entries = |app: &App| -> Vec<(String, Vec<String>)> {
+        app.messages
+            .digest()
+            .entries
+            .iter()
+            .map(|e| (e.key.clone(), e.detail.clone()))
+            .collect()
+    };
+    app.note_harness_host(said(Some(cedar.clone())));
+    let raised = entries(&app);
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    assert_eq!(raised[0].0, mr::ACCOUNTS_WINDOW_FULL_KEY);
+    assert!(
+        raised[0]
+            .1
+            .iter()
+            .any(|l| l.contains("Limit resets left: cedar 1 weekly")),
+        "{raised:?}"
+    );
+    let rev = app.messages.digest_revision();
+    let id = app.messages.digest().entries[0].id;
+    for grants in [Some(offer(Some(ResetKind::Weekly), 2, None)), None] {
+        app.note_harness_host(said(grants.clone()));
+        assert_eq!(entries(&app), raised, "{grants:?}: the one entry, kept");
+        assert_eq!(
+            app.messages.digest_revision(),
+            rev,
+            "{grants:?}: not restated within RESTATE_QUIET"
+        );
+    }
+    let spent = mr::accounts_window_full_entry(
+        &[nearly_full("cedar", "org_level_disabled", None)],
+        app.harness_policy.get().policy.usage_credits,
+        &utc,
+    )
+    .expect("an entry");
+    let posted = app.messages.post(
+        spent.message().expect("an entry that passes"),
+        wall_stamp_now(),
+        Instant::now() + aterm_messages::need::RESTATE_QUIET + Duration::from_secs(60),
+    );
+    assert_eq!(posted.outcome, PostOutcome::Restated, "past RESTATE_QUIET");
+    assert_eq!(posted.id, id, "the same entry");
+    let updated = entries(&app);
+    assert_eq!(updated.len(), 1, "{updated:?}");
+    assert_eq!(updated[0].0, mr::ACCOUNTS_WINDOW_FULL_KEY);
+    assert!(
+        !updated[0].1.iter().any(|l| l.contains("Limit resets left")),
+        "the stale count is gone: {updated:?}"
+    );
+    assert_ne!(app.messages.digest_revision(), rev, "updated in place");
 }
 
 /// A row whose automatic sign-in found no route is one `harness.accounts.no-sign-in` line, a

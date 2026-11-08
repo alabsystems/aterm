@@ -13218,8 +13218,11 @@ struct GoAheads {
 /// [`TurnEndState::go_ahead_judged`]; DESIGN-harness-autopilot §15.6).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GoAheadVerdict {
-    /// The decision types the owner's standing go-ahead ([`RULE_GO_AHEAD`]) or waits out its
-    /// back-off: the lines it answers ([`go_ahead::Park::needs`]) are off the menu bar.
+    /// The decision types the owner's standing go-ahead ([`RULE_GO_AHEAD`]) or Land's instruction
+    /// over its park, itself, as a restart's `otherwise` or by the Enter of the loop's own line
+    /// of it, or waits out the go-ahead's back-off: the lines it answers
+    /// ([`go_ahead::Park::needs`]) are off the menu bar, and they are all the act answers
+    /// ([`TurnEndState::acted`]).
     Answers(Vec<String>),
     /// The go-ahead is spent and the person is told now
     /// ([`super::exception::Exception::refuses_go_ahead`]): every line is back.
@@ -15388,7 +15391,13 @@ impl TurnEndState {
     /// ([`super::exception::Exception::refuses`]). A point answers them where it types the
     /// go-ahead owed ([`Self::go_ahead_owed`]) or waits out the back-off before it, and where it
     /// types Land's instruction over the park the go-ahead answers once it is typed
-    /// ([`Self::go_ahead_first`], 2026-10-30 review 9).
+    /// ([`Self::go_ahead_first`], 2026-10-30 review 9). A decision is judged on the act it types:
+    /// a restart on its `otherwise`, which the loop types where the restart waits for a quiet
+    /// moment or is not made (a restart made types none and puts the lines back,
+    /// [`Self::restarted`]); a draft's Enter ([`TurnEndAction::Submit`]) on the act it sends in
+    /// place of, which is the loop's own line of that act where it wrote one and left it
+    /// unsent. So the lines a go-ahead answers are always ones its decision judged
+    /// ([`Self::acted`]).
     #[must_use]
     pub fn go_ahead_verdict(
         &self,
@@ -15401,15 +15410,22 @@ impl TurnEndState {
         if refused {
             return GoAheadVerdict::Refused;
         }
+        if let TurnEndAction::Restart { otherwise, .. } = action {
+            return self.go_ahead_verdict(otherwise, reading, cfg, false, now);
+        }
         let park = match action {
-            TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_GO_AHEAD => {
+            TurnEndAction::Type { rule_id, .. } | TurnEndAction::Submit { rule_id }
+                if *rule_id == RULE_GO_AHEAD =>
+            {
                 self.go_ahead_owed(reading, now)
             }
             TurnEndAction::WaitUntil {
                 wait: WaitKind::BackOff { .. },
                 ..
             } => self.go_ahead_owed(reading, now),
-            TurnEndAction::Type { rule_id, .. } if *rule_id == RULE_LAND => {
+            TurnEndAction::Type { rule_id, .. } | TurnEndAction::Submit { rule_id }
+                if *rule_id == RULE_LAND =>
+            {
                 self.go_ahead_first(reading, cfg, now)
             }
             _ => None,
@@ -16675,11 +16691,17 @@ impl TurnEndState {
         }
     }
 
-    /// THE GO-AHEAD WENT ON `park` at `now` ([`RULE_GO_AHEAD`], at a turn end or a break): one
-    /// more act on the standing park, or its first, and the lines it answers are off the menu bar
-    /// for good ([`GoAheadVerdict::Answers`]).
+    /// THE GO-AHEAD WENT ON `park` at `now` at a break ([`RULE_GO_AHEAD`]; a turn end's is booked
+    /// by [`Self::acted`]): one more act on the standing park, or its first, and the lines it
+    /// answers are off the menu bar for good ([`GoAheadVerdict::Answers`]).
     pub fn go_ahead_typed(&mut self, park: &go_ahead::Park, now: Instant) {
-        self.go_ahead_answered(&park.needs);
+        self.go_ahead_counted(&park.needs, now);
+    }
+
+    /// One act of the go-ahead's count at `now` ([`GoAheads`]), answering the lines being
+    /// answered and those `past` names: the act counts whatever lines it names.
+    fn go_ahead_counted(&mut self, past: &[String], now: Instant) {
+        self.go_ahead_answered(past);
         self.go_aheads.first.get_or_insert(now);
         self.go_aheads.acts = self.go_aheads.acts.saturating_add(1);
     }
@@ -19937,22 +19959,26 @@ impl TurnEndState {
             TurnEndAction::Type { text, .. } => Some(text.clone()),
             _ => None,
         };
-        // The lines the go-ahead answers, whose ack it does not owe ([`Self::needs_ack_owed_past`]).
-        let mut past = Vec::new();
+        // The lines the go-ahead answers, whose ack it does not owe ([`Self::needs_ack_owed_past`]):
+        // those its decision judged ([`Self::go_ahead_judged`]), and no others.
+        let past = self.needs.answering.clone();
         if typed_rule == Some(RULE_GO_AHEAD) {
-            let act = self.act_words.as_deref().filter(|_| reading.opens_cut);
-            match reading.go_ahead_past(act) {
-                Some(park) => {
-                    self.go_ahead_typed(&park, now);
-                    past = park.needs;
-                }
-                None => self.go_ahead_answered(&[]),
-            }
-        } else if !self.needs.answering.is_empty() {
+            // THE GO-AHEAD TYPED IS ONE ACT OF ITS COUNT ([`GoAheads`]) on the park its decision
+            // read, and answers that park's lines alone: a point types it only there
+            // ([`Self::go_ahead_owed`]), and those lines are the ones being answered. The loop
+            // records the act on the point read again (`Session::turn_end_reread`), which runs no
+            // whole-turn read, so its park is no judge of the turn: a park only an earlier message
+            // read whole above the screen held parks nothing on `reading`, and the act counts all
+            // the same, or its bound would never trip; a line that earlier message makes a
+            // person's parks on `reading`, and stays on the menu bar all the same (§15.6).
+            self.go_ahead_counted(&[], now);
+        } else if !past.is_empty() && !matches!(action, TurnEndAction::Submit { .. }) {
             // Another act its decision typed over the park (Land's instruction first,
             // [`Self::go_ahead_first`]) answers its lines as the go-ahead's would, but is no act
-            // of the go-ahead's count.
-            past = self.needs.answering.clone();
+            // of the go-ahead's count. A draft's Enter booked as itself answers none: the loop
+            // books a line a point's act wrote and left unsent as that act
+            // (`Session::turn_end_execute`), so this one sent no words its decision judged, and
+            // the loop puts their lines back as for an act not submitted.
             self.go_ahead_answered(&[]);
         }
         self.act_words.clone_from(&typed_text);
@@ -20400,6 +20426,9 @@ impl TurnEndState {
         // is answered past the prompt that screen showed answered ([`Self::host_typed`]).
         self.screen_prompt = reading.answered.map(|a| a.prompt);
         if made {
+            // The act the restart was decided over is not typed: the lines its go-ahead would
+            // answer are back on the menu bar ([`Self::go_ahead_verdict`]).
+            self.go_ahead_unwritten();
             self.replies = Replies::default();
             self.settling = None;
             // The relaunch resumes the session's conversation: a banner read while it was under

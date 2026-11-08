@@ -1153,6 +1153,7 @@ trait Kernel {
     fn birth_alive(&self, process: &Process) -> Option<bool>;
     fn signal(&self, master: i32, process: &Process, ctx: &crate::SessionCtx) -> String;
     fn watch(&self, process: &Process) -> Option<DeathWatch>;
+    /// Whether `group` can no longer act ([`crate::native_observe::cohort_gone`] ships).
     fn group_gone(&self, group: u32) -> Option<bool>;
     fn conversation(&self, ctx: &crate::SessionCtx, vendor: &Process) -> Option<Conversation>;
     fn record_key(&self, ctx: &crate::SessionCtx) -> Option<String>;
@@ -1586,7 +1587,7 @@ impl Kernel for System<'_> {
         DeathWatch::watch(process)
     }
     fn group_gone(&self, group: u32) -> Option<bool> {
-        process_group_gone(group)
+        crate::native_observe::cohort_gone(group)
     }
     fn conversation(&self, ctx: &crate::SessionCtx, vendor: &Process) -> Option<Conversation> {
         let snapshot = crate::harness_host::published_snapshot(ctx.self_id.as_str())?;
@@ -4789,26 +4790,6 @@ fn connection_closed_by(ctx: &crate::SessionCtx, connection: u64, kernel: &dyn K
         }
     }
     reconcile_extinct_by(ctx, kernel);
-}
-
-#[cfg(unix)]
-fn process_group_gone(group: u32) -> Option<bool> {
-    let group = i32::try_from(group).ok().filter(|group| *group > 1)?;
-    // SAFETY: signal zero only observes the positive group identity captured from the kernel.
-    let observed = unsafe { libc::kill(-group, 0) };
-    if observed == 0 {
-        return Some(false);
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => Some(true),
-        Some(libc::EPERM) => Some(false),
-        _ => None,
-    }
-}
-
-#[cfg(not(unix))]
-fn process_group_gone(_: u32) -> Option<bool> {
-    None
 }
 
 /// Native coordination is explicitly selected by actual prepare, rather than retroactively

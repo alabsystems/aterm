@@ -405,7 +405,8 @@ pub fn judge(
             return Err("busy_p_time");
         }
     }
-    let mhz = |cycles: u64, ns: u64| (ns >= MIN_CLOCK_NS).then(|| cycles as f64 * 1e3 / ns as f64);
+    let mhz =
+        |cycles: u64, ns: u64| (ns >= MIN_CLOCK_NS).then_some(cycles as f64 * 1e3 / ns as f64);
     let within = |v: f64, (lo, hi): (f64, f64)| v >= lo * BELOW_BOTTOM && v <= hi * OVER_TOP;
     let whole = (
         range.p_mhz.0.min(range.e_mhz.0),
@@ -429,7 +430,7 @@ pub fn judge(
     let (e, e_refused) = efficiency(cpu_ns);
     let (e_qos, e_qos_refused) = efficiency(qos_ns);
     let ipc =
-        (cpu_ns >= MIN_CLOCK_NS && m.cycles > 0).then(|| m.instructions as f64 / m.cycles as f64);
+        (cpu_ns >= MIN_CLOCK_NS && m.cycles > 0).then_some(m.instructions as f64 / m.cycles as f64);
     if ipc.is_some_and(|v| !(MIN_IPC..MAX_IPC).contains(&v)) {
         return Err("ipc");
     }

@@ -2919,8 +2919,8 @@ impl App {
             agent,
             program,
             task,
-            need_since: self.presence.herald.need_since(h.local_id),
-            held_since: self.presence.herald.held_since(h.local_id),
+            need_since: self.presence.need_ages.need_since(h.local_id),
+            held_since: self.presence.need_ages.held_since(h.local_id),
             person_refusals: h.ctx.fabric.person_refusals(),
             held_by_host: h.ctx.fabric.holds().remote().map(|r| r.host.clone()),
             end,
@@ -2967,8 +2967,8 @@ impl App {
         }
     }
 
-    /// Fold one session's PUBLISHED need into the herald ([`crate::status_item::Herald`], §9 S4: the herald is fed by the need): remember since when its need and hold stand (the glance's ages), and dirty the menu-bar item where what it shows of the session moved.
-    pub(crate) fn herald_session(&mut self, session: u64) {
+    /// Fold one session's PUBLISHED need into the need ages ([`crate::status_item::NeedAges`], §9 S4: the ages are fed by the need): remember since when its need and hold stand (the glance's ages), and dirty the menu-bar item where what it shows of the session moved.
+    pub(crate) fn age_session_need(&mut self, session: u64) {
         let handle = self
             .store
             .read()
@@ -2984,7 +2984,7 @@ impl App {
         }
         if self
             .presence
-            .herald
+            .need_ages
             .observe(session, row.as_ref(), now_unix)
         {
             self.mark_status_dirty();
@@ -3010,7 +3010,7 @@ impl App {
         {
             self.mark_done_seen(session, task.entered);
         }
-        self.presence.herald.adopt(session, carry, now_unix);
+        self.presence.need_ages.adopt(session, carry, now_unix);
     }
 
     fn adopt_end_carry(&mut self, session: u64, sid: &str) {
@@ -3133,7 +3133,7 @@ impl App {
             .iter()
             .map(|session| {
                 let id = session.id;
-                let mut carry = self.presence.herald.carry_of(id);
+                let mut carry = self.presence.need_ages.carry_of(id);
                 carry.done = self.done_seen.get(&id).and_then(|entered| {
                     session
                         .ctx
@@ -3149,7 +3149,7 @@ impl App {
             .collect()
     }
 
-    /// THE STATUS GLANCE (§3): the REGISTRY snapshot → one [`crate::status_item::SessionRow`] per live session ([`Self::status_session_row`], leaf locks only) → the pure [`crate::status_item::Glance::build`], with the last sibling scan, the digest's entries and the alerts switch.
+    /// THE STATUS GLANCE (§3): the REGISTRY snapshot → one [`crate::status_item::SessionRow`] per live session ([`Self::status_session_row`], leaf locks only) → the pure [`crate::status_item::Glance::build`], with the last sibling scan, the fleet read, the API outage's start and the digest's entries.
     pub(crate) fn status_glance(&self) -> crate::status_item::Glance {
         let started = std::time::Instant::now();
         let glance = self.status_glance_built();
@@ -6942,7 +6942,7 @@ mod mixed_tab_tests {
     use super::*;
 
     #[test]
-    fn per_agent_off_questions_reach_the_herald_only_for_disabled_agents() {
+    fn per_agent_off_questions_need_you_only_for_disabled_agents() {
         use aterm_agent::supervise::SupervisorConfig;
         use aterm_phase::Program;
 
@@ -10097,8 +10097,8 @@ mod status_glance_tests {
     /// `error` report is resting and a `working` one, or none, working; a `blocked` one is
     /// published as the tab's need (`needs::program_need`, through `publish_need` as every
     /// presence refresh does) and counted need-you, except under a proven self-claim, which
-    /// speaks for the tab: there it works. A word its reader names stands over any report. The
-    /// herald sees the bucket move, so the menu bar is rebuilt.
+    /// speaks for the tab: there it works. A word its reader names stands over any report.
+    /// `NeedAges::observe` sees the bucket move, so the menu bar is rebuilt.
     #[test]
     fn a_codex_tabs_own_report_rests_it_only_where_its_reader_names_no_state() {
         use aterm_core::terminal::program_state::{
@@ -10231,13 +10231,13 @@ mod status_glance_tests {
         report(Some(W::Working));
         let working = app.status_session_row(&handle);
         let now = status_unix_now();
-        assert!(app.presence.herald.observe(0, Some(&resting), now));
+        assert!(app.presence.need_ages.observe(0, Some(&resting), now));
         assert!(
-            app.presence.herald.observe(0, Some(&working), now),
+            app.presence.need_ages.observe(0, Some(&working), now),
             "the bucket moved with the report alone"
         );
         assert!(
-            !app.presence.herald.observe(0, Some(&working), now),
+            !app.presence.need_ages.observe(0, Some(&working), now),
             "control: no move"
         );
         publish("busy", aterm_phase::Program::Claude, "claude");
@@ -10460,9 +10460,9 @@ mod status_glance_tests {
         on_screen(&mut parent, true);
         parent.note_done_seen_looking();
         on_screen(&mut parent, false);
-        parent.herald_session(1);
+        parent.age_session_need(1);
         assert!(
-            parent.presence.herald.need_since(1).is_some(),
+            parent.presence.need_ages.need_since(1).is_some(),
             "PRECONDITION: the parent saw the need"
         );
         let row = parent
@@ -10487,27 +10487,27 @@ mod status_glance_tests {
                 app.status_carry
                     .insert(ctx.self_id.as_str().to_string(), carry);
             }
-            app.herald_session(1);
+            app.age_session_need(1);
             app
         };
         let mut adopted = successor(true);
         assert_eq!(
-            adopted.presence.herald.need_since(1),
+            adopted.presence.need_ages.need_since(1),
             Some(1_000),
             "the carried age"
         );
         assert!(adopted.status_glance().done.is_empty(), "read before it");
         assert!(adopted.status_carry.is_empty(), "spent");
         publish_meta(&mut adopted, 1, "attention", "a new question");
-        adopted.herald_session(1);
+        adopted.age_session_need(1);
         assert_ne!(
-            adopted.presence.herald.need_since(1),
+            adopted.presence.need_ages.need_since(1),
             Some(1_000),
             "a new ask after it ages from its own sight"
         );
 
         let fresh = successor(false);
-        assert_ne!(fresh.presence.herald.need_since(1), Some(1_000));
+        assert_ne!(fresh.presence.need_ages.need_since(1), Some(1_000));
         assert_eq!(fresh.status_glance().done.len(), 1, "no carry: unread");
     }
 

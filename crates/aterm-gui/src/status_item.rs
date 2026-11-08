@@ -170,7 +170,7 @@ pub(crate) struct SessionRow {
     pub program: Option<&'static str>,
     /// The task record, for a worker.
     pub task: Option<TaskRow>,
-    /// When the need was first published (unix seconds, [`Herald::observe`]).
+    /// When the need was first published (unix seconds, [`NeedAges::observe`]).
     pub need_since: Option<i64>,
     /// When the hold was first seen standing (unix seconds).
     pub held_since: Option<i64>,
@@ -316,12 +316,12 @@ pub(crate) use crate::needs::{fold_clip, wall_words};
 
 /// THE NEED-AGE KEEPER: per session, since when its published need and its hold have stood ([`Self::observe`]), which the glance's ages read, and what a seamless update carried of them ([`Self::adopt`]).
 #[derive(Debug, Default)]
-pub(crate) struct Herald {
+pub(crate) struct NeedAges {
     since: std::collections::HashMap<u64, Since>,
     adopted: std::collections::HashMap<u64, Adopted>,
 }
 
-/// How long a seamless successor's first sighting of a need or a hold takes the age its outgoing process carried ([`Herald::adopt`]): room for every standing need to be published again, which the stall watch's re-detection (`input_backlog::STALL_AFTER`, stretched under load, then `input_stall::RECHECK`) bounds.
+/// How long a seamless successor's first sighting of a need or a hold takes the age its outgoing process carried ([`NeedAges::adopt`]): room for every standing need to be published again, which the stall watch's re-detection (`input_backlog::STALL_AFTER`, stretched under load, then `input_stall::RECHECK`) bounds.
 pub(crate) const ADOPT_SETTLE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// What the status item knew of one session, carried across a seamless update as one row (`SessionRecord::status_seen`): the published need and since when it stood, the hold and since when, and the done the owner looked at, by when its task entered it.
@@ -421,7 +421,7 @@ fn shown_key(row: &SessionRow) -> u64 {
     aterm_hash::fnv1a_64(format!("{fact:?}").as_bytes())
 }
 
-impl Herald {
+impl NeedAges {
     /// Fold session `session`'s row at `now_unix` (`None`: it is gone): the first sight of a need (a new word or key) or of a hold (a new word) starts its age; the same one re-read keeps it.
     pub(crate) fn observe(
         &mut self,
@@ -477,7 +477,7 @@ impl Herald {
         );
     }
 
-    /// What this herald knows of `session` for the next process ([`StatusCarry`]; the done is the App's): the need and hold it last observed and since when.
+    /// What the keeper knows of `session` for the next process ([`StatusCarry`]; the done is the App's): the need and hold it last observed and since when.
     #[cfg(any(unix, test))]
     pub(crate) fn carry_of(&self, session: u64) -> StatusCarry {
         let since = self.since.get(&session).copied().unwrap_or_default();
@@ -3519,7 +3519,7 @@ mod tests {
         assert_eq!(stopped.key, first.key);
         assert_eq!(stopped.word, NeedWord::Stopped);
 
-        let mut h = Herald::default();
+        let mut h = NeedAges::default();
         assert!(h.observe(5, Some(&first_row), 100));
         assert!(
             h.observe(5, Some(&later_row), 140),
@@ -5340,7 +5340,7 @@ mod tests {
     }
 
     #[test]
-    fn the_herald_remembers_since_when_a_need_and_a_hold_stand() {
+    fn the_need_ages_remember_since_when_a_need_and_a_hold_stand() {
         let asked = |key: u64, hold: Option<HoldWord>| SessionRow {
             id: 1,
             title: "zsh".to_string(),
@@ -5355,7 +5355,7 @@ mod tests {
             held: hold,
             ..SessionRow::default()
         };
-        let mut h = Herald::default();
+        let mut h = NeedAges::default();
         assert!(h.observe(1, Some(&asked(7, None)), 100));
         assert!(!h.observe(1, Some(&asked(7, None)), 130), "the same row");
         assert!(h.observe(1, Some(&asked(7, Some(HoldWord::Local))), 160));
@@ -5400,13 +5400,13 @@ mod tests {
 
     #[test]
     fn an_adopted_standing_need_keeps_its_age() {
-        let mut before = Herald::default();
+        let mut before = NeedAges::default();
         let boxed = agent_row(4, "builder", "prompt", 5);
         let _ = before.observe(4, Some(&boxed), 100);
         let carry = StatusCarry::parse(&before.carry_of(4).row().expect("a row"));
         let reboxed = agent_row(9, "builder", "prompt", 1);
         let successor = |carry: StatusCarry, at: i64| {
-            let mut h = Herald::default();
+            let mut h = NeedAges::default();
             h.adopt(9, carry, 1_000);
             let _ = h.observe(9, Some(&reboxed), at);
             h
@@ -5444,7 +5444,7 @@ mod tests {
             ..StatusCarry::default()
         };
         let first_age = |carry: StatusCarry, verdict: &'static str| {
-            let mut h = Herald::default();
+            let mut h = NeedAges::default();
             h.adopt(9, carry, 1_000);
             let _ = h.observe(9, Some(&agent_row(9, "builder", verdict, 1)), 1_010);
             h.need_since(9)

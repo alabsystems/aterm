@@ -211,7 +211,7 @@ pub(super) fn live(
             || !job.metadata_sdk.as_ref().is_some_and(|sdk| {
                 sdk.execution().as_os_str().as_bytes() == linker.root
                     && sdk
-                        .workload_linker(Instant::now() + Duration::from_secs(2))
+                        .workload_linker(native_inputs::deadline(Instant::now()))
                         .is_ok()
             })
         {

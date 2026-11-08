@@ -450,11 +450,26 @@ pub(crate) struct OwnNames {
 
 impl OwnNames {
     /// All three names, `LocalHostName` first.
-    fn each(&self) -> [(&'static str, Option<&str>); 3] {
+    fn each(
+        &self,
+    ) -> [(
+        &'static str,
+        aterm_types::machine_name::OsSlot,
+        Option<&str>,
+    ); 3] {
+        use aterm_types::machine_name::OsSlot;
         [
-            ("Local hostname", self.local_host.as_deref()),
-            ("Computer Name", self.computer.as_deref()),
-            ("Hostname", self.host.as_deref()),
+            (
+                "Local hostname",
+                OsSlot::MacLocalHostName,
+                self.local_host.as_deref(),
+            ),
+            (
+                "Computer Name",
+                OsSlot::MacComputerName,
+                self.computer.as_deref(),
+            ),
+            ("Hostname", OsSlot::MacHostName, self.host.as_deref()),
         ]
     }
 }
@@ -1138,8 +1153,8 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
     })
 }
 
-/// Where any of the Mac's own names (`ComputerName`, `LocalHostName` or `HostName`) differs
-/// from the projected `label` and `target` is that number: what names it. macOS lets only root
+/// Where any of the Mac's own names (`ComputerName`, `LocalHostName` or `HostName`) does not
+/// accept the projected `label` and `target` is that number: what names it. macOS lets only root
 /// set them: setup's one early Mac password
 /// sets them where a number was known by then (its argv carries it), and otherwise leaves the
 /// narrow rule through which `sync.identity` sets them with no password once admission gives the
@@ -1151,10 +1166,10 @@ pub(crate) fn own_name_pending(
     own: &OwnNames,
 ) -> Option<String> {
     let label = label.filter(|label| *label == target)?;
-    let (which, now) = own
+    let (which, _, now) = own
         .each()
         .into_iter()
-        .find(|(_, name)| *name != Some(label))?;
+        .find(|(_, slot, name)| name.is_none_or(|name| !slot.accepts_projection(label, name)))?;
     let now = now.unwrap_or("unread");
     Some(format!(
         "this Mac's own name is {now} ({which}), not {label}"
@@ -2608,6 +2623,31 @@ mod tests {
             own_name_due(keys.clone(), None, true),
             keys,
             "all three repaired names leave the current identity row current"
+        );
+
+        let mut aliased = OwnNames {
+            computer: Some("m183".to_owned()),
+            local_host: Some("m183-2".to_owned()),
+            host: Some("m183".to_owned()),
+        };
+        assert_eq!(
+            own_name_pending("m183", Some("m183"), &aliased),
+            None,
+            "a numbered Bonjour alias retains the admitted machine number"
+        );
+        for name in ["m183-x", "m183-02", "m183-1", "m183-2-extra", "m184-2"] {
+            aliased.local_host = Some(name.to_owned());
+            assert!(
+                own_name_pending("m183", Some("m183"), &aliased).is_some(),
+                "{name} is not the accepted local projection of m183"
+            );
+        }
+        aliased.computer = Some("m184".to_owned());
+        aliased.host = Some("m184".to_owned());
+        aliased.local_host = Some("m183-2".to_owned());
+        assert!(
+            own_name_pending("m184", Some("m184"), &aliased).is_some(),
+            "an earlier number's alias cannot fulfill a new naming intent"
         );
     }
 

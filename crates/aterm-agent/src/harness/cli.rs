@@ -11682,7 +11682,7 @@ fn accounts_json(
     rotation.insert("probe".to_owned(), Value::from(supervised && early));
     rotation.insert(
         "limit_reset".to_owned(),
-        Value::from(supervised && policy.limit_reset),
+        Value::from(moves && policy.limit_reset_on()),
     );
     rotation.insert(
         "observed".to_owned(),
@@ -19058,8 +19058,9 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
     let machine = (!state_unread)
         .then(|| store.machine_id(&state.machine).ok())
         .flatten();
-    let tap = stats_tap_for(
-        env,
+    let (policy, _) = SupervisorConfig::from_path(env.config.as_deref());
+    let tap = stats_tap(
+        &policy,
         !state_unread
             && (roster.row(&label).is_some()
                 || roster.rows.is_empty() && label == ACCOUNTS_OWN_LABEL),
@@ -19125,6 +19126,7 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
         several,
         api_key_seen,
         tap,
+        limit_reset: policy.limit_reset_on(),
         spend: folded.as_ref().map(|(spend, complete)| SpendLook {
             spend,
             complete: *complete,
@@ -19159,8 +19161,14 @@ fn stats_default_home(env: &Env) -> bool {
 }
 
 fn stats_tap_for(env: &Env, served: bool) -> super::account_stats::Tap {
+    stats_tap(
+        &SupervisorConfig::from_path(env.config.as_deref()).0,
+        served,
+    )
+}
+
+fn stats_tap(policy: &SupervisorConfig, served: bool) -> super::account_stats::Tap {
     use super::account_stats::Tap;
-    let (policy, _) = SupervisorConfig::from_path(env.config.as_deref());
     match (policy.usage_tap, policy.usage_tap_on(), served) {
         (false, ..) => Tap::Off,
         (true, false, _) => Tap::HarnessOff,

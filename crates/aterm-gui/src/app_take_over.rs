@@ -158,7 +158,7 @@ pub(crate) struct AgentsState {
 /// (`status_item::need_order`): stuck before decide; within a severity a need that has stopped
 /// its agent before a harness's report it carries on past
 /// (`docs/DESIGN-harness-autopilot-2026-10-15.md` §14.7); then oldest first (since this aterm
-/// first saw it published, `Herald::need_since`; unknown age last), then by the tab's label,
+/// first saw it published, `NeedAges::need_since`; unknown age last), then by the tab's label,
 /// then the session's local id.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct NeedStop {
@@ -644,7 +644,11 @@ impl App {
             .map(|(session, severity, carries_on, key)| NeedStop {
                 severity,
                 carries_on,
-                since: self.presence.herald.need_since(session).unwrap_or(i64::MAX),
+                since: self
+                    .presence
+                    .need_ages
+                    .need_since(session)
+                    .unwrap_or(i64::MAX),
                 label: self.tab_label_of_session(session),
                 session,
                 key,
@@ -3000,7 +3004,7 @@ mod tests {
                 .cloned()
                 .expect("registered");
             let row = app.status_session_row(&handle);
-            let _ = app.presence.herald.observe(session, Some(&row), at);
+            let _ = app.presence.need_ages.observe(session, Some(&row), at);
         }
         assert!(
             first < second,
@@ -3056,7 +3060,7 @@ mod tests {
                 .cloned()
                 .expect("registered");
             let row = app.status_session_row(&handle);
-            let _ = app.presence.herald.observe(session, Some(&row), at);
+            let _ = app.presence.need_ages.observe(session, Some(&row), at);
         }
         let stops = app.local_needs();
         let stop = |s: u64| stops.iter().find(|n| n.session == s).cloned();

@@ -24,6 +24,11 @@ fn retained_sdk_capture_and_validation_wait_for_unchanged_inputs() {
     // This native image is read, never executed, so no assessment can outlive its fixture.
     std::fs::copy(std::env::current_exe().unwrap(), &program).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let compiler = build.join("bin/trustc");
+    for target in [&compiler, &build.join("bin/rust-lld")] {
+        std::fs::copy(&program, target).unwrap();
+        std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
     atpkg::store::mark_build_ready(&build).unwrap();
     let keeper = Keeper::capture(&layout, &program).unwrap();
     let captured = Keeper::capture_at(&layout, &program, Instant::now() - Duration::from_secs(31));
@@ -42,6 +47,48 @@ fn retained_sdk_capture_and_validation_wait_for_unchanged_inputs() {
             .is_err()
     );
     keeper.lease.check_current().unwrap();
+    keeper
+        .capture_workload_compiler(native_inputs::deadline(Instant::now()))
+        .unwrap();
+    keeper
+        .require_resolver_protocol(native_inputs::deadline(
+            Instant::now() - Duration::from_secs(31),
+        ))
+        .unwrap();
+    keeper
+        .require_workload_protocol(native_inputs::deadline(
+            Instant::now() - Duration::from_secs(31),
+        ))
+        .unwrap();
+    let root_deadline = Instant::now() + Duration::from_secs(60);
+    let (held, observed_deadline) = super::super::workload::compiler_input(
+        &keeper,
+        root_deadline,
+        Instant::now() - Duration::from_secs(3),
+    )
+    .unwrap();
+    assert_eq!(held.program(), compiler);
+    assert!(observed_deadline <= root_deadline);
+    assert!(
+        super::super::workload::compiler_input(&keeper, Instant::now(), Instant::now()).is_err()
+    );
+    std::fs::rename(&compiler, compiler.with_extension("original")).unwrap();
+    std::fs::copy(compiler.with_extension("original"), &compiler).unwrap();
+    assert!(
+        super::super::workload::compiler_input(
+            &keeper,
+            native_inputs::deadline(Instant::now()),
+            Instant::now()
+        )
+        .is_err()
+    );
+    std::fs::remove_file(&compiler).unwrap();
+    std::fs::rename(compiler.with_extension("original"), &compiler).unwrap();
+    assert!(
+        keeper.validate().is_err(),
+        "the original directory witness stays changed"
+    );
+    let keeper = Keeper::capture(&layout, &program).unwrap();
     std::fs::rename(&program, program.with_extension("original")).unwrap();
     std::fs::copy(program.with_extension("original"), &program).unwrap();
     assert!(

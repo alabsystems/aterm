@@ -3884,7 +3884,7 @@ fn a_second_box_between_two_sweeps_is_a_new_need() {
 }
 
 /// A PROGRAM'S NOTIFICATION PASSES A BOX THE SWEEP PUBLISHED: codex's box stands, its need is
-/// published (the glance lists it and the herald keeps its age), and codex's own OSC 9, OSC 99
+/// published (the glance lists it and the need ages keep its age), and codex's own OSC 9, OSC 99
 /// and OSC 777, written while that box stands into a terminal wired as a spawn wires it
 /// (`spawn::configure_notifications`), each reach the notifier's queue once, as the session's,
 /// with their words.
@@ -3913,8 +3913,8 @@ fn a_program_notification_passes_a_box_the_sweep_published() {
         "PRECONDITION: the glance lists it"
     );
     assert!(
-        rig.app.presence.herald.need_since(rig.sid).is_some(),
-        "PRECONDITION: the herald keeps its age"
+        rig.app.presence.need_ages.need_since(rig.sid).is_some(),
+        "PRECONDITION: the need ages keep its age"
     );
     for notice in [
         format!("\x1b]9;{WORDS}\x07"),

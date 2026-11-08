@@ -3283,8 +3283,9 @@ pub(crate) enum AccountsSaid {
         signed_out: Vec<String>,
         /// The credits line: accounts usage credits carry (`accounts::credits_noted`).
         credits: Vec<String>,
-        /// The week's line: accounts whose week is nearly used with no credits.
-        window_full: Vec<(String, String)>,
+        /// The week's line: accounts whose week is nearly used with no credits, each with the
+        /// limit resets it was last seen to have, while they stand (`accounts::windows_full`).
+        window_full: Vec<accounts::WindowFull>,
         /// The due line: renewable logins still on this Mac due or ended (`accounts::due_logins_here`), which the upkeep renews by itself.
         due: Vec<String>,
         /// The warning that no renewable login is left working within a day (`accounts::none_working_within`).

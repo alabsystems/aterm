@@ -50,7 +50,7 @@ pub struct Spec {
     pub reach: Reach,
     /// The tools the machine must have for it to run (`aterm_uds::host::TOOLS`).
     pub needs: &'static [&'static str],
-    /// What else it needs that is no tool: the network, a pushed HEAD, an argument.
+    /// What else it needs that is no tool: the network, a mainline HEAD, an argument.
     pub also: &'static str,
     /// What it runs, in one line.
     pub runs: &'static str,
@@ -225,7 +225,7 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::Export],
         reach: Reach::WholeTree,
         needs: &["pub", "gitleaks", "git"],
-        also: "network, rustup trust, HEAD pushed",
+        also: "network, rustup trust, HEAD on locally fetched origin/main",
         runs: "ship check --export (the publication engine's export guards)",
     },
     Spec {

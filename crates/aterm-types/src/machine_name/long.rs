@@ -130,6 +130,39 @@ pub enum OsSlot {
 }
 
 impl OsSlot {
+    /// The macOS slot named by an Apple `scutil` preference.
+    #[must_use]
+    pub fn from_macos_preference(preference: &str) -> Option<Self> {
+        match preference {
+            "HostName" => Some(Self::MacHostName),
+            "LocalHostName" => Some(Self::MacLocalHostName),
+            "ComputerName" => Some(Self::MacComputerName),
+            _ => None,
+        }
+    }
+
+    /// Whether `observed` is an accepted projection of `expected` in this slot.
+    /// A canonical machine number's Bonjour name may carry macOS's numeric collision suffix
+    /// (`m8-2`): canonical decimal `u32`, at least two. That is naming policy, not evidence
+    /// of who assigned the alias. Every other slot and every noncanonical target still require
+    /// exact equality.
+    #[must_use]
+    pub fn accepts_projection(self, expected: &str, observed: &str) -> bool {
+        if observed == expected {
+            return true;
+        }
+        if self != Self::MacLocalHostName
+            || !Number::parse(expected).is_ok_and(|number| number.to_string() == expected)
+        {
+            return false;
+        }
+        observed
+            .strip_prefix(expected)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .and_then(|suffix| suffix.parse::<u32>().ok().map(|number| (suffix, number)))
+            .is_some_and(|(suffix, number)| number >= 2 && number.to_string() == suffix)
+    }
+
     /// The most bytes the slot holds as aterm writes it.
     #[must_use]
     pub const fn limit(self) -> usize {

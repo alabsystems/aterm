@@ -300,6 +300,10 @@ impl Owner {
 }
 
 pub(super) fn entry(args: &[OsString]) -> Option<std::process::ExitCode> {
+    entry_at(args, Instant::now())
+}
+
+fn entry_at(args: &[OsString], started: Instant) -> Option<std::process::ExitCode> {
     if args.first().is_none_or(|word| word != VERB) {
         return None;
     }
@@ -316,7 +320,7 @@ pub(super) fn entry(args: &[OsString]) -> Option<std::process::ExitCode> {
         // SAFETY: this private early role consumes its one reserved connected
         // socket, before other libraries or threads can claim the target slot.
         let channel = CtlStream::from(unsafe { spawnfd::adopt_inherited_socket(fd)? });
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = started + Duration::from_secs(60);
         channel.set_nonblocking(true)?;
         let peer = transport::local_peer(&channel)?;
         let parent = process::read_lineage(std::process::id() as i32)
@@ -403,6 +407,7 @@ mod tests {
     use std::os::fd::FromRawFd as _;
     use std::os::unix::process::ExitStatusExt as _;
     const ACTOR: &str = "metadata_prelude::tests::native_prelude_actor";
+    const DELAYED_ACTOR: &str = "metadata_prelude::tests::native_delayed_prelude_actor";
     const TARGET: &str = "metadata_prelude::tests::native_no_fork_target";
     const REPLACEMENT: &str = "metadata_prelude::tests::native_exec_replacement";
     struct ChildGuard(spawnfd::Child);
@@ -428,6 +433,33 @@ mod tests {
         } else {
             75
         });
+    }
+
+    #[test]
+    fn native_delayed_prelude_actor() {
+        let Some(fd) = std::env::var_os("ATERM_TEST_METADATA_PRELUDE_FD") else {
+            return;
+        };
+        let args = vec![
+            OsString::from(VERB),
+            OsString::from(format!("--control-fd={}", fd.to_str().unwrap())),
+        ];
+        let result = entry_at(&args, Instant::now() - Duration::from_secs(31)).unwrap();
+        std::process::exit(if result == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            75
+        });
+    }
+
+    #[test]
+    fn actual_native_preparation_survives_scheduling_delay() {
+        crate::runtime::test_endpoint().unwrap();
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let marker = scratch.path().join("delayed-target-ran");
+        let (result, _) = run_selected_actor(&marker, None, DELAYED_ACTOR);
+        assert!(result.success());
+        assert!(marker.is_file());
     }
     #[test]
     fn native_no_fork_target() {
@@ -603,6 +635,14 @@ mod tests {
         marker: &std::path::Path,
         mode: Option<&str>,
     ) -> (std::process::ExitStatus, u32) {
+        run_selected_actor(marker, mode, ACTOR)
+    }
+
+    fn run_selected_actor(
+        marker: &std::path::Path,
+        mode: Option<&str>,
+        actor: &str,
+    ) -> (std::process::ExitStatus, u32) {
         let mut target = spawnfd::command(std::env::current_exe().unwrap());
         target
             .arg0("original-selected-argv0")
@@ -617,7 +657,7 @@ mod tests {
         let (mut owner, _) = Owner::new(&target, &[3, 4], deadline).unwrap();
         let mut prelude = spawnfd::command(std::env::current_exe().unwrap());
         prelude
-            .args(["--exact", ACTOR, "--nocapture"])
+            .args(["--exact", actor, "--nocapture"])
             .env_clear()
             .env("ATERM_TEST_METADATA_MARKER", marker)
             .env("ATERM_TEST_METADATA_PRELUDE_FD", owner.target.to_string())

@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use aterm_toml::edit::{DocumentMut, Item, Table, Value};
-use aterm_types::machine_name::{Class, Number};
+use aterm_types::machine_name::{Class, Number, OsSlot};
 use aterm_uds::atomic_file::ConfigFile;
 
 use super::file::{self, MachineName, Migration};
@@ -219,13 +219,21 @@ pub fn is_apply_system(words: &[String], exe: &Path) -> Option<Number> {
     (apply_system_words(exe, number).ok()? == words).then_some(number)
 }
 
-/// Whether each of `names` ([`SYSTEM_NAMES`]' values) reads `number` (`m59`).
+/// Whether each of `names` ([`SYSTEM_NAMES`]' values) accepts `number`'s OS projection.
 #[must_use]
 pub fn all_read(names: &[Option<String>; 3], number: Number) -> bool {
     let number = number.to_string();
-    names
-        .iter()
-        .all(|name| name.as_deref() == Some(number.as_str()))
+    SYSTEM_NAMES
+        .into_iter()
+        .zip(names)
+        .all(|(field, name)| accepts_system_name(field, &number, name.as_deref()))
+}
+
+fn accepts_system_name(field: &str, number: &str, observed: Option<&str>) -> bool {
+    observed.is_some_and(|observed| {
+        OsSlot::from_macos_preference(field)
+            .is_some_and(|slot| slot.accepts_projection(number, observed))
+    })
 }
 
 /// The only way [`publish`] reads or sets macOS's three system names: `aterm name set` asks
@@ -246,32 +254,47 @@ pub trait SystemNames {
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn read_system_names() -> [Option<String>; 3] {
-    SYSTEM_NAMES.map(|field| {
-        let mut command = aterm_uds::spawnfd::command("/usr/sbin/scutil");
-        command.args(["--get", field]);
-        aterm_uds::deadline::output_within(&mut command, SCUTIL_WAIT)
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-    })
+    SYSTEM_NAMES.map(read_system_name)
 }
 
-/// Set each of [`SYSTEM_NAMES`] to `number` with Apple's fixed `/usr/sbin/scutil --set`, within
-/// 10 seconds each, reading no configuration, registry or user path: `aterm name apply-system`'s
-/// root half, once it has checked that it runs as root. Answers the fields scutil did not set.
+#[cfg(target_os = "macos")]
+fn read_system_name(field: &str) -> Option<String> {
+    let mut command = aterm_uds::spawnfd::command("/usr/sbin/scutil");
+    command.args(["--get", field]);
+    aterm_uds::deadline::output_within(&mut command, SCUTIL_WAIT)
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
+/// Read each of [`SYSTEM_NAMES`] and set an unaccepted projection to `number` with Apple's
+/// fixed `/usr/sbin/scutil --set`, within 10 seconds per read or set, reading no configuration,
+/// registry or user path: `aterm name apply-system`'s root half, once it has checked that it
+/// runs as root. Answers the fields scutil did not set.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn set_as_root(number: Number) -> Vec<&'static str> {
+    set_system_names(number, read_system_name, |field, number| {
+        let mut command = aterm_uds::spawnfd::command("/usr/sbin/scutil");
+        command.args(["--set", field, number]);
+        matches!(
+            aterm_uds::deadline::output_within(&mut command, SCUTIL_WAIT),
+            Ok(out) if out.status.success()
+        )
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn set_system_names(
+    number: Number,
+    mut read: impl FnMut(&str) -> Option<String>,
+    mut set: impl FnMut(&str, &str) -> bool,
+) -> Vec<&'static str> {
     let number = number.to_string();
     SYSTEM_NAMES
         .into_iter()
         .filter(|field| {
-            let mut command = aterm_uds::spawnfd::command("/usr/sbin/scutil");
-            command.args(["--set", field, &number]);
-            !matches!(
-                aterm_uds::deadline::output_within(&mut command, SCUTIL_WAIT),
-                Ok(out) if out.status.success()
-            )
+            !accepts_system_name(field, &number, read(field).as_deref()) && !set(field, &number)
         })
         .collect()
 }
@@ -503,7 +526,7 @@ pub fn publication_of(
         let differ: Vec<(&'static str, Option<String>)> = SYSTEM_NAMES
             .into_iter()
             .zip(names)
-            .filter(|(_, value)| value.as_deref() != Some(word.as_str()))
+            .filter(|(field, value)| !accepts_system_name(field, &word, value.as_deref()))
             .map(|(field, value)| (field, value.clone()))
             .collect();
         if !differ.is_empty() {

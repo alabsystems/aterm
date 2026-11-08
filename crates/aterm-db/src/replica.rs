@@ -362,6 +362,9 @@ pub struct Report {
     pub recovery: bool,
     /// The selected table, if both peers had one in common.
     pub table: Option<Digest>,
+    /// The selected table's scope, whose digest is [`Self::table`]: which application table the
+    /// round served, for a reader that would otherwise read custody and the catalog to say.
+    pub scope: Option<Scope>,
     /// Local retained operation count before this table's positive repair.
     /// This is inventory knowledge, never a claim of complete network history.
     pub retained: usize,
@@ -1909,6 +1912,7 @@ impl Round<'_> {
             repair.table_yield = true;
         }
         report.table = Some(id);
+        report.scope = self.tables.get(&id).map(|(scope, _)| *scope);
         let deferred = report.deferred;
         self.table(stream, peer, side, id, repair, report)?;
         report.table_deferred = report.deferred > deferred;

@@ -164,22 +164,20 @@ pub(crate) fn round(paths: &Paths, report: &aterm_db::runtime::RepairRound) {
     if !holds() {
         return;
     }
+    let Some(dir) = settled_dir() else {
+        return;
+    };
     // Only the round's completion gate admits a witness: a cancelled, interrupted, deferred or
     // failed round, or one whose witness names another peer, table or inventory, settles nothing.
     let Some(table) = witness_table(
         report
             .matching_inventory()
-            .map(|witness| (witness.inventory().count, witness.scope().digest())),
+            .map(|witness| (witness.inventory().count, witness.scope())),
+        |table| settled_in(&dir, table),
         || Registry::at(paths.clone()).table().ok().flatten(),
     ) else {
         return;
     };
-    let Some(dir) = settled_dir() else {
-        return;
-    };
-    if settled_in(&dir, &table) {
-        return;
-    }
     let hex = aterm_codec::hex::encode_lower(&table);
     if aterm_types::fs_restricted::ensure_private_dir(&dir).is_ok() {
         let _ = aterm_agent::harness::upgrade_models::write_atomic_mode(
@@ -191,14 +189,19 @@ pub(crate) fn round(paths: &Paths, report: &aterm_db::runtime::RepairRound) {
 }
 
 /// The registry table a completed round's witness (`witness`: the operations it counts and its
-/// table) settles: its table where it counts at least one operation and the registry holds that
-/// table now (`held`, read only where there is such a witness), else none.
+/// table's scope) settles: its table where it counts at least one operation, is one of the
+/// registry's generations ([`Registry::is_generation`]), is not `settled` already, and is the
+/// table the registry holds now (`held`, a read of custody and the catalog, made only where all
+/// the rest hold), else none.
 fn witness_table(
-    witness: Option<(usize, [u8; 32])>,
+    witness: Option<(usize, aterm_db::table::Scope)>,
+    settled: impl FnOnce(&[u8; 32]) -> bool,
     held: impl FnOnce() -> Option<[u8; 32]>,
 ) -> Option<[u8; 32]> {
-    let (_, table) = witness.filter(|(count, _)| *count > 0)?;
-    (held() == Some(table)).then_some(table)
+    let (_, scope) =
+        witness.filter(|(count, scope)| *count > 0 && Registry::is_generation(*scope))?;
+    let table = scope.digest();
+    (!settled(&table) && held() == Some(table)).then_some(table)
 }
 
 /// Each mailbox key a login of `ai-mailbox.toml` (`logins`) names, to that login lower-cased:
@@ -1181,37 +1184,63 @@ mod tests {
         assert!(!due(Some(after(1)), true, at), "a look stamped after now");
     }
 
-    /// A completed round settles a table only where its witness counts an operation and names
-    /// the table the registry holds here, and the held table is read only for such a witness.
+    /// A completed round settles a table only where its witness counts an operation of one of
+    /// the registry's generations, not settled yet, that the registry holds here, and the held
+    /// table, a read of custody and the catalog, is read only for such a witness.
     /// NEGATIVE CONTROL: without the `count > 0` filter, `` an empty witness `` settles the held
-    /// table.
+    /// table; without the `is_generation` filter, `` another application `` reads the held table.
     #[test]
     fn a_round_settles_only_a_witness_that_counts_an_operation_of_the_table_held_here() {
-        const HELD: [u8; 32] = [1; 32];
-        const OTHER: [u8; 32] = [2; 32];
+        use aterm_secrets::commons::journal::Trust;
+        let trust = Trust {
+            network: [3; 16],
+            authority: [4; 32],
+            genesis: [5; 32],
+        };
+        let registry =
+            |compiled: &aterm_db::att::Compiled| compiled.descriptor(trust).unwrap().scope;
+        let held = registry(&aterm_db::att::REGISTRY);
+        let next = registry(&aterm_db::att::REGISTRY_2);
+        let other = aterm_db::catalog::Descriptor::application(trust, "aterm.lab", "tables", 1)
+            .unwrap()
+            .scope;
         let unread = || -> Option<[u8; 32]> { panic!("the held table is read only for a witness") };
+        let unsettled = |_: &[u8; 32]| false;
         assert_eq!(
-            witness_table(Some((0, HELD)), || Some(HELD)),
+            witness_table(Some((0, held)), unsettled, || Some(held.digest())),
             None,
             "an empty witness"
         );
         assert_eq!(
-            witness_table(Some((3, OTHER)), || Some(HELD)),
+            witness_table(Some((3, next)), unsettled, || Some(held.digest())),
             None,
-            "another table"
+            "another generation"
         );
         assert_eq!(
-            witness_table(Some((3, HELD)), || None),
+            witness_table(Some((3, held)), unsettled, || None),
             None,
             "no table held here"
         );
-        assert_eq!(witness_table(None, unread), None, "no witness");
+        assert_eq!(witness_table(None, unsettled, unread), None, "no witness");
         assert_eq!(
-            witness_table(Some((0, HELD)), unread),
+            witness_table(Some((0, held)), unsettled, unread),
             None,
             "an empty witness"
         );
-        assert_eq!(witness_table(Some((3, HELD)), || Some(HELD)), Some(HELD));
+        assert_eq!(
+            witness_table(Some((3, other)), unsettled, unread),
+            None,
+            "another application"
+        );
+        assert_eq!(
+            witness_table(Some((3, held)), |table| *table == held.digest(), unread),
+            None,
+            "settled already"
+        );
+        assert_eq!(
+            witness_table(Some((3, held)), unsettled, || Some(held.digest())),
+            Some(held.digest())
+        );
     }
 
     /// A shipped build holds a lab only in the person's own environment: a build tool's run, a

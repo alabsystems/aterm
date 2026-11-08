@@ -3561,7 +3561,7 @@ mod tests {
     }
 
     /// A slice keeps the features its own package selects: the workspace's feature unification,
-    /// which every test-profile build takes (`aterm_toolchain::build_cache::with_test_graph`),
+    /// which verify's test builds take (`aterm_toolchain::build_cache::with_test_graph`),
     /// reaches no slice's argv, nor the two configs a slice reads (the sealed one and the
     /// checkout's, where only verify's alias carries the words). NEGATIVE CONTROL: the reader
     /// finds the words in a test build's argv and a `[resolver]` table in a config.

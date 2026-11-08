@@ -4457,6 +4457,11 @@ struct WriteSeal {
 }
 
 impl FooterUndo {
+    /// Whether the last footer splice rewrote any row's columns.
+    pub(crate) const fn has_glass_shifts(&self) -> bool {
+        self.write.is_some() && self.glass.len > 0
+    }
+
     /// Maps glass column `col` on `row` back to its underlying terminal grid column.
     pub(crate) fn grid_col(&self, row: u16, col: u16) -> u16 {
         if self.write.is_none() {

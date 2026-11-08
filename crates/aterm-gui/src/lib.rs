@@ -20212,13 +20212,7 @@ impl App {
                 let _ = reply.send(self.control_security_posture(&asked));
             }
             Wake::UpdateHealth { title, body } => {
-                let announced = self.note_update_health(&title, &body);
-                if !announced {
-                    self.request_native_update_reconcile(
-                        crate::app_native::NativeUpdateReconcilePurpose::Refresh,
-                    );
-                    return;
-                }
+                self.note_update_health(&title, &body);
                 self.request_native_update_reconcile(
                     crate::app_native::NativeUpdateReconcilePurpose::Refresh,
                 );

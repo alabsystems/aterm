@@ -185,23 +185,8 @@ fn clear_default_record(root: &Path) -> Result<(), String> {
 /// steps before it): a hang bound, not a latency budget a busy machine's working fabric misses.
 const PROOF_DEADLINE: Duration = Duration::from_secs(60);
 
-/// How long `on` waits for the broker launchd or systemd started to answer ([`wait_for_broker`]).
-const BIND_DEADLINE: Duration = Duration::from_secs(5);
-
-/// [`BIND_DEADLINE`]'s seam, in milliseconds, in a seam-enabled build: the fabric_world harness
-/// sets it (its `BIND_WAIT`) for a broker a test's stand-in launchd or systemd starts on the
-/// test's loaded machine, where a debug `aterm link broker` can take past 5 s to bind.
-const BIND_DEADLINE_SEAM: &str = "ATERM_FABRIC_BIND_DEADLINE_MS";
-
-/// [`BIND_DEADLINE`], or the [`BIND_DEADLINE_SEAM`] a seam-enabled build was given, read once.
-fn bind_deadline() -> Duration {
-    static AT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
-    *AT.get_or_init(|| {
-        aterm_types::dev_seam!(BIND_DEADLINE_SEAM)
-            .and_then(|ms| crate::parse_uint::<u64>(ms.to_str()?))
-            .map_or(BIND_DEADLINE, Duration::from_millis)
-    })
-}
+/// A minute hang detector for the local broker launchd or systemd started to answer.
+const BIND_DEADLINE: Duration = Duration::from_secs(60);
 
 const ARM_DEADLINE: Duration = Duration::from_secs(5);
 
@@ -2956,7 +2941,7 @@ fn wait_for_broker(p: &Paths, node: &str) -> Result<fabric::BrokerView, Box<fabr
     poll_broker(
         || poll_reach(p, node),
         fabric::BrokerView::locate,
-        bind_deadline(),
+        BIND_DEADLINE,
         BIND_DEADLINE,
     )
 }
@@ -2968,16 +2953,25 @@ fn poll_reach(p: &Paths, node: &str) -> fabric::BrokerView {
 
 /// `reach` every 100 ms until a broker answers, then `name` its process once: the poll itself
 /// connects and names nothing, so no process table is scanned while nothing listens yet. Past
-/// `deadline`, the last poll's view; past `refused_after` ([`BIND_DEADLINE`]) too once a broker
-/// answers, in this astream protocol or another, but its bus cannot be read, so a seam that
-/// waits longer for a broker to bind waits no longer on one that refuses.
+/// `deadline`, the last poll's view; past `refused_after` too once a broker answers, in this
+/// astream protocol or another, but its bus cannot be read. Neither expiry establishes a
+/// successful attach or a valid protocol.
 fn poll_broker(
-    mut reach: impl FnMut() -> fabric::BrokerView,
+    reach: impl FnMut() -> fabric::BrokerView,
     name: impl FnOnce(&mut fabric::BrokerView),
     deadline: Duration,
     refused_after: Duration,
 ) -> Result<fabric::BrokerView, Box<fabric::BrokerView>> {
-    let started = Instant::now();
+    poll_broker_at(reach, name, deadline, refused_after, Instant::now())
+}
+
+fn poll_broker_at(
+    mut reach: impl FnMut() -> fabric::BrokerView,
+    name: impl FnOnce(&mut fabric::BrokerView),
+    deadline: Duration,
+    refused_after: Duration,
+    started: Instant,
+) -> Result<fabric::BrokerView, Box<fabric::BrokerView>> {
     loop {
         let mut view = reach();
         if view.read_ok() {
@@ -8892,6 +8886,46 @@ mod tests {
     /// The wait for a starting broker connects until one answers and names its process once,
     /// after it answers: no poll that finds nothing names anything.
     #[test]
+    fn a_scheduled_local_broker_is_observed_before_startup_is_refused() {
+        let mut polls = 0;
+        let view = poll_broker_at(
+            || {
+                polls += 1;
+                if polls == 1 {
+                    fabric::BrokerView::default()
+                } else {
+                    fabric::BrokerView {
+                        reachable: true,
+                        attached: true,
+                        head: Some(0),
+                        ..fabric::BrokerView::default()
+                    }
+                }
+            },
+            |view| view.pid = Some(71),
+            BIND_DEADLINE,
+            BIND_DEADLINE,
+            Instant::now() - Duration::from_secs(6),
+        )
+        .expect("the broker completes its local startup");
+        assert_eq!(polls, 2);
+        assert_eq!(view.pid, Some(71));
+        let mut looks = 0;
+        let expired = poll_broker_at(
+            || {
+                looks += 1;
+                fabric::BrokerView::default()
+            },
+            |_| panic!("an unanswered broker must not be named"),
+            BIND_DEADLINE,
+            BIND_DEADLINE,
+            Instant::now() - Duration::from_secs(61),
+        );
+        assert!(expired.is_err());
+        assert_eq!(looks, 1);
+    }
+
+    #[test]
     fn the_wait_names_the_broker_once_it_answers() {
         let answered = || fabric::BrokerView {
             reachable: true,
@@ -8939,8 +8973,8 @@ mod tests {
         );
     }
 
-    /// A broker that answers but whose bus cannot be read, in this astream protocol or another,
-    /// ends the wait at the refusal bound, not at a seam's longer wait for a broker to bind.
+    /// An answered but unreadable broker ends the wait at its refusal bound, independently of
+    /// the caller's bound for binding.
     #[test]
     fn a_broker_that_answers_but_cannot_be_read_ends_the_wait_at_the_refusal_bound() {
         let unattached = fabric::BrokerView {

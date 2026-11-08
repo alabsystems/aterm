@@ -125,10 +125,22 @@ fn acknowledge_case(state: &aterm_spec::interp::State, buggy: u8) -> bool {
         let failure = (state["failed"] == 1)
             .then(|| aterm_durable::seam::FailingDirs::with(aterm_durable::seam::EIO));
         let accepted = match buggy {
-            1 => state["failed"] == 0,
-            2 => state["changed"] == 0,
+            1 => state["failed"] == 0 && state["file_failed"] == 0,
+            2 => state["changed"] == 0 && state["file_failed"] == 0,
             3 => false,
-            _ => writer.acknowledge(&expected).is_ok(),
+            4 => {
+                read_receipt(&env, &expected.id).as_ref() == Some(&expected)
+                    && flush_receipt_dir(&env, &expected).is_ok()
+            }
+            _ => writer
+                .acknowledge_using(&expected, |file| {
+                    if state["file_failed"] == 1 {
+                        Err(std::io::Error::other("injected receipt file flush"))
+                    } else {
+                        crate::durable::sync_all(file)
+                    }
+                })
+                .is_ok(),
         };
         drop(failure);
         Ok(accepted)
@@ -149,6 +161,9 @@ pub(crate) fn acknowledgement_transition(
         "Failed" => {
             next.insert("failed", 1);
         }
+        "FileFailed" => {
+            next.insert("file_failed", 1);
+        }
         "Acknowledge" => {
             next.insert("done", 1);
             next.insert("accepted", i64::from(acknowledge_case(state, 0)));
@@ -159,7 +174,7 @@ pub(crate) fn acknowledgement_transition(
 }
 
 #[test]
-fn receipt_acknowledgement_refines_exact_read_and_real_directory_barrier() {
+fn receipt_acknowledgement_refines_exact_read_and_file_directory_barriers() {
     let model = aterm_models_harness::receipt_acknowledgement_model();
     aterm_spec::interp::prove_and_catch(&model);
     assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
@@ -171,14 +186,16 @@ fn receipt_acknowledgement_refines_exact_read_and_real_directory_barrier() {
             }
         }
     }
-    for (buggy, changed, failed, law) in [
-        (1, 1, 0, "Exact"),
-        (2, 0, 1, "Durable"),
-        (3, 0, 0, "Available"),
+    for (buggy, changed, failed, file_failed, law) in [
+        (1, 1, 0, 0, "Exact"),
+        (2, 0, 1, 0, "Durable"),
+        (3, 0, 0, 0, "Available"),
+        (4, 0, 0, 1, "Durable"),
     ] {
         let mut state = model.init_state();
         state.insert("changed", changed);
         state.insert("failed", failed);
+        state.insert("file_failed", file_failed);
         let accepted = acknowledge_case(&state, buggy);
         let mut next = state.clone();
         next.insert("done", 1);
@@ -186,6 +203,44 @@ fn receipt_acknowledgement_refines_exact_read_and_real_directory_barrier() {
         assert!(!model.check_invariant(law, &next), "{law}");
         assert!(!model.successors("Acknowledge", &state).contains(&next));
     }
+}
+
+#[test]
+fn receipt_acknowledgement_repairs_a_visible_creation_file_failure() {
+    let (_tmp, env, mut root, mut prepare) = fixture();
+    root.id = "a5".repeat(16);
+    prepare.id.clone_from(&root.id);
+    root.native_prepare = NativeRequest::prepare(prepare).encode().unwrap();
+    root.phase = Phase::Ready;
+    root.launch_attempted = false;
+    let path = receipt_path(&env, &root.id).unwrap();
+    with_receipt_writer(&env, |writer| {
+        assert_eq!(
+            write_immutable_using(&path, &root, |file| {
+                assert!(file.metadata().unwrap().is_file());
+                Err(std::io::Error::other("injected creation file flush"))
+            }),
+            Err("journal-file-flush")
+        );
+        assert_eq!(read_receipt(&env, &root.id), Some(root.clone()));
+        let mut attempted = false;
+        assert_eq!(
+            writer.acknowledge_using(&root, |file| {
+                attempted = true;
+                assert!(file.metadata().unwrap().is_file());
+                Err(std::io::Error::other("injected retry file flush"))
+            }),
+            Err("receipt-file-flush")
+        );
+        assert!(attempted);
+        let recording = aterm_durable::seam::Recording::start();
+        writer.acknowledge(&root)?;
+        assert_eq!(recording.take(), vec![aterm_durable::Flush::Durable; 2]);
+        assert_eq!(read_receipt(&env, &root.id), Some(root));
+        Ok(())
+    })
+    .unwrap()
+    .unwrap();
 }
 
 #[test]

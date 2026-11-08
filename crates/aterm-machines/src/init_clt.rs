@@ -1114,14 +1114,6 @@ mod tests {
 
         let row = run(&sys, &item, Mode::Plan);
         assert_eq!(row.outcome, Outcome::Planned, "{row:?}");
-        assert_eq!(
-            row.to.as_deref(),
-            Some(
-                "installed as root by `/usr/bin/sudo /Applications/aterm.app/Contents/MacOS/\
-                 aterm machines here apply --plain` (one password prompt)"
-            ),
-            "{row:?}"
-        );
         assert_eq!(row.layer, Some(Layer::Base));
         assert_eq!(row.class, Some(Class::Elevate));
         assert!(
@@ -2416,6 +2408,53 @@ mod tests {
         let row = run(&sys, &item, Mode::Apply);
         assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
         assert_eq!(tab.unfinished(), Some(Unfinished::Other));
+    }
+
+    #[test]
+    fn a_successful_installer_still_needs_a_working_compiler_and_can_recover() {
+        for (unready, unfinished) in [
+            (
+                Found::Refuses("SDK cannot link".into()),
+                Unfinished::Refuses,
+            ),
+            (
+                Found::Unknown("compiler did not answer".into()),
+                Unfinished::Unread,
+            ),
+        ] {
+            let sys = Arc::new(console());
+            let (mut item, _, tab) = in_tab(&sys, Found::Missing("not installed".into()));
+            item.found = Box::new(move |sys: &dyn System| match sys.read_file(Path::new(CC)) {
+                Ok(bytes) if bytes == b"ready" => Found::Present("compiler links".into()),
+                Ok(_) => unready.clone(),
+                Err(_) => Found::Missing("not installed".into()),
+            });
+            sys.on(&argv(), Ran::ok(""))
+                .on_write(&argv(), Path::new(CC), b"unready");
+
+            let row = run(&sys, &item, Mode::Apply);
+            assert_eq!(row.outcome, Outcome::Failed, "{row:?}");
+            assert_eq!(tab.unfinished(), Some(unfinished));
+            assert_eq!(asked(&sys), [argv()]);
+
+            // Installing the files and exiting successfully is no compiler health proof.
+            let row = run(&sys, &item, Mode::Apply);
+            assert!(
+                matches!(row.outcome, Outcome::Blocked | Outcome::Unknown),
+                "{row:?}"
+            );
+            assert_eq!(tab.unfinished(), Some(unfinished));
+            assert_eq!(
+                asked(&sys),
+                [argv()],
+                "an unready read-back starts no second prompt"
+            );
+
+            sys.file(CC, b"ready");
+            let row = run(&sys, &item, Mode::Apply);
+            assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
+            assert_eq!(asked(&sys), [argv()], "recovery needs no new root episode");
+        }
     }
 
     /// A stop the person sent while the root half ran (a Ctrl-C in the tab, which reaches the

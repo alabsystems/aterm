@@ -19,28 +19,9 @@ use crate::image_payload_memo::{ImagePayload, image_payloads};
 use crate::platform::AppRt as _;
 use crate::{Wake, term_lock};
 
-/// How long a main-thread hop waits for its reply ([`recv_main`]).
-const MAIN_THREAD_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// The dev seam that sets, in milliseconds, [`main_thread_reply_within`] for a test of the binary.
-const MAIN_THREAD_REPLY_SEAM: &str = "ATERM_DEBUG_MAIN_REPLY_WITHIN_MS";
-
-/// How long [`recv_main`] waits, and the reason it answers once that runs out:
-/// [`MAIN_THREAD_REPLY_TIMEOUT`], or what [`MAIN_THREAD_REPLY_SEAM`] names, read once. A test
-/// world's instance runs on the test's own machine, whose main thread answers however loaded the
-/// machine is, so under the seam its hops wait the hang detector.
-fn main_thread_reply_within() -> (std::time::Duration, &'static str) {
-    static WITHIN: std::sync::OnceLock<(std::time::Duration, String)> = std::sync::OnceLock::new();
-    let (within, late) = WITHIN.get_or_init(|| {
-        let within =
-            crate::fleet_listen::seam_or(MAIN_THREAD_REPLY_SEAM, MAIN_THREAD_REPLY_TIMEOUT);
-        (
-            within,
-            format!("main-thread reply did not arrive within {within:?}"),
-        )
-    });
-    (*within, late)
-}
+/// A minute hang detector for a required reply from this instance's main thread.
+const MAIN_THREAD_REPLY_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+const MAIN_THREAD_REPLY_LATE: &str = "main-thread reply did not arrive within 60s";
 
 /// Wire-ready error reason returned when a main-thread RPC hop fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -244,18 +225,29 @@ pub(crate) fn call_main<T>(
     recv_main(&rx)
 }
 
-/// Waits up to the default allowance ([`main_thread_reply_within`]: 30 s unless a test's dev seam
-/// names another) for a main-thread reply.
+/// Waits under [`MAIN_THREAD_REPLY_HANG`] for a required main-thread reply.
 ///
 /// # Errors
 ///
 /// The reply did not arrive within the allowance, or the main thread dropped its channel
 /// unanswered.
 pub(crate) fn recv_main<T>(rx: &std::sync::mpsc::Receiver<T>) -> Result<T, MainHopError> {
-    let (within, late) = main_thread_reply_within();
+    recv_main_at(rx, std::time::Instant::now())
+}
+
+fn recv_main_at<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    started: std::time::Instant,
+) -> Result<T, MainHopError> {
+    let within = MAIN_THREAD_REPLY_HANG
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
+        .ok_or(MainHopError::Reason(MAIN_THREAD_REPLY_LATE))?;
     match rx.recv_timeout(within) {
         Ok(v) => Ok(v),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(MainHopError::Reason(late)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(MainHopError::Reason(MAIN_THREAD_REPLY_LATE))
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(MainHopError::Reason("main-thread reply dropped"))
         }
@@ -8161,6 +8153,23 @@ mod call_main_within_tests {
     use std::time::Duration;
 
     use super::recv_within;
+
+    #[test]
+    fn a_scheduled_main_thread_supplies_its_required_reply() {
+        let (tx, rx) = mpsc::channel::<u8>();
+        tx.send(7).unwrap();
+        let reply = super::recv_main_at(&rx, std::time::Instant::now() - Duration::from_secs(31));
+        assert_eq!(reply, Ok(7));
+        let (tx, rx) = mpsc::channel::<u8>();
+        tx.send(9).unwrap();
+        let expired = super::recv_main_at(&rx, std::time::Instant::now() - Duration::from_secs(61))
+            .expect_err("the whole hang detector expired");
+        assert_eq!(rx.try_recv(), Ok(9), "expiry must not consume a late reply");
+        let (tx, rx) = mpsc::channel::<u8>();
+        drop(tx);
+        let dropped = super::recv_main_at(&rx, std::time::Instant::now()).unwrap_err();
+        assert_ne!(expired, dropped);
+    }
 
     #[test]
     fn recv_within_tells_a_timeout_from_a_dropped_reply() {

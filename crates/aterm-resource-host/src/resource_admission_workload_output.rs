@@ -135,7 +135,7 @@ impl Owner {
             + job
                 .timeout
                 .ok_or_else(|| refused("original output handoff deadline missing"))?)
-        .min(Instant::now() + Duration::from_secs(2));
+        .min(native_inputs::deadline(Instant::now()));
         let state = job
             .workload
             .as_mut()

@@ -400,10 +400,12 @@ pub(crate) struct Host {
     /// tab would put a password ask on the desk and take the keys the check types into its own
     /// session, so the tab never opens by itself there and the root steps go unread.
     pub(crate) developer_tools_scratch_world: bool,
-    /// The elevation's other steps are still to be read ([`Self::take_root_steps_read`]): set at
+    /// The elevation's other steps are still to be read ([`Self::start_root_steps_read`]): set at
     /// launch where the window reads this Mac, outside a scratch world, and this build's tab
     /// never opened for the account.
     root_steps_unread: bool,
+    /// A reader whose thread could not start is tried again at this existing host deadline.
+    root_steps_retry: Option<Instant>,
     /// The launch reads the elevation's other steps and their answer has not landed
     /// ([`crate::App::root_steps_owed`]): set where [`Self::root_steps_unread`] is, cleared by
     /// that answer or a reading that could not start. Until then the Mac Setup tab may still be
@@ -420,17 +422,32 @@ impl Host {
         self.maintenance = maintenance;
         self
     }
-    /// Whether the elevation's other steps are to be read now
-    /// ([`crate::clt_install::read_root_steps`]), once: only when the window's wake proxy is
+    /// Start the elevation's prompt-free reading ([`crate::clt_install::read_root_steps`])
+    /// once its thread can start, only when the window's wake proxy is
     /// registered (`registered`), as the reading's answer is a wake that a window without its
     /// proxy drops, which left a Mac that has the tools with no automatic tab (round 9, the CLT
     /// base: the reading landed 55 ms before the window's first present registered the proxy).
-    fn take_root_steps_read(&mut self, registered: bool) -> bool {
-        let due = registered && self.root_steps_unread;
-        if due {
-            self.root_steps_unread = false;
+    /// A failed spawn retains the reading for a later host deadline, with no answer in flight
+    /// holding the window's other macOS asks while it waits.
+    fn start_root_steps_read(
+        &mut self,
+        registered: bool,
+        now: Instant,
+        start: impl FnOnce() -> bool,
+    ) {
+        if !registered
+            || !self.root_steps_unread
+            || self.root_steps_retry.is_some_and(|retry| retry > now)
+        {
+            return;
         }
-        due
+        self.root_steps_awaited = start();
+        if self.root_steps_awaited {
+            self.root_steps_unread = false;
+            self.root_steps_retry = None;
+        } else {
+            self.root_steps_retry = Some(now + Duration::from_secs(60));
+        }
     }
 
     /// The window's setup host at launch, keeping the Command Line Tools `shim` the launch
@@ -521,6 +538,7 @@ impl Host {
             developer_tools_root_owed: false,
             developer_tools_scratch_world: scratch_world,
             root_steps_unread,
+            root_steps_retry: None,
             root_steps_awaited: root_steps_unread,
             developer_tools_held_said: std::cell::Cell::new(None),
         }
@@ -546,6 +564,7 @@ impl Host {
             .map(|_| now + Duration::from_millis(250))
             .into_iter()
             .chain(self.startup_retry)
+            .chain(self.root_steps_retry)
             .chain(self.maintenance_due)
             .min()
     }
@@ -857,11 +876,11 @@ impl App {
         // The elevation's other steps read off the loop, answered by a wake: a Mac that has the
         // tools gets the automatic tab only for what that reading says is owed.
         let registered = self.workstation_setup.proxy_registered;
-        if self.workstation_setup.take_root_steps_read(registered)
-            && !crate::clt_install::read_root_steps()
-        {
-            self.workstation_setup.root_steps_awaited = false;
-        }
+        self.workstation_setup.start_root_steps_read(
+            registered,
+            now,
+            crate::clt_install::read_root_steps,
+        );
         self.workstation_setup.start(now);
         self.tick_system_state(now);
         if self
@@ -879,20 +898,48 @@ impl App {
 mod tests {
     use super::*;
 
-    /// The elevation's reading starts only once the window can hear its answer, and only once:
-    /// before the wake proxy registers it waits (its wake would be dropped), and a launch that
-    /// owes no reading starts none.
+    /// The elevation's reading waits for its wake proxy and retries only a failed thread spawn.
+    /// A started reader runs once, and a launch that owes no reading starts none.
     #[test]
     fn the_root_steps_read_waits_for_the_wake_proxy_and_runs_once() {
         let mut host = Host::default();
         host.root_steps_unread = true;
-        assert!(!host.take_root_steps_read(false), "no proxy: no read yet");
-        assert!(host.take_root_steps_read(true), "the proxy is up: read now");
-        assert!(!host.take_root_steps_read(true), "once");
-        assert!(
-            !Host::default().take_root_steps_read(true),
-            "nothing to read"
+        host.root_steps_awaited = true;
+        let now = Instant::now();
+        let attempts = std::cell::Cell::new(0);
+        let attempt = || {
+            attempts.set(attempts.get() + 1);
+            attempts.get() > 1
+        };
+        host.start_root_steps_read(false, now, attempt);
+        assert_eq!(attempts.get(), 0, "no proxy: no read yet");
+        host.start_root_steps_read(true, now, attempt);
+        assert_eq!(attempts.get(), 1);
+        assert!(host.root_steps_unread, "a failed spawn owes its read");
+        assert!(!host.root_steps_awaited, "no answer is in flight");
+        assert_eq!(host.deadline(now), Some(now + Duration::from_secs(60)));
+        host.start_root_steps_read(true, now + Duration::from_secs(59), attempt);
+        assert_eq!(
+            attempts.get(),
+            1,
+            "no spawn on intervening event-loop turns"
         );
+        host.start_root_steps_read(false, now + Duration::from_secs(60), attempt);
+        assert_eq!(attempts.get(), 1, "a retry still requires the proxy");
+        host.start_root_steps_read(true, now + Duration::from_secs(60), attempt);
+        assert_eq!(attempts.get(), 2);
+        assert!(!host.root_steps_unread, "the reader started");
+        assert!(host.root_steps_awaited, "the window awaits its answer");
+        assert_eq!(
+            host.deadline(now),
+            None,
+            "a started reader adds no idle clock"
+        );
+        host.start_root_steps_read(true, now + Duration::from_secs(120), attempt);
+        assert_eq!(attempts.get(), 2, "a started reader is not duplicated");
+        Host::default().start_root_steps_read(true, now, || {
+            panic!("a launch that owes no reading starts none")
+        });
     }
 
     #[test]

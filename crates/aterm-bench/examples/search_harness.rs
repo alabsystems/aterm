@@ -3,11 +3,12 @@
 
 //! Benchmark harness for trigram search build throughput, cached query rate, and retained heap.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::System;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
 
+use aterm_bench::allocator::{Observed, Observer};
 use aterm_bench::{linkheavy_corpus, replog_corpus, rotating_corpus};
 use aterm_core::search::TerminalSearch;
 use aterm_core::terminal::{Terminal, TerminalBuilder};
@@ -15,21 +16,15 @@ use aterm_core::terminal::{Terminal, TerminalBuilder};
 static NET: AtomicI64 = AtomicI64::new(0);
 
 struct Counting;
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        NET.fetch_add(l.size() as i64, Ordering::Relaxed);
-        // SAFETY: forwarding to the System allocator with the same layout.
-        unsafe { System.alloc(l) }
-    }
-    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        NET.fetch_sub(l.size() as i64, Ordering::Relaxed);
-        // SAFETY: forwarding to the System allocator with the same ptr+layout.
-        unsafe { System.dealloc(p, l) }
+// SAFETY: the callback uses only nonallocating, nonpanicking atomic arithmetic.
+unsafe impl Observer for Counting {
+    fn retained(&self, old: usize, new: usize) {
+        NET.fetch_add((new as i64).wrapping_sub(old as i64), Ordering::Relaxed);
     }
 }
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
+static ALLOC: Observed<System, Counting> = Observed::new(System, Counting);
 
 fn net() -> i64 {
     NET.load(Ordering::Relaxed)

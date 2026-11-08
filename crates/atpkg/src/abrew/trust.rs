@@ -364,8 +364,7 @@ fn write_store(pairs: &StorePairs) -> Result<(), String> {
     })
 }
 
-/// Run `f` under the trust-store lock (brew `flock`s the
-/// sibling `.lock` file; we take it by exclusive creation).
+/// Run `f` under the trust store's exclusive-creation lease, removed after the write ends.
 fn with_store_lock<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     let path =
         trust_file_path().ok_or_else(|| "abrew: cannot resolve the trust store path".to_owned())?;
@@ -376,23 +375,38 @@ fn with_store_lock<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String
             .map_err(|e| format!("abrew: cannot create {}: {e}", dir.display()))?;
     }
     let lock_path = PathBuf::from(format!("{}.lock", path.display()));
-    let mut lock_file = None;
-    for _ in 0..200 {
-        match crate::platform::open_create_new_write(&lock_path, 0o600) {
-            Ok(file) => {
-                lock_file = Some(file);
-                break;
-            }
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
-        }
-    }
-    if lock_file.is_none() {
-        return Err("abrew: cannot lock the trust store".to_owned());
-    }
+    let lock_file = acquire_store_lock(
+        &lock_path,
+        std::time::Instant::now(),
+        crate::platform::open_create_new_write,
+        std::thread::sleep,
+    )?;
     let result = f();
     drop(lock_file);
     let _ = std::fs::remove_file(&lock_path);
     result
+}
+
+const STORE_LOCK_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn acquire_store_lock(
+    path: &Path,
+    started: std::time::Instant,
+    mut create: impl FnMut(&Path, u32) -> std::io::Result<std::fs::File>,
+    mut pause: impl FnMut(std::time::Duration),
+) -> Result<std::fs::File, String> {
+    loop {
+        match create(path, 0o600) {
+            Ok(file) => return Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if started.elapsed() >= STORE_LOCK_HANG {
+                    return Err("abrew: cannot lock the trust store".to_owned());
+                }
+                pause(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("abrew: cannot lock the trust store: {error}")),
+        }
+    }
 }
 
 fn store_entries_mut(pairs: &mut StorePairs, kind: TrustType) -> &mut Vec<aterm_json::Value> {
@@ -1302,6 +1316,60 @@ pub fn untrusted_taps(prefix: &Prefix) -> Vec<TapRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheduled_store_writer_preserves_exclusive_creation_custody() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let path = root.path().join("fixture.lock");
+        let mut attempts = 0;
+        let acquired = acquire_store_lock(
+            &path,
+            std::time::Instant::now() - std::time::Duration::from_secs(3),
+            |path, mode| {
+                attempts += 1;
+                if attempts <= 201 {
+                    Err(std::io::ErrorKind::AlreadyExists.into())
+                } else {
+                    crate::platform::open_create_new_write(path, mode)
+                }
+            },
+            |_| {},
+        );
+        let acquired = acquired.expect("the preceding store writer releases its lease");
+        assert_eq!(attempts, 202);
+        assert!(crate::platform::open_create_new_write(&path, 0o600).is_err());
+        drop(acquired);
+    }
+
+    #[test]
+    fn a_store_lock_hang_or_conclusive_io_error_does_not_write() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let path = root.path().join("fixture.lock");
+        let mut attempts = 0;
+        assert!(
+            acquire_store_lock(
+                &path,
+                std::time::Instant::now() - std::time::Duration::from_secs(61),
+                |_, _| {
+                    attempts += 1;
+                    Err(std::io::ErrorKind::AlreadyExists.into())
+                },
+                |_| panic!("an exhausted hang detector must not poll again"),
+            )
+            .is_err()
+        );
+        assert_eq!(attempts, 1);
+        assert!(
+            acquire_store_lock(
+                &path,
+                std::time::Instant::now(),
+                |_, _| Err(std::io::ErrorKind::PermissionDenied.into()),
+                |_| panic!("a conclusive error must not be retried"),
+            )
+            .is_err()
+        );
+        assert!(!path.exists());
+    }
 
     #[test]
     fn normalize_remote_matches_brew_rules() {

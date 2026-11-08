@@ -436,6 +436,19 @@ impl Registry {
         Ok(Some(compiled.descriptor(bootstrap.trust())?.scope.digest()))
     }
 
+    /// Whether `scope` is the table of one of the registry's generations under its own trust.
+    /// The registry's table here ([`Self::table`]) is one of these under this Mac's trust, so a
+    /// scope that is none of them is not that table under any trust, which a round's witness of
+    /// it says without the reads of custody and the catalog [`Self::table`] makes.
+    #[must_use]
+    pub fn is_generation(scope: Scope) -> bool {
+        crate::att::REGISTRY.chain().into_iter().any(|compiled| {
+            compiled
+                .descriptor(scope.trust())
+                .is_ok_and(|descriptor| descriptor.scope == scope)
+        })
+    }
+
     /// What this Mac's catalog says of the registry: the catalog's table id, and whether a Mac
     /// other than this one declared the registry in it. Only an owner's import declares it, so a
     /// declaration from another Mac says the lab holds the registry. A Mac that holds it holds

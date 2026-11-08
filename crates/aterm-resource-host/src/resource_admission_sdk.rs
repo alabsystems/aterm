@@ -241,7 +241,7 @@ impl Keeper {
         };
         current(program_path, &program, &program_before)?;
         current(&ready_path, &ready, &ready_before)?;
-        let deadline = started + Duration::from_secs(60);
+        let deadline = native_inputs::deadline(started);
         if program_before.len() > 1024 * 1024 * 1024 {
             return Err(refused(
                 "metadata service image exceeds native profile bound",

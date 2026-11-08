@@ -4,7 +4,7 @@
 //! Hardened git diff and untracked-file collector for AI code review.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::facts::{Job, Runner};
 
@@ -12,13 +12,8 @@ use super::facts::{Job, Runner};
 pub const CHANGE_MAX: usize = 200 * 1024;
 /// The largest untracked file read into the change.
 pub const UNTRACKED_FILE_MAX: u64 = 64 * 1024;
-/// Each git run's time limit.
-#[cfg(not(test))]
-pub const GIT_BUDGET: Duration = Duration::from_secs(20);
-/// Each git run's time limit: the unit tests run real git on a scratch repository, so a run a
-/// loaded machine holds is waited for by the hang detector, not read as a refusal.
-#[cfg(test)]
-pub const GIT_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// A minute hang detector for each required local Git snapshot read.
+pub const GIT_BUDGET: Duration = Duration::from_secs(60);
 
 /// Which base the change is taken from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +136,10 @@ struct Git<'a> {
 
 impl Git<'_> {
     fn run(&self, args: &[&str], ok_exits: &[i32]) -> Result<String, String> {
+        self.run_at(args, ok_exits, Instant::now())
+    }
+
+    fn run_at(&self, args: &[&str], ok_exits: &[i32], started: Instant) -> Result<String, String> {
         let mut all: Vec<String> = [
             "-c",
             "core.fsmonitor=false",
@@ -162,6 +161,10 @@ impl Git<'_> {
         }
         all.push("--no-pager".to_string());
         all.extend(args.iter().map(|s| (*s).to_string()));
+        let budget = GIT_BUDGET
+            .checked_sub(started.elapsed())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| "git change read exceeded its hang detector".to_string())?;
         let ran = self
             .runner
             .run(&Job {
@@ -170,7 +173,7 @@ impl Git<'_> {
                 env: &self.env,
                 stdin: None,
                 cwd: Some(&self.cwd),
-                budget: GIT_BUDGET,
+                budget,
             })
             .map_err(|e| format!("git {}: {e:?}", args.first().copied().unwrap_or_default()))?;
         if ran.stdout.len() >= super::facts::OUTPUT_KEEP {

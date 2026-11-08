@@ -144,7 +144,7 @@ impl<'a> ReceiptWriter<'a> {
     /// Acknowledge the exact visible receipt, including any cancellation
     /// projected from its adjacent tombstone. This grants no native authority.
     /// # Errors
-    /// The receipt changed or cannot be read, or its directory cannot be flushed.
+    /// The receipt changed or cannot be read, or its file/directory cannot be flushed.
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(
@@ -163,6 +163,14 @@ impl<'a> ReceiptWriter<'a> {
     )]
     #[cfg_attr(
         any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "ReceiptAcknowledgement",
+            action = "FileFailed",
+            reason = "The filesystem refuses the retained receipt file durability barrier"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
         aterm_spec_anchor::refines(
             machine = "ReceiptAcknowledgement",
             action = "Acknowledge",
@@ -170,11 +178,24 @@ impl<'a> ReceiptWriter<'a> {
         )
     )]
     pub fn acknowledge(&self, expected: &Receipt) -> Result<(), &'static str> {
+        self.acknowledge_using(expected, crate::durable::sync_all)
+    }
+
+    fn acknowledge_using(
+        &self,
+        expected: &Receipt,
+        flush: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    ) -> Result<(), &'static str> {
         if read_receipt(self.env, &expected.id).as_ref() != Some(expected) {
             return Err("receipt-acknowledge-changed");
         }
-        // Both writers sync file data and directory reachability before rename.
-        // Repair the remaining entry barrier for the root and its tombstone.
+        // Immutable creation can leave complete bytes visible after a failed
+        // file flush. Repair their durability before acknowledging reachability.
+        let path = receipt_path(self.env, &expected.id).ok_or("receipt-id")?;
+        let (file, _) = read_retained(&path, true)?.ok_or("receipt-acknowledge-missing")?;
+        flush(&file).map_err(|_| "receipt-file-flush")?;
+        // Cancellation uses a file-flushed atomic rename; its remaining entry
+        // barrier is shared with the root in this directory.
         flush_receipt_dir(self.env, expected)
     }
 
@@ -750,6 +771,14 @@ fn flush_receipt_dir(env: &Env, receipt: &Receipt) -> Result<(), &'static str> {
 }
 
 fn write_immutable<T: Serialize>(path: &Path, value: &T) -> Result<(), &'static str> {
+    write_immutable_using(path, value, crate::durable::sync_all)
+}
+
+fn write_immutable_using<T: Serialize>(
+    path: &Path,
+    value: &T,
+    flush: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+) -> Result<(), &'static str> {
     let text = encoded(value)?;
     private_parent(path)?;
     let mut open = std::fs::OpenOptions::new();
@@ -764,7 +793,7 @@ fn write_immutable<T: Serialize>(path: &Path, value: &T) -> Result<(), &'static 
         Ok(mut file) => {
             file.write_all(text.as_bytes())
                 .map_err(|_| "journal-write")?;
-            crate::durable::sync_all(&file).map_err(|_| "journal-file-flush")?;
+            flush(&file).map_err(|_| "journal-file-flush")?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let (file, bytes) = read_retained(path, true)?.ok_or("journal-existing-missing")?;
@@ -773,7 +802,7 @@ fn write_immutable<T: Serialize>(path: &Path, value: &T) -> Result<(), &'static 
             }
             // A previous caller may have lost the file-flush acknowledgement,
             // not merely the directory acknowledgement. Repair both before CAS.
-            crate::durable::sync_all(&file).map_err(|_| "journal-file-flush")?;
+            flush(&file).map_err(|_| "journal-file-flush")?;
         }
         Err(_) => return Err("journal-create"),
     }

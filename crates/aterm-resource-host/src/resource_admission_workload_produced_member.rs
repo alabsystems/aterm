@@ -50,7 +50,7 @@ impl member::MemberResources for Resources {
         }
         self.registered
             .program
-            .validate(Instant::now() + Duration::from_secs(2))?;
+            .validate(native_inputs::deadline(Instant::now()))?;
         let mut guards = vec![
             (self.gnu[0].try_clone()?, 3),
             (self.gnu[1].try_clone()?, 4),
@@ -72,7 +72,7 @@ impl member::MemberResources for Resources {
         self.handoff.bind_child(pid)?;
         self.registered.program.validate_loaded(
             trust_resource_provenance::process::read_identity(pid)?,
-            Instant::now() + Duration::from_secs(2),
+            native_inputs::deadline(Instant::now()),
         )
     }
     fn prepare_target(&mut self, child: &mut spawnfd::Child) -> io::Result<bool> {
@@ -80,7 +80,7 @@ impl member::MemberResources for Resources {
         self.prelude.poll(child, |pid| {
             held.validate_loaded(
                 trust_resource_provenance::process::read_identity(pid)?,
-                Instant::now() + Duration::from_secs(2),
+                native_inputs::deadline(Instant::now()),
             )
         })
     }
@@ -90,7 +90,7 @@ impl member::MemberResources for Resources {
         events: &mut Events,
     ) -> io::Result<()> {
         let held = &self.registered.program;
-        held.validate(Instant::now() + Duration::from_secs(2))?;
+        held.validate(native_inputs::deadline(Instant::now()))?;
         let observed = held.observation();
         let inventory = wire::ProducedPrepared {
             key: self.request.key.clone(),
@@ -128,7 +128,7 @@ impl member::MemberResources for Resources {
         Some(
             self.registered
                 .program
-                .validate(Instant::now() + Duration::from_secs(2))
+                .validate(native_inputs::deadline(Instant::now()))
                 .map_err(|error| error.to_string()),
         )
     }
@@ -199,7 +199,7 @@ impl Member {
         let build = || -> io::Result<_> {
             registered
                 .program
-                .validate(Instant::now() + Duration::from_secs(2))?;
+                .validate(native_inputs::deadline(Instant::now()))?;
             let mut command = spawnfd::command(registered.program.program());
             command
                 .env_clear()
@@ -229,7 +229,7 @@ impl Member {
             let (prelude, mut command) = crate::metadata_prelude::Owner::new(
                 &command,
                 &[3, 4, sdk::TARGET as u32],
-                Instant::now() + Duration::from_secs(30),
+                native_inputs::deadline(Instant::now()),
             )?;
             // A direct peer's source handle is never consumed by these closed
             // producing profiles. The real target observes owned empty input.
@@ -511,7 +511,7 @@ impl Owner {
                 .is_some_and(|ready| environment(ready, request))
             && registered
                 .program
-                .validate(Instant::now() + Duration::from_secs(2))
+                .validate(native_inputs::deadline(Instant::now()))
                 .is_ok()
     }
     pub(in crate::actor) fn submit_workload_produced(

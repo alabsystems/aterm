@@ -115,18 +115,18 @@ pub trait Desk {
     /// Returns when `session`'s `ttl=` supervisor claim lapses.
     fn supervisor_lapse(&self, session: u64, now: Instant) -> Option<Instant>;
     /// Returns when the host's next timed need work (a need recheck) is due.
-    fn herald_deadline(&self, now: Instant) -> Option<Instant>;
+    fn next_need_recheck(&self, now: Instant) -> Option<Instant>;
     /// Tells the host a refresh reached window `w`.
     fn projecting(&mut self, w: Self::Win);
     /// Re-stamps tab chips for `windows`.
     fn restamp_chips(&mut self, windows: Vec<Self::Win>);
     /// Publishes `session`'s need and folds it into the host's record of since when it stands.
-    fn herald(&mut self, session: u64);
+    fn publish_and_age_need(&mut self, session: u64);
     /// Runs the host's timed need work (its need rechecks) due at `now`.
-    fn herald_owed(&mut self, now: Instant);
+    fn run_need_rechecks(&mut self, now: Instant);
     /// Removes and records `session`'s lapsed supervisor claim.
     fn lapse_supervisor(&mut self, session: u64);
-    /// Forgets a closed session's slot, claim, and herald state.
+    /// Forgets a closed session's slot, claim, and need age.
     fn forget(&mut self, session: u64);
 }
 
@@ -149,7 +149,7 @@ pub fn refresh_session<D: Desk>(d: &mut D, session: u64) {
             d.table_mut().supervisor_until.remove(&session);
         }
     }
-    d.herald(session);
+    d.publish_and_age_need(session);
     let Some(facts) = d.sense(session) else {
         return;
     };
@@ -201,12 +201,16 @@ pub fn tell<D: Desk>(d: &mut D, session: u64) -> Option<u64> {
     Some(d.table_mut().tell(session, now))
 }
 
-/// Returns the earliest timer deadline across leases, supervisors, and the herald.
+/// Returns the earliest timer deadline across leases, supervisors, and the host's next need
+/// recheck ([`Desk::next_need_recheck`]).
 pub fn deadline<D: Desk>(d: &D, now: Instant) -> Option<Instant> {
     let table = d
         .table()
         .deadline(now, |session| d.supervisor_lapse(session, now));
-    [table, d.herald_deadline(now)].into_iter().flatten().min()
+    [table, d.next_need_recheck(now)]
+        .into_iter()
+        .flatten()
+        .min()
 }
 
 /// Processes timer expirations at `now`.
@@ -219,7 +223,7 @@ pub fn tick<D: Desk>(d: &mut D, now: Instant) {
         d.lapse_supervisor(session);
         refresh_session(d, session);
     }
-    d.herald_owed(now);
+    d.run_need_rechecks(now);
     for session in d.table().lapsed_leases(now) {
         if !d.holds_session(session) {
             d.forget(session);

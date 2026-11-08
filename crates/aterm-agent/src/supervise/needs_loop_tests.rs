@@ -610,6 +610,10 @@ const NEEDS_DOOR: &str = "host.needs_standing";
 #[derive(Debug, Default)]
 struct Hears {
     told: Mutex<Vec<(Vec<String>, String)>>,
+    /// The first of its execution-authority checks ([`IdleHost::account_execution_hold`], counted
+    /// from 0 in `checks`) from which the host holds the account for an hour; `None`, never.
+    held_from: Option<usize>,
+    checks: std::sync::atomic::AtomicUsize,
 }
 
 impl Hears {
@@ -636,6 +640,14 @@ impl IdleHost for Hears {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((needs.to_vec(), entry.to_string()));
+    }
+    fn account_execution_hold(&self) -> Option<Instant> {
+        let check = self
+            .checks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.held_from
+            .filter(|&from| check >= from)
+            .map(|_| Instant::now() + Duration::from_secs(3600))
     }
 }
 
@@ -2492,6 +2504,62 @@ fn a_go_ahead_not_submitted_puts_its_line_up() {
     );
 }
 
+/// AN ACCOUNT'S HOLD AFTER THE DECISION PUTS THE LINE BACK AT ONCE (§15.6, What it costs): the
+/// decision's check of the account's authority lets the go-ahead through, and the execution's
+/// recheck (`Session::guard_account_execution`) holds the act past the run's end, so nothing is
+/// typed and the line its decision judged goes up at the park's own point, told to the window's
+/// host, as for any act not submitted: no later decision comes to put it up. With no hold the
+/// same run types the go-ahead and the line never goes up ([`a_go_ahead_line_never_goes_up`]).
+#[test]
+fn an_account_hold_after_the_decision_puts_the_go_aheads_line_back_at_once() {
+    let host = Arc::new(Hears {
+        held_from: Some(1),
+        ..Hears::default()
+    });
+    let (m, run, up) = go_ahead_run(
+        "go-ahead-held-at-execution",
+        &[],
+        owners_policy(),
+        &host,
+        |_| {},
+    );
+    assert_eq!(go_aheads_typed(&m), 0, "{:#?}", m.requests);
+    assert!(
+        host.checks.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the decision's check and the execution's: {:#?}",
+        m.requests
+    );
+    assert!(
+        m.needs_calls
+            .first()
+            .is_some_and(|c| c.starts_with("set ") && c.contains("rerun the checks")),
+        "the held act's line goes up: {:#?}",
+        m.needs_calls
+    );
+    assert!(
+        host.told()
+            .first()
+            .is_some_and(|(n, _)| n.iter().any(|n| n.contains("rerun the checks"))),
+        "{:#?}",
+        host.told()
+    );
+    let seq_of = |l: &str| {
+        l.split_whitespace()
+            .find_map(|w| w.strip_prefix("seq="))
+            .map(str::to_string)
+    };
+    let park = run
+        .lines
+        .iter()
+        .find(|l| l.starts_with("EVENT idle ") && l.contains("rerun the checks"))
+        .unwrap_or_else(|| panic!("the park's point: {:#?}", run.lines));
+    assert_eq!(
+        up.first().and_then(|l| seq_of(l)),
+        seq_of(park),
+        "at the park's own point: {up:#?}"
+    );
+}
+
 /// A turn whose `lines` the session limit cut: the limit's notice under its last message (a line
 /// of `lines` that opens with `⏺` opens a message of its own).
 fn walled(lines: &[&str]) -> Vec<String> {
@@ -2898,6 +2966,169 @@ fn a_wrapped_parks_line_never_goes_up_under_lands_instruction() {
             "{tag}: Land's instruction answered the park, yet the line went up: {:#?} host {:#?}",
             m.needs_calls,
             host.told()
+        );
+    }
+}
+
+/// A turn too tall for the pane: the person's row and the turn's `earlier` message in the history
+/// (the first), then twenty tool calls and its last message, `last`, on the screen (the second).
+fn turn_above(earlier: &[&str], last: &[&str]) -> (Vec<String>, Vec<String>) {
+    let mut above = vec!["❯ Land the parser.".to_string(), String::new()];
+    above.push(format!("⏺ {}", earlier[0]));
+    above.extend(earlier[1..].iter().map(|l| format!("  {l}")));
+    above.push(String::new());
+    let mut shown = Vec::new();
+    for i in 0..20 {
+        shown.push(format!("⏺ Read(crates/aterm-agent/src/part_{i:02}.rs)"));
+        shown.push("  ⎿  Read 40 lines".to_string());
+    }
+    shown.push(String::new());
+    shown.extend(said(last));
+    (above, shown)
+}
+
+/// Under Land, a run of `screens` whose turns open where `gates` hold them, the history above
+/// every screen `above` where a turn opens there; the window's host hears through `host`, and
+/// the journal's take-downs of the needs entry come back.
+fn above_run(
+    tag: &str,
+    screens: Vec<Vec<String>>,
+    gates: Vec<usize>,
+    above: Option<Vec<String>>,
+    host: &Arc<Hears>,
+) -> (Mock, Vec<String>) {
+    let last = u32::try_from(screens.len()).expect("a short script");
+    let (dir, journal) = journal_file(tag);
+    let mut m = Mock::new(screens);
+    m.autopilot = Some("land");
+    m.turn_gates = gates;
+    m.vanish_after = Some(last - 1);
+    m.stall_sleep = Some(Duration::from_secs(20));
+    if let Some(above) = above {
+        m.scrollback = Some(above);
+        m.alt_screen = Some(false);
+    }
+    let opts = SuperviseOpts {
+        policy: owners_policy(),
+        journal: Some(journal.clone()),
+        idle_host: Some(Arc::clone(host) as Arc<dyn IdleHost>),
+        ..auto(30)
+    };
+    let _ = record_watch(&mut m, &opts, |s| {
+        s.set_turn_end_timing(TurnEndTiming {
+            short_backoff: Duration::from_millis(30),
+            short_backoff_max: Duration::from_millis(60),
+            ..TurnEndTiming::default()
+        });
+    });
+    let down: Vec<String> = journaled(&journal, "CLEARED ")
+        .into_iter()
+        .filter(|l| l.contains(&format!(" {CLEARED_NEEDS} ")))
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    (m, down)
+}
+
+/// THE GO-AHEAD'S BOUND HOLDS FOR A PARK ABOVE THE SCREEN (`GO_AHEAD_ACTS`): under Land the agent
+/// parks in an earlier message of a turn too tall for the pane, the screen showing only its tool
+/// calls and last words, and parks again after every act, each turn worked. The loop records each
+/// act on the point read again (`Session::turn_end_reread`), which reads no turn whole and so
+/// parks nothing, yet counts every go-ahead its decision typed: Land's instruction, then the
+/// bound's go-aheads, then nothing. CONTROL: the park in the last message, on the screen.
+#[test]
+fn a_park_above_the_screen_is_bounded_in_the_loop() {
+    const PARK: &str = "NEEDS YOU: say \"rerun the checks\" so I can build and test my branch \
+                        and push it to main.";
+    const REPORT: &str = "Committed the parser fix on my branch.";
+    const LAST: &str = "Fetched main again; nothing moved.";
+    let bound = crate::supervise::policy::turn_end::GO_AHEAD_ACTS as usize;
+    let (above, shown) = turn_above(&[REPORT, PARK], &[LAST]);
+    // Each run's go-aheads and the `turn` requests it made.
+    let mut seen = Vec::new();
+    for (tag, drawn, history) in [
+        ("bound-park-screen", said(&[REPORT, PARK]), None),
+        ("bound-park-above", shown, Some(above)),
+    ] {
+        let mut screens = Vec::new();
+        let mut gates = Vec::new();
+        for _ in 0..7 {
+            screens.push(busy_screen());
+            gates.push(screens.len());
+            screens.push(drawn.clone());
+        }
+        let host = Arc::new(Hears::default());
+        let (m, _) = above_run(tag, screens, gates, history, &host);
+        let turns: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("turn "))
+            .cloned()
+            .collect();
+        seen.push((tag, go_aheads_typed(&m), turns));
+    }
+    for (tag, go_aheads, turns) in &seen {
+        // Land's instruction, then the bound's go-aheads, then nothing.
+        assert!(
+            *go_aheads == bound && turns.len() == bound + 1,
+            "{tag}: {go_aheads} go-aheads (the bound is {bound}) in {} turns: {turns:#?}",
+            turns.len()
+        );
+    }
+}
+
+/// A PERSON'S NEED AN EARLIER MESSAGE MAKES STAYS UP IN THE LOOP (§15.6: the lines held off the
+/// menu bar are exactly the decision's `Park::needs`): under Land the agent's turn holds, in an
+/// earlier message above the screen, that it cannot push without the person's token, so of its
+/// last message's two `NEEDS YOU:` lines the push line is a person's, and Land's instruction, then
+/// the go-ahead, answer the rerun line alone. The loop records each act on the point read again
+/// (`Session::turn_end_reread`), which reads no turn whole and so parks the push line too; the
+/// go-ahead still answers only its decision's line, so the entry goes up naming the push line
+/// once, and stays up through the next reply, which names no need, until the loop ends. CONTROL:
+/// the token sentence in the last message too, on the screen, so the reread reads it as the
+/// decision did.
+#[test]
+fn a_persons_need_an_earlier_message_makes_stays_up_in_the_loop() {
+    const TOKEN: &str = "I can't push to main without your GitHub token.";
+    const RERUN: &str = "say \"rerun the checks\" so I can build and test my branch.";
+    const PUSH: &str = "say \"go\" so I can push my branch to main.";
+    const NEXT: &str = "Built and tested the branch; the checks pass.";
+    let (rerun, push) = (format!("NEEDS YOU: {RERUN}"), format!("NEEDS YOU: {PUSH}"));
+    let last = ["Built the branch.", rerun.as_str(), push.as_str()];
+    let (above, shown) = turn_above(&[TOKEN], &last);
+    let mut next = rows(&["❯ Go on.", ""]);
+    next.extend(said(&[NEXT]));
+    // Each run's go-aheads, the entry's writes and the journal's take-downs of it.
+    let mut seen = Vec::new();
+    for (tag, drawn, history) in [
+        (
+            "person-need-screen",
+            said(&[TOKEN, last[0], last[1], last[2]]),
+            None,
+        ),
+        ("person-need-above", shown, Some(above)),
+    ] {
+        // Land's instruction, then the go-ahead, each on the park; then the reply after it.
+        let screens = vec![
+            busy_screen(),
+            drawn.clone(),
+            busy_screen(),
+            drawn,
+            busy_screen(),
+            next.clone(),
+        ];
+        let host = Arc::new(Hears::default());
+        let (m, down) = above_run(tag, screens, vec![1, 3], history, &host);
+        seen.push((tag, go_aheads_typed(&m), needs_calls(&m), down));
+    }
+    let set = format!("set attention owner=needs kind=ask claude needs you: {PUSH} — carrying on");
+    for (tag, go_aheads, calls, down) in &seen {
+        assert!(
+            *go_aheads == 1
+                && *calls == [set.as_str(), "unset attention owner=needs"]
+                && down.len() == 1
+                && down[0].ends_with("the loop ended"),
+            "{tag}: {go_aheads} go-aheads; the entry's writes {calls:#?}, taken down {down:#?}; \
+             every run: {seen:#?}"
         );
     }
 }

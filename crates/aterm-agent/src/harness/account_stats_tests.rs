@@ -67,6 +67,7 @@ fn look<'a>(
         several: false,
         api_key_seen: false,
         tap,
+        limit_reset: true,
         spend: None,
         prices_as_of: Some("2026-10-15"),
         login: None,
@@ -1758,5 +1759,276 @@ fn a_fable_wall_that_named_no_reset_has_the_rolling_weeks_dollars() {
     assert!(
         !named.rolling,
         "the control: a wall that named its reset gives the window"
+    );
+}
+
+/// Thursday, November 12, 2026, at the hour and minute of [`NOW`] (UTC).
+const NOV_12: i64 = NOW + 28 * DAY;
+
+/// The record of `main` after one limit-reset offer was noted of it on machine `by`
+/// ([`accounts::note_offer`], the record's one writer), seen at `at`.
+fn offered(
+    kind: Option<aterm_phase::ResetKind>,
+    left: u32,
+    use_by: Option<i64>,
+    at: i64,
+    by: &str,
+) -> accounts::Account {
+    let mut state = State {
+        machine: by.to_string(),
+        ..State::default()
+    };
+    assert!(accounts::note_offer(
+        &mut state, "main", kind, left, use_by, at, NOW
+    ));
+    state.account("main")
+}
+
+/// The `resets` object of the `--json` document.
+fn resets_doc(l: &Look<'_>) -> Value {
+    doc(l)["accounts"][0]["resets"].clone()
+}
+
+/// THE `resets` OBJECT IS THE LIMIT-RESET OFFER AS LAST SEEN, NEVER AN INVENTED ONE: its count, its
+/// kind where one was named (null where not), the use-by instant the confirmation drew, when and by
+/// which machine it was seen, and `void` from that instant on; and with no offer held, every value
+/// null (never 0) and `missing` naming why: `no-grant-read`, or `limit-reset-off` where the
+/// harness's limit reset, the one program that records an offer, is off. An offer held stays as
+/// last seen with the limit reset off since. It carries instants only, never a local day or a hint
+/// flag: the use-by is a deadline the vendor drew to the minute. The next-available date is never
+/// read, so it is null in every case.
+#[test]
+fn the_resets_object_is_the_offer_as_last_seen_and_never_invented() {
+    use aterm_phase::ResetKind;
+    let p = profile(None);
+    let seen = NOW - 3 * DAY;
+    let current = offered(Some(ResetKind::Weekly), 1, Some(NOV_12), seen, MACHINE);
+    let r = resets_doc(&look(Some(&current), &p, Tap::On));
+    assert_eq!(
+        r,
+        json!({
+            "left": 1,
+            "kind": "weekly",
+            "use_by": NOV_12,
+            "use_by_rfc3339": "2026-11-12T16:40:00Z",
+            "next_available_at": null,
+            "next_available_at_rfc3339": null,
+            "as_of": seen,
+            "as_of_rfc3339": "2026-10-12T16:40:00Z",
+            "source": "limit-reset",
+            "by": MACHINE,
+            "state": "current",
+            "missing": null
+        })
+    );
+    let east = Look {
+        tz_s: 9 * HOUR,
+        ..look(Some(&current), &p, Tap::On)
+    };
+    assert_eq!(resets_doc(&east), r, "no local clock in the document");
+    let passed = offered(Some(ResetKind::Weekly), 1, Some(NOW - DAY), seen, MACHINE);
+    let r = resets_doc(&look(Some(&passed), &p, Tap::On));
+    assert_eq!(r["state"], Value::from("void"));
+    assert_eq!(r["left"], Value::from(1u32), "as last seen");
+    assert_eq!(r["use_by"], Value::from(NOW - DAY));
+    let at_it = Look {
+        now: NOV_12,
+        ..look(Some(&current), &p, Tap::On)
+    };
+    assert_eq!(
+        resets_doc(&at_it)["state"],
+        Value::from("void"),
+        "at use_by"
+    );
+    let kindless = offered(None, 2, None, seen, MACHINE);
+    let r = resets_doc(&look(Some(&kindless), &p, Tap::On));
+    assert_eq!(
+        (&r["left"], &r["kind"], &r["use_by"], &r["state"]),
+        (
+            &Value::from(2u32),
+            &Value::Null,
+            &Value::Null,
+            &Value::from("current")
+        )
+    );
+    let none = |why: &str| {
+        json!({
+            "left": null,
+            "kind": null,
+            "use_by": null,
+            "use_by_rfc3339": null,
+            "next_available_at": null,
+            "next_available_at_rfc3339": null,
+            "as_of": null,
+            "as_of_rfc3339": null,
+            "source": null,
+            "by": null,
+            "state": null,
+            "missing": {"reason": why}
+        })
+    };
+    let bare = tapped(425, 710, NOW - MIN);
+    for (account, why) in [
+        (bare.accounts.get("main"), "a record with no offer"),
+        (None, "no record"),
+    ] {
+        assert_eq!(
+            resets_doc(&look(account, &p, Tap::On)),
+            none("no-grant-read"),
+            "{why}"
+        );
+        let off = Look {
+            limit_reset: false,
+            ..look(account, &p, Tap::On)
+        };
+        assert_eq!(
+            resets_doc(&off),
+            none("limit-reset-off"),
+            "{why}, the limit reset off"
+        );
+    }
+    for account in [&current, &passed, &kindless] {
+        let r = resets_doc(&look(Some(account), &p, Tap::On));
+        assert_eq!(r["next_available_at"], Value::Null);
+        assert_eq!(r["missing"], Value::Null, "the control: an offer is held");
+        let off = Look {
+            limit_reset: false,
+            ..look(Some(account), &p, Tap::On)
+        };
+        assert_eq!(
+            resets_doc(&off),
+            r,
+            "as last seen, the limit reset off since"
+        );
+    }
+}
+
+/// A STATE THAT COULD NOT BE READ GIVES THE `resets` FIGURE THE WORD EVERY WINDOW GETS,
+/// `state-unread`, in the document and the text: never the word of a state read whole that holds
+/// no offer.
+#[test]
+fn an_unread_state_gives_the_resets_figure_the_windows_word() {
+    let p = profile(None);
+    let unread = Look {
+        state_unread: true,
+        ..look(None, &p, Tap::On)
+    };
+    let d = doc(&unread);
+    let five = d["accounts"][0]["windows"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .find(|w| w["id"] == Value::from("five_hour"))
+        .cloned()
+        .expect("the five-hour window");
+    assert_eq!(
+        five["missing"],
+        json!({"reason": "state-unread"}),
+        "the control: a window's word"
+    );
+    let r = &d["accounts"][0]["resets"];
+    assert_eq!(r["missing"], json!({"reason": "state-unread"}));
+    assert_eq!((&r["left"], &r["state"]), (&Value::Null, &Value::Null));
+    let shown = text(&unread, &view(&unread));
+    assert!(
+        shown.contains("  resets \u{2014}  the accounts state could not be read\n"),
+        "{shown}"
+    );
+}
+
+/// THE `resets` ROW SAYS THE OFFER AS LAST SEEN IN THE WINDOWS' STYLE: `1 weekly left`, or `2 left`
+/// where no kind was named; its use-by instant on the local clock at that instant with the time
+/// to it, or `passed` from that instant on; its age, source and machine; and with no offer, never a
+/// count: `—  no offer read yet`, or, the harness's limit reset off, that only it records one. It
+/// comes after the dollars and before `used`.
+#[test]
+fn the_resets_row_says_the_offer_as_last_seen() {
+    use aterm_phase::ResetKind;
+    let p = profile(None);
+    let seen = NOW - 3 * DAY;
+    let row = |account: Option<&accounts::Account>| -> String {
+        let l = look(account, &p, Tap::On);
+        let shown = text(&l, &view(&l));
+        let lines: Vec<&str> = shown.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.starts_with("  resets "))
+            .unwrap_or_else(|| panic!("a resets row in {shown}"));
+        assert!(lines[at - 1].starts_with("  \u{2248}$ "), "{shown}");
+        assert!(lines[at + 1].starts_with("  used "), "{shown}");
+        lines[at].to_owned()
+    };
+    for (account, line) in [
+        (
+            offered(Some(ResetKind::Weekly), 1, Some(NOV_12), seen, MACHINE),
+            "  resets 1 weekly left \u{b7} use by Thu Nov 12 16:40 (in 28d) \u{b7} as of 3d (limit-reset, here)",
+        ),
+        (
+            offered(None, 2, None, seen, MACHINE),
+            "  resets 2 left \u{b7} as of 3d (limit-reset, here)",
+        ),
+        (
+            offered(None, 2, Some(NOW + 5 * HOUR), seen, MACHINE),
+            "  resets 2 left \u{b7} use by 21:40 (in 5h) \u{b7} as of 3d (limit-reset, here)",
+        ),
+        (
+            offered(Some(ResetKind::Weekly), 1, Some(NOW - DAY), seen, MACHINE),
+            "  resets 1 weekly left \u{b7} use by Wed Oct 14 16:40, passed \u{b7} as of 3d (limit-reset, here)",
+        ),
+        (
+            offered(
+                Some(ResetKind::Session),
+                0,
+                None,
+                NOW - 2 * HOUR,
+                "a1b2c3d4e5f60718",
+            ),
+            "  resets 0 session left \u{b7} as of 2h (limit-reset, a1b2c3)",
+        ),
+    ] {
+        assert_eq!(row(Some(&account)), line);
+    }
+    let bare = tapped(425, 710, NOW - MIN);
+    for account in [bare.accounts.get("main"), None] {
+        assert_eq!(
+            row(account),
+            "  resets \u{2014}  no offer read yet",
+            "{account:?}"
+        );
+        let off = Look {
+            limit_reset: false,
+            ..look(account, &p, Tap::On)
+        };
+        let shown = text(&off, &view(&off));
+        assert!(
+            shown.contains(
+                "  resets \u{2014}  not read: only the harness's limit reset ([harness] limit_reset) records an offer, and it is off\n"
+            ),
+            "{account:?}: {shown}"
+        );
+    }
+}
+
+/// THE `resets` ROW NAMES THE USE-BY DAY ON THE LOCAL CLOCK AT THAT INSTANT, as every instant in
+/// the text is named: across a change of the zone's offset, the day is the one the clock shows at
+/// the deadline, not the one it shows now.
+#[test]
+fn the_resets_rows_use_by_is_on_the_clock_at_that_instant() {
+    use aterm_phase::ResetKind;
+    let p = profile(None);
+    let by = NOV_12 + 14 * HOUR + 50 * MIN;
+    let offer = offered(Some(ResetKind::Weekly), 1, Some(by), NOW - DAY, MACHINE);
+    let l = look(Some(&offer), &p, Tap::On);
+    let at = |t: i64| if t >= NOV_12 { -8 * HOUR } else { -7 * HOUR };
+    let shown = text_local(&l, &view(&l), &at);
+    assert!(
+        shown.contains("use by Thu Nov 12 23:30 (in 28d14h)"),
+        "{shown}"
+    );
+    let now_only = |_: i64| -7 * HOUR;
+    let shown = text_local(&l, &view(&l), &now_only);
+    assert!(
+        shown.contains("use by Fri Nov 13 00:30 (in 28d14h)"),
+        "the control, the offset now: {shown}"
     );
 }

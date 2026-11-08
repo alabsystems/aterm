@@ -355,7 +355,7 @@ impl ReclaimPolicy<'_> {
 const SH_BLOCK: &str = r#"# aterm: build intermediates out of Spotlight
 __atb_t=
 __atb_c=${HOME-}/Library/Caches/aterm/.ubd/cargo-build.noindex
-__atb= __atb_k= __atb_e= __atb_T= __atb_tf= __atb_tn= __atb_D= __atb_al= __atb_ab= __atb_q= __atb_v= __atb_r= __atb_g= __atb_p=dev
+__atb= __atb_k= __atb_e= __atb_T= __atb_tf= __atb_tn= __atb_D= __atb_al= __atb_ab= __atb_q= __atb_v= __atb_r=
 case ${HOME-} in /?*) case ${PWD-} in "$HOME"/*) __atb=1 ;; esac ;; esac
 case ${HOME-} in *[\'[:cntrl:]]*) __atb= ;; esac
 case ${HOME-}${PWD-} in *[{}]*) __atb= ;; esac
@@ -404,7 +404,6 @@ if [ -n "$__atb" ]; then
     case $__atb_n in
       c | m | t) __atb_ok "$__atb_n" "$__atb_a"; __atb_n=; continue ;;
       s) __atb_n=; continue ;;
-      p) __atb_p=$__atb_a; __atb_n=; continue ;;
     esac
     case $__atb_a in
       --) break ;;
@@ -415,12 +414,8 @@ if [ -n "$__atb" ]; then
       --manifest-path=*) __atb_ok m "${__atb_a#--manifest-path=}" ;;
       --target-dir) __atb_n=t ;;
       --target-dir=*) __atb_ok t "${__atb_a#--target-dir=}" ;;
-      --release | -r) __atb_p=release ;;
-      --profile) __atb_n=p ;;
-      --profile=*) __atb_p=${__atb_a#--profile=} ;;
       -C | -C?*) __atb= ;;
       -Z | --color | --explain) [ -n "$__atb_v" ] || __atb_n=s ;;
-      -Zfeature-unification) __atb_g=1 ;;
       -*) ;;
       *) [ -n "$__atb_v" ] || __atb_v=$__atb_a ;;
     esac
@@ -481,31 +476,8 @@ fi
 if [ -z "$__atb" ]; then __atb_D=
 else
   [ -n "$__atb_D" ] || __atb_D=$__atb_c'{workspace-root}/.cargo-build'
-  # aterm: dev and test builds resolve features over the whole workspace, so a narrow one reuses the
-  # units the wide one compiled, unless the call chose its own (`-Zfeature-unification`). The
-  # flag follows the verb, since targo drops it before the verb; its `--config` goes right before
-  # the verb, with the build-dir pair below, since one after the verb replaces theirs: "$@" turns
-  # over once, the verb found as the scan above found it, and the build-dir pair still leads.
-  if [ -z "$__atb_g" ]; then
-    case $__atb_v:$__atb_p in
-      test:* | t:* | bench:* | build:dev | build:test | b:dev | b:test)
-        __atb_n= __atb_w=
-        for __atb_a in "$@"; do
-          shift
-          if [ -n "$__atb_w" ]; then set -- "$@" "$__atb_a"
-          elif [ -n "$__atb_n" ]; then __atb_n=; set -- "$@" "$__atb_a"
-          else
-            case $__atb_a in
-              --) __atb_w=1; set -- "$@" "$__atb_a" ;;
-              --config | --manifest-path | --target-dir | -Z | --color | --explain) __atb_n=1; set -- "$@" "$__atb_a" ;;
-              -*) set -- "$@" "$__atb_a" ;;
-              *) __atb_w=1; set -- "$@" @ATB_TEST_GRAPH_CONFIG@ "$__atb_a" @ATB_TEST_GRAPH_FLAG@ ;;
-            esac
-          fi
-        done
-        ;;
-    esac
-  fi
+  # aterm: the build-dir pair is the only word added: it says where the intermediates go, never
+  # which units the build compiles, so the call resolves the unit graph it resolves typed.
   [ -n "$__atb_e" ] || set -- --config "build.build-dir='$__atb_D'" "$@"
   # Only an external frontend loses those words, and the trust lane reads only the variable.
   # Anything else keeps them, aliases included, and the variable would reach its build scripts,
@@ -560,19 +532,7 @@ pub fn shim_block(name: &str) -> Option<String> {
     // (`aterm_uds::spawnfd::SOFT_NOFILE_FLOOR`) so the script and the Rust
     // raises can never drift apart.
     let floor = aterm_uds::spawnfd::SOFT_NOFILE_FLOOR.to_string();
-    // The test graph's words, from theirs (`TEST_GRAPH_CONFIG`, `TEST_GRAPH_FLAG`), each quoted
-    // for the shell (none holds a `'`).
-    let quoted = |words: &[&str]| {
-        words
-            .iter()
-            .map(|word| format!("'{word}'"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    let block = SH_BLOCK
-        .replace("@ATB_NOFILE_FLOOR@", &floor)
-        .replace("@ATB_TEST_GRAPH_CONFIG@", &quoted(&TEST_GRAPH_CONFIG))
-        .replace("@ATB_TEST_GRAPH_FLAG@", &quoted(&[TEST_GRAPH_FLAG]));
+    let block = SH_BLOCK.replace("@ATB_NOFILE_FLOOR@", &floor);
     match name {
         "targo" => Some(block),
         "targo-tippy" => Some(block.replacen("\n__atb_t=\n", "\n__atb_t=tippy\n", 1)),

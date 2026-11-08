@@ -7864,7 +7864,8 @@ struct RegistryTarget {
 /// How long a label's registry read may run ([`aterm_db::alab::Registry::view_until`]). A person's
 /// command waits on it, and on a loaded Mac, or one whose Commons is a successor home that reads
 /// its predecessors beside its own custody, it takes seconds; each wait for a holder stays the
-/// ordinary admission's. A drive's own connection budget starts after it.
+/// ordinary admission's. It comes out of the drive's or survey's own budget, which starts before
+/// the word is resolved, so a slow registry leaves the connection less of it.
 const REGISTRY_READ: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The refusal of a label this Mac's registry could not be read for, saying what to do: a label

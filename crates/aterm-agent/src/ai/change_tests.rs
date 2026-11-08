@@ -55,6 +55,28 @@ fn repo() -> Repo {
     Repo { _dir: dir, root }
 }
 
+#[cfg(unix)]
+#[test]
+fn scheduled_local_git_work_still_supplies_the_review() {
+    let r = repo();
+    let git = Git {
+        runner: &LiveRunner,
+        program: crate::test_program::git().to_path_buf(),
+        env: git_env(&|_| None),
+        cwd: r.root.clone(),
+        filters_off: Vec::new(),
+    };
+    let args = ["rev-parse", "--is-inside-work-tree"];
+    let read = git
+        .run_at(&args, &[], Instant::now() - Duration::from_secs(21))
+        .expect("required local git read");
+    assert_eq!(read.trim(), "true");
+    assert!(
+        git.run_at(&args, &[], Instant::now() - Duration::from_secs(61))
+            .is_err()
+    );
+}
+
 fn take(r: &Repo, base: &Base) -> Result<Change, Refused> {
     take_home(r, base, None)
 }

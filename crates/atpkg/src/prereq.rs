@@ -147,6 +147,7 @@ pub struct CcHost {
     /// when no override or selection is set. `None` where Xcode is not a candidate.
     pub xcode_developer_dir: Option<PathBuf>,
     /// The inherited `DEVELOPER_DIR`, which Apple's tools read before the system selection.
+    /// Its SDK may change without an Apple install receipt, so successes are not cached.
     pub developer_dir_override: Option<PathBuf>,
     /// The inherited SDK override. An explicit SDK is mutable outside Apple's install receipts,
     /// so a successful probe using it is not cached.
@@ -311,16 +312,16 @@ pub fn probe_cached(path_var: Option<&OsStr>, host: &CcHost, cache: Option<&CcCa
 /// the Command Line Tools receipt's time, the SDK a build would fall back to and the `PATH`
 /// the build sees, its minimum macOS deployment target, and the inherited environment's digest
 /// when project configuration is inherited. `None` when the compiler cannot
-/// be read or an explicit SDK is used:
-/// changes within that SDK have no Apple install receipt to retire a cached success.
-/// The fresh-output policy domain retires verdicts made by weaker output checks.
+/// be read or an explicit SDK or developer directory is used: changes within its SDK have
+/// no Apple install receipt to retire a cached success. The policy domain retires verdicts
+/// made by weaker output or SDK custody checks.
 fn cc_key(
     located: &Located,
     path_var: Option<&OsStr>,
     host: &CcHost,
     cache: &CcCache,
 ) -> Option<String> {
-    if host.sdkroot().is_some() {
+    if host.sdkroot().is_some() || host.developer_override().is_some() {
         return None;
     }
     let (kind, cc) = match located {
@@ -349,7 +350,7 @@ fn cc_key(
             .unwrap_or_default()
     }
     crate::probe_cache::key([
-        Some("fresh-executable-link-v4".to_owned()),
+        Some("fresh-executable-link-v5".to_owned()),
         Some(kind.to_owned()),
         crate::probe_cache::identity(cc),
         Some(developer_dir.display().to_string()),
@@ -1439,37 +1440,41 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_explicit_sdk_cannot_reuse_a_cached_success() {
-        let root = scratch("mutable-sdk");
-        let bin = root.join("bin");
-        let sdk = root.join("external SDK");
-        std::fs::create_dir_all(&sdk).unwrap();
-        let usable = sdk.join("usable");
-        std::fs::write(&usable, "headers and libraries").unwrap();
-        script(
-            &bin.join("cc"),
-            "case \"$1\" in --version) echo cc;; -o) if [ -f \"$SDKROOT/usable\" ]; then printf x > \"$2\"; /bin/chmod +x \"$2\"; else echo 'SDK no longer usable' >&2; exit 1; fi;; esac",
-        );
-        let host = CcHost {
-            sdkroot_override: Some(sdk),
-            ..plain_host(&root)
-        };
-        let cache = CcCache {
-            file: root.join("state/cc"),
-            receipt: root.join("no-receipt"),
-        };
-        let path = Some(bin.as_os_str());
-        assert_eq!(
-            probe_cached(path, &host, Some(&cache)),
-            CcVerdict::Ready {
-                driver: bin.join("cc")
-            }
-        );
-        std::fs::remove_file(&usable).unwrap();
-        assert!(matches!(
-            probe_cached(path, &host, Some(&cache)),
-            CcVerdict::Broken { why, .. } if why == "SDK no longer usable"
-        ));
+    fn a_changed_explicit_sdk_or_developer_directory_cannot_reuse_a_cached_success() {
+        for select_developer in [false, true] {
+            let root = scratch("mutable-sdk");
+            let bin = root.join("bin");
+            let developer = root.join("external developer");
+            let sdk = developer.join("SDKs/MacOSX.sdk");
+            std::fs::create_dir_all(&sdk).unwrap();
+            let usable = sdk.join("usable");
+            std::fs::write(&usable, "headers and libraries").unwrap();
+            script(
+                &bin.join("cc"),
+                "sdk=${SDKROOT:-$DEVELOPER_DIR/SDKs/MacOSX.sdk}\ncase \"$1\" in --version) echo cc;; -o) if [ -f \"$sdk/usable\" ]; then printf x > \"$2\"; /bin/chmod +x \"$2\"; else echo 'SDK no longer usable' >&2; exit 1; fi;; esac",
+            );
+            let host = CcHost {
+                sdkroot_override: (!select_developer).then_some(sdk),
+                developer_dir_override: select_developer.then_some(developer),
+                ..plain_host(&root)
+            };
+            let cache = CcCache {
+                file: root.join("state/cc"),
+                receipt: root.join("no-receipt"),
+            };
+            let path = Some(bin.as_os_str());
+            assert_eq!(
+                probe_cached(path, &host, Some(&cache)),
+                CcVerdict::Ready {
+                    driver: bin.join("cc")
+                }
+            );
+            std::fs::remove_file(&usable).unwrap();
+            assert!(matches!(
+                probe_cached(path, &host, Some(&cache)),
+                CcVerdict::Broken { why, .. } if why == "SDK no longer usable"
+            ));
+        }
     }
 
     #[test]
@@ -1505,14 +1510,29 @@ mod tests {
             Some("no sdk".to_owned()),
             Some(bin.display().to_string()),
         ];
-        for (epoch, domain) in [None, Some("executable-link-v1")].into_iter().enumerate() {
-            let old_key = crate::probe_cache::key(
-                domain
-                    .into_iter()
-                    .map(|domain| Some(domain.to_owned()))
-                    .chain(old_parts.iter().cloned()),
-            )
-            .unwrap();
+        let mut old_keys: Vec<_> = [None, Some("executable-link-v1")]
+            .into_iter()
+            .map(|domain| {
+                crate::probe_cache::key(
+                    domain
+                        .into_iter()
+                        .map(|domain| Some(domain.to_owned()))
+                        .chain(old_parts.iter().cloned()),
+                )
+                .unwrap()
+            })
+            .collect();
+        // The preceding policy could keep a private SDK's success under the same effective
+        // developer directory, then reuse it after its explicit override was removed.
+        let current = cc_key(
+            &Located::Plain(cc.clone()),
+            Some(bin.as_os_str()),
+            &host,
+            &cache,
+        )
+        .unwrap();
+        old_keys.push(current.replacen("fresh-executable-link-v5", "fresh-executable-link-v4", 1));
+        for (epoch, old_key) in old_keys.into_iter().enumerate() {
             crate::probe_cache::put(&cache.file, &old_key, &cc.to_string_lossy());
             for calls in [2, 4] {
                 assert!(matches!(
@@ -1529,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn a_developer_override_controls_discovery_and_retires_the_cached_compiler() {
+    fn a_developer_override_controls_discovery_and_always_probes_the_compiler() {
         let root = scratch("developer-override");
         let shim = root.join("usr-bin");
         let first = root.join("first");
@@ -1567,7 +1587,7 @@ mod tests {
             assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
             assert_eq!(probe_cached(path, &host, Some(&cache)), ready);
             let calls = std::fs::read_to_string(&asked).unwrap();
-            assert_eq!(calls.lines().count(), index + 1);
+            assert_eq!(calls.lines().count(), (index + 1) * 2);
             assert_eq!(calls.lines().last(), developer.to_str());
         }
         host.developer_dir_override = Some(root.join("clt-shim/developer"));

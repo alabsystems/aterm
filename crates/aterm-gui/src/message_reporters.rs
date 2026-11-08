@@ -5611,13 +5611,59 @@ pub(crate) fn accounts_credits_entry(labels: &[String]) -> Option<Entry> {
     )
 }
 
-/// Builds the exceptions digest entry when an account's weekly quota is nearly full with credits off.
+/// The local day of `t` (`offset` from UTC) as `Nov 12`.
+fn month_day(t: i64, offset: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (_, month, day) =
+        aterm_types::rfc3339::civil_from_days(t.saturating_add(offset).div_euclid(86_400));
+    let month = MONTHS[usize::try_from(month - 1).unwrap_or(0).min(11)];
+    format!("{month} {day}")
+}
+
+/// THE LIMIT RESETS THE NEARLY FULL ACCOUNTS WERE LAST SEEN TO HAVE, as one fact
+/// (`Limit resets left: cedar 1 weekly (seen Oct 12, use by Nov 12)`): each account whose standing
+/// offer [`aterm_agent::harness::accounts::windows_full`] carried, by its label, its count, its
+/// kind where one was named, the day the count was seen, and its use-by day where one was read,
+/// each on the local clock at that instant (`offset_at`). The seen day says the count is as last
+/// seen, never one read now. `None` where no account carries one.
+fn window_full_grants(
+    full: &[aterm_agent::harness::accounts::WindowFull],
+    offset_at: &dyn Fn(i64) -> i64,
+) -> Option<String> {
+    let parts: Vec<String> = full
+        .iter()
+        .filter_map(|f| {
+            let grants = f.grants.as_ref()?;
+            let kind = grants
+                .kind
+                .map_or_else(String::new, |kind| format!(" {}", kind.word()));
+            let seen = month_day(grants.at, offset_at(grants.at));
+            let by = grants.use_by.map_or_else(String::new, |by| {
+                format!(", use by {}", month_day(by, offset_at(by)))
+            });
+            Some(format!(
+                "{} {}{kind} (seen {seen}{by})",
+                f.label, grants.left
+            ))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| format!("Limit resets left: {}", parts.join(", ")))
+}
+
+/// Builds the exceptions digest entry when an account's weekly quota is nearly full with credits
+/// off. Its detail names the limit resets each such account was last seen to have
+/// ([`window_full_grants`]): volatile detail, so the entry keeps its key and is not restated at
+/// once for it. A change of the counts alone changes words only, which the message center holds
+/// back within `RESTATE_QUIET` of the entry's last statement and then states in place.
 pub(crate) fn accounts_window_full_entry(
-    full: &[(String, String)],
+    full: &[aterm_agent::harness::accounts::WindowFull],
     usage_credits: bool,
+    offset_at: &dyn Fn(i64) -> i64,
 ) -> Option<Entry> {
     full.first()?;
-    let spent = full.iter().any(|(_, why)| why == "out_of_credits");
+    let spent = full.iter().any(|f| f.reason == "out_of_credits");
     let then = match (usage_credits, spent) {
         (true, true) => "Raise the usage credit cap in claude.ai settings",
         (true, false) => "Turn on usage credits in claude.ai settings",
@@ -5633,24 +5679,26 @@ pub(crate) fn accounts_window_full_entry(
     } else {
         "aterm keeps sessions on your plan: one at the limit stops until the week resets"
     };
-    let labels: Vec<&str> = full.iter().map(|(label, _)| label.as_str()).collect();
-    Some(
-        Entry::new(
-            Family::Accounts,
-            "",
-            "window-full",
-            "Weekly Claude limit nearly used",
-            Why::OnlyYou(Reason::new(why)),
-            Then::step(then),
-        )
-        .severity(Severity::Info)
-        .resurface(Resurface::WAIT)
-        .more(format!("Nearly used: {}", labels.join(", ")))
-        .log_line(format!(
-            "accounts need=window-full n={} spent={spent}",
-            full.len()
-        )),
+    let labels: Vec<&str> = full.iter().map(|f| f.label.as_str()).collect();
+    let entry = Entry::new(
+        Family::Accounts,
+        "",
+        "window-full",
+        "Weekly Claude limit nearly used",
+        Why::OnlyYou(Reason::new(why)),
+        Then::step(then),
     )
+    .severity(Severity::Info)
+    .resurface(Resurface::WAIT)
+    .more(format!("Nearly used: {}", labels.join(", ")));
+    let entry = match window_full_grants(full, offset_at) {
+        Some(line) => entry.more(line),
+        None => entry,
+    };
+    Some(entry.log_line(format!(
+        "accounts need=window-full n={} spent={spent}",
+        full.len()
+    )))
 }
 
 pub(crate) const ACCOUNTS_DUE_KEY: &str = "harness.accounts.due";

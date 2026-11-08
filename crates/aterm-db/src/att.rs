@@ -474,8 +474,9 @@ pub fn current(paths: &Paths, first: &'static Compiled) -> &'static Compiled {
 }
 
 /// [`current`] for a read a person waits on: the generation this Mac's catalog names, read
-/// under `read_by` with the ordinary admission's wait for each holder, and a failure to read it
-/// the read's own, never the first generation in its place.
+/// under `read_by` with the ordinary admission's wait for each holder (never past `read_by`), and
+/// a failure to read it, a busy vault included, the read's own, never the first generation in
+/// its place. A home with no Commons custody reads the first generation, as [`current`] does.
 ///
 /// # Errors
 /// The catalog cannot be read by `read_by`.
@@ -488,12 +489,12 @@ pub(crate) fn current_within(
     if chain.len() == 1 {
         return Ok(first);
     }
-    Ok(
-        application::peek_catalog_within(paths, read_by, &crate::admission::deadline)?
-            .map_or(first, |(trust, snapshot)| {
-                current_in(&snapshot, trust, &chain)
-            }),
-    )
+    Ok(application::peek_catalog_within(paths, read_by, &|| {
+        crate::admission::deadline().min(read_by)
+    })?
+    .map_or(first, |(trust, snapshot)| {
+        current_in(&snapshot, trust, &chain)
+    }))
 }
 
 /// The compiled table of `table`'s family at `generation`.
@@ -1094,7 +1095,7 @@ impl Handle {
                 &self.paths,
                 self.descriptor(),
                 read_by,
-                &crate::admission::deadline,
+                &|| crate::admission::deadline().min(read_by),
                 |session, store, scope| {
                     Ok(View::read(
                         table,

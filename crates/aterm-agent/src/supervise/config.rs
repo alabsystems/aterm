@@ -855,6 +855,14 @@ impl SupervisorConfig {
         self.on_for(Program::Claude) && self.usage_tap
     }
 
+    /// Whether the limit reset ([`Self::limit_reset`]) is on for Claude Code: the one program
+    /// that records a limit-reset offer (`accounts::note_offer`), which `aterm harness accounts`'
+    /// rotation and `accounts stats`' `resets` both read.
+    #[must_use]
+    pub fn limit_reset_on(&self) -> bool {
+        self.on_for(Program::Claude) && self.limit_reset
+    }
+
     fn switch_off(&mut self, agent: Program) {
         if !self.off.contains(&agent) {
             self.off.push(agent);
