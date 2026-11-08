@@ -246,6 +246,10 @@ impl Reader<'_, '_> {
 
     fn contained(&mut self, query: &AncestryQuery) -> Result<bool> {
         self.read(&[query.ancestor.clone(), query.descendant.clone()])?;
+        self.remaining()?;
+        if query.ancestor == query.descendant {
+            return Ok(true);
+        }
         // A native positive is an actual original parent path. A negative is
         // withheld until every reachable raw parent has been read and hashed.
         if self.ask(query)? == Some(true) {
@@ -274,6 +278,12 @@ impl Reader<'_, '_> {
                                 "commit walk count bound reached; ancestry unknown",
                             ));
                         }
+                        // This edge is from an exact hashed original body;
+                        // the requested ancestor's body was also validated.
+                        // Its own older history cannot invalidate this path.
+                        if parent == query.ancestor {
+                            return Ok(true);
+                        }
                         pending.push_back(parent);
                     }
                 }
@@ -282,8 +292,14 @@ impl Reader<'_, '_> {
                 return Ok(true);
             }
         }
-        self.ask(query)?
-            .ok_or_else(|| Error::local("native complete-parent ancestry could not be read"))
+        // Every reachable original descendant parent was read and hashed,
+        // and none was the validated requested ancestor. Git merge-base may
+        // still require unrelated ancestor-side history before answering; it
+        // is unnecessary for this complete negative and must not trigger a
+        // whole-history acquisition. Missing descendant parents still fail
+        // above, as do every original work and deadline bound.
+        self.remaining()?;
+        Ok(false)
     }
 }
 

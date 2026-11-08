@@ -216,7 +216,7 @@ pub fn observe_until(
 /// for a moment. A founding's read-back waits so ([`crate::client::admin_commons_init`]), and so
 /// does `sync.shared-data`'s read, which may follow one ([`observe_until_settled`]).
 #[cfg(unix)]
-pub const SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+pub const SETTLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// [`observe`] for a reader that asks again every few seconds whatever it found (the Commons
 /// runtime's presence poll, the members desk): where every file the observation reads, and the

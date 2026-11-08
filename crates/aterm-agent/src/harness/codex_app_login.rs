@@ -514,8 +514,8 @@ pub const JOURNAL_SUFFIX: &str = ".refreshed";
 /// during [`confirmed_signed_out`]. Lock acquisition uses `aterm_uds::file_lock`.
 const LOCK_POLL: Duration = Duration::from_millis(20);
 
-/// How long a sign-in's write waits for a refresh of the login it replaces ([`AuthLock`]).
-const SIGN_IN_LOCK_WAIT: Duration = Duration::from_secs(15);
+/// Hang detector for a sign-in's write waiting for the login's refresh ([`AuthLock`]).
+const SIGN_IN_LOCK_HANG: Duration = Duration::from_secs(60);
 
 /// The longest a sign-in's code exchange request may take: a request in flight while the host
 /// sleeps measures it on the clock that stops in sleep, so it holds a sign-in that sleep ended
@@ -3798,7 +3798,7 @@ impl CodeExchange<'_> {
             if let Some(capture) = capture.as_mut() {
                 capture.claim_exchange().ok()?;
             }
-            let _held = take_lock(home, deadline.within(SIGN_IN_LOCK_WAIT))?;
+            let _held = take_lock(home, deadline.within(SIGN_IN_LOCK_HANG))?;
             let existing_journal = RefreshJournal::read(home).ok()?;
             if matches!(
                 existing_journal.as_ref(),

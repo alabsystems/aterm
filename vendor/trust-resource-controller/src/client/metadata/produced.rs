@@ -5,7 +5,7 @@ use crate::client::workload::RegisteredOutput;
 use crate::workload::host::produced::{Key, ProducedPrepared, ProducedRequest};
 
 pub struct ProducedMember {
-    inner: MetadataMember,
+    pub(super) inner: MetadataMember,
 }
 #[derive(Debug)]
 pub struct ProducedResult {
@@ -121,7 +121,7 @@ impl ProducedMember {
     ) -> io::Result<Option<ProducedResult>> {
         self.poll_observed(deadline, &mut Some(observer))
     }
-    fn poll_observed(
+    pub(super) fn poll_observed(
         &mut self,
         deadline: Instant,
         observer: &mut Option<&mut OutputObserver<'_>>,
@@ -193,11 +193,11 @@ impl ProducedMember {
     ) -> io::Result<Option<ProducedFailureObservation>> {
         Ok(self.take_failure(&mut Some(observer)))
     }
-    fn take_failure(
+    pub(super) fn take_failure(
         &mut self,
         observer: &mut Option<&mut OutputObserver<'_>>,
     ) -> Option<ProducedFailureObservation> {
-        let NativeQueryRequest::Produced(request, _) = &self.inner.request else {
+        let Some((request, _)) = self.inner.request.produced_parts() else {
             unreachable!("opaque produced member has another purpose")
         };
         let key = request.key.clone();

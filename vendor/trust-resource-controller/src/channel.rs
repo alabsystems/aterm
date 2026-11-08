@@ -203,3 +203,8 @@ impl Channel {
 }
 
 mod lifeline;
+mod retained_inputs;
+
+impl Channel {
+    pub(crate) fn poison(&mut self) { self.poisoned = true; }
+}

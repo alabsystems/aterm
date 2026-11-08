@@ -30,9 +30,8 @@ const PIN_LEN: usize = 4 + 16 + 32 + 32;
 const MAX_DEVICE: usize = 4096;
 
 fn custody_digest(path: &Path) -> Result<[u8; 32]> {
-    let bytes = fsx::read_private(path, MAX_DEVICE)?
-        .ok_or_else(|| Error::new("Commons immutable custody is missing"))?;
-    Ok(aterm_digest::Sha256::digest(bytes.as_slice()))
+    fsx::private_digest(path, MAX_DEVICE)?
+        .ok_or_else(|| Error::new("Commons immutable custody is missing"))
 }
 
 fn established_files(paths: &Paths) -> Result<()> {
@@ -404,7 +403,18 @@ pub struct Device {
     seed: SecretBytes,
     /// The lab mark of the identity file this device was opened from ([`Device::lab`]).
     lab: Option<crate::LabMark>,
+    /// The requests [`Device::request`] made, by the network and authority each names, at most
+    /// [`REQUESTS`]: a request is a pure function of those and of this device's fields, which never
+    /// change, so it is made once for each.
+    requests: std::sync::Mutex<Vec<KeptRequest>>,
 }
+
+/// A request a [`Device`] keeps, after the network and authority it names.
+type KeptRequest = ([u8; 16], [u8; 32], Request);
+
+/// How many requests a [`Device`] keeps: its own trust's and the binding check's
+/// ([`Device::generate`], [`Device::decode`]).
+const REQUESTS: usize = 4;
 
 impl Device {
     /// Load or create an encrypted device using an EXISTING secrets identity.
@@ -742,6 +752,7 @@ impl Device {
             incarnation: bytes.as_slice()[16..32].try_into().unwrap(),
             seed: SecretBytes::from(&bytes.as_slice()[32..]),
             lab: None,
+            requests: std::sync::Mutex::new(Vec::new()),
         };
         // Binding validation also rejects zero identifiers and unusable keys.
         device.request([1; 16], [2; 32])?;
@@ -774,6 +785,7 @@ impl Device {
             incarnation: bytes[52..68].try_into().unwrap(),
             seed: SecretBytes::from(&bytes[68..]),
             lab: None,
+            requests: std::sync::Mutex::new(Vec::new()),
         };
         device.request([1; 16], [2; 32])?;
         Ok(device)
@@ -799,8 +811,25 @@ impl Device {
 
     /// Self-signed enrollment request; authority approval still requires the
     /// existing fresh, single-use joint-possession challenge protocol.
+    ///
+    /// Made once for each network and authority: Ed25519 signing is deterministic (RFC 8032), so
+    /// the request kept is the one [`Request::create`] would make again. A quiet Commons repair
+    /// round asks for it every time it opens this Mac's access (`Bootstrap::access_in_observed`),
+    /// 18 times a round on each side of a loopback pair, and each made a key pair from the seed,
+    /// signed and verified its own signature: 21% of the round's CPU (2026-11-08). A request that
+    /// fails is not kept.
     pub fn request(&self, network: [u8; 16], authority: [u8; 32]) -> Result<Request> {
-        self.with_seed(|seed| {
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((_, _, request)) = requests
+            .iter()
+            .find(|(n, a, _)| *n == network && *a == authority)
+        {
+            return Ok(request.clone());
+        }
+        let request = self.with_seed(|seed| {
             Request::create(
                 network,
                 authority,
@@ -809,7 +838,12 @@ impl Device {
                 &self.identity,
                 seed,
             )
-        })
+        })?;
+        if requests.len() >= REQUESTS {
+            requests.remove(0);
+        }
+        requests.push((network, authority, request.clone()));
+        Ok(request)
     }
 
     /// Open an age file sealed to this device's identity: the bundle a member hands after a
@@ -1509,9 +1543,12 @@ impl Bootstrap {
     }
 
     fn validate_snapshot(paths: &Paths, snapshot: &Snapshot) -> Result<()> {
-        // Never wait on a vault writer while holding Commons/control custody:
-        // source admission is a nonblocking observation, not a cached grant.
-        let current = match super::observe(paths)? {
+        // Never wait on a vault writer while holding Commons/control custody: source admission
+        // is a nonblocking observation at each check, never a grant kept past a change to the
+        // files it was observed from. A writer holding the vault meets a fresh read, which finds
+        // it busy; with none, files whose stamps have not moved give the observation they gave
+        // (`client::observe_commons_quiet`).
+        let current = match client::observe_commons_quiet(paths)? {
             super::Observation::Visible(current) => current,
             super::Observation::Unavailable(reason) => {
                 return Err(
@@ -1818,9 +1855,13 @@ impl Bootstrap {
         if journal.trust() != self.trust() {
             return Err(Error::new("Commons access has another trust context"));
         }
-        if let Some(lock) = lock
-            && client::local_recipient_denial_held(&self.paths, lock)?
-        {
+        // This Mac's own denial, kept while none of the files it was judged from moved. A read
+        // fault on one of them that has not moved gives the judgement those files gave, so this
+        // Mac keeps the access it held, as a server keeps the role it holds while its device
+        // cannot be read; the swarm's checks of this Mac
+        // (`client::local_recipient_denied_in_roster`) read afresh and give such a Mac nothing
+        // new.
+        if lock.is_some() && client::local_recipient_denied_now(&self.paths)? {
             return Ok(None);
         }
         let maybe_access = if let Some((log, heads_digest)) =

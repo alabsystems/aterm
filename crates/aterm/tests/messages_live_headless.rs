@@ -138,7 +138,11 @@ fn the_message_verbs_round_trip_on_a_live_instance() {
     assert_eq!(row_id(rec), a);
     assert_eq!(field(rec, "origin"), Some("wire"), "{rec}");
     assert_eq!(field(rec, "state"), Some("recorded"), "{rec}");
-    assert_eq!(field(rec, "glass"), Some("-"), "{rec}");
+    assert_eq!(
+        field(rec, "glass"),
+        None,
+        "a glass-less host prints no glass=: {rec}"
+    );
 
     let w = status(
         &inst,

@@ -3,7 +3,7 @@
 
 //! Tests for the Settings Messages page projection and wire lines.
 
-use crate::center::MessageCenter;
+use crate::center::{Glass, MessageCenter};
 use crate::log::{LogLine, LogRecord, MessageLog};
 use crate::model::{
     Decision, Glyph, Hold, Intent, Message, MessageId, Meter, Restatement, Severity, Tag,
@@ -97,6 +97,7 @@ fn entry_at(id: u64, at_unix_ms: u64) -> MessageView {
         detail: vec!["aterm.toml: unknown key `foo` at line 12".to_string()],
         state: "folded",
         on_glass: None,
+        glass: Glass::Band,
         repeats: 1,
         retired_unix_ms: Some(at_unix_ms + 30_000),
         superseded_by: None,
@@ -285,6 +286,70 @@ fn the_projection_is_newest_first_in_the_chips_order_with_the_hosts_facts() {
     assert!(!unsaved.saved, "an in-memory ring says so ({NOT_SAVED})");
     assert_eq!(MessagesState::empty().revision, 0);
     assert!(MessagesState::empty().saved && MessagesState::empty().entries.is_empty());
+}
+
+/// A GLASS-LESS HOST'S PAGE SAYS HOW LONG A ROW WAS LIVE, NEVER WHERE IT STOOD ON A BAND (the
+/// native app, which paints none): `live` while its hold runs, `live for 8 s` once it ended, and a
+/// record an older aterm filed unseen reads the same; a band host's same rows still read `waiting
+/// to show` and `not shown — too many at once`.
+/// NEGATIVE CONTROL (scratch): dropping `state_words`' glass-less arms reads `waiting to show`.
+#[test]
+fn a_glassless_page_says_how_long_a_row_was_live() {
+    let now = Instant::now();
+    let mut c = MessageCenter::glassless(
+        MessageLog::empty(),
+        now,
+        std::sync::Arc::new(crate::ConfirmationSource::new(None)),
+    );
+    let id = c
+        .post(
+            Message::new(tags::SYSTEM, Severity::Success, "Settings saved"),
+            stamp(NOW),
+            now,
+        )
+        .id;
+    c.settle(now, true);
+    let page = MessagesState::of(&c, &Desk::default());
+    let row = page.entry(id.raw()).expect("in the projection");
+    assert_eq!((row.glass, row.on_glass), (Glass::Glassless, None));
+    assert_eq!(row.state_words(), "live");
+    c.settle(now + crate::HOLD_SUCCESS, true);
+    let page = MessagesState::of(&c, &Desk::default());
+    let row = page.entry(id.raw()).expect("in the projection");
+    assert_eq!(row.state, "folded", "its hold ended it");
+    assert_eq!(row.state_words(), "live for 8 s");
+    let filed_unseen = MessageView {
+        state: "unseen",
+        ..row.clone()
+    };
+    assert_eq!(filed_unseen.state_words(), "live for 8 s");
+
+    let mut band = center(now);
+    let queued = band
+        .post(
+            Message::new(tags::SYSTEM, Severity::Success, "Settings saved"),
+            stamp(NOW),
+            now,
+        )
+        .id;
+    band.settle(now, true);
+    let page = MessagesState::of(&band, &Desk::default());
+    let row = page.entry(queued.raw()).expect("in the projection");
+    assert_eq!(row.glass, Glass::Band);
+    assert_eq!(
+        row.state_words(),
+        "waiting to show",
+        "CONTROL: a band host's queue"
+    );
+    assert_eq!(
+        MessageView {
+            glass: Glass::Band,
+            ..filed_unseen
+        }
+        .state_words(),
+        "not shown \u{2014} too many at once",
+        "CONTROL: a band host's unseen row"
+    );
 }
 
 #[test]
@@ -960,7 +1025,7 @@ fn a_replayed_open_record_is_cut_off_and_a_silent_one_blames_its_reporter() {
     let mut log = MessageLog::empty();
     log.replay(LogLine::Posted(dead));
     let replayed = log.records().next().expect("replayed");
-    let view = MessageView::of(replayed, None, None, None, &Desk::default());
+    let view = MessageView::of(replayed, None, None, None, Glass::Band, &Desk::default());
     assert_eq!(view.state, "stale");
     assert_eq!(view.state_words(), "still open when aterm stopped");
     assert_eq!(view.glyph, '\u{2139}', "the replayed open record's mark");
@@ -975,7 +1040,7 @@ fn a_replayed_open_record_is_cut_off_and_a_silent_one_blames_its_reporter() {
     let mut silent = replayed.clone();
     silent.retired_unix_ms = Some(61_000);
     assert_eq!(
-        MessageView::of(&silent, None, None, None, &Desk::default()).state_words(),
+        MessageView::of(&silent, None, None, None, Glass::Band, &Desk::default()).state_words(),
         "stopped reporting after 1 min"
     );
     let now = Instant::now();

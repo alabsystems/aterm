@@ -249,9 +249,10 @@ pub use member::{HelperObservation, MemberError, MemberIo, ProxyChild, inherit_d
 
 mod metadata;
 pub use metadata::{
-    LinkerError, LinkerMember, LinkerOutcome, LinkerResult, MetadataError, MetadataIo,
-    MetadataMember, MetadataOutputStream, MetadataResult, ProducedError,
-    ProducedFailureObservation, ProducedMember, ProducedResult,
+    CompletedProducedOperation, ContainedProducedError, ContainedProducedMember, LinkerError,
+    LinkerMember, LinkerOutcome, LinkerResult, MetadataError, MetadataIo, MetadataMember,
+    MetadataOutputStream, MetadataResult, ProducedError, ProducedFailureObservation,
+    ProducedMember, ProducedResult,
 };
 
 mod telemetry;
@@ -260,5 +261,10 @@ pub use telemetry::ReceivedTelemetry;
 mod liveness;
 pub use liveness::HostLifeline;
 
+pub mod paired_qualification;
 pub mod sdk;
 pub mod workload;
+
+#[cfg(feature = "probe-scheduler")]
+pub mod probe_scheduler;
+pub mod runtime_input_retention;

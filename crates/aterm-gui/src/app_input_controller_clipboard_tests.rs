@@ -414,6 +414,45 @@ fn a_controllers_act_on_a_native_copy_button_copies_nothing() {
     set_board(None);
 }
 
+/// A CONTROL CLIENT'S COPY IN A LAB WHOSE CLIPBOARD IS A FILE IS NO REACH INTO A PERSON'S: a
+/// debug build pointed at `ATERM_DEBUG_CLIPBOARD_FILE` copies to that file, nobody's clipboard, so
+/// a lab's `act` on About's Copy Build Information writes the file and the button reaches its
+/// success words; with the person's clipboard (no lab file, as every release build) the same `act`
+/// is refused ([`a_controllers_act_on_a_native_copy_button_copies_nothing`]).
+/// NEGATIVE CONTROL: before the refusal asked whose clipboard it was, the lab's `act` was refused
+/// with [`CLIPBOARD_REFUSED`] and the file stayed empty, so a lab could never see `Copied`.
+#[test]
+fn a_controllers_copy_into_a_lab_clipboard_file_lands() {
+    const COPY: &str = "about/copy-build-info";
+    let lab = std::env::temp_dir().join(format!(
+        "aterm-lab-clipboard-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&lab);
+    crate::control::LAB_FILE_FOR_TEST.with(|file| *file.borrow_mut() = Some(lab.clone()));
+    let mut app = App::headless_for_test();
+    assert!(app.open_about_tab_in_window(WID));
+    let (_, view) = app.active_native_view(WID).expect("About in front");
+    app.pending_action_refusal = None;
+    let acted = app.act_app(crate::app_control::ActRequest {
+        view,
+        ui_key: COPY.to_string(),
+        action: COPY.to_string(),
+        value: None,
+    });
+    let landed = std::fs::read_to_string(&lab).ok();
+    crate::control::LAB_FILE_FOR_TEST.with(|file| *file.borrow_mut() = None);
+    let _ = std::fs::remove_file(&lab);
+    acted.expect("the act is handled");
+    assert_eq!(
+        landed,
+        Some(crate::about::provenance_text()),
+        "the lab's copy lands in its clipboard file"
+    );
+    assert_eq!(app.pending_action_refusal, None, "nothing was refused");
+}
+
 /// The person's pointer over the front terminal's cell (`row`, `col`), as the window reports it.
 fn person_pointer_at(app: &mut App, row: u16, col: u16) {
     let (cw, ch) = app.win_cell_size(WID);

@@ -171,18 +171,6 @@ impl Prerequisite {
         }
     }
 
-    /// Executable relative to the authenticated package root.
-    #[must_use]
-    pub const fn package_executable(self) -> &'static str {
-        match self {
-            Self::Gitleaks => upstream::GITLEAKS.executable,
-            Self::Python => upstream::CPYTHON.executable,
-            Self::OpenSslSigning => upstream::OPENSSL_SIGNING.executable,
-            Self::Lake => upstream::LEAN4.executable,
-            Self::AtpkgKeys => "bin/atpkg-keys",
-        }
-    }
-
     /// The exposed package executable, preserving its invocation name.
     #[must_use]
     pub const fn executable(self) -> &'static str {

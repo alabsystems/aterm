@@ -26,6 +26,130 @@ use crate::common;
 
 mod commit_ancestry_tests;
 
+/// Exercise the real CLI entry and its signal-to-collector handoff. The fake Git waits for
+/// a release file, so even the old orphaning CLI can be cleaned without signalling a guessed
+/// descendant PID. The production collector still must retire it before returning 130.
+#[test]
+fn native_cli_stop_retires_its_git_before_returning() {
+    native_cli_stop(false);
+}
+
+#[test]
+fn native_cli_ancestry_stop_retires_its_git_before_returning() {
+    native_cli_stop(true);
+}
+
+fn native_cli_stop(ancestry: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Instant;
+
+    struct Fixture {
+        child: aterm_uds::spawnfd::Child,
+        release: PathBuf,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.release, b"release");
+            // This is the actual owning handle, never an observed numeric PID.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    {
+        let root = common::scratch("native-cli-stop");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).expect("bin");
+        let git = bin.join("git");
+        std::fs::write(
+            &git,
+            b"#!/bin/sh\ndir=${0%/*}\nprintf '%s\\n' \"$$\" > \"$dir/pid\"\nwhile test ! -f \"$dir/release\"; do /bin/sleep 0.01; done\n",
+        )
+        .expect("fake Git");
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).expect("executable");
+        let path = std::env::join_paths([
+            bin.clone(),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ])
+        .expect("PATH");
+        let mut command = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("agh"));
+        command.args(["--anonymous", "repo"]);
+        if ancestry {
+            let repo = root.path().join("repo.git");
+            host_git(
+                root.path(),
+                &[
+                    "init",
+                    "--quiet",
+                    "--bare",
+                    "--template=",
+                    repo.to_str().unwrap(),
+                ],
+            );
+            let input = root.path().join("commits.json");
+            let oid = "1".repeat(40);
+            std::fs::write(
+                &input,
+                format!(
+                    "{{\"commits\":[\"{oid}\"],\"queries\":[{{\"ancestor\":\"{oid}\",\"descendant\":\"{oid}\"}}]}}"
+                ),
+            )
+            .expect("commit query");
+            command
+                .args(["commit-ancestry", "alabsystems/aterm"])
+                .arg(&repo)
+                .arg("--input")
+                .arg(&input);
+        } else {
+            command.args(["public-refs", "alabsystems/aterm"]);
+        }
+        command
+            .env_clear()
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("PATH", path)
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null());
+        let mut fixture = Fixture {
+            child: command.spawn().expect("actual CLI"),
+            release: bin.join("release"),
+        };
+        let marker = bin.join("pid");
+        let until = Instant::now() + Duration::from_secs(60);
+        while !std::fs::read_to_string(&marker).is_ok_and(|text| text.ends_with('\n'))
+            && Instant::now() < until
+        {
+            assert!(fixture.child.try_wait().expect("CLI wait").is_none());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pid = std::fs::read_to_string(&marker)
+            .expect("actual Git started")
+            .trim()
+            .parse::<u32>()
+            .expect("Git pid");
+        fixture.child.terminate().expect("TERM only the actual CLI");
+        let until = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = fixture.child.try_wait().expect("CLI wait") {
+                break status;
+            }
+            assert!(Instant::now() < until, "CLI stop hang detector");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let git_alive_at_return = aterm_uds::process::pid_alive(pid);
+        std::fs::write(&fixture.release, b"release").expect("cooperative fixture cleanup");
+        let until = Instant::now() + Duration::from_secs(60);
+        while aterm_uds::process::pid_alive(pid) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!aterm_uds::process::pid_alive(pid), "fixture ended");
+        assert_eq!(status.code(), Some(130));
+        assert!(!git_alive_at_return, "Git retired before CLI return");
+    }
+}
+
 /// A host `git` command in `dir`, under a cleared environment holding only what makes it
 /// hermetic: no system or global config, a fixed author, committer and date.
 pub(crate) fn host_git(dir: &Path, args: &[&str]) -> String {
@@ -1925,7 +2049,30 @@ fn a_fetch_accepts_benign_main_and_linked_worktree_config() {
     let slug = common::slug("fixture-dev/app");
     // Ordinary named-remote URLs do not route this operation: agh hands git
     // the admitted URL explicitly. They remain harmless in either scope.
+    // Shared config carries the reported regression; each worktree also exercises every
+    // allowed variable, both plain and URL-scoped, through Git's real parser.
+    host_git(
+        &main,
+        &["config", "--local", "http.postBuffer", "524288000"],
+    );
     for dir in [&main, &linked] {
+        for (var, value) in [
+            ("postBuffer", "524288000"),
+            ("lowSpeedLimit", "1"),
+            ("lowSpeedTime", "60"),
+            ("maxRequests", "2"),
+            ("minSessions", "1"),
+            ("keepAliveIdle", "60"),
+            ("keepAliveInterval", "30"),
+            ("keepAliveCount", "3"),
+        ] {
+            for prefix in ["http.", "http.https://github.com/fixture-dev/app.git."] {
+                host_git(
+                    dir,
+                    &["config", "--worktree", &format!("{prefix}{var}"), value],
+                );
+            }
+        }
         host_git(
             dir,
             &[
@@ -1985,6 +2132,22 @@ fn a_fetch_refuses_rewrites_in_each_worktree_config_without_following_includes()
     std::fs::write(&include, "[unterminated\n").unwrap();
     let include_name = include.to_str().unwrap();
     let rows = [
+        (
+            "http.extraHeader",
+            "Authorization: fixture",
+            "http.extraheader",
+        ),
+        (
+            "http.https://github.com/.sslVerify",
+            "false",
+            "http.sslverify",
+        ),
+        (
+            "http.https://github.com/.followRedirects",
+            "true",
+            "http.followredirects",
+        ),
+        ("http.futureOption", "true", "http.futureoption"),
         (
             "url.https://elsewhere.invalid/.insteadOf",
             "https://github.com/",

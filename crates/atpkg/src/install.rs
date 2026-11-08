@@ -941,32 +941,14 @@ pub(crate) fn developer_id_gate(
 pub(crate) type TeamCheck =
     fn(&Path, &str, std::time::Instant) -> Result<(), aterm_update_core::codesign::CodesignError>;
 
-/// The real [`TeamCheck`]: `/usr/bin/codesign` under the pinned Developer ID requirement, by
-/// [`codesign_deadline`].
+/// The real [`TeamCheck`]: `/usr/bin/codesign` under the pinned Developer ID requirement,
+/// by the caller's deadline.
 pub(crate) fn codesign_team_check(
     path: &Path,
     team: &str,
     deadline: std::time::Instant,
 ) -> Result<(), aterm_update_core::codesign::CodesignError> {
-    aterm_update_core::codesign::verify_developer_id_until(
-        path,
-        team,
-        false,
-        codesign_deadline(deadline),
-    )
-}
-
-/// When a real codesign check is killed: the gate's `deadline`.
-#[cfg(not(test))]
-fn codesign_deadline(deadline: std::time::Instant) -> std::time::Instant {
-    deadline
-}
-
-/// Unit tests: no sooner than [`aterm_uds::deadline::CODESIGN_HANG`] from now, since every
-/// codesign these tests run must give its verdict.
-#[cfg(test)]
-fn codesign_deadline(deadline: std::time::Instant) -> std::time::Instant {
-    deadline.max(std::time::Instant::now() + aterm_uds::deadline::CODESIGN_HANG)
+    aterm_update_core::codesign::verify_developer_id_until(path, team, false, deadline)
 }
 
 type VerifyOne<'a> =
@@ -1036,7 +1018,7 @@ const ALAB_SIGNER: &str = "a valid signature (codesign --verify --strict)";
 pub(crate) type StrictCheck =
     fn(&Path, std::time::Instant) -> Result<(), aterm_update_core::codesign::CodesignError>;
 
-/// The real [`StrictCheck`], by [`codesign_deadline`].
+/// The real [`StrictCheck`], by the caller's deadline.
 pub(crate) fn codesign_strict_check(
     path: &Path,
     deadline: std::time::Instant,
@@ -1047,10 +1029,7 @@ pub(crate) fn codesign_strict_check(
     }
     let mut cmd = aterm_uds::spawnfd::command(CODESIGN);
     cmd.args(["--verify", "--strict", "--verbose=2"]).arg(path);
-    developer_id_verdict(aterm_uds::deadline::output_until(
-        &mut cmd,
-        codesign_deadline(deadline),
-    ))
+    developer_id_verdict(aterm_uds::deadline::output_until(&mut cmd, deadline))
 }
 
 fn check_signed_tree(

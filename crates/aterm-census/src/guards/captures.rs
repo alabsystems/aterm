@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use super::{Finding, Rule, Tree};
-use crate::export_scan::rows::{EXTRA, Row, baseline, file_rows};
+use crate::export_scan::rows::{EXTRA, Row, file_rows};
 
 pub(super) const CAPTURE_PRIVACY: Rule = Rule {
     id: "capture-privacy",
@@ -301,9 +301,9 @@ pub(super) fn capture_rows() -> Vec<Row> {
 }
 
 /// Returns census notes listing any absent baseline or extras files.
-pub(super) fn notes(root: &Path) -> Vec<String> {
+pub(super) fn notes(root: &Path, engine: &crate::EngineBaseline) -> Vec<String> {
     let mut without = Vec::new();
-    if let Err(why) = baseline() {
+    if let Err(why) = engine {
         without.push(format!("the publication engine's baseline ({why})"));
     }
     if !root.join(EXTRA).exists() {
@@ -331,10 +331,10 @@ fn rows_of(text: &str, label: &str, path: &str, out: &mut Vec<Finding>) -> Vec<R
 }
 
 fn capture_privacy(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    held_to(tree, baseline(), out);
+    held_to(tree, tree.engine, out);
 }
 
-fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mut Vec<Finding>) {
+fn held_to(tree: &Tree<'_>, baseline: &crate::EngineBaseline, out: &mut Vec<Finding>) {
     let captures: Vec<&String> = tree
         .corpus
         .paths
@@ -359,7 +359,7 @@ fn held_to(tree: &Tree<'_>, baseline: Result<(String, String), String>, out: &mu
     };
     let mut rows = rows_of(&extra, EXTRA, EXTRA, out);
     if let Ok((path, text)) = baseline {
-        rows.extend(rows_of(&text, "the engine's baseline", &path, out));
+        rows.extend(rows_of(text, "the engine's baseline", path, out));
     }
     rows.extend(capture_rows());
     for rel in captures {

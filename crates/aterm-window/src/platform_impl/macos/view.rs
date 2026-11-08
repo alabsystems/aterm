@@ -765,7 +765,7 @@ impl WinitView {
                 sel!(addObserver:selector:name:object:),
                 this.as_id(),
                 sel!(frameDidChange:),
-                seam::NS_VIEW_FRAME_DID_CHANGE_NOTIFICATION,
+                seam::view_frame_did_change_notification(),
                 this.as_id(),
             );
         }

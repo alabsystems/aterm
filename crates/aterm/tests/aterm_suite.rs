@@ -135,6 +135,8 @@ mod tether_live;
 mod turn_submit_live_headless;
 #[cfg(unix)]
 mod typed_by_live_headless;
+#[cfg(unix)]
+mod window_resize_replies_live_headless;
 #[cfg(target_os = "macos")]
 mod window_server_census_live_headless;
 #[cfg(windows)]

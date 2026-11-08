@@ -59,7 +59,7 @@ fn desk() -> (App, String, TestHost) {
     app.push_stub_tab(WindowId(0), crate::stub_session(id));
     app.frontmost_window = Some(WindowId(0));
     assert!(
-        !crate::messages_host::band_on_screen(&app.windows[&WindowId(0)]),
+        !crate::messages_host::window_on_screen(&app.windows[&WindowId(0)]),
         "PRECONDITION: a headless window is on no screen"
     );
     (app, ctx.self_id.as_str().to_string(), host)
@@ -245,14 +245,14 @@ fn a_look_at_a_window_behind_sees_nothing() {
     app.windows
         .get_mut(&WindowId(0))
         .expect("window 0")
-        .band_on_screen_for_test = true;
+        .window_on_screen_for_test = true;
     app.switch_tab_in(WindowId(0), 0);
     assert!(app.end_unseen(0), "a window behind is looked at by nobody");
     app.switch_tab_in(WindowId(0), 1);
     app.windows
         .get_mut(&WindowId(0))
         .expect("window 0")
-        .band_on_screen_for_test = false;
+        .window_on_screen_for_test = false;
 
     assert_eq!(
         look(&mut app, Some(0)),

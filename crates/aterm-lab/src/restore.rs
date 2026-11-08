@@ -1637,10 +1637,10 @@ mod tests {
     #[test]
     fn the_lift_is_read_off_the_held_tabs_record() {
         let messages = "message 3 at=1 ago_ms=1 tag=harness sev=info origin=host state=recorded \
-                        glass=- rep=1 key=harness.restored-held.s-1 title=Tab%201:%20old detail=x \
+                        rep=1 key=harness.restored-held.s-1 title=Tab%201:%20old detail=x \
                         actions=-\n\
                         message 7 at=2 ago_ms=1 tag=harness sev=info origin=host state=recorded \
-                        glass=- rep=1 key=harness.restored-held.s-1 \
+                        rep=1 key=harness.restored-held.s-1 \
                         title=Tab%201:%20Claude%20was%20not%20restarted \
                         detail=To%20pick%20it%20up:%0Aclaude%20--resume%20c-1%0AYour%20hold%20came\
                         %20back:%20lift%20it%20with%20the%20menu,%20or%20aterm%20ctl%20hold%20s-1\

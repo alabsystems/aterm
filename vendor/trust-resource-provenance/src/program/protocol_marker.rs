@@ -10,6 +10,8 @@ pub(super) enum Profile {
     Resolver,
     Workload,
     WorkloadMember,
+    PairedQualification,
+    BootstrapFixed,
 }
 impl Profile {
     fn section(self) -> &'static [u8; 16] {
@@ -17,6 +19,8 @@ impl Profile {
             Self::Resolver => b"__trust_resolve\0",
             Self::Workload => b"__trust_workload",
             Self::WorkloadMember => b"__trust_member\0\0",
+            Self::PairedQualification => b"__trust_pairqual",
+            Self::BootstrapFixed => b"__trust_btfix\0\0\0",
         }
     }
     fn magic(self) -> &'static [u8; 16] {
@@ -24,6 +28,8 @@ impl Profile {
             Self::Resolver => b"TRUSTRESOLVER001",
             Self::Workload => b"TRUSTWORKLOAD001",
             Self::WorkloadMember => b"TRUSTMEMBER00002",
+            Self::PairedQualification => b"TRUSTPAIRQUAL002",
+            Self::BootstrapFixed => b"TRUSTBTFIX000001",
         }
     }
     fn fields(self) -> [u64; 6] {
@@ -31,6 +37,8 @@ impl Profile {
             Self::Resolver => [3, 5, 32, 33, 34, 1],
             Self::Workload => [3, 6, 7, 40, 48, 1],
             Self::WorkloadMember => [3, 2, 50, 56, 57, 58],
+            Self::PairedQualification => [3, 6, 7, 60, 48, 2],
+            Self::BootstrapFixed => [1, 1, 1, 1, 0, 0],
         }
     }
 }
@@ -209,8 +217,10 @@ pub(super) fn require(
     time(deadline)?;
     if &expected[..16] != profile.magic()
         || expected[16..]
-            .chunks_exact(8)
-            .map(|v| u64::from_be_bytes(v.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|v| u64::from_be_bytes(*v))
             .ne(profile.fields())
     {
         return Err(refused("unsupported native protocol marker format"));
@@ -235,6 +245,120 @@ pub(super) fn require(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bootstrap_fixed_declaration_is_separate_closed_and_read_from_original_bytes() {
+        use std::io::Write as _;
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        for profile in [
+            Profile::Resolver,
+            Profile::Workload,
+            Profile::WorkloadMember,
+            Profile::PairedQualification,
+            Profile::BootstrapFixed,
+        ] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&image(profile)).unwrap();
+            assert_eq!(
+                require(
+                    &file,
+                    Profile::BootstrapFixed,
+                    &expected(Profile::BootstrapFixed),
+                    deadline
+                )
+                .is_ok(),
+                matches!(profile, Profile::BootstrapFixed)
+            );
+        }
+        for index in 0..64 {
+            let mut bytes = image(Profile::BootstrapFixed);
+            bytes[256 + index] ^= 1;
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&bytes).unwrap();
+            assert!(
+                require(
+                    &file,
+                    Profile::BootstrapFixed,
+                    &expected(Profile::BootstrapFixed),
+                    deadline
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn paired_declaration_never_reinterprets_workload_v1_or_other_held_profiles() {
+        use std::io::Write as _;
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        assert_eq!(Profile::PairedQualification.section(), b"__trust_pairqual");
+        assert_eq!(Profile::PairedQualification.magic(), b"TRUSTPAIRQUAL002");
+        assert_eq!(Profile::PairedQualification.fields(), [3, 6, 7, 60, 48, 2]);
+        for profile in [
+            Profile::Resolver,
+            Profile::Workload,
+            Profile::WorkloadMember,
+            Profile::PairedQualification,
+        ] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&image(profile)).unwrap();
+            let observed = require(
+                &file,
+                Profile::PairedQualification,
+                &expected(Profile::PairedQualification),
+                deadline,
+            );
+            assert_eq!(observed.is_ok(), matches!(profile, Profile::PairedQualification));
+        }
+        let mut paired = tempfile::tempfile().unwrap();
+        paired.write_all(&image(Profile::PairedQualification)).unwrap();
+        for old in [Profile::Resolver, Profile::Workload, Profile::WorkloadMember] {
+            assert!(require(&paired, old, &expected(old), deadline).is_err());
+        }
+    }
+    #[test]
+    fn paired_marker_bytes_are_closed_and_cannot_borrow_workload40_fields() {
+        use std::io::Write as _;
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        for index in 0..64 {
+            let mut bytes = image(Profile::PairedQualification);
+            bytes[256 + index] ^= 1;
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(&bytes).unwrap();
+            assert!(
+                require(
+                    &file,
+                    Profile::PairedQualification,
+                    &expected(Profile::PairedQualification),
+                    deadline,
+                )
+                .is_err(),
+                "mutated byte {index}"
+            );
+        }
+    }
+    #[test]
+    fn paired_cost_revision_refuses_the_old_sdk_before_root_go() {
+        use std::io::Write as _;
+        let deadline = Instant::now() + std::time::Duration::from_secs(2);
+        let mut bytes = image(Profile::PairedQualification);
+        bytes[256..272].copy_from_slice(b"TRUSTPAIRQUAL001");
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&bytes).unwrap();
+        assert!(
+            require(
+                &file,
+                Profile::PairedQualification,
+                &expected(Profile::PairedQualification),
+                deadline
+            )
+            .is_err()
+        );
+        let mut old_expected = expected(Profile::PairedQualification);
+        old_expected[..16].copy_from_slice(b"TRUSTPAIRQUAL001");
+        assert!(
+            require(&file, Profile::PairedQualification, &old_expected, deadline).is_err(),
+            "even an old caller's expected bytes cannot relabel the closed reader profile"
+        );
+    }
     #[test]
     fn direct_linker_member_rejects_the_legacy_helper_only_declaration() {
         use std::io::Write as _;

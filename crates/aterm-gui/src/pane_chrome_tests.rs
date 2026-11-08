@@ -1140,6 +1140,31 @@ fn the_thumb_drags_its_pane_through_history_and_the_track_pages() {
     let (wx4, wy4) = window_px(&app, wid, 10.0, f64::from(top));
     assert!(!app.scrollbar_pointer_motion(wid, wx4, wy4));
     assert_eq!(app.windows[&wid].pane_overlay.hover, None);
+
+    app.windows
+        .get_mut(&wid)
+        .expect("window")
+        .input_scratch
+        .cells
+        .resize(30, Vec::new());
+    app.paste_banner = Some(crate::paste_banner::PendingPaste::new(
+        wid,
+        Some(session),
+        "one\ntwo\n".to_owned(),
+        crate::input::Source::Controller,
+        crate::input::PasteFraming::Gesture { bracketed: true },
+    ));
+    assert_eq!(app.band_banner_at(wid, wx3, wy3), Some(true));
+    app.windows.get_mut(&wid).expect("window").last_cursor_px = (wx3, wy3);
+    assert!(
+        !app.scrollbar_pointer_motion(wid, wx3, wy3),
+        "paste banner shields scrollbar hover on covered rows"
+    );
+    assert_eq!(app.windows[&wid].pane_overlay.hover, None);
+    assert!(
+        !app.scrollbar_press(wid),
+        "paste banner shields scrollbar press on covered rows"
+    );
 }
 
 /// A track click or a thumb press on a rewound pane's bar is withheld: the live view stays at the bottom and no drag begins.
@@ -1383,6 +1408,32 @@ fn the_bar_shows_hovers_and_drags_without_regridding_any_pane() {
         let (sx, sw) = scrollbar::span(lane, m.thin, m);
         let x = f64::from(sx) + f64::from(sw) / 2.0;
         let (wx, wy) = window_px(&app, wid, x, f64::from(top + len / 2));
+        let (frame_row, col) = app.frame_cell_at(wid, wx, wy).expect("gap cell");
+        let term_row = frame_row.saturating_sub(usize::from(app.chrome_rows(wid)));
+        let laid = app.glass_grid(wid);
+        app.windows.get_mut(&wid).expect("window").find_bar_hit = Some(crate::FindBarHit {
+            row: term_row,
+            case_cols: None,
+            regex_cols: None,
+            prev_cols: None,
+            next_cols: None,
+            close_cols: None,
+            field_cols: col..col + 1,
+            field_scroll: 0,
+            band: term_row..term_row + 1,
+            cols: col..col + 1,
+            laid,
+        });
+        assert!(
+            !app.scrollbar_pointer_motion(wid, wx, wy),
+            "find bar shields gap scrollbar hover"
+        );
+        app.windows.get_mut(&wid).expect("window").last_cursor_px = (wx, wy);
+        assert!(
+            !app.scrollbar_press(wid),
+            "find bar shields gap scrollbar press"
+        );
+        app.windows.get_mut(&wid).expect("window").find_bar_hit = None;
         app.on_cursor_moved(wid, wx, wy);
         assert_eq!(app.windows[&wid].pane_overlay.hover, Some(left), "hovered");
         app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);

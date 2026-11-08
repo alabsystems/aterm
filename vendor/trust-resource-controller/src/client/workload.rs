@@ -225,11 +225,30 @@ impl ReceivedOriginals {
         channel: Channel,
         host: std::sync::Arc<trust_resource_provenance::PinnedHelper>,
     ) -> AuthenticatedWorkloadStartup {
-        let control = WorkloadControl {
+        let control = WorkloadControl::from_original_channel(
             channel,
             host,
-            root_attempt: self.reply.context.context.root_attempt,
-            invocation_sha256: self.reply.invocation_sha256,
+            self.reply.context.context.root_attempt,
+            self.reply.invocation_sha256,
+        );
+        AuthenticatedWorkloadStartup { reply: self.reply, originals: self.originals, control }
+    }
+}
+
+impl WorkloadControl {
+    /// Internal assembly after authenticated original-description receipt.
+    /// Plain context or digest observations cannot call this constructor.
+    pub(super) fn from_original_channel(
+        channel: Channel,
+        host: std::sync::Arc<trust_resource_provenance::PinnedHelper>,
+        root_attempt: [u8; 16],
+        invocation_sha256: [u8; 32],
+    ) -> Self {
+        Self {
+            channel,
+            host,
+            root_attempt,
+            invocation_sha256,
             last_sequence: 0,
             last_phase_sequence: 0,
             active_phase: None,
@@ -237,8 +256,7 @@ impl ReceivedOriginals {
             pending: None,
             failed: false,
             drained: false,
-        };
-        AuthenticatedWorkloadStartup { reply: self.reply, originals: self.originals, control }
+        }
     }
 }
 
@@ -467,7 +485,7 @@ pub(super) fn receive_originals(
     let originals = receive_set(channel, &set, early, deadline)?;
     Ok(ReceivedOriginals { reply, originals })
 }
-fn live_context(context: &crate::Context, member: Option<[u8; 16]>) -> io::Result<()> {
+pub(super) fn live_context(context: &crate::Context, member: Option<[u8; 16]>) -> io::Result<()> {
     let (machine, boot) = trust_resource_provenance::process::host_boot()?;
     let current = trust_resource_provenance::process::read_identity(std::process::id())?;
     #[cfg(target_os = "macos")]
@@ -489,7 +507,7 @@ fn live_context(context: &crate::Context, member: Option<[u8; 16]>) -> io::Resul
     }
     Ok(())
 }
-fn receive_set(
+pub(super) fn receive_set(
     channel: &Channel,
     set: &[&host::PrimaryCpu],
     early: EarlyCpuSet,

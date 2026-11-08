@@ -53,7 +53,8 @@ mod tokens_tests;
 pub use animate::{Anim, BandMotion, FineTone, Look, Pace, ROW, RowMotion, Stop, Surface, Tone};
 pub use carry::{CarriedMessage, Carry};
 pub use center::{
-    CatchUp, DigestSync, Echo, EchoKind, Live, MessageCenter, Outcome, PostOutcome, Posted, Settled,
+    CatchUp, DigestSync, Echo, EchoKind, Glass, Live, MessageCenter, Outcome, PostOutcome, Posted,
+    Settled,
 };
 pub use confirmations::ConfirmationSource;
 pub use digest::{

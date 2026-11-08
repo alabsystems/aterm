@@ -1069,28 +1069,37 @@ pub(crate) fn probe_local_seal_at(layout: &Layout, rustup_home: &Path) -> Option
         return None;
     }
     let trustc = target.join("bin").join("trustc");
-    let commit = kept_answer(
-        &trustc,
-        "-Vv commit-hash",
-        crate::probe_cache::file(VERSIONS).as_deref(),
-        || {
-            output_bounded(aterm_uds::spawnfd::command(&trustc).arg("-Vv"))
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .and_then(|s| {
-                    s.lines().find_map(|l| {
-                        l.strip_prefix("commit-hash: ")
-                            .map(|c| c.chars().take(10).collect::<String>())
-                    })
-                })
-        },
-    )
-    .unwrap_or_else(|| "unknown".to_string());
+    let commit = probe_trust_commit(&trustc, crate::probe_cache::file(VERSIONS).as_deref());
     Some(LocalSealProbe {
         stale: crate::seam::stale_against_store(layout, &target),
         link,
         link_target: target,
         trustc: commit,
     })
+}
+
+fn probe_trust_commit(trustc: &Path, cache: Option<&Path>) -> String {
+    kept_answer(
+        trustc,
+        "-Vv unique-full-commit complete-exit-zero-v1",
+        cache,
+        || {
+            let stdout = version_stdout(aterm_uds::spawnfd::command(trustc).arg("-Vv"))?;
+            let text = std::str::from_utf8(&stdout).ok()?;
+            let mut commits = text
+                .lines()
+                .filter_map(|line| line.strip_prefix("commit-hash:"));
+            let commit = commits.next()?.strip_prefix(' ')?;
+            if commits.next().is_some()
+                || commit.len() != 40
+                || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return None;
+            }
+            Some(commit[..10].to_owned())
+        },
+    )
+    .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// How much of the report a person asked for: the problems (the default), or everything
@@ -3703,47 +3712,67 @@ fn toolset_command(f: &ToolsetFacts<'_>, grouped: impl Fn(&str) -> bool) -> Opti
 const VERSIONS: &str = "versions";
 
 /// What `bin` answered to `question` (the words naming what is asked and read of the answer),
-/// kept in `cache` under the question and the program's identity
-/// ([`crate::probe_cache::identity`]): a store build never changes in place, so the answer is
-/// read from the cache until the file is rewritten or replaced, and `ask` (a spawn) runs only
-/// then. An unanswered question is asked again next time.
+/// kept in `cache` under the question, native invocation path and program's identity
+/// ([`crate::probe_cache::identity`]). With an admitted key, revalidate that identity before
+/// returning either a cached or fresh answer, and before publishing a fresh one. If that key
+/// changes or becomes unavailable, leave the question unanswered. Without a key, query afresh
+/// without caching. An unanswered question is asked again next time.
 fn kept_answer(
     bin: &Path,
     question: &str,
     cache: Option<&Path>,
     ask: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
-    let kept = cache.zip(crate::probe_cache::key([
-        Some(question.to_owned()),
-        crate::probe_cache::identity(bin),
-    ]));
-    if let Some((file, key)) = &kept
-        && let Some(answer) = crate::probe_cache::get(file, key)
-    {
-        return Some(answer);
-    }
-    let answer = ask()?;
+    let current_key = || {
+        crate::probe_cache::key([
+            Some("program-answer-snapshot-v1".to_owned()),
+            Some(question.to_owned()),
+            Some(aterm_codec::hex::encode_lower(
+                bin.as_os_str().as_encoded_bytes(),
+            )),
+            crate::probe_cache::identity(bin),
+        ])
+    };
+    let kept = cache.zip(current_key());
+    let cached = kept
+        .as_ref()
+        .and_then(|(file, key)| crate::probe_cache::get(file, key));
+    let (answer, needs_store) = match cached {
+        Some(answer) => (answer, false),
+        None => (ask()?, true),
+    };
     if let Some((file, key)) = &kept {
-        crate::probe_cache::put(file, key, &answer);
+        if current_key().as_ref() != Some(key) {
+            return None;
+        }
+        if needs_store {
+            crate::probe_cache::put(file, key, &answer);
+        }
     }
     Some(answer)
 }
 
-fn probe_version(bin: &Path) -> String {
-    kept_answer(
-        bin,
-        "--version",
-        crate::probe_cache::file(VERSIONS).as_deref(),
-        || {
-            let out = output_bounded(aterm_uds::spawnfd::command(bin).arg("--version"))?;
-            if !out.status.success() {
-                return None;
-            }
-            let text = String::from_utf8_lossy(&out.stdout);
-            let token = text.lines().next()?.split_whitespace().nth(1)?;
-            Some(token.split('+').next().unwrap_or(token).to_string())
-        },
+/// Version-query parsers consume complete stdout from successful commands within the probe bound.
+fn version_stdout(cmd: &mut aterm_uds::spawnfd::Command) -> Option<Vec<u8>> {
+    let out = aterm_uds::deadline::output_until_complete_stdout(
+        cmd,
+        std::time::Instant::now() + probe_timeout(),
     )
+    .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+fn probe_version(bin: &Path) -> String {
+    probe_version_with_cache(bin, crate::probe_cache::file(VERSIONS).as_deref())
+}
+
+fn probe_version_with_cache(bin: &Path, cache: Option<&Path>) -> String {
+    kept_answer(bin, "--version complete-exit-zero-v1", cache, || {
+        let stdout = version_stdout(aterm_uds::spawnfd::command(bin).arg("--version"))?;
+        let text = String::from_utf8_lossy(&stdout);
+        let token = text.lines().next()?.split_whitespace().nth(1)?;
+        Some(token.split('+').next().unwrap_or(token).to_string())
+    })
     .unwrap_or_else(|| "unknown".to_string())
 }
 

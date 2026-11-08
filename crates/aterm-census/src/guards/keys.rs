@@ -278,6 +278,7 @@ mod tests {
         let tree = Tree {
             root: &root,
             corpus: &corpus,
+            engine: crate::guards::tests::NO_ENGINE,
         };
         let mut found = Vec::new();
         key_material(&tree, &mut found);

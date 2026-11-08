@@ -20,11 +20,31 @@ pub(super) struct Active {
     pub(super) ordinal: u64,
 }
 struct OriginalGnu {
-    read: OwnedFd,
-    write: OwnedFd,
+    descriptions: Arc<[OwnedFd; 2]>,
     backing: trust_resource_controller::FileIdentity,
 }
 impl Phases {
+    pub(super) fn matches_gnu(
+        &self,
+        key: &host::produced::Key,
+        expected: trust_resource_controller::FileIdentity,
+    ) -> io::Result<()> {
+        if self
+            .active
+            .as_ref()
+            .is_none_or(|active| active.id != key.phase || active.ordinal != key.ordinal)
+        {
+            return Err(refused("contained operation has no original phase"));
+        }
+        let original = self
+            .original_gnu
+            .as_ref()
+            .ok_or_else(|| refused("contained original GNU missing"))?;
+        if original.backing != expected {
+            return Err(refused("contained operation original GNU differs"));
+        }
+        no_supplemental(original)
+    }
     pub(super) fn descriptions(&self, key: &host::produced::Key) -> io::Result<[OwnedFd; 2]> {
         if self
             .active
@@ -39,9 +59,20 @@ impl Phases {
             .ok_or_else(|| refused("original phase GNU missing"))?;
         no_supplemental(original)?;
         Ok([
-            aterm_uds::kept_out(|| original.read.try_clone())?,
-            aterm_uds::kept_out(|| original.write.try_clone())?,
+            aterm_uds::kept_out(|| original.descriptions[0].try_clone())?,
+            aterm_uds::kept_out(|| original.descriptions[1].try_clone())?,
         ])
+    }
+    pub(super) fn retained_descriptions(
+        &self,
+        key: &host::produced::Key,
+    ) -> io::Result<Arc<[OwnedFd; 2]>> {
+        let original = self
+            .original_gnu
+            .as_ref()
+            .ok_or_else(|| refused("original phase GNU missing"))?;
+        self.matches_gnu(key, original.backing)?;
+        Ok(Arc::clone(&original.descriptions))
     }
     pub(super) fn active(&self) -> Option<&Active> {
         self.active.as_ref()
@@ -69,15 +100,15 @@ fn fifo(fd: &OwnedFd, access: libc::c_int) -> io::Result<trust_resource_controll
     })
 }
 fn no_supplemental(gnu: &OriginalGnu) -> io::Result<()> {
-    if fifo(&gnu.read, libc::O_RDONLY)? != gnu.backing
-        || fifo(&gnu.write, libc::O_WRONLY)? != gnu.backing
+    if fifo(&gnu.descriptions[0], libc::O_RDONLY)? != gnu.backing
+        || fifo(&gnu.descriptions[1], libc::O_WRONLY)? != gnu.backing
     {
         return Err(refused("original GNU descriptions changed"));
     }
     let mut bytes: libc::c_int = -1;
     // SAFETY: actual held FIFO, native FIONREAD output; no read, write, token
     // consumption or shared OFD flag mutation occurs.
-    if unsafe { libc::ioctl(gnu.read.as_raw_fd(), libc::FIONREAD, &mut bytes) } != 0 {
+    if unsafe { libc::ioctl(gnu.descriptions[0].as_raw_fd(), libc::FIONREAD, &mut bytes) } != 0 {
         return Err(io::Error::last_os_error());
     }
     if bytes != 0 {
@@ -102,7 +133,7 @@ impl Owner {
             .ok_or_else(|| refused("original phase root unavailable"))?;
         if !job.launched
             || job.reaped
-            || job.settled
+            || job.is_settled()
             || job.cleanup_at.is_some()
             || peer.pid != job.child.child_mut().id()
             || peer.birth != job.root_birth
@@ -187,8 +218,7 @@ impl Owner {
                     }
                 } else {
                     state.phase.original_gnu = Some(OriginalGnu {
-                        read,
-                        write,
+                        descriptions: Arc::new([read, write]),
                         backing: gnu,
                     });
                 }
@@ -292,8 +322,7 @@ mod tests {
         assert!(fifo(&read, libc::O_WRONLY).is_err());
         let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
         let original = OriginalGnu {
-            read,
-            write,
+            descriptions: Arc::new([read, write]),
             backing,
         };
         no_supplemental(&original).unwrap();
@@ -309,7 +338,7 @@ mod tests {
             "observation must not consume or replace an actual original token"
         );
         no_supplemental(&original).unwrap();
-        let after = unsafe { libc::fcntl(original.read.as_raw_fd(), libc::F_GETFL) };
+        let after = unsafe { libc::fcntl(original.descriptions[0].as_raw_fd(), libc::F_GETFL) };
         #[cfg(target_os = "macos")]
         let kernel_markers = 0x1000 | 0x2000; // XNU FMARK/FDEFER are not semantic OFD flags.
         #[cfg(not(target_os = "macos"))]

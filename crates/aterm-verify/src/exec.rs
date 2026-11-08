@@ -2104,6 +2104,24 @@ mod ends {
     pub(super) const fn saw() {}
 }
 
+/// A check or measurement child with a signal environment independent of verify's launcher.
+pub(crate) fn check_command(program: impl AsRef<OsStr>) -> Command {
+    check_signals(aterm_uds::spawnfd::command(program))
+}
+
+fn check_signals(command: Command) -> Command {
+    #[cfg(unix)]
+    {
+        let mut command = command;
+        command.default_signals();
+        command
+    }
+    #[cfg(not(unix))]
+    {
+        command
+    }
+}
+
 fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
     let native = |program: &OsStr| {
         #[cfg(unix)]
@@ -2139,7 +2157,7 @@ fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
     {
         c.process_group(0);
     }
-    c
+    check_signals(c)
 }
 
 const ENV: &str = aterm_uds::os_path!("env");
@@ -4074,6 +4092,104 @@ mod tests {
 
     /// A variable every test run inherits, which a child that keeps only its record must not.
     const INHERITED: &str = if cfg!(unix) { "HOME" } else { "USERPROFILE" };
+
+    /// Only the isolated fixture reads its inherited dispositions; ordinary suite runs do not
+    /// assert anything about the launcher that started libtest.
+    #[cfg(unix)]
+    #[test]
+    fn signal_disposition_probe() {
+        let Ok(expected) = std::env::var("ATERM_VERIFY_SIGNAL_PROBE") else {
+            return;
+        };
+        let expected = if expected == "ignored" {
+            libc::SIG_IGN
+        } else {
+            libc::SIG_DFL
+        };
+        for sig in [
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTERM,
+            libc::SIGHUP,
+            libc::SIGUSR1,
+            libc::SIGUSR2,
+            libc::SIGALRM,
+        ] {
+            let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+            // SAFETY: a null new action only reads the disposition into the live local.
+            assert_eq!(
+                unsafe { libc::sigaction(sig, std::ptr::null(), action.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: the successful query initialized the action.
+            assert_eq!(
+                unsafe { action.assume_init() }.sa_sigaction,
+                expected,
+                "signal {sig}"
+            );
+        }
+        println!("\nSIGNALS_CHECKED");
+    }
+
+    /// Verify's actual test runner and direct measurement commands discard a parent's ignores.
+    /// The ordinary spawn is the negative control: it must observe SIG_IGN, not SIG_DFL.
+    #[cfg(unix)]
+    #[test]
+    fn test_runner_defaults_signals_from_an_ignoring_parent() {
+        const PARENT: &str = "ATERM_VERIFY_SIGNAL_PARENT";
+        const NAME: &str = "exec::tests::test_runner_defaults_signals_from_an_ignoring_parent";
+        const PROBE: &str = "exec::tests::signal_disposition_probe";
+        let me = std::env::current_exe().unwrap();
+        if std::env::var_os(PARENT).is_none() {
+            let mut parent = aterm_uds::spawnfd::command("/bin/sh");
+            parent
+                .args([
+                    "-c",
+                    "trap '' INT QUIT TERM HUP USR1 USR2 ALRM PIPE; exec \"$0\" \"$@\"",
+                ])
+                .arg(&me)
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(PARENT, "1");
+            let out = aterm_uds::deadline::ends_within(&mut parent, Duration::from_secs(60));
+            assert!(out.status.success(), "{out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("\nSIGNAL_RUNNER_CHECKED\n"),
+                "{out:?}"
+            );
+            return;
+        }
+        let args = ["--exact", PROBE, "--nocapture", "--test-threads=1"];
+        let mut control = aterm_uds::spawnfd::command(&me);
+        control
+            .args(args)
+            .env("ATERM_VERIFY_SIGNAL_PROBE", "ignored");
+        let out = aterm_uds::deadline::ends_within(&mut control, Duration::from_secs(60));
+        assert!(out.status.success(), "inherited-ignore control: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("\nSIGNALS_CHECKED\n"),
+            "{out:?}"
+        );
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let cmd = Cmd::new(&me)
+            .args(args)
+            .env("ATERM_VERIFY_SIGNAL_PROBE", "default");
+        let ran = run_test(&cmd, env_in(dir.path()), &|| {});
+        assert!(ran.ok, "test runner: {}", ran.output);
+        assert!(ran.output.contains("\nSIGNALS_CHECKED\n"), "{}", ran.output);
+
+        let mut measured = check_command(&me);
+        measured
+            .args(args)
+            .env("ATERM_VERIFY_SIGNAL_PROBE", "default");
+        let out = aterm_uds::deadline::ends_within(&mut measured, Duration::from_secs(60));
+        assert!(out.status.success(), "measurement runner: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("\nSIGNALS_CHECKED\n"),
+            "{out:?}"
+        );
+        println!("\nSIGNAL_RUNNER_CHECKED");
+    }
 
     #[test]
     fn a_child_runs_in_the_root_with_the_runs_variables_and_its_own_win() {

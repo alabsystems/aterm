@@ -800,7 +800,7 @@ mod tests {
     #[test]
     fn messages_rows_are_read_by_their_decoded_words() {
         let reply = "OK 1 messages\n\
-             message 7 at=1 ago_ms=2 tag=harness sev=info origin=wire state=live glass=- rep=1 key=- title=codex-alab%20%405 detail=typed%20%22keep%20going%20(ate%0Arm%3A%20x)%22 actions=-\n";
+             message 7 at=1 ago_ms=2 tag=harness sev=info origin=wire state=live rep=1 key=- title=codex-alab%20%405 detail=typed%20%22keep%20going%20(ate%0Arm%3A%20x)%22 actions=-\n";
         assert_eq!(
             message_texts(reply),
             ["codex-alab @5 typed \"keep going (aterm: x)\""]

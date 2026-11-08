@@ -19,8 +19,8 @@ use super::*;
 use crate::swarm_roster::{DEFAULT_RESERVED_RELEASE_LABEL, SwarmPolicy, SwarmRoster};
 use aterm_types::machine_name::Number;
 
-/// How long the read waits for a vault writer that holds the state lock.
-const LOCK_WAIT: Duration = Duration::from_millis(250);
+/// Hang detector for the whole-generation read waiting for the vault's state writer.
+const LOCK_HANG: Duration = Duration::from_secs(60);
 
 /// What gives a number to another Mac or a role ([`LabLabels::held`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,16 +91,24 @@ pub struct LabLabels {
 /// # Errors
 /// This Mac is still joining its fleet, or its last apply did not finish, so it holds no whole
 /// copy of the lab's labels; it holds no applied copy at all; a writer held the state lock past
-/// 250 ms; or the configuration, identity, state, roster, policy or log cannot be read or
-/// parsed. A rename never reads any of these as nothing held.
+/// the one-minute hang detector; or the configuration, identity, state, roster, policy or log
+/// cannot be read or parsed. A rename never reads any of these as nothing held.
 pub fn lab_labels(paths: &Paths) -> crate::Result<LabLabels> {
+    lab_labels_with_clock(paths, Instant::now)
+}
+
+fn lab_labels_with_clock(
+    paths: &Paths,
+    mut now: impl FnMut() -> Instant,
+) -> crate::Result<LabLabels> {
     let Some(config) = config(paths)? else {
         return Ok(LabLabels::default());
     };
     let Some(identity) = read_identity(paths)? else {
         return Ok(LabLabels::default());
     };
-    let held = observe_within(paths, Instant::now() + LOCK_WAIT)?;
+    let deadline = now() + LOCK_HANG;
+    let held = observe_within(paths, deadline, &mut now)?;
     let state = load_state(paths)?;
     match state.membership {
         Stored::Revoked | Stored::Plain => return Ok(LabLabels::default()),
@@ -146,7 +154,11 @@ pub fn lab_labels(paths: &Paths) -> crate::Result<LabLabels> {
 
 /// The state lock taken shared, waiting out a writer until `deadline`; `None` where no lock file
 /// exists, so no copy was ever applied here.
-fn observe_within(paths: &Paths, deadline: Instant) -> crate::Result<Option<StateLock>> {
+fn observe_within(
+    paths: &Paths,
+    deadline: Instant,
+    now: &mut impl FnMut() -> Instant,
+) -> crate::Result<Option<StateLock>> {
     let mut backoff = Duration::from_millis(1);
     loop {
         StateLock::narrow_owned(paths)?;
@@ -155,7 +167,7 @@ fn observe_within(paths: &Paths, deadline: Instant) -> crate::Result<Option<Stat
             StateObservation::Absent => return Ok(None),
             StateObservation::Busy => {}
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline.saturating_duration_since(now());
         if remaining.is_zero() {
             return Err(Error::of_kind(
                 crate::ErrorKind::VaultBusy,

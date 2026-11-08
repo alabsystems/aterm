@@ -545,6 +545,9 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
     let presented_seq = snapshot
         .presented_seq
         .map_or_else(|| "none".to_string(), |seq| seq.to_string());
+    let session = snapshot
+        .session
+        .map_or_else(|| "none".to_string(), |session| session.to_string());
     format!(
         "OK {} {} {} {} session={} cell_w={} cell_h={} font_px={:.2} scale={:.2} window={} \
          window_rows={} window_cols={} composed_rows={} grid_w={} grid_h={} \
@@ -559,7 +562,7 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
         snapshot.cols,
         snapshot.pixel_w,
         snapshot.pixel_h,
-        snapshot.session,
+        session,
         snapshot.cell_w,
         snapshot.cell_h,
         snapshot.font_px,
@@ -613,6 +616,17 @@ pub(crate) fn cmd_dims(
 ) -> String {
     match read_dims(term, session, proxy) {
         Ok(snapshot) => serialize_dims(&snapshot),
+        Err(error) => format!("ERR {error}\n"),
+    }
+}
+
+/// `dims` (plain, or `--json` when `json`) with no terminal in front: the front window's own
+/// grid and geometry ([`crate::App::window_dims_snapshot`], `session=none`).
+pub(crate) fn cmd_window_dims(proxy: &EventLoopProxy<Wake>, json: bool) -> String {
+    match control_media::call_main(proxy, |reply| Wake::ReadWindowDims { reply }) {
+        Ok(Some(snapshot)) if json => serialize_dims_json(&snapshot),
+        Ok(Some(snapshot)) => serialize_dims(&snapshot),
+        Ok(None) => "ERR no window\n".to_string(),
         Err(error) => format!("ERR {error}\n"),
     }
 }
@@ -2891,6 +2905,9 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
     let presented_seq = snapshot
         .presented_seq
         .map_or_else(|| "null".to_string(), |seq| seq.to_string());
+    let session = snapshot
+        .session
+        .map_or_else(|| "null".to_string(), |session| session.to_string());
     json_ok(&format!(
         "{{\"rows\":{},\"cols\":{},\"pixel_w\":{},\"pixel_h\":{},\
          \"session\":{},\"cell_w\":{},\"cell_h\":{},\"font_px\":{:.2},\"scale\":{:.2},\
@@ -2907,7 +2924,7 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
         snapshot.cols,
         snapshot.pixel_w,
         snapshot.pixel_h,
-        snapshot.session,
+        session,
         snapshot.cell_w,
         snapshot.cell_h,
         snapshot.font_px,

@@ -1287,7 +1287,8 @@ pub const VERBS: &[VerbSpec] = &[
          present drew; `none` before one, after a native or mixed frame, or once the session's \
          terminal or grid changed, a grid an alternate-screen enter or a checkpoint restore \
          builds starting its clock over; a capture's forced present leaves it, and the window \
-         presents again only once its frame changes).",
+         presents again only once its frame changes). With an app tab (Settings) in front and no \
+         session named, the rows and cols are the front window's own grid and `session=none`.",
     )
     .json(Json::Emits),
     v(
@@ -1579,7 +1580,7 @@ pub const VERBS: &[VerbSpec] = &[
         "appnotice <toolchain|update|harness|proc> <text>: log a helper notice",
         "— Owner-only. Records `<text>` from a helper process (`aterm pkg install`, harness) into \
          Settings ▸ Messages and `appstatus` (`kind=harness` on the `harness` lane) without \
-         raising a band row (`OK recorded`). On `toolchain`, `managed-current: …` and \
+         raising a live row (`OK recorded`). On `toolchain`, `managed-current: …` and \
          `machine-settings: …` update those `atpkg` markers. On `proc`, a verify run's line of \
          a process it ended unasked is a `proc.auto-end` record, and a line opening `lab` (a \
          link the lab refused) a `proc.lab-link` one.",
@@ -1595,14 +1596,14 @@ pub const VERBS: &[VerbSpec] = &[
         "— rows ascend by id: `message <id> at=<unix_ms> ago_ms=<ms> tag=<tag> \
          sev=<success|info|warn|error> origin=<host|wire|carried> \
          state=<held|live|review|folded|stale|unseen|superseded|resolved-ok|resolved-warn|dismissed|answered|evicted|carried|withdrawn|recorded|quit> \
-         glass=<row|-> rep=<n> key=<k|-> title=<t> detail=<d> actions=<a|-> \
+         rep=<n> key=<k|-> title=<t> detail=<d> actions=<a|-> \
          [progress=<n>/100|busy=1] [load=<network|disk|cpu>] [reveal=pending] [since_ms=<ms>] \
          [need=<now|working|notice|later>] [rev=<confirmation>]` (free text pct-encoded; `rev` \
          is an opaque per-entry observation on open digest entries, changed by each accepted \
          report, including an identical repeat; unrelated entries do not change it). Bare `<n>` \
          keeps the newest `n` (default 64, max \
          512); `since=<id>` pages forward from `<id>`; `tag=` and `sev=` (floor) filter; \
-         `need=later` selects exceptions to review; `live` selects unretired band rows \
+         `need=later` selects exceptions to review; `live` selects unretired rows \
          (`need=later live` for open exceptions; `reveal=pending` marks a row still inside its \
          grace period).",
     ),
@@ -1612,10 +1613,12 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         OwnerOnly,
-        "notice <post|progress|done|settle|ask|later|dismiss|act> …: post and manage band messages",
-        "— Owner-only. `notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..120>] <title>[ -- \
+        "notice <post|progress|done|settle|ask|later|dismiss|act> …: post and manage messages",
+        "— Owner-only. No message takes a window's terminal rows or draws on its glass \
+         (`messages` rows carry no `glass=`); live ones are listed in Settings ▸ Messages and by \
+         `messages live`. `notice post <tag> [sev=<sev>] [key=<key>] [hold=<1..120>] <title>[ -- \
          <detail>]`: `sev=success|info` (default `info`) only logs (`OK recorded message=<id>`), \
-         `sev=warn|error` raises a band row (`OK message=<id>`). `notice progress <key> \
+         `sev=warn|error` holds a live message (`OK message=<id>`). `notice progress <key> \
          [tag=<tag>] [pct=<0..100>|done=<n>/<total>|busy] [unit=<bytes|items|steps>] \
          [load=<network|disk|cpu>] <title>[ -- <stats>]` shows a metered row after 2 s (stale \
          after 120 s unrefreshed); `notice done <key> [ok|warn|withdraw] [<words>]` ends it (`OK \
@@ -2718,7 +2721,17 @@ pub const VERBS: &[VerbSpec] = &[
          platform resize event (measure with `metrics` `resize_present` and `dims` `layer_*`); a \
          headless window takes the size asked for, as the grid that fits it; accepted only for \
          the focused pane of the front window's active tab (`ERR resize px: only the focused \
-         pane of the front window's active tab` otherwise).",
+         pane of the front window's active tab` otherwise). A window holding Settings is never \
+         smaller than Settings' least view, on either form. The reply says what the window was \
+         given: `OK rows=<r> cols=<c>` (the cell form) or `OK width=<w> height=<h>` (the px \
+         form, the size the window was asked for), followed by `held=least` and the size asked \
+         (`asked_rows= asked_cols=` or `asked_width= asked_height=`) when that least held it \
+         bigger. `@<sid> resize <r> <c>` of another session re-grids it (`OK rows=<r> \
+         cols=<c>`); a pane in a tab behind keeps that grid only until its tab comes to the \
+         front, when its window gives it its pane's grid again (`until=front window=<w> \
+         front_rows=<r> front_cols=<c>`), and a pane in a window's front tab, which the window \
+         lays out again at its next frame, is refused (`ERR resize: session <sid> is a pane of \
+         window <w> in its front tab, …`).",
     )
     .input(Input::PTY.with(Input::FENCES)),
     v("focus", Write, Status, Session, "focus <in|out>: send a focus report", "")

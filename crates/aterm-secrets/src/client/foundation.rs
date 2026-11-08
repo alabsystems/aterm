@@ -493,11 +493,18 @@ fn installed(paths: &Paths, deadline: Instant) -> crate::Result<Bootstrap> {
     }
 }
 
+fn installed_after(paths: &Paths, elapsed: Duration) -> crate::Result<Bootstrap> {
+    installed(
+        paths,
+        Instant::now() + crate::commons::SETTLE.saturating_sub(elapsed),
+    )
+}
+
 fn finish(paths: &Paths, descriptor: &Descriptor, published: bool) -> crate::Result<CommonsInit> {
     let _ = sync(paths, None)?;
     #[cfg(test)]
     tests::synced();
-    let bootstrap = installed(paths, Instant::now() + crate::commons::SETTLE)?;
+    let bootstrap = installed_after(paths, Duration::ZERO)?;
     if bootstrap.trust() != descriptor.trust() {
         return Err(Error::new(
             "installed Commons history belongs to another foundation",

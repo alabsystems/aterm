@@ -115,9 +115,10 @@ fn the_rule_reads_the_checkouts_rows_and_judges_every_capture_it_holds() {
     let tree = Tree {
         root: &root,
         corpus: &corpus,
+        engine: crate::guards::tests::NO_ENGINE,
     };
     let mut found = Vec::new();
-    held_to(&tree, Err(NO_BASELINE.to_string()), &mut found);
+    held_to(&tree, &Err(NO_BASELINE.to_string()), &mut found);
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(
         spots(&found),
@@ -181,7 +182,11 @@ fn the_exports_rows_compile_and_every_capture_row_does() {
     let text = match std::fs::read_to_string(root.join(EXTRA)) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            assert!(!notes(&root).is_empty(), "an absent {EXTRA} is noted");
+            let engine = Ok(("synthetic baseline".to_string(), String::new()));
+            assert!(
+                !notes(&root, &engine).is_empty(),
+                "an absent {EXTRA} is noted"
+            );
             return;
         }
         Err(e) => panic!("{EXTRA}: {e}"),
@@ -207,10 +212,11 @@ fn without_the_exports_rows_the_capture_rows_still_hold() {
     let tree = Tree {
         root: &root,
         corpus: &corpus,
+        engine: crate::guards::tests::NO_ENGINE,
     };
     let mut found = Vec::new();
-    held_to(&tree, Err(NO_BASELINE.to_string()), &mut found);
-    let noted = notes(&root);
+    held_to(&tree, &Err(NO_BASELINE.to_string()), &mut found);
+    let noted = notes(&root, &Err(NO_BASELINE.to_string()));
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(
         spots(&found),
@@ -267,8 +273,13 @@ fn the_edited_view_reads_a_word_fixed_while_it_was_typed() {
     );
 }
 
+/// THE GUARDS HOLD CAPTURES TO THE BASELINE THEIR CALLER HANDED IN: a capture holding a word
+/// only the engine's baseline lists is a finding when the census is handed that baseline (as
+/// aterm-verify hands it one commit of the engine), and the notes name no missing baseline.
+/// NEGATIVE CONTROL: handed none, the same capture is no finding, and the note says why there
+/// is no baseline. The census reads no engine of its own, from any environment.
 #[test]
-fn the_engines_baseline_rows_are_held_when_the_host_has_them() {
+fn the_guards_hold_captures_to_the_baseline_they_are_handed() {
     use crate::scan_set::test_fixtures::disk_tree;
     let files = [
         (EXTRA.to_string(), format!("# synthetic\n{WORD}\n")),
@@ -279,22 +290,22 @@ fn the_engines_baseline_rows_are_held_when_the_host_has_them() {
         ),
     ];
     let root = disk_tree("aterm-census-guards", "capture-privacy-baseline", &files);
-    let corpus = Corpus::read(&root).expect("the synth tree reads");
-    let tree = Tree {
-        root: &root,
-        corpus: &corpus,
+    let handed: crate::EngineBaseline = Ok((
+        "the engine's baseline".to_string(),
+        "# rows\nquokkaword\n".to_string(),
+    ));
+    let held = |engine: &crate::EngineBaseline| {
+        crate::guards::run_guards(&root, engine)
+            .expect("the synth tree reads")
+            .findings
+            .into_iter()
+            .filter(|f| f.rule == CAPTURE_PRIVACY.id)
+            .collect::<Vec<_>>()
     };
-    let mut found = Vec::new();
-    held_to(
-        &tree,
-        Ok((
-            "synthetic baseline".to_string(),
-            "# rows\nquokkaword\n".to_string(),
-        )),
-        &mut found,
-    );
-    let mut without = Vec::new();
-    held_to(&tree, Err(NO_BASELINE.to_string()), &mut without);
+    let found = held(&handed);
+    let noted = notes(&root, &handed);
+    let without = held(&Err(NO_BASELINE.to_string()));
+    let noted_without = notes(&root, &Err(NO_BASELINE.to_string()));
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(
         spots(&found),
@@ -307,5 +318,10 @@ fn the_engines_baseline_rows_are_held_when_the_host_has_them() {
             .all(|f| f.detail.contains("the engine's baseline:2")),
         "{found:#?}"
     );
-    assert!(without.is_empty(), "{without:#?}");
+    assert!(noted.is_empty(), "{noted:?}");
+    assert!(without.is_empty(), "NEGATIVE CONTROL: {without:#?}");
+    assert!(
+        noted_without.iter().any(|n| n.contains(NO_BASELINE)),
+        "{noted_without:?}"
+    );
 }

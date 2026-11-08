@@ -56,7 +56,7 @@ fn desk(on_screen: bool) -> (App, String, TestHost) {
     app.windows
         .get_mut(&W)
         .expect("window 0")
-        .band_on_screen_for_test = on_screen;
+        .window_on_screen_for_test = on_screen;
     (app, ctx.self_id.as_str().to_string(), host)
 }
 
@@ -127,7 +127,7 @@ fn away(app: &mut App) {
         "PRECONDITION: still aterm's frontmost window"
     );
     assert!(
-        crate::messages_host::band_on_screen(ws),
+        crate::messages_host::window_on_screen(ws),
         "PRECONDITION: on screen, uncovered"
     );
 }
@@ -176,7 +176,7 @@ fn a_workers_done_in_the_front_tab_waits_for_their_return_too() {
     app.windows
         .get_mut(&W)
         .expect("window 0")
-        .band_on_screen_for_test = true;
+        .window_on_screen_for_test = true;
     let ctx = app.pool.get(1).expect("pooled").ctx.clone();
     assert_eq!(
         app.focused_session_id(W),

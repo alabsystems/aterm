@@ -350,8 +350,10 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
         "kept after the baseline's reload"
     );
 
-    apply_config_text(&mut app, dir, "line_height = 1.5\n");
+    // The reload re-grids every window inside the size it holds, a headless one too, so the
+    // one derivation may fall in the reload or in the frame after it.
     let _ = work_counts::take_cell_geometry_derivations();
+    apply_config_text(&mut app, dir, "line_height = 1.5\n");
     app.redraw_window(wid);
     assert_eq!(
         work_counts::take_cell_geometry_derivations(),

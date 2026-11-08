@@ -250,17 +250,20 @@ pub struct Live {
     pub revision: u32,
     /// Duplicate posts folded into it.
     pub repeats: u32,
-    /// When the row reached the glass, where its hold anchors; `None` while queued.
+    /// When the row reached the front, where its hold anchors: the glass on a band host, its
+    /// reveal on a glass-less one ([`Glass::Glassless`], whose glass stays empty); `None` while
+    /// queued.
     pub on_glass_since: Option<Instant>,
-    /// Default/For/Ask rows: `None` until first glass.
+    /// Default/For/Ask rows: `None` until the row first reaches the front
+    /// ([`Self::on_glass_since`]).
     pub fold_at: Option<Instant>,
     /// Live rows: `posted_at` (or the last restate) + `stale_after`.
     pub stale_at: Option<Instant>,
-    /// `reveal_at` (or the post) + `max(hold, OVERFLOW_PATIENCE_MIN)`.
+    /// `reveal_at` (or the post) + `max(hold, OVERFLOW_PATIENCE_MIN)`; spent only on a band host.
     pub patience_at: Instant,
     /// Where the patience clock runs from: the reveal (or the post), then the last
-    /// demote, restart or handoff commit (a carried row's); a restated hold changes
-    /// the span, never this anchor.
+    /// demote or handoff commit (a carried row's); a restated hold changes the span,
+    /// never this anchor.
     patience_from: Instant,
     /// Details was opened.
     pub seen: bool,
@@ -340,7 +343,7 @@ impl Live {
         }
     }
 
-    /// `true` while not on glass.
+    /// `true` while not at the front ([`Self::on_glass_since`]).
     #[must_use]
     pub const fn is_queued(&self) -> bool {
         self.on_glass_since.is_none()
@@ -590,10 +593,26 @@ type GlassSignature = (
     Option<String>,
 );
 
+/// What a center's host shows its live rows on, fixed when the center is made.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Glass {
+    /// The host paints the committed rows on a band (the web terminal): a row's hold anchors
+    /// when it reaches the glass, and a revealed row the glass does not take waits there until
+    /// its patience runs out, then retires [`Retired::Unseen`].
+    #[default]
+    Band,
+    /// The host paints no glass (the native app, whose rows are read in Settings ▸ Messages and
+    /// `aterm ctl messages`): a row is at the front once it is revealed, its hold anchors there,
+    /// it spends no patience and never retires Unseen, so its hold ends it.
+    Glassless,
+}
+
 /// The center.
 #[derive(Clone, Debug)]
 pub struct MessageCenter {
     confirmations: Arc<crate::ConfirmationSource>,
+    /// What the host shows the live rows on.
+    glass_host: Glass,
     live: Vec<Live>,
     glass: Vec<MessageId>,
     echoes: Vec<Echo>,
@@ -655,6 +674,7 @@ impl MessageCenter {
     ) -> Self {
         Self {
             confirmations,
+            glass_host: Glass::Band,
             live: Vec::new(),
             glass: Vec::new(),
             echoes: Vec::new(),
@@ -670,6 +690,26 @@ impl MessageCenter {
             demotions: 0,
             last_demoted: None,
         }
+    }
+
+    /// A center for a host that paints no glass ([`Glass::Glassless`]), sharing the host
+    /// incarnation's `confirmations` as [`Self::with_confirmations`] does.
+    #[must_use]
+    pub fn glassless(
+        log: MessageLog,
+        now: Instant,
+        confirmations: Arc<crate::ConfirmationSource>,
+    ) -> Self {
+        Self {
+            glass_host: Glass::Glassless,
+            ..Self::with_confirmations(log, now, confirmations)
+        }
+    }
+
+    /// What the host shows the live rows on.
+    #[must_use]
+    pub const fn glass(&self) -> Glass {
+        self.glass_host
     }
 
     /// Set the display's frame period, which glides and echoes are read on while in flight:
@@ -1350,17 +1390,6 @@ impl MessageCenter {
         true
     }
 
-    /// Restart the patience of a queued row nobody could have seen: it waits a whole span from
-    /// `now`.
-    pub fn restart_patience(&mut self, id: MessageId, now: Instant) -> bool {
-        let Some(row) = self.live.iter_mut().find(|l| l.id == id && l.is_queued()) else {
-            return false;
-        };
-        row.patience_from = now;
-        row.patience_at = at(now, row.hold_span().max(OVERFLOW_PATIENCE_MIN));
-        true
-    }
-
     /// A capsule press.
     pub fn act(&mut self, id: MessageId, action: ActionIndex, now: Instant) -> Option<Intent> {
         let i = self.index(id)?;
@@ -1389,8 +1418,8 @@ impl MessageCenter {
 
     /// Reveal the rows whose grace is over, show the load words that have lasted, retire what is
     /// due (folds only when `holds`: a handoff freeze suspends them, never staleness; a carried
-    /// row spends no patience until [`Self::after_handoff_commit`] restarts it), end the echoes
-    /// that are over, and re-rank the queue.
+    /// row spends no patience until [`Self::after_handoff_commit`] restarts it, and on a
+    /// glass-less host no row spends any), end the echoes that are over, and re-rank the queue.
     pub fn settle(&mut self, now: Instant, holds: bool) -> Settled {
         let before = self.glass_signature();
         let mut revealed = false;
@@ -1423,7 +1452,7 @@ impl MessageCenter {
                 Some(Retired::Folded)
             } else if row.stale_at.is_some_and(|t| now >= t) {
                 Some(Retired::Stale)
-            } else if row.is_queued() && row.carried == Carried::No && now >= row.patience_at {
+            } else if self.spends_patience(row) && now >= row.patience_at {
                 Some(Retired::Unseen)
             } else {
                 None
@@ -1459,7 +1488,7 @@ impl MessageCenter {
             [
                 if holds { l.fold_at } else { None },
                 l.stale_at,
-                (l.is_queued() && l.carried == Carried::No).then_some(l.patience_at),
+                self.spends_patience(l).then_some(l.patience_at),
                 l.reveal_at.filter(|_| !l.revealed),
                 load,
             ]
@@ -1472,6 +1501,12 @@ impl MessageCenter {
                     .and_then(|_| self.quiet_shrink_at()),
             )
             .min()
+    }
+
+    /// Whether `row`'s patience runs: a queued row on a band host, past its handoff commit if it
+    /// was carried. A glass-less host's rows spend none.
+    fn spends_patience(&self, row: &Live) -> bool {
+        self.glass_host == Glass::Band && row.is_queued() && row.carried == Carried::No
     }
 
     /// The rows eligible for the glass.
@@ -1488,8 +1523,12 @@ impl MessageCenter {
             .min(MAX_ROWS)
     }
 
-    /// Commit the row count with hysteresis over `min(wanted, afford)`.
+    /// Commit the row count with hysteresis over `min(wanted, afford)`. A glass-less center
+    /// ([`Glass::Glassless`]) commits no rows: it keeps 0 and answers `None`.
     pub fn commit_rows(&mut self, now: Instant, afford: u16) -> Option<u16> {
+        if self.glass_host == Glass::Glassless {
+            return None;
+        }
         let want = self.wanted_rows().min(afford);
         let mut moved = None;
         match want.cmp(&self.committed_rows) {
@@ -1566,6 +1605,18 @@ impl MessageCenter {
     }
 
     fn rebalance(&mut self, now: Instant) {
+        if self.glass_host == Glass::Glassless {
+            // No glass to place rows on: a revealed row is at the front, and its hold runs.
+            for row in self
+                .live
+                .iter_mut()
+                .filter(|l| l.revealed && l.on_glass_since.is_none())
+            {
+                row.on_glass_since = Some(now);
+                row.arm(now);
+            }
+            return;
+        }
         let committed = usize::from(self.committed_rows);
         self.echoes.retain(|e| usize::from(e.slot) < committed);
         let cap = if self.overflow_up() {
@@ -2416,7 +2467,8 @@ impl MessageCenter {
 
     /// The handoff committed: each carried row's patience starts now, restated or not. A row not
     /// restated since the seed is stilled, loses the handoff cap, and arms its own hold where it
-    /// is live or already on the glass; a restated one keeps what its restate set.
+    /// is live or already at the front ([`Live::on_glass_since`]); a restated one keeps what its
+    /// restate set.
     pub fn after_handoff_commit(&mut self, now: Instant) {
         for row in &mut self.live {
             let seeded = match std::mem::replace(&mut row.carried, Carried::No) {
@@ -4409,40 +4461,174 @@ mod tests {
         );
     }
 
+    fn glassless(now: Instant) -> MessageCenter {
+        MessageCenter::glassless(
+            MessageLog::empty(),
+            now,
+            Arc::new(crate::ConfirmationSource::new(None)),
+        )
+    }
+
+    /// A GLASS-LESS HOST'S ROW IS AT THE FRONT ONCE REVEALED (the native app, which paints no
+    /// band): its hold anchors at its reveal, a held-back reveal's included, and ends it, Folded,
+    /// on no glass; the center commits no rows, and only a row not yet revealed is queued. A band
+    /// host's same row, which no commit placed, waits in the queue past its hold and retires
+    /// Unseen once its patience runs out.
+    /// NEGATIVE CONTROL (scratch): arming nothing in `rebalance`'s glass-less arm leaves the row
+    /// live past its hold; dropping that arm's `l.revealed` filter puts the unrevealed row at
+    /// the front at its post.
     #[test]
-    fn a_restarted_patience_keeps_a_queued_row_waiting() {
+    fn a_glassless_row_arms_its_hold_at_its_reveal_and_folds_when_it_ends() {
         let now = t0();
-        let mut c = fresh(now);
-        let on_glass = c.post(standing("a"), stamp(1), now).id;
-        c.post(standing("b"), stamp(2), now);
-        c.commit_rows(now, 2);
-        let s = c
-            .post(
-                Message::new(tags::PACKAGES, Severity::Success, "installed"),
-                stamp(3),
-                now,
-            )
-            .id;
-        c.commit_rows(now, 2);
-        assert!(c.live(s).unwrap().is_queued(), "PRECONDITION: queued");
-        assert!(
-            !c.restart_patience(on_glass, now),
-            "a row on the glass has none"
-        );
-        let mut t = now;
-        for _ in 0..10 {
-            t += OVERFLOW_PATIENCE_MIN - ms(1);
-            assert!(c.restart_patience(s, t));
-            assert!(c.settle(t, true).retired.is_empty(), "it waits on");
-        }
-        assert_eq!(c.live(s).unwrap().patience_at, t + OVERFLOW_PATIENCE_MIN);
-        let settled = c.settle(t + OVERFLOW_PATIENCE_MIN, true);
+        let mut c = glassless(now);
+        assert_eq!(c.glass(), Glass::Glassless);
         assert_eq!(
-            settled.retired,
-            vec![(s, Retired::Unseen)],
-            "left alone, it folds"
+            fresh(now).glass(),
+            Glass::Band,
+            "a center is a band host by default"
         );
-        assert!(!c.restart_patience(s, t), "no live row any more");
+        let id = c.post(info("installed"), stamp(1), now).id;
+        let row = c.live(id).unwrap();
+        assert_eq!(row.on_glass_since, Some(now), "at the front at its post");
+        assert_eq!(
+            row.fold_at,
+            Some(now + HOLD_INFO),
+            "its hold runs from there"
+        );
+        assert_eq!(c.commit_rows(now, 3), None, "no rows to commit");
+        assert_eq!(c.committed_rows(), 0);
+        assert!(glass_ids(&c).is_empty(), "nothing on any glass");
+        assert_eq!(c.deadline(true), Some(now + HOLD_INFO));
+        assert!(c.settle(now + HOLD_INFO - ms(1), true).retired.is_empty());
+        assert_eq!(
+            c.settle(now + HOLD_INFO, true).retired,
+            vec![(id, Retired::Folded)],
+            "its hold ends it"
+        );
+
+        let mut later = info("revealed later");
+        later.reveal_after = Some(ms(2_000));
+        let late = c.post(later, stamp(2), now).id;
+        assert!(
+            c.live(late).unwrap().is_queued(),
+            "an unrevealed row is the only queued kind"
+        );
+        assert_eq!(
+            c.live(late).unwrap().fold_at,
+            None,
+            "no hold before its reveal"
+        );
+        let revealed = now + ms(2_000);
+        assert!(c.settle(revealed, true).retired.is_empty());
+        assert!(
+            !c.live(late).unwrap().is_queued(),
+            "at the front at its reveal"
+        );
+        assert!(glass_ids(&c).is_empty(), "still nothing on any glass");
+        assert_eq!(c.committed_rows(), 0);
+        assert_eq!(
+            c.live(late).unwrap().fold_at,
+            Some(revealed + HOLD_INFO),
+            "the hold anchors at the reveal"
+        );
+
+        let mut band = fresh(now);
+        let queued = band.post(info("installed"), stamp(1), now).id;
+        assert!(
+            band.live(queued).unwrap().is_queued(),
+            "CONTROL: no commit placed it"
+        );
+        assert!(
+            band.settle(now + HOLD_INFO, true).retired.is_empty(),
+            "CONTROL: it waits"
+        );
+        assert_eq!(
+            band.settle(now + OVERFLOW_PATIENCE_MIN, true).retired,
+            vec![(queued, Retired::Unseen)],
+            "CONTROL: a band host's queued row ages out unseen"
+        );
+    }
+
+    /// NO GLASS-LESS ROW SPENDS PATIENCE: a row whose reveal the first settle meets only past its
+    /// patience (the host slept through it) is revealed and held from that settle, a standing row
+    /// outlives a day, the patience a band host's queue spends on it, with no deadline asked for
+    /// it, and a busy update row its reporter keeps alive outlives its patience; a band host
+    /// retires all three Unseen.
+    /// NEGATIVE CONTROL (scratch): dropping `spends_patience`'s `Glass::Band` term retires the
+    /// slept-through row Unseen.
+    #[test]
+    fn a_glassless_row_spends_no_patience() {
+        let now = t0();
+        let mut slept = info("revealed in a sleep");
+        slept.reveal_after = Some(ms(2_000));
+        let woke = now + ms(2_000) + OVERFLOW_PATIENCE_MIN;
+        for (host, mut c) in [("glass-less", glassless(now)), ("band", fresh(now))] {
+            let id = c.post(slept.clone(), stamp(1), now).id;
+            let retired = c.settle(woke, true).retired;
+            if host == "band" {
+                assert_eq!(retired, vec![(id, Retired::Unseen)], "CONTROL: {host}");
+                continue;
+            }
+            assert!(retired.is_empty(), "{host}: {retired:?}");
+            assert_eq!(
+                c.live(id).unwrap().fold_at,
+                Some(woke + HOLD_INFO),
+                "{host}"
+            );
+        }
+        let day = STANDING_PATIENCE;
+        for (host, mut c) in [("glass-less", glassless(now)), ("band", fresh(now))] {
+            let still = c.post(standing("Disk nearly full"), stamp(1), now).id;
+            let work = c.post(busy("Installing the update"), stamp(2), now).id;
+            let mut t = now;
+            let mut retired = Vec::new();
+            while t < now + day + ms(1) {
+                t += Duration::from_mins(10);
+                c.restate(work, Restatement::default(), t);
+                retired.extend(c.settle(t, true).retired);
+            }
+            if host == "band" {
+                assert_eq!(
+                    retired,
+                    vec![(work, Retired::Unseen), (still, Retired::Unseen)],
+                    "CONTROL: {host}"
+                );
+                continue;
+            }
+            assert!(retired.is_empty(), "{host}: {retired:?}");
+            assert!(c.live(still).is_some() && c.live(work).is_some(), "{host}");
+            c.withdraw(work, t);
+            assert_eq!(c.deadline(true), None, "{host}: no patience is asked for");
+        }
+    }
+
+    /// A GLASS-LESS SUCCESSOR'S CARRIED ROW HOLDS FROM THE COMMIT: seeded at the front, it waits
+    /// out the freeze, then its hold runs from the handoff commit and ends it, Folded.
+    #[test]
+    fn a_glassless_successors_carried_row_holds_from_the_commit() {
+        let now = t0();
+        let mut parent = glassless(now);
+        let id = parent.post(info("carried"), stamp(1), now).id;
+        let mut child = glassless(now);
+        child.seed_carried(&parent.carried(), stamp(1), now);
+        let freeze = Duration::from_mins(2);
+        assert!(
+            child.settle(now + freeze, false).retired.is_empty(),
+            "the freeze"
+        );
+        let commit = now + freeze;
+        child.after_handoff_commit(commit);
+        assert_eq!(child.live(id).unwrap().fold_at, Some(commit + HOLD_INFO));
+        assert!(
+            child
+                .settle(commit + HOLD_INFO - ms(1), true)
+                .retired
+                .is_empty()
+        );
+        assert_eq!(
+            child.settle(commit + HOLD_INFO, true).retired,
+            vec![(id, Retired::Folded)]
+        );
     }
 
     #[test]

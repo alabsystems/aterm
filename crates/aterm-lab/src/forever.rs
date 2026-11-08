@@ -2741,10 +2741,11 @@ pub struct Seen {
     /// many requests of its conversation the stub read between the hold and the lift, read once
     /// the watch is over ([`lift_witness`]); `None` where it was not lifted.
     pub lift_stub: Option<usize>,
-    /// A same-reply chain's resume ask as `ctl messages tag=harness` printed it at each change
-    /// ([`surfaces::held::band_rows`]), and every read of it that answered.
-    pub band: Vec<(i64, String)>,
-    pub band_reads: Vec<i64>,
+    /// The harness rows `ctl messages tag=harness` printed at each change: a same-reply chain's
+    /// resume ask ([`surfaces::held::resume_ask_rows`]) or a login chain's warnings
+    /// ([`sysmsg::login::rows`]), and every read of them that answered.
+    pub harness: Vec<(i64, String)>,
+    pub harness_reads: Vec<i64>,
     /// When same-land's person began typing their turn into its held tab
     /// ([`surfaces::held::person_due`], [`surfaces::held::person_typed`]): their first key is
     /// already their turn (aterm journals `a person is typing`).
@@ -8343,15 +8344,19 @@ fn look(run: &Run, door: &Door<'_>, tab: &mut Tab) {
     if tab.chain.same_reply()
         && let Ok(messages) = reading(door, &["messages", "tag=harness"])
     {
-        let band = surfaces::held::band_rows(&messages, &tab.sid);
-        tab.seen.band_reads.push(now);
-        put(&mut tab.seen.band, "band", band);
+        let asks = surfaces::held::resume_ask_rows(&messages, &tab.sid);
+        tab.seen.harness_reads.push(now);
+        put(&mut tab.seen.harness, "harness", asks);
     }
     if tab.chain.login()
         && let Ok(messages) = reading(door, &["messages", "tag=harness"])
     {
-        tab.seen.band_reads.push(now);
-        put(&mut tab.seen.band, "band", sysmsg::login::rows(&messages));
+        tab.seen.harness_reads.push(now);
+        put(
+            &mut tab.seen.harness,
+            "harness",
+            sysmsg::login::rows(&messages),
+        );
     }
     if tab.chain == Chain::Off && tab.seen.reply_ms.is_none() {
         let text = on(door, &tab.sid, &["text"]);
@@ -8641,11 +8646,12 @@ fn finished(tab: &Tab, now: i64) -> bool {
                 || (nudge.is_some() && surfaces::held::watched_past(s, now))
                 || done_since(20_000)
         }
-        // same-land is watched past its person's turn, until its band is gone or a minute passed.
+        // same-land is watched past its person's turn, until its resume ask is gone or a minute
+        // passed.
         Chain::SameLand => {
             s.stop_person_ms.is_some_and(|p| {
                 now - p >= 60_000
-                    || s.band
+                    || s.harness
                         .last()
                         .is_some_and(|(t, b)| *t > p && surfaces::held::stop_rows(b).is_empty())
             }) || done_since(20_000)
@@ -9732,7 +9738,7 @@ fn parse_args(args: &[String]) -> Result<Option<Asked>, Fail> {
     {
         return Err(usage(
             "--window opens a window for native controller keys (hwkey) or for same-land's hold read off \
-             a real window (its chip's and its band's screen-reader nodes): the run needs land-p \
+             a real window (its chip's screen-reader node): the run needs land-p \
              (--mode cover, --chains land-p) or same-land (--chains same-land)",
         ));
     }

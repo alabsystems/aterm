@@ -336,52 +336,50 @@ fn an_open_failure_and_a_launch_fatal_reach_the_log_by_their_length() {
     );
 }
 
-/// A row said while no window showed a band is owed to the person: once a band is on screen it
-/// is shown, or posted again if it left unseen, and both lines name it by its key and its
-/// title's length while the Messages store keeps the title (E7's second land; restored by
-/// PRIV4-4 after 1a7cad3eb5 dropped it while both lines stayed). Since aa4a2b2881 the app's
-/// own band takes no rows (`band_commit`'s afford is 0), so the shown leg puts the row on the
-/// glass through the center's own commit, as a band that takes rows would. NEGATIVE CONTROLS
-/// (scratch): either line formatting the message's title fails its own leg's sentinel check
-/// with `QZP7E7P1`.
+/// A row said while no window was on screen is owed to the person: once a window is on screen
+/// it counts as seen, or is posted again if it left unseen, and both lines name it by its key and
+/// its title's length while the Messages store keeps the title (E7's second land; restored by
+/// PRIV4-4 after 1a7cad3eb5 dropped it while both lines stayed). The app's center is glass-less,
+/// so the owed row is at the front from its post and a window on screen is all the seen leg
+/// needs. NEGATIVE CONTROLS (scratch): either line formatting the message's title fails its own
+/// leg's sentinel check with `QZP7E7P1`.
 #[test]
 fn an_owed_row_reaches_the_log_by_its_key_and_its_titles_length() {
     use aterm_messages::{Message, Severity, tags};
     use std::time::{Duration, Instant};
-    let title = "QZP7E7P1 waits for a band";
+    let title = "QZP7E7P1 waits for a window";
     let owed = || Message::new(tags::HARNESS, Severity::Info, title).key("e7.owed");
-    let band_shown = |app: &mut App| {
+    let on_screen = |app: &mut App| {
         app.windows
             .get_mut(&crate::WindowId(0))
             .expect("window 0")
-            .band_on_screen_for_test = true;
+            .window_on_screen_for_test = true;
     };
     let named = format!("key=e7.owed title={}B", title.len());
 
-    // Said while no band was on screen, then shown once one is.
+    // Said while no window was on screen, then seen once one is.
     let mut shown = App::headless_for_test();
     shown.say_owed_unless_seen(owed());
-    band_shown(&mut shown);
+    on_screen(&mut shown);
     let now = Instant::now();
-    shown.messages.commit_rows(now, 1);
     assert!(
         shown
             .messages
             .live_by_key("e7.owed")
             .is_some_and(|live| !live.is_queued()),
-        "PRECONDITION: the owed row is on the glass"
+        "PRECONDITION: the owed row is at the front"
     );
     let logged = logged_while(|| {
         shown.settle_messages(now);
     });
     assert!(
         !logged.iter().any(|line| line.contains("QZP7E7P")),
-        "the log keeps the shown row's title"
+        "the log keeps the seen row's title"
     );
     assert!(
         logged.iter().any(|line| line
-            == &format!("message: said while no window was on screen, shown now: {named}")),
-        "the shown row is logged by its key: {} lines",
+            == &format!("message: said while no window was on screen, on screen now: {named}")),
+        "the seen row is logged by its key: {} lines",
         logged.len()
     );
     assert!(
@@ -389,7 +387,7 @@ fn an_owed_row_reaches_the_log_by_its_key_and_its_titles_length() {
         "CONTROL: the Messages store keeps the title"
     );
 
-    // Said while no band was on screen and gone unseen, then posted again once one is.
+    // Said while no window was on screen and gone unseen, then posted again once one is.
     let mut again = App::headless_for_test();
     again.say_owed_unless_seen(owed());
     let id = again
@@ -404,7 +402,7 @@ fn an_owed_row_reaches_the_log_by_its_key_and_its_titles_length() {
         again.messages.live_by_key("e7.owed").is_none(),
         "PRECONDITION: the row left unseen"
     );
-    band_shown(&mut again);
+    on_screen(&mut again);
     let logged = logged_while(|| {
         again.settle_messages(later + Duration::from_secs(1));
     });
@@ -414,7 +412,7 @@ fn an_owed_row_reaches_the_log_by_its_key_and_its_titles_length() {
     );
     assert!(
         logged.iter().any(|line| line
-            == &format!("message: left unseen, posted again for a visible band: {named}")),
+            == &format!("message: left unseen, posted again for a window on screen: {named}")),
         "the row posted again is logged by its key: {} lines",
         logged.len()
     );

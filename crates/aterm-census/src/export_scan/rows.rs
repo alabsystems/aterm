@@ -5,16 +5,15 @@
 //! The forbidden-content rows: the export's own (`publish/forbidden-extra.txt`) and the
 //! publication engine's baseline, compiled as the engine's `grep -E` runs them. The scan holds
 //! the export's text to them ([`super::forbidden`]), and `capture-privacy` holds decoded test
-//! captures to the same rows.
-
-use std::path::{Path, PathBuf};
+//! captures to the same rows. The census reads no engine itself: its caller hands it one
+//! commit's baseline ([`crate::EngineBaseline`]), as `aterm-verify`'s engine reader read it.
 
 use aterm_regex::{Regex, RegexBuilder};
 
 /// The export's own rows, relative to the checkout.
 pub const EXTRA: &str = "publish/forbidden-extra.txt";
 
-/// The engine's central rows, relative to its checkout.
+/// The engine's central rows, relative to its root.
 pub const BASELINE: &str = "baseline/forbidden-content.txt";
 
 /// One pattern the text is held to.
@@ -61,30 +60,4 @@ pub(crate) fn file_rows(text: &str, label: &str) -> (Vec<Row>, Vec<(usize, Strin
         }
     }
     (rows, refused)
-}
-
-/// The publication engine's checkout as this host names it: `PUBLICATION_ENGINE` when set and
-/// not empty, else `$HOME/publication` (where `ship release` and `verify export` look too).
-#[must_use]
-pub fn engine_dir(var: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
-    var("PUBLICATION_ENGINE")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| var("HOME").map(|h| PathBuf::from(h).join("publication")))
-}
-
-/// The engine's baseline `(where, text)` in the checkout at `engine`, or why it cannot be read.
-pub(crate) fn baseline_in(engine: &Path) -> Result<(String, String), String> {
-    let path = engine.join(BASELINE);
-    let shown = path.display().to_string();
-    crate::tree::read_to_string(&path)
-        .map(|text| (shown.clone(), text))
-        .map_err(|e| format!("{shown}: {e}"))
-}
-
-/// The engine's baseline as this process's environment names the engine ([`engine_dir`]).
-pub(crate) fn baseline() -> Result<(String, String), String> {
-    let engine = engine_dir(&|name| std::env::var_os(name))
-        .ok_or("neither PUBLICATION_ENGINE nor HOME names the engine")?;
-    baseline_in(&engine)
 }

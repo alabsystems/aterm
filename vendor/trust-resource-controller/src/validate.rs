@@ -33,6 +33,17 @@ fn linker_loan_shape(request: &Request, loan: Loan) -> bool {
 impl Request {
     /// Validate syntax only; every descriptor and producer still needs native authentication.
     pub fn validate(&self) -> io::Result<()> {
+        self.validate_profile(false)
+    }
+    // Selected only by the distinct paired50/v2 codec. Ordinary Request and
+    // every existing role6 exchange retain the original closed env6 profile.
+    pub(crate) fn validate_paired_query(&self) -> io::Result<()> {
+        if self.role != Role::WorkloadQuery {
+            return Err(invalid());
+        }
+        self.validate_profile(true)
+    }
+    fn validate_profile(&self, paired_query: bool) -> io::Result<()> {
         self.binding.validate()?;
         if self.member_attempt == [0; 16]
             || self.member_attempt == self.binding.root_attempt
@@ -97,6 +108,9 @@ impl Request {
         }
         match self.role {
             Role::ResolverQuery => crate::resolver::validate_member(self)?,
+            Role::WorkloadQuery if paired_query => {
+                crate::paired_qualification::query::validate_member(self)?
+            }
             Role::WorkloadQuery => crate::workload::host::validate_query_member(self)?,
             Role::WorkloadProduced => crate::workload::host::produced::validate_member(self)?,
             Role::MachOLinker(loan) if !linker_loan_shape(self, loan) => {

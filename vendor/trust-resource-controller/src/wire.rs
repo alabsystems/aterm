@@ -125,6 +125,13 @@ impl Request {
     /// Encode for one explicit private control exchange. Never log the result.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
+        self.encode_validated()
+    }
+    pub(crate) fn encode_paired_query(&self) -> io::Result<Vec<u8>> {
+        self.validate_paired_query()?;
+        self.encode_validated()
+    }
+    fn encode_validated(&self) -> io::Result<Vec<u8>> {
         let mut e = Encoder::new(1);
         e.bytes(self.binding.session.as_bytes())?;
         e.0.extend(self.binding.root_attempt);
@@ -189,6 +196,12 @@ impl Request {
     }
     /// Decode bounded untrusted bytes, rejecting extra fields and invalid shapes.
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        Self::decode_profile(bytes, false)
+    }
+    pub(crate) fn decode_paired_query(bytes: &[u8]) -> io::Result<Self> {
+        Self::decode_profile(bytes, true)
+    }
+    fn decode_profile(bytes: &[u8], paired_query: bool) -> io::Result<Self> {
         let mut d = header(bytes, 1)?;
         let binding =
             JobBinding { session: d.text()?, root_attempt: d.array()?, capability: d.array()? };
@@ -254,7 +267,11 @@ impl Request {
             delegations: Delegations { cpu, gnu, fences },
             timeout_ns: (timeout != 0).then_some(timeout),
         };
-        request.validate()?;
+        if paired_query {
+            request.validate_paired_query()?;
+        } else {
+            request.validate()?;
+        }
         Ok(request)
     }
 }

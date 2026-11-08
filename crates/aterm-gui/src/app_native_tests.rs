@@ -26,7 +26,7 @@ fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
     let terminal = app.windows[&wid].tab_set.active().unwrap().focus;
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     app.post_message(aterm_messages::Message::new(
         aterm_messages::tags::CONFIG,
         aterm_messages::Severity::Warn,

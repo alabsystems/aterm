@@ -2912,6 +2912,8 @@ impl Wake {
             | Wake::KittyWear { .. }
             | Wake::TypingMomentum { .. }
             | Wake::PaneRegridOwed { .. }
+            | Wake::ReadPaneGrid { .. }
+            | Wake::ReadWindowDims { .. }
             | Wake::ReadSessionStatus { .. }
             | Wake::ReadSetupStatus { .. }
             | Wake::ReadSessionStatuses { .. }

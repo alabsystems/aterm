@@ -269,7 +269,7 @@ pub struct ReleaseOptions {
     /// `--release-credentials <path>`; default `~/.aterm/release-ring/release-credentials.toml`.
     pub release_credentials: Option<PathBuf>,
     /// `--engine <path>`; default `$PUBLICATION_ENGINE`, else `~/publication`: the engine whose
-    /// origin the release's own engine is cloned from ([`crate::gates::engine_copy`]).
+    /// origin the release's own engine is cloned from ([`aterm_verify::engine::engine_copy`]).
     pub engine: Option<PathBuf>,
     pub dry_run: bool,
     pub verbose: bool,
@@ -312,9 +312,9 @@ impl ReleaseOptions {
     /// since the new image resumes the head the journal names (the hops are made); and
     /// `--engine` with its directory left out, since the exec'd image is handed the engine source
     /// this release took (`ATERM_RELEASE_ENGINE_SOURCE`) and the repository it captured, beside
-    /// this release's own engine as `PUBLICATION_ENGINE` ([`crate::gates::engine_copy`]), which a
-    /// cutter older than that handover takes, and a cutter older than that copy would run and sync
-    /// the directory `--engine` named in place.
+    /// this release's own engine as `PUBLICATION_ENGINE` ([`aterm_verify::engine::engine_copy`]),
+    /// which a cutter older than that handover takes, and a cutter older than that copy would run
+    /// and sync the directory `--engine` named in place.
     #[must_use]
     pub fn exec_args(&self, args: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
         let value = |flag: &str| match flag {
@@ -3014,10 +3014,10 @@ impl Run<'_> {
     }
 
     /// Select locally, freeze, and only then let the candidate's cutter judge the release.
-    /// Selection is deliberately independent of the launching cutter's origin refresh and
-    /// publication roster reader. An old local origin/main is a pinned candidate, not a claim
-    /// about the current remote tip; step 1 refreshes and proves its ancestry before a product
-    /// build or staging begins.
+    /// Selection is independent of the launching cutter's engine and publication roster
+    /// readers. An old local origin/main is a pinned candidate, not a claim about the current
+    /// remote tip; `--fix` refreshes source refs before admission, and step 1 refreshes and
+    /// proves the candidate's ancestry before a product build or staging begins.
     fn prepare_candidate(&mut self) -> Flow {
         if let Some(refusal) = self.claim_refused.take() {
             return self.refuse_hard(refusal);

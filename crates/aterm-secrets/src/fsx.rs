@@ -575,6 +575,143 @@ pub(crate) fn seen_if_present(path: &Path) -> crate::Result<Option<Seen>> {
     }
 }
 
+/// The SHA-256 of the file at `path` as [`read_private`] reads it, `None` where there is none,
+/// kept while the file stands ([`digest_while_seen`]).
+///
+/// # Errors
+/// As [`read_private`], or the `lstat` of `path`.
+pub(crate) fn private_digest(path: &Path, max: usize) -> crate::Result<Option<[u8; 32]>> {
+    digest_while_seen(
+        path,
+        Reader {
+            admit: Admit::Private,
+            max,
+        },
+    )
+}
+
+/// [`private_digest`] as [`read_public`] reads the file.
+///
+/// # Errors
+/// As [`read_public`], or the `lstat` of `path`.
+pub(crate) fn public_digest(path: &Path, max: usize) -> crate::Result<Option<[u8; 32]>> {
+    digest_while_seen(
+        path,
+        Reader {
+            admit: Admit::Any,
+            max,
+        },
+    )
+}
+
+/// A reader whose digests [`digest_while_seen`] keeps: its admission and its cap. A digest one
+/// reader kept answers only that reader, since another may refuse the file it admitted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Reader {
+    admit: Admit,
+    max: usize,
+}
+
+impl Reader {
+    /// The [`FileStamp`] of the file this reader opens at `path`, taken before it reads a byte,
+    /// and the SHA-256 of the bytes it reads, wiped once hashed; `None` where there is no file.
+    fn digest(self, path: &Path) -> crate::Result<Option<(FileStamp, [u8; 32])>> {
+        Ok(
+            read_opened_stamped(path, self.max, self.admit, Past::Refuse, Links::Refuse)
+                .map_err(Unread::into_error)?
+                .map(|(stamp, bytes)| {
+                    let bytes = SecretBytes::new(bytes);
+                    (stamp, aterm_digest::Sha256::digest(bytes.as_slice()))
+                }),
+        )
+    }
+}
+
+/// The digest `reader` gives of the file at `path`, kept for that reader while one `lstat` of
+/// `path` ([`Seen`]) shows what it showed before the read that gave it, when the file the read
+/// opened was the one that `lstat` saw and had stood [`SETTLED_NS`] unchanged.
+///
+/// The opened file's `fstat` ([`FileStamp`]) shows the `lstat`'s device, inode, length and change
+/// times, so its owner, mode and link count are the ones seen: a `chmod`, `chown` or link moves
+/// the change time past a settled one. A file swapped in for the read, at the path or through a
+/// parent directory renamed aside and back (which moves none of the times of the file it stood in
+/// for: measured on APFS, 2026-11-08), has another stamp, and its digest is not kept. Each later
+/// change to the file seen shows in its [`Seen`]: a write, `chmod`, link or rename moves its
+/// change time past the settled one, and another file at the path has another inode or a later
+/// change time. A reader's admission judges the opened file by its type, owner and mode, and its
+/// bytes by their length, so an unchanged witness stands for the same verdict and the same bytes.
+///
+/// A quiet repair round's custody and log-state observations opened, read and hashed the same
+/// unchanged files at each of their checks (2026-11-08). A file that changed too recently, is
+/// absent, or that the reader refused is read again at the next ask. Only digests are kept,
+/// never a file's bytes.
+fn digest_while_seen(path: &Path, reader: Reader) -> crate::Result<Option<[u8; 32]>> {
+    static DIGESTS: KeptDigests = std::sync::Mutex::new(std::collections::VecDeque::new());
+    digest_while_seen_in(
+        &DIGESTS,
+        std::time::SystemTime::now(),
+        path,
+        reader,
+        |path| reader.digest(path),
+    )
+}
+
+/// The digests [`digest_while_seen`] keeps, each with the path, the reader and the [`Seen`] it
+/// stands for.
+type KeptDigests =
+    std::sync::Mutex<std::collections::VecDeque<(std::path::PathBuf, Reader, Seen, [u8; 32])>>;
+
+/// How long before a digest's ask its file must have last changed for the digest to be kept. A
+/// change made after the ask then takes a later time on a clock that ticks this coarsely or finer
+/// (FAT's two seconds), so the file's [`Seen`] shows it, as git's index treats a file it stamped
+/// within its own tick as racily clean. Without it, a rewrite in place at the same length, or a
+/// new file given a freed inode, in one tick of a coarse clock would keep the stamp of the file
+/// it replaced.
+const SETTLED_NS: i128 = 2_000_000_000;
+
+/// [`digest_while_seen`] with its digests in `kept`, asked at `now`, reading with `read` what
+/// `reader` reads.
+fn digest_while_seen_in(
+    kept: &KeptDigests,
+    now: std::time::SystemTime,
+    path: &Path,
+    reader: Reader,
+    read: impl FnOnce(&Path) -> crate::Result<Option<(FileStamp, [u8; 32])>>,
+) -> crate::Result<Option<[u8; 32]>> {
+    /// The files whose digests are kept, the oldest let go first.
+    const KEPT: usize = 32;
+    let before = seen_if_present(path)?;
+    if let Some(seen) = before
+        && let Ok(kept) = kept.lock()
+        && let Some((.., digest)) = kept
+            .iter()
+            .find(|(at, by, was, _)| *was == seen && *by == reader && at == path)
+    {
+        return Ok(Some(*digest));
+    }
+    let Some((opened, digest)) = read(path)? else {
+        return Ok(None);
+    };
+    let settled = |seen: &Seen| {
+        now.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|since| i128::try_from(since.as_nanos()).ok())
+            .is_some_and(|now| seen.stamp.mtime_ns.max(seen.stamp.ctime_ns) <= now - SETTLED_NS)
+    };
+    if let Some(seen) = before
+        && opened == seen.stamp
+        && settled(&seen)
+        && let Ok(mut kept) = kept.lock()
+    {
+        kept.retain(|(at, by, ..)| !(at == path && *by == reader));
+        if kept.len() >= KEPT {
+            kept.pop_front();
+        }
+        kept.push_back((path.to_path_buf(), reader, seen, digest));
+    }
+    Ok(Some(digest))
+}
+
 /// [`stamp_if_present`], with the [`Kind`] the same `lstat` found.
 ///
 /// # Errors
@@ -1129,6 +1266,212 @@ mod tests {
         write_atomic(&path, b"present", 0o600).unwrap();
         assert!(stamp_if_present(&path).unwrap().is_some());
         assert!(stamp_if_present(&path.join("cannot-be-a-child")).is_err());
+    }
+
+    /// A digest is kept while its file stands ([`digest_while_seen`]): a settled file is read once
+    /// however often its digest is asked, and each change a reader would see is read again (its
+    /// bytes rewritten in place at the same length, the file opened to others, another file renamed
+    /// over it at the same length, the file removed), as is a file swapped in for the read that
+    /// gave the digest, at its path or through its parent directory, and a file changed within
+    /// [`SETTLED_NS`] of the ask. A digest one reader kept never answers a reader that refuses the
+    /// file.
+    /// NEGATIVE CONTROLS (2026-11-08): a digest kept by its path alone, and one kept by the file's
+    /// device, inode and length, each answer the rewrite in place with the digest they kept; one
+    /// kept without the opened file's stamp answers the parent's swap with the swapped-in file's;
+    /// one kept for any reader answers the stricter reader; one kept without the settled rule
+    /// reads a file changed a second before the ask once. A digest kept without its mode answers
+    /// no change here wrongly, since APFS moves a file's change time at each `chmod`, which
+    /// [`Seen`] holds for a coarser clock.
+    #[test]
+    fn a_digest_is_kept_while_its_file_stands_and_read_again_after_each_change() {
+        use std::os::unix::fs::PermissionsExt as _;
+        /// A change to a file whose digest is kept, and what makes it.
+        struct Change {
+            what: &'static str,
+            make: fn(&Path),
+        }
+        const PRIVATE: Reader = Reader {
+            admit: Admit::Private,
+            max: 64,
+        };
+        fn read(path: &Path) -> crate::Result<Option<(FileStamp, [u8; 32])>> {
+            PRIVATE.digest(path)
+        }
+        /// What a fresh read by `reader` answers: its digest, `None` where there is no file, or
+        /// `None` for its refusal.
+        fn fresh(reader: Reader, path: &Path) -> Option<Option<[u8; 32]>> {
+            reader
+                .digest(path)
+                .ok()
+                .map(|read| read.map(|(_, digest)| digest))
+        }
+        fn store() -> KeptDigests {
+            std::sync::Mutex::new(std::collections::VecDeque::new())
+        }
+        /// When the file at `path` last changed, `secs` seconds on.
+        fn after_its_change(path: &Path, secs: u64) -> std::time::SystemTime {
+            let seen = seen_if_present(path).unwrap().unwrap();
+            let changed = seen.stamp.mtime_ns.max(seen.stamp.ctime_ns);
+            std::time::UNIX_EPOCH
+                + std::time::Duration::from_nanos(u64::try_from(changed).unwrap())
+                + std::time::Duration::from_secs(secs)
+        }
+        let sha = aterm_digest::Sha256::digest;
+        // The file stood an hour unchanged at each ask but the settled rule's.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let changes = [
+            Change {
+                what: "its bytes rewritten in place at the same length",
+                make: |path| {
+                    let file = File::options().write(true).open(path).unwrap();
+                    file.write_all_at(b"CUSTODY", 0).unwrap();
+                    // Its mtime moved away too, so the case holds where a coarse clock gives the
+                    // rewrite the time the file had, which the settled rule answers at a real ask.
+                    file.set_modified(std::time::UNIX_EPOCH).unwrap();
+                },
+            },
+            Change {
+                what: "the file opened to others",
+                make: |path| {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+                },
+            },
+            Change {
+                what: "another file renamed over it at the same length",
+                make: |path| {
+                    let beside = path.with_extension("new");
+                    write_atomic(&beside, b"CUSTODY", 0o600).unwrap();
+                    std::fs::rename(&beside, path).unwrap();
+                },
+            },
+            Change {
+                what: "the file removed",
+                make: |path| std::fs::remove_file(path).unwrap(),
+            },
+        ];
+        for Change { what, make } in changes {
+            let root = scratch();
+            let path = root.path().join("custody");
+            write_atomic(&path, b"custody", 0o600).unwrap();
+            let kept = store();
+            let first = digest_while_seen_in(&kept, later, &path, PRIVATE, read).unwrap();
+            assert_eq!(first, Some(sha(b"custody")), "{what}");
+            let reads = reads_of(&path);
+            assert_eq!(
+                digest_while_seen_in(&kept, later, &path, PRIVATE, read).unwrap(),
+                first
+            );
+            assert_eq!(reads_of(&path), reads, "{what}: read again while it stood");
+            make(&path);
+            let again = digest_while_seen_in(&kept, later, &path, PRIVATE, read).ok();
+            assert_eq!(again, fresh(PRIVATE, &path), "{what}");
+            assert_ne!(again, Some(first), "{what}: answered with the kept digest");
+        }
+
+        // Another file swapped in for the read, at the path or through its parent directory,
+        // gives that read its digest, which is not kept: the next ask reads the file put back.
+        let root = scratch();
+        let dir = root.path().join("vault");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("custody");
+        write_atomic(&path, b"custody", 0o600).unwrap();
+        /// A swap of another file in for the read: it puts the other file there, reads it and
+        /// puts the file back.
+        type Swap = fn(&Path) -> crate::Result<Option<(FileStamp, [u8; 32])>>;
+        let swaps: [(&str, Swap); 2] = [
+            ("its path", |path| {
+                let aside = path.with_extension("aside");
+                std::fs::rename(path, &aside).unwrap();
+                write_atomic(path, b"CUSTODY", 0o600).unwrap();
+                let swapped_in = read(path);
+                std::fs::rename(&aside, path).unwrap();
+                swapped_in
+            }),
+            ("its parent directory", |path| {
+                let dir = path.parent().unwrap();
+                let aside = dir.with_extension("aside");
+                std::fs::rename(dir, &aside).unwrap();
+                std::fs::create_dir(dir).unwrap();
+                write_atomic(path, b"CUSTODY", 0o600).unwrap();
+                let swapped_in = read(path);
+                std::fs::remove_file(path).unwrap();
+                std::fs::remove_dir(dir).unwrap();
+                std::fs::rename(&aside, dir).unwrap();
+                swapped_in
+            }),
+        ];
+        for (through, swap) in swaps {
+            let kept = store();
+            let seen = seen_if_present(&path).unwrap();
+            let swapped = digest_while_seen_in(&kept, later, &path, PRIVATE, swap);
+            assert_eq!(swapped.unwrap(), Some(sha(b"CUSTODY")), "through {through}");
+            if through == "its parent directory" {
+                assert_eq!(
+                    seen_if_present(&path).unwrap(),
+                    seen,
+                    "the parent's swap left the file's witness as it was"
+                );
+            }
+            assert_eq!(
+                digest_while_seen_in(&kept, later, &path, PRIVATE, read).unwrap(),
+                Some(sha(b"custody")),
+                "the file put back through {through}"
+            );
+        }
+
+        // A digest one reader kept answers no reader that refuses the file.
+        let stricter = [
+            (
+                "a reader refusing its mode",
+                Reader {
+                    admit: Admit::Any,
+                    max: 64,
+                },
+                PRIVATE,
+                0o640,
+            ),
+            (
+                "a reader with a smaller cap",
+                PRIVATE,
+                Reader {
+                    admit: Admit::Private,
+                    max: 4,
+                },
+                0o600,
+            ),
+        ];
+        for (what, laxer, stricter, mode) in stricter {
+            let root = scratch();
+            let path = root.path().join("custody");
+            write_atomic(&path, b"custody", mode).unwrap();
+            let kept = store();
+            let admitted =
+                digest_while_seen_in(&kept, later, &path, laxer, |path| laxer.digest(path));
+            assert_eq!(admitted.unwrap(), Some(sha(b"custody")), "{what}");
+            let refused =
+                digest_while_seen_in(&kept, later, &path, stricter, |path| stricter.digest(path));
+            assert!(refused.is_err(), "{what}: {refused:?}");
+        }
+
+        // A file that changed a second before the ask is read at each ask, and one that changed
+        // three seconds before it once.
+        let root = scratch();
+        let path = root.path().join("custody");
+        write_atomic(&path, b"changed", 0o600).unwrap();
+        for (secs, read_at) in [(1, 2), (3, 1)] {
+            let kept = store();
+            let at = after_its_change(&path, secs);
+            let reads = reads_of(&path);
+            for _ in 0..2 {
+                let changed = digest_while_seen_in(&kept, at, &path, PRIVATE, read).unwrap();
+                assert_eq!(changed, Some(sha(b"changed")));
+            }
+            assert_eq!(
+                reads_of(&path) - reads,
+                read_at,
+                "a file changed {secs} s before the ask"
+            );
+        }
     }
 
     /// F23 (rule 5): an append refuses a file renamed over the one its writer last left, though

@@ -1432,7 +1432,7 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
     assert_eq!(step(&mut app, listed(&["work-2"])), [login("work-2")]);
 
     let adopting = || {
-        use aterm_messages::{LogLine, MessageCenter, MessageLog};
+        use aterm_messages::{LogLine, MessageLog};
         let mut earlier = App::headless_for_test();
         earlier.except(&mr::accounts_signed_out_entry(&both.map(str::to_string)).expect("one"));
         earlier.except(&mr::accounts_refused_entry());
@@ -1445,7 +1445,7 @@ fn the_accounts_lines_follow_what_the_host_says_and_mark_nothing() {
         let mut log = MessageLog::empty();
         log.replay_all(lines);
         let now = Instant::now();
-        let mut center = MessageCenter::new(log, now);
+        let mut center = crate::messages_host::new_center(log, now);
         assert_eq!(center.adopt_digest(wall_stamp_now(), now), 2);
         let mut app = App::headless_for_test();
         app.messages = center;
@@ -4889,7 +4889,7 @@ fn a_land_hold_is_only_a_diagnostic() {
 #[test]
 fn a_dismissed_service_alert_holds_for_its_process_across_a_relaunch() {
     use crate::messages_host::wall_stamp_now;
-    use aterm_messages::{LogLine, MessageCenter, MessageLog};
+    use aterm_messages::{LogLine, MessageLog};
     use aterm_vitals::services::{FSEVENTSD, Seen, Service, Size, Told};
     let seen = |pid: u32, held: bool| Seen {
         service: Service {
@@ -4963,7 +4963,7 @@ fn a_dismissed_service_alert_holds_for_its_process_across_a_relaunch() {
     let mut log = MessageLog::empty();
     log.replay_all(lines);
     let now = Instant::now();
-    let mut center = MessageCenter::new(log, now);
+    let mut center = crate::messages_host::new_center(log, now);
     center.adopt_digest(wall_stamp_now(), now);
     let mut app = App::headless_for_test();
     app.messages = center;
@@ -5026,7 +5026,7 @@ fn fseventsd_note(s: aterm_vitals::services::Seen, pressed: bool) -> HostNote {
     }
 }
 
-/// The alert on glass, carried across an update's handoff, survives the successor's first
+/// The live alert, carried across an update's handoff, survives the successor's first
 /// readings, whose watch has not met the hold in its own life: the carry holds the service as
 /// told past the huge bar, so the alert is neither resolved as fixed nor asked anew under a new
 /// id. NEGATIVE CONTROL: once a reading this process holds falls under the huge bar's margin,
@@ -5039,7 +5039,6 @@ fn a_carried_service_alert_survives_the_successors_first_reading() {
     parent.note_harness_host(fseventsd_note(fseventsd_seen(true, 141 << 30), true));
     let first = parent.messages.live_by_key(&key).expect("the alert").id;
     let t = Instant::now();
-    parent.messages.commit_rows(t, 3);
     for s in 1..=10u64 {
         parent.messages.settle(t + Duration::from_secs(s), true);
     }
@@ -5078,7 +5077,7 @@ fn a_carried_service_alert_survives_the_successors_first_reading() {
 #[test]
 fn an_adopted_service_entry_is_told_from_the_first_reading() {
     use crate::messages_host::wall_stamp_now;
-    use aterm_messages::{LogLine, MessageCenter, MessageLog};
+    use aterm_messages::{LogLine, MessageLog};
     let key = mr::service_memory_alert_key("537-1790000000");
     let entry = mr::service_memory_entry_key("fseventsd", "537-1790000000");
     let mut app = App::headless_for_test();
@@ -5093,7 +5092,7 @@ fn an_adopted_service_entry_is_told_from_the_first_reading() {
     let mut log = MessageLog::empty();
     log.replay_all(lines);
     let now = Instant::now();
-    let mut center = MessageCenter::new(log, now);
+    let mut center = crate::messages_host::new_center(log, now);
     center.adopt_digest(wall_stamp_now(), now);
     let mut app = App::headless_for_test();
     app.messages = center;

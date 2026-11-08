@@ -6608,24 +6608,23 @@ impl App {
         {
             return InputOutcome::RangeRejected;
         }
-        if echo_to_window {
-            if !self
-                .frontmost_window
-                .is_some_and(|front| self.windows.contains_key(&front))
-            {
-                return InputOutcome::NotApplied("resize: no window to resize");
-            }
-            self.apply_grid_resize(rows, cols);
-        } else {
+        if !echo_to_window {
             self.apply_term_resize(wid, rows, cols);
+            let _ = self.reconcile_active_editor_viewport(wid);
+            return InputOutcome::Ok;
         }
-        let target = if echo_to_window {
-            self.frontmost_window.unwrap_or(wid)
-        } else {
-            wid
+        let Some(front) = self
+            .frontmost_window
+            .filter(|front| self.windows.contains_key(front))
+        else {
+            return InputOutcome::NotApplied("resize: no window to resize");
         };
-        let _ = self.reconcile_active_editor_viewport(target);
-        InputOutcome::Ok
+        let given = self.apply_grid_resize(rows, cols);
+        let _ = self.reconcile_active_editor_viewport(front);
+        InputOutcome::Resized(crate::input::WindowResize::Grid {
+            asked: (rows, cols),
+            given,
+        })
     }
 
     /// The [`InputEvent::ResizeWindowPx`] arm of [`App::input`].
@@ -6639,10 +6638,11 @@ impl App {
         )
     }
 
-    /// Ask window `target` for `asked` device pixels: the platform's window takes it as the
-    /// window manager allows, a headless one as given, one holding Settings no smaller than its
-    /// least ([`App::least_window_size`]) ([`InputOutcome::NotApplied`] when no such window
-    /// stands).
+    /// Ask window `target` for `asked` device pixels, held to the least-size rule
+    /// ([`App::held_window_size`]: one holding Settings no smaller than its least): the platform's
+    /// window takes it as the window manager allows, a headless one as given
+    /// ([`InputOutcome::NotApplied`] when no such window stands; else [`InputOutcome::Resized`]
+    /// with the size asked and the size the window was asked for).
     pub(crate) fn resize_window_to_px(
         &mut self,
         target: WindowId,
@@ -6655,13 +6655,14 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&target) {
             ws.initial_frame_settle = None;
         }
+        let held = self.held_window_size(target, asked);
         match os_window {
             Some(w) => {
                 // Best-effort: the WM may clamp or ignore it, so no local geometry is
                 // written on our own request, except when the backend answers `Some`
                 // (Wayland applies synchronously and sends no `Resized`): that answer is
                 // fed through the event's path.
-                if let Some(applied) = w.request_inner_size(asked) {
+                if let Some(applied) = w.request_inner_size(held) {
                     crate::metrics::note_resize_arrival();
                     if let Some(ws) = self.windows.get_mut(&target) {
                         ws.win_px = Some(applied);
@@ -6672,26 +6673,19 @@ impl App {
                     w.request_redraw();
                 }
             }
-            // A headless window has no window manager to ask, so the size asked for is the size
-            // it gets, through the grid half of a `Resized` (the live-resize throttle, its
-            // coalescing and its trailing settle), as an edge drag would; one holding Settings
-            // no smaller than Settings' least, as a window manager holds a platform's
-            // ([`App::least_window_size`]). Its frame stays the grid's ([`App::headless_frame_px`]),
-            // so the pixels a cell does not fill are left out.
+            // A headless window has no window manager to ask, so the size the rule holds is the
+            // size it gets, through the grid half of a `Resized` (the live-resize throttle, its
+            // coalescing and its trailing settle), as an edge drag would. Its frame stays the
+            // grid's ([`App::headless_frame_px`]), so the pixels a cell does not fill are left out.
             None => {
-                let held = if self.window_holds_settings(target) {
-                    let least = self.least_window_size(target);
-                    aterm_window::dpi::PhysicalSize::new(
-                        asked.width.max(least.width),
-                        asked.height.max(least.height),
-                    )
-                } else {
-                    asked
-                };
+                self.note_headless_px(target, held);
                 self.apply_window_resized_grid(target, held);
             }
         }
-        InputOutcome::Ok
+        InputOutcome::Resized(crate::input::WindowResize::Px {
+            asked: (asked.width, asked.height),
+            given: (held.width, held.height),
+        })
     }
 
     /// Seam-internal left-press gesture dispatch for both sources.
@@ -6862,7 +6856,9 @@ impl App {
             delivery: match outcome {
                 InputOutcome::Ok => input::Delivery::Full,
                 InputOutcome::WriteFailed | InputOutcome::QueueFull => input::Delivery::Failed,
-                InputOutcome::RangeRejected | InputOutcome::NotApplied(_) => {
+                InputOutcome::RangeRejected
+                | InputOutcome::NotApplied(_)
+                | InputOutcome::Resized(_) => {
                     unreachable!("a raw key sequence cannot produce a resize range verdict")
                 }
             },
@@ -6920,7 +6916,9 @@ impl App {
             delivery: match outcome {
                 InputOutcome::Ok => input::Delivery::Full,
                 InputOutcome::WriteFailed | InputOutcome::QueueFull => input::Delivery::Failed,
-                InputOutcome::RangeRejected | InputOutcome::NotApplied(_) => {
+                InputOutcome::RangeRejected
+                | InputOutcome::NotApplied(_)
+                | InputOutcome::Resized(_) => {
                     unreachable!("a raw key sequence cannot produce a resize range verdict")
                 }
             },
@@ -7214,7 +7212,9 @@ impl App {
             let delivery = match outcome {
                 InputOutcome::Ok => input::Delivery::Full,
                 InputOutcome::WriteFailed | InputOutcome::QueueFull => input::Delivery::Failed,
-                InputOutcome::RangeRejected | InputOutcome::NotApplied(_) => {
+                InputOutcome::RangeRejected
+                | InputOutcome::NotApplied(_)
+                | InputOutcome::Resized(_) => {
                     unreachable!("a key repeat cannot produce a resize range verdict")
                 }
             };

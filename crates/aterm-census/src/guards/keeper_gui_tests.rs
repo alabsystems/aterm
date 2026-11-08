@@ -39,6 +39,7 @@ fn findings(
     let tree = Tree {
         root: &root,
         corpus: &corpus,
+        engine: crate::guards::tests::NO_ENGINE,
     };
     let mut out = Vec::new();
     keeper_gui_deps(&tree, &mut out);
@@ -200,6 +201,7 @@ fn direct_keeper_and_uds_runtime_sends_remain_forbidden() {
     let tree = Tree {
         root: std::path::Path::new("."),
         corpus: &corpus,
+        engine: crate::guards::tests::NO_ENGINE,
     };
     let mut found = Vec::new();
     super::keeper_gui(&tree, &mut found);

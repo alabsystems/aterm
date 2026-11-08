@@ -3884,6 +3884,18 @@ enum Wake {
     PaneRegridOwed {
         session: u64,
     },
+    /// Which window lays `session` out as a pane, the grid its pane gives it and whether its tab
+    /// is in front ([`App::pane_grid_of`]), for a cross-session `resize` to say how long its grid
+    /// lasts, or to refuse one the window lays out again at its next frame.
+    ReadPaneGrid {
+        session: u64,
+        reply: std::sync::mpsc::Sender<Option<app_render::SessionPane>>,
+    },
+    /// The front window's own geometry for a `dims` with no terminal in front
+    /// ([`App::window_dims_snapshot`]).
+    ReadWindowDims {
+        reply: std::sync::mpsc::Sender<Option<control::DimsSnapshot>>,
+    },
     ReadSessionStatus {
         session: u64,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
@@ -5599,6 +5611,57 @@ mod headless_font_seal_deferral_tests {
             app.redeem_deferred_font_seal(),
             None,
             "a spent debt times nothing"
+        );
+    }
+
+    /// A HEADLESS RUN'S FIRST NATIVE VIEW LAYS OUT IN THE FACES ITS CAPTURE PAINTS WITH: with
+    /// the font seal deferred, opening Settings redeems it and installs the chrome faces before
+    /// the page is laid out, so the layout `inspect` reads before any capture is the one read
+    /// after the capture's pixel demand. NEGATIVE CONTROL: with the faces left to the first
+    /// capture (main before this), the page first laid out in the fallback face's metrics and
+    /// the capture re-laid it out (`All Settings` required 93.6 then 64.2; here the layout
+    /// check fails first, the page's 35 painted nodes 29 after the capture's faces landed).
+    #[test]
+    fn a_headless_runs_first_native_view_lays_out_in_its_painted_faces() {
+        use crate::native_settings::SettingsRoute;
+        let mut app = super::App::headless_for_test();
+        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
+            super::Renderer::from_system(super::FONT_PX, app.theme)
+                .expect("system font for an unsealed generation"),
+        ));
+        app.deferred_font_seal = true;
+        let wid = crate::WindowId(0);
+        assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Home));
+        let redeemed = !app.deferred_font_seal && sealed(&app);
+        let (_, view) = app.active_native_view(wid).expect("Settings in front");
+        // The layout: every audit line but its raster identities, which name the faces' install.
+        let audit = |app: &super::App| {
+            app.inspect_app(crate::app_control::InspectRequest::View {
+                view,
+                projection: aterm_types::app_inspection::InspectionProjection::Audit,
+            })
+            .expect("the page inspects")
+            .into_iter()
+            .skip(2)
+            .map(|line| {
+                line.split(' ')
+                    .filter(|word| !word.contains("fingerprint="))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+        };
+        let before = audit(&app);
+        app.ensure_pixel_backend();
+        app.sync_chrome_fonts();
+        assert_eq!(
+            audit(&app),
+            before,
+            "the layout read before the first capture is the painted one"
+        );
+        assert!(
+            redeemed,
+            "the first native view redeemed the deferred faces"
         );
     }
 
@@ -7690,6 +7753,12 @@ struct WindowState {
     restore_regrid_owed: Option<app_restore::RestoreRegridOwed>,
     last_visible_views: Vec<tab_model::ViewId>,
     win_px: Option<PhysicalSize<u32>>,
+    /// A headless window's size, as a window manager would hold it had it one: the size it was
+    /// last given (`resize px`, a grid resize's frame, a re-grid's pixels), which a font,
+    /// line-height or padding change re-grids it inside, as a platform window keeps its inner
+    /// size ([`App::held_inner_px`]). `None` for a platform window, and for a headless one no
+    /// size was given yet (its grid's frame stands for it).
+    headless_px: Option<app_config::HeadlessSize>,
     carried_inner_px: Option<PhysicalSize<u32>>,
     #[cfg(any(windows, target_os = "linux"))]
     restore_placement: Option<app_window::RestorePlacement>,
@@ -7776,7 +7845,7 @@ struct WindowState {
     cached_strip_rows: Vec<Vec<RenderCell>>,
     occluded: bool,
     #[cfg(test)]
-    band_on_screen_for_test: bool,
+    window_on_screen_for_test: bool,
     presence: presence::WindowView,
     regrow_floor: aterm_messages::chrome::RegrowFloor,
     #[cfg(test)]
@@ -8831,6 +8900,7 @@ impl WindowState {
             restore_regrid_owed: None,
             last_visible_views: Vec::new(),
             win_px: None,
+            headless_px: None,
             carried_inner_px: None,
             #[cfg(any(windows, target_os = "linux"))]
             restore_placement: None,
@@ -8906,7 +8976,7 @@ impl WindowState {
             cached_strip_rows: Vec::new(),
             occluded: false,
             #[cfg(test)]
-            band_on_screen_for_test: false,
+            window_on_screen_for_test: false,
             presence: presence::WindowView::default(),
             regrow_floor: aterm_messages::chrome::RegrowFloor::default(),
             #[cfg(test)]
@@ -17221,6 +17291,17 @@ impl App {
         true
     }
 
+    /// A NATIVE VIEW MEASURES ITS TEXT IN THE FACES ITS FRAME PAINTS WITH: a headless run defers
+    /// its font seal, and the chrome faces with it, to its first pixel demand
+    /// ([`Self::ensure_pixel_backend`]), and a native view's layout is such a demand: every label
+    /// wraps and every control sizes by those faces. So the first native view attached redeems
+    /// them ([`App::install_native_tab_keeping`]), and `inspect` reads the layout a capture
+    /// paints, never one laid out in the fallback face's metrics until a capture happened to land
+    /// the faces. A run that opens no native view still reads no rasterization-only face.
+    pub(crate) fn land_native_layout_faces(&mut self) {
+        let _ = self.redeem_deferred_font_seal();
+    }
+
     /// Initialize the deferred pixel backend on demand before rasterizing a frame.
     pub(crate) fn ensure_pixel_backend(&mut self) {
         // The common call owes nothing and must cost nothing.
@@ -18703,7 +18784,7 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline,
                 &mut deadline_owner,
                 d,
-                metrics::DeadlineOwner::MessageBand,
+                metrics::DeadlineOwner::Messages,
             );
         }
         let waits_now = native_preview_now;
@@ -20654,6 +20735,12 @@ impl App {
                 let _ = reply.send(self.typing_momentum_of(session));
             }
             Wake::PaneRegridOwed { session } => self.owe_pane_regrid(session),
+            Wake::ReadPaneGrid { session, reply } => {
+                let _ = reply.send(self.pane_grid_of(session));
+            }
+            Wake::ReadWindowDims { reply } => {
+                let _ = reply.send(self.window_dims_snapshot());
+            }
             Wake::ReadSessionStatus { session, reply } => {
                 let _ = reply.send(self.session_status_record(session));
             }
@@ -29417,7 +29504,7 @@ mod session_chrome_expiry_conformance_tests {
         app.windows
             .get_mut(&WindowId(0))
             .expect("window")
-            .band_on_screen_for_test = true;
+            .window_on_screen_for_test = true;
         app.refresh_window_tabs(WindowId(0));
         let (now, now_ms) = (Instant::now(), crate::turn_ledger::now_ms());
         assert_eq!(app.session_chrome[&0].expires_ms, None, "nothing to move");

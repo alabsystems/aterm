@@ -344,11 +344,18 @@ const fn controller_reaches(authority: ActionAuthority) -> bool {
     )
 }
 
-/// The editor authority classes a gesture carries, read off the host ceiling each class asks for.
+/// The editor authority classes a gesture carries, read off the host ceiling each class asks for;
+/// a control client's reaches the clipboard class only where the clipboard is a lab file, nobody's
+/// ([`crate::control::reaches_persons_clipboard`]).
 pub(crate) fn editor_grant(controller: bool) -> Vec<crate::native_editor::CommandAuthority> {
     crate::native_editor::CommandAuthority::ALL
         .into_iter()
-        .filter(|class| !controller || controller_reaches(editor_action_authority(*class)))
+        .filter(|class| {
+            !controller
+                || controller_reaches(editor_action_authority(*class))
+                || editor_action_authority(*class) == ActionAuthority::Clipboard
+                    && !crate::control::reaches_persons_clipboard()
+        })
         .collect()
 }
 

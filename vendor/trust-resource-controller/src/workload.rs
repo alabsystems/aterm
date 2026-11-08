@@ -9,6 +9,7 @@ use crate::wire::{Encoder, header, invalid};
 
 pub mod budget;
 pub mod host;
+pub mod service;
 
 pub const WORKLOAD_STARTUP_ARGUMENT: &str = "--resource-workload-v1";
 /// Protocol spelling only. A live original host/root/SDK/output owner is still

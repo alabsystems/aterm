@@ -84,7 +84,16 @@ fn an_existing_native_response_blocks_ordinary_exchange_without_losing_custody()
             work: None,
             now,
         }
-        .exchange();
+        .persist_using(Some("fixture-owner"), |home, deadline| {
+            AuthLock::within(
+                home,
+                if boundary == 1 {
+                    Instant::now()
+                } else {
+                    deadline.instant()
+                },
+            )
+        });
         drop(held);
         let seen = provider_seen(port, server);
         assert_eq!(result, Err(ExchangeError::Protected));
@@ -3873,6 +3882,104 @@ fn first_sign_in_holds_its_lock_during_the_token_exchange() {
         Some("new-refresh")
     );
     assert!(AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn required_sign_in_waits_for_the_native_credential_writer() {
+    use std::os::unix::fs::MetadataExt as _;
+    for age in [Duration::from_secs(16), Duration::from_secs(61)] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let home = tmp.path().join("login");
+        let now = 1_790_000_000;
+        hour_login(&home, now, Some("previous-refresh"));
+        let held = std::rc::Rc::new(std::cell::RefCell::new(Some(
+            AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().unwrap(),
+        )));
+        let metadata = held.borrow().as_ref().unwrap().0.metadata().unwrap();
+        let expected = (metadata.dev(), metadata.ino());
+        let before = std::fs::read(home.join(AUTH_FILE)).unwrap();
+        let journal_before = std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).ok();
+        let (port, server) = provider(move |_, _| {
+            let access = make_chatgpt_jwt(Some("owner@example.test"), "pro", now + 3600);
+            (
+                "200 OK",
+                json!({"id_token":access,"access_token":access,"refresh_token":"new-refresh"}),
+            )
+        });
+        let observed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let released = std::rc::Rc::clone(&held);
+        let count = std::rc::Rc::clone(&observed);
+        let result = aterm_uds::file_lock::with_lock_wait_observer(
+            move |file| {
+                let metadata = file.metadata().unwrap();
+                if (metadata.dev(), metadata.ino()) == expected {
+                    count.set(count.get() + 1);
+                    drop(released.borrow_mut().take());
+                }
+            },
+            || {
+                CodeExchange {
+                    native_scope: None,
+                    publication: None,
+                    enrollment: None,
+                    home: &home,
+                    endpoints: &Endpoints {
+                        issuer: format!("http://127.0.0.1:{port}"),
+                        token_url: format!("http://127.0.0.1:{port}/oauth/token"),
+                        callback_ports: vec![],
+                    },
+                    redirect_uri: "http://127.0.0.1/callback",
+                    code: "code",
+                    code_verifier: "verifier",
+                    deadline: WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN * 2),
+                    work: None,
+                    now,
+                }
+                .persist_using(Some("native-delayed-owner"), |home, deadline| {
+                    AuthLock::within(home, deadline.instant() - age)
+                })
+            },
+        );
+        drop(held.borrow_mut().take());
+        let seen = provider_seen(port, server);
+        if age < aterm_spec::wait::MUST_HAPPEN {
+            assert_eq!(
+                result,
+                Ok(Some("owner@example.test".into())),
+                "a scheduled writer is not a failed sign-in"
+            );
+            assert_eq!(seen, ["POST /oauth/token"]);
+            assert_eq!(
+                load_stored_auth(&home).unwrap().refresh_token.as_deref(),
+                Some("new-refresh")
+            );
+            assert!(
+                observed.get() > 0,
+                "the reader actually waited on this exact native credential writer"
+            );
+        } else {
+            assert!(
+                result.is_err(),
+                "a held writer after the hang detector must not spend a code"
+            );
+            assert!(seen.is_empty());
+            assert_eq!(
+                observed.get(),
+                0,
+                "an expired native wait never releases the held writer"
+            );
+            assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), before);
+            assert_eq!(
+                std::fs::read(beside_auth(&home, JOURNAL_SUFFIX)).ok(),
+                journal_before
+            );
+        }
+        assert!(
+            AuthLock::try_take(&home.join(AUTH_FILE)).unwrap().is_some(),
+            "no reader lock remains held"
+        );
+    }
 }
 
 #[cfg(unix)]

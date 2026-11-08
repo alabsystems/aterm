@@ -28,6 +28,9 @@ struct Resources {
     gnu: [OwnedFd; 2],
     handoff: jobserver_utils::ScopedHandoff,
     prelude: crate::metadata_prelude::Owner,
+    contained: Option<trust_resource_controller::workload::host::contained::Request>,
+    transport: Option<OwnedFd>,
+    retirement_gnu: Option<Arc<[OwnedFd; 2]>>,
 }
 
 fn control_identity(pid: u32, birth: u64) -> trust_resource_controller::Identity {
@@ -42,6 +45,37 @@ fn control_identity(pid: u32, birth: u64) -> trust_resource_controller::Identity
     }
 }
 impl member::MemberResources for Resources {
+    fn take_producer_inputs(&mut self) -> io::Result<Option<member_custody::ProducerInputs>> {
+        let target = self
+            .prelude
+            .take_retirement()
+            .ok_or_else(|| refused("native produced retirement witness missing"))?;
+        let inputs = if self.contained.is_some() {
+            member_custody::ProducerInputs::original_phase(
+                target,
+                self.retirement_gnu
+                    .take()
+                    .ok_or_else(|| refused("contained actual phase GNU owner missing"))?,
+            )?
+        } else {
+            member_custody::ProducerInputs::new(
+                target,
+                self.gnu
+                    .iter()
+                    .map(OwnedFd::try_clone)
+                    .collect::<io::Result<_>>()?,
+            )?
+        };
+        Ok(Some(match &self.contained {
+            Some(request) => inputs.contained(
+                request.clone(),
+                self.transport
+                    .take()
+                    .ok_or_else(|| refused("contained original accepted transport missing"))?,
+            )?,
+            None => inputs,
+        }))
+    }
     fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
         if command.guard_targets().len() != 0 {
             return Err(refused(
@@ -169,6 +203,8 @@ impl Member {
     ) -> io::Result<Self> {
         let crate::workload_transport::ProducedIncoming {
             request,
+            contained,
+            transport,
             peer,
             stdin,
             stdout,
@@ -184,6 +220,9 @@ impl Member {
         };
         let mut events = Events::new(events, binding.clone())?;
         events.produced(request.key.clone(), request.kind)?;
+        if let Some(contained) = &contained {
+            events.contained(contained.clone())?;
+        }
         events.emit(Event::Queued)?;
         let state = job
             .workload
@@ -192,6 +231,13 @@ impl Member {
         let registered = state.produced.registered(&request.key)?;
         request.validate_registered(&registered.request)?;
         let gnu = state.phase.descriptions(&request.key)?;
+        let retirement_gnu = contained
+            .as_ref()
+            .map(|_| state.phase.retained_descriptions(&request.key))
+            .transpose()?;
+        if let Some(contained) = &contained {
+            state.phase.matches_gnu(&request.key, contained.gnu)?;
+        }
         let handoff = jobserver_utils::ScopedHandoff::jobserver(
             [gnu[0].try_clone()?, gnu[1].try_clone()?],
             [3, 4],
@@ -260,6 +306,9 @@ impl Member {
                         gnu,
                         handoff,
                         prelude,
+                        contained,
+                        transport,
+                        retirement_gnu,
                     },
                     events,
                     binding.clone(),
@@ -341,6 +390,14 @@ impl Member {
                     || (progress.launched && !progress.go_attempted)
                     || active.attempt.binding() != &self.binding
                 {
+                    if let Some(reason) = active.attempt.launch_failure() {
+                        // Failure DATA only. This cannot supply NoChild,
+                        // retirement or a release; originals stay retained.
+                        let prefix: String = reason.chars().take(2048).collect();
+                        let _ = owner
+                            .journal
+                            .patch(&self.binding, aterm_json::json!({"launch_failure":prefix}));
+                    }
                     return Err(refused("produced original native custody became unknown"));
                 }
                 if progress.ready_to_start && !faulted {
@@ -356,7 +413,7 @@ impl Member {
                     owner
                         .journal
                         .update(&self.binding, "member_running", aterm_json::json!({}))?;
-                    match active.attempt.start(&mut custody) {
+                    match active.attempt.start_producer(&mut custody) {
                         Ok(started) => custody
                             .job
                             .workload
@@ -374,8 +431,18 @@ impl Member {
                         .is_ok();
                 }
                 if progress.retired && !active.settled {
-                    active.settled = owner.journal.settle(&self.binding).is_ok()
+                    active.settled = if active.attempt.contained() {
+                        active.attempt.settle_contained(&owner.journal).is_ok()
+                    } else {
+                        owner.journal.settle(&self.binding).is_ok()
+                    };
+                    // The distinct terminal may have just been enqueued. Let
+                    // the SAME owner flush it before taking any drain snapshot.
+                    return Ok(false);
                 }
+                // The SAME accepted socket and native inputs remain in the
+                // original Job through root settlement, including after a
+                // written terminal. A write is not client consumption.
                 Ok(progress.retired && progress.drained && active.settled)
             }
         }
@@ -436,6 +503,28 @@ fn environment(ready: &Ready, request: &wire::ProducedRequest) -> bool {
 }
 
 impl Owner {
+    pub(in crate::actor) fn authorize_contained_produced(
+        &mut self,
+        peer: Peer,
+        request: &trust_resource_controller::workload::host::contained::Request,
+    ) -> bool {
+        if request.validate().is_err() || !self.authorize_workload_produced(peer, &request.produced)
+        {
+            return false;
+        }
+        self.jobs
+            .get(&(
+                request.produced.member.binding.session.clone(),
+                request.produced.key.root_attempt,
+            ))
+            .and_then(|job| job.workload.as_ref())
+            .is_some_and(|state| {
+                state
+                    .phase
+                    .matches_gnu(&request.produced.key, request.gnu)
+                    .is_ok()
+            })
+    }
     pub(in crate::actor) fn authorize_workload_produced(
         &mut self,
         peer: Peer,
@@ -518,7 +607,11 @@ impl Owner {
         &mut self,
         incoming: crate::workload_transport::ProducedIncoming,
     ) -> io::Result<()> {
-        if !self.authorize_workload_produced(incoming.peer, &incoming.request) {
+        let authorized = match &incoming.contained {
+            Some(request) => self.authorize_contained_produced(incoming.peer, request),
+            None => self.authorize_workload_produced(incoming.peer, &incoming.request),
+        };
+        if !authorized {
             return Err(refused("produced request lost original active custody"));
         }
         let root = (
@@ -548,7 +641,7 @@ impl Owner {
                 .as_mut()
                 .ok_or_else(|| refused("original produced census unavailable"))?
                 .register(binding.attempt, kind)?;
-            self.journal.update(&binding,"member_prepared",aterm_json::json!({"parent_session":job.binding.session,"parent_attempt":aterm_codec::hex::encode_lower(&job.binding.attempt),"phase":incoming.request.key.ordinal}))?;
+            self.journal.update(&binding,"member_prepared",aterm_json::json!({"parent_session":job.binding.session,"parent_attempt":aterm_codec::hex::encode_lower(&job.binding.attempt),"workload_phase":incoming.request.key.ordinal}))?;
             let member = Member::new(self, &mut job, incoming)?;
             job.members.insert(
                 binding.attempt,

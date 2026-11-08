@@ -15,7 +15,13 @@
 use std::ffi::c_void;
 
 use aterm_cg::CGDirectDisplayID;
-use aterm_objc::cf::{Boolean, CFStringRef, CFUUIDRef};
+pub use aterm_macos_ui::carbon::{
+    copy_current_keyboard_layout_input_source as TISCopyCurrentKeyboardLayoutInputSource,
+    input_source_property as TISGetInputSourceProperty, key_translate as UCKeyTranslate,
+    keyboard_type as LMGetKbdType, unicode_key_layout_data, OptionBits, TISInputSourceRef,
+    UCKeyboardLayout, UniCharCount,
+};
+use aterm_objc::cf::{Boolean, CFUUIDRef};
 
 pub const TRUE: Boolean = 1;
 
@@ -69,50 +75,9 @@ mod core_video {
 }
 
 pub use core_video::*;
-#[repr(transparent)]
-pub struct TISInputSource(std::ffi::c_void);
-pub type TISInputSourceRef = *mut TISInputSource;
-
-#[repr(transparent)]
-pub struct UCKeyboardLayout(std::ffi::c_void);
-
-pub type OptionBits = u32;
-pub type UniCharCount = std::os::raw::c_ulong;
-pub type UniChar = std::os::raw::c_ushort;
-pub type OSStatus = i32;
-
 #[allow(non_upper_case_globals)]
 pub const kUCKeyActionDown: u16 = 0;
 #[allow(non_upper_case_globals)]
 pub const kUCKeyActionDisplay: u16 = 3;
 #[allow(non_upper_case_globals)]
 pub const kUCKeyTranslateNoDeadKeysMask: OptionBits = 1;
-
-#[link(name = "Carbon", kind = "framework")]
-extern "C" {
-    pub static kTISPropertyUnicodeKeyLayoutData: CFStringRef;
-
-    #[allow(non_snake_case)]
-    pub fn TISGetInputSourceProperty(
-        inputSource: TISInputSourceRef,
-        propertyKey: CFStringRef,
-    ) -> *mut c_void;
-
-    pub fn TISCopyCurrentKeyboardLayoutInputSource() -> TISInputSourceRef;
-
-    pub fn LMGetKbdType() -> u8;
-
-    #[allow(non_snake_case)]
-    pub fn UCKeyTranslate(
-        keyLayoutPtr: *const UCKeyboardLayout,
-        virtualKeyCode: u16,
-        keyAction: u16,
-        modifierKeyState: u32,
-        keyboardType: u32,
-        keyTranslateOptions: OptionBits,
-        deadKeyState: *mut u32,
-        maxStringLength: UniCharCount,
-        actualStringLength: *mut UniCharCount,
-        unicodeString: *mut UniChar,
-    ) -> OSStatus;
-}

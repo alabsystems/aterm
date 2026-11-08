@@ -1961,15 +1961,17 @@ fn in_checkout(ctx: &Ctx, r: &mut Report, what: &str) -> bool {
     here
 }
 
-/// Every walk of [`aterm_census::CENSUSES`], each once.
+/// Every walk of [`aterm_census::CENSUSES`], each once, holding `capture-privacy` to the
+/// baseline of the engine's commit ([`census_baseline`]).
 fn walks(ctx: &Ctx, r: &mut Report, check: &str) {
     if !in_checkout(ctx, r, check) {
         return;
     }
     let selected: Vec<&aterm_census::Census> = aterm_census::CENSUSES.iter().collect();
     let root = ctx.root.clone();
+    let var = engine_vars(ctx);
     let outcomes = match exec::bounded(ctx.child_ceiling, move || {
-        aterm_census::run_censuses(&root, &selected)
+        census_walk(&root, &var, &selected)
     }) {
         Ok(o) => o,
         Err(why) => {
@@ -1986,6 +1988,43 @@ fn walks(ctx: &Ctx, r: &mut Report, check: &str) {
             r.raw(outcome.log.trim_end().to_string());
         }
     }
+}
+
+/// The engine-naming variables of `ctx`'s environment ([`crate::EnvSnapshot::engine_var`]),
+/// owned so a walk on another thread reads them.
+fn engine_vars(ctx: &Ctx) -> impl Fn(&str) -> Option<std::ffi::OsString> + Send + 'static {
+    let held = ["PUBLICATION_ENGINE", "HOME"].map(|name| (name, ctx.env.engine_var(name)));
+    move |name| {
+        held.iter()
+            .find(|(held, _)| *held == name)
+            .and_then(|(_, value)| value.clone())
+    }
+}
+
+/// The `selected` censuses over the checkout at `root`, `capture-privacy` held to the baseline
+/// of the engine's commit `var` names ([`census_baseline`]).
+fn census_walk(
+    root: &std::path::Path,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    selected: &[&aterm_census::Census],
+) -> Vec<aterm_census::CensusOutcome> {
+    aterm_census::run_censuses(root, selected, &census_baseline(root, var))
+}
+
+/// The forbidden-content baseline of the engine's commit as `var` names the engine for the
+/// checkout at `root` ([`crate::engine::named`]): a named checkout's HEAD, else its origin's main
+/// imported now ([`crate::engine::native`]); never a working tree.
+fn census_baseline(
+    root: &std::path::Path,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> aterm_census::EngineBaseline {
+    let run = crate::engine::bounded;
+    let commit = crate::engine::named(root, var)
+        .and_then(|named| crate::engine::Commit::read(&named, &run, &crate::engine::native))
+        .map_err(|e| e.why)?;
+    let path = aterm_census::export_scan::rows::BASELINE;
+    let text = commit.text(path, &run).map_err(|e| e.why)?;
+    Ok((format!("{path} on {}", commit.shown()), text))
 }
 
 /// The export check's row.
@@ -2708,6 +2747,71 @@ mod tests {
     use super::*;
     use crate::EnvSnapshot;
     use std::path::PathBuf;
+
+    /// THE CENSUS WALK HOLDS CAPTURES TO THE BASELINE OF THE ENGINE'S COMMIT: a capture holding a
+    /// word only the named engine's committed baseline lists is a `capture-privacy` finding of
+    /// the guard census. NEGATIVE CONTROL: the same word left uncommitted in that engine's
+    /// working tree (what the census read before) judges nothing, and the walk says it held
+    /// captures to the commit's baseline.
+    #[test]
+    fn the_census_walk_holds_captures_to_the_engines_committed_baseline() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let write = |path: &std::path::Path, text: &str| {
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            std::fs::write(path, text).expect("write");
+        };
+        let git = |at: &std::path::Path, args: &[&str]| {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let out = crate::changed::git(at, &path)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let root = dir.path().join("repo");
+        write(
+            &root.join(aterm_census::export_scan::rows::EXTRA),
+            "# x\nzebrafish\n",
+        );
+        write(&root.join("crates/x/src/lib.rs"), "// x\n");
+        let capture: String = b"plain quokkaword\r\n"
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        write(
+            &root.join("crates/x/tests/fixtures/base.ptylog"),
+            &format!("1000 O {capture}\n"),
+        );
+        let engine = dir.path().join("engine");
+        let baseline = engine.join(aterm_census::export_scan::rows::BASELINE);
+        write(&baseline, "# rows\n");
+        git(dir.path(), &["init", "-q", "-b", "main", "engine"]);
+        git(&engine, &["add", "-A"]);
+        git(&engine, &["commit", "-q", "-m", "engine"]);
+        write(&baseline, "# rows\nquokkaword\n");
+        let named = engine.clone().into_os_string();
+        let var = move |name: &str| (name == "PUBLICATION_ENGINE").then(|| named.clone());
+        let guards: Vec<&aterm_census::Census> = aterm_census::CENSUSES
+            .iter()
+            .filter(|c| c.name == "guards")
+            .collect();
+        assert_eq!(guards.len(), 1, "the guard census");
+        let log = |outcomes: Vec<aterm_census::CensusOutcome>| {
+            outcomes.into_iter().map(|o| o.log).collect::<String>()
+        };
+        let uncommitted = log(census_walk(&root, &var, &guards));
+        assert!(
+            !uncommitted.contains("base.ptylog"),
+            "NEGATIVE CONTROL: an uncommitted row is no part of the engine: {uncommitted}"
+        );
+        git(&engine, &["commit", "-q", "-am", "row"]);
+        let committed = log(census_walk(&root, &var, &guards));
+        assert!(
+            committed.contains("base.ptylog"),
+            "the committed row holds: {committed}"
+        );
+    }
 
     /// A cone lints all the targets of what the change touched and the default targets of the rest,
     /// matching by package name whichever spec the cone holds it by. CONTROL: `-p`, `--all`, an

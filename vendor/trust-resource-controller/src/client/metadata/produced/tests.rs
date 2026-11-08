@@ -84,7 +84,7 @@ fn prefix(target: &mut Channel, deadline: Instant) {
 
 #[test]
 fn producing_stream_requires_mixed_preparation_accounted_completion_and_all_actual_eofs() {
-    let deadline = crate::fixture_deadline(Instant::now() - Duration::from_secs(11));
+    let deadline = Instant::now() + Duration::from_secs(3);
     let (mut member, mut target, mut stdout, stderr) = streams();
     stdout.write_all(b"actual\0binary\xff").unwrap();
     prefix(&mut target, deadline);
@@ -109,7 +109,7 @@ fn producing_stream_requires_mixed_preparation_accounted_completion_and_all_actu
 #[test]
 fn producing_stream_refuses_legacy_terminal_wrong_phase_kind_and_another_child_identity() {
     for changed in 0..4 {
-        let deadline = crate::fixture_deadline(Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(3);
         let (mut member, mut target, stdout, stderr) = streams();
         if changed == 3 {
             target.send(&status(Status::Attached), deadline).unwrap();
@@ -172,7 +172,7 @@ fn producing_limit_is_distinct_and_does_not_widen_old_metadata_query_captures() 
     for limit in [METADATA_MAX_OUTPUT, crate::workload::host::produced::MAX_OUTPUT_BYTES] {
         let (mut output, mut stdout, stderr) = Capture::with_limit(limit).unwrap();
         let payload: Vec<u8> = (0..METADATA_MAX_OUTPUT + 4096).map(|n| n as u8).collect();
-        let deadline = crate::fixture_deadline(Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(3);
         std::thread::scope(|scope| {
             let bytes = &payload;
             let writer = scope.spawn(move || {

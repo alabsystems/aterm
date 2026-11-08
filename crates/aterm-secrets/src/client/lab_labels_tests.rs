@@ -241,6 +241,48 @@ fn a_vault_holds_its_rosters_labels_and_an_unwhole_copy_refuses() {
     assert_eq!(labels.held.get(&n("m21")), Some(&LabelHold::Alias));
     assert_eq!(labels.label, Some(n("m7")));
     assert!(!labels.held.contains_key(&n("m7")), "{labels:?}");
+    let writer = StateLock::take(&paths).expect("native writer remains held");
+    let mut expired_clock = 0;
+    let error = lab_labels_with_clock(&paths, || {
+        expired_clock += 1;
+        Instant::now()
+            - if expired_clock == 1 {
+                Duration::from_secs(61)
+            } else {
+                Duration::ZERO
+            }
+    })
+    .expect_err("an unreleased native writer hits the hang detector");
+    assert_eq!(error.kind(), crate::ErrorKind::VaultBusy);
+    drop(writer);
+    assert_eq!(
+        lab_labels(&paths).unwrap(),
+        labels,
+        "the same generation stays whole"
+    );
+    let mut writer = Some(StateLock::take(&paths).expect("native state writer"));
+    let mut observed = 0;
+    let after_writer = lab_labels_with_clock(&paths, || {
+        observed += 1;
+        if observed == 2 {
+            drop(writer.take());
+        }
+        Instant::now()
+            - if observed == 1 {
+                Duration::from_secs(1)
+            } else {
+                Duration::ZERO
+            }
+    });
+    drop(writer);
+    assert_eq!(
+        after_writer.expect("a scheduled writer leaves the whole generation readable"),
+        labels
+    );
+    assert!(
+        observed >= 2,
+        "the actual native reader found the writer held"
+    );
     let mut failed = state.clone();
     failed.failed = true;
     let mut unapplied = state.clone();

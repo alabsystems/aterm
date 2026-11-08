@@ -972,6 +972,36 @@ fn the_read_back_waits_out_the_subscriber_its_publication_woke() {
     assert_eq!(read.trust().genesis, founded.genesis);
 }
 
+#[test]
+fn a_scheduled_subscriber_readback_retains_authenticated_control() {
+    let lab = lab_open("scheduled-readback");
+    let founded = admin_commons_found_by_default(&lab.paths).unwrap();
+    let subscriber = std::rc::Rc::new(std::cell::RefCell::new(Some(
+        StateLock::take(&lab.paths).unwrap(),
+    )));
+    let released = std::rc::Rc::clone(&subscriber);
+    let read = crate::commons::bootstrap::tests::while_held(
+        move || drop(released.borrow_mut().take()),
+        || installed_after(&lab.paths, Duration::from_secs(6)),
+    );
+    drop(subscriber.borrow_mut().take());
+    assert_eq!(read.unwrap().trust().genesis, founded.genesis);
+
+    let held = StateLock::take(&lab.paths).unwrap();
+    let error = installed_after(&lab.paths, Duration::from_secs(61))
+        .err()
+        .expect("held past the detector");
+    assert_eq!(error.kind(), crate::ErrorKind::VaultBusy);
+    drop(held);
+    assert_eq!(
+        installed_after(&lab.paths, Duration::ZERO)
+            .unwrap()
+            .trust()
+            .genesis,
+        founded.genesis
+    );
+}
+
 /// A founding by default meets another founding on this Mac (a person's `commons init`) only
 /// through the founding lock: while that holds it, the pass prepares and publishes nothing and
 /// says what runs; once it is let go the pass founds.

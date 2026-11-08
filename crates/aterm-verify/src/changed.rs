@@ -769,7 +769,7 @@ fn shares_changed_input(
     })
 }
 
-const GIT_REDIRECTS: [&str; 8] = [
+pub(crate) const GIT_REDIRECTS: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",

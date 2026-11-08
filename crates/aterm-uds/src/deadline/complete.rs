@@ -314,7 +314,28 @@ pub fn output_until_complete_stdout_with_limit(
     deadline: Instant,
     limit: usize,
 ) -> Result<Output, CompleteOutputError> {
-    capped(cmd, deadline, limit, MAX_COMPLETE_STDOUT_BYTES)
+    capped(cmd, deadline, limit, MAX_COMPLETE_STDOUT_BYTES, None)
+}
+
+/// As [`output_until_complete_stdout_with_limit`], observing `stopped` at least every
+/// [`STOP_TICK`] as [`output_until_complete_stdout_from_unless`] does: a cancelled child is
+/// ended and reaped, publishes no partial output, and is a post-spawn [`RunError::TimedOut`].
+///
+/// # Errors
+/// As [`output_until_complete_stdout_with_limit`], or cancellation after process creation.
+pub fn output_until_complete_stdout_with_limit_unless(
+    cmd: &mut Command,
+    deadline: Instant,
+    limit: usize,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<Output, CompleteOutputError> {
+    capped(
+        cmd,
+        deadline,
+        limit,
+        MAX_COMPLETE_STDOUT_BYTES,
+        Some(stopped),
+    )
 }
 
 /// As [`output_until_complete_stdout_with_limit`], for a listing that runs to tens of MiB: an
@@ -329,7 +350,7 @@ pub fn output_until_complete_listing(
     deadline: Instant,
     limit: usize,
 ) -> Result<Output, CompleteOutputError> {
-    capped(cmd, deadline, limit, MAX_COMPLETE_LISTING_BYTES)
+    capped(cmd, deadline, limit, MAX_COMPLETE_LISTING_BYTES, None)
 }
 
 /// As [`output_until_complete_listing`], ending `within` from now.
@@ -344,12 +365,14 @@ pub fn output_within_complete_listing(
     output_until_complete_listing(cmd, super::saturating_after(Instant::now(), within), limit)
 }
 
-/// A complete capture of at most `limit` bytes of stdout, refused before dispatch past `cap`.
+/// A complete capture of at most `limit` bytes of stdout, refused before dispatch past `cap`,
+/// cancelled once `stopped` says so.
 fn capped(
     cmd: &mut Command,
     deadline: Instant,
     limit: usize,
     cap: usize,
+    stopped: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<Output, CompleteOutputError> {
     if limit > cap {
         return Err(CompleteOutputError::Run(RunError::Spawn(io::Error::new(
@@ -363,7 +386,7 @@ fn capped(
         deadline,
         || {},
         move |pipe, stream| drain_stdout_with_limit(pipe, stream, limit),
-        None,
+        stopped,
     )
 }
 

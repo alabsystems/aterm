@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Zero-dependency temporary directories with RAII cleanup.
+//! Zero-dependency private temporary files and directories.
 
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
@@ -529,6 +529,53 @@ impl Builder {
 /// Returns an error if the directory cannot be created.
 pub fn tempdir() -> io::Result<TempDir> {
     TempDir::new()
+}
+
+/// Open a private anonymous read/write file. Its temporary name and directory
+/// are removed before return; the returned description keeps the file alive.
+///
+/// # Errors
+/// Creating or unlinking the private file fails. Non-Unix targets return
+/// [`io::ErrorKind::Unsupported`] before examining temporary storage.
+pub fn tempfile() -> io::Result<fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let directory = tempdir()?;
+        let path = directory.path().join("file");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        fs::remove_file(&path)?;
+        fs::remove_dir(directory.path())?;
+        drop(directory);
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn anonymous_file_is_private_unlinked_and_preserves_binary_io() {
+    use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+    use std::os::unix::fs::MetadataExt as _;
+    let mut file = tempfile().unwrap();
+    let metadata = file.metadata().unwrap();
+    assert!(metadata.is_file());
+    assert_eq!(metadata.nlink(), 0);
+    assert_eq!(metadata.mode() & 0o077, 0);
+    let bytes = [0, 255, b'\n', 1];
+    file.write_all(&bytes).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut observed = Vec::new();
+    file.read_to_end(&mut observed).unwrap();
+    assert_eq!(observed, bytes);
 }
 
 /// Clone the directory `src` to the new name `dst`, each file and directory under it with its

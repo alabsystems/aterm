@@ -3170,8 +3170,8 @@ fn instant_landed() -> Seen {
             new_turns: 0,
         }),
         lift_stub: None,
-        band: Vec::new(),
-        band_reads: Vec::new(),
+        harness: Vec::new(),
+        harness_reads: Vec::new(),
         stop_person_ms: None,
         stop_person_sent_ms: None,
         head: None,
@@ -9574,8 +9574,8 @@ fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
          working"
             .into(),
     ));
-    gone.band.push((p + 2_000, "-".into()));
-    gone.band_reads.push(p + 2_000);
+    gone.harness.push((p + 2_000, "-".into()));
+    gone.harness_reads.push(p + 2_000);
     gone.end_ms = p + 2_000;
     assert!(finished(&tab_of(Chain::SameLand, gone.clone()), p + 2_000));
     // same-cruise holds nothing (continuous forward): with no hold, its watch runs to the

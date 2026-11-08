@@ -28,6 +28,18 @@ pub(crate) fn run(
     args: &[OsString],
     until: Instant,
 ) -> Result<Output, String> {
+    let mut cmd = command(root, git, tool, args);
+    aterm_uds::deadline::output_until_complete_stdout(&mut cmd, until)
+        .map_err(|e| format!("{tool:?} remote operation: {e}"))
+}
+
+/// The command [`run`] runs, for a caller that waits on it its own way.
+pub(crate) fn command(
+    root: &Path,
+    git: &dyn Fn(&Path) -> Command,
+    tool: Tool,
+    args: &[OsString],
+) -> Command {
     let mut cmd = match tool {
         Tool::Git => {
             let mut cmd = git(root);
@@ -50,8 +62,7 @@ pub(crate) fn run(
         }
     };
     cmd.args(args);
-    aterm_uds::deadline::output_until_complete_stdout(&mut cmd, until)
-        .map_err(|e| format!("{tool:?} remote operation: {e}"))
+    cmd
 }
 
 #[derive(Debug, PartialEq, Eq)]

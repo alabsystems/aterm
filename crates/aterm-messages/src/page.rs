@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 
-use crate::center::{Live, MessageCenter};
+use crate::center::{Glass, Live, MessageCenter};
 use crate::digest::DigestEntry;
 use crate::log::{LogRecord, Retired, escape_into, join_us};
 use crate::model::{Glyph, Intent, MessageId, Severity, UpgradeWord, tags};
@@ -291,7 +291,14 @@ impl MessagesState {
             let exception = (live.is_none() && rec.later && rec.is_live())
                 .then(|| center.digest_entry(rec.id))
                 .flatten();
-            let view = MessageView::of(rec, live, exception.as_ref(), on_glass, host);
+            let view = MessageView::of(
+                rec,
+                live,
+                exception.as_ref(),
+                on_glass,
+                center.glass(),
+                host,
+            );
             match counts.iter_mut().find(|(tag, _)| *tag == view.tag) {
                 Some((_, n)) => *n += 1,
                 None => counts.push((view.tag.clone(), 1)),
@@ -388,8 +395,11 @@ pub struct MessageView {
     pub detail: Vec<String>,
     /// Wire state word ([`wire::state_word`]), or `aged` for an expired exception.
     pub state: &'static str,
-    /// Band row index (`0` = topmost) while on glass.
+    /// Band row index (`0` = topmost) while on glass; always `None` on a glass-less host.
     pub on_glass: Option<u8>,
+    /// What the center's host shows its live rows on ([`MessageCenter::glass`]): a band host's
+    /// words say where a row stood on its band, a glass-less host's only how long it was live.
+    pub glass: Glass,
     /// Count of duplicate posts folded into this record.
     pub repeats: u32,
     /// Wall-clock timestamp (unix ms) when the entry retired, if retired.
@@ -429,13 +439,14 @@ pub struct MessageActionView {
 }
 
 impl MessageView {
-    /// Projects a single record from `rec`, `live`, `on_glass`, and `host`.
+    /// Projects a single record from `rec`, `live`, `on_glass`, `glass`, and `host`.
     #[must_use]
     pub fn of(
         rec: &LogRecord,
         live: Option<&Live>,
         exception: Option<&DigestEntry>,
         on_glass: Option<u8>,
+        glass: Glass,
         host: &impl Host,
     ) -> Self {
         let (severity, glyph, title, detail, actions, repeats) = match (live, exception) {
@@ -480,6 +491,7 @@ impl MessageView {
             detail: detail.clone(),
             state,
             on_glass,
+            glass,
             repeats,
             retired_unix_ms: rec.retired_unix_ms,
             superseded_by,
@@ -519,7 +531,10 @@ impl MessageView {
         matches!(self.severity, "warn" | "error")
     }
 
-    /// Plain-language state description for an expanded row's meta line.
+    /// Plain-language state description for an expanded row's meta line. A glass-less host's
+    /// row ([`Glass::Glassless`]) is `live` until it ends and `live for …` once its hold ended
+    /// it (or, in a record an older aterm filed, its patience did): with no band, nothing waited
+    /// to be shown or was shown.
     #[must_use]
     pub fn state_words(&self) -> String {
         let span_from = |from: u64| {
@@ -532,12 +547,18 @@ impl MessageView {
             Some(span) => format!("{words} after {span}"),
             None => words.to_string(),
         };
+        let glassless = self.glass == Glass::Glassless;
         match self.state {
+            "live" | "held" if glassless => "live".to_string(),
             "live" | "held" => match self.on_glass {
                 Some(_) => "showing now".to_string(),
                 None => "waiting to show".to_string(),
             },
             "folded" if self.retired_unix_ms == Some(self.at_unix_ms) => self.record_words(),
+            "folded" | "unseen" if glassless => match &span {
+                Some(span) => format!("live for {span}"),
+                None => "ended".to_string(),
+            },
             "folded" => match &span {
                 Some(span) => format!("shown for {span}"),
                 None => "shown".to_string(),

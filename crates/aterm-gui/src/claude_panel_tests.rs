@@ -697,7 +697,7 @@ fn breath_of(app: &App, wid: WindowId) -> (bool, Option<u64>) {
 fn a_stuck_dot_arms_the_breath_and_a_settled_panel_arms_nothing() {
     let t0 = Instant::now();
     let (mut app, wid, session) = glass(t0);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let plan = app.active_visible_leaf_plan(wid).unwrap();
     frame(&mut app, wid);
     let at = |ms: u64| t0 + Duration::from_millis(ms);
@@ -772,7 +772,7 @@ fn a_stuck_dot_arms_the_breath_and_a_settled_panel_arms_nothing() {
     );
 
     let (mut app, wid, session) = glass(t0);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let done = "  \u{25EF} sweep  \u{25B0}\u{25B0}\u{25B0}  3/3 \u{B7} 12m05s \u{B7} \u{2193} 88.1k tokens";
     let rows = probe::screen(&Live {
         status: DONE,
@@ -824,7 +824,7 @@ fn a_focus_blip_breathes_no_rested_dot_again() {
     let (mut app, wid, session) = glass(t0);
     {
         let ws = app.windows.get_mut(&wid).unwrap();
-        ws.band_on_screen_for_test = true;
+        ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
     frame(&mut app, wid);
@@ -915,7 +915,7 @@ fn a_second_stuck_row_breathes_a_new_course() {
     let (mut app, wid, session) = glass(t0);
     {
         let ws = app.windows.get_mut(&wid).unwrap();
-        ws.band_on_screen_for_test = true;
+        ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
     frame(&mut app, wid);
@@ -1153,7 +1153,7 @@ fn a_scrolled_back_view_keeps_claudes_panel() {
 fn a_turn_that_moves_no_dot_asks_no_frame() {
     let t0 = Instant::now();
     let (mut app, wid, _) = glass(t0);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     app.windows.get_mut(&wid).unwrap().focused = false;
     let plan = app.active_visible_leaf_plan(wid).unwrap();
     frame(&mut app, wid);
@@ -1207,7 +1207,7 @@ fn the_bar_crests_while_an_agent_runs_and_only_its_fill_moves() {
     let (mut app, wid, session) = glass(t0);
     {
         let ws = app.windows.get_mut(&wid).unwrap();
-        ws.band_on_screen_for_test = true;
+        ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
     let plan = app.active_visible_leaf_plan(wid).unwrap();
@@ -1326,7 +1326,7 @@ fn crest_and_breath(t0: Instant) -> (App, WindowId, Instant) {
     let (mut app, wid, session) = glass(t0);
     {
         let ws = app.windows.get_mut(&wid).unwrap();
-        ws.band_on_screen_for_test = true;
+        ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
     frame(&mut app, wid);
@@ -1380,7 +1380,7 @@ fn a_present_in_the_slack_draws_the_breaths_step() {
     let (mut app, wid, session) = glass(t0);
     {
         let ws = app.windows.get_mut(&wid).unwrap();
-        ws.band_on_screen_for_test = true;
+        ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
     let host = supervise(&mut app, session);
@@ -1440,7 +1440,7 @@ fn the_panel_shimmer_rides_the_cards_clock() {
     let (mut app, wid, session) = glass(t0);
     {
         let ws = app.windows.get_mut(&wid).unwrap();
-        ws.band_on_screen_for_test = true;
+        ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
     let host = supervise(&mut app, session);
@@ -1487,7 +1487,7 @@ fn the_panel_shimmer_rides_the_cards_clock() {
     let (mut app, wid, _) = glass(t0);
     {
         let ws = app.windows.get_mut(&wid).unwrap();
-        ws.band_on_screen_for_test = true;
+        ws.window_on_screen_for_test = true;
         ws.focused = true;
     }
     frame(&mut app, wid);
@@ -1512,7 +1512,7 @@ fn reduced_motion_and_serious_mode_ask_no_step() {
         let (mut app, wid, session) = glass(t0);
         {
             let ws = app.windows.get_mut(&wid).unwrap();
-            ws.band_on_screen_for_test = true;
+            ws.window_on_screen_for_test = true;
             ws.focused = true;
         }
         app.system_reduce_motion = reduce;

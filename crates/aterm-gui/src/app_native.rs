@@ -4308,7 +4308,7 @@ impl App {
             }
             // A native button or key's copy is a control client's when its gesture was (`act`,
             // or a key a control client sent the view): it copies nothing, and the view says why.
-            AppEffect::Clipboard { reply, .. } if self.person_gesture_refused() => {
+            AppEffect::Clipboard { reply, .. } if self.clipboard_gesture_refused() => {
                 crate::app_take_over::note_clipboard_refused("native copy");
                 if self.native_runtime.completion_is_current(&reply) {
                     self.dispatch_native_completion(
@@ -6471,7 +6471,7 @@ impl App {
             })
         };
         let shown = |ws: &crate::WindowState| {
-            crate::messages_host::band_on_screen(ws)
+            crate::messages_host::window_on_screen(ws)
                 || (self.headless
                     && ws.os_window.is_none()
                     && ws.pending_reveal.is_none()

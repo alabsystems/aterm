@@ -1048,7 +1048,7 @@ fn a_card_2_1_304_redraws_from_home_after_a_resize_is_decorated() {
 #[test]
 fn the_reshow_bound_holds_a_flapping_card_and_shows_it_on_time() {
     let (mut app, wid, session, host) = bare_window();
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let ms = |t0: Instant, ms: u64| t0 + Duration::from_millis(ms);
     for i in 0..40 {
         bytes(&app, session, &format!("line {i}\r\n"));

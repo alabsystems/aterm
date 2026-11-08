@@ -4,6 +4,7 @@
 //! One host-owned member borrows the original job's resources. Its original
 //! child and descriptor capabilities survive errors until durable scope retirement.
 use super::job::Events;
+use super::member_custody::{ProducerInputs, ProducerRetirement, ReturnedProducer};
 use super::start::clocks;
 use aterm_capacity::cohort::launch::{CohortChild, CohortSignal, LaunchError};
 use aterm_capacity::retained_cohort::CancelError;
@@ -41,6 +42,25 @@ pub(super) trait MemberCustody {
     fn bind(&mut self, child: spawnfd::Spawned) -> Result<CohortChild, LaunchError>;
     fn cancel_no_child(&mut self, proof: spawnfd::NotSpawned) -> Result<(), CancelError>;
     fn retire(&mut self, child: &CohortChild) -> io::Result<()>;
+    fn bind_producer(&mut self, _: &mut ProducerInputs) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    /// General group retirement cannot certify escaped descendants. Only the
+    /// original custody implementation may compose enforced containment with
+    /// its actual native retirement into the stronger one-use result.
+    fn retire_producer(
+        &mut self,
+        _: &mut CohortChild,
+        _: &mut Option<ProducerInputs>,
+    ) -> io::Result<ProducerRetirement> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    fn return_producer(
+        &mut self,
+        original: Box<ProducerRetirement>,
+    ) -> Result<Box<ReturnedProducer>, Box<ProducerRetirement>> {
+        Err(original)
+    }
     /// Called only after lexical NoLaunch, authenticated NoChild cancellation,
     /// or successful actual scope retirement. Retry bookkeeping without
     /// repeating or reconstructing the consumed native closure proof.
@@ -69,6 +89,9 @@ pub(super) trait MemberResources {
     /// image. False is preparation only, never target Started or a new grant.
     fn prepare_target(&mut self, _: &mut spawnfd::Child) -> io::Result<bool> {
         Ok(true)
+    }
+    fn take_producer_inputs(&mut self) -> io::Result<Option<ProducerInputs>> {
+        Ok(None)
     }
 }
 
@@ -115,6 +138,7 @@ struct Bound {
     cleanup_at: Option<Instant>,
     cause: CompletionCause,
     completed: Option<Completed>,
+    producer: Option<ProducerInputs>,
 }
 impl Bound {
     fn new(mut child: CohortChild, wake: fn()) -> Self {
@@ -136,6 +160,7 @@ impl Bound {
             cleanup_at: None,
             cause: CompletionCause::Exited,
             completed: None,
+            producer: None,
         }
     }
     fn stop(&mut self, cause: CompletionCause) {
@@ -169,6 +194,9 @@ pub(super) struct OwnedAttempt<D> {
     retired: bool,
     scope_closed: bool,
     uncertain: bool,
+    launch_failure: Option<String>,
+    producer_retirement: Option<Box<ProducerRetirement>>,
+    producer_returned: Option<Box<ReturnedProducer>>,
 }
 impl<D: MemberResources> OwnedAttempt<D> {
     /// The owner has durably journaled this member and emitted Queued. ARM/BIND
@@ -194,6 +222,9 @@ impl<D: MemberResources> OwnedAttempt<D> {
             retired: false,
             scope_closed: false,
             uncertain: false,
+            launch_failure: None,
+            producer_retirement: None,
+            producer_returned: None,
         };
         if prepared.is_err()
             || timeout == Some(Duration::ZERO)
@@ -217,7 +248,8 @@ impl<D: MemberResources> OwnedAttempt<D> {
                 self.uncertain = true;
                 State::Unbound(Some(spawned))
             }
-            Err(LaunchError::Refused(_)) => {
+            Err(LaunchError::Refused(error)) => {
+                self.launch_failure = Some(error.to_string());
                 self.uncertain = true;
                 self.events.abandon();
                 State::Unknown
@@ -226,6 +258,12 @@ impl<D: MemberResources> OwnedAttempt<D> {
     }
     pub fn binding(&self) -> &Binding {
         &self.binding
+    }
+    pub(super) fn launch_failure(&self) -> Option<&str> {
+        self.launch_failure.as_deref()
+    }
+    pub(super) fn contained(&self) -> bool {
+        self.events.is_contained()
     }
     /// Observation for private BOUND journaling, never an owned-child capability.
     pub fn identity(&self) -> Option<(u32, u64)> {
@@ -250,6 +288,18 @@ impl<D: MemberResources> OwnedAttempt<D> {
     /// The actor has durably written BOUND/RUNNING and installed its member map.
     /// Validate the original current claim again immediately before actual GO.
     pub fn start(&mut self, custody: &mut impl MemberCustody) -> io::Result<Started> {
+        self.start_inner(custody, false)
+    }
+    /// A producing action cannot substitute legacy process-group coverage for
+    /// enforced containment. Refusal occurs before target GO.
+    pub fn start_producer(&mut self, custody: &mut impl MemberCustody) -> io::Result<Started> {
+        self.start_inner(custody, true)
+    }
+    fn start_inner(
+        &mut self,
+        custody: &mut impl MemberCustody,
+        require_containment: bool,
+    ) -> io::Result<Started> {
         let State::Bound(bound) = &mut self.state else {
             return Err(refused("member is not durably bound"));
         };
@@ -276,6 +326,19 @@ impl<D: MemberResources> OwnedAttempt<D> {
             }
         }
         let prepare = (|| {
+            bound.producer = self
+                .resources
+                .as_mut()
+                .ok_or_else(|| refused("member descriptors missing"))?
+                .take_producer_inputs()?;
+            if let Some(inputs) = &bound.producer {
+                inputs.check_child(&bound.child, bound.pid, bound.birth)?;
+            } else if require_containment {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "producer descendant retirement requires enforced native containment",
+                ));
+            }
             self.resources
                 .as_mut()
                 .ok_or_else(|| refused("member descriptors missing"))?
@@ -285,6 +348,9 @@ impl<D: MemberResources> OwnedAttempt<D> {
                 .ok_or_else(|| refused("member descriptors missing"))?
                 .publish_prepared((bound.pid, bound.birth), &mut self.events)?;
             custody.validate()?;
+            if let Some(inputs) = &mut bound.producer {
+                custody.bind_producer(inputs)?;
+            }
             custody.before_go()?;
             let (monotonic_ns, unix_ns) = clocks()?;
             if self.events.cancelled() || bound.child.child_mut().exited()? {
@@ -395,8 +461,18 @@ impl<D: MemberResources> OwnedAttempt<D> {
                     self.events.inputs_unchanged(result);
                 }
             }
-            if bound.reaped && !self.scope_closed && custody.retire(&bound.child).is_ok() {
-                self.scope_closed = true;
+            if bound.reaped && !self.scope_closed {
+                if bound.producer.is_some() {
+                    match custody.retire_producer(&mut bound.child, &mut bound.producer) {
+                        Ok(retirement) => {
+                            self.producer_retirement = Some(Box::new(retirement));
+                            self.scope_closed = true;
+                        }
+                        Err(_) => self.uncertain = true,
+                    }
+                } else if custody.retire(&bound.child).is_ok() {
+                    self.scope_closed = true;
+                }
             }
         }
         self.finish_return(custody);
@@ -430,11 +506,26 @@ impl<D: MemberResources> OwnedAttempt<D> {
         } else {
             ReturnReceipt::ScopeClosed
         };
-        if custody.return_unit(receipt).is_err() {
+        if let Some(retirement) = self.producer_retirement.take() {
+            match custody.return_producer(retirement) {
+                Ok(returned) => self.producer_returned = Some(returned),
+                Err(original) => {
+                    self.producer_retirement = Some(original);
+                    self.uncertain = true;
+                    return;
+                }
+            }
+        } else if custody.return_unit(receipt).is_err() {
             return;
         }
+        // Consume once, only after the SAME original custody has durably
+        // returned the unit. A failed return retains the result and originals.
         self.retired = true;
+        self.uncertain = false;
         self.resources.take();
+        if self.events.is_contained() {
+            return;
+        }
         // Native closure and the durable logical return are separate receipts.
         // Never re-consume a NoChild proof or re-retire a scope on write retry.
         let event = match &self.state {
@@ -456,6 +547,53 @@ impl<D: MemberResources> OwnedAttempt<D> {
             .unwrap_or_else(aterm_types::resource_admission::AccountingObservation::uncollected);
             let _ = self.events.emit_terminal(event, accounting);
         }
+    }
+    /// Actual journal persistence is performed here before the one-use native
+    /// issuer may write its distinct terminal. No settled bool is accepted.
+    pub(super) fn settle_contained(&mut self, journal: &super::journal::Journal) -> io::Result<()> {
+        if !self.retired || !self.events.is_contained() {
+            return Err(refused("contained operation is not actually retired"));
+        }
+        if let Some(returned) = &self.producer_returned {
+            returned.settle(journal, &self.binding)?;
+        } else {
+            journal.settle(&self.binding)?;
+        }
+        let terminal = self.emit_contained_completion();
+        if terminal.is_err() {
+            // Actual journal settlement and native retirement already happened.
+            // Lost/malformed delivery remains Unknown to the client; the SAME
+            // issuer and accepted socket remain retained by the original Job.
+            self.events.abandon();
+        }
+        Ok(())
+    }
+    fn emit_contained_completion(&mut self) -> io::Result<()> {
+        let bound = match &self.state {
+            State::NotAttempted | State::NoChild(None) => {
+                return self.events.emit_contained_refused();
+            }
+            State::Bound(bound) if !bound.go_attempted => {
+                return self.events.emit_contained_refused();
+            }
+            State::Bound(bound) => bound,
+            _ => return Err(refused("contained original child missing")),
+        };
+        let completed = bound
+            .completed
+            .as_ref()
+            .ok_or_else(|| refused("contained original wait missing"))?;
+        self.events.emit_contained_terminal(
+            self.producer_returned
+                .as_ref()
+                .ok_or_else(|| refused("contained native issuer missing"))?,
+            Event::Finished {
+                outcome: completed.outcome.clone(),
+                cause: completed.cause,
+                runtime_ns: completed.runtime_ns,
+            },
+            completed.accounting,
+        )
     }
 }
 impl<D> Drop for OwnedAttempt<D> {

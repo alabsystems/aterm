@@ -80,6 +80,14 @@ impl App {
     ) -> Option<Composed> {
         #[cfg(test)]
         trace::composition();
+        // A route card folds a native page under the badge ([`App::compose_native_route_card`]):
+        // a terminal route shows none, so its composition drops the one a native frame left, on
+        // every path that composes (a window's redraw, a headless capture, a glassless lay).
+        if matches!(route, VisibleContentRoute::Terminal { .. })
+            && let Some(window) = self.windows.get_mut(&wid)
+        {
+            window.route_card = None;
+        }
         let mut composed = Composed::default();
         for step in ChromeStep::order(route) {
             #[cfg(test)]

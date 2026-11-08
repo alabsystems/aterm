@@ -1754,18 +1754,27 @@ pub enum OldPath {
     /// its caret, and about the body in a second window
     /// ([`crate::pet_world::PetWorld::body_window`]): the rows where it was last drawn and
     /// [`crate::pet_world::KEPT_ROWS`] over and under them, over as many columns as the map
-    /// reads about the body's centre, for their glyphs, so the laws that read the rows beside a
-    /// body (the head law's, [`PetBrain::head_target`]) read them wherever the caret leaps, for
-    /// a read one window holds whole: a span along the body's row longer than the map's columns,
-    /// or across the edge between the two windows, reads nothing (ATERM-KI-1107-3). Reverted, the map is read about the caret alone: on a pane 100 rows tall, once the caret
-    /// leapt 40, 58 or 70 rows down from a body at rest fitted between rows lettered to the
-    /// margin, the head law read nothing of the body's rows and let the fit go as it gathered to
-    /// leap, and its box met the row above's letters in 38 or 39, 43 and 12 frames of each run
-    /// from rest, and in 9 to 12 after the `steam` scene's Backspaces; on a pane 300 columns
-    /// wide, leaping five rows down to the 290th column, in 37 to 39; from the 85th row of a
-    /// pane 160 rows tall, leaping 40 and 58 rows down, in 38 or 39 and 43; and at the foot of
-    /// a pane 100 rows tall, leaping 88 rows up, in 10 standing on the prompt's row (every face,
-    /// the cat and the dog, both ways of typing, Linux arm64, 2026-11-07).
+    /// reads about the body's centre, for their glyphs (in a flight to another row whose landing
+    /// the caret's window does not read whole, about that landing), so the laws that read the
+    /// rows beside a body (the head law's, [`PetBrain::head_target`], and a bound's arc,
+    /// [`PetBrain::arc_under_letters`]) read them wherever the caret leaps; a read along the
+    /// body's row that neither window holds whole (longer than the map's columns, or across the
+    /// edge between the windows) is read as far either way from the body as the window that
+    /// reads it reaches ([`PetBrain::read_about`]). Reverted, the map is read about the caret
+    /// alone and such a read reads nothing: on a pane 100 rows tall, once the caret leapt 40, 58
+    /// or 70 rows down from a body at rest fitted between rows lettered to the margin, the head
+    /// law read nothing of the body's rows and let the fit go as it gathered to leap, and its box
+    /// met the row above's letters in 38 or 39, 43 and 12 frames of each run from rest, and in 9
+    /// to 12 after the `steam` scene's Backspaces; on a pane 300 columns wide, leaping five rows
+    /// down to the 290th column, in 37 to 39 after the Backspaces and 153 from rest, 40 rows
+    /// down on a pane 100 rows tall in 113, and along the prompt's row to the 290th column in
+    /// 128 on the rows over and under it; on a pane 1000 columns wide, along the row from the
+    /// 15th column to the 990th, in 359; from the 85th row of a pane 160 rows tall, leaping 40
+    /// and 58 rows down, in 38 or 39 and 43; at the foot of a pane 100 rows tall, leaping 88 rows
+    /// up, in 10 standing on the prompt's row (every face, the cat and the dog, both ways of
+    /// typing, Linux arm64, 2026-11-07 and 2026-11-08); and a bound back along the row from the
+    /// 290th column rose into a row lettered two over its own in 1 or 2 frames of each run
+    /// (Linux arm64, 2026-11-08).
     WorldReadsTheBodysRows = 1 << 36,
     /// A flight re-aimed in the air keeps the box's top a held body took off with
     /// ([`PetBrain::left_top`]) only while its way has never gone up ([`PetBrain::rebase`]).
@@ -5785,9 +5794,10 @@ impl PetBrain {
     /// land there after take-off lower it (a prompt's blank line on the grid's last row, its
     /// command's last line printed two rows above while the cat bounded back along the row:
     /// its head lay on that line for 18 frames; the frames' judging is reverted by
-    /// [`OldPath::ArcJudgedInTheAir`]). The head law at rest and along the row
-    /// ([`Self::head_target`]) keeps it off the row above its feet. Reverted by
-    /// [`OldPath::HeadClearInFlight`].
+    /// [`OldPath::ArcJudgedInTheAir`]). On a pane past the map's columns, a way longer than a
+    /// window reads is read as far either way from the body as the map reads about it
+    /// ([`Self::read_about`]). The head law at rest and along the row ([`Self::head_target`])
+    /// keeps it off the row above its feet. Reverted by [`OldPath::HeadClearInFlight`].
     #[inline]
     const fn arc_under_letters(&self, to_col: f32, to_row: f32, width: f32, arc: f32) -> f32 {
         // Reverted ([`OldPath::HeadClearInFlight`]): a quarter row's reach into the lettered
@@ -5802,9 +5812,13 @@ impl PetBrain {
             return arc;
         }
         let over = self.row.round() - 2.0;
-        let (a, b) = (
-            self.col.min(to_col) + INK_PAD,
-            self.col.max(to_col) + width - INK_PAD,
+        let (a, b) = self.read_about(
+            over,
+            (
+                self.col.min(to_col) + INK_PAD,
+                self.col.max(to_col) + width - INK_PAD,
+            ),
+            (self.col + INK_PAD, self.col + width - INK_PAD),
         );
         match self.observed_last_letter(over, a, b) {
             Some(Some(_)) => ceiling.max(0.0),
@@ -13190,7 +13204,9 @@ impl PetBrain {
     /// runs, to its stand; a body at rest [`HEAD_REST_REACH`] the way the writing carries it).
     /// A body at rest about to set off along its row ([`Self::setting_off`]) is read over its
     /// way as well, so the law draws it for that way before it goes
-    /// ([`OldPath::WayBeforeSettingOff`]).
+    /// ([`OldPath::WayBeforeSettingOff`]). Along its own row, on a pane past the map's columns, the
+    /// span is read as far either way from the body as the map reads about it
+    /// ([`Self::read_about`]).
     #[inline]
     fn head_span(&self, cols: u16, width: f32) -> ((f32, f32), (f32, f32)) {
         let (seat, (a, b)) = match &self.flight {
@@ -13241,6 +13257,15 @@ impl PetBrain {
                 (a - pad - behind).max(0.0).min(a),
                 (b + pad + ahead).min(cols).max(b),
             )
+        };
+        // Along its own row, read as far as the map reads about the body: on a pane past its
+        // columns, the way to a far caret runs past either window ([`Self::read_about`]).
+        let span = if (seat.1 - self.row).abs() < 0.5 {
+            let core = (self.col, self.col + width);
+            let span = self.read_about(seat.1 - 1.0, span, core);
+            self.read_about(seat.1 + 1.0, span, core)
+        } else {
+            span
         };
         (seat, span)
     }

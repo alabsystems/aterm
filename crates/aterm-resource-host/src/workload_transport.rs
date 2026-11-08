@@ -308,6 +308,8 @@ pub(super) struct Incoming {
 }
 pub(crate) struct ProducedIncoming {
     pub(crate) request: trust_resource_controller::workload::host::produced::ProducedRequest,
+    pub(crate) contained: Option<trust_resource_controller::workload::host::contained::Request>,
+    pub(crate) transport: Option<std::os::fd::OwnedFd>,
     pub(crate) peer: transport::Peer,
     pub(crate) stdin: std::os::fd::OwnedFd,
     pub(crate) stdout: std::os::fd::OwnedFd,
@@ -368,14 +370,42 @@ pub(super) fn receive_produced(
     job: &Binding,
     deadline: Instant,
 ) -> io::Result<ProducedIncoming> {
+    receive_produced_inner(stream, job, deadline, false)
+}
+pub(super) fn receive_contained_produced(
+    stream: &CtlStream,
+    job: &Binding,
+    deadline: Instant,
+) -> io::Result<ProducedIncoming> {
+    receive_produced_inner(stream, job, deadline, true)
+}
+fn receive_produced_inner(
+    stream: &CtlStream,
+    job: &Binding,
+    deadline: Instant,
+    contained_mode: bool,
+) -> io::Result<ProducedIncoming> {
     use std::os::fd::AsRawFd as _;
     use trust_resource_controller::workload::host::produced::ProducedRequest;
     stream.set_nonblocking(true)?;
     let peer = transport::local_peer(stream)?;
-    let request = ProducedRequest::decode(&transport::read_frame(stream, deadline)?)?;
+    let bytes = transport::read_frame(stream, deadline)?;
+    let contained = if contained_mode {
+        Some(trust_resource_controller::workload::host::contained::Request::decode(&bytes)?)
+    } else {
+        None
+    };
+    let request = match &contained {
+        Some(request) => request.produced.clone(),
+        None => ProducedRequest::decode(&bytes)?,
+    };
+    let authorized = match &contained {
+        Some(request) => crate::actor::authorize_contained_produced(peer, request.clone()),
+        None => crate::actor::authorize_workload_produced(peer, request.clone()),
+    };
     if request.member.binding.session != job.session
         || request.key.root_attempt != job.attempt
-        || !crate::actor::authorize_workload_produced(peer, request.clone())
+        || !authorized
         || transport::local_peer(stream)? != peer
     {
         transport::write_frame(stream, &[0], deadline)?;
@@ -428,6 +458,12 @@ pub(super) fn receive_produced(
     events.set_nonblocking(true)?;
     Ok(ProducedIncoming {
         request,
+        contained,
+        transport: if contained_mode {
+            Some(stream.try_clone()?.into())
+        } else {
+            None
+        },
         peer,
         stdin,
         stdout,

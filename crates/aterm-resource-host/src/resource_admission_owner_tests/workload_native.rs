@@ -21,6 +21,27 @@ const ROLE: &str = "ATERM_WORKLOAD_NATIVE_TEST_ROLE";
 const STORE: &str = "ATERM_WORKLOAD_NATIVE_TEST_STORE";
 const CASE: &str = "ATERM_WORKLOAD_NATIVE_TEST_CASE";
 const LOCK_CHECKPOINT: [u8; 32] = [38; 32];
+fn descriptor_population() -> (libc::rlim_t, usize) {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    let count = (0..limit.rlim_cur.min(65536))
+        .filter(|fd| unsafe { libc::fcntl(*fd as i32, libc::F_GETFD) } >= 0)
+        .count();
+    (limit.rlim_cur, count)
+}
+
+fn attempt_budget(full: bool) -> Duration {
+    if full { Duration::from_secs(600) } else { HANG }
+}
+#[cfg(target_arch = "aarch64")]
+#[path = "workload_native/contained.rs"]
+mod contained;
 #[repr(C, align(16))]
 struct Marker([u8; 64]);
 #[used]
@@ -30,6 +51,19 @@ static ROOT_MARKER: Marker = Marker(wire::WORKLOAD_PROTOCOL_MARKER);
 #[unsafe(link_section = "__TEXT,__trust_member")]
 static MEMBER_MARKER: Marker = Marker(wire::WORKLOAD_MEMBER_PROTOCOL_MARKER);
 extern "C" fn entry() {
+    #[cfg(target_arch = "aarch64")]
+    if matches!(std::env::args_os().skip(1).collect::<Vec<_>>().as_slice(),[arg] if arg=="--list" || arg=="--test-threads=1")
+        && std::env::args_os().next().is_some_and(|arg| {
+            matches!(
+                std::path::Path::new(&arg)
+                    .file_name()
+                    .and_then(|name| name.to_str()),
+                Some("contained-harness-0" | "contained-harness-1")
+            )
+        })
+    {
+        std::process::exit(std::panic::catch_unwind(contained::target).unwrap_or(101));
+    }
     if std::env::args_os().skip(1).collect::<Vec<_>>()
         != [OsString::from(wire::WORKLOAD_STARTUP_ARGUMENT)]
     {
@@ -73,39 +107,60 @@ fn actual_original_workload_root_and_phases_keep_all_resources_until_retirement(
         return host_process();
     }
     for case in ["normal", "nonzero", "unknown", "cancel"] {
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix("workload-")
-            .suffix(".noindex")
-            .tempdir_in(fs::canonicalize("/tmp").unwrap())
-            .unwrap();
-        let path = scratch.path().canonicalize().unwrap().join("host");
-        let store = ImageStore::prepare_at(&path).unwrap();
-        let program = store.cache_current().unwrap();
-        let mut command = spawnfd::command(program.path());
-        command
-            .args(["--exact", EXACT, "--nocapture"])
-            .env(ROLE, "host")
-            .env(STORE, &path)
-            .env(CASE, case);
-        let output = match deadline::output_within(&mut command, HANG) {
-            Ok(output) => output,
-            Err(error) => panic!(
-                "workload host {case} failed; preserved {}: {error:?}",
-                scratch.keep().display()
-            ),
-        };
-        assert!(
-            output.status.success(),
-            "actual workload host {case} failed; preserved {}: {output:?}",
+        run_case(case);
+    }
+}
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn actual_contained_member_uses_native_retirement_and_original_phase() {
+    run_case("contained");
+}
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn actual_complete_contained_population_retains_owners_with_original_fd_limit() {
+    run_case("contained-full-population");
+}
+fn run_case(case: &str) {
+    let scratch = aterm_tempfile::Builder::new()
+        .prefix("workload-")
+        .suffix(".noindex")
+        .tempdir_in(fs::canonicalize("/tmp").unwrap())
+        .unwrap();
+    let path = scratch.path().canonicalize().unwrap().join("host");
+    let store = ImageStore::prepare_at(&path).unwrap();
+    let program = store.cache_current().unwrap();
+    let mut command = spawnfd::command(program.path());
+    command
+        .args(["--exact", EXACT, "--nocapture"])
+        .env(ROLE, "host")
+        .env(STORE, &path)
+        .env(CASE, case);
+    let output = match deadline::output_within(
+        &mut command,
+        attempt_budget(case == "contained-full-population"),
+    ) {
+        Ok(output) => output,
+        Err(error) => panic!(
+            "workload host {case} failed; preserved {}: {error:?}",
             scratch.keep().display()
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout)
-                .contains("actual-workload-original-owner-retired")
-        );
-        for file in fs::read_dir(path.join("images")).unwrap() {
-            fs::set_permissions(file.unwrap().path(), fs::Permissions::from_mode(0o700)).unwrap()
-        }
+        ),
+    };
+    assert!(
+        output.status.success(),
+        "actual workload host {case} failed; preserved {}: {output:?}",
+        scratch.keep().display()
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("actual-workload-original-owner-retired")
+    );
+    for line in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with("contained "))
+    {
+        println!("{line}");
+    }
+    for file in fs::read_dir(path.join("images")).unwrap() {
+        fs::set_permissions(file.unwrap().path(), fs::Permissions::from_mode(0o700)).unwrap()
     }
 }
 fn input(path: &std::path::Path) -> wire::InputFile {
@@ -117,6 +172,17 @@ fn input(path: &std::path::Path) -> wire::InputFile {
 fn host_process() {
     let path = PathBuf::from(std::env::var_os(STORE).unwrap());
     let case = std::env::var(CASE).unwrap();
+    if case == "contained-full-population" {
+        // This fresh private fixture gets a stricter real kernel limit BEFORE
+        // any owners. Capping hard and soft prevents ordinary spawn's existing
+        // soft-limit preparation from widening this controlled input.
+        let limit = libc::rlimit {
+            rlim_cur: 256,
+            rlim_max: 256,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    }
+    let budget = attempt_budget(case == "contained-full-population");
     let store = ImageStore::open_at(&path).unwrap();
     let program = store.cache_current().unwrap();
     let socket = path.join("workload.sock");
@@ -173,7 +239,11 @@ fn host_process() {
         refutation_step: inputs.remove(0),
         refutation_loop: inputs.remove(0),
         trust_spec_source: inputs.remove(0),
-        repetitions: 1,
+        repetitions: if case == "contained-full-population" {
+            32
+        } else {
+            1
+        },
         // This stand-in's phase budget fits WITHIN its original whole-attempt
         // minute, including actual admission/preparation before target GO.
         timeout_ns: Duration::from_secs(5).as_nanos() as u64,
@@ -184,7 +254,7 @@ fn host_process() {
         .write_all(&(bytes.len() as u32).to_be_bytes())
         .unwrap();
     continuation.write_all(&bytes).unwrap();
-    let (binding, memory, events) = queue_owned(&mut owner, &scratch.path, HANG, [7; 16]);
+    let (binding, memory, events) = queue_owned(&mut owner, &scratch.path, budget, [7; 16]);
     let pending = owner.pending.back_mut().unwrap();
     pending.events.account().unwrap();
     pending.submission.request.argv = vec![
@@ -212,11 +282,36 @@ fn host_process() {
     let ledger = owner.ledger.clone();
     let mut actor = ActualActor(Some(crate::actor::activate_test(owner).unwrap()));
     let mut connections = Vec::new();
-    let end = Instant::now() + HANG;
+    let end = Instant::now() + budget;
+    let mut last_progress = Instant::now();
+    let mut progress_bytes = 0;
     let mut reserved = false;
     let mut cancelled = false;
     let mut locks_observed = false;
+    let (original_fd_limit, _) = descriptor_population();
+    let mut fd_trace = File::create(scratch.path.join("host-descriptors")).unwrap();
+    writeln!(fd_trace, "soft={original_fd_limit}").unwrap();
+    let mut peak_descriptors = 0;
     while !crate::actor::idle() {
+        let actual_bytes =
+            fs::metadata(source.join("contained-descriptors")).map_or(0, |stat| stat.len());
+        if actual_bytes != progress_bytes {
+            progress_bytes = actual_bytes;
+            last_progress = Instant::now();
+            writeln!(
+                fd_trace,
+                "root_progress_bytes={actual_bytes} descriptors={} peak={peak_descriptors}",
+                descriptor_population().1
+            )
+            .unwrap();
+        }
+        assert!(
+            last_progress.elapsed() < HANG,
+            "no actual fixture action progress within original hang detector"
+        );
+        let (actual_limit, actual_count) = descriptor_population();
+        assert_eq!(actual_limit, original_fd_limit);
+        peak_descriptors = peak_descriptors.max(actual_count);
         assert!(
             Instant::now() < end,
             "native original workload never settled: {}",
@@ -279,7 +374,9 @@ fn host_process() {
             Ok((stream, _)) => {
                 let image = program.clone();
                 connections.push(std::thread::spawn(move || {
-                    let _ = crate::runtime::serve_test(&stream, &image);
+                    if let Err(error) = crate::runtime::serve_test(&stream, &image) {
+                        eprintln!("actual workload connection ended: {error:?}");
+                    }
                 }));
             }
             Err(error)
@@ -371,6 +468,13 @@ fn host_process() {
         ),
         atpkg::lease::Holders::Free
     ));
+    if case.starts_with("contained") {
+        println!("contained host soft={original_fd_limit} peak={peak_descriptors}");
+        print!(
+            "{}",
+            fs::read_to_string(source.join("contained-descriptors")).unwrap()
+        );
+    }
     let probe = aterm_uds::file_lock::LockFile::take_existing(
         &output.join(".cargo-lock"),
         Instant::now(),
@@ -399,7 +503,7 @@ fn root() -> i32 {
     let mut raw = vec![0; n];
     std::io::stdin().read_exact(&mut raw).unwrap();
     let invocation = wire::WorkloadInvocation::decode(&raw).unwrap();
-    let deadline = Instant::now() + HANG;
+    let deadline = Instant::now() + attempt_budget(invocation.repetitions == 32);
     let client = store.discover(deadline).unwrap();
     assert_eq!(
         Some(client.original_store_path().as_os_str().as_bytes()),
@@ -608,17 +712,48 @@ fn root() -> i32 {
             ..
         }
     ));
-    let left = control
-        .request_phase(
-            &host::phase::Request {
-                key: key(2),
-                operation: host::phase::Operation::Leave { phase: [35; 16] },
-            },
-            None,
+    let action_count: u8 = if case == "contained-full-population" {
+        68
+    } else {
+        3
+    };
+    #[cfg(target_arch = "aarch64")]
+    let _contained = case.starts_with("contained").then(|| {
+        contained::run(
+            &client,
+            &mut control,
+            &request,
+            reply.invocation_sha256,
+            backing,
             deadline,
+            action_count,
         )
-        .unwrap();
-    assert!(matches!(left.decision, host::phase::Decision::Left { .. }));
+    });
+    let mut sequence = 2;
+    loop {
+        let left = control
+            .request_phase(
+                &host::phase::Request {
+                    key: key(sequence),
+                    operation: host::phase::Operation::Leave { phase: [35; 16] },
+                },
+                None,
+                deadline,
+            )
+            .unwrap();
+        sequence += 1;
+        match left.decision {
+            host::phase::Decision::Left { .. } => break,
+            host::phase::Decision::Busy => {
+                assert!(
+                    Instant::now() < deadline,
+                    "original members must actually retire before Leave"
+                );
+                std::thread::sleep(POLL);
+            }
+            other => panic!("unexpected original phase Leave: {other:?}"),
+        }
+    }
     fs::write(
         source.join("original-lock-dropped"),
         "actual close plus positive Leave",
@@ -643,7 +778,7 @@ fn root() -> i32 {
     let drained = control
         .request_phase(
             &host::phase::Request {
-                key: key(3),
+                key: key(sequence),
                 operation: host::phase::Operation::Drained,
             },
             None,
@@ -652,7 +787,21 @@ fn root() -> i32 {
         .unwrap();
     assert!(matches!(drained.decision, host::phase::Decision::Drained));
     let mut census = control.census_snapshot([36; 16], deadline).unwrap();
-    assert_eq!(census.next_page(deadline).unwrap(), Some(Vec::new()));
+    let observed = census.next_page(deadline).unwrap().unwrap();
+    if case.starts_with("contained") {
+        assert_eq!(
+            observed.len(),
+            usize::from(action_count),
+            "complete real admitted action denominator"
+        );
+        assert!(
+            observed
+                .iter()
+                .all(|entry| entry.retired && entry.drained && entry.started.is_some())
+        );
+    } else {
+        assert!(observed.is_empty());
+    }
     assert_eq!(census.next_page(deadline).unwrap(), None);
     assert!(census.complete());
     drop(census);

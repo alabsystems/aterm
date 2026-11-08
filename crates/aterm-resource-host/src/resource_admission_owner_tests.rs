@@ -138,6 +138,11 @@ fn native_owner_fixture_resolver_waits_for_original_hello() {
 
 #[test]
 fn loan_bookkeeping_does_not_resurrect_a_native_terminal_phase() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::loan_bookkeeping_does_not_resurrect_a_native_terminal_phase",
+    ) {
+        return;
+    }
     let world = World::new();
     let binding = Binding {
         session: "s-ab".into(),
@@ -225,6 +230,11 @@ struct World {
 #[test]
 #[cfg(target_os = "macos")]
 fn metadata_ancestry_admits_after_scheduling_delay_but_still_detects_a_hang() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::metadata_ancestry_admits_after_scheduling_delay_but_still_detects_a_hang",
+    ) {
+        return;
+    }
     let mut world = World::new();
     let (_, _, events) = world.queue_sleep(HANG);
     let pending = world.owner.pending.front_mut().unwrap();
@@ -259,6 +269,11 @@ fn metadata_ancestry_admits_after_scheduling_delay_but_still_detects_a_hang() {
 #[test]
 #[cfg(target_os = "macos")]
 fn fresh_metadata_refuses_funded_native_ancestor_but_admits_unrelated_original_capacity() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::fresh_metadata_refuses_funded_native_ancestor_but_admits_unrelated_original_capacity",
+    ) {
+        return;
+    }
     crate::runtime::test_endpoint().unwrap();
     let mut world = World::new();
     let (binding, memory, events) = world.queue_sleep(HANG);
@@ -601,6 +616,11 @@ fn read_event(client: &CtlStream, binding: &Binding) -> Event {
 #[test]
 #[cfg(target_os = "macos")]
 fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources",
+    ) {
+        return;
+    }
     crate::runtime::test_endpoint().unwrap();
     for cancel_caller in [false, true] {
         let mut world = World::new();
@@ -692,7 +712,7 @@ fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
             .jobs
             .get_mut(&(binding.session.clone(), binding.attempt))
             .unwrap();
-        assert!(job.launched && !job.reaped && !job.settled);
+        assert!(job.launched && !job.reaped && !job.is_settled());
         assert_eq!((job.child.child_mut().id(), job.root_birth), (pid, birth));
         assert_eq!(
             process::read_birth(i32::try_from(pid).unwrap()).unwrap().0,
@@ -739,6 +759,11 @@ fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
 #[test]
 #[cfg(target_os = "macos")]
 fn impossible_memory_head_refuses_before_arm_and_next_job_runs() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::impossible_memory_head_refuses_before_arm_and_next_job_runs",
+    ) {
+        return;
+    }
     crate::runtime::test_endpoint().unwrap();
     let mut world = World::new();
     let (impossible, _, client) = world.queue_sleep(Duration::from_secs(60));
@@ -798,6 +823,11 @@ fn admission_words(
 /// the decision; a row each look: three for the looks that waited.
 #[test]
 fn a_retained_runs_memory_admission_writes_one_row_where_it_is_decided() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::a_retained_runs_memory_admission_writes_one_row_where_it_is_decided",
+    ) {
+        return;
+    }
     use aterm_capacity::telemetry::{capture, wait};
     use aterm_telemetry::{Kind, Meter, Outcome, Stop};
     let mut world = World::new();
@@ -853,6 +883,11 @@ fn a_retained_runs_memory_admission_writes_one_row_where_it_is_decided() {
 /// none for the first; the refusal written before its ask is taken: none for the second.
 #[test]
 fn a_retained_runs_memory_wait_given_up_or_refused_writes_one_row() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::a_retained_runs_memory_wait_given_up_or_refused_writes_one_row",
+    ) {
+        return;
+    }
     use aterm_capacity::telemetry::capture;
     use aterm_telemetry::{Kind, Meter, Outcome, Stop};
     let mut world = World::new();
@@ -918,6 +953,11 @@ mod context_rpc;
 
 #[test]
 fn cancelled_paid_metadata_preparation_joins_before_native_release_and_settlement() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::cancelled_paid_metadata_preparation_joins_before_native_release_and_settlement",
+    ) {
+        return;
+    }
     for fault_owner in [false, true] {
         let mut world = World::new();
         let (binding, memory, client) = world.queue_sleep(HANG);
@@ -1006,6 +1046,11 @@ mod metadata_native;
 
 #[test]
 fn workload_ancestry_slice_waits_without_renewing_or_granting_original_resources() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::workload_ancestry_slice_waits_without_renewing_or_granting_original_resources",
+    ) {
+        return;
+    }
     let mut world = World::new();
     let (binding, memory, client) = world.queue_sleep(HANG);
     assert_eq!(read_event(&client, &binding), Event::Queued);
@@ -1100,6 +1145,11 @@ fn workload_final_go_preserves_the_original_absolute_clock() {
 
 #[test]
 fn workload_queue_expiry_and_parent_close_keep_paid_preparation_until_join() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::workload_queue_expiry_and_parent_close_keep_paid_preparation_until_join",
+    ) {
+        return;
+    }
     for expire in [true, false] {
         let mut world = World::new();
         let (binding, memory, client) = world.queue_sleep(HANG);
@@ -1211,6 +1261,11 @@ mod resolver_engineering;
 
 #[test]
 fn known_member_attempt_never_receives_a_new_no_child_refusal() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::known_member_attempt_never_receives_a_new_no_child_refusal",
+    ) {
+        return;
+    }
     use aterm_ctl::resource_subgroup_client::{
         AuthorizedSubgroup, Delegations, RemoteChild, Rights,
     };
@@ -1294,6 +1349,11 @@ pub(super) fn member_fixture(
 #[test]
 #[cfg(target_os = "macos")]
 fn accounted_root_waits_for_original_settlement_and_preserves_real_outcomes() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::accounted_root_waits_for_original_settlement_and_preserves_real_outcomes",
+    ) {
+        return;
+    }
     crate::runtime::test_endpoint().unwrap();
     use aterm_types::resource_admission::AccountedEventFrame;
     use std::io::Read as _;
@@ -1343,7 +1403,7 @@ fn accounted_root_waits_for_original_settlement_and_preserves_real_outcomes() {
             std::thread::sleep(POLL);
         }
         let job = world.owner.jobs.get_mut(&key).unwrap();
-        assert!(!job.settled && !job.terminal_sent && job.completion.is_some());
+        assert!(!job.is_settled() && !job.terminal_sent && job.completion.is_some());
         assert_eq!(world.owner.debt.reserved().unwrap(), 1);
         events.set_nonblocking(true).unwrap();
         assert_eq!(
@@ -1410,7 +1470,105 @@ fn accounted_root_waits_for_original_settlement_and_preserves_real_outcomes() {
 
 #[test]
 #[cfg(target_os = "macos")]
+fn original_root_settlement_is_live_single_owner_and_bound_to_the_actual_attempt() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::original_root_settlement_is_live_single_owner_and_bound_to_the_actual_attempt",
+    ) {
+        return;
+    }
+    crate::runtime::test_endpoint().unwrap();
+    let mut world = World::new();
+    let (binding, memory, events) = world.queue_sleep(HANG);
+    world
+        .owner
+        .pending
+        .front_mut()
+        .unwrap()
+        .events
+        .account()
+        .unwrap();
+    world.owner.tick_queue();
+    assert_eq!(read_event(&events, &binding), Event::Queued);
+    let Event::Started { pid, .. } = read_event(&events, &binding) else {
+        panic!("actual original root did not start")
+    };
+    let key = (binding.session.clone(), binding.attempt);
+    {
+        let Owner {
+            jobs,
+            fence,
+            journal,
+            ..
+        } = &mut world.owner;
+        let job = jobs.get_mut(&key).unwrap();
+        assert!(settlement::settle(job, fence, journal).is_err());
+        assert!(job.closed.is_none());
+        // Delay automatic settlement so the actual owning wait and the
+        // independently retried native closure remain separately observable.
+        job.settlement_at = Some(Instant::now() + HANG);
+    }
+    assert_eq!(world.owner.debt.reserved().unwrap(), 1);
+    wire::send_cancel(
+        &events,
+        aterm_types::resource_admission::Cancel {
+            binding: binding.clone(),
+        },
+        Instant::now() + HANG,
+    )
+    .unwrap();
+    let deadline = Instant::now() + HANG;
+    while !world.owner.jobs.get(&key).unwrap().reaped {
+        world.owner.tick();
+        assert!(
+            Instant::now() < deadline,
+            "actual original root did not reap"
+        );
+        std::thread::sleep(POLL);
+    }
+    {
+        let Owner {
+            jobs,
+            fence,
+            journal,
+            ..
+        } = &mut world.owner;
+        let job = jobs.get_mut(&key).unwrap();
+        assert!(job.closed.is_none(), "exit/reap is not complete settlement");
+        settlement::settle(job, fence, journal).unwrap();
+        assert!(job.is_settled());
+        assert!(job.closed.as_ref().unwrap().matches(job));
+        assert!(
+            settlement::settle(job, fence, journal).is_err(),
+            "one actual root cannot mint two original settlement results"
+        );
+        let original = job.binding.clone();
+        job.binding.attempt[0] ^= 1;
+        assert!(
+            !job.is_settled(),
+            "foreign attempt inherited original settlement"
+        );
+        job.binding = original;
+        let original_birth = job.root_birth;
+        job.root_birth ^= 1;
+        assert!(
+            !job.is_settled(),
+            "foreign native birth inherited original settlement"
+        );
+        job.root_birth = original_birth;
+        assert!(job.is_settled());
+    }
+    world.settle();
+    world.assert_settled(&binding, &memory, pid);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
 fn accounted_paid_no_child_refusal_waits_for_original_custody_settlement() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::accounted_paid_no_child_refusal_waits_for_original_custody_settlement",
+    ) {
+        return;
+    }
     use aterm_types::resource_admission::AccountedEventFrame;
     use std::io::Read as _;
     crate::runtime::test_endpoint().unwrap();
@@ -1464,6 +1622,11 @@ fn accounted_paid_no_child_refusal_waits_for_original_custody_settlement() {
 #[test]
 #[cfg(target_os = "macos")]
 fn accounted_memory_only_refusal_keeps_original_funded_ancestor_untouched() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::tests::accounted_memory_only_refusal_keeps_original_funded_ancestor_untouched",
+    ) {
+        return;
+    }
     use aterm_types::resource_admission::AccountedEventFrame;
     use std::io::Read as _;
     crate::runtime::test_endpoint().unwrap();

@@ -111,7 +111,7 @@ impl Owner {
         if self.faulted
             || !job.launched
             || job.reaped
-            || job.settled
+            || job.is_settled()
             || job.cleanup_at.is_some()
             || peer.pid != job.child.child_mut().id()
             || peer.birth != job.root_birth

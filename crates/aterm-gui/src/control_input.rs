@@ -1066,6 +1066,7 @@ pub(super) fn input_reply_to_str(r: Result<InputOutcome, String>) -> String {
         Ok(InputOutcome::WriteFailed) => "ERR write failed\n".to_string(),
         Ok(InputOutcome::QueueFull) => INPUT_QUEUE_FULL.to_string(),
         Ok(InputOutcome::NotApplied(why)) => format!("ERR {why}\n"),
+        Ok(InputOutcome::Resized(resize)) => resize.reply(),
         Err(e) => e,
     }
 }

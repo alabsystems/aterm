@@ -449,6 +449,7 @@ struct Placement<'a> {
     replace: bool,
     long_entry_ends: bool,
     inherit_all: bool,
+    default_signals: bool,
     /// Keep the caller's mask across an in-place exec instead of installing the ordinary empty
     /// child mask.
     #[cfg(target_vendor = "apple")]
@@ -522,6 +523,7 @@ impl Default for Placement<'_> {
             replace: false,
             long_entry_ends: false,
             inherit_all: false,
+            default_signals: false,
             #[cfg(target_vendor = "apple")]
             inherit_signal_mask: false,
             #[cfg(target_vendor = "apple")]
@@ -994,7 +996,10 @@ mod platform {
         let disclaim = place.disclaim.map(disclaimer).transpose()?;
         let mut objects = Objects::new()?;
         let empty: u32 = 0;
-        let defaults: u32 = if place.suspended {
+        // Darwin has signals 1..31. SIGKILL and SIGSTOP have no settable disposition.
+        let defaults: u32 = if place.default_signals {
+            0x7fff_ffff & !(1 << (libc::SIGKILL - 1)) & !(1 << (libc::SIGSTOP - 1))
+        } else if place.suspended {
             SIGPIPE_BIT | SIGHUP_BIT
         } else {
             SIGPIPE_BIT
@@ -1442,6 +1447,7 @@ mod platform {
             || place.long_entry_ends
             || place.disclaim.is_some()
             || place.suspended
+            || place.default_signals
             || !place.guards.is_empty()
         {
             return Err(io::Error::new(
@@ -2365,6 +2371,10 @@ mod mapped_tests;
 #[cfg(test)]
 #[path = "spawnfd_command_tests.rs"]
 mod command_tests;
+
+#[cfg(test)]
+#[path = "spawnfd_signal_tests.rs"]
+mod signal_tests;
 
 #[cfg(test)]
 #[path = "spawnfd_transparent_tests.rs"]

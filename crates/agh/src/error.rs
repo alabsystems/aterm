@@ -506,7 +506,7 @@ pub enum Sub {
         /// `Sub::Local` instead (`fx::child::run`).
         exit: Option<i32>,
     },
-    /// A clone's local config rewrites where git goes (design §6.9).
+    /// A clone's local config is outside the transport security policy (design §6.9).
     GitConfig {
         /// The key.
         key: String,

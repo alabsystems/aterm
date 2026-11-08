@@ -156,14 +156,20 @@ impl std::fmt::Display for Floor {
     }
 }
 
+/// The publication engine's forbidden-content baseline as the caller read it, `(where, text)`,
+/// or why it has none. A census spawns nothing and reads no network, so whoever runs the
+/// censuses reads one commit of the engine (aterm-verify's `engine` module) and hands its
+/// baseline in; `capture-privacy` holds test captures to it.
+pub type EngineBaseline = Result<(String, String), String>;
+
 /// CLI-selectable census descriptor and runner.
 pub struct Census {
     /// Selection flag name without leading dashes.
     pub name: &'static str,
     /// Short description for `--help`.
     pub about: &'static str,
-    /// Runner over a checkout root.
-    pub run: fn(&Path) -> CensusOutcome,
+    /// Runner over a checkout root, with the engine's baseline its caller read.
+    pub run: fn(&Path, &EngineBaseline) -> CensusOutcome,
 }
 
 /// Every census, in the order a run prints them (they run in parallel).
@@ -172,27 +178,27 @@ pub const CENSUSES: &[Census] = &[
         name: "mainloop",
         about: "main-thread reach to unbounded work or a frame wait; unbounded work under a held \
                 `term` guard (OB-1..OB-6, OB-22, OB-23)",
-        run: run_mainloop_census,
+        run: |root, _| run_mainloop_census(root),
     },
     Census {
         name: "locks",
         about: "lock-order cycles across the GUI process (OB-7)",
-        run: run_lock_order_census,
+        run: |root, _| run_lock_order_census(root),
     },
     Census {
         name: "wasm",
         about: "wasm reach to unbounded work; no threads (OB-8..OB-10, OB-12)",
-        run: run_wasm_census,
+        run: |root, _| run_wasm_census(root),
     },
     Census {
         name: "scope",
         about: "window-scoped enforcers that multiply (OB-13..OB-16)",
-        run: run_scope_census,
+        run: |root, _| run_scope_census(root),
     },
     Census {
         name: "lazy-init",
         about: "lazy cells re-entered by their own initializer (OB-19..OB-21)",
-        run: run_lazy_init_census,
+        run: |root, _| run_lazy_init_census(root),
     },
     Census {
         name: "guards",
@@ -201,9 +207,14 @@ pub const CENSUSES: &[Census] = &[
     },
 ];
 
-/// Runs `selected` censuses in parallel over `root` and enforces their floors.
+/// Runs `selected` censuses in parallel over `root`, with the engine's baseline `engine`, and
+/// enforces their floors.
 #[must_use]
-pub fn run_censuses(root: &Path, selected: &[&Census]) -> Vec<CensusOutcome> {
+pub fn run_censuses(
+    root: &Path,
+    selected: &[&Census],
+    engine: &EngineBaseline,
+) -> Vec<CensusOutcome> {
     std::thread::scope(|scope| {
         let running: Vec<_> = selected
             .iter()
@@ -211,7 +222,7 @@ pub fn run_censuses(root: &Path, selected: &[&Census]) -> Vec<CensusOutcome> {
                 std::thread::Builder::new()
                     .name(format!("census-{}", census.name))
                     .stack_size(8 << 20)
-                    .spawn_scoped(scope, move || (census.run)(root))
+                    .spawn_scoped(scope, move || (census.run)(root, engine))
             })
             .collect();
         running
@@ -239,12 +250,12 @@ pub fn run_censuses(root: &Path, selected: &[&Census]) -> Vec<CensusOutcome> {
 /// Runs every census over `root` in parallel and returns each outcome under its
 /// name, in [`CENSUSES`] order.
 #[must_use]
-pub fn run_all(root: &Path) -> Vec<(&'static str, CensusOutcome)> {
+pub fn run_all(root: &Path, engine: &EngineBaseline) -> Vec<(&'static str, CensusOutcome)> {
     let every: Vec<&Census> = CENSUSES.iter().collect();
     CENSUSES
         .iter()
         .map(|c| c.name)
-        .zip(run_censuses(root, &every))
+        .zip(run_censuses(root, &every, engine))
         .collect()
 }
 
@@ -1749,10 +1760,10 @@ include!("commented.rs");
 
     #[test]
     fn run_censuses_keeps_the_given_order_and_turns_a_panic_red() {
-        fn clean(_: &Path) -> CensusOutcome {
+        fn clean(_: &Path, _: &EngineBaseline) -> CensusOutcome {
             CensusOutcome::green("a", String::new(), "clean")
         }
-        fn broken(_: &Path) -> CensusOutcome {
+        fn broken(_: &Path, _: &EngineBaseline) -> CensusOutcome {
             panic!("a walker bug")
         }
         let a = Census {
@@ -1765,7 +1776,7 @@ include!("commented.rs");
             about: "",
             run: broken,
         };
-        let out = run_censuses(Path::new("."), &[&b, &a]);
+        let out = run_censuses(Path::new("."), &[&b, &a], &Err(String::new()));
         assert!(
             !out[0].ok && out[0].log.contains("b census"),
             "{}",
@@ -1776,13 +1787,13 @@ include!("commented.rs");
 
     #[test]
     fn run_censuses_turns_a_missed_floor_red() {
-        fn thin(_: &Path) -> CensusOutcome {
+        fn thin(_: &Path, _: &EngineBaseline) -> CensusOutcome {
             CensusOutcome::green("thin", "=== thin ===\n".to_string(), "1 site").with_floors(vec![
                 Floor::at_least("sites read", 1, 100, "the walk went blind"),
                 Floor::at_least("files read", 3, 1, "no files"),
             ])
         }
-        fn red(_: &Path) -> CensusOutcome {
+        fn red(_: &Path, _: &EngineBaseline) -> CensusOutcome {
             CensusOutcome::red("red", String::new(), "1 violation").with_floors(vec![
                 Floor::at_least("sites read", 0, 100, "the walk went blind"),
             ])
@@ -1799,8 +1810,11 @@ include!("commented.rs");
                 run: red,
             },
         );
-        assert!(thin(Path::new(".")).ok, "the bare walk holds no floors");
-        let out = run_censuses(Path::new("."), &[&a, &b]);
+        assert!(
+            thin(Path::new("."), &Err(String::new())).ok,
+            "the bare walk holds no floors"
+        );
+        let out = run_censuses(Path::new("."), &[&a, &b], &Err(String::new()));
         assert!(!out[0].ok, "{}", out[0].log);
         assert!(
             out[0].log.contains("[floor] sites read") && !out[0].log.contains("files read"),

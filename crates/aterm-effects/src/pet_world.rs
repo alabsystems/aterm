@@ -18,10 +18,15 @@ pub const MAX_WORLD_CELLS: usize = MAX_WORLD_ROWS * MAX_WORLD_COLS;
 pub const MAX_WORLD_ANCHORS: usize = 8;
 /// What a pane past the map's budget ([`MAX_WORLD_ROWS`], [`MAX_WORLD_COLS`]) is read about
 /// ([`PetWorld::observe_with_exclusions_near`]): the body's centre (rows and columns of the pane)
-/// when the console hides its caret, and the pane's rows about the body (`first..end`) and the
+/// when the console hides its caret; the pane's rows about the body (`first..end`) and the
 /// body's centre column, which a second window reads where the caret's does not read them all
-/// ([`PetWorld::body_window`]).
-pub(crate) type PetCentre = (Option<(f32, f32)>, Option<(usize, usize, usize)>);
+/// ([`PetWorld::body_window`]); and the cells about a flight's landing on another row, which
+/// that window reads about instead where the caret's window does not read them whole.
+pub(crate) type PetCentre = (
+    Option<(f32, f32)>,
+    Option<(usize, usize, usize)>,
+    Option<PetPane>,
+);
 /// How many rows over and under the box the body was last drawn in the console asks the window
 /// about the body to read ([`PetWorld::body_window`]): the rows the laws that keep a body off
 /// the rows beside its own read about it, the row over its feet and the row under them (the
@@ -666,14 +671,15 @@ impl PetWorld {
         pane: PetPane,
         reserve: PetReserve<'_>,
     ) -> bool {
-        self.observe_with_exclusions_near(input, facts, pane, reserve, (None, None))
+        self.observe_with_exclusions_near(input, facts, pane, reserve, (None, None, None))
     }
 
     /// Observes cells around `held_center` (the body's centre, rows and columns of the pane)
     /// when the console hides its cursor, on a pane past the map's budget ([`MAX_WORLD_ROWS`],
     /// [`MAX_WORLD_COLS`]) about the caret where it shows; and the glyphs of the pane's rows
     /// `keep` (`first..end`, the rows about the body, and the body's centre column) in a second
-    /// window where that one does not read them all ([`Self::body_window`]). A cell neither
+    /// window where that one does not read them all, or about the cells of a flight's `landing`
+    /// on another row where it does not read those ([`Self::body_window`]). A cell neither
     /// reads is not read: the glyph readers take no reading of it.
     #[inline]
     pub(crate) fn observe_with_exclusions_near(
@@ -682,7 +688,7 @@ impl PetWorld {
         facts: &PetWorldFacts,
         pane: PetPane,
         reserve: PetReserve<'_>,
-        (held_center, keep): PetCentre,
+        (held_center, keep, landing): PetCentre,
     ) -> bool {
         self.retire();
         let PetReserve {
@@ -784,7 +790,7 @@ impl PetWorld {
             cols,
         };
         if input.display_offset == 0 {
-            self.read_body(input, pane, blanked, keep);
+            self.read_body(input, pane, blanked, (keep, landing));
         }
         let track_ground = any_selection || !overlays.is_empty();
         const PREFIX_LEN: usize = (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1);
@@ -1153,17 +1159,18 @@ impl PetWorld {
         self.cells.as_slice()[r * MAX_WORLD_COLS + c]
     }
 
-    /// The window about the body ([`Self::observe_with_exclusions_near`]): on a pane past the
-    /// map's budget, the pane's rows the console asks for about the body (as many as
-    /// [`MAX_BODY_ROWS`]), over as many columns as the map reads about the body's centre, read
-    /// for their glyphs alone ([`Self::locomotion_ink_in_span`], [`Self::last_letter_in_span`],
+    /// The window about the body ([`Self::observe_with_exclusions_near`]): on a pane past the map's
+    /// budget, the pane's rows the console asks for about the body (as many as [`MAX_BODY_ROWS`]),
+    /// over as many columns as the map reads about the body's centre (in a flight to another row
+    /// whose landing the caret's window does not read whole, about that landing), read for their
+    /// glyphs alone ([`Self::locomotion_ink_in_span`], [`Self::last_letter_in_span`],
     /// [`Self::ink_row_bits`], [`Self::ink_at`], [`Self::letter_at`] and
-    /// [`Self::locomotion_ink_at`]). Where the caret's window
-    /// ([`Self::coverage`]) reads those columns, the window leaves out the rows it reads, and
-    /// reads none where it reads them all (every pane within the budget). Where it does not (a
-    /// pane past [`MAX_WORLD_COLS`]), the window reads the rows it reads too, for a span's
-    /// columns past it. No rows where the frame is scrolled into history, or where the console
-    /// asked for none ([`crate::kitty_pet::OldPath::WorldReadsTheBodysRows`]).
+    /// [`Self::locomotion_ink_at`]). Where the caret's window ([`Self::coverage`]) reads those
+    /// columns, the window leaves out the rows it reads, and reads none where it reads them all
+    /// (every pane within the budget). Where it does not (a pane past [`MAX_WORLD_COLS`]), the
+    /// window reads the rows it reads too, for a span's columns past it. No rows where the frame is
+    /// scrolled into history, or where the console asked for none
+    /// ([`crate::kitty_pet::OldPath::WorldReadsTheBodysRows`]).
     #[inline]
     #[must_use]
     pub const fn body_window(&self) -> PetPane {
@@ -1187,18 +1194,75 @@ impl PetWorld {
         }
     }
 
+    /// The part of the pane row `row`'s columns `first..end` that one window reads whole with the
+    /// columns `core` among them, for the glyph readers to read ([`Self::glyphs_for`]):
+    /// `first..end` itself where one window reads them all; else their part in the window that
+    /// reads `core` there and the most of them, the caret's ([`Self::coverage`]) or the one about
+    /// the body ([`Self::body_window`]). On a pane past [`MAX_WORLD_COLS`] a span along the body's
+    /// row can be longer than either window, or cross the edge between them, and is then read as
+    /// far as the window that reads the body's columns reaches. `None` where the span runs past
+    /// the pane's last column, which no window reads: it is read as a pane within the budget reads
+    /// it, not at all, wherever the body stands (a part cut at an edge between the windows would
+    /// read it as far as that edge about one stand and not at all about another). `None` too
+    /// where neither window reads `core` there, where `core` is not among `first..end`, and where
+    /// nothing is read.
+    #[inline]
+    #[must_use]
+    pub const fn span_read_about(
+        &self,
+        row: usize,
+        (first, end): (usize, usize),
+        (c0, c1): (usize, usize),
+    ) -> Option<(usize, usize)> {
+        #[inline]
+        const fn part(w: PetPane, first: usize, end: usize) -> (usize, usize) {
+            (
+                if first > w.col { first } else { w.col },
+                if end < w.col + w.cols {
+                    end
+                } else {
+                    w.col + w.cols
+                },
+            )
+        }
+        let Some(stamp) = self.stamp else {
+            return None;
+        };
+        if c1 <= c0 || c0 < first || c1 > end || end > stamp.surface.cols {
+            return None;
+        }
+        if reads_span(self.coverage, row, first, end) || reads_span(self.body, row, first, end) {
+            return Some((first, end));
+        }
+        let caret = if reads_span(self.coverage, row, c0, c1) {
+            Some(part(self.coverage, first, end))
+        } else {
+            None
+        };
+        let body = if reads_span(self.body, row, c0, c1) {
+            Some(part(self.body, first, end))
+        } else {
+            None
+        };
+        match (caret, body) {
+            (Some(c), Some(b)) if b.1 - b.0 > c.1 - c.0 => Some(b),
+            (Some(c), _) => Some(c),
+            (None, b) => b,
+        }
+    }
+
     /// Reads the glyphs of the window about the body the pane's rows `keep` ask for
-    /// (`first..end`, and the body's centre column) where the caret's window reads `coverage`
-    /// ([`body_window_about`], [`Self::body_window`]), counted with the cells it examined
-    /// ([`Self::examined_cells`]).
+    /// (`first..end`, and the body's centre column), or the cells about a flight's `landing`,
+    /// where the caret's window reads `coverage` ([`body_window_about`], [`Self::body_window`]),
+    /// counted with the cells it examined ([`Self::examined_cells`]).
     fn read_body(
         &mut self,
         input: &RenderInput,
         pane: PetPane,
         blanked: &[PetRect],
-        keep: Option<(usize, usize, usize)>,
+        (keep, landing): (Option<(usize, usize, usize)>, Option<PetPane>),
     ) {
-        let body = body_window_about(pane, self.coverage, keep);
+        let body = body_window_about(pane, self.coverage, keep, landing);
         if body.rows == 0 {
             return;
         }
@@ -2747,7 +2811,7 @@ impl PetReading {
         facts: &PetWorldFacts,
         pane: PetPane,
         reserve: PetReserve<'_>,
-        (held_center, keep): PetCentre,
+        (held_center, keep, landing): PetCentre,
     ) -> bool {
         let Some(kept) = &self.key else {
             return false;
@@ -2770,7 +2834,7 @@ impl PetReading {
             return false;
         }
         let body = if input.display_offset == 0 {
-            body_window_about(pane, self.coverage, keep)
+            body_window_about(pane, self.coverage, keep, landing)
         } else {
             PetPane::EMPTY
         };
@@ -3239,13 +3303,31 @@ const fn span_contains(spans: &[(usize, usize)], col: usize) -> bool {
 /// it reads them all; past the budget's rows it reads more rows than the window has, so those
 /// are every row it reads. Where it does not read those columns (a pane past
 /// [`MAX_WORLD_COLS`]), every row is kept, so a span past its columns is read whole by one
-/// window. `None` asks for none.
+/// window. `None` asks for none. Where `landing` names the cells about a flight's landing on
+/// another row and `coverage` does not read them all, the window is placed about those instead:
+/// their rows, about their centre column. The head law judges such a flight where it lands
+/// (`PetBrain::head_span`), and a flight re-aimed in the air can land far from the caret and
+/// from where the body flies.
 #[inline]
 const fn body_window_about(
     pane: PetPane,
     coverage: PetPane,
     keep: Option<(usize, usize, usize)>,
+    landing: Option<PetPane>,
 ) -> PetPane {
+    let keep = match landing {
+        Some(at)
+            if at.rows > 0
+                && at.cols > 0
+                && !(at.row >= coverage.row
+                    && at.row + at.rows <= coverage.row + coverage.rows
+                    && at.col >= coverage.col
+                    && at.col + at.cols <= coverage.col + coverage.cols) =>
+        {
+            Some((at.row, at.row + at.rows, at.col + at.cols / 2))
+        }
+        _ => keep,
+    };
     let Some((first, end, mid)) = keep else {
         return PetPane::EMPTY;
     };
@@ -4374,7 +4456,7 @@ mod tests {
                 &facts,
                 pane,
                 PetReserve::protected(&[]),
-                (None, keep),
+                (None, keep, None),
             ));
         };
         read(&mut world, Some((70, 90, 290)));
@@ -4455,7 +4537,7 @@ mod tests {
                 &facts,
                 pane,
                 PetReserve::protected(&[]),
-                (None, Some(keep)),
+                (None, Some(keep), None),
             ));
             assert_eq!(
                 (world.coverage().row, world.coverage().rows),
@@ -4483,11 +4565,101 @@ mod tests {
             &facts,
             pane,
             PetReserve::protected(&[]),
-            (None, Some((40, 52, 40))),
+            (None, Some((40, 52, 40)), None),
         ));
         assert_eq!(world.body_window().rows, 0);
         assert_eq!(world.examined_cells(), 60 * 80);
         assert_eq!(world.letter_at(45, 40), Some(true));
+    }
+
+    /// A READ ALONG THE BODY'S ROW PAST EITHER WINDOW IS READ AS FAR AS A WINDOW READS IT
+    /// ([`PetWorld::span_read_about`], ATERM-KI-1107-3): on a pane 100 rows by 300 columns, the
+    /// caret at its top left (the caret's window rows 0..64 and columns 0..256) and the window
+    /// about the body rows 2..9 about column 290 (columns 44..300), a letter at row 4 in column
+    /// 270. Along row 4, columns 13..297 are read whole by neither window, and read nothing:
+    /// about columns 13..18, which the caret's window alone reads, they are read as far as its
+    /// last column (13..256); about columns 280..285, which the window about the body alone
+    /// reads, from its first (44..297), the letter among them; about columns 100..110, which both
+    /// read, as far as the one that reads more of them (44..297). Columns 100..200, which the
+    /// caret's window reads whole, are read whole. A span past the pane's last column is read as
+    /// on a pane within the budget, not at all, wherever the body stands: columns 13..301 about
+    /// columns 13..18 (the caret's window's alone), 100..110 (both windows') and 280..285 (the
+    /// window about the body's alone), and columns 250..310 about columns 260..270. About
+    /// columns outside the span, or on a row neither window reads (row 70), nothing is read
+    /// either. A flight's landing the caret's window
+    /// does not read (rows 70..78 about column 290) places the window about the body there,
+    /// though the rows asked for about the body (2..9 about column 15) are the caret's window's,
+    /// and a letter at row 72 in column 290 is read; a landing it reads (rows 10..18 about
+    /// column 25) leaves the window as those rows ask for it: none.
+    #[test]
+    fn a_read_along_the_row_past_either_window_is_read_as_far_as_a_window_reads_it() {
+        let mut term = Terminal::new(100, 300);
+        term.process(b"\x1b[5;271Hx\x1b[73;291Hy\x1b[1;1H");
+        let (input, facts) = snapshot(&mut term);
+        let pane = PetPane::full(&input);
+        let mut world = PetWorld::default();
+        let read = |world: &mut PetWorld, keep, landing| {
+            assert!(world.observe_with_exclusions_near(
+                &input,
+                &facts,
+                pane,
+                PetReserve::protected(&[]),
+                (None, Some(keep), landing),
+            ));
+            world.body_window()
+        };
+        let window = |row, rows, col| PetPane {
+            row,
+            col,
+            rows,
+            cols: MAX_WORLD_COLS,
+        };
+        assert_eq!(read(&mut world, (2, 9, 290), None), window(2, 7, 44));
+        assert_eq!(world.coverage(), window(0, MAX_WORLD_ROWS, 0));
+        assert_eq!(world.locomotion_ink_in_span(4, 13, 297), None);
+        assert_eq!(
+            world.span_read_about(4, (13, 297), (13, 18)),
+            Some((13, 256))
+        );
+        assert_eq!(
+            world.span_read_about(4, (13, 297), (280, 285)),
+            Some((44, 297))
+        );
+        assert_eq!(world.locomotion_ink_in_span(4, 44, 297), Some(true));
+        assert_eq!(world.last_letter_in_span(4, 44, 297), Some(Some(270)));
+        assert_eq!(
+            world.span_read_about(4, (13, 297), (100, 110)),
+            Some((44, 297))
+        );
+        assert_eq!(
+            world.span_read_about(4, (100, 200), (120, 130)),
+            Some((100, 200))
+        );
+        for core in [(13, 18), (100, 110), (280, 285)] {
+            assert_eq!(world.span_read_about(4, (13, 301), core), None, "{core:?}");
+        }
+        assert_eq!(world.span_read_about(4, (250, 310), (260, 270)), None);
+        assert_eq!(world.span_read_about(4, (13, 100), (200, 210)), None);
+        assert_eq!(world.span_read_about(70, (13, 297), (280, 285)), None);
+        let landing = PetPane {
+            row: 70,
+            col: 285,
+            rows: 8,
+            cols: 10,
+        };
+        assert_eq!(
+            read(&mut world, (2, 9, 15), Some(landing)),
+            window(70, 8, 44)
+        );
+        assert_eq!(world.letter_at(72, 290), Some(true));
+        let landing = PetPane {
+            row: 10,
+            col: 20,
+            rows: 8,
+            cols: 10,
+        };
+        assert_eq!(read(&mut world, (2, 9, 15), Some(landing)).rows, 0);
+        assert_eq!(world.letter_at(72, 290), None);
     }
 
     #[test]
@@ -5232,7 +5404,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                (Some((3.0, 4.0)), None)
+                (Some((3.0, 4.0)), None, None)
             ),
             "the same screen is the same reading (a centre moves no window of a pane in budget)"
         );
@@ -5293,7 +5465,7 @@ mod tests {
                     &changed_facts,
                     pane,
                     reserve,
-                    (None, None)
+                    (None, None, None)
                 ),
                 "{what} moves the reading"
             );
@@ -5303,7 +5475,13 @@ mod tests {
             ..pane
         };
         assert!(
-            !reading.holds(consumed(&input), &facts, narrower, reserve, (None, None)),
+            !reading.holds(
+                consumed(&input),
+                &facts,
+                narrower,
+                reserve,
+                (None, None, None)
+            ),
             "the pane moves the reading"
         );
         let other = [PetRect::new(1.0, 2.0, 1.0, 4.0)];
@@ -5338,7 +5516,7 @@ mod tests {
             ),
         ] {
             assert!(
-                !reading.holds(consumed(&input), &facts, pane, moved, (None, None)),
+                !reading.holds(consumed(&input), &facts, pane, moved, (None, None, None)),
                 "the host's {what} move the reading"
             );
         }
@@ -5348,7 +5526,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                (None, None)
+                (None, None, None)
             ),
             "an unconsumed fill is always read"
         );
@@ -5361,7 +5539,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                (None, None)
+                (None, None, None)
             ),
             "a fill that re-extracted no row of the cells read keeps the reading"
         );
@@ -5371,7 +5549,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                (None, None)
+                (None, None, None)
             ),
             "a fill that re-extracted no row of other cells moves the reading"
         );
@@ -5386,7 +5564,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                (None, None)
+                (None, None, None)
             ),
             "a kept reading is named by the fill that kept it"
         );
@@ -5396,7 +5574,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                (None, None)
+                (None, None, None)
             ),
             "a kept reading is no longer named by the fill it was taken from"
         );
@@ -5408,7 +5586,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                (None, None)
+                (None, None, None)
             ),
             "a retained scratch a host wrote into is read"
         );
@@ -5439,7 +5617,13 @@ mod tests {
         host_wrote.snapshot_seq += 1;
         reading.note(consumed(&host_wrote), &facts, pane, reserve, None, UNREAD);
         assert!(
-            !reading.holds(consumed(&host_wrote), &facts, pane, reserve, (None, None)),
+            !reading.holds(
+                consumed(&host_wrote),
+                &facts,
+                pane,
+                reserve,
+                (None, None, None)
+            ),
             "a scratch a host wrote into is never kept"
         );
 
@@ -5459,7 +5643,7 @@ mod tests {
             &facts,
             pane,
             reserve,
-            (Some((30.0, 4.0)), None)
+            (Some((30.0, 4.0)), None, None)
         ));
         assert!(
             !reading.holds(
@@ -5467,7 +5651,7 @@ mod tests {
                 &facts,
                 pane,
                 reserve,
-                (Some((31.0, 4.0)), None)
+                (Some((31.0, 4.0)), None, None)
             ),
             "past the budget, the held centre moves the window"
         );
@@ -5483,12 +5667,18 @@ mod tests {
         let none = PetReserve::default();
         let mut world = PetWorld::default();
         let mut read = |reading: &mut PetReading, keep| {
-            assert!(world.observe_with_exclusions_near(&input, &facts, pane, none, (None, keep)));
+            assert!(world.observe_with_exclusions_near(
+                &input,
+                &facts,
+                pane,
+                none,
+                (None, keep, None)
+            ));
             let windows = (world.coverage(), world.body_window());
             reading.note(consumed(&input), &facts, pane, none, None, windows);
             world.body_window()
         };
-        let asks = |rows: (usize, usize)| (None, Some((rows.0, rows.1, 40)));
+        let asks = |rows: (usize, usize)| (None, Some((rows.0, rows.1, 40)), None);
         assert_eq!(
             read(&mut reading, Some((70, 80, 40))),
             PetPane {

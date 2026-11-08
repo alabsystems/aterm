@@ -51,7 +51,7 @@ fn desk() -> (App, String, TestHost) {
     app.windows
         .get_mut(&WindowId(0))
         .expect("window 0")
-        .band_on_screen_for_test = true;
+        .window_on_screen_for_test = true;
     (app, ctx.self_id.as_str().to_string(), host)
 }
 

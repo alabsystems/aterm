@@ -7,8 +7,9 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crate::exec::check_command as command;
 use aterm_json::Value;
-use aterm_uds::spawnfd::{Stdio, command};
+use aterm_uds::spawnfd::Stdio;
 
 use super::{
     Group, Halt, Ledger, Scratch, arena_dir, await_socket, build_aterm, ctl_out, in_scratch_world,

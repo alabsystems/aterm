@@ -295,6 +295,7 @@ impl<T> AppKitEventLoop<T> {
     fn new(attributes: &PlatformSpecificEventLoopAttributes) -> Result<Self, EventLoopError> {
         let mtm =
             MainThread::new().expect("on macOS, `EventLoop` must be created on the main thread!");
+        aterm_macos_ui::appkit::load();
 
         // SAFETY: `+sharedApplication` returns the process-lifetime singleton, retained here.
         let app = unsafe { Obj::retain(app()) }.expect("+sharedApplication to answer");

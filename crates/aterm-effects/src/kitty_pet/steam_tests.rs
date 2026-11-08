@@ -1002,9 +1002,15 @@ fn a_wall_that_holds_no_seat_hides_the_body_on_every_face() {
 /// reads at once ([`crate::pet_world::MAX_WORLD_ROWS`]).
 const TALL_ROWS: u16 = 100;
 
-/// How many columns wide the pane of [`FAR_LEAPS`]' wide scene is: past the columns the
+/// How many columns wide the pane of [`FAR_LEAPS`]' wide scenes is: past the columns the
 /// console's map reads at once ([`crate::pet_world::MAX_WORLD_COLS`]).
 const WIDE_COLS: u16 = 300;
+
+/// How many columns wide the pane of [`FAR_LEAPS`]' widest scene is: past the columns the
+/// caret's window and the window about the body read together
+/// (2 x [`crate::pet_world::MAX_WORLD_COLS`]), so a way from one to the other crosses columns
+/// neither reads.
+const WIDEST_COLS: u16 = 1_000;
 
 /// A scene of [`a_body_far_from_the_caret_reads_its_own_rows_on_every_face`]: the caret leaps
 /// far from the body and back, twice.
@@ -1028,7 +1034,7 @@ struct FarLeap {
     /// How many frames, at the fewest, the negative control's box meets the letters its law
     /// keeps it off ([`kept_off`] for [`FAR_LEAPS`], the row under's for [`TURNED_LEAPS`])
     /// between rows lettered to the margin, typed at the window and as the gallery types (a
-    /// scene from rest: the first).
+    /// scene from rest: the first; for [`ARC_LEAPS`], over all of a scene's controls).
     bites: [usize; 2],
 }
 
@@ -1037,8 +1043,11 @@ struct FarLeap {
 /// 11 x 28 px cells): from rest 38, 43 and 12 frames; after the Backspaces 9 at the window
 /// and 11 as the gallery types, on the tall pane, 37 and 39 on the wide one; from rest on a
 /// 160-row pane's 85th row 38 and 43; and from rest at a 100-row pane's foot, 88 rows up, 10
-/// standing on the prompt's row.
-const FAR_LEAPS: [FarLeap; 10] = [
+/// standing on the prompt's row; and 2026-11-08, from rest on the wide pane, 128 along the
+/// prompt's row to the 290th column (the rows over and under it), 153 five rows down there,
+/// 113 forty rows down there on a pane [`TALL_ROWS`] tall, and 359 along the row from the 15th
+/// column to the 990th of a pane [`WIDEST_COLS`] wide (ATERM-KI-1107-3's scenes).
+const FAR_LEAPS: [FarLeap; 14] = [
     FarLeap {
         name: "40j from rest",
         grid: (TALL_ROWS, COLS),
@@ -1119,54 +1128,102 @@ const FAR_LEAPS: [FarLeap; 10] = [
         to: (10, 58),
         bites: [6, 0],
     },
+    FarLeap {
+        name: "along the prompt's row to the 290th column from rest",
+        grid: (ROWS, WIDE_COLS),
+        typed: false,
+        from: (5, 15),
+        to: (5, 290),
+        bites: [85, 0],
+    },
+    FarLeap {
+        name: "5j to the 290th column from rest",
+        grid: (ROWS, WIDE_COLS),
+        typed: false,
+        from: (5, 15),
+        to: (10, 290),
+        bites: [102, 0],
+    },
+    FarLeap {
+        name: "40j to the 290th column from rest",
+        grid: (TALL_ROWS, WIDE_COLS),
+        typed: false,
+        from: (5, 15),
+        to: (45, 290),
+        bites: [75, 0],
+    },
+    FarLeap {
+        name: "along the prompt's row to the 990th column from rest",
+        grid: (ROWS, WIDEST_COLS),
+        typed: false,
+        from: (5, 15),
+        to: (5, 990),
+        bites: [239, 0],
+    },
 ];
 
 /// The frames (ms) from [`FROM`] in which `scene`'s box meets letters the head law keeps the
 /// body off (cells `ch` px tall): the row's beside the prompt's that its leaps do not cross (the
-/// row above's for a leap down, the row under's for one up), and for a leap up, the row above's
-/// while the box's foot stands on the prompt's row, before the flight crosses it.
+/// row above's for a leap down, the row under's for one up, both for a leap along the prompt's
+/// row), and for a leap up, the row above's while the box's foot stands on the prompt's row,
+/// before the flight crosses it.
 fn kept_off(frames: &[Frame], scene: FarLeap, ch: usize) -> Vec<u64> {
     let prompt = usize::from(scene.from.0) - 1;
     if scene.to.0 > scene.from.0 {
         return on_letters_of(frames, prompt - 1);
     }
+    let along = scene.to.0 == scene.from.0;
     let ground = ((prompt + 1) * ch) as i32;
     frames
         .iter()
         .filter(|f| {
             f.ms >= FROM
                 && f.boxed.iter().any(|c| {
-                    c.0 == prompt + 1 || (c.0 == prompt - 1 && f.pet.is_some_and(|p| p.3 >= ground))
+                    c.0 == prompt + 1
+                        || (c.0 == prompt - 1 && (along || f.pet.is_some_and(|p| p.3 >= ground)))
                 })
         })
         .map(|f| f.ms)
         .collect()
 }
 
-/// `scene` on `cell` px cells, between rows lettered to the margin (a sentence written on across
-/// the pane, over and under the prompt's row) or on a blank page, the laws in `old` reverted,
-/// keys typed as `ctl` says ([`replay`]).
+/// What a [`far_leap`] page holds beside the prompt's row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Page {
+    /// Rows lettered to the margin over and under it.
+    Between,
+    /// Nothing.
+    Blank,
+    /// A row lettered to the margin two over it, the row between blank: the row a bound's arc
+    /// keeps its head under (`PetBrain::arc_under_letters`).
+    TwoOver,
+}
+
+/// `scene` on `cell` px cells, on the `page` (a sentence written on across the pane where a row
+/// is lettered), the laws in `old` reverted, keys typed as `ctl` says ([`replay`]).
 fn far_leap(
     cell: (usize, usize),
     style: &str,
-    (scene, lettered): (FarLeap, bool),
+    (scene, page): (FarLeap, Page),
     old: &[OldPath],
     ctl: bool,
 ) -> Vec<Frame> {
-    let row = if lettered {
-        "the quick brown fox jumps over the lazy dog "
-            .repeat(usize::from(scene.grid.1))
-            .chars()
-            .take(usize::from(scene.grid.1))
-            .collect()
-    } else {
-        String::new()
+    let row: String = "the quick brown fox jumps over the lazy dog "
+        .repeat(usize::from(scene.grid.1))
+        .chars()
+        .take(usize::from(scene.grid.1))
+        .collect();
+    let prompt = scene.from.0;
+    let page = match page {
+        Page::Between => steam_page_at(prompt, (&row, &row)),
+        Page::Blank => steam_page_at(prompt, ("", "")),
+        Page::TwoOver => format!(
+            "\x1b[?1049h\x1b[2J\x1b[{}H{row}\x1b[{prompt}H$ ",
+            prompt - 2
+        ),
     };
     let at = |(r, c): (u16, u16)| format!("\x1b[{r};{c}H").into_bytes();
-    let mut ev = vec![(
-        0,
-        Ev::Out(steam_page_at(scene.from.0, (&row, &row)).into_bytes()),
-    )];
+    let mut ev = vec![(0, Ev::Out(page.into_bytes()))];
     let (leaps, tail) = if scene.typed {
         ev.extend(typed(TYPING_TEXT, TYPING_FROM, 60));
         let erase_from = TYPING_FROM + 60 * TYPING_TEXT.len() as u64 + 300;
@@ -1206,26 +1263,35 @@ fn far_leap(
 /// a body wherever the caret leaps. On the alternate screen between rows lettered to the margin
 /// ([`FAR_LEAPS`]), the program moves the caret far from the body and back, twice: 40, 58 and
 /// 70 rows down on a pane [`TALL_ROWS`] tall, from rest at the prompt's 58th column and after
-/// the Backspaces at its 15th; five rows down to the 290th column on a pane [`WIDE_COLS`] wide
-/// after the Backspaces; 40 and 58 rows down from rest on the 85th row of a pane 160 rows tall,
-/// where the window about the body reads rows far down the pane; and 88 rows up from rest at the
-/// foot of a pane [`TALL_ROWS`] tall. The body gathers to leap where it rests fitted to its row,
-/// far from the caret. From 600 ms, the cat and the dog, both ways of typing (a scene from rest
-/// types no key, and runs once): no frame's box meets the letters the head law keeps it off
-/// ([`kept_off`]: the row's beside the prompt's that the leaps do not cross, and for the leap up
-/// the row above's while the box stands on the prompt's row), and none moves more than
-/// [`STEP_ROWS`] rows from the frame before (measured at most 2.3). On a blank page the same
-/// leaps find no letters, and no frame draws the body down its row or fits it: the rows read
-/// about the body are read as they are, blank. Negative control (the law reverted alone, the cat
-/// and the dog, both ways of typing): the map reads about the caret alone, the head law reads
-/// none of the body's rows and lets its fit go as it gathers to leap, and its box meets those
-/// letters in each scene's [`FarLeap::bites`] frames or more (measured on Linux arm64,
-/// 2026-11-07: 38 or 39, 43 and 12 from rest; 9 or 10 at the window and 11 or 12 as the gallery
-/// types after the Backspaces on the tall pane, 37 and 39 on the wide one; 38 or 39 and 43 on
-/// the 160-row pane; 10 at the foot, standing on the prompt's row). In every scene the body
-/// follows the caret away from the prompt's rows in 60 frames or more (90 to 308), and between
-/// the lettered rows the head law holds it, drawn down or fitted, in 100 frames or more (153 to
-/// 374).
+/// the Backspaces at its 15th; five rows down to the 290th column on a pane [`WIDE_COLS`] wide,
+/// after the Backspaces and from rest, and 40 rows down to it from rest on a pane that wide and
+/// [`TALL_ROWS`] tall; along the prompt's row from rest, from its 15th column to its 290th on a
+/// pane [`WIDE_COLS`] wide and to its 990th on one [`WIDEST_COLS`] wide, a way longer than
+/// either window reads, which the head law reads as far as the window that reads the body's
+/// columns reaches (ATERM-KI-1107-3); 40 and 58 rows down from rest on the 85th row of a pane 160
+/// rows tall, where the window about the body reads rows far down the pane; and 88 rows up
+/// from rest at the foot of a pane [`TALL_ROWS`] tall. The body gathers to leap where it rests
+/// fitted to its row, far from the caret. From 600 ms, the cat and the dog, both ways of typing
+/// (a scene from rest types no key, and runs once): no frame's box meets the letters the head
+/// law keeps it off ([`kept_off`]: the row's beside the prompt's that the leaps do not cross,
+/// both for a leap along the prompt's row, and for the leap up the row above's while the box
+/// stands on the prompt's row), and none moves more than [`STEP_ROWS`] rows from the frame
+/// before (measured at most 2.3). On a blank page the same leaps find no letters, and no frame
+/// draws the body down its row or fits it: the rows read about the body are read as they are,
+/// blank. Negative control (the law reverted alone, the cat and the dog, both ways of typing):
+/// the map reads about the caret alone and a read longer than a window reads nothing, the head
+/// law reads none of the body's rows and lets its fit go as it gathers to leap or sets off, and
+/// its box meets those letters in each scene's [`FarLeap::bites`] frames or more (measured on
+/// Linux arm64, 2026-11-07: 38 or 39, 43 and 12 from rest; 9 or 10 at the window and 11 or 12
+/// as the gallery types after the Backspaces on the tall pane, 37 and 39 on the wide one; 38 or
+/// 39 and 43 on the 160-row pane; 10 at the foot, standing on the prompt's row; 2026-11-08: 153
+/// and 113 to the 290th column from rest, 128 along the row to it, 359 along the row to the
+/// 990th). In every scene the body follows the caret away: off the prompt's rows in 60 frames
+/// or more (90 to 308), and along the row, from the caret's first leap, drawn with its box's
+/// middle past halfway in 34 or more (52 to 105; on the pane [`WIDEST_COLS`] wide it runs to
+/// the 602nd column). With the law, between the lettered rows the head law holds it, drawn down
+/// or fitted, in 100 frames or more (164 to 469); reverted, the fit lets go where the law reads
+/// nothing, so the control is not held to that (63 frames on the pane [`WIDEST_COLS`] wide).
 #[test]
 fn a_body_far_from_the_caret_reads_its_own_rows_on_every_face() {
     let mut runs = Vec::new();
@@ -1237,43 +1303,48 @@ fn a_body_far_from_the_caret_reads_its_own_rows_on_every_face() {
                 } else {
                     &[false][..]
                 } {
-                    for (lettered, control) in [(true, false), (false, false), (true, true)] {
-                        runs.push((scene, cell, style, *ctl, lettered, control));
+                    for (page, control) in [
+                        (Page::Between, false),
+                        (Page::Blank, false),
+                        (Page::Between, true),
+                    ] {
+                        runs.push((scene, cell, style, *ctl, page, control));
                     }
                 }
             }
         }
     }
-    let seen = aterm_spec::check::each(&runs, |&(scene, cell, style, ctl, lettered, control)| {
+    let seen = aterm_spec::check::each(&runs, |&(scene, cell, style, ctl, page, control)| {
         let old: &[OldPath] = if control {
             &[OldPath::WorldReadsTheBodysRows]
         } else {
             &[]
         };
-        let frames = far_leap(cell, style, (scene, lettered), old, ctl);
+        let frames = far_leap(cell, style, (scene, page), old, ctl);
         let held: Vec<u64> = frames
             .iter()
             .filter(|f| f.ms >= FROM && (f.sink_fit.0 > 0.0 || f.sink_fit.1 < 1.0))
             .map(|f| f.ms)
             .collect();
-        let prompt = usize::from(scene.from.0) - 1;
         (
-            away_from_the_prompt(&frames, prompt, cell.1),
+            away(&frames, scene, cell),
             kept_off(&frames, scene, cell.1),
             held,
             largest_step(&frames, cell.1),
         )
     });
-    for (&(scene, cell, style, ctl, lettered, control), (away, met, held, step)) in
+    for (&(scene, cell, style, ctl, page, control), (away, met, held, step)) in
         runs.iter().zip(&seen)
     {
         let name = scene.name;
+        let lettered = page == Page::Between;
+        let follows = if scene.to.0 == scene.from.0 { 34 } else { 60 };
         assert!(
-            *away >= 60,
+            *away >= follows,
             "fixture: {style} on {cell:?} ({name}, ctl {ctl}) follows the caret ({away} frames)"
         );
         assert!(
-            !lettered || held.len() >= 100,
+            !lettered || control || held.len() >= 100,
             "fixture: {style} on {cell:?} ({name}, ctl {ctl}) is fitted under the lettered rows \
              ({} frames)",
             held.len()
@@ -1302,6 +1373,99 @@ fn a_body_far_from_the_caret_reads_its_own_rows_on_every_face() {
     }
 }
 
+/// The leaps of [`a_bound_along_the_row_keeps_its_head_under_the_row_two_over_on_every_face`],
+/// from rest at the prompt's 15th column on a pane [`WIDE_COLS`] wide to the 290th column some
+/// rows down and back, under a row lettered two over the prompt's ([`Page::TwoOver`]). Each
+/// control's floor ([`FarLeap::bites`], the first) counts the frames over all of the scene's
+/// controls (the cat and the dog, 13 x 29, 14 x 26 and 11 x 28 px cells): two thirds of those
+/// measured on Linux arm64, 2026-11-08.
+const ARC_LEAPS: [FarLeap; 2] = [
+    FarLeap {
+        name: "5j to the 290th column from rest, a row two over the prompt lettered",
+        grid: (ROWS, WIDE_COLS),
+        typed: false,
+        from: (5, 15),
+        to: (10, 290),
+        bites: [6, 0],
+    },
+    FarLeap {
+        name: "40j to the 290th column from rest, a row two over the prompt lettered",
+        grid: (TALL_ROWS, WIDE_COLS),
+        typed: false,
+        from: (5, 15),
+        to: (45, 290),
+        bites: [6, 0],
+    },
+];
+
+/// A BOUND ALONG THE ROW PAST EITHER WINDOW KEEPS ITS HEAD UNDER THE ROW TWO OVER
+/// (`PetBrain::arc_under_letters`, read about the body, [`OldPath::WorldReadsTheBodysRows`]), on
+/// every face's cells ([`CELLS`]): on a pane past the columns the console's map reads at once,
+/// under a row lettered two over the prompt's, the row between blank ([`ARC_LEAPS`]), the caret
+/// leaps from rest to the 290th column some rows down and back, twice. The body follows it, and
+/// comes back to the prompt's row in a bound along a row whose arc's way, 275 columns, is longer
+/// than either window reads: the arc reads the row two over as far either way from the body as
+/// the window about it reaches, finds its letters and keeps its head under them. From 600 ms,
+/// the cat and the dog: no frame's box meets the letters two rows over the prompt's (the box's
+/// top measured at 88, 79 and 85 px on 13 x 29, 14 x 26 and 11 x 28 px cells, under that row's
+/// foot at 87, 78 and 84). Negative control (the law reverted alone): the arc reads nothing of a
+/// way that long and rises its whole arc, its box meets those letters in 1 or 2 frames of
+/// each run, the scene's [`FarLeap::bites`] or more over its six (measured 10 in each scene,
+/// its top at 79, 74 and 76 px, Linux arm64, 2026-11-08). In every run the body follows the
+/// caret off the prompt's rows in 60 frames or more (179 to 255).
+#[test]
+fn a_bound_along_the_row_keeps_its_head_under_the_row_two_over_on_every_face() {
+    let mut runs = Vec::new();
+    for scene in ARC_LEAPS {
+        for cell in CELLS {
+            for style in STYLES {
+                for control in [false, true] {
+                    runs.push((scene, cell, style, control));
+                }
+            }
+        }
+    }
+    let seen = aterm_spec::check::each(&runs, |&(scene, cell, style, control)| {
+        let old: &[OldPath] = if control {
+            &[OldPath::WorldReadsTheBodysRows]
+        } else {
+            &[]
+        };
+        let frames = far_leap(cell, style, (scene, Page::TwoOver), old, false);
+        let prompt = usize::from(scene.from.0) - 1;
+        (
+            away(&frames, scene, cell),
+            on_letters_of(&frames, prompt - 2),
+        )
+    });
+    for scene in ARC_LEAPS {
+        let met: usize = runs
+            .iter()
+            .zip(&seen)
+            .filter(|(run, _)| run.0.name == scene.name && run.3)
+            .map(|(_, (_, met))| met.len())
+            .sum();
+        assert!(
+            met >= scene.bites[0],
+            "negative control ({}): read about the caret alone, the bound's box met the letters \
+             two rows over the prompt's in only {met} frames",
+            scene.name
+        );
+    }
+    for (&(scene, cell, style, control), (away, met)) in runs.iter().zip(&seen) {
+        let name = scene.name;
+        assert!(
+            *away >= 60,
+            "fixture: {style} on {cell:?} ({name}) follows the caret ({away} frames)"
+        );
+        assert!(
+            control || met.is_empty(),
+            "{style} on {cell:?} ({name}): frames at {met:?} ms whose box meets the letters two \
+             rows over the prompt's"
+        );
+    }
+}
+
 /// How many rows a frame's box's top may move from the frame before's, at the most
 /// ([`a_body_far_from_the_caret_reads_its_own_rows_on_every_face`],
 /// [`a_flight_re_aimed_keeps_its_take_off_top_while_its_way_is_down_on_every_face`]): a body's
@@ -1318,6 +1482,32 @@ fn largest_step(frames: &[Frame], ch: usize) -> f32 {
         .max()
         .map_or(0.0, |px| px as f32 / ch as f32)
 }
+
+/// How many frames show the body followed `scene`'s caret away, on `cell` px cells: from
+/// [`FROM`], off the prompt's rows ([`away_from_the_prompt`]); for a leap along the prompt's row,
+/// from the caret's first leap ([`LEFT_REST`]), drawn with the box's middle past the column
+/// halfway from the rest to the leap's. A frame that draws no body counts in neither: a body
+/// faded out has followed nothing, and meets no letters.
+fn away(frames: &[Frame], scene: FarLeap, (cw, ch): (usize, usize)) -> usize {
+    if scene.to.0 != scene.from.0 {
+        return away_from_the_prompt(frames, usize::from(scene.from.0) - 1, ch);
+    }
+    let half = (i32::from(scene.from.1) + i32::from(scene.to.1) - 2) * cw as i32 / 2;
+    let right = scene.to.1 > scene.from.1;
+    frames
+        .iter()
+        .filter(|f| {
+            f.ms >= LEFT_REST
+                && f.pet.is_some_and(|p| {
+                    let mid = (p.0 + p.1) / 2;
+                    if right { mid > half } else { mid < half }
+                })
+        })
+        .count()
+}
+
+/// When (ms) a [`far_leap`] from rest has the caret leave the rest for the first time.
+const LEFT_REST: u64 = 1_500;
 
 /// How many frames from [`FROM`] have the box's foot past the row under the prompt's row
 /// `prompt` (counted from 0), or over the row above it (cells `ch` px tall): the body has
@@ -1425,7 +1615,7 @@ fn a_flight_re_aimed_keeps_its_take_off_top_while_its_way_is_down_on_every_face(
                 } else {
                     &[]
                 };
-                let frames = far_leap(cell, style, (scene, true), old, false);
+                let frames = far_leap(cell, style, (scene, Page::Between), old, false);
                 (frames, usize::from(scene.from.0) - 1)
             }
             None => {

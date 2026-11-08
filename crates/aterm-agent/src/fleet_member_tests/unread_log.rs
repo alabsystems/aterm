@@ -64,6 +64,27 @@ fn relabel(registry: &aterm_db::alab::Registry, mac: &str, label: &str) {
 }
 
 #[test]
+fn an_unbudgeted_local_roster_read_waits_for_its_writer() {
+    let lab = Lab::new("default-roster-writer");
+    let expected = roster_of(&lab.paths).unwrap().unwrap().to_toml();
+    let held = std::rc::Rc::new(std::cell::RefCell::new(Some(
+        client::test_hold_state_lock(&lab.paths).unwrap(),
+    )));
+    let released = std::rc::Rc::clone(&held);
+    let actual = client::test_with_denied_nodes_busy(
+        move || drop(released.borrow_mut().take()),
+        || roster_of_started(&lab.paths, Instant::now() - Duration::from_secs(4)),
+    );
+    drop(held.borrow_mut().take());
+    assert_eq!(actual.unwrap().unwrap().to_toml(), expected);
+
+    let held = client::test_hold_state_lock(&lab.paths).unwrap();
+    assert!(roster_of_started(&lab.paths, Instant::now() - Duration::from_secs(61)).is_err());
+    drop(held);
+    assert_eq!(roster_of(&lab.paths).unwrap().unwrap().to_toml(), expected);
+}
+
+#[test]
 fn a_registry_label_waits_for_its_local_writer() {
     let lab = Lab::new("registry-label-writer");
     label_this_mac(&lab, "m42");

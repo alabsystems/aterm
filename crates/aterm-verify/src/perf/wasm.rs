@@ -14,8 +14,8 @@ use aterm_uds::output::CommandOutput as _;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::exec::check_command as command;
 use aterm_json::{Value, json};
-use aterm_uds::spawnfd::command;
 
 use super::LaneRun;
 use super::floors::{self, FloorLane};

@@ -20,7 +20,9 @@ use crate::toolchain_words::{self, HookDialect, SnapshotWords};
 use crate::update_words;
 use crate::{App, WindowId};
 
-/// Every center in this process shares one CSPRNG-seeded confirmation sequence.
+/// A glass-less center ([`aterm_messages::Glass::Glassless`]): the native app paints no message
+/// band, so a row is at the front once revealed and its hold ends it. Every center in this process
+/// shares one CSPRNG-seeded confirmation sequence.
 pub(crate) fn new_center(
     log: aterm_messages::MessageLog,
     now: Instant,
@@ -31,7 +33,7 @@ pub(crate) fn new_center(
             aterm_uds::rand::fill(bytes).is_ok()
         }))
     });
-    aterm_messages::MessageCenter::with_confirmations(log, now, Arc::clone(source))
+    aterm_messages::MessageCenter::glassless(log, now, Arc::clone(source))
 }
 
 pub(crate) const MESSAGES_FLUSH_UI_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1869,7 +1871,7 @@ impl App {
         self.withdraw_owed_row(update_words::KEY_AWAITS_START);
     }
 
-    /// Posts `msg` and queues it as owed if no window currently has a visible band.
+    /// Posts `msg` and queues it as owed if no window is on screen.
     pub(crate) fn say_owed_unless_seen(&mut self, msg: Message) {
         self.post_message(msg.clone());
         self.owe_unless_seen(msg);
@@ -1889,7 +1891,7 @@ impl App {
         };
         if let Some(owed) = self.rows_owed.iter_mut().find(|owed| owed.key == key) {
             owed.msg = msg;
-        } else if !self.any_band_on_screen() {
+        } else if !self.any_window_on_screen() {
             self.rows_owed.push(OwedRow {
                 key,
                 msg,
@@ -1908,15 +1910,19 @@ impl App {
         self.rows_owed.retain(|owed| owed.key != key);
     }
 
-    fn any_band_on_screen(&self) -> bool {
-        self.windows.values().any(|ws| band_on_screen(ws))
+    fn any_window_on_screen(&self) -> bool {
+        self.windows.values().any(|ws| window_on_screen(ws))
     }
 
+    /// Keeps each owed row ([`OwedRow`]) live until a window is on screen: until then every
+    /// settle restates its hold, so the hold runs from when one is; a row revealed while one is
+    /// counts as seen for good, its hold left to end it though the window leaves the screen, and
+    /// is forgotten once it has.
     fn keep_owed_rows(&mut self, now: Instant) {
         if self.rows_owed.is_empty() || self.message_holds_frozen() {
             return;
         }
-        let on_screen = self.any_band_on_screen();
+        let on_screen = self.any_window_on_screen();
         let mut owed_rows = std::mem::take(&mut self.rows_owed);
         owed_rows.retain_mut(|owed| {
             let live: Vec<MessageId> = self
@@ -1926,14 +1932,14 @@ impl App {
                 .map(|l| l.id)
                 .collect();
             if live.is_empty() {
-                // Shown on screen and gone: its hold ran out where it was seen,
+                // Seen and gone: its hold ran out once a window was on screen,
                 // or the person put it away.
                 if owed.seen {
                     return false;
                 }
                 if on_screen && self.messages.has_live_capacity() {
                     aterm_log::info!(
-                        "message: left unseen, posted again for a visible band: {}",
+                        "message: left unseen, posted again for a window on screen: {}",
                         logged_as(&owed.msg)
                     );
                     let id = self.post_unsynced_at(owed.msg.clone(), wall_stamp_now(), now);
@@ -1941,24 +1947,23 @@ impl App {
                 }
                 return true;
             }
+            if owed.seen {
+                return true;
+            }
             let showing = on_screen
                 && live
                     .iter()
                     .any(|id| self.messages.live(*id).is_some_and(|row| !row.is_queued()));
-            if showing && owed.seen {
-                return true;
-            }
             let hold = Restatement {
                 hold: Some(owed.msg.hold),
                 ..Restatement::default()
             };
             for id in live {
                 self.messages.restate(id, hold.clone(), now);
-                self.messages.restart_patience(id, now);
             }
             if showing {
                 aterm_log::info!(
-                    "message: said while no window was on screen, shown now: {}",
+                    "message: said while no window was on screen, on screen now: {}",
                     logged_as(&owed.msg)
                 );
                 self.note_message_rule();
@@ -2311,13 +2316,13 @@ pub(crate) fn assert_completes_in_place(msg: &Message, finished: &str) {
     }
 }
 
-/// Returns whether window `ws` is visible on screen and capable of showing the message band.
-pub(crate) fn band_on_screen(ws: &crate::WindowState) -> bool {
+/// Returns whether window `ws` is visible on screen.
+pub(crate) fn window_on_screen(ws: &crate::WindowState) -> bool {
     let shown = ws.pending_reveal.is_none() && !ws.occluded;
     #[cfg(test)]
     {
         crate::work_counts::on_screen_asked();
-        if ws.band_on_screen_for_test {
+        if ws.window_on_screen_for_test {
             return shown;
         }
     }
@@ -2349,7 +2354,7 @@ impl App {
                 owed: self
                     .rows_owed
                     .iter()
-                    .any(|owed| owed.key == said.kind.key()),
+                    .any(|owed| owed.key == said.kind.key() && !owed.seen),
             })
             .collect()
     }
@@ -2584,7 +2589,7 @@ impl App {
     }
 }
 
-/// Band row posted while no window was visible, held to re-post when a window appears.
+/// Row posted while no window was on screen, kept live (or posted again) until one is.
 #[derive(Clone, Debug)]
 pub(crate) struct OwedRow {
     key: String,

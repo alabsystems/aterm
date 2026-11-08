@@ -102,7 +102,22 @@ pub(super) struct Owner {
     started: bool,
     ready: bool,
     original: Option<process::Lineage>,
+    retirement: Option<NoForkTarget>,
     deadline: Instant,
+}
+
+/// A native pre-GO observation owned by the two-stop preparation that enforced
+/// it. There is no constructor from a PID, acknowledgement or wire observation.
+pub(crate) struct NoForkTarget {
+    original: process::Lineage,
+}
+impl NoForkTarget {
+    pub(crate) fn matches(&self, pid: u32, birth: u64, group: i32) -> bool {
+        self.original.identity.pid == pid as i32
+            && self.original.identity.birth.0 == birth
+            && self.original.pgid == pid
+            && group == pid as i32
+    }
 }
 impl Owner {
     pub(super) fn new(
@@ -147,6 +162,7 @@ impl Owner {
                 started: false,
                 ready: false,
                 original: None,
+                retirement: None,
                 deadline,
             },
             prelude,
@@ -278,6 +294,7 @@ impl Owner {
             || current.uniqueid != original.uniqueid
             || current.parent != original.parent
             || current.pgid != original.pgid
+            || current.pgid != pid
             || unsafe { libc::getsid(pid as i32) } != pid as i32
             || !no_fork(pid)?
         {
@@ -295,7 +312,12 @@ impl Owner {
             return Err(refused_at("selected image stop was not acknowledged"));
         }
         self.ready = true;
+        self.retirement = Some(NoForkTarget { original: current });
         Ok(true)
+    }
+
+    pub(super) fn take_retirement(&mut self) -> Option<NoForkTarget> {
+        self.retirement.take()
     }
 }
 

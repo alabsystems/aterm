@@ -82,10 +82,11 @@ pub const CHECKS: [Spec; 19] = [
         stages: &[StageId::ExportScan],
         reach: Reach::Selection,
         needs: &["gitleaks"],
-        also: "the publication engine's checkout (~/publication or $PUBLICATION_ENGINE)",
+        also: "one commit of the publication engine ($PUBLICATION_ENGINE's HEAD, else the main \
+               of the origin the release's engine copy, else ~/publication, names, fetched)",
         runs: "the publication engine's content guards (forbidden content, private references, \
-               gitleaks with its config policy and the engine's adjudication), offline, over the \
-               export of what the change touched (-p, --all, or a change under publish/, to \
+               gitleaks with its config policy and the engine's adjudication) over the export of \
+               what the change touched (-p, --all, or a change under publish/, to \
                gitleaks' config or to the export's transforms: the whole export)",
     },
     Spec {

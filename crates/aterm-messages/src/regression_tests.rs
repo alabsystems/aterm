@@ -4,7 +4,7 @@
 //! Regression repros across the engine: each test states the behaviour it pins.
 
 use crate::carry::{CarriedMessage, Carry};
-use crate::center::{EchoKind, MessageCenter, Outcome};
+use crate::center::{EchoKind, Glass, MessageCenter, Outcome};
 use crate::glass::{Links, Presentation, RowKind, RowSpec, layout_row, layout_row_with};
 use crate::log::{LogLine, LogRecord, LogState, MessageLog, Retired, Shelf};
 use crate::model::{
@@ -1007,6 +1007,7 @@ fn view_at(at_unix_ms: u64) -> MessageView {
         detail: Vec::new(),
         state: "recorded",
         on_glass: None,
+        glass: Glass::Band,
         repeats: 1,
         retired_unix_ms: None,
         superseded_by: None,

@@ -1358,7 +1358,7 @@ fn a_fork_lane_successor_gets_the_page_once_its_reading_is_its_own() {
 /// An update's successor with `entries` its predecessor raised: the successor reads the
 /// predecessor's log at launch and adopts each open entry under the id it had there.
 fn successor_holding(entries: &[&aterm_messages::exceptions::Entry]) -> App {
-    use aterm_messages::{LogLine, MessageCenter, MessageLog};
+    use aterm_messages::{LogLine, MessageLog};
     let mut predecessor = App::headless_for_test();
     for entry in entries {
         predecessor.except(entry);
@@ -1372,7 +1372,7 @@ fn successor_holding(entries: &[&aterm_messages::exceptions::Entry]) -> App {
     let mut log = MessageLog::empty();
     log.replay_all(lines);
     let now = Instant::now();
-    let mut center = MessageCenter::new(log, now);
+    let mut center = crate::messages_host::new_center(log, now);
     assert_eq!(
         center.adopt_digest(crate::messages_host::wall_stamp_now(), now),
         entries.len()

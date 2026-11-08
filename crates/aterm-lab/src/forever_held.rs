@@ -667,10 +667,10 @@ pub fn said(seen: &Seen, cx: &Ctx<'_>, (ts, line): &(i64, String)) -> Verdict {
 }
 
 /// The rows `ctl messages tag=harness` printed of tab `sid`'s resume ask (`harness.resume-ask.<sid>`,
-/// the band a `Now` exception raises): `<id> state=<state> title=<title>` each, `|` apart, its
+/// the row a `Now` exception raises): `<id> state=<state> title=<title>` each, `|` apart, its
 /// title decoded; `-` where none.
 #[must_use]
-pub fn band_rows(messages: &str, sid: &str) -> String {
+pub fn resume_ask_rows(messages: &str, sid: &str) -> String {
     let key = format!("harness.resume-ask.{sid}");
     let rows: Vec<String> = messages
         .lines()
@@ -694,13 +694,13 @@ pub fn band_rows(messages: &str, sid: &str) -> String {
 
 /// Any live resume-ask row is an alert regression, irrespective of its title.
 #[must_use]
-pub fn stop_rows(band: &str) -> Vec<&str> {
-    band.split(" | ")
+pub fn stop_rows(rows: &str) -> Vec<&str> {
+    rows.split(" | ")
         .filter(|row| word(row, "state").as_deref() == Some("live"))
         .collect()
 }
 
-/// When same-land's person types their turn into its held tab (§14.3: the band is withdrawn once
+/// When same-land's person types their turn into its held tab (§14.3: the row is withdrawn once
 /// the hold lifts, and someone's turn lifts it): once it was held and watched past its hold
 /// ([`watched_past`]), the looks had; never twice.
 #[must_use]
@@ -824,12 +824,12 @@ pub fn three_a(seen: &Seen, cx: &Ctx<'_>, (ts, line): &(i64, String)) -> Verdict
     } else {
         skipped.push("the state line: SKIPPED (--no-surfaces)".into());
     }
-    let band = observed(&seen.band, &seen.band_reads, from, until);
-    if band.is_empty() {
+    let asks = observed(&seen.harness, &seen.harness_reads, from, until);
+    if asks.is_empty() {
         unread.push("`ctl messages` was not read while it held".into());
     }
     {
-        let after = observed(&seen.band, &seen.band_reads, ts - 1, seen.end_ms + 1);
+        let after = observed(&seen.harness, &seen.harness_reads, ts - 1, seen.end_ms + 1);
         match after.iter().find(|(_, b)| !stop_rows(b).is_empty()) {
             Some((t, b)) => bad.push(format!(
                 "+{} a removed `Stopped typing` alert row: {}",
@@ -845,8 +845,9 @@ pub fn three_a(seen: &Seen, cx: &Ctx<'_>, (ts, line): &(i64, String)) -> Verdict
             None => unread.push("no person's turn was typed past its looks".into()),
             Some(p) => {
                 let lift = seen.journal.iter().find(|(t, l)| *t >= p && is_lift(l));
-                let past = lift
-                    .map(|(tl, _)| observed(&seen.band, &seen.band_reads, *tl, seen.end_ms + 1));
+                let past = lift.map(|(tl, _)| {
+                    observed(&seen.harness, &seen.harness_reads, *tl, seen.end_ms + 1)
+                });
                 match (lift, past) {
                     (Some((tl, _)), Some(past)) if past.is_empty() => unread.push(format!(
                         "the person's turn at +{} lifted the hold at +{}; `ctl messages` was not \

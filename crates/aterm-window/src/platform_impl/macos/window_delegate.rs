@@ -346,7 +346,7 @@ unsafe fn dragged_paths(sender: Id) -> Option<Vec<std::path::PathBuf>> {
     // `NSPasteboard`; `-propertyListForType:` is `@@:@` and answers nil when empty.
     unsafe {
         let pb = send_id(sender, sel!(draggingPasteboard));
-        let list = send_id_id(pb, sel!(propertyListForType:), seam::NS_FILENAMES_PBOARD_TYPE);
+        let list = send_id_id(pb, sel!(propertyListForType:), seam::filenames_pboard_type());
         if list.is_null() {
             return None;
         }
@@ -471,14 +471,14 @@ fn new_window(
         unsafe {
             send_v_bool(v, sel!(setWantsBestResolutionOpenGLSurface:), true);
 
-            if seam::NS_APPKIT_VERSION_NUMBER.floor() > consts::NS_APPKIT_VERSION_NUMBER_10_12 {
+            if seam::version_number().floor() > consts::NS_APPKIT_VERSION_NUMBER_10_12 {
                 send_v_bool(v, sel!(setWantsLayer:), true);
             }
 
             send_v_id(ns, sel!(setContentView:), v);
             send_v_id(ns, sel!(setInitialFirstResponder:), v);
 
-            let types = [seam::NS_FILENAMES_PBOARD_TYPE];
+            let types = [seam::filenames_pboard_type()];
             let arr = send_id_idptr_usize(
                 class(c"NSArray").as_id(),
                 sel!(arrayWithObjects:count:),
@@ -1202,7 +1202,7 @@ pub unsafe fn appearance_to_theme(appearance: Id) -> Theme {
     // `-bestMatchFromAppearancesWithNames:` `@@:@` on `NSAppearance` and `-isEqualToString:`
     // `B@:@` on `NSString`; both names are live for the whole call.
     unsafe {
-        let names = [seam::NS_APPEARANCE_NAME_AQUA, dark.id()];
+        let names = [seam::appearance_name_aqua(), dark.id()];
         let arr = send_id_idptr_usize(
             class(c"NSArray").as_id(),
             sel!(arrayWithObjects:count:),
@@ -1224,9 +1224,8 @@ pub unsafe fn appearance_to_theme(appearance: Id) -> Theme {
 
 fn theme_to_appearance(theme: Option<Theme>) -> Option<aterm_objc::Obj> {
     let dark;
-    // SAFETY: `NS_APPEARANCE_NAME_AQUA` is an AppKit global that lives for the process.
     let name = match theme? {
-        Theme::Light => unsafe { seam::NS_APPEARANCE_NAME_AQUA },
+        Theme::Light => seam::appearance_name_aqua(),
         Theme::Dark => {
             dark = dark_appearance_name();
             dark.id()

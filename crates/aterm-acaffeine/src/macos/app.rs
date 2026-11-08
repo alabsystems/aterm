@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use aterm_macos_ui::appkit::class;
 use aterm_objc::send::{
     send_bool_isize, send_f64, send_id, send_id_idptr_usize,
     send_id_usize_point_usize_f64_isize_id_i16_isize_isize, send_isize, send_u32, send_usize,
     send_v, send_v_id, send_v_id_bool, send_v_id_sel_id_id, send_v_sel_id_f64,
 };
-use aterm_objc::{Bool, CGPoint, Id, MainThread, Obj, Retained, Sel, autoreleasepool, class, sel};
+use aterm_objc::{Bool, CGPoint, Id, MainThread, Obj, Retained, Sel, autoreleasepool, sel};
 
 use super::ServeContext;
 use super::awake::{AWAKE_REASON, Awake};
@@ -29,9 +30,6 @@ use crate::model::{Clocks, Hold, Machine, Mode};
 use crate::notify::ChangedObserver;
 use crate::paths::Paths;
 use crate::state;
-
-#[link(name = "AppKit", kind = "framework")]
-unsafe extern "C" {}
 
 /// `NSApplicationActivationPolicyAccessory`.
 const ACTIVATION_POLICY_ACCESSORY: isize = 1;
@@ -1101,6 +1099,7 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
     let Some(main) = MainThread::new() else {
         return Unstarted::NotMainThread.exit(&ctx.paths);
     };
+    aterm_macos_ui::appkit::load();
     let ServeContext {
         paths,
         label,

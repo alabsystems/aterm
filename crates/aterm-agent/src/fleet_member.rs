@@ -2005,7 +2005,23 @@ fn reserve_fleet_port(host: &str, preferred: Option<u16>) -> io::Result<std::net
 fn join(places: &Places, opts: &Opts, code_text: &str) -> Result<String, Failure> {
     // Local vault contention has its own bound. The later issuer exchange retains its existing
     // network budget, so waiting for a local apply does not shorten a healthy registration.
-    join_with_denial_deadline(places, opts, code_text, after_now(join_within()))
+    join_with_denial_elapsed(places, opts, code_text, Duration::ZERO)
+}
+
+const LOCAL_DENIAL_WAIT: Duration = Duration::from_secs(60);
+
+fn join_with_denial_elapsed(
+    places: &Places,
+    opts: &Opts,
+    code_text: &str,
+    elapsed: Duration,
+) -> Result<String, Failure> {
+    join_with_denial_deadline(
+        places,
+        opts,
+        code_text,
+        after_now(LOCAL_DENIAL_WAIT.saturating_sub(elapsed)),
+    )
 }
 
 fn join_with_denial_deadline(
@@ -5073,7 +5089,7 @@ fn peer_is_denied_or_held_out(
 /// How long a verb that names Macs by their swarm labels and names no deadline of its own (`allow
 /// drive`, `name set`, the fleet name's follow) waits out a vault writer that holds this Mac's
 /// state lock before it reads the roster ([`hold_roster`]).
-const ROSTER_WAIT: Duration = PEER_CHECK_WITHIN;
+const ROSTER_WAIT: Duration = Duration::from_secs(60);
 
 thread_local! {
     /// The swarm roster this thread's verb read once for its whole resolution ([`hold_roster`]),
@@ -5163,6 +5179,13 @@ fn hold_roster(places: &Places, by: Instant) -> RosterHeld {
 fn roster_of(
     paths: &aterm_secrets::client::Paths,
 ) -> Result<Option<aterm_secrets::swarm_roster::SwarmRoster>, String> {
+    roster_of_started(paths, Instant::now())
+}
+
+fn roster_of_started(
+    paths: &aterm_secrets::client::Paths,
+    started: Instant,
+) -> Result<Option<aterm_secrets::swarm_roster::SwarmRoster>, String> {
     let held = HELD_ROSTER.with(|held| {
         held.borrow()
             .as_ref()
@@ -5171,7 +5194,7 @@ fn roster_of(
     });
     match held {
         Some(roster) => Ok(roster),
-        None => aterm_secrets::client::swarm_roster_until(paths, after_now(ROSTER_WAIT))
+        None => aterm_secrets::client::swarm_roster_until(paths, started + ROSTER_WAIT)
             .map_err(|why| format!("swarm roster unread: {why}")),
     }
 }
@@ -6846,6 +6869,16 @@ fn converge_under(
     under: Option<&crate::fleet_vault::Vault>,
     at: &Opts,
 ) -> Result<FleetSync, Failure> {
+    converge_under_elapsed(places, code, under, at, Duration::ZERO)
+}
+
+fn converge_under_elapsed(
+    places: &Places,
+    code: &str,
+    under: Option<&crate::fleet_vault::Vault>,
+    at: &Opts,
+    denial_elapsed: Duration,
+) -> Result<FleetSync, Failure> {
     let parsed = JoinCode::parse(code).map_err(failed)?;
     let current = FleetSecret::new(&parsed.secret).map_err(failed)?;
     let from = match sync_plan(places, &parsed, &current)? {
@@ -6871,7 +6904,7 @@ fn converge_under(
         adverts: at.adverts.clone(),
         ..Opts::default()
     };
-    match join(places, &opts, code) {
+    match join_with_denial_elapsed(places, &opts, code, denial_elapsed) {
         Ok(joined) => Ok(FleetSync::Joined(joined)),
         Err(failure) => {
             if opts.saw_capacity.load(std::sync::atomic::Ordering::Relaxed) {

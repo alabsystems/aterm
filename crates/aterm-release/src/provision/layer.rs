@@ -28,10 +28,20 @@ pub(crate) trait ReleaseHost: Send + Sync {
     /// `/usr/bin/openssl version`'s line; `None` off macOS, where no LibreSSL is wanted.
     fn openssl(&self) -> Option<Result<String, String>>;
 
-    /// The publication engine's checkout: `$PUBLICATION_ENGINE` (a release hands each child its
-    /// own engine), else the engine a release of this clone made and runs
-    /// ([`crate::gates::engine_copy`]), else `~/publication`, whose origin a first release clones.
+    /// The publication engine's checkout whose launcher the audit starts: `$PUBLICATION_ENGINE`
+    /// (a release hands each child its own engine), else the engine a release of this clone made
+    /// and runs ([`aterm_verify::engine::engine_copy`]), else `~/publication`, whose origin a
+    /// first release clones. A checkout, not a commit, because the probe runs its `bin/pub`; what
+    /// it judges is this Mac's side of the launch (the signed prerequisites the launcher leases),
+    /// and the engine's files themselves are read from a commit ([`Self::engine_registry`]).
     fn publication(&self) -> PathBuf;
+
+    /// The engine's registry ([`REGISTRY`]) on one commit of the engine
+    /// ([`aterm_verify::engine`]: a named checkout's HEAD, else its origin's main fetched now),
+    /// never a working tree: where it was read, and its text.
+    /// # Errors
+    /// No engine is named, its commit cannot be read, or it holds no registry: why, naming where.
+    fn engine_registry(&self) -> Result<(String, String), String>;
 
     /// Whether the engine's launcher starts successfully on the publication PATH.
     /// # Errors
@@ -271,15 +281,11 @@ impl LayerItem {
     /// registry names them as the engine's home machine spells them (an SSH alias, an
     /// `insteadOf` route), so a machine without that spelling stages nothing.
     fn probe_engine_reach(&self) -> Probe {
-        let registry = self.host.publication().join(REGISTRY);
-        let text = match crate::durable::read_text(&registry) {
-            Ok(text) => text,
-            Err(e) => {
+        let (shown, text) = match self.host.engine_registry() {
+            Ok(read) => read,
+            Err(why) => {
                 return Probe::Blocked {
-                    why: format!(
-                        "cannot read the engine's registry {}: {e}",
-                        registry.display()
-                    ),
+                    why: format!("cannot read the engine's registry: {why}"),
                 };
             }
         };
@@ -287,7 +293,7 @@ impl LayerItem {
             Ok(addresses) => addresses,
             Err(why) => {
                 return Probe::Unusable {
-                    why: format!("{}: {why}", registry.display()),
+                    why: format!("{shown}: {why}"),
                 };
             }
         };
@@ -757,6 +763,24 @@ fn report_in(stdout: &str) -> Option<aterm_converge::Report> {
 }
 
 #[cfg(unix)]
+/// The engine's registry ([`REGISTRY`]) on the commit of the engine `var` names for the clone
+/// at `repo` ([`aterm_verify::engine`]), an origin's main imported through this Mac's native
+/// identity for it ([`crate::github_remote::Remote::refresh_main`]): where it was read, and its
+/// text.
+fn registry_on_commit(
+    repo: &Path,
+    var: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<(String, String), String> {
+    use aterm_verify::engine::{self, Commit};
+    let run: engine::RunGit<'_> = &engine::bounded;
+    let import = |at: &Path, _: &Path| crate::github_remote::Remote::origin(at)?.refresh_main();
+    let commit = engine::named(repo, var)
+        .and_then(|named| Commit::read(&named, run, &import))
+        .map_err(|e| e.why)?;
+    let text = commit.text(REGISTRY, run).map_err(|e| e.why)?;
+    Ok((format!("{REGISTRY} on {}", commit.shown()), text))
+}
+
 impl ReleaseHost for System {
     fn base(&self) -> Result<Option<aterm_converge::Report>, String> {
         use aterm_uds::output::CommandOutput as _;
@@ -829,11 +853,20 @@ impl ReleaseHost for System {
             return PathBuf::from(named);
         }
         // What a release of this clone runs once it has made its own engine.
-        let copy = crate::gates::engine_copy(&crate::gates::release_dir(&self.repo));
+        let copy =
+            aterm_verify::engine::engine_copy(&aterm_verify::engine::release_dir(&self.repo));
         if copy.join(".git").exists() {
             return copy;
         }
         self.home.join("publication")
+    }
+
+    fn engine_registry(&self) -> Result<(String, String), String> {
+        let home = self.home.clone();
+        registry_on_commit(&self.repo, &move |name: &str| match name {
+            "HOME" => Some(home.clone().into_os_string()),
+            _ => std::env::var_os(name),
+        })
     }
 
     fn publication_bootstrap(&self) -> Result<(), Bootstrap> {
@@ -948,6 +981,14 @@ mod tests {
         }
         fn publication(&self) -> PathBuf {
             self.home.join("publication")
+        }
+        /// The registry file [`registry`] wrote stands in for the engine's commit: reading a
+        /// commit is `aterm_verify::engine`'s, tested there.
+        fn engine_registry(&self) -> Result<(String, String), String> {
+            let path = self.home.join("publication").join(REGISTRY);
+            std::fs::read_to_string(&path)
+                .map(|text| (path.display().to_string(), text))
+                .map_err(|e| format!("{}: {e}", path.display()))
         }
         fn publication_bootstrap(&self) -> Result<(), Bootstrap> {
             self.bootstrap_error.clone().map_or(Ok(()), Err)
@@ -1374,6 +1415,44 @@ mod tests {
         ));
         assert_eq!(settle_site_key(&host).as_deref(), Some("fulfilled"));
         assert!(fake.needs.lock().unwrap().contains(&NeedStep::Satisfied));
+    }
+
+    /// THE PROBE'S REGISTRY IS THE ENGINE'S COMMIT, NEVER ITS WORKING TREE: an address a session
+    /// left uncommitted in the named engine's registry is not read, and the reading names the
+    /// commit. NEGATIVE CONTROL: the working tree holds that address.
+    #[test]
+    fn the_registry_is_read_on_the_engines_commit() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engine");
+        let repo = dir.path().join("repo");
+        crate::ledger::testing::init(&repo, &[]);
+        crate::ledger::testing::init(
+            &engine,
+            &[
+                ("user.name", "Test"),
+                ("user.email", "test@example.invalid"),
+            ],
+        );
+        let registry = engine.join(REGISTRY);
+        std::fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        std::fs::write(&registry, aterm_entry()).unwrap();
+        use crate::ledger::GitRunner as _;
+        let git = crate::ledger::GitCli::new(&engine);
+        git.git(&["add", "-A"]).unwrap();
+        git.git(&["commit", "-q", "-m", "engine"]).unwrap();
+        let uncommitted = aterm_entry().replace(STAGING, "git@elsewhere:x/aterm-staging.git");
+        std::fs::write(&registry, &uncommitted).unwrap();
+        let named = engine.clone().into_os_string();
+        let var = move |name: &str| (name == "PUBLICATION_ENGINE").then(|| named.clone());
+        let (shown, text) = registry_on_commit(&repo, &var).unwrap();
+        assert_eq!(text, aterm_entry());
+        assert!(shown.contains("at HEAD"), "{shown}");
+        assert!(
+            std::fs::read_to_string(&registry)
+                .unwrap()
+                .contains("git@elsewhere"),
+            "NEGATIVE CONTROL: the working tree holds the uncommitted address"
+        );
     }
 
     #[test]

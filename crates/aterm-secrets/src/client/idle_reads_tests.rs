@@ -448,6 +448,176 @@ fn denies(roster: &crate::Result<Option<SwarmRoster>>, label: &str) -> bool {
         .is_ok_and(|roster| roster.as_ref().is_some_and(|r| r.is_label_denied(label)))
 }
 
+/// Whether `paths`' own denial check, as a table session's access asks it
+/// (`Bootstrap::access_in_observed`), finds this Mac denied, with the files it read.
+fn denial(paths: &Paths) -> (bool, BTreeMap<PathBuf, usize>) {
+    let (denied, read) = reads_during(paths, || local_recipient_denied_now(paths));
+    (denied.expect("the denial check reads"), read)
+}
+
+/// A Commons repair round checks its custody against the vault (`Bootstrap::revalidate_custody`)
+/// and this Mac's own denial (`Bootstrap::access_in_observed`) each time it opens a table session.
+/// Each answer is the fresh read's, and every file the fresh reads open is one the memos stamp;
+/// read again with no file moved, they open none. While a writer holds the vault's state lock
+/// nothing kept is given: the custody check finds the vault busy, as a fresh read does, and the
+/// writer's own denial check reads afresh. A denial the vault writes is seen at the next call.
+///
+/// NEGATIVE CONTROLS (2026-11-08): with `observe_commons_quiet`'s memo not quiet
+/// (`Memo::keyed(observation_inputs, false)`), the custody check under the writer is given the
+/// observation kept from before it (`left: "visible", right: "vault-busy"`); with
+/// `local_recipient_denied_now`'s not quiet, the writer's own check reads nothing
+/// (`a writer's denial check reads afresh`).
+#[test]
+fn a_custody_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer() {
+    let _answering = ServersAnswering::set();
+    let lab =
+        log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    with_a_denied_node(&lab.m22, &lab.m7);
+    let m7 = &lab.m7;
+
+    let ((observed, denied), read) = reads_during(m7, || {
+        (
+            observe_commons(m7),
+            steward::local_recipient_denied(&Reads::new(m7)),
+        )
+    });
+    assert_eq!(verdict(&observed), "visible");
+    assert!(!denied.unwrap(), "m7 is not denied");
+    let inputs = vault_memo::observation_inputs(m7).expect("the inputs");
+    let unstamped: Vec<_> = read.keys().filter(|path| !inputs.contains(path)).collect();
+    assert!(unstamped.is_empty(), "read but not stamped: {unstamped:#?}");
+
+    assert_eq!(verdict(&observe_commons_quiet(m7)), "visible");
+    assert!(!denial(m7).0);
+    let (again, read) = reads_during(m7, || observe_commons_quiet(m7));
+    assert_eq!(verdict(&again), "visible");
+    let (denied, denial_read) = denial(m7);
+    assert!(!denied);
+    let read: Vec<_> = read.into_iter().chain(denial_read).collect();
+    assert_eq!(read, vec![], "kept checks of unchanged files");
+
+    {
+        let _writer = StateLock::take(m7).unwrap();
+        assert_eq!(
+            verdict(&observe_commons_quiet(m7)),
+            verdict(&observe_commons(m7)),
+            "a writer holding the vault meets the custody check"
+        );
+        let (denied, read) = denial(m7);
+        assert!(!denied);
+        assert!(!read.is_empty(), "a writer's denial check reads afresh");
+    }
+
+    let admin = admin_open(&lab.m22).unwrap();
+    let mut doc = admin.doc.clone();
+    let roster = SwarmRoster {
+        deny_labels: vec!["m7".to_owned()],
+        ..Default::default()
+    };
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::SWARM_ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    admin_publish(&lab.m22, &admin, &doc).unwrap();
+    sync(m7, None).expect("m7 syncs");
+    assert!(denial(m7).0, "m7's denial at the next call");
+    let ((observed, denied), read) = reads_during(m7, || {
+        (
+            verdict(&observe_commons(m7)),
+            steward::local_recipient_denied(&Reads::new(m7)),
+        )
+    });
+    assert!(denied.unwrap(), "m7 is denied");
+    let inputs = vault_memo::observation_inputs(m7).expect("the inputs");
+    let unstamped: Vec<_> = read.keys().filter(|path| !inputs.contains(path)).collect();
+    assert!(unstamped.is_empty(), "read but not stamped: {unstamped:#?}");
+    assert_ne!(observed, "visible", "m7 denied is out of Commons custody");
+    assert_eq!(
+        verdict(&observe_commons_quiet(m7)),
+        observed,
+        "at the next call"
+    );
+    lab.server.stop();
+}
+
+/// The vault's held files: the envelope, the records entry and its data.
+fn vault_files(paths: &Paths) -> Vec<PathBuf> {
+    vec![
+        paths.cache_file(),
+        paths.records_file(),
+        paths.records_data_file().expect("the records data"),
+    ]
+}
+
+/// A table session asks both kept checks through its bootstrap: asked again with no file moved,
+/// its custody check (`Bootstrap::revalidate_custody`) and its access (`Bootstrap::access`) open
+/// none of the vault's files, and a denial the vault writes is the access's `None` at the next
+/// call. A read fault on a device file that has not moved gives the access the bootstrap held, the
+/// judgement those files gave; the swarm's checks of this Mac take it as denied and give it
+/// nothing new (`a_device_it_cannot_read_gives_a_mac_still_in_no_new_authority`).
+///
+/// NEGATIVE CONTROLS (2026-11-08): with `Bootstrap::validate_snapshot` back on `super::observe`,
+/// the kept custody check opens the vault (`a custody check of unchanged files`); with
+/// `Bootstrap::access_in_observed` back on `local_recipient_denial_held`, the kept access does
+/// (`an access of unchanged files`).
+#[test]
+fn a_table_sessions_custody_and_access_keep_their_reads_until_a_file_moves() {
+    let _answering = ServersAnswering::set();
+    let lab =
+        log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    with_a_denied_node(&lab.m22, &lab.m7);
+    let m7 = &lab.m7;
+    let bootstrap = crate::commons::bootstrap::Bootstrap::required(m7).expect("m7's Commons");
+    bootstrap.revalidate_custody().expect("m7's custody");
+    assert!(bootstrap.access().unwrap().is_some(), "m7 has access");
+    let vault = vault_files(m7);
+
+    let (custody, read) = reads_during(m7, || bootstrap.revalidate_custody());
+    custody.expect("m7's custody, kept");
+    let opened: Vec<_> = read.keys().filter(|path| vault.contains(path)).collect();
+    assert!(
+        opened.is_empty(),
+        "a custody check of unchanged files: {opened:#?}"
+    );
+    let (access, read) = reads_during(m7, || bootstrap.access());
+    assert!(access.unwrap().is_some(), "m7 has access, kept");
+    let opened: Vec<_> = read.keys().filter(|path| vault.contains(path)).collect();
+    assert!(
+        opened.is_empty(),
+        "an access of unchanged files: {opened:#?}"
+    );
+
+    let device = m7.dir.join("commons/device.age");
+    fsx::fail_reads(&device, usize::MAX);
+    let held = bootstrap.access();
+    let denied = steward::local_recipient_denied_in_roster(m7);
+    fsx::fail_reads(&device, 0);
+    assert!(held.unwrap().is_some(), "the access it held");
+    assert!(denied, "the swarm's check of a device it cannot read");
+
+    let admin = admin_open(&lab.m22).unwrap();
+    let mut doc = admin.doc.clone();
+    let roster = SwarmRoster {
+        deny_labels: vec!["m7".to_owned()],
+        ..Default::default()
+    };
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::SWARM_ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    admin_publish(&lab.m22, &admin, &doc).unwrap();
+    sync(m7, None).expect("m7 syncs");
+    assert!(
+        bootstrap.access().unwrap().is_none(),
+        "m7's denial at the next call"
+    );
+    lab.server.stop();
+}
+
 /// A Commons peer check reads this Mac's roster, its acknowledged log and the roster for that log
 /// at every check, four or five checks a session, every session. Every file those reads open is
 /// one the memos stamp; read through them again, with no file moved, they open none, the records

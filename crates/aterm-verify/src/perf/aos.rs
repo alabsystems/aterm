@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
+use crate::exec::check_command as command;
 use aterm_json::Value;
-use aterm_uds::spawnfd::command;
 
 use super::arena::{Halt, outcome, stdout_of, thermal};
 use super::driver::{cargo_driver, target_dir};

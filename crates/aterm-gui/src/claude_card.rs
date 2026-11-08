@@ -3322,7 +3322,7 @@ impl App {
                 let soonest = entries
                     .filter_map(|e| wanted_frame(&self.view_store, ws, e, now))
                     .min()?;
-                crate::messages_host::band_on_screen(ws).then_some(soonest)
+                crate::messages_host::window_on_screen(ws).then_some(soonest)
             })
             .min()
     }
@@ -3361,7 +3361,7 @@ impl App {
                 let_go(ws);
                 continue;
             };
-            if !crate::messages_host::band_on_screen(ws) {
+            if !crate::messages_host::window_on_screen(ws) {
                 let_go(ws);
                 continue;
             }

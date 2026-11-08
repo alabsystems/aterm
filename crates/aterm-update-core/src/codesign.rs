@@ -12,7 +12,7 @@ use aterm_uds::deadline::{RunError, output_until};
 pub const CODESIGN: &str = aterm_uds::os_path!("codesign");
 
 /// Base verification timeout and floor for [`verify_timeout_for`].
-pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Minimum assumed read rate in bytes per second for [`verify_timeout_for`].
 pub const VERIFY_MIN_BYTES_PER_SEC: u64 = 2 * 1024 * 1024;
@@ -239,6 +239,37 @@ pub fn developer_id_verdict(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn verification_allowance_admits_scheduled_local_work() {
+        let deadline = Instant::now() - Duration::from_secs(31) + verify_timeout_for(0);
+        assert!(
+            deadline > Instant::now(),
+            "required local work remains admissible"
+        );
+        let program = aterm_uds::deadline::stand_in(Path::new("/bin/echo"));
+        let mut command = aterm_uds::spawnfd::command(&program);
+        command.env_clear().arg("ready");
+        let output = output_until(&mut command, deadline).expect("native local work completes");
+        assert_eq!(output.stdout, b"ready\n");
+        assert!(developer_id_verdict(Ok(output)).is_ok());
+
+        let (input, held) = std::os::unix::net::UnixStream::pair().unwrap();
+        let program = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+        let mut blocked = aterm_uds::spawnfd::command(&program);
+        blocked.env_clear();
+        let spent = Instant::now() - Duration::from_secs(61) + verify_timeout_for(0);
+        let result = developer_id_verdict(aterm_uds::deadline::output_until_from(
+            &mut blocked,
+            aterm_uds::spawnfd::Stdio::from(std::os::fd::OwnedFd::from(input)),
+            spent,
+        ));
+        drop(held);
+        let error = result.unwrap_err();
+        assert!(matches!(error, CodesignError::TimedOut));
+        assert!(!error.is_verdict());
+    }
+
     /// The requirement is Apple's Developer ID shape with the team spliced in verbatim.
     #[test]
     fn the_requirement_pins_anchor_chain_and_team() {
@@ -447,14 +478,14 @@ mod tests {
         assert!(!unsigned.judged_nothing_at(&file), "{unsigned}");
     }
 
-    /// A small file keeps 30 s, a 238 MB binary gets 143 s, nothing more than the cap.
+    /// A small file keeps a minute, a 238 MB binary gets 173 s, nothing more than the cap.
     #[test]
     fn the_verify_deadline_scales_with_the_file_and_is_capped() {
         assert_eq!(verify_timeout_for(0), VERIFY_TIMEOUT);
         assert_eq!(verify_timeout_for(64 * 1024), VERIFY_TIMEOUT);
         assert_eq!(
             verify_timeout_for(238_223_808),
-            Duration::from_secs(30 + 113)
+            Duration::from_secs(60 + 113)
         );
         assert!(verify_timeout_for(238_223_808) > VERIFY_TIMEOUT);
         assert_eq!(verify_timeout_for(u64::MAX), VERIFY_TIMEOUT_MAX);
@@ -462,16 +493,6 @@ mod tests {
             verify_timeout_for(10 * 1024 * 1024 * 1024),
             VERIFY_TIMEOUT_MAX
         );
-    }
-
-    /// A deadline already spent kills and reaps the child rather than waiting on it.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_spent_deadline_is_a_timeout_not_a_pass() {
-        assert!(matches!(
-            verify_developer_id_until(Path::new("/bin/ls"), "Q6L2SF6YDW", false, Instant::now()),
-            Err(CodesignError::TimedOut)
-        ));
     }
 
     /// Apple's own binaries carry no Developer ID: the requirement refuses them (exit 3, or 1

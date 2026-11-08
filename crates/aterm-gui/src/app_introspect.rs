@@ -2841,6 +2841,44 @@ impl App {
             .frontmost_window
             .filter(|wid| windows.contains(wid))
             .or_else(|| windows.first().copied());
+        self.dims_snapshot_in(
+            Some(session),
+            selected,
+            (windows.len(), visible_viewers),
+            rows,
+            cols,
+        )
+    }
+
+    /// `dims` with no terminal in front (an app tab such as Settings is): the front window's own
+    /// grid through its live geometry, `session=none`, so a script reads back the size a resize
+    /// gave the window whatever tab is in front. `None` with no window.
+    pub(crate) fn window_dims_snapshot(&self) -> Option<DimsSnapshot> {
+        let wid = self
+            .frontmost_window
+            .filter(|wid| self.windows.contains_key(wid))?;
+        let ws = &self.windows[&wid];
+        Some(self.dims_snapshot_in(
+            None,
+            Some(wid),
+            (0, 0),
+            u32::from(ws.rows),
+            u32::from(ws.cols),
+        ))
+    }
+
+    /// [`Self::dims_snapshot`] of `session` (none for a window's own grid) at `rows`x`cols`,
+    /// through window `selected`'s geometry (detached when none), with `viewers` the windows that
+    /// hold the session and that show it.
+    fn dims_snapshot_in(
+        &self,
+        session: Option<u64>,
+        selected: Option<crate::WindowId>,
+        viewers: (usize, usize),
+        rows: u32,
+        cols: u32,
+    ) -> DimsSnapshot {
+        let (viewers, visible_viewers) = viewers;
         let scale = selected.map_or_else(|| self.detached_scale(), |wid| self.windows[&wid].scale);
 
         let (
@@ -3035,7 +3073,7 @@ impl App {
             tab_rows,
             deck_y,
             deck_h,
-            viewers: u32::try_from(windows.len()).unwrap_or(u32::MAX),
+            viewers: u32::try_from(viewers).unwrap_or(u32::MAX),
             visible_viewers: u32::try_from(visible_viewers).unwrap_or(u32::MAX),
             geometry,
             present_retry_state,
@@ -8334,6 +8372,17 @@ mod dims_snapshot_tests {
             "font rebuild is an explicit recovery stimulus"
         );
         assert!(zoomed.cell_w > banded.cell_w && zoomed.cell_h > banded.cell_h);
+        assert!(
+            zoomed.frame_w <= banded.frame_w && zoomed.frame_h <= banded.frame_h,
+            "a zoom re-grids the window inside the size it holds"
+        );
+        // A grid the surface does not hold (as before its window re-grids): the frame overhangs
+        // the raw surface and dims crops it.
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.rows = 24;
+            ws.cols = 80;
+        }
+        let zoomed = app.dims_snapshot(0, 24, 80);
         assert!(zoomed.frame_w > banded.frame_w && zoomed.frame_h > banded.frame_h);
         assert_eq!(
             (zoomed.surface_w, zoomed.surface_h),
@@ -9464,7 +9513,8 @@ mod chrome_output_tests {
         tagged_srgb: bool,
         fill: impl FnOnce(&mut [u8], usize),
     ) -> (aterm_objc::Obj, aterm_objc::Id) {
-        use aterm_objc::{Bool, Id, Obj, Sel, class, sel};
+        use aterm_macos_ui::appkit::class;
+        use aterm_objc::{Bool, Id, Obj, Sel, sel};
 
         use crate::appkit;
         use crate::appkit::consts::NS_COLOR_RENDERING_INTENT_PERCEPTUAL;

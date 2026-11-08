@@ -16598,7 +16598,7 @@ fn the_rail_scrolls_to_keep_the_selected_route_whole() {
         let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
             unreachable!()
         };
-        (state.navigation_scroll.get(), state.page_scroll)
+        (state.navigation_offset(), state.page_scroll)
     };
     let _ = compile_settings_view(&runtime, instance, view, &cx);
     let before = scroll(&runtime);
@@ -16633,6 +16633,445 @@ fn the_rail_scrolls_to_keep_the_selected_route_whole() {
     let page = scroll(&runtime);
     assert_eq!(page.0, after.0, "the sidebar stayed");
     assert!(page.1 > after.1, "the page moved: {after:?} -> {page:?}");
+}
+
+/// Each row and group heading of the rail on `compiled`'s screen, its rect, and whether the
+/// rail's list shows it whole (in the list's room, drawn uncut), cut by the room's top edge, or
+/// neither.
+fn rail_items_shown(
+    compiled: &crate::native_ui::CompiledUi,
+) -> Vec<(String, LogicalRect, bool, bool)> {
+    let room = compiled
+        .semantic(&UiKey::new("settings/navigation/list"))
+        .expect("the rail's list")
+        .rect;
+    let mut keys = Vec::new();
+    for (section, routes) in navigation_groups() {
+        if !section.is_empty() {
+            keys.push(format!("settings/nav-label/{}", key_fragment(section)));
+        }
+        keys.extend(
+            routes
+                .iter()
+                .map(|route| format!("settings/nav{}", route.path())),
+        );
+    }
+    keys.into_iter()
+        .map(|key| {
+            // Where it is laid out: a drawn item's paint rect (its semantic rect is what the
+            // list's room shows of it), else its semantic one (a picture's, an offscreen row's).
+            let rect = compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == key)
+                .map(|node| node.rect)
+                .or_else(|| {
+                    compiled
+                        .semantics
+                        .iter()
+                        .find(|node| node.key.as_str() == key)
+                        .map(|node| node.rect)
+                })
+                .unwrap_or_else(|| panic!("{key} is in the tree"));
+            let inside = rect.y >= room.y - 0.5 && rect.bottom() <= room.bottom() + 0.5;
+            let drawn_whole = compiled.paint.iter().any(|node| {
+                node.key.as_str() == key
+                    && (node.clip.y - node.rect.y).abs() < 0.5
+                    && (node.clip.height - node.rect.height).abs() < 0.5
+            });
+            let cut_at_top = rect.y < room.y - 0.5 && rect.bottom() > room.y + 0.5;
+            (key, rect, inside && drawn_whole, cut_at_top)
+        })
+        .collect()
+}
+
+/// NO SCREEN OF THE RAIL CUTS A ROW AT ITS TOP, AND EVERY ROW IS WHOLE ON ONE: every page opens
+/// the rail on a screen that starts at a row or a group's heading and shows the selected row
+/// whole; the wheel steps the rail a row at a time from the last screen to the first and back,
+/// no screen cutting a row or a heading at its top, the last ending with the last row whole; and
+/// every row and heading is whole on some screen. The rail's last screen ended at the list's end
+/// wherever the list's room was no whole number of rows, so at 1x in a 1095x696 window About
+/// opened the rail on Cursor & Motion cut at its top, Packages on Wallpaper and Software Update
+/// on Themes, and the wheel kept a cut row at the top of each screen it stepped to from there.
+#[test]
+fn no_rail_screen_cuts_a_row_at_its_top_and_every_row_is_whole_on_one() {
+    at_each_text_scale(&[0.85, 1.0, 1.5, 2.0], "the rail's screens", |scale| {
+        let (_, least) = least_view(scale);
+        let mut faults = Vec::new();
+        let mut scrolled = 0;
+        for width in [800.0 * scale, 1_095.0_f32.max(1_100.0 * scale)] {
+            for height in [least, least + 77.0, 513.0 * scale, 696.0, 696.0 * scale] {
+                let cx = view_cx_at(width, height);
+                let at = format!("{width}x{height}");
+                let mut whole = BTreeSet::new();
+                let look = |compiled: &crate::native_ui::CompiledUi,
+                            what: &str,
+                            faults: &mut Vec<String>,
+                            whole: &mut BTreeSet<String>| {
+                    for (key, rect, shown, cut) in rail_items_shown(compiled) {
+                        if shown {
+                            whole.insert(key.clone());
+                        }
+                        if cut {
+                            faults.push(format!("{at} {what}: {key} {rect:?} cut at the top"));
+                        }
+                    }
+                };
+                for route in SettingsRoute::ALL {
+                    let (mut runtime, instance, view) = setup();
+                    let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                        unreachable!()
+                    };
+                    state.navigate(route);
+                    let compiled = compile_settings_view(&runtime, instance, view, &cx);
+                    look(
+                        &compiled,
+                        &format!("{route:?} opened"),
+                        &mut faults,
+                        &mut whole,
+                    );
+                    let selected = format!("settings/nav{}", route.path());
+                    if !rail_items_shown(&compiled)
+                        .iter()
+                        .any(|(key, _, shown, _)| *key == selected && *shown)
+                    {
+                        faults.push(format!("{at} {route:?} opened: {selected} not whole"));
+                    }
+                    if route != SettingsRoute::About {
+                        continue;
+                    }
+                    let offset = |runtime: &NativeRuntime| {
+                        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+                            unreachable!()
+                        };
+                        state.navigation_offset()
+                    };
+                    let mut last = compiled;
+                    for lines in [-1, 1] {
+                        for step in 0..40 {
+                            let before = offset(&runtime);
+                            runtime
+                                .dispatch(
+                                    instance,
+                                    view,
+                                    AppEvent::ScrollAt {
+                                        lines,
+                                        key: UiKey::new("settings/navigation/list"),
+                                    },
+                                )
+                                .expect("dispatched");
+                            last = compile_settings_view(&runtime, instance, view, &cx);
+                            look(
+                                &last,
+                                &format!("wheel {lines} #{step}"),
+                                &mut faults,
+                                &mut whole,
+                            );
+                            if (offset(&runtime) - before).abs() < 0.01 {
+                                break;
+                            }
+                            scrolled += 1;
+                        }
+                    }
+                    if !rail_items_shown(&last)
+                        .iter()
+                        .any(|(key, _, shown, _)| key == "settings/nav/about" && *shown)
+                    {
+                        faults.push(format!("{at}: the last screen cuts About's row"));
+                    }
+                }
+                let (runtime, instance, view) = setup();
+                let opened = compile_settings_view(&runtime, instance, view, &cx);
+                for (key, _, _, _) in rail_items_shown(&opened) {
+                    if !whole.contains(&key) {
+                        faults.push(format!("{at}: {key} is whole on no screen"));
+                    }
+                }
+            }
+        }
+        assert!(
+            scrolled > 0,
+            "PRECONDITION: the rail scrolls in some window"
+        );
+        assert!(
+            faults.is_empty(),
+            "{} faults:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// A NEW WINDOW SIZE OR TEXT SIZE KEEPS THE RAIL'S ROW WHOLE: the page's row, and the
+/// keyboard's row in the rail, whole before the window grows or shrinks or the text size
+/// changes, are whole after, on a screen that starts at a row; a row the wheel scrolled off
+/// stays off. The rail kept the points it was scrolled over a change, so a shorter window cut
+/// the page's row at the rail's foot (Appearance's at 800x208 after 800x248 at 1x), and a larger
+/// text size drew the rail some rows up and the page's row under its foot (Terminal's at
+/// 2200x696 from 1.5x to 2x).
+#[test]
+fn a_new_window_or_text_size_keeps_the_rails_row_whole() {
+    let whole = |compiled: &crate::native_ui::CompiledUi, row: &str| {
+        rail_items_shown(compiled)
+            .iter()
+            .any(|(key, _, whole, _)| key == row && *whole)
+    };
+    let cut = |compiled: &crate::native_ui::CompiledUi| {
+        rail_items_shown(compiled)
+            .into_iter()
+            .filter(|(_, _, _, cut)| *cut)
+            .map(|(key, ..)| key)
+            .collect::<Vec<_>>()
+    };
+    at_each_text_scale(&[1.0, 1.5], "the rail's row over a change", |scale| {
+        let (_, least) = least_view(scale);
+        let width = 800.0 * scale;
+        let heights = [least, least + 40.0, least + 120.0, 513.0 * scale];
+        let mut faults = Vec::new();
+        let mut kept = 0;
+        let rows: Vec<SettingsRoute> = navigation_groups()
+            .into_iter()
+            .flat_map(|(_, routes)| routes)
+            .collect();
+        for &route in &rows {
+            let row = format!("settings/nav{}", route.path());
+            for keyboard in [false, true] {
+                for &from in &heights {
+                    for &to in heights.iter().filter(|to| **to != from) {
+                        let mut lab = modified::Lab::new("");
+                        if keyboard {
+                            // The keyboard on this row, the page still Top Settings.
+                            lab.state_mut().common.last_focus = Some(UiKey::new(row.as_str()));
+                        } else {
+                            lab.state_mut().navigate(route);
+                        }
+                        let before = lab.compile(width, from);
+                        if !whole(&before, &row) {
+                            continue;
+                        }
+                        let after = lab.compile(width, to);
+                        kept += 1;
+                        let at = format!("{route:?} (keyboard {keyboard}) {width}x{from} to {to}");
+                        if !whole(&after, &row) {
+                            faults.push(format!("{at}: the row is not whole"));
+                        }
+                        let cut = cut(&after);
+                        if !cut.is_empty() {
+                            faults.push(format!("{at}: {cut:?} cut at the top"));
+                        }
+                    }
+                }
+            }
+        }
+        // A text-size change, the window kept, in a window wide enough for the rail at both.
+        for to in [1.0, 1.5, 2.0_f32]
+            .into_iter()
+            .filter(|to| (to - scale).abs() > 0.01)
+        {
+            let width = 1_100.0 * scale.max(to);
+            for &route in &rows {
+                let row = format!("settings/nav{}", route.path());
+                for height in [696.0, 900.0] {
+                    let mut lab = modified::Lab::new("");
+                    lab.state_mut().navigate(route);
+                    let before = lab.compile(width, height);
+                    crate::native_appearance::install_preferences(
+                        crate::native_appearance::AppearancePreferences {
+                            text_scale: to,
+                            ..crate::native_appearance::current_preferences()
+                        },
+                    );
+                    let after = lab.compile(width, height);
+                    crate::native_appearance::install_preferences(
+                        crate::native_appearance::AppearancePreferences {
+                            text_scale: scale,
+                            ..crate::native_appearance::current_preferences()
+                        },
+                    );
+                    if !whole(&before, &row) {
+                        continue;
+                    }
+                    kept += 1;
+                    let at = format!("{route:?} {width}x{height} from {scale}x to {to}x");
+                    if !whole(&after, &row) {
+                        faults.push(format!("{at}: the row is not whole"));
+                    }
+                    let cut = cut(&after);
+                    if !cut.is_empty() {
+                        faults.push(format!("{at}: {cut:?} cut at the top"));
+                    }
+                }
+            }
+        }
+        // The wheel's screen is the person's: About scrolled off stays off in a shorter window.
+        let mut lab = modified::Lab::new("");
+        lab.state_mut().navigate(SettingsRoute::About);
+        let tall = least + 120.0;
+        assert!(
+            whole(&lab.compile(width, tall), "settings/nav/about"),
+            "PRECONDITION: About's row whole at {width}x{tall}"
+        );
+        while whole(&lab.compile(width, tall), "settings/nav/about") {
+            assert!(
+                lab.state_mut().scroll_navigation(-1),
+                "PRECONDITION: the wheel scrolls About off at {width}x{tall}"
+            );
+        }
+        if whole(&lab.compile(width, least), "settings/nav/about") {
+            faults.push(format!(
+                "{width}x{tall} to {least}: the rail scrolled back to About the wheel left"
+            ));
+        }
+        assert!(kept > 0, "PRECONDITION: a change with the row whole before");
+        assert!(
+            faults.is_empty(),
+            "{} faults of {kept} changes:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// A CLICK ON A RAIL ROW OPENS ITS PAGE, WHEREVER THE RAIL STANDS: on every screen the wheel
+/// reaches, a press at the top and at the foot of what the screen draws of each row (it arms the
+/// row and gives it the keyboard, as the pointer does), a frame, and the release over the same
+/// point lands on the row pressed, so its page opens, with its row whole after. The rail brought
+/// the pressed row whole on the press: a row cut at the rail's foot moved on to a row's start,
+/// further than its cut, and a group's first row at the rail's top moved down under its
+/// heading, so the release fell on another row or the heading and the click did nothing.
+#[test]
+fn a_click_on_a_rail_row_opens_its_page_wherever_the_rail_stands() {
+    at_each_text_scale(&[1.0, 2.0], "a click on the rail", |scale| {
+        let (_, least) = least_view(scale);
+        let width = 800.0 * scale;
+        let rows: Vec<SettingsRoute> = navigation_groups()
+            .into_iter()
+            .flat_map(|(_, routes)| routes)
+            .collect();
+        let mut faults = Vec::new();
+        let mut clicks = 0;
+        for height in [least, 513.0 * scale] {
+            for wheel in 0.. {
+                let wheeled = |lab: &mut modified::Lab| {
+                    let _ = lab.compile(width, height);
+                    (0..wheel).all(|_| lab.state_mut().scroll_navigation(1))
+                };
+                let mut lab = modified::Lab::new("");
+                if !wheeled(&mut lab) {
+                    break;
+                }
+                let screen = lab.compile(width, height);
+                let room = screen
+                    .semantic(&UiKey::new("settings/navigation/list"))
+                    .expect("the rail's list")
+                    .rect;
+                for &route in &rows {
+                    let key = UiKey::new(format!("settings/nav{}", route.path()));
+                    let Some(rect) = screen
+                        .paint
+                        .iter()
+                        .find(|node| node.key == key)
+                        .map(|node| node.rect)
+                    else {
+                        continue;
+                    };
+                    let (top, foot) = (rect.y.max(room.y), rect.bottom().min(room.bottom()));
+                    for y in [top + 1.0, foot - 1.0] {
+                        let x = rect.x + rect.width / 2.0;
+                        if screen.hit_test(x, y).map(|hit| &hit.key) != Some(&key) {
+                            continue;
+                        }
+                        let mut lab = modified::Lab::new("");
+                        assert!(wheeled(&mut lab), "PRECONDITION: the same screen again");
+                        let common = &mut lab.state_mut().common;
+                        common.pressed = Some(key.clone());
+                        common.last_focus = Some(key.clone());
+                        common.focus_visible = false;
+                        let pressed = lab.compile(width, height);
+                        lab.state_mut().common.pressed = None;
+                        clicks += 1;
+                        let at = format!("{width}x{height} wheel {wheel}: {route:?} at {y}");
+                        let under = pressed.hit_test(x, y).map(|hit| hit.key.clone());
+                        if under.as_ref() != Some(&key) {
+                            faults.push(format!("{at}: the release fell on {under:?}"));
+                            continue;
+                        }
+                        let _ = lab.invoke(route_action(route).as_str(), None);
+                        if !rail_items_shown(&lab.compile(width, height))
+                            .iter()
+                            .any(|(row, _, whole, _)| row == key.as_str() && *whole)
+                        {
+                            faults.push(format!("{at}: its row is not whole after the click"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(clicks > 0, "PRECONDITION: a row to click");
+        assert!(
+            faults.is_empty(),
+            "{} of {clicks} clicks:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
+}
+
+/// THE KEYBOARD COME ONTO A RAIL ROW SHOWS IT WHOLE, THE PAGE'S OWN ROW TOO: the page's row the
+/// wheel scrolled off the rail comes back whole when the keyboard lands on it (a Tab into the
+/// rail, a Shift-Tab back to it). The rail brought a row into view only when its row changed,
+/// and the keyboard's row was the page's row it already had, so the keyboard sat on a row off
+/// the rail.
+#[test]
+fn the_keyboard_on_the_pages_row_the_wheel_scrolled_off_brings_it_back_whole() {
+    at_each_text_scale(&[1.0, 2.0], "the keyboard on a wheeled-off row", |scale| {
+        let (_, least) = least_view(scale);
+        let width = 800.0 * scale;
+        let mut faults = Vec::new();
+        let mut landings = 0;
+        for height in [least, 513.0 * scale] {
+            for (_, routes) in navigation_groups() {
+                for route in routes {
+                    let row = format!("settings/nav{}", route.path());
+                    let shown = |compiled: &crate::native_ui::CompiledUi| {
+                        rail_items_shown(compiled)
+                            .iter()
+                            .any(|(key, _, whole, _)| *key == row && *whole)
+                    };
+                    for lines in [1, -1] {
+                        let mut lab = modified::Lab::new("");
+                        lab.state_mut().navigate(route);
+                        let _ = lab.compile(width, height);
+                        let mut off = false;
+                        while !off && lab.state_mut().scroll_navigation(lines) {
+                            off = !shown(&lab.compile(width, height));
+                        }
+                        if !off {
+                            continue;
+                        }
+                        landings += 1;
+                        lab.dispatch(AppEvent::FocusChanged(Some(UiKey::new(row.as_str()))));
+                        lab.state_mut().common.focus_visible = true;
+                        if !shown(&lab.compile(width, height)) {
+                            faults.push(format!(
+                                "{width}x{height} {route:?} wheeled {lines} off: not whole"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            landings > 0,
+            "PRECONDITION: a page's row the wheel scrolls off"
+        );
+        assert!(
+            faults.is_empty(),
+            "{} of {landings} landings:\n{}",
+            faults.len(),
+            faults.join("\n")
+        );
+    });
 }
 
 #[test]
@@ -28944,6 +29383,7 @@ fn sample_messages() -> MessagesState {
         detail: detail.iter().map(|line| (*line).to_string()).collect(),
         state,
         on_glass: None,
+        glass: aterm_messages::Glass::Glassless,
         repeats: 1,
         retired_unix_ms: (!matches!(state, "live" | "held")).then_some(at(id) + 30_000),
         superseded_by: None,
@@ -28996,7 +29436,6 @@ fn sample_messages() -> MessagesState {
             vec![action(0, "Packages", true)],
         ),
     ];
-    entries[2].on_glass = Some(0);
     for id in (1..=37).rev() {
         entries.push(entry(
             id,
@@ -29925,7 +30364,7 @@ fn selecting_a_row_expands_its_detail_lines_and_actions() {
     );
     let meta = label("settings/messages/row/39/meta/0");
     assert!(
-        meta.ends_with("3:51:20 PM \u{00b7} waiting to show") && !meta.contains("UTC"),
+        meta.ends_with("3:51:20 PM \u{00b7} live") && !meta.contains("UTC"),
         "{meta}"
     );
     let after = message_rows(&compiled);
@@ -30271,6 +30710,7 @@ fn a_diagram_entry_paints_its_rows_in_the_monospace_face_and_cuts_them() {
             detail: msg.detail.clone(),
             state: "live",
             on_glass: None,
+            glass: aterm_messages::Glass::Glassless,
             repeats: 1,
             retired_unix_ms: None,
             superseded_by: None,

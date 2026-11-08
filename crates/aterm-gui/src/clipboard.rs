@@ -28,12 +28,36 @@ fn route_for(seam: Option<OsString>) -> ClipboardRoute {
 fn route() -> ClipboardRoute {
     #[cfg(test)]
     {
-        ClipboardRoute::TestBoard
+        LAB_FILE_FOR_TEST
+            .with(|file| file.borrow().clone())
+            .map_or(ClipboardRoute::TestBoard, ClipboardRoute::File)
     }
     #[cfg(not(test))]
     {
         route_for(aterm_types::dev_seam!("ATERM_DEBUG_CLIPBOARD_FILE"))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's stand-in for `ATERM_DEBUG_CLIPBOARD_FILE` on this thread: `Some(path)` routes
+    /// the clipboard to that lab file in place of the test board.
+    pub(crate) static LAB_FILE_FOR_TEST: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// WHETHER A COPY OR A PASTE REACHES THE PERSON'S OWN CLIPBOARD: the platform's, as it always
+/// is in a release build, which never reads the seam. A debug or `dev-seams` build pointed at a
+/// lab file (`ATERM_DEBUG_CLIPBOARD_FILE`) copies to and pastes from that file, which is nobody's
+/// clipboard, so there a control client's copy or paste reaches no person's clipboard and is not
+/// refused for it (`App::clipboard_gesture_refused`): a lab can drive a Copy button to its
+/// `Copied` and read the file. A test board stands for the person's.
+pub(crate) fn reaches_persons_clipboard() -> bool {
+    route_reaches_person(&route())
+}
+
+fn route_reaches_person(route: &ClipboardRoute) -> bool {
+    !matches!(route, ClipboardRoute::File(_))
 }
 
 const CLIPBOARD_FILE_CAP: u64 = 64 << 20;
@@ -151,6 +175,7 @@ fn system_pbcopy(text: &str) -> bool {
         use aterm_objc::{Id, Sel, autoreleasepool, class, sel};
 
         use crate::appkit;
+        aterm_macos_ui::appkit::load();
         // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread;
         // `-clearContents` is `-(NSInteger)`, `-setString:forType:` is
         // `-(BOOL)(NSString *, NSPasteboardType)`, and both arguments outlive the call.
@@ -196,13 +221,7 @@ fn system_pbcopy(text: &str) -> bool {
 /// `NSPasteboardTypeString`, the UTF-8 plain-text pasteboard type.
 #[cfg(target_os = "macos")]
 fn pasteboard_type_string() -> aterm_objc::Id {
-    // SAFETY: AppKit exports this as an immortal `NSString *` constant.
-    #[link(name = "AppKit", kind = "framework")]
-    unsafe extern "C" {
-        static NSPasteboardTypeString: *mut std::ffi::c_void;
-    }
-    // SAFETY: As above.
-    aterm_objc::Id::from_ptr(unsafe { NSPasteboardTypeString })
+    aterm_macos_ui::appkit::pasteboard_type_string()
 }
 
 /// Read the clipboard as UTF-8 text, or `None` when empty or unavailable.
@@ -221,6 +240,7 @@ fn system_pbpaste() -> Option<String> {
         use aterm_objc::{autoreleasepool, class, sel};
 
         use crate::appkit;
+        aterm_macos_ui::appkit::load();
         // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread;
         // `-stringForType:` is `-(NSString *)(NSPasteboardType)`, and its borrowed result is
         // copied out inside this pool.
@@ -363,7 +383,20 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
 
-    use super::{ClipboardRoute, file_copy, file_paste, primary_file, route_for};
+    use super::{
+        ClipboardRoute, file_copy, file_paste, primary_file, route_for, route_reaches_person,
+    };
+
+    /// Only a lab file is nobody's clipboard: the platform's is the person's, and with no seam
+    /// set (every release build) the route is the platform's.
+    #[test]
+    fn only_a_lab_file_is_not_the_persons_clipboard() {
+        assert!(route_reaches_person(&ClipboardRoute::System));
+        assert!(route_reaches_person(&route_for(None)));
+        assert!(!route_reaches_person(&route_for(Some(OsString::from(
+            "/lab/clipboard"
+        )))));
+    }
 
     #[test]
     fn a_clipboard_write_keeps_its_owner_until_after_close() {

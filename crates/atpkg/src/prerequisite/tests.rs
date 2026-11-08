@@ -385,6 +385,64 @@ fn named_lean_build_keeps_default_selection_and_binds_its_import_world() {
 }
 
 #[test]
+fn named_prerequisites_use_packaged_commands_instead_of_recipe_build_outputs() {
+    for want in [
+        Prerequisite::Gitleaks,
+        Prerequisite::OpenSslSigning,
+        Prerequisite::Python,
+        Prerequisite::Lake,
+    ] {
+        let mut fixture = Fixture::new(want);
+        if want == Prerequisite::Lake {
+            fixture.historical_lean();
+        }
+        let recipe_output = want.recipe().unwrap().executable;
+        if matches!(want, Prerequisite::Gitleaks | Prerequisite::OpenSslSigning) {
+            assert_ne!(fixture.root.join(recipe_output), fixture.executable());
+            assert!(!fixture.root.join(recipe_output).exists());
+        }
+        crate::store::mark_build_ready(&fixture.root).unwrap();
+        let selected = crate::ops::which(&fixture.layout, want.executable());
+        let session = fixture.session(TRIPLE).unwrap();
+        let tool = session.acquire_build(want, 7).unwrap();
+        assert_eq!(tool.path(), fixture.executable().canonicalize().unwrap());
+        assert_eq!(
+            tool.tree_root(),
+            crate::tree::tree_root(&fixture.root).unwrap()
+        );
+        assert_eq!(want.recipe().unwrap().executable, recipe_output);
+        tool.validate().unwrap();
+        assert_eq!(
+            crate::ops::which(&fixture.layout, want.executable()),
+            selected
+        );
+    }
+}
+
+#[test]
+fn named_prerequisites_refuse_signed_recipe_outputs_without_packaged_commands() {
+    for want in [Prerequisite::Gitleaks, Prerequisite::OpenSslSigning] {
+        let mut fixture = Fixture::new(want);
+        let before = crate::tree::tree_root(&fixture.root).unwrap();
+        let recipe_output = fixture.root.join(want.recipe().unwrap().executable);
+        std::fs::create_dir_all(recipe_output.parent().unwrap()).unwrap();
+        std::fs::rename(fixture.executable(), &recipe_output).unwrap();
+        let after = crate::tree::tree_root(&fixture.root).unwrap();
+        fixture.change_package(&before, &after);
+        crate::store::mark_build_ready(&fixture.root).unwrap();
+        assert!(recipe_output.is_file());
+        assert!(!fixture.executable().exists());
+        assert!(
+            fixture
+                .session(TRIPLE)
+                .unwrap()
+                .acquire_build(want, 7)
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn named_prerequisite_refuses_unknown_versions_unstaged_or_changed_payloads() {
     for fault in ["unknown-version", "unstaged", "changed"] {
         let mut fixture = Fixture::new(Prerequisite::Lake);

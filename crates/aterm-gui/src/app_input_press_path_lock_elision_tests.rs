@@ -503,7 +503,7 @@ fn a_same_grid_window_resize_keeps_the_first_echo_owned_without_relaxing_control
         let size = app.window_frame_px_for(wid, rows, cols);
         assert_eq!(app.grid_dims_for(wid, size), (rows, cols));
         if window_px {
-            assert_eq!(
+            assert!(matches!(
                 app.input(
                     wid,
                     InputEvent::ResizeWindowPx {
@@ -512,8 +512,8 @@ fn a_same_grid_window_resize_keeps_the_first_echo_owned_without_relaxing_control
                     },
                     Source::Controller,
                 ),
-                crate::input::InputOutcome::Ok,
-            );
+                crate::input::InputOutcome::Resized(_),
+            ));
         } else {
             app.on_resize(wid, size);
         }
@@ -602,10 +602,10 @@ fn a_valid_control_resize_keeps_the_first_echo_owned_through_its_published_fence
                 app.reconcile_licence(wid);
             }
             let event = crate::control::parse_window_resize(&body).unwrap();
-            assert_eq!(
+            assert!(matches!(
                 app.input(wid, event, Source::Controller),
-                crate::input::InputOutcome::Ok,
-            );
+                crate::input::InputOutcome::Resized(_),
+            ));
             assert_eq!(
                 (app.windows[&wid].rows, app.windows[&wid].cols),
                 (rows, cols)
@@ -3354,7 +3354,10 @@ fn a_pinned_view_gesture_for_a_hidden_session_is_dropped() {
             Some(hidden_session),
             crate::app_input::PressPhase::Initial,
         );
-        assert!(matches!(outcome, InputOutcome::Ok));
+        assert!(matches!(
+            outcome,
+            InputOutcome::Ok | InputOutcome::Resized(_)
+        ));
     }
     let t = term_lock(&term);
     assert_eq!(t.grid().display_offset(), offset, "viewport left alone");

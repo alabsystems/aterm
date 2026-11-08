@@ -111,6 +111,42 @@ fn local_denial_observation_finishes_while_bootstrap_holds_device_custody() {
     assert!(!Device::denied_in_roster(&paths, identity(), &roster).unwrap());
 }
 
+/// A device makes its request for each network and authority once: asked again, it gives the
+/// bytes [`Request::create`] makes of its fields, and asked for another trust, that trust's own.
+///
+/// NEGATIVE CONTROL (2026-11-08): with `Device::request` giving the first request it kept for
+/// any trust, the first trust asked is given the binding check's (`left: [1, 1, ...], right: [7, 7,
+/// ...]`).
+#[test]
+fn a_device_makes_each_trusts_request_once_and_for_that_trust() {
+    let (_home, paths) = fixture();
+    let device = Device::open(&paths).unwrap().unwrap();
+    let fresh = |network, authority| {
+        device.with_seed(|seed| {
+            Request::create(
+                network,
+                authority,
+                device.machine,
+                device.incarnation,
+                &device.identity,
+                seed,
+            )
+            .unwrap()
+        })
+    };
+    for (network, authority) in [(NETWORK, ROOT), ([8; 16], [12; 32]), (NETWORK, ROOT)] {
+        let request = device.request(network, authority).unwrap();
+        assert_eq!(*request.binding().network(), network);
+        assert_eq!(*request.binding().authority(), authority);
+        assert_eq!(request.bytes(), fresh(network, authority).bytes());
+    }
+    assert_eq!(
+        device.requests.lock().unwrap().len(),
+        3,
+        "the binding check's request and one for each trust"
+    );
+}
+
 #[test]
 fn existing_binding_observation_never_takes_or_repairs_device_custody() {
     let (_home, paths) = fixture();

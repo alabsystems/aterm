@@ -42,6 +42,8 @@ fn observe<'a>(
         || streams.state.started.is_some()
         || streams.state.completed.is_some()
         || streams.state.workload.is_some()
+        || streams.state.paired.is_some()
+        || streams.state.contained.is_some()
         || streams.state.linker_completed.is_some()
         || streams.state.accounting.is_some()
         || streams.output.observer_failed

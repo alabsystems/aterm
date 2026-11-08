@@ -289,6 +289,140 @@ fn a_missing_vendor_cli_is_missing_and_an_excluded_one_is_only_said() {
 }
 
 #[cfg(unix)]
+fn check_version_output_capture(
+    query: fn(&std::path::Path, Option<&std::path::Path>) -> String,
+    old_question: &str,
+    reply: &[u8],
+    expected: &str,
+) {
+    let mut oversized = b"noise x ".repeat(aterm_uds::deadline::OUTPUT_KEEP / 8 + 1);
+    oversized.push(b'\n');
+    oversized.extend_from_slice(reply);
+    check_rejected_version_reply(query, old_question, &oversized, reply, expected);
+}
+
+#[cfg(unix)]
+fn check_rejected_version_reply(
+    query: fn(&std::path::Path, Option<&std::path::Path>) -> String,
+    old_question: &str,
+    rejected: &[u8],
+    reply: &[u8],
+    expected: &str,
+) {
+    for legacy in [false, true] {
+        let root = synthetic_home("complete-version-output");
+        let bin = root.join("program");
+        let output = root.join("program.stdout");
+        let asked = root.join("program.asked");
+        std::fs::write(
+            &bin,
+            b"#!/bin/sh\necho query >> \"$0.asked\"\n/bin/cat \"$0.stdout\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let identity = crate::probe_cache::identity(&bin).unwrap();
+        std::fs::write(&output, rejected).unwrap();
+        let cache = root.join("state").join(VERSIONS);
+        if legacy {
+            kept_answer(&bin, old_question, Some(&cache), || {
+                Some("old truncated reply".to_owned())
+            })
+            .unwrap();
+        }
+        let before = std::fs::read(&cache).ok();
+        assert_eq!(query(&bin, Some(&cache)), "unknown");
+        assert_eq!(std::fs::read(&cache).ok(), before);
+        assert_eq!(std::fs::read_to_string(&asked).unwrap().lines().count(), 1);
+        std::fs::write(&output, reply).unwrap();
+        assert_eq!(crate::probe_cache::identity(&bin).unwrap(), identity);
+        assert_eq!(query(&bin, Some(&cache)), expected);
+        assert_eq!(query(&bin, Some(&cache)), expected);
+        assert_eq!(std::fs::read_to_string(&asked).unwrap().lines().count(), 2);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn compiler_version_output_must_be_complete_before_caching() {
+    check_version_output_capture(
+        probe_trust_commit,
+        "-Vv commit-hash exit-zero-v1",
+        b"commit-hash: 0123456789abcdef0123456789abcdef01234567\n",
+        "0123456789",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn program_version_output_must_be_complete_before_caching() {
+    check_version_output_capture(
+        probe_version_with_cache,
+        "--version",
+        b"tool 1.2.3\n",
+        "1.2.3",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_compiler_commit_must_be_unique_and_full_before_caching() {
+    let valid =
+        b"rustc compatibility report\r\ncommit-hash: 0123456789abcdef0123456789abcdef01234567\r\n";
+    for rejected in [
+        b"commit-hash: \n".as_slice(),
+        b"commit-hash: unknown\n",
+        b"commit-hash: 0123456789\n",
+        b"commit-hash: 0123456789abcdef0123456789abcdef0123456z\n",
+        b"commit-hash: 0123456789abcdef0123456789abcdef012345678\n",
+        b"commit-hash: 0123456789abcdef0123456789abcdef01234567\ncommit-hash: 0123456789abcdef0123456789abcdef01234567\n",
+        b"commit-hash: 0123456789abcdef0123456789abcdef01234567\ncommit-hash: unknown\n",
+        b"commit-hash: 0123456789abcdef0123456789abcdef01234567\ncommit-hash:unknown\n",
+        b"commit-hash: 0123456789abcdef0123456789abcdef01234567 \n",
+        b"commit-hash: 0123456789abcdef0123456789abcdef01234567\n\xff\n",
+        b"rustc compatibility report\n",
+    ] {
+        check_rejected_version_reply(
+            probe_trust_commit,
+            "-Vv commit-hash complete-exit-zero-v1",
+            rejected,
+            valid,
+            "0123456789",
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_local_compiler_query_cannot_supply_or_cache_a_commit() {
+    for legacy in [false, true] {
+        let root = synthetic_home("failed-compiler-version");
+        let bin = root.join("trustc");
+        let state = root.join("trustc.state");
+        let asked = root.join("trustc.asked");
+        std::fs::write(&bin, b"#!/bin/sh\necho query >> \"$0.asked\"\necho 'commit-hash: 0123456789abcdef0123456789abcdef01234567'\nif [ \"$(/bin/cat \"$0.state\")\" != ok ]; then exit 7; fi\nexit 0\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(&state, "fail").unwrap();
+        let identity = crate::probe_cache::identity(&bin).unwrap();
+        let cache = root.join("state").join(VERSIONS);
+        if legacy {
+            kept_answer(&bin, "-Vv commit-hash", Some(&cache), || {
+                Some("old unchecked hash".to_owned())
+            })
+            .unwrap();
+        }
+        let before = std::fs::read(&cache).ok();
+        assert_eq!(probe_trust_commit(&bin, Some(&cache)), "unknown");
+        assert_eq!(std::fs::read(&cache).ok(), before);
+        assert_eq!(std::fs::read_to_string(&asked).unwrap().lines().count(), 1);
+        std::fs::write(&state, "ok").unwrap();
+        assert_eq!(crate::probe_cache::identity(&bin).unwrap(), identity);
+        assert_eq!(probe_trust_commit(&bin, Some(&cache)), "0123456789");
+        assert_eq!(probe_trust_commit(&bin, Some(&cache)), "0123456789");
+        assert_eq!(std::fs::read_to_string(&asked).unwrap().lines().count(), 2);
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn a_foreign_rustup_trust_entry_is_named_with_its_repoint_and_never_repointed() {
     let l = layout("foreign-seam");
@@ -4264,6 +4398,12 @@ fn a_kept_version_answer_is_asked_once_until_the_program_changes() {
     let bin = root.join("solver");
     std::fs::write(&bin, "build one").unwrap();
     let cache = root.join("state").join(VERSIONS);
+    let old_key = crate::probe_cache::key([
+        Some("--version".to_owned()),
+        crate::probe_cache::identity(&bin),
+    ])
+    .unwrap();
+    crate::probe_cache::put(&cache, &old_key, "unvalidated old answer");
     let asked = std::cell::Cell::new(0);
     let ask = || {
         asked.set(asked.get() + 1);
@@ -4315,6 +4455,83 @@ fn a_kept_version_answer_is_asked_once_until_the_program_changes() {
         None
     );
     assert_eq!(asked.get(), 5, "an unanswered question was kept");
+}
+
+#[test]
+#[cfg(unix)]
+fn version_answers_keep_each_invocation_of_a_shared_executable_separate() {
+    let root = synthetic_home("version-aliases");
+    let target = root.join("multicall");
+    std::fs::write(&target, "shared executable fixture").unwrap();
+    let first = root.join("first");
+    let second = root.join("second");
+    std::os::unix::fs::symlink(&target, &first).unwrap();
+    std::os::unix::fs::symlink(&target, &second).unwrap();
+    assert_eq!(
+        crate::probe_cache::identity(&first).unwrap(),
+        crate::probe_cache::identity(&second).unwrap()
+    );
+    let cache = root.join("state").join(VERSIONS);
+    let asked = std::cell::Cell::new(0);
+    for (bin, answer) in [
+        (&first, "first answer"),
+        (&second, "second answer"),
+        (&first, "first answer"),
+        (&second, "second answer"),
+    ] {
+        let found = kept_answer(bin, "--version", Some(&cache), || {
+            asked.set(asked.get() + 1);
+            Some(answer.to_owned())
+        });
+        assert_eq!(found.as_deref(), Some(answer));
+    }
+    assert_eq!(asked.get(), 2, "each invocation should keep its own answer");
+}
+
+#[test]
+fn a_version_answer_is_discarded_when_its_program_changes_during_the_query() {
+    for change in [
+        "rewrite",
+        "remove",
+        #[cfg(unix)]
+        "loop",
+    ] {
+        let root = synthetic_home("version-snapshot");
+        let bin = root.join("solver");
+        std::fs::write(&bin, "original program").unwrap();
+        let cache = root.join("state").join(VERSIONS);
+        let answer = kept_answer(&bin, "--version", Some(&cache), || {
+            match change {
+                "rewrite" => std::fs::write(&bin, "different replacement program").unwrap(),
+                "remove" => std::fs::remove_file(&bin).unwrap(),
+                #[cfg(unix)]
+                "loop" => {
+                    std::fs::remove_file(&bin).unwrap();
+                    std::os::unix::fs::symlink("solver", &bin).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            Some("stale answer".to_owned())
+        });
+        assert_eq!(answer, None, "{change}");
+        assert!(!cache.exists(), "a moving program published an answer");
+        if change != "remove" {
+            std::fs::remove_file(&bin).unwrap();
+        }
+        std::fs::write(&bin, "repaired stable program").unwrap();
+        let asked = std::cell::Cell::new(0);
+        let ask = || {
+            asked.set(asked.get() + 1);
+            Some("current answer".to_owned())
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                kept_answer(&bin, "--version", Some(&cache), ask).as_deref(),
+                Some("current answer")
+            );
+        }
+        assert_eq!(asked.get(), 1, "repair should retain a stable answer");
+    }
 }
 
 /// Bare doctor's packages line names the row's fix once: appended when the sentence does not

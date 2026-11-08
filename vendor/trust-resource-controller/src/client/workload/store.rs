@@ -180,7 +180,7 @@ mod tests {
             file.as_fd().try_clone_to_owned().unwrap(),
             pending.0.unwrap().1,
         )));
-        assert!(borrowed.discover(crate::fixture_deadline(Instant::now())).is_err());
+        assert!(borrowed.discover(Instant::now() + std::time::Duration::from_secs(1)).is_err());
         drop(file);
         std::fs::remove_dir_all(root).unwrap();
     }

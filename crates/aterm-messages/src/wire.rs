@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::fmt::Write as _;
 
-use crate::center::{Live, MessageCenter, Outcome, PostOutcome};
+use crate::center::{Glass, Live, MessageCenter, Outcome, PostOutcome};
 use crate::log::{LogRecord, MessageLog, Retired};
 use crate::model::{
     ActionIndex, Amount, Glyph, Hold, Intent, Load, Message, MessageId, Meter, Origin, Restatement,
@@ -138,11 +138,13 @@ pub const fn state_word(rec: &LogRecord, live: Option<&Live>) -> &'static str {
     }
 }
 
-/// One `messages` row: `message <id> at=<unix_ms> ago_ms=<ms> tag=<tag> sev=<sev> origin=<host|wire|carried> state=<…> glass=<row|-> rep=<n> key=<pct|-> title=<pct> detail=<pct> actions=<pct|-> [progress=<n>/100|busy=1] [load=<network|disk|cpu>] [reveal=pending] [since_ms=<ms>] [need=<class>]`.
+/// One `messages` row: `message <id> at=<unix_ms> ago_ms=<ms> tag=<tag> sev=<sev> origin=<host|wire|carried> state=<…> [glass=<row|->] rep=<n> key=<pct|-> title=<pct> detail=<pct> actions=<pct|-> [progress=<n>/100|busy=1] [load=<network|disk|cpu>] [reveal=pending] [since_ms=<ms>] [need=<class>]`.
+/// `glass=` says a band host's band row ([`Glass::Band`]); a glass-less host's rows omit it.
 #[must_use]
 pub(crate) fn message_row(
     rec: &LogRecord,
     live: Option<&Live>,
+    glass: Glass,
     glass_row: Option<usize>,
     now_unix_ms: u64,
     enc: &dyn Fn(&str) -> String,
@@ -159,13 +161,17 @@ pub(crate) fn message_row(
         .collect();
     let ago_ms = now_unix_ms.saturating_sub(rec.stamp.unix_ms);
     let mut row = format!(
-        "message {} at={} ago_ms={ago_ms} tag={} sev={} origin={} state={state} glass={} rep={repeats} key={} title={} detail={} actions={}",
+        "message {} at={} ago_ms={ago_ms} tag={} sev={} origin={} state={state}{} rep={repeats} key={} title={} detail={} actions={}",
         rec.id,
         rec.stamp.unix_ms,
         rec.tag,
         rec.severity.as_str(),
         rec.origin.as_str(),
-        glass_row.map_or_else(|| "-".to_string(), |r| r.to_string()),
+        match (glass, glass_row) {
+            (Glass::Glassless, _) => String::new(),
+            (Glass::Band, Some(r)) => format!(" glass={r}"),
+            (Glass::Band, None) => " glass=-".to_string(),
+        },
         rec.key.as_deref().map_or_else(|| "-".to_string(), enc),
         enc(title),
         enc(&detail.join("\n")),
@@ -240,14 +246,14 @@ pub fn message_rows(
                 now_words.detail = e.detail;
                 now_words.actions = e.actions;
                 now_words.repeats = e.repeats;
-                let mut row = message_row(&now_words, None, None, now_unix_ms, enc);
+                let mut row = message_row(&now_words, None, center.glass(), None, now_unix_ms, enc);
                 if let Some(confirmation) = center.digest_confirmation(rec.id) {
                     let _ = write!(row, " rev={confirmation}");
                 }
                 return row;
             }
-            let glass = live.and_then(|_| center.glass_position(rec.id));
-            message_row(rec, live, glass, now_unix_ms, enc)
+            let row = live.and_then(|_| center.glass_position(rec.id));
+            message_row(rec, live, center.glass(), row, now_unix_ms, enc)
         })
         .collect()
 }
@@ -1889,7 +1895,7 @@ mod tests {
                 .unwrap()
         };
         for now_unix_ms in [10_000, 10_150, 10_300, 10_301, 12_345, 99_999] {
-            let row = message_row(rec, None, None, now_unix_ms, &pct_encode);
+            let row = message_row(rec, None, Glass::Band, None, now_unix_ms, &pct_encode);
             let (ago, since) = (field(&row, "ago_ms="), field(&row, "since_ms="));
             assert_eq!(ago, now_unix_ms - 10_000, "{row}");
             assert!(since <= ago, "{row}");
@@ -1923,9 +1929,44 @@ mod tests {
         let rec = child.log().get(p.id).unwrap();
         assert!(rec.retired_at.is_some(), "{rec:?}");
         assert_eq!(rec.retired_unix_ms, Some(71_000));
-        let row = message_row(rec, None, None, 71_050, &pct_encode);
+        let row = message_row(rec, None, Glass::Band, None, 71_050, &pct_encode);
         assert!(row.contains(" ago_ms=61050 "), "{row}");
         assert!(row.ends_with(" since_ms=50"), "{row}");
+    }
+
+    /// A GLASS-LESS HOST'S ROWS CARRY NO `glass=` FIELD (the native app, which paints no band),
+    /// live or retired; a band host's same row still carries `glass=-`.
+    /// NEGATIVE CONTROL (scratch): printing ` glass=-` for a glass-less host fails it.
+    #[test]
+    fn a_glassless_hosts_rows_carry_no_glass_field() {
+        let now = t0();
+        let warn = || {
+            Message::new(tags::SYSTEM, Severity::Warn, "Disk nearly full")
+                .hold(Hold::For(Duration::from_secs(5)))
+        };
+        let mut c = MessageCenter::glassless(
+            MessageLog::empty(),
+            now,
+            std::sync::Arc::new(crate::ConfirmationSource::new(None)),
+        );
+        let id = c.post(warn(), stamp(5_000), now).id;
+        c.settle(now, true);
+        let live = message_rows(&c, &ReadQuery::default(), 6_000, &pct_encode);
+        assert!(live[0].contains(" state=held rep=1 "), "{}", live[0]);
+        c.settle(now + Duration::from_secs(5), true);
+        assert!(c.live(id).is_none(), "its hold ended it");
+        let ended = message_rows(&c, &ReadQuery::default(), 11_000, &pct_encode);
+        assert!(ended[0].contains(" state=folded rep=1 "), "{}", ended[0]);
+
+        let mut band = MessageCenter::new(MessageLog::empty(), now);
+        band.post(warn(), stamp(5_000), now);
+        band.settle(now, true);
+        let queued = message_rows(&band, &ReadQuery::default(), 6_000, &pct_encode);
+        assert!(
+            queued[0].contains(" state=held glass=- rep=1 "),
+            "CONTROL: {}",
+            queued[0]
+        );
     }
 
     #[test]
@@ -1949,7 +1990,7 @@ mod tests {
         );
         c.commit_rows(now, 3);
         let rec = c.log().get(p.id).unwrap();
-        let row = message_row(rec, c.live(p.id), Some(0), 6_500, &pct_encode);
+        let row = message_row(rec, c.live(p.id), Glass::Band, Some(0), 6_500, &pct_encode);
         assert_eq!(
             row,
             "message 1 at=5000 ago_ms=1500 tag=privacy sev=info origin=host state=held glass=0 rep=1 key=privacy.fda title=File%20access%20not%20confirmed detail=Full%20Disk%20Access%20may%20already%20be%20enabled%0Asecond%20line actions=Open%20Settings,Not%20now"
@@ -1968,7 +2009,7 @@ mod tests {
             now,
         );
         let rec = c.log().get(m.id).unwrap();
-        let row = message_row(rec, c.live(m.id), None, 5_100, &pct_encode);
+        let row = message_row(rec, c.live(m.id), Glass::Band, None, 5_100, &pct_encode);
         assert!(
             row.ends_with(" key=- title=Installing detail= actions=- progress=42/100"),
             "{row}"
@@ -1976,7 +2017,7 @@ mod tests {
         assert!(row.contains(" state=live glass=- "), "{row}");
         c.dismiss(p.id, now + Duration::from_millis(250));
         let rec = c.log().get(p.id).unwrap();
-        let row = message_row(rec, None, None, 9_000, &pct_encode);
+        let row = message_row(rec, None, Glass::Band, None, 9_000, &pct_encode);
         assert!(row.contains(" state=dismissed glass=- "), "{row}");
         assert!(row.contains(" ago_ms=4000 "), "{row}");
         assert!(row.ends_with(" since_ms=3750"), "{row}");

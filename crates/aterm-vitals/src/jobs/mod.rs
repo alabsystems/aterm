@@ -359,8 +359,8 @@ pub enum StartWait {
     /// An x86_64 process on an arm64 Mac: Rosetta translates it, and aterm's Developer Tools
     /// grant does not reach that.
     Translating,
-    /// Its executable is on a volume not proven local: it has not started, and nothing read
-    /// says why.
+    /// An unresolved start: execution was not observed, and no request evidence attributes
+    /// it to the program check. This includes native executables on local volumes.
     NotStarted,
     /// It reads stopped or traced: a start-suspended spawn or a debugger's launch, unless macOS's
     /// program check holds a program that reads so, which nothing has measured (the

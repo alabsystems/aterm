@@ -129,9 +129,8 @@ pub(in crate::forever) fn three_a_said(mut seen: Seen, chain: Chain) -> Seen {
         .map_or_else(String::new, |(_, s)| s.clone());
     seen.status.push((t, format!("{last} held=same-reply")));
     seen.status_reads.extend(&reads);
-    let band = "-".to_string();
-    seen.band.push((t, band));
-    seen.band_reads.extend(&reads);
+    seen.harness.push((t, "-".to_string()));
+    seen.harness_reads.extend(&reads);
     if seen.window.read {
         seen.window.page.push((
             t,
@@ -421,24 +420,24 @@ const LIVE_ROW: &str = "message 7 at=1792903362447 ago_ms=84963 tag=harness sev=
      detail=Open%20the%20tab%20and%20tell%20it%20what%20is%20still%20open. actions=Show%20tab%203 \
      need=now";
 
-/// A band's rows are read by the tab's key, their titles decoded; only a live one titled for the
+/// A resume ask's rows are read by the tab's key, their titles decoded; only a live one titled for the
 /// stop stands for it.
 #[test]
-fn the_band_is_read_by_its_tabs_key_and_stands_only_while_live() {
+fn the_resume_ask_is_read_by_its_tabs_key_and_stands_only_while_live() {
     let sid = "s-d1d1ee8fc5845d9a582e";
     let other = LIVE_ROW.replace(sid, "s-0000000000000000aaaa");
     let messages = format!("{other}\n{LIVE_ROW}\nmessage 8 tag=harness key=harness.task.{sid}\n");
-    let band = band_rows(&messages, sid);
+    let asks = resume_ask_rows(&messages, sid);
     assert_eq!(
-        band,
+        asks,
         "7 state=live title=aterm stopped typing in window 3, tab 3"
     );
-    assert_eq!(stop_rows(&band), [band.as_str()]);
-    assert_eq!(band_rows(&other, sid), "-");
+    assert_eq!(stop_rows(&asks), [asks.as_str()]);
+    assert_eq!(resume_ask_rows(&other, sid), "-");
     assert!(stop_rows("-").is_empty());
-    let withdrawn = band_rows(&LIVE_ROW.replace("state=live", "state=withdrawn"), sid);
+    let withdrawn = resume_ask_rows(&LIVE_ROW.replace("state=live", "state=withdrawn"), sid);
     assert!(stop_rows(&withdrawn).is_empty(), "{withdrawn}");
-    let untitled = band_rows(
+    let untitled = resume_ask_rows(
         &LIVE_ROW.replace("aterm%20stopped%20typing", "Claude%20needs%20you"),
         sid,
     );
@@ -448,7 +447,7 @@ fn the_band_is_read_by_its_tabs_key_and_stands_only_while_live() {
         "any live resume ask is an alert"
     );
     let two = format!("{LIVE_ROW}\n{}", LIVE_ROW.replace("message 7", "message 9"));
-    assert_eq!(stop_rows(&band_rows(&two, sid)).len(), 2);
+    assert_eq!(stop_rows(&resume_ask_rows(&two, sid)).len(), 2);
 }
 
 /// A reader of a hold's words reads them past a stop that leads them, in every form and arm, and
@@ -979,7 +978,7 @@ fn held_diagnostics_are_later_and_never_raise_a_stop_alert() {
     }
     assert!(matches!(judge(&immediate), Verdict::Fail(_)));
     let mut alerted = good;
-    alerted.band.push((
+    alerted.harness.push((
         T0 + HELD_AT + 20_000,
         "m-7 state=live title=Harness decision in window 2, tab 3".to_string(),
     ));

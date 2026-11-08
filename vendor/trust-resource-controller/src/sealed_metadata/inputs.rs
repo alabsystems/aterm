@@ -181,6 +181,25 @@ impl MetadataPrepared {
         }
         Ok(())
     }
+    /// Paired query50/v2 binds the actual compiler in the complete plan. It
+    /// never constructs an old query50/v1 or drops configured environment.
+    pub fn validate_for_paired_query(
+        &self,
+        request: &crate::paired_qualification::query::CompilerQuery,
+    ) -> io::Result<()> {
+        self.validate()?;
+        request.validate()?;
+        let compiler = &request.invocation.consumer.compiler;
+        if self.root_attempt != request.member.binding.root_attempt
+            || self.member_attempt != request.member.member_attempt
+            || self.root != request.invocation.consumer.root
+            || self.executable.path != compiler.path
+            || self.executable.sha256 != compiler.sha256
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
         let mut e = Encoder::new(13);

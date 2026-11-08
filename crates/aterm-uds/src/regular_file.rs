@@ -37,6 +37,65 @@ pub fn open(path: &Path) -> io::Result<(File, Metadata)> {
     }
 }
 
+/// Make a distinct copy-on-write file from the actual held regular description.
+/// This never reopens a source pathname, changes its cursor/flags or replaces an
+/// existing destination. The caller owns destination permissions and durability.
+/// `false` means this OS/filesystem cannot clone; callers retain their bounded
+/// copy policy. Resource exhaustion and other errors are returned unchanged.
+///
+/// # Errors
+/// The source is not regular, the destination exists, or the native clone fails.
+pub fn clone_held(source: &File, destination: &Path) -> io::Result<bool> {
+    if !source.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular clone source",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::{fd::AsRawFd as _, unix::ffi::OsStrExt as _};
+        let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        unsafe extern "C" {
+            fn fclonefileat(
+                source: i32,
+                directory: i32,
+                path: *const std::ffi::c_char,
+                flags: u32,
+            ) -> i32;
+        }
+        // CLONE_NOFOLLOW | CLONE_NOOWNERCOPY. Native cloning creates a distinct
+        // inode owned by this caller, sharing immutable blocks until a write.
+        // SAFETY: the source File and destination CString remain live; no
+        // borrowed source path or mutable descriptor flags enter the operation.
+        if unsafe {
+            fclonefileat(
+                source.as_raw_fd(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                0x1 | 0x2,
+            )
+        } == 0
+        {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.raw_os_error(),
+            Some(libc::EXDEV | libc::ENOTSUP | libc::ENOSYS)
+        ) {
+            return Ok(false);
+        }
+        Err(error)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = destination;
+        Ok(false)
+    }
+}
+
 #[cfg(unix)]
 fn open_unix(path: &Path) -> io::Result<(File, Metadata)> {
     use std::os::unix::fs::OpenOptionsExt as _;

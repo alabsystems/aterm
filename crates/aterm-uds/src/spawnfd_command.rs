@@ -178,6 +178,8 @@ pub struct Command {
     /// Pass-through commands retain the caller's non-close-on-exec table. Ordinary commands
     /// still hand on only explicitly named guards.
     inherit_all: bool,
+    /// Start with default dispositions for every catchable signal, including inherited ignores.
+    default_signals: bool,
     /// An in-place native exec keeps this thread's signal mask instead of starting empty.
     #[cfg(target_vendor = "apple")]
     inherit_exec_signal_mask: bool,
@@ -250,6 +252,7 @@ impl Command {
             #[cfg(unix)]
             guards: Vec::new(),
             inherit_all: false,
+            default_signals: false,
             #[cfg(target_vendor = "apple")]
             inherit_exec_signal_mask: false,
             pgroup: None,
@@ -349,6 +352,17 @@ impl Command {
     /// The child's stderr.
     pub fn stderr(&mut self, cfg: impl Into<Stdio>) -> &mut Self {
         self.stderr = Some(cfg.into());
+        self
+    }
+
+    /// Reset every catchable signal to `SIG_DFL` in the child before its image starts.
+    ///
+    /// Ordinary commands preserve inherited ignored dispositions (apart from SIGPIPE, as std
+    /// does). A check runner opts in so a background shell's ignored SIGINT/SIGQUIT cannot
+    /// change a test's behavior. This never changes the parent's dispositions or the command's
+    /// signal-mask policy. The new image may install its own handlers after exec.
+    pub const fn default_signals(&mut self) -> &mut Self {
+        self.default_signals = true;
         self
     }
 
@@ -1561,6 +1575,7 @@ impl Command {
                 replace,
                 long_entry_ends: !self.env.saw_path(),
                 inherit_all: self.inherit_all,
+                default_signals: self.default_signals,
                 inherit_signal_mask: self.inherit_exec_signal_mask,
                 native_image: self.native_image,
                 disclaim: self.disclaim,
@@ -1871,6 +1886,7 @@ impl Command {
             command.process_group(pgroup);
         }
         let setsid = self.setsid;
+        let default_signals = self.default_signals;
         let guards: Vec<_> = self.guard_targets().collect();
         #[cfg(target_os = "linux")]
         let tether = self
@@ -1878,12 +1894,32 @@ impl Command {
             .then(|| i32::try_from(std::process::id()))
             .transpose()
             .map_err(io::Error::other)?;
-        // SAFETY: the hook runs between fork and exec and calls only signal/session queries,
+        // SAFETY: the hook runs between fork and exec and calls only signal/session operations,
         // the tether's prctl/getppid, and fcntl over pre-captured descriptors. Command owns
         // those occupied guard numbers throughout this private forked command's spawn/exec;
         // no allocation, lock or descriptor replacement occurs in the child hook.
         unsafe {
             command.pre_exec(move || {
+                if default_signals {
+                    // SAFETY: a zeroed action with an empty mask and SIG_DFL holds no Rust
+                    // callback; sigaction is async-signal-safe. Linux exposes signals 1..=64;
+                    // KILL/STOP cannot be changed, and libc reserves 32/33 for its threads.
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    action.sa_sigaction = libc::SIG_DFL;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    for sig in 1..=64 {
+                        if sig == libc::SIGKILL || sig == libc::SIGSTOP {
+                            continue;
+                        }
+                        if libc::sigaction(sig, &action, std::ptr::null_mut()) != 0 {
+                            let error = io::Error::last_os_error();
+                            if !matches!(sig, 32 | 33) || error.raw_os_error() != Some(libc::EINVAL)
+                            {
+                                return Err(error);
+                            }
+                        }
+                    }
+                }
                 let empty = [0u64; 16];
                 sigprocmask(SIG_SETMASK, empty.as_ptr(), std::ptr::null_mut());
                 if setsid && new_session() < 0 {

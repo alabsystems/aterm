@@ -595,6 +595,7 @@ aterm-a11y = { workspace = true }
 # First-party Objective-C bindings (typed sends, ownership, runtime class creation, the
 # block ABI; no dependencies of its own): every AppKit call in this crate goes through it.
 aterm-objc = { workspace = true }
+aterm-macos-ui = { workspace = true }
 
 # The `window` capture's `CGImage` layout reads (`app_introspect.rs`'s AppKit
 # chrome copy, `lib.rs`'s `cg_capture`), which `aterm-cg` holds to the SDK.

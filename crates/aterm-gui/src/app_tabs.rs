@@ -1183,6 +1183,8 @@ impl App {
         if !self.windows.contains_key(&wid) {
             return Err(NativeTabInstallError::UnknownWindow);
         }
+        // The view lays out in the faces its frame paints with, from its first layout.
+        self.land_native_layout_faces();
 
         let view = self
             .view_store
@@ -5761,6 +5763,10 @@ impl App {
 
     /// A MIDDLE press on the in-grid tab strip at `col`.
     pub(crate) fn handle_tab_strip_middle_press(&mut self, wid: WindowId, col: u16) {
+        if self.inline_rename_edit(wid).is_some() {
+            self.clear_strip_press(wid);
+            self.settle_rename_edit(wid);
+        }
         let Some(segs) = self.windows.get(&wid).map(|ws| ws.tab_segments.clone()) else {
             return;
         };
@@ -9941,6 +9947,53 @@ mod rename_strip_click_tests {
         assert!(app.windows[&wid].strip_press.is_none(), "streak broken");
     }
 
+    #[test]
+    fn non_left_strip_and_native_page_presses_settle_rename_and_middle_click_closes_from_a_native_tab()
+     {
+        use aterm_window::event::{ElementState, MouseButton};
+
+        let (mut app, wid) = app_with_two_tabs();
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Themes));
+        app.splice_tab_strip(wid);
+        assert!(app.active_native_view(wid).is_some());
+        assert_eq!(app.windows[&wid].tab_set.len(), 3);
+
+        let tab0 = app.windows[&wid].tab_set.tabs()[0].id;
+        assert!(app.begin_session_rename(wid, tab0));
+        app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert("kept".into()));
+
+        let (cw, ch) = app.win_cell_size(wid);
+        let (ox, oy) = app.frame_origin(wid);
+        let col2 = chip_col(&app, wid, 2);
+        let x = ox as f64 + (app.win_pad(wid) + usize::from(col2) * cw + cw / 2) as f64;
+        let y = oy as f64 + (app.win_pad_top(wid) + app.win_head(wid) + ch / 2) as f64;
+        app.on_cursor_moved(wid, x, y);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Middle);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Middle);
+        assert_eq!(app.rename_edit_session(wid), None);
+        assert_eq!(pin(&app, 0).as_deref(), Some("kept"));
+        assert_eq!(
+            app.windows[&wid].tab_set.len(),
+            2,
+            "middle-clicking the Settings chip while Settings is active closes it"
+        );
+
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Themes));
+        app.splice_tab_strip(wid);
+        assert!(app.begin_session_rename(wid, tab0));
+        app.rename_field_edit(wid, crate::app_search::SearchEdit::Insert(" body".into()));
+        let (bx, by) = app.cell_centre_px(wid, 4, 4).expect("native body cell");
+        app.on_cursor_moved(wid, bx, by);
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Right);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Right);
+        assert_eq!(
+            app.rename_edit_session(wid),
+            None,
+            "a right press on an active native page settles the inline rename"
+        );
+        assert_eq!(pin(&app, 0).as_deref(), Some("kept body"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn a_version_press_is_a_button_not_caption() {
@@ -10466,7 +10519,7 @@ mod status_glance_tests {
             app.windows
                 .get_mut(&WindowId(0))
                 .expect("window 0")
-                .band_on_screen_for_test = on;
+                .window_on_screen_for_test = on;
         };
         on_screen(&mut parent, true);
         parent.note_done_seen_looking();

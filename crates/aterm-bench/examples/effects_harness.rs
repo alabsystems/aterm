@@ -2790,7 +2790,8 @@ fn main() {
              | passes {} (drop {}, split {}) | pass cost {} us = {}% of present p95 {} us \
              | split present p95 {} us, route gain {} us = {}% | unorm draws {} us \
              | build+stage {}% | instances max {} (under {}) | clock {} us, {} kins \
-             | rel emit {} raster {} encode {} gpu {} | kins emit {} raster {} encode {}",
+             | rel emit {} raster {} encode {} gpu {} (at ref {} us) | kins emit {} raster {} \
+             encode {}",
             scene.name,
             get("n"),
             get("emit_p50_us"),
@@ -2818,6 +2819,7 @@ fn main() {
             get("raster_rel"),
             get("encode_rel"),
             get("gpu_rel"),
+            get("gpu_rel_ref_gpu_p50_us"),
             get("emit_kins_p50"),
             get("raster_kins_p50"),
             get("encode_kins_p50"),

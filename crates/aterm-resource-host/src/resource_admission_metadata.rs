@@ -426,6 +426,17 @@ pub(super) struct Resources {
     pub(super) _output: Option<std::sync::Arc<workload::OutputLocks>>,
 }
 impl member::MemberResources for Resources {
+    fn take_producer_inputs(&mut self) -> io::Result<Option<member_custody::ProducerInputs>> {
+        let Some(inputs) = &mut self.inputs else {
+            return Ok(None);
+        };
+        let gnu = self.scheduling.retirement_gnu()?;
+        let target = inputs
+            .prelude
+            .take_retirement()
+            .ok_or_else(|| refused("native target retirement witness missing"))?;
+        Ok(Some(member_custody::ProducerInputs::new(target, gnu)?))
+    }
     fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
         if let Some(inputs) = &mut self.inputs {
             let mut extra = vec![inputs.prelude.extra()?];

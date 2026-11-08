@@ -596,7 +596,7 @@ label_enum! {
         SessionChrome => "session_chrome",
         TitleDrift => "title_drift",
         KittyTenure => "kitty_tenure",
-        MessageBand => "message_band",
+        Messages => "messages",
         SessionStatus => "session_status",
         AccountProgress => "account_progress",
         ConsentCard => "consent_card",

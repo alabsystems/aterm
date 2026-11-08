@@ -191,7 +191,9 @@ impl Session<'_> {
             .ok_or("the named prerequisite has unowned path indirection")?;
         let identity = crate::trust_lock::tree_identity(&root)
             .ok_or("the named prerequisite has no stable tree identity")?;
-        let physical = root.join(want.package_executable());
+        let command = crate::store::ToolName::new(want.executable())
+            .ok_or("the named prerequisite has an invalid exposed command")?;
+        let physical = root.join("bin").join(command.exe_file());
         if physical.canonicalize().ok().as_ref() != Some(&physical) {
             return Err("the named prerequisite executable is redirected".into());
         }

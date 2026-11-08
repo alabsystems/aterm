@@ -52,6 +52,26 @@ pub struct Prepared {
     phase: Phase,
 }
 impl Prepared {
+    /// Borrow the same retained GNU descriptions for a native retirement
+    /// bookend. This duplicates custody, never reads or replenishes tokens.
+    pub(crate) fn retirement_gnu(&self) -> io::Result<Vec<OwnedFd>> {
+        if self.phase != Phase::Configured && self.phase != Phase::Bound {
+            return Err(refused("GNU retirement requires configured originals"));
+        }
+        if let Some(named) = &self.named {
+            named.validate()?;
+            named
+                .files
+                .iter()
+                .map(|file| duplicate(file.as_fd()))
+                .collect()
+        } else {
+            self._gnu_files
+                .iter()
+                .map(|file| duplicate(file.as_fd()))
+                .collect()
+        }
+    }
     /// Retain another host-owned lifetime guard without replacing existing
     /// CPU/GNU mappings. This is transport, not allocation or SDK validation.
     pub(crate) fn retain_guard(&mut self, guard: OwnedFd) -> io::Result<u32> {

@@ -175,7 +175,7 @@ pub(super) fn live(
         || !same_capability(&request.capability, &job.delegation.capability)
         || !job.launched
         || job.reaped
-        || job.settled
+        || job.is_settled()
         || job.cleanup_at.is_some()
         || request.units == 0
         || request.units > job.cpu_ceiling

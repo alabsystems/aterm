@@ -1813,13 +1813,11 @@ fn no_list_top_slices_a_line_in_a_short_window() {
                 lab.state_mut().scroll_page_to(top);
                 lab.state_mut().page_reveal = None;
                 let _ = lab.compile(width, height);
-                let rail = lab.state().navigation_scroll.get();
-                let rail_limit = lab.state().navigation_scroll_limit.get();
-                lab.state().navigation_scroll.set(if rail >= 20.0 {
-                    rail - 20.0
-                } else {
-                    (rail + 20.0).min(rail_limit)
-                });
+                // The rail a wheel's line along (its screens start at a row: no top of it cuts
+                // one).
+                if !lab.state_mut().scroll_navigation(-1) {
+                    lab.state_mut().scroll_navigation(1);
+                }
                 let compiled = lab.compile(width, height);
                 let room_bottom = lab
                     .state()

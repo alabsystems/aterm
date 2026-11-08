@@ -434,13 +434,17 @@ impl Findings {
             (StartWait::NotStarted, &self.not_started),
         ] {
             for n in list {
-                out.push(format!(
+                let mut line = format!(
                     "finding kind={} pid={} exe={} for_ms={}",
                     wait.word(),
                     n.pid,
                     exe_word(&n.name),
                     n.for_ms
-                ));
+                );
+                if wait == StartWait::NotStarted {
+                    line.push_str(" cause=unknown program_check=unconfirmed");
+                }
+                out.push(line);
             }
         }
         for n in &self.program_check_stranded {

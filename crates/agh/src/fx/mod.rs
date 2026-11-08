@@ -156,6 +156,8 @@ enum Seam {
 /// The effect seam.
 pub struct Fx {
     seam: Seam,
+    /// Cooperative CLI stop request, absent for library clients unless explicitly supplied.
+    git_stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The first divergence or refusal under a tape: every later door answers it (plan §4.6.27).
     latch: Mutex<Option<Error>>,
     /// The tape header's mode (`Anonymous` live and simulated): `route`, `gh` and `gh_stream`
@@ -469,6 +471,7 @@ impl Fx {
     const fn over(seam: Seam) -> Fx {
         Fx {
             seam,
+            git_stop: None,
             latch: Mutex::new(None),
             tape: TapeMode::Anonymous,
             endpoints: None,
@@ -539,6 +542,15 @@ impl Fx {
     #[must_use]
     pub fn live() -> Fx {
         Fx::over(Seam::Live(Mutex::new(LiveSeam::new(OsEffects::new()))))
+    }
+
+    pub(crate) fn with_git_stop(mut self, stop: Option<Arc<std::sync::atomic::AtomicBool>>) -> Fx {
+        self.git_stop = stop;
+        self
+    }
+
+    pub(crate) fn git_stop(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        self.git_stop.clone()
     }
 
     /// Tests: the deadlines of every request `gh` and `gh_stream` were handed so far, in order:
@@ -1438,8 +1450,15 @@ impl Fx {
     /// latched: it is the run's own answer, as a gh round trip's failure is).
     #[cfg(any(unix, test))]
     pub(crate) fn git(&self, spec: &child::ChildSpec, canonical: &[u8]) -> Result<child::ChildOut> {
+        let dispatch = || {
+            child::run_unless(spec, &mut || {
+                self.git_stop
+                    .as_ref()
+                    .is_some_and(|stop| stop.load(Ordering::Acquire))
+            })
+        };
         match &self.seam {
-            Seam::Live(_) => child::run(spec),
+            Seam::Live(_) => dispatch(),
             #[cfg(any(test, debug_assertions))]
             Seam::Simulated(clock) => {
                 child::check(spec)?;
@@ -1456,9 +1475,9 @@ impl Fx {
                     hook.after
                 });
                 #[cfg(unix)]
-                let mut result = child::run(spec);
+                let mut result = dispatch();
                 #[cfg(not(unix))]
-                let result = child::run(spec);
+                let result = dispatch();
                 #[cfg(unix)]
                 if let Some(after) = after {
                     after(&mut result);
@@ -1480,7 +1499,7 @@ impl Fx {
                 if tape::redacts(canonical) {
                     return Err(self.shaped_out(sink, shaped_request()));
                 }
-                let ran = child::run(spec);
+                let ran = dispatch();
                 let reply = match &ran {
                     Ok(out) => canon::git_reply(out),
                     Err(e) => canon::git_failure(e),

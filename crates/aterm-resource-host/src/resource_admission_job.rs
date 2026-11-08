@@ -118,7 +118,7 @@ impl Owner {
             // kernel quota or evidence of closure. Unknown coverage is never
             // treated as zero. Original custody remains held during cleanup.
             if (job.launched || job.resolver.is_some())
-                && !job.settled
+                && !job.is_settled()
                 && (!job.reaped || job.members.values().any(|member| member.group().is_some()))
                 && job.memory_at.elapsed() >= Duration::from_millis(100)
             {
@@ -283,7 +283,7 @@ impl Owner {
                 }
             }
             if job.reaped
-                && !job.settled
+                && !job.is_settled()
                 && job.members.is_empty()
                 && job
                     .workload
@@ -294,21 +294,9 @@ impl Owner {
                     .is_none_or(|at| at.elapsed() >= Duration::from_secs(1))
             {
                 job.settlement_at = Some(Instant::now());
-                let closed = match &mut job.custody {
-                    Custody::Fixed(custody) => custody.try_finish(fence),
-                    Custody::Cooperative(claim) => claim.finish_cohort(),
-                };
-                if closed.is_ok()
-                    && job
-                        .workload
-                        .as_ref()
-                        .is_none_or(|state| state.primary.settle().is_ok())
-                    && journal.settle(&job.binding).is_ok()
-                {
-                    job.settled = true;
-                }
+                let _ = settlement::settle(job, fence, journal);
             }
-            if job.settled
+            if job.is_settled()
                 && !job.terminal_sent
                 && let Some((event, observation)) = job.completion.take()
             {
@@ -323,7 +311,7 @@ impl Owner {
                 let _ = job.events.emit_terminal(event, observation);
                 job.terminal_sent = true;
             }
-            !(job.settled && job.terminal_sent && job.events.drained())
+            !(job.is_settled() && job.terminal_sent && job.events.drained())
         });
     }
 }

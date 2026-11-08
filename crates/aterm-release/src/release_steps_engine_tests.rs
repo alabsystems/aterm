@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The release's own publication engine ([`crate::gates::engine_copy`]) against a stand-in
+//! The release's own publication engine ([`aterm_verify::engine::engine_copy`]) against a stand-in
 //! engine: an origin, the checkout other processes on the Mac align (`~/publication`), a peer
 //! that lands engine code on the origin, and a release clone. The stand-in's `bin/pub` keeps the
 //! two rules of the real engine's stage that decide this (`bin/pub`'s capture and
@@ -167,9 +167,9 @@ impl World {
         }
     }
 
-    /// The release's own engine, where [`crate::gates::engine_copy`] puts it.
+    /// The release's own engine, where [`aterm_verify::engine::engine_copy`] puts it.
     fn copy(&self) -> PathBuf {
-        crate::gates::engine_copy(&crate::gates::release_dir(&self.repo))
+        aterm_verify::engine::engine_copy(&aterm_verify::engine::release_dir(&self.repo))
     }
 
     /// A real run's backend named the shared checkout (`dry`: a dry run's), its logs its own.

@@ -999,12 +999,20 @@ impl App {
         out
     }
 
+    /// Whether a copy or a paste being dispatched is refused for its clipboard: a control
+    /// client's gesture against the person's own clipboard. A debug build pointed at a lab file
+    /// copies to nobody's clipboard ([`crate::control::reaches_persons_clipboard`]), so a lab's
+    /// gesture there is not refused; a release build always reaches the person's.
+    pub(crate) fn clipboard_gesture_refused(&self) -> bool {
+        self.person_gesture_refused() && crate::control::reaches_persons_clipboard()
+    }
+
     /// Whether a control client's gesture is being dispatched, so `what` (a copy to, or a paste
-    /// from, the person's clipboard) refuses it: `selection.copy` and `selection.paste` ask for
+    /// from, the person's clipboard) refuses it ([`Self::clipboard_gesture_refused`]): `selection.copy` and `selection.paste` ask for
     /// [`crate::command_registry::ActionAuthority::Clipboard`], which no control client reaches.
     /// A refusal is logged and answers an `invoke` with [`CLIPBOARD_REFUSED`].
     pub(crate) fn refuse_clipboard_gesture(&mut self, what: &str) -> bool {
-        if !self.person_gesture_refused() {
+        if !self.clipboard_gesture_refused() {
             return false;
         }
         note_clipboard_refused(what);

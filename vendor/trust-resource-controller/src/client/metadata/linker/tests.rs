@@ -34,20 +34,20 @@ fn prepared() -> crate::linker::Prepared {
     p.scope = program::INPUT_SCOPE.into();
     p
 }
-fn prefix(target: &mut Channel, deadline: Instant) {
-    target.send(&status(Status::Attached), deadline).unwrap();
+fn prefix(target: &mut Channel, deadline: Instant) -> Vec<u8> {
     let p = prepared();
-    target.send(&p.encode().unwrap(), deadline).unwrap();
-    target
-        .send(
-            &status(Status::Started(Started {
-                identity: p.identity,
-                monotonic_ns: 10,
-                unix_ns: 11,
-            })),
-            deadline,
-        )
-        .unwrap();
+    let frames = [
+        status(Status::Attached),
+        p.encode().unwrap(),
+        status(Status::Started(Started { identity: p.identity, monotonic_ns: 10, unix_ns: 11 })),
+    ];
+    let mut original = Vec::new();
+    for frame in frames {
+        original.extend((frame.len() as u32).to_be_bytes());
+        original.extend(&frame);
+        target.send(&frame, deadline).unwrap();
+    }
+    original
 }
 #[test]
 fn direct_linker_orders_the_exact_actual_cpu_description_without_gnu() {
@@ -73,8 +73,8 @@ fn direct_linker_orders_the_exact_actual_cpu_description_without_gnu() {
 fn direct_linker_actual_streams_require_distinct_retirement_and_both_output_eofs() {
     let request = NativeQueryRequest::Linker(fixture::request());
     let (mut streams, mut target, mut stdout, stderr) = streams();
-    let deadline = crate::fixture_deadline(Instant::now() - Duration::from_secs(11));
-    prefix(&mut target, deadline);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let _ = prefix(&mut target, deadline);
     let completion = fixture::completion(&fixture::request());
     target.send(&completion.encode().unwrap(), deadline).unwrap();
     stdout.write_all(b"actual\0\xfflinker bytes").unwrap();
@@ -100,7 +100,7 @@ fn direct_linker_rejects_legacy_terminal_and_wrong_suspended_child() {
     let request = NativeQueryRequest::Linker(fixture::request());
     for wrong_identity in [false, true] {
         let (mut streams, mut target, stdout, stderr) = streams();
-        let deadline = crate::fixture_deadline(Instant::now());
+        let deadline = Instant::now() + Duration::from_secs(5);
         if wrong_identity {
             target.send(&status(Status::Attached), deadline).unwrap();
             target.send(&prepared().encode().unwrap(), deadline).unwrap();
@@ -113,7 +113,7 @@ fn direct_linker_rejects_legacy_terminal_and_wrong_suspended_child() {
                 )
                 .unwrap();
         } else {
-            prefix(&mut target, deadline);
+            let _ = prefix(&mut target, deadline);
             target
                 .send(
                     &fixture::completion(&fixture::request()).completed.encode().unwrap(),
@@ -130,15 +130,48 @@ fn direct_linker_rejects_legacy_terminal_and_wrong_suspended_child() {
 fn direct_linker_eof_before_retirement_keeps_actual_failed_prefix() {
     let request = NativeQueryRequest::Linker(fixture::request());
     let (mut streams, mut target, mut stdout, stderr) = streams();
-    let deadline = crate::fixture_deadline(Instant::now());
-    prefix(&mut target, deadline);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let original_events = prefix(&mut target, deadline);
     stdout.write_all(b"failed\0\xffprefix").unwrap();
+    // An actual duplicate retains the SAME event peer, as a concurrent birth
+    // can retain it before exec closes descriptors. Local Drop is not EOF.
+    let retained_event_peer = target.as_fd().try_clone_to_owned().unwrap();
     drop((target, stdout, stderr));
-    assert!(streams.poll(&request, deadline).is_err());
+    assert!(matches!(streams.poll(&request, deadline).unwrap(), StreamReady::Pending));
+    assert!(streams.state.started.is_some());
+    assert!(streams.state.completed.is_none());
+    drop(retained_event_peer);
+    // SAME streams, no reexecution: another process birth may still retain an
+    // original writer until exec. Pending cannot stand in for physical EOF.
+    loop {
+        match streams.poll(&request, deadline) {
+            Ok(StreamReady::Pending) => {
+                assert!(Instant::now() < deadline, "actual negative event EOF was not observed");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+                assert!(streams.events.at_eof().unwrap(), "a polling error is not physical EOF");
+                break;
+            }
+            Ok(StreamReady::Completed) => panic!("event EOF cannot become Completed"),
+            Ok(StreamReady::Refused) => panic!("event EOF cannot become Refused"),
+        }
+    }
+    while !streams.output.eof.iter().all(|eof| *eof) {
+        assert!(Instant::now() < deadline, "actual output EOFs were not observed");
+        streams.output.drain().unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let observed = streams.take_failure_observation(&request);
     assert_eq!(observed.stdout, b"failed\0\xffprefix");
-    assert!(observed.event_bytes_seen > 0);
+    assert!(observed.stderr.is_empty());
+    assert!(observed.stdout_eof && observed.stderr_eof);
+    assert_eq!(observed.event_prefix, original_events);
+    assert_eq!(observed.event_bytes_seen, original_events.len() as u64);
+    assert!(!observed.event_prefix_truncated());
     assert!(streams.state.completed.is_none());
+    assert!(streams.state.linker_completed.is_none());
 }
 #[test]
 fn direct_linker_capture_does_not_change_existing_query_limits() {

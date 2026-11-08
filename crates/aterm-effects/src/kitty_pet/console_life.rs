@@ -1076,7 +1076,34 @@ impl PetBrain {
             }
             _ => None,
         };
-        let centre = (held_center, keep);
+        // A flight to another row is judged where it lands ([`Self::head_span`]): the cells about
+        // its landing (the box as last drawn, set down there, and `KEPT_ROWS` over and under it),
+        // which that window reads about where the caret's does not read them all. A flight re-aimed
+        // in the air lands where neither the caret nor the body is.
+        let landing = match (&self.flight, self.console.last_body) {
+            (Some(f), Some(body))
+                if keep.is_some()
+                    && (f.to_row - f.from_row).abs() >= 0.5
+                    && f.to_row.is_finite()
+                    && f.to_col.is_finite()
+                    && self.col.is_finite() =>
+            {
+                let kept = crate::pet_world::KEPT_ROWS as f32;
+                let (top, col) = (f.to_row + 1.0 - body.rows, f.to_col + (body.col - self.col));
+                let first = ((top - kept).max(0.0).floor() as usize).min(pane.rows);
+                let end = ((top + body.rows + kept).ceil().max(0.0) as usize).min(pane.rows);
+                let c0 = (col.max(0.0).floor() as usize).min(pane.cols);
+                let c1 = ((col + body.cols).ceil().max(0.0) as usize).min(pane.cols);
+                (end > first && c1 > c0).then_some(PetPane {
+                    row: first,
+                    col: c0,
+                    rows: end - first,
+                    cols: c1 - c0,
+                })
+            }
+            _ => None,
+        };
+        let centre = (held_center, keep, landing);
         // Taking the reading held again ([`PetReading`]) would leave the
         // world, the observation count, the row signatures, the faux caret and
         // the contact as they stand: the same cells give the same world, whose
@@ -1564,6 +1591,49 @@ impl PetBrain {
             return None;
         }
         world.locomotion_ink_in_span(row.round() as usize, first, end)
+    }
+
+    /// The columns `a..b` of `row` a read along the body's row takes
+    /// ([`Self::observed_ink_in_span`], [`Self::observed_last_letter`]): `a..b` where the map
+    /// reads them whole, else as far either way from the columns `core` (the body's, among
+    /// them) as the window that reads those reaches
+    /// ([`crate::pet_world::PetWorld::span_read_about`]). On a pane past the map's columns, a
+    /// body setting off along its row, or bounding along it, is read over its way that far, not
+    /// over none of it (ATERM-KI-1107-3). `a..b` as they are where neither window reads `core` on
+    /// `row`, where they run past the pane's last column, and with
+    /// [`OldPath::WorldReadsTheBodysRows`] reverted.
+    #[inline]
+    pub(super) const fn read_about(
+        &self,
+        row: f32,
+        (a, b): (f32, f32),
+        core: (f32, f32),
+    ) -> (f32, f32) {
+        if self.old_path(OldPath::WorldReadsTheBodysRows)
+            || !self.console.presentable
+            || !row.is_finite()
+            || row < 0.0
+            || !a.is_finite()
+            || !b.is_finite()
+            || b <= a
+            || !core.0.is_finite()
+            || !core.1.is_finite()
+        {
+            return (a, b);
+        }
+        let Some(world) = self.console.world.as_ref() else {
+            return (a, b);
+        };
+        let (c0, c1) = (core.0.max(a), core.1.min(b));
+        if c1 <= c0 {
+            return (a, b);
+        }
+        let (first, end) = (a.max(0.0).floor() as usize, b.ceil() as usize);
+        let core = (c0.max(0.0).floor() as usize, c1.ceil() as usize);
+        match world.span_read_about(row.round() as usize, (first, end), core) {
+            Some((n0, n1)) if n0 > first || n1 < end => (a.max(n0 as f32), b.min(n1 as f32)),
+            _ => (a, b),
+        }
     }
 
     /// Exact locomotion occupancy where the map covers the whole footprint.
@@ -11859,5 +11929,71 @@ mod tests {
             pet.speed,
             pet.chrome_hop
         );
+    }
+
+    /// A WAY ALONG THE BODY'S ROW IS READ ON THE ROWS OVER AND UNDER IT ALIKE
+    /// ([`PetBrain::head_span`], [`PetBrain::read_about`], ATERM-KI-1107-3): on a pane 100 rows
+    /// by 300 columns, the caret at row 39's third column (the caret's window rows 7..71 and
+    /// columns 0..256), and a body at rest on row 70 at column 250, last drawn there (the window
+    /// about it rows 66..74 and columns 44..300), about to set off back along its row to column
+    /// 5, between rows 69 and 71 lettered to the margin. Its way, from 5 less a stretch's reach
+    /// to past column 256, is read whole by neither window. Over row 69 the caret's window reads
+    /// the body's columns and the most of the way, and reads it to that window's last column;
+    /// under, row 71 lies past that window's rows, and the way read so far reads nothing there.
+    /// The head law reads the way as far as both rows are read, from the first column of the
+    /// window about the body to the caret's window's last (44..256), each lettered: the body is
+    /// fitted to its row.
+    #[test]
+    fn a_way_along_the_row_is_read_on_the_rows_over_and_under_the_body_alike() {
+        let row: String = "the quick brown fox jumps over the lazy dog "
+            .repeat(7)
+            .chars()
+            .take(300)
+            .collect();
+        let mut term = Terminal::new(100, 300);
+        term.process(format!("\x1b[70;1H{row}\x1b[72;1H{row}\x1b[40;3H").as_bytes());
+        let input = term.cell_frame(100, 300);
+        let facts = PetWorldFacts::read(&term, 17);
+        let width = 4.0;
+        let mut pet = PetBrain {
+            col: 250.0,
+            row: 70.0,
+            alpha: 1.0,
+            ..PetBrain::default()
+        };
+        pet.console.last_body = Some(PetRect::new(69.25, 250.0, 1.75, width));
+        pet.observe_console(&input, &facts, PetPane::full(&input));
+        pet.set_console_presentable(true);
+        let window = |row, rows, col| PetPane {
+            row,
+            col,
+            rows,
+            cols: crate::pet_world::MAX_WORLD_COLS,
+        };
+        let world = pet.console.world.as_ref().expect("the pane is read");
+        assert_eq!(
+            (world.coverage(), world.body_window()),
+            (window(7, 64, 0), window(66, 8, 44))
+        );
+        pet.setting_off = Some(5.0);
+        let pad = HEAD_STRETCH_PAD * width;
+        let way = (5.0 - pad, 254.0 + pad + HEAD_REST_REACH);
+        assert!(
+            way.1 > 256.0 && way.1 < 300.0,
+            "fixture: the way runs past the caret's window's last column ({way:?})"
+        );
+        let over = pet.read_about(69.0, way, (250.0, 254.0));
+        assert_eq!(over, (way.0, 256.0));
+        assert_eq!(
+            pet.observed_ink_in_span(71.0, over.0, over.1),
+            None,
+            "fixture: the way as read over the body reads nothing under it"
+        );
+        let (seat, span) = pet.head_span(300, width);
+        assert_eq!((seat, span), ((250.0, 70.0), (44.0, 256.0)));
+        let read = pet
+            .head_target(70.0, (100, 300), span)
+            .expect("the rows over and under the body are read");
+        assert_eq!(read.law, head_law(true, true));
     }
 }

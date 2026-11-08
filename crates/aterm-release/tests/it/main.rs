@@ -214,6 +214,8 @@ mod channel_latest;
 mod claim_landing_model;
 mod durable_post_intent_model;
 mod export_policy;
+#[cfg(unix)]
+mod frozen_cutter;
 mod handoff_policy_bundle;
 mod hooks;
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]

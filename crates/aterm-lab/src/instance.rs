@@ -1925,7 +1925,6 @@ fn drive(inst: &mut Instance, world: &World, run: &Drive<'_>) -> Res {
     }
     run_verbs(inst, run.pre)?;
     if let Some(dest) = &run.image {
-        await_band(inst)?;
         let _ = terminal_request(
             |args| inst.ctl(args),
             &["await", "idle", "500", "timeout=60000"],
@@ -2212,36 +2211,6 @@ pub fn with_harness_keys(config: &str, keys: &[String]) -> String {
     }
     out.push_str(&config[at..]);
     out
-}
-
-/// Whether a `messages live` reply names a row with `reveal=pending`.
-fn reveal_pending(rows: &str) -> bool {
-    rows.lines()
-        .any(|row| row.starts_with("message ") && row.split(' ').any(|w| w == "reveal=pending"))
-}
-
-/// The band settled: no live row still in its reveal's grace, read through `messages live`.
-/// # Errors
-/// A row still pending after a minute, or the run interrupted ([`Stopped`]).
-fn await_band(inst: &Instance) -> Result<(), Fail> {
-    let start = Instant::now();
-    loop {
-        let rows = inst.ctl(&["messages", "live"]);
-        // A signal can end the client too (Ctrl-C reaches its group): its reply then says
-        // nothing of the band.
-        stop::check()?;
-        if rows.code != 0 || !reveal_pending(&rows.stdout) {
-            return Ok(());
-        }
-        if start.elapsed() >= BOOT {
-            return Err(Fail::die(format!(
-                "instance: a band row is still in its reveal's grace after {}s: {}",
-                BOOT.as_secs(),
-                rows.first()
-            )));
-        }
-        stop::sleep(Duration::from_millis(100))?;
-    }
 }
 
 /// Runs each control verb against `inst` and prints its reply.
@@ -2819,27 +2788,6 @@ mod launch_line_tests {
         );
         assert_eq!(line(&launch(true), Via::Job, keeper, sock), headless);
         assert_eq!(line(&launch(true), Via::Child, keeper, sock), headless);
-    }
-}
-
-#[cfg(test)]
-mod band_tests {
-    use super::reveal_pending;
-
-    #[test]
-    fn a_row_in_its_grace_holds_the_frame_and_nothing_else_does() {
-        let row = |tail: &str| {
-            format!(
-                "message 7 at=1 ago_ms=5 tag=harness sev=warn origin=host state=live glass=- \
-                 rep=0 key=k title=t detail=d actions=-{tail}"
-            )
-        };
-        assert!(reveal_pending(&row(" reveal=pending need=now")));
-        assert!(!reveal_pending(&row(" need=now")));
-        assert!(!reveal_pending(""));
-        assert!(!reveal_pending(
-            &row(" need=now").replace("title=t", "title=reveal=pending")
-        ));
     }
 }
 

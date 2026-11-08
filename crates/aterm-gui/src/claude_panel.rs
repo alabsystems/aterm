@@ -1035,7 +1035,7 @@ impl App {
                     .filter(|e| crate::active_tab_displays_session(ws, &self.view_store, e.session))
                     .filter_map(|e| e.next(panels.grid))
                     .min()?;
-                crate::messages_host::band_on_screen(ws)
+                crate::messages_host::window_on_screen(ws)
                     .then(|| epoch + Duration::from_millis(soonest))
             })
             .min()
@@ -1071,7 +1071,7 @@ impl App {
                     && crate::active_tab_displays_session(ws, views, e.session)
             };
             if !ws.claude_card.panels().entries.iter().any(|e| wants(ws, e))
-                || !crate::messages_host::band_on_screen(ws)
+                || !crate::messages_host::window_on_screen(ws)
             {
                 continue;
             }

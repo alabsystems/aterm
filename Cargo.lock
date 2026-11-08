@@ -148,7 +148,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.177.0"
+version = "0.178.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -209,6 +209,7 @@ version = "0.0.0"
 dependencies = [
  "aterm-dbus",
  "aterm-log",
+ "aterm-macos-ui",
  "aterm-objc",
  "aterm-tempfile",
  "aterm-types",
@@ -226,6 +227,7 @@ dependencies = [
  "aterm-durable",
  "aterm-hash",
  "aterm-log",
+ "aterm-macos-ui",
  "aterm-objc",
  "aterm-png",
  "aterm-sysprobe",
@@ -874,6 +876,7 @@ dependencies = [
  "aterm-link",
  "aterm-log",
  "aterm-machines",
+ "aterm-macos-ui",
  "aterm-mail",
  "aterm-mesh",
  "aterm-messages",
@@ -1235,6 +1238,14 @@ dependencies = [
  "aterm-vitals",
  "libc",
  "zeroize",
+]
+
+[[package]]
+name = "aterm-macos-ui"
+version = "0.0.0"
+dependencies = [
+ "aterm-dl",
+ "aterm-objc",
 ]
 
 [[package]]
@@ -2275,6 +2286,7 @@ dependencies = [
  "aterm-cg",
  "aterm-grapheme",
  "aterm-hash",
+ "aterm-macos-ui",
  "aterm-objc",
  "aterm-tempfile",
  "aterm-types",

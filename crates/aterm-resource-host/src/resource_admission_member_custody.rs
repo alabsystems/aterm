@@ -6,6 +6,326 @@
 use super::*;
 use aterm_capacity::cohort::launch::{CohortChild, LaunchError};
 use aterm_capacity::retained_cohort::CancelError;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+use std::sync::Arc;
+
+/// Actual pre-GO containment and the original scheduling descriptions. No wire
+/// value can manufacture the native target witness.
+pub(super) struct ProducerInputs {
+    target: crate::metadata_prelude::NoForkTarget,
+    gnu: GnuDescriptions,
+    original: Option<OriginalProducer>,
+    operation: Option<trust_resource_controller::workload::host::contained::Request>,
+    transport: std::sync::Mutex<RetainedControl>,
+}
+enum RetainedControl {
+    Absent,
+    Pending(OwnedFd),
+    Settled(OwnedFd),
+    Closed,
+}
+enum GnuDescriptions {
+    Owned(Vec<OwnedFd>),
+    OriginalPhase(Arc<[OwnedFd; 2]>),
+}
+impl GnuDescriptions {
+    fn descriptions(&self) -> &[OwnedFd] {
+        match self {
+            Self::Owned(fds) => fds,
+            Self::OriginalPhase(fds) => fds.as_slice(),
+        }
+    }
+}
+struct OriginalProducer {
+    root: Binding,
+    root_identity: aterm_uds::process::Identity,
+    member: [u8; 16],
+    loan: Option<parent_loan::Edge>,
+}
+impl ProducerInputs {
+    pub(super) fn new(
+        target: crate::metadata_prelude::NoForkTarget,
+        gnu: Vec<OwnedFd>,
+    ) -> io::Result<Self> {
+        let inputs = Self {
+            target,
+            gnu: GnuDescriptions::Owned(gnu),
+            original: None,
+            operation: None,
+            transport: std::sync::Mutex::new(RetainedControl::Absent),
+        };
+        inputs.check_gnu()?;
+        Ok(inputs)
+    }
+    pub(super) fn original_phase(
+        target: crate::metadata_prelude::NoForkTarget,
+        gnu: Arc<[OwnedFd; 2]>,
+    ) -> io::Result<Self> {
+        let inputs = Self {
+            target,
+            gnu: GnuDescriptions::OriginalPhase(gnu),
+            original: None,
+            operation: None,
+            transport: std::sync::Mutex::new(RetainedControl::Absent),
+        };
+        inputs.check_gnu()?;
+        Ok(inputs)
+    }
+    pub(super) fn contained(
+        mut self,
+        request: trust_resource_controller::workload::host::contained::Request,
+        transport: OwnedFd,
+    ) -> io::Result<Self> {
+        request.validate()?;
+        self.check_named_gnu(request.gnu)?;
+        self.operation = Some(request);
+        self.transport = std::sync::Mutex::new(RetainedControl::Pending(transport));
+        Ok(self)
+    }
+    fn check_named_gnu(&self, expected: trust_resource_controller::FileIdentity) -> io::Result<()> {
+        if self.gnu.descriptions().len() != 2 {
+            return Err(refused("contained producer requires original FIFO pair"));
+        }
+        for fd in self.gnu.descriptions() {
+            let file = std::fs::File::from(fd.try_clone()?);
+            let metadata = file.metadata()?;
+            if metadata.dev() != expected.device || metadata.ino() != expected.inode {
+                return Err(refused("contained producer differs from original GNU FIFO"));
+            }
+        }
+        self.check_gnu()
+    }
+    fn check_gnu(&self) -> io::Result<()> {
+        // Role6 has no GNU delegation. Named FIFO may use one RDWR original;
+        // numerical pipe and ordinary named FIFO retain their full pair.
+        if self.gnu.descriptions().len() > 2 {
+            return Err(refused("producer GNU population differs"));
+        }
+        for (index, fd) in self.gnu.descriptions().iter().enumerate() {
+            let file = std::fs::File::from(fd.try_clone()?);
+            let metadata = file.metadata()?;
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+            let expected = if self.gnu.descriptions().len() == 1 {
+                libc::O_RDWR
+            } else if index == 0 {
+                libc::O_RDONLY
+            } else {
+                libc::O_WRONLY
+            };
+            if !metadata.file_type().is_fifo()
+                || metadata.uid() != aterm_uds::peer::our_uid()
+                || flags < 0
+                || ![expected, libc::O_RDWR].contains(&(flags & libc::O_ACCMODE))
+            {
+                return Err(refused("original producer GNU description changed"));
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn check_child(&self, child: &CohortChild, pid: u32, birth: u64) -> io::Result<()> {
+        if !self.target.matches(pid, birth, child.cohort().group()) {
+            return Err(refused(
+                "native producer containment belongs to another child",
+            ));
+        }
+        self.check_gnu()
+    }
+}
+
+/// A private, non-Clone one-use native result. Construction follows original
+/// owning reap and successful retire_subgroup under the original custody.
+/// Group-only retirement, Finished, EOF and a saved status cannot create it.
+pub(super) struct ProducerRetirement {
+    original: OriginalProducer,
+    inputs: ProducerInputs,
+}
+
+/// Only consuming the actual retirement in the SAME successful custody return
+/// creates this one-use issuer. The Job shares lifetime of the same physical
+/// inputs; that Arc is not another issuer or a capacity-release constructor.
+pub(super) struct ReturnedProducer {
+    retirement: std::sync::Arc<ProducerRetirement>,
+}
+impl ReturnedProducer {
+    pub(super) fn settle(
+        &self,
+        journal: &super::journal::Journal,
+        binding: &Binding,
+    ) -> io::Result<()> {
+        if binding.session != self.retirement.original.root.session
+            || binding.attempt != self.retirement.original.member
+        {
+            return Err(refused("settlement differs from actual returned producer"));
+        }
+        journal.settle(binding)?;
+        let mut transport = self
+            .retirement
+            .inputs
+            .transport
+            .lock()
+            .map_err(|_| refused("original contained transport poisoned"))?;
+        let original = std::mem::replace(&mut *transport, RetainedControl::Closed);
+        *transport = match original {
+            RetainedControl::Pending(fd) => RetainedControl::Settled(fd),
+            other => other,
+        };
+        Ok(())
+    }
+    pub(super) fn completion(
+        &self,
+        request: &trust_resource_controller::workload::host::contained::Request,
+        completion: trust_resource_controller::workload::host::Completion,
+    ) -> io::Result<trust_resource_controller::workload::host::contained::Completion> {
+        let original = &self.retirement.original;
+        if self.retirement.inputs.operation.as_ref() != Some(request)
+            || request.produced.key.root_attempt != original.root.attempt
+            || request.produced.member.member_attempt != original.member
+            || completion.completed.finished.root_attempt != original.root.attempt
+            || completion.completed.finished.member_attempt != original.member
+            || completion.phase != request.produced.key.ordinal
+            || completion.kind != request.produced.kind
+        {
+            return Err(refused(
+                "contained issuer belongs to another original operation",
+            ));
+        }
+        self.retirement.inputs.check_named_gnu(request.gnu)?;
+        Ok(
+            trust_resource_controller::workload::host::contained::Completion {
+                operation: request.operation,
+                request_sha256: aterm_digest::Sha256::digest(request.binding_preimage()?),
+                gnu: request.gnu,
+                completion,
+            },
+        )
+    }
+}
+
+impl ProducerRetirement {
+    pub(super) fn close_exhausted_transport(&self) -> io::Result<()> {
+        let mut control = self
+            .inputs
+            .transport
+            .try_lock()
+            .map_err(|_| refused("original transport unavailable"))?;
+        let RetainedControl::Settled(fd) = &*control else {
+            return Ok(());
+        };
+        let mut byte = 0u8;
+        // Observe only the SAME accepted description. EOF never returns CPU,
+        // GNU, SDK or a phase: the actual typed retirement and journal settlement
+        // already happened, and their original owners stay in this same Job.
+        let result = unsafe {
+            libc::recv(
+                fd.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+        if result == 0 {
+            *control = RetainedControl::Closed;
+            return Ok(());
+        }
+        if result > 0 {
+            return Err(refused("trailing contained control bytes"));
+        }
+        let error = io::Error::last_os_error();
+        if matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ) {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl ProducerRetirement {
+    pub(super) fn returned_fixture(self: Box<Self>) -> Box<ReturnedProducer> {
+        Box::new(ReturnedProducer {
+            retirement: std::sync::Arc::from(self),
+        })
+    }
+    // A fixture owns a real original Claim/root/subgroup. It performs the same
+    // native retirement here; no status or test observation mints the result.
+    pub(super) fn retire_fixture(
+        claim: &mut aterm_capacity::Claim,
+        root: &mut CohortChild,
+        child: &mut CohortChild,
+        inputs: &mut Option<ProducerInputs>,
+        binding: Binding,
+    ) -> io::Result<Self> {
+        if !claim.cohort_bound(root.cohort()) || root.child_mut().exited()? {
+            return Err(refused("fixture original root unavailable"));
+        }
+        inputs
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "group-only producer has no enforced containment",
+                )
+            })?
+            .check_gnu()?;
+        if !child.child_mut().is_reaped() {
+            return Err(refused("original producer child has not been reaped"));
+        }
+        claim.retire_subgroup(child)?;
+        let mut inputs = inputs.take().ok_or_else(|| refused("inputs consumed"))?;
+        let original = inputs
+            .original
+            .take()
+            .ok_or_else(|| refused("original pre-GO producer owner missing"))?;
+        if original.root != binding {
+            return Err(refused("fixture original root differs"));
+        }
+        Ok(Self { original, inputs })
+    }
+    pub(super) fn check_fixture(
+        &self,
+        root: &mut CohortChild,
+        binding: &Binding,
+    ) -> io::Result<()> {
+        if &self.original.root != binding
+            || self.original.member != binding.attempt
+            || self.original.loan.is_some()
+            || aterm_uds::process::read_identity(root.child_mut().id() as i32)
+                != Some(self.original.root_identity)
+            || root.child_mut().exited()?
+        {
+            return Err(refused(
+                "fixture retirement belongs to another original root",
+            ));
+        }
+        self.inputs.check_gnu()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+impl ProducerInputs {
+    pub(super) fn bind_fixture(
+        &mut self,
+        root: &mut CohortChild,
+        binding: Binding,
+    ) -> io::Result<()> {
+        if self.original.is_some() || root.child_mut().exited()? {
+            return Err(refused("original producer cannot be rebound"));
+        }
+        let root_identity = aterm_uds::process::read_identity(root.child_mut().id() as i32)
+            .ok_or_else(|| refused("fixture original root unavailable"))?;
+        self.original = Some(OriginalProducer {
+            member: binding.attempt,
+            root: binding,
+            root_identity,
+            loan: None,
+        });
+        Ok(())
+    }
+}
 
 pub(super) struct Borrowed<'a> {
     pub job: &'a mut Job,
@@ -18,6 +338,88 @@ pub(super) struct Borrowed<'a> {
     pub journal: &'a journal::Journal,
 }
 impl member::MemberCustody for Borrowed<'_> {
+    fn bind_producer(&mut self, inputs: &mut ProducerInputs) -> io::Result<()> {
+        self.validate()?;
+        if inputs.original.is_some() {
+            return Err(refused("original producer cannot be rebound"));
+        }
+        let root_identity =
+            aterm_uds::process::read_identity(self.job.child.child_mut().id() as i32)
+                .ok_or_else(|| refused("original producer root unavailable before GO"))?;
+        if root_identity.birth.0 != self.job.root_birth {
+            return Err(refused("original producer root changed"));
+        }
+        if let Some(operation) = &inputs.operation {
+            if operation.produced.member.member_attempt != self.member
+                || operation.produced.key.root_attempt != self.job.binding.attempt
+            {
+                return Err(refused("contained operation differs before original GO"));
+            }
+            inputs.check_named_gnu(operation.gnu)?;
+        }
+        inputs.original = Some(OriginalProducer {
+            root: self.job.binding.clone(),
+            root_identity,
+            member: self.member,
+            loan: self.loan,
+        });
+        Ok(())
+    }
+    fn retire_producer(
+        &mut self,
+        child: &mut CohortChild,
+        inputs: &mut Option<ProducerInputs>,
+    ) -> io::Result<ProducerRetirement> {
+        // Root/caller loss is not successful producer retirement. Preserve the
+        // candidate and its original descriptors across every ambiguous error.
+        self.validate()?;
+        let inputs_ref = inputs
+            .as_ref()
+            .ok_or_else(|| refused("native producer inputs missing"))?;
+        inputs_ref.check_gnu()?;
+        if !child.child_mut().is_reaped() {
+            return Err(refused("original producer child has not been reaped"));
+        }
+        let original = inputs_ref
+            .original
+            .as_ref()
+            .ok_or_else(|| refused("pre-GO producer owner missing"))?;
+        self.check_producer(original)?;
+        self.retire(child)?;
+        self.validate()?;
+        let mut inputs = inputs
+            .take()
+            .ok_or_else(|| refused("native producer witness consumed"))?;
+        let original = inputs
+            .original
+            .take()
+            .ok_or_else(|| refused("native producer owner consumed"))?;
+        Ok(ProducerRetirement { original, inputs })
+    }
+    fn return_producer(
+        &mut self,
+        retirement: Box<ProducerRetirement>,
+    ) -> Result<Box<ReturnedProducer>, Box<ProducerRetirement>> {
+        let returned = (|| {
+            self.validate()?;
+            self.check_producer(&retirement.original)?;
+            retirement.inputs.check_gnu()?;
+            self.return_unit(member::ReturnReceipt::ScopeClosed)
+        })();
+        match returned {
+            Ok(()) => {
+                let retirement: std::sync::Arc<ProducerRetirement> =
+                    std::sync::Arc::from(retirement);
+                if retirement.inputs.operation.is_some() {
+                    self.job
+                        .contained_retirements
+                        .insert(self.member, std::sync::Arc::clone(&retirement));
+                }
+                Ok(Box::new(ReturnedProducer { retirement }))
+            }
+            Err(_) => Err(retirement),
+        }
+    }
     fn before_arm(&mut self) -> io::Result<()> {
         if let Some(edge) = self.loan {
             self.validate()?;
@@ -91,7 +493,7 @@ impl member::MemberCustody for Borrowed<'_> {
         self.fence.check_current()?;
         if !self.job.launched
             || self.job.reaped
-            || self.job.settled
+            || self.job.is_settled()
             || self.job.cleanup_at.is_some()
             || self.job.child.child_mut().exited()?
             || !members::covered(self.job, self.peer)
@@ -132,6 +534,22 @@ impl member::MemberCustody for Borrowed<'_> {
                         .unwrap_or_else(Instant::now),
                 )?;
             }
+        }
+        Ok(())
+    }
+}
+
+impl Borrowed<'_> {
+    fn check_producer(&mut self, original: &OriginalProducer) -> io::Result<()> {
+        if original.root != self.job.binding
+            || original.member != self.member
+            || original.loan != self.loan
+            || aterm_uds::process::read_identity(self.job.child.child_mut().id() as i32)
+                != Some(original.root_identity)
+        {
+            return Err(refused(
+                "producer retirement belongs to another original custody",
+            ));
         }
         Ok(())
     }

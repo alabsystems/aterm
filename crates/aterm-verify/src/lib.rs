@@ -28,6 +28,7 @@ mod compiler_observation;
 pub mod disk;
 pub mod docdriver;
 pub mod docscan;
+pub mod engine;
 pub mod event_log;
 pub mod exec;
 pub mod export_scan;
@@ -147,9 +148,10 @@ pub struct EnvSnapshot {
     pub cargo_home: Option<PathBuf>,
     /// The enabled native package prefix, resolved by the package manager.
     pub native_packages: Option<PathBuf>,
-    /// The publication engine's checkout: `PUBLICATION_ENGINE`, else `$HOME/publication`
-    /// ([`aterm_census::export_scan::rows::engine_dir`]).
-    pub publication_engine: Option<PathBuf>,
+    /// `PUBLICATION_ENGINE`, raw: an engine checkout whose HEAD commit the engine's readers
+    /// judge (a release hands each child its own); unset, they read the engine origin's main
+    /// ([`engine::named`]).
+    pub publication_engine: Option<OsString>,
     /// `ATERM_DISK_COVERED` ([`aterm_capacity::DISK_COVER_ENV`]): the name of the disk claim the
     /// work this run is part of holds (the release's), which covers the run's disk
     /// ([`disk::admit`]). Read here alone and removed from every child ([`CHILD_ENV_REMOVED`]),
@@ -158,6 +160,17 @@ pub struct EnvSnapshot {
 }
 
 impl EnvSnapshot {
+    /// The variables that name the publication engine ([`engine::named`]), as this snapshot
+    /// holds them: `PUBLICATION_ENGINE` and `HOME`.
+    #[must_use]
+    pub fn engine_var(&self, name: &str) -> Option<OsString> {
+        match name {
+            "PUBLICATION_ENGINE" => self.publication_engine.clone(),
+            "HOME" => Some(self.home.clone().into_os_string()).filter(|h| !h.is_empty()),
+            _ => None,
+        }
+    }
+
     /// Read the process environment.
     #[must_use]
     pub fn capture() -> Self {
@@ -195,9 +208,7 @@ impl EnvSnapshot {
                 .collect(),
             rust_test_threads: std::env::var_os("RUST_TEST_THREADS"),
             native_packages,
-            publication_engine: aterm_census::export_scan::rows::engine_dir(&|name| {
-                std::env::var_os(name)
-            }),
+            publication_engine: std::env::var_os("PUBLICATION_ENGINE").filter(|v| !v.is_empty()),
             disk_cover: std::env::var(aterm_capacity::DISK_COVER_ENV)
                 .ok()
                 .filter(|m| !m.trim().is_empty()),

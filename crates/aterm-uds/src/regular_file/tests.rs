@@ -5,6 +5,71 @@ use super::*;
 #[cfg(any(unix, windows))]
 use std::io::Read as _;
 
+#[test]
+#[cfg(target_os = "macos")]
+fn native_clone_uses_the_held_inode_and_keeps_copies_independent() {
+    use std::io::{Seek as _, SeekFrom};
+    use std::os::{
+        fd::AsRawFd as _,
+        unix::fs::{FileExt as _, MetadataExt as _},
+    };
+    let dir = aterm_tempfile::Builder::new()
+        .suffix(".noindex")
+        .tempdir()
+        .unwrap();
+    let source_path = dir.path().join("source");
+    let bytes = vec![0xa5; 8 * 1024 * 1024];
+    std::fs::write(&source_path, &bytes).unwrap();
+    let (mut source, original) = open(&source_path).unwrap();
+    source.seek(SeekFrom::Start(17)).unwrap();
+    let flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) };
+    let descriptor_flags = unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) };
+    std::fs::rename(&source_path, dir.path().join("held-original")).unwrap();
+    std::fs::write(&source_path, b"replacement must not be cloned").unwrap();
+    let destination = dir.path().join("clone");
+    assert!(
+        clone_held(&source, &destination).unwrap(),
+        "native APFS test requires actual clone support"
+    );
+    let cloned = std::fs::metadata(&destination).unwrap();
+    assert_ne!(cloned.ino(), original.ino());
+    assert_eq!(cloned.nlink(), 1);
+    assert_eq!(std::fs::read(&destination).unwrap(), bytes);
+    assert_eq!(source.stream_position().unwrap(), 17);
+    assert_eq!(
+        unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFL) },
+        flags
+    );
+    assert_eq!(
+        unsafe { libc::fcntl(source.as_raw_fd(), libc::F_GETFD) },
+        descriptor_flags
+    );
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&destination)
+        .unwrap();
+    writer.write_all_at(b"changed", 0).unwrap();
+    let mut original_prefix = [0; 7];
+    source.read_exact_at(&mut original_prefix, 0).unwrap();
+    assert_eq!(original_prefix, [0xa5; 7]);
+    assert_eq!(
+        std::fs::read(&source_path).unwrap(),
+        b"replacement must not be cloned"
+    );
+    assert_eq!(
+        clone_held(&source, &destination).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(&std::fs::read(destination).unwrap()[..7], b"changed");
+    assert!(
+        clone_held(
+            &File::open(dir.path()).unwrap(),
+            &dir.path().join("directory")
+        )
+        .is_err()
+    );
+}
+
 #[cfg(any(unix, windows))]
 #[test]
 fn a_regular_reader_returns_binary_bytes_and_its_own_metadata() {

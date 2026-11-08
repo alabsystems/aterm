@@ -895,7 +895,7 @@ fn the_cards_line_names_no_autopilot_and_no_task_end() {
     for word in [Autopilot::Land, Autopilot::Cruise] {
         let (mut app, wid, session) = glass(120);
         let host = supervise(&mut app, session);
-        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+        app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
         let sid = app
             .pool
             .get(session)
@@ -1017,7 +1017,7 @@ fn the_cards_line_ladder_names_the_harness_and_the_site() {
 fn an_armed_timer_leaves_the_cards_line_alone() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let mut t = Instant::now();
     set_now(Some(t));
     frame(&mut app, wid);
@@ -1348,7 +1348,7 @@ fn capture_resplice(tab_strip: u16) {
 fn the_card_flows_a_frame_a_step_and_held_keys_constant() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let plan = app.active_visible_leaf_plan(wid).unwrap();
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
@@ -1525,7 +1525,7 @@ fn own_wakes(app: &mut App, wid: WindowId, from: Instant, until: Instant) -> usi
 fn a_focus_blip_replays_no_intro_and_the_card_rides_on() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     set_now(Some(t0));
@@ -2528,7 +2528,7 @@ fn the_layers_meet_the_renderers_pixel_spaces() {
 fn serious_mode_keeps_a_still_border_only() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     frame(&mut app, wid);
     let right = |app: &App| hull(&marks(app, wid, FxSlot::Under)).x1;
     assert!(!marks(&app, wid, FxSlot::Over).is_empty());
@@ -2675,7 +2675,7 @@ fn over_col(app: &App, wid: WindowId, cw: usize, pad: usize) -> usize {
 fn other_wakes_never_push_an_episode_frame_on() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     set_now(Some(t0));
@@ -2703,7 +2703,7 @@ fn an_episode_draws_a_frame_a_frame_time_whatever_else_wakes() {
     for wake_ms in [4u64, 8, 20] {
         let (mut app, wid, session) = glass(120);
         let host = supervise(&mut app, session);
-        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+        app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
         let plan = app.active_visible_leaf_plan(wid).unwrap();
         let t0 = Instant::now();
         set_now(Some(t0));
@@ -2805,7 +2805,7 @@ fn a_pane_that_moves_in_the_plan_keeps_its_card() {
 fn a_native_tab_in_front_arms_no_card_wake() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     set_now(Some(t0));
@@ -2857,7 +2857,7 @@ fn serious_mode_moves_a_settled_cards_key() {
 fn an_autopilot_change_arms_an_episode() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let mut t = Instant::now();
     set_now(Some(t));
     frame(&mut app, wid);
@@ -2912,7 +2912,7 @@ fn an_autopilot_change_arms_an_episode() {
 fn off_to_cruise_plays_though_the_claim_lands_a_frame_later() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let ctx = app.pool.get(session).expect("session").ctx.clone();
     let reclaim = || {
         crate::session_timeline::claim_supervisor(
@@ -3005,7 +3005,7 @@ fn off_to_cruise_plays_though_the_claim_lands_a_frame_later() {
 fn tab_status_off_hides_every_card() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let t0 = Instant::now();
     set_now(Some(t0));
     frame(&mut app, wid);
@@ -3196,7 +3196,7 @@ fn a_fence_of_another_holder_reads_no_card() {
 fn only_a_wanted_card_frame_asks_whether_its_window_is_on_screen() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     set_now(Some(t0));
@@ -4582,7 +4582,7 @@ fn a_change_in_a_split_lays_the_card_as_a_fresh_split_would() {
 fn a_window_hidden_mid_episode_costs_the_wakes_nothing() {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let t0 = Instant::now();
     let at = |ms: u64| t0 + Duration::from_millis(ms);
     set_now(Some(t0));
@@ -4745,7 +4745,7 @@ fn a_timer_weekday_change_moves_the_footer_key() {
 fn flowing_glass(t0: Instant, at_ms: u64) -> (App, WindowId, u64, crate::harness_host::HostHandle) {
     let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     for t in [0, at_ms] {
         set_now(Some(t0 + Duration::from_millis(t)));
         frame(&mut app, wid);
@@ -4964,7 +4964,7 @@ fn workspace_glass() -> (App, WindowId, u64, crate::harness_host::HostHandle) {
     publish(&app, session, "2.1.302");
     feed(&app, session, &screen);
     let host = supervise(&mut app, session);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     (app, wid, session, host)
 }
 

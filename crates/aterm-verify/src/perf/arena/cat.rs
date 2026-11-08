@@ -7,7 +7,8 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aterm_uds::spawnfd::{Stdio, command};
+use crate::exec::check_command as command;
+use aterm_uds::spawnfd::Stdio;
 
 use super::{
     Aterm, COOLDOWN, Ghostty, Group, Halt, Inbox, Ledger, Scratch, arena_dir, ghostty_tip,

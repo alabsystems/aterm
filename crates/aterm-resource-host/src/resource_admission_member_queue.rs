@@ -432,6 +432,12 @@ impl Owner {
             let Some(mut job) = self.jobs.remove(&root) else {
                 continue;
             };
+            for original in job.contained_retirements.values() {
+                // Transport cleanup only after actual returned native custody,
+                // actual journal settlement and actual peer EOF. Any error
+                // retains it; the original phase/SDK/GNU owners stay live.
+                let _ = original.close_exhausted_transport();
+            }
             let attempts: Vec<_> = job.members.keys().copied().collect();
             for attempt in attempts {
                 let Some(mut slot) = job.members.remove(&attempt) else {

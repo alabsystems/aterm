@@ -246,6 +246,7 @@ impl Owner {
             compiler: pending.recipe.as_ref().and_then(|r| r.compiler.clone()),
             sdk: pending.sdk,
             members: BTreeMap::new(),
+            contained_retirements: BTreeMap::new(),
             loans: BTreeMap::new(),
             events: pending.events,
             custody,
@@ -265,7 +266,7 @@ impl Owner {
             terminal_sent: false,
             completion: None,
             launched: false,
-            settled: false,
+            closed: None,
             settlement_at: None,
         };
         if prepared.is_ok()

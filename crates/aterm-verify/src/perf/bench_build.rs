@@ -151,7 +151,7 @@ pub(crate) fn run_bench(
         output.1,
         executable.display()
     );
-    let mut command = aterm_uds::spawnfd::command(&executable);
+    let mut command = crate::exec::check_command(&executable);
     targo.environment(&mut command);
     command.current_dir(workspace_root()).arg("--bench");
     let admitted = match entry {
@@ -277,7 +277,7 @@ impl<'a> Targo<'a> {
     }
 
     pub(crate) fn command(&self, verb: &str) -> Command {
-        let mut cmd = aterm_uds::spawnfd::command(&self.driver.program);
+        let mut cmd = crate::exec::check_command(&self.driver.program);
         cmd.args(self.lead(verb)).current_dir(workspace_root());
         self.environment(&mut cmd);
         cmd
@@ -507,7 +507,7 @@ pub(crate) fn ledger_paths(dir: &Path, date: &str, stem: &str) -> (PathBuf, Path
 /// `vm.loadavg`'s three figures, or `unavailable`.
 pub(crate) fn load_average() -> String {
     arena::stdout_of(
-        aterm_uds::spawnfd::command(aterm_uds::os_path!("sysctl")).args(["-n", "vm.loadavg"]),
+        crate::exec::check_command(aterm_uds::os_path!("sysctl")).args(["-n", "vm.loadavg"]),
     )
     .map(|s| {
         s.trim_matches(|c| c == '{' || c == '}' || c == ' ')
@@ -521,7 +521,7 @@ pub(crate) fn cpus() -> String {
     let logical = std::thread::available_parallelism()
         .map_or_else(|_| "?".to_string(), |n| n.get().to_string());
     match arena::stdout_of(
-        aterm_uds::spawnfd::command(aterm_uds::os_path!("sysctl"))
+        crate::exec::check_command(aterm_uds::os_path!("sysctl"))
             .args(["-n", "hw.perflevel0.physicalcpu"]),
     )
     .filter(|s| !s.is_empty())
@@ -668,7 +668,7 @@ mod tests {
     #[test]
     fn bench_output_environment_keeps_os_paths() {
         let keeps = |path: &Path| {
-            let mut command = aterm_uds::spawnfd::command("not-executed");
+            let mut command = crate::exec::check_command("not-executed");
             set_bench_environment(&mut command, "KNOBS", "samples=3", ("OUTPUT", path));
             let vars: Vec<_> = command.get_envs().collect();
             assert!(vars.contains(&(

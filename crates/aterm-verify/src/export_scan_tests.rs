@@ -178,7 +178,8 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// A checkout whose export carries `crates/x/src/lib.rs` holding `lib`, committed on `main`
-/// with `lib` added after, and an engine checkout beside it.
+/// with `lib` added after, and beside it an engine checkout, its baseline and registry
+/// committed, that `PUBLICATION_ENGINE` names.
 fn checkout(lib: &str) -> (aterm_tempfile::TempDir, Ctx) {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("repo");
@@ -192,6 +193,9 @@ fn checkout(lib: &str) -> (aterm_tempfile::TempDir, Ctx) {
         &engine.join(REGISTRY),
         "[repos.aterm]\npath = \"~/aterm\"\n",
     );
+    git(&engine, &["init", "-q", "-b", "main"]);
+    git(&engine, &["add", "-A"]);
+    git(&engine, &["commit", "-q", "-m", "engine"]);
     write(&root.join(MANIFEST), "crates\n.gitleaks.toml\n");
     write(&root.join(CONFIG), ACCEPTED);
     write(&root.join("crates/aterm-gui/Cargo.toml"), "[package]\n");
@@ -203,7 +207,7 @@ fn checkout(lib: &str) -> (aterm_tempfile::TempDir, Ctx) {
     std::fs::create_dir_all(&scratch).expect("scratch");
     let env = crate::EnvSnapshot {
         path: std::env::var_os("PATH").unwrap_or_default(),
-        publication_engine: Some(engine),
+        publication_engine: Some(engine.into_os_string()),
         ..crate::EnvSnapshot::default()
     };
     let scope = Scope::changed("main", Vec::new(), false);
@@ -269,6 +273,39 @@ fn a_fixture_gitleaks_refuses_is_found_before_a_cut() {
     let (outcomes, ids, report) = verdict(&ctx, Ok(Scanner::Fixture(scanner)));
     require_fixture(&report).unwrap_or_else(|why| aterm_uds::host::could_not_run(why));
     assert_eq!(outcomes, [Outcome::Ok], "{ids:?}; {report:#?}");
+}
+
+/// THE ENGINE'S BASELINE IS ITS COMMIT, NEVER ITS WORKING TREE: a row a session left
+/// uncommitted in the named engine's checkout judges nothing, and the label names the commit
+/// the scan held the export to. NEGATIVE CONTROL: the same row, committed, is a finding.
+#[test]
+fn an_uncommitted_engine_row_is_not_the_engines_until_it_is_committed() {
+    let (_dir, ctx) = checkout("// a fixture\n// wombatword\n");
+    let engine = std::path::PathBuf::from(ctx.env.engine_var("PUBLICATION_ENGINE").expect("named"));
+    let rows = engine.join(rows::BASELINE);
+    std::fs::write(&rows, "# Paths\nquokkaword\nwombatword\n").expect("edit");
+    let scan = |ctx: &Ctx| {
+        let mut r = Report::new("export-scan");
+        run_with(ctx, &mut r, || Err("no signed scanner in fixture".into()));
+        let labels: Vec<String> = r.outcomes().map(|(_, l)| l.to_string()).collect();
+        let ids: Vec<String> = r.findings().iter().map(|f| f.id.clone()).collect();
+        (labels, ids)
+    };
+    let (labels, uncommitted) = scan(&ctx);
+    assert!(
+        !uncommitted.contains(&"crates/x/src/lib.rs:2".to_string()),
+        "an uncommitted row is no part of the engine: {uncommitted:?}"
+    );
+    assert!(
+        labels.iter().any(|l| l.contains("at HEAD")),
+        "the label names the commit: {labels:#?}"
+    );
+    git(&engine, &["commit", "-q", "-am", "row"]);
+    let (_, committed) = scan(&ctx);
+    assert!(
+        committed.contains(&"crates/x/src/lib.rs:2".to_string()),
+        "NEGATIVE CONTROL: committed, the row holds: {committed:?}"
+    );
 }
 
 #[test]

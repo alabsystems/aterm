@@ -411,7 +411,7 @@ fn message(id: u32, key: &str, title: &str) -> String {
             .collect::<String>()
     };
     format!(
-        "message {id} at=1000 ago_ms=5 tag=harness sev=info origin=host state=live glass=- rep=1 \
+        "message {id} at=1000 ago_ms=5 tag=harness sev=info origin=host state=live rep=1 \
          key={} title={} detail= actions=-",
         pct(key),
         pct(title)

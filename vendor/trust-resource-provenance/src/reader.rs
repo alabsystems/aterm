@@ -59,8 +59,8 @@ struct Image {
 pub struct Host {
     instance: Instance,
     identity: Identity,
-    image: Image,
-    socket_parent: File,
+    image: Arc<Image>,
+    socket_parent: Arc<File>,
     stream: UnixStream,
 }
 
@@ -71,8 +71,8 @@ pub struct Host {
 pub struct PinnedHelper {
     instance: Instance,
     identity: Identity,
-    image: Image,
-    socket_parent: File,
+    image: Arc<Image>,
+    socket_parent: Arc<File>,
 }
 
 fn same_file(actual: &File, original: &File) -> io::Result<bool> {
@@ -182,10 +182,10 @@ impl Store {
             if instance.proven_stale() {
                 continue;
             }
-            if let Some(host) = instance.connect_ancestor(deadline)? {
-                if selected.replace(host).is_some() {
-                    return Err(refused("ambiguous native custodian ancestors"));
-                }
+            if let Some(host) = instance.connect_ancestor(deadline)?
+                && selected.replace(host).is_some()
+            {
+                return Err(refused("ambiguous native custodian ancestors"));
             }
         }
         selected.ok_or_else(|| refused("native custodian ancestor unavailable"))
@@ -246,7 +246,13 @@ impl Instance {
         self.check_socket(&socket_parent)?;
         let stream = crate::connection::connect(&self.socket, deadline)?;
         process::check_peer(&stream, native)?;
-        let host = Host { instance: self.clone(), identity: native, image, socket_parent, stream };
+        let host = Host {
+            instance: self.clone(),
+            identity: native,
+            image: Arc::new(image),
+            socket_parent: Arc::new(socket_parent),
+            stream,
+        };
         host.instance.check_socket(&host.socket_parent)?;
         let own = process::read_identity(std::process::id())?;
         if !process::stable_ancestor(native, own, deadline)? {
@@ -277,7 +283,22 @@ impl Host {
     /// Keep original image/host backing while dropping the unused pre-HELLO
     /// connection. The helper reconnects independently for its actual operation.
     pub fn into_helper(self, deadline: Instant) -> io::Result<PinnedHelper> {
-        self.revalidate(deadline)?;
+        self.into_helper_preserving(deadline).map_err(|original| {
+            let (_original, error) = *original;
+            error
+        })
+    }
+    /// Consume this actual connection into its SAME opaque original pin after
+    /// native validation. Failure returns the original owner, never a pin made
+    /// from a saved process identity, descriptor number or decoded observation.
+    /// Closing the connection confers no execution or resource-return authority.
+    pub fn into_helper_preserving(
+        self,
+        deadline: Instant,
+    ) -> Result<PinnedHelper, Box<(Self, io::Error)>> {
+        if let Err(error) = self.revalidate(deadline) {
+            return Err(Box::new((self, error)));
+        }
         Ok(PinnedHelper {
             instance: self.instance,
             identity: self.identity,
@@ -399,13 +420,11 @@ impl PinnedHelper {
         let host = Host {
             instance: self.instance.clone(),
             identity: self.identity,
-            image: Image {
-                file: self.image.file.try_clone()?,
-                before: self.image.before.clone(),
-                directory: self.image.directory.try_clone()?,
-                directory_before: self.image.directory_before.clone(),
-            },
-            socket_parent: self.socket_parent.try_clone()?,
+            // Share the SAME original held descriptions, not one duplicate
+            // image/directory set per accepted operation. Validation below
+            // still checks every actual connection and original backing.
+            image: Arc::clone(&self.image),
+            socket_parent: Arc::clone(&self.socket_parent),
             stream,
         };
         host.revalidate(deadline)?;

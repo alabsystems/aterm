@@ -152,11 +152,12 @@ pub struct GuardReport {
 }
 
 /// Run every guard over the checkout at `root`.
-pub fn run_guards(root: &Path) -> Result<GuardReport, String> {
+pub fn run_guards(root: &Path, engine: &crate::EngineBaseline) -> Result<GuardReport, String> {
     let corpus = Corpus::read(root)?;
     let tree = Tree {
         root,
         corpus: &corpus,
+        engine,
     };
     let mut findings = scope_findings(&corpus, GUARDS);
     findings.extend(run_rules(&tree, GUARDS));
@@ -227,7 +228,7 @@ fn run_rules(tree: &Tree<'_>, rules: &[Rule]) -> Vec<Finding> {
 }
 
 /// The guards as a census: the transcript `aterm-census --guards` prints.
-pub(crate) fn run_guard_census(root: &Path) -> CensusOutcome {
+pub(crate) fn run_guard_census(root: &Path, engine: &crate::EngineBaseline) -> CensusOutcome {
     const TITLE: &str = "guards";
     let ids: Vec<&str> = GUARDS.iter().map(|r| r.id).collect();
     let mut log = format!(
@@ -236,13 +237,13 @@ pub(crate) fn run_guard_census(root: &Path) -> CensusOutcome {
         root.display(),
         ids.join(", ")
     );
-    let report = match run_guards(root) {
+    let report = match run_guards(root, engine) {
         Ok(report) => report,
         Err(why) => {
             return CensusOutcome::red(TITLE, log, format!("the tree could not be read: {why}"));
         }
     };
-    let notes = captures::notes(root);
+    let notes = captures::notes(root, engine);
     for note in &notes {
         let _ = writeln!(log, "    note: {note}");
     }
@@ -298,6 +299,8 @@ pub(crate) fn run_guard_census(root: &Path) -> CensusOutcome {
 pub(crate) struct Tree<'a> {
     pub(crate) root: &'a Path,
     pub(crate) corpus: &'a Corpus,
+    /// The publication engine's baseline the caller read ([`crate::EngineBaseline`]).
+    pub(crate) engine: &'a crate::EngineBaseline,
 }
 
 impl<'a> Tree<'a> {
@@ -1148,12 +1151,16 @@ pub(crate) fn calls(code: &str) -> Vec<&str> {
 pub(crate) mod tests {
     use super::*;
 
+    /// No engine baseline: what a test's tree is judged with unless it says otherwise.
+    pub(crate) const NO_ENGINE: &crate::EngineBaseline = &Err(String::new());
+
     /// The rule's findings over `files`, with no checkout behind them.
     pub(crate) fn run(rule: &Rule, files: &[(&str, &str)]) -> Vec<Finding> {
         let corpus = Corpus::of(files);
         let tree = Tree {
             root: Path::new("/nonexistent-aterm-census-root"),
             corpus: &corpus,
+            engine: NO_ENGINE,
         };
         run_rules(&tree, std::slice::from_ref(rule))
     }

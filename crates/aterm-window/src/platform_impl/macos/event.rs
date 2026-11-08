@@ -45,7 +45,7 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
             return Key::Unidentified(NativeKey::MacOS(scancode));
         }
         let layout_data =
-            ffi::TISGetInputSourceProperty(input_source, ffi::kTISPropertyUnicodeKeyLayoutData);
+            ffi::TISGetInputSourceProperty(input_source, ffi::unicode_key_layout_data());
         if layout_data.is_null() {
             CFRelease(input_source as *mut c_void);
             tracing::error!("`TISGetInputSourceProperty` returned null ptr");
@@ -133,8 +133,7 @@ impl CurrentLayout {
             if source.is_null() {
                 return None;
             }
-            let data =
-                ffi::TISGetInputSourceProperty(source, ffi::kTISPropertyUnicodeKeyLayoutData);
+            let data = ffi::TISGetInputSourceProperty(source, ffi::unicode_key_layout_data());
             if data.is_null() {
                 CFRelease(source as *mut c_void);
                 return None;

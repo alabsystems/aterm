@@ -150,7 +150,7 @@ fn bench(dir: &Path) -> Result<String, super::floors::MeasureError> {
         "aterm_gui",
         "lib",
     )?;
-    let mut run = aterm_uds::spawnfd::command(&executable);
+    let mut run = crate::exec::check_command(&executable);
     run.args([BENCH, "--exact", "--nocapture", "--test-threads", "1"])
         .env("ATERM_DECK_COST", &out)
         .current_dir(workspace_root());

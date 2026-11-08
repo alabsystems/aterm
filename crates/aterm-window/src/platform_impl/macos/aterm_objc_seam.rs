@@ -75,21 +75,9 @@ pub(super) mod consts {
     pub(crate) const NS_UTF8_STRING_ENCODING: usize = 4;
 }
 
-#[link(name = "AppKit", kind = "framework")]
-unsafe extern "C" {
-    /// Running AppKit version (`NSAppKitVersionNumber`).
-    #[link_name = "NSAppKitVersionNumber"]
-    pub(super) static NS_APPKIT_VERSION_NUMBER: f64;
-    /// Legacy filenames pasteboard type (`NSFilenamesPboardType`).
-    #[link_name = "NSFilenamesPboardType"]
-    pub(super) static NS_FILENAMES_PBOARD_TYPE: Id;
-    /// Light system appearance name (`NSAppearanceNameAqua`).
-    #[link_name = "NSAppearanceNameAqua"]
-    pub(super) static NS_APPEARANCE_NAME_AQUA: Id;
-    /// Notification posted when an `NSView`'s frame changes (`NSViewFrameDidChangeNotification`).
-    #[link_name = "NSViewFrameDidChangeNotification"]
-    pub(super) static NS_VIEW_FRAME_DID_CHANGE_NOTIFICATION: Id;
-}
+pub(super) use aterm_macos_ui::appkit::{
+    appearance_name_aqua, filenames_pboard_type, version_number, view_frame_did_change_notification,
+};
 
 #[link(name = "Foundation", kind = "framework")]
 unsafe extern "C" {

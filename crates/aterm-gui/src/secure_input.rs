@@ -10,11 +10,7 @@
 mod imp {
     use std::sync::Mutex;
 
-    #[link(name = "Carbon", kind = "framework")]
-    unsafe extern "C" {
-        fn EnableSecureEventInput() -> i32;
-        fn DisableSecureEventInput() -> i32;
-    }
+    use aterm_macos_ui::carbon::{disable_secure_event_input, enable_secure_event_input};
 
     struct State {
         /// The config toggle's value (the user's standing wish).
@@ -45,9 +41,9 @@ mod imp {
             // the lock keeps this process's contribution balanced at 0 or 1.
             unsafe {
                 if want {
-                    EnableSecureEventInput()
+                    enable_secure_event_input()
                 } else {
-                    DisableSecureEventInput()
+                    disable_secure_event_input()
                 }
             }
         })

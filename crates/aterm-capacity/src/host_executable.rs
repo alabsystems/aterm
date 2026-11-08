@@ -381,16 +381,23 @@ impl Store {
                 .tempdir_in(self.root.join("images"))?;
             fs::set_permissions(stage.path(), fs::Permissions::from_mode(0o700))?;
             use std::io::{Seek as _, SeekFrom};
-            file.seek(SeekFrom::Start(0))?;
-            aterm_uds::atomic_file::write_with(&stage.path().join("aterm"), 0o500, |out| {
-                // A writer extending the source cannot turn this second pass into an
-                // unbounded copy, even before the subsequent stat/hash checks reject it.
-                let copied = io::copy(&mut (&mut file).take(before.len() + 1), out)?;
-                if copied != before.len() {
-                    return Err(refused("image length changed during copy"));
-                }
-                Ok(())
-            })?;
+            let staged_image = stage.path().join("aterm");
+            if aterm_uds::regular_file::clone_held(&file, &staged_image)? {
+                let (cloned, _) = aterm_uds::regular_file::open(&staged_image)?;
+                cloned.set_permissions(fs::Permissions::from_mode(0o500))?;
+                aterm_durable::durable(&cloned)?;
+            } else {
+                file.seek(SeekFrom::Start(0))?;
+                aterm_uds::atomic_file::write_with(&staged_image, 0o500, |out| {
+                    // A writer extending the source cannot turn this second pass into an
+                    // unbounded copy, even before the subsequent stat/hash checks reject it.
+                    let copied = io::copy(&mut (&mut file).take(before.len() + 1), out)?;
+                    if copied != before.len() {
+                        return Err(refused("image length changed during copy"));
+                    }
+                    Ok(())
+                })?;
+            }
             let (mut copied, meta) =
                 private_file::open_private(stage.path(), "aterm").map_err(private_error)?;
             if hash_file(&mut copied, &meta)? != digest

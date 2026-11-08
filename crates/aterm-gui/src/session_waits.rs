@@ -325,10 +325,10 @@ impl App {
             .is_some_and(|s| s.ctx.rewrap_gauge.reading().running)
     }
 
-    /// Whether `session` is on screen: in the active tab of a window whose band is on screen.
+    /// Whether `session` is on screen: in the active tab of a window that is on screen.
     pub(crate) fn session_on_screen(&self, session: u64) -> bool {
         self.windows.values().any(|ws| {
-            crate::messages_host::band_on_screen(ws)
+            crate::messages_host::window_on_screen(ws)
                 && ws.tab_set.active().is_some_and(|tab| {
                     tab.root.leaves().into_iter().any(|view| {
                         self.view_store
@@ -499,7 +499,7 @@ mod tests {
         app.windows
             .get_mut(&WindowId(0))
             .expect("window 0")
-            .band_on_screen_for_test = true;
+            .window_on_screen_for_test = true;
         (app, sink, reader)
     }
 

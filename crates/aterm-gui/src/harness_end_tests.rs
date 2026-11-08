@@ -52,7 +52,7 @@ fn look(app: &mut App, on: bool) {
     app.windows
         .get_mut(&WindowId(0))
         .unwrap()
-        .band_on_screen_for_test = on;
+        .window_on_screen_for_test = on;
 }
 
 fn publish(app: &App, session: u64, word: &'static str) -> bool {

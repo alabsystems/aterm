@@ -184,7 +184,10 @@ pub(crate) fn begin_with(
     };
     ctx.env = Arc::new(MapEnv::new());
     ctx.dirs = None;
-    ctx.fx = Arc::new(fx.with_endpoints(&ctx.endpoints));
+    ctx.fx = Arc::new(
+        fx.with_endpoints(&ctx.endpoints)
+            .with_git_stop(ctx.fx.git_stop()),
+    );
     ctx.retry = RetryPolicy::STANDARD;
     Ok(())
 }
@@ -234,7 +237,7 @@ fn settle_adoption(ctx: &mut Ctx, inv: &Invocation) -> Result<()> {
 /// the two, no client is kept and the verb's own `Ctx::github` builds one and reports what it
 /// meets.
 fn build_over(ctx: &mut Ctx, recording: Fx) {
-    ctx.fx = Arc::new(recording);
+    ctx.fx = Arc::new(recording.with_git_stop(ctx.fx.git_stop()));
     ctx.retry = RetryPolicy::STANDARD;
     ctx.github = None;
     ctx.adoption = None;

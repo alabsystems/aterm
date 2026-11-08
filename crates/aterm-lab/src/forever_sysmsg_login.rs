@@ -29,11 +29,11 @@
 //!   key): on Claude Code `/login` typed at most once and nothing else typed, no key of aterm's in
 //!   its method picker (no `login-method@v1`, no other approval), the inert browser never run, no
 //!   escalation, and one quiet notice (`login-choose`: one `EXCEPTION … kind=login` journaled, one
-//!   band row of `need=now`, which plays no sound, opens no dialog and brings no window forward);
-//!   on agy and Muse Code nothing typed, no band row, and one escalation (`ESCALATED` journaled)
+//!   message row of `need=now`, which plays no sound, opens no dialog and brings no window forward);
+//!   on agy and Muse Code nothing typed, no message row, and one escalation (`ESCALATED` journaled)
 //!   whose words (its ledger row's reason, else the tab's attention, what the person's badge shows)
 //!   name how the agent signs in (`turn_end::sign_in_how`, [`escalations`]). A want with no
-//!   evidence makes no pass: the control not logged, the browser or the band never read, no picker
+//!   evidence makes no pass: the control not logged, the browser or `messages` never read, no picker
 //!   drawn, or on the stored login a picker whose reason names no subscription row.
 //! * The person's play is the lab's, last ([`step`]), [`QUIET_MS`] past the wall's first reading:
 //!   on Claude Code the person presses the picker's first method as a person does (`key
@@ -540,7 +540,7 @@ pub fn watched(seen: &Seen, land: bool, now: i64) -> bool {
     }
 }
 
-/// The harness's band rows of a `messages tag=harness` reply that raise the band (`sev=warn` and
+/// The harness's rows of a `messages tag=harness` reply that warn (`sev=warn` and
 /// up), each `<id> at=<ms> state=<state> need=<class> title=<title>`, joined by ` | `; `-` for
 /// none.
 #[must_use]
@@ -567,30 +567,30 @@ pub fn rows(messages: &str) -> String {
     }
 }
 
-/// One band row of [`rows`]: its id, when it was posted (ms), its state, its need's class and
+/// One row of [`rows`]: its id, when it was posted (ms), its state, its need's class and
 /// its title.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BandRow {
+pub struct HarnessRow {
     /// Its id.
     pub id: String,
     /// `at=`, ms.
     pub at: i64,
     /// `state=`.
     pub state: String,
-    /// `need=`: `now` for a need the band shows at once, which plays no sound, opens no dialog and
+    /// `need=`: `now` for a need shown at once, which plays no sound, opens no dialog and
     /// brings no window forward (v6 §14.17's bar, as the hold's ask).
     pub need: String,
     /// The title.
     pub title: String,
 }
 
-/// The band rows of a [`rows`] read.
+/// The rows of a [`rows`] read.
 #[must_use]
-pub fn band_rows(read: &str) -> Vec<BandRow> {
+pub fn harness_rows(read: &str) -> Vec<HarnessRow> {
     read.split(" | ")
         .filter(|r| *r != "-")
         .filter_map(|r| {
-            Some(BandRow {
+            Some(HarnessRow {
                 id: r.split_whitespace().next()?.to_string(),
                 at: word(r, "at")?.parse().ok()?,
                 state: word(r, "state").unwrap_or_default(),
@@ -601,13 +601,13 @@ pub fn band_rows(read: &str) -> Vec<BandRow> {
         .collect()
 }
 
-/// The band rows the tab's reads saw posted from `from` to `to`, each once, as its last read
-/// before `to` drew it: what the band said while that time lasted (a row the person's sign-in
+/// The rows the tab's reads saw posted from `from` to `to`, each once, as its last read
+/// before `to` drew it: what `messages` said while that time lasted (a row the person's sign-in
 /// later superseded reads `need=-` past it).
-fn posted(seen: &Seen, from: i64, to: i64) -> Vec<BandRow> {
-    let mut seen_rows: Vec<BandRow> = Vec::new();
-    for (_, read) in seen.band.iter().filter(|(t, _)| *t < to) {
-        for r in band_rows(read) {
+fn posted(seen: &Seen, from: i64, to: i64) -> Vec<HarnessRow> {
+    let mut seen_rows: Vec<HarnessRow> = Vec::new();
+    for (_, read) in seen.harness.iter().filter(|(t, _)| *t < to) {
+        for r in harness_rows(read) {
             if r.at < from || r.at >= to {
                 continue;
             }
@@ -759,10 +759,10 @@ pub const fn what_on(h: Harness, land: bool, signed: bool) -> &'static str {
             "the person's sign-in after an expired login under Land: the browser on their key alone, nothing of aterm's past their pick, then Land carries on to its landing"
         }
         (_, false, false) => {
-            "an expired login under Cruise: nothing typed, one quiet escalation naming how the agent signs in, no band row"
+            "an expired login under Cruise: nothing typed, one quiet escalation naming how the agent signs in, no message row"
         }
         (_, true, false) => {
-            "an expired login under Land: nothing typed, one quiet escalation naming how the agent signs in, no band row, no act of Land's"
+            "an expired login under Land: nothing typed, one quiet escalation naming how the agent signs in, no message row, no act of Land's"
         }
         (_, false, true) => {
             "the person's sign-in after an expired login under Cruise: nothing of aterm's past the sign-in, the escalation down, then Cruise goes on once"
@@ -876,7 +876,7 @@ pub fn past_ladder(seen: &Seen, p: i64, t0: i64) -> Option<String> {
 /// JUDGES THE EXPIRED LOGIN on `program` ([`Harness::name`]), under Land where `land`: what the
 /// tab saw from the act that met it to the person's first key ([`person_at`]); the module's
 /// wants. A want whose evidence is missing makes no pass: the inert browser's control not logged
-/// or its log never read, the band never read in that time, and on Claude Code no picker drawn
+/// or its log never read, `messages` never read in that time, and on Claude Code no picker drawn
 /// when the person came, or on the stored login ([`Played::stored`]) a picker whose reason names
 /// no subscription row (aterm never read the method, or a guard before it decided, so the rule
 /// slice 12a changed was not what decided).
@@ -983,9 +983,9 @@ pub fn judge(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdict {
         ),
         None => unseen.push("the inert browser's log was never read (the person never came)".into()),
     }
-    let band_read = seen.band_reads.iter().any(|t| *t > t1 && *t < gone_to);
-    if !band_read {
-        unseen.push("the band was never read while the login was gone".into());
+    let messages_read = seen.harness_reads.iter().any(|t| *t > t1 && *t < gone_to);
+    if !messages_read {
+        unseen.push("`ctl messages` was never read while the login was gone".into());
     }
     let ups = escalations(seen, t1, gone_to);
     match h {
@@ -1068,21 +1068,21 @@ pub fn judge(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdict {
                     told_said(&ups, t0)
                 ));
             }
-            let band: Vec<BandRow> = posted(seen, t1, gone_to)
+            let notices: Vec<HarnessRow> = posted(seen, t1, gone_to)
                 .into_iter()
                 .filter(|r| r.title.starts_with(notice.title))
                 .collect();
-            match &band[..] {
+            match &notices[..] {
                 [r] if r.need == "now" => {
-                    said.push_str(&format!("; one band row \"{}\" (need=now)", r.title));
+                    said.push_str(&format!("; one message row \"{}\" (need=now)", r.title));
                 }
                 [r] => bad.push(format!(
-                    "THE LOGIN'S BAND ROW IS NO NEED NOW: \"{}\" need={}",
+                    "THE LOGIN'S MESSAGE ROW IS NO NEED NOW: \"{}\" need={}",
                     r.title, r.need
                 )),
-                [] if !band_read => {}
+                [] if !messages_read => {}
                 rows => bad.push(format!(
-                    "{} BAND ROWS titled \"{}\" while the login was gone",
+                    "{} MESSAGE ROWS titled \"{}\" while the login was gone",
                     rows.len(),
                     notice.title
                 )),
@@ -1112,7 +1112,7 @@ pub fn judge(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdict {
             let rows = posted(seen, t1, gone_to);
             if !rows.is_empty() {
                 bad.push(format!(
-                    "A BAND ROW BESIDE THE ESCALATION: {}",
+                    "A MESSAGE ROW BESIDE THE ESCALATION: {}",
                     rows.iter()
                         .map(|r| format!("\"{}\" need={}", r.title, r.need))
                         .collect::<Vec<_>>()
@@ -1335,17 +1335,17 @@ pub fn judge_signed_in(seen: &Seen, land: bool, program: &str, t0: i64) -> Verdi
     }
     match h {
         Harness::Claude => {
-            let live: Vec<BandRow> = seen
-                .band
+            let live: Vec<HarnessRow> = seen
+                .harness
                 .last()
-                .map(|(_, r)| band_rows(r))
+                .map(|(_, r)| harness_rows(r))
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|r| r.state == "live" && r.title.starts_with(LOGIN_CHOOSE.title))
                 .collect();
             if let Some(r) = live.first() {
                 bad.push(format!(
-                    "THE LOGIN'S NOTICE STILL UP past the sign-in: band row {} \"{}\"",
+                    "THE LOGIN'S NOTICE STILL UP past the sign-in: message row {} \"{}\"",
                     r.id, r.title
                 ));
             }

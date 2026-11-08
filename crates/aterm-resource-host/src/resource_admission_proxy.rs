@@ -40,7 +40,7 @@ impl Owner {
             || !job.native_targo
             || !job.launched
             || job.reaped
-            || job.settled
+            || job.is_settled()
             || job.cleanup_at.is_some()
             || !matches!(&job.custody, Custody::Cooperative(_))
         {

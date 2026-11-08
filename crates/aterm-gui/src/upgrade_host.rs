@@ -4187,7 +4187,7 @@ mod tests {
         drop(first.messages_log.take());
 
         let mut next = App::headless_for_test();
-        next.messages = aterm_messages::MessageCenter::new(
+        next.messages = crate::messages_host::new_center(
             crate::messages_store::load_tail(&path, u64::MAX).log,
             std::time::Instant::now(),
         );

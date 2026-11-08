@@ -53,7 +53,7 @@ fn look(app: &mut App) {
     app.windows
         .get_mut(&WindowId(0))
         .expect("window 0")
-        .band_on_screen_for_test = true;
+        .window_on_screen_for_test = true;
 }
 
 fn publish(app: &App, session: u64, word: &'static str) -> bool {

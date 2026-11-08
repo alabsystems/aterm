@@ -128,9 +128,15 @@ fn shell_word(path: &Path) -> String {
     }
 }
 
+/// Why a census run by this binary holds captures to no engine baseline: it reads no engine
+/// (a census spawns nothing and reads no network), and `targo --unverified verify census` reads
+/// one commit of it.
+const STANDALONE: &str = "aterm-census reads no engine; `targo --unverified verify census` \
+                          holds captures to one commit's baseline";
+
 fn run(selected: &[&'static Census], root: &Path, verbose: bool) -> bool {
     let started = Instant::now();
-    let outcomes = aterm_census::run_censuses(root, selected);
+    let outcomes = aterm_census::run_censuses(root, selected, &Err(STANDALONE.into()));
     let mut verdicts = Vec::new();
     for (census, outcome) in selected.iter().zip(&outcomes) {
         if outcome.ok && !verbose {

@@ -4974,7 +4974,8 @@ fn decode_wallpaper_bytes(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), Strin
 fn decode_wallpaper_appkit(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), String> {
     use std::ffi::c_void;
 
-    use aterm_objc::{Id, Sel, autoreleasepool, class, sel};
+    use aterm_macos_ui::appkit::class;
+    use aterm_objc::{Id, Sel, autoreleasepool, sel};
 
     use crate::appkit;
 
@@ -6486,6 +6487,7 @@ impl App {
         }
         self.sync_synthetic_strip_head(wid, size.height);
         let (rows, cols) = self.grid_dims_for(wid, size);
+        self.note_headless_px_for(wid, size, (rows, cols));
         self.input(
             wid,
             InputEvent::Resize {
@@ -6645,6 +6647,50 @@ impl App {
         }
     }
 
+    /// The size window `wid` holds while its metrics change under it: a platform window's inner
+    /// size; a headless window's the size it was last given ([`crate::WindowState::headless_px`]),
+    /// else its grid's frame under the metrics it has now. A font, line-height or padding change
+    /// re-grids every window inside this size and resizes none, so a headless window lays a page
+    /// out at the size a platform window would keep, not one its new cells made.
+    pub(crate) fn held_inner_px(&self, wid: WindowId) -> Option<PhysicalSize<u32>> {
+        let ws = self.windows.get(&wid)?;
+        Some(match ws.os_window.as_ref() {
+            Some(w) => w.inner_size(),
+            None => ws
+                .headless_px
+                .filter(|held| held.grid == (ws.rows, ws.cols, self.chrome_rows(wid)))
+                .map_or_else(
+                    || self.window_frame_px_for(wid, ws.rows, ws.cols),
+                    |held| held.px,
+                ),
+        })
+    }
+
+    /// Headless window `wid` was given `px`, which it lays out as the grid it gets for it
+    /// ([`Self::grid_dims_for`]): the size [`Self::held_inner_px`] keeps while that grid stands.
+    pub(crate) fn note_headless_px(&mut self, wid: WindowId, px: PhysicalSize<u32>) {
+        let (rows, cols) = self.grid_dims_for(wid, px);
+        self.note_headless_px_for(wid, px, (rows, cols));
+    }
+
+    /// [`Self::note_headless_px`] where the grid `px` holds is known.
+    pub(crate) fn note_headless_px_for(
+        &mut self,
+        wid: WindowId,
+        px: PhysicalSize<u32>,
+        (rows, cols): (u16, u16),
+    ) {
+        let chrome = self.chrome_rows(wid);
+        if let Some(ws) = self.windows.get_mut(&wid)
+            && ws.os_window.is_none()
+        {
+            ws.headless_px = Some(HeadlessSize {
+                px,
+                grid: (rows, cols, chrome),
+            });
+        }
+    }
+
     /// The `(rows, cols)` window `wid` gets for raw `size`.
     pub(crate) fn grid_dims_for(&self, wid: WindowId, size: PhysicalSize<u32>) -> (u16, u16) {
         let (cw, ch) = self.win_cell_size(wid);
@@ -6695,6 +6741,37 @@ impl App {
         )
     }
 
+    /// THE ONE LEAST-SIZE RULE: the size window `wid` is given when anything asks it for `asked`
+    /// device pixels (`resize px`, a program's XTWINOPS, a page opening, a text-scale or font
+    /// change, and, through [`Self::held_window_grid`], the grid form of `resize`). A window
+    /// holding Settings is never smaller than its least ([`Self::least_window_size`]) on either
+    /// axis; any other window is given what was asked, a platform window's manager holding it to
+    /// the least it was told ([`Self::push_least_window_size`]). The rule is held here rather
+    /// than left to the window manager: a manager holds a person's drag to the least, but a size
+    /// the app asks for is the app's to keep, and a headless window has no manager at all.
+    pub(crate) fn held_window_size(
+        &self,
+        wid: WindowId,
+        asked: PhysicalSize<u32>,
+    ) -> PhysicalSize<u32> {
+        if !self.window_holds_settings(wid) {
+            return asked;
+        }
+        let least = self.least_window_size(wid);
+        PhysicalSize::new(asked.width.max(least.width), asked.height.max(least.height))
+    }
+
+    /// [`Self::held_window_size`] for a grid: the `(rows, cols)` window `wid` takes when asked
+    /// for a `rows`x`cols` grid, each axis as asked unless the least holds it wider. The least
+    /// sits on the whole-cell lattice, so its grid is exact.
+    pub(crate) fn held_window_grid(&self, wid: WindowId, rows: u16, cols: u16) -> (u16, u16) {
+        if !self.window_holds_settings(wid) {
+            return (rows, cols);
+        }
+        let (least_rows, least_cols) = self.grid_dims_for(wid, self.least_window_size(wid));
+        (rows.max(least_rows), cols.max(least_cols))
+    }
+
     /// Window `wid`'s platform window is told its least size ([`Self::least_window_size`]) where
     /// that moved since it was last told: up as a Settings tab comes, down as the last goes.
     pub(crate) fn push_least_window_size(&mut self, wid: WindowId) {
@@ -6719,15 +6796,21 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return;
         };
+        let headless = ws.os_window.is_none();
         let now = match ws.os_window.as_ref() {
             Some(w) => w.inner_size(),
             None => self.window_frame_px_for(wid, ws.rows, ws.cols),
         };
-        if now.width < least.width || now.height < least.height {
-            let _ = self.resize_window_to_px(
-                wid,
-                PhysicalSize::new(now.width.max(least.width), now.height.max(least.height)),
-            );
+        if now.width >= least.width && now.height >= least.height {
+            return;
+        }
+        if headless {
+            // The app's own hold, not a drag: no live-resize throttle stands between a headless
+            // window and its least.
+            let held = self.held_window_size(wid, now);
+            self.on_resize(wid, held);
+        } else {
+            let _ = self.resize_window_to_px(wid, now);
         }
     }
 
@@ -6892,24 +6975,30 @@ impl App {
         self.pin_backend_render_config_core();
         let _ = self.video_abort_backend_rebuild();
         self.reset_window_raster_caches();
+        // Every window keeps its size and re-grids inside it, a headless one as a platform one
+        // ([`Self::held_inner_px`]), then holds the least its new cells give it.
         let sized: Vec<(WindowId, PhysicalSize<u32>)> = self
             .windows
-            .iter()
-            .filter_map(|(wid, ws)| ws.os_window.as_ref().map(|w| (*wid, w.inner_size())))
+            .keys()
+            .filter_map(|wid| self.held_inner_px(*wid).map(|size| (*wid, size)))
             .collect();
         for (wid, size) in sized {
             let (cw, ch) = self.win_cell_size(wid);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            if let Some(ws) = self.windows.get_mut(&wid)
+                && let Some(w) = ws.os_window.as_ref()
+            {
                 if size.width > 0 && size.height > 0 {
                     ws.win_px = Some(size);
                 }
-                if let Some(w) = ws.os_window.as_ref() {
-                    w.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
-                }
+                w.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
             }
             self.push_least_window_size(wid);
             self.on_resize(wid, size);
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            self.hold_least_window_size(wid);
+            // A platform window's next present is re-armed; a headless one presents on a capture.
+            if let Some(ws) = self.windows.get_mut(&wid)
+                && ws.os_window.is_some()
+            {
                 ws.rearm_present(true);
             }
         }
@@ -8015,10 +8104,20 @@ impl App {
             let sized: Vec<(WindowId, PhysicalSize<u32>)> = self
                 .windows
                 .iter()
-                .filter_map(|(wid, ws)| ws.win_px.map(|size| (*wid, size)))
+                .filter_map(|(wid, ws)| {
+                    ws.win_px
+                        .or_else(|| {
+                            ws.os_window
+                                .is_none()
+                                .then(|| self.held_inner_px(*wid))
+                                .flatten()
+                        })
+                        .map(|size| (*wid, size))
+                })
                 .collect();
             for (wid, size) in sized {
                 self.on_resize(wid, size);
+                self.hold_least_window_size(wid);
             }
             for ws in self.windows.values() {
                 if let Some(w) = ws.os_window.as_ref() {
@@ -8126,6 +8225,28 @@ impl App {
 
     /// Re-resolve every window's [`MetricsView`](crate::MetricsView) from the live font size.
     pub(crate) fn refresh_all_window_metrics(&mut self) {
+        // A headless window given no size yet holds its grid's frame under the metrics it had, as
+        // a platform window holds its inner size through the change ([`Self::held_inner_px`]).
+        let unheld: Vec<(WindowId, PhysicalSize<u32>, (u16, u16))> = self
+            .windows
+            .iter()
+            .filter(|(wid, ws)| {
+                ws.os_window.is_none()
+                    && ws
+                        .headless_px
+                        .is_none_or(|held| held.grid != (ws.rows, ws.cols, self.chrome_rows(**wid)))
+            })
+            .map(|(wid, ws)| {
+                (
+                    *wid,
+                    self.window_frame_px_for(*wid, ws.rows, ws.cols),
+                    (ws.rows, ws.cols),
+                )
+            })
+            .collect();
+        for (wid, size, grid) in unheld {
+            self.note_headless_px_for(wid, size, grid);
+        }
         let forced = resolve_force_scale();
         let size = self.font_size;
         let (pad_l, pad_top_l) = (
@@ -11568,6 +11689,14 @@ mod reload_dedupe_tests {
     }
 }
 
+/// The size a headless window was given and the `(rows, cols, chrome rows)` it lays that out as
+/// ([`App::held_inner_px`]): the size stands while that grid does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeadlessSize {
+    pub(crate) px: PhysicalSize<u32>,
+    pub(crate) grid: (u16, u16, u16),
+}
+
 /// Tell platform window `w` its least inner size ([`App::least_window_size`]): the window manager
 /// (AppKit's content minimum, X11's and Wayland's size hints, Windows' least track size) holds a
 /// drag to it.
@@ -11669,6 +11798,174 @@ mod least_window_size_tests {
             width + 0.01 >= least_w && height + 0.01 >= least_h,
             "asked for less, it keeps {width}x{height} over {least_w}x{least_h}"
         );
+    }
+
+    /// BOTH FORMS OF `resize` HOLD A WINDOW HOLDING SETTINGS TO ITS LEAST, AND SAY SO, AT 1x AND
+    /// 2x TEXT: the grid form asked for a grid under Settings' least view gives the window the
+    /// least on each held axis and answers with the grid given, `held=least` and the grid asked;
+    /// a grid over the least is given as asked; the pixel form holds and answers the same in
+    /// pixels. The grid form resized the grid and the window as asked (a 164x96 Settings view at
+    /// 1x, 1564x180 at 2x) and answered a bare `OK`, until a page opening grew it back.
+    #[test]
+    fn both_forms_of_resize_hold_a_window_holding_settings_to_its_least_and_say_so() {
+        use crate::input::{InputEvent, InputOutcome, Source, WindowResize};
+        for scale in [1.0_f32, 2.0] {
+            let mut app = crate::App::headless_for_test();
+            let wid = crate::WindowId(0);
+            at_text_scale(scale);
+            assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Home));
+            app.follow_least_window_scale();
+            let (least_w, least_h) = least_view(scale);
+            let holds_least = |app: &crate::App, what: &str| {
+                let (width, height) = view(app, wid);
+                assert!(
+                    width + 0.01 >= least_w && height + 0.01 >= least_h,
+                    "{scale}x {what}: a {width}x{height} view under Settings' least \
+                     {least_w}x{least_h}"
+                );
+            };
+            let grid = |app: &crate::App| (app.windows[&wid].rows, app.windows[&wid].cols);
+            for asked in [(6, 20), (12, 220), (60, 22)] {
+                let reply = app.input(
+                    wid,
+                    InputEvent::Resize {
+                        rows: asked.0,
+                        cols: asked.1,
+                        echo_to_window: true,
+                    },
+                    Source::Controller,
+                );
+                holds_least(&app, &format!("resize {} {}", asked.0, asked.1));
+                let given = grid(&app);
+                assert_eq!(
+                    reply,
+                    InputOutcome::Resized(WindowResize::Grid { asked, given }),
+                    "{scale}x: the reply names the grid given"
+                );
+                assert!(
+                    given != asked && given.0 >= asked.0 && given.1 >= asked.1,
+                    "{scale}x: {asked:?} is under the least on an axis, held to {given:?}"
+                );
+            }
+            let roomy = (grid(&app).0 + 3, grid(&app).1 + 5);
+            let reply = app.input(
+                wid,
+                InputEvent::Resize {
+                    rows: roomy.0,
+                    cols: roomy.1,
+                    echo_to_window: true,
+                },
+                Source::Controller,
+            );
+            assert_eq!(
+                reply,
+                InputOutcome::Resized(WindowResize::Grid {
+                    asked: roomy,
+                    given: roomy
+                }),
+                "{scale}x: a grid over the least is given as asked"
+            );
+            assert_eq!(grid(&app), roomy);
+            app.windows
+                .get_mut(&wid)
+                .expect("the window")
+                .last_resize_at = None;
+            let reply = app.input(
+                wid,
+                InputEvent::ResizeWindowPx {
+                    width: 200,
+                    height: 150,
+                },
+                Source::Controller,
+            );
+            let least = app.least_window_size(wid);
+            assert_eq!(
+                reply,
+                InputOutcome::Resized(WindowResize::Px {
+                    asked: (200, 150),
+                    given: (least.width.max(200), least.height.max(150)),
+                }),
+                "{scale}x: the pixel form names the size it gave"
+            );
+            holds_least(&app, "resize px 200 150");
+        }
+        at_text_scale(1.0);
+    }
+
+    /// A FONT CHANGE KEEPS A HEADLESS WINDOW'S SIZE, AS A PLATFORM WINDOW KEEPS ITS INNER SIZE:
+    /// the window re-grids inside the pixels it held, so a page lays out at the size a person's
+    /// window keeps through the change, and a window holding Settings still holds its least. It
+    /// kept its grid instead, its frame growing with the font, and Settings laid out in a window
+    /// no person has (a Text & Fonts press's status bar stood mid-page in it).
+    #[test]
+    fn a_font_change_keeps_a_headless_windows_size() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let frame = |app: &crate::App| {
+            let ws = &app.windows[&wid];
+            app.window_frame_px_for(wid, ws.rows, ws.cols)
+        };
+        let grid = |app: &crate::App| (app.windows[&wid].rows, app.windows[&wid].cols);
+        let (before, grid_before) = (frame(&app), grid(&app));
+        let base = app.font_size;
+        app.set_font_size(base + 8.0);
+        let (cw, ch) = app.win_cell_size(wid);
+        let after = frame(&app);
+        assert!(
+            grid(&app).0 < grid_before.0 && grid(&app).1 < grid_before.1,
+            "bigger cells, fewer of them: {grid_before:?} -> {:?}",
+            grid(&app)
+        );
+        assert!(
+            after.width <= before.width
+                && before.width - after.width < cw as u32
+                && after.height <= before.height
+                && before.height - after.height < ch as u32,
+            "the window keeps its {before:?} (its frame {after:?} the whole cells inside it)"
+        );
+        app.set_font_size(base);
+        assert_eq!(grid(&app), grid_before, "zoomed back into the same pixels");
+        assert_eq!(frame(&app), before);
+
+        at_text_scale(1.0);
+        assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Home));
+        shrink(&mut app, wid);
+        app.set_font_size(base + 8.0);
+        let (width, height) = view(&app, wid);
+        let (least_w, least_h) = least_view(1.0);
+        assert!(
+            width + 0.01 >= least_w && height + 0.01 >= least_h,
+            "after the font change, a {width}x{height} view under Settings' least \
+             {least_w}x{least_h}"
+        );
+    }
+
+    /// A terminal's window takes the grid it is asked for: the least that holds Settings holds
+    /// nothing else.
+    #[test]
+    fn a_terminals_window_takes_the_grid_it_is_asked_for() {
+        use crate::input::{InputEvent, InputOutcome, Source, WindowResize};
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        at_text_scale(2.0);
+        let reply = app.input(
+            wid,
+            InputEvent::Resize {
+                rows: 6,
+                cols: 20,
+                echo_to_window: true,
+            },
+            Source::Controller,
+        );
+        at_text_scale(1.0);
+        assert_eq!(
+            reply,
+            InputOutcome::Resized(WindowResize::Grid {
+                asked: (6, 20),
+                given: (6, 20)
+            })
+        );
+        assert_eq!((app.windows[&wid].rows, app.windows[&wid].cols), (6, 20));
     }
 
     #[test]

@@ -171,50 +171,25 @@ pub(crate) mod consts {
     pub(crate) const CG_NULL_WINDOW_ID: u32 = 0;
 }
 
-#[link(name = "AppKit", kind = "framework")]
-unsafe extern "C" {
-    /// `NSApplication.h:196` — nil until AppKit has created the application.
-    #[link_name = "NSApp"]
-    static mut NS_APP: Id;
-
-    /// `NSAppearance.h:63` — the light system appearance's name.
-    #[link_name = "NSAppearanceNameAqua"]
-    static NS_APPEARANCE_NAME_AQUA: Id;
-    /// `NSAppearance.h:64` — the dark system appearance's name.
-    #[link_name = "NSAppearanceNameDarkAqua"]
-    static NS_APPEARANCE_NAME_DARK_AQUA: Id;
-
-    /// `NSGraphics.h:222` — `APPKIT_EXTERN void NSBeep(void);`, a C function AppKit exports
-    /// (`_NSBeep`), bound as a symbol like the globals above.
-    #[link_name = "NSBeep"]
-    fn ns_beep();
-}
-
 /// The already-created application, borrowed, or `None` before its creation.
 #[must_use]
-pub(crate) fn existing_application(_main_thread: MainThread) -> Option<Id> {
-    // SAFETY: NSApp is AppKit's exported, nullable application pointer. AppKit
-    // initializes it on the main thread; the witness keeps this load on that thread.
-    let app = unsafe { NS_APP };
+pub(crate) fn existing_application(main_thread: MainThread) -> Option<Id> {
+    let app = aterm_macos_ui::appkit::application(main_thread);
     (!app.is_null()).then_some(app)
 }
 
 /// Play the user's configured macOS alert sound (the BEL bell), honouring their sound settings.
 pub(crate) fn beep() {
     // SAFETY: `_NSBeep` is exported by AppKit, takes no arguments and returns nothing, so the declaration above is its complete prototype.
-    unsafe { ns_beep() }
+    unsafe { aterm_macos_ui::appkit::beep() }
 }
 
 /// The `NSAppearanceName` for the light or dark system appearance, +0: AppKit's own global, never released or retained.
 #[must_use]
 pub(crate) fn appearance_name(dark: bool) -> Id {
-    // SAFETY: both symbols are AppKit globals that live for the whole process; reading one
-    // is a plain load of an initialised `NSString *`.
-    unsafe {
-        if dark {
-            NS_APPEARANCE_NAME_DARK_AQUA
-        } else {
-            NS_APPEARANCE_NAME_AQUA
-        }
+    if dark {
+        aterm_macos_ui::appkit::appearance_name_dark_aqua()
+    } else {
+        aterm_macos_ui::appkit::appearance_name_aqua()
     }
 }

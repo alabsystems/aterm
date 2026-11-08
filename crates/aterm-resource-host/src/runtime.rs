@@ -519,6 +519,21 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
             crate::actor::submit_workload_produced(incoming)?;
             aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)
         }
+        Some("sealed-workload-contained-produced-v1") => {
+            let job = crate::actor::member_binding_role(
+                &hello,
+                trust_resource_controller::workload::host::contained::PURPOSE,
+            )?;
+            if wire::local_peer(stream)? != peer {
+                return Err(refused());
+            }
+            wire::write_frame(stream, &[0x50], deadline)?;
+            let incoming =
+                crate::workload_transport::receive_contained_produced(stream, &job, deadline)?;
+            crate::actor::submit_workload_produced(incoming)?;
+            aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)?;
+            stream.shutdown(std::net::Shutdown::Write)
+        }
         Some(role)
             if hello["version"].as_u64() == Some(3)
                 && matches!(

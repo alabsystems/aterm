@@ -11,6 +11,9 @@ fn unavailable() -> io::Error {
     io::ErrorKind::Unsupported.into()
 }
 impl Prepared {
+    pub(crate) fn retirement_gnu(&self) -> io::Result<Vec<std::os::fd::OwnedFd>> {
+        Err(unavailable())
+    }
     pub(crate) fn child_targets(&self) -> io::Result<Vec<u32>> {
         Err(io::ErrorKind::Unsupported.into())
     }

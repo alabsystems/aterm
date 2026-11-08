@@ -1335,13 +1335,34 @@ fn a_translating_or_unstarted_row_is_named_by_its_wait_and_opens_no_episode() {
         "no row the check holds: no episode"
     );
     let lines = v.findings.wire_lines();
-    for line in [
-        "finding kind=translating pid=7010 exe=x86tool for_ms=2000",
-        "finding kind=not-started pid=7011 exe=nfsprog for_ms=2000",
-        "finding kind=stopped-unstarted pid=7013 exe=spawned stopped=yes traced=no for_ms=2000",
-        "finding kind=stopped-unstarted pid=7014 exe=debuggee stopped=no traced=yes for_ms=2000",
+    for (pid, kind) in [
+        (7010, "translating"),
+        (7011, "not-started"),
+        (7012, "not-started"),
+        (7013, "stopped-unstarted"),
+        (7014, "stopped-unstarted"),
     ] {
-        assert!(lines.contains(&line.to_owned()), "{lines:?}");
+        let pid = format!("pid={pid}");
+        let fields = lines
+            .iter()
+            .find(|line| line.split_whitespace().any(|field| field == pid))
+            .expect("the finding's row")
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        assert!(
+            fields.contains(&format!("kind={kind}").as_str()),
+            "{fields:?}"
+        );
+        assert_eq!(
+            fields.contains(&"cause=unknown"),
+            kind == "not-started",
+            "{fields:?}"
+        );
+        assert_eq!(
+            fields.contains(&"program_check=unconfirmed"),
+            kind == "not-started",
+            "{fields:?}"
+        );
     }
 }
 

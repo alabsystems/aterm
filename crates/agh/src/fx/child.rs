@@ -273,7 +273,17 @@ pub(crate) fn check(spec: &ChildSpec) -> Result<()> {
 /// contract is separate from dispatch classification. A caller that only reads remotely
 /// (ls-remote, clone, `gh auth token`) may lower the side effect to none.
 pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
+    run_unless(spec, &mut || false)
+}
+
+/// The same owned collector, with an operation owner's cooperative cancellation request.
+/// An explicit stop before dispatch has no side effect; after dispatch the collector retires
+/// its actual child/group before returning, while a remote write may already have happened.
+pub(crate) fn run_unless(spec: &ChildSpec, stopped: &mut dyn FnMut() -> bool) -> Result<ChildOut> {
     check(spec)?;
+    if stopped() {
+        return Err(interrupted(SideEffect::None));
+    }
     #[cfg(unix)]
     if let Some(query) = spec.config_input
         && !spec
@@ -321,19 +331,33 @@ pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
         spawnfd::Stdio::null()
     };
     let output = match &spec.progress {
-        Some(progress) => deadline::output_from_while_process_progressing(
+        Some(progress) => deadline::output_from_while_process_progressing_unless(
             &mut cmd,
             input,
             progress.window,
             &progress.waiting_on,
+            stopped,
         )
-        .map_err(|error| classify_progress_failure(spec, error))?,
-        None => deadline::output_until_from(
+        .map_err(|error| {
+            if stopped() {
+                interrupted(SideEffect::Unknown)
+            } else {
+                classify_progress_failure(spec, error)
+            }
+        })?,
+        None => deadline::output_until_from_unless(
             &mut cmd,
             input,
             until.expect("a wall-bound child has a deadline"),
+            stopped,
         )
-        .map_err(|error| classify_failure(spec, error))?,
+        .map_err(|error| {
+            if stopped() {
+                interrupted(SideEffect::Unknown)
+            } else {
+                classify_failure(spec, error)
+            }
+        })?,
     };
     let out = ChildOut {
         code: output.status.code(),
@@ -343,6 +367,14 @@ pub(crate) fn run(spec: &ChildSpec) -> Result<ChildOut> {
     #[cfg(unix)]
     let out = config_output(spec, out);
     Ok(out)
+}
+
+fn interrupted(effect: SideEffect) -> Error {
+    Error::new(
+        crate::error::Kind::Interrupted,
+        "native Git operation interrupted",
+    )
+    .with_side_effect(effect)
 }
 
 #[cfg(unix)]
@@ -594,6 +626,78 @@ mod tests {
             (err.kind, err.sub, err.side_effect),
             (Kind::CouldNotRun, Sub::Local, SideEffect::Unknown)
         );
+    }
+
+    #[test]
+    fn explicit_git_stop_before_dispatch_starts_nothing() {
+        let missing = ChildSpec::new(Path::new("/missing/agh-stop-must-not-spawn"));
+        let error = super::run_unless(&missing, &mut || true)
+            .expect_err("stop precedes dispatch")
+            .into_data();
+        assert_eq!(
+            (error.kind, error.side_effect),
+            (Kind::Interrupted, SideEffect::None)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_git_stop_retires_wall_and_progress_children_without_touching_a_bystander() {
+        use std::time::Instant;
+        struct Bystander(aterm_uds::spawnfd::Child);
+        impl Drop for Bystander {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut bystander = Bystander(
+            aterm_uds::spawnfd::command("/bin/sleep")
+                .arg("600")
+                .spawn()
+                .expect("owned bystander"),
+        );
+        for progress in [false, true] {
+            let dir = aterm_tempfile::tempdir().expect("scratch");
+            let marker = dir.path().join("pid");
+            let mut spec = ChildSpec::new(Path::new("/bin/sh"))
+                .arg("-c")
+                .arg("/bin/sh -c 'while test ! -f \"$0.release\"; do /bin/sleep 0.01; done' \"$0\" & printf '%s %s\\n' \"$$\" \"$!\" > \"$0\"; wait")
+                .arg(marker.as_os_str())
+                .budget(Duration::from_secs(60));
+            if progress {
+                spec = spec.progressing(Duration::from_secs(60), "owned stop fixture");
+            }
+            let error = super::run_unless(&spec, &mut || {
+                std::fs::read_to_string(&marker).is_ok_and(|text| text.ends_with('\n'))
+            })
+            .expect_err("explicit stop")
+            .into_data();
+            assert_eq!(
+                (error.kind, error.side_effect),
+                (Kind::Interrupted, SideEffect::Unknown)
+            );
+            let pids: Vec<u32> = std::fs::read_to_string(&marker)
+                .expect("actual child started")
+                .split_whitespace()
+                .map(|pid| pid.parse().expect("pid"))
+                .collect();
+            assert_eq!(pids.len(), 2);
+            let alive_at_return = pids.iter().any(|pid| aterm_uds::process::pid_alive(*pid));
+            std::fs::write(marker.with_extension("release"), b"release").expect("release fixture");
+            let until = Instant::now() + Duration::from_secs(60);
+            while pids.iter().any(|pid| aterm_uds::process::pid_alive(*pid))
+                && Instant::now() < until
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(pids.iter().all(|pid| !aterm_uds::process::pid_alive(*pid)));
+            assert!(
+                !alive_at_return,
+                "owned child and descendant retired before return"
+            );
+            assert!(bystander.0.try_wait().expect("bystander wait").is_none());
+        }
     }
 
     /// A child's `Debug` never holds its streams: `gh auth token`'s stdout is a token.

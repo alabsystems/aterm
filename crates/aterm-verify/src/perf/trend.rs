@@ -76,7 +76,7 @@ fn slug(s: &str) -> String {
 
 fn platform_uuid() -> Option<String> {
     if cfg!(target_os = "macos") {
-        let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("ioreg"))
+        let out = crate::exec::check_command(aterm_uds::os_path!("ioreg"))
             .args(["-rd1", "-c", "IOPlatformExpertDevice"])
             .output()
             .ok()?;
@@ -90,7 +90,7 @@ fn platform_uuid() -> Option<String> {
         return Some(rest[..close].to_string());
     }
     if cfg!(target_os = "windows") {
-        let out = aterm_uds::spawnfd::command("reg")
+        let out = crate::exec::check_command("reg")
             .args([
                 "query",
                 r"HKLM\SOFTWARE\Microsoft\Cryptography",
@@ -124,7 +124,7 @@ fn platform_fingerprint() -> Option<String> {
 }
 
 fn hostname() -> String {
-    aterm_uds::spawnfd::command(aterm_uds::os_path!("hostname"))
+    crate::exec::check_command(aterm_uds::os_path!("hostname"))
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -134,7 +134,7 @@ fn hostname() -> String {
 
 fn machine_shape() -> String {
     let chip = if cfg!(target_os = "macos") {
-        aterm_uds::spawnfd::command(aterm_uds::os_path!("sysctl"))
+        crate::exec::check_command(aterm_uds::os_path!("sysctl"))
             .args(["-n", "machdep.cpu.brand_string"])
             .output()
             .ok()
@@ -277,7 +277,7 @@ pub(crate) fn machine_id() -> MachineId {
 /// HEAD's short `sha` as [`tree_label`] labels it.
 pub(crate) fn head_sha() -> String {
     let git = |args: &[&str]| {
-        aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
+        crate::exec::check_command(aterm_uds::os_path!("git"))
             .args(args)
             .current_dir(super::workspace_root())
             .output()

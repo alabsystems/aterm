@@ -282,6 +282,32 @@ fn headless_capture_shows_the_wallpaper() {
     assert_ne!(bare, papered, "the wallpaper is in the capture");
 }
 
+/// A TERMINAL CAPTURE SHOWS NO ROUTE CARD A NATIVE ONE LEFT: with the build badge on, a native
+/// route folds its page and the badge into one route card; once Settings closes, the terminal's
+/// capture is the one taken before Settings opened. NEGATIVE CONTROL: only a platform window's
+/// redraw dropped the folded card, so a headless capture after the close drew the closed Settings
+/// page over the terminal, and every capture after it, until a native page composed again.
+#[test]
+fn a_terminal_capture_shows_no_route_card_a_native_one_left() {
+    let mut app = scripted_app();
+    app.config.show_build_badge = Some(true);
+    let before = image(&mut app);
+    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+    let native = image(&mut app);
+    assert!(
+        app.windows[&WID].route_card.is_some(),
+        "precondition: the native capture folded the page and the badge into a route card"
+    );
+    assert!(app.close_settings_tabs());
+    let after = image(&mut app);
+    assert_ne!(after, native, "the capture is not the closed page");
+    assert_eq!(
+        after, before,
+        "the terminal's capture, as before Settings opened"
+    );
+    assert!(app.windows[&WID].route_card.is_none());
+}
+
 #[test]
 fn terminal_present_visuals_equal_host_visual_state() {
     let mut app = scripted_app();

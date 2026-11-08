@@ -716,6 +716,7 @@ mod tests {
         let tree = Tree {
             root: Path::new("/nonexistent-aterm-census-root"),
             corpus: &corpus,
+            engine: crate::guards::tests::NO_ENGINE,
         };
         let shipped: Vec<String> = released_files(&tree).into_iter().collect();
         assert_eq!(

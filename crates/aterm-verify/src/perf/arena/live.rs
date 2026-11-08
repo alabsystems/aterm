@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, Once, PoisonError, mpsc};
 use std::time::Duration;
 
-use aterm_uds::spawnfd::{Child, Command, Stdio, command};
+use crate::exec::check_command as command;
+use aterm_uds::spawnfd::{Child, Command, Stdio};
 
 /// Everything live, under one lock. Holding it is what keeps a launch and an
 /// interrupt from interleaving: an interrupt that takes it first exits before

@@ -6,8 +6,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::exec::check_command as command;
 use aterm_json::{Map, Value, json};
-use aterm_uds::spawnfd::{Stdio, command};
+use aterm_uds::spawnfd::Stdio;
 
 use super::{
     Args, Halt, Scratch, await_socket, in_scratch_world, private, scratch_config, sha256_file,

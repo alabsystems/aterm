@@ -83,6 +83,31 @@ pub fn main_entry(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
             }
         }
     }
+    // Only native Git CLI commands adopt stop signals, before request/child threads.
+    // Library callers use `run` and keep their signal policy; other CLI verbs keep theirs.
+    // The waiter only publishes a stop. The actual Git owner retires its child/group.
+    #[cfg(unix)]
+    if matches!(
+        args::parse(&text),
+        Ok(Parsed::Run(verb, _)) if matches!(
+            verb.path,
+            ["repo", "fetch" | "fetch-main" | "public-refs" | "clone" | "push" | "check-local" | "commit-ancestry"]
+                | ["ref", "delete"]
+        )
+    ) {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requested = stop.clone();
+        if !aterm_uds::process::take_stop_signals("agh-stop", move |_| {
+            requested.store(true, std::sync::atomic::Ordering::Release);
+        }) {
+            return std::process::ExitCode::from(out::fail(
+                &mut ctx,
+                "-",
+                &Error::local("cannot start the CLI stop-signal waiter"),
+            ));
+        }
+        ctx.fx = Arc::new(Fx::live().with_git_stop(Some(stop)));
+    }
     std::process::ExitCode::from(run(&text, &mut ctx))
 }
 

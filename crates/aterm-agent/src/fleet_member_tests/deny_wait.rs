@@ -231,7 +231,15 @@ fn a_fleet_join_waits_for_its_own_vault_apply_to_finish() {
             count.set(count.get() + 1);
             drop(release.borrow_mut().take());
         },
-        || converge_on(&member.places, &code, &sync_here()),
+        || {
+            converge_under_elapsed(
+                &member.places,
+                &code,
+                vault_now(&member.places).as_ref(),
+                &sync_here(),
+                Duration::from_secs(11),
+            )
+        },
     );
     drop(writer.borrow_mut().take());
     serving.stop();
@@ -239,7 +247,7 @@ fn a_fleet_join_waits_for_its_own_vault_apply_to_finish() {
     assert_eq!(
         observed.get(),
         1,
-        "the join read the vault while its apply held state"
+        "the required join observed the actual vault writer"
     );
     assert!(
         matches!(joined, Ok(FleetSync::Joined(_))),
@@ -268,7 +276,8 @@ fn an_expired_vault_wait_refuses_before_dialing_the_fleet() {
     let member = World::new("join-expired-vault-member");
     let paths = vault_beside(&member);
     let writer = client::test_hold_state_lock(&paths).unwrap();
-    let joined = join_with_denial_deadline(&member.places, &sync_here(), &code, Instant::now());
+    let joined =
+        join_with_denial_elapsed(&member.places, &sync_here(), &code, Duration::from_secs(61));
     drop(writer);
 
     let words = failure_words(joined.unwrap_err());

@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
+use crate::exec::check_command as command;
 use aterm_json::{Value, json};
-use aterm_uds::spawnfd::command;
 
 use super::arena::{Halt, chip, outcome, stdout_of, thermal};
 use super::bench_build::{self, Targo, load_average};

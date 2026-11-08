@@ -690,7 +690,7 @@ fn measure_example_for(
         example,
         "example",
     )?;
-    let mut run = aterm_uds::spawnfd::command(&executable);
+    let mut run = crate::exec::check_command(&executable);
     run.args(harness_args).current_dir(workspace_root());
     // Compilation and command preparation are complete. No targo run/bench prefix can build
     // after this fresh observation and before the measurement executable starts.

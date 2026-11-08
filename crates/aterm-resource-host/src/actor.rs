@@ -67,6 +67,7 @@ enum Message {
     AuthorizeWorkloadProduced {
         peer: Peer,
         request: Box<trust_resource_controller::workload::host::produced::ProducedRequest>,
+        contained: Option<Box<trust_resource_controller::workload::host::contained::Request>>,
         reply: SyncSender<bool>,
     },
     SubmitWorkloadProduced {
@@ -521,6 +522,21 @@ pub(super) fn authorize_workload_produced(
     send(Message::AuthorizeWorkloadProduced {
         peer,
         request: Box::new(request),
+        contained: None,
+        reply,
+    })
+    .is_ok()
+        && receive_reply(read).unwrap_or(false)
+}
+pub(super) fn authorize_contained_produced(
+    peer: Peer,
+    request: trust_resource_controller::workload::host::contained::Request,
+) -> bool {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::AuthorizeWorkloadProduced {
+        peer,
+        request: Box::new(request.produced.clone()),
+        contained: Some(Box::new(request)),
         reply,
     })
     .is_ok()
@@ -669,9 +685,17 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
                 Message::AuthorizeWorkloadProduced {
                     peer,
                     request,
+                    contained,
                     reply,
                 } => {
-                    let _ = reply.try_send(owner.authorize_workload_produced(peer, &request));
+                    let allowed = match contained {
+                        Some(contained) if contained.produced == *request => {
+                            owner.authorize_contained_produced(peer, &contained)
+                        }
+                        Some(_) => false,
+                        None => owner.authorize_workload_produced(peer, &request),
+                    };
+                    let _ = reply.try_send(allowed);
                 }
                 Message::SubmitWorkloadProduced { incoming, reply } => {
                     let _ = reply.try_send(owner.submit_workload_produced(*incoming));

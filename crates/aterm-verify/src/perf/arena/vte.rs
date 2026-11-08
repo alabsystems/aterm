@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use aterm_uds::spawnfd::{Stdio, command};
+use crate::exec::check_command as command;
+use aterm_uds::spawnfd::Stdio;
 
 use super::cat::{Term, inner_argv, order, run_in};
 use super::{

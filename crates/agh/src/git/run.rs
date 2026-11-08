@@ -1119,9 +1119,9 @@ mod unix {
         text.get(from..).unwrap_or_default().to_string()
     }
 
-    /// Step 3: whether a clone's local config key can send git elsewhere, through a proxy, or
-    /// into a program of the clone's choosing. That includes a bundle URI a fetch reads first
-    /// (`fetch.bundleuri`, `bundle.*`) and a partial clone's promisor, which git fetches from
+    /// Step 3: whether a clone's local config key can change routing, trust, authentication or
+    /// execution, or has HTTP behavior we have not audited. That includes a fetch's initial
+    /// bundle URI (`fetch.bundleuri`, `bundle.*`) and a partial clone's promisor, fetched from
     /// lazily (`extensions.partialclone`, `remote.*.promisor`, `remote.*.partialclonefilter`),
     /// and a config-based hook (`hook.<name>.command`), which git 2.54 runs from the clone's
     /// config whatever `core.hooksPath` says.
@@ -1134,10 +1134,26 @@ mod unix {
         let is = |s: &str, list: &[&str]| list.iter().any(|w| s.eq_ignore_ascii_case(w));
         if section.eq_ignore_ascii_case("url") {
             sub.is_some() && is(var, &["insteadof", "pushinsteadof"])
+        } else if section.eq_ignore_ascii_case("http") {
+            // Git 2.54's urlmatch_config_entry strips a URL subsection at the last dot before
+            // calling http_options, so these tuning variables preserve security in either scope.
+            // Unknown variables stay refused. See design §6.9 and its linked per-key audit.
+            !is(
+                var,
+                &[
+                    "postbuffer",
+                    "lowspeedlimit",
+                    "lowspeedtime",
+                    "maxrequests",
+                    "minsessions",
+                    "keepaliveidle",
+                    "keepaliveinterval",
+                    "keepalivecount",
+                ],
+            )
         } else if is(
             section,
             &[
-                "http",
                 "credential",
                 "include",
                 "includeif",
@@ -1183,8 +1199,8 @@ mod unix {
     }
 
     /// Step 3's screen over each local/worktree `git config --list --name-only -z` output: a listing
-    /// longer than `SCREEN_MAX`, or the first key that rewrites where git goes, Refused. The
-    /// child door keeps only the tail of a stream (`fx::child`, the last 1 MiB), so a listing
+    /// longer than `SCREEN_MAX`, or the first key outside the transport security policy, Refused.
+    /// The child door keeps only the tail of a stream (`fx::child`, the last 1 MiB), so a listing
     /// past `SCREEN_MAX` may have lost its head, and a key cut off there would pass the screen
     /// while git still reads it: the screen fails closed on the length alone. Listing names
     /// only keeps a value from padding the listing; a long subsection name still can.
@@ -1233,10 +1249,14 @@ mod unix {
             .with_repo(slug.to_string())),
             ConfigVerdict::Refused { class } => {
                 let key = class.key().to_owned();
-                Err(Error::refused(format!("the clone's config rewrites where git goes: {key}"))
-                    .with_sub(Sub::GitConfig { key })
-                    .with_next("remove the guarded key from the clone's local/worktree config, or clone again")
-                    .with_repo(slug.to_string()))
+                Err(Error::refused(format!(
+                    "the clone's config is outside agh's transport security policy: {key}"
+                ))
+                .with_sub(Sub::GitConfig { key })
+                .with_next(
+                    "remove the guarded key from the clone's local/worktree config, or clone again",
+                )
+                .with_repo(slug.to_string()))
             }
         }
     }
@@ -3370,6 +3390,110 @@ mod tests {
             "extensions.worktreeconfig",
         ] {
             assert!(!rewrites(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn http_transport_tuning_passes_the_config_screen() {
+        // Independent of the implementation's allowlist: restoring the blanket HTTP refusal
+        // fails every row. Mutating an allowed spelling must remain fail-closed.
+        for var in [
+            "postBuffer",
+            "lowSpeedLimit",
+            "lowSpeedTime",
+            "maxRequests",
+            "minSessions",
+            "keepAliveIdle",
+            "keepAliveInterval",
+            "keepAliveCount",
+        ] {
+            for prefix in ["http.", "HTTP.https://github.com/owner/repo.git."] {
+                let key = format!("{prefix}{var}");
+                for read_only in [false, true] {
+                    let project = |key: &str| {
+                        super::unix::project_config_names(
+                            format!("core.bare\0{key}\0").as_bytes(),
+                            read_only,
+                        )
+                    };
+                    let allowed: aterm_json::Value =
+                        aterm_json::from_slice(&project(&key)).unwrap();
+                    assert_eq!(
+                        allowed,
+                        aterm_json::json!({"Allowed": {"keys": 2}}),
+                        "{key}"
+                    );
+                    let unknown = format!("{key}Future");
+                    let refused: aterm_json::Value =
+                        aterm_json::from_slice(&project(&unknown)).unwrap();
+                    assert_eq!(
+                        refused,
+                        aterm_json::json!({"Refused": {"class": "Http"}}),
+                        "{unknown}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn http_security_protocol_and_unknown_options_stay_refused() {
+        // Git 2.54 http_options minus the eight audited tuning variables; both scopes and
+        // both read/write screens must refuse. Values never enter the screen's verdict.
+        for var in [
+            "proxy",
+            "proxyAuthMethod",
+            "proxySSLCert",
+            "proxySSLKey",
+            "proxySSLCertPasswordProtected",
+            "proxySSLCAInfo",
+            "emptyAuth",
+            "proactiveAuth",
+            "delegation",
+            "extraHeader",
+            "cookieFile",
+            "saveCookies",
+            "version",
+            "curloptResolve",
+            "sslVersion",
+            "sslCipherList",
+            "sslVerify",
+            "sslCert",
+            "sslKey",
+            "sslCertPasswordProtected",
+            "sslCAInfo",
+            "sslCAPath",
+            "sslBackend",
+            "sslCertType",
+            "sslKeyType",
+            "schannelCheckRevoke",
+            "schannelUseSSLCAInfo",
+            "pinnedPubkey",
+            "sslTry",
+            "retryAfter",
+            "maxRetries",
+            "maxRetryTime",
+            "noEPSV",
+            "userAgent",
+            "followRedirects",
+            "futureOption",
+            "",
+            "postBuffer.extraHeader",
+        ] {
+            for prefix in ["http.", "HtTp.https://github.com/owner/repo.git."] {
+                let key = format!("{prefix}{var}\0");
+                for read_only in [false, true] {
+                    let verdict: aterm_json::Value = aterm_json::from_slice(
+                        &super::unix::project_config_names(key.as_bytes(), read_only),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        verdict,
+                        aterm_json::json!({"Refused": {"class": "Http"}}),
+                        "{key}"
+                    );
+                }
+            }
         }
     }
 

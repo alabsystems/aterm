@@ -145,13 +145,6 @@ mod macos {
     /// The lowest rate `frame_clock.rs` holds a link to, frames per second (its `RATE_MIN`).
     const RATE_MIN: f64 = 60.0;
 
-    #[link(name = "AppKit", kind = "framework")]
-    unsafe extern "C" {
-        /// `NSEventTrackingRunLoopMode`, an immortal `NSString *`: the mode AppKit runs the main
-        /// run loop in through a live resize, a menu's tracking and a control's drag.
-        static NSEventTrackingRunLoopMode: *mut c_void;
-    }
-
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         /// `void CFRunLoopPerformBlock(CFRunLoopRef, CFTypeRef mode, void (^)(void))`: runs the
@@ -355,7 +348,10 @@ mod macos {
         let block = unsafe {
             RcBlock::new0(move || {
                 let start = Instant::now();
-                let mode = NSEventTrackingRunLoopMode.cast_const().cast();
+                let mode = aterm_macos_ui::appkit::event_tracking_run_loop_mode()
+                    .as_ptr()
+                    .cast_const()
+                    .cast();
                 t.now.set(true);
                 while t.ticks.get() < TRACK_TICKS && start.elapsed() < HANG {
                     let _ = CFRunLoopRunInMode(mode, TURN.as_secs_f64(), 0);

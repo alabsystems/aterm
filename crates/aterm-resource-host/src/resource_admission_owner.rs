@@ -65,6 +65,8 @@ mod recovery;
 mod resolver_root;
 #[path = "resource_admission_sdk.rs"]
 mod sdk;
+#[path = "resource_admission_settlement.rs"]
+mod settlement;
 #[path = "resource_admission_start.rs"]
 mod start;
 #[cfg(test)]
@@ -167,6 +169,7 @@ struct Job {
     resolver_queries: usize,
     sdk: Option<trust_resource_controller::SdkCustody>,
     members: BTreeMap<[u8; 16], member_queue::Slot>,
+    contained_retirements: BTreeMap<[u8; 16], std::sync::Arc<member_custody::ProducerRetirement>>,
     loans: BTreeMap<[u8; 16], parent_loan::RunState>,
     workload: Option<workload::State>,
     // Preparing members join on drop. Keep the original transport and SDK
@@ -196,8 +199,15 @@ struct Job {
         aterm_types::resource_admission::AccountingObservation,
     )>,
     launched: bool,
-    settled: bool,
+    closed: Option<settlement::ClosedRoot>,
     settlement_at: Option<Instant>,
+}
+impl Job {
+    fn is_settled(&self) -> bool {
+        self.closed
+            .as_ref()
+            .is_some_and(|closed| closed.matches(self))
+    }
 }
 fn refused(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, reason)
@@ -250,7 +260,7 @@ impl Owner {
         else {
             return false;
         };
-        if !job.launched || job.reaped || job.settled {
+        if !job.launched || job.reaped || job.is_settled() {
             return false;
         }
         // Order the real control EOF before the owning reap. This touches no
@@ -389,7 +399,7 @@ impl Owner {
             let deadline = started + Duration::from_secs(60);
             if job.binding.session == session
                 && !job.reaped
-                && !job.settled
+                && !job.is_settled()
                 && job.cleanup_at.is_none()
                 && aterm_uds::process::stable_descendant(
                     peer.pid,
@@ -403,7 +413,7 @@ impl Owner {
             }
             if job.binding.session == session
                 && !job.reaped
-                && !job.settled
+                && !job.is_settled()
                 && job.cleanup_at.is_none()
             {
                 let subject = job.members.values_mut().find_map(|member| {

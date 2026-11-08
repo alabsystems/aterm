@@ -5141,6 +5141,30 @@ fn both_forms_of_resize_survive_a_native_front() {
         .starts_with("ERR "),
         "a resize that reached no window says so, never OK",
     );
+    let words = |resize| control_input::input_reply_to_str(Ok(InputOutcome::Resized(resize)));
+    assert_eq!(
+        words(crate::input::WindowResize::Grid {
+            asked: (24, 80),
+            given: (24, 80)
+        }),
+        "OK rows=24 cols=80\n",
+        "a resize given as asked names the grid"
+    );
+    assert_eq!(
+        words(crate::input::WindowResize::Grid {
+            asked: (6, 20),
+            given: (27, 27)
+        }),
+        "OK rows=27 cols=27 held=least asked_rows=6 asked_cols=20\n",
+        "a resize the least held says what it gave and what was asked"
+    );
+    assert_eq!(
+        words(crate::input::WindowResize::Px {
+            asked: (200, 150),
+            given: (566, 528)
+        }),
+        "OK width=566 height=528 held=least asked_width=200 asked_height=150\n"
+    );
     for rest in ["px 420", "px wide tall"] {
         let answer = sessionless_front_window_resize(
             "resize",
@@ -5870,7 +5894,10 @@ fn cross_session_resize_targets_term_only() {
     let (term, ctx) = (h.term.clone(), h.ctx.clone());
     let before = ctx.cast.lock().unwrap().event_count();
 
-    assert_eq!(cross_resize(&term, master, &ctx, 0, None, "10 40"), "OK\n");
+    assert_eq!(
+        cross_resize(&term, master, &ctx, 0, None, "10 40", None),
+        "OK rows=10 cols=40\n"
+    );
     {
         let t = term_lock(&term);
         assert_eq!((t.rows(), t.cols()), (10, 40), "TARGET grid resized");
@@ -5894,8 +5921,25 @@ fn cross_session_resize_targets_term_only() {
         "cross resize recorded into the TARGET's cast"
     );
 
+    let behind = crate::app_render::SessionPane {
+        window: crate::WindowId(2),
+        grid: (34, 100),
+        in_front: false,
+    };
     assert_eq!(
-        cross_resize(&term, master, &ctx, 0, None, "65535 65535"),
+        cross_resize(&term, master, &ctx, 0, None, "12 50", Some(behind)),
+        "OK rows=12 cols=50 until=front window=2 front_rows=34 front_cols=100\n",
+        "a grid set behind a tab's pane says it lasts until the tab comes to the front"
+    );
+    assert_eq!(
+        term_lock(&term).rows(),
+        12,
+        "a pane's session behind is re-gridded"
+    );
+    let _ = cross_resize(&term, master, &ctx, 0, None, "10 40", None);
+    let recorded = ctx.cast.lock().unwrap().event_count();
+    assert_eq!(
+        cross_resize(&term, master, &ctx, 0, None, "65535 65535", None),
         "ERR out of range: rows 1-4096, cols 1-4096\n"
     );
     {
@@ -5908,7 +5952,7 @@ fn cross_session_resize_targets_term_only() {
     }
     assert_eq!(
         ctx.cast.lock().unwrap().event_count(),
-        before + 1,
+        recorded,
         "rejected resize records nothing"
     );
 
@@ -5943,7 +5987,10 @@ fn cross_session_resize_books_the_rewrap_on_the_targets_gauge() {
     let ctx = test_ctx();
     assert_eq!(ctx.rewrap_gauge.reading().total, 0, "nothing booked yet");
 
-    assert_eq!(cross_resize(&term, master, &ctx, 0, None, "24 40"), "OK\n");
+    assert_eq!(
+        cross_resize(&term, master, &ctx, 0, None, "24 40", None),
+        "OK rows=24 cols=40\n"
+    );
     let reading = ctx.rewrap_gauge.reading();
     assert!(reading.total > 0, "the rewrap was booked: {reading:?}");
     assert_eq!(reading.jobs, 1, "one job: {reading:?}");

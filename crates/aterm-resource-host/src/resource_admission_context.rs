@@ -114,7 +114,7 @@ impl Owner {
             .jobs
             .get_mut(&key)
             .ok_or_else(|| refused("unknown native job"))?;
-        if job.reaped || job.settled || job.cleanup_at.is_some() {
+        if job.reaped || job.is_settled() || job.cleanup_at.is_some() {
             return Err(refused("native context scope is closing"));
         }
         let mut value = job::inspection(&self.fence, &self.debt, job)?;

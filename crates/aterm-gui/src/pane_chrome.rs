@@ -951,6 +951,9 @@ impl App {
         x: f64,
         y: f64,
     ) -> Option<(PaneFacts, scrollbar::Lane, (u32, u32), scrollbar::Hit)> {
+        if self.band_banner_at(wid, x, y).is_some() || self.find_bar_cell_at(wid, x, y).is_some() {
+            return None;
+        }
         let inputs = self.laid_overlay_inputs(wid).filter(|i| i.scrollbar)?;
         let ws = self.windows.get(&wid)?;
         let (gx, gy) = self.grid_pixel(wid, x, y);

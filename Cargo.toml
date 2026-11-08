@@ -27,7 +27,7 @@ default-members = [
     "crates/aterm-hash", "crates/aterm-heap-count", "crates/aterm-http", "crates/aterm-journal", "crates/aterm-jpeg", "crates/aterm-json",
     "crates/aterm-keeper", "crates/aterm-lan", "crates/aterm-lexicon", "crates/aterm-libc",
     "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-lz4",
-    "crates/aterm-macro-support", "crates/aterm-mail", "crates/aterm-mail-bigint", "crates/aterm-mesh", "crates/aterm-mesh-core", "crates/aterm-messages", "crates/aterm-metrics", "crates/aterm-net", "crates/aterm-netplace", "crates/aterm-objc",
+    "crates/aterm-macos-ui", "crates/aterm-macro-support", "crates/aterm-mail", "crates/aterm-mail-bigint", "crates/aterm-mesh", "crates/aterm-mesh-core", "crates/aterm-messages", "crates/aterm-metrics", "crates/aterm-net", "crates/aterm-netplace", "crates/aterm-objc",
     "crates/aterm-models-agh", "crates/aterm-models-aos", "crates/aterm-models-atpkg", "crates/aterm-models-capacity", "crates/aterm-models-core", "crates/aterm-models-effects",
     "crates/aterm-models-db", "crates/aterm-models-gui", "crates/aterm-models-harness", "crates/aterm-models-misc",
     "crates/aterm-models-native", "crates/aterm-models-release", "crates/aterm-models-render",
@@ -84,7 +84,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit (census `identity-read`).
 [workspace.package]
-version = "0.177.0"
+version = "0.178.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -230,6 +230,7 @@ aterm-net = { path = "crates/aterm-net" }
 # This Mac's network place: where it is (ALab LAN, remote, offline), its internet, its keeper.
 aterm-netplace = { path = "crates/aterm-netplace" }
 aterm-objc = { path = "crates/aterm-objc" }
+aterm-macos-ui = { path = "crates/aterm-macos-ui" }
 aterm-observe = { path = "crates/aterm-observe" }
 aterm-parser = { path = "crates/aterm-parser" }
 aterm-phase = { path = "crates/aterm-phase" }

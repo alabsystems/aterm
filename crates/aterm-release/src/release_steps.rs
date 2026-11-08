@@ -21,6 +21,12 @@ use crate::release::{
 #[path = "release_scanner_tools.rs"]
 mod scanner_tools;
 
+#[cfg(all(debug_assertions, not(test)))]
+#[path = "release_cutter_probe.rs"]
+mod cutter_probe;
+#[cfg(all(debug_assertions, not(test)))]
+pub(crate) use cutter_probe::cutter_probe_if_asked;
+
 fn preflight_cache(repo: &Path) -> Result<PathBuf, String> {
     let dir = crate::snapshot::CacheRoot::for_repo(repo)?.preflight();
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
@@ -135,7 +141,9 @@ fn hand_cutter_with_proof(
 fn detach(cmd: &mut Command) {
     crate::credential_wait::ask_no_one(cmd);
     #[cfg(unix)]
-    cmd.setsid(true);
+    // Detached step groups receive the cutter's forwarded stops. They must not inherit a
+    // background shell's ignored keys, which would disable those stops before verify starts.
+    cmd.setsid(true).default_signals();
 }
 
 fn note_child_in(release: &Path, step: Step, pid: u32) -> PathBuf {
@@ -171,7 +179,7 @@ impl crate::site::Launch for StepChildren {
                 "not started: the release was interrupted",
             ));
         }
-        crate::credential_wait::ask_no_one(cmd).setsid(true);
+        detach(cmd);
         let child = cmd.spawn()?;
         let running = interrupt::Running::enter(child.id());
         let note = self
@@ -226,10 +234,10 @@ pub struct Real {
     /// The publication engine this release is named (`--engine`, else the source a release that
     /// execed this cutter handed it ([`ENGINE_SOURCE_ENV`]), else `$PUBLICATION_ENGINE`, else
     /// `~/publication`): it names the engine's origin and committer, and nothing here runs, syncs
-    /// or writes it, since other processes move it ([`crate::gates::engine_copy`]).
+    /// or writes it, since other processes move it ([`aterm_verify::engine::engine_copy`]).
     engine_source: PathBuf,
     /// The engine this release runs, syncs, reads and hands every child as `PUBLICATION_ENGINE`:
-    /// its own copy ([`crate::gates::engine_copy`], made from `engine_source`'s origin by
+    /// its own copy ([`aterm_verify::engine::engine_copy`], made from `engine_source`'s origin by
     /// [`Real::engine_copy`]); in a dry run, which never makes or moves one, `engine_source` until a
     /// real run has made it.
     engine: PathBuf,
@@ -242,7 +250,7 @@ pub struct Real {
     /// judges of the engine (its ledger, its code) until it has synced its copy
     /// ([`Real::engine_text`]), which may be a release behind or not made yet; a dry run, which
     /// syncs none, judges it throughout.
-    origin_main: Option<crate::gates::OriginMain>,
+    origin_main: Option<aterm_verify::engine::OriginMain>,
     /// This run brought its copy to the origin's main ([`Real::engine_sync`]): what it judges of
     /// the engine is the copy's from then on, whose ledger this run's own `pub publish` writes.
     engine_synced: std::sync::atomic::AtomicBool,
@@ -254,6 +262,7 @@ pub struct Real {
     scratch_logs: bool,
     verbose: bool,
     origin_tags: String,
+    source_origin: fn(&Path) -> Result<crate::github_remote::Remote, String>,
     prefetched_origin: Option<crate::github_remote::FetchedOrigin>,
     /// The step the run is at ([`Backend::entered`]): what a child is noted under.
     step: Step,
@@ -591,8 +600,8 @@ impl Real {
             std::env::var_os(ENGINE_REPOSITORY_ENV),
             std::env::var_os(ENGINE_REPOSITORY_WHY_ENV),
         );
-        let release = crate::gates::release_dir(repo);
-        let copy = crate::gates::engine_copy(&release);
+        let release = aterm_verify::engine::release_dir(repo);
+        let copy = aterm_verify::engine::engine_copy(&release);
         let engine = if dry && !copy.join(".git").exists() {
             engine_source.clone()
         } else {
@@ -633,6 +642,7 @@ impl Real {
             scratch_logs: dry,
             verbose,
             origin_tags: String::new(),
+            source_origin: crate::github_remote::Remote::origin,
             prefetched_origin: None,
             step: Step::Checks,
             argv: std::env::args_os().skip(1).collect(),
@@ -1286,12 +1296,15 @@ impl Real {
         })
     }
 
-    /// The main of the engine's `origin` ([`crate::gates::OriginMain`]), or why it cannot be
+    /// The main of the engine's `origin` ([`aterm_verify::engine::OriginMain`]), or why it cannot be
     /// read.
-    fn read_origin_main(&self, origin: &str) -> Result<crate::gates::OriginMain, Refusal> {
-        crate::gates::OriginMain::fetch(origin, &|cmd| self.output_forwarded(cmd), &|at| {
-            self.engine_remote(at)
-        })
+    fn read_origin_main(&self, origin: &str) -> Result<aterm_verify::engine::OriginMain, Refusal> {
+        aterm_verify::engine::OriginMain::fetch(
+            origin,
+            &self.engine_source,
+            &|cmd| self.output_forwarded(cmd),
+            &|at, _| self.engine_remote(at)?.refresh_main(),
+        )
         .map_err(|why| {
             Refusal::new(
                 format!("cannot read the publication engine's origin ({origin}): {why}"),
@@ -1307,6 +1320,19 @@ impl Real {
     fn fetch_engine_origin(&mut self) -> Result<(), Refusal> {
         if let Ok(engine_origin) = self.source_origin() {
             self.origin_main = Some(self.read_origin_main(&engine_origin)?);
+        }
+        Ok(())
+    }
+
+    /// Refresh source refs before admitting `--fix`, without reading the engine or roster.
+    /// Fleet discovery and step 1 consume this same snapshot rather than fetching it again.
+    fn prefetch_source(&mut self) -> Result<(), Refusal> {
+        if self.prefetched_origin.is_none() {
+            self.prefetched_origin = Some(
+                (self.source_origin)(&self.repo)
+                    .and_then(|remote| remote.fetch_origin())
+                    .map_err(origin_refresh_refusal)?,
+            );
         }
         Ok(())
     }
@@ -1339,7 +1365,7 @@ impl Real {
             .ok()
     }
 
-    /// The release's own engine ([`crate::gates::engine_copy`]): cloned from the origin
+    /// The release's own engine ([`aterm_verify::engine::engine_copy`]): cloned from the origin
     /// `engine_source` names where there is none yet (into a name of its own, then renamed into
     /// place, so an interrupted clone is never taken for one), or where the one there was made
     /// from another origin and holds nothing that origin lacks (one that does is refused, never
@@ -1797,18 +1823,10 @@ impl Real {
     /// and the release's own copy, where it has one, is on main with no change but its audit log.
     /// `engine_source`'s branch and changes are its users', not the release's.
     fn engine_unready(&self) -> Option<Refusal> {
-        let s = self.engine_source.display().to_string();
-        if self.engine_source.join(".git").exists() && !self.engine_source.join("bin/pub").is_file()
-        {
-            return Some(Refusal::new(
-                format!("no publication engine at {s} (bin/pub)"),
-                "clone it there, or name one: --engine <path> (or PUBLICATION_ENGINE)",
-            ));
-        }
         if let Err(why) = self.source_origin() {
             return Some(why);
         }
-        if self.engine != crate::gates::engine_copy(&self.release)
+        if self.engine != aterm_verify::engine::engine_copy(&self.release)
             || !self.engine.join(".git").exists()
         {
             return None;
@@ -5295,11 +5313,7 @@ impl Backend for Real {
             .map_err(|why| Refusal::new(why, retry()).could_not_run())?;
         // Source discovery must see durable supersessions even when the independent claim
         // read was stale. It reads no engine or roster, and step 1 consumes the same result.
-        self.prefetched_origin = Some(
-            crate::github_remote::Remote::origin(&self.repo)
-                .and_then(|remote| remote.fetch_origin())
-                .map_err(origin_refresh_refusal)?,
-        );
+        self.prefetch_source()?;
         line = crate::line_claim::current(&self.git(), version, line)
             .map_err(|why| Refusal::new(why, retry()).could_not_run())?;
         if let Some(line) = &line {
@@ -5534,12 +5548,10 @@ impl Backend for Real {
 
     fn fetch(&mut self) -> Result<String, Refusal> {
         let prefetched = self.prefetched_origin.take();
+        let source_origin = self.source_origin;
         self.fetch_origins(|repo| {
             prefetched.map_or_else(
-                || {
-                    crate::github_remote::Remote::origin(repo)
-                        .and_then(|remote| remote.fetch_origin())
-                },
+                || source_origin(repo).and_then(|remote| remote.fetch_origin()),
                 Ok,
             )
         })
@@ -5637,7 +5649,7 @@ impl Backend for Real {
         // recorded as the origin's: a publish whose ledger push failed published its commit. Only
         // a copy naming the repository this release captured holds that repository's rows; one
         // naming another holds the other's, which its sync keeps there and never delivers here.
-        let copy = crate::gates::engine_copy(&self.release);
+        let copy = aterm_verify::engine::engine_copy(&self.release);
         let captured = self.engine_repository.as_ref().is_ok_and(|captured| {
             crate::github_remote::origin_slug(&copy).is_ok_and(|named| &named == captured)
         });
@@ -5796,6 +5808,7 @@ impl Backend for Real {
     }
 
     fn fix_of(&mut self, line: &Line, rev: &str) -> Result<crate::line::Admitted, Refusal> {
+        self.prefetch_source()?;
         let git = self.git();
         crate::line::git_ready(&git)?;
         Ok(crate::line::admit(&git, line, rev)?)
@@ -7393,7 +7406,86 @@ mod public_reads_http_tests;
 mod engine_tests;
 
 #[cfg(test)]
+#[path = "release_fix_tests.rs"]
+mod fix_tests;
+
+#[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn release_signal_disposition_probe() {
+        let Ok(expected) = std::env::var("ATERM_RELEASE_SIGNAL_PROBE") else {
+            return;
+        };
+        let expected = if expected == "ignored" {
+            libc::SIG_IGN
+        } else {
+            libc::SIG_DFL
+        };
+        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM] {
+            let mut action = std::mem::MaybeUninit::<libc::sigaction>::zeroed();
+            // SAFETY: a null new action reads into a live output slot.
+            assert_eq!(
+                unsafe { libc::sigaction(sig, std::ptr::null(), action.as_mut_ptr()) },
+                0
+            );
+            // SAFETY: the successful query initialized the action.
+            assert_eq!(
+                unsafe { action.assume_init() }.sa_sigaction,
+                expected,
+                "signal {sig}"
+            );
+        }
+        println!("\nRELEASE_SIGNAL_CHILD_CHECKED");
+    }
+
+    /// Detached release steps default the signals the cutter forwards even when its shell
+    /// ignored them. The ordinary child is the negative control: it observes inherited ignores.
+    #[cfg(unix)]
+    #[test]
+    fn detached_steps_default_the_background_shells_ignored_signals() {
+        use super::*;
+        use std::time::Duration;
+        const PARENT: &str = "ATERM_RELEASE_SIGNAL_PARENT";
+        const NAME: &str =
+            "release_steps::tests::detached_steps_default_the_background_shells_ignored_signals";
+        const PROBE: &str = "release_steps::tests::release_signal_disposition_probe";
+        if std::env::var_os(PARENT).is_none() {
+            let mut parent = command("/bin/sh");
+            parent
+                .args(["-c", "trap '' INT QUIT TERM; exec \"$0\" \"$@\""])
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(PARENT, "1");
+            let out = aterm_uds::deadline::ends_within(&mut parent, Duration::from_secs(60));
+            assert!(out.status.success(), "{out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("\nDETACHED_SIGNALS_CHECKED\n"),
+                "{out:?}"
+            );
+            return;
+        }
+        for reset in [false, true] {
+            let mut child = command(std::env::current_exe().unwrap());
+            child
+                .args(["--exact", PROBE, "--nocapture", "--test-threads=1"])
+                .env(
+                    "ATERM_RELEASE_SIGNAL_PROBE",
+                    if reset { "default" } else { "ignored" },
+                );
+            if reset {
+                detach(&mut child);
+            }
+            let out = aterm_uds::deadline::ends_within(&mut child, Duration::from_secs(60));
+            assert!(out.status.success(), "{out:?}");
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("\nRELEASE_SIGNAL_CHILD_CHECKED\n"),
+                "reset={reset}: {out:?}"
+            );
+        }
+        println!("\nDETACHED_SIGNALS_CHECKED");
+    }
+
     #[test]
     fn a_channel_transport_failure_never_blames_installed_prerequisites() {
         let transport = "curl: (56) HTTP 504";

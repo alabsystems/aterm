@@ -12,7 +12,7 @@ use aterm_agent::supervise::policy::turn_end::{self, RULE_LOGIN};
 
 use super::*;
 use crate::forever::sysmsg::login::{
-    self, BandRow, GO_ON_MS, Played, QUIET_MS, SIGNED_PROMPT, band_rows, rows,
+    self, GO_ON_MS, HarnessRow, Played, QUIET_MS, SIGNED_PROMPT, harness_rows, rows,
 };
 use crate::forever::sysmsg::{Form, LAND_ON_MS};
 
@@ -34,9 +34,9 @@ const PROMPT: i64 = LEFT + 14_000;
 const ANSWERED: i64 = PROMPT + 3_000;
 const WENT_ON: i64 = ANSWERED + 120_000;
 
-/// The login's band row read at `t` in `state`: a need now while it is live, none once it left
-/// (`need=-`, as the band reads a superseded or withdrawn row).
-fn band(t: i64, state: &str) -> (i64, String) {
+/// The login's message row read at `t` in `state`: a need now while it is live, none once it
+/// left (`need=-`, as `messages` reads a superseded or withdrawn row).
+fn login_row(t: i64, state: &str) -> (i64, String) {
     j(
         t,
         &format!(
@@ -105,11 +105,11 @@ fn expired() -> Seen {
         ],
         status: vec![j(1_000, "task=open needs=- autopilot=cruise agent=-")],
         meta: vec![no_meta(1_000)],
-        band: vec![
-            band(TOLD + 2_000, "live"),
-            band(ANSWERED + 2_000, "withdrawn"),
+        harness: vec![
+            login_row(TOLD + 2_000, "live"),
+            login_row(ANSWERED + 2_000, "withdrawn"),
         ],
-        band_reads: vec![T0 + TOLD + 2_000, T0 + ANSWERED + 2_000],
+        harness_reads: vec![T0 + TOLD + 2_000, T0 + ANSWERED + 2_000],
         end_ms: T0 + WENT_ON + 25_000,
         cover: Cover {
             outage_ms: Some(T0 + 5_500),
@@ -184,8 +184,8 @@ fn expired_agy() -> Seen {
         no_meta(PICK + 3_000),
         no_meta(ANSWERED + 1_000),
     ];
-    s.band = vec![j(TOLD + 2_000, "-"), j(ANSWERED + 2_000, "-")];
-    s.band_reads = vec![T0 + TOLD + 2_000, T0 + ANSWERED + 2_000];
+    s.harness = vec![j(TOLD + 2_000, "-"), j(ANSWERED + 2_000, "-")];
+    s.harness_reads = vec![T0 + TOLD + 2_000, T0 + ANSWERED + 2_000];
     s.cover.outage_lifted_ms = Some(T0 + PICK);
     s.cover.login = Some(Played {
         control: Some(true),
@@ -226,7 +226,10 @@ fn claude_codes_expired_login_left_to_the_person_and_told_once_passes() {
             && why.contains("/login once at +127.5 s")
             && why.contains("the inert browser logged nothing (its control logged)")
             && why.contains(&format!("told once at +128.3 s ({}", LOGIN_CHOOSE.id))
-            && why.contains(&format!("one band row \"{} in tab 1\"", LOGIN_CHOOSE.title)),
+            && why.contains(&format!(
+                "one message row \"{} in tab 1\"",
+                LOGIN_CHOOSE.title
+            )),
         "{why}"
     );
 }
@@ -344,9 +347,9 @@ fn the_login_told_twice_otherwise_or_never_fails() {
     let (w, why) = gone(&s, "claude");
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("NOBODY TOLD"), "{why}");
-    // Two band rows for one login.
+    // Two message rows for one login.
     let mut s = expired();
-    s.band.push(j(
+    s.harness.push(j(
         TOLD + 70_000,
         &format!(
             "12 at={} state=live need=now title={} in tab 1 | 13 at={} state=live need=now title={} in tab 1",
@@ -356,10 +359,10 @@ fn the_login_told_twice_otherwise_or_never_fails() {
             LOGIN_CHOOSE.title
         ),
     ));
-    s.band.sort_by_key(|(t, _)| *t);
+    s.harness.sort_by_key(|(t, _)| *t);
     let (w, why) = gone(&s, "claude");
     assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("2 BAND ROWS"), "{why}");
+    assert!(why.contains("2 MESSAGE ROWS"), "{why}");
 }
 
 #[test]
@@ -526,7 +529,7 @@ fn past_the_persons_sign_in_the_logins_acts_again_or_none_fail() {
     assert_eq!(signed(&s, "claude").0, "UNOBSERVED");
     // The notice left standing past the sign-in.
     let mut s = expired();
-    s.band.pop();
+    s.harness.pop();
     let (w, why) = signed(&s, "claude");
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("THE LOGIN'S NOTICE STILL UP"), "{why}");
@@ -766,11 +769,11 @@ fn the_watch_ends_past_the_persons_prompt_and_cruises_act() {
 }
 
 #[test]
-fn the_band_rows_read_back_as_written() {
+fn the_harness_rows_read_back_as_written() {
     let messages = "message 5 at=17 ago_ms=1 tag=harness sev=info origin=host state=recorded \
-                    glass=- rep=1 key=- title=Autopilot%20set%20to%20cruise detail=- actions=-\n\
+                    rep=1 key=- title=Autopilot%20set%20to%20cruise detail=- actions=-\n\
                     message 12 at=1792980409718 ago_ms=5 tag=harness sev=warn origin=host \
-                    state=live glass=row rep=1 key=harness.ch.s-1 \
+                    state=live rep=1 key=harness.ch.s-1 \
                     title=Claude%27s%20login%20expired%20in%20tab%202 detail=Pick actions=- \
                     need=now\n";
     let read = rows(messages);
@@ -779,8 +782,8 @@ fn the_band_rows_read_back_as_written() {
         "12 at=1792980409718 state=live need=now title=Claude's login expired in tab 2"
     );
     assert_eq!(
-        band_rows(&read),
-        [BandRow {
+        harness_rows(&read),
+        [HarnessRow {
             id: "12".into(),
             at: 1_792_980_409_718,
             state: "live".into(),
@@ -789,7 +792,7 @@ fn the_band_rows_read_back_as_written() {
         }]
     );
     assert_eq!(rows(""), "-");
-    assert!(band_rows("-").is_empty());
+    assert!(harness_rows("-").is_empty());
 }
 
 #[test]
@@ -811,10 +814,10 @@ fn claudes_stand_in_is_the_apis_answer_to_an_expired_oauth_token() {
 }
 
 /// A want with no evidence makes no pass: the recorder's control not logged at the raise, its log
-/// never read, the band never read while the login was gone, or no picker drawn when the person
+/// never read, `messages` never read while the login was gone, or no picker drawn when the person
 /// came (on Claude Code, whose picker and browser wants then judge nothing).
 #[test]
-fn a_login_whose_browser_band_or_picker_went_unseen_is_unobserved() {
+fn a_login_whose_browser_messages_or_picker_went_unseen_is_unobserved() {
     let control = |s: &mut Seen, logged: Option<bool>| {
         if let Some(p) = s.cover.login.as_mut() {
             p.control = logged;
@@ -837,13 +840,13 @@ fn a_login_whose_browser_band_or_picker_went_unseen_is_unobserved() {
         assert_eq!(w, "UNOBSERVED", "{program}: {why}");
         assert!(why.contains("log was never read"), "{why}");
         let mut s = base.clone();
-        s.band_reads.clear();
+        s.harness_reads.clear();
         let (w, why) = gone(&s, program);
         assert_eq!(w, "UNOBSERVED", "{program}: {why}");
-        assert!(why.contains("the band was never read"), "{why}");
+        assert!(why.contains("`ctl messages` was never read"), "{why}");
         // A fail is a fail whatever went unseen beside it.
         let mut s = base;
-        s.band_reads.clear();
+        s.harness_reads.clear();
         push(
             &mut s,
             WALL + 241_000,
@@ -889,9 +892,9 @@ fn a_persons_pick_the_inert_browser_logged_nothing_of_fails() {
     assert_eq!(signed(&s, "claude").0, "UNOBSERVED");
 }
 
-/// One quiet notice on Claude Code: its band row a need now (the band, which plays no sound, opens
-/// no dialog and brings no window forward), and no escalation beside it; on agy and Muse Code the
-/// escalation alone, no band row.
+/// One quiet notice on Claude Code: its message row a need now (which plays no sound, opens no
+/// dialog and brings no window forward), and no escalation beside it; on agy and Muse Code the
+/// escalation alone, no message row.
 #[test]
 fn a_louder_or_second_signal_while_the_login_is_gone_fails() {
     let mut s = expired();
@@ -904,14 +907,17 @@ fn a_louder_or_second_signal_while_the_login_is_gone_fails() {
     assert_eq!(w, "FAIL", "{why}");
     assert!(why.contains("ESCALATED BESIDE THE NOTICE"), "{why}");
     let mut s = expired();
-    for (_, r) in &mut s.band {
+    for (_, r) in &mut s.harness {
         *r = r.replace("need=now", "need=later");
     }
     let (w, why) = gone(&s, "claude");
     assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("THE LOGIN'S BAND ROW IS NO NEED NOW"), "{why}");
+    assert!(
+        why.contains("THE LOGIN'S MESSAGE ROW IS NO NEED NOW"),
+        "{why}"
+    );
     let mut s = expired_agy();
-    s.band[0] = j(
+    s.harness[0] = j(
         TOLD + 2_000,
         &format!(
             "14 at={} state=live need=now title=agy's login expired in tab 1",
@@ -920,7 +926,7 @@ fn a_louder_or_second_signal_while_the_login_is_gone_fails() {
     );
     let (w, why) = gone(&s, "agy");
     assert_eq!(w, "FAIL", "{why}");
-    assert!(why.contains("A BAND ROW BESIDE THE ESCALATION"), "{why}");
+    assert!(why.contains("A MESSAGE ROW BESIDE THE ESCALATION"), "{why}");
 }
 
 /// On the stored login aterm reads the method, a subscription's, so its picker's reason names the
@@ -1006,8 +1012,8 @@ fn expired_pinned() -> Seen {
         None,
     );
     s.ledger.retain(|r| r.rule != RULE_LOGIN);
-    s.band = s
-        .band
+    s.harness = s
+        .harness
         .iter()
         .map(|(t, l)| {
             (

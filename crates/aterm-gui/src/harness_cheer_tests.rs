@@ -64,7 +64,7 @@ fn cheer_app(behind: bool) -> (App, String, crate::harness_host::HostHandle) {
         app.push_stub_tab(WID, crate::stub_session(id));
     }
     app.frontmost_window = Some(WID);
-    app.windows.get_mut(&WID).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&WID).unwrap().window_on_screen_for_test = true;
     (app, ctx.self_id.as_str().to_string(), host)
 }
 

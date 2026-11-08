@@ -35,7 +35,9 @@ pub enum MetadataOutputStream {
     Stderr,
 }
 type OutputObserver<'a> = dyn FnMut(MetadataOutputStream, &[u8]) -> io::Result<()> + 'a;
+mod contained;
 mod produced;
+pub use contained::{CompletedProducedOperation, ContainedProducedError, ContainedProducedMember};
 mod refusal;
 pub use produced::{ProducedError, ProducedFailureObservation, ProducedMember, ProducedResult};
 mod linker;
@@ -78,12 +80,34 @@ enum NativeQueryRequest {
     Metadata(SealedMetadataRequest),
     Resolver(crate::resolver::SealedResolverQueryRequest),
     Workload(crate::workload::host::CompilerQuery),
+    Paired(crate::paired_qualification::query::CompilerQuery),
     Produced(
         crate::workload::host::produced::ProducedRequest,
         crate::workload::host::produced::RegistrationAck,
     ),
+    ContainedProduced(
+        crate::workload::host::contained::Request,
+        crate::workload::host::produced::RegistrationAck,
+    ),
+}
+impl NativeQueryRequest {
+    fn produced_parts(
+        &self,
+    ) -> Option<(
+        &crate::workload::host::produced::ProducedRequest,
+        &crate::workload::host::produced::RegistrationAck,
+    )> {
+        match self {
+            Self::Produced(request, ack) => Some((request, ack)),
+            Self::ContainedProduced(request, ack) => Some((&request.produced, ack)),
+            _ => None,
+        }
+    }
 }
 trait NativeQuery {
+    fn contained(&self) -> Option<&crate::workload::host::contained::Request> {
+        None
+    }
     fn linker(&self) -> Option<&crate::linker::Request> {
         None
     }
@@ -99,6 +123,9 @@ trait NativeQuery {
         Ok(None)
     }
     fn workload_completion(&self) -> Option<(u64, crate::workload::host::MemberKind)> {
+        None
+    }
+    fn paired_query(&self) -> Option<&crate::paired_qualification::query::CompilerQuery> {
         None
     }
     fn output_limit(&self) -> usize {
@@ -159,7 +186,33 @@ impl NativeQuery for crate::workload::host::CompilerQuery {
         Some((0, crate::workload::host::MemberKind::CompilerQuery))
     }
 }
+impl NativeQuery for crate::paired_qualification::query::CompilerQuery {
+    fn member(&self) -> &crate::Request {
+        &self.member
+    }
+    fn validate_request(&self) -> io::Result<()> {
+        self.validate()
+    }
+    fn payload(&self) -> io::Result<Vec<u8>> {
+        self.encode()
+    }
+    fn purpose_hello(&self) -> io::Result<Vec<u8>> {
+        self.hello()
+    }
+    fn validate_prepared(&self, p: &MetadataPrepared) -> io::Result<()> {
+        self.validate_prepared(p)
+    }
+    fn paired_query(&self) -> Option<&crate::paired_qualification::query::CompilerQuery> {
+        Some(self)
+    }
+}
 impl NativeQuery for NativeQueryRequest {
+    fn contained(&self) -> Option<&crate::workload::host::contained::Request> {
+        match self {
+            Self::ContainedProduced(request, _) => Some(request),
+            _ => None,
+        }
+    }
     fn linker(&self) -> Option<&crate::linker::Request> {
         match self {
             Self::Linker(request) => Some(request),
@@ -172,7 +225,9 @@ impl NativeQuery for NativeQueryRequest {
             Self::Metadata(r) => r.member(),
             Self::Resolver(r) => r.member(),
             Self::Workload(r) => r.member(),
+            Self::Paired(r) => r.member(),
             Self::Produced(r, _) => &r.member,
+            Self::ContainedProduced(r, _) => &r.produced.member,
         }
     }
     fn validate_request(&self) -> io::Result<()> {
@@ -181,7 +236,9 @@ impl NativeQuery for NativeQueryRequest {
             Self::Metadata(r) => r.validate_request(),
             Self::Resolver(r) => r.validate_request(),
             Self::Workload(r) => r.validate_request(),
+            Self::Paired(r) => r.validate_request(),
             Self::Produced(r, _) => r.validate(),
+            Self::ContainedProduced(r, _) => r.validate(),
         }
     }
     fn payload(&self) -> io::Result<Vec<u8>> {
@@ -190,7 +247,9 @@ impl NativeQuery for NativeQueryRequest {
             Self::Metadata(r) => r.payload(),
             Self::Resolver(r) => r.payload(),
             Self::Workload(r) => r.payload(),
+            Self::Paired(r) => r.payload(),
             Self::Produced(r, _) => r.encode(),
+            Self::ContainedProduced(r, _) => r.encode(),
         }
     }
     fn purpose_hello(&self) -> io::Result<Vec<u8>> {
@@ -199,7 +258,9 @@ impl NativeQuery for NativeQueryRequest {
             Self::Metadata(r) => r.purpose_hello(),
             Self::Resolver(r) => r.purpose_hello(),
             Self::Workload(r) => r.purpose_hello(),
+            Self::Paired(r) => r.purpose_hello(),
             Self::Produced(r, _) => r.hello(),
+            Self::ContainedProduced(r, _) => r.hello(),
         }
     }
     fn validate_prepared(&self, p: &MetadataPrepared) -> io::Result<()> {
@@ -208,7 +269,8 @@ impl NativeQuery for NativeQueryRequest {
             Self::Metadata(r) => r.validate_prepared(p),
             Self::Resolver(r) => r.validate_prepared(p),
             Self::Workload(r) => r.validate_prepared(p),
-            Self::Produced(_, _) => {
+            Self::Paired(r) => r.validate_prepared(p),
+            Self::Produced(..) | Self::ContainedProduced(..) => {
                 Err(invalid("produced output requires its separate mixed-root preparation"))
             }
         }
@@ -217,7 +279,7 @@ impl NativeQuery for NativeQueryRequest {
         &self,
         bytes: &[u8],
     ) -> io::Result<Option<crate::workload::host::produced::ProducedPrepared>> {
-        let Self::Produced(request, ack) = self else {
+        let Some((request, ack)) = self.produced_parts() else {
             return Ok(None);
         };
         if crate::wire::header(bytes, 54).is_err() {
@@ -236,9 +298,17 @@ impl NativeQuery for NativeQueryRequest {
             _ => None,
         }
     }
+    fn paired_query(&self) -> Option<&crate::paired_qualification::query::CompilerQuery> {
+        match self {
+            Self::Paired(query) => Some(query),
+            _ => None,
+        }
+    }
     fn output_limit(&self) -> usize {
         match self {
-            Self::Produced(..) => crate::workload::host::produced::MAX_OUTPUT_BYTES,
+            Self::Produced(..) | Self::ContainedProduced(..) => {
+                crate::workload::host::produced::MAX_OUTPUT_BYTES
+            }
             Self::Linker(_) => crate::linker::MAX_OUTPUT,
             _ => METADATA_MAX_OUTPUT,
         }
@@ -340,6 +410,16 @@ impl Client {
     ) -> Result<MetadataMember, MetadataError> {
         self.native_query(&NativeQueryRequest::Workload(request.clone()), io, deadline)
     }
+    /// Distinct50/v2 query under the authenticated paired root. Actual normal
+    /// config environment stays in the bound command; no role6/v1 fallback.
+    pub fn paired_qualification_query(
+        &self,
+        request: &crate::paired_qualification::query::CompilerQuery,
+        io: MetadataIo,
+        deadline: Instant,
+    ) -> Result<MetadataMember, MetadataError> {
+        self.native_query(&NativeQueryRequest::Paired(request.clone()), io, deadline)
+    }
     fn native_query(
         &self,
         request: &NativeQueryRequest,
@@ -432,6 +512,14 @@ impl MetadataMember {
     /// no malformed/unknown execution can yield a measured zero.
     pub fn accounting(&self) -> Option<crate::accounting::Observation> {
         self.result_delivered.then_some(self.streams.state.accounting).flatten()
+    }
+    /// Available only after actual output/event EOF and original host recheck.
+    pub fn paired_completion(&self) -> Option<&crate::paired_qualification::query::Completion> {
+        self.result_delivered.then_some(self.streams.state.paired.as_ref()).flatten()
+    }
+    /// The old workload completion remains a separate v1 observation.
+    pub fn workload_completion(&self) -> Option<&crate::workload::host::Completion> {
+        self.result_delivered.then_some(self.streams.state.workload.as_ref()).flatten()
     }
     pub fn started(&self) -> Option<Started> {
         self.streams.state.started
@@ -556,7 +644,13 @@ impl MetadataMember {
 }
 
 fn require_workload_observer(request: &NativeQueryRequest) -> io::Result<()> {
-    if matches!(request, NativeQueryRequest::Workload(_) | NativeQueryRequest::Produced(..)) {
+    if matches!(
+        request,
+        NativeQueryRequest::Workload(_)
+            | NativeQueryRequest::Paired(_)
+            | NativeQueryRequest::Produced(..)
+            | NativeQueryRequest::ContainedProduced(..)
+    ) {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -709,6 +803,47 @@ impl MetadataStreams {
                     }
                     event
                 }
+            } else if let Some(query) = request.paired_query() {
+                use sha2::{Digest, Sha256};
+
+                use crate::paired_qualification::query::Completion;
+                let expected: [u8; 32] =
+                    Sha256::digest(query.invocation.binding_preimage()?).into();
+                if let Ok(completion) = Completion::decode(&bytes, query, expected) {
+                    self.state.accounting = Some(completion.observation);
+                    self.state.paired = Some(completion.clone());
+                    MetadataEvent::Completed(completion.completed)
+                } else {
+                    let event = MetadataEvent::decode(&bytes, root, member)?;
+                    if matches!(event, MetadataEvent::Completed(_)) {
+                        return Err(invalid("paired query requires full60-bound55/v2 retirement"));
+                    }
+                    event
+                }
+            } else if let Some(request) = request.contained() {
+                use sha2::{Digest, Sha256};
+                let expected: [u8; 32] = Sha256::digest(request.binding_preimage()?).into();
+                match crate::workload::host::contained::Completion::decode(
+                    &bytes, request, expected,
+                ) {
+                    Ok(completion) => {
+                        self.state.accounting = Some(completion.completion.observation);
+                        self.state.workload = Some(completion.completion.clone());
+                        let event =
+                            MetadataEvent::Completed(completion.completion.completed.clone());
+                        self.state.contained = Some(completion);
+                        event
+                    }
+                    Err(_) => {
+                        let event = MetadataEvent::decode(&bytes, root, member)?;
+                        if matches!(event, MetadataEvent::Completed(_)) {
+                            return Err(invalid(
+                                "contained operation requires its own native retirement",
+                            ));
+                        }
+                        event
+                    }
+                }
             } else if let Some((phase, kind)) = request.workload_completion() {
                 use crate::workload::host::Completion;
                 if let Ok(completion) = Completion::decode(&bytes, root, member) {
@@ -792,6 +927,8 @@ struct Lifecycle {
     refused_frame: Option<StatusFrame>,
     accounting: Option<crate::accounting::Observation>,
     workload: Option<crate::workload::host::Completion>,
+    paired: Option<crate::paired_qualification::query::Completion>,
+    contained: Option<crate::workload::host::contained::Completion>,
 }
 impl Lifecycle {
     fn accept_linker(&mut self, prepared: crate::linker::Prepared) -> io::Result<()> {

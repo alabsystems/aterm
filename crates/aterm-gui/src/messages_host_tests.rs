@@ -930,7 +930,7 @@ fn a_transient_status_line_is_cleared_about_five_seconds_on() {
     };
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     app.post_message(warn("a record the page dates"));
     assert!(app.open_settings_tab_in_window(wid, SettingsRoute::Messages));
     let opened = app
@@ -975,7 +975,7 @@ fn a_transient_status_line_clears_on_every_page() {
     use crate::app_native::{MESSAGES_FEEDBACK_WAIT as WAIT, MESSAGES_PUBLISH_MIN_GAP as GAP};
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     assert!(app.open_settings_tab_in_window(wid, SettingsRoute::About));
     let opened = app
         .messages_last_publish
@@ -1015,7 +1015,7 @@ fn publish_is_rate_limited_and_only_while_settings_exists() {
     use crate::app_native::MESSAGES_PUBLISH_TICK as TICK;
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+    app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
     let settings_exists = |app: &App| {
         app.native_runtime
             .instance_by_kind(crate::native_app::AppKind::Settings)
@@ -1978,7 +1978,7 @@ fn a_record_the_seed_moves_off_a_carried_id_lands_above_the_parked_band() {
         },
     ]);
     let mut successor = App::headless_for_test();
-    successor.messages = aterm_messages::MessageCenter::new(boot, Instant::now());
+    successor.messages = crate::messages_host::new_center(boot, Instant::now());
     successor.incoming_handoff_pending = true;
     successor.seed_carried_messages(&window_carry(carried.clone()), Some("0.76.0"));
     assert_eq!(
@@ -2048,9 +2048,9 @@ fn a_landed_update_leaves_no_outcome_row_that_said_it_had_not() {
 }
 
 #[cfg(unix)]
-fn band_seen(app: &mut App) {
+fn window_seen(app: &mut App) {
     for ws in app.windows.values_mut() {
-        ws.band_on_screen_for_test = true;
+        ws.window_on_screen_for_test = true;
         ws.occluded = false;
     }
 }
@@ -2109,7 +2109,7 @@ fn a_carried_unhealed_stall_never_silences_the_successors_own_watchdog() {
     let stalled = update_words::HealthKind::Stalled;
     for carried in [true, false] {
         let mut parent = App::headless_for_test();
-        band_seen(&mut parent);
+        window_seen(&mut parent);
         if carried {
             parent.announce_update_checker_stall(
                 CheckerStall {
@@ -2214,7 +2214,7 @@ fn a_carried_check_warning_heals_by_the_successors_first_healthy_check() {
     }
     UPDATER_ADOPTED_HEALTH.with(|adopted| adopted.borrow_mut().clear());
     let _folded = landed_successor(false, |parent| {
-        band_seen(parent);
+        window_seen(parent);
         assert!(parent.note_update_health(title, body));
         parent.settle_messages(
             Instant::now() + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(60),
@@ -2445,7 +2445,7 @@ fn a_late_park_successor_sees_the_parents_records_written_after_its_boot() {
     let x = parent.post_message(warn("open at the boot"));
     parent.flush_messages_log();
     let mut successor = App::headless_for_test();
-    successor.messages = aterm_messages::MessageCenter::new(
+    successor.messages = crate::messages_host::new_center(
         crate::messages_store::load_tail(&path, u64::MAX).log,
         Instant::now(),
     );
@@ -2639,7 +2639,7 @@ fn a_healing_the_parked_parent_recorded_is_on_record_once_whatever_its_row_did()
         let (mut successor, dir) = committed_after_park(
             name,
             |parent| {
-                band_seen(parent);
+                window_seen(parent);
                 say_check_warning(parent);
                 assert!(parent.note_update_health_as(
                     update_words::HealthKind::Download,
@@ -2911,7 +2911,7 @@ fn a_record_the_parked_parent_makes_never_shares_an_id_with_the_successor() {
     parent.record_message(warn("before the boot").hold(Hold::LogOnly));
     parent.flush_messages_log();
     let mut successor = App::headless_for_test();
-    successor.messages = aterm_messages::MessageCenter::new(
+    successor.messages = crate::messages_host::new_center(
         crate::messages_store::load_tail(&path, u64::MAX).log,
         Instant::now(),
     );
@@ -4078,7 +4078,7 @@ fn a_linux_install_waiting_for_a_start_is_a_notice_and_its_end_takes_it_down() {
     app.windows
         .get_mut(&WindowId(0))
         .unwrap()
-        .band_on_screen_for_test = true;
+        .window_on_screen_for_test = true;
     assert!(
         !app.note_update_health(aterm_update::INSTALL_AWAITS_START_TITLE, body),
         "the wait for a start is no health warning"
@@ -4135,7 +4135,7 @@ fn a_linux_start_wait_said_unseen_is_shown_once_seen_unless_it_ended() {
     let secs = std::time::Duration::from_secs;
     let on_screen = |app: &mut App, seen: bool| {
         let ws = app.windows.get_mut(&WindowId(0)).unwrap();
-        ws.band_on_screen_for_test = true;
+        ws.window_on_screen_for_test = true;
         ws.occluded = !seen;
     };
     let live = |app: &App| {
@@ -4175,7 +4175,7 @@ fn an_owed_install_warning_is_answered_by_the_landing_it_is_carried_to() {
     let secs = std::time::Duration::from_secs;
     let on_screen = |app: &mut App, seen: bool| {
         let ws = app.windows.get_mut(&WindowId(0)).unwrap();
-        ws.band_on_screen_for_test = true;
+        ws.window_on_screen_for_test = true;
         ws.occluded = !seen;
     };
     let records = |app: &App, title: &str| {
@@ -4250,6 +4250,71 @@ fn an_owed_install_warning_is_answered_by_the_landing_it_is_carried_to() {
         1,
         "the landing records the healing"
     );
+}
+
+/// AN OWED WARNING IS SEEN ONCE A WINDOW IS ON SCREEN AND ENDS AT ITS HOLD: said while no window
+/// is on screen, it stays live and owed however long that lasts; once a window is, it counts as
+/// seen, the carry owes it no more, and it is restated no more though the window leaves the
+/// screen again, so its hold (`HOLD_WARN`) from the window ends it. The Messages page says `live`,
+/// then `live for …`, never `waiting to show`.
+/// NEGATIVE CONTROL (scratch): restating an owed row's hold on every settle, seen or not, keeps it
+/// live past its hold.
+#[test]
+fn an_owed_warning_is_seen_once_a_window_is_on_screen_and_ends_at_its_hold() {
+    let title = aterm_update::health_failing_title("apply");
+    let body = "build 12 has been waiting on this machine since 2026-10-16T08:00:00Z and \
+                build 11 is still running: no apply attempt has been recorded for it.";
+    let secs = std::time::Duration::from_secs;
+    let on_screen = |app: &mut App, seen: bool| {
+        let ws = app.windows.get_mut(&WindowId(0)).unwrap();
+        ws.window_on_screen_for_test = true;
+        ws.occluded = !seen;
+    };
+    let owed = |app: &App| app.carried_health_said().iter().any(|said| said.owed);
+    let mut app = App::headless_for_test();
+    on_screen(&mut app, false);
+    let said = Instant::now();
+    assert!(app.note_update_health(title, body), "announced");
+    let id = *app
+        .live_update_health(|_| true)
+        .first()
+        .expect("PRECONDITION: the warning is live");
+    let words = |app: &App| {
+        app.messages_state()
+            .entries
+            .iter()
+            .find(|e| e.id == id.raw())
+            .map(aterm_messages::page::MessageView::state_words)
+    };
+    for at in [10, 70, 10 * 60] {
+        app.settle_messages(said + secs(at));
+        assert!(
+            app.messages.live(id).is_some(),
+            "{at} s: it waits while no window is on screen"
+        );
+        assert!(owed(&app), "{at} s: and is owed");
+    }
+    assert_eq!(words(&app).as_deref(), Some("live"));
+    let seen = said + secs(10 * 60 + 1);
+    on_screen(&mut app, true);
+    app.settle_messages(seen);
+    assert!(!owed(&app), "seen, the carry owes it no more");
+    on_screen(&mut app, false);
+    let hold = aterm_messages::HOLD_WARN;
+    let mut step = secs(1);
+    while step < hold {
+        app.settle_messages(seen + step);
+        assert!(app.messages.live(id).is_some(), "{step:?} into its hold");
+        step += secs(1);
+    }
+    app.settle_messages(seen + hold);
+    assert!(
+        app.messages.live(id).is_none(),
+        "its hold from the window ends it"
+    );
+    assert!(!owed(&app), "the carry owes it no more");
+    let ended = words(&app).expect("its record");
+    assert!(ended.starts_with("live for "), "{ended}");
 }
 
 /// A SETTINGS TAB CLOSED FROM BEHIND SHOWED NOTHING: `settings close` with a terminal in front
@@ -4692,7 +4757,7 @@ fn appstatus_carries_no_motion_words() {
 fn the_messages_page_lists_log_only_records() {
     let mut app = App::headless_for_test();
     let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
-    ws.band_on_screen_for_test = true;
+    ws.window_on_screen_for_test = true;
     ws.focused = true;
     let first = app.record_message(Message::new(
         tags::TOOLCHAIN,

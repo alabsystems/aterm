@@ -91,9 +91,9 @@ pub use complete::{
     MAX_COMPLETE_STDOUT_BYTES, output_until_complete_listing, output_until_complete_stdout,
     output_until_complete_stdout_from, output_until_complete_stdout_from_observed,
     output_until_complete_stdout_from_unless, output_until_complete_stdout_observed,
-    output_until_complete_stdout_with_limit, output_while_process_progressing_complete_stdout,
-    output_within_complete_listing, output_within_complete_stdout_records,
-    output_within_complete_stdout_records_from,
+    output_until_complete_stdout_with_limit, output_until_complete_stdout_with_limit_unless,
+    output_while_process_progressing_complete_stdout, output_within_complete_listing,
+    output_within_complete_stdout_records, output_within_complete_stdout_records_from,
 };
 #[cfg(unix)]
 pub use complete::{RetainedOutputError, output_until_complete_stdout_retained};
@@ -1114,6 +1114,33 @@ pub fn output_from_while_process_progressing(
         waiting_on,
         &mut now,
         &mut |pid| probe.read(pid),
+        None,
+    )
+}
+
+/// As [`output_from_while_process_progressing`], also observing an explicit stop every
+/// [`STOP_TICK`]. A stop retires the owned child/group through the same collector as a stall,
+/// publishing no output. The caller distinguishes its stop from a stall by its own reading.
+/// Escaped descendants and termination of this owner are outside this collector's contract.
+///
+/// # Errors
+/// The same errors as [`output_from_while_process_progressing`].
+pub fn output_from_while_process_progressing_unless(
+    cmd: &mut Command,
+    stdin: Stdio,
+    window: Duration,
+    waiting_on: impl Into<String>,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<Output, ProgressError> {
+    let mut probe = ProcessProgressProbe::default();
+    output_from_while_process_progressing_with(
+        cmd,
+        stdin,
+        window,
+        waiting_on.into(),
+        &mut deadline_now,
+        &mut |pid| probe.read(pid),
+        Some(stopped),
     )
 }
 
@@ -1124,6 +1151,7 @@ fn output_from_while_process_progressing_with(
     waiting_on: String,
     now: &mut dyn FnMut() -> Instant,
     work: &mut dyn FnMut(u32) -> Option<u64>,
+    stopped: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<Output, ProgressError> {
     let mut progress = ProgressWindow::new(window, now());
     let mut left = |pid, bytes| progress.remaining(now(), bytes, work(pid));
@@ -1135,7 +1163,7 @@ fn output_from_while_process_progressing_with(
         &mut left,
         &mut settle_child,
         true,
-        None,
+        stopped,
     )?
     .map_err(|_| ProgressError::Stalled { window, waiting_on })
 }
@@ -2899,6 +2927,7 @@ mod tests {
             "git fetch origin/main".to_owned(),
             &mut now,
             &mut probe,
+            None,
         );
         let child = pid_in(&pid_file).expect("the stalled child wrote its pid");
         let _ = std::fs::remove_dir_all(&dir);

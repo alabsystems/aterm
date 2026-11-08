@@ -268,6 +268,13 @@ impl State {
     pub(super) fn registration_preparing(&self) -> bool {
         self.produced.preparing()
     }
+    pub(super) fn settlement_ready(&self) -> bool {
+        !self.produced.preparing()
+            && self
+                .control
+                .as_ref()
+                .is_none_or(crate::workload_transport::Link::closed)
+    }
     pub(super) fn foreign_member(&self, attempt: [u8; 16]) -> bool {
         self.census.get(&attempt).is_some_and(|entry| {
             matches!(
@@ -453,7 +460,7 @@ impl Owner {
             .ok_or_else(|| refused("original workload root unavailable"))?;
         if !job.launched
             || job.reaped
-            || job.settled
+            || job.is_settled()
             || job.cleanup_at.is_some()
             || peer.pid != job.child.child_mut().id()
             || peer.birth != job.root_birth

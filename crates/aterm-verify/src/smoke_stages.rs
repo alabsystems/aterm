@@ -473,28 +473,33 @@ fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
         r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
         return;
     }
-    let mut got = String::new();
-    let mut presented = false;
-    for _ in 0..150 {
-        if child_exited(sb) {
+    let started = std::time::Instant::now();
+    let presented = wait_for_initial_present(
+        || {
+            if child_exited(sb) {
+                Err(InitialPresent::Exited)
+            } else {
+                Ok(ctl(ctx, sb, ctl_bin, &["metrics"]))
+            }
+        },
+        || started.elapsed(),
+        || std::thread::sleep(POLL_GAP),
+    );
+    match presented {
+        Ok(_) => {}
+        Err(InitialPresent::Exited) => {
             r.fail("gui smoke: aterm-gui exited before its initial present");
             r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
             return;
         }
-        got = ctl(ctx, sb, ctl_bin, &["metrics"]);
-        if metric_u64(&got, "frames").is_some_and(|f| f > 0) {
-            presented = true;
-            break;
+        Err(InitialPresent::Unpresented(got)) => {
+            r.fail(format!(
+                "gui smoke: the frontmost window never produced an initial present [{}]",
+                or_no_reply(&got)
+            ));
+            r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
+            return;
         }
-        std::thread::sleep(POLL_GAP);
-    }
-    if !presented {
-        r.fail(format!(
-            "gui smoke: the frontmost window never produced an initial present [{}]",
-            or_no_reply(&got)
-        ));
-        r.raw(smoke_log_tail("GUI smoke", &sb.gui_log));
-        return;
     }
     guarded_burst(
         r,
@@ -530,6 +535,31 @@ fn typing_burst(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path) {
         },
         check_burst_timing,
     );
+}
+
+#[derive(Debug)]
+enum InitialPresent {
+    Exited,
+    Unpresented(String),
+}
+
+const INITIAL_PRESENT_HANG: Duration = Duration::from_secs(60);
+
+fn wait_for_initial_present(
+    mut observe: impl FnMut() -> Result<String, InitialPresent>,
+    elapsed: impl Fn() -> Duration,
+    mut pause: impl FnMut(),
+) -> Result<String, InitialPresent> {
+    loop {
+        let got = observe()?;
+        if metric_u64(&got, "frames").is_some_and(|frames| frames > 0) {
+            return Ok(got);
+        }
+        if elapsed() >= INITIAL_PRESENT_HANG {
+            return Err(InitialPresent::Unpresented(got));
+        }
+        pause();
+    }
 }
 
 struct BurstTiming {
@@ -1128,6 +1158,42 @@ pub(crate) mod tests {
     use super::*;
     use crate::EnvSnapshot;
     use crate::scope::Scope;
+
+    #[test]
+    fn required_initial_present_waits_for_a_scheduled_frame() {
+        let clock = std::cell::Cell::new(Duration::from_secs(16));
+        let mut polls = 0;
+        let result = wait_for_initial_present(
+            || {
+                polls += 1;
+                Ok(format!("OK frames={}", u8::from(polls == 151)))
+            },
+            || clock.get(),
+            || clock.set(clock.get() + POLL_GAP),
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(polls, 151);
+        assert_eq!(metric_u64(&result.unwrap(), "frames"), Some(1));
+
+        let mut polls = 0;
+        let result = wait_for_initial_present(
+            || {
+                polls += 1;
+                Ok("OK frames=0".into())
+            },
+            || Duration::from_secs(61),
+            || panic!("expired observation never pauses"),
+        );
+        assert!(matches!(result, Err(InitialPresent::Unpresented(_))));
+        assert_eq!(polls, 1);
+
+        let result = wait_for_initial_present(
+            || Err(InitialPresent::Exited),
+            || Duration::ZERO,
+            || panic!("an actual exit never pauses"),
+        );
+        assert!(matches!(result, Err(InitialPresent::Exited)));
+    }
 
     fn ctx() -> Ctx {
         Ctx::new(

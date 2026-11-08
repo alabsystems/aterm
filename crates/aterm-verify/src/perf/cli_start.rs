@@ -7,7 +7,7 @@
 //! Every agent's `aterm ctl` call, and every bridge, broker and notifier relaunch, is a fresh
 //! start of the one shipped executable. The lane times none of them by the clock: it counts what
 //! the kernel's per-thread counters say each start retired. Each launch is spawned through
-//! [`aterm_uds::spawnfd::command`], observed exited without being reaped (`waitid` with
+//! [`crate::exec::check_command`], observed exited without being reaped (`waitid` with
 //! `WNOWAIT`, [`aterm_uds::spawnfd::Child::exited`], woken by the kernel's exit report), read
 //! while the zombie still holds its usage (`proc_pid_rusage`'s `RUSAGE_INFO_V4`:
 //! `ri_instructions`, `ri_cycles`, and its user and system time), and only then reaped.
@@ -948,8 +948,9 @@ mod live {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    use crate::exec::check_command as command;
     use aterm_uds::deadline::ExitWait;
-    use aterm_uds::spawnfd::{Child, Stdio, command};
+    use aterm_uds::spawnfd::{Child, Stdio};
 
     use super::super::arena::{self, without_aterm_env};
     use super::super::{LaneRun, driver, workspace_root};

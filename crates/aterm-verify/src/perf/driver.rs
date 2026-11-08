@@ -6,7 +6,8 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use aterm_uds::spawnfd::{Command, command};
+use crate::exec::check_command as command;
+use aterm_uds::spawnfd::Command;
 
 /// The pinned toolchain's `targo`.
 #[derive(Clone, Debug, PartialEq, Eq)]

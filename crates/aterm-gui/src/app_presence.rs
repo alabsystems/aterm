@@ -1157,7 +1157,7 @@ impl App {
                 || self
                     .windows
                     .get(&wid)
-                    .is_some_and(|ws| ws.os_key && crate::messages_host::band_on_screen(ws)))
+                    .is_some_and(|ws| ws.os_key && crate::messages_host::window_on_screen(ws)))
     }
 
     /// `aterm ctl person …` on the main thread.
@@ -2230,7 +2230,7 @@ mod tests {
                 .map(|m| m.attention)
                 .collect::<Vec<_>>()
         };
-        app.windows.get_mut(&wid).unwrap().band_on_screen_for_test = true;
+        app.windows.get_mut(&wid).unwrap().window_on_screen_for_test = true;
         assert_eq!(app.frontmost_window, Some(wid));
         ask(&first_ctx, Some("approve?"));
         app.refresh_presence_session(first);
@@ -2277,7 +2277,7 @@ mod tests {
             .windows
             .get_mut(&wid)
             .unwrap()
-            .band_on_screen_for_test = true;
+            .window_on_screen_for_test = true;
         parent.frontmost_window = Some(wid);
         for (ctx, local) in [(&seen_ctx, seen), (&unseen_ctx, unseen)] {
             task(ctx, local, TaskState::Done);
@@ -2352,7 +2352,7 @@ mod tests {
         let tabs = app.windows[&wid].tab_set.tabs().len();
         {
             let ws = app.windows.get_mut(&wid).unwrap();
-            ws.band_on_screen_for_test = true;
+            ws.window_on_screen_for_test = true;
             ws.occluded = true;
         }
         app.frontmost_window = Some(wid);
@@ -2409,7 +2409,7 @@ mod tests {
         };
         {
             let ws = app.windows.get_mut(&wid).unwrap();
-            ws.band_on_screen_for_test = true;
+            ws.window_on_screen_for_test = true;
             ws.occluded = true;
         }
         task(&second_ctx, second, TaskState::Done);
@@ -2431,7 +2431,7 @@ mod tests {
             assert_eq!(app.focused_session_id(wid), Some(other), "the new pane");
             {
                 let ws = app.windows.get_mut(&wid).unwrap();
-                ws.band_on_screen_for_test = true;
+                ws.window_on_screen_for_test = true;
                 ws.occluded = occluded;
             }
             app.frontmost_window = Some(wid);
@@ -3206,7 +3206,7 @@ mod tests {
             app.windows
                 .get_mut(&wid)
                 .expect("window")
-                .band_on_screen_for_test = true;
+                .window_on_screen_for_test = true;
             assert_eq!(app.frontmost_window, Some(wid));
             app.switch_tab_in(wid, ia);
             assert_eq!(app.focused_session_id(wid), Some(sid_a));

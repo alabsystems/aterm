@@ -468,7 +468,7 @@ pub fn declared(scope: &Scope) -> Vec<StageSpec> {
         ),
         spec(
             StageId::ExportScan,
-            "export scan (the publication engine's content guards, offline)",
+            "export scan (the publication engine's content guards)",
             Lane::Pure,
         ),
         StageSpec {

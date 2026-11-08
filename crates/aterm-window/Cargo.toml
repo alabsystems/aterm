@@ -210,6 +210,9 @@ workspace = true
 [target.'cfg(target_os = "macos")'.dependencies.aterm-objc]
 path = "../aterm-objc"
 
+[target.'cfg(target_os = "macos")'.dependencies.aterm-macos-ui]
+path = "../aterm-macos-ui"
+
 # LOCAL PATCH (aterm): `aterm-cg`, the CoreGraphics display calls
 # `monitor.rs` and `window_delegate.rs` make (the CF/CG carve). Its own crate,
 # not an `aterm-objc` feature, so CoreGraphics is linked only where this

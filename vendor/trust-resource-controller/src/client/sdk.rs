@@ -102,6 +102,22 @@ pub unsafe fn capture_sdk_lease(pending: PendingSdkCapture) -> io::Result<()> {
         io::Error::new(io::ErrorKind::AlreadyExists, "SDK early capture already complete")
     })
 }
+/// Forward only the still-original captured SDK locator, never a reopened path
+/// or unrelated descriptor. The global keeper retains its duplicate while the
+/// caller retains the original inherited number through child retirement.
+/// No Context/lease authentication is inferred by this transparent handoff.
+pub fn inherit_original_lease(command: &mut std::process::Command) -> io::Result<()> {
+    let Some(keeper) = KEEPER.get().ok_or_else(refused)?.as_ref() else {
+        return Ok(());
+    };
+    if identity(keeper.original)? != keeper.identity
+        || identity(keeper.file.as_raw_fd())? != keeper.identity
+    {
+        return Err(refused());
+    }
+    super::member::inherit_descriptions(command, &[keeper.original])
+}
+
 impl Keeper {
     fn validate(&self, sdk: &SdkCustody) -> io::Result<()> {
         if sdk.inherited_fd != self.original as u32

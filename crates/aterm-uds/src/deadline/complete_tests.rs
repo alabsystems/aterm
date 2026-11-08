@@ -420,6 +420,60 @@ fn explicit_stdout_limit_accepts_the_native_boundary_without_changing_the_defaul
     ));
 }
 
+/// A LIMITED CAPTURE IS CANCELLED WHEN ITS CALLER STOPS: a child that would exit 0 after 30 s
+/// (inside the 60 s deadline, so ignoring the stop returns its success) is ended once
+/// `stopped` says so, as a post-spawn timeout with no output, and `stopped` was asked. NEGATIVE CONTROL: never stopped, a short
+/// child's whole stdout comes back, and the limit still refuses one byte too many.
+#[cfg(unix)]
+#[test]
+fn a_limited_capture_is_cancelled_when_its_caller_stops() {
+    let sleep = crate::deadline::stand_in(std::path::Path::new("/bin/sleep"));
+    let mut slow = crate::spawnfd::command(&sleep);
+    slow.arg("30");
+    let mut asked = 0;
+    let stopped = output_until_complete_stdout_with_limit_unless(
+        &mut slow,
+        Instant::now() + HANG,
+        MAX_COMPLETE_STDOUT_BYTES,
+        &mut || {
+            asked += 1;
+            true
+        },
+    );
+    assert!(
+        matches!(stopped, Err(CompleteOutputError::Run(RunError::TimedOut))),
+        "{stopped:?}"
+    );
+    assert!(asked > 0, "the caller's stop was asked");
+    let echo = crate::deadline::stand_in(std::path::Path::new("/bin/echo"));
+    let quick = || {
+        let mut quick = crate::spawnfd::command(&echo);
+        quick.arg("done");
+        quick
+    };
+    let output = output_until_complete_stdout_with_limit_unless(
+        &mut quick(),
+        Instant::now() + HANG,
+        4,
+        &mut || false,
+    );
+    assert!(
+        matches!(
+            output,
+            Err(CompleteOutputError::StdoutTooLarge { limit: 4 })
+        ),
+        "{output:?}"
+    );
+    let output = output_until_complete_stdout_with_limit_unless(
+        &mut quick(),
+        Instant::now() + HANG,
+        MAX_COMPLETE_STDOUT_BYTES,
+        &mut || false,
+    )
+    .expect("NEGATIVE CONTROL: never stopped, it runs to its end");
+    assert_eq!(output.stdout, b"done\n");
+}
+
 /// A LISTING IS READ WHOLE PAST THE SHARED HARD MAXIMUM, UP TO ITS OWN: one byte past
 /// [`MAX_COMPLETE_STDOUT_BYTES`] comes back whole. NEGATIVE CONTROLS: the shared entry point
 /// refuses that limit before dispatch, and the listing's refuses one past its own maximum.

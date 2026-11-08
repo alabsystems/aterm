@@ -10,6 +10,7 @@ use super::{WorkloadInvocation, path};
 
 pub mod bank;
 pub mod census;
+pub mod contained;
 pub mod output;
 pub mod phase;
 pub mod produced;

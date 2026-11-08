@@ -59,6 +59,46 @@ pub(crate) fn observe_commons_now(paths: &Paths) -> crate::Result<crate::commons
     MEMO.read(paths, super::observe_commons)
 }
 
+/// [`observe_commons`](super::observe_commons) for a check of Commons custody, read again only
+/// when one of the files it reads ([`observation_inputs`]) moved; quiet, as
+/// [`local_swarm_roster_for_log_now`], so a vault a writer holds is the fresh read's `Busy`, as
+/// before, never the observation kept from before that writer. A Commons repair round checks its
+/// custody against the vault at every step it opens a table session
+/// (`Bootstrap::revalidate_custody`), 24 times a round on each side of a loopback pair, and each
+/// check read and verified the vault, its log and this Mac's denial again: 14% of a quiet round's
+/// CPU (2026-11-08), and nearly half its reads of the vault, which on a fleet node holds a
+/// megabyte or more.
+///
+/// # Errors
+/// As [`observe_commons`](super::observe_commons).
+pub(crate) fn observe_commons_quiet(paths: &Paths) -> crate::Result<crate::commons::Observation> {
+    static MEMO: Memo<crate::commons::Observation> = Memo::keyed(observation_inputs, true);
+    MEMO.read_keyed(paths, &(), super::observe_commons)
+}
+
+/// [`local_recipient_denied`](super::steward::local_recipient_denied) of a fresh read, read again
+/// only when one of the files it reads ([`observation_inputs`]) moved; quiet, as
+/// [`local_swarm_roster_for_log_now`], so a writer holding the vault (the caller's own exclusive
+/// take included) meets a fresh read. Every table session a repair round opens checks this Mac's
+/// own denial under its access (`Bootstrap::access_in_observed`), 18 times a round on each side of
+/// a loopback pair, reading the vault, its log and roster each time: 7% of a quiet round's CPU
+/// (2026-11-08) and a third of its reads of the vault. The swarm's checks of this Mac
+/// ([`local_recipient_denied_in_roster`](super::local_recipient_denied_in_roster)) read afresh, so
+/// one that cannot read a file it was settled on takes this Mac as denied. This one, like every
+/// memo here, gives the answer it kept through a read fault on files that have not moved: the
+/// judgement those files gave, so a Mac keeps the table access it held, as a server keeps the
+/// role it holds while its device cannot be read
+/// (`a_device_it_cannot_read_gives_a_mac_still_in_no_new_authority`).
+///
+/// # Errors
+/// As [`local_recipient_denied`](super::steward::local_recipient_denied).
+pub(crate) fn local_recipient_denied_now(paths: &Paths) -> crate::Result<bool> {
+    static MEMO: Memo<bool> = Memo::keyed(observation_inputs, true);
+    MEMO.read_keyed(paths, &(), |paths| {
+        super::steward::local_recipient_denied(&super::Reads::new(paths))
+    })
+}
+
 /// [`local_swarm_roster_for_log`](super::local_swarm_roster_for_log), read again only when one
 /// of the files it reads ([`inputs`]) moved, or `log` is another log than the one it was read for
 /// (by its heads, which name every record it holds, and its budgets). Every Commons peer check
@@ -156,8 +196,9 @@ pub(super) fn inputs(paths: &Paths) -> Option<Vec<PathBuf>> {
     ])
 }
 
-/// The files [`observe_commons`](super::observe_commons) takes its answer from: [`inputs`], and
-/// the Commons device files its denial check reads to bind this Mac's own node.
+/// The files [`observe_commons`](super::observe_commons) and its check of this Mac's own denial
+/// ([`local_recipient_denied`](super::steward::local_recipient_denied)) take their answers from:
+/// [`inputs`], and the Commons device files that denial check reads to bind this Mac's own node.
 pub(super) fn observation_inputs(paths: &Paths) -> Option<Vec<PathBuf>> {
     let mut files = inputs(paths)?;
     let device = paths.dir.join("commons");

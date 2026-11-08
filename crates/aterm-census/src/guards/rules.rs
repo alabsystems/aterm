@@ -3117,6 +3117,7 @@ mod tests {
             let tree = Tree {
                 root: &root,
                 corpus: &corpus,
+                engine: crate::guards::tests::NO_ENGINE,
             };
             let mut found = Vec::new();
             restore_stays_local(&tree, &mut found);
@@ -3192,6 +3193,7 @@ mod tests {
         let tree = Tree {
             root: &root,
             corpus: &corpus,
+            engine: crate::guards::tests::NO_ENGINE,
         };
         let mut found = Vec::new();
         keeper_gui_deps(&tree, &mut found);
@@ -3231,6 +3233,7 @@ mod tests {
         let tree = Tree {
             root: &root,
             corpus: &corpus,
+            engine: crate::guards::tests::NO_ENGINE,
         };
         let mut found = Vec::new();
         keeper_gui_deps(&tree, &mut found);
@@ -3257,6 +3260,7 @@ mod tests {
         let tree = Tree {
             root: &root,
             corpus: &corpus,
+            engine: crate::guards::tests::NO_ENGINE,
         };
         let mut found = Vec::new();
         keeper_gui_deps(&tree, &mut found);
@@ -3302,6 +3306,7 @@ mod tests {
                 let tree = Tree {
                     root: &root,
                     corpus: &corpus,
+                    engine: crate::guards::tests::NO_ENGINE,
                 };
                 let mut found = Vec::new();
                 keeper_gui_deps(&tree, &mut found);
@@ -3371,6 +3376,7 @@ mod tests {
             let tree = Tree {
                 root,
                 corpus: &corpus,
+                engine: crate::guards::tests::NO_ENGINE,
             };
             let mut found = Vec::new();
             keeper_gui_deps(&tree, &mut found);

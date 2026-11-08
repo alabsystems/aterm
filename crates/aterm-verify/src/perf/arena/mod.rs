@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use aterm_uds::spawnfd::{Command, command};
+use crate::exec::check_command as command;
+use aterm_uds::spawnfd::Command;
 
 use crate::perf::LaneRun;
 use crate::perf::workspace_root;

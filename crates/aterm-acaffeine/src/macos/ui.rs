@@ -3,18 +3,16 @@
 
 //! AppKit status item, mug button, template images, and popup menu.
 
+use aterm_macos_ui::appkit::class;
 use aterm_objc::send::{
     alloc, send_bool, send_id, send_id_cptr_usize, send_id_f64, send_id_id, send_id_id_id_sel,
     send_id_id_sel_id, send_id_size, send_isize_usize, send_rect, send_v, send_v_bool, send_v_id,
     send_v_isize, send_v_sel, send_v_size, send_v_usize,
 };
-use aterm_objc::{Bool, CGPoint, CGRect, CGSize, Id, Obj, Sel, autoreleasepool, class, sel};
+use aterm_objc::{Bool, CGPoint, CGRect, CGSize, Id, Obj, Sel, autoreleasepool, sel};
 
 use crate::icon;
 use crate::menu::Row;
-
-#[link(name = "AppKit", kind = "framework")]
-unsafe extern "C" {}
 
 const VARIABLE_LENGTH: f64 = -1.0;
 const IMAGE_ONLY: usize = 1;

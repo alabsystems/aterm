@@ -2142,14 +2142,14 @@ fn a_standing_need_and_a_read_done_cross_the_update() {
     app.windows
         .get_mut(&wid)
         .expect("window 0")
-        .band_on_screen_for_test = true;
+        .window_on_screen_for_test = true;
     app.switch_tab_in(wid, 0);
     app.note_done_seen_looking();
     app.switch_tab_in(wid, 1);
     app.windows
         .get_mut(&wid)
         .expect("window 0")
-        .band_on_screen_for_test = false;
+        .window_on_screen_for_test = false;
     ctx.meta
         .lock()
         .unwrap_or_else(PoisonError::into_inner)

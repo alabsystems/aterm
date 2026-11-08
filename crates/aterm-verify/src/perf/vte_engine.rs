@@ -36,8 +36,9 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use crate::exec::check_command as command;
 use aterm_capacity::Machine as _;
-use aterm_uds::spawnfd::{Command, Stdio, command};
+use aterm_uds::spawnfd::{Command, Stdio};
 
 use super::LaneRun;
 use super::arena::cat::{CORPUS_MB, Corpus, corpus_file, inner_argv};

@@ -20,18 +20,15 @@ use crate::model::{
 use crate::platform::{self as state, Changes, Handle, Publication};
 use crate::tree::{FilterResult, Node, NodeId, common_filter};
 
-#[link(name = "AppKit", kind = "framework")]
-unsafe extern "C-unwind" {
-    fn NSAccessibilityFrameInView(view: Id, frame: CGRect) -> CGRect;
-    fn NSAccessibilityPostNotification(element: Id, notification: Id);
-    fn NSAccessibilityPostNotificationWithUserInfo(element: Id, notification: Id, info: Id);
-    static NSAccessibilityAnnouncementRequestedNotification: Id;
-    static NSAccessibilityAnnouncementKey: Id;
-    static NSAccessibilityPriorityKey: Id;
-    static NSAccessibilityLayoutChangedNotification: Id;
-    static NSAccessibilityValueChangedNotification: Id;
-    static NSAccessibilityFocusedUIElementChangedNotification: Id;
-}
+use aterm_macos_ui::appkit::{
+    accessibility_announcement_key, accessibility_announcement_requested_notification,
+    accessibility_focused_ui_element_changed_notification,
+    accessibility_frame_in_view as NSAccessibilityFrameInView,
+    accessibility_layout_changed_notification,
+    accessibility_post_notification as NSAccessibilityPostNotification,
+    accessibility_post_notification_with_user_info as NSAccessibilityPostNotificationWithUserInfo,
+    accessibility_priority_key, accessibility_value_changed_notification,
+};
 
 type Shared = Arc<RefCell<Context>>;
 
@@ -463,6 +460,7 @@ impl Adapter {
     ) -> Option<Self> {
         let view = view.filter(|view| !view.is_null())?;
         let mtm = MainThread::new()?;
+        aterm_macos_ui::appkit::load();
         // SAFETY: caller supplies a live view, held by its window during this call.
         let view = unsafe { WeakObj::new(view) };
         #[expect(
@@ -622,9 +620,9 @@ fn notify(element: Id, notification: Notification) {
     // constants have static lifetime and the C signature is exact.
     unsafe {
         let name = match notification {
-            Notification::Layout => NSAccessibilityLayoutChangedNotification,
-            Notification::Value => NSAccessibilityValueChangedNotification,
-            Notification::Focus => NSAccessibilityFocusedUIElementChangedNotification,
+            Notification::Layout => accessibility_layout_changed_notification(),
+            Notification::Value => accessibility_value_changed_notification(),
+            Notification::Focus => accessibility_focused_ui_element_changed_notification(),
         };
         if name.is_null() {
             return;
@@ -663,13 +661,16 @@ fn announce_live(context: &Shared, live: Live, value: &str) {
     unsafe {
         let priority = number_object(if live == Live::Assertive { 90. } else { 50. });
         if priority.is_null()
-            || NSAccessibilityAnnouncementKey.is_null()
-            || NSAccessibilityPriorityKey.is_null()
-            || NSAccessibilityAnnouncementRequestedNotification.is_null()
+            || accessibility_announcement_key().is_null()
+            || accessibility_priority_key().is_null()
+            || accessibility_announcement_requested_notification().is_null()
         {
             return;
         }
-        let keys = [NSAccessibilityAnnouncementKey, NSAccessibilityPriorityKey];
+        let keys = [
+            accessibility_announcement_key(),
+            accessibility_priority_key(),
+        ];
         let values = [value.id(), priority];
         let dictionary: unsafe extern "C-unwind" fn(
             aterm_objc::ClassPtr,
@@ -690,7 +691,7 @@ fn announce_live(context: &Shared, live: Live, value: &str) {
         }
         NSAccessibilityPostNotificationWithUserInfo(
             application.id(),
-            NSAccessibilityAnnouncementRequestedNotification,
+            accessibility_announcement_requested_notification(),
             info,
         );
     }

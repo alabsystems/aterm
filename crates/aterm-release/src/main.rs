@@ -129,5 +129,15 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
     cutter::judge_at_start();
+    #[cfg(all(debug_assertions, not(test)))]
+    if let Some(result) = release_steps::cutter_probe_if_asked(&args) {
+        return match result {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(why) => {
+                eprintln!("cutter child probe: {why}");
+                std::process::ExitCode::from(2)
+            }
+        };
+    }
     std::process::exit(cli::run());
 }

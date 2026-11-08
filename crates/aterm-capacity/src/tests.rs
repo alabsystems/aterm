@@ -624,7 +624,9 @@ fn admitted(w: Waiter, m: &Fixed) -> crate::Claim {
 /// Poll until a look is taken in its turn, and expect admission: a look turned away because
 /// another process's admission held the ledger's lock decided nothing (a stand-in polling the
 /// same ledger takes it every few milliseconds), so it is taken again, within the one-minute
-/// hang detector.
+/// hang detector. Only the cross-process tests, which run where a stand-in is spawned (unix),
+/// take one.
+#[cfg(unix)]
 #[track_caller]
 fn admitted_in_its_turn(w: Waiter, m: &Fixed) -> crate::Claim {
     let mut w = Some(w);

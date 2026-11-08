@@ -33,6 +33,8 @@ pub(crate) use control_query::rows_hash;
 pub(crate) use control_query::screen_stamp;
 #[cfg(test)]
 pub(crate) use control_query::search_full_history;
+#[cfg(test)]
+pub(crate) use control_query::serialize_dims;
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use control_query::serve_ask_walk;
 pub(crate) use control_query::{
@@ -91,10 +93,13 @@ pub(crate) mod native_host_fixture;
 
 #[path = "clipboard.rs"]
 mod clipboard;
+#[cfg(all(test, unix))]
+pub(crate) use clipboard::LAB_FILE_FOR_TEST;
 #[cfg(test)]
 pub(crate) use clipboard::PBPASTE_STUB;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use clipboard::PRIMARY_STUB;
+pub(crate) use clipboard::reaches_persons_clipboard;
 pub(crate) use clipboard::{pbcopy, pbpaste};
 #[cfg(target_os = "linux")]
 pub(crate) use clipboard::{pbpaste_owned, primary_get, primary_get_owned, primary_set};
@@ -171,7 +176,9 @@ pub(crate) type ActiveHandle = Arc<Mutex<Option<ActiveSession>>>;
 /// One coherent `dims` observation assembled on the main thread.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DimsSnapshot {
-    pub(crate) session: u64,
+    /// The session whose grid `rows`x`cols` is; `None` for a window's own grid (no terminal in
+    /// front: [`crate::App::window_dims_snapshot`]).
+    pub(crate) session: Option<u64>,
     pub(crate) rows: u32,
     pub(crate) cols: u32,
     pub(crate) pixel_w: u32,
@@ -231,6 +238,12 @@ fn resolve_active(active: &ActiveHandle) -> Option<Target> {
 }
 
 const NO_ACTIVE_TERMINAL: &str = "ERR no active terminal\n";
+
+/// A bare `status` with no terminal in front: an app tab (Settings) has no session to report,
+/// so the reply names the verbs that read what is there.
+const NO_TERMINAL_STATUS: &str = "ERR no active terminal: the front tab is an app tab, which has \
+     no session to report; `dims` reads the window's size, `inspect app/v1 tabs` its tabs, \
+     `@<sid> status` a session\n";
 
 fn owner_only_refusal(verb: &str, selector: Option<&Selector>, scope: Scope) -> Option<String> {
     if !matches!(selector, None | Some(Selector::SelfTok)) {
@@ -5288,6 +5301,20 @@ fn sessionless_front(head: &Head<'_>, cx: &DispatchCx<'_>) -> Option<ControlRepl
             .into(),
         );
     }
+    if verb == "status" && matches!(selector, None | Some(Selector::SelfTok)) {
+        return Some(NO_TERMINAL_STATUS.into());
+    }
+    if verb == "dims" && matches!(selector, None | Some(Selector::SelfTok)) {
+        return Some(
+            match native_control_decision(false, true, principal, NativeControlTarget::App) {
+                NativeControlDecision::WithoutSession => {
+                    control_query::cmd_window_dims(cx.proxy, take_json_flag(rest).0)
+                }
+                _ => "ERR denied\n".to_string(),
+            }
+            .into(),
+        );
+    }
     let route = match verb {
         "paste" => sessionless_front_paste_event(
             verb,
@@ -10087,6 +10114,39 @@ fn cross_mouse_apply(
     }
 }
 
+/// Where a window lays out `session`, for a cross-session `resize <r> <c>`
+/// ([`App::pane_grid_of`]): that pane sets the session's grid, so a grid set behind it lasts only
+/// until the window lays the pane out again. `Err` refuses a pane whose tab is in front, which the
+/// window lays out again at its next frame, so an `OK` would report a size that never shows;
+/// `Ok(Some(_))` is a pane in a tab behind, whose grid lasts until its tab comes to the front (the
+/// reply says so); `Ok(None)` is a session no window lays out, or a body that does not parse (the
+/// resize answers its usage).
+fn session_pane_for_resize(
+    proxy: &EventLoopProxy<Wake>,
+    session: u64,
+    rest: &str,
+) -> Result<Option<crate::app_render::SessionPane>, String> {
+    if control_input::parse_resize(rest).is_err() {
+        return Ok(None);
+    }
+    let pane = control_media::call_main(proxy, |reply| Wake::ReadPaneGrid { session, reply })
+        .ok()
+        .flatten();
+    match pane {
+        Some(pane) if pane.in_front => Err(format!(
+            "ERR resize: session {session} is a pane of window {} in its front tab, which gives \
+             it its grid ({}x{}); resize the window instead (`resize` with its tab in front, or \
+             `resize px`)\n",
+            pane.window.0, pane.grid.0, pane.grid.1
+        )),
+        pane => Ok(pane),
+    }
+}
+
+/// A cross-session `resize <r> <c>`: re-grid `session`'s engine and PTY, answering the grid it
+/// took, and, where `behind` is the pane of a tab behind that lays it out
+/// ([`session_pane_for_resize`]), that the grid lasts until that tab comes to the front and the
+/// grid the window gives it then (`until=front window= front_rows= front_cols=`).
 fn cross_resize(
     term: &Arc<Mutex<Terminal>>,
     master: i32,
@@ -10094,6 +10154,7 @@ fn cross_resize(
     session: u64,
     proxy: Option<&EventLoopProxy<Wake>>,
     rest: &str,
+    behind: Option<crate::app_render::SessionPane>,
 ) -> String {
     let (rows, cols) = match control_input::parse_resize(rest) {
         Ok(rc) => rc,
@@ -10177,7 +10238,13 @@ fn cross_resize(
             Some(crate::resize_ledger::Attribution::CTL_CROSS),
             crate::turn_ledger::now_ms(),
         );
-    "OK\n".to_string()
+    match behind {
+        Some(pane) => format!(
+            "OK rows={rows} cols={cols} until=front window={} front_rows={} front_cols={}\n",
+            pane.window.0, pane.grid.0, pane.grid.1
+        ),
+        None => format!("OK rows={rows} cols={cols}\n"),
+    }
 }
 
 fn cross_scroll(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
@@ -10946,9 +11013,11 @@ fn serve_session_verb(
         "resize" => match route {
             InputRoute::Seam { pin: Some(_) } => front_routed_resize(proxy, session, rest),
             InputRoute::Seam { pin: None } => control_input::cmd_resize(proxy, rest),
-            InputRoute::Background => match control_input::cross_resize_px_refusal(rest) {
-                Some(refusal) => refusal,
-                None => cross_resize(term, master, ctx, session, Some(proxy), rest),
+            InputRoute::Background => match control_input::cross_resize_px_refusal(rest)
+                .map_or_else(|| session_pane_for_resize(proxy, session, rest), Err)
+            {
+                Err(refusal) => refusal,
+                Ok(behind) => cross_resize(term, master, ctx, session, Some(proxy), rest, behind),
             },
         },
         "scroll" => match route {

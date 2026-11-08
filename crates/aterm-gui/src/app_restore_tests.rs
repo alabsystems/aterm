@@ -7853,6 +7853,12 @@ fn a_successors_restored_row_stands_beside_the_one_carried_to_it() {
     }
 }
 
+/// A restored row withdrawn before anyone saw it through has its misses named again in the next
+/// row; one dismissed, resolved, opened (folded) or live for its whole hold stays down. The app's
+/// center is glass-less, so no row of it retires unseen: its hold ends it, folded, which counts as
+/// seen through, as a row that stood its whole span on a band did.
+/// NEGATIVE CONTROL (scratch): `restored_row_seen_through` without its `Folded` arm names the held
+/// row's misses again.
 #[test]
 fn a_restored_row_nobody_saw_through_comes_back_inside_the_next() {
     use aterm_messages::Retired;
@@ -7862,14 +7868,14 @@ fn a_restored_row_nobody_saw_through_comes_back_inside_the_next() {
     }
     let cases: [(&str, Retire, Retired, bool); 5] = [
         (
-            "unseen",
+            "held out",
             |app, _| {
                 let _ = app
                     .messages
                     .settle(now() + std::time::Duration::from_secs(3600), true);
             },
-            Retired::Unseen,
-            true,
+            Retired::Folded,
+            false,
         ),
         (
             "folded",
@@ -7912,7 +7918,7 @@ fn a_restored_row_nobody_saw_through_comes_back_inside_the_next() {
             .log()
             .get(first)
             .and_then(|r| r.retired().cloned());
-        assert!(app.messages.live(first).is_none(), "{case}: off the band");
+        assert!(app.messages.live(first).is_none(), "{case}: no longer live");
         assert_eq!(retired, Some(how), "{case}: retired so");
         app.post_restored_row(
             restored_row(3, &[(&sids[0], "in tab 1", 1), (&sids[1], "in tab 2", 2)]),

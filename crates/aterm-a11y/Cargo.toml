@@ -19,6 +19,7 @@ libc = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 aterm-objc = { workspace = true }
+aterm-macos-ui = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 aterm-types = { workspace = true }

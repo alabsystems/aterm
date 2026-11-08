@@ -277,3 +277,49 @@ fn progress_only_execution_cannot_extend_the_finite_ancestry_contract() {
     assert_eq!(error.kind, Kind::Usage);
     assert!(gh.fx().children_run().is_empty());
 }
+
+#[test]
+fn complete_descendant_answers_do_not_require_ancestor_side_history() {
+    let world = World::canonical("commit-ancestry-ancestor-gap");
+    let store = bare_repo(world.path(), "source");
+    let root = host_git(&store, &["rev-parse", "main"]);
+    let tree = host_git(&store, &["rev-parse", "main^{tree}"]);
+    let missing = "a".repeat(40);
+    let raw = format!(
+        "tree {tree}\nparent {missing}\nauthor fixture <fixture> 1700000000 +0000\ncommitter fixture <fixture> 1700000000 +0000\n\nancestor with unavailable history\n"
+    );
+    let input = world.path().join("ancestor-commit");
+    std::fs::write(&input, raw).unwrap();
+    let ancestor = host_git(
+        &store,
+        &[
+            "hash-object",
+            "-w",
+            "-t",
+            "commit",
+            &input.to_string_lossy(),
+        ],
+    );
+    let refs = host_git(&store, &["show-ref"]);
+    let config = std::fs::read(store.join("config")).unwrap();
+    let gh = world.client(git_env()).build();
+    let negative = answer(&gh, &store, &ancestor, &root).unwrap();
+    assert_eq!(negative["queries"][0]["contained"], json!(false));
+    assert_eq!(negative["acquired_commits"], json!(0));
+    assert_eq!(negative["api_body_bytes"], json!(0));
+    let tip = host_git(
+        &store,
+        &["commit-tree", &tree, "-p", &ancestor, "-m", "tip"],
+    );
+    let positive = answer(&gh, &store, &ancestor, &tip).unwrap();
+    assert_eq!(positive["queries"][0]["contained"], json!(true));
+    assert_eq!(positive["acquired_commits"], json!(0));
+    assert_eq!(host_git(&store, &["show-ref"]), refs);
+    assert_eq!(std::fs::read(store.join("config")).unwrap(), config);
+    assert!(gh.fx().children_run().iter().all(|step| {
+        !step
+            .args
+            .iter()
+            .any(|arg| arg == "fetch" || arg == "clone" || arg == "update-ref")
+    }));
+}

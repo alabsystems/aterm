@@ -2,8 +2,10 @@
 // Copyright 2026 Andrew Yates
 
 //! The `export-scan` check: the publication engine's content guards (forbidden content, private
-//! references, gitleaks), held offline in the dev set to what the change touched, so a red is
-//! found before a cut rather than in one (`docs/DESIGN-fast-build-release-2026-11-05.md`, B7).
+//! references, gitleaks), held in the dev set to what the change touched, so a red is found
+//! before a cut rather than in one (`docs/DESIGN-fast-build-release-2026-11-05.md`, B7). The
+//! engine's half (its baseline and registry) is one commit of it ([`crate::engine`]); the scan
+//! itself reads no network.
 //!
 //! [`aterm_census::export_scan`] exports each file as the engine does and judges its text;
 //! this stage lists the files, runs gitleaks over the exported copies with the engine's
@@ -59,22 +61,26 @@ const ENTROPY_RULE: &str = "generic-api-key";
 /// What gitleaks may take before the stage gives it up, as the engine's run allows.
 const GITLEAKS_CEILING_S: u64 = 1800;
 
-/// The engine half the scan reads from the engine's checkout at `dir`: its baseline and its
-/// registry's repository names.
+/// The engine half the scan reads from one commit of the engine ([`crate::engine::Commit`]),
+/// never a working tree: its baseline and its registry's repository names.
 ///
 /// # Errors
-/// The baseline or the registry is unreadable, or the registry names no repository.
-pub fn engine(dir: &Path) -> Result<Engine, String> {
-    let baseline_path = dir.join(rows::BASELINE);
-    let baseline = crate::read_regular_text(&baseline_path)
-        .map_err(|e| format!("{}: {e}", baseline_path.display()))?;
-    let registry_path = dir.join(REGISTRY);
-    let registry = crate::read_regular_text(&registry_path)
-        .map_err(|e| format!("{}: {e}", registry_path.display()))?;
-    let names =
-        registry_names(&registry).map_err(|why| format!("{}: {why}", registry_path.display()))?;
+/// The commit holds no baseline or registry, or the registry names no repository.
+pub fn engine(
+    commit: &crate::engine::Commit,
+    run: crate::engine::RunGit<'_>,
+) -> Result<Engine, String> {
+    let baseline = commit
+        .text(rows::BASELINE, run)
+        .map_err(|e| e.to_string())?;
+    let registry = commit.text(REGISTRY, run).map_err(|e| e.to_string())?;
+    let names = registry_names(&registry)
+        .map_err(|why| format!("{REGISTRY} on {}: {why}", commit.shown()))?;
     Ok(Engine {
-        baseline: (baseline_path.display().to_string(), baseline),
+        baseline: (
+            format!("{} on {}", rows::BASELINE, commit.shown()),
+            baseline,
+        ),
         names,
     })
 }
@@ -632,18 +638,16 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
             None
         }
     };
-    let engine = match ctx.env.publication_engine.as_deref() {
-        None => Err(
-            "neither PUBLICATION_ENGINE nor HOME names the publication engine's checkout"
-                .to_string(),
-        ),
-        Some(dir) => engine(dir)
-            .map_err(|why| format!("the publication engine's checkout cannot be read ({why})")),
-    };
+    let run: crate::engine::RunGit<'_> = &crate::engine::bounded;
+    let engine = crate::engine::named(&ctx.root, &|name| ctx.env.engine_var(name))
+        .and_then(|named| crate::engine::Commit::read(&named, run, &crate::engine::native))
+        .map_err(|e| e.to_string())
+        .and_then(|commit| engine(&commit, run).map(|engine| (commit.shown().to_string(), engine)));
     if let Err(why) = &engine {
         not_run.push(format!(
-            "export-scan — {why}, so neither its baseline nor private references were judged \
-             (fix: clone it to ~/publication or set PUBLICATION_ENGINE)"
+            "export-scan — {why}, so neither the publication engine's baseline nor private \
+             references were judged (fix: reach the engine's origin, clone the engine to \
+             ~/publication, or set PUBLICATION_ENGINE to a checkout whose HEAD is judged)"
         ));
     }
     let listed = match listed(&ctx.root, &ctx.path_env, &ctx.scope) {
@@ -675,7 +679,11 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
         whole: listed.whole,
         export: &export,
     };
-    let scanned = export_scan::scan(&listing, engine.as_ref().ok(), Some(&tree));
+    let scanned = export_scan::scan(
+        &listing,
+        engine.as_ref().ok().map(|(_, engine)| engine),
+        Some(&tree),
+    );
     let mut findings: Vec<Finding> = scanned
         .findings
         .iter()
@@ -697,10 +705,9 @@ fn run_with(ctx: &Ctx, r: &mut Report, acquire: impl FnOnce() -> Result<Scanner,
         }
     }
     let _ = std::fs::remove_dir_all(&work);
-    let held = if engine.is_ok() {
-        "the engine's content guards"
-    } else {
-        "the export's own rows"
+    let held = match &engine {
+        Ok((shown, _)) => format!("the engine's content guards ({shown})"),
+        Err(_) => "the export's own rows".to_string(),
     };
     let mut label = format!(
         "export-scan: {} exported file(s) of {} held to {held}",

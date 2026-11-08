@@ -7330,6 +7330,58 @@ impl App {
         }
     }
 
+    /// Where a window lays `session` out as a pane, or `None` when none does: a window whose
+    /// front tab holds it where one does (the lowest-numbered), else the lowest-numbered window
+    /// that holds it in a tab behind, with the grid that pane gives its engine
+    /// ([`Self::pane_target_grid`]; the window's grid while pane zoom hides it). A grid set
+    /// behind such a pane lasts only until the window lays the pane out again
+    /// ([`Self::owe_pane_regrid`]): at its next frame while its tab is in front, when its tab
+    /// comes to the front while it is behind. A cross-session `resize` reads this to say so.
+    pub(crate) fn pane_grid_of(&self, session: u64) -> Option<SessionPane> {
+        let shows = |view: crate::tab_model::ViewId| {
+            self.view_store
+                .get(view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+                == Some(session)
+        };
+        let mut windows: Vec<WindowId> = self.windows.keys().copied().collect();
+        windows.sort_unstable_by_key(|wid| wid.0);
+        let mut behind = None;
+        for wid in windows {
+            let Some(ws) = self.windows.get(&wid) else {
+                continue;
+            };
+            let Some(tab) = ws
+                .tab_set
+                .tabs()
+                .iter()
+                .find(|tab| tab.root.any_leaf(&mut |view| shows(*view)))
+            else {
+                continue;
+            };
+            let planned = self
+                .visible_leaf_plan_for_tab(wid, tab.id)
+                .and_then(|plan| {
+                    plan.leaves
+                        .iter()
+                        .find(|leaf| shows(leaf.view))
+                        .map(|leaf| Self::leaf_grid_cells(&leaf.rect))
+                })
+                .unwrap_or((ws.rows, ws.cols));
+            let pane = SessionPane {
+                window: wid,
+                grid: self.pane_target_grid(session, planned),
+                in_front: ws.tab_set.active_id() == Some(tab.id),
+            };
+            if pane.in_front {
+                return Some(pane);
+            }
+            behind.get_or_insert(pane);
+        }
+        behind
+    }
+
     /// The body of [`Self::resize_panes`].
     #[track_caller]
     pub(crate) fn resize_panes_scoped(&mut self, wid: WindowId, active_only: bool) {
@@ -11993,12 +12045,7 @@ impl App {
             self.resize_panes_scoped_with_active_plan(id, true, Some(plan), site);
         }
         let multi_pane = match route {
-            crate::VisibleContentRoute::Terminal { composed } => {
-                if let Some(window) = self.windows.get_mut(&id) {
-                    window.route_card = None;
-                }
-                composed
-            }
+            crate::VisibleContentRoute::Terminal { composed } => composed,
             crate::VisibleContentRoute::Heterogeneous => {
                 self.redraw_heterogeneous_window(id, frame_started, &window, plan);
                 return;
@@ -18986,16 +19033,20 @@ impl App {
         }
     }
 
-    /// Apply a control-socket `resize` (an `InputEvent::Resize { echo_to_window: true }`).
-    pub(crate) fn apply_grid_resize(&mut self, rows: u16, cols: u16) {
+    /// Apply a control-socket `resize` (an `InputEvent::Resize { echo_to_window: true }`) to the
+    /// front window, held to the least-size rule ([`Self::held_window_grid`]) before the grid,
+    /// the PTY or the window take it, as the pixel form is; the grid the window took.
+    pub(crate) fn apply_grid_resize(&mut self, rows: u16, cols: u16) -> (u16, u16) {
         let Some(wid) = self.frontmost_window else {
-            return;
+            return (rows, cols);
         };
+        let (rows, cols) = self.held_window_grid(wid, rows, cols);
         let changed = self.apply_term_resize(wid, rows, cols);
-        if !changed {
-            return;
-        }
         let size = self.window_frame_px_for(wid, rows, cols);
+        self.note_headless_px_for(wid, size, (rows, cols));
+        if !changed {
+            return (rows, cols);
+        }
         #[cfg(target_os = "linux")]
         if let Some(ws) = self.front_mut() {
             ws.initial_frame_settle = None;
@@ -19011,7 +19062,20 @@ impl App {
             }
             w.request_redraw();
         }
+        (rows, cols)
     }
+}
+
+/// Where a window lays a session out as a pane ([`App::pane_grid_of`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SessionPane {
+    /// The window that lays the session out.
+    pub(crate) window: WindowId,
+    /// The `(rows, cols)` that pane gives the session's engine.
+    pub(crate) grid: (u16, u16),
+    /// Whether the pane's tab is the window's front tab, which the window lays out again at its
+    /// next frame; a tab behind is laid out again when it comes to the front.
+    pub(crate) in_front: bool,
 }
 
 fn preview_damage_from_compiled(

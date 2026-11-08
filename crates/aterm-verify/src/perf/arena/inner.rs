@@ -8,7 +8,8 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use aterm_uds::spawnfd::{Stdio, command};
+use crate::exec::check_command as command;
+use aterm_uds::spawnfd::Stdio;
 
 use super::report;
 

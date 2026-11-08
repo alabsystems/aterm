@@ -26,6 +26,12 @@ impl RegisteredOutput {
     pub(crate) fn matches(&self, client: &super::super::Client) -> bool {
         std::sync::Arc::ptr_eq(&self.host, &client.host)
     }
+    pub(crate) fn matches_pin(
+        &self,
+        pin: &std::sync::Arc<trust_resource_provenance::PinnedHelper>,
+    ) -> bool {
+        std::sync::Arc::ptr_eq(&self.host, pin)
+    }
 }
 fn executable(fd: BorrowedFd<'_>) -> io::Result<(crate::FileIdentity, u64)> {
     // SAFETY: observe existing flags on the caller's live borrowed description.

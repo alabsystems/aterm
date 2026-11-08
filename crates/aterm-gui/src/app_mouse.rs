@@ -1677,7 +1677,7 @@ impl App {
         {
             return false;
         }
-        if self.person_gesture_refused() {
+        if self.clipboard_gesture_refused() {
             crate::app_take_over::note_clipboard_refused("copy");
             return false;
         }
@@ -1718,7 +1718,7 @@ impl App {
             }
             return self.copy_selection_in(wid);
         }
-        let copied = self.native_has_selection(wid) && !self.person_gesture_refused();
+        let copied = self.native_has_selection(wid) && !self.clipboard_gesture_refused();
         self.dispatch_native_event(
             wid,
             crate::native_app::AppEvent::EditorCommand(
@@ -2026,6 +2026,9 @@ impl App {
         if self.window_shows_private(wid) {
             return Err(crate::app_control::PRIVATE_VIEW_REFUSED.into());
         }
+        // The pointer aims at, and hits, the frame the window shows: a page changed since its last
+        // present (a press's save landing, a recompile) is presented first, committed where the
+        // window has no glass and drawn on glass where it has, as the reply reads it after.
         if matches!(
             action,
             PointerAction::Move { .. }
@@ -2033,8 +2036,9 @@ impl App {
                 | PointerAction::MoveItem(_)
                 | PointerAction::Click
                 | PointerAction::Wheel { .. }
-        ) {
-            let _ = self.commit_glassless_native_frame(wid);
+        ) && !self.commit_glassless_native_frame(wid)
+        {
+            self.present_native_frame_on_glass(wid);
         }
         if matches!(
             action,
@@ -2362,7 +2366,11 @@ impl App {
         bool,
         bool,
     )> {
-        if over_pane_header || self.strip_col_at_with(wid, geom, x, y).is_some() {
+        if over_pane_header
+            || self.strip_col_at_with(wid, geom, x, y).is_some()
+            || self.band_banner_at(wid, x, y).is_some()
+            || self.find_bar_cell_at(wid, x, y).is_some()
+        {
             return None;
         }
         self.retained_native_leaf_at_pointer(wid, x, y)
@@ -2553,6 +2561,10 @@ impl App {
         let Some(paste_up) = self.band_banner_at(wid, px, py) else {
             return false;
         };
+        if self.inline_rename_edit(wid).is_some() {
+            self.clear_strip_press(wid);
+            self.settle_rename_edit(wid);
+        }
         if paste_up {
             self.answer_paste_banner(false);
         } else {
@@ -2562,7 +2574,48 @@ impl App {
         true
     }
 
-    fn band_banner_at(&self, wid: WindowId, px: f64, py: f64) -> Option<bool> {
+    fn handle_tab_strip_right_press(&mut self, wid: WindowId, col: u16, px: f64, py: f64) {
+        if self.inline_rename_edit(wid).is_some() {
+            self.clear_strip_press(wid);
+            self.settle_rename_edit(wid);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (px, py);
+        #[cfg(not(any(windows, target_os = "linux")))]
+        let _ = col;
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let segs = self
+                .windows
+                .get(&wid)
+                .map(|ws| ws.tab_segments.clone())
+                .unwrap_or_default();
+            match crate::tab_bar::hit_test(&segs, col) {
+                Some(
+                    crate::tab_bar::TabHit::Select(index) | crate::tab_bar::TabHit::Close(index),
+                ) => {
+                    let _ = self.open_tab_context_menu(wid, index, col, false);
+                }
+                _ => {
+                    #[cfg(windows)]
+                    if let Some(ws) = self.windows.get_mut(&wid) {
+                        ws.band_menu_release_pending = true;
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Some(ws) = self.windows.get(&wid)
+                        && ws
+                            .client_frame
+                            .is_some_and(|frame| frame.header && frame.window_menu)
+                        && let Some(w) = &ws.os_window
+                    {
+                        w.show_window_menu(aterm_window::dpi::PhysicalPosition::new(px, py));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn band_banner_at(&self, wid: WindowId, px: f64, py: f64) -> Option<bool> {
         let paste_up = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid);
         let close_up = self.close_band(wid).is_some();
         if !(paste_up || close_up) {
@@ -2698,6 +2751,11 @@ impl App {
             return false;
         };
         let (px, py) = ws.last_cursor_px;
+        if self.band_banner_at(wid, px, py).is_some()
+            || self.find_bar_cell_at(wid, px, py).is_some()
+        {
+            return false;
+        }
         let (fx, fy) = self.window_to_frame(wid, px, py);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
@@ -3736,7 +3794,11 @@ impl App {
                     .as_ref()
                     .map(|(view, _, key, ..)| (*view, key.clone())),
             );
-            let text_cursor = !over_pane_header && (editor_target.is_some() || text_field_hovered);
+            let over_banner = self.band_banner_at(wid, x, y).is_some()
+                || self.find_bar_cell_at(wid, x, y).is_some();
+            let text_cursor = !over_pane_header
+                && !over_banner
+                && (editor_target.is_some() || text_field_hovered);
             let pointer = over_pane_header
                 || (!text_field_hovered
                     && native_hover
@@ -4711,6 +4773,9 @@ impl App {
         if !window.pointer_position_known || !x.is_finite() || !y.is_finite() {
             return self.active_native_view(wid).map(|(_, view)| view);
         }
+        if self.band_banner_at(wid, x, y).is_some() || self.find_bar_cell_at(wid, x, y).is_some() {
+            return None;
+        }
         let plan = self.active_visible_leaf_plan(wid)?;
         let geom = self.pointer_geometry(wid);
         let (cw, ch) = geom.cell;
@@ -4898,11 +4963,11 @@ impl App {
                     .and_then(|(_, view)| self.native_runtime.view_state(view))
                     .is_some_and(|state| state.common().pressed.is_some()));
             if pressed || !captured {
+                if pressed && !captured && self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
                 if pressed && button == WinitMouseButton::Left && !captured {
-                    if self.inline_rename_edit(wid).is_some() {
-                        self.clear_strip_press(wid);
-                        self.settle_rename_edit(wid);
-                    }
                     let (x, y) = self.windows[&wid].last_cursor_px;
                     self.refresh_mouse_cell(wid, self.pointer_geometry(wid), x, y);
                     self.focus_pane_under_pointer(wid);
@@ -4919,7 +4984,8 @@ impl App {
                     self.stats_owns_pointer(wid)
                 };
                 if taken {
-                    if left {
+                    if self.inline_rename_edit(wid).is_some() {
+                        self.clear_strip_press(wid);
                         self.settle_rename_edit(wid);
                     }
                     return None;
@@ -4960,9 +5026,17 @@ impl App {
                 return None;
             }
             if in_content && self.begin_divider_drag_with_plan(wid, Some(&plan)) {
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
                 return None;
             }
             if in_content && self.focus_pane_under_pointer_from_plan(wid, &plan) {
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
                 return native_body_press;
             }
         }
@@ -5007,42 +5081,42 @@ impl App {
                     .native_runtime
                     .view_state(view)
                     .and_then(|state| state.common().pressed.clone());
-                let release = self.retained_native_leaf_at_pointer(wid, px, py).and_then(
-                    |(artifact, x, y)| {
-                        if artifact.view != view
-                            || self.native_runtime.view_generation(artifact.view)
-                                != Some(artifact.generation)
-                        {
-                            return None;
-                        }
-                        let hit = artifact.compiled.hit_test(x, y)?.clone();
-                        let value = artifact
-                            .compiled
-                            .text_field_byte_at(&hit.key, x)
-                            .map(|byte| crate::native_app::SemanticInput::TextPosition {
-                                byte,
-                                extend: true,
-                            })
-                            .or_else(|| {
-                                // A click on a slider's number opens it for an exact value.
-                                (!artifact.compiled.slider_readout_at(&hit.key, x, y))
-                                    .then(|| artifact.compiled.slider_value_at(&hit.key, x))
-                                    .flatten()
-                                    .map(crate::native_app::SemanticInput::Number)
-                            })
-                            .or_else(|| {
-                                artifact.compiled.color_wheel_pick_at(&hit.key, x, y).map(
-                                    |(hue, saturation)| {
-                                        crate::native_app::SemanticInput::ColorPick {
-                                            hue,
-                                            saturation,
-                                        }
-                                    },
-                                )
-                            });
-                        Some((artifact.view, artifact.generation, hit, value))
-                    },
-                );
+                let release = (self.band_banner_at(wid, px, py).is_none()
+                    && self.find_bar_cell_at(wid, px, py).is_none())
+                .then(|| self.retained_native_leaf_at_pointer(wid, px, py))
+                .flatten()
+                .and_then(|(artifact, x, y)| {
+                    if artifact.view != view
+                        || self.native_runtime.view_generation(artifact.view)
+                            != Some(artifact.generation)
+                    {
+                        return None;
+                    }
+                    let hit = artifact.compiled.hit_test(x, y)?.clone();
+                    let value = artifact
+                        .compiled
+                        .text_field_byte_at(&hit.key, x)
+                        .map(|byte| crate::native_app::SemanticInput::TextPosition {
+                            byte,
+                            extend: true,
+                        })
+                        .or_else(|| {
+                            // A click on a slider's number opens it for an exact value.
+                            (!artifact.compiled.slider_readout_at(&hit.key, x, y))
+                                .then(|| artifact.compiled.slider_value_at(&hit.key, x))
+                                .flatten()
+                                .map(crate::native_app::SemanticInput::Number)
+                        })
+                        .or_else(|| {
+                            artifact.compiled.color_wheel_pick_at(&hit.key, x, y).map(
+                                |(hue, saturation)| crate::native_app::SemanticInput::ColorPick {
+                                    hue,
+                                    saturation,
+                                },
+                            )
+                        });
+                    Some((artifact.view, artifact.generation, hit, value))
+                });
                 if let Some(state) = self.native_runtime.view_state_mut(view) {
                     state.common_mut().pressed = None;
                 }
@@ -5086,6 +5160,11 @@ impl App {
                 if self.inline_rename_edit(wid).is_some() {
                     self.clear_strip_press(wid);
                     self.settle_rename_edit(wid);
+                }
+                if let Some((row, col)) = self.find_bar_cell_at(wid, px, py)
+                    && self.find_bar_click_at(wid, row, col, Some(px))
+                {
+                    return None;
                 }
                 let editor_target = self.native_editor_pointer_target(wid, px, py);
                 let grid_target = self.native_editor_grid_target(wid, px, py);
@@ -5233,6 +5312,42 @@ impl App {
                     }
                 }
             }
+            #[cfg(windows)]
+            if button == WinitMouseButton::Right
+                && self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|ws| ws.band_menu_release_pending)
+            {
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.band_menu_release_pending = false;
+                }
+                if !pressed {
+                    if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                        let _ = crate::platform_win::popup_system_menu(w);
+                    }
+                    return native_press;
+                }
+            }
+            if pressed && button != WinitMouseButton::Left {
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
+                if self.band_banner_at(wid, px, py).is_some()
+                    || self.find_bar_cell_at(wid, px, py).is_some()
+                {
+                    return None;
+                }
+                if let Some(col) = self.strip_col_at(wid, px, py) {
+                    if button == WinitMouseButton::Middle {
+                        self.handle_tab_strip_middle_press(wid, col);
+                    } else if button == WinitMouseButton::Right {
+                        self.handle_tab_strip_right_press(wid, col, px, py);
+                    }
+                    return None;
+                }
+            }
             return native_press;
         }
         if pressed && button == WinitMouseButton::Left {
@@ -5298,6 +5413,10 @@ impl App {
             if button != WinitMouseButton::Right
                 && let Some(col) = self.strip_col_at(wid, px, py)
             {
+                if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
                 if button == WinitMouseButton::Middle {
                     self.handle_tab_strip_middle_press(wid, col);
                 }
@@ -5377,38 +5496,12 @@ impl App {
             });
             match right_press_plan(gesture_on, over_strip, tracking, selection.is_some()) {
                 RightPressPlan::Chrome => {
-                    #[cfg(any(windows, target_os = "linux"))]
+                    if self.inline_rename_edit(wid).is_some() {
+                        self.clear_strip_press(wid);
+                        self.settle_rename_edit(wid);
+                    }
                     if let Some(col) = self.strip_col_at(wid, px, py) {
-                        let segs = self
-                            .windows
-                            .get(&wid)
-                            .map(|ws| ws.tab_segments.clone())
-                            .unwrap_or_default();
-                        match crate::tab_bar::hit_test(&segs, col) {
-                            Some(
-                                crate::tab_bar::TabHit::Select(index)
-                                | crate::tab_bar::TabHit::Close(index),
-                            ) => {
-                                let _ = self.open_tab_context_menu(wid, index, col, false);
-                            }
-                            _ => {
-                                #[cfg(windows)]
-                                if let Some(ws) = self.windows.get_mut(&wid) {
-                                    ws.band_menu_release_pending = true;
-                                }
-                                #[cfg(target_os = "linux")]
-                                if let Some(ws) = self.windows.get(&wid)
-                                    && ws
-                                        .client_frame
-                                        .is_some_and(|frame| frame.header && frame.window_menu)
-                                    && let Some(w) = &ws.os_window
-                                {
-                                    w.show_window_menu(aterm_window::dpi::PhysicalPosition::new(
-                                        px, py,
-                                    ));
-                                }
-                            }
-                        }
+                        self.handle_tab_strip_right_press(wid, col, px, py);
                     }
                     return None;
                 }
@@ -7034,6 +7127,54 @@ mod tests {
             }),
             "an already-dispatched click must not look like a rejected request"
         );
+    }
+
+    /// AN AIMED POINTER VERB ON GLASS AIMS AT THE PAGE AS IT NOW STANDS: a page that changed
+    /// after its last present (a press's save landing recompiles it) is presented before
+    /// `pointer move key=` or an aimed `wheel` aims, as a glassless window commits it first. On
+    /// glass the aim read only a presented frame, so right after a click it answered `no
+    /// presented native frame to aim at` until something else presented the page.
+    #[test]
+    fn an_aimed_pointer_on_glass_presents_the_changed_page_before_it_aims() {
+        use super::{NativePointerTarget, PointerAt, WheelUnit};
+        use crate::native_settings::SettingsRoute;
+        let mut app = crate::scripted_redraw_fixture::scripted_app();
+        app.perf_reduced = true;
+        app.perf_flip_at = Some(std::time::Instant::now());
+        app.perf_shed_dwell = std::time::Duration::MAX;
+        let (mut app, wid, view) = settings_at_1000_by_600_in(app, SettingsRoute::KeyboardInput);
+        assert!(
+            !app.commit_glassless_native_frame(wid),
+            "the window has glass"
+        );
+        app.sync_chrome_fonts();
+        app.redraw_window(wid);
+        let key = "settings/control/copy_on_select".to_string();
+        let aims = [
+            PointerAction::MoveNative(NativePointerTarget::Key(key.clone())),
+            PointerAction::Wheel {
+                dx: 0.0,
+                dy: 1.0,
+                unit: WheelUnit::Lines,
+                aim: Some(NativePointerTarget::Key(key)),
+            },
+        ];
+        for action in aims {
+            // What a landed save does to the page: it changes, so its presented raster is stale.
+            assert!(app.native_runtime.change_view_state(view, |state| {
+                let common = state.common_mut();
+                common.presentation_revision = common.presentation_revision.saturating_add(1);
+                true
+            }));
+            assert!(
+                app.retained_native_leaf_artifact(wid, view, true).is_none(),
+                "precondition: the changed page is not presented"
+            );
+            match app.pointer_request(action.clone()) {
+                Ok(PointerAt::Native { view: at, .. }) => assert_eq!(at, view.get()),
+                other => panic!("{action:?} aims at the page it presents first: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -11517,6 +11658,77 @@ mod tests {
             );
             app.on_mouse_input(wid, ElementState::Released, button);
         }
+    }
+
+    #[test]
+    fn find_bar_shields_native_hover_and_routes_click_when_native_view_is_active() {
+        use aterm_window::event::{ElementState, MouseButton};
+
+        use crate::native_settings::SettingsRoute;
+        use crate::{App, FindBarHit, WindowId};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        let (_, view) = app.active_native_view(wid).expect("Settings view");
+        assert!(app.commit_glassless_native_frame(wid));
+
+        let (key, px, py) = {
+            let artifact = app
+                .retained_native_pointer_artifact(wid, view)
+                .expect("presented Settings frame");
+            let hit = artifact.compiled.hits.first().expect("hit target");
+            let x = artifact.device_x as f64
+                + f64::from(hit.rect.x + hit.rect.width * 0.5) * artifact.scale;
+            let y = artifact.device_y as f64
+                + f64::from(hit.rect.y + hit.rect.height * 0.5) * artifact.scale;
+            (hit.key.clone(), x, y)
+        };
+        app.on_cursor_moved(wid, px, py);
+        assert_eq!(
+            app.native_runtime
+                .view_state(view)
+                .and_then(|state| state.common().hovered.clone()),
+            Some(key),
+            "control: hovering uncovered native control sets hovered"
+        );
+
+        let (frame_row, _) = app.frame_cell_at(wid, px, py).expect("frame cell");
+        let term_row = frame_row.saturating_sub(usize::from(app.chrome_rows(wid)));
+        let cols = usize::from(app.windows[&wid].cols);
+        let laid = app.glass_grid(wid);
+        app.windows.get_mut(&wid).expect("window").search =
+            Some(crate::app_search::SearchState::default());
+        app.windows.get_mut(&wid).expect("window").find_bar_hit = Some(FindBarHit {
+            row: term_row,
+            case_cols: Some(0..cols),
+            regex_cols: None,
+            prev_cols: None,
+            next_cols: None,
+            close_cols: None,
+            field_cols: 0..0,
+            field_scroll: 0,
+            band: term_row..term_row + 1,
+            cols: 0..cols,
+            laid,
+        });
+
+        app.on_cursor_moved(wid, px, py);
+        assert_eq!(
+            app.native_runtime
+                .view_state(view)
+                .and_then(|state| state.common().hovered.clone()),
+            None,
+            "find bar shields native hover hit underneath it"
+        );
+
+        let before_case = app.search_sticky_case;
+        app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+        assert_ne!(
+            app.search_sticky_case, before_case,
+            "left click on find bar over active native view routes to find_bar_click_at"
+        );
     }
 }
 

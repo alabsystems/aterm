@@ -539,6 +539,9 @@ mod macos {
             eprintln!("control: not on the main thread");
             return NOT_RUN;
         };
+        // This standalone child constructs NSEvent before creating any window or event loop.
+        // Native class lookup therefore owns its first-use AppKit initialization here.
+        aterm_macos_ui::appkit::load();
         autoreleasepool(|_| {
             let Some(obj) = EventDriveControl::alloc_init(mtm, ()) else {
                 eprintln!("control: the class did not instantiate");

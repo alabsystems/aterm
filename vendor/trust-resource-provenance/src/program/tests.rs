@@ -77,7 +77,7 @@ impl Fixture {
         }
     }
     fn digest(&self) -> [u8; 32] {
-        Sha256::digest(&fs::read(&self.program).unwrap()).into()
+        Sha256::digest(fs::read(&self.program).unwrap()).into()
     }
     fn open(&self) -> io::Result<HeldProgram> {
         HeldProgram::open(&self.root, &self.program, &self.digest(), deadline())
@@ -265,10 +265,10 @@ fn actor(fixture: &mut Fixture) -> OwnedChild {
             }
             total += line.len();
             assert!(total <= 4096);
-            if line.contains("held-native-program-running") {
-                if let Some(send) = send.take() {
-                    send.send(()).unwrap();
-                }
+            if line.contains("held-native-program-running")
+                && let Some(send) = send.take()
+            {
+                send.send(()).unwrap();
             }
         }
     });
@@ -389,8 +389,9 @@ fn produced_inputs_keep_original_output_root_across_compilation_and_hold_both_ru
         false,
     );
     let digest = Sha256::digest(fs::read(&program).unwrap()).into();
-    let held =
-        original.program(Arc::clone(&sdk), &program, &digest, &[deps.clone()], deadline()).unwrap();
+    let held = original
+        .program(Arc::clone(&sdk), &program, &digest, std::slice::from_ref(&deps), deadline())
+        .unwrap();
     assert_eq!(held.program(), program);
     assert_eq!(held.output_root(), output);
     assert_eq!(held.observation().policy, produced::RUNTIME_POLICY);
@@ -695,8 +696,9 @@ fn direct_load_override_is_refused(relative: bool) {
     write_output(&program, &image(true, &[&load], Vec::new()), true);
     write_output(&library, &image(false, &["/usr/lib/libSystem.B.dylib"], Vec::new()), false);
     let digest = Sha256::digest(fs::read(&program).unwrap()).into();
-    let clean =
-        output.program(Arc::clone(&sdk), &program, &digest, &[deps.clone()], deadline()).unwrap();
+    let clean = output
+        .program(Arc::clone(&sdk), &program, &digest, std::slice::from_ref(&deps), deadline())
+        .unwrap();
     assert_eq!(clean.observation().runtime.len(), 1);
     assert_eq!(clean.observation().runtime[0].path, library);
     drop(clean);

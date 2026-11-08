@@ -260,7 +260,7 @@ impl TrailRig {
             height: px.height,
         };
         let outcome = self.at(at, |app, wid| app.input(wid, asked, Source::Controller));
-        if outcome != InputOutcome::Ok {
+        if !matches!(outcome, InputOutcome::Resized(_)) {
             return Err(format!("grid {rows} {cols}: {outcome:?}"));
         }
         let ws = &self.app.windows[&self.wid];

@@ -1621,9 +1621,21 @@ pub(crate) struct SettingsViewState {
     messages_scroll_end: Cell<Option<(usize, Option<u64>, bool)>>,
     messages_anchor: RefCell<Option<MessagesAnchor>>,
     page_window: Cell<Option<usize>>,
-    navigation_scroll: Cell<f32>,
-    navigation_scroll_limit: Cell<f32>,
-    navigation_revealed: RefCell<Option<UiKey>>,
+    /// The rail's screen: the index of the item (a row or a group's heading) its list starts
+    /// at, one of its starts ([`rail_stops`]). An item, not a length, so a new window size or
+    /// text size keeps the screen's first item.
+    navigation_start: Cell<usize>,
+    /// Where each screen of the rail starts, its list's points from the top, as last laid out
+    /// ([`rail_stops`]); the last is where its last screen starts.
+    navigation_stops: RefCell<Vec<f32>>,
+    /// The row the rail last brought into view (the keyboard's, else the page's) and whether it
+    /// was the keyboard's: a new row, or the keyboard come onto that same row (a Tab into the
+    /// rail onto the page's row the wheel had scrolled off), comes whole into view.
+    navigation_revealed: RefCell<Option<(UiKey, bool)>>,
+    /// Whether the last screen of the rail showed its revealed row (the keyboard's, else the
+    /// page's) whole: a new window size or text size keeps it whole. The wheel clears it, so a
+    /// row the person scrolled off stays off.
+    navigation_revealed_whole: Cell<bool>,
     /// A rail row a screen reader asked to see (its ScrollIntoView), scrolled whole into the
     /// rail at the next build without moving the keyboard.
     navigation_reveal: RefCell<Option<UiKey>>,
@@ -1903,9 +1915,10 @@ impl SettingsViewState {
             messages_scroll_end: Cell::new(None),
             messages_anchor: RefCell::new(None),
             page_window: Cell::new(None),
-            navigation_scroll: Cell::new(0.0),
-            navigation_scroll_limit: Cell::new(0.0),
+            navigation_start: Cell::new(0),
+            navigation_stops: RefCell::new(Vec::new()),
             navigation_revealed: RefCell::new(None),
+            navigation_revealed_whole: Cell::new(false),
             navigation_reveal: RefCell::new(None),
             scroll_record: RefCell::new(None),
             live_row_heights: RefCell::default(),
@@ -3467,12 +3480,32 @@ impl SettingsViewState {
                 .is_some_and(|key| key.as_str().starts_with("settings/categories/"))
     }
 
+    /// The wheel over the rail: `lines` of its screens' starts ([`rail_stops`]) on, a row or a
+    /// group's heading a line, so every screen it steps to starts with one whole.
     fn scroll_navigation(&mut self, lines: i32) -> bool {
-        let pitch = navigation_row_height(settings_text_scale()) + NAVIGATION_GAP;
-        let before = self.navigation_scroll.get();
-        let after = (before + lines as f32 * pitch).clamp(0.0, self.navigation_scroll_limit.get());
-        self.navigation_scroll.set(after);
-        (after - before).abs() > 0.01
+        let before = self.navigation_start.get();
+        let last = self.navigation_stops.borrow().len().saturating_sub(1);
+        let after = before
+            .min(last)
+            .saturating_add_signed(isize::try_from(lines).unwrap_or(0))
+            .min(last);
+        self.navigation_start.set(after);
+        if after == before {
+            return false;
+        }
+        self.navigation_revealed_whole.set(false);
+        true
+    }
+
+    /// Where the rail's list stands: the points its screen starts down its list.
+    #[cfg(test)]
+    fn navigation_offset(&self) -> f32 {
+        let stops = self.navigation_stops.borrow();
+        stops
+            .get(self.navigation_start.get())
+            .or(stops.last())
+            .copied()
+            .unwrap_or(0.0)
     }
 
     fn status_scrolls_toward(&self, lines: i32) -> bool {
@@ -15679,6 +15712,28 @@ fn navigation_groups() -> Vec<(&'static str, Vec<SettingsRoute>)> {
 
 const SUB_ROW_INDENT: f32 = 14.0;
 
+/// WHERE A SCREEN OF THE RAIL'S LIST STARTS: at the top of one of its items (a row or a group's
+/// heading, tops `tops`), never inside one, so no screen's top edge cuts an item; the last
+/// screen starts at the first item from which the rest of the list, `content` tall, fits its
+/// `room`, so it ends with the last row whole over what room is left. Ended at the list's own
+/// end, the last screen cut the item at its top wherever the room was no whole number of items,
+/// and every screen the wheel stepped to from there cut one too: at 1x in a 1095x696 window the
+/// rail opened on About with Cursor & Motion cut at its top, on Packages with Wallpaper cut and
+/// on Software Update with Themes cut, a row no screen of those pages showed whole.
+fn rail_stops(tops: &[f32], content: f32, room: f32) -> Vec<f32> {
+    let mut stops = Vec::with_capacity(tops.len().max(1));
+    for &top in tops {
+        stops.push(top);
+        if content - top <= room + 0.01 {
+            break;
+        }
+    }
+    if stops.is_empty() {
+        stops.push(0.0);
+    }
+    stops
+}
+
 fn navigation(
     state: &SettingsViewState,
     packages: &PackagesProjection,
@@ -15782,8 +15837,12 @@ fn navigation(
         tops.push(content);
         content += height;
     }
-    let limit = (content - list_height).max(0.0);
-    let mut offset = state.navigation_scroll.get().clamp(0.0, limit);
+    let stops = rail_stops(&tops, content, list_height);
+    let last = stops.len() - 1;
+    let limit = stops[last];
+    // The screen keeps its first item over a new window size or text size, as far as the list
+    // still scrolls.
+    let mut start = state.navigation_start.get().min(last);
     let target = state
         .common
         .last_focus
@@ -15797,30 +15856,83 @@ fn navigation(
                 .is_empty()
                 .then(|| UiKey::new(format!("settings/nav{}", state.route.path())))
         });
-    let reveal = |offset: &mut f32, target: Option<&UiKey>| {
-        if let Some(index) = target.and_then(|target| {
-            items
-                .iter()
-                .position(|(_, _, key)| key.as_ref() == Some(target))
-        }) {
-            let top = tops[index];
-            let bottom = top + items[index].1;
-            if top < *offset {
-                *offset = top;
-            } else if bottom > *offset + list_height {
-                *offset = (bottom - list_height).min(limit);
-            }
-        }
+    let index_of = |key: &UiKey| {
+        items
+            .iter()
+            .position(|(_, _, row)| row.as_ref() == Some(key))
     };
-    if *state.navigation_revealed.borrow() != target {
-        reveal(&mut offset, target.as_ref());
-        *state.navigation_revealed.borrow_mut() = target;
+    let whole_at = |start: usize, index: usize| {
+        let top = tops[index] - tops[start];
+        top >= -0.01 && top + items[index].1 <= list_height + 0.01
+    };
+    let reveal = |start: &mut usize, index: usize| {
+        let bottom = tops[index] + items[index].1;
+        if index < *start {
+            // A row above the screen comes in at its top, under its group's heading where both
+            // fit. Only a row off the screen: a group's first row the rail's top showed whole
+            // went down under its heading as the keyboard or the pointer came onto it.
+            *start = index
+                .checked_sub(1)
+                .filter(|&above| {
+                    items[above].2.is_none() && bottom - tops[above] <= list_height + 0.01
+                })
+                .unwrap_or(index);
+        } else if bottom > tops[*start] + list_height + 0.01 {
+            *start = (0..=last)
+                .find(|&stop| bottom - stops[stop] <= list_height + 0.01)
+                .unwrap_or(index);
+        }
+        *start = (*start).min(last);
+    };
+    let target_index = target.as_ref().and_then(index_of);
+    let keyboard = target.is_some() && state.common.last_focus == target;
+    let (revealed, revealed_keyboard) = state
+        .navigation_revealed
+        .borrow()
+        .clone()
+        .map_or((None, false), |(key, keyboard)| (Some(key), keyboard));
+    let pressed = state
+        .common
+        .pressed
+        .as_ref()
+        .is_some_and(|key| index_of(key).is_some());
+    // WHAT IS LIT IS WHAT A PRESS HITS: the rail holds still under a pressed row (the pointer's
+    // press gives it the keyboard), so the release lands on the row pressed and its action runs;
+    // the row comes whole after. A screen starts at a row, so bringing a row cut at the rail's
+    // foot whole moves the rail on to a row's start, further than the cut: done on the press, it
+    // took the row from under the pointer, and the release, over the next row, did nothing.
+    if !pressed {
+        if revealed != target || (keyboard && !revealed_keyboard) {
+            if let Some(index) = target_index {
+                reveal(&mut start, index);
+            }
+        } else if let Some(index) = target_index
+            && state.navigation_revealed_whole.get()
+            && !whole_at(start, index)
+        {
+            // A new window size or text size keeps a row the rail showed whole whole.
+            reveal(&mut start, index);
+        }
+        *state.navigation_revealed.borrow_mut() = target.map(|key| (key, keyboard));
     }
-    if let Some(asked) = state.navigation_reveal.borrow_mut().take() {
-        reveal(&mut offset, Some(&asked));
+    if let Some(index) = state
+        .navigation_reveal
+        .borrow_mut()
+        .take()
+        .as_ref()
+        .and_then(index_of)
+    {
+        reveal(&mut start, index);
     }
-    state.navigation_scroll.set(offset);
-    state.navigation_scroll_limit.set(limit);
+    state
+        .navigation_revealed_whole
+        .set(target_index.is_some_and(|index| whole_at(start, index)));
+    state.navigation_start.set(start);
+    let offset = stops[start];
+    // The thumb spans what the list scrolls through: its rows, and the room its last screen
+    // leaves under the last of them.
+    let extent = content.max(limit + list_height);
+    *state.navigation_stops.borrow_mut() = stops;
 
     let children: Vec<UiNode> = items
         .into_iter()
@@ -15864,7 +15976,7 @@ fn navigation(
             "{},{},{}",
             offset.round() as u32,
             list_height.round() as u32,
-            content.round() as u32
+            extent.round() as u32
         );
         let thumb = UiNode::new(
             "settings/navigation/thumb",

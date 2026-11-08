@@ -2645,7 +2645,8 @@ pub(crate) fn open_privacy_settings(pane: PrivacyPane) -> SettingsOpen {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use aterm_objc::{BlockPtr, Id, Obj, RcBlock, Retained, Sel, autoreleasepool, class, sel};
+    use aterm_macos_ui::appkit::class;
+    use aterm_objc::{BlockPtr, Id, Obj, RcBlock, Retained, Sel, autoreleasepool, sel};
     use aterm_window::event_loop::EventLoopProxy;
 
     use crate::appkit::consts::{
@@ -3636,9 +3637,9 @@ mod macos {
 
     #[cfg(test)]
     mod tests {
-        use aterm_objc::{Bool, ClassType, Encode, class, class_name, method_types, sel};
+        use aterm_objc::{Bool, ClassType, Encode, class_name, method_types, sel};
 
-        use super::MenuTarget;
+        use super::{MenuTarget, class};
         use crate::appkit;
 
         /// A quit Apple event's reason and sender read back through prototypes the runtime

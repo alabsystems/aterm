@@ -948,21 +948,17 @@ fn commons_log_state_digest(
 ) -> Result<[u8; 32]> {
     let mut hash = aterm_digest::Sha256::new();
     hash.update(heads_digest);
-    if let Some(bytes) = crate::fsx::read_private(&paths.state_file(), crate::client::MAX_STATE)? {
-        hash.update([1]);
-        hash.update((bytes.len() as u64).to_le_bytes());
-        hash.update(bytes.as_slice());
-    } else {
-        hash.update([0]);
-    }
-    if let Some(bytes) =
-        crate::fsx::read_public(&paths.dir.join("source.toml"), crate::client::MAX_STATE)?
-    {
-        hash.update([1]);
-        hash.update((bytes.len() as u64).to_le_bytes());
-        hash.update(&bytes);
-    } else {
-        hash.update([0]);
+    // Each file's digest is kept while the file stands ([`crate::fsx::private_digest`]).
+    let state = crate::fsx::private_digest(&paths.state_file(), crate::client::MAX_STATE)?;
+    let source =
+        crate::fsx::public_digest(&paths.dir.join("source.toml"), crate::client::MAX_STATE)?;
+    for digest in [state, source] {
+        if let Some(digest) = digest {
+            hash.update([1]);
+            hash.update(digest);
+        } else {
+            hash.update([0]);
+        }
     }
     let node_dir = paths
         .home

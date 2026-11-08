@@ -4923,7 +4923,13 @@ mod tests {
             width: frame.width,
             height: frame.height,
         };
-        assert_eq!(app.input(wid, asked, Source::Controller), InputOutcome::Ok);
+        assert_eq!(
+            app.input(wid, asked, Source::Controller),
+            InputOutcome::Resized(crate::input::WindowResize::Px {
+                asked: (frame.width, frame.height),
+                given: (frame.width, frame.height),
+            })
+        );
         assert_eq!(grid(&app), (30, 50), "the grid follows the pixels");
         let (cw, ch) = app.win_cell_size(wid);
         let between = app.window_frame_px_for(wid, 20, 40);
@@ -4933,7 +4939,10 @@ mod tests {
         };
         // Past the throttle window, so this one is not coalesced into a later settle.
         app.windows.get_mut(&wid).unwrap().last_resize_at = None;
-        assert_eq!(app.input(wid, asked, Source::Controller), InputOutcome::Ok);
+        assert!(matches!(
+            app.input(wid, asked, Source::Controller),
+            InputOutcome::Resized(_)
+        ));
         assert_eq!(
             grid(&app),
             (20, 40),
@@ -4982,6 +4991,63 @@ mod tests {
             (t.rows(), t.cols())
         };
         assert_eq!(engine, window, "the pane's grid, not the one set behind");
+    }
+
+    /// A SESSION A WINDOW LAYS OUT AS A PANE TAKES ITS GRID FROM THAT WINDOW, AND `pane_grid_of`
+    /// SAYS FOR HOW LONG: behind Settings, the terminal's tab is behind, so a grid set behind its
+    /// pane lasts until the tab comes to the front, when the window gives it the grid named; with
+    /// the tab in front the window lays the pane out at its next frame (a cross-session `resize`
+    /// refuses); a session no window lays out is named by none, and its grid is the resize's.
+    /// NEGATIVE CONTROL: the cross-session resize answered a bare `OK` for a grid the window undid
+    /// as the tab came to the front.
+    #[test]
+    fn a_session_a_window_lays_out_names_its_window_its_panes_grid_and_whether_it_is_in_front() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let window = (app.windows[&wid].rows, app.windows[&wid].cols);
+        assert_eq!(
+            app.pane_grid_of(0),
+            Some(crate::app_render::SessionPane {
+                window: wid,
+                grid: window,
+                in_front: false,
+            })
+        );
+        app.switch_tab_in(wid, 0);
+        assert_eq!(
+            app.pane_grid_of(0),
+            Some(crate::app_render::SessionPane {
+                window: wid,
+                grid: window,
+                in_front: true,
+            })
+        );
+        assert_eq!(app.pane_grid_of(9_999), None);
+    }
+
+    /// `dims` WITH AN APP TAB IN FRONT READS THE WINDOW: with Settings in front and no session
+    /// named, the snapshot is the front window's own grid and geometry, `session=none`, so a
+    /// script reads back what a resize gave the window (it answered `ERR no active terminal`).
+    #[test]
+    fn dims_with_an_app_tab_in_front_reads_the_window() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        let snapshot = app.window_dims_snapshot().expect("a front window");
+        let grid = (
+            u32::from(app.windows[&wid].rows),
+            u32::from(app.windows[&wid].cols),
+        );
+        assert_eq!((snapshot.rows, snapshot.cols), grid);
+        assert_eq!((snapshot.window_rows, snapshot.window_cols), grid);
+        assert_eq!((snapshot.session, snapshot.window), (None, Some(0)));
+        let line = crate::control::serialize_dims(&snapshot);
+        assert!(
+            line.starts_with(&format!("OK {} {} ", grid.0, grid.1)),
+            "{line}"
+        );
+        assert!(line.contains(" session=none "), "{line}");
     }
 
     #[test]

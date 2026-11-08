@@ -96,10 +96,10 @@ fn once_hashed_pin_validates_native_cached_child_and_rejects_changed_backing() {
             if read.read_line(&mut line).unwrap() == 0 {
                 break;
             }
-            if line.contains("pinned-image-running") {
-                if let Some(sent) = sent.take() {
-                    sent.send(()).unwrap();
-                }
+            if line.contains("pinned-image-running")
+                && let Some(sent) = sent.take()
+            {
+                sent.send(()).unwrap();
             }
         }
     });

@@ -280,7 +280,8 @@ pub struct Left {
     pub ended: Vec<String>,
     /// Named and left.
     pub named: Vec<String>,
-    /// Born in the run's window, running from its roots, but held at the program check.
+    /// Born in the run's window, running from its roots, with execution unobserved and
+    /// no confirmed program-check cause.
     pub unjudged: usize,
     /// The ended, as a poster tells them.
     pub told: Vec<Told>,

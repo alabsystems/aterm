@@ -60,6 +60,7 @@ libc = { workspace = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 # The status item, its menu, the image and the NSProcessInfo activity.
 aterm-objc = { workspace = true }
+aterm-macos-ui = { workspace = true }
 
 [dev-dependencies]
 aterm-tempfile = { workspace = true }

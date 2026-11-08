@@ -41,6 +41,8 @@ struct Fixture {
     retired: usize,
     before_arm_error: bool,
     launches: usize,
+    #[cfg(target_os = "macos")]
+    producer_returns: usize,
 }
 impl Fixture {
     fn new() -> Self {
@@ -80,6 +82,8 @@ impl Fixture {
             retired: 0,
             before_arm_error: false,
             launches: 0,
+            #[cfg(target_os = "macos")]
+            producer_returns: 0,
         }
     }
 }
@@ -92,6 +96,48 @@ impl Drop for Fixture {
     }
 }
 impl MemberCustody for Fixture {
+    #[cfg(target_os = "macos")]
+    fn bind_producer(&mut self, inputs: &mut ProducerInputs) -> io::Result<()> {
+        self.validate()?;
+        inputs.bind_fixture(&mut self.root, binding())
+    }
+    #[cfg(target_os = "macos")]
+    fn retire_producer(
+        &mut self,
+        child: &mut CohortChild,
+        inputs: &mut Option<ProducerInputs>,
+    ) -> io::Result<ProducerRetirement> {
+        if self.defer_retire {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        let retired = ProducerRetirement::retire_fixture(
+            &mut self.claim,
+            &mut self.root,
+            child,
+            inputs,
+            binding(),
+        )?;
+        self.retired += 1;
+        Ok(retired)
+    }
+    #[cfg(target_os = "macos")]
+    fn return_producer(
+        &mut self,
+        retirement: Box<ProducerRetirement>,
+    ) -> Result<Box<ReturnedProducer>, Box<ProducerRetirement>> {
+        let returned = (|| {
+            self.validate()?;
+            retirement.check_fixture(&mut self.root, &binding())?;
+            self.return_unit(ReturnReceipt::ScopeClosed)
+        })();
+        match returned {
+            Ok(()) => {
+                self.producer_returns += 1;
+                Ok(retirement.returned_fixture())
+            }
+            Err(_) => Err(retirement),
+        }
+    }
     fn before_arm(&mut self) -> io::Result<()> {
         if self.before_arm_error {
             Err(io::Error::other("injected intent acknowledgment loss"))
@@ -207,6 +253,11 @@ fn done(member: &mut OwnedAttempt<Resources>, fixture: &mut Fixture) -> Progress
 #[test]
 #[cfg(target_os = "macos")]
 fn actual_bound_retry_keeps_descriptors_until_scoped_retirement() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::actual_bound_retry_keeps_descriptors_until_scoped_retirement",
+    ) {
+        return;
+    }
     let mut fixture = Fixture::new();
     fixture.defer_bind = true;
     fixture.defer_retire = true;
@@ -285,6 +336,11 @@ fn actual_bound_retry_keeps_descriptors_until_scoped_retirement() {
 }
 #[test]
 fn exact_no_child_receipt_voids_only_its_original_subgroup() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::exact_no_child_receipt_voids_only_its_original_subgroup",
+    ) {
+        return;
+    }
     let mut fixture = Fixture::new();
     fixture.defer_return = true;
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -315,6 +371,11 @@ fn exact_no_child_receipt_voids_only_its_original_subgroup() {
 }
 #[test]
 fn before_arm_write_failure_retries_return_without_launching_a_native_child() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::before_arm_write_failure_retries_return_without_launching_a_native_child",
+    ) {
+        return;
+    }
     let mut fixture = Fixture::new();
     fixture.before_arm_error = true;
     fixture.defer_return = true;
@@ -342,6 +403,11 @@ fn before_arm_write_failure_retries_return_without_launching_a_native_child() {
 }
 #[test]
 fn cancellation_before_go_does_not_run_target_or_release_early() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::cancellation_before_go_does_not_run_target_or_release_early",
+    ) {
+        return;
+    }
     let mut fixture = Fixture::new();
     let marker = fixture._scratch.path().join("must-not-run");
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -370,6 +436,11 @@ fn cancellation_before_go_does_not_run_target_or_release_early() {
 #[test]
 #[cfg(target_os = "macos")]
 fn live_member_coverage_and_outer_timeout_preserve_original_scope() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::live_member_coverage_and_outer_timeout_preserve_original_scope",
+    ) {
+        return;
+    }
     let mut fixture = Fixture::new();
     let dropped = Arc::new(AtomicUsize::new(0));
     let (events, _client) = event_pair();
@@ -441,6 +512,11 @@ fn live_member_coverage_and_outer_timeout_preserve_original_scope() {
 #[test]
 #[cfg(target_os = "macos")]
 fn exited_leader_keeps_group_pin_until_other_members_are_positively_exited() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::exited_leader_keeps_group_pin_until_other_members_are_positively_exited",
+    ) {
+        return;
+    }
     let mut fixture = Fixture::new();
     let dropped = Arc::new(AtomicUsize::new(0));
     let (events, _client) = event_pair();
@@ -452,7 +528,8 @@ fn exited_leader_keeps_group_pin_until_other_members_are_positively_exited() {
         .args(["-c", "exec 3<&0; printf 'root\\n' > \"$1\"; while IFS= read -r line <&3; do printf '%s\\n' \"$line\" > \"$1\"; done & exit 0", "fixture"])
         .arg(&marker)
         .stdin(spawnfd::Stdio::from(input))
-        .stdout(spawnfd::Stdio::null());
+        .stdout(spawnfd::Stdio::null())
+        .stderr(spawnfd::Stdio::null());
     let mut member = OwnedAttempt::launch(
         &mut fixture,
         command,
@@ -498,6 +575,10 @@ fn exited_leader_keeps_group_pin_until_other_members_are_positively_exited() {
     assert!(!first.retired);
     assert!(first.go_attempted && first.launched);
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert!(
+        member.producer_retirement.is_none(),
+        "group drain is not producer containment"
+    );
     let finished = done(&mut member, &mut fixture);
     assert!(finished.retired);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
@@ -569,12 +650,29 @@ fn native_escaped_metadata_actor() {
 struct GuardedResources {
     original: Resources,
     prelude: crate::metadata_prelude::Owner,
+    gnu: [OwnedFd; 2],
 }
 #[cfg(target_os = "macos")]
 impl MemberResources for GuardedResources {
+    fn take_producer_inputs(&mut self) -> io::Result<Option<ProducerInputs>> {
+        let target = self
+            .prelude
+            .take_retirement()
+            .ok_or_else(|| io::Error::other("native containment missing"))?;
+        let gnu = self
+            .gnu
+            .iter()
+            .map(OwnedFd::try_clone)
+            .collect::<io::Result<Vec<_>>>()?;
+        ProducerInputs::new(target, gnu).map(Some)
+    }
     fn configure(&mut self, command: &mut spawnfd::Command) -> io::Result<()> {
         let extra = self.prelude.extra()?;
-        command.inherit_guards_at(vec![extra])?;
+        command.inherit_guards_at(vec![
+            extra,
+            (self.gnu[0].try_clone()?, 3),
+            (self.gnu[1].try_clone()?, 4),
+        ])?;
         self.prelude.configured(command)
     }
     fn prepare_target(&mut self, child: &mut spawnfd::Child) -> io::Result<bool> {
@@ -594,6 +692,11 @@ impl MemberResources for GuardedResources {
 #[test]
 #[cfg(target_os = "macos")]
 fn metadata_cannot_return_original_resources_while_a_setsid_child_survives() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::metadata_cannot_return_original_resources_while_a_setsid_child_survives",
+    ) {
+        return;
+    }
     crate::runtime::test_endpoint().unwrap();
     let mut fixture = Fixture::new();
     let path = fixture._scratch.path().join("escaped-pid");
@@ -611,7 +714,7 @@ fn metadata_cannot_return_original_resources_while_a_setsid_child_survives() {
         .current_dir(fixture._scratch.path());
     let deadline = Instant::now() + Duration::from_secs(60);
     let (prelude, mut command) =
-        crate::metadata_prelude::Owner::new(&target, &[], deadline).unwrap();
+        crate::metadata_prelude::Owner::new(&target, &[3, 4], deadline).unwrap();
     command
         .stdin(spawnfd::Stdio::null())
         .stdout(spawnfd::Stdio::null());
@@ -621,6 +724,10 @@ fn metadata_cannot_return_original_resources_while_a_setsid_child_survives() {
         GuardedResources {
             original: Resources(dropped.clone(), None),
             prelude,
+            gnu: {
+                let (read, write) = aterm_uds::kept_out(std::io::pipe).unwrap();
+                [read.into(), write.into()]
+            },
         },
         events,
         binding(),
@@ -665,6 +772,10 @@ fn metadata_cannot_return_original_resources_while_a_setsid_child_survives() {
                 Outcome::Exit(0)
             ));
             assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fixture.producer_returns, 1,
+                "actual no-fork retire result consumed once"
+            );
             assert!(
                 fixture.claim.finish_cohort().is_err(),
                 "the live original root still retains its memory claim"
@@ -678,7 +789,273 @@ fn metadata_cannot_return_original_resources_while_a_setsid_child_survives() {
 
 #[test]
 #[cfg(target_os = "macos")]
+fn general_producer_profile_refuses_before_go_and_never_mints_retirement() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::general_producer_profile_refuses_before_go_and_never_mints_retirement",
+    ) {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    fixture.defer_retire = true;
+    let marker = fixture._scratch.path().join("must-not-run");
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (events, _client) = event_pair();
+    let mut command = spawnfd::command("/usr/bin/touch");
+    command.arg(&marker);
+    let mut member = OwnedAttempt::launch(
+        &mut fixture,
+        command,
+        Resources(dropped.clone(), None),
+        events,
+        binding(),
+        None,
+        wake,
+    );
+    let error = member.start_producer(&mut fixture).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(!marker.exists());
+    assert!(member.producer_retirement.is_none());
+    assert_eq!(fixture.producer_returns, 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    fixture.defer_retire = false;
+    let progress = done(&mut member, &mut fixture);
+    assert!(!progress.go_attempted);
+    assert_eq!(fixture.producer_returns, 0);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn native_producer_retirement_retains_originals_until_same_owner_return() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::native_producer_retirement_retains_originals_until_same_owner_return",
+    ) {
+        return;
+    }
+    native_producer_return_control(false);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn lost_original_root_cannot_consume_producer_retirement_or_drop_gnu() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::lost_original_root_cannot_consume_producer_retirement_or_drop_gnu",
+    ) {
+        return;
+    }
+    native_producer_return_control(true);
+}
+
+#[cfg(target_os = "macos")]
+fn native_producer_return_control(lose_owner: bool) {
+    crate::runtime::test_endpoint().unwrap();
+    let mut fixture = Fixture::new();
+    fixture.defer_retire = true;
+    fixture.defer_return = true;
+    let path = fixture._scratch.path().join("fork-denied");
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (events, _client) = event_pair();
+    let mut target = spawnfd::command(std::env::current_exe().unwrap());
+    target
+        .args([
+            "--exact",
+            "actor::owner::member::tests::native_escaped_metadata_actor",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("ATERM_TEST_METADATA_ESCAPE", &path)
+        .current_dir(fixture._scratch.path());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (prelude, mut command) =
+        crate::metadata_prelude::Owner::new(&target, &[3, 4], deadline).unwrap();
+    command
+        .stdin(spawnfd::Stdio::null())
+        .stdout(spawnfd::Stdio::null())
+        .stderr(spawnfd::Stdio::null());
+    let (read, write) = aterm_uds::kept_out(std::io::pipe).unwrap();
+    let mut member = OwnedAttempt::launch(
+        &mut fixture,
+        command,
+        GuardedResources {
+            original: Resources(dropped.clone(), None),
+            prelude,
+            gnu: [read.into(), write.into()],
+        },
+        events,
+        binding(),
+        None,
+        wake,
+    );
+    loop {
+        match member.start_producer(&mut fixture) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("actual contained producer start: {error}"),
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    loop {
+        let progress = member.poll(&mut fixture, None);
+        if progress.completed.is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        member.producer_retirement.is_none(),
+        "reap alone cannot mint native retirement"
+    );
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    fixture.defer_retire = false;
+    member.poll(&mut fixture, None);
+    let retirement = member
+        .producer_retirement
+        .as_ref()
+        .expect("actual durable retirement");
+    let mut wrong = Fixture::new();
+    assert!(
+        retirement
+            .check_fixture(&mut wrong.root, &binding())
+            .is_err()
+    );
+    assert_eq!(fixture.producer_returns, 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    if lose_owner {
+        use std::os::fd::AsRawFd as _;
+        let probe = member.resources.as_ref().unwrap().gnu[0]
+            .try_clone()
+            .unwrap();
+        // Reap only this fixture's actual original root, never a numeric PID.
+        fixture.input.take();
+        fixture.root.child_mut().wait().unwrap();
+        fixture.defer_return = false;
+        let progress = member.poll(&mut fixture, None);
+        assert!(!progress.retired && progress.uncertain);
+        assert!(member.producer_retirement.is_some());
+        assert_eq!(fixture.producer_returns, 0);
+        drop(member);
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            0,
+            "unknown owner retains originals"
+        );
+        let mut descriptor = libc::pollfd {
+            fd: probe.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLHUP,
+            revents: 0,
+        };
+        assert_eq!(
+            unsafe { libc::poll(&mut descriptor, 1, 0) },
+            0,
+            "SAME original GNU writer remains held after unresolved owner drop"
+        );
+        return;
+    }
+    fixture.defer_return = false;
+    loop {
+        if member.poll(&mut fixture, None).drained {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(fixture.producer_returns, 1);
+    assert!(member.producer_retirement.is_none());
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    member.poll(&mut fixture, None);
+    assert_eq!(
+        fixture.producer_returns, 1,
+        "one original retirement cannot return twice"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn escaped_closed_stream_descendant_cannot_create_producer_retirement() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::escaped_closed_stream_descendant_cannot_create_producer_retirement",
+    ) {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    let marker = fixture._scratch.path().join("escaped");
+    let (reader, writer) = aterm_uds::kept_out(std::io::pipe).unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let (events, _client) = event_pair();
+    let mut command = spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "actor::owner::member::tests::native_escaped_metadata_actor",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("ATERM_TEST_METADATA_ESCAPE", &marker)
+        .stdin(spawnfd::Stdio::null())
+        .stdout(spawnfd::Stdio::null())
+        .stderr(spawnfd::Stdio::null());
+    command
+        .inherit_guards_at(vec![(reader.into(), 19)])
+        .unwrap();
+    let mut member = OwnedAttempt::launch(
+        &mut fixture,
+        command,
+        Resources(dropped.clone(), None),
+        events,
+        binding(),
+        None,
+        wake,
+    );
+    member.start(&mut fixture).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let escaped = loop {
+        if let Ok(text) = std::fs::read_to_string(&marker)
+            && let Ok(pid) = text.parse::<u32>()
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    let exit = ExitMoment::watch_then(escaped, Instant::now, wake)
+        .expect("actual escaped child exit observer");
+    let State::Bound(bound) = &mut member.state else {
+        panic!("original child")
+    };
+    assert_ne!(
+        unsafe { libc::getpgid(escaped as i32) },
+        bound.child.cohort().group()
+    );
+    assert!(bound.producer.is_none());
+    assert!(
+        exit.get().is_none(),
+        "closed-stream escaped descendant is genuinely live"
+    );
+    let mut absent = None;
+    let result = fixture.retire_producer(&mut bound.child, &mut absent);
+    assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Unsupported));
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert!(member.producer_retirement.is_none());
+    // The fixture owns the original stop writer. EOF closes the escaped child;
+    // no recycled PID/group signal and no alleged production closure is used.
+    drop(writer);
+    while exit.get().is_none() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    done(&mut member, &mut fixture);
+    assert_eq!(fixture.producer_returns, 0);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
 fn accounted_member_retains_original_wait_until_scope_and_unit_return() {
+    if !aterm_uds::test_binary::isolated_lifecycle(
+        "actor::owner::member::tests::accounted_member_retains_original_wait_until_scope_and_unit_return",
+    ) {
+        return;
+    }
     use aterm_types::resource_admission::AccountedEventFrame;
     for (script, cancel, expected) in [
         ("exit 0", false, Some(0)),

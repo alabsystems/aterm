@@ -115,6 +115,9 @@ pub struct HeldProgram {
     observation: ProgramObservation,
 }
 
+mod system_command;
+pub use system_command::HeldSystemCommand;
+
 fn time(deadline: Instant) -> io::Result<()> {
     if Instant::now() >= deadline { Err(io::ErrorKind::TimedOut.into()) } else { Ok(()) }
 }
@@ -507,6 +510,31 @@ impl HeldProgram {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "native workload image declarations require macOS arm64",
+        ));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.validate(deadline)
+    }
+
+    /// Require the separate paired qualification declaration in this same
+    /// original held image. Workload-v1 support cannot negotiate Invocation60
+    /// or Ready48/v2. This observation grants no startup or execution authority.
+    pub fn require_paired_protocol_marker(
+        &self,
+        _expected: &[u8; 64],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.validate(deadline)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        protocol_marker::require(
+            &self.executable.file,
+            protocol_marker::Profile::PairedQualification,
+            _expected,
+            deadline,
+        )?;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native paired qualification image declarations require macOS arm64",
         ));
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         self.validate(deadline)

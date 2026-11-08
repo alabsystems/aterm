@@ -210,6 +210,54 @@ pub(crate) enum InputOutcome {
     QueueFull,
     /// A geometry request found no window to change, so nothing was applied; the words say why.
     NotApplied(&'static str),
+    /// A window resize (either form of the `resize` verb) was applied: what was asked and what
+    /// the window was given, which differ where the least-size rule held an axis
+    /// (`App::held_window_size`).
+    Resized(WindowResize),
+}
+
+/// What one window resize asked for and what the window was given ([`InputOutcome::Resized`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowResize {
+    /// The grid form: `(rows, cols)` asked, and the grid the window took.
+    Grid {
+        asked: (u16, u16),
+        given: (u16, u16),
+    },
+    /// The pixel form: `(width, height)` device pixels asked, and the size the window was asked
+    /// for after the least-size rule (a window manager may still change a platform window's).
+    Px {
+        asked: (u32, u32),
+        given: (u32, u32),
+    },
+}
+
+impl WindowResize {
+    /// Whether the least-size rule gave the window more than was asked.
+    pub(crate) const fn held(self) -> bool {
+        match self {
+            Self::Grid { asked, given } => asked.0 != given.0 || asked.1 != given.1,
+            Self::Px { asked, given } => asked.0 != given.0 || asked.1 != given.1,
+        }
+    }
+
+    /// The `resize` verb's `OK` line: the size given, then, where the least-size rule held it,
+    /// `held=least` and the size asked.
+    pub(crate) fn reply(self) -> String {
+        let held = self.held();
+        match self {
+            Self::Grid { asked, given } if held => format!(
+                "OK rows={} cols={} held=least asked_rows={} asked_cols={}\n",
+                given.0, given.1, asked.0, asked.1
+            ),
+            Self::Grid { given, .. } => format!("OK rows={} cols={}\n", given.0, given.1),
+            Self::Px { asked, given } if held => format!(
+                "OK width={} height={} held=least asked_width={} asked_height={}\n",
+                given.0, given.1, asked.0, asked.1
+            ),
+            Self::Px { given, .. } => format!("OK width={} height={}\n", given.0, given.1),
+        }
+    }
 }
 
 impl InputOutcome {

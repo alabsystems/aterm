@@ -32,6 +32,8 @@ pub(in super::super) struct Events {
         trust_resource_controller::workload::host::produced::Key,
         trust_resource_controller::workload::host::MemberKind,
     )>,
+    contained: Option<trust_resource_controller::workload::host::contained::Request>,
+    contained_terminal: bool,
     #[cfg(all(test, target_os = "macos"))]
     sent_frames: Vec<Vec<u8>>,
     #[cfg(all(test, target_os = "macos"))]
@@ -57,6 +59,8 @@ impl Events {
             workload: false,
             linker: None,
             produced: None,
+            contained: None,
+            contained_terminal: false,
             #[cfg(all(test, target_os = "macos"))]
             sent_frames: Vec::new(),
             #[cfg(all(test, target_os = "macos"))]
@@ -123,6 +127,11 @@ impl Events {
         event: Event,
         observation: AccountingObservation,
     ) -> io::Result<()> {
+        if self.contained.is_some() && matches!(event, Event::Finished { .. }) {
+            return Err(io::Error::other(
+                "contained terminal requires actual native issuer",
+            ));
+        }
         if !self.accounted {
             return self.emit(event);
         }
@@ -254,6 +263,70 @@ impl Events {
         }
         self.enqueue(inventory.encode()?)?;
         self.prepared = true;
+        Ok(())
+    }
+    pub(in super::super) fn contained(
+        &mut self,
+        request: trust_resource_controller::workload::host::contained::Request,
+    ) -> io::Result<()> {
+        request.validate()?;
+        if self.contained.is_some()
+            || self.prepared
+            || self.binding.attempt != request.produced.member.member_attempt
+            || self.produced.as_ref()
+                != Some(&(request.produced.key.clone(), request.produced.kind))
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        self.contained = Some(request);
+        Ok(())
+    }
+    pub(in super::super) fn is_contained(&self) -> bool {
+        self.contained.is_some()
+    }
+    pub(in super::super) fn emit_contained_refused(&mut self) -> io::Result<()> {
+        if !self.is_contained() || self.contained_terminal || self.failed {
+            return Err(io::Error::other(
+                "contained refusal unavailable or already issued",
+            ));
+        }
+        self.emit(Event::Refused {
+            reason: "contained target did not reach GO".into(),
+        })?;
+        self.contained_terminal = true;
+        Ok(())
+    }
+    pub(in super::super) fn emit_contained_terminal(
+        &mut self,
+        returned: &super::super::member_custody::ReturnedProducer,
+        event: Event,
+        observation: AccountingObservation,
+    ) -> io::Result<()> {
+        let request = self
+            .contained
+            .as_ref()
+            .ok_or_else(|| io::Error::other("contained request missing"))?;
+        if self.contained_terminal || self.failed {
+            return Err(io::Error::other(
+                "contained terminal unusable or already issued",
+            ));
+        }
+        let root = request.produced.key.root_attempt;
+        let bytes = self.metadata_event(root, event)?;
+        let trust_resource_controller::MetadataEvent::Completed(completed) =
+            trust_resource_controller::MetadataEvent::decode(&bytes, root, self.binding.attempt)?
+        else {
+            return Err(io::ErrorKind::InvalidData.into());
+        };
+        let completion = trust_resource_controller::workload::host::Completion {
+            phase: request.produced.key.ordinal,
+            kind: request.produced.kind,
+            completed,
+            observation,
+        };
+        let bytes = returned.completion(request, completion)?.encode()?;
+        self.enqueue(bytes)?;
+        self.contained_terminal = true;
         Ok(())
     }
     pub(in super::super) fn inputs_unchanged(&mut self, result: Result<(), String>) {
