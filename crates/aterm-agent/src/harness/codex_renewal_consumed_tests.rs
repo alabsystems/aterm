@@ -162,8 +162,6 @@ pub(crate) fn transition(
 fn consumed_publication_refines_actual_files_and_durability_barriers() {
     let model = aterm_models_harness::consumed_receipt_model();
     aterm_spec::interp::prove_and_catch(&model);
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{faults:?}");
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

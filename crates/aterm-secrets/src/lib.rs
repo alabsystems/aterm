@@ -7,10 +7,7 @@
 //! Client and service flows ([`materialize`], [`client`], [`service`], [`cli`]).
 
 #![forbid(unsafe_code)]
-#![cfg_attr(
-    all(unix, anchor_rules, any(test, debug_assertions)),
-    feature(macro_attr)
-)]
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();

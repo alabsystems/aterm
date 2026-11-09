@@ -911,6 +911,7 @@ fn real_lapse_keeps_the_anchor_and_a_park_miss_stays_in_the_activity_lane() {
         restored_hold_said: false,
     });
     app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+        replacement: None,
         build,
         dmg_sha256: [0xab; 32],
         activation: false,
@@ -1301,9 +1302,12 @@ fn real_hidden_output_quiet_clock_ages_without_present_ack() {
     assert!(!buggy.check_invariant("ActivityRetryIsStrictlyFuture", &stuck));
 }
 
-/// The observable state of a structural latch.
+/// Current replacement custody and any separately proved structural resample.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct StructuralLatchObservation {
+    pub(crate) structural: bool,
+    /// Current known offer custody, or the still-owned dispatch it admitted.
+    pub(crate) eligible: bool,
     pub(crate) room: bool,
     /// The installed facts no longer report the latched build.
     pub(crate) unread: bool,
@@ -1321,7 +1325,7 @@ pub(crate) struct StructuralLatchObservation {
     pub(crate) newer_spent: bool,
     pub(crate) said: bool,
     pub(crate) escaped: bool,
-    /// A retire of the latched activation is in flight (`App::native_activation_supersede`).
+    /// Retirement is still owned, including an accepted worker awaiting checked disk facts.
     pub(crate) superseding: bool,
     /// It landed: the newer release is the lane's stage in the activation's place.
     pub(crate) superseded: bool,
@@ -1340,6 +1344,8 @@ pub(crate) fn project_structural_latch(
 ) -> State {
     let mut state = model.init_state();
     state.insert("phase", 1);
+    state.insert("structural", i64::from(observed.structural));
+    state.insert("eligible", i64::from(observed.eligible));
     state.insert("room", i64::from(observed.room));
     state.insert(
         "unread",
@@ -1355,7 +1361,7 @@ pub(crate) fn project_structural_latch(
     state.insert("pending", i64::from(observed.pending));
     state.insert("day", i64::from(observed.day));
     state.insert("owed", i64::from(observed.owed));
-    state.insert("spent", i64::from(!observed.owed));
+    state.insert("spent", i64::from(observed.structural && !observed.owed));
     state.insert("newer", i64::from(observed.newer));
     state.insert("newer_spent", i64::from(observed.newer_spent));
     state.insert("said", i64::from(observed.said));
@@ -1431,6 +1437,10 @@ fn observe_latch(model: &Model, app: &crate::App, day: bool, pending: bool) -> S
     project_structural_latch(
         model,
         StructuralLatchObservation {
+            structural: true,
+            eligible: app
+                .auto_apply_manual_only
+                .is_some_and(|latch| latch.replacement.is_some()),
             room: true,
             unread: app
                 .native_installed_trial
@@ -1522,6 +1532,7 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
         let unread = state["unread"] >= 1;
         let unproven = state["unread"] == 2;
         let facts = StructuralLatchFacts {
+            replacement_eligible: state["eligible"] == 1,
             resample_due: state["day"] == 1 && state["owed"] == 1,
             resample_owed: state["owed"] == 1,
             unspent_newer_download: (unspent && state["backoff"] == 0).then_some(12),
@@ -1581,6 +1592,8 @@ fn real_structural_latch_decision_is_exactly_the_model_s_decide() {
         let after = project_structural_latch(
             &model,
             StructuralLatchObservation {
+                structural: state["structural"] == 1,
+                eligible: state["eligible"] == 1 && latched,
                 room: state["room"] == 1,
                 unread,
                 unproven,
@@ -1656,6 +1669,294 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
         "the evidence window must open"
     );
 
+    for (withdrawn, unavailable) in [(false, false), (true, false), (false, true)] {
+        use crate::app_native::{EnvironmentBlockCause, HandoffFailureLane, PhysicalFailureShape};
+        let installed = installed_bundle(11, 0);
+        let mut app = crate::App::headless_for_test();
+        app.native_updater_service = NativeUpdaterService::new(10, "1.0.10", true);
+        let _ = app.reconcile_native_update_facts(observation(
+            1,
+            Some(installed.clone()),
+            unavailable.then_some(12),
+            false,
+        ));
+        let activation = crate::native_updater_service::installed_activation_digest(11, COMMIT);
+        for _ in 0..3 {
+            let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+                11,
+                COMMIT,
+                &activation,
+            );
+            ticket.make_current_apply_for_test(&mut app.native_updater_service);
+            let _ = app.abort_reaped_native_apply_before_reconcile(
+                &ticket,
+                "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+                HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+            );
+        }
+        let budget = app.auto_apply_physical_retry;
+        assert_eq!(budget.map(|retry| retry.cycles), Some(3));
+        assert!(app.auto_apply_structural_verdict.is_none());
+        let observe = |app: &crate::App, newer, pending, refused| {
+            let replacement = app
+                .auto_apply_manual_only
+                .and_then(|latch| latch.replacement);
+            let superseding = app.native_activation_supersede.is_some();
+            let superseded = app
+                .native_updater_service
+                .snapshot()
+                .staged
+                .as_ref()
+                .is_some_and(|stage| stage.build >= 12 && !stage.is_installed_activation())
+                && !superseding;
+            project_structural_latch(
+                &model,
+                StructuralLatchObservation {
+                    structural: false,
+                    eligible: replacement.is_some() || superseding,
+                    room: false,
+                    unread: false,
+                    unproven: false,
+                    looks: 0,
+                    doubts: 0,
+                    latched: app.auto_apply_manual_only.is_some() || superseding,
+                    pending,
+                    day: false,
+                    owed: false,
+                    newer,
+                    newer_spent: replacement
+                        .is_some_and(|replacement| replacement.newer_spent >= 12)
+                        || superseding
+                        || superseded,
+                    said: refused,
+                    escaped: false,
+                    superseding,
+                    superseded,
+                    refused,
+                    backoff: replacement
+                        .is_some_and(|replacement| replacement.newer_retry.is_some()),
+                    booted_old: false,
+                },
+            )
+        };
+        let physical = model.successors("PhysicalLatch", &model.init_state())[0].clone();
+        assert_eq!(observe(&app, false, true, false), physical);
+        let mut before = if unavailable {
+            physical.clone()
+        } else {
+            let _ = app.reconcile_native_update_facts(observation(
+                2,
+                Some(installed.clone()),
+                None,
+                false,
+            ));
+            let before = observe(&app, false, false, false);
+            assert_exact_model_action(&model, "Decide", &physical, &before);
+            before
+        };
+        if withdrawn {
+            app.block_native_auto_apply_environment(
+                11,
+                crate::app_native::decode_dmg_sha256(&activation).unwrap(),
+                EnvironmentBlockCause::InstalledSource,
+            );
+            let withdrawn = observe(&app, false, true, false);
+            assert_exact_model_action(&model, "WithdrawEligibility", &before, &withdrawn);
+            before = withdrawn;
+        } else if !unavailable {
+            let latch = app.auto_apply_manual_only.unwrap();
+            app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+                retry_at: Some(past()),
+                ..latch
+            });
+            let paused = app.auto_apply_manual_only;
+            app.config.update = Some(crate::app_config::UpdateConfig {
+                auto_apply: Some(false),
+                ..crate::app_config::UpdateConfig::default()
+            });
+            let _ = app.reconcile_native_update_facts(observation(
+                3,
+                Some(installed.clone()),
+                Some(12),
+                false,
+            ));
+            assert!(app.native_activation_supersede.is_none());
+            assert!(!app.lapse_expired_auto_apply_manual_only());
+            assert_eq!(app.auto_apply_manual_only, paused);
+            assert_eq!(app.auto_apply_physical_retry, budget);
+            assert_eq!(app.activation_replacement_retry_at(), None);
+            assert!(!app.native_auto_apply_enabled());
+            app.config.update.as_mut().unwrap().auto_apply = Some(true);
+        }
+        // Deliver the already-paid newer hint to the current failure latch.
+        let arrived = model.successors("NewerArrives", &before)[0].clone();
+        let decided = if unavailable {
+            assert_eq!(app.native_verified_download_on_disk, 12);
+            let latch = app.auto_apply_manual_only.unwrap();
+            let preflight = match app.native_updater_service.begin_apply_preflight() {
+                ApplyPreflightStart::Inspect(ticket) => ticket,
+                other => panic!("the existing updater must own the admission: {other:?}"),
+            };
+            let command = match app
+                .native_updater_service
+                .finish_apply_preflight(preflight, ClosePreflight::Ready)
+            {
+                ApplyDecision::Execute(command) => command,
+                other => panic!("the real preflight must mint its apply owner: {other:?}"),
+            };
+            let now = std::time::Instant::now();
+            assert!(!app.look_at_activation_latch(now, Some(12)));
+            // The deadline owns reconsideration debt; no retire worker started.
+            let held = observe(&app, true, true, false);
+            assert_exact_model_action(&model, "RetireUnavailable", &arrived, &held);
+            let unpaced = buggy.successors("RetireUnavailable", &arrived)[0].clone();
+            assert!(!buggy.check_invariant("ANewerReleaseClearsTheLatch", &unpaced));
+            let replacement = app.auto_apply_manual_only.unwrap().replacement.unwrap();
+            let retry = replacement
+                .newer_retry
+                .expect("a nonstart retains its first retry");
+            assert!(retry.at > now);
+            assert_eq!(
+                (replacement.newer_spent, replacement.newer_refusals),
+                (0, 0)
+            );
+            assert_eq!(app.auto_apply_manual_only.unwrap().retry_at, latch.retry_at);
+            assert_eq!(app.activation_replacement_retry_at(), Some(retry.at));
+            assert!(app.native_updater_service.abort_apply(
+                &command.attempt(),
+                "the admission owner ended without dispatch"
+            ));
+            drop(command);
+            let paused = app.auto_apply_manual_only;
+            assert!(!app.look_at_activation_latch(now, Some(12)));
+            let waiting = observe(&app, true, false, false);
+            assert_exact_model_action(&model, "Decide", &held, &waiting);
+            for before_due in [now, retry.at - std::time::Duration::from_nanos(1)] {
+                assert!(!app.look_at_activation_latch(before_due, Some(12)));
+                assert!(app.native_activation_supersede.is_none());
+                assert_eq!(
+                    app.auto_apply_manual_only, paused,
+                    "event turns do not slide the retry"
+                );
+                assert_eq!(app.auto_apply_physical_retry, budget);
+                assert_eq!(observe(&app, true, false, false), waiting);
+            }
+            assert!(!app.look_at_activation_latch(retry.at, Some(12)));
+            let due = model.successors("RetryDue", &waiting)[0].clone();
+            let decided = observe(&app, true, false, false);
+            assert_exact_model_action(&model, "Decide", &due, &decided);
+            assert_eq!(app.auto_apply_physical_retry, budget);
+            decided
+        } else {
+            let _ = app.reconcile_native_update_facts(observation(
+                4,
+                Some(installed.clone()),
+                Some(12),
+                false,
+            ));
+            let decided = observe(&app, true, false, false);
+            assert_exact_model_action(&model, "Decide", &arrived, &decided);
+            decided
+        };
+        if withdrawn {
+            assert!(app.native_activation_supersede.is_none());
+            assert_eq!(app.auto_apply_physical_retry, budget);
+            let unbacked = buggy.successors("Decide", &arrived)[0].clone();
+            assert!(!buggy.check_invariant("IneligibleLatchNeverStartsRetire", &unbacked));
+            continue;
+        }
+        let latch = app.auto_apply_manual_only.unwrap();
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            retry_at: Some(past()),
+            ..latch
+        });
+        assert!(!app.lapse_expired_auto_apply_manual_only());
+        assert!(app.auto_apply_manual_only.unwrap().retry_at.unwrap() > std::time::Instant::now());
+        let job = app
+            .native_activation_supersede
+            .clone()
+            .expect("the new release owns the retire");
+        app.finish_activation_supersede(ActivationSupersedeCompletion {
+            job,
+            outcome: Err(aterm_update::SupersedeRefusal::ForNow(
+                "apply lock: busy".to_string(),
+            )),
+            facts: Some(observation(5, Some(installed.clone()), Some(12), false)),
+        });
+        let refused = model.successors("SupersedeRefused", &decided)[0].clone();
+        let waiting = observe(&app, true, false, true);
+        assert_exact_model_action(&model, "Decide", &refused, &waiting);
+        let latch = app.auto_apply_manual_only.unwrap();
+        app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            retry_at: Some(past()),
+            ..latch
+        });
+        assert!(!app.lapse_expired_auto_apply_manual_only());
+        assert_eq!(observe(&app, true, false, true), waiting);
+        let replacement = app
+            .auto_apply_manual_only
+            .as_mut()
+            .unwrap()
+            .replacement
+            .as_mut()
+            .unwrap();
+        replacement.newer_retry.as_mut().unwrap().at = past();
+        assert!(!app.lapse_expired_auto_apply_manual_only());
+        let retried = observe(&app, true, false, true);
+        let due = model.successors("RetryDue", &waiting)[0].clone();
+        assert_exact_model_action(&model, "Decide", &due, &retried);
+        let job = app
+            .native_activation_supersede
+            .clone()
+            .expect("the refused offer is retained");
+        let _ = app.reconcile_native_update_facts(observation(
+            6,
+            Some(installed_bundle(10, 0)),
+            Some(13),
+            false,
+        ));
+        assert_eq!(
+            observe(&app, true, false, true),
+            retried,
+            "new disk selection does not release the still-owned retirement"
+        );
+        for mode in [
+            crate::native_updater_service::ApplyMode::Immediate,
+            crate::native_updater_service::ApplyMode::AutomaticPastGrace,
+        ] {
+            assert!(matches!(
+                app.apply_native_update(mode),
+                crate::native_app::UpdateOutcome::Deferred { .. }
+            ));
+        }
+        app.next_native_update_reconcile_sequence = 7;
+        app.finish_activation_supersede(ActivationSupersedeCompletion {
+            job,
+            outcome: Ok(aterm_update::SupersededActivation {
+                activation_build: 11,
+                restored_build: 10,
+                newer_build: 12,
+                trial_launches: 0,
+                trial_disarm_deferred: None,
+            }),
+            facts: None,
+        });
+        assert_eq!(
+            observe(&app, true, false, true),
+            retried,
+            "acceptance without post-completion disk facts is a model stutter"
+        );
+        let _ = app.reconcile_native_update_facts(observation(
+            7,
+            Some(installed_bundle(10, 0)),
+            Some(13),
+            false,
+        ));
+        let landed = observe(&app, true, false, true);
+        assert_exact_model_action(&model, "Supersede", &retried, &landed);
+        assert_eq!(app.auto_apply_physical_retry, budget);
+    }
+
     for room in [true, false] {
         for lands in [true, false] {
             let launches = if room {
@@ -1678,34 +1979,49 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                     let verdict = app
                         .auto_apply_structural_verdict
                         .expect("the converged lane stands on a structural verdict");
+                    let replacement = app
+                        .auto_apply_manual_only
+                        .map_or(Some(verdict.replacement_history), |latch| latch.replacement);
+                    let superseding = app.native_activation_supersede.is_some();
                     let superseded = app
                         .native_updater_service
                         .snapshot()
                         .staged
                         .as_ref()
-                        .is_some_and(|stage| stage.build == 12 && !stage.is_installed_activation());
+                        .is_some_and(|stage| stage.build == 12 && !stage.is_installed_activation())
+                        && !superseding;
                     project_structural_latch(
                         &model,
                         StructuralLatchObservation {
+                            structural: true,
+                            eligible: app
+                                .auto_apply_manual_only
+                                .is_some_and(|latch| latch.replacement.is_some())
+                                || superseding,
                             room,
                             unread: false,
                             unproven: app.native_installed_trial_unproven,
                             looks: verdict.unmeasured_looks,
                             doubts: verdict.unproven_looks,
-                            latched: app.auto_apply_manual_only.is_some(),
+                            latched: app.auto_apply_manual_only.is_some() || superseding,
                             pending: false,
                             day,
                             owed: verdict.resample_at.is_some(),
                             newer,
-                            newer_spent: verdict.newer_spent >= 12,
+                            newer_spent: replacement
+                                .is_some_and(|replacement| replacement.newer_spent >= 12)
+                                || superseding
+                                || superseded,
                             said: (!room && app.auto_apply_stranded_announced == Some((11, false)))
                                 || refused,
                             escaped,
-                            superseding: app.native_activation_supersede.is_some(),
+                            superseding,
                             superseded,
                             refused,
-                            backoff: verdict.newer_retry.is_some_and(|retry| {
-                                retry.newer == 12 && std::time::Instant::now() < retry.at
+                            backoff: replacement.is_some_and(|replacement| {
+                                replacement.newer_retry.is_some_and(|retry| {
+                                    retry.newer == 12 && std::time::Instant::now() < retry.at
+                                })
                             }),
                             booted_old: false,
                         },
@@ -1872,7 +2188,7 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
                 );
                 assert_eq!(
                     app.auto_apply_manual_only.and_then(|latch| latch.retry_at),
-                    app.structural_supersede_retry_at(),
+                    app.activation_replacement_retry_at(),
                     "{arc}: the day's deadline moves to the retry's, so the fold does not spin"
                 );
             } else {
@@ -1884,14 +2200,15 @@ fn real_structural_latch_arc_is_the_model_s_arc() {
             assert_eq!(outranked, dawn_look);
 
             let due = model.successors("RetryDue", &outranked)[0].clone();
-            let verdict = app.auto_apply_structural_verdict.expect("the verdict");
-            let retry = verdict.newer_retry.expect("{arc}: a retry waits");
-            app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
-                newer_retry: Some(crate::SupersedeRetry {
-                    at: std::time::Instant::now() - std::time::Duration::from_secs(1),
-                    ..retry
-                }),
-                ..verdict
+            let replacement = app
+                .auto_apply_manual_only
+                .as_mut()
+                .and_then(|latch| latch.replacement.as_mut())
+                .expect("known failure custody");
+            let retry = replacement.newer_retry.expect("{arc}: a retry waits");
+            replacement.newer_retry = Some(crate::SupersedeRetry {
+                at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+                ..retry
             });
             assert!(!app.lapse_expired_auto_apply_manual_only());
             let retried = observe(&app, true, true, false, true);

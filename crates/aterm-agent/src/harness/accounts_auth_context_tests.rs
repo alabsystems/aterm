@@ -113,6 +113,7 @@ fn explicit_same_time_auth_is_checked_against_the_final_roster_before_pin_effect
                 NOW,
                 &mut None,
                 SyncTarget {
+                    fleet: None,
                     path: &roster_path,
                     before: Some(&before),
                     after: Some(&after),

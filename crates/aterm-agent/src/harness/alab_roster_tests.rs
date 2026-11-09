@@ -8,6 +8,7 @@ use super::*;
 use crate::ai::connector::Region;
 use crate::harness::accounts::Auth;
 use crate::harness::accounts::rename_tests::{NOW, seed_reference};
+use crate::harness::alab_roster::test_machine;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -52,8 +53,138 @@ fn account(local: &str, cli: Cli, label: &str, preferred: &[(&str, Option<u64>)]
         joinable: true,
         preferred: preferred
             .iter()
-            .map(|(machine, rank)| ((*machine).to_owned(), *rank))
+            .map(|(machine, rank)| (test_machine(machine), *rank))
             .collect(),
+    }
+}
+
+#[test]
+fn registry_keys_survive_label_collisions_and_missing_labels_across_roster_operations() {
+    let me = MachineRef::from_registry("pk-m3", Some("m3".into()));
+    let other = MachineRef::from_registry("PK_m4", Some("m3".into()));
+    let mut account = account("one", Cli::Claude, "claude-one", &[]);
+    account.preferred.push((other.clone(), Some(9)));
+    let mut lab = Lab {
+        me: Some(me.clone()),
+        accounts: vec![account],
+        ..Lab::default()
+    };
+    let existing = Roster {
+        rows: vec![Row {
+            label: "claude-one".into(),
+            email: Some(email("one")),
+            class: Class::Preferred,
+            ..Row::default()
+        }],
+    };
+    assert_eq!(lab.class_of(&lab.accounts[0]), Class::Pool);
+    assert!(
+        fleet_for(&lab, Cli::Claude, None)
+            .unwrap()
+            .accounts
+            .is_empty()
+    );
+    let kept = retain(
+        Roster::default(),
+        &existing,
+        Some(&lab),
+        Cli::Claude,
+        &me.key,
+    );
+    assert_eq!(kept.rows[0].class, Class::Pool);
+    assert_eq!(
+        holdings(&lab, Cli::Claude, &existing),
+        [(lab.accounts[0].pk.clone(), "borrow")]
+    );
+    let digest = with_lab(lab.clone(), || fleet_digest(Cli::Claude).unwrap());
+    let mut rebound = lab.clone();
+    rebound.me = Some(other);
+    assert_ne!(
+        with_lab(rebound, || fleet_digest(Cli::Claude).unwrap()),
+        digest
+    );
+
+    lab.accounts[0].preferred[0].0 = me.clone();
+    assert_ne!(
+        with_lab(lab.clone(), || fleet_digest(Cli::Claude).unwrap()),
+        digest
+    );
+    for label in [None, Some("m3".to_owned()), Some("m99".to_owned())] {
+        lab.me.as_mut().unwrap().label = label;
+        assert_eq!(lab.class_of(&lab.accounts[0]), Class::Preferred);
+        assert_eq!(lab.accounts[0].preferred_on(&me.key), Some(Some(9)));
+        let fleet = fleet_for(&lab, Cli::Claude, None).unwrap();
+        assert_eq!(fleet.accounts_for_machine(me.key.as_str()).len(), 1);
+        assert!(fleet.accounts_for_machine("m3").is_empty());
+        assert!(holdings(&lab, Cli::Claude, &existing).is_empty());
+        let kept = retain(
+            Roster::default(),
+            &existing,
+            Some(&lab),
+            Cli::Claude,
+            &me.key,
+        );
+        assert_eq!(kept.rows[0].class, Class::Preferred);
+        with_lab(lab.clone(), || {
+            assert!(names_this_mac());
+            assert!(chosen(Cli::Claude, None, None, None).unwrap().is_some());
+        });
+    }
+}
+
+#[test]
+fn native_selector_and_composition_preserve_preference_rank_with_opaque_keys() {
+    for key in ["pk-m3", "PK_m4"] {
+        let me = MachineRef::from_registry(key, Some("m3".into()));
+        let ranked = |local: &str, rank: Option<u64>| {
+            let mut row = account(local, Cli::Claude, local, &[]);
+            row.preferred.push((me.clone(), rank));
+            row
+        };
+        let lab = Lab {
+            me: Some(me.clone()),
+            accounts: vec![
+                ranked("alpha", Some(9)),
+                ranked("zeta", Some(1)),
+                ranked("middle", None),
+            ],
+            ..Lab::default()
+        };
+        let fleet = fleet_for(&lab, Cli::Claude, None).unwrap();
+        let labels: Vec<_> = fleet
+            .accounts_for_machine(key)
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert_eq!(labels, ["zeta", "alpha", "middle"]);
+        assert!(fleet.accounts_for_machine("m3").is_empty());
+        let root = aterm_tempfile::TempDir::new().unwrap();
+        let store = Store::at(root.path());
+        let built = accounts_sync::build_machine_roster(&fleet, key, &store, None, None);
+        assert_eq!(
+            built
+                .rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            labels
+        );
+        let mut reversed = built.clone();
+        reversed.rows.reverse();
+        let kept = retain(
+            reversed,
+            &Roster::default(),
+            Some(&lab),
+            Cli::Claude,
+            &me.key,
+        );
+        assert_eq!(
+            kept.rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            labels
+        );
     }
 }
 
@@ -92,7 +223,7 @@ fn a_bound_registry_name_snapshot_keeps_its_exact_value_over_pending_state() {
         )),
     };
     let lab = Lab {
-        me: Some("m86".to_owned()),
+        me: Some(test_machine("m86")),
         machine_name: Some(Ok(name.clone())),
         ..Lab::default()
     };
@@ -121,12 +252,18 @@ fn a_bound_name_conflict_stays_bound_without_a_display_label() {
         machine_name: Some(Err(why.clone())),
         ..Lab::default()
     };
+    let mut keyed = lab.clone();
+    keyed.me = Some(test_machine("m86"));
     with_lab(lab, || {
         assert!(
             names_this_mac(),
             "a missing label does not erase its facts binding"
         );
         assert_eq!(machine_name(), RegistryNameRead::Bound(Err(why.clone())));
+        assert!(
+            chosen(Cli::Claude, None, None, None).is_err(),
+            "a binding without a usable key cannot authorize legacy discovery"
+        );
         while_pending(|| {
             assert_eq!(
                 machine_name(),
@@ -134,6 +271,12 @@ fn a_bound_name_conflict_stays_bound_without_a_display_label() {
                 "a bound conflict must not become an apparently unbound machine"
             );
         });
+    });
+    with_lab(keyed, || {
+        assert!(
+            matches!(chosen(Cli::Claude, None, None, None), Ok(Some(_))),
+            "a conflicted display name must not disable a usable stable machine key"
+        );
     });
 }
 
@@ -170,7 +313,7 @@ fn the_lab_fleet_adds_this_macs_preferred_accounts_in_rank_order() {
     let mut paused = account("dee", Cli::Claude, "claude-dddddd", &[("m22", Some(1))]);
     paused.joinable = false;
     let lab = Lab {
-        me: Some("m22".into()),
+        me: Some(test_machine("m22")),
         settled: false,
         accounts: vec![
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", None)]),
@@ -202,8 +345,13 @@ fn the_lab_fleet_adds_this_macs_preferred_accounts_in_rank_order() {
     let fleet = fleet_for(&lab, Cli::Claude, Some(&existing)).unwrap();
     let labels: Vec<&str> = fleet.accounts.iter().map(|a| a.label.as_str()).collect();
     assert_eq!(labels, ["claude-cccccc", "m22-2", "claude-aaaaaa"]);
-    assert!(fleet.accounts.iter().all(|a| a.machines == ["m22"]));
-    assert_eq!(fleet.alab.as_deref(), Some("m22"));
+    assert!(
+        fleet
+            .accounts
+            .iter()
+            .all(|a| a.machines == [test_machine("m22").key.as_str()])
+    );
+    assert_eq!(fleet.alab.as_ref(), Some(&test_machine("m22")));
     let kimi = fleet_for(&lab, Cli::Kimi, None).unwrap();
     assert_eq!(kimi.accounts.len(), 1);
     assert_eq!(kimi.accounts[0].vendor.region, Some(Region::Global));
@@ -222,7 +370,7 @@ fn the_lab_fleet_adds_this_macs_preferred_accounts_in_rank_order() {
 #[test]
 fn a_preference_never_drops_a_row() {
     let lab = Lab {
-        me: Some("m22".into()),
+        me: Some(test_machine("m22")),
         settled: true,
         accounts: vec![
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(1))]),
@@ -251,7 +399,13 @@ fn a_preference_never_drops_a_row() {
     let rebuilt = Roster {
         rows: vec![row("claude-aaaaaa", None, "ann", Cli::Claude)],
     };
-    let roster = retain(rebuilt, &existing, Some(&lab), Cli::Claude, "m22");
+    let roster = retain(
+        rebuilt,
+        &existing,
+        Some(&lab),
+        Cli::Claude,
+        &test_machine("m22").key,
+    );
     let got: Vec<(&str, Class, Option<&str>)> = roster
         .rows
         .iter()
@@ -349,7 +503,7 @@ impl Home {
     /// label), but `kept`'s account, which the lab does not know.
     fn lab(&self, settled: bool) -> Lab {
         Lab {
-            me: Some("m22".into()),
+            me: Some(test_machine("m22")),
             settled,
             accounts: vec![
                 legacy(
@@ -570,7 +724,7 @@ fn a_rename_waits_where_its_secrets_or_records_would_not_follow() {
 #[test]
 fn a_label_another_account_holds_stays_with_its_row() {
     let lab = Lab {
-        me: Some("m22".into()),
+        me: Some(test_machine("m22")),
         settled: false,
         accounts: vec![
             account("gil", Cli::Claude, "work", &[("m22", Some(1))]),
@@ -601,7 +755,13 @@ fn a_label_another_account_holds_stays_with_its_row() {
             Cli::Claude,
         )],
     };
-    let roster = retain(rebuilt, &existing, Some(&lab), Cli::Claude, "m22");
+    let roster = retain(
+        rebuilt,
+        &existing,
+        Some(&lab),
+        Cli::Claude,
+        &test_machine("m22").key,
+    );
     assert_eq!(roster.rows.len(), 1);
     let kept = roster.row("work").unwrap();
     assert_eq!(kept.email, Some(email("ann")));
@@ -625,7 +785,7 @@ fn a_source_the_owner_set_wins_over_the_lab() {
     let plain = dir.path().join("plain.toml");
     fs::write(&plain, "").unwrap();
     let lab = Lab {
-        me: Some("m22".into()),
+        me: Some(test_machine("m22")),
         settled: false,
         accounts: vec![
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(1))]),
@@ -743,8 +903,20 @@ fn preference_sync(lab: &Lab, existing: &Roster) -> Roster {
     let root = aterm_tempfile::TempDir::new().unwrap();
     let store = Store::at(&root.path().join("state"));
     let fleet = fleet_for(lab, Cli::Claude, Some(existing)).expect("the lab names m1");
-    let built = accounts_sync::build_machine_roster(&fleet, "m1", &store, Some(existing), None);
-    retain(built, existing, Some(lab), Cli::Claude, "m1")
+    let built = accounts_sync::build_machine_roster(
+        &fleet,
+        test_machine("m1").key.as_str(),
+        &store,
+        Some(existing),
+        None,
+    );
+    retain(
+        built,
+        existing,
+        Some(lab),
+        Cli::Claude,
+        &test_machine("m1").key,
+    )
 }
 
 /// The lab and roster an area-5 `state` stands for: account `x` (`example.test`), preferred on
@@ -755,7 +927,7 @@ fn preference_bed(state: &aterm_spec::interp::State) -> (Lab, Roster) {
     let mut x = account("x", Cli::Claude, "claude-xxxxxx", &[(on, Some(1))]);
     x.joinable = state["joinable"] == 1;
     let lab = Lab {
-        me: Some("m1".into()),
+        me: Some(test_machine("m1")),
         settled: false,
         accounts: vec![x],
         aliases: BTreeMap::new(),
@@ -868,8 +1040,13 @@ fn a_sync_takes_the_preference_models_steps() {
     let root = aterm_tempfile::TempDir::new().unwrap();
     let store = Store::at(&root.path().join("state"));
     let fleet = fleet_for(&lab, Cli::Claude, Some(&existing)).unwrap();
-    let unretained =
-        accounts_sync::build_machine_roster(&fleet, "m1", &store, Some(&existing), None);
+    let unretained = accounts_sync::build_machine_roster(
+        &fleet,
+        test_machine("m1").key.as_str(),
+        &store,
+        Some(&existing),
+        None,
+    );
     let next = preference_project(held, &unretained);
     assert_eq!(next["limited"], 1);
     assert!(!model.successors("Sync", held).contains(&next));
@@ -900,7 +1077,7 @@ fn an_account_asked_for_by_name_joins_with_no_preference() {
     let mut paused = account("carol", Cli::Claude, "claude-cccccc", &[("m20", Some(1))]);
     paused.joinable = false;
     let lab = Lab {
-        me: Some("m1".into()),
+        me: Some(test_machine("m1")),
         settled: false,
         accounts: vec![
             legacy(
@@ -979,7 +1156,7 @@ fn an_empty_lab_roster_stays_empty_and_keeps_every_row() {
     let plain = dir.path().join("plain.toml");
     fs::write(&plain, "").unwrap();
     let lab = Lab {
-        me: Some("m1".into()),
+        me: Some(test_machine("m1")),
         settled: true,
         accounts: vec![account(
             "ann",
@@ -998,7 +1175,7 @@ fn an_empty_lab_roster_stays_empty_and_keeps_every_row() {
             .unwrap()
             .expect("the lab is the source");
         assert!(fleet.accounts.is_empty());
-        assert_eq!(fleet.alab.as_deref(), Some("m1"));
+        assert_eq!(fleet.alab.as_ref(), Some(&test_machine("m1")));
     });
     let existing = Roster {
         rows: vec![
@@ -1038,7 +1215,7 @@ fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
     };
     let ann = account("ann", Cli::Claude, "claude-aaaaaa", &[("m1", Some(1))]);
     let lab = Lab {
-        me: Some("m1".into()),
+        me: Some(test_machine("m1")),
         settled: true,
         accounts: vec![
             ann.clone(),
@@ -1080,7 +1257,9 @@ fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
         );
     });
     let mut moved = lab.clone();
-    moved.accounts[1].preferred.push(("m1".into(), Some(2)));
+    moved.accounts[1]
+        .preferred
+        .push((test_machine("m1"), Some(2)));
     with_lab(moved, || {
         assert!(
             sync_due(Cli::Claude, &path, |_| false),
@@ -1132,7 +1311,7 @@ fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
 #[test]
 fn the_mailbox_labels_are_the_labs() {
     let lab = Lab {
-        me: Some("m16".into()),
+        me: Some(test_machine("m16")),
         accounts: vec![legacy(
             account("eve", Cli::Kimi, "kimi-eeeeee", &[]),
             "kimi-m16",
@@ -1201,7 +1380,7 @@ fn holdings_report_each_unpreferred_account_with_its_reason() {
         ..keyed("cy", &[])
     };
     let lab = Lab {
-        me: Some("m22".into()),
+        me: Some(test_machine("m22")),
         accounts: vec![
             keyed("ann", &[("m22", Some(1))]),
             keyed("bob", &[("m3", Some(1))]),

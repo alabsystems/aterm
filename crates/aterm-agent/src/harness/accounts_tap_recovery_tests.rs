@@ -77,6 +77,7 @@ fn exercise(cli: Cli, reader: i64, fault: i64, shape: i64) -> [bool; 4] {
         NOW,
         &mut None,
         SyncTarget {
+            fleet: None,
             path: &path,
             before: Some(&raw_before),
             after: Some(&after),

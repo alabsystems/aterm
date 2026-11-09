@@ -5,6 +5,10 @@
 
 #![cfg_attr(all(unix, trust_verify), feature(register_tool))]
 #![cfg_attr(all(unix, trust_verify), register_tool(trust))]
+#![cfg_attr(
+    all(unix, anchor_rules, any(test, debug_assertions)),
+    feature(macro_attr)
+)]
 
 use std::ffi::OsString;
 use std::ops::ControlFlow;

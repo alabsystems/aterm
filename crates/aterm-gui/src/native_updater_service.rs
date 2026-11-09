@@ -189,7 +189,12 @@ pub(crate) struct InstalledUpdate {
 
 impl InstalledUpdate {
     #[must_use]
-    fn proves_artifact(&self, build: u64, commit: Option<&str>, dmg_sha256: &str) -> bool {
+    pub(super) fn proves_artifact(
+        &self,
+        build: u64,
+        commit: Option<&str>,
+        dmg_sha256: &str,
+    ) -> bool {
         self.build == build
             && commit.is_some_and(|commit| aterm_update::commit_matches(&self.commit, commit))
             && self.receipt_build == Some(build)

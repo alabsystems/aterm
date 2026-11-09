@@ -1758,6 +1758,7 @@ pub(crate) mod tests {
         );
         let build = stage_one_build(&mut app);
         let latch = |build: u64, retry_at: Option<std::time::Instant>| crate::AutoApplyManualOnly {
+            replacement: None,
             build,
             dmg_sha256: [0xab; 32],
             activation: false,
@@ -1948,6 +1949,7 @@ pub(crate) mod tests {
         assert_eq!(staged_record(&app), staged_detail(headless));
 
         let latch = |retry_at| crate::AutoApplyManualOnly {
+            replacement: None,
             build,
             dmg_sha256: [0xab; 32],
             activation: false,
@@ -2208,6 +2210,7 @@ pub(crate) mod tests {
             held: crate::native_update_lane_hold::NamedHold::default(),
         });
         app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            replacement: None,
             build,
             dmg_sha256: [0xcd; 32],
             activation: false,
@@ -2247,6 +2250,7 @@ pub(crate) mod tests {
             assert!(!app.automatic_apply_retry_scheduled(build + 1));
             app.auto_apply_intent = None;
             app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+                replacement: None,
                 build,
                 dmg_sha256: digest,
                 activation: false,
@@ -2263,6 +2267,7 @@ pub(crate) mod tests {
             );
         }
         app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            replacement: None,
             build,
             dmg_sha256: [0xab; 32],
             activation: false,
@@ -2322,6 +2327,7 @@ pub(crate) mod tests {
 
         app.auto_apply_intent = None;
         let lapsing = crate::AutoApplyManualOnly {
+            replacement: None,
             build,
             dmg_sha256: [0xab; 32],
             activation: false,
@@ -2347,6 +2353,7 @@ pub(crate) mod tests {
         app.auto_apply_physical_retry = None;
 
         app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            replacement: None,
             build,
             dmg_sha256: [0xab; 32],
             activation: false,

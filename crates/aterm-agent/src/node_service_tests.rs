@@ -308,6 +308,12 @@ fn alab_tcp_txt_carries_only_four_anonymous_fields_and_info_plist_lists_service(
     );
 }
 
+/// A member advertises on every network it has a route on, while its vault heard it within a
+/// day of its clock: an unread clock, or a word dated after it, gives no age and no advert.
+///
+/// NEGATIVE CONTROL (2026-11-09): with the age judged as before
+/// (`now_secs.unwrap_or(0).saturating_sub(heard)`), the unread clock advertises (`a clock it
+/// cannot read gives no age`).
 #[test]
 fn alab_tcp_is_advertised_on_every_network_a_member_is_on() {
     let tmp = aterm_tempfile::tempdir().unwrap();
@@ -329,32 +335,157 @@ fn alab_tcp_is_advertised_on_every_network_a_member_is_on() {
     let heard = Some(now - 60);
     for routes in [&office_routes, &cafe_routes] {
         assert!(
-            advertises(true, routes, heard, now),
+            advertises(true, routes, heard, Some(now)),
             "a member advertises on {routes:?}: no network is special"
         );
     }
-    assert!(!advertises(true, &[], heard, now), "offline");
-    assert!(!advertises(false, &office_routes, heard, now), "swarm off");
+    assert!(!advertises(true, &[], heard, Some(now)), "offline");
     assert!(
-        !advertises(true, &office_routes, None, now),
+        !advertises(false, &office_routes, heard, Some(now)),
+        "swarm off"
+    );
+    assert!(
+        !advertises(true, &office_routes, None, Some(now)),
         "no ALab vault member"
+    );
+    assert!(
+        !advertises(true, &office_routes, heard, None),
+        "a clock it cannot read gives no age"
+    );
+    assert!(
+        !advertises(true, &office_routes, Some(now + 1), Some(now)),
+        "a word dated after its clock gives no age"
+    );
+    assert!(
+        advertises(
+            true,
+            &office_routes,
+            Some(now - ALAB_MEMBER_TTL_SECS),
+            Some(now)
+        ),
+        "its vault heard a day ago to the second"
     );
     assert!(
         !advertises(
             true,
             &office_routes,
             Some(now - ALAB_MEMBER_TTL_SECS - 1),
-            now
+            Some(now)
         ),
         "its vault unheard a day"
     );
     for paths in [&unconfigured, &foreign_paths] {
         assert!(
-            !should_advertise_alab_tcp_with(paths, None, &cafe_routes, now).0,
+            !should_advertise_alab_tcp_with(paths, None, &cafe_routes, Some(now)),
             "{}: no ALab vault, no advert",
             paths.home.display()
         );
     }
+}
+
+/// The node's LAN responder asks [`lan_responder_allowed`] at each refresh and before each answer
+/// it sends, and its advert asks [`should_advertise_alab_tcp_with`] at each watch tick, both many
+/// times a minute, while the vault's word on this Mac is read again only when one of its files
+/// moved (`aterm_secrets::client::swarm_member_heard_now`). Each removal and turn-off still ends
+/// the answers at the next ask: a roster that denies this Mac, the node turned off, the fleet
+/// left, another node key. What the vault's word keeps is when it last heard this Mac, judged at
+/// each ask, so a Mac its vault last heard a day ago to the second answers, and one second later
+/// it does not, with no file moved between; with a clock it cannot read it does not answer.
+///
+/// NEGATIVE CONTROLS (2026-11-09): with the vault's memo stamping none of the files it reads
+/// (`Memo::keyed(|_| Some(Vec::new()), true)` in `swarm_member_heard_now`), the roster that
+/// denies `m1` leaves the responder answering (`a roster that denies this Mac`); with the age
+/// judged as before (`now_secs.unwrap_or(0).saturating_sub(heard)` in `advertises`), it answers
+/// with a clock it cannot read (`a clock it cannot read`).
+#[cfg(unix)]
+#[test]
+fn the_lan_responder_stops_at_the_next_ask_after_a_removal_or_turn_off() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let paths = aterm_secrets::client::Paths::for_home(&tmp.path().join("home"));
+    let source = tmp.path().join("fixture.vault");
+    aterm_secrets::client::create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+    aterm_secrets::client::test_alab_standing(&paths);
+    let state = tmp.path().join("state");
+    aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+    let key = aterm_net::fleet_member::node_identity(&state)
+        .unwrap()
+        .key();
+    // When the vault last heard this Mac: a publish that crosses a second moves it.
+    let heard_now = || match aterm_secrets::client::status(&paths).unwrap().membership {
+        aterm_secrets::client::Membership::In { heard, .. } => heard,
+        other => panic!("the vault's creator is in it: {other:?}"),
+    };
+    let heard = heard_now();
+    let routes = vec!["192.0.2.7".to_owned()];
+    let answers =
+        |now: u64| lan_responder_allowed(Some(&state), key, (&paths, None), &routes, Some(now));
+    let roster = |toml: &str| {
+        let admin = aterm_secrets::client::admin_open(&paths).unwrap();
+        let mut doc = admin.doc.clone();
+        doc.set_entry(
+            &aterm_secrets::text::Audience::Everyone,
+            aterm_secrets::SWARM_ROSTER_ENTRY,
+            toml.as_bytes(),
+        )
+        .unwrap();
+        aterm_secrets::client::admin_publish(&paths, &admin, &doc).unwrap();
+    };
+    assert!(answers(heard), "an ALab member answers");
+    assert!(
+        !lan_responder_allowed(Some(&state), key, (&paths, None), &[], Some(heard)),
+        "offline"
+    );
+
+    assert!(
+        answers(heard + ALAB_MEMBER_TTL_SECS),
+        "a day heard to the second"
+    );
+    assert!(
+        !lan_responder_allowed(Some(&state), key, (&paths, None), &routes, None),
+        "a clock it cannot read"
+    );
+    assert!(!answers(heard - 1), "a word dated after its clock");
+    assert!(
+        !answers(heard + ALAB_MEMBER_TTL_SECS + 1),
+        "a day and a second unheard"
+    );
+    assert!(
+        !should_advertise_alab_tcp_with(
+            &paths,
+            None,
+            &routes,
+            Some(heard + ALAB_MEMBER_TTL_SECS + 1)
+        ),
+        "its advert too"
+    );
+
+    roster("deny_labels = [\"m1\"]\n");
+    assert!(!answers(heard_now()), "a roster that denies this Mac");
+    roster("deny_labels = [\"m99\"]\n");
+    let heard = heard_now();
+    assert!(answers(heard), "a roster that denies another");
+
+    let off = off_path(&state);
+    std::fs::write(&off, b"").unwrap();
+    assert!(!answers(heard), "the node turned off");
+    std::fs::remove_file(&off).unwrap();
+    assert!(answers(heard), "the node turned on");
+
+    let left = state.join(aterm_net::fleet_member::OFF_FILE);
+    std::fs::write(&left, b"").unwrap();
+    assert!(!answers(heard), "the fleet left");
+    std::fs::remove_file(&left).unwrap();
+    assert!(answers(heard), "a member again");
+
+    let other = aterm_net::fleet::NodeKey::from_bytes([9; 32]);
+    assert!(
+        !lan_responder_allowed(Some(&state), other, (&paths, None), &routes, Some(heard)),
+        "another node key"
+    );
+    assert!(
+        !lan_responder_allowed(None, key, (&paths, None), &routes, Some(heard)),
+        "no state folder"
+    );
 }
 
 #[test]

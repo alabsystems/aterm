@@ -1323,8 +1323,8 @@ pub struct NodeServeConfig {
     pub tick_every: Duration,
     /// Maximum wait for a woken window's `wf-<pid>.sock` relay on windowless `spawn`.
     pub wake_timeout: Duration,
-    /// Shutdown flag cleared/set by callers or tests to stop the node job cleanly.
-    pub stop: Arc<AtomicBool>,
+    /// The node job's stop, set by its updater or a test to end the run cleanly.
+    pub stop: Arc<NodeStop>,
     /// Window launcher seam for windowless `Drive` `spawn` (§7.4).
     pub launcher: Arc<dyn WindowLauncher>,
     /// Why this job cannot use the local network now, in the LAN broker's words
@@ -1564,8 +1564,8 @@ impl NodeUpdates {
         self.updater.trial_pending()
     }
 
-    fn confirm_checkpoint(&self, stop: &AtomicBool) {
-        if !stop.load(Ordering::Acquire) && self.active_trial() && !stop.load(Ordering::Acquire) {
+    fn confirm_checkpoint(&self, stop: &NodeStop) {
+        if !stop.is_set() && self.active_trial() && !stop.is_set() {
             // Confirmation rechecks headless ownership under the apply lock. A
             // window may have acquired it since active_trial; its true return
             // can leave that window's trial armed, so never cache the result.
@@ -1573,8 +1573,8 @@ impl NodeUpdates {
         }
     }
 
-    fn failed_trial(&self, stop: &AtomicBool, why: &str) {
-        if !stop.load(Ordering::Acquire) && self.active_trial() && !stop.load(Ordering::Acquire) {
+    fn failed_trial(&self, stop: &NodeStop, why: &str) {
+        if !stop.is_set() && self.active_trial() && !stop.is_set() {
             self.updater.restart(&format!(
                 "the active node update trial could not prove its listener: {why}"
             ));
@@ -1590,7 +1590,7 @@ impl NodeUpdates {
             &Option<(String, aterm_net::fleet::NodeKey)>,
             &str,
         ),
-        stop: &AtomicBool,
+        stop: &NodeStop,
     ) -> bool {
         self.settle_service_with(inputs, (addr, secret, node, listen), stop, |basis| {
             basis.prove(addr, HANDSHAKE)
@@ -1606,10 +1606,10 @@ impl NodeUpdates {
             &Option<(String, aterm_net::fleet::NodeKey)>,
             &str,
         ),
-        stop: &AtomicBool,
+        stop: &NodeStop,
         prove: impl FnOnce(&health::Basis) -> Result<health::Proven, String>,
     ) -> bool {
-        if stop.load(Ordering::Acquire) {
+        if stop.is_set() {
             return false;
         }
         if !self.active_trial() {
@@ -1617,10 +1617,10 @@ impl NodeUpdates {
         }
         let before = match inputs.observe() {
             health::Standing::Held => {
-                if !stop.load(Ordering::Acquire) {
+                if !stop.is_set() {
                     self.confirm_checkpoint(stop);
                 }
-                return !stop.load(Ordering::Acquire);
+                return !stop.is_set();
             }
             health::Standing::Unread(why) => {
                 self.failed_trial(stop, why);
@@ -1631,17 +1631,17 @@ impl NodeUpdates {
         if !before.is_generation(secret, node, listen) {
             return false;
         }
-        if stop.load(Ordering::Acquire) {
+        if stop.is_set() {
             return false;
         }
         let proof = prove(&before);
-        if stop.load(Ordering::Acquire) {
+        if stop.is_set() {
             return false;
         }
         // A successful old exchange grants no checkpoint after its policy, key,
         // identity or generation changed. A withdrawn source grants no restart either.
         let after = inputs.observe();
-        if stop.load(Ordering::Acquire) {
+        if stop.is_set() {
             return false;
         }
         match after {
@@ -1655,10 +1655,10 @@ impl NodeUpdates {
             }
             _ => return false,
         }
-        !stop.load(Ordering::Acquire)
+        !stop.is_set()
     }
 
-    fn confirm_service(&self, stop: &AtomicBool, _proof: health::Proven) {
+    fn confirm_service(&self, stop: &NodeStop, _proof: health::Proven) {
         self.confirm_checkpoint(stop);
     }
 }
@@ -1681,12 +1681,12 @@ fn checkpoint_idle_with(
     let Some(updates) = &cfg.updates else {
         return;
     };
-    if cfg.stop.load(Ordering::Acquire) || !updates.active_trial() {
+    if cfg.stop.is_set() || !updates.active_trial() {
         return;
     }
     let inputs = health::Inputs::of(cfg);
     let standing = inputs.observe();
-    if cfg.stop.load(Ordering::Acquire) {
+    if cfg.stop.is_set() {
         return;
     }
     match standing {
@@ -1696,11 +1696,11 @@ fn checkpoint_idle_with(
             IdleCheckpoint::Waiting => {}
             IdleCheckpoint::PortOwnedElsewhere => {
                 let answers = window_answers();
-                if cfg.stop.load(Ordering::Acquire) {
+                if cfg.stop.is_set() {
                     return;
                 }
                 let after = inputs.observe();
-                if cfg.stop.load(Ordering::Acquire)
+                if cfg.stop.is_set()
                     || !matches!(after, health::Standing::Admitted(after) if before.same_as(&after))
                 {
                     return;
@@ -1834,7 +1834,7 @@ fn why_the_run_ends(updater: &dyn NodeUpdater, boot: NodeBoot, relay_dir: &Path)
 /// [`NodeUpdater::look_every`], the look minds the checker ([`NodeUpdater::mind_checker`]) and
 /// [`why_the_run_ends`] decides. Once it names a reason the run ends through
 /// [`NodeUpdater::restart`] and the look ends; it ends too once `stop` is set.
-fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<AtomicBool>) {
+fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<NodeStop>) {
     let (noticed, notices) = std::sync::mpsc::sync_channel::<()>(1);
     let updater = Arc::clone(&updates.updater);
     let boot = updates.boot;
@@ -1845,7 +1845,7 @@ fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<Atomi
         .name("aterm-node-updates".to_owned())
         .spawn(move || {
             let every = updater.look_every();
-            while !stop.load(Ordering::Acquire) {
+            while !stop.is_set() {
                 updater.mind_checker();
                 if let Some(why) = why_the_run_ends(&*updater, boot, &relay_dir) {
                     updater.restart(&why);
@@ -1856,7 +1856,7 @@ fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<Atomi
                 {
                     // The checker let its notices go (automatic checks are off): look on the
                     // clock alone, for a build another process staged or installed.
-                    std::thread::sleep(every);
+                    stop.sleep(every);
                 }
             }
         });
@@ -1873,7 +1873,7 @@ fn spawn_node_updates(updates: &NodeUpdates, relay_dir: PathBuf, stop: Arc<Atomi
 /// launchd's `KeepAlive` starts the job again).
 #[cfg(target_os = "macos")]
 struct LiveNodeUpdater {
-    stop: Arc<AtomicBool>,
+    stop: Arc<NodeStop>,
     /// What the job's checker watchdog remembers between looks ([`mind_node_checker`]).
     checker_watch: Mutex<crate::update_checker_watch::CheckerWatchState>,
 }
@@ -2005,7 +2005,7 @@ impl NodeUpdater for LiveNodeUpdater {
 
     fn restart(&self, why: &str) {
         aterm_log::info!("aterm node serve: {why}");
-        self.stop.store(true, Ordering::Release);
+        self.stop.set();
     }
 
     fn now(&self) -> Instant {
@@ -2030,7 +2030,7 @@ fn node_relay_dir(state_dir: &Path) -> PathBuf {
 /// This Mac's updater for a run that `stop` ends: production's on macOS, and none on scratch
 /// state (a lab instance, a test) or a CI runner ([`node_run_updates_and_claims_nothing`]) or on
 /// another platform.
-fn live_node_updater(stop: &Arc<AtomicBool>) -> Option<Arc<dyn NodeUpdater>> {
+fn live_node_updater(stop: &Arc<NodeStop>) -> Option<Arc<dyn NodeUpdater>> {
     if node_run_updates_and_claims_nothing() {
         return None;
     }
@@ -2053,7 +2053,7 @@ fn live_node_updater(stop: &Arc<AtomicBool>) -> Option<Arc<dyn NodeUpdater>> {
 /// ([`live_node_updater`]).
 fn apply_node_update_at_boot() -> NodeBoot {
     // A boot asks no restart: no run has started for one to end.
-    let no_run = Arc::new(AtomicBool::new(false));
+    let no_run = Arc::new(NodeStop::default());
     match (live_node_updater(&no_run), aterm_types::dirs::state_dir()) {
         (Some(updater), Some(state_dir)) => {
             apply_at_node_boot(&*updater, &node_relay_dir(&state_dir))
@@ -2187,7 +2187,7 @@ fn run_node_serve(
     let members = vault_paths
         .as_ref()
         .map(|paths| Arc::new(aterm_agent::fleet_log::LocalLog::of(paths)));
-    let stop = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(NodeStop::default());
     let updates = live_node_updater(&stop).map(|updater| NodeUpdates::new(updater, boot));
     let cfg = NodeServeConfig {
         state_dir,
@@ -2267,14 +2267,14 @@ fn arm_claims_off_on_quit(relay_dir: PathBuf, off: fn()) {
 }
 
 /// Run [`claims_upkeep`] now and every `claims::RECHECK_S` until `stop`.
-fn spawn_claims_upkeep(relay_dir: PathBuf, stop: Arc<AtomicBool>) {
+fn spawn_claims_upkeep(relay_dir: PathBuf, stop: Arc<NodeStop>) {
     let every = Duration::from_secs(aterm_agent::harness::claims::RECHECK_S.unsigned_abs());
     let spawned = std::thread::Builder::new()
         .name("aterm-node-claims".to_owned())
         .spawn(move || {
-            while !stop.load(Ordering::Acquire) {
+            while !stop.is_set() {
                 claims_upkeep(&relay_dir, &crate::harness_host::claims_look);
-                sleep_interruptible(&stop, every);
+                stop.sleep(every);
             }
         });
     if let Err(err) = spawned {
@@ -2310,7 +2310,7 @@ fn serve_node_job(
     let _held_lock = job_lock;
     // Local upkeep retires before the job relinquishes its exclusive lifetime.
     let maintenance = maintenance;
-    if !cfg.stop.load(Ordering::Acquire) {
+    if !cfg.stop.is_set() {
         aterm_agent::service_repair_rpc::start_recovery_in_context(
             cfg.vault_paths.as_ref(),
             &cfg.state_dir,
@@ -2361,21 +2361,21 @@ fn serve_node_job(
     let mut mesh_logs = MeshHeld::default();
     mesh_logs.bus = bus_keeper.as_ref().map(|keeper| Arc::clone(keeper.slot()));
 
-    while !cfg.stop.load(Ordering::Acquire) {
+    while !cfg.stop.is_set() {
         if let Some(maintain) = &maintenance {
             maintain();
         }
         if fleet_turned_off_or_swarm_disabled(&cfg) {
             advertiser.stop();
             port_lock = None;
-            sleep_interruptible(&cfg.stop, cfg.tick_every);
+            cfg.stop.sleep(cfg.tick_every);
             checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
             continue;
         }
         let Some(wanted) = wanted_for_node(&cfg) else {
             advertiser.stop();
             port_lock = None;
-            sleep_interruptible(&cfg.stop, cfg.tick_every);
+            cfg.stop.sleep(cfg.tick_every);
             checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
             continue;
         };
@@ -2384,7 +2384,7 @@ fn serve_node_job(
             Err(_) => {
                 advertiser.stop();
                 port_lock = None;
-                sleep_interruptible(&cfg.stop, cfg.tick_every);
+                cfg.stop.sleep(cfg.tick_every);
                 checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
                 continue;
             }
@@ -2400,7 +2400,7 @@ fn serve_node_job(
             }
             advertiser.stop();
             port_lock = None;
-            sleep_interruptible(&cfg.stop, cfg.tick_every);
+            cfg.stop.sleep(cfg.tick_every);
             checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
             continue;
         }
@@ -2421,7 +2421,7 @@ fn serve_node_job(
             let Ok(addr) = wanted.listen.parse::<SocketAddr>() else {
                 advertiser.stop();
                 port_lock = None;
-                sleep_interruptible(&cfg.stop, cfg.tick_every);
+                cfg.stop.sleep(cfg.tick_every);
                 checkpoint_idle(
                     &cfg,
                     IdleCheckpoint::Failed("node listen address is invalid"),
@@ -2431,7 +2431,7 @@ fn serve_node_job(
             if aterm_net::loopback::check(aterm_net::loopback::Reach::Listen(addr)).is_err() {
                 advertiser.stop();
                 port_lock = None;
-                sleep_interruptible(&cfg.stop, cfg.tick_every);
+                cfg.stop.sleep(cfg.tick_every);
                 checkpoint_idle(
                     &cfg,
                     IdleCheckpoint::Failed("node listen address is refused"),
@@ -2442,12 +2442,12 @@ fn serve_node_job(
                 match NodeJobLock::try_acquire_port(&cfg.state_dir) {
                     Ok(Some(held)) => port_lock = Some(held),
                     Ok(None) => {
-                        sleep_interruptible(&cfg.stop, cfg.tick_every);
+                        cfg.stop.sleep(cfg.tick_every);
                         checkpoint_idle(&cfg, IdleCheckpoint::PortOwnedElsewhere);
                         continue;
                     }
                     Err(_) => {
-                        sleep_interruptible(&cfg.stop, cfg.tick_every);
+                        cfg.stop.sleep(cfg.tick_every);
                         checkpoint_idle(
                             &cfg,
                             IdleCheckpoint::Failed("node port custody is unreadable"),
@@ -2462,7 +2462,7 @@ fn serve_node_job(
                     if !keeps_port_after(&err) {
                         port_lock = None;
                     }
-                    sleep_interruptible(&cfg.stop, cfg.tick_every);
+                    cfg.stop.sleep(cfg.tick_every);
                     checkpoint_idle(&cfg, IdleCheckpoint::Failed("node listener could not bind"));
                     continue;
                 }
@@ -2471,7 +2471,7 @@ fn serve_node_job(
 
         let Ok(bound_addr) = listener.local_addr() else {
             port_lock = None;
-            sleep_interruptible(&cfg.stop, cfg.tick_every);
+            cfg.stop.sleep(cfg.tick_every);
             checkpoint_idle(
                 &cfg,
                 IdleCheckpoint::Failed("node bound address is unreadable"),
@@ -2540,7 +2540,7 @@ fn spawn_node_vault_pass(cfg: &NodeServeConfig) -> Option<std::thread::JoinHandl
         .spawn(move || {
             aterm_secrets::client::run_node_pass(&aterm_secrets::client::NodePassHost {
                 paths: &paths,
-                stop: &stop,
+                stop: stop.flag(),
                 held: &|| sharing_held(&state_dir, config_path.as_deref()),
                 may_post: &|| lan_unavailable().is_none(),
                 routes: &aterm_secrets::server::route_sources,
@@ -2901,7 +2901,7 @@ struct WindowNeedsReads {
 /// What [`WindowNeedsReads`]' threads share.
 struct NeedsReads {
     /// Set as the reads stop.
-    stop: AtomicBool,
+    stop: NodeStop,
     /// Each window's latest row, by pid: the map the sink is handed.
     rows: Mutex<BTreeMap<u32, NeedsRow>>,
     /// A copy of the stream each window is read on, by pid, to hang up on as the reads stop.
@@ -2929,7 +2929,7 @@ impl WindowNeedsReads {
     /// The spawn of the thread that looks for windows.
     fn start(relay_dir: PathBuf, every: Duration, sink: WindowNeeds) -> std::io::Result<Self> {
         let shared = Arc::new(NeedsReads {
-            stop: AtomicBool::new(false),
+            stop: NodeStop::default(),
             rows: Mutex::default(),
             streams: Mutex::default(),
             readers: Mutex::default(),
@@ -2953,7 +2953,7 @@ impl WindowNeedsReads {
 
 impl Drop for WindowNeedsReads {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Release);
+        self.shared.stop.set();
         if let Some(dialer) = self.dialer.take() {
             let _ = dialer.join();
         }
@@ -2973,14 +2973,14 @@ impl NeedsReads {
     fn dial_windows(self: &Arc<Self>, relay_dir: &Path, every: Duration) {
         let mut refused: BTreeMap<u32, Instant> = BTreeMap::new();
         let mut looked = false;
-        while !self.stop.load(Ordering::Acquire) {
+        while !self.stop.is_set() {
             self.readers
                 .lock_or_recover()
                 .retain(|reader| !reader.is_finished());
             let windows = live_relay_candidates(relay_dir);
             refused.retain(|pid, _| windows.iter().any(|(live, _)| live == pid));
             for (pid, path) in windows {
-                if self.stop.load(Ordering::Acquire) {
+                if self.stop.is_set() {
                     return;
                 }
                 if self.streams.lock_or_recover().contains_key(&pid)
@@ -3006,7 +3006,7 @@ impl NeedsReads {
                 looked = true;
                 self.prime();
             }
-            sleep_interruptible(&self.stop, every);
+            self.stop.sleep(every);
         }
     }
 
@@ -3042,7 +3042,7 @@ impl NeedsReads {
     fn take_frames(&self, pid: u32, stream: &CtlStream) {
         let mut awake = aterm_uds::hangup::Awake(stream);
         while let Ok(row) = read_needs_frame(&mut awake) {
-            if self.stop.load(Ordering::Acquire) {
+            if self.stop.is_set() {
                 break;
             }
             let mut rows = self.rows.lock_or_recover();
@@ -3061,7 +3061,7 @@ impl NeedsReads {
             let mut rows = self.rows.lock_or_recover();
             if rows.remove(&pid).is_some()
                 && self.primed.load(Ordering::Acquire)
-                && !self.stop.load(Ordering::Acquire)
+                && !self.stop.is_set()
             {
                 (self.sink)(&rows);
             }
@@ -3079,7 +3079,7 @@ impl NeedsReads {
     fn prime(&self) {
         let deadline = Instant::now() + HANDSHAKE;
         let mut first = self.first.lock_or_recover();
-        while !first.is_empty() && !self.stop.load(Ordering::Acquire) {
+        while !first.is_empty() && !self.stop.is_set() {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
@@ -3094,7 +3094,7 @@ impl NeedsReads {
         drop(first);
         let rows = self.rows.lock_or_recover();
         self.primed.store(true, Ordering::Release);
-        if !self.stop.load(Ordering::Acquire) {
+        if !self.stop.is_set() {
             (self.sink)(&rows);
         }
     }
@@ -3164,7 +3164,7 @@ pub(crate) fn activity_of_windows(windows: &WindowRelays, at: u64) -> Option<Act
 /// it made. Dropping it stops the thread and joins it, which waits out a survey under way
 /// (`SURVEY_ANSWER_WITHIN` at most).
 struct WindowActivityReads {
-    stop: Arc<AtomicBool>,
+    stop: Arc<NodeStop>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -3178,20 +3178,20 @@ impl WindowActivityReads {
         every: Duration,
         sink: WindowActivity,
     ) -> std::io::Result<Self> {
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(NodeStop::default());
         let thread = std::thread::Builder::new()
             .name("aterm-node-activity".to_owned())
             .spawn({
                 let stop = Arc::clone(&stop);
                 move || {
-                    while !stop.load(Ordering::Acquire) {
+                    while !stop.is_set() {
                         let at = aterm_time::unix_secs().unwrap_or(0);
                         if let Some(row) = activity_of_windows(&windows, at)
-                            && !stop.load(Ordering::Acquire)
+                            && !stop.is_set()
                         {
                             sink(&row);
                         }
-                        sleep_interruptible(&stop, every);
+                        stop.sleep(every);
                     }
                 }
             })?;
@@ -3204,7 +3204,7 @@ impl WindowActivityReads {
 
 impl Drop for WindowActivityReads {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.set();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -3296,18 +3296,55 @@ fn mesh_hints(state_dir: PathBuf) -> aterm_mesh::overlay::Hints {
     })
 }
 
-fn sleep_interruptible(stop: &AtomicBool, total: Duration) {
-    let now = Instant::now();
-    let deadline = now
-        .checked_add(total)
-        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
-    let step = Duration::from_millis(25).min(total);
-    while !stop.load(Ordering::Acquire) {
+/// A stop every loop that sleeps on it hears at once ([`NodeStop::sleep`]): the sleep waits on a
+/// condition variable rather than polling a flag, so an idle loop wakes only at its own tick. Set
+/// once, never cleared.
+#[derive(Debug, Default)]
+pub(crate) struct NodeStop {
+    stopped: AtomicBool,
+    asleep: Mutex<()>,
+    wake: std::sync::Condvar,
+}
+
+impl NodeStop {
+    /// Stop: every [`Self::sleep`] under way returns now, and every later one at once.
+    pub(crate) fn set(&self) {
+        // Set and rung under the sleepers' lock, so a sleeper that has checked the flag and not
+        // yet waited cannot miss the ring.
+        let _asleep = self.asleep.lock_or_recover();
+        self.stopped.store(true, Ordering::Release);
+        self.wake.notify_all();
+    }
+
+    /// Whether [`Self::set`] ran.
+    pub(crate) fn is_set(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// The flag [`Self::set`] sets, for a reader that only reads it (aterm-secrets'
+    /// `NodePassHost`). A store into it wakes no [`Self::sleep`].
+    pub(crate) fn flag(&self) -> &AtomicBool {
+        &self.stopped
+    }
+
+    /// Sleep `total`, or until [`Self::set`].
+    pub(crate) fn sleep(&self, total: Duration) {
         let now = Instant::now();
-        if now >= deadline {
-            break;
+        let deadline = now
+            .checked_add(total)
+            .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
+        let mut asleep = self.asleep.lock_or_recover();
+        while !self.is_set() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            asleep = self
+                .wake
+                .wait_timeout(asleep, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
         }
-        std::thread::sleep(step.min(deadline - now));
     }
 }
 
@@ -3633,7 +3670,7 @@ fn serve_one_node_generation(
         Err(error) => {
             aterm_log::warn!("node: the automatic admission worker did not start: {error}");
             announcing.stop();
-            sleep_interruptible(&cfg.stop, cfg.tick_every);
+            cfg.stop.sleep(cfg.tick_every);
             return false;
         }
     };
@@ -3789,8 +3826,8 @@ fn serve_one_node_generation(
                 let mut admission_network = crate::network_moved::watch_at_once();
 
                 while running.load(Ordering::Acquire) {
-                    sleep_interruptible(&stop, tick_every);
-                    if stop.load(Ordering::Acquire) {
+                    stop.sleep(tick_every);
+                    if stop.is_set() {
                         running.store(false, Ordering::Release);
                         return;
                     }
@@ -3969,7 +4006,7 @@ fn serve_one_node_generation(
                 "aterm node serve: the watch thread did not start ({err}); not serving"
             );
             announcing.stop();
-            sleep_interruptible(&cfg.stop, cfg.tick_every);
+            cfg.stop.sleep(cfg.tick_every);
             return false;
         }
     };

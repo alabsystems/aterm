@@ -13766,6 +13766,41 @@ fn accounts_report_reads_rotation_from_parsed_config_and_names_running_sessions(
     }
 }
 
+#[test]
+fn the_native_source_table_separates_machine_keys_from_display_names() {
+    use crate::harness::accounts_sync::{CliFleet, FleetAccount, FleetRoster};
+    use crate::harness::alab_roster::MachineRef;
+    for label in [Some("m3".to_owned()), None] {
+        let fleet = CliFleet {
+            cli: Cli::Codex,
+            roster: FleetRoster {
+                source: "alab".into(),
+                alab: Some(MachineRef::from_registry("PK_m3", label.clone())),
+                accounts: vec![FleetAccount {
+                    label: "one".into(),
+                    machines: vec!["PK_m3".into()],
+                    class: Class::Preferred,
+                    email: "one@example.test".into(),
+                    browser: None,
+                    vendor: accounts::Vendor::default(),
+                }],
+                ..FleetRoster::default()
+            },
+            held: Vec::new(),
+        };
+        let (json, rows) = source_table_rows(Cli::Codex, &fleet, None);
+        assert_eq!(
+            json["accounts"][0]["preferred_machine_keys"],
+            aterm_json::json!(["PK_m3"])
+        );
+        assert_eq!(
+            json["accounts"][0]["preferred_machines"],
+            aterm_json::json!([label.as_deref().unwrap_or("PK_m3")])
+        );
+        assert_eq!(rows[0].2, label.as_deref().unwrap_or("PK_m3"));
+    }
+}
+
 /// THE FLEET SOURCE TABLE reads a Codex default row (no directory) as here only while the
 /// owner's `~/.codex/auth.json` is, as a launch does, whether the sheet lists the row or it is
 /// the machine's own; signed in, it is ready to be read.

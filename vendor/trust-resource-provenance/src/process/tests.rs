@@ -37,7 +37,7 @@ fn native_connected_peer_matches_exact_process_and_exec_identity() {
     }
 }
 
-struct Child(std::process::Child);
+struct Child(aterm_uds::spawnfd::Child);
 impl Drop for Child {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -47,14 +47,33 @@ impl Drop for Child {
 
 #[test]
 fn actual_owned_child_ancestry_is_bounded_and_reread() {
+    ancestry_with_original_age(Duration::ZERO);
+}
+
+#[test]
+fn required_native_ancestry_keeps_its_original_start_without_a_latency_budget() {
+    ancestry_with_original_age(Duration::from_secs(3));
+}
+
+const ANCESTRY_WAIT: Duration = Duration::from_secs(60);
+
+fn ancestry_with_original_age(age: Duration) {
     let me = read_identity(std::process::id()).unwrap();
-    let child = Child(std::process::Command::new("/bin/sleep").arg("10").spawn().unwrap());
+    let mut child = Child(
+        aterm_uds::spawnfd::command(aterm_uds::deadline::stand_in(Path::new("/bin/cat")))
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let _stdin = aterm_uds::deadline::cat_echoes(&mut child.0);
     let descendant = read_identity(child.0.id()).unwrap();
-    assert!(stable_ancestor(me, descendant, Instant::now() + Duration::from_secs(2)).unwrap());
+    let deadline = Instant::now() - age + ANCESTRY_WAIT;
+    assert!(stable_ancestor(me, descendant, deadline).unwrap());
     let mut foreign = me;
     foreign.birth ^= 1;
     assert!(
-        !stable_ancestor(foreign, descendant, Instant::now() + Duration::from_secs(2)).unwrap()
+        !stable_ancestor(foreign, descendant, deadline).unwrap()
     );
     assert!(stable_ancestor(me, descendant, Instant::now()).is_err());
 }

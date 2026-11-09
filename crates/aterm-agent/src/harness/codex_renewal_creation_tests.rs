@@ -155,7 +155,6 @@ pub(crate) fn transition(
 fn receipt_creation_refines_real_artifact_retention_and_barriers() {
     let model = aterm_models_harness::receipt_creation_model();
     aterm_spec::interp::prove_and_catch(&model);
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

@@ -8056,8 +8056,28 @@ impl App {
         &self,
         wid: WindowId,
     ) -> Option<crate::OverlayCoordinateTransform> {
-        let plan = self.active_visible_leaf_plan(wid)?;
-        self.overlay_coordinate_transform_from_plan(wid, &plan)
+        let window = self.windows.get(&wid)?;
+        let mut any_leaf = false;
+        let mut missing_view = false;
+        let mut has_visible_native = false;
+        let _ = crate::active_tab_shows(window, |view| {
+            any_leaf = true;
+            match self.view_store.get(view) {
+                Some(crate::tab_model::View::Terminal(_)) => false,
+                Some(crate::tab_model::View::Native(_)) => {
+                    has_visible_native = true;
+                    false
+                }
+                None => {
+                    missing_view = true;
+                    true
+                }
+            }
+        });
+        if !any_leaf || missing_view {
+            return None;
+        }
+        self.overlay_coordinate_transform_with_native(wid, has_visible_native)
     }
 
     fn overlay_coordinate_transform_from_plan(
@@ -8065,9 +8085,17 @@ impl App {
         wid: WindowId,
         plan: &crate::tab_model::VisibleLeafPlan,
     ) -> Option<crate::OverlayCoordinateTransform> {
-        let window = self.windows.get(&wid)?;
         let route = self.visible_content_route_from_plan(plan)?;
-        let panel_rows = if route.has_visible_native() {
+        self.overlay_coordinate_transform_with_native(wid, route.has_visible_native())
+    }
+
+    fn overlay_coordinate_transform_with_native(
+        &self,
+        wid: WindowId,
+        has_visible_native: bool,
+    ) -> Option<crate::OverlayCoordinateTransform> {
+        let window = self.windows.get(&wid)?;
+        let panel_rows = if has_visible_native {
             window.overlay_rows_with_available(usize::from(window.rows))
         } else {
             window.overlay_rows()
@@ -8076,7 +8104,7 @@ impl App {
             return None;
         }
         let (cw, ch) = self.win_cell_size(wid);
-        if route.has_visible_native() {
+        if has_visible_native {
             let scale = window.scale.max(f64::EPSILON) as f32;
             Some(crate::OverlayCoordinateTransform {
                 geom: crate::settings::SettingsGeom {
@@ -10015,6 +10043,7 @@ impl App {
     }
 
     /// [`Self::prepare_native_input_scratch_from_plan`] on the layout the window shows now, for a standalone caller with no frame plan (a glassless window's native commit, `App::commit_glassless_native_frame`).
+    #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn prepare_native_input_scratch(&mut self, id: WindowId) -> bool {
         let Some((plan, route @ crate::VisibleContentRoute::Native { .. })) =
             self.active_visible_frame_layout(id)
@@ -10345,15 +10374,23 @@ impl App {
 
     /// Prepare a glassless window's mixed frame and mark its native leaves presented, as a
     /// mixed present does (`finalize_successful_present`), so pointer input can aim at them.
-    pub(crate) fn commit_glassless_heterogeneous_frame(&mut self, id: WindowId) -> bool {
-        let Some((plan, route @ crate::VisibleContentRoute::Heterogeneous)) =
-            self.active_visible_frame_layout(id)
-        else {
+    pub(crate) fn commit_glassless_heterogeneous_frame_from_plan(
+        &mut self,
+        id: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) -> bool {
+        if self.visible_content_route_from_plan(plan)
+            != Some(crate::VisibleContentRoute::Heterogeneous)
+        {
             return false;
-        };
-        self.prepare_layout_coordinate_space_from_plan(id, route, &plan);
+        }
+        self.prepare_layout_coordinate_space_from_plan(
+            id,
+            crate::VisibleContentRoute::Heterogeneous,
+            plan,
+        );
         if self
-            .prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan(id, None, &plan)
+            .prepare_heterogeneous_input_scratch_with_cursor_fx_from_plan(id, None, plan)
             .is_none()
         {
             return false;
@@ -11541,9 +11578,9 @@ impl App {
         self.report_native_ime_cursor_area(id, presented_plan);
 
         if !matches!(route, SuccessfulPresentRoute::Terminal) {
-            self.refresh_native_hover_for_frame(id);
+            self.refresh_native_hover_for_frame_from_plan(id, presented_plan);
         }
-        self.refresh_glass_cursor_for_frame(id);
+        self.refresh_glass_cursor_for_frame_with_plan(id, Some(presented_plan));
 
         if matches!(route, SuccessfulPresentRoute::Heterogeneous)
             && matches!(

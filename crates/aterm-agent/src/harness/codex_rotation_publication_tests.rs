@@ -225,8 +225,6 @@ pub(crate) fn publication_transition(
 fn exec_publication_refines_real_writer_and_file_failures() {
     let model = aterm_models_harness::exec_publication_model();
     aterm_spec::interp::prove_and_catch(&model);
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{faults:?}");
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

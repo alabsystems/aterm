@@ -196,6 +196,7 @@ fn no_such(api: &Api, name: &str, kind: Option<&str>) -> String {
 }
 
 fn failed(msg: &str) -> ExitCode {
+    super::usage_preamble(msg);
     eprintln!("{}", super::tty::error_line(msg));
     ExitCode::from(1)
 }
@@ -7695,6 +7696,8 @@ pub(super) fn cmd_uninstall(
         }
     }
     let mut failures = 0;
+    let mut removed_formulae: std::collections::BTreeSet<String> = Default::default();
+    let mut removed_casks: std::collections::BTreeSet<String> = Default::default();
     let mut completed = false;
     for name in &names {
         let short = Formula::short_name(name);
@@ -7809,7 +7812,14 @@ pub(super) fn cmd_uninstall(
             })
         };
         match r {
-            Ok(()) => completed = true,
+            Ok(()) => {
+                completed = true;
+                if as_cask {
+                    removed_casks.insert(cask_short.to_string());
+                } else {
+                    removed_formulae.insert(short.to_string());
+                }
+            }
             Err(e @ install::InstallError::Unsupported(_)) => {
                 return from_install(
                     prefix,
@@ -7825,10 +7835,20 @@ pub(super) fn cmd_uninstall(
         }
     }
     if failures > 0 {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
+        return ExitCode::from(1);
     }
+    // Brew autoremoves at the end of uninstall (dry runs show
+    // what would go, with the named packages excluded).
+    if completed && !super::env_set("HOMEBREW_NO_AUTOREMOVE") {
+        if !dry && std::env::var("HOMEBREW_AUTOREMOVE").is_ok_and(|v| !v.trim().is_empty()) {
+            super::tty::opoo!(
+                "`$HOMEBREW_AUTOREMOVE` is now a no-op as it is the default behaviour. \
+                 Set `HOMEBREW_NO_AUTOREMOVE=1` to disable it."
+            );
+        }
+        return run_autoremove(prefix, api, dry, &removed_formulae, &removed_casks, true);
+    }
+    ExitCode::SUCCESS
 }
 
 /// The tap user a full name belongs to (`homebrew` for core,
@@ -10300,22 +10320,31 @@ fn upgrade_dep_plan(
     planned: &[Formula],
     exclude: &std::collections::BTreeSet<String>,
 ) -> (ChangeRows, ChangeRows) {
-    struct Walk {
-        seen: std::collections::BTreeSet<String>,
-        minimums: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
-        installs: ChangeRows,
-        upgrades: ChangeRows,
-    }
+    // Brew expands the planned formulae's whole declared
+    // graph (post-order, deps before dependents). A dep in
+    // that graph changes when some changing ancestor's new
+    // bottle tab (whose runtime_dependencies cover the full
+    // closure) records a minimum above what is installed;
+    // a missing dep with a changing ancestor is installed.
+    // Unchanging intermediates never gate their subtree.
+    let mut records: std::collections::BTreeMap<String, Formula> = Default::default();
+    let mut parents: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let mut order: Vec<String> = Vec::new();
     fn walk(
         prefix: &Prefix,
         api: &Api,
         parent: &Formula,
-        exclude: &std::collections::BTreeSet<String>,
-        state: &mut Walk,
+        records: &mut std::collections::BTreeMap<String, Formula>,
+        parents: &mut std::collections::BTreeMap<String, Vec<String>>,
+        order: &mut Vec<String>,
     ) {
         for dep in &parent.dependencies {
             let short = Formula::short_name(dep).to_string();
-            if !state.seen.insert(short.clone()) {
+            let entry = parents.entry(short.clone()).or_default();
+            if !entry.contains(&parent.name) {
+                entry.push(parent.name.clone());
+            }
+            if records.contains_key(&short) {
                 continue;
             }
             let Some(df) = api
@@ -10325,52 +10354,83 @@ fn upgrade_dep_plan(
             else {
                 continue;
             };
-            let latest = install::keg_version(&df);
-            // Brew's Dependency.expand is post-order: a pouring
-            // dep's own dependencies come before it, so rows are
-            // pushed only after the subtree has been walked.
-            // `change` is Some(true) for a new install,
-            // Some(false) for an upgrade, None when kept.
-            let change = match prefix.installed_one(Kind::Formula, &short) {
-                None => Some((true, String::new())),
-                Some(inst) if version_cmp(&inst.version, &latest) != Ordering::Less => None,
-                Some(_) if prefix.is_pinned(&short) => None,
-                Some(inst) => {
-                    let tab = state
-                        .minimums
-                        .entry(parent.name.clone())
-                        .or_insert_with(|| install::bottle_tab_minimums(prefix, parent));
-                    match tab.get(&short) {
-                        Some(minimum) if version_cmp(&inst.version, minimum) == Ordering::Less => {
-                            Some((false, inst.version))
-                        }
-                        _ => None,
-                    }
-                }
-            };
-            if let Some((is_install, old)) = change {
-                walk(prefix, api, &df, exclude, state);
-                if !exclude.contains(&short) {
-                    let group = if is_install {
-                        &mut state.installs
-                    } else {
-                        &mut state.upgrades
-                    };
-                    group.push((short, old, latest, None));
-                }
-            }
+            records.insert(short.clone(), df.clone());
+            walk(prefix, api, &df, records, parents, order);
+            order.push(short);
         }
     }
-    let mut state = Walk {
-        seen: planned.iter().map(|f| f.name.clone()).collect(),
-        minimums: Default::default(),
-        installs: Vec::new(),
-        upgrades: Vec::new(),
-    };
     for f in planned {
-        walk(prefix, api, f, exclude, &mut state);
+        records.insert(f.name.clone(), f.clone());
     }
-    (state.installs, state.upgrades)
+    for f in planned {
+        let f = f.clone();
+        walk(prefix, api, &f, &mut records, &mut parents, &mut order);
+    }
+    let ancestors = |name: &str| -> std::collections::BTreeSet<String> {
+        let mut out: std::collections::BTreeSet<String> = Default::default();
+        let mut stack: Vec<String> = parents.get(name).cloned().unwrap_or_default();
+        while let Some(next) = stack.pop() {
+            if out.insert(next.clone())
+                && let Some(ups) = parents.get(&next)
+            {
+                stack.extend(ups.iter().cloned());
+            }
+        }
+        out
+    };
+    let mut minimums: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    > = Default::default();
+    let mut changing: std::collections::BTreeSet<String> =
+        planned.iter().map(|f| f.name.clone()).collect();
+    loop {
+        let mut grew = false;
+        for name in &order {
+            if changing.contains(name) {
+                continue;
+            }
+            let df = &records[name];
+            let latest = install::keg_version(df);
+            let ups = ancestors(name);
+            let change = match prefix.installed_one(Kind::Formula, name) {
+                None => ups.iter().any(|a| changing.contains(a)),
+                Some(inst) => {
+                    version_cmp(&inst.version, &latest) == Ordering::Less
+                        && !prefix.is_pinned(name)
+                        && ups.iter().filter(|a| changing.contains(*a)).any(|a| {
+                            let tab = minimums.entry(a.clone()).or_insert_with(|| {
+                                install::bottle_tab_minimums(prefix, &records[a])
+                            });
+                            tab.get(name).is_some_and(|minimum| {
+                                version_cmp(&inst.version, minimum) == Ordering::Less
+                            })
+                        })
+                }
+            };
+            if change {
+                changing.insert(name.clone());
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let mut installs: ChangeRows = Vec::new();
+    let mut upgrades: ChangeRows = Vec::new();
+    for name in &order {
+        if !changing.contains(name) || exclude.contains(name) {
+            continue;
+        }
+        let df = &records[name];
+        let latest = install::keg_version(df);
+        match prefix.installed_one(Kind::Formula, name) {
+            None => installs.push((name.clone(), String::new(), latest, None)),
+            Some(inst) => upgrades.push((name.clone(), inst.version, latest, None)),
+        }
+    }
+    (installs, upgrades)
 }
 
 /// Brew's final-summary deprecated/disabled section: the
@@ -11848,62 +11908,250 @@ fn cleanup_old_versions(
     Ok((removed, freed))
 }
 
+/// Brew `Cleanup#cleanup_cache` over abrew's own cache
+/// layout: every file in `downloads/` (plus legacy
+/// top-level caches and, when scrubbed or aged out, the
+/// API documents) is removed when (a) it is an incomplete
+/// download, (b) it is older than the cleanup age in both
+/// mtime and ctime (default 120 days, the age check always
+/// runs), or (c) unless `--prune` was given, it is stale
+/// for its formula: an old-version bottle or manifest once
+/// the latest version is installed, a download above
+/// whose formula has moved past it, or (under `--scrub`)
+/// any download whose latest version is not installed.
+/// Versions with a keg cleanup would keep are protected.
+struct DownloadCleanup {
+    days: std::time::Duration,
+    explicit_prune: bool,
+    scrub: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DownloadKind {
+    Bottle,
+    Manifest,
+    Api,
+    Other,
+}
+
+/// Parse (formula, version, tag) from a cached file's
+/// basename under either layout:
+/// `downloads/<sha>--<name>--<pkg>.<tag>.bottle[.r].tar.gz`,
+/// `downloads/<sha>--<name>-<pkg>.bottle_manifest.json`, or
+/// the pre-downloads/ `<name>-<pkg>.bottle.tar.gz` forms.
+fn parse_download_name(
+    file_name: &str,
+    in_api_dir: bool,
+) -> (DownloadKind, Option<(String, String)>, Option<String>) {
+    if in_api_dir {
+        return (DownloadKind::Api, None, None);
+    }
+    let tail = match file_name.split_once("--") {
+        Some((head, tail)) if head.len() == 64 && head.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            tail
+        }
+        _ => file_name,
+    };
+    let split_stem = |stem: &str| -> Option<(String, String)> {
+        let bytes = stem.as_bytes();
+        for at in 0..bytes.len() {
+            if bytes[at] == b'-' && bytes.get(at + 1).is_some_and(|b| b.is_ascii_digit()) && at > 0
+            {
+                return Some((stem[..at].to_string(), stem[at + 1..].to_string()));
+            }
+        }
+        None
+    };
+    if let Some(stem) = tail.strip_suffix(".bottle_manifest.json") {
+        return (DownloadKind::Manifest, split_stem(stem), None);
+    }
+    if let Some(rest) = tail.strip_suffix(".tar.gz")
+        && let Some((before, _)) = rest.split_once(".bottle")
+    {
+        if let Some((name, pkg_and_tag)) = before.split_once("--")
+            && let Some((pkg, tag)) = pkg_and_tag.rsplit_once('.')
+        {
+            return (
+                DownloadKind::Bottle,
+                Some((name.to_string(), pkg.to_string())),
+                Some(tag.to_string()),
+            );
+        }
+        // Legacy `<name>-<pkg>.bottle.tar.gz`.
+        let stem = rest.strip_suffix(".bottle").unwrap_or(rest);
+        return (DownloadKind::Bottle, split_stem(stem), None);
+    }
+    (DownloadKind::Other, split_stem(tail), None)
+}
+
+/// Keg versions cleanup keeps for one installed formula
+/// (brew's `excluded_versions_from_cleanup`): everything
+/// installed unless the latest is installed, in which
+/// case only kegs at or past it by scheme.
+fn kept_keg_versions(
+    prefix: &Prefix,
+    api: &Api,
+    inst: &Installed,
+) -> std::collections::BTreeSet<String> {
+    let record = api
+        .formula(&inst.name)
+        .ok()
+        .or_else(|| tap::lookup(prefix, &inst.name));
+    let Some(f) = record else {
+        return inst.versions.iter().cloned().collect();
+    };
+    let latest = install::keg_version(&f);
+    if !inst.versions.iter().any(|v| v == &latest) {
+        return inst.versions.iter().cloned().collect();
+    }
+    inst.versions
+        .iter()
+        .filter(|v| {
+            let scheme = super::prefix::receipt_tab_versions(&prefix.keg(&inst.name, v))
+                .1
+                .unwrap_or(0);
+            scheme > f.version_scheme
+                || (scheme == f.version_scheme && version_cmp(v, &latest) != Ordering::Less)
+        })
+        .cloned()
+        .collect()
+}
+
 fn prune_downloads(
     prefix: &Prefix,
+    api: &Api,
     dry: bool,
-    max_age: Option<std::time::Duration>,
+    mode: &DownloadCleanup,
     scope: &[&str],
     out: &mut Vec<String>,
 ) -> Result<(usize, u64), String> {
-    if !scope.is_empty() {
-        return Ok((0, 0));
-    }
     let now = std::time::SystemTime::now();
     let mut removed = 0;
     let mut freed = 0u64;
-    // Cached downloads live in the `downloads/` subdirectory
-    // (brew's layout); the cache root is still swept so files
-    // cached by older abrew layouts age out too.
-    let mut entries: Vec<std::fs::DirEntry> = Vec::new();
-    for dir in [prefix.cache(), prefix.cache().join("downloads")] {
-        match std::fs::read_dir(&dir) {
-            Ok(read) => entries.extend(read.flatten()),
-            Err(_) => continue,
+    let mut entries: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    for (dir, in_api) in [
+        (prefix.cache().join("downloads"), false),
+        (prefix.cache(), false),
+        (prefix.cache().join("api"), true),
+    ] {
+        if let Ok(read) = std::fs::read_dir(&dir) {
+            entries.extend(read.flatten().map(|e| (e.path(), in_api)));
         }
     }
-    entries.sort_by_key(|e| e.path());
-    for entry in entries {
-        if !entry
-            .file_type()
-            .is_ok_and(|t| t.is_file() && !t.is_symlink())
-        {
+    entries.sort();
+    let tags = super::machine::Machine::this().bottle_tags();
+    let mut kept_cache: std::collections::BTreeMap<
+        String,
+        Option<(Formula, std::collections::BTreeSet<String>)>,
+    > = Default::default();
+    for (path, in_api) in entries {
+        let Ok(kind) = path.symlink_metadata().map(|m| m.file_type()) else {
+            continue;
+        };
+        if kind.is_dir() {
             continue;
         }
-        if let Some(max) = max_age {
-            let old = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|m| now.duration_since(m).ok())
-                .is_some_and(|age| age >= max);
-            if !old {
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (dl_kind, name_version, tag) = parse_download_name(&file_name, in_api);
+        if !scope.is_empty() {
+            let Some((ref name, _)) = name_version else {
+                continue;
+            };
+            if !scope.contains(&name.as_str()) {
                 continue;
             }
         }
-        let path = entry.path();
-        let usage = entry.metadata().map(|m| m.len()).unwrap_or(0);
-        if dry {
-            out.push(format!(
-                "Would remove: {} ({})",
-                path.display(),
-                disk_usage_readable(usage)
-            ));
+        let remove = if file_name.ends_with(".incomplete") {
+            true
         } else {
-            out.push(format!(
-                "Removing: {}... ({})",
-                path.display(),
-                disk_usage_readable(usage)
-            ));
+            let aged = {
+                #[cfg(unix)]
+                let (mtime, ctime) = {
+                    use std::os::unix::fs::MetadataExt;
+                    std::fs::symlink_metadata(&path).map_or((None, None), |m| {
+                        (
+                            Some(
+                                std::time::UNIX_EPOCH
+                                    + std::time::Duration::from_secs(m.mtime().max(0) as u64),
+                            ),
+                            Some(
+                                std::time::UNIX_EPOCH
+                                    + std::time::Duration::from_secs(m.ctime().max(0) as u64),
+                            ),
+                        )
+                    })
+                };
+                #[cfg(not(unix))]
+                let (mtime, ctime) = (
+                    std::fs::symlink_metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok(),
+                    None,
+                );
+                let old = |t: Option<std::time::SystemTime>| {
+                    t.and_then(|t| now.duration_since(t).ok())
+                        .is_some_and(|age| age > mode.days)
+                };
+                mode.days.is_zero()
+                    || (old(mtime) && ctime.is_none_or(|_| old(ctime)))
+                    || (kind.is_symlink() && !path.exists())
+            };
+            if aged {
+                true
+            } else if mode.explicit_prune {
+                false
+            } else {
+                match dl_kind {
+                    DownloadKind::Api => mode.scrub,
+                    DownloadKind::Other => false,
+                    DownloadKind::Bottle | DownloadKind::Manifest => {
+                        let Some((name, version)) = name_version.clone() else {
+                            continue;
+                        };
+                        let found = kept_cache.entry(name.clone()).or_insert_with(|| {
+                            let inst = prefix.installed_one(Kind::Formula, &name)?;
+                            let record = api
+                                .formula(&name)
+                                .ok()
+                                .or_else(|| tap::lookup(prefix, &name))?;
+                            let kept = kept_keg_versions(prefix, api, &inst);
+                            Some((record, kept))
+                        });
+                        let Some((record, kept)) = found else {
+                            continue;
+                        };
+                        if kept.contains(&version) {
+                            false
+                        } else {
+                            let pkg = install::keg_version(record);
+                            let latest_installed = kept.contains(&pkg);
+                            match dl_kind {
+                                DownloadKind::Manifest => latest_installed && version != pkg,
+                                _ => {
+                                    (latest_installed && pkg != version)
+                                        || version_cmp(&pkg, &version) == Ordering::Greater
+                                        || (mode.scrub && !latest_installed)
+                                        || tag.as_deref().is_some_and(|t| {
+                                            t != "all" && !tags.iter().any(|want| want == t)
+                                        })
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        if !remove {
+            continue;
+        }
+        let usage = dir_disk_usage(&path);
+        if dry {
+            out.push(format!("Would remove: {} ({})", path.display(), abv(&path)));
+        } else {
+            out.push(format!("Removing: {}... ({})", path.display(), abv(&path)));
             std::fs::remove_file(&path)
                 .map_err(|e| format!("abrew: cannot remove {}: {e}", path.display()))?;
         }
@@ -12184,9 +12432,34 @@ pub(super) fn cmd_which_formula(prefix: &Prefix, api: &Api, rest: &[String]) -> 
 }
 
 pub(super) fn cmd_cleanup(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
+    // cleanup_max_age validates --prune and collapses scrub
+    // into its result; the download mode is then derived
+    // brew's way: an explicit --prune sets the age (and
+    // disables the stale check), otherwise the age is
+    // $HOMEBREW_CLEANUP_MAX_AGE_DAYS or 120 days.
     let max_age = match cleanup_max_age(rest) {
         Ok(age) => age,
         Err(error) => return failed(&format!("Error: Invalid usage: {error}")),
+    };
+    let explicit_prune = rest
+        .iter()
+        .any(|a| a == "--prune" || a.starts_with("--prune="));
+    let env_days = || -> std::time::Duration {
+        let days: u64 = std::env::var("HOMEBREW_CLEANUP_MAX_AGE_DAYS")
+            .map(|v| {
+                let digits: String = v.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse().unwrap_or(0)
+            })
+            .unwrap_or(120);
+        std::time::Duration::from_secs(days.saturating_mul(86_400))
+    };
+    let download_mode = DownloadCleanup {
+        days: match max_age {
+            Some(Some(days)) => days,
+            _ => env_days(),
+        },
+        explicit_prune,
+        scrub: has_flag(rest, "--scrub", "-s"),
     };
     let dry = has_flag(rest, "--dry-run", "-n");
     let named = operands_without_flag_values(rest, &["--prune"]);
@@ -12213,11 +12486,9 @@ pub(super) fn cmd_cleanup(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
         Ok((_, bytes)) => bytes,
         Err(error) => return failed(&error),
     };
-    if let Some(max_age) = max_age {
-        match prune_downloads(prefix, dry, max_age, &scope, &mut out) {
-            Ok((_, bytes)) => freed = freed.saturating_add(bytes),
-            Err(error) => return failed(&error),
-        }
+    match prune_downloads(prefix, api, dry, &download_mode, &scope, &mut out) {
+        Ok((_, bytes)) => freed = freed.saturating_add(bytes),
+        Err(error) => return failed(&error),
     }
     if named.is_empty() {
         prune_prefix_links(prefix, dry, &mut out);
@@ -12315,12 +12586,36 @@ fn no_cleanup_formula(api: &Api, name: &str, protected: &[String]) -> bool {
 /// Pinned formulae are never taken (their closures still
 /// protect), and `HOMEBREW_NO_CLEANUP_FORMULAE` names are out
 /// of the pool with their whole closures.
+#[cfg(test)]
 fn autoremove_targets(
+    prefix: &Prefix,
+    read: impl FnMut(&str) -> Result<Formula, String>,
+    cask_formula_deps: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> Result<Vec<String>, String> {
+    autoremove_targets_excluding(
+        prefix,
+        read,
+        cask_formula_deps,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+    )
+}
+
+/// `autoremove_targets` over the state as if `removed_formulae`
+/// and `removed_casks` were already gone (uninstall's dry-run
+/// autoremove tail).
+fn autoremove_targets_excluding(
     prefix: &Prefix,
     mut read: impl FnMut(&str) -> Result<Formula, String>,
     cask_formula_deps: &dyn Fn(&str) -> Option<Vec<String>>,
+    removed_formulae: &std::collections::BTreeSet<String>,
+    removed_casks: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<String>, String> {
-    let installed = prefix.installed_checked(Kind::Formula)?;
+    let installed: Vec<_> = prefix
+        .installed_checked(Kind::Formula)?
+        .into_iter()
+        .filter(|i| !removed_formulae.contains(&i.name))
+        .collect();
     let installed_names: std::collections::BTreeSet<String> =
         installed.iter().map(|i| i.name.clone()).collect();
     let protected = no_cleanup_names();
@@ -12431,6 +12726,9 @@ fn autoremove_targets(
     // recorded closures) are never removable.
     let mut cask_keeps: std::collections::BTreeSet<String> = Default::default();
     for cask in prefix.installed(Kind::Cask) {
+        if removed_casks.contains(&cask.name) {
+            continue;
+        }
         let direct = match cask_formula_deps(&cask.name) {
             Some(deps) => deps,
             None => {
@@ -12480,10 +12778,39 @@ fn autoremove_targets(
 
 pub(super) fn cmd_autoremove(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     let dry = has_flag(rest, "--dry-run", "-n");
-    let targets = match autoremove_targets(prefix, |n| api.dependency_formula(n), &|token| {
-        api.cask(token).ok().map(|c| c.depends_formula)
-    }) {
+    run_autoremove(
+        prefix,
+        api,
+        dry,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+        false,
+    )
+}
+
+/// Brew's `Cleanup.autoremove`: also the tail of `uninstall`
+/// (with the just-removed packages excluded when dry).
+fn run_autoremove(
+    prefix: &Prefix,
+    api: &Api,
+    dry: bool,
+    removed_formulae: &std::collections::BTreeSet<String>,
+    removed_casks: &std::collections::BTreeSet<String>,
+    tail: bool,
+) -> ExitCode {
+    let targets = match autoremove_targets_excluding(
+        prefix,
+        |n| api.dependency_formula(n),
+        &|token| api.cask(token).ok().map(|c| c.depends_formula),
+        removed_formulae,
+        removed_casks,
+    ) {
         Ok(targets) => targets,
+        // As uninstall's tail, an unprovable graph skips the
+        // autoremove silently (fail-closed: nothing more is
+        // deleted) instead of failing the finished uninstall;
+        // the standalone command reports the refusal.
+        Err(_) if tail => return ExitCode::SUCCESS,
         Err(e) => return failed(&e),
     };
     if targets.is_empty() {
@@ -12933,6 +13260,29 @@ fn list_absent_error(prefix: &Prefix, api: &Api, kind: Kind, short: &str, lookup
     }
 }
 
+/// Installed rows in brew `list`'s ls order: by name, or
+/// by rack mtime (newest first) under `-t`, reversed
+/// under `-r`.
+fn ordered_installed(prefix: &Prefix, kind: Kind, rest: &[String]) -> Vec<Installed> {
+    let mut rows = prefix.installed(kind);
+    if has_flag(rest, "-t", "") {
+        let mtime = |i: &Installed| -> std::time::SystemTime {
+            let rack = match kind {
+                Kind::Formula => prefix.cellar().join(&i.name),
+                Kind::Cask => prefix.caskroom().join(&i.name),
+            };
+            std::fs::metadata(rack)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        };
+        rows.sort_by(|a, b| mtime(b).cmp(&mtime(a)).then_with(|| a.name.cmp(&b.name)));
+    }
+    if has_flag(rest, "-r", "") {
+        rows.reverse();
+    }
+    rows
+}
+
 pub(super) fn cmd_list(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     if has_flag(rest, "--json", "") && !has_flag(rest, "--versions", "") {
         return super::usage_failed(
@@ -13120,6 +13470,14 @@ pub(super) fn cmd_list(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
             continue;
         }
         let kind = if casks { Kind::Cask } else { Kind::Formula };
+        // The ls pass-through switches brew forwards: -t
+        // sorts by rack mtime (newest first), -r reverses
+        // whichever order applies.
+        let installed_rows = if versions || pinned || full_name {
+            prefix.installed(kind)
+        } else {
+            ordered_installed(prefix, kind, rest)
+        };
         #[cfg(unix)]
         let mut lister = long.then(LongLister::new);
         // Plain name listings go through brew's column layout on a
@@ -13132,7 +13490,7 @@ pub(super) fn cmd_list(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode 
         // section headings the kind switches suppress.
         let ls_mode = plain_names && !full_name;
         let mut names: Vec<String> = Vec::new();
-        for i in prefix.installed(kind) {
+        for i in installed_rows {
             if has_flag(rest, "--pinned", "")
                 && !(if casks {
                     prefix.cask_is_pinned(&i.name)
@@ -15520,31 +15878,148 @@ pub(super) fn cmd_linkage(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
     }
 }
 
-pub(super) fn cmd_log(prefix: &Prefix, rest: &[String]) -> ExitCode {
-    let names = operands(rest);
+/// `brew log [formula|cask]`: `git log --follow` over the
+/// package's tap file, or over the repository itself when
+/// unnamed. Abrew prefixes have no bundled repository, so
+/// the unnamed form runs in the prefix root when it is a
+/// git checkout (a foreign brew prefix) and refuses
+/// otherwise; an unresolvable name is an unavailable error
+/// rather than brew's current-directory fallback.
+pub(super) fn cmd_log(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
+    let mut git_args: Vec<String> = Vec::new();
+    if has_flag(rest, "--patch", "-p") || has_flag(rest, "-u", "") {
+        git_args.push("--patch".to_string());
+    }
+    if has_flag(rest, "--stat", "") {
+        git_args.push("--stat".to_string());
+    }
+    if has_flag(rest, "--oneline", "") {
+        git_args.push("--oneline".to_string());
+    }
+    if has_flag(rest, "-1", "") {
+        git_args.push("-1".to_string());
+    }
+    if let Some(count) =
+        super::valued_flag_last(rest, "--max-count").or_else(|| super::valued_flag_last(rest, "-n"))
+    {
+        git_args.push("--max-count".to_string());
+        git_args.push(count);
+    }
+    let names = operands_without_flag_values(rest, &["--max-count", "-n"]);
     let Some(name) = names.first() else {
-        for t in tap::list(prefix) {
-            println!("{}", super::tty::ohai(&format!("tap {}", t.name())));
-            let _ = fetch::run_inherit(
-                aterm_uds::os_path!("git"),
-                &["-C", &t.path.to_string_lossy(), "log", "--oneline", "-5"],
+        if prefix.root.join(".git").exists() {
+            return git_log_in(
+                &prefix.root,
+                None,
+                &git_args,
+                "Homebrew/brew",
+                "$(brew --repo)",
             );
         }
-        return ExitCode::SUCCESS;
+        return from_install(
+            prefix,
+            &[],
+            Err(install::InstallError::Unsupported(
+                "log with no formula needs the Homebrew repository, which abrew does not bundle"
+                    .to_string(),
+            )),
+        );
     };
-    let short = Formula::short_name(name);
-    let token = super::api::canonical_cask_token(short);
     let want_cask = has_flag(rest, "--cask", "");
     let want_formula = has_flag(rest, "--formula", "");
-    if !want_cask && prefix.installed_one(Kind::Formula, short).is_some() {
-        println!("{short}: installed by abrew (see INSTALL_RECEIPT.json in the keg)");
-    } else if !want_formula && prefix.installed_one(Kind::Cask, token).is_some() {
-        println!("{token}: installed by abrew (see INSTALL_RECEIPT.json in the caskroom)");
+    let taps = tap::list(prefix);
+    let parts: Vec<&str> = name.split('/').collect();
+    let (scope, leaf): (Vec<&tap::Tap>, String) = if parts.len() >= 3 {
+        let wanted = format!("{}/{}", parts[0], parts[1]).to_lowercase();
+        (
+            taps.iter().filter(|t| t.name() == wanted).collect(),
+            parts[2].to_string(),
+        )
     } else {
-        let shown = if want_cask { token } else { short };
-        println!("{shown}: no abrew install record (abrew keeps no build logs)");
+        (taps.iter().collect(), name.clone())
+    };
+    let mut found: Option<(&tap::Tap, std::path::PathBuf)> = None;
+    if !want_cask {
+        for t in &scope {
+            if let Some(path) = tap_formula_file(t, &leaf) {
+                found = Some((t, path));
+                break;
+            }
+        }
     }
-    ExitCode::SUCCESS
+    if found.is_none() && !want_formula {
+        for t in &scope {
+            if let Some(path) = tap_file_in(&t.path.join("Casks"), &leaf) {
+                found = Some((t, path));
+                break;
+            }
+        }
+    }
+    let Some((tap, path)) = found else {
+        return failed(&format!(
+            "Error: {}",
+            if want_cask {
+                cask_unavailable(&leaf)
+            } else {
+                formula_unavailable(api, &leaf)
+            }
+        ));
+    };
+    let tap_name = tap.name();
+    git_log_in(
+        path.parent().unwrap_or(&path),
+        Some(&path),
+        &git_args,
+        &tap_name,
+        &format!("$(brew --repo {tap_name})"),
+    )
+}
+
+/// Brew's `git_log` body: shallow-clone warning, then
+/// `git log` inheriting stdio; git's own failure is not an
+/// abrew failure (brew ignores `system`'s result), but a
+/// missing git binary is.
+fn git_log_in(
+    dir: &std::path::Path,
+    path: Option<&std::path::Path>,
+    git_args: &[String],
+    repo_name: &str,
+    git_cd: &str,
+) -> ExitCode {
+    let dir_text = dir.to_string_lossy().into_owned();
+    let toplevel = fetch::run_capture(
+        aterm_uds::os_path!("git"),
+        &["-C", &dir_text, "rev-parse", "--show-toplevel"],
+    )
+    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    .unwrap_or_default();
+    if !toplevel.is_empty()
+        && std::path::Path::new(&toplevel)
+            .join(".git/shallow")
+            .exists()
+    {
+        super::tty::opoo!(
+            "Warning: {repo_name} is a shallow clone so only partial output will be shown.\n\
+             To get a full clone, run:\n  git -C \"{git_cd}\" fetch --unshallow"
+        );
+    }
+    let mut args: Vec<String> = vec!["-C".into(), dir_text, "log".into()];
+    args.extend(git_args.iter().cloned());
+    if let Some(path) = path
+        && path.is_file()
+    {
+        args.push("--follow".into());
+        args.push("--".into());
+        args.push(path.to_string_lossy().into_owned());
+    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
+        .args(&refs)
+        .status()
+    {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(e) => failed(&format!("Error: {e}")),
+    }
 }
 
 /// `brew analytics [state]`: abrew records nothing, so the
@@ -17573,97 +18048,82 @@ mod tests {
     }
 
     #[test]
-    fn prune_downloads_respects_age_and_dry_run() {
+    fn prune_downloads_follows_brew_stale_rules() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let p = Prefix::at(tmp.path());
-        std::fs::create_dir_all(p.cache().join("api")).unwrap();
-        std::fs::write(p.cache().join("demo-1.bottle.tar.gz"), b"x").unwrap();
-        std::fs::write(p.cache().join("api/formula-demo.json"), b"{}").unwrap();
-        assert_eq!(
-            prune_downloads(&p, true, None, &[], &mut Vec::new())
-                .unwrap()
-                .0,
-            1
-        );
-        assert!(p.cache().join("demo-1.bottle.tar.gz").exists());
-        assert_eq!(
-            prune_downloads(
-                &p,
-                false,
-                Some(std::time::Duration::from_secs(999_999_999)),
-                &[],
-                &mut Vec::new()
+        p.ensure_api_cache().unwrap();
+        let api = Api::new(p.clone());
+        let write_doc = |p: &Prefix| {
+            std::fs::write(
+                p.cache().join("api/formula-demo.json"),
+                br#"{"name":"demo","versions":{"stable":"2"}}"#,
             )
-            .unwrap()
-            .0,
-            0
-        );
-        assert_eq!(
-            prune_downloads(
-                &p,
-                false,
-                Some(std::time::Duration::ZERO),
-                &[],
-                &mut Vec::new()
-            )
-            .unwrap()
-            .0,
-            1
-        );
-        assert!(!p.cache().join("demo-1.bottle.tar.gz").exists());
-        assert!(p.cache().join("api/formula-demo.json").exists());
-        let downloads: [(&str, &[u8]); 5] = [
-            ("demo-2.bottle.tar.gz", b"ordinary bottle"),
-            (
-                "demo-extra-1.bottle.tar.gz",
-                b"hyphenated name or alpha version",
-            ),
-            ("demo-extra-release.zip", b"arbitrary cask URL basename"),
-            ("demo-extra-1-fetch", b"stray cache file"),
-            ("other-1.bottle.tar.gz", b"other package"),
+            .unwrap();
+        };
+        write_doc(&p);
+        owned_keg(&p, "demo", "2");
+        let downloads = p.cache().join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let files = [
+            "demo--1.all.bottle.tar.gz",
+            "demo--2.all.bottle.tar.gz",
+            "demo-1.bottle_manifest.json",
+            "demo-2.bottle_manifest.json",
+            "other--1.all.bottle.tar.gz",
+            "stray.bin",
+            "demo--1.all.bottle.tar.gz.incomplete",
         ];
-        for (file, contents) in downloads {
-            std::fs::write(p.cache().join(file), contents).unwrap();
+        for f in files {
+            std::fs::write(downloads.join(f), b"x").unwrap();
         }
-        for (dry, max_age, scope) in [
-            (false, Some(std::time::Duration::ZERO), &["demo"][..]),
-            (false, None, &["demo-extra"][..]),
-            (true, None, &["demo"][..]),
-            (false, None, &["demo", "other"][..]),
-            (false, None, &["oth"][..]),
-        ] {
-            assert_eq!(
-                prune_downloads(&p, dry, max_age, scope, &mut Vec::new())
-                    .unwrap()
-                    .0,
-                0
-            );
-            for (file, contents) in downloads {
-                assert_eq!(std::fs::read(p.cache().join(file)).unwrap(), contents);
-            }
+        let default_mode = DownloadCleanup {
+            days: std::time::Duration::from_secs(120 * 86_400),
+            explicit_prune: false,
+            scrub: false,
+        };
+        // Default: the old-version bottle + manifest and the
+        // incomplete download go; current, uninstalled, and
+        // unrecognized files stay.
+        let (removed, _) =
+            prune_downloads(&p, &api, true, &default_mode, &[], &mut Vec::new()).unwrap();
+        assert_eq!(removed, 3);
+        for f in files {
+            assert!(downloads.join(f).exists(), "{f}");
         }
-        assert_eq!(
-            prune_downloads(&p, true, None, &[], &mut Vec::new())
-                .unwrap()
-                .0,
-            downloads.len()
-        );
-        for (file, contents) in downloads {
-            assert_eq!(std::fs::read(p.cache().join(file)).unwrap(), contents);
-        }
-        assert_eq!(
-            prune_downloads(&p, false, None, &[], &mut Vec::new())
-                .unwrap()
-                .0,
-            downloads.len()
-        );
-        for (file, _) in downloads {
-            assert!(!p.cache().join(file).exists());
-        }
-        assert_eq!(
-            std::fs::read(p.cache().join("api/formula-demo.json")).unwrap(),
-            b"{}"
-        );
+        // Named scope only considers that formula's files.
+        let (removed, _) =
+            prune_downloads(&p, &api, true, &default_mode, &["other"], &mut Vec::new()).unwrap();
+        assert_eq!(removed, 0);
+        // An explicit --prune disables the stale check: with
+        // a huge age nothing goes; with age zero everything
+        // (incomplete included) goes.
+        let huge = DownloadCleanup {
+            days: std::time::Duration::from_secs(999_999_999),
+            explicit_prune: true,
+            scrub: false,
+        };
+        let (removed, _) = prune_downloads(&p, &api, true, &huge, &[], &mut Vec::new()).unwrap();
+        assert_eq!(removed, 1, "only the incomplete download");
+        let zero = DownloadCleanup {
+            days: std::time::Duration::ZERO,
+            explicit_prune: true,
+            scrub: false,
+        };
+        let (removed, _) = prune_downloads(&p, &api, false, &zero, &[], &mut Vec::new()).unwrap();
+        // --prune=all takes the API documents too (brew's
+        // cache_files entries all pass prune? at zero days).
+        assert_eq!(removed, files.len() + 1);
+        assert!(!p.cache().join("api/formula-demo.json").exists());
+        // Scrub also removes the API documents.
+        write_doc(&p);
+        let scrub = DownloadCleanup {
+            days: std::time::Duration::from_secs(120 * 86_400),
+            explicit_prune: false,
+            scrub: true,
+        };
+        let (removed, _) = prune_downloads(&p, &api, false, &scrub, &[], &mut Vec::new()).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!p.cache().join("api/formula-demo.json").exists());
     }
 
     #[test]

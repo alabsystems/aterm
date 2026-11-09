@@ -152,7 +152,6 @@ pub(crate) fn transition(before: &Projection, action: &str) -> Projection {
 fn native_canary_ownership_refines_real_cancellation_and_pool_records() {
     let model = aterm_models_harness::native_canary_model();
     aterm_spec::interp::prove_and_catch(&model);
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     for before in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &before) {

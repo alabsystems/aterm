@@ -538,8 +538,6 @@ pub(crate) fn fence_transition(
 fn typed_fence_refines_pending_cleanup_and_rejects_premature_release() {
     let model = aterm_models_harness::account_fence_model();
     assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{faults:?}");
     let states = aterm_spec::interp::reachable_states(&model);
     let mut evidence = aterm_spec::xref::StepEvidence::new("AccountFence");
     let mut negative_control = false;

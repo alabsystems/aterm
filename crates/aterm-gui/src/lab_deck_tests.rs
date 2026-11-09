@@ -4,6 +4,7 @@
 use super::*;
 use aterm_agent::harness::accounts::{Cli, Vendor};
 use aterm_agent::harness::alab_roster::LabAccount;
+use aterm_agent::harness::alab_roster::test_machine;
 use aterm_agent::harness::alab_seen::{LastUse, SignedIn, WindowSeen};
 
 const NOW: i64 = 1_800_000_000;
@@ -21,7 +22,7 @@ fn account(pk: &str, label: &str, preferred: &[(&str, Option<u64>)]) -> LabAccou
         joinable: true,
         preferred: preferred
             .iter()
-            .map(|(m, rank)| ((*m).to_string(), *rank))
+            .map(|(m, rank)| (test_machine(m), *rank))
             .collect(),
     }
 }
@@ -76,7 +77,7 @@ fn every_word(deck: &LabDeck) -> String {
 #[test]
 fn rows_name_an_account_by_its_label_never_an_address() {
     let lab = Lab {
-        me: Some("m1".into()),
+        me: Some(test_machine("m1")),
         accounts: vec![
             account(
                 "ac-0a1b2c3d4e5f60718293a4",
@@ -109,7 +110,7 @@ fn rows_name_an_account_by_its_label_never_an_address() {
 #[test]
 fn this_macs_preferred_accounts_come_first_and_a_preference_limits_nothing() {
     let lab = Lab {
-        me: Some("m1".into()),
+        me: Some(test_machine("m1")),
         accounts: vec![
             account("ac-01", "b-first", &[("m1", Some(2))]),
             account("ac-02", "z-first", &[("m1", Some(1))]),
@@ -146,7 +147,7 @@ fn this_macs_preferred_accounts_come_first_and_a_preference_limits_nothing() {
 #[test]
 fn quota_left_is_the_binding_windows_with_its_readings_age() {
     let lab = Lab {
-        me: Some("m1".into()),
+        me: Some(test_machine("m1")),
         accounts: vec![
             account("ac-01", "two-windows", &[("m1", Some(1))]),
             account("ac-02", "walled", &[("m1", Some(2))]),
@@ -423,7 +424,7 @@ fn the_lens_steps_from_secrets_onto_the_accounts_and_shows_their_rows() {
 #[test]
 fn an_unread_journal_is_not_read_as_an_empty_one() {
     let lab = Lab {
-        me: Some("m1".into()),
+        me: Some(test_machine("m1")),
         accounts: vec![account("ac-01", "mine", &[("m1", Some(1))])],
         ..Lab::default()
     };
@@ -470,7 +471,7 @@ fn an_account_held_from_use_has_no_cell_and_is_counted() {
     let mut unseen = account("ac-03", "quiet", &[]);
     unseen.joinable = false;
     let lab = Lab {
-        me: Some("m1".into()),
+        me: Some(test_machine("m1")),
         accounts: vec![
             retired,
             paused,
@@ -500,7 +501,7 @@ fn an_account_held_from_use_has_no_cell_and_is_counted() {
 #[test]
 fn a_reading_older_than_its_wall_or_reset_draws_neither() {
     let lab = Lab {
-        me: Some("m1".into()),
+        me: Some(test_machine("m1")),
         accounts: vec![
             account("ac-01", "lifted", &[("m1", Some(1))]),
             account("ac-02", "reset", &[("m1", Some(2))]),

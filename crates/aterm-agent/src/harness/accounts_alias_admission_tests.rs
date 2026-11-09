@@ -320,13 +320,23 @@ fn represented_sync(
     }
     let retained = || {
         let now = Snapshot::read(bed._dir.path(), &store);
-        now.files.keys().eq(before.files.keys())
+        now.files
+            .keys()
+            .filter(|path| !store.is_sync_receipt_file(path))
+            .eq(before
+                .files
+                .keys()
+                .filter(|path| !store.is_sync_receipt_file(path)))
             && now.directories == expected_directories
-            && before.files.iter().all(|(path, bytes)| {
-                path == &roster_path
-                    || path == &store.wake_path()
-                    || now.files.get(path) == Some(bytes)
-            })
+            && before
+                .files
+                .iter()
+                .filter(|(path, _)| !store.is_sync_receipt_file(path))
+                .all(|(path, bytes)| {
+                    path == &roster_path
+                        || path == &store.wake_path()
+                        || now.files.get(path) == Some(bytes)
+                })
             && now
                 .files
                 .get(&roster_path)

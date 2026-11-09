@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Resolves the newest published release tag via one unmetered HEAD request to
-//! `/releases/latest/download/{name}`.
+//! `/releases/latest/download/{name}`, with a fresh query per lookup so an
+//! intermediary cannot reuse a redirect for an older release.
 //!
 //! Only a redirect to the exact tag-specific download URL for `(owner, repo, name)` under a
 //! [`crate::cdn::path_segment_safe`] tag accepted by the caller is trusted to name the tag;
@@ -184,7 +185,14 @@ pub fn resolve_with(
     accept_tag: &dyn Fn(&str) -> bool,
     head: &mut dyn FnMut(&str) -> Result<HeadAnswer, HttpError>,
 ) -> Result<Pointer, PointerError> {
-    let url = latest_download_url(owner, repo, name).ok_or(PointerError::UnsafeName)?;
+    let mut url = latest_download_url(owner, repo, name).ok_or(PointerError::UnsafeName)?;
+    let mut nonce = [0u8; 16];
+    aterm_uds::rand::fill(&mut nonce)
+        .map_err(|error| PointerError::Transport(format!("release lookup freshness: {error}")))?;
+    url.push_str(&format!(
+        "?aterm_lookup={:032x}",
+        u128::from_be_bytes(nonce)
+    ));
     let answer = head(&url);
     classify(owner, repo, name, &url, answer, accept_tag)
 }
@@ -391,6 +399,29 @@ mod tests {
     }
 
     #[test]
+    fn each_lookup_escapes_an_intermediarys_cached_release_pointer() {
+        let mut cached = std::collections::HashMap::new();
+        let mut published = "v0.74.0";
+        let mut lookup = |published: &str| {
+            resolve_with(OWNER, REPO, NAME, &canonical_app_tag, &mut |url| {
+                let tag = cached
+                    .entry(url.to_owned())
+                    .or_insert_with(|| published.to_owned());
+                Ok(HeadAnswer {
+                    code: 302,
+                    location: Some(
+                        crate::cdn::release_download_url(OWNER, REPO, tag, NAME).unwrap(),
+                    ),
+                })
+            })
+            .unwrap()
+        };
+        assert_eq!(lookup(published).tag, published);
+        published = "v0.75.0";
+        assert_eq!(lookup(published).tag, published);
+    }
+
+    #[test]
     fn resolve_makes_one_head_and_none_for_an_unsafe_source() {
         let mut asked: Vec<String> = Vec::new();
         let mut head = |url: &str| {
@@ -402,11 +433,11 @@ mod tests {
         };
         let p = resolve_with(OWNER, REPO, NAME, &canonical_app_tag, &mut head).unwrap();
         assert_eq!(p.tag, "v0.74.0");
-        assert_eq!(
-            asked,
-            vec![latest_download_url(OWNER, REPO, NAME).unwrap()],
-            "one HEAD, to the evergreen URL"
-        );
+        assert_eq!(asked.len(), 1, "one HEAD");
+        let (base, nonce) = asked[0].split_once("?aterm_lookup=").unwrap();
+        assert_eq!(base, latest_download_url(OWNER, REPO, NAME).unwrap());
+        assert_eq!(nonce.len(), 32);
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(!crate::cdn::is_api_host(&asked[0]));
         let mut none = |_: &str| panic!("no request may be made for an unsafe source");
         assert_eq!(

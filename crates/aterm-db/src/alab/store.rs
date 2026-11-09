@@ -430,7 +430,7 @@ impl Registry {
     /// This Mac's custody cannot be read.
     pub fn table(&self) -> Result<Option<Digest>> {
         let compiled = self.generation();
-        let Some(bootstrap) = Bootstrap::cached(&self.paths).map_err(crate::table::failure)? else {
+        let Some(bootstrap) = application::observed_bootstrap(&self.paths)? else {
             return Ok(None);
         };
         Ok(Some(compiled.descriptor(bootstrap.trust())?.scope.digest()))
@@ -766,7 +766,7 @@ impl Registry {
         config: &Path,
     ) -> Result<std::result::Result<aterm_secrets::commons::journal::Trust, Outcome>> {
         let compiled = self.generation();
-        let Some(bootstrap) = Bootstrap::cached(&self.paths).map_err(crate::table::failure)? else {
+        let Some(bootstrap) = application::observed_bootstrap(&self.paths)? else {
             return Ok(Err(Outcome::NotHeld));
         };
         let trust = bootstrap.trust();

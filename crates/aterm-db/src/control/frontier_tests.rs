@@ -1471,6 +1471,77 @@ fn a_mac_admitted_at_record_ten_thousand_pushes_only_what_its_peer_lacks() {
     });
 }
 
+/// A push reads its records custody only for the records its witness's past of what the peer
+/// states it holds leaves: a Mac whose witness ends at its `Admit` pushes nothing to a peer that
+/// states the `Admit`, reading no custody; the `Admit` alone to one that states the record before
+/// it; and nothing to one that states a record past the witness, which only the custody holds,
+/// where without a custody it pushes the whole witness.
+///
+/// NEGATIVE CONTROLS (round 15's controls): a push that reads its custody before its witness's
+/// past fails `a push its witness settles`; one whose custody's past is never applied pushes the
+/// whole witness to the peer past it (`the custody's past settles the rest`).
+#[test]
+fn a_push_reads_its_custody_only_for_what_its_witness_leaves() {
+    use crate::control::frontier::CUSTODY_READS;
+    let lab = Lab::new();
+    let genesis = Record::found(&ROOT, vec![entrant(&lab, 0)], 1).unwrap();
+    let network = *genesis.id();
+    let mut records = vec![genesis];
+    records.extend(chain(network, 0, network, None, 8));
+    let last = *records.last().unwrap().id();
+    let admit = Draft {
+        network,
+        sequence: 9,
+        previous: Some(last),
+        parents: vec![last],
+        authored_ms: 20_000,
+        body: Body::Admit {
+            entrant: entrant(&lab, 1),
+            evidence: aterm_secrets::membership_log::Evidence::Phrase,
+        },
+    }
+    .sign(&[31; 32], [3; 16])
+    .unwrap();
+    let admitted = *admit.id();
+    records.push(admit);
+    let witness = log_of(&records);
+    let mut beyond = records.clone();
+    beyond.extend(chain(network, 0, admitted, Some((admitted, 9)), 1));
+    let past = *beyond.last().unwrap().id();
+    let sender = custodied(&lab, 1, "sender", witness.clone(), &log_of(&beyond));
+    let push = |endpoint: &Endpoint, have: &[Digest]| {
+        CUSTODY_READS.set(0);
+        let mut stream = evidence_frames(
+            endpoint,
+            RecordsBound::here(true),
+            &Evidence::Log(Arc::new(witness.clone())),
+            &lab.requests[1],
+            Wire::Delta,
+            have,
+        );
+        let header = receive_frame(&mut stream, 22).unwrap();
+        let pushed = u32::from_be_bytes(header[10..14].try_into().unwrap()) as usize;
+        (pushed, CUSTODY_READS.get())
+    };
+
+    assert_eq!(
+        push(&sender, &[admitted]),
+        (0, 0),
+        "a push its witness settles"
+    );
+    assert_eq!(push(&sender, &[last]), (1, 1), "the Admit the peer lacks");
+    assert_eq!(
+        push(&sender, &[past]),
+        (0, 1),
+        "the custody's past settles the rest"
+    );
+    assert_eq!(
+        push(&witnessed(&lab, 1, witness.clone()), &[past]),
+        (records.len(), 0),
+        "without a custody, the whole witness"
+    );
+}
+
 /// `record`, pushed as Lab Mac 2's whole evidence to `receiver`, answering its session: the
 /// receiver's repair.
 fn push_one(lab: &Lab, receiver: &Endpoint, record: &Record) -> Repair {

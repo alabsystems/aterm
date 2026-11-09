@@ -403,6 +403,320 @@ fn a_look_under_a_writer_reads_the_records_afresh() {
     });
 }
 
+/// The records asked outside a look ([`client::records_now`]: each control exchange's membership
+/// store) are the same memo's: a warm ask reads none of the records' data and gives what a fresh
+/// read gives, an ask after the records changed gives them as they stand, and an ask while a
+/// writer holds the state lock reads them afresh.
+/// NEGATIVE CONTROLS (2026-11-09): with `records_now` on `load_records`, the warm ask reads the
+/// data (`a warm ask reads nothing`); with the records' memo not quiet, the ask under the writer
+/// gives what it kept (`an ask under a writer reads the records afresh`).
+#[test]
+fn an_ask_for_the_records_outside_a_look_asks_their_memo() {
+    let vault = Vault::new();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let held = client::records_now(&vault.paths).unwrap();
+        assert_eq!(
+            held.encode(),
+            client::load_records(&vault.paths).unwrap().encode()
+        );
+        assert!(held.len() > 1, "a log past its genesis");
+        let data = crate::records_storage::reader_path(&vault.paths.records_file()).unwrap();
+        let reads = crate::fsx::reads_of(&data);
+        assert_eq!(
+            client::records_now(&vault.paths).unwrap().encode(),
+            held.encode()
+        );
+        assert_eq!(
+            crate::fsx::reads_of(&data),
+            reads,
+            "a warm ask reads nothing"
+        );
+        let genesis =
+            crate::membership_log::store::encode_records(held.log().unwrap().records().take(1));
+        crate::fsx::write_atomic(&data, &genesis, 0o600).unwrap();
+        let fresh = client::load_records(&vault.paths).unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(
+            client::records_now(&vault.paths).unwrap().encode(),
+            fresh.encode(),
+            "an ask reads the records as they stand"
+        );
+        let writing = writer(&vault.paths).unwrap();
+        let reads = crate::fsx::reads_of(&data);
+        assert_eq!(
+            client::records_now(&vault.paths).unwrap().encode(),
+            fresh.encode()
+        );
+        assert!(
+            crate::fsx::reads_of(&data) > reads,
+            "an ask under a writer reads the records afresh"
+        );
+        drop(writing);
+    });
+}
+
+/// What a table session's open and the checks a local batch makes at once after it ask
+/// (`aterm-db`'s `Replica::observe`), through `look`: the custody, the access, and the access's
+/// currency twice. The access it opened, and each check's answer.
+fn a_session_through(vault: &Vault, look: &client::VaultLook<'_>) -> SessionJudged {
+    let custody = vault.bootstrap.revalidate_custody_in(look);
+    let access = vault
+        .bootstrap
+        .access_observed_in_look(&vault.journal, look);
+    let checks = match &access {
+        Ok(Some(access)) => Some((
+            access.is_current_in(&vault.journal, look),
+            access.is_current_observed_in(&vault.journal, look),
+        )),
+        _ => None,
+    };
+    SessionJudged {
+        custody,
+        access,
+        checks,
+    }
+}
+
+/// The same asks, each on its own call, as before the look.
+fn a_session_on_own_calls(vault: &Vault) -> SessionJudged {
+    let custody = vault.bootstrap.revalidate_custody();
+    let access = vault.bootstrap.access_observed_in(&vault.journal);
+    let checks = match &access {
+        Ok(Some(access)) => Some((
+            access.is_current(&vault.journal),
+            access.is_current_observed(&vault.journal),
+        )),
+        _ => None,
+    };
+    SessionJudged {
+        custody,
+        access,
+        checks,
+    }
+}
+
+/// What a session's asks answered.
+struct SessionJudged {
+    custody: crate::Result<()>,
+    access: crate::Result<Option<Access>>,
+    checks: Option<(bool, crate::Result<bool>)>,
+}
+
+impl SessionJudged {
+    /// The answers as comparable values: an error by its kind, an access by what it was opened
+    /// on.
+    fn verdict(&self) -> impl PartialEq + std::fmt::Debug {
+        let kind = |error: &crate::Error| format!("{:?}", error.kind());
+        (
+            self.custody.as_ref().map_err(kind).copied(),
+            self.access.as_ref().map_err(kind).map(|access| {
+                access
+                    .as_ref()
+                    .map(|access| (access.head, access.basis, access.log_heads_digest))
+            }),
+            self.checks
+                .as_ref()
+                .map(|(current, observed)| (*current, observed.as_ref().map_err(kind).copied())),
+        )
+    }
+}
+
+/// A warm table session's look ([`client::VaultLook`]: `Bootstrap::revalidate_custody_in`,
+/// `Bootstrap::access_observed_in_look`, `Access::is_current_in` and
+/// `Access::is_current_observed_in`) observes the state lock once for the open and both checks,
+/// takes one stamping `lstat` of each file they stamp (the custody's digests of its immutable
+/// files look at those once more, as on their own call), opens no file the asks on their own
+/// calls do not, and answers as those calls do; the next look looks again.
+/// NEGATIVE CONTROLS (2026-11-09): with `Access::is_current_observed_in` on its own call, a
+/// session observes the lock three times (`a session look's observations`); with
+/// `Bootstrap::access_observed_in_look` on its own call, twice; with
+/// `Bootstrap::revalidate_custody_in` on its own call, twice.
+#[test]
+fn a_session_look_observes_once_and_judges_as_its_own_calls() {
+    let vault = Vault::new();
+    let home = vault.paths.home.clone();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        let own = a_session_on_own_calls(&vault);
+        assert!(matches!(own.access, Ok(Some(_))), "{:?}", own.verdict());
+        assert!(matches!(own.checks, Some((true, Ok(true)))));
+        a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+        let own_reads = crate::fsx::reads_under(&home);
+        a_session_on_own_calls(&vault);
+        let own_reads = read_since(&crate::fsx::reads_under(&home), &own_reads);
+
+        let observations = client::lock_observations_of(&vault.paths);
+        let reads = crate::fsx::reads_under(&home);
+        let mut judged = None;
+        let looked = looks_during(&home, || {
+            judged = Some(a_session_through(
+                &vault,
+                &client::VaultLook::new(&vault.paths),
+            ));
+        });
+        assert_eq!(
+            client::lock_observations_of(&vault.paths) - observations,
+            1,
+            "a session look's observations"
+        );
+        let read = read_since(&crate::fsx::reads_under(&home), &reads);
+        assert!(
+            read.iter()
+                .all(|(path, reads)| own_reads.get(path) >= Some(reads)),
+            "a session look's reads {read:#?}, its own calls' {own_reads:#?}"
+        );
+        assert_eq!(judged.unwrap().verdict(), own.verdict());
+        // The immutable custody's digests open and look at their files themselves.
+        let custody = looks_during(&home, || {
+            vault.bootstrap.revalidate_immutable_custody().unwrap();
+        });
+        assert!(custody.contains_key(&vault.paths.dir.join("identity")));
+        let stamped: std::collections::BTreeMap<_, _> = looked
+            .iter()
+            .map(|(path, looks)| (path, looks - custody.get(path).copied().unwrap_or(0)))
+            .filter(|(_, looks)| *looks > 0)
+            .collect();
+        for file in [
+            vault.paths.dir.clone(),
+            vault.paths.dir.join("identity"),
+            vault.paths.state_file(),
+            vault.paths.dir.join("source.toml"),
+            vault.paths.cache_file(),
+        ] {
+            assert_eq!(
+                stamped.get(&file),
+                Some(&1),
+                "a session look's looks: {looked:#?}, its custody's {custody:#?}"
+            );
+        }
+        assert!(
+            stamped.values().all(|looks| *looks == 1),
+            "a session look's looks: {looked:#?}, its custody's {custody:#?}"
+        );
+        assert_eq!(
+            looks_during(&home, || {
+                a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+            }),
+            looked,
+            "the next look looks again"
+        );
+    });
+}
+
+/// The opens of each file under a folder since `before` ([`crate::fsx::reads_under`]).
+fn read_since(
+    now: &std::collections::BTreeMap<std::path::PathBuf, usize>,
+    before: &std::collections::BTreeMap<std::path::PathBuf, usize>,
+) -> std::collections::BTreeMap<std::path::PathBuf, usize> {
+    now.iter()
+        .filter_map(|(path, reads)| {
+            let read = reads - before.get(path).copied().unwrap_or(0);
+            (read > 0).then(|| (path.clone(), read))
+        })
+        .collect()
+}
+
+/// A session look that holds no observation of the vault's state lock judges as the asks' own
+/// calls do: one taken while a writer holds the lock (a busy vault, no access opened, and a warm
+/// access not current by its boolean check and busy by its observed one), and one whose
+/// observation guards a lock file put away since it
+/// looked, a writer now holding the lock at the vault's path ([`client::StateLock::observes`]).
+/// NEGATIVE CONTROL (2026-11-09): with `VaultLook::held` giving the look's observation whether
+/// or not it guards the lock at the vault's path, the session whose lock was put away opens an
+/// access under the writer (`a look at a lock put away`).
+#[test]
+fn a_session_look_with_no_observation_judges_as_its_own_calls() {
+    let vault = Vault::new();
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+        let writing = writer(&vault.paths).unwrap();
+        let look = client::VaultLook::new(&vault.paths);
+        let judged = a_session_through(&vault, &look);
+        let own = a_session_on_own_calls(&vault);
+        assert_eq!(judged.verdict(), own.verdict(), "a look under a writer");
+        assert!(
+            matches!(&own.access, Err(busy) if busy.kind() == crate::ErrorKind::VaultBusy),
+            "{:?}",
+            own.verdict()
+        );
+        assert!(!access.is_current_in(&vault.journal, &look));
+        assert_eq!(
+            access
+                .is_current_observed_in(&vault.journal, &look)
+                .map_err(|error| error.kind()),
+            Err(crate::ErrorKind::VaultBusy)
+        );
+        drop(look);
+        drop(writing);
+
+        let lock = vault.paths.dir.join(".lock");
+        let look = client::VaultLook::new(&vault.paths);
+        let put_away = lock.with_extension("put-away");
+        std::fs::rename(&lock, &put_away).unwrap();
+        std::fs::copy(&put_away, &lock).unwrap();
+        let writing = writer(&vault.paths).unwrap();
+        let judged = a_session_through(&vault, &look);
+        let own = a_session_on_own_calls(&vault);
+        assert_eq!(judged.verdict(), own.verdict(), "a look at a lock put away");
+        assert!(own.access.is_err(), "{:?}", own.verdict());
+        let kind = |error: crate::Error| error.kind();
+        assert_eq!(
+            (
+                access.is_current_in(&vault.journal, &look),
+                access
+                    .is_current_observed_in(&vault.journal, &look)
+                    .map_err(kind)
+            ),
+            (
+                access.is_current(&vault.journal),
+                access.is_current_observed(&vault.journal).map_err(kind)
+            ),
+            "a look at a lock put away checks as its own calls"
+        );
+        drop(writing);
+        drop(look);
+    });
+}
+
+/// A look stands for one moment of the vault: a session look after this Mac's identity was put
+/// in another's place judges as the asks' own calls do (its custody refused, and the access it
+/// opens no longer current), and finds a warm access no longer current.
+/// NEGATIVE CONTROL (2026-11-09): with `Access::is_current_observed_in` comparing no recipient,
+/// the look finds the access it opens current (`a look after another identity`).
+#[test]
+fn the_next_session_look_sees_another_identity() {
+    let vault = Vault::new();
+    let access = vault.bootstrap.access_in(&vault.journal).unwrap().unwrap();
+    let other = aterm_tempfile::tempdir().unwrap();
+    let other = client::Paths::for_home(other.path());
+    client::machine_identity(&other).unwrap();
+    crate::fsx::as_if_later(std::time::Duration::from_secs(3600), || {
+        a_session_through(&vault, &client::VaultLook::new(&vault.paths));
+        let identity = vault.paths.dir.join("identity");
+        crate::fsx::write_atomic(
+            &identity,
+            &std::fs::read(other.dir.join("identity")).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        let look = client::VaultLook::new(&vault.paths);
+        let judged = a_session_through(&vault, &look);
+        let own = a_session_on_own_calls(&vault);
+        assert_eq!(
+            judged.verdict(),
+            own.verdict(),
+            "a look after another identity"
+        );
+        assert!(own.custody.is_err());
+        assert!(matches!(own.checks, Some((false, Ok(false)))));
+        assert!(!access.is_current(&vault.journal));
+        assert!(
+            !access.is_current_in(&vault.journal, &look),
+            "the next look sees another identity"
+        );
+    });
+}
+
 #[test]
 fn a_failed_vault_read_cannot_poison_commons_access_without_an_input_change() {
     struct ReadFault(std::path::PathBuf);

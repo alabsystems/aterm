@@ -232,7 +232,7 @@ fn slot_why(
     current: Option<&PoolAccount>,
 ) -> SlotWhy {
     if let Some(account) = account {
-        if account.preferred_on(machine).is_some() {
+        if account.prefers_label_for_export(machine) {
             return SlotWhy::Pin;
         }
         if let Some(why) = lab

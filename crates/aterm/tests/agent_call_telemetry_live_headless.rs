@@ -18,6 +18,8 @@ use crate::standin;
 
 /// This file's stand-in entry: run as the agent, with the calls [`standin::spec`] names.
 const ENTRY: &str = "agent_call_telemetry_live_headless::agent_standin";
+const ROLE: &str = "agent-calls";
+const CALLS_FILE: &str = "calls.json";
 
 /// The four ends of the package's measurement, each a call of its own, and what its row says:
 /// `(command, label, outcome, code, sig)`. Each end of its own runs a program of its own, so a
@@ -52,15 +54,21 @@ fn reaped(screen: &str) -> std::collections::BTreeMap<usize, (String, String)> {
 /// A wait for something that must happen: a hang detector, never a latency budget.
 const HANG: Duration = Duration::from_secs(60);
 
-/// The stand-in agent: start each call (`;`-separated in the spec, as `<ms>:<command>`, started
-/// `<ms>` after the first), each `zsh -c` in a session of its own with no terminal; write a dot
+/// The stand-in agent: read the calls and their start offsets from its gate's JSON file,
+/// each `zsh -c` in a session of its own with no terminal; write a dot
 /// every quarter second while any runs (the output a windowless instance's passes follow), then
 /// one `status <i> <code|-> <sig|->` line per call as the stand-in reaped it, and `standin-done`.
 /// Closing their input pipes releases the programs only after the observer's `release` marker.
 #[test]
 fn agent_standin() {
-    let Some(spec) = standin::spec() else { return };
+    if standin::spec().as_deref() != Some(ROLE) {
+        return;
+    }
     let gate = std::path::PathBuf::from(std::env::var_os("CALL_GATE").expect("call gate"));
+    let calls: Vec<(u64, String)> = aterm_json::from_str(
+        &std::fs::read_to_string(gate.join(CALLS_FILE)).expect("call specification"),
+    )
+    .expect("call offsets and commands");
     standin::put(b"standin-ready\n");
     let deadline = Instant::now() + HANG;
     while !gate.join("start").exists() {
@@ -68,14 +76,9 @@ fn agent_standin() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let t0 = Instant::now();
-    let mut queue: Vec<(Duration, String)> = spec
-        .split(';')
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            let (ms, cmd) = s.split_once(':').expect("<ms>:<command>");
-            let cmd = cmd.replace("%3B", ";");
-            (Duration::from_millis(ms.parse().expect("ms")), cmd)
-        })
+    let mut queue: Vec<(Duration, String)> = calls
+        .into_iter()
+        .map(|(ms, cmd)| (Duration::from_millis(ms), cmd))
         .collect();
     queue.reverse();
     let mut running = Vec::new();
@@ -159,18 +162,6 @@ fn agent_standin() {
         std::thread::sleep(Duration::from_millis(250));
     }
     standin::exit(0)
-}
-
-/// The stand-in's spec for `calls`, each `(start ms, command)`.
-fn spec(calls: &[(u64, &str)]) -> String {
-    calls
-        .iter()
-        .map(|(ms, cmd)| {
-            assert!(!cmd.contains(':') && !cmd.contains('\''), "{cmd}");
-            format!("{ms}:{}", cmd.replace(';', "%3B"))
-        })
-        .collect::<Vec<_>>()
-        .join(";")
 }
 
 /// The instance's `kind=agent-call` rows, polled until `n` are written.
@@ -279,6 +270,13 @@ impl Drop for Resume {
 
 /// Start behind a gate so even a reader delayed until every call was spawned must observe them.
 fn start(inst: &Instance, sid: &str, calls: &[(u64, &str)]) {
+    // Session publication precedes the shell's raw mode. Keep the submitted command
+    // below the canonical input limit, regardless of how many calls its data describes.
+    std::fs::write(
+        inst.tmp.join(CALLS_FILE),
+        aterm_json::to_string(calls).expect("serialize calls"),
+    )
+    .expect("write call specification");
     for name in ["sleep", "caffeinate"] {
         aterm_uds::deadline::ad_hoc_copy(std::path::Path::new("/bin/cat"), &inst.tmp.join(name));
     }
@@ -288,7 +286,7 @@ fn start(inst: &Instance, sid: &str, calls: &[(u64, &str)]) {
         &format!(
             "env CALL_GATE='{}' {}",
             inst.tmp.display(),
-            standin::shell_line(ENTRY, &spec(calls))
+            standin::shell_line(ENTRY, ROLE)
         ),
     );
     headless_boot::ctl_ok(

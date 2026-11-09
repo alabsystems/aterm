@@ -397,6 +397,69 @@ fn head_disagreements(scratch: &Scratch, script: &Path, redefine: &str) -> Vec<S
 }
 
 #[test]
+fn a_new_release_is_not_hidden_by_a_cached_bootstrap_pointer() {
+    let scratch = Scratch::new();
+    let cache = scratch.mkdir("pointer-cache");
+    let mut lib = Lib::new();
+    lib.env("POINTER_CACHE", s(&cache));
+    lib.step(format!("REPO_SLUG={OWNER}/{REPO}"));
+    lib.step(
+        r#"
+web_curl() {
+    local url="${!#}" cached='' tag="$PUBLISHED_TAG"
+    if [[ -f "$POINTER_CACHE/url" ]]; then IFS= read -r cached < "$POINTER_CACHE/url"; fi
+    if [[ "$url" == "$cached" ]]; then
+        IFS= read -r tag < "$POINTER_CACHE/tag"
+    else
+        printf '%s\n' "$url" > "$POINTER_CACHE/url"
+        printf '%s\n' "$tag" > "$POINTER_CACHE/tag"
+    fi
+    printf '302 https://github.com/%s/releases/download/%s/aterm-appcast.toml' "$REPO_SLUG" "$tag"
+}
+"#,
+    );
+    let before = lib.call("PUBLISHED_TAG=v0.186.0; channel_head", &["HEAD_TAG"]);
+    let after = lib.call("PUBLISHED_TAG=v0.187.0; channel_head", &["HEAD_TAG"]);
+    let records = lib.run(&scratch);
+    assert_eq!(records[before].rc, 0);
+    assert_eq!(records[before].var("HEAD_TAG"), "v0.186.0");
+    assert_eq!(records[after].rc, 0);
+    assert_eq!(records[after].var("HEAD_TAG"), "v0.187.0");
+    let request = std::fs::read_to_string(cache.join("url")).unwrap();
+    let (base, nonce) = request.trim_end().split_once("?aterm_lookup=").unwrap();
+    assert_eq!(
+        base,
+        format!("https://github.com/{OWNER}/{REPO}/releases/latest/download/{APPCAST}")
+    );
+    assert_eq!(nonce.len(), 32);
+    assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+}
+
+#[test]
+fn missing_bootstrap_lookup_entropy_never_reuses_a_cached_pointer() {
+    let scratch = Scratch::new();
+    let request = scratch.path().join("unexpected-request");
+    let mut lib = Lib::new();
+    lib.env("UNEXPECTED_REQUEST", s(&request));
+    lib.step(format!("REPO_SLUG={OWNER}/{REPO}"));
+    lib.step(
+        r#"
+od() { return 1; }
+web_curl() { printf called > "$UNEXPECTED_REQUEST"; printf '404 '; }
+"#,
+    );
+    let call = lib.call("HEAD_TAG=old; channel_head", &["HEAD_TAG", "HEAD_WHY"]);
+    let records = lib.run(&scratch);
+    assert_eq!(records[call].rc, 1);
+    assert_eq!(records[call].var("HEAD_TAG"), "");
+    assert!(!records[call].var("HEAD_WHY").is_empty());
+    assert!(
+        !request.exists(),
+        "no network request without a fresh lookup"
+    );
+}
+
+#[test]
 fn the_head_pointer_elects_what_the_updater_elects() {
     let scratch = Scratch::new();
     let wrong = head_disagreements(&scratch, &install_sh(), ":");
@@ -511,8 +574,10 @@ fn the_head_pointer_classifies_each_answer() {
     assert!(argv.contains(&"-I"), "{argv:?}");
     assert!(!crate::support::follows_redirects(&argv), "{argv:?}");
     assert_eq!(
-        argv.last(),
-        Some(&"https://github.com/example/aterm/releases/latest/download/aterm-appcast.toml")
+        argv.last()
+            .and_then(|url| url.split_once("?aterm_lookup="))
+            .map(|(base, _)| base),
+        Some("https://github.com/example/aterm/releases/latest/download/aterm-appcast.toml")
     );
 }
 

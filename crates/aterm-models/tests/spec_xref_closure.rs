@@ -57,6 +57,12 @@ fn collected_digests(refs: &[&xref::RefinementAnchor], waivers: &[&xref::Waiver]
 #[test]
 fn spec_xref_closure() {
     let _domains = aterm_models::link_all();
+    std::hint::black_box((
+        aterm_agent::harness::alab_roster::preference_projection_inputs as fn(),
+        aterm_agent::harness::alab_roster::source_observation_inputs as fn(),
+        aterm_agent::harness::alab_roster::SourceSnapshot::permits_sheet as *const (),
+        aterm_agent::harness::alab_roster::fleet_for as *const (),
+    ));
     std::hint::black_box(
         aterm_agent::harness::accounts::account_workflow_scope_environment as fn(),
     );
@@ -153,6 +159,21 @@ fn spec_xref_closure() {
                 &mut aterm_db::control::Repair,
             ) -> aterm_db::Result<aterm_db::control::Report>,
     );
+    // Keep the admission primitive's anchors active before an application adopts it.
+    #[cfg(unix)]
+    std::hint::black_box(
+        aterm_secrets::client::EntrySnapshot::admit::<()>
+            as fn(
+                &aterm_secrets::client::EntrySnapshot,
+                &aterm_secrets::client::Paths,
+                fn(&aterm_secrets::client::VerifiedEntry),
+            ) -> aterm_secrets::Result<aterm_secrets::client::EntryAdmission<()>>,
+    );
+    #[cfg(unix)]
+    std::hint::black_box(aterm_secrets::client::EntrySnapshot::supersedes as *const ());
+    #[cfg(unix)]
+    std::hint::black_box(aterm_secrets::client::EntrySnapshot::compare_claim as *const ());
+    std::hint::black_box(aterm_secrets::membership_log::Log::open_entry_set as *const ());
     #[cfg(unix)]
     {
         use aterm_secrets::{
@@ -396,12 +417,21 @@ fn spec_xref_closure() {
         "DbImportAtomic",
         "DbAccountPlan",
         "DbProposalConditional",
+        "DbEntryAdmission",
+        "DbEntryProvenance",
+        "DbHostCarry",
+        "DbEntryClaim",
         "AccountSharedRecovery",
         "AccountSharedProgress",
         "AccountSharedAdoptionProgress",
         "AccountSharedAdoptionRecovery",
         "FabricRouting",
         "FabricHalts",
+        "LabPreferenceIdentity",
+        "LabSourceAvailability",
+        "AccountSourceCapture",
+        "AccountFleetCommit",
+        "AccountProviderCommit",
     ] {
         assert!(
             report

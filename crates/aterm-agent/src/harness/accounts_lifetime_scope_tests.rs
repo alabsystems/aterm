@@ -192,6 +192,7 @@ impl Fixture {
                     NOW,
                     &mut None,
                     SyncTarget {
+                        fleet: None,
                         path: &self.roster,
                         before: Some(&before),
                         after: Some(&after),
@@ -743,6 +744,7 @@ fn an_entry_clock_result_cannot_certify_a_later_policy_even_when_its_value_did_n
                 NOW,
                 &mut None,
                 SyncTarget {
+                    fleet: None,
                     path: &fixture.roster,
                     before: Some(&before),
                     after: Some(&after),
@@ -784,6 +786,7 @@ fn an_explicit_clock_observation_follows_only_the_policy_actually_inspected() {
             NOW,
             &mut None,
             SyncTarget {
+                fleet: None,
                 path: &fixture.roster,
                 before: Some(&before),
                 after: Some(&after),
@@ -898,6 +901,7 @@ fn reads_inside_an_admitted_edit_cannot_lend_entry_clocks_to_the_next_row() {
                 NOW,
                 &mut None,
                 SyncTarget {
+                    fleet: None,
                     path: &fixture.roster,
                     before: Some(&before),
                     after: Some(&after),

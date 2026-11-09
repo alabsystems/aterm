@@ -40,13 +40,117 @@ use std::sync::{Arc, OnceLock};
 /// [`FleetRoster::source`] of the fleet it reads.
 pub const SOURCE: &str = "alab";
 
+/// A machine's primary key in the registry, independent of its displayed name.
+/// This value grants no authority; the registry's facts binding selects this Mac's key.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MachineKey(String);
+
+impl MachineKey {
+    /// Keep the exact key from the registry projection, without interpreting it as a label.
+    #[must_use]
+    pub fn from_registry(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A registry identity and its optional display label. Identity comparisons use `key`;
+/// equality of this complete observation also notices a renamed or unavailable label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachineRef {
+    pub key: MachineKey,
+    pub label: Option<String>,
+}
+
+impl MachineRef {
+    #[must_use]
+    pub fn from_registry(key: impl Into<String>, label: Option<String>) -> Self {
+        Self {
+            key: MachineKey::from_registry(key),
+            label,
+        }
+    }
+
+    /// Presentation only: a missing label is shown by its stable key, never guessed.
+    #[must_use]
+    pub fn display_or_key(&self) -> &str {
+        self.label.as_deref().unwrap_or_else(|| self.key.as_str())
+    }
+}
+
+/// A synthetic machine whose key deliberately differs from its display label.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn test_machine(label: &str) -> MachineRef {
+    MachineRef::from_registry(format!("test-machine:{label}"), Some(label.to_owned()))
+}
+
+/// Inputs supplied by the registry projection, not steps performed by the harness.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "LabPreferenceIdentity",
+    action = "Bind",
+    reason = "The authenticated live facts binding is an input to this projection; its creation is outside this model."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "LabPreferenceIdentity",
+    action = "Prefer",
+    reason = "The validated preference owner is an input; registry editing and replication are outside this model."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "LabPreferenceIdentity",
+    action = "LabelA",
+    reason = "A machine display label is an independent input, including an absent or conflicting label."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "LabPreferenceIdentity",
+    action = "LabelB",
+    reason = "The other machine display label is an independent input, including collisions."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "LabPreferenceIdentity",
+    action = "Joinable",
+    reason = "Account status is an input; provider authentication is outside this projection."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "LabPreferenceIdentity",
+    action = "Rank",
+    reason = "Preference rank is an input from the registry, including an unranked preference."
+)]
+pub fn preference_projection_inputs() {}
+
+/// Inputs to one local source observation; persistence and network behavior are outside it.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "LabSourceAvailability",
+    action = "Held",
+    reason = "The previously retained projection is an input to this local observation."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "LabSourceAvailability",
+    action = "Read",
+    reason = "The validated registry reader supplies absence, a projection, unchanged state, partial state or failure."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "LabSourceAvailability",
+    action = "Policy",
+    reason = "Local policy is supplied by its admitted file read; editing that file is outside this observation."
+)]
+pub fn source_observation_inputs() {}
+
 /// The registry as this Mac's harness reads it: what `LabView` projects, with the addresses an
 /// account row holds. It stays in this process and is never printed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Lab {
-    /// This Mac's machine label (`m22`), the machine its own facts row binds; `None` where this
-    /// Mac has no live binding yet, which leaves every sync on the sources it always read.
-    pub me: Option<String>,
+    /// The live machine identity this Mac's own facts row binds, with its display label kept
+    /// separately. Only an absent binding is `None`; an unavailable label keeps its key.
+    pub me: Option<MachineRef>,
     /// The live facts-bound machine's naming projection: no binding, a validated name, or a
     /// bound row whose name is conflicted or invalid. Kept separately from `me` so a missing
     /// display label never becomes permission to invent another name.
@@ -101,18 +205,27 @@ pub struct LabAccount {
     pub browser: Option<String>,
     /// A live row whose status lets a sign-in be tried: only such an account is added unasked.
     pub joinable: bool,
-    /// The machines that prefer it, by label, smaller rank first, then the smaller machine number.
-    pub preferred: Vec<(String, Option<u64>)>,
+    /// The machines that prefer it, by registry identity, with labels for display. Smaller
+    /// rank comes first, then the smaller machine number, as the registry orders them.
+    pub preferred: Vec<(MachineRef, Option<u64>)>,
 }
 
 impl LabAccount {
     /// Its rank on `machine`, where `machine` prefers it.
     #[must_use]
-    pub fn preferred_on(&self, machine: &str) -> Option<Option<u64>> {
+    pub fn preferred_on(&self, machine: &MachineKey) -> Option<Option<u64>> {
         self.preferred
             .iter()
-            .find(|(label, _)| label == machine)
+            .find(|(held, _)| &held.key == machine)
             .map(|(_, rank)| *rank)
+    }
+
+    /// The legacy export format names machines by label. This predicate is for rendering
+    /// that format only; local preference decisions use [`Self::preferred_on`].
+    pub(crate) fn prefers_label_for_export(&self, label: &str) -> bool {
+        self.preferred
+            .iter()
+            .any(|(machine, _)| machine.label.as_deref() == Some(label))
     }
 
     /// Whether `row` is this account's: its address or provider identity, in the same realm.
@@ -131,8 +244,8 @@ impl Lab {
     /// prefers it, else [`Class::Pool`]. An order alone: several Macs may prefer one account.
     #[must_use]
     pub fn class_of(&self, account: &LabAccount) -> Class {
-        match self.me.as_deref() {
-            Some(me) if account.preferred_on(me).is_some() => Class::Preferred,
+        match self.me.as_ref() {
+            Some(me) if account.preferred_on(&me.key).is_some() => Class::Preferred,
             _ => Class::Pool,
         }
     }
@@ -141,7 +254,11 @@ impl Lab {
     /// then those whose live place rows say they run it. Neither half is a limit.
     #[must_use]
     pub fn holders(&self, account: &LabAccount) -> Vec<String> {
-        let mut out: Vec<String> = account.preferred.iter().map(|(m, _)| m.clone()).collect();
+        let mut out: Vec<String> = account
+            .preferred
+            .iter()
+            .filter_map(|(machine, _)| machine.label.clone())
+            .collect();
         for (machine, _) in self
             .places
             .by_account
@@ -212,33 +329,90 @@ impl std::fmt::Debug for LabMailbox {
     }
 }
 
+/// One admitted source observation. A decision keeps this snapshot even if the
+/// source refreshes while the decision is being made.
+#[derive(Clone, Debug)]
+pub enum SourceSnapshot {
+    /// A registry read or local policy is unresolved.
+    Pending,
+    /// A successful read found no registry source for this installation.
+    Absent,
+    /// Local policy explicitly disables the registry source.
+    Disabled,
+    /// A complete retained projection, including one with no local binding.
+    Present(Arc<Lab>),
+}
+
+impl SourceSnapshot {
+    /// The admitted retained projection, if any.
+    #[must_use]
+    pub fn lab(&self) -> Option<Arc<Lab>> {
+        match self {
+            Self::Present(lab) => Some(lab.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether automatic discovery must wait for a usable source observation.
+    #[must_use]
+    pub fn pending(&self) -> bool {
+        matches!(self, Self::Pending)
+    }
+
+    /// Whether the local roster policy explicitly disables the registry.
+    #[must_use]
+    pub fn disabled(&self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+
+    /// Whether this projection binds the local machine, including a name conflict.
+    #[must_use]
+    pub fn names_this_mac(&self) -> bool {
+        let Self::Present(lab) = self else {
+            return false;
+        };
+        #[cfg(unix)]
+        if lab.machine_name.is_some() {
+            return true;
+        }
+        lab.me.is_some()
+    }
+
+    /// A sheet is admitted only after a known absence of a local registry binding.
+    #[must_use]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LabSourceAvailability",
+            action = "Project",
+            project = "aterm::alab_view::source_model_tests::project"
+        )
+    )]
+    pub fn permits_sheet(&self) -> bool {
+        !self.pending() && !self.names_this_mac()
+    }
+
+    /// The naming decision from this same admitted snapshot.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn machine_name(&self) -> crate::machine_name::RegistryNameRead {
+        use crate::machine_name::RegistryNameRead;
+        match self {
+            Self::Pending => RegistryNameRead::Pending,
+            Self::Absent | Self::Disabled => RegistryNameRead::Unbound,
+            Self::Present(lab) => lab
+                .machine_name
+                .clone()
+                .map_or(RegistryNameRead::Unbound, RegistryNameRead::Bound),
+        }
+    }
+}
+
 /// What gives the harness its [`Lab`]: the `aterm` executable's cache.
 pub trait Source: Send + Sync {
-    /// The lab as last projected, at once; `None` while nothing is projected, or where the
-    /// registry is not held here, current local policy is unavailable, or the source is off.
-    fn lab(&self) -> Option<Arc<Lab>>;
-
-    /// One naming decision from a consistent source snapshot, including unavailable policy
-    /// or a pending read. Sources without a naming projection leave first-name creation on
-    /// its existing fallback.
-    #[cfg(unix)]
-    fn machine_name(&self) -> crate::machine_name::RegistryNameRead {
-        crate::machine_name::RegistryNameRead::Unbound
-    }
-
-    /// Whether current local policy is unavailable, or no projection is held because reading
-    /// the registry failed, where a projection
-    /// named this Mac before: the lab may still name it, so nothing reads the sheet or labels a row after a machine until
-    /// a read succeeds ([`pending`]).
-    fn pending(&self) -> bool {
-        false
-    }
-
-    /// Whether `aterm.toml` turns the source off (`[alab] roster = false`), so the lab is not read
-    /// and no lab names this Mac whatever the registry says.
-    fn turned_off(&self) -> bool {
-        false
-    }
+    /// Observe local policy and the held projection once. Callers must make each
+    /// source-selection decision from the returned snapshot.
+    fn snapshot(&self) -> SourceSnapshot;
 
     /// The registry's live mailboxes with a live login, as last projected; empty where no lab
     /// is held.
@@ -289,21 +463,17 @@ thread_local! {
     static MAIL: std::cell::RefCell<Option<(Vec<LabMailbox>, Secrets)>> =
         const { std::cell::RefCell::new(None) };
     static REVEALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static OVERRIDE: std::cell::RefCell<Option<Arc<Lab>>> = const { std::cell::RefCell::new(None) };
+    static OVERRIDE: std::cell::RefCell<Option<SourceSnapshot>> = const { std::cell::RefCell::new(None) };
     static PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TURNED_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether the lab this process may hold could not be read yet ([`Source::pending`]): a Mac the
+/// Whether the lab this process may hold could not be read yet: a Mac the
 /// lab may name then reads no sheet ([`chosen`] refuses a sync with no source named), so a
 /// failed first look never labels a row after a machine that a later look would have named.
 #[must_use]
 pub fn pending() -> bool {
-    #[cfg(test)]
-    if PENDING.with(std::cell::Cell::get) {
-        return true;
-    }
-    current().is_none() && INSTALLED.get().is_some_and(|source| source.pending())
+    snapshot().pending()
 }
 
 /// Run `f` with this thread's lab [`pending`].
@@ -315,13 +485,9 @@ pub(crate) fn while_pending<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// Whether the installed [`Source`] is turned off ([`Source::turned_off`]).
+/// Whether the installed source is explicitly turned off by local policy.
 fn turned_off() -> bool {
-    #[cfg(test)]
-    if TURNED_OFF.with(std::cell::Cell::get) {
-        return true;
-    }
-    INSTALLED.get().is_some_and(|source| source.turned_off())
+    snapshot().disabled()
 }
 
 /// Run `f` with this thread's source [`turned_off`].
@@ -337,13 +503,7 @@ pub(crate) fn while_turned_off<T>(f: impl FnOnce() -> T) -> T {
 /// it does, the harness reads no sheet (§0: the sheet is the importer's input alone).
 #[must_use]
 pub fn names_this_mac() -> bool {
-    current().is_some_and(|lab| {
-        #[cfg(unix)]
-        if lab.machine_name.is_some() {
-            return true;
-        }
-        lab.me.is_some()
-    })
+    snapshot().names_this_mac()
 }
 
 /// The registry's first-name source, taken in one call so a concurrent refresh cannot turn a
@@ -351,44 +511,62 @@ pub fn names_this_mac() -> bool {
 #[must_use]
 #[cfg(unix)]
 pub fn machine_name() -> crate::machine_name::RegistryNameRead {
-    use crate::machine_name::RegistryNameRead;
+    snapshot().machine_name()
+}
+
+/// One observation for naming, source selection and automatic discovery.
+#[must_use]
+pub fn snapshot() -> SourceSnapshot {
     #[cfg(test)]
     {
         if TURNED_OFF.with(std::cell::Cell::get) {
-            return RegistryNameRead::Unbound;
+            return SourceSnapshot::Disabled;
         }
-        if let Some(lab) = OVERRIDE.with(|cell| cell.borrow().clone()) {
-            return lab
-                .machine_name
-                .clone()
-                .map_or(RegistryNameRead::Unbound, RegistryNameRead::Bound);
+        if let Some(source) = OVERRIDE.with(|cell| cell.borrow().clone()) {
+            return source;
         }
         if PENDING.with(std::cell::Cell::get) {
-            return RegistryNameRead::Pending;
+            return SourceSnapshot::Pending;
         }
     }
     INSTALLED
         .get()
-        .map_or(RegistryNameRead::Unbound, |source| source.machine_name())
+        .map_or(SourceSnapshot::Absent, |source| source.snapshot())
 }
 
 /// The lab as this process holds it now.
 #[must_use]
 pub fn current() -> Option<Arc<Lab>> {
-    #[cfg(test)]
-    if let Some(lab) = OVERRIDE.with(|cell| cell.borrow().clone()) {
-        return Some(lab);
-    }
-    INSTALLED.get()?.lab()
+    snapshot().lab()
 }
 
 /// Run `f` with `lab` as this thread's [`current`] lab.
 #[cfg(test)]
 pub(crate) fn with_lab<T>(lab: Lab, f: impl FnOnce() -> T) -> T {
-    OVERRIDE.with(|cell| *cell.borrow_mut() = Some(Arc::new(lab)));
-    let out = f();
-    OVERRIDE.with(|cell| *cell.borrow_mut() = None);
-    out
+    let _source = TestSourceOverride::new(SourceSnapshot::Present(Arc::new(lab)));
+    f()
+}
+
+/// A controlled source refresh in a test, restored even when an assertion unwinds.
+#[cfg(test)]
+pub(crate) struct TestSourceOverride(Option<SourceSnapshot>);
+
+#[cfg(test)]
+impl TestSourceOverride {
+    pub(crate) fn new(source: SourceSnapshot) -> Self {
+        Self(OVERRIDE.with(|cell| cell.replace(Some(source))))
+    }
+
+    pub(crate) fn set(&self, source: SourceSnapshot) {
+        OVERRIDE.with(|cell| *cell.borrow_mut() = Some(source));
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestSourceOverride {
+    fn drop(&mut self) {
+        OVERRIDE.with(|cell| *cell.borrow_mut() = self.0.take());
+    }
 }
 
 /// The registry's mailboxes this process holds ([`Source::mail`]): what a mailbox sign-in
@@ -550,12 +728,20 @@ pub(crate) fn reveals() -> usize {
         project = "aterm_agent::harness::alab_roster::assignment_tests::labels_transition"
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "LabPreferenceIdentity",
+        action = "Project",
+        project = "aterm::alab_view::preference_model_tests::project"
+    )
+)]
 pub fn fleet_for(lab: &Lab, cli: Cli, existing: Option<&Roster>) -> Option<FleetRoster> {
     let me = lab.me.clone()?;
     let mut mine: Vec<(&LabAccount, Option<u64>)> = lab
         .of(cli)
         .filter(|account| account.joinable)
-        .filter_map(|account| Some((account, account.preferred_on(&me)?)))
+        .filter_map(|account| Some((account, account.preferred_on(&me.key)?)))
         .collect();
     mine.sort_by(|(a, ra), (b, rb)| {
         (ra.is_none(), ra, &a.label).cmp(&(rb.is_none(), rb, &b.label))
@@ -592,7 +778,7 @@ pub fn fleet_for(lab: &Lab, cli: Cli, existing: Option<&Roster>) -> Option<Fleet
     // stays, by [`retain`]).
     let known = lab
         .of(cli)
-        .filter(|account| account.joinable && account.preferred_on(&me).is_none())
+        .filter(|account| account.joinable && account.preferred_on(&me.key).is_none())
         .filter(|account| accounts::label_refusal(&account.label).is_none())
         .map(|account| fleet_account(account, cli, &me, account.label.clone(), Class::Pool))
         .collect();
@@ -600,6 +786,7 @@ pub fn fleet_for(lab: &Lab, cli: Cli, existing: Option<&Roster>) -> Option<Fleet
         source: SOURCE.to_owned(),
         accounts,
         alab: Some(me),
+        lab_snapshot: Some(Arc::new(lab.clone())),
         known,
         clashes,
         ..FleetRoster::default()
@@ -610,13 +797,13 @@ pub fn fleet_for(lab: &Lab, cli: Cli, existing: Option<&Roster>) -> Option<Fleet
 fn fleet_account(
     account: &LabAccount,
     cli: Cli,
-    me: &str,
+    me: &MachineRef,
     label: String,
     class: Class,
 ) -> FleetAccount {
     FleetAccount {
         label,
-        machines: vec![me.to_owned()],
+        machines: vec![me.key.as_str().to_owned()],
         class,
         email: account.email.clone(),
         browser: account.browser.clone(),
@@ -647,6 +834,26 @@ pub(super) fn chosen(
     named: Option<&str>,
     config: Option<&Path>,
 ) -> Result<Option<FleetRoster>, String> {
+    // An explicit external source need not open the registry at all.
+    let named = named.map(str::trim).filter(|s| !s.is_empty());
+    if named.is_some_and(|named| named != SOURCE)
+        || (named.is_none()
+            && cli == Cli::Claude
+            && config.and_then(accounts_sync::source_key).is_some())
+    {
+        return Ok(None);
+    }
+    chosen_from(&snapshot(), cli, roster_path, named, config)
+}
+
+/// Select from the observation a caller retained, without reading another projection.
+pub(super) fn chosen_from(
+    source: &SourceSnapshot,
+    cli: Cli,
+    roster_path: Option<&Path>,
+    named: Option<&str>,
+    config: Option<&Path>,
+) -> Result<Option<FleetRoster>, String> {
     let named = named.map(str::trim).filter(|s| !s.is_empty());
     if named.is_some_and(|named| named != SOURCE) {
         return Ok(None);
@@ -656,17 +863,25 @@ pub(super) fn chosen(
         return Ok(None);
     }
     let existing = roster_path.and_then(|path| Roster::load_for(cli, path).ok());
-    let fleet = current().and_then(|lab| fleet_for(&lab, cli, existing.as_ref()));
-    if fleet.is_none() && pending() {
+    let fleet = source
+        .lab()
+        .and_then(|lab| fleet_for(&lab, cli, existing.as_ref()));
+    if source.pending() {
         return Err(
             "the lab source or its local policy could not be read, so this Mac may be one it \
              names: nothing was synced (no sheet is read meanwhile); a later sync reads it again"
                 .to_owned(),
         );
     }
+    if source.names_this_mac() && fleet.is_none() {
+        return Err(
+            "the lab binds this Mac but supplies no usable machine key; nothing was synced"
+                .to_owned(),
+        );
+    }
     if named.is_some() {
         return fleet.map(Some).ok_or_else(|| {
-            if turned_off() {
+            if source.disabled() {
                 "`[alab] roster = false` in aterm.toml turns the lab source off, so the `alab` \
                  source has nothing to read"
                     .to_owned()
@@ -776,10 +991,14 @@ pub fn sync_due(cli: Cli, roster_path: &Path, retained: impl Fn(&str) -> bool) -
                     .account_of(cli, row)
                     .is_some_and(|account| lab.class_of(account) != row.class)
         })
+        || lab
+            .me
+            .as_ref()
+            .is_some_and(|me| order_rows(Some(&lab), cli, &me.key, &mut existing.rows.clone()))
         || (lab.settled && !renames(&lab, cli, &existing, retained).moved.is_empty())
 }
 
-/// A digest of what a sync of `cli` reads from the lab this process holds: this Mac's label,
+/// A digest of what a sync of `cli` reads from the lab this process holds: this Mac's key and label,
 /// whether the lab is settled, and every account of `cli` (key, labels, address, identity,
 /// vendor keys, whether it may join and the Macs that prefer it). The upkeep's sync inputs where
 /// the lab names this Mac, in place of the sheet's and fleet files' bytes; `None` where it does
@@ -787,14 +1006,15 @@ pub fn sync_due(cli: Cli, roster_path: &Path, retained: impl Fn(&str) -> bool) -
 #[must_use]
 pub fn fleet_digest(cli: Cli) -> Option<[u8; 32]> {
     let lab = current()?;
-    let me = lab.me.as_deref()?;
+    let me = lab.me.as_ref()?;
     let mut hash = aterm_digest::Sha256::new();
-    hash.update(b"aterm-alab-fleet-v1");
+    hash.update(b"aterm-alab-fleet-v2");
     let mut field = |value: &str| {
         hash.update((value.len() as u64).to_be_bytes());
         hash.update(value.as_bytes());
     };
-    field(me);
+    field(me.key.as_str());
+    field(me.label.as_deref().unwrap_or(""));
     field(if lab.settled { "settled" } else { "partial" });
     for account in lab.of(cli) {
         field(&account.pk);
@@ -807,7 +1027,8 @@ pub fn fleet_digest(cli: Cli) -> Option<[u8; 32]> {
         field(account.vendor.flow.map_or("", |f| f.as_str()));
         field(if account.joinable { "joinable" } else { "held" });
         for (machine, rank) in &account.preferred {
-            field(machine);
+            field(machine.key.as_str());
+            field(machine.label.as_deref().unwrap_or(""));
             field(&rank.map_or_else(String::new, |rank| rank.to_string()));
         }
     }
@@ -878,7 +1099,7 @@ pub fn retain(
     existing: &Roster,
     lab: Option<&Lab>,
     cli: Cli,
-    machine: &str,
+    machine: &MachineKey,
 ) -> Roster {
     for prev in &existing.rows {
         if roster
@@ -909,10 +1130,34 @@ pub fn retain(
             };
         }
     }
+    order_rows(lab, cli, machine, &mut roster.rows);
     roster
-        .rows
-        .sort_by_key(|r| (r.dir.is_some(), r.class, r.label.clone()));
-    roster
+}
+
+/// Keep the default login first, then class and this key's preference rank.
+/// Unknown and unranked rows keep a deterministic label tie-break. Returns whether order moved.
+pub(super) fn order_rows(
+    lab: Option<&Lab>,
+    cli: Cli,
+    machine: &MachineKey,
+    rows: &mut [Row],
+) -> bool {
+    let key = |row: &Row| {
+        let rank = lab
+            .and_then(|lab| lab.account_of(cli, row))
+            .and_then(|account| account.preferred_on(machine))
+            .flatten();
+        (
+            row.dir.is_some(),
+            row.class,
+            rank.is_none(),
+            rank,
+            row.label.clone(),
+        )
+    };
+    let changed = !rows.is_sorted_by_key(&key);
+    rows.sort_by_key(key);
+    changed
 }
 
 /// `AlabCells`' preference area besides its `Sync`: the owner's verbs and a person's acts, which
@@ -1046,8 +1291,8 @@ pub fn migrate(
         .acquire_within(ladder)
         .map_err(|why| format!("{}: {why}", store.dir.display()))?
         .ok_or_else(|| format!("{} at {}", accounts::LOCK_HELD, store.dir.display()))?;
+    store.recover_sync_held(&held, roster_path)?;
     let (write_to, keep_mode) = super::cli::roster_target(roster_path)?;
-    store.recover_sync_held(&held, &write_to)?;
     let before = accounts::roster_text(&write_to)?;
     let Some(text) = before.as_deref() else {
         return Ok(Migrated::default());
@@ -1078,6 +1323,7 @@ pub fn migrate(
         now,
         &mut None,
         accounts::SyncTarget {
+            fleet: None,
             path: &write_to,
             before: Some(text),
             after: Some(&after),
@@ -1107,7 +1353,11 @@ pub(super) fn migrate_before_sync(
     now: i64,
     ladder: &[std::time::Duration],
 ) -> Result<Migrated, String> {
-    match (current(), chosen(cli, Some(roster_path), named, config)) {
+    let source = snapshot();
+    match (
+        source.lab(),
+        chosen_from(&source, cli, Some(roster_path), named, config),
+    ) {
         (Some(lab), Ok(Some(_))) => migrate(&lab, cli, store, roster_path, now, ladder),
         // The sync's own read of its source says why the lab is not one.
         _ => Ok(Migrated::default()),
@@ -1124,7 +1374,7 @@ pub(super) fn migrate_before_sync(
 /// Empty where the lab names no machine for this Mac. Pure.
 #[must_use]
 pub fn holdings(lab: &Lab, cli: Cli, roster: &Roster) -> Vec<(String, &'static str)> {
-    let Some(me) = lab.me.as_deref() else {
+    let Some(me) = lab.me.as_ref() else {
         return Vec::new();
     };
     let mut out: Vec<(String, &'static str)> = Vec::new();
@@ -1132,10 +1382,14 @@ pub fn holdings(lab: &Lab, cli: Cli, roster: &Roster) -> Vec<(String, &'static s
         let Some(account) = lab.account_of(cli, row) else {
             continue;
         };
-        if account.preferred_on(me).is_some() || out.iter().any(|(pk, _)| *pk == account.pk) {
+        if account.preferred_on(&me.key).is_some() || out.iter().any(|(pk, _)| *pk == account.pk) {
             continue;
         }
-        let why = if account.preferred.iter().any(|(machine, _)| machine != me) {
+        let why = if account
+            .preferred
+            .iter()
+            .any(|(machine, _)| machine.key != me.key)
+        {
             "borrow"
         } else if account.joinable {
             "fill"

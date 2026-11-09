@@ -43,6 +43,7 @@
 //! - `procs EXE OUT`: every [`WATCH_EVERY`], the processes running EXE with no argument (the app,
 //!   as LaunchServices opens it; never a command run from it): `up` with the kernel's start time
 //!   for each that appears, `down` for each that goes ([`procs`]).
+//! - `socket-owner PATH`: the serving process's kernel identity, read through a local socket.
 //! - `member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE]`: the Allowing member of the `vault-phrase` row, F10's
 //!   members desk on the vault custody under HOME behind an `ask`-only listener on loopback
 //!   or, with `--advertise`, at the guest's address under a private lab service,
@@ -125,7 +126,7 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<(), String> {
-    let usage = "usage: aterm-lab-guest census OUT | reader OUT | ax-texts PID | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | captures EXE DIR OUT SOURCE=FILE... | capture EXE DIR OUT KEY [WORDS...] | member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY | genesis HOME OUT | repair HOME PEER ROUNDS [AUTHORITY]";
+    let usage = "usage: aterm-lab-guest census OUT | reader OUT | ax-texts PID | socket-owner PATH | person OUT [--password PW] [--admin NAME:PW] [--sheet reopen|later] [--app EXE] | watch FILE OUT [--kill PID --when-running MASK] | procs EXE OUT | captures EXE DIR OUT SOURCE=FILE... | capture EXE DIR OUT KEY [WORDS...] | member HOME LISTEN OUT [--allow NAME] [--advertise SERVICE] | browse SECS DIR SERVICE... | dns-sd SECS OUT ARG... | arrivals SEED JOINER FILE... | enrol HOME AUTHORITY | genesis HOME OUT | repair HOME PEER ROUNDS [AUTHORITY]";
     match args.first().map(String::as_str) {
         Some("census") => census(&Out::open(args.get(1).ok_or(usage)?)?),
         Some("person") => {
@@ -167,6 +168,7 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         Some("reader") => reader(&Out::open(args.get(1).ok_or(usage)?)?),
         Some("ax-texts") => ax_texts(args.get(1).ok_or(usage)?, &mut std::io::stdout().lock()),
+        Some("socket-owner") if args.len() == 2 => socket_owner(&args[1]),
         Some("procs") => {
             let exe = args.get(1).ok_or(usage)?;
             procs(exe, &Out::open(args.get(2).ok_or(usage)?)?)
@@ -182,6 +184,23 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("repair") => steps::repair(&args[1..], &mut std::io::stdout().lock()),
         _ => Err(usage.into()),
     }
+}
+
+/// Print the kernel identity of the process serving a local control socket.
+#[cfg(unix)]
+fn socket_owner(path: &str) -> Result<(), String> {
+    let stream = std::os::unix::net::UnixStream::connect(path).map_err(|e| e.to_string())?;
+    let pid = aterm_uds::fdpass::peer_pid(&stream).map_err(|e| e.to_string())?;
+    let pid = i32::try_from(pid).map_err(|e| e.to_string())?;
+    let identity =
+        aterm_uds::process::read_identity(pid).ok_or("socket owner's identity unavailable")?;
+    println!("{}", identity.token());
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn socket_owner(_path: &str) -> Result<(), String> {
+    Err("local socket ownership needs Unix".into())
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {

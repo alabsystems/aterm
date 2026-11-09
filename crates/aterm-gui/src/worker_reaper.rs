@@ -373,7 +373,7 @@ impl crate::App {
             self.reaped_autopilot_off(handle);
         }
         let looked_at = self.windows.iter().any(|(wid, ws)| {
-            crate::os_window_focused(ws) && self.visible_session_rect(*wid, session).is_some()
+            crate::os_window_focused(ws) && self.active_tab_shows_session(*wid, session)
         });
         let driven = crate::input_stall::other_hand(&handle.ctx, crate::metrics::now_us());
         let step = ending(Stand {

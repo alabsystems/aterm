@@ -8,6 +8,7 @@
 use super::super::mailbox_routes::{MailboxRoute, resolve_index};
 use super::*;
 use crate::harness::accounts::rename_tests::NOW;
+use crate::harness::alab_roster::test_machine;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 use std::collections::BTreeMap;
@@ -40,14 +41,14 @@ fn account(preferred: &[&str]) -> LabAccount {
         joinable: true,
         preferred: preferred
             .iter()
-            .map(|machine| ((*machine).to_owned(), Some(1)))
+            .map(|machine| (test_machine(machine), Some(1)))
             .collect(),
     }
 }
 
 fn lab(accounts: Vec<LabAccount>, settled: bool) -> Lab {
     Lab {
-        me: Some(ME.to_owned()),
+        me: Some(test_machine(ME)),
         settled,
         accounts,
         ..Lab::default()
@@ -91,20 +92,21 @@ fn conforms(model: &Model, states: &[State], transition: fn(&State, &str) -> Sta
 }
 
 /// A lab sync for this Mac, as the product runs it: [`fleet_for`], then
-/// [`accounts_sync::compose_roster`] (the sync's own composition: conflicting rows carried, the
+/// [`accounts_sync::compose_roster_with_logins`] (the sync's own composition: conflicting rows carried, the
 /// build, [`retain`] under `lab`, the retained shared rows) on a scratch store with the default
 /// login's address `default`.
 fn sync(lab: &Lab, existing: &Roster, default: Option<&str>) -> Roster {
     let root = aterm_tempfile::TempDir::new().unwrap();
     let store = Store::at(&root.path().join("state"));
     let fleet = fleet_for(lab, Cli::Claude, Some(existing)).expect("the lab names m1");
-    accounts_sync::compose_roster(
+    let logins = store.load_logins(NOW).unwrap().0;
+    accounts_sync::compose_roster_with_logins(
         &fleet,
-        (ME, default),
+        (test_machine(ME).key.as_str(), default),
         (&store, existing),
         None,
         Some(lab),
-        NOW,
+        &logins,
     )
     .expect("the sync composes")
 }
@@ -246,10 +248,22 @@ fn the_lab_sync_orders_by_this_macs_preference_and_limits_nothing() {
     fleet.accounts.extend(fleet.known.clone());
     let root = aterm_tempfile::TempDir::new().unwrap();
     let store = Store::at(&root.path().join("state"));
-    let built = accounts_sync::build_machine_roster(&fleet, ME, &store, Some(&existing), None);
+    let built = accounts_sync::build_machine_roster(
+        &fleet,
+        test_machine(ME).key.as_str(),
+        &store,
+        Some(&existing),
+        None,
+    );
     let next = order_project(
         unrowed,
-        x_row(&retain(built, &existing, Some(&lab), Cli::Claude, ME)),
+        x_row(&retain(
+            built,
+            &existing,
+            Some(&lab),
+            Cli::Claude,
+            &test_machine(ME).key,
+        )),
         false,
     );
     assert_eq!(next["unasked"], 1);
@@ -369,6 +383,9 @@ fn labels_come_from_the_lab_and_only_a_legacy_label_is_renamed() {
     let store = Store::at(&root.path().join("state"));
     let mut fleet = fleet_for(&lab, Cli::Claude, Some(&existing)).unwrap();
     fleet.alab = None;
+    for account in &mut fleet.accounts {
+        account.machines = vec![ME.to_owned()];
+    }
     // The sheet path reads a fleet that lists some row here; another account's stands in.
     fleet.accounts.push(FleetAccount {
         label: "claude-yyyyyy".to_owned(),

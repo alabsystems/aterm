@@ -619,7 +619,8 @@ pub(crate) fn lstat_in(
     }
 }
 
-/// The `lstat`s one check of a vault takes, each path's once. A Commons check asks several reads
+/// The `lstat`s one check of a vault takes, or the checks one look at it serves, each path's once.
+/// A Commons check asks several reads
 /// of the same files under one shared observation of the vault's state lock (a table session's
 /// access: this Mac's own denial, the membership log and the state behind it; a roster access's
 /// currency: the identity, the log and the state), and each stamped them again: a quiet repair
@@ -628,8 +629,11 @@ pub(crate) fn lstat_in(
 /// `docs/measured/commons-long-log-rounds-2026-11-07.md`). A check that looks through one glance
 /// stamps each file once, at its first ask of it, and a kept answer stands for the files as that
 /// look saw them; a miss reads and stamps afresh. A file that moved meanwhile moves the next
-/// check's stamps, which read it again. Each check takes its own, never one kept across checks, and a look that
-/// confirms a file stood still across a read is never taken from one.
+/// glance's stamps, which read it again. Each check takes its own, or shares the one of a look at
+/// the vault it is judged through ([`crate::client::VaultLook`]: checks that stand for one moment
+/// of the vault, a table session's open and the checks its local batch makes at once after it);
+/// none outlives its check or its look, and a look that confirms a file stood still across a read
+/// is never taken from one.
 pub(crate) struct Glance(std::cell::RefCell<Vec<(std::path::PathBuf, Option<std::fs::Metadata>)>>);
 
 impl Glance {

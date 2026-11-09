@@ -26,7 +26,8 @@ fn an_actual_sdk_lease_waits_for_native_gc_to_finish() {
             .kind(),
         io::ErrorKind::TimedOut
     );
-    drop(lease);
+    // Sibling tests may fork with a duplicate until exec; wait for actual last-close.
+    lease.release();
     let atpkg::lease::Reclaim::Clear(guard) = atpkg::lease::reclaim(&layout.prefix, &subject)
     else {
         panic!("native lease no longer holds after drop")

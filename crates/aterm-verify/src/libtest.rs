@@ -164,6 +164,59 @@ pub fn tests_run(log: &str) -> Option<u64> {
         .find_map(|l| banner_count(l.trim_end_matches('\r')))
 }
 
+/// Counts reported by one completed libtest harness, distinct from its opening
+/// announced count, which includes ignored tests. These are diagnostic output,
+/// not evidence that a provider action or other external effect succeeded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct TestCounts {
+    pub passed: u64,
+    pub failed: u64,
+    pub ignored: u64,
+    pub measured: u64,
+    pub filtered_out: u64,
+}
+
+/// Read the last result line of a single binary only when all outcome counts
+/// are present, agree with its announced count and agree with its verdict.
+/// A missing, partial or malformed final summary stays unknown; an earlier
+/// nested summary cannot fill it in.
+pub(crate) fn test_counts(log: &str) -> Option<TestCounts> {
+    if log.contains('\x1b') {
+        return test_counts(&strip_ansi(log));
+    }
+    let announced = tests_run(log)?;
+    let result = log
+        .lines()
+        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("test result: "))
+        .next_back()?;
+    let (verdict, fields) = result.split_once(". ")?;
+    let mut fields = fields.split("; ");
+    let count = |field: &str, suffix: &str| {
+        let digits = field.strip_suffix(suffix)?;
+        (!digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| digits.parse::<u64>().ok())
+            .flatten()
+    };
+    let counts = TestCounts {
+        passed: count(fields.next()?, " passed")?,
+        failed: count(fields.next()?, " failed")?,
+        ignored: count(fields.next()?, " ignored")?,
+        measured: count(fields.next()?, " measured")?,
+        filtered_out: count(fields.next()?, " filtered out")?,
+    };
+    let elapsed = fields.next()?.strip_prefix("finished in ")?;
+    if elapsed.strip_suffix('s').is_none_or(str::is_empty) || fields.next().is_some() {
+        return None;
+    }
+    let total = counts
+        .passed
+        .checked_add(counts.failed)?
+        .checked_add(counts.ignored)?
+        .checked_add(counts.measured)?;
+    (total == announced && matches!((verdict, counts.failed), ("ok", 0) | ("FAILED", 1..)))
+        .then_some(counts)
+}
+
 /// cargo's `--no-fail-fast` summary header (`error: <n> target(s) failed:`).
 fn cargo_summary_line(line: &str) -> bool {
     let Some(rest) = line.strip_prefix("error: ") else {
@@ -667,6 +720,72 @@ mod tests {
         ] {
             assert_eq!(tests_run(none), None, "{none:?}");
         }
+    }
+
+    #[test]
+    fn completed_counts_distinguish_passed_ignored_and_measured_cases() {
+        for (verdict, passed, failed, ignored, measured) in [
+            ("ok", 2, 0, 1, 0),
+            ("FAILED", 1, 1, 1, 0),
+            ("ok", 1, 0, 1, 1),
+            ("ok", 0, 0, 0, 0),
+        ] {
+            let announced = passed + failed + ignored + measured;
+            let log = format!(
+                "running {announced} tests\r\n\x1b[32mtest result: {verdict}. {passed} passed; {failed} failed; {ignored} ignored; {measured} measured; 7 filtered out; finished in 0.01s\x1b[0m\r\n"
+            );
+            assert_eq!(
+                test_counts(&log),
+                Some(TestCounts {
+                    passed,
+                    failed,
+                    ignored,
+                    measured,
+                    filtered_out: 7,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_or_inconsistent_counts_stay_unknown() {
+        let valid = "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        assert_eq!(
+            test_counts(valid),
+            None,
+            "a summary without a harness banner"
+        );
+        for summary in [
+            "",
+            "test result: ok. 3 passed\n",
+            "test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+            "test result: ok. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+            "test result: FAILED. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+            "test result: ok. -1 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+            "test result: ok. 18446744073709551615 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+            "test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\n",
+        ] {
+            assert_eq!(
+                test_counts(&format!("running 3 tests\n{summary}")),
+                None,
+                "{summary}"
+            );
+        }
+        assert_eq!(
+            test_counts(&format!("running 3 tests\n{valid}test result: malformed\n")),
+            None,
+            "an earlier summary cannot fill in a malformed terminal summary"
+        );
+    }
+
+    #[test]
+    fn completed_counts_use_the_terminal_summary_not_an_earlier_nested_one() {
+        let log = "running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\ntest result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.02s\n";
+        let counts = test_counts(log).unwrap();
+        assert_eq!(
+            (tests_run(log), counts.passed, counts.ignored),
+            (Some(3), 2, 1)
+        );
     }
 
     /// Each binary is read on its own, coloured or not: a target whose rows were

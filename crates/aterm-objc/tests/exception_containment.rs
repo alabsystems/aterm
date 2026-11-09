@@ -318,6 +318,44 @@ fn child(test: &str, mode: &str) -> (Option<i32>, String, String) {
 }
 
 #[test]
+fn a_checked_send_with_an_argument_preserves_foreign_unwinding() {
+    if crate::reexec::is_child(CHILD) {
+        autoreleasepool(|_| {
+            // SAFETY: NSMutableArray's +new returns an owned array. Adding nil deliberately
+            // raises NSInvalidArgumentException through the checked one-object send.
+            let array = unsafe {
+                aterm_objc::Obj::from_owned(aterm_objc::send::send_id(
+                    class(c"NSMutableArray").as_id(),
+                    sel!(new),
+                ))
+            }
+            .unwrap();
+            let drops = Arc::new(AtomicUsize::new(0));
+            let result = aterm_objc::exception::objc_try(
+                || {
+                    let _guard = Tell(Arc::clone(&drops));
+                    // SAFETY: -addObject: takes an object; nil is an intentional exception.
+                    unsafe {
+                        aterm_objc::send::send_v_id(array.id(), sel!(addObject:), Id::NIL);
+                    }
+                },
+                |_| {},
+            );
+            assert!(result.is_err(), "the deliberate exception was not caught");
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        });
+        println!("CHECKED-ARGUMENT-UNWOUND");
+        return;
+    }
+    let (code, stdout, stderr) = child(
+        "a_checked_send_with_an_argument_preserves_foreign_unwinding",
+        "checked-argument",
+    );
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("CHECKED-ARGUMENT-UNWOUND"));
+}
+
+#[test]
 fn a_rust_panic_inside_a_contained_method_still_aborts_with_the_named_message() {
     if crate::reexec::is_child(CHILD) {
         let drops = Arc::new(AtomicUsize::new(0));
@@ -373,6 +411,16 @@ fn an_abort_on_exception_method_still_aborts_on_a_raise() {
         Some(crate::reexec::ABORTED),
         "expected an abort\nstdout: {stdout}\nstderr: {stderr}"
     );
+    for detail in [
+        "raiseUncontained",
+        "ATermProbeUncontained",
+        "the opted-out row raised",
+    ] {
+        assert!(
+            stderr.contains(detail),
+            "fatal exception lost {detail:?}\nstderr: {stderr}"
+        );
+    }
 }
 
 struct RaiseOnDrop;

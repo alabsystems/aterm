@@ -246,7 +246,7 @@ mod tests {
     fn channel_at(tag: &'static str) -> impl FnMut(&str) -> Result<HeadAnswer, HttpError> {
         move |url: &str| {
             assert_eq!(
-                url,
+                url.split_once("?aterm_lookup=").unwrap().0,
                 evergreen(),
                 "only the public evergreen appcast is asked"
             );

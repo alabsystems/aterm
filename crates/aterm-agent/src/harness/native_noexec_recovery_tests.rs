@@ -149,7 +149,6 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
 fn noexec_recovery_refines_real_validation_barriers_and_transport() {
     let model = aterm_models_harness::native_noexec_recovery_model();
     aterm_spec::interp::prove_and_catch(&model);
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

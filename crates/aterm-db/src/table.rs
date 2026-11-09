@@ -182,6 +182,41 @@ pub struct Session<'a> {
     generation_deadline: Option<std::time::Instant>,
 }
 
+/// `bootstrap`'s custody checked again ([`Bootstrap::revalidate_custody`]), the vault observed
+/// through `look` where given ([`Bootstrap::revalidate_custody_in`]).
+fn revalidate(
+    bootstrap: &Bootstrap,
+    look: Option<&aterm_secrets::client::VaultLook<'_>>,
+) -> Result<()> {
+    match look {
+        Some(look) => bootstrap.revalidate_custody_in(look),
+        None => {
+            #[cfg(test)]
+            own_check();
+            bootstrap.revalidate_custody()
+        }
+    }
+    .map_err(failure)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many of this thread's session checks that a look at the vault ([`Session::observe_in`])
+    /// can serve were handed none, and asked on their own calls: an open's custody (`revalidate`)
+    /// and access (`Session::with_generation`), and a peer's or an observation's currency
+    /// (`Session::current_in`). A check handed a look counts as served by it, though where the look
+    /// observes nothing or looks at another vault `aterm-secrets` answers on its own call
+    /// uncounted; a session's other checks (a read batch's custody, `Session::context`'s currency,
+    /// ...) are not counted.
+    pub(crate) static OWN_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One more of [`OWN_CHECKS`].
+#[cfg(test)]
+fn own_check() {
+    OWN_CHECKS.set(OWN_CHECKS.get() + 1);
+}
+
 /// Envelope authentication inside one source-pinned local read. The enclosing
 /// session rechecks custody and live context before returning its result.
 struct ReadBatch<'s, 'b> {
@@ -412,8 +447,17 @@ impl<'a> Session<'a> {
     }
 
     pub(crate) fn observation(&self) -> Result<[u8; 64]> {
+        self.observation_in(None)
+    }
+
+    /// [`Self::observation`], its currency judged through `look` where given
+    /// ([`Self::observe_in`]).
+    pub(crate) fn observation_in(
+        &self,
+        look: Option<&aterm_secrets::client::VaultLook<'_>>,
+    ) -> Result<[u8; 64]> {
         if self.access.is_log_backed() {
-            if !self.access.is_current(&self.journal) {
+            if !self.current_in(look) {
                 return Err(Error::new("table repair needs current Commons membership"));
             }
             return Ok(self.access_observation());
@@ -482,8 +526,30 @@ impl<'a> Session<'a> {
         Ok((self.bootstrap, &self.journal))
     }
 
+    /// Whether this session's access is current ([`Access::is_current`]), judged through `look`
+    /// where given ([`Access::is_current_in`]).
+    fn current_in(&self, look: Option<&aterm_secrets::client::VaultLook<'_>>) -> bool {
+        match look {
+            Some(look) => self.access.is_current_in(&self.journal, look),
+            None => {
+                #[cfg(test)]
+                own_check();
+                self.access.is_current(&self.journal)
+            }
+        }
+    }
+
     fn peer_member(&self, actor: Actor) -> Result<&aterm_secrets::commons::roster::Member> {
-        if !self.access.is_current(&self.journal) {
+        self.peer_member_in(actor, None)
+    }
+
+    /// [`Self::peer_member`], the session's currency judged through `look` where given.
+    fn peer_member_in(
+        &self,
+        actor: Actor,
+        look: Option<&aterm_secrets::client::VaultLook<'_>>,
+    ) -> Result<&aterm_secrets::commons::roster::Member> {
+        if !self.current_in(look) {
             return Err(Error::new("Commons membership changed during table repair"));
         }
         // A roster this device cannot read now could name this peer: the last one it read is
@@ -504,7 +570,17 @@ impl<'a> Session<'a> {
 
     /// Current peer membership for an already channel-authenticated actor.
     pub(crate) fn peer(&self, actor: Actor) -> Result<aterm_secrets::commons::binding::Binding> {
-        self.peer_member(actor)
+        self.peer_in(actor, None)
+    }
+
+    /// [`Self::peer`], the session's currency judged through `look` where given
+    /// ([`Self::observe_in`]).
+    pub(crate) fn peer_in(
+        &self,
+        actor: Actor,
+        look: Option<&aterm_secrets::client::VaultLook<'_>>,
+    ) -> Result<aterm_secrets::commons::binding::Binding> {
+        self.peer_member_in(actor, look)
             .map(|member| member.binding().clone())
     }
 
@@ -755,10 +831,20 @@ impl<'a> Session<'a> {
     /// After admission, generation checks receive fresh bounded budgets; the
     /// lock-wait deadline is not an expiration of this session's authority.
     pub fn open_until(bootstrap: &'a Bootstrap, deadline: std::time::Instant) -> Result<Self> {
+        Self::open_until_in(bootstrap, deadline, None)
+    }
+
+    /// [`Self::open_until`], its custody and access judged through `look` where given
+    /// ([`Self::observe_in`]).
+    pub(crate) fn open_until_in(
+        bootstrap: &'a Bootstrap,
+        deadline: std::time::Instant,
+        look: Option<&aterm_secrets::client::VaultLook<'_>>,
+    ) -> Result<Self> {
         let journal =
             Journal::open_existing_until(bootstrap.journal_dir(), bootstrap.trust(), deadline)
                 .map_err(failure)?;
-        let mut session = Self::from_admitted_journal_until(bootstrap, journal, Some(deadline))?;
+        let mut session = Self::from_admitted_journal_in(bootstrap, journal, Some(deadline), look)?;
         session.generation_deadline = None;
         Ok(session)
     }
@@ -778,6 +864,17 @@ impl<'a> Session<'a> {
         journal: Journal,
         deadline: Option<std::time::Instant>,
     ) -> Result<Self> {
+        Self::from_admitted_journal_in(bootstrap, journal, deadline, None)
+    }
+
+    /// [`Self::from_admitted_journal_until`], its custody and access judged through `look` where
+    /// given.
+    fn from_admitted_journal_in(
+        bootstrap: &'a Bootstrap,
+        journal: Journal,
+        deadline: Option<std::time::Instant>,
+        look: Option<&aterm_secrets::client::VaultLook<'_>>,
+    ) -> Result<Self> {
         if journal.directory() != bootstrap.journal_dir() {
             return Err(Error::new(
                 "Commons session journal belongs to another custody directory",
@@ -788,8 +885,8 @@ impl<'a> Session<'a> {
                 "Commons admitted session requires its exclusive writer",
             ));
         }
-        bootstrap.revalidate_custody().map_err(failure)?;
-        Self::from_journal(bootstrap, journal, deadline)
+        revalidate(bootstrap, look)?;
+        Self::from_journal(bootstrap, journal, deadline, look)
     }
 
     /// Observe existing custody through a read-only control view, so another
@@ -802,9 +899,24 @@ impl<'a> Session<'a> {
     /// current membership cannot be validated, including missing or unready
     /// local membership.
     pub fn observe(bootstrap: &'a Bootstrap) -> Result<Self> {
+        Self::observe_in(bootstrap, None)
+    }
+
+    /// [`Self::observe`], its custody and access judged through `look` where given: one look at
+    /// the vault ([`aterm_secrets::client::VaultLook`]) for a session's open and the checks a
+    /// local batch makes at once after it ([`Self::peer_in`], [`Self::observation_in`]), which
+    /// stand for one moment of the vault. A table repair round opened a session about 18 times a
+    /// round on each side of a loopback pair and checked it twice at once, each check observing
+    /// the state lock and looking at the vault's files again: its checks of currency took 23.7%
+    /// of a sustained quiet round over a log of 9,605 records and 27.0% over a short one, its
+    /// custody checks 8.2% and 10.9% (2026-11-09).
+    pub(crate) fn observe_in(
+        bootstrap: &'a Bootstrap,
+        look: Option<&aterm_secrets::client::VaultLook<'_>>,
+    ) -> Result<Self> {
         let journal =
             Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
-        Self::from_observed_journal(bootstrap, journal, None)
+        Self::from_observed_journal_in(bootstrap, journal, None, look)
     }
 
     /// [`Self::observe`] by `deadline`, which bounds each wait of a successor home's predecessor
@@ -825,7 +937,7 @@ impl<'a> Session<'a> {
             crate::generation::guard_until(bootstrap.paths(), false, deadline)?;
             None
         };
-        Self::with_generation(bootstrap, journal, generation, Some(deadline))
+        Self::with_generation(bootstrap, journal, generation, Some(deadline), None)
     }
 
     /// [`Self::observation`] as this session's home stands now: its control view read again and
@@ -841,8 +953,14 @@ impl<'a> Session<'a> {
             .map_err(failure)?;
         self.bootstrap.revalidate_custody().map_err(failure)?;
         self.generation_guard(false)?;
-        Self::with_generation(self.bootstrap, journal, None, self.generation_deadline)?
-            .observation()
+        Self::with_generation(
+            self.bootstrap,
+            journal,
+            None,
+            self.generation_deadline,
+            None,
+        )?
+        .observation()
     }
 
     /// Keep the read-only control prefix returned with an established bootstrap.
@@ -852,6 +970,16 @@ impl<'a> Session<'a> {
         bootstrap: &'a Bootstrap,
         journal: Journal,
         deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        Self::from_observed_journal_in(bootstrap, journal, deadline, None)
+    }
+
+    /// [`Self::from_observed_journal`], its custody and access judged through `look` where given.
+    fn from_observed_journal_in(
+        bootstrap: &'a Bootstrap,
+        journal: Journal,
+        deadline: Option<std::time::Instant>,
+        look: Option<&aterm_secrets::client::VaultLook<'_>>,
     ) -> Result<Self> {
         if journal.directory() != bootstrap.journal_dir() {
             return Err(Error::new(
@@ -863,8 +991,8 @@ impl<'a> Session<'a> {
                 "Commons observed session requires a read-only journal",
             ));
         }
-        bootstrap.revalidate_custody().map_err(failure)?;
-        Self::from_journal(bootstrap, journal, deadline)
+        revalidate(bootstrap, look)?;
+        Self::from_journal(bootstrap, journal, deadline, look)
     }
 
     /// Observe the generation `selection` observed ([`crate::generation::observe_generation`],
@@ -907,13 +1035,14 @@ impl<'a> Session<'a> {
             crate::generation::guard_until(bootstrap.paths(), false, read_by)?;
             None
         };
-        Self::with_generation(bootstrap, journal, generation, Some(read_by))
+        Self::with_generation(bootstrap, journal, generation, Some(read_by), None)
     }
 
     fn from_journal(
         bootstrap: &'a Bootstrap,
         journal: Journal,
         deadline: Option<std::time::Instant>,
+        look: Option<&aterm_secrets::client::VaultLook<'_>>,
     ) -> Result<Self> {
         let generation = if crate::generation::is_candidate(bootstrap.paths()) {
             let capture = if journal.is_writer() {
@@ -934,7 +1063,7 @@ impl<'a> Session<'a> {
             }
             None
         };
-        Self::with_generation(bootstrap, journal, generation, deadline)
+        Self::with_generation(bootstrap, journal, generation, deadline, look)
     }
 
     /// Open the session on `journal`'s access. A vault writer that holds the state lock at this
@@ -945,16 +1074,23 @@ impl<'a> Session<'a> {
         journal: Journal,
         generation: Option<crate::generation::Observation>,
         deadline: Option<std::time::Instant>,
+        look: Option<&aterm_secrets::client::VaultLook<'_>>,
     ) -> Result<Self> {
-        let access = bootstrap
-            .access_observed_in(&journal)
-            .map_err(failure)?
-            .ok_or_else(|| {
-                Error::repair(
-                    "Commons membership is not ready for table access",
-                    aterm_types::network_state::RepairCause::NotReady,
-                )
-            })?;
+        let access = match look {
+            Some(look) => bootstrap.access_observed_in_look(&journal, look),
+            None => {
+                #[cfg(test)]
+                own_check();
+                bootstrap.access_observed_in(&journal)
+            }
+        }
+        .map_err(failure)?
+        .ok_or_else(|| {
+            Error::repair(
+                "Commons membership is not ready for table access",
+                aterm_types::network_state::RepairCause::NotReady,
+            )
+        })?;
         Ok(Self {
             bootstrap,
             journal,

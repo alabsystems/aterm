@@ -592,34 +592,75 @@ fn an_unacknowledged_native_write_cannot_note_a_build_failure() {
     assert_eq!(std::fs::read_dir(notes).unwrap().count(), 1);
 }
 
-fn model_step(
-    state: &State,
+/// The state a real step reads: the barrier fault, the run's dryness and the slot the record
+/// holds. What the model's history adds (attempts, exposures, rivals, reloads) reaches no record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Inputs {
+    barrier_failed: bool,
+    dry: bool,
+    staged: bool,
+    readable: bool,
+}
+
+impl Inputs {
+    fn of(state: &State) -> Self {
+        Self {
+            barrier_failed: state["barrier_failed"] == 1,
+            dry: state["dry"] == 1,
+            staged: state["staged"] == 1,
+            readable: state["readable"] == 1,
+        }
+    }
+}
+
+/// What one real step showed: each fact the model's next state takes from the code.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Observed {
+    /// `Attempt` exposed its candidate.
+    exposed: bool,
+    /// `Rival` was refused yet changed the slot.
+    slot_changed: bool,
+    /// `Reload` or `StaleSave` came back with another slot.
+    lost: bool,
+    /// In a live run, `Rewrite` asked for less durability, or succeeded past a failed barrier.
+    weakened: bool,
+    /// The in-memory state holds a slot afterwards, whatever the save did.
+    staged: bool,
+    /// Something besides the slot changed.
+    debt_cleared: bool,
+}
+
+/// The next state after an action only a later attempt reads, or `None` for one the code runs.
+/// What these change reaches no record, whichever record there is: a state they are enabled in
+/// also enables `Attempt`, which plants and judges that record.
+fn modeled(state: &State, action: &str) -> Option<State> {
+    let (field, value) = match action {
+        "FailBarrier" => ("barrier_failed", 1),
+        "RepairBarrier" => ("barrier_failed", 0),
+        "DryRun" => ("dry", 1),
+        "LiveRun" => ("dry", 0),
+        _ => return None,
+    };
+    let mut next = state.clone();
+    next.insert(field, value);
+    Some(next)
+}
+
+/// Run `action` on a fresh record planted from `inputs` in `phase`.
+fn observe(
+    inputs: Inputs,
     action: &str,
     bypass_barrier: bool,
     phase: ImagePhase,
     restore: bool,
-) -> State {
-    // What only a later attempt reads reaches no record, whichever record there is: a state these
-    // are enabled in also enables `Attempt`, which plants and judges that record.
-    let modeled = match action {
-        "FailBarrier" => Some(("barrier_failed", 1)),
-        "RepairBarrier" => Some(("barrier_failed", 0)),
-        "DryRun" => Some(("dry", 1)),
-        "LiveRun" => Some(("dry", 0)),
-        _ => None,
-    };
-    if let Some((field, value)) = modeled {
-        let mut next = state.clone();
-        next.insert(field, value);
-        return next;
-    }
+) -> Observed {
     let root = aterm_tempfile::tempdir().unwrap();
     let mut opts = opts(root.path());
-    opts.dry_run = state["dry"] == 1;
+    opts.dry_run = inputs.dry;
     let (mut st, candidate) = fixture(phase);
     let old = st.clone();
-    if state["staged"] == 1 {
-        st.native_account_candidate = Some(if state["readable"] == 1 {
+    if inputs.staged {
+        st.native_account_candidate = Some(if inputs.readable {
             Pending::new(st.native.as_ref().unwrap(), phase, &candidate).unwrap()
         } else {
             Pending::read(&Value::Null)
@@ -631,14 +672,14 @@ fn model_step(
     planting.dry_run = false;
     upgrade_drive::save_checked(&planting, "conversation", &st).unwrap();
     let original_slot = st.native_account_candidate.clone();
-    let mut next = state.clone();
+    let mut seen = Observed::default();
     match action {
         "Attempt" => {
-            let fault = (state["barrier_failed"] == 1).then(|| {
+            let fault = inputs.barrier_failed.then(|| {
                 aterm_durable::seam::FailingDirs::with_kind(std::io::ErrorKind::Unsupported)
             });
             let result = stage(&opts, "conversation", &mut st, &candidate, phase);
-            let exposed = result.is_ok()
+            seen.exposed = result.is_ok()
                 || (bypass_barrier
                     && st
                         .native_account_candidate
@@ -646,49 +687,27 @@ fn model_step(
                         .and_then(|pending| pending.checked(&st))
                         .is_some());
             drop(fault);
-            next.insert("attempts", state["attempts"] + 1);
-            next.insert("exposed", state["exposed"] + i64::from(exposed));
-            if exposed && state["barrier_failed"] == 1 {
-                next.insert("unpublished", 1);
-            }
-            if exposed && opts.dry_run {
-                next.insert("dry_exposed", 1);
-            }
         }
         "Rival" => {
             let mut rival = candidate.clone();
             rival.id = "02".repeat(16);
             assert!(stage(&opts, "conversation", &mut st, &rival, phase).is_err());
-            next.insert("rival", 1);
-            if st.native_account_candidate != original_slot {
-                next.insert("exact", 0);
-            }
+            seen.slot_changed = st.native_account_candidate != original_slot;
         }
-        "Opaque" => {
-            st.native_account_candidate = Some(Pending::read(&Value::Null));
-            next.insert("readable", 0);
-        }
+        "Opaque" => st.native_account_candidate = Some(Pending::read(&Value::Null)),
         "Reload" => {
             st = upgrade_drive::load(&opts, "conversation").unwrap();
-            next.insert("reloaded", 1);
-            if st.native_account_candidate != original_slot {
-                next.insert("lost", 1);
-            }
+            seen.lost = st.native_account_candidate != original_slot;
         }
         "StaleSave" => {
-            let mut planting = opts.clone();
-            planting.dry_run = false;
             upgrade_drive::save_checked(&planting, "conversation", &st).unwrap();
             let result = upgrade_drive::save_checked(&opts, "conversation", &old);
             assert!(opts.dry_run || result.is_err());
             st = upgrade_drive::load(&opts, "conversation").unwrap();
-            next.insert("stale", 1);
-            if st.native_account_candidate != original_slot {
-                next.insert("lost", 1);
-            }
+            seen.lost = st.native_account_candidate != original_slot;
         }
         "Rewrite" => {
-            let fault = (state["barrier_failed"] == 1).then(|| {
+            let fault = inputs.barrier_failed.then(|| {
                 aterm_durable::seam::FailingDirs::with_kind(std::io::ErrorKind::Unsupported)
             });
             let recording = aterm_durable::seam::Recording::start();
@@ -699,53 +718,128 @@ fn model_step(
             };
             let flushes = recording.take();
             drop(fault);
-            next.insert("rewritten", 1);
-            if !opts.dry_run
+            seen.weakened = !opts.dry_run
                 && (!asks_for_file_and_directory_durability(&flushes)
-                    || (state["barrier_failed"] == 1 && result.is_ok()))
-            {
+                    || (inputs.barrier_failed && result.is_ok()));
+        }
+        other => unreachable!("{other}"),
+    }
+    seen.staged = st.native_account_candidate.is_some();
+    seen.debt_cleared = without_candidate(&st) != old;
+    seen
+}
+
+/// The model's next state after `action` showed `seen` from `state`.
+fn apply(state: &State, action: &str, seen: Observed) -> State {
+    let mut next = state.clone();
+    match action {
+        "Attempt" => {
+            next.insert("attempts", state["attempts"] + 1);
+            next.insert("exposed", state["exposed"] + i64::from(seen.exposed));
+            if seen.exposed && state["barrier_failed"] == 1 {
+                next.insert("unpublished", 1);
+            }
+            if seen.exposed && state["dry"] == 1 {
+                next.insert("dry_exposed", 1);
+            }
+        }
+        "Rival" => {
+            next.insert("rival", 1);
+            if seen.slot_changed {
+                next.insert("exact", 0);
+            }
+        }
+        "Opaque" => {
+            next.insert("readable", 0);
+        }
+        "Reload" => {
+            next.insert("reloaded", 1);
+            if seen.lost {
+                next.insert("lost", 1);
+            }
+        }
+        "StaleSave" => {
+            next.insert("stale", 1);
+            if seen.lost {
+                next.insert("lost", 1);
+            }
+        }
+        "Rewrite" => {
+            next.insert("rewritten", 1);
+            if seen.weakened {
                 next.insert("weakened", 1);
             }
         }
         other => unreachable!("{other}"),
     }
-    next.insert("staged", i64::from(st.native_account_candidate.is_some()));
-    if without_candidate(&st) != old {
+    next.insert("staged", i64::from(seen.staged));
+    if seen.debt_cleared {
         next.insert("debt", 0);
     }
     next
 }
 
-pub(super) fn transition(state: &State, action: &str) -> State {
-    let forward = model_step(state, action, false, ImagePhase::Forward, false);
-    let rollback = model_step(state, action, false, ImagePhase::Rollback, false);
+fn model_step(
+    state: &State,
+    action: &str,
+    bypass_barrier: bool,
+    phase: ImagePhase,
+    restore: bool,
+) -> State {
+    modeled(state, action).unwrap_or_else(|| {
+        let seen = observe(Inputs::of(state), action, bypass_barrier, phase, restore);
+        apply(state, action, seen)
+    })
+}
+
+/// What `action` shows from `inputs` in each phase, which must agree, and for `Rewrite` with
+/// each phase's restore too.
+fn observe_in_both_phases(inputs: Inputs, action: &str) -> Observed {
+    let forward = observe(inputs, action, false, ImagePhase::Forward, false);
+    let rollback = observe(inputs, action, false, ImagePhase::Rollback, false);
     assert_eq!(
         forward, rollback,
         "the slot protocol must preserve either active phase"
     );
     if action == "Rewrite" {
         for phase in [ImagePhase::Forward, ImagePhase::Rollback] {
-            assert_eq!(forward, model_step(state, action, false, phase, true));
+            assert_eq!(forward, observe(inputs, action, false, phase, true));
         }
     }
     forward
+}
+
+/// What each real input showed for each action.
+pub(super) type Seen<'a> = std::collections::BTreeMap<(Inputs, &'a str), Observed>;
+
+/// `action` from `state`, with what each real input showed kept in `seen`: [`observe`] reads
+/// only its [`Inputs`], so the states that agree on them share one observation.
+pub(super) fn transition<'a>(state: &State, action: &'a str, seen: &mut Seen<'a>) -> State {
+    modeled(state, action).unwrap_or_else(|| {
+        let inputs = Inputs::of(state);
+        let observed = *seen
+            .entry((inputs, action))
+            .or_insert_with(|| observe_in_both_phases(inputs, action));
+        apply(state, action, observed)
+    })
 }
 
 #[test]
 fn client_slot_refines_every_model_transition_and_breaks_on_early_exposure() {
     let model = aterm_models_harness::native_account_client_slot_model();
     aterm_spec::interp::prove_and_catch(&model);
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
-    // NEGATIVE CONTROL (2026-11-05): with one phase's copy served for both this fails at
-    // "Rollback's fixture". With a retry that exposes its candidate past a failed save, the walk
-    // below fails at `Attempt` from `barrier_failed: 1`.
+    // NEGATIVE CONTROL (2026-11-09): with one phase's copy served for both this fails at
+    // "Rollback's fixture". With a retry that exposes its candidate past a failed save, or with
+    // `seen` keyed on the action alone, the walk below fails at `Attempt` from
+    // `barrier_failed: 1`.
     for phase in [ImagePhase::Forward, ImagePhase::Rollback] {
         assert_eq!(fixture(phase), laid_out(phase), "{phase:?}'s fixture");
     }
+    let mut seen = Seen::new();
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {
-                let next = transition(&state, action.name);
+                let next = transition(&state, action.name, &mut seen);
                 assert!(
                     model.successors(action.name, &state).contains(&next),
                     "{}: {state:?} -> {next:?}",

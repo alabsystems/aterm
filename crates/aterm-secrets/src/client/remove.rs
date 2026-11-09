@@ -3627,4 +3627,4 @@ mod node_pass_tests;
 
 #[cfg(test)]
 #[path = "remove_tests.rs"]
-mod tests;
+pub(crate) mod tests;

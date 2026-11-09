@@ -17,6 +17,18 @@
 //! and those tests, never a library.
 
 mod models_account_adopt_identity;
+mod models_lab_preference_identity;
+pub use models_lab_preference_identity::lab_preference_identity_model;
+mod models_lab_source_availability;
+pub use models_lab_source_availability::lab_source_availability_model;
+mod models_account_source_capture;
+pub use models_account_source_capture::account_source_capture_model;
+mod models_account_fleet_commit;
+pub use models_account_fleet_commit::account_fleet_commit_model;
+mod models_account_provider_commit;
+pub use models_account_provider_commit::account_provider_commit_model;
+mod models_account_identity_completion;
+pub use models_account_identity_completion::account_identity_completion_model;
 mod models_account_continuation;
 pub use models_account_continuation::account_continuation_model;
 mod models_account_claim_publication;

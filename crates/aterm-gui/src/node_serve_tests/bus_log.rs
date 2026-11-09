@@ -108,7 +108,7 @@ fn with_bus(state: &Path, bus: Option<BusKeeperConfig>) -> NodeServeConfig {
         tick_every: Duration::from_millis(40),
         wake_timeout: Duration::from_secs(1),
         lan_unavailable: || None,
-        stop: Arc::new(AtomicBool::new(false)),
+        stop: Arc::new(NodeStop::default()),
         launcher: idle_launcher(),
         updates: None,
         mesh: NodeMesh {
@@ -153,7 +153,7 @@ fn the_node_service_hosts_bus_log_with_the_mesh_on() {
     drop(client);
     assert_eq!(root.held(&format!("/f/{FLEET}/in/>")), ["hi"]);
 
-    stop.store(true, Ordering::Release);
+    stop.set();
     assert_eq!(server.join().expect("join node"), ExitCode::SUCCESS);
     let reopened = BusHost::open(BusSpec {
         root: root.path().to_path_buf(),
@@ -192,7 +192,7 @@ fn with_the_mesh_off_the_node_service_keeps_no_bus_log() {
 struct BusNode {
     addr: SocketAddr,
     table: Arc<Neighbours>,
-    stop: Arc<AtomicBool>,
+    stop: Arc<NodeStop>,
     server: std::thread::JoinHandle<ExitCode>,
 }
 
@@ -215,7 +215,7 @@ impl BusNode {
         );
         let (told, tables) = mpsc::channel();
         let told = Mutex::new(told);
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(NodeStop::default());
         let relay = crate::test_scratch::short_dir("bus-relay");
         let cfg = NodeServeConfig {
             relay_dir: relay.path().to_path_buf(),
@@ -256,7 +256,7 @@ impl BusNode {
     }
 
     fn end(self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.set();
         assert_eq!(self.server.join().expect("join node"), ExitCode::SUCCESS);
     }
 }

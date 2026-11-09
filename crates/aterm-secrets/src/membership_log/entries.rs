@@ -214,6 +214,20 @@ pub struct OpenedEntries {
     pub hidden_epochs: bool,
 }
 
+/// The same selected entries with their value-free register evidence. The
+/// public convenience readers discard this evidence only after selection.
+pub(crate) struct SelectedEntries {
+    pub(crate) opened: OpenedEntries,
+    #[cfg(any(unix, test))]
+    pub(crate) operations: BTreeMap<(Audience, String), RecordId>,
+    #[cfg(any(unix, test))]
+    pub(crate) puts: BTreeMap<(Audience, String), RecordId>,
+    /// Audiences whose current and retained keyed history this reader opens
+    /// completely. Other private audiences do not obscure a complete one.
+    #[cfg(any(unix, test))]
+    pub(crate) complete: BTreeSet<Audience>,
+}
+
 /// Domain-separated SHA-256 commitment binding `epoch_key` to `(network, audience, generation)`.
 #[must_use]
 pub fn epoch_commitment(
@@ -891,6 +905,11 @@ struct ResolvedEntries {
     commons: Option<usize>,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static HOST_WRAPPER_PRECEDENCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl ResolvedEntries {
     fn into_full(self, log: &Log) -> Result<OpenedAudienceEntries> {
         let Self {
@@ -922,6 +941,10 @@ impl ResolvedEntries {
 
     #[cfg(any(unix, test))]
     fn into_named(self, log: &Log, names: &[&str]) -> Result<Vec<Entry>> {
+        Ok(self.into_selection(log, Some(names))?.opened.entries)
+    }
+
+    fn into_selection(self, log: &Log, names: Option<&[&str]>) -> Result<SelectedEntries> {
         let Self {
             summary,
             entries,
@@ -933,13 +956,19 @@ impl ResolvedEntries {
             keyed: &summary.keyed_keys,
             effective: log.effective(),
         };
+        #[cfg(any(unix, test))]
+        let complete = entries
+            .keys()
+            .filter(|audience| summary.reputs_whole(&EpochAudience::from(*audience)))
+            .cloned()
+            .collect();
         let mut selected = BTreeMap::new();
         for (name, entry) in merge_visible_entries(entries, &summary.winning_host_audience) {
-            if names.contains(&name.as_str()) {
+            if names.is_none_or(|names| names.contains(&name.as_str())) {
                 selected.insert(name, opening.text_put(entry.index)?);
             }
         }
-        if names.contains(&crate::commons::ENTRY)
+        if names.is_none_or(|names| names.contains(&crate::commons::ENTRY))
             && let Some(index) = commons
         {
             selected.insert(
@@ -953,7 +982,38 @@ impl ResolvedEntries {
                 },
             );
         }
-        Ok(selected.into_values().collect())
+        #[cfg(any(unix, test))]
+        let selected_key = |key: &(Audience, String)| {
+            selected
+                .get(&key.1)
+                .is_some_and(|entry| entry.audience == key.0)
+        };
+        #[cfg(any(unix, test))]
+        let operations = summary
+            .winning_ops
+            .into_iter()
+            .filter(|(key, _)| selected_key(key))
+            .collect();
+        #[cfg(any(unix, test))]
+        let puts = summary
+            .winning_puts
+            .into_iter()
+            .filter(|(key, _)| selected_key(key))
+            .collect();
+        Ok(SelectedEntries {
+            opened: OpenedEntries {
+                entries: selected.into_values().collect(),
+                conflicts: summary.conflicts,
+                unwrapped_epochs: summary.unwrapped_keys.into_keys().collect(),
+                hidden_epochs: summary.hidden_epochs,
+            },
+            #[cfg(any(unix, test))]
+            operations,
+            #[cfg(any(unix, test))]
+            puts,
+            #[cfg(any(unix, test))]
+            complete,
+        })
     }
 
     #[cfg(any(unix, test))]
@@ -2074,6 +2134,24 @@ impl Log {
         self.open_entries_named_with_digest(identity, names, value_digest)
     }
 
+    /// Retain semantic operations from the very resolution that selected the
+    /// returned values. `None` names selects every visible winner.
+    pub(crate) fn open_selection(
+        &self,
+        identity: &Identity,
+        names: Option<&[&str]>,
+    ) -> Result<Option<SelectedEntries>> {
+        let Some(resolved) = self.resolve_audience_entries(identity, value_digest)? else {
+            return Ok(None);
+        };
+        if resolved.summary.unwrapped_keys.is_empty()
+            || self.audience_left_out_recipient(&EpochAudience::Everyone, &identity.recipient())
+        {
+            return Ok(None);
+        }
+        Ok(Some(resolved.into_selection(self, names)?))
+    }
+
     #[cfg(any(unix, test))]
     fn open_entries_named_with_digest(
         &self,
@@ -2092,6 +2170,22 @@ impl Log {
         Ok(Some(resolved.into_named(self, names)?))
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::spec_unmodeled(
+            machine = "DbHostCarry",
+            action = "Ordered",
+            reason = "The environment chooses causal or concurrent writes across host audiences."
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "DbHostCarry",
+            action = "Read",
+            project = "aterm_secrets::membership_log::entries::tests::host_carry_transition"
+        )
+    )]
     fn resolve_audience_entries(
         &self,
         identity: &Identity,
@@ -2296,17 +2390,22 @@ impl Log {
                 conflicts.insert((audience.clone(), name.clone()));
             }
             if let DecodedOp::Put(entry) = &winner.op {
+                let semantic = &candidates[register.reps[w]];
                 if matches!(audience, Audience::Hosts(_)) {
+                    let precedence = semantic;
+                    #[cfg(test)]
+                    let precedence = if HOST_WRAPPER_PRECEDENCE.get() {
+                        winner
+                    } else {
+                        precedence
+                    };
                     host_winners.entry(name.clone()).or_default().push((
                         audience.clone(),
-                        winner.index,
-                        winner.record_id,
+                        precedence.index,
+                        precedence.record_id,
                     ));
                 }
-                winning_ops.insert(
-                    (audience.clone(), name.clone()),
-                    candidates[register.reps[w]].record_id,
-                );
+                winning_ops.insert((audience.clone(), name.clone()), semantic.record_id);
                 winning_puts.insert((audience.clone(), name.clone()), winner.record_id);
                 by_audience
                     .entry(audience.clone())
@@ -2513,34 +2612,9 @@ impl Log {
     /// Any addressed [`Body::Wrap`], [`Body::Put`] or [`Body::Delete`] fails authentication or
     /// validation.
     pub fn open_entry_set(&self, identity: &Identity) -> Result<Option<OpenedEntries>> {
-        let Some(opened) = self.open_audience_entries(identity)? else {
-            return Ok(None);
-        };
-        if opened.unwrapped_keys.is_empty()
-            || self.audience_left_out_recipient(&EpochAudience::Everyone, &identity.recipient())
-        {
-            return Ok(None);
-        }
-        let mut everyone = merge_visible_entries(opened.by_audience, &opened.winning_host_audience);
-        if let Some(value) = opened.commons_control {
-            everyone.insert(
-                crate::commons::ENTRY.to_owned(),
-                Entry {
-                    name: crate::commons::ENTRY.to_owned(),
-                    value,
-                    audience: Audience::Everyone,
-                    if_absent: false,
-                    anchor: None,
-                },
-            );
-        }
-        let unwrapped_epochs = opened.unwrapped_keys.into_keys().collect();
-        Ok(Some(OpenedEntries {
-            entries: everyone.into_values().collect(),
-            conflicts: opened.conflicts,
-            unwrapped_epochs,
-            hidden_epochs: opened.hidden_epochs,
-        }))
+        Ok(self
+            .open_selection(identity, None)?
+            .map(|selected| selected.opened))
     }
 
     /// Convenience wrapper over [`Log::open_entry_set`] returning the merged [`Entry`] list.
@@ -5142,4 +5216,6 @@ mod tests {
             }
         }
     }
+
+    include!("entries/host_carry_tests.rs");
 }

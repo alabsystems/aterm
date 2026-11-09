@@ -1168,6 +1168,17 @@ impl App {
             .map_or((0, 0, ws.rows, ws.cols), |leaf| leaf_cell_rect(leaf.rect))
     }
 
+    pub(crate) fn focused_pane_rect_with_plan(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> (u16, u16, u16, u16) {
+        match frame_plan {
+            Some(plan) => self.focused_pane_rect_from_plan(wid, plan),
+            None => self.focused_pane_rect(wid),
+        }
+    }
+
     /// Whether terminal `session` is window `wid`'s front (focused) terminal.
     pub(crate) fn session_is_front(&self, wid: WindowId, session: u64) -> bool {
         self.front_terminal(wid)
@@ -1180,6 +1191,15 @@ impl App {
         wid: WindowId,
         session: u64,
     ) -> Option<(u16, u16, u16, u16)> {
+        self.visible_session_rect_with_plan(wid, session, None)
+    }
+
+    pub(crate) fn visible_session_rect_with_plan(
+        &self,
+        wid: WindowId,
+        session: u64,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> Option<(u16, u16, u16, u16)> {
         if self.active_tab_is_single_focused_pane(wid) {
             let ws = self.windows.get(&wid)?;
             let tab = ws.tab_set.active()?;
@@ -1190,7 +1210,14 @@ impl App {
                 .and_then(crate::tab_model::View::terminal_session)?;
             return (focus_session == session).then(|| (0, 0, ws.rows.max(1), ws.cols.max(1)));
         }
-        let plan = self.active_visible_leaf_plan(wid)?;
+        let owned_plan;
+        let plan = match frame_plan {
+            Some(plan) => plan,
+            None => {
+                owned_plan = self.active_visible_leaf_plan(wid)?;
+                &owned_plan
+            }
+        };
         plan.leaves
             .iter()
             .find(|leaf| {
@@ -1204,6 +1231,7 @@ impl App {
     }
 
     /// Where a pointer event other than a release goes in window `wid` (a hover or drag step, a wheel notch, a non-left press).
+    #[cfg(all(test, unix))]
     pub(crate) fn pointer_route(
         &self,
         wid: WindowId,
@@ -1212,19 +1240,23 @@ impl App {
         self.pointer_route_with_plan(wid, focused, None)
     }
 
-    fn pointer_route_with_plan(
+    pub(crate) fn pointer_route_with_plan(
         &self,
         wid: WindowId,
         focused: Option<(u16, u16, u16, u16)>,
         frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> PointerRoute {
-        self.pointer_capture_route(wid)
+        self.pointer_capture_route_with_plan(wid, frame_plan)
             .unwrap_or_else(|| self.pane_under_pointer_with_plan(wid, focused, frame_plan))
     }
 
     /// A held gesture keeps its owner even when the pointer crosses a pane.
     /// With no capture, pointer routing can resolve the leaf under it.
-    fn pointer_capture_route(&self, wid: WindowId) -> Option<PointerRoute> {
+    fn pointer_capture_route_with_plan(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> Option<PointerRoute> {
         let ws = self.windows.get(&wid)?;
         if ws.overlay_open() || ws.tab_menu.is_some() || ws.selecting || ws.divider_drag.is_some() {
             return Some(PointerRoute::Front);
@@ -1243,7 +1275,7 @@ impl App {
             let owner = ws
                 .held_mouse_button
                 .and_then(|button| ws.button_owners[usize::from(button.slot())]);
-            return Some(self.owner_route(wid, owner));
+            return Some(self.owner_route_with_plan(wid, owner, frame_plan));
         }
         None
     }
@@ -1302,7 +1334,12 @@ impl App {
         }
     }
 
-    fn owner_route(&self, wid: WindowId, owner: Option<ButtonOwner>) -> PointerRoute {
+    fn owner_route_with_plan(
+        &self,
+        wid: WindowId,
+        owner: Option<ButtonOwner>,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> PointerRoute {
         let Some(owner) = owner else {
             return PointerRoute::Front;
         };
@@ -1312,7 +1349,7 @@ impl App {
         let Some(window_cell) = self.windows.get(&wid).map(|ws| ws.last_mouse_window_cell) else {
             return PointerRoute::Nowhere;
         };
-        self.visible_session_rect(wid, owner.session)
+        self.visible_session_rect_with_plan(wid, owner.session, frame_plan)
             .map_or(PointerRoute::Nowhere, |rect| PointerRoute::Pane {
                 session: owner.session,
                 cell: cell_in_rect(window_cell, rect),
@@ -1343,7 +1380,7 @@ impl App {
             .windows
             .get(&wid)
             .and_then(|ws| ws.pane_overlay.drag)
-            .is_some_and(|d| self.visible_session_rect(wid, d.session).is_none())
+            .is_some_and(|d| !self.active_tab_shows_session(wid, d.session))
         {
             self.scrollbar_release(wid);
         }
@@ -1351,7 +1388,7 @@ impl App {
             .windows
             .get(&wid)
             .and_then(|ws| ws.pane_overlay.hover)
-            .is_some_and(|h| self.visible_session_rect(wid, h).is_none())
+            .is_some_and(|h| !self.active_tab_shows_session(wid, h))
             && let Some(ws) = self.windows.get_mut(&wid)
         {
             ws.pane_overlay.hover = None;
@@ -1370,9 +1407,7 @@ impl App {
             let Some(owner) = owners[slot] else {
                 continue;
             };
-            if reported & (1 << slot) == 0
-                || self.visible_session_rect(wid, owner.session).is_some()
-            {
+            if reported & (1 << slot) == 0 || self.active_tab_shows_session(wid, owner.session) {
                 continue;
             }
             self.write_owner_release(button, owner);
@@ -1396,6 +1431,7 @@ impl App {
     /// `true` when the pointer's last window cell lies inside the focused pane's rect, i.e.
     /// `last_mouse_cell` translates where the pointer is rather than clamping where it is
     /// not.
+    #[cfg(test)]
     pub(crate) fn pointer_is_inside_focused_pane(&self, wid: WindowId) -> bool {
         self.pointer_is_inside_focused_pane_with(wid, None)
     }
@@ -1412,6 +1448,7 @@ impl App {
         rect_contains(rect, (wr, wc))
     }
 
+    #[cfg(test)]
     fn pane_header_at_with(
         &self,
         wid: WindowId,
@@ -1466,18 +1503,39 @@ impl App {
         plan.header_at(point).map(|leaf| leaf.view)
     }
 
+    #[cfg(all(test, unix))]
     fn pointer_is_over_pane_header(&self, wid: WindowId) -> bool {
+        self.pointer_is_over_pane_header_with_plan(wid, None)
+    }
+
+    fn pointer_is_over_pane_header_with_plan(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> bool {
         self.windows.get(&wid).is_some_and(|ws| {
             let (x, y) = ws.last_cursor_px;
-            self.pane_header_at_with(wid, self.pointer_geometry(wid), x, y)
+            self.pane_header_at_with_plan(wid, self.pointer_geometry(wid), x, y, frame_plan)
                 .is_some()
         })
     }
 
     /// Click-to-focus in window `wid`.
+    #[cfg(test)]
     pub(crate) fn focus_pane_under_pointer(&mut self, wid: WindowId) -> bool {
+        self.focus_pane_under_pointer_with_plan(wid, None)
+    }
+
+    fn focus_pane_under_pointer_with_plan(
+        &mut self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> bool {
         if !self.active_tab_has_multiple_visible_panes(wid) {
             return false;
+        }
+        if let Some(plan) = frame_plan {
+            return self.focus_pane_under_pointer_from_plan(wid, plan);
         }
         let Some(plan) = self.active_visible_leaf_plan(wid) else {
             return false;
@@ -1546,6 +1604,7 @@ impl App {
     }
 
     /// If window `wid`'s last pointer position lands on a pane divider.
+    #[cfg(test)]
     pub(crate) fn begin_divider_drag(&mut self, wid: WindowId) -> bool {
         self.begin_divider_drag_with_plan(wid, None)
     }
@@ -1888,6 +1947,9 @@ impl App {
             if term.text_selection().has_selection() {
                 return term.selection_to_string();
             }
+        }
+        if !self.active_tab_has_multiple_visible_panes(wid) {
+            return None;
         }
         let plan = self.active_visible_leaf_plan(wid)?;
         for leaf in &plan.leaves {
@@ -2371,18 +2433,18 @@ impl App {
         let Some((_, view)) = self.active_native_view(wid) else {
             return false;
         };
+        let Some((plan, route)) = self.active_visible_frame_layout(wid) else {
+            return false;
+        };
         // A mixed tab's focused native leaf is committed with the mixed frame it sits in.
-        if self
-            .active_visible_frame_layout(wid)
-            .is_some_and(|(_, route)| route == crate::VisibleContentRoute::Heterogeneous)
-        {
-            if !self.commit_glassless_heterogeneous_frame(wid) {
+        if route == crate::VisibleContentRoute::Heterogeneous {
+            if !self.commit_glassless_heterogeneous_frame_from_plan(wid, &plan) {
                 return false;
             }
-            self.refresh_native_hover_for_frame(wid);
+            self.refresh_native_hover_for_frame_from_plan(wid, &plan);
             return true;
         }
-        if !self.prepare_native_input_scratch(wid) {
+        if !self.prepare_native_input_scratch_from_capture_plan(wid, &plan) {
             return false;
         }
         let Some(raster) = self
@@ -2394,7 +2456,7 @@ impl App {
             return false;
         };
         raster.presented = true;
-        self.refresh_native_hover_for_frame(wid);
+        self.refresh_native_hover_for_frame_from_plan(wid, &plan);
         true
     }
 
@@ -2534,7 +2596,27 @@ impl App {
     }
 
     /// A PAGE A WHEEL OR A PRESS MOVED IS HOVERED WHERE THE POINTER IS ON THE FRAME IT LEFT.
+    #[cfg(test)]
     pub(crate) fn refresh_native_hover_for_frame(&mut self, wid: WindowId) {
+        if self.active_native_view(wid).is_none()
+            || !self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.native_rehover && ws.pointer_position_known)
+        {
+            return;
+        }
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return;
+        };
+        self.refresh_native_hover_for_frame_from_plan(wid, &plan);
+    }
+
+    pub(crate) fn refresh_native_hover_for_frame_from_plan(
+        &mut self,
+        wid: WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
+    ) {
         let Some((_, front)) = self.active_native_view(wid) else {
             return;
         };
@@ -2545,24 +2627,21 @@ impl App {
             return;
         }
         let (x, y) = ws.last_cursor_px;
-        let Some(plan) = self.active_visible_leaf_plan(wid) else {
-            return;
-        };
         if self
-            .retained_native_pointer_artifact_from_plan(wid, front, &plan)
+            .retained_native_pointer_artifact_from_plan(wid, front, plan)
             .is_none()
         {
             return;
         }
         let geom = self.pointer_geometry(wid);
         let over_chrome = self
-            .pane_header_at_with_plan(wid, geom, x, y, Some(&plan))
+            .pane_header_at_with_plan(wid, geom, x, y, Some(plan))
             .is_some()
             || self.strip_col_at_with(wid, geom, x, y).is_some()
             || self.band_banner_at(wid, x, y).is_some()
             || self.find_bar_cell_at(wid, x, y).is_some()
             || self.stats_owns_pointer(wid);
-        let hit = self.native_hover_hit(wid, x, y, over_chrome, Some(&plan));
+        let hit = self.native_hover_hit(wid, x, y, over_chrome, Some(plan));
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.native_rehover = false;
         }
@@ -3284,8 +3363,23 @@ impl App {
 
     /// Resolve the OS cursor for the pointer's current location.
     pub(crate) fn update_hover_cursor(&mut self, wid: WindowId) {
+        self.update_hover_cursor_from_plan(wid, None);
+    }
+
+    pub(crate) fn update_hover_cursor_from_plan(
+        &mut self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) {
         let parked = self.park_link_target(wid);
-        self.update_hover_cursor_with(wid, self.pointer_geometry(wid), parked, None, None, None);
+        self.update_hover_cursor_with(
+            wid,
+            self.pointer_geometry(wid),
+            parked,
+            None,
+            None,
+            frame_plan,
+        );
         self.settle_link_target(wid, parked);
     }
 
@@ -4551,7 +4645,11 @@ impl App {
 
     /// Keep a completed double/triple-click selection draggable while the button stays down.
     pub(crate) fn arm_gesture_drag(&mut self, wid: WindowId, sel_row: i32, col: u16) {
-        let pane = self.focused_pane_rect(wid);
+        let pane = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.staged_drag_pane.take())
+            .unwrap_or_else(|| self.focused_pane_rect(wid));
         let controller = self.person_gesture_refused();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -4571,7 +4669,11 @@ impl App {
         let Some((term, _)) = self.front_shown(wid) else {
             return;
         };
-        let pane = self.focused_pane_rect(wid);
+        let pane = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|ws| ws.staged_drag_pane.take())
+            .unwrap_or_else(|| self.focused_pane_rect(wid));
         let controller = self.person_gesture_refused();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -4689,7 +4791,16 @@ impl App {
         self.sourced_link_under_pointer(wid).map(|(url, _)| url)
     }
 
+    #[cfg(test)]
     fn sourced_link_under_pointer(&self, wid: WindowId) -> Option<(String, bool)> {
+        self.sourced_link_under_pointer_with(wid, None)
+    }
+
+    fn sourced_link_under_pointer_with(
+        &self,
+        wid: WindowId,
+        focused_rect: Option<(u16, u16, u16, u16)>,
+    ) -> Option<(String, bool)> {
         if self.rewound_front(wid).is_some() {
             return None;
         }
@@ -4712,7 +4823,9 @@ impl App {
         if let Some((_, url)) = self.claude_glass_hit_at(wid, px, py) {
             return url.map(|url| (url.to_owned(), false));
         }
-        if !self.pointer_is_inside_focused_pane(wid) || self.glass_swallows_at(wid, px, py) {
+        if !self.pointer_is_inside_focused_pane_with(wid, focused_rect)
+            || self.glass_swallows_at(wid, px, py)
+        {
             return None;
         }
         let term = term_lock(&ws.front_terminal()?.term);
@@ -4727,9 +4840,18 @@ impl App {
     }
 
     /// The file citation a press at the pointer would open (`crate::path_link`).
+    #[cfg(test)]
     pub(crate) fn path_link_under_pointer(
         &self,
         wid: WindowId,
+    ) -> Option<crate::path_link::PathTarget> {
+        self.path_link_under_pointer_with(wid, None)
+    }
+
+    fn path_link_under_pointer_with(
+        &self,
+        wid: WindowId,
+        focused_rect: Option<(u16, u16, u16, u16)>,
     ) -> Option<crate::path_link::PathTarget> {
         if self.rewound_front(wid).is_some() {
             return None;
@@ -4748,7 +4870,7 @@ impl App {
             || crate::claude_lights::OverChips::of_glass(self.claude_glass_at(wid, px, py).as_ref())
                 != crate::claude_lights::OverChips::No
             || self.claude_glass_hit_at(wid, px, py).is_some()
-            || !self.pointer_is_inside_focused_pane(wid)
+            || !self.pointer_is_inside_focused_pane_with(wid, focused_rect)
             || self.glass_swallows_at(wid, px, py)
         {
             return None;
@@ -4877,8 +4999,18 @@ impl App {
     }
 
     /// Cmd-click.
+    #[cfg(test)]
     pub(crate) fn open_link_under_pointer(&mut self, wid: WindowId) -> bool {
-        let sourced = self.sourced_link_under_pointer(wid);
+        self.open_link_under_pointer_with_plan(wid, None)
+    }
+
+    fn open_link_under_pointer_with_plan(
+        &mut self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> bool {
+        let focused_rect = Some(self.focused_pane_rect_with_plan(wid, frame_plan));
+        let sourced = self.sourced_link_under_pointer_with(wid, focused_rect);
         let pressed = sourced.as_ref().map(|(url, osc8)| {
             if *osc8 {
                 PressedUrl::Osc8(url)
@@ -4888,7 +5020,7 @@ impl App {
         });
         let url = sourced.as_ref().map(|(url, _)| url.clone());
         let path = if url.is_none() {
-            self.path_link_under_pointer(wid)
+            self.path_link_under_pointer_with(wid, focused_rect)
         } else {
             None
         };
@@ -4906,7 +5038,7 @@ impl App {
                     w.request_redraw();
                 }
             }
-            self.update_hover_cursor(wid);
+            self.update_hover_cursor_from_plan(wid, frame_plan);
             return false;
         }
         match crate::path_link::decide(url, path) {
@@ -5035,19 +5167,30 @@ impl App {
     /// Resolve a native pointer without moving keyboard focus. Captured gestures
     /// keep their owner; free gestures use the current visible layout, even
     /// when an earlier gesture has invalidated its retained paint.
-    fn native_pointer_view(&self, wid: WindowId) -> Option<crate::tab_model::ViewId> {
+    fn native_pointer_view(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> Option<crate::tab_model::ViewId> {
         let focused = || self.active_native_view(wid).map(|(_, view)| view);
-        if let Some(route) = self.pointer_capture_route(wid) {
+        if let Some(route) = self.pointer_capture_route_with_plan(wid, frame_plan) {
             return match route {
                 PointerRoute::Front => focused(),
                 PointerRoute::Pane { .. } | PointerRoute::Nowhere => None,
             };
         }
-        self.native_view_under_pointer(wid)
+        self.native_view_under_pointer(wid, frame_plan)
     }
 
     /// The free body hit, used when a new press overrides an older hold.
-    fn native_view_under_pointer(&self, wid: WindowId) -> Option<crate::tab_model::ViewId> {
+    fn native_view_under_pointer(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> Option<crate::tab_model::ViewId> {
+        if !self.active_tab_contains_native(wid) {
+            return None;
+        }
         let window = self.windows.get(&wid)?;
         let (x, y) = window.last_cursor_px;
         if !window.pointer_position_known || !x.is_finite() || !y.is_finite() {
@@ -5056,7 +5199,14 @@ impl App {
         if self.band_banner_at(wid, x, y).is_some() || self.find_bar_cell_at(wid, x, y).is_some() {
             return None;
         }
-        let plan = self.active_visible_leaf_plan(wid)?;
+        let owned_plan;
+        let plan = match frame_plan {
+            Some(plan) => plan,
+            None => {
+                owned_plan = self.active_visible_leaf_plan(wid)?;
+                &owned_plan
+            }
+        };
         let geom = self.pointer_geometry(wid);
         let (cw, ch) = geom.cell;
         if cw == 0 || ch == 0 {
@@ -5082,13 +5232,15 @@ impl App {
         &self,
         wid: WindowId,
         view: crate::tab_model::ViewId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
     ) -> Option<crate::native_ui::UiKey> {
         let ws = self
             .windows
             .get(&wid)
             .filter(|ws| ws.pointer_position_known)?;
         let (x, y) = ws.last_cursor_px;
-        let (artifact, local_x, local_y) = self.retained_native_leaf_at_pointer(wid, x, y)?;
+        let (artifact, local_x, local_y) =
+            self.retained_native_leaf_at_pointer_from_plan(wid, x, y, frame_plan)?;
         if artifact.view != view {
             return None;
         }
@@ -5120,9 +5272,13 @@ impl App {
         )
     }
 
-    fn press_lands_on_a_terminal_pane(&self, wid: WindowId) -> bool {
+    fn press_lands_on_a_terminal_pane(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> bool {
         matches!(
-            self.pane_under_pointer_with_plan(wid, None, None),
+            self.pane_under_pointer_with_plan(wid, None, frame_plan),
             PointerRoute::Pane { .. }
         )
     }
@@ -5237,8 +5393,12 @@ impl App {
             return None;
         }
         let mods_state = self.windows.get(&wid).map(|ws| ws.mods)?;
+        let input_plan = (self.active_tab_has_multiple_visible_panes(wid)
+            || self.active_tab_contains_native(wid))
+        .then(|| self.active_visible_leaf_plan(wid))
+        .flatten();
         if self.windows.get(&wid).is_some_and(|ws| !ws.overlay_open())
-            && self.pointer_is_over_pane_header(wid)
+            && self.pointer_is_over_pane_header_with_plan(wid, input_plan.as_ref())
         {
             let captured = self.windows.get(&wid).is_some_and(|ws| {
                 (button == WinitMouseButton::Left && (ws.selecting || ws.divider_drag.is_some()))
@@ -5259,8 +5419,14 @@ impl App {
                 }
                 if pressed && button == WinitMouseButton::Left && !captured {
                     let (x, y) = self.windows[&wid].last_cursor_px;
-                    self.refresh_mouse_cell(wid, self.pointer_geometry(wid), x, y);
-                    self.focus_pane_under_pointer(wid);
+                    self.refresh_mouse_cell_with_plan(
+                        wid,
+                        self.pointer_geometry(wid),
+                        x,
+                        y,
+                        input_plan.as_ref(),
+                    );
+                    self.focus_pane_under_pointer_with_plan(wid, input_plan.as_ref());
                 }
                 return None;
             }
@@ -5297,15 +5463,25 @@ impl App {
                 .windows
                 .get(&wid)
                 .is_some_and(|window| !window.selecting && window.divider_drag.is_none());
-        let mut native_press = page_press.then(|| self.native_pointer_view(wid)).flatten();
         let native_body_press = page_press
-            .then(|| self.native_view_under_pointer(wid))
+            .then(|| self.native_view_under_pointer(wid, input_plan.as_ref()))
             .flatten();
+        let mut native_press = if !page_press {
+            None
+        } else if let Some(route) = self.pointer_capture_route_with_plan(wid, input_plan.as_ref()) {
+            match route {
+                PointerRoute::Front => self.active_native_view(wid).map(|(_, view)| view),
+                PointerRoute::Pane { .. } | PointerRoute::Nowhere => None,
+            }
+        } else {
+            native_body_press
+        };
         let mut canonical_press_routed = false;
         if pressed
             && button == WinitMouseButton::Left
-            && let Some((plan, crate::VisibleContentRoute::Heterogeneous)) =
-                self.active_visible_frame_layout(wid)
+            && let Some(plan) = input_plan.as_ref()
+            && self.visible_content_route_from_plan(plan)
+                == Some(crate::VisibleContentRoute::Heterogeneous)
         {
             canonical_press_routed = true;
             let (px, py) = self
@@ -5325,14 +5501,14 @@ impl App {
                 }
                 return None;
             }
-            if in_content && self.begin_divider_drag_with_plan(wid, Some(&plan)) {
+            if in_content && self.begin_divider_drag_with_plan(wid, Some(plan)) {
                 if self.inline_rename_edit(wid).is_some() {
                     self.clear_strip_press(wid);
                     self.settle_rename_edit(wid);
                 }
                 return None;
             }
-            if in_content && self.focus_pane_under_pointer_from_plan(wid, &plan) {
+            if in_content && self.focus_pane_under_pointer_from_plan(wid, plan) {
                 if self.inline_rename_edit(wid).is_some() {
                     self.clear_strip_press(wid);
                     self.settle_rename_edit(wid);
@@ -5340,19 +5516,24 @@ impl App {
                 return native_body_press;
             }
         }
-        let terminal_beside = if pressed {
-            self.press_lands_on_a_terminal_pane(wid)
-        } else {
-            winit_mouse_button(button).is_some_and(|button| {
-                self.windows.get(&wid).is_some_and(|ws| {
-                    ws.reported_buttons & (1 << button.slot()) != 0
-                        && matches!(
-                            self.owner_route(wid, ws.button_owners[usize::from(button.slot())]),
-                            PointerRoute::Pane { .. }
-                        )
+        let terminal_beside = self.active_native_view(wid).is_some()
+            && if pressed {
+                self.press_lands_on_a_terminal_pane(wid, input_plan.as_ref())
+            } else {
+                winit_mouse_button(button).is_some_and(|button| {
+                    self.windows.get(&wid).is_some_and(|ws| {
+                        ws.reported_buttons & (1 << button.slot()) != 0
+                            && matches!(
+                                self.owner_route_with_plan(
+                                    wid,
+                                    ws.button_owners[usize::from(button.slot())],
+                                    input_plan.as_ref()
+                                ),
+                                PointerRoute::Pane { .. }
+                            )
+                    })
                 })
-            })
-        };
+            };
         if self.active_native_view(wid).is_some() && !terminal_beside {
             // The native handler takes this body press directly, including a
             // new left press while an older terminal button remains held.
@@ -5390,7 +5571,9 @@ impl App {
                 let release = (self.band_banner_at(wid, px, py).is_none()
                     && self.find_bar_cell_at(wid, px, py).is_none()
                     && !self.stats_owns_pointer(wid))
-                .then(|| self.retained_native_leaf_at_pointer(wid, px, py))
+                .then(|| {
+                    self.retained_native_leaf_at_pointer_from_plan(wid, px, py, input_plan.as_ref())
+                })
                 .flatten()
                 .and_then(|(artifact, x, y)| {
                     if artifact.view != view
@@ -5472,12 +5655,11 @@ impl App {
                 {
                     return None;
                 }
-                let press_plan = self.active_visible_leaf_plan(wid);
-                let editor_target =
-                    self.native_editor_pointer_target(wid, px, py, press_plan.as_ref());
-                let grid_target = self.native_editor_grid_target(wid, px, py, press_plan.as_ref());
+                let press_plan = input_plan.as_ref();
+                let editor_target = self.native_editor_pointer_target(wid, px, py, press_plan);
+                let grid_target = self.native_editor_grid_target(wid, px, py, press_plan);
                 let press = self
-                    .retained_native_leaf_at_pointer_from_plan(wid, px, py, press_plan.as_ref())
+                    .retained_native_leaf_at_pointer_from_plan(wid, px, py, press_plan)
                     .and_then(|(artifact, x, y)| {
                         let (_, active_view) = self.active_native_view(wid)?;
                         if artifact.view != active_view
@@ -5497,7 +5679,7 @@ impl App {
                         ))
                     });
                 let picture = if press.is_none() {
-                    self.retained_native_leaf_at_pointer_from_plan(wid, px, py, press_plan.as_ref())
+                    self.retained_native_leaf_at_pointer_from_plan(wid, px, py, press_plan)
                         .and_then(|(artifact, x, y)| {
                             let (_, active_view) = self.active_native_view(wid)?;
                             (artifact.view == active_view
@@ -5665,7 +5847,7 @@ impl App {
             if self.press_banner_at(wid, px, py) {
                 return None;
             }
-            if self.press_claude_light(wid, at) {
+            if !canonical_press_routed && self.press_claude_light(wid, at) {
                 return None;
             }
         }
@@ -5731,7 +5913,7 @@ impl App {
             }
         }
         let press_route = if pressed && button != WinitMouseButton::Left {
-            self.pointer_route(wid, None)
+            self.pointer_route_with_plan(wid, None, input_plan.as_ref())
         } else {
             PointerRoute::Front
         };
@@ -5747,7 +5929,7 @@ impl App {
                 tl.mouse_tracking_enabled()
             });
             if !tracking {
-                if self.front_pane_for_local_press(wid, press_route) {
+                if self.front_pane_for_local_press(wid, press_route, input_plan.as_ref()) {
                     self.paste_primary_into(wid);
                 }
                 return native_press;
@@ -5813,7 +5995,7 @@ impl App {
                     return None;
                 }
                 RightPressPlan::Copy => {
-                    if !self.front_pane_for_local_press(wid, press_route) {
+                    if !self.front_pane_for_local_press(wid, press_route, input_plan.as_ref()) {
                         return native_press;
                     }
                     if let (Some(text), Some(t)) = (selection, term.as_ref()) {
@@ -5833,7 +6015,7 @@ impl App {
                     return native_press;
                 }
                 RightPressPlan::Paste => {
-                    if self.front_pane_for_local_press(wid, press_route) {
+                    if self.front_pane_for_local_press(wid, press_route, input_plan.as_ref()) {
                         self.paste_clipboard_into(wid);
                     }
                     return native_press;
@@ -5869,12 +6051,18 @@ impl App {
         if pressed && button == WinitMouseButton::Left && self.pet_press_at(wid, at) {
             return None;
         }
-        if pressed && button == WinitMouseButton::Left && self.scrollbar_press(wid) {
+        if pressed
+            && button == WinitMouseButton::Left
+            && !canonical_press_routed
+            && self.scrollbar_press(wid)
+        {
             return None;
         }
         if button == WinitMouseButton::Left {
             if pressed {
-                if !canonical_press_routed && self.begin_divider_drag(wid) {
+                if !canonical_press_routed
+                    && self.begin_divider_drag_with_plan(wid, input_plan.as_ref())
+                {
                     return None;
                 }
             } else if self.finish_divider_drag(wid) {
@@ -5887,13 +6075,13 @@ impl App {
         if pressed
             && button == WinitMouseButton::Left
             && !canonical_press_routed
-            && self.focus_pane_under_pointer(wid)
+            && self.focus_pane_under_pointer_with_plan(wid, input_plan.as_ref())
         {
             return native_press;
         }
         if let Some(session) = self.rewound_front(wid) {
             if button == WinitMouseButton::Left {
-                self.rewind_press(wid, session, pressed);
+                self.rewind_press(wid, session, pressed, input_plan.as_ref());
             } else if pressed {
                 self.note_rewind_withheld(session);
             }
@@ -5914,12 +6102,18 @@ impl App {
             if pressed && press_starts_selection(tracking, tracking_bypass_held(mods_state)) {
                 // Cmd-click (macOS) / Ctrl-click (elsewhere) on a link opens it (safe
                 // schemes only) instead of starting a selection; GUI-only, never the seam.
-                if link_modifier_held(mods_state) && self.open_link_under_pointer(wid) {
+                if link_modifier_held(mods_state)
+                    && self.open_link_under_pointer_with_plan(wid, input_plan.as_ref())
+                {
                     return native_press;
                 }
                 if mods_state.shift_key() && !(tracking && !option_held) {
                     self.shift_extend_press(wid, at);
                     return native_press;
+                }
+                let drag_pane = self.focused_pane_rect_with_plan(wid, input_plan.as_ref());
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.staged_drag_pane = Some(drag_pane);
                 }
                 click_count = self.advance_click_streak(wid, at);
                 if tracking {
@@ -5929,6 +6123,9 @@ impl App {
                         .map_or((0, 0), |ws| ws.last_mouse_cell);
                     let block = press_selection_kind(option_held, tracking) == SelectionType::Block;
                     self.seam_left_press(wid, row, col, click_count, block);
+                    if let Some(ws) = self.windows.get_mut(&wid) {
+                        ws.staged_drag_pane = None;
+                    }
                     return native_press;
                 }
             }
@@ -5941,6 +6138,9 @@ impl App {
             }
         }
         let Some(button) = winit_mouse_button(button) else {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.staged_drag_pane = None;
+            }
             return native_press;
         };
         let slot = usize::from(button.slot());
@@ -5951,9 +6151,12 @@ impl App {
         let route = if pressed {
             press_route
         } else {
-            self.owner_route(wid, owner)
+            self.owner_route_with_plan(wid, owner, input_plan.as_ref())
         };
         if pressed && route == PointerRoute::Nowhere {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.staged_drag_pane = None;
+            }
             return native_press;
         }
         let (row, col) = match route {
@@ -6011,14 +6214,23 @@ impl App {
                 px_off,
             },
         );
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.staged_drag_pane = None;
+        }
         native_press
     }
 
-    fn front_pane_for_local_press(&mut self, wid: WindowId, route: PointerRoute) -> bool {
+    fn front_pane_for_local_press(
+        &mut self,
+        wid: WindowId,
+        route: PointerRoute,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> bool {
         match route {
             PointerRoute::Front => true,
             PointerRoute::Pane { session, .. } => {
-                self.focus_pane_under_pointer(wid) && self.session_is_front(wid, session)
+                self.focus_pane_under_pointer_with_plan(wid, frame_plan)
+                    && self.session_is_front(wid, session)
             }
             PointerRoute::Nowhere => false,
         }
@@ -6105,7 +6317,14 @@ impl App {
         self.fence_pointer_license(wid);
         let palette = self.palette_claims_pointer(wid);
         let overview = self.overview_claims_pointer(wid);
-        if !(palette || overview) && self.pointer_is_over_pane_header(wid) {
+        let wheel_plan = (!(palette || overview)
+            && (self.active_tab_has_multiple_visible_panes(wid)
+                || self.active_tab_contains_native(wid)))
+        .then(|| self.active_visible_leaf_plan(wid))
+        .flatten();
+        if !(palette || overview)
+            && self.pointer_is_over_pane_header_with_plan(wid, wheel_plan.as_ref())
+        {
             return;
         }
         if !(palette || overview) && self.stats_owns_pointer(wid) {
@@ -6116,11 +6335,11 @@ impl App {
             .get(&wid)
             .is_none_or(|ws| ws.tab_menu.is_some() || ws.overlay_open());
         let native_view = (!seam_owned)
-            .then(|| self.native_pointer_view(wid))
+            .then(|| self.native_pointer_view(wid, wheel_plan.as_ref()))
             .flatten();
         let native_page = native_view.is_some();
         if !(seam_owned || palette || overview || native_page)
-            && let Some(session) = self.rewound_under_pointer(wid)
+            && let Some(session) = self.rewound_under_pointer(wid, wheel_plan.as_ref())
         {
             let (dy, px) = match delta {
                 MouseScrollDelta::LineDelta(_, y) => (f64::from(y), false),
@@ -6155,7 +6374,7 @@ impl App {
             if let Some(dy_px) = track_px
                 && !(seam_owned || palette || overview || native_page)
             {
-                match self.pointer_route(wid, None) {
+                match self.pointer_route_with_plan(wid, None, wheel_plan.as_ref()) {
                     PointerRoute::Front => self.track_precise_scroll(wid, dy_px, None),
                     PointerRoute::Pane { session, .. } => {
                         self.track_precise_scroll(wid, dy_px, Some(session));
@@ -6199,12 +6418,12 @@ impl App {
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.native_rehover = true;
                 }
-                let key = self.native_scroll_target(wid, view);
+                let key = self.native_scroll_target(wid, view, wheel_plan.as_ref());
                 let _ = self.scroll_native_view(wid, view, signed, key);
                 return;
             }
         }
-        let route = self.pointer_route(wid, None);
+        let route = self.pointer_route_with_plan(wid, None, wheel_plan.as_ref());
         let (row, col) = match route {
             PointerRoute::Pane { cell, .. } => cell,
             PointerRoute::Front => self
@@ -11857,6 +12076,186 @@ mod tests {
             1,
             "refresh_native_hover_for_frame must reuse a single VisibleLeafPlan"
         );
+    }
+
+    #[test]
+    fn mouse_input_and_wheel_reuse_a_single_leaf_plan_or_skip_it_on_single_pane_tabs() {
+        use super::{ElementState, MouseScrollDelta, WinitMouseButton};
+        use crate::{App, reset_visible_leaf_plan_builds, visible_leaf_plan_builds};
+
+        // 1. Single-pane and zoomed-split terminal tabs build 0 plans on press, release, and wheel.
+        let (mut app, wid, _, bottom) = stacked_autoscroll_fixture();
+        app.toggle_pane_zoom();
+        let (x, y) = app.cell_centre_px(wid, 3, 5).expect("interior cell");
+        app.on_cursor_moved(wid, x, y);
+        reset_visible_leaf_plan_builds();
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, 1.0));
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            0,
+            "zoomed/single-pane terminal press, release, and wheel need no VisibleLeafPlan"
+        );
+
+        // 2. Unzoomed multi-pane split terminal builds 1 plan per press, release, and wheel.
+        app.toggle_pane_zoom();
+        let (row, col, _, _) = app.focused_pane_rect(wid);
+        let (x, y) = app
+            .cell_centre_px(wid, row + 1, col + 1)
+            .expect("interior split cell");
+        app.on_cursor_moved(wid, x, y);
+
+        reset_visible_leaf_plan_builds();
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "split terminal press must share one VisibleLeafPlan"
+        );
+        reset_visible_leaf_plan_builds();
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "split terminal release must share one VisibleLeafPlan"
+        );
+        reset_visible_leaf_plan_builds();
+        app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, 1.0));
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "split terminal wheel must share one VisibleLeafPlan"
+        );
+
+        // 3. Rewound split terminal pane builds 1 plan on press and release, and 0 on rewind_presented.
+        let mut rewind_view = crate::rewind::RewindView::new(0);
+        rewind_view.shown = Some(app.pool.get(bottom).expect("bottom session").term.clone());
+        app.pool.set_rewind(bottom, Some(rewind_view));
+        reset_visible_leaf_plan_builds();
+        app.rewind_presented(wid);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            0,
+            "rewind_presented visits active tab leaves without building a VisibleLeafPlan"
+        );
+        reset_visible_leaf_plan_builds();
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "rewound split terminal press must share one VisibleLeafPlan across band check and selection"
+        );
+        reset_visible_leaf_plan_builds();
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "rewound split terminal release must share one VisibleLeafPlan"
+        );
+        app.pool.set_rewind(bottom, None);
+
+        // 4. Native Settings and heterogeneous split build 1 plan on commit_glassless_native_frame, press, release, and wheel.
+        let mut native_app = App::headless_for_test();
+        assert!(native_app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        native_app.on_cursor_moved(wid, 120.0, 140.0);
+        native_app
+            .windows
+            .get_mut(&wid)
+            .expect("window")
+            .native_rehover = true;
+        reset_visible_leaf_plan_builds();
+        assert!(native_app.commit_glassless_native_frame(wid));
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "commit_glassless_native_frame must share one VisibleLeafPlan across scratch preparation and rehover"
+        );
+
+        reset_visible_leaf_plan_builds();
+        native_app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "native Settings press must share one VisibleLeafPlan"
+        );
+        reset_visible_leaf_plan_builds();
+        native_app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "native Settings release must share one VisibleLeafPlan"
+        );
+        reset_visible_leaf_plan_builds();
+        native_app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, -1.0));
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "native Settings wheel must share one VisibleLeafPlan"
+        );
+
+        let mut mixed_app = App::headless_for_test();
+        mixed_app.open_allocation(true).expect("open mixed split");
+        mixed_app.on_cursor_moved(wid, 120.0, 140.0);
+        mixed_app
+            .windows
+            .get_mut(&wid)
+            .expect("window")
+            .native_rehover = true;
+        reset_visible_leaf_plan_builds();
+        assert!(mixed_app.commit_glassless_native_frame(wid));
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "heterogeneous commit_glassless_native_frame must share one VisibleLeafPlan"
+        );
+        reset_visible_leaf_plan_builds();
+        mixed_app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, -1.0));
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            1,
+            "heterogeneous split wheel must share one VisibleLeafPlan"
+        );
+
+        // 5. Palette live, menu live, IME recipient, and overlay coordinate transform build 0 plans on split tabs.
+        reset_visible_leaf_plan_builds();
+        let _ = app.palette_live();
+        app.publish_menu_live();
+        let _ = app.overlay_coordinate_transform(wid);
+        let _ = mixed_app.overlay_coordinate_transform(wid);
+        app.dispatch_ime_event(
+            wid,
+            aterm_window::event::Ime::Enabled,
+            aterm_window::event::InputOrigin::Person,
+        );
+        app.dispatch_ime_event(
+            wid,
+            aterm_window::event::Ime::Preedit("a".to_owned(), Some((1, 1))),
+            aterm_window::event::InputOrigin::Person,
+        );
+        let _ = app.preedit_owner(wid);
+        app.dispatch_ime_event(
+            wid,
+            aterm_window::event::Ime::Disabled,
+            aterm_window::event::InputOrigin::Person,
+        );
+        assert_eq!(
+            visible_leaf_plan_builds(),
+            0,
+            "palette_live, publish_menu_live, overlay_coordinate_transform, and dispatch_ime_event need no VisibleLeafPlan"
+        );
+
+        #[cfg(a11y_tree)]
+        {
+            mixed_app.windows.get_mut(&wid).expect("window").a11y_active = true;
+            reset_visible_leaf_plan_builds();
+            mixed_app.push_a11y_tree(wid);
+            assert_eq!(
+                visible_leaf_plan_builds(),
+                1,
+                "push_a11y_tree must share a single VisibleLeafPlan across client_reads, native a11y, and chrome"
+            );
+        }
     }
 
     #[test]

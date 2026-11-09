@@ -9,6 +9,7 @@ use crate::{App, Wake};
 use aterm_types::MutexExt as _;
 
 pub(crate) struct Snapshot {
+    pub(crate) enabled: bool,
     pub(crate) owner: Option<String>,
     pub(crate) repo: Option<String>,
     pub(crate) auto_apply: bool,
@@ -38,6 +39,12 @@ impl Snapshot {
         let updater = app.native_updater_service.snapshot();
         let now = std::time::Instant::now();
         Self {
+            enabled: app
+                .config
+                .update
+                .as_ref()
+                .and_then(|u| u.enabled)
+                .unwrap_or(true),
             owner: app.config.update.as_ref().and_then(|u| u.owner.clone()),
             repo: app.config.update.as_ref().and_then(|u| u.repo.clone()),
             auto_apply: app
@@ -339,6 +346,7 @@ mod tests {
     fn control_posture_requires_the_same_artifact_and_a_real_retry() {
         let mut status = status();
         let mut snapshot = Snapshot {
+            enabled: true,
             owner: None,
             repo: None,
             auto_apply: true,
@@ -403,6 +411,7 @@ mod tests {
     fn the_restored_agents_hold_is_named_while_it_holds() {
         let status = status();
         let mut snapshot = Snapshot {
+            enabled: true,
             owner: None,
             repo: None,
             auto_apply: true,
@@ -520,6 +529,7 @@ mod tests {
     #[test]
     fn the_live_stage_outranks_the_published_one() {
         let live = |staged| Snapshot {
+            enabled: true,
             owner: None,
             repo: None,
             auto_apply: true,
@@ -548,12 +558,16 @@ mod tests {
         let config = app.config.update.get_or_insert_with(Default::default);
         config.owner = Some("first-owner".into());
         config.repo = Some("first-repo".into());
+        config.enabled = Some(false);
         let first = Snapshot::capture(&app);
         let config = app.config.update.as_mut().unwrap();
         config.owner = Some("second-owner".into());
         config.repo = Some("second-repo".into());
+        config.enabled = Some(true);
         let second = Snapshot::capture(&app);
         assert_eq!(first.owner.as_deref(), Some("first-owner"));
+        assert!(!first.enabled);
+        assert!(second.enabled);
         assert_eq!(first.repo.as_deref(), Some("first-repo"));
         assert_eq!(second.owner.as_deref(), Some("second-owner"));
         assert_eq!(second.repo.as_deref(), Some("second-repo"));

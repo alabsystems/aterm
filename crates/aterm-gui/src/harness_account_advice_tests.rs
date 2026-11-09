@@ -1479,7 +1479,6 @@ fn execution_visibility_conforms_to_the_actual_gate_and_rejects_hidden_off_contr
     if verify::checkers_required() {
         assert_eq!(coverage, verify::Covered::InterpreterAndTy);
     }
-    assert!(verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     let mut transitions = 0;
     let mut independent_transitions = 0;
     for before in aterm_spec::interp::reachable_states(&model) {

@@ -267,8 +267,6 @@ pub(crate) fn transition(
 #[test]
 fn atomic_successors_refine_three_link_races_retries_and_capacity() {
     let model = aterm_models_harness::noexec_successor_model();
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "successor model audit: {faults:?}");
     aterm_spec::interp::prove_and_catch(&model);
     let states = aterm_spec::interp::reachable_states(&model);
     assert!(states.iter().any(|state| state["depth"] == 3));

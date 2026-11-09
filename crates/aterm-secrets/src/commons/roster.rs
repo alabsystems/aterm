@@ -409,7 +409,7 @@ impl Access {
                         self.head,
                         self.basis,
                         self.log_heads_digest,
-                        lock,
+                        (lock, &crate::fsx::Glance::new()),
                     )
                 }) {
                     Err(busy) if busy.kind() == crate::ErrorKind::VaultBusy => return Err(busy),
@@ -423,6 +423,48 @@ impl Access {
                         basis: self.basis,
                     })
         };
+        Ok(aterm_db_core::roster_access(current, true, true))
+    }
+
+    /// [`Self::is_current`] through `look`, one look at this access's vault for checks that stand
+    /// for one moment of it ([`crate::client::VaultLook`]).
+    pub fn is_current_in(&self, journal: &Journal, look: &crate::client::VaultLook<'_>) -> bool {
+        self.is_current_observed_in(journal, look).unwrap_or(false)
+    }
+
+    /// [`Self::is_current_observed`] through `look`: judged under the look's shared observation of
+    /// the state lock and its look at each file, rather than an observation and a look of its own,
+    /// where it looks at this access's vault and observes that lock; otherwise
+    /// [`Self::is_current_observed`]'s own. A file that changed under the look without taking the
+    /// lock is judged by what the look's memos kept for their first stamps of it, where they kept
+    /// an answer (a miss reads it afresh, as the memo's own call does), and the next look sees it.
+    ///
+    /// # Errors
+    /// As [`Self::is_current_observed`].
+    pub fn is_current_observed_in(
+        &self,
+        journal: &Journal,
+        look: &crate::client::VaultLook<'_>,
+    ) -> crate::Result<bool> {
+        let (Some(paths), Some((lock, glance))) = (&self.log_paths, look.held()) else {
+            return self.is_current_observed(journal);
+        };
+        if look.paths() != paths {
+            return self.is_current_observed(journal);
+        }
+        let current = journal.trust() == self.trust
+            && match log_observation_is_current(
+                paths,
+                self.trust,
+                Some(self.local().binding.recipient()),
+                self.head,
+                self.basis,
+                self.log_heads_digest,
+                (lock, glance),
+            ) {
+                Err(busy) if busy.kind() == crate::ErrorKind::VaultBusy => return Err(busy),
+                observed => observed.unwrap_or(false),
+            };
         Ok(aterm_db_core::roster_access(current, true, true))
     }
     /// Refuse a stale observation, a fork, missing history or failed durability
@@ -445,7 +487,7 @@ impl Access {
                         self.head,
                         self.basis,
                         self.log_heads_digest,
-                        lock,
+                        (lock, &crate::fsx::Glance::new()),
                     )?
                 {
                     return Err(Error::new(
@@ -889,7 +931,7 @@ impl Historical {
                         self.head,
                         self.basis,
                         self.log_heads_digest,
-                        lock,
+                        (lock, &crate::fsx::Glance::new()),
                     )?
                 {
                     return Err(Error::new(
@@ -922,31 +964,25 @@ fn log_observation_is_current(
     head: [u8; 32],
     basis: [u8; 32],
     remembered: Option<[u8; 32]>,
-    lock: &crate::client::StateLock,
+    (lock, glance): (&crate::client::StateLock, &crate::fsx::Glance),
 ) -> Result<bool> {
-    // One look at the vault's files for the whole check ([`crate::fsx::Glance`]): the identity's,
-    // the log memo's stamps and the state digest name many of the same files.
-    let glance = crate::fsx::Glance::new();
+    // One look at the vault's files for the whole check, `glance` (the caller's, or the look's
+    // of a moment the check stands for: [`crate::fsx::Glance`]): the identity's, the log memo's
+    // stamps and the state digest name many of the same files.
     // The recipient alone answers a quiet check, kept while the identity file stands; the
     // identity itself is read only to judge the log afresh.
-    let Some(local) = crate::client::identity_recipient(paths, Some(&glance))? else {
+    let Some(local) = crate::client::identity_recipient(paths, Some(glance))? else {
         return Ok(false);
     };
     if recipient.is_some_and(|expected| expected != local) {
         return Ok(false);
     }
     let Some((log, heads_digest)) =
-        crate::client::trusted_commons_log_under(paths, trust, lock, &glance)?
+        crate::client::trusted_commons_log_under(paths, trust, lock, glance)?
     else {
         return Ok(false);
     };
-    if remembered
-        == Some(commons_log_state_digest(
-            paths,
-            heads_digest,
-            Some(&glance),
-        )?)
-    {
+    if remembered == Some(commons_log_state_digest(paths, heads_digest, Some(glance))?) {
         return Ok(true);
     }
     let Some(identity) = crate::client::read_identity(paths)? else {
@@ -956,7 +992,7 @@ fn log_observation_is_current(
         return Ok(false);
     }
     Ok(
-        current_from_loaded_log(paths, trust, &identity, &log, heads_digest, lock, &glance)?
+        current_from_loaded_log(paths, trust, &identity, &log, heads_digest, lock, glance)?
             .is_some_and(|fresh| fresh.head == head && fresh.basis == basis),
     )
 }

@@ -2648,7 +2648,8 @@ struct Reads<'a> {
     /// not be made ([`git_as`]), or the repository found could not be read
     /// ([`probe_reads`]).
     cut: Cell<bool>,
-    /// The git processes started so far ([`run_git_bytes`]).
+    /// The git processes started so far ([`run_git_bytes`]); in a test, a read the thread's
+    /// [`read_memo`] answers counts too, so a cut's index names the same read with it as without.
     starts: Cell<u32>,
     /// Whether new starts are held back now (the host's to say: macOS's program check reads
     /// full or stuck): a read then starts no git, and is cut. `None` holds nothing back.
@@ -2768,23 +2769,31 @@ fn run_git_bytes(
     if offline {
         cmd.env("GIT_NO_LAZY_FETCH", "1");
     }
+    // A test's memoized read ([`read_memo`]).
+    #[cfg(test)]
+    let memo = read_memo::read(dir, args, reads, global, offline, feed.as_ref());
     let stdin = feed.map_or_else(
         aterm_uds::spawnfd::Stdio::null,
         aterm_uds::spawnfd::Stdio::from,
     );
     reads.starts.set(reads.starts.get().saturating_add(1));
-    let output =
-        match aterm_uds::deadline::output_until_complete_stdout_from(&mut cmd, stdin, deadline) {
-            Ok(output) => output,
-            // No `git` here: the probe cannot run, and reads clean.
-            Err(aterm_uds::deadline::CompleteOutputError::Run(
-                aterm_uds::deadline::RunError::Spawn(e),
-            )) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(_) => {
-                reads.cut.set(true);
-                return None;
-            }
-        };
+    #[cfg(test)]
+    let made = read_memo::through(memo, || {
+        aterm_uds::deadline::output_until_complete_stdout_from(&mut cmd, stdin, deadline)
+    });
+    #[cfg(not(test))]
+    let made = aterm_uds::deadline::output_until_complete_stdout_from(&mut cmd, stdin, deadline);
+    let output = match made {
+        Ok(output) => output,
+        // No `git` here: the probe cannot run, and reads clean.
+        Err(aterm_uds::deadline::CompleteOutputError::Run(
+            aterm_uds::deadline::RunError::Spawn(e),
+        )) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => {
+            reads.cut.set(true);
+            return None;
+        }
+    };
     reads.ended();
     if output.status.code().is_none() {
         // A signal ended it: what it would have said is not known.
@@ -2958,6 +2967,193 @@ pub(crate) mod read_stall {
             s.set(s.get().saturating_add(next));
             Duration::from_millis(s.get())
         })
+    }
+}
+
+/// This thread's reads answered from memory (tests), for a sweep that probes one repository it
+/// leaves as it is: while a [`read_memo::Memo`] is held, a read made again in the same folder with
+/// the same arguments, environment and standard input gives the output the first gave, and starts
+/// no `git` unless [`read_memo::Memo::checking`] asks it to check that output. A read writes
+/// nothing (`GIT_OPTIONAL_LOCKS=0`), so over an unchanged repository that is the output its `git`
+/// would give again. Every check before the start (the deadline, [`Reads::held`],
+/// [`Reads::refused`]) and everything after it ([`Reads::ended`], the exit and the diagnostics)
+/// runs as for a read that starts its `git`.
+#[cfg(test)]
+pub(crate) mod read_memo {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::process::Output;
+
+    /// What a read's `git` is: its folder, arguments, global and offline settings, home,
+    /// `XDG_CONFIG_HOME` and the bytes fed to its standard input.
+    pub(super) type Key = (
+        PathBuf,
+        Vec<String>,
+        bool,
+        bool,
+        PathBuf,
+        Option<PathBuf>,
+        Option<Vec<u8>>,
+    );
+
+    /// How a read meets this thread's memo.
+    pub(super) enum Read {
+        /// No [`Memo`] is held: the read starts its `git`.
+        Off,
+        /// A [`Memo`] is held but could not read back what the read feeds its `git`: the read
+        /// starts its `git`, is counted in [`Memo::missed`] and is not kept.
+        Unnamed,
+        /// A [`Memo`] is held and the read is this key.
+        Named(Key),
+    }
+
+    std::thread_local! {
+        static MEMORY: RefCell<Option<HashMap<Key, Output>>> = const { RefCell::new(None) };
+        static MISSED: Cell<u32> = const { Cell::new(0) };
+        static CHECKING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Held, this thread's reads are memoized, from an empty memo; dropped, none is.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) struct Memo(());
+
+    /// Memoize this thread's reads until the [`Memo`] is dropped.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn on() -> Memo {
+        assert!(
+            MEMORY.with(|m| m.borrow().is_none()),
+            "a memo is already held on this thread"
+        );
+        MEMORY.with(|m| *m.borrow_mut() = Some(HashMap::new()));
+        MISSED.with(|s| s.set(0));
+        CHECKING.with(|c| c.set(false));
+        Memo(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    impl Memo {
+        /// The reads that came to this memo while it was held and that it could not answer, each
+        /// of which started its `git` (a read cut or refused before its start never comes to it).
+        pub(crate) fn missed(&self) -> u32 {
+            MISSED.with(Cell::get)
+        }
+
+        /// `run`'s value, with each read this memo answers during it also starting its `git`
+        /// again, whose output (exit status, standard output and standard error) must equal the
+        /// answer: a read whose answer differs, or whose `git` gives no output to compare,
+        /// panics naming its key.
+        pub(crate) fn checking<T>(&self, run: impl FnOnce() -> T) -> T {
+            struct Done;
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    CHECKING.with(|c| c.set(false));
+                }
+            }
+            CHECKING.with(|c| c.set(true));
+            let _done = Done;
+            run()
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    impl Drop for Memo {
+        fn drop(&mut self) {
+            MEMORY.with(|m| *m.borrow_mut() = None);
+            CHECKING.with(|c| c.set(false));
+        }
+    }
+
+    /// How a read of `args` in `dir`, fed `feed` where given, meets this thread's memo.
+    pub(super) fn read(
+        dir: &Path,
+        args: &[&str],
+        reads: &super::Reads<'_>,
+        global: bool,
+        offline: bool,
+        feed: Option<&std::fs::File>,
+    ) -> Read {
+        if MEMORY.with(|m| m.borrow().is_none()) {
+            return Read::Off;
+        }
+        let fed = match feed.map(fed) {
+            None => None,
+            Some(Some(bytes)) => Some(bytes),
+            Some(None) => return Read::Unnamed,
+        };
+        Read::Named((
+            dir.to_path_buf(),
+            args.iter().map(|a| (*a).to_string()).collect(),
+            global,
+            offline,
+            reads.home.to_path_buf(),
+            reads.xdg.map(Path::to_path_buf),
+            fed,
+        ))
+    }
+
+    /// The whole of `file` from its start, read without moving its offset, so the `git` it feeds
+    /// still reads all of it; `None` where it cannot be read.
+    #[cfg(unix)]
+    pub(super) fn fed(file: &std::fs::File) -> Option<Vec<u8>> {
+        use std::os::unix::fs::FileExt as _;
+        let mut body = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let at = u64::try_from(body.len()).ok()?;
+            let n = file.read_at(&mut chunk, at).ok()?;
+            if n == 0 {
+                return Some(body);
+            }
+            body.extend_from_slice(chunk.get(..n)?);
+        }
+    }
+
+    /// No read back here: a fed read is [`Read::Unnamed`].
+    #[cfg(not(unix))]
+    pub(super) fn fed(_: &std::fs::File) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// What the read gave before, where the memo holds it (each such answer checked against a
+    /// fresh `run` under [`Memo::checking`], and otherwise given without calling `run`); else
+    /// `run`'s output, which a [`Read::Named`] read keeps for the next read with the same key
+    /// where its `git` exited (one a signal ended is not kept).
+    pub(super) fn through<E: std::fmt::Debug>(
+        read: Read,
+        run: impl FnOnce() -> Result<Output, E>,
+    ) -> Result<Output, E> {
+        let key = match read {
+            Read::Off => return run(),
+            Read::Unnamed => {
+                MISSED.with(|s| s.set(s.get().saturating_add(1)));
+                return run();
+            }
+            Read::Named(key) => key,
+        };
+        let known = MEMORY.with(|m| m.borrow().as_ref().and_then(|m| m.get(&key).cloned()));
+        if let Some(known) = known {
+            if CHECKING.with(Cell::get) {
+                match run() {
+                    Ok(again) => assert_eq!(
+                        again, known,
+                        "the memo's answer to {key:?} is what its git gives again"
+                    ),
+                    Err(e) => panic!("the memo's answer to {key:?}: its git gave no output: {e:?}"),
+                }
+            }
+            return Ok(known);
+        }
+        MISSED.with(|s| s.set(s.get().saturating_add(1)));
+        let output = run()?;
+        if output.status.code().is_some() {
+            MEMORY.with(|m| {
+                if let Some(m) = m.borrow_mut().as_mut() {
+                    m.insert(key, output.clone());
+                }
+            });
+        }
+        Ok(output)
     }
 }
 

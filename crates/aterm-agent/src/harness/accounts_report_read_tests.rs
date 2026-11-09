@@ -166,6 +166,7 @@ fn exercise(provider: i64, shape: i64, fault: i64) -> [bool; 4] {
                 NOW,
                 &mut None,
                 SyncTarget {
+                    fleet: None,
                     path: &path,
                     before: (shape > 0).then_some(raw),
                     after: Some(&populated),
@@ -371,6 +372,7 @@ fn only_the_supplied_roster_target_can_complete_its_pending_report() {
             NOW,
             &mut None,
             SyncTarget {
+                fleet: None,
                 path: &path,
                 before: None,
                 after: Some(&target),

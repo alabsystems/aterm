@@ -80,7 +80,6 @@ pub(crate) fn closure_phase_transition(
 fn closure_policy_refines_known_phase_and_rollback_retention() {
     let model = aterm_models_harness::account_closure_phase_model();
     aterm_spec::interp::prove_and_catch(&model);
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

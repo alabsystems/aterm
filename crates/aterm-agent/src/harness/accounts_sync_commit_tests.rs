@@ -34,9 +34,17 @@ impl Bed {
         let events = note_auth(&mut state, "new", Auth::SignedOut, NOW);
         advance_renewal_generations(&before, &mut logins, &events).unwrap();
         let plan = Plan {
+            fleet: None,
             local_logins: false,
             wake: None,
-            roster_path: Some(absolute(&path).unwrap().to_str().unwrap().into()),
+            roster_path: Some(
+                usage_target(Some(&path))
+                    .unwrap()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .into(),
+            ),
             roster_mode: None,
             state: Image {
                 before: read(&store.state_file(), MAX_STATE_BYTES).unwrap(),
@@ -93,6 +101,115 @@ impl Bed {
             .iter()
             .map(|i| i.after.clone())
             .collect()
+    }
+}
+
+/// The admitted size is the actual stored envelope, including its digest and JSON framing.
+#[test]
+fn oversized_stored_receipt_refuses_before_auxiliary_effects() {
+    let bed = Bed::new();
+    let mut plan = bed.receipt.plan.clone().unwrap();
+    plan.ledger = Image {
+        before: Some(String::new()),
+        after: Some(String::new()),
+    };
+    let framed = |plan: Plan| Receipt {
+        schema: 1,
+        id: "f".repeat(32),
+        plan: Some(plan),
+    };
+    let empty_len = aterm_json::to_string(&framed(plan.clone())).unwrap().len();
+    let padding = usize::try_from(MAX_RECEIPT).unwrap() - empty_len;
+    // JSON NUL escaping fits within the ledger's decoded image bound while reaching
+    // the combined encoded receipt boundary.
+    plan.ledger.before = Some("\0".repeat(padding / 6) + &"x".repeat(padding % 6));
+    assert_eq!(
+        aterm_json::to_string(&framed(plan.clone())).unwrap().len() as u64,
+        MAX_RECEIPT
+    );
+    let held = bed.store.acquire().unwrap();
+    let invoked = std::cell::Cell::new(false);
+    let before = bed.files();
+    let result = bed.store.publish_plan_scoped(
+        &held,
+        Scope {
+            roster: Some(&bed.path),
+            fleet: None,
+        },
+        plan,
+        &[],
+        || {
+            invoked.set(true);
+            Ok(())
+        },
+    );
+    assert!(result.unwrap_err().contains("receipt exceeds its limit"));
+    assert!(
+        !invoked.get(),
+        "an oversized envelope must refuse before auxiliary publication"
+    );
+    assert_eq!(bed.files(), before);
+}
+
+#[test]
+fn scoped_state_publications_refuse_missing_witnessed_images() {
+    for missing_state in [false, true] {
+        for operation in 0..3 {
+            let bed = Bed::new();
+            let missing = if missing_state {
+                bed.store.state_file()
+            } else {
+                bed.store.logins_file()
+            };
+            let witness = if missing_state {
+                bed.store.state_witness_file()
+            } else {
+                bed.store.logins_witness_file()
+            };
+            assert!(witness.is_file());
+            std::fs::rename(&missing, bed.root.path().join("retained-image")).unwrap();
+            let before = bed.files();
+            let receipt = read(&bed.store.dir.join(RECEIPT), MAX_RECEIPT).unwrap();
+            let held = bed.store.acquire().unwrap();
+            let plan = bed.receipt.plan.as_ref().unwrap();
+            let target = || SyncTarget {
+                path: &bed.path,
+                before: plan.roster.before.as_deref(),
+                after: plan.roster.after.as_deref(),
+                mode: None,
+                fleet: None,
+            };
+            let edit = |state: &mut State| {
+                state.swarm_label = Some("m16".into());
+                Ok(Vec::new())
+            };
+            let result = match operation {
+                0 => bed
+                    .store
+                    .transact_roster_held(&held, NOW, &mut None, target()),
+                1 => bed
+                    .store
+                    .transact_roster_state_held(&held, NOW, &mut None, target(), edit),
+                2 => bed.store.transact_fleet_state_held(
+                    &held,
+                    NOW,
+                    &mut None,
+                    (&bed.path, "account = []\n"),
+                    edit,
+                ),
+                _ => unreachable!(),
+            };
+            assert!(
+                result.unwrap_err().contains("unknown"),
+                "state={missing_state}, operation={operation}"
+            );
+            assert_eq!(bed.files(), before);
+            assert_eq!(
+                read(&bed.store.dir.join(RECEIPT), MAX_RECEIPT).unwrap(),
+                receipt
+            );
+            assert!(!bed.path.with_file_name("fleet-accounts.toml").exists());
+        }
     }
 }
 
@@ -293,6 +410,7 @@ fn a_held_sync_refuses_a_pending_or_damaged_receipt_before_its_edit() {
             NOW,
             &mut None,
             SyncTarget {
+                fleet: None,
                 path: &bed.path,
                 before: Some(&text),
                 after: Some(&text),

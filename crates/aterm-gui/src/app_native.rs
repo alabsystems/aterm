@@ -425,6 +425,9 @@ pub(crate) struct ActivationSupersedeJob {
     pub(crate) activation_commit: String,
     pub(crate) newer: u64,
     pub(crate) spent_before: u64,
+    /// None while running; after acceptance, only a request minted at or above this floor
+    /// can confirm the old install place. Already queued reads belong to the prior epoch.
+    pub(crate) awaiting_facts: Option<u64>,
 }
 
 /// What the retire worker posts back.
@@ -3008,8 +3011,9 @@ impl App {
         key: Option<crate::native_ui::UiKey>,
     ) -> Result<EventResult, String> {
         if !self
-            .active_visible_leaf_plan(wid)
-            .is_some_and(|plan| plan.leaf(view).is_some())
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| crate::active_tab_shows(ws, |candidate| candidate == view))
         {
             return Err("native scroll target is no longer visible".to_string());
         }
@@ -6885,6 +6889,11 @@ impl App {
         };
         if let Some(latch) = self.auto_apply_manual_only.as_mut() {
             latch.retry_at = latch.retry_at.map(forward);
+            if let Some(replacement) = latch.replacement.as_mut()
+                && let Some(retry) = replacement.newer_retry.as_mut()
+            {
+                retry.at = forward(retry.at);
+            }
         }
         #[cfg(unix)]
         if let Some(wait) = self.auto_apply_roster_wait.as_mut() {
@@ -6892,9 +6901,6 @@ impl App {
         }
         if let Some(verdict) = self.auto_apply_structural_verdict.as_mut() {
             verdict.resample_at = verdict.resample_at.map(forward);
-            if let Some(retry) = verdict.newer_retry.as_mut() {
-                retry.at = forward(retry.at);
-            }
         }
         Some(slept)
     }
@@ -6918,7 +6924,20 @@ impl App {
 
     /// Let a manual-only latch lapse once its deadline passes, restoring automatic apply for that artifact.
     pub(crate) fn lapse_expired_auto_apply_manual_only(&mut self) -> bool {
+        if !self.native_auto_apply_enabled() {
+            return false;
+        }
         let now = std::time::Instant::now();
+        // A different verified artifact owns its offer/backoff even if the old artifact's
+        // retry becomes due meanwhile. Only fresh disk facts can retire that activation.
+        if self.auto_apply_manual_only.is_some_and(|latch| {
+            latch.activation
+                && latch.replacement.is_some()
+                && self.native_verified_download_on_disk > latch.build
+        }) {
+            let on_disk = self.native_verified_download_on_disk;
+            return self.look_at_activation_latch(now, Some(on_disk));
+        }
         let lapsed = self
             .auto_apply_manual_only
             .is_some_and(|manual| manual.retry_at.is_some_and(|at| now >= at));
@@ -6926,14 +6945,17 @@ impl App {
             .auto_apply_manual_only
             .and_then(|manual| self.structural_verdict_of(manual));
         let retry_due = self.native_activation_supersede.is_none()
-            && verdict
-                .is_some_and(|verdict| verdict.newer_retry.is_some_and(|retry| now >= retry.at));
+            && self.auto_apply_manual_only.is_some_and(|latch| {
+                latch.replacement.is_some_and(|replacement| {
+                    replacement.newer_retry.is_some_and(|retry| now >= retry.at)
+                })
+            });
         if retry_due
             || (lapsed
                 && verdict.is_some_and(|verdict| verdict.resample_at.is_some_and(|at| now >= at)))
         {
             let on_disk = self.native_verified_download_on_disk;
-            return self.look_at_structural_latch(now, (on_disk > 0).then_some(on_disk));
+            return self.look_at_activation_latch(now, (on_disk > 0).then_some(on_disk));
         }
         if lapsed {
             aterm_log::info!(
@@ -6950,6 +6972,7 @@ impl App {
         &self,
         latch: crate::AutoApplyManualOnly,
     ) -> Option<crate::AutoApplyStructuralVerdict> {
+        latch.replacement?;
         if self.auto_apply_environment_block.is_some_and(|blocked| {
             blocked.build == latch.build && blocked.dmg_sha256 == latch.dmg_sha256
         }) {
@@ -6959,15 +6982,13 @@ impl App {
             .filter(|verdict| verdict.covers(latch.build, latch.dmg_sha256, latch.activation))
     }
 
-    /// When a refused release behind the structural latch may be offered the install path again.
-    pub(crate) fn structural_supersede_retry_at(&self) -> Option<std::time::Instant> {
-        if self.native_activation_supersede.is_some() {
+    /// When a refused newer release may be offered the install path again.
+    pub(crate) fn activation_replacement_retry_at(&self) -> Option<std::time::Instant> {
+        if !self.native_auto_apply_enabled() || self.native_activation_supersede.is_some() {
             return None;
         }
         let latch = self.auto_apply_manual_only?;
-        self.structural_verdict_of(latch)?
-            .newer_retry
-            .map(|retry| retry.at)
+        latch.replacement?.newer_retry.map(|retry| retry.at)
     }
 
     fn structural_latch_trial_room(&self, latch: crate::AutoApplyManualOnly) -> Option<bool> {
@@ -7000,20 +7021,29 @@ impl App {
             project = "aterm_gui::native_updater_conformance::project_structural_latch"
         )
     )]
-    fn look_at_structural_latch(
+    pub(super) fn look_at_activation_latch(
         &mut self,
         now: std::time::Instant,
         newest_download: Option<u64>,
     ) -> bool {
+        if !self.native_auto_apply_enabled() {
+            return false;
+        }
         use crate::native_update_auto_intent::{
             StructuralLatchDecision, StructuralLatchFacts, structural_latch,
         };
-        let Some(latch) = self.auto_apply_manual_only else {
+        let Some(mut latch) = self.auto_apply_manual_only else {
             return false;
         };
-        let Some(mut verdict) = self.structural_verdict_of(latch) else {
+        if self.auto_apply_environment_block.is_some_and(|blocked| {
+            blocked.build == latch.build && blocked.dmg_sha256 == latch.dmg_sha256
+        }) {
+            return false;
+        }
+        let Some(mut replacement) = latch.replacement else {
             return false;
         };
+        let mut verdict = self.structural_verdict_of(latch);
         if self.native_activation_supersede.is_some() {
             // The retire runs off the event loop; the latch stands until it
             // answers (`finish_activation_supersede`). A latch past its deadline
@@ -7026,49 +7056,65 @@ impl App {
             }
             return false;
         }
-        if verdict
+        if replacement
             .newer_retry
             .is_some_and(|retry| newest_download != Some(retry.newer))
         {
-            verdict.newer_retry = None;
-            self.auto_apply_structural_verdict = Some(verdict);
+            replacement.newer_retry = None;
+            latch.replacement = Some(replacement);
+            self.auto_apply_manual_only = Some(latch);
         }
         let offerable = newest_download.filter(|newer| {
-            latch.activation && *newer > latch.build && *newer > verdict.newer_spent
+            latch.activation && *newer > latch.build && *newer > replacement.newer_spent
         });
-        let waiting =
-            offerable.is_some() && verdict.newer_retry.is_some_and(|retry| now < retry.at);
-        let retry_due = verdict.newer_retry.is_some_and(|retry| now >= retry.at);
+        let waiting = (offerable.is_some()
+            && replacement.newer_retry.is_some_and(|retry| now < retry.at))
+            || newest_download.is_some_and(|newer| {
+                latch.activation && newer > latch.build && newer <= replacement.newer_spent
+            });
         let facts = StructuralLatchFacts {
-            resample_due: verdict.resample_at.is_some_and(|at| now >= at),
-            resample_owed: verdict.resample_at.is_some(),
+            replacement_eligible: latch.replacement.is_some(),
+            resample_due: verdict
+                .is_some_and(|verdict| verdict.resample_at.is_some_and(|at| now >= at)),
+            resample_owed: verdict.is_some_and(|verdict| verdict.resample_at.is_some()),
             unspent_newer_download: offerable.filter(|_| !waiting),
             newer_download_waiting: waiting,
             trial_room: self.structural_latch_trial_room(latch),
         };
-        if facts.trial_room.is_some() && verdict.unmeasured_looks != 0 {
-            verdict.unmeasured_looks = 0;
-            verdict.unmeasured_through = 0;
-            self.auto_apply_structural_verdict = Some(verdict);
-        }
-        if !self.native_installed_trial_unproven && verdict.unproven_looks != 0 {
-            verdict.unproven_looks = 0;
-            verdict.unproven_through = 0;
-            self.auto_apply_structural_verdict = Some(verdict);
+        if let Some(current) = verdict.as_mut() {
+            if facts.trial_room.is_some() && current.unmeasured_looks != 0 {
+                current.unmeasured_looks = 0;
+                current.unmeasured_through = 0;
+            }
+            if !self.native_installed_trial_unproven && current.unproven_looks != 0 {
+                current.unproven_looks = 0;
+                current.unproven_through = 0;
+            }
+            self.auto_apply_structural_verdict = Some(*current);
         }
         match structural_latch(facts) {
             StructuralLatchDecision::Hold => {
-                // A look its own deadline brought (the re-sample, now outranked by a release waiting out a refusal) must move that deadline or the deadline fold wakes on it forever.
-                if facts.resample_due
-                    && latch.retry_at.is_some_and(|at| now >= at)
-                    && let Some(retry) = verdict.newer_retry
+                // The old artifact cannot lapse through a newer offer's backoff or the
+                // fresh-disk observation still owed after a completed retirement.
+                if latch.retry_at.is_some_and(|at| now >= at)
+                    && (facts.resample_due
+                        || newest_download
+                            .is_some_and(|newer| latch.activation && newer > latch.build))
                 {
                     self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
-                        retry_at: Some(retry.at),
+                        retry_at: Some(
+                            replacement
+                                .newer_retry
+                                .filter(|retry| retry.at > now)
+                                .map_or(now + STRUCTURAL_TRIAL_REMEASURE, |retry| retry.at),
+                        ),
                         ..latch
                     });
                 }
-                if verdict.held_unmeasured && facts.trial_room == Some(false) {
+                if let Some(mut verdict) = verdict
+                    && verdict.held_unmeasured
+                    && facts.trial_room == Some(false)
+                {
                     verdict.held_unmeasured = false;
                     self.auto_apply_structural_verdict = Some(verdict);
                     self.auto_apply_stranded_announced = None;
@@ -7079,31 +7125,20 @@ impl App {
             StructuralLatchDecision::Supersede { newer } => {
                 // Spent only once the retire is under way; a look that cannot start
                 // it now leaves the release for the next look.
-                if self.request_activation_supersede(latch, newer, verdict.newer_spent) {
-                    verdict.newer_spent = newer;
-                    verdict.newer_retry = None;
-                    self.auto_apply_structural_verdict = Some(verdict);
+                if self.request_activation_supersede(latch, newer, replacement.newer_spent) {
+                    replacement.newer_spent = newer;
+                    replacement.newer_retry = None;
+                    latch.replacement = Some(replacement);
+                    self.auto_apply_manual_only = Some(latch);
                 } else {
-                    // Not started, nothing spent; a deadline that brought this look
-                    // moves, so the deadline fold does not spin on it.
-                    if retry_due {
-                        verdict.newer_retry =
-                            verdict.newer_retry.map(|retry| crate::SupersedeRetry {
-                                at: now + STRUCTURAL_TRIAL_REMEASURE,
-                                ..retry
-                            });
-                        self.auto_apply_structural_verdict = Some(verdict);
-                    }
-                    if facts.resample_due && latch.retry_at.is_some_and(|at| now >= at) {
-                        self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
-                            retry_at: Some(now + STRUCTURAL_TRIAL_REMEASURE),
-                            ..latch
-                        });
-                    }
+                    self.retain_unstarted_activation_replacement(latch, replacement, newer, now);
                 }
                 false
             }
             StructuralLatchDecision::Unmeasured => {
+                let Some(mut verdict) = verdict else {
+                    return false;
+                };
                 let due = latch.retry_at.is_some_and(|at| now >= at);
                 if self.native_installed_trial_unproven {
                     self.look_over_unproven_reads(latch, verdict, now, due);
@@ -7166,7 +7201,11 @@ impl App {
                 false
             }
             StructuralLatchDecision::Release => {
+                let Some(mut verdict) = verdict else {
+                    return false;
+                };
                 verdict.resample_at = None;
+                verdict.replacement_history = replacement;
                 self.auto_apply_structural_verdict = Some(verdict);
                 self.auto_apply_manual_only = None;
                 self.auto_overlap_retry = None;
@@ -7180,6 +7219,9 @@ impl App {
                 true
             }
             StructuralLatchDecision::HoldForTrial => {
+                let Some(mut verdict) = verdict else {
+                    return false;
+                };
                 verdict.resample_at = None;
                 self.auto_apply_structural_verdict = Some(verdict);
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
@@ -7190,6 +7232,32 @@ impl App {
                 false
             }
         }
+    }
+
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeUpdateStructuralLatch",
+            action = "RetireUnavailable",
+            project = "aterm_gui::native_updater_conformance::project_structural_latch"
+        )
+    )]
+    fn retain_unstarted_activation_replacement(
+        &mut self,
+        mut latch: crate::AutoApplyManualOnly,
+        mut replacement: crate::ActivationReplacement,
+        newer: u64,
+        now: std::time::Instant,
+    ) {
+        replacement.newer_retry = Some(crate::SupersedeRetry {
+            newer,
+            at: now + STRUCTURAL_TRIAL_REMEASURE,
+        });
+        latch.replacement = Some(replacement);
+        if latch.retry_at.is_some_and(|at| now >= at) {
+            latch.retry_at = Some(now + STRUCTURAL_TRIAL_REMEASURE);
+        }
+        self.auto_apply_manual_only = Some(latch);
     }
 
     fn say_structural_hold_for_trial(&mut self, build: u64) {
@@ -7297,7 +7365,10 @@ impl App {
         spent_before: u64,
     ) -> bool {
         let snapshot = self.native_updater_service.snapshot();
-        if snapshot.active.is_some() || snapshot.phase == UpdaterPhase::Applying {
+        if !self.native_auto_apply_enabled()
+            || snapshot.active.is_some()
+            || snapshot.phase == UpdaterPhase::Applying
+        {
             return false;
         }
         let Some(activation_commit) = snapshot
@@ -7314,9 +7385,10 @@ impl App {
             activation_commit,
             newer,
             spent_before,
+            awaiting_facts: None,
         };
         aterm_log::info!(
-            "update auto-apply: verified build {newer} arrived behind build {}'s structural \
+            "update auto-apply: verified build {newer} arrived behind build {}'s failed \
              latch — retiring build {}'s installed activation so build {newer} installs over \
              the running build {} instead (no launch of build {})",
             latch.build,
@@ -7400,7 +7472,14 @@ impl App {
             facts,
         } = completion;
         if self.native_activation_supersede.as_ref() == Some(&job) {
-            self.native_activation_supersede = None;
+            if outcome.is_ok() {
+                self.native_activation_supersede
+                    .as_mut()
+                    .unwrap()
+                    .awaiting_facts = Some(self.next_native_update_reconcile_sequence);
+            } else {
+                self.native_activation_supersede = None;
+            }
         }
         match outcome {
             Ok(superseded) => {
@@ -7423,16 +7502,20 @@ impl App {
                         superseded.newer_build
                     ),
                 }
-                match facts {
-                    Some(facts) => self.finish_native_update_reconcile(
+                if let Some(facts) = facts {
+                    self.finish_native_update_reconcile(
                         NativeUpdateReconcilePurpose::StageAvailable,
                         facts,
-                    ),
-                    None => {
-                        let _ = self.request_native_update_reconcile(
-                            NativeUpdateReconcilePurpose::StageAvailable,
-                        );
-                    }
+                    );
+                }
+                if self
+                    .native_activation_supersede
+                    .as_ref()
+                    .is_some_and(|job| job.awaiting_facts.is_some())
+                {
+                    let _ = self.request_native_update_reconcile(
+                        NativeUpdateReconcilePurpose::StageAvailable,
+                    );
                 }
             }
             Err(refusal) => {
@@ -7458,16 +7541,18 @@ impl App {
         job: &ActivationSupersedeJob,
         now: std::time::Instant,
     ) -> Option<std::time::Duration> {
-        let verdict = self
-            .auto_apply_structural_verdict
+        let latch = self
+            .auto_apply_manual_only
             .as_mut()
-            .filter(|verdict| {
-                verdict.build == job.activation && verdict.newer_spent == job.newer
-            })?;
-        verdict.newer_spent = job.spent_before;
-        verdict.newer_refusals = verdict.newer_refusals.saturating_add(1);
-        let wait = supersede_retry_after(verdict.newer_refusals);
-        verdict.newer_retry = Some(crate::SupersedeRetry {
+            .filter(|latch| latch.activation && latch.build == job.activation)?;
+        let replacement = latch
+            .replacement
+            .as_mut()
+            .filter(|replacement| replacement.newer_spent == job.newer)?;
+        replacement.newer_spent = job.spent_before;
+        replacement.newer_refusals = replacement.newer_refusals.saturating_add(1);
+        let wait = supersede_retry_after(replacement.newer_refusals);
+        replacement.newer_retry = Some(crate::SupersedeRetry {
             newer: job.newer,
             at: now + wait,
         });
@@ -7744,13 +7829,18 @@ impl App {
         }
     }
 
+    /// The same pure admission for automatic retry, replacement, arm and poll.
+    pub(super) fn native_auto_apply_enabled(&self) -> bool {
+        crate::app_config::update_auto_apply(&self.config)
+            && !Self::relaunch_nudge_seam_suppresses_auto_apply()
+    }
+
     /// Retain automatic apply intent for one exact (or superseding) staged build.
     pub(crate) fn arm_native_auto_apply(&mut self, build: u64, digest: &str) -> bool {
         use crate::native_update_auto_intent::{ArmDecision, ArmFacts};
 
         self.lapse_expired_auto_apply_manual_only();
-        let enabled = crate::app_config::update_auto_apply(&self.config)
-            && !Self::relaunch_nudge_seam_suppresses_auto_apply();
+        let enabled = self.native_auto_apply_enabled();
         let Some(dmg_sha256) = decode_dmg_sha256(digest) else {
             aterm_log::warn!(
                 "refusing to arm automatic update build {build}: malformed DMG identity"
@@ -8079,6 +8169,11 @@ impl App {
         rearm: bool,
         book: bool,
     ) -> crate::AutoApplyRosterWait {
+        if let Some(latch) = self.auto_apply_manual_only.as_mut()
+            && latch.covers(build, dmg_sha256, false)
+        {
+            latch.replacement = None;
+        }
         let now = std::time::Instant::now();
         let renewed = self
             .auto_apply_roster_wait
@@ -8372,8 +8467,7 @@ impl App {
         let staged_ready = updater.phase == UpdaterPhase::Staged
             && staged_build.is_some_and(|build| build > current_build);
         let decision = crate::native_update_auto_intent::poll(PollFacts {
-            enabled: crate::app_config::update_auto_apply(&self.config)
-                && !Self::relaunch_nudge_seam_suppresses_auto_apply(),
+            enabled: self.native_auto_apply_enabled(),
             deadline_ready,
             current_build,
             target_build: intent.build,
@@ -8707,6 +8801,7 @@ impl App {
                     self.auto_apply_structural_verdict = None;
                 }
                 self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+                    replacement: None,
                     build: intent.build,
                     dmg_sha256: intent.dmg_sha256,
                     activation: false,
@@ -8789,6 +8884,14 @@ impl App {
         &mut self,
         facts: NativeUpdateReconcileFacts,
     ) -> NativeUpdateFactsResult {
+        if self
+            .native_activation_supersede
+            .as_ref()
+            .and_then(|job| job.awaiting_facts)
+            .is_some_and(|floor| facts._ticket.request_sequence < floor)
+        {
+            return NativeUpdateFactsResult::IgnoredStale;
+        }
         if facts.observation_sequence <= self.last_native_update_reconcile_sequence {
             return NativeUpdateFactsResult::IgnoredStale;
         }
@@ -8833,6 +8936,19 @@ impl App {
             self.publish_native_update_state();
         }
         let build = self.native_updater_service.snapshot().current_build;
+        if self
+            .native_activation_supersede
+            .as_ref()
+            .is_some_and(|job| {
+                job.awaiting_facts.is_some()
+                    && !installed_unproven
+                    && installed.as_ref().is_some_and(|installed| {
+                        !installed.backs_activation(build, job.activation, &job.activation_commit)
+                    })
+            })
+        {
+            self.native_activation_supersede = None;
+        }
         let trial_stale_before = self.native_installed_trial_stale_before;
         let trial_readable = trial_stale_before.is_none_or(|stale| observed_at >= stale);
         self.native_installed_trial = installed
@@ -8856,8 +8972,14 @@ impl App {
                 .staged
                 .as_ref()
                 .filter(|staged| !staged.is_installed_activation())
-                .map(|staged| staged.build);
-            if let Some(retired_build) = retired
+                .map(|staged| {
+                    (
+                        staged.build,
+                        staged.commit.clone(),
+                        staged.dmg_sha256.clone(),
+                    )
+                });
+            if let Some((retired_build, retired_commit, retired_digest)) = retired
                 && self.native_updater_service.retire_stage_for_activation()
             {
                 let _ = self.drop_auto_apply_intent();
@@ -8865,6 +8987,9 @@ impl App {
                     retired_build,
                     installed.build,
                     Some(installed),
+                    retired_commit
+                        .as_deref()
+                        .map(|commit| (commit, retired_digest.as_str())),
                 );
                 aterm_log::info!(
                     "update sync: staged download {retired_build} retired — the bundle at this \
@@ -8902,7 +9027,17 @@ impl App {
                 self.publish_native_update_state();
                 match disposition {
                     DurableStageDisposition::InstalledNeedsRelaunch { build } => {
-                        self.carry_manual_only_latch_across_swap(build, build, installed.as_ref());
+                        self.carry_manual_only_latch_across_swap(
+                            build,
+                            build,
+                            installed.as_ref(),
+                            current.as_ref().and_then(|stage| {
+                                stage
+                                    .commit
+                                    .as_deref()
+                                    .map(|commit| (commit, stage.dmg_sha256.as_str()))
+                            }),
+                        );
                         let what = installed
                             .as_ref()
                             .and_then(|installed| installed.version.as_deref())
@@ -8951,7 +9086,7 @@ impl App {
         });
         if exact_effective {
             let effective_stage = effective.cloned();
-            self.look_at_structural_latch_after_reconcile();
+            self.look_at_activation_latch_after_reconcile();
             return NativeUpdateFactsResult::Reduced { effective_stage };
         }
 
@@ -8994,16 +9129,16 @@ impl App {
                 self.publish_native_update_state();
             }
         }
-        self.look_at_structural_latch_after_reconcile();
+        self.look_at_activation_latch_after_reconcile();
         NativeUpdateFactsResult::Reduced {
             effective_stage: self.native_updater_service.snapshot().staged.clone(),
         }
     }
 
-    fn look_at_structural_latch_after_reconcile(&mut self) {
+    fn look_at_activation_latch_after_reconcile(&mut self) {
         let on_disk = self.native_verified_download_on_disk;
         let _released = self
-            .look_at_structural_latch(std::time::Instant::now(), (on_disk > 0).then_some(on_disk));
+            .look_at_activation_latch(std::time::Instant::now(), (on_disk > 0).then_some(on_disk));
     }
 
     fn suspend_automatic_apply_for_person(
@@ -9032,7 +9167,15 @@ impl App {
         );
     }
 
-    fn block_native_auto_apply_environment(
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeUpdateStructuralLatch",
+            action = "WithdrawEligibility",
+            project = "aterm_gui::native_updater_conformance::project_structural_latch"
+        )
+    )]
+    pub(super) fn block_native_auto_apply_environment(
         &mut self,
         build: u64,
         dmg_sha256: [u8; 32],
@@ -9046,6 +9189,7 @@ impl App {
             cause,
         });
         self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            replacement: None,
             build,
             dmg_sha256,
             activation: false,
@@ -9266,16 +9410,7 @@ impl App {
         if !mode.is_automatic() && self.person_apply_is_held() {
             return UpdateOutcome::Accepted;
         }
-        if let Some(job) = self.native_activation_supersede.as_ref()
-            && self
-                .native_updater_service
-                .snapshot()
-                .staged
-                .as_ref()
-                .is_some_and(|staged| {
-                    staged.build == job.activation && staged.is_installed_activation()
-                })
-        {
+        if let Some(job) = self.native_activation_supersede.as_ref() {
             return UpdateOutcome::Deferred {
                 reason: format!(
                     "the installed build {} is being replaced by the verified build {}",
@@ -9585,9 +9720,7 @@ impl App {
                 resample_at: carried
                     .resample_in_secs
                     .map(|secs| now + std::time::Duration::from_secs(secs)),
-                newer_spent: 0,
-                newer_retry: None,
-                newer_refusals: 0,
+                replacement_history: crate::ActivationReplacement::default(),
                 unmeasured_looks: 0,
                 unmeasured_through: 0,
                 unproven_looks: 0,
@@ -9610,9 +9743,7 @@ impl App {
             dmg_sha256,
             activation,
             resample_at: schedule.retry_at(),
-            newer_spent: 0,
-            newer_retry: None,
-            newer_refusals: 0,
+            replacement_history: crate::ActivationReplacement::default(),
             unmeasured_looks: 0,
             unmeasured_through: 0,
             unproven_looks: 0,
@@ -9622,6 +9753,14 @@ impl App {
         schedule
     }
 
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "NativeUpdateStructuralLatch",
+            action = "PhysicalLatch",
+            project = "aterm_gui::native_updater_conformance::project_structural_latch"
+        )
+    )]
     fn latch_after_physical_failure(
         &mut self,
         build: u64,
@@ -9631,7 +9770,18 @@ impl App {
         detail: &str,
     ) -> PhysicalFailureSchedule {
         let schedule = self.spend_physical_failure_budget(build, dmg_sha256, activation, shape);
+        let replacement = self
+            .auto_apply_manual_only
+            .filter(|latch| latch.covers(build, dmg_sha256, activation))
+            .and_then(|latch| latch.replacement)
+            .or_else(|| {
+                self.auto_apply_structural_verdict
+                    .filter(|verdict| verdict.covers(build, dmg_sha256, activation))
+                    .map(|verdict| verdict.replacement_history)
+            })
+            .unwrap_or_default();
         self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            replacement: Some(replacement),
             build,
             dmg_sha256,
             activation,
@@ -9797,6 +9947,7 @@ impl App {
         retired_build: u64,
         installed_build: u64,
         installed: Option<&InstalledUpdate>,
+        retired_artifact: Option<(&str, &str)>,
     ) {
         let Some(manual) = self.auto_apply_manual_only else {
             return;
@@ -9815,7 +9966,33 @@ impl App {
                 .filter(|installed| installed.build == installed_build)
                 .and_then(|installed| installed.activation_stage(current_build, 0))
                 .and_then(|stage| decode_dmg_sha256(&stage.dmg_sha256));
+            let proven_transfer = if manual.activation {
+                activation == Some(manual.dmg_sha256)
+            } else {
+                retired_build == manual.build
+                    && retired_artifact.is_some_and(|(commit, digest)| {
+                        decode_dmg_sha256(digest) == Some(manual.dmg_sha256)
+                            && installed.is_some_and(|installed| {
+                                installed.proves_artifact(manual.build, Some(commit), digest)
+                            })
+                    })
+            };
+            if let Some(verdict) = self
+                .auto_apply_structural_verdict
+                .as_mut()
+                .filter(|verdict| {
+                    verdict.covers(manual.build, manual.dmg_sha256, manual.activation)
+                })
+            {
+                if proven_transfer && manual.replacement.is_some() {
+                    verdict.dmg_sha256 = activation.unwrap_or(manual.dmg_sha256);
+                    verdict.activation = true;
+                } else {
+                    self.auto_apply_structural_verdict = None;
+                }
+            }
             self.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+                replacement: manual.replacement.filter(|_| proven_transfer),
                 dmg_sha256: activation.unwrap_or(manual.dmg_sha256),
                 activation: true,
                 ..manual
@@ -10300,7 +10477,12 @@ impl App {
                         &message,
                     );
                 }
-                self.carry_manual_only_latch_across_swap(build, build, facts.installed.as_ref());
+                self.carry_manual_only_latch_across_swap(
+                    build,
+                    build,
+                    facts.installed.as_ref(),
+                    Some((attempt.target_commit(), attempt.target_dmg_sha256())),
+                );
                 self.publish_native_update_state();
                 self.reduce_returned_apply_facts(facts);
                 Some(UpdateOutcome::InstalledNeedsRelaunch {

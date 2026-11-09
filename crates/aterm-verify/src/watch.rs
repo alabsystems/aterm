@@ -981,11 +981,9 @@ fn sample(root: &Path, result: &Path) -> Result<bool, String> {
         };
         fs::write(root.join(".git/watch-candidate.log"), &built.ran.output)
             .map_err(|e| e.to_string())?;
-        if built.ran.code == Some(75) || crate::exec::group::stopping() {
-            eprintln!(
-                "watch bootstrap stopped: code={:?}\n{}",
-                built.ran.code, built.ran.output
-            );
+        let run_stopping = crate::exec::group::stopping();
+        if built.ran.code == Some(75) || run_stopping {
+            eprintln!("{}", stopped_run("bootstrap", &built.ran, run_stopping));
             return Ok(false);
         }
         if !built.ran.ok {
@@ -1051,6 +1049,21 @@ fn candidate_failure_row(ran: &crate::exec::Run) -> Row {
         row.log.push_str(&format!("\n{why}"));
     }
     row
+}
+
+fn stopped_run(scope: &str, ran: &crate::exec::Run, run_stopping: bool) -> String {
+    let (kind, condition) = match ran.environment_failure() {
+        Some(why) => ("environment", why),
+        None if run_stopping => (
+            "run-stop",
+            format!("sample run marked stopping; {}", ran.unnamed_cause()),
+        ),
+        None => ("child-exit", ran.unnamed_cause()),
+    };
+    format!(
+        "watch {scope} stopped: code={:?} kind={kind} condition={condition:?}\n{}",
+        ran.code, ran.output
+    )
 }
 
 fn write_bootstrap_result(root: &Path, result: &Path, mut row: Row) -> Result<(), String> {
@@ -1255,10 +1268,11 @@ fn sample_ready(root: &Path, result: &Path) -> Result<bool, String> {
             )
         };
         fs::write(&log, &ran.output).map_err(|e| e.to_string())?;
-        if ran.code == Some(75) || crate::exec::group::stopping() {
+        let run_stopping = crate::exec::group::stopping();
+        if ran.code == Some(75) || run_stopping {
             eprintln!(
-                "watch stage={id} stopped: code={:?}\n{}",
-                ran.code, ran.output
+                "{}",
+                stopped_run(&format!("stage={id}"), &ran, run_stopping)
             );
             return Ok(false);
         }
@@ -1372,7 +1386,7 @@ fn row(id: &str, code: Option<i32>, text: &str) -> Row {
     let mut evidence = Vec::new();
     for line in text
         .lines()
-        .filter(|line| line.starts_with("capacity background "))
+        .filter(|line| line.starts_with("capacity background ") || line.starts_with("watch "))
         .take(16)
     {
         if !tail.lines().any(|kept| kept == line) && !evidence.contains(&line) {
@@ -1729,6 +1743,45 @@ fn dependency_closure(roots: &BTreeSet<String>, graph: &DependencyGraph) -> BTre
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bootstrap_stop_cause_keeps_named_environment_before_build_output() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let output = std::iter::once(crate::exec::ENOSPC_SENTENCE.to_owned())
+            .chain((0..80).map(|n| format!("compiler note {n}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ran = crate::exec::Run {
+            case_observations: None,
+            ok: false,
+            output,
+            code: Some(75),
+            spawn_error: None,
+            usage: None,
+            stopped_at: None,
+            hung: None,
+        };
+        let mut record: Record = aterm_toml::from_str("commit='c'\ntree='t'\nhost='h'\nverifier=''\ninputs=''\ntoken='k'\nstate='judging'\nstarted=0\nupdated=1\nlease_until=0\nrows=[]").unwrap();
+        cancel_record(
+            &mut record,
+            std::process::ExitStatus::from_raw(75 << 8),
+            &stopped_run("bootstrap", &ran, false),
+        );
+        assert!(
+            record.cause.contains("watch bootstrap stopped:"),
+            "{}",
+            record.cause
+        );
+        assert!(
+            record.cause.contains("kind=environment"),
+            "{}",
+            record.cause
+        );
+        assert!(
+            record.cause.contains(crate::exec::ENOSPC_SENTENCE),
+            "{}",
+            record.cause
+        );
+    }
     #[test]
     fn preemption_cause_survives_later_not_run_reporting() {
         let cause = "capacity background preemption: signal=15 sender_pid=42; Release claim pid=43";

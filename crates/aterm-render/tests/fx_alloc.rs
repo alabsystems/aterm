@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Allocation gate for the CPU fx-layer rasterizer.
+//! Allocation gate for warmed CPU frame damage and rasterization.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -9,9 +9,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use aterm_core::render::{
-    FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot, FxSpace, FxSprite,
-    FxTexels, PxRect, RenderInput,
+    COLOR_UNSET, FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot,
+    FxSpace, FxSprite, FxTexels, PaneSelection, PxRect, RenderInput, SelectionClip,
 };
+use aterm_core::selection::{SelectionSide, SelectionType, TextSelection};
 use aterm_core::terminal::Terminal;
 use aterm_render::{DamageOutcome, Renderer, Theme, WindowCpu, embedded_font};
 
@@ -284,5 +285,88 @@ fn the_fx_path_allocates_nothing_once_warm() {
     assert_eq!(
         in_motion, 0,
         "changing layers must allocate nothing once warm"
+    );
+
+    let many: Vec<_> = settled
+        .iter()
+        .cycle()
+        .take(32)
+        .cloned()
+        .enumerate()
+        .map(|(i, mut layer)| {
+            layer.id = 100 + i as u64;
+            layer
+        })
+        .collect();
+    let mut reverse = many.clone();
+    reverse.reverse();
+    let reordered = frames(&mut t, rows, cols, [&many, &reverse], &occluders);
+    assert_eq!(
+        steady_allocs(&mut renderer, &mut window, &reordered, DamageOutcome::Rows),
+        0,
+        "reordering a large layer set must reuse its matching index"
+    );
+    let mut replacement = many.clone();
+    for layer in &mut replacement {
+        layer.id += 1000;
+    }
+    let replaced = frames(&mut t, rows, cols, [&many, &replacement], &occluders);
+    assert_eq!(
+        steady_allocs(&mut renderer, &mut window, &replaced, DamageOutcome::Rows),
+        0,
+        "replacing a large layer set must reuse its matching index"
+    );
+
+    let selected = [3, 6].map(|end| {
+        let selection = t.text_selection_mut();
+        selection.start_selection(0, 1, SelectionSide::Left, SelectionType::Simple);
+        selection.update_selection(0, end, SelectionSide::Right);
+        selection.complete_selection();
+        t.cell_frame(rows, cols)
+    });
+    assert_eq!(
+        steady_allocs(&mut renderer, &mut window, &selected, DamageOutcome::Rows),
+        0,
+        "selection drags must compare borrowed row keys without allocation"
+    );
+    assert_eq!(
+        window.dirty_rows(),
+        &[true, false, false, false, false, false]
+    );
+
+    let mut panes = Terminal::new(rows as u16, 64);
+    panes.process(b"\x1b[?25l");
+    let composed = [false, true].map(|changed| {
+        let mut frame = panes.cell_frame(rows, 64);
+        frame.selections = (0..32)
+            .map(|pane| {
+                let col = pane * 2;
+                let mut selection = TextSelection::new();
+                selection.start_selection(0, col, SelectionSide::Left, SelectionType::Simple);
+                selection.update_selection(0, col + 1, SelectionSide::Right);
+                selection.complete_selection();
+                PaneSelection {
+                    selection,
+                    clip: SelectionClip::new(0, rows, col as usize, col as usize + 2),
+                    bg: if changed && pane == 31 {
+                        0x0011_2233
+                    } else {
+                        COLOR_UNSET
+                    },
+                    fg: COLOR_UNSET,
+                    inactive: false,
+                }
+            })
+            .collect();
+        frame
+    });
+    assert_eq!(
+        steady_allocs(&mut renderer, &mut window, &composed, DamageOutcome::Rows),
+        0,
+        "composed pane recolours must compare borrowed row keys without allocation"
+    );
+    assert_eq!(
+        window.dirty_rows(),
+        &[true, false, false, false, false, false]
     );
 }

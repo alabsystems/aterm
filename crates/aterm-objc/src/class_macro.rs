@@ -55,7 +55,10 @@ macro_rules! __aterm_objc_method_call {
         }
     };
     ([abort_on_exception] $name:ident :: $method:ident, [$($sel_tok:tt)+], $slf:ident, [$($ret:ty)?], ($($arg:ident),*)) => {
-        $name::$method($slf $(, $arg)*)
+        $crate::exception::abort_on_exception(
+            $crate::__aterm_objc_sel_str!($($sel_tok)+),
+            move || $name::$method($slf $(, $arg)*),
+        )
     };
     ([$other:ident] $name:ident :: $method:ident, [$($sel_tok:tt)+], $slf:ident, [$($ret:ty)?], ($($arg:ident),*)) => {
         ::core::compile_error!(::core::concat!(

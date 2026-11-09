@@ -394,16 +394,21 @@ impl App {
         if !self.native_motion_may_run(wid) {
             return None;
         }
-        let plan = self.active_visible_leaf_plan(wid)?;
-        let next_ms = plan
-            .leaves
-            .iter()
-            .filter_map(|leaf| ws.leaf_render_cache.get(&leaf.view)?.native.as_ref())
-            .filter_map(|raster| {
+        let mut next_ms: Option<u64> = None;
+        let _ = crate::active_tab_shows(ws, |view| {
+            if let Some(raster) = ws
+                .leaf_render_cache
+                .get(&view)
+                .and_then(|cache| cache.native.as_ref())
+            {
                 let painted = raster.motion_ms.max(ws.native_motion_fired_ms.unwrap_or(0));
-                next_motion_ms(&raster.compiled, painted)
-            })
-            .min()?;
+                if let Some(ms) = next_motion_ms(&raster.compiled, painted) {
+                    next_ms = Some(next_ms.map_or(ms, |cur| cur.min(ms)));
+                }
+            }
+            false
+        });
+        let next_ms = next_ms?;
         let at = self.lat_epoch + Duration::from_millis(next_ms);
         // Held while a key was typed in a focused window: the wake comes back as the gap closes.
         Some(match self.last_keystroke_at {
@@ -429,17 +434,17 @@ impl App {
         if !self.native_motion_may_run(wid) {
             return false;
         }
-        let Some(plan) = self.active_visible_leaf_plan(wid) else {
-            return false;
-        };
         let t_ms = self.native_motion_ms();
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
         };
+        if ws.tab_set.active().is_none() {
+            return false;
+        }
         ws.native_motion_fired_ms = Some(t_ms);
-        plan.leaves.iter().any(|leaf| {
+        crate::active_tab_shows(ws, |view| {
             ws.leaf_render_cache
-                .get(&leaf.view)
+                .get(&view)
                 .and_then(|cache| cache.native.as_ref())
                 .is_some_and(|raster| {
                     due_motion_damage(&raster.compiled, raster.motion_ms, t_ms).is_some()

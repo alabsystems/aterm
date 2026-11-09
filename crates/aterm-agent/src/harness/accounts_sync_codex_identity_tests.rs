@@ -4,6 +4,7 @@
 //! Default-login ownership follows a coherent native file identity, not a mutable label.
 
 use super::*;
+use crate::harness::alab_roster::test_machine;
 
 #[path = "accounts_sync_rerun_tests.rs"]
 mod rerun;
@@ -104,6 +105,7 @@ impl World {
             &self.roster,
             &target,
             &[],
+            None,
             before_publish,
         )
     }
@@ -516,7 +518,7 @@ fn the_second_lab_sync_follows_the_native_default_after_the_actual_first_import(
     let world = World::new("codex-default-lab-import-");
     fs::remove_file(&world.roster).unwrap();
     let lab = Lab {
-        me: Some("m16".into()),
+        me: Some(test_machine("m16")),
         settled: true,
         accounts: [("a", A), ("b", B)]
             .into_iter()
@@ -531,7 +533,7 @@ fn the_second_lab_sync_follows_the_native_default_after_the_actual_first_import(
                 identity: None,
                 browser: None,
                 joinable: true,
-                preferred: vec![("m16".into(), Some(index as u64 + 1))],
+                preferred: vec![(test_machine("m16"), Some(index as u64 + 1))],
             })
             .collect(),
         aliases: BTreeMap::new(),

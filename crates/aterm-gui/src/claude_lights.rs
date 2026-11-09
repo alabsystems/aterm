@@ -4238,12 +4238,22 @@ impl App {
     }
 
     /// The cursor follows the glass's hover.
+    #[cfg(test)]
     pub(crate) fn refresh_glass_cursor_for_frame(&mut self, wid: WindowId) {
+        self.refresh_glass_cursor_for_frame_with_plan(wid, None);
+    }
+
+    /// The cursor follows the glass's hover, reusing an already-built visible plan when available.
+    pub(crate) fn refresh_glass_cursor_for_frame_with_plan(
+        &mut self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) {
         let owed = self.windows.get_mut(&wid).is_some_and(|ws| {
             std::mem::take(&mut ws.claude_lights.cursor_owed) && ws.pointer_position_known
         });
         if owed {
-            self.update_hover_cursor(wid);
+            self.update_hover_cursor_from_plan(wid, frame_plan);
         }
     }
 

@@ -278,7 +278,7 @@ fn row_of(
             account
                 .preferred
                 .iter()
-                .map(|(m, _)| m.as_str())
+                .map(|(machine, _)| machine.display_or_key())
                 .collect::<Vec<_>>()
                 .join(", ")
         },
@@ -318,7 +318,7 @@ pub(crate) fn project(lab: Option<&Lab>, seen: Option<&Seen>, now: i64) -> LabDe
     let found = |pk: &str| seen.and_then(|seen| seen.accounts.get(pk));
     let says =
         |s: &AccountSeen| s.last_use.is_some() || !s.signed_in.is_empty() || !s.windows.is_empty();
-    let me = lab.me.as_deref();
+    let me = lab.me.as_ref().map(|machine| &machine.key);
     let shown = |a: &&alab_roster::LabAccount| {
         me.and_then(|me| a.preferred_on(me)).is_some() || found(&a.pk).is_some_and(says)
     };
@@ -372,31 +372,36 @@ pub(crate) fn project(lab: Option<&Lab>, seen: Option<&Seen>, now: i64) -> LabDe
 fn fixture(now: i64) -> LabDeck {
     use aterm_agent::harness::accounts::Cli;
     use aterm_agent::harness::alab_seen::{LastUse, SignedIn, WindowSeen};
+    let machine = |label: &str| {
+        alab_roster::MachineRef::from_registry(format!("fixture-{label}"), Some(label.to_owned()))
+    };
     let account =
-        |pk: &str, label: &str, preferred: Vec<(String, Option<u64>)>| alab_roster::LabAccount {
-            pk: pk.into(),
-            cli: Cli::Claude,
-            vendor: aterm_agent::harness::accounts::Vendor::default(),
-            label: label.into(),
-            legacy_label: None,
-            email: String::new(),
-            identity: None,
-            browser: None,
-            joinable: true,
-            preferred,
+        |pk: &str, label: &str, preferred: Vec<(alab_roster::MachineRef, Option<u64>)>| {
+            alab_roster::LabAccount {
+                pk: pk.into(),
+                cli: Cli::Claude,
+                vendor: aterm_agent::harness::accounts::Vendor::default(),
+                label: label.into(),
+                legacy_label: None,
+                email: String::new(),
+                identity: None,
+                browser: None,
+                joinable: true,
+                preferred,
+            }
         };
     let lab = Lab {
-        me: Some("m1".into()),
+        me: Some(machine("m1")),
         accounts: vec![
             account(
                 "ac-0a1b2c3d4e5f60718293a4",
                 "claude-0a1b2c",
-                vec![("m1".into(), Some(1))],
+                vec![(machine("m1"), Some(1))],
             ),
             account(
                 "ac-1b2c3d4e5f60718293a4b5",
                 "claude-1b2c3d",
-                vec![("m2".into(), Some(1))],
+                vec![(machine("m2"), Some(1))],
             ),
             account("ac-2c3d4e5f60718293a4b5c6", "claude-2c3d4e", Vec::new()),
         ],

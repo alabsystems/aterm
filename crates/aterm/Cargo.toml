@@ -48,6 +48,7 @@ test = false
 bench = false
 
 [dependencies]
+aterm-spec-anchor = { workspace = true }
 # The four faces of the one command, all libraries:
 aterm-cli = { path = "../aterm-cli" }     # the SESSION (PTY passthrough) + parser/diag/manual
 aterm-gui = { path = "../aterm-gui" }     # the WINDOW (aterm-window/aterm-gpu) + headless engine
@@ -202,6 +203,7 @@ aterm-tempfile = { workspace = true }
 aterm-spec = { workspace = true }
 # The models its tests drive (a model edit rebuilds only their tests).
 aterm-models-session = { workspace = true }
+aterm-models-harness = { workspace = true }
 # The front-door verb-routing test drives the binary under a real pty (piped stdio takes the
 # window route instead). Its pairs, and the launch tests', come from `open_pty_pair`, both ends
 # close-on-exec from birth: an `openpty(3)` pair is inheritable, so a child would hold its own

@@ -738,53 +738,79 @@ pub fn current_route_tokens() -> Vec<String> {
 /// Whether `_alab._tcp` is advertised (§3.3, C23; on every network since F17,
 /// `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1): `[swarm] enabled` is not `false` (`enabled`),
 /// this Mac has a route (`routes`), and it is an ALab vault member whose vault answered within
-/// [`ALAB_MEMBER_TTL_SECS`] of `now_secs` (`heard`, unix seconds). No network is special: a
-/// café's routes advertise as an office's do, since the advert carries no identity and a dial of
-/// it is judged by its handshake's proof.
+/// [`ALAB_MEMBER_TTL_SECS`] before `now_secs` (`heard`, unix seconds). A clock that could not be
+/// read (`now_secs` `None`) or an answer dated after it (the clock stepped back since) gives no
+/// age, so nothing is advertised until the vault answers again. No network is special: a café's
+/// routes advertise as an office's do, since the advert carries no identity and a dial of it is
+/// judged by its handshake's proof.
 #[must_use]
-pub fn advertises(enabled: bool, routes: &[String], heard: Option<u64>, now_secs: u64) -> bool {
+pub fn advertises(
+    enabled: bool,
+    routes: &[String],
+    heard: Option<u64>,
+    now_secs: Option<u64>,
+) -> bool {
     enabled
         && !routes.is_empty()
-        && heard.is_some_and(|heard| now_secs.saturating_sub(heard) <= ALAB_MEMBER_TTL_SECS)
+        && heard
+            .zip(now_secs)
+            .and_then(|(heard, now)| now.checked_sub(heard))
+            .is_some_and(|age| age <= ALAB_MEMBER_TTL_SECS)
 }
 
 /// [`advertises`] as `aterm_config`'s `[swarm]` and the vault at `vault_paths` stand at
-/// `now_secs` on `routes`, with the role the advert names: steward on a vault admin.
+/// `now_secs` on `routes`: the vault's word that this Mac is an ALab member no evidence denies,
+/// and when it last heard it, is read again only when one of the vault's files it was read from
+/// moved ([`aterm_secrets::client::swarm_member_heard_now`]), and judged against `now_secs` at
+/// every call. A read that judged nothing (a vault writer mid-apply, a file it cannot read) is no
+/// member's.
+#[must_use]
 pub fn should_advertise_alab_tcp_with(
     vault_paths: &aterm_secrets::client::Paths,
     aterm_config: Option<&Path>,
     routes: &[String],
-    now_secs: u64,
-) -> (bool, NodeRole) {
+    now_secs: Option<u64>,
+) -> bool {
     let enabled = aterm_config
         .is_none_or(|cfg_path| aterm_secrets::swarm::enabled_at(cfg_path).unwrap_or(false));
-    let status = aterm_secrets::client::status(vault_paths)
+    let heard = aterm_secrets::client::swarm_member_heard_now(vault_paths)
         .ok()
-        .filter(|status| {
-            status
-                .config
-                .as_ref()
-                .is_some_and(aterm_secrets::client::alab_vault)
-        });
-    let heard = status.as_ref().and_then(|status| match status.membership {
-        aterm_secrets::client::Membership::In { heard, .. } => Some(heard),
-        aterm_secrets::client::Membership::Plain
-        | aterm_secrets::client::Membership::Unconfigured
-        | aterm_secrets::client::Membership::Pending
-        | aterm_secrets::client::Membership::Revoked { .. } => None,
-    });
-    if !advertises(enabled, routes, heard, now_secs) {
-        return (false, NodeRole::Member);
-    }
-    if aterm_secrets::client::local_recipient_denied_in_roster(vault_paths) {
-        return (false, NodeRole::Member);
-    }
-    let role = if aterm_secrets::client::admin_cached(vault_paths).is_ok() {
+        .flatten();
+    advertises(enabled, routes, heard, now_secs)
+}
+
+/// Whether this Mac's LAN responder answers now ([`crate::lan_members::Responder`]), which asks at
+/// each of its refreshes and before each answer it sends: the node `state` holds is still the one
+/// keyed `key`, neither turned off ([`node_turned_off`]) nor gone from its fleet
+/// ([`left_the_fleet`]), each read afresh, and this Mac advertises on `routes` at `now_secs`
+/// ([`should_advertise_alab_tcp_with`] of the vault and `aterm.toml` in `vault`), so a removal, a
+/// turn-off or a day unheard ends its answers at the next ask.
+#[cfg(unix)]
+fn lan_responder_allowed(
+    state: Option<&Path>,
+    key: aterm_net::fleet::NodeKey,
+    (vault_paths, aterm_config): (&aterm_secrets::client::Paths, Option<&Path>),
+    routes: &[String],
+    now_secs: Option<u64>,
+) -> bool {
+    state.is_some_and(|state| {
+        !left_the_fleet(state)
+            && !node_turned_off(state)
+            && aterm_net::fleet_member::read_node_identity(state)
+                .ok()
+                .flatten()
+                .is_some_and(|node| node.key() == key)
+    }) && should_advertise_alab_tcp_with(vault_paths, aterm_config, routes, now_secs)
+}
+
+/// The role `_alab._tcp`'s TXT names ([`AlabTcpTxt`]): steward on a vault admin, which opens the
+/// vault's admin custody to tell. Only the advert that carries it asks.
+fn alab_tcp_role(vault_paths: &aterm_secrets::client::Paths) -> NodeRole {
+    if aterm_secrets::client::admin_cached(vault_paths).is_ok() {
         NodeRole::Steward
     } else {
         NodeRole::Member
-    };
-    (true, role)
+    }
 }
 
 /// The listener's direct LAN responder and one `_alab._tcp` advert, a
@@ -924,10 +950,9 @@ impl AlabTcpAdvertiser {
         window_open: bool,
     ) {
         let routes = current_route_tokens();
-        let now_secs = aterm_time::unix_secs().unwrap_or(0);
+        let now_secs = aterm_time::unix_secs();
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let (eligible, role) =
-            should_advertise_alab_tcp_with(vault_paths, aterm_config, &routes, now_secs);
+        let eligible = should_advertise_alab_tcp_with(vault_paths, aterm_config, &routes, now_secs);
         #[cfg(unix)]
         {
             let identity = eligible
@@ -956,20 +981,13 @@ impl AlabTcpAdvertiser {
                     let config = aterm_config.map(Path::to_owned);
                     let state = self.state.clone();
                     guard.lan = crate::lan_members::Responder::start(port, key, move || {
-                        state.as_ref().is_some_and(|state| {
-                            !left_the_fleet(state)
-                                && !node_turned_off(state)
-                                && aterm_net::fleet_member::read_node_identity(state)
-                                    .ok()
-                                    .flatten()
-                                    .is_some_and(|node| node.key() == key)
-                        }) && should_advertise_alab_tcp_with(
-                            &paths,
-                            config.as_deref(),
+                        lan_responder_allowed(
+                            state.as_deref(),
+                            key,
+                            (&paths, config.as_deref()),
                             &current_route_tokens(),
-                            aterm_time::unix_secs().unwrap_or(0),
+                            aterm_time::unix_secs(),
                         )
-                        .0
                     })
                     .ok();
                 }
@@ -988,7 +1006,7 @@ impl AlabTcpAdvertiser {
                     Some(alab_tcp_advert(
                         &self.instance,
                         AlabTcpTxt {
-                            role,
+                            role: alab_tcp_role(vault_paths),
                             fleet_port,
                             window: window_open,
                         },

@@ -627,6 +627,47 @@ pub(super) fn log_base(
 
 pub(super) type OpenedWithDigest = (Option<Vec<Entry>>, Option<[u8; 32]>);
 
+/// Metadata from the log that actually selected the returned entries. A
+/// trusted log retained only for denial checks does not construct this value.
+pub(super) struct LogSelection {
+    pub(super) digest: [u8; 32],
+    pub(super) operations: BTreeMap<(Audience, String), RecordId>,
+    pub(super) puts: BTreeMap<(Audience, String), RecordId>,
+    pub(super) conflicts: BTreeSet<(Audience, String)>,
+    pub(super) complete: BTreeSet<Audience>,
+}
+
+pub(super) struct SelectedVaultEntries {
+    pub(super) entries: Option<Vec<Entry>>,
+    pub(super) log: Option<LogSelection>,
+}
+
+impl SelectedVaultEntries {
+    pub(super) fn from_log(
+        selected: Option<crate::membership_log::entries::SelectedEntries>,
+        digest: [u8; 32],
+    ) -> Self {
+        let mut log = LogSelection {
+            digest,
+            operations: BTreeMap::new(),
+            puts: BTreeMap::new(),
+            conflicts: BTreeSet::new(),
+            complete: BTreeSet::new(),
+        };
+        let entries = selected.map(|selected| {
+            log.operations = selected.operations;
+            log.puts = selected.puts;
+            log.conflicts = selected.opened.conflicts;
+            log.complete = selected.complete;
+            selected.opened.entries
+        });
+        Self {
+            entries,
+            log: Some(log),
+        }
+    }
+}
+
 /// Positive observations cannot fall back to an envelope after applying a log.
 /// This does not filter authenticated evidence used only to establish denial.
 #[cfg_attr(
@@ -686,6 +727,16 @@ pub(super) fn open_entries_with_log(
     identity: &Identity,
     names: Option<&[&str]>,
 ) -> crate::Result<OpenedWithDigest> {
+    let selected = select_entries_with_log(seeded, envelope, identity, names)?;
+    Ok((selected.entries, selected.log.map(|log| log.digest)))
+}
+
+pub(super) fn select_entries_with_log(
+    seeded: Option<(&Log, [u8; 32])>,
+    envelope: &Envelope,
+    identity: &Identity,
+    names: Option<&[&str]>,
+) -> crate::Result<SelectedVaultEntries> {
     if let Some((log, digest)) = seeded
         && (log.removes(&identity.recipient())
             || recipient_denied_by_roster_or_log(None, log, &identity.recipient())
@@ -693,17 +744,16 @@ pub(super) fn open_entries_with_log(
                 && log
                     .audience_left_out_recipient(&EpochAudience::Everyone, &identity.recipient())))
     {
-        return Ok((None, Some(digest)));
+        return Ok(SelectedVaultEntries::from_log(None, digest));
     }
     if let Some((log, digest)) = seeded
         && log_base(Some(log), envelope, identity)? == LogBase::Covers
         && reads_log(log, identity)
     {
-        let entries = match names {
-            Some(names) => log.open_entries_named(identity, names)?,
-            None => log.open_entries(identity)?,
-        };
-        return Ok((entries, Some(digest)));
+        return Ok(SelectedVaultEntries::from_log(
+            log.open_selection(identity, names)?,
+            digest,
+        ));
     }
     // An envelope still validates its complete locker view before selection. This only
     // limits the returned entries; it does not make envelope parsing a selective read.
@@ -713,7 +763,7 @@ pub(super) fn open_entries_with_log(
         }
         entries
     });
-    Ok((entries, None))
+    Ok(SelectedVaultEntries { entries, log: None })
 }
 
 #[derive(Clone, Default)]

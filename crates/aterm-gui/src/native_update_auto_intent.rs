@@ -227,16 +227,20 @@ pub(crate) fn arm(facts: ArmFacts) -> ArmDecision {
     ArmDecision::Set(facts.incoming_build)
 }
 
-/// What the lane knows, at one look, about a structural latch (automatic apply converged on build N's bytes after two handoffs the bytes answered for).
+/// A known physical failure may offer different bytes; only structural convergence owns a
+/// same-artifact resample and its boot-trial obligations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StructuralLatchFacts {
+    /// The current latch owns known-failure replacement custody, rather than older history.
+    pub(crate) replacement_eligible: bool,
     /// The latch's one re-sample is still owed and its deadline, a day after convergence, has passed.
     pub(crate) resample_due: bool,
     /// The latch's one re-sample is still owed, due or not: the convergence notice promises it ("it tries again by itself in 24 h").
     pub(crate) resample_owed: bool,
     /// A verified download strictly newer than the latched activation, not yet offered the install path.
     pub(crate) unspent_newer_download: Option<u64>,
-    /// A verified download strictly newer than the latched activation is on disk, but its retire was refused and the retry deadline has not passed: not offered now, yet it still outranks the re-sample.
+    /// A verified newer download waits out a refused retire, or an accepted retire still
+    /// owes fresh disk facts. It is not offered again now and still outranks a resample.
     pub(crate) newer_download_waiting: bool,
     /// Whether one more launch of the latched build keeps its boot trial under the revert threshold: `Some(false)` when that launch would be the one `check_boot_health` reverts on, `None` when the sentinel's count has not been measured yet.
     pub(crate) trial_room: Option<bool>,
@@ -257,7 +261,7 @@ pub(crate) enum StructuralLatchDecision {
     Supersede { newer: u64 },
 }
 
-/// The structural latch's way out.
+/// A known failure latch's newer-artifact offer or structural resample.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -303,7 +307,7 @@ pub(crate) enum StructuralLatchDecision {
     aterm_spec_anchor::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "RetryDue",
-        reason = "A refused retire's retry deadline (`AutoApplyStructuralVerdict::newer_retry`) passing, the Mac's sleep counted (`App::count_sleep_toward_update_deadlines`); the host reads it into `unspent_newer_download` / `newer_download_waiting`."
+        reason = "A refused retire's retry deadline (`AutoApplyManualOnly::replacement`) passing, the Mac's sleep counted (`App::count_sleep_toward_update_deadlines`); the host reads it into `unspent_newer_download` / `newer_download_waiting`."
     )
 )]
 #[cfg_attr(
@@ -311,7 +315,7 @@ pub(crate) enum StructuralLatchDecision {
     aterm_spec_anchor::spec_unmodeled(
         machine = "NativeUpdateStructuralLatch",
         action = "TrialUnreadable",
-        reason = "The installed facts ceasing to report the latched build (the facts worker drops a yanked bundle newer than the running one); the host reads it as `trial_room: None`, and its bound on such looks is `App::look_at_structural_latch`'s."
+        reason = "The installed facts ceasing to report the latched build (the facts worker drops a yanked bundle newer than the running one); the host reads it as `trial_room: None`, and its bound on such looks is `App::look_at_activation_latch`'s."
     )
 )]
 #[cfg_attr(
@@ -332,6 +336,9 @@ pub(crate) enum StructuralLatchDecision {
 )]
 #[must_use]
 pub(crate) fn structural_latch(facts: StructuralLatchFacts) -> StructuralLatchDecision {
+    if !facts.replacement_eligible {
+        return StructuralLatchDecision::Hold;
+    }
     if let Some(newer) = facts.unspent_newer_download {
         return StructuralLatchDecision::Supersede { newer };
     }

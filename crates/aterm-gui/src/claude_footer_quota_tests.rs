@@ -1143,13 +1143,20 @@ fn the_kitty_keeps_off_the_painted_cells() {
 
 /// THE QUOTA ROW AS A PERSON SEES IT (§7): cases (a) to (d) at 170, 100 and 70 columns, under
 /// Cruise, Land, Autopilot Off and no harness (no palette), on Aterm Day and Aterm Night, through
-/// the capture route `aterm ctl image` takes: each frame whole, and its last six rows twice their
-/// size, written to `ATERM_QUOTA_ROW_GALLERY` (a scratch folder where unset).
+/// the capture route `aterm ctl image` takes, at 1x and again on a window of its own put at 2x
+/// before its first frame (a render at twice the device px, held to one by
+/// [`crate::scripted_redraw_fixture::drawn_at_2x`]): each frame whole (`{stem}.png`,
+/// `{stem}-2x.png`), the 2x frame's last six rows (`{stem}-rows-2x.png`), and what the check
+/// read of each 2x frame (`2x.tsv`), written to `ATERM_QUOTA_ROW_GALLERY` (a scratch folder where
+/// unset). Its first scene's fakes of a 2x frame are refused (`CONTROL`,
+/// [`crate::scripted_redraw_fixture::refuse_fakes`]).
 #[test]
 fn quota_row_gallery() {
+    use crate::scripted_redraw_fixture as fixture;
     use aterm_agent::supervise::Autopilot;
-    let (dir, _gallery) =
-        crate::scripted_redraw_fixture::gallery_directory("ATERM_QUOTA_ROW_GALLERY");
+    let (dir, _gallery) = fixture::gallery_directory("ATERM_QUOTA_ROW_GALLERY");
+    let mut first = true;
+    let mut readings = format!("{}\n", fixture::At2x::HEAD);
     let tap_row = format!("  {WORDS}");
     let under = [tap_row.as_str(), probe::BYPASS];
     let live = probe::Live {
@@ -1162,75 +1169,94 @@ fn quota_row_gallery() {
             for cols in [170u16, 100, 70] {
                 for (name, view) in quota_scenes::cases() {
                     let rows = probe::screen_at(&live, ROWS as u16, cols);
-                    let (mut app, wid, session) = pane(cols, &rows);
-                    app.set_session_theme(
-                        session,
-                        Some(crate::session_theme::SessionTheme {
-                            selector: theme.into(),
-                            origin: crate::session_theme::SessionThemeOrigin::Ctl,
-                        }),
-                    );
-                    let ctx = app.pool.get(session).expect("session").ctx.clone();
-                    {
-                        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-                        timeline.note_foreground_group(4242);
-                        timeline.set_program(4242, Some("claude".into()));
-                        timeline.set_agent_reader_for_test(true);
-                        assert!(timeline.set_claude_footer(
-                            4242,
-                            None,
-                            Some(facts_with(Some(view), true))
-                        ));
-                    }
-                    let _host = (palette != "none").then(|| {
-                        let host = probe::hosted(&mut app);
-                        crate::session_timeline::claim_supervisor(
-                            &ctx,
-                            &crate::harness_host::holder(),
-                            None,
-                            None,
-                            crate::metrics::now_us(),
-                        )
-                        .expect("the claim");
-                        host
-                    });
-                    let word = match palette {
-                        "land" => Some(Autopilot::Land),
-                        "off" => Some(Autopilot::Off),
-                        _ => None,
-                    };
-                    if let Some(word) = word {
-                        assert!(app.set_session_autopilot(
-                            session,
-                            Some(word),
-                            crate::autopilot::Surface::Chip
-                        ));
-                    }
-                    probe::feed(&app, session, &rows);
-                    frame(&mut app, wid);
-                    frame(&mut app, wid);
                     let what = format!("{theme} {palette} {cols} ({name})");
-                    assert!(!row_hits(&app, wid).is_empty(), "{what}: claimed");
-                    let png = capture(&mut app, wid);
                     let stem = format!(
                         "{}-{palette}-{cols}-{name}",
                         theme.to_lowercase().replace(' ', "-")
                     );
-                    std::fs::write(dir.join(format!("{stem}.png")), &png).expect("the PNG");
-                    let (rgba, w, h) = aterm_render::decode_png_rgba8(&png).expect("a PNG");
-                    let y0 = h - h * 6 / ROWS;
-                    let (cw, ch) = (2 * w, 2 * (h - y0));
-                    let mut crop = Vec::with_capacity(cw * ch * 4);
-                    for y in 0..ch {
-                        for x in 0..cw {
-                            let at = ((y0 + y / 2) * w + x / 2) * 4;
-                            crop.extend_from_slice(&rgba[at..at + 4]);
+                    let mut drawn = Vec::new();
+                    for (scale, file) in [
+                        (1.0, format!("{stem}.png")),
+                        (2.0, format!("{stem}-2x.png")),
+                    ] {
+                        let (mut app, wid, session) = pane(cols, &rows);
+                        if scale != 1.0 {
+                            fixture::at_scale(&mut app, wid, scale);
                         }
+                        app.set_session_theme(
+                            session,
+                            Some(crate::session_theme::SessionTheme {
+                                selector: theme.into(),
+                                origin: crate::session_theme::SessionThemeOrigin::Ctl,
+                            }),
+                        );
+                        let ctx = app.pool.get(session).expect("session").ctx.clone();
+                        {
+                            let mut timeline =
+                                ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+                            timeline.note_foreground_group(4242);
+                            timeline.set_program(4242, Some("claude".into()));
+                            timeline.set_agent_reader_for_test(true);
+                            assert!(timeline.set_claude_footer(
+                                4242,
+                                None,
+                                Some(facts_with(Some(view.clone()), true))
+                            ));
+                        }
+                        let _host = (palette != "none").then(|| {
+                            let host = probe::hosted(&mut app);
+                            crate::session_timeline::claim_supervisor(
+                                &ctx,
+                                &crate::harness_host::holder(),
+                                None,
+                                None,
+                                crate::metrics::now_us(),
+                            )
+                            .expect("the claim");
+                            host
+                        });
+                        let word = match palette {
+                            "land" => Some(Autopilot::Land),
+                            "off" => Some(Autopilot::Off),
+                            _ => None,
+                        };
+                        if let Some(word) = word {
+                            assert!(app.set_session_autopilot(
+                                session,
+                                Some(word),
+                                crate::autopilot::Surface::Chip
+                            ));
+                        }
+                        probe::feed(&app, session, &rows);
+                        frame(&mut app, wid);
+                        frame(&mut app, wid);
+                        assert!(
+                            !row_hits(&app, wid).is_empty(),
+                            "{what} at {scale}x: claimed"
+                        );
+                        let png = capture(&mut app, wid);
+                        std::fs::write(dir.join(file), &png).expect("the PNG");
+                        let (rgba, w, h) = aterm_render::decode_png_rgba8(&png).expect("a PNG");
+                        drawn.push(fixture::Drawn::of(&mut app, wid, (w, h, rgba)));
                     }
+                    let [one, two] = &drawn[..] else {
+                        unreachable!("a frame at 1x and at 2x")
+                    };
+                    if first {
+                        first = false;
+                        fixture::refuse_fakes(one, two);
+                    }
+                    let read = fixture::drawn_at_2x(one, two).unwrap_or_else(|why| {
+                        panic!("{what}: the 2x frame is no 2x render: {why}")
+                    });
+                    readings.push_str(&read.row(&stem));
+                    readings.push('\n');
+                    let (w, h) = two.size;
+                    let y0 = h - h * 6 / ROWS;
                     let png = crate::app_introspect::encode_rgba8_png(
-                        &crop,
-                        u32::try_from(cw).expect("a width"),
-                        u32::try_from(ch).expect("a height"),
+                        &two.crop((0, w), (y0, h)),
+                        u32::try_from(w).expect("a width"),
+                        u32::try_from(h - y0).expect("a height"),
                     )
                     .expect("the crop encodes");
                     std::fs::write(dir.join(format!("{stem}-rows-2x.png")), png).expect("the PNG");
@@ -1238,6 +1264,7 @@ fn quota_row_gallery() {
             }
         }
     }
+    std::fs::write(dir.join("2x.tsv"), readings).expect("the readings");
 }
 
 /// The PNG the capture route renders of window `wid` (`aterm ctl image`).

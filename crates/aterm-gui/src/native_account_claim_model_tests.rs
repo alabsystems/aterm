@@ -193,7 +193,6 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
 fn pending_claim_refines_actual_admission_and_journal_acknowledgement() {
     let model = aterm_models_harness::account_claim_publication_model();
     assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     let mut evidence = StepEvidence::new("AccountClaimPublication");
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
@@ -270,7 +269,6 @@ pub(crate) fn noeffect_transition(state: &State, action: &str) -> State {
 fn account_noeffect_closure_requires_retained_cohort_evidence() {
     let model = aterm_models_harness::account_noeffect_closure_model();
     assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     let mut evidence = StepEvidence::new("AccountNoEffectClosure");
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {

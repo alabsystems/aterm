@@ -133,6 +133,8 @@ pub(in crate::harness) use native_publication::{ActualPublicationPermit, ActualP
 mod sync_commit;
 #[cfg(test)]
 pub(super) use sync_commit::CUT as SYNC_COMMIT_CUT;
+#[cfg(test)]
+pub(super) use sync_commit::EARLY_ROSTER as SYNC_COMMIT_EARLY_ROSTER;
 pub(super) use sync_commit::SyncTarget;
 use sync_commit::usage_target;
 

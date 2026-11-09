@@ -257,6 +257,8 @@ struct World {
     tree_unread: bool,
     /// Why carrying fails (a conflict, a record push that cannot land).
     carry_refusal: Option<Refusal>,
+    /// Exercise the production Git carry while keeping publication in this fake world.
+    carry_repo: Option<PathBuf>,
     /// The meaning check's answer ([`crate::line::verify`]).
     line_verify: Result<String, Refusal>,
     /// The qualify branches whose fake runs on until its stop fires, then ends stopped.
@@ -416,6 +418,7 @@ impl World {
             pre_line: BTreeSet::new(),
             tree_unread: false,
             carry_refusal: None,
+            carry_repo: None,
             line_verify: Ok("the line verifies".into()),
             holds: BTreeSet::new(),
             verify_half: None,
@@ -1445,15 +1448,21 @@ impl Backend for World {
             return Err(refusal);
         }
         let main = self.versions.get(&self.tip()).cloned().unwrap_or_default();
-        let hops: Vec<Hop> = fixes
-            .iter()
-            .map(|fix| Hop {
-                commit: hop_of(&fix.commit),
-                carries: fix.commit.clone(),
-                why: fix.subject.clone(),
-                paths: fix.paths.clone(),
-            })
-            .collect();
+        let hops: Vec<Hop> = if let Some(repo) = &self.carry_repo {
+            let git = crate::ledger::testing::Git::new(repo);
+            let fixes = crate::line::order(&git, fixes.to_vec())?;
+            crate::line::carry(&git, line, &fixes)?
+        } else {
+            fixes
+                .iter()
+                .map(|fix| Hop {
+                    commit: hop_of(&fix.commit),
+                    carries: fix.commit.clone(),
+                    why: fix.subject.clone(),
+                    paths: fix.paths.clone(),
+                })
+                .collect()
+        };
         for hop in &hops {
             self.unrecorded_hops.insert(hop.commit.clone());
             self.history.push(hop.commit.clone());
@@ -3391,7 +3400,50 @@ fn fix(commits: &[&str]) -> ReleaseOptions {
     }
 }
 
-/// A dry `--fix` plans the head step 3 would make: it carries, moves and journals nothing, and
+/// Run the release flow against real carry plumbing, with every external service faked.
+pub(super) fn real_carry_fixture(
+    repo: &Path,
+    line: &Line,
+    fixes: &[Fix],
+    dry_run: bool,
+) -> (i32, String, Vec<String>) {
+    let mut w = World::new();
+    w.carry_repo = Some(repo.to_path_buf());
+    w.verify_code = 0;
+    w.verify_passes = true;
+    w.head = line.head().into();
+    for commit in std::iter::once(line.base.as_str())
+        .chain(std::iter::once(line.head()))
+        .chain(fixes.iter().map(|fix| fix.commit.as_str()))
+    {
+        w.history.push(commit.into());
+        w.versions.insert(commit.into(), line.version.clone());
+    }
+    std::fs::create_dir_all(w.release_dir()).unwrap();
+    Journal {
+        version: line.version.clone(),
+        commit: line.head().into(),
+        prover: w.prover.bin.display().to_string(),
+        trustc: w.prover.commit.clone(),
+        started: w.now,
+        line: Some(line.clone()),
+        ..Journal::default()
+    }
+    .save(&w.release_dir().join(JOURNAL_FILE))
+    .unwrap();
+    let before = w.journal().unwrap();
+    let names: Vec<&str> = fixes.iter().map(|fix| fix.commit.as_str()).collect();
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run,
+        ..fix(&names)
+    });
+    if dry_run || code != 0 {
+        assert_eq!(w.journal().unwrap(), before);
+    }
+    (code, last, w.out)
+}
+
+/// A dry `--fix` constructs the head step 3 would make, but moves and journals nothing, and
 /// reads none of the old head's journaled facts (its preflight, its reserved build) as the new
 /// head's, so it agrees with the real run, which journals the new head afresh — going ahead,
 /// and refusing at the preflight. NEGATIVE CONTROL: let the journal's facts stand for R while
@@ -3415,8 +3467,8 @@ fn a_dry_fix_plans_the_new_head_and_agrees_with_the_real_run() {
     assert_eq!(code, 0, "{last}\n{:#?}", w.out);
     assert!(last.contains("a real run would go ahead"), "{last}");
     assert_eq!(w.journal().unwrap(), before, "a dry run journals nothing");
+    assert_eq!(w.count("carry"), 1);
     for call in [
-        "carry",
         "stage",
         "reserve",
         "build",
@@ -3439,7 +3491,7 @@ fn a_dry_fix_plans_the_new_head_and_agrees_with_the_real_run() {
     );
     let said = |needle: &str| w.out.iter().any(|l| l.contains(needle));
     for needle in [
-        "would carry 111111111 onto the line's head ccccccccc",
+        "111111111 carries cleanly as hop 1",
         "asked of the line's head ccccccccc before the carry",
         "would reserve build n",
         "the line's new head is not made yet",
@@ -3470,7 +3522,7 @@ fn a_dry_fix_plans_the_new_head_and_agrees_with_the_real_run() {
         "{dry_last}"
     );
     assert_eq!(w.journal().unwrap(), before);
-    assert_eq!(w.count("carry"), 0, "{:?}", w.calls);
+    assert_eq!(w.count("carry"), 1, "{:?}", w.calls);
     let (code, last) = w.run(fix(&[FIX]));
     assert!(
         code == 1 && last.starts_with("REFUSED at 4/10 qualify: the preflight BLOCKED"),

@@ -1245,9 +1245,9 @@ impl App {
     fn system_state_showing_windows(&self) -> Vec<crate::WindowId> {
         self.system_state_on_screen()
             .filter(|wid| {
-                self.active_visible_leaf_plan(*wid).is_some_and(|plan| {
-                    plan.leaves.iter().any(|leaf| {
-                        matches!(self.view_store.get(leaf.view), Some(crate::tab_model::View::Native(native))
+                self.windows.get(wid).is_some_and(|window| {
+                    crate::active_tab_shows(window, |view| {
+                        matches!(self.view_store.get(view), Some(crate::tab_model::View::Native(native))
                             if matches!(self.native_runtime.app(native.instance), Some(NativeApp::SystemState(_))))
                     })
                 })
@@ -1296,14 +1296,14 @@ impl App {
         wid: crate::WindowId,
         view: crate::tab_model::ViewId,
     ) {
-        let ours = self
-            .active_visible_leaf_plan(wid)
-            .is_some_and(|plan| plan.leaf(view).is_some())
-            && matches!(
-                self.view_store.get(view),
-                Some(crate::tab_model::View::Native(native))
-                    if matches!(self.native_runtime.app(native.instance), Some(NativeApp::SystemState(_)))
-            );
+        let ours = matches!(
+            self.view_store.get(view),
+            Some(crate::tab_model::View::Native(native))
+                if matches!(self.native_runtime.app(native.instance), Some(NativeApp::SystemState(_)))
+        ) && self
+            .windows
+            .get(&wid)
+            .is_some_and(|window| crate::active_tab_shows(window, |shown| shown == view));
         if ours {
             let by_person = !self.person_gesture_refused();
             self.native_runtime.system_state_gesture(by_person);
@@ -1532,9 +1532,7 @@ impl App {
                         matches!(
                             self.native_runtime.app(instance),
                             Some(crate::native_app::NativeApp::SystemState(_))
-                        ) && self
-                            .active_visible_leaf_plan(wid)
-                            .is_some_and(|plan| plan.leaf(view).is_some())
+                        ) && crate::active_tab_shows(window, |shown| shown == view)
                     })
         })
     }
@@ -1557,12 +1555,10 @@ impl App {
     ) -> Vec<crate::tab_model::ViewId> {
         self.system_state_on_screen()
             .filter_map(|wid| {
+                let window = self.windows.get(&wid)?;
                 self.active_native_view(wid).and_then(|(current, view)| {
-                    (current == instance
-                        && self
-                            .active_visible_leaf_plan(wid)
-                            .is_some_and(|plan| plan.leaf(view).is_some()))
-                    .then_some(view)
+                    (current == instance && crate::active_tab_shows(window, |shown| shown == view))
+                        .then_some(view)
                 })
             })
             .collect()
@@ -1572,20 +1568,18 @@ impl App {
     /// while the page stayed visible. Its accepted reading is stale then;
     /// the next tick reads again, keeping a refused start's retry deadline.
     pub(crate) fn system_state_focus_returned(&mut self, wid: crate::WindowId) {
-        let visible = self
-            .windows
-            .get(&wid)
-            .is_some_and(|window| !window.occluded && window.overlay.is_none())
-            && self
-                .active_native_view(wid)
-                .is_some_and(|(instance, view)| {
-                    matches!(
-                        self.native_runtime.app(instance),
-                        Some(NativeApp::SystemState(_))
-                    ) && self
-                        .active_visible_leaf_plan(wid)
-                        .is_some_and(|plan| plan.leaf(view).is_some())
-                });
+        let visible = self.windows.get(&wid).is_some_and(|window| {
+            !window.occluded
+                && window.overlay.is_none()
+                && self
+                    .active_native_view(wid)
+                    .is_some_and(|(instance, view)| {
+                        matches!(
+                            self.native_runtime.app(instance),
+                            Some(NativeApp::SystemState(_))
+                        ) && crate::active_tab_shows(window, |shown| shown == view)
+                    })
+        });
         if visible {
             self.system_state_host.shown = false;
             self.system_state_host.next_tick = Some(Instant::now());

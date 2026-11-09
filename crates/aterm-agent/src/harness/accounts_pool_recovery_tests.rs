@@ -34,6 +34,7 @@ pub(super) fn pending_renewal(world: &World, cli: Cli, staging: &Path, create: b
                 NOW,
                 &mut None,
                 accounts::SyncTarget {
+                    fleet: None,
                     path: &path,
                     before: Some(&old),
                     after: Some(&text),

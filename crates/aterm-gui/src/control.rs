@@ -1178,6 +1178,11 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         .is_none()
         .then(crate::update_control::published_activation)
         .flatten();
+    // The durable ledger may predate configuration changes, or not exist yet.
+    // The running application's policy governs this control response.
+    if let Some(live) = &apply_snapshot {
+        st.enabled = live.enabled;
+    }
     fold_installed_activation(
         &mut st,
         crate::update_control::status_activation(apply_snapshot.as_ref(), published.as_ref()),

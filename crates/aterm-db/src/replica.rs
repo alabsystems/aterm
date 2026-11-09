@@ -803,11 +803,17 @@ impl Replica {
         tests::session_boundary(0);
         // Both sessions revalidate the exact vault observation and immutable
         // custody. Only a mutation waits for the control writer; reads use its
-        // acknowledged prefix. No session survives this local batch.
+        // acknowledged prefix. No session survives this local batch. The session's
+        // open, its peer and its observation stand for one moment of the vault, and
+        // read through one look at it, which ends before the batch runs. The look
+        // observes the state lock as the sources above already do, through the open's
+        // waits, so while their observation still guards the lock at the vault's path
+        // it keeps out no writer they let in.
+        let look = aterm_secrets::client::VaultLook::new(bootstrap.paths());
         let session = if write {
-            Session::open_until(bootstrap, admission_deadline())
+            Session::open_until_in(bootstrap, admission_deadline(), Some(&look))
         } else {
-            Session::observe(bootstrap)
+            Session::observe_in(bootstrap, Some(&look))
         }
         .map_err(|error| error.context("table repair session admission"))?;
         #[cfg(test)]
@@ -816,11 +822,14 @@ impl Replica {
             return Err(Error::new("table repair local identity changed"));
         }
         if let Some(peer) = peer.into() {
-            session.peer(peer)?;
+            session.peer_in(peer, Some(&look))?;
         }
-        if expected.is_some_and(|expected| session.observation().ok() != Some(expected)) {
+        if expected
+            .is_some_and(|expected| session.observation_in(Some(&look)).ok() != Some(expected))
+        {
             return Err(Error::new("control history changed during table repair"));
         }
+        drop(look);
         run(&session)
     }
 

@@ -1743,6 +1743,52 @@ fn base_clt_reads_a_missing_toolchain_as_the_install_s_and_nothing_else() {
     ));
 }
 
+/// A killed compile is not installation evidence, even when Git is missing. The next
+/// machine probe must observe tools that recover at the same path without a cached failure.
+#[cfg(target_os = "macos")]
+#[test]
+fn base_clt_recovers_after_a_killed_compile_without_planning_an_install() {
+    use aterm_machines::init_clt::Found;
+    use atpkg::prereq::{CcHost, CcVerdict};
+
+    let root = aterm_tempfile::tempdir().unwrap();
+    let cc = root.path().join("cc");
+    std::fs::write(
+        &cc,
+        "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nif [ ! -f \"$0.recovered\" ]; then\n  printf yes > \"$0.recovered\"\n  kill -KILL $$\nfi\nprintf x > \"$2\"\n/bin/chmod +x \"$2\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&cc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let host = CcHost {
+        shim_dir: None,
+        tmp_root: root.path().to_owned(),
+        ..CcHost::waited_on()
+    };
+    let path = Some(root.path().as_os_str());
+    let interrupted = super::base_clt_probe_on(path, host.clone());
+    assert!(
+        matches!(interrupted, CcVerdict::Unproven { .. }),
+        "{interrupted:?}"
+    );
+    for git in [false, true] {
+        assert!(matches!(
+            super::clt_found(&interrupted, git),
+            Found::Unknown(_)
+        ));
+    }
+
+    let recovered = super::base_clt_probe_on(path, host);
+    assert_eq!(recovered, CcVerdict::Ready { driver: cc });
+    assert!(matches!(
+        super::clt_found(&recovered, true),
+        Found::Present(_)
+    ));
+    assert!(matches!(
+        super::clt_found(&recovered, false),
+        Found::Missing(_)
+    ));
+}
+
 /// `base.clt`'s probe is one a person waits on: a compiler whose build answers only after the
 /// 5 s a status read waits (a new Mac's first compile behind macOS's first check of it, which a
 /// slow network stretches) reads as there, not unknown, so the Mac Setup tab goes on to setup's

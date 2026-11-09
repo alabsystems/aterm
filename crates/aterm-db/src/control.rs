@@ -2659,7 +2659,7 @@ struct MembershipDisk<'a> {
     paths: &'a aterm_secrets::client::Paths,
     trust: Trust,
     cached: std::sync::Mutex<Option<aterm_secrets::membership_log::Store>>,
-    /// How many times it read the records file.
+    /// How many times it asked for the records ([`aterm_secrets::client::records_now`]).
     #[cfg(test)]
     loads: std::sync::atomic::AtomicUsize,
     /// How many records it put in batches for the peer.
@@ -2705,7 +2705,7 @@ impl<'a> MembershipDisk<'a> {
             #[cfg(test)]
             self.loads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let store = aterm_secrets::client::load_records(self.paths)
+            let store = aterm_secrets::client::records_now(self.paths)
                 .map_err(|error| local_failure(op, error))?;
             *guard = Some(store);
         }

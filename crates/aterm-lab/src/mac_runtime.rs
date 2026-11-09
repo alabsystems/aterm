@@ -17,6 +17,30 @@ use crate::paths::paths;
 use crate::util::shell_quote as q;
 use crate::{Fail, Res, stop};
 
+mod count_compare;
+
+pub(crate) const COUNT_USAGE: &str = "  count-ranks --record DIR [--candidate DIR]\n                Recompute B14's exact count ranks from retained Q4 logs; no product is run.\n                Candidate is five later default-policy takes on the same bundle and guest shape.\n                Relative directories are resolved from this checkout's root.\n";
+
+fn count_args(args: &[String], repo: &Path) -> Result<(PathBuf, Option<PathBuf>), Fail> {
+    match args {
+        [flag, record] if flag == "--record" => Ok((repo.join(record), None)),
+        [flag, record, next, candidate] if flag == "--record" && next == "--candidate" => {
+            Ok((repo.join(record), Some(repo.join(candidate))))
+        }
+        _ => Err(Fail::usage(COUNT_USAGE)),
+    }
+}
+
+pub(crate) fn count_ranks(args: &[String]) -> Res {
+    if args == ["--help"] {
+        print!("{COUNT_USAGE}");
+        return Ok(0);
+    }
+    let (record, candidate) = count_args(args, &paths().repo)?;
+    println!("{}", count_compare::records(&record, candidate.as_deref())?);
+    Ok(0)
+}
+
 pub(crate) const USAGE: &str = "\
   runtime --app BUNDLE --record DIR [--lane measure|cursor|rewind|rewind-control|cat|compare|fabric|floors] [--image REF]
       [--cpus N] [--memory-gib N] [--disk-gb N]
@@ -857,6 +881,36 @@ fn run_in(ask: &Ask) -> Res {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_rank_paths_belong_to_the_selected_checkout_not_the_runner_directory() {
+        let args = |words: &[&str]| words.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            count_args(
+                &args(&["--record", "docs/rows", "--candidate", "/scratch/default"]),
+                Path::new("/selected")
+            )
+            .unwrap(),
+            (
+                PathBuf::from("/selected/docs/rows"),
+                Some(PathBuf::from("/scratch/default"))
+            )
+        );
+        assert_ne!(
+            count_args(&args(&["--record", "docs/rows"]), Path::new("/other"))
+                .unwrap()
+                .0,
+            PathBuf::from("/selected/docs/rows")
+        );
+        assert!(
+            count_args(
+                &args(&["--record", "r", "--other", "c"]),
+                Path::new("/selected")
+            )
+            .is_err()
+        );
+        assert!(count_args(&args(&["--record"]), Path::new("/selected")).is_err());
+    }
 
     #[test]
     fn focused_rewind_uses_cargos_artifacts_and_keeps_controls_explicit() {

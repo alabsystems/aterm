@@ -347,25 +347,29 @@ impl App {
         {
             return selected;
         }
-        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+        let Some(window) = self.windows.get(&wid) else {
             return selected;
         };
-        for leaf in &plan.leaves {
-            let Some(crate::tab_model::View::Terminal(view)) = self.view_store.get(leaf.view)
-            else {
-                continue;
+        if crate::active_tab_shows(window, |view| {
+            let Some(crate::tab_model::View::Terminal(view)) = self.view_store.get(view) else {
+                return false;
             };
             if view.session == focused.session {
-                continue;
+                return false;
             }
             let Some(term) = self.pool.shown_term(view.session) else {
-                continue;
+                return false;
             };
             match read(&term) {
-                Some(true) => return Some(true),
-                Some(false) => {}
-                None => selected = None,
+                Some(true) => true,
+                Some(false) => false,
+                None => {
+                    selected = None;
+                    false
+                }
             }
+        }) {
+            return Some(true);
         }
         selected
     }

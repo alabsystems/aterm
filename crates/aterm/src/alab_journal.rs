@@ -581,14 +581,14 @@ mod tests {
     fn holdings_come_from_the_rosters_beside_the_config() {
         use aterm_agent::harness::{
             accounts::{Row, Vendor},
-            alab_roster::LabAccount,
+            alab_roster::{LabAccount, MachineRef},
         };
         let scratch = aterm_tempfile::tempdir().unwrap();
         let config = scratch.path().join("aterm.toml");
         let email = "ann@example.test";
         let key = aterm_db::typed::keys::account_pk("claude", email).unwrap();
         let lab = Lab {
-            me: Some("m22".into()),
+            me: Some(MachineRef::from_registry("fixture-m22", Some("m22".into()))),
             accounts: vec![LabAccount {
                 pk: key.clone(),
                 cli: Cli::Claude,
@@ -599,7 +599,10 @@ mod tests {
                 identity: None,
                 browser: None,
                 joinable: true,
-                preferred: vec![("m3".into(), Some(1))],
+                preferred: vec![(
+                    MachineRef::from_registry("fixture-m3", Some("m3".into())),
+                    Some(1),
+                )],
             }],
             ..Lab::default()
         };

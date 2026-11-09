@@ -226,7 +226,10 @@ fn serve(listener: std::net::TcpListener, assets: Vec<(String, Vec<u8>)>, seen: 
                     .unwrap()
                     .push((method.clone(), path.clone(), range.clone()));
                 let evergreen = "/alabsystems/aterm/releases/latest/download/aterm-appcast.toml";
-                if path == evergreen {
+                if path
+                    .split_once("?aterm_lookup=")
+                    .is_some_and(|(base, _)| base == evergreen)
+                {
                     let to = tag_url(TAG, APPCAST_ASSET);
                     let _ = conn.write_all(
                         format!(
@@ -299,9 +302,17 @@ fn assert_staged_and_seen(world: &std::path::Path, seen: &[(String, String, Stri
 
     let evergreen = "/alabsystems/aterm/releases/latest/download/aterm-appcast.toml";
     assert_eq!(seen[0].0, "HEAD", "{seen:?}");
-    assert_eq!(seen[0].1, evergreen, "{seen:?}");
+    let (base, nonce) = seen[0]
+        .1
+        .split_once("?aterm_lookup=")
+        .expect("fresh pointer lookup");
+    assert_eq!(base, evergreen, "{seen:?}");
+    assert_eq!(nonce.len(), 32);
+    assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
     assert_eq!(
-        seen.iter().filter(|(_, path, _)| path == evergreen).count(),
+        seen.iter()
+            .filter(|(_, path, _)| path.starts_with(evergreen))
+            .count(),
         1,
         "{seen:?}"
     );

@@ -31,12 +31,39 @@ fn good_body() -> String {
     )
 }
 
+const REQUIRED_PROBE_HANG: Duration = Duration::from_secs(60);
+
+fn required_probe_budget(started: Instant) -> Duration {
+    REQUIRED_PROBE_HANG.saturating_sub(started.elapsed())
+}
+
+fn required_latest(monitor: &Monitor) -> (Observation, u64) {
+    wait_for("required observation", || {
+        assert!(
+            monitor.unavailable().is_none(),
+            "required successful probe failed: {:?}",
+            monitor.unavailable()
+        );
+        monitor.latest()
+    })
+}
+
 #[test]
 fn successful_round_preserves_cache_age_and_does_not_probe_on_reads() {
+    successful_round_with_age(Duration::ZERO);
+}
+
+#[test]
+fn required_probe_keeps_its_original_start_without_a_latency_budget() {
+    successful_round_with_age(Duration::from_secs(3));
+}
+
+fn successful_round_with_age(age: Duration) {
+    let started = Instant::now() - age;
     let (_dir, program) = fixture(&good_body());
     let monitor =
-        Monitor::spawn(program.clone(), Duration::from_secs(60), Duration::from_secs(2)).unwrap();
-    let first = wait_for("first observation", || monitor.latest());
+        Monitor::spawn(program.clone(), Duration::from_secs(60), required_probe_budget(started)).unwrap();
+    let first = required_latest(&monitor);
     assert_eq!(first.1, 32000);
     let again = monitor.latest().unwrap();
     assert_eq!(format!("{:?}", first.0), format!("{:?}", again.0));
@@ -55,10 +82,11 @@ fn successful_round_preserves_cache_age_and_does_not_probe_on_reads() {
 
 #[test]
 fn a_failed_round_clears_the_previous_observation() {
+    let started = Instant::now();
     let (_dir, program) = fixture(&good_body());
     let monitor =
-        Monitor::spawn(program.clone(), Duration::from_millis(20), Duration::from_secs(2)).unwrap();
-    wait_for("first observation", || monitor.latest());
+        Monitor::spawn(program.clone(), Duration::from_millis(20), required_probe_budget(started)).unwrap();
+    required_latest(&monitor);
     fs::write(program.with_extension("bad"), b"bad").unwrap();
     wait_for("malformed observation", || monitor.unavailable());
     assert!(monitor.latest().is_none());
@@ -103,9 +131,10 @@ fn cancellation_interrupts_a_probe_and_reaps_it() {
 
 #[test]
 fn output_is_bounded_and_invalid_configuration_is_refused() {
+    let started = Instant::now();
     let (_dir, program) = fixture("while :; do printf '%1024s' x; done");
     let monitor =
-        Monitor::spawn(program.clone(), Duration::from_secs(60), Duration::from_secs(2)).unwrap();
+        Monitor::spawn(program.clone(), Duration::from_secs(60), required_probe_budget(started)).unwrap();
     assert!(wait_for("output limit", || monitor.unavailable()).contains("size bound"));
     assert!(monitor.latest().is_none());
     assert!(Monitor::spawn(program, Duration::ZERO, Duration::from_secs(1)).is_err());

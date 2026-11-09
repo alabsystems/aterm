@@ -13,6 +13,14 @@ mod account_activation;
 pub use account_activation::account_activation_model;
 mod verified_entry;
 pub use verified_entry::verified_entry_model;
+mod entry_admission;
+pub use entry_admission::entry_admission_model;
+mod entry_provenance;
+pub use entry_provenance::entry_provenance_model;
+mod host_carry;
+pub use host_carry::host_carry_model;
+mod entry_claim;
+pub use entry_claim::entry_claim_model;
 
 mod dispatch;
 pub use dispatch::resource_dispatch_model;

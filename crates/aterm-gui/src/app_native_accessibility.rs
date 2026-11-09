@@ -145,7 +145,7 @@ impl App {
                     .is_none()
         });
         if staged || moved || self.reads_differ(wid, &plan) {
-            self.push_a11y_tree(wid);
+            self.push_a11y_tree_with_plan(wid, Some(&plan));
         }
     }
 
@@ -275,7 +275,7 @@ impl App {
         #[cfg(a11y_tree)]
         let update = match self
             .with_mixed_terminal_panes(wid, plan, update)
-            .and_then(|update| self.with_window_chrome(wid, update))
+            .and_then(|update| self.with_window_chrome(wid, plan, update))
         {
             Ok(update) => update,
             Err(error) => return Some(Err(error)),
@@ -382,10 +382,47 @@ impl App {
         &self,
         wid: WindowId,
     ) -> Result<(Vec<AccessibilityOwner>, Option<ViewId>), String> {
-        let plan = self
-            .active_visible_leaf_plan(wid)
+        let ws = self
+            .windows
+            .get(&wid)
             .ok_or_else(|| "native accessibility window is no longer live".to_string())?;
-        self.visible_native_accessibility_owners_from_plan(&plan)
+        let tab = ws
+            .tab_set
+            .active()
+            .ok_or_else(|| "native accessibility window is no longer live".to_string())?;
+        let mut owners = Vec::new();
+        let mut focused_native = None;
+        let mut error = None;
+        let _ = crate::active_tab_shows(ws, |view| {
+            if !matches!(self.view_store.get(view), Some(View::Native(_))) {
+                return false;
+            }
+            let Some(generation) = self.native_runtime.view_generation(view) else {
+                error = Some("native accessibility view is no longer live".to_string());
+                return true;
+            };
+            let Some(review_revision) = self
+                .native_runtime
+                .view_state(view)
+                .map(|state| state.common().review_revision)
+            else {
+                error = Some("native accessibility view is no longer live".to_string());
+                return true;
+            };
+            owners.push(AccessibilityOwner {
+                view,
+                generation,
+                review_revision,
+            });
+            if view == tab.focus {
+                focused_native = Some(view);
+            }
+            false
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+        Ok((owners, focused_native))
     }
 
     fn visible_native_accessibility_owners_from_plan(
@@ -569,8 +606,10 @@ impl App {
 
         self.clear_staged_native_accessibility(wid);
         let focused = self
-            .active_visible_leaf_plan(wid)
-            .is_some_and(|plan| plan.focused == owner.view);
+            .windows
+            .get(&wid)
+            .and_then(|window| window.tab_set.active())
+            .is_some_and(|tab| tab.focus == owner.view);
         if !focused {
             let moved = self
                 .windows

@@ -434,6 +434,11 @@ impl Machine {
     }
 }
 
+/// The macOS major version (first component of `sw_vers`).
+pub(super) fn macos_major() -> Option<String> {
+    probe_macos()?.split('.').next().map(str::to_string)
+}
+
 fn probe_macos() -> Option<String> {
     let out = super::fetch::run_capture("/usr/bin/sw_vers", &["-productVersion"]).ok()?;
     if !out.status.success() {
@@ -490,6 +495,32 @@ impl DeveloperDir {
             dir = dir.join("Contents/Developer");
         }
         Some(dir)
+    }
+
+    /// The active macOS SDK directory (`xcrun --show-sdk-path`
+    /// without running it), as brew names it.
+    pub(super) fn sdk_path(&self) -> Option<std::path::PathBuf> {
+        let sdks = self.active()?.join("SDKs");
+        // Brew names the versioned SDK (`MacOSX27.sdk`), not
+        // the resolved `MacOSX27.0.sdk` directory.
+        if let Some(major) = macos_major() {
+            let versioned = sdks.join(format!("MacOSX{major}.sdk"));
+            if versioned.is_dir() {
+                return Some(versioned);
+            }
+        }
+        let generic = sdks.join("MacOSX.sdk");
+        if generic.is_dir() {
+            return Some(generic);
+        }
+        let mut dirs: Vec<_> = std::fs::read_dir(&sdks)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        dirs.pop()
     }
 
     /// The developer tool `name` a shim would run.

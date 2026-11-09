@@ -32,6 +32,85 @@ use astream_wire::sync::{Digest, Header, Index, MAX_PARENTS};
 use aterm_json::{Value, json};
 use aterm_secrets::commons::roster::Role;
 
+#[test]
+fn a_registry_read_keeps_vault_contention_distinct_from_absence() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let registry = Registry::at(paths.clone());
+    registry.open().unwrap();
+    let config = paths.home.join("aterm.toml");
+    assert!(matches!(
+        registry.lab(&config, None),
+        Ok(Some(LabRead::Projected(..)))
+    ));
+    let writer = aterm_secrets::client::test_hold_state_lock(paths).unwrap();
+    let read = registry.lab(&config, None);
+    let table = registry.table();
+    let imports = crate::import::commons::Imports::at(paths.clone()).snapshot_if_declared();
+    let proposals = crate::accounts::proposals::Proposals::at(paths.clone()).snapshot_if_declared();
+    drop(writer);
+    assert!(
+        read.expect_err("a busy vault is not an absent registry")
+            .is_busy()
+    );
+    assert!(
+        table
+            .expect_err("a busy vault is not an absent table")
+            .is_busy()
+    );
+    assert!(
+        imports
+            .expect_err("busy imports must not look absent")
+            .is_busy()
+    );
+    assert!(
+        proposals
+            .expect_err("busy proposals must not look absent")
+            .is_busy()
+    );
+    assert!(matches!(
+        registry.lab(&config, None),
+        Ok(Some(LabRead::Projected(..)))
+    ));
+}
+
+#[test]
+fn a_signed_vault_without_commons_is_a_known_absent_source() {
+    use aterm_secrets::commons::{
+        Unavailable,
+        bootstrap::{Availability, Bootstrap},
+    };
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = aterm_secrets::client::Paths::for_home(&root.path().join("home"));
+    let vault = root.path().join("team.vault");
+    aterm_secrets::client::test_create_unbound(&paths, vault.to_str().unwrap(), None, Some("m1"))
+        .unwrap();
+    assert!(matches!(
+        Bootstrap::observe(&paths).unwrap(),
+        Availability::Unavailable(Unavailable::ControlNotVisible)
+    ));
+    let registry = Registry::at(paths.clone());
+    assert!(registry.table().unwrap().is_none());
+    assert!(
+        registry
+            .lab(&paths.home.join("aterm.toml"), None)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        crate::import::commons::Imports::at(paths.clone())
+            .snapshot_if_declared()
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        crate::accounts::proposals::Proposals::at(paths)
+            .snapshot_if_declared()
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// Every collection a type refers to.
 fn refs(ty: &Ty, out: &mut Vec<&'static str>) {
     match ty {

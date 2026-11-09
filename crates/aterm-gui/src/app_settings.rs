@@ -1249,15 +1249,16 @@ impl App {
             .windows
             .get(&wid)
             .is_some_and(|ws| ws.overlay.is_some());
+        let owned_plan = (!has_overlay && frame_plan.is_none())
+            .then(|| self.active_visible_leaf_plan(wid))
+            .flatten();
+        let plan = frame_plan.or(owned_plan.as_ref());
         // Read before a page's tree reads them again: output landing between the two is then told
         // again, never lost. An overlay's tree holds no terminal, so it says nothing of what the
         // client has read of one.
-        let reads = (!has_overlay).then(|| match frame_plan {
-            Some(plan) => self.client_reads(wid, Some(plan)),
-            None => self.client_reads(wid, self.active_visible_leaf_plan(wid).as_ref()),
-        });
+        let reads = (!has_overlay).then(|| self.client_reads(wid, plan));
         let native_update = (!has_overlay)
-            .then(|| match frame_plan {
+            .then(|| match plan {
                 Some(plan) => self.take_native_accessibility_update_from_plan(wid, plan),
                 None => self.take_native_accessibility_update(wid),
             })
@@ -1336,7 +1337,7 @@ impl App {
             }),
             panes,
             front,
-            rewind: self.rewind_a11y(wid),
+            rewind: self.rewind_a11y(wid, plan),
             questions: self.grid_a11y_questions(wid),
             menu: self.grid_a11y_menu(wid),
             rename: self.grid_a11y_rename(wid),
@@ -1522,6 +1523,7 @@ impl App {
     pub(crate) fn with_window_chrome(
         &self,
         wid: crate::WindowId,
+        plan: &crate::tab_model::VisibleLeafPlan,
         mut update: aterm_a11y::model::TreeUpdate,
     ) -> Result<aterm_a11y::model::TreeUpdate, String> {
         let Some(cols) = self.windows.get(&wid).map(|ws| usize::from(ws.cols)) else {
@@ -1534,7 +1536,7 @@ impl App {
         let chips = self.claude_chips_a11y(wid);
         let menu = self.grid_a11y_menu(wid);
         let stats = self.stats_a11y(wid);
-        let rewind = self.rewind_a11y(wid);
+        let rewind = self.rewind_a11y(wid, Some(plan));
         crate::a11y_tree::splice_chrome(
             &mut update,
             self.grid_a11y_geometry(wid),

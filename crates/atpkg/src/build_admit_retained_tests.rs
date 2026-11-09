@@ -42,7 +42,9 @@ fn with_world(run: impl FnOnce(&Path, &Seat<'_>) -> usize) {
         .create(&home)
         .unwrap();
     let namespace = Namespace::create_private(world.path(), &home).unwrap();
-    let machine = Fixed::new(Reading::of_gib(256, 200, 128));
+    let mut reading = Reading::of_gib(256, 200, 128);
+    reading.load5 = Some(128.0);
+    let machine = Fixed::new(reading);
     let seat = Seat {
         ledger: Some(Ledger::at(namespace.fence())),
         machine: &machine,

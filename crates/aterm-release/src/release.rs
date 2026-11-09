@@ -3739,15 +3739,36 @@ impl Run<'_> {
                     short(&self.tip)
                 ),
                 None if !cand.carry.is_empty() => {
-                    let named: Vec<&str> = cand.carry.iter().map(|f| short(&f.commit)).collect();
-                    format!(
-                        "would carry {} onto the line's head {} in ancestry order, one hop each \
-                         (git merge-tree, then git commit-tree), push a merge that keeps main's \
-                         tree onto main's tip to record the new head, and put this clone's main \
-                         at it",
-                        named.join(", "),
-                        short(&cand.commit)
-                    )
+                    let line = self.journal.as_ref().map_or_else(
+                        || crate::line::Line::start(&cand.version, &cand.commit, self.t_start),
+                        Journal::line,
+                    );
+                    match self.b.carry(&line, &cand.carry) {
+                        Ok((hops, _)) => {
+                            let first = line.hops.len() + 1;
+                            let results: Vec<String> = hops
+                                .iter()
+                                .enumerate()
+                                .map(|(i, hop)| {
+                                    format!(
+                                        "{} carries cleanly as hop {} ({})",
+                                        short(&hop.carries),
+                                        first + i,
+                                        short(&hop.commit)
+                                    )
+                                })
+                                .collect();
+                            format!(
+                                "{}; constructed locally with git merge-tree and git commit-tree; \
+                                 no refs changed; would record the new head on main and move this clone to it",
+                                results.join("; ")
+                            )
+                        }
+                        Err(refusal) => {
+                            self.refuse(refusal)?;
+                            "carry refused; no refs changed".into()
+                        }
+                    }
                 }
                 None => format!(
                     "would put this clone's main at {} (v{})",

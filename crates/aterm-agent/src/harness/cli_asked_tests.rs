@@ -5,6 +5,7 @@
 //! is synthetic (`example.test`).
 
 use super::*;
+use crate::harness::alab_roster::test_machine;
 use crate::harness::alab_roster::{Lab, LabAccount, with_lab};
 
 fn lab() -> Lab {
@@ -18,10 +19,10 @@ fn lab() -> Lab {
         identity: None,
         browser: None,
         joinable,
-        preferred: vec![("m20".to_owned(), Some(1))],
+        preferred: vec![(test_machine("m20"), Some(1))],
     };
     Lab {
-        me: Some("m22".into()),
+        me: Some(test_machine("m22")),
         settled: false,
         accounts: vec![
             account("ann", "claude-aaaaaa", true),

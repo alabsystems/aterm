@@ -328,7 +328,9 @@ fn sync_case(case: i64, cli: Cli) -> (i64, i64, i64) {
     let authority = |files: BTreeMap<PathBuf, Vec<u8>>| {
         files
             .into_iter()
-            .filter(|(path, _)| path != &raw_path && path != &store.wake_path())
+            .filter(|(path, _)| {
+                path != &raw_path && path != &store.wake_path() && !store.is_sync_receipt_file(path)
+            })
             .collect::<BTreeMap<_, _>>()
     };
     let authority_changed = authority(after) != authority(before);

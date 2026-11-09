@@ -19,11 +19,77 @@ mod provider_realm_tests;
 #[path = "accounts_alias_admission_tests.rs"]
 mod alias_admission_tests;
 
+#[path = "accounts_provider_commit_tests.rs"]
+mod provider_commit_tests;
+
 #[cfg(test)]
 #[path = "accounts_source_presence_tests.rs"]
 mod source_presence;
 
+#[path = "accounts_source_pending_tests.rs"]
+mod source_pending;
+
 const NOW: i64 = 1_792_660_000;
+
+#[test]
+fn refused_empty_pool_fleet_publication_preserves_account_state() {
+    use crate::harness::alab_roster::{SourceSnapshot, TestSourceOverride};
+    let bed = Bed::new("empty-pool-publication");
+    bed.secret(
+        super::super::ai_pool::AI_POOL_FILE,
+        "version=1\naccount=[]\n",
+    );
+    let _source = TestSourceOverride::new(SourceSnapshot::Absent);
+    let roster = bed.roster(Cli::Claude);
+    let fleet = bed.config.join(FLEET_ROSTER_FILE);
+    fs::create_dir(&fleet).unwrap();
+    let env = quiet_env(&bed.home, &bed.state, &bed.aterm_toml(), NOW);
+    let store = env.accounts_store();
+    let paths = [
+        roster,
+        store.state_file(),
+        store.logins_file(),
+        store.ledger_path(),
+        store.wake_path(),
+        store.machine_file(),
+    ];
+    let image = || paths.iter().map(|p| fs::read(p).ok()).collect::<Vec<_>>();
+    let before = image();
+    let pool = bed.secrets().join(super::super::ai_pool::AI_POOL_FILE);
+    let fetch = |_: &Env, source: &str| -> Result<String, String> {
+        assert_eq!(
+            Path::new(source),
+            pool.as_path(),
+            "only the fixture pool may be read"
+        );
+        fs::read_to_string(source).map_err(|why| why.to_string())
+    };
+    let how = SyncHow {
+        fetch: &fetch,
+        ladder: &[],
+        fleet_snapshots: &[],
+        heal: None,
+        allow_empty_pool: true,
+    };
+    let error = sync_accounts_request(
+        &env,
+        SourceRequest::Requested(pool.to_str()),
+        Some("m16"),
+        &how,
+    )
+    .err()
+    .expect("a directory cannot be published as the fleet file");
+    assert!(
+        error.contains("fleet") || error.contains("regular"),
+        "{error}"
+    );
+    assert_eq!(
+        image(),
+        before,
+        "a refused fleet publication cannot commit swarm state"
+    );
+    assert!(fleet.is_dir());
+}
 
 #[test]
 fn malformed_automatic_source_is_a_refusal_and_preserves_account_records() {
@@ -782,7 +848,10 @@ impl Bed {
             },
         );
         store.save(&state).unwrap();
-        let mut logins = accounts::Logins::default();
+        let mut logins = accounts::Logins {
+            generation_clock: 2,
+            ..accounts::Logins::default()
+        };
         logins.labels.insert(
             "kept".into(),
             accounts::Binding {
@@ -792,6 +861,9 @@ impl Bed {
             },
         );
         store.save_logins(&logins).unwrap();
+        store
+            .load_logins(NOW)
+            .expect("seeded login records must satisfy the generation clock invariant");
         store
             .append(&[accounts::Event::new(NOW, accounts::Kind::Wall, "kept")])
             .unwrap();

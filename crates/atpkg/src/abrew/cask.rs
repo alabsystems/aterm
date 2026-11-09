@@ -2373,7 +2373,7 @@ pub fn zap(
         )));
     }
     if dry_run {
-        println!("Would uninstall cask {token}");
+        println!("Would uninstall Cask {token}");
         return Ok(());
     }
     // Brew's order: non-deferred directives (trash) run before the
@@ -2435,7 +2435,7 @@ fn uninstall_from(
         )));
     };
     if dry_run {
-        println!("Would uninstall cask {token}");
+        println!("Would uninstall Cask {token}");
         return Ok(());
     }
     let mut plan = UninstallPlan::prepare(prefix, token, &inst.versions, directories)?;

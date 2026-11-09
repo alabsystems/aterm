@@ -17,6 +17,7 @@ pub mod formula;
 pub mod install;
 pub mod machine;
 pub mod prefix;
+pub mod services;
 pub mod stub;
 pub mod tap;
 pub mod token_generator;
@@ -92,6 +93,10 @@ pub fn rerouted_entry(args: &[String]) -> ExitCode {
 /// Runs `abrew` on `args`.
 pub fn run(args: &[String], via_reroute: bool) -> ExitCode {
     VIA_REROUTE.with(|cell| cell.set(via_reroute));
+    CURRENT_CMD.with(|cell| {
+        *cell.borrow_mut() = args.first().cloned().unwrap_or_default();
+    });
+    PREAMBLE_DONE.with(|cell| cell.set(false));
     #[cfg(all(unix, not(test)))]
     {
         // Rust ignores SIGPIPE, which turns `abrew ... | head` into
@@ -200,21 +205,34 @@ fn print_env(prefix: &Prefix, rest: &[String]) -> ExitCode {
             Some(shell) => kind_of(shell),
         }
     };
-    let brand = if via_reroute() { "HOMEBREW" } else { "ABREW" };
-    let vars = [
-        (format!("{brand}_PREFIX"), prefix.root.display().to_string()),
-        (
-            format!("{brand}_CELLAR"),
-            prefix.cellar().display().to_string(),
-        ),
-    ];
+    let vars: Vec<(String, String)> = if via_reroute() {
+        brew_build_env(prefix)
+    } else {
+        vec![
+            (
+                "ABREW_PREFIX".to_string(),
+                prefix.root.display().to_string(),
+            ),
+            (
+                "ABREW_CELLAR".to_string(),
+                prefix.cellar().display().to_string(),
+            ),
+        ]
+    };
+    // Brew's plain dump drops the compiler duplicates.
+    let keep_cc = vars_cc_differs(&vars);
+    let plain_drop = mode == Mode::Plain && via_reroute() && !keep_cc;
+    let vars: Vec<&(String, String)> = vars
+        .iter()
+        .filter(|(k, _)| !plain_drop || !matches!(k.as_str(), "CC" | "CXX" | "OBJC" | "OBJCXX"))
+        .collect();
     let raw_ok = |value: &str| {
         !value.is_empty()
             && value.chars().all(|c| {
-                c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '=')
+                c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '+')
             })
     };
-    for (key, value) in &vars {
+    for (key, value) in vars {
         match mode {
             Mode::Plain => println!("{key}: {value}"),
             Mode::Bash => {
@@ -225,11 +243,15 @@ fn print_env(prefix: &Prefix, rest: &[String]) -> ExitCode {
                 }
             }
             Mode::Fish => {
-                let value = value
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('$', "\\$");
-                println!("set -gx {key} \"{value}\"");
+                if raw_ok(value) {
+                    println!("set -gx {key} {value}");
+                } else {
+                    let value = value
+                        .replace('\\', "\\\\")
+                        .replace('"', "\\\"")
+                        .replace('$', "\\$");
+                    println!("set -gx {key} \"{value}\"");
+                }
             }
             Mode::Csh => {
                 if raw_ok(value) {
@@ -243,6 +265,101 @@ fn print_env(prefix: &Prefix, rest: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Whether brew's plain `--env` dump keeps CC/CXX/OBJC/OBJCXX:
+/// dropped only when CC equals HOMEBREW_CC.
+fn vars_cc_differs(vars: &[(String, String)]) -> bool {
+    let get = |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+    get("CC") != get("HOMEBREW_CC")
+}
+
+/// Brew's superenv build environment for `brew --env`, in
+/// `BuildEnvironment::KEYS` order (macOS shape).
+fn brew_build_env(prefix: &Prefix) -> Vec<(String, String)> {
+    let root = prefix.root.display().to_string();
+    let cc = std::env::var("HOMEBREW_CC")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "clang".to_string());
+    let cxx = std::env::var("HOMEBREW_CXX")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| match cc.as_str() {
+            "clang" => "clang++".to_string(),
+            "gcc" => "g++".to_string(),
+            "cc" => "c++".to_string(),
+            other => format!("{other}++"),
+        });
+    let jobs = std::env::var("HOMEBREW_MAKE_JOBS")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get)
+                .to_string()
+        });
+    let dev = machine::DeveloperDir::this();
+    let sdk = std::env::var("SDKROOT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| dev.sdk_path().map(|p| p.display().to_string()));
+    let git = std::env::var("HOMEBREW_GIT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| dev.tool("git").map(|p| p.display().to_string()));
+    let shims = format!("{root}/Library/Homebrew/shims/mac/super");
+    let mut vars: Vec<(String, String)> = vec![
+        ("CC".into(), cc.clone()),
+        ("CXX".into(), cxx.clone()),
+        ("OBJC".into(), cc.clone()),
+        ("OBJCXX".into(), cxx),
+        ("HOMEBREW_CC".into(), cc),
+        ("MAKEFLAGS".into(), format!("-j{jobs}")),
+        ("CMAKE_PREFIX_PATH".into(), format!("{shims}:{root}")),
+    ];
+    if let Some(sdk) = &sdk {
+        vars.push((
+            "CMAKE_INCLUDE_PATH".into(),
+            format!("{sdk}/System/Library/Frameworks/OpenGL.framework/Versions/Current/Headers"),
+        ));
+        vars.push((
+            "CMAKE_LIBRARY_PATH".into(),
+            format!("{sdk}/System/Library/Frameworks/OpenGL.framework/Versions/Current/Libraries"),
+        ));
+    }
+    if let Some(major) = machine::macos_major() {
+        vars.push((
+            "PKG_CONFIG_LIBDIR".into(),
+            format!("/usr/lib/pkgconfig:{root}/Library/Homebrew/os/mac/pkgconfig/{major}"),
+        ));
+    }
+    vars.push(("HOMEBREW_MAKE_JOBS".into(), jobs));
+    for proxy in [
+        "all_proxy",
+        "ftp_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ] {
+        if let Ok(v) = std::env::var(proxy)
+            && !v.is_empty()
+        {
+            vars.push((proxy.into(), v));
+        }
+    }
+    if let Some(git) = git {
+        vars.push(("HOMEBREW_GIT".into(), git));
+    }
+    if let Some(sdk) = sdk {
+        vars.push(("HOMEBREW_SDKROOT".into(), sdk));
+    }
+    vars.push(("ACLOCAL_PATH".into(), format!("{root}/share/aclocal")));
+    vars.push((
+        "PATH".into(),
+        format!("{shims}/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+    ));
+    vars
+}
+
 fn unsupported(reason: &str) -> ExitCode {
     failed(&format!("abrew: unsupported native operation: {reason}"))
 }
@@ -252,6 +369,7 @@ fn not_native(_prefix: &Prefix, _args: &[String], cmd: &str) -> ExitCode {
 }
 
 fn failed(msg: &str) -> ExitCode {
+    usage_preamble(msg);
     eprintln!("{}", tty::error_line(msg));
     ExitCode::from(1)
 }
@@ -296,6 +414,10 @@ thread_local! {
     /// (`atpkg __abrew`, what the stub execs) rather than as `abrew`.
     /// A CLI process has exactly one entry mode; `run` records it.
     static VIA_REROUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The command being run, for brew's usage-error help preamble.
+    static CURRENT_CMD: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Whether the usage preamble already printed this run.
+    static PREAMBLE_DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(super) fn via_reroute() -> bool {
@@ -381,36 +503,48 @@ fn brew_help_text(cmd: &str) -> &'static str {
         .map_or(help_texts::TOP, |(_, text)| text)
 }
 
-/// Brew prints the command's help before an Invalid usage error;
-/// under the `brew` reroute, do the same.
-fn print_usage_preamble(args: &[String]) {
-    if !via_reroute() {
+/// Brew prints the command's help before a usage-class error
+/// under the reroute: `Invalid usage:` errors get a blank line
+/// after the help, OptionParser invalid/ambiguous-option
+/// errors do not, and other parser errors (missing/needless
+/// argument) get no help at all. Printed once per run.
+pub(super) fn usage_preamble_for(cmd: &str, message: &str) {
+    if !via_reroute() || PREAMBLE_DONE.with(std::cell::Cell::get) {
         return;
     }
-    let cmd = args.first().map_or("", String::as_str);
+    let blank = if message.starts_with("Error: Invalid usage:") {
+        true
+    } else if message.starts_with("Error: invalid option:")
+        || message.starts_with("Error: ambiguous option:")
+    {
+        false
+    } else {
+        return;
+    };
+    PREAMBLE_DONE.with(|cell| cell.set(true));
     eprint!("{}", brew_help_text(cmd));
-    eprintln!();
+    if blank {
+        eprintln!();
+    }
+}
+
+/// The usage preamble for the command this run is executing.
+pub(super) fn usage_preamble(message: &str) {
+    let cmd = CURRENT_CMD.with(|cell| cell.borrow().clone());
+    usage_preamble_for(&cmd, message);
 }
 
 /// A failed() for `Error: Invalid usage:` messages, carrying
 /// brew's help preamble under the reroute.
 pub(super) fn usage_failed(cmd: &str, message: &str) -> ExitCode {
-    if via_reroute() {
-        eprint!("{}", brew_help_text(cmd));
-        eprintln!();
-    }
+    usage_preamble_for(cmd, message);
     failed(message)
 }
 
 fn from_install(_prefix: &Prefix, _args: &[String], r: Result<(), InstallError>) -> ExitCode {
     match r {
         Ok(()) => ExitCode::SUCCESS,
-        Err(InstallError::Failed(m)) => {
-            if m.starts_with("Error: Invalid usage:") {
-                print_usage_preamble(_args);
-            }
-            failed(&m)
-        }
+        Err(InstallError::Failed(m)) => failed(&m),
         Err(InstallError::Unsupported(reason)) => unsupported(&reason),
         Err(InstallError::Aborted) => ExitCode::from(1),
     }
@@ -749,7 +883,7 @@ fn native_args(
         "missing" => &["--hide"],
         "services" => &["--file", "--max-wait", "--sudo-service-user"],
         "options" => &["--command"],
-        "log" => &["--max-count"],
+        "log" => &["--max-count", "-n"],
         "exec" => &["--sandbox"],
         "vulns" => &["--fix-type"],
         "--env" | "env" => &["--shell"],
@@ -801,7 +935,7 @@ fn native_args(
             &[m("--desc"), m("--pull-request")],
             &[m("--open"), m("--closed")],
         ],
-        "log" => &[&[m("-1"), m("--max-count")]],
+        "log" => &[&[m("-1"), ("--max-count", &["-n"])]],
         "install" => &[
             &[m("--ignore-dependencies"), m("--only-dependencies")],
             &[m("--adopt"), ("--force", &["-f"])],
@@ -893,19 +1027,26 @@ fn native_args(
         "search" => &[("--open", "--pull-request"), ("--closed", "--pull-request")],
         _ => &[],
     };
-    for (switch, requires) in depends_on {
-        if has_flag_eq(rest, switch) && !has_flag_eq(rest, requires) {
-            return Err(InstallError::Failed(format!(
-                "Error: Invalid usage: `{switch}` cannot be passed without `{requires}`."
-            )));
+    // Evaluated again after abbreviation expansion below:
+    // brew's parser expands first, so `--prun` is `--prune`
+    // to this gate too.
+    let check_depends_on = |rest: &[String]| -> Result<(), InstallError> {
+        for (switch, requires) in depends_on {
+            if has_flag_eq(rest, switch) && !has_flag_eq(rest, requires) {
+                return Err(InstallError::Failed(format!(
+                    "Error: Invalid usage: `{switch}` cannot be passed without `{requires}`."
+                )));
+            }
         }
-    }
+        Ok(())
+    };
+    check_depends_on(rest)?;
     if cmd == "services" {
         // Brew's services subcommands resolve like bundle's:
         // unknown names and out-of-scope switches are parser
         // errors ahead of the (delegated) execution.
         const SERVICE_SUBS: &[&str] = &[
-            "cleanup", "info", "kill", "list", "restart", "run", "start", "stop",
+            "cleanup", "i", "info", "kill", "list", "ls", "restart", "run", "start", "stop",
         ];
         const SERVICE_SCOPED: &[(&str, &str, &[&str])] = &[
             (
@@ -980,7 +1121,11 @@ fn native_args(
                 "Error: Invalid usage: unknown subcommand: `{named}`"
             )));
         }
-        let subcommand = first_positional.unwrap_or("list");
+        let subcommand = match first_positional {
+            Some("ls") | None => "list",
+            Some("i") => "info",
+            Some(other) => other,
+        };
         for arg in rest.iter().take_while(|arg| arg.as_str() != "--") {
             let name = arg.split('=').next().unwrap_or(arg);
             if let Some((display, kind, subs)) = SERVICE_SCOPED
@@ -1038,6 +1183,13 @@ fn native_args(
             return Err(InstallError::Failed(
                 "Error: Invalid usage: Formula(e) missing, please provide a formula name or use `--all`."
                     .to_string(),
+            ));
+        }
+        // Only the read-only listing is native; service
+        // control refuses here, ahead of any prefix effect.
+        if !matches!(subcommand, "list" | "info") {
+            return Err(InstallError::Unsupported(
+                "'services' is not native".to_string(),
             ));
         }
     }
@@ -1567,6 +1719,8 @@ fn native_args(
                 "--long",
                 "-l",
                 "-1",
+                "-r",
+                "-t",
                 "--multiple",
                 "--json",
             ],
@@ -1625,7 +1779,20 @@ fn native_args(
             true,
         ),
         "log" => (
-            &["--formula", "--formulae", "--cask", "--casks"],
+            &[
+                "-p",
+                "-u",
+                "--patch",
+                "--stat",
+                "--oneline",
+                "-1",
+                "-n",
+                "--max-count",
+                "--formula",
+                "--formulae",
+                "--cask",
+                "--casks",
+            ],
             0,
             1,
             true,
@@ -1689,6 +1856,20 @@ fn native_args(
         "command" => (&[], 1, usize::MAX, true),
         "formula" => (&[], 1, usize::MAX, false),
         "generate-cask-token" => (&[], 1, 1, false),
+        "services" => (
+            &[
+                "--all",
+                "--json",
+                "--file",
+                "--max-wait",
+                "--no-wait",
+                "--keep",
+                "--sudo-service-user",
+            ],
+            0,
+            usize::MAX,
+            false,
+        ),
         "unpack" => (
             &[
                 "--destdir",
@@ -1745,6 +1926,10 @@ fn native_args(
             arg,
             "--verbose" | "-v" | "--quiet" | "-q" | "--debug" | "-d"
         ) || flags.contains(&arg)
+            || (value_flags
+                .iter()
+                .any(|f| arg == *f || arg.starts_with(&format!("{f}=")))
+                && !(cmd == "missing" && arg.starts_with("--hide=")))
             || (cmd == "info" && (arg.starts_with("--days=") || arg.starts_with("--category=")))
             || (matches!(cmd, "--env" | "env") && arg.starts_with("--shell="))
             || (cmd == "cleanup" && arg.starts_with("--prune="))
@@ -1889,6 +2074,7 @@ fn native_args(
         out
     };
     let rest: &[String] = &expanded;
+    check_depends_on(rest)?;
     // `--minimum-version` (outdated/upgrade) is a one-name
     // check; brew raises the arity error when the command
     // starts, ahead of its own JSON-version handling. A blank
@@ -1937,7 +2123,7 @@ fn native_args(
     }
     // brew's reinstall has no `--dry-run` switch (abrew's
     // direct dialect keeps it; under the reroute brew's
-    // parser error wins).
+    // parser error wins). Uninstall has one in brew 7.
     if via_reroute()
         && cmd == "reinstall"
         && let Some(flag) = rest
@@ -2087,11 +2273,7 @@ fn native_args(
         cleanup_max_age(rest)
             .map_err(|error| InstallError::Failed(format!("Error: Invalid usage: {error}")))?;
     }
-    let ops = if cmd == "info" {
-        operands_without_flag_values(rest, &["--days", "--category"])
-    } else {
-        operands(rest)
-    };
+    let ops = operands_without_flag_values(rest, value_flags);
     if cmd == "completions"
         && let Some(sub) = ops.first()
         && !matches!(sub.as_str(), "state" | "link" | "unlink")
@@ -2327,9 +2509,7 @@ fn native_args(
                 )));
             }
         }
-        if (days.is_some() || category.is_some()) && !analytics {
-            return Err(unsupported());
-        }
+
         if analytics && (json || has_flag(rest, "--installed", "") || ops.is_empty()) {
             return Err(unsupported());
         }
@@ -2970,6 +3150,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             return commands::cmd_generate_cask_token(&api0, rest);
         }
         "command-not-found-init" => return commands::cmd_command_not_found_init(),
+        "services" => return services::cmd_services(prefix, rest),
         "unpack" => {
             let api0 = api::Api::new(prefix.clone());
             return commands::cmd_unpack(prefix, &api0, args, rest);
@@ -3178,10 +3359,26 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
                 let short = Formula::short_name(n);
                 let token = api::canonical_cask_token(short);
                 if !want_cask && prefix.installed_one(prefix::Kind::Formula, short).is_some() {
-                    prefix.pin(short)
+                    if prefix.pinned_version(short).is_some() {
+                        tty::opoo!("Warning: {short} already pinned");
+                        Ok(())
+                    } else {
+                        prefix.pin(short)
+                    }
                 } else if !want_formula && prefix.installed_one(prefix::Kind::Cask, token).is_some()
                 {
-                    prefix.pin_cask(token)
+                    if prefix.cask_pinned_version(token).is_some() {
+                        tty::opoo!("Warning: {token} already pinned");
+                        Ok(())
+                    } else {
+                        let pinned = prefix.pin_cask(token);
+                        if pinned.is_ok() && api.cask(token).is_ok_and(|c| c.auto_updates) {
+                            tty::opoo!(
+                                "Warning: {token} has `auto_updates true` and may update itself outside Homebrew despite being pinned."
+                            );
+                        }
+                        pinned
+                    }
                 } else if want_cask {
                     if commands::package_definitively_unknown(prefix, &api, token, false, true) {
                         Err(format!("Error: {}", commands::cask_unavailable(token)))
@@ -3216,7 +3413,7 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
         "migrate" => cmd_migrate(prefix, &api, args, rest),
         "options" => cmd_options(prefix, &api, args, rest),
         "linkage" => cmd_linkage(prefix, &api, rest),
-        "log" => cmd_log(prefix, rest),
+        "log" => commands::cmd_log(prefix, &api, rest),
         "tap" => cmd_tap(prefix, rest),
         "trust" => cmd_trust(prefix, &api, rest),
         "untrust" => cmd_untrust(prefix, &api, rest),
@@ -3745,7 +3942,7 @@ Common commands:
 abrew pours bottles that need no relocation (or, on macOS with the developer
 tools, `:any` relocation) and installs tar, zip, DMG and single-file casks
 whose artifacts and constraints are plain data. Unsupported source builds,
-post-install recipes, pkg casks, services and flags fail with their missing
+post-install recipes, pkg casks, service control and flags fail with their missing
 native capability. atpkg never installs or invokes real Homebrew as a fallback;
 --real and ABREW_REAL are unsupported. Existing legacy bundles are unused and
 can be inspected or explicitly removed with bundle status / bundle remove.
@@ -3823,7 +4020,7 @@ fn help_for(cmd: &str) -> &'static str {
             "Usage: abrew bundle [install|check] [--file F]\n       abrew bundle dump [--file F] [--force]\n       abrew bundle status | remove\n  No subcommand means native Brewfile install. Unsupported rows fail before\n  installation; no Homebrew is installed or invoked. status/remove inspect\n  or explicitly remove an owned legacy Homebrew bundle, which is never used.\n"
         }
         "services" => {
-            "Usage: abrew services <args>…\n  Not supported: atpkg's brew compatibility has no native service manager.\n"
+            "Usage: abrew services [list] [--json]\n       abrew services info (<formula>|--all) [--json]\n  List and inspect launchd services of formulae. Starting and\n  stopping services is not native.\n"
         }
         "tab" => {
             "Usage: abrew tab [--formula|--cask] (--installed-on-request|--no-installed-on-request) <name>…\n  Marks installed packages as installed on request or not, which is what\n  autoremove keeps or removes.\n"
@@ -4725,6 +4922,15 @@ mod admission_tests {
             failed("search", &["--open", "acl"]),
             "Error: Invalid usage: `--open` cannot be passed without `--pull-request`."
         );
+        // Abbreviations expand before the gate, as in brew.
+        assert_eq!(
+            failed("deps", &["--prun", "acl"]),
+            "Error: Invalid usage: `--prune` cannot be passed without `--tree`."
+        );
+        assert_eq!(
+            failed("info", &["--cat", "install"]),
+            "Error: Invalid usage: `--category` cannot be passed without `--analytics`."
+        );
         // Boolean switches reject =values (needless argument),
         // and explicit JSON versions are validated per command.
         assert_eq!(
@@ -4926,6 +5132,22 @@ mod admission_tests {
     }
 
     #[test]
+    fn brew_build_env_key_order_and_cc_drop_rule() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(temp.path());
+        let vars = brew_build_env(&prefix);
+        let keys: Vec<&str> = vars.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(&keys[..5], &["CC", "CXX", "OBJC", "OBJCXX", "HOMEBREW_CC"]);
+        assert_eq!(keys.last(), Some(&"PATH"));
+        assert!(!vars_cc_differs(&vars));
+        let custom = vec![
+            ("CC".to_string(), "gcc-14".to_string()),
+            ("HOMEBREW_CC".to_string(), "clang".to_string()),
+        ];
+        assert!(vars_cc_differs(&custom));
+    }
+
+    #[test]
     fn native_admission_messages_are_precise() {
         let msg = |args: &[&str]| {
             let args = argv(args);
@@ -4934,7 +5156,7 @@ mod admission_tests {
                 other => panic!("expected native refusal, got {other:?}"),
             }
         };
-        assert!(msg(&["services", "list"]).contains("'services' is not native"));
+        assert!(msg(&["services", "start", "wget"]).contains("'services' is not native"));
         let cat_args = argv(&["--analytics", "wget", "--category=other"]);
         assert_eq!(
             native_args("info", &cat_args),
@@ -5043,7 +5265,7 @@ mod admission_tests {
         let fresh = Prefix::at(&temp.path().join("never-created"));
         for args in [
             &["--real", "list"][..],
-            &["services", "list"][..],
+            &["services", "start", "wget"][..],
             &["install", "--HEAD", "wget"][..],
             &[
                 "bundle",

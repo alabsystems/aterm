@@ -43,6 +43,7 @@ unsafe impl Receiver for ClassPtr {
 /// `unsafe extern "C-unwind" fn(R, Sel, A0, …) -> Ret` with a [`Receiver`] first, the selector
 /// second, and an [`Encode`] type in every other position, up to fourteen arguments (the
 /// [`MsgFn`] ceiling).
+/// Arguments are [`Copy`]: the foreign callee receives C values, never Rust drop ownership.
 /// # Safety
 /// `get` must return a function pointer of the implementing type that sends the message.
 pub unsafe trait CheckedFn: MsgFn {
@@ -90,7 +91,7 @@ fn types_of(ret: &str, args: &[&str]) -> String {
 macro_rules! impl_checked_fn {
     ($($arg:ident $val:ident),*) => {
         // SAFETY: both arms of `get` return an `unsafe extern "C-unwind"` pointer of type `Self`.
-        unsafe impl<Recv: Receiver, Ret: Encode, $($arg: Encode),*> CheckedFn
+        unsafe impl<Recv: Receiver, Ret: Encode, $($arg: Encode + Copy),*> CheckedFn
             for unsafe extern "C-unwind" fn(Recv, Sel, $($arg),*) -> Ret
         {
             fn types() -> String {
@@ -101,7 +102,7 @@ macro_rules! impl_checked_fn {
             fn get() -> Self {
                 #[cfg(debug_assertions)]
                 {
-                    unsafe extern "C-unwind" fn trampoline<Recv: Receiver, Ret: Encode, $($arg: Encode),*>(
+                    unsafe extern "C-unwind" fn trampoline<Recv: Receiver, Ret: Encode, $($arg: Encode + Copy),*>(
                         recv: Recv,
                         sel: Sel,
                         $($val: $arg),*

@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
@@ -37,28 +38,43 @@ fn shrinking_pauses_new_admission_without_revoking_workers_and_recovers() {
 
 #[test]
 fn competing_roots_cannot_race_past_the_measured_limit() {
+    competing_roots_started(Instant::now());
+}
+
+#[test]
+fn required_competing_roots_keep_the_original_start_and_actual_native_capacity() {
+    competing_roots_started(Instant::now() - Duration::from_secs(1));
+}
+
+const ADMISSION_WAIT: Duration = Duration::from_secs(60);
+
+fn competing_roots_started(started: Instant) {
     let _fixture = crate::tests::kernel_fixture();
     let dir = tempfile::tempdir().unwrap();
     let pool = Pool::open_in(dir.path(), width(16)).unwrap();
     let ready = Arc::new(Barrier::new(16));
+    let granted = Arc::new(AtomicUsize::new(0));
+    let deadline = started + ADMISSION_WAIT;
     let (tx, rx) = mpsc::channel();
     let threads: Vec<_> = (0..16)
         .map(|_| {
             // Separate open descriptions, as in independent compiler roots.
             let pool = Pool::open_in(dir.path(), width(16)).unwrap();
             let ready = Arc::clone(&ready);
+            let granted = Arc::clone(&granted);
             let tx = tx.clone();
             std::thread::spawn(move || {
                 ready.wait();
-                let deadline = Instant::now() + Duration::from_millis(300);
                 loop {
+                    assert!(Instant::now() < deadline, "native admission did not complete");
                     if let Some(lease) =
                         pool.try_acquire_with_limit(Owner::current(None), 3).unwrap()
                     {
                         tx.send(Some(lease)).unwrap();
+                        granted.fetch_add(1, Ordering::Release);
                         return;
                     }
-                    if Instant::now() >= deadline {
+                    if granted.load(Ordering::Acquire) >= 3 {
                         tx.send(None).unwrap();
                         return;
                     }
@@ -74,6 +90,7 @@ fn competing_roots_cannot_race_past_the_measured_limit() {
         thread.join().unwrap();
     }
     assert_eq!(held.len(), 3);
+    assert!(pool.try_acquire_with_limit(Owner::current(None), 3).unwrap().is_none());
     assert_eq!(
         pool.snapshot().unwrap().iter().filter(|s| matches!(s, SlotState::Held { .. })).count(),
         3

@@ -486,7 +486,7 @@ done
 echo "$head$follow $url" >>"${STUB_LOG:?}"
 BASE="https://github.com/${STUB_SLUG:?}/releases"
 case "$head$follow $url" in
-"10 $BASE/latest/download/aterm-appcast.toml")
+"10 $BASE/latest/download/aterm-appcast.toml?aterm_lookup="*)
 	printf '%s' "$fmt" | sed "s#%{http_code}#302#; s#%{redirect_url}#$BASE/download/v9.9.9/aterm-appcast.toml#" ;;
 "10 $BASE/download/v9.9.9/aterm-appcast.toml")
 	printf '%s' "$fmt" | sed "s#%{http_code}#302#; s#%{redirect_url}#https://release-assets.githubusercontent.com/m#" ;;
@@ -969,9 +969,12 @@ fn a_dry_run_prints_the_plan_and_changes_nothing() {
         .iter()
         .filter(|r| r.contains("latest/download"))
         .collect();
+    assert_eq!(pointer.len(), 1, "{:?}", dry.requests);
     assert_eq!(
-        pointer,
-        ["10 https://github.com/example/aterm/releases/latest/download/aterm-appcast.toml"],
+        pointer[0]
+            .split_once("?aterm_lookup=")
+            .map(|(base, _)| base),
+        Some("10 https://github.com/example/aterm/releases/latest/download/aterm-appcast.toml"),
         "{:?}",
         dry.requests
     );
@@ -1024,7 +1027,7 @@ done
 echo "$head$follow $url" >>"${STUB_LOG:?}"
 BASE="https://github.com/alabsystems/aterm/releases"
 case "$head$follow $url" in
-"10 $BASE/latest/download/aterm-appcast.toml")
+"10 $BASE/latest/download/aterm-appcast.toml?aterm_lookup="*)
 	printf '%s' "$fmt" | sed "s#%{http_code}#302#; s#%{redirect_url}#$BASE/download/v9.9.9/aterm-appcast.toml#" ;;
 "10 $BASE/download/v9.9.9/aterm-9.9.9-linux-aarch64" | "10 $BASE/download/v9.9.9/aterm-9.9.9-linux-x86_64")
 	printf '%s' "$fmt" | sed "s#%{http_code}#404#" ;;
@@ -1076,7 +1079,10 @@ fn a_piped_linux_run_installs_from_the_public_channel_and_says_what_it_lacks() {
         let (ran, requests) = piped(name, args);
         let out = ran.all();
         assert_eq!(
-            requests.first().map(String::as_str),
+            requests
+                .first()
+                .and_then(|url| url.split_once("?aterm_lookup="))
+                .map(|(base, _)| base),
             Some(
                 "10 https://github.com/alabsystems/aterm/releases/latest/download/aterm-appcast.toml"
             ),

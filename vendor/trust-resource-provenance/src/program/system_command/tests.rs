@@ -11,20 +11,24 @@ fn deadline() -> Instant {
 fn actual_native_system_command_holds_original_image_without_an_sdk() {
     const NAME: &str = "program::system_command::tests::actual_native_system_command_holds_original_image_without_an_sdk";
     const ACTOR: &str = "TRUST_SYSTEM_COMMAND_ORIGINAL_ACTOR";
+    const STARTED: &str = "native-system-command-original-started";
     if std::env::var_os(ACTOR).as_deref() != Some(std::ffi::OsStr::new("1")) {
         // Other native-program fixtures deliberately mutate current_exe's
         // parent. Select an actual loaded child in its own stable private root;
         // keep the production directory-identity checks fully strict.
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
-        let executable = root.join("native-system-command-test");
-        std::fs::copy(std::env::current_exe().unwrap(), &executable).unwrap();
+        let source = std::env::current_exe().unwrap();
+        let executable = root.join(source.file_name().unwrap());
+        std::fs::copy(&source, &executable).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let output = std::process::Command::new(&executable)
-            .args(["--exact", NAME, "--nocapture"])
-            .env(ACTOR, "1")
-            .output()
-            .unwrap();
+        let mut retained = aterm_uds::deadline::KeptUntilRan::new(temp.keep());
+        let mut command = aterm_uds::spawnfd::command(&executable);
+        command.args(["--exact", NAME, "--nocapture"]).env(ACTOR, "1");
+        let output = aterm_uds::deadline::output_within(&mut command, Duration::from_secs(60)).unwrap();
+        if String::from_utf8_lossy(&output.stdout).lines().any(|line| line.ends_with(STARTED)) {
+            retained.ran();
+        }
         assert!(output.status.success(), "actual native command actor failed: {output:?}");
         assert!(
             String::from_utf8_lossy(&output.stdout)
@@ -32,6 +36,10 @@ fn actual_native_system_command_holds_original_image_without_an_sdk() {
         );
         return;
     }
+    use std::io::Write as _;
+    println!("{STARTED}");
+    std::io::stdout().flush().unwrap();
+    assert!(aterm_uds::test_binary::is_test_binary(&std::env::current_exe().unwrap()), "native actor must retain Cargo test isolation");
     let original = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
     let held = HeldSystemCommand::open(&original, deadline()).unwrap();
     assert!(held.observation().runtime.is_empty());

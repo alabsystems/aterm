@@ -275,6 +275,25 @@ pub fn contain<R, B: FnOnce() -> R>(method: &str, body: B) -> Result<R, Containe
     })
 }
 
+/// Runs `body`, reporting and aborting if an Objective-C exception escapes.
+///
+/// Fatal callbacks cannot return an inert value, but must retain the original
+/// exception before Rust's unwind catcher can replace it with a foreign-exception abort.
+#[inline]
+pub fn abort_on_exception<R, B: FnOnce() -> R>(method: &str, body: B) -> R {
+    match contain(method, body) {
+        Ok(value) => value,
+        Err(_) =>
+        {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a fatal Objective-C callback cannot resume after an exception; report it before terminating"
+            )]
+            std::process::abort()
+        }
+    }
+}
+
 /// Return type whose all-zero bit pattern is a valid inert value when an exception is contained.
 /// # Safety
 /// All-zero bytes must be a valid initialized value of `Self`.

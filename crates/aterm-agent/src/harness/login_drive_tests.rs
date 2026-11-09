@@ -15,6 +15,100 @@ use std::ffi::OsString;
 use super::*;
 use crate::ai::connector::{CODEX_SIGNIN, GROK_SIGNIN, Hosts, KIMI_SIGNIN};
 
+/// Native wrapper preserves the exact sandbox preflight arguments and runs the real probe.
+#[cfg(target_os = "macos")]
+#[test]
+fn sandbox_preflight_native_child() {
+    let tail: Vec<_> = std::env::args_os()
+        .skip_while(|a| a != "--")
+        .skip(1)
+        .collect();
+    if tail
+        .first()
+        .is_none_or(|a| a != "sandbox-preflight-fixture")
+    {
+        return;
+    }
+    assert_eq!(&tail[3..], no_desk_argv(Path::new(SANDBOX_PROBE), &[]));
+    let root = Path::new(&tail[1]);
+    std::fs::write(root.join("started"), b"native wrapper entered").unwrap();
+    assert!(tail[2] == "pass" || tail[2] == "refuse");
+    if tail[2] == "refuse" {
+        std::process::exit(7);
+    }
+    let status = aterm_uds::spawnfd::command(SANDBOX_EXEC)
+        .args(&tail[3..])
+        .status()
+        .unwrap();
+    std::fs::write(
+        root.join("completed"),
+        status.code().unwrap_or(-1).to_string(),
+    )
+    .unwrap();
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_preflight_fixture(root: &Path, role: &str) -> aterm_uds::spawnfd::Command {
+    let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "harness::login_drive::tests::sandbox_preflight_native_child",
+            "--nocapture",
+            "--",
+            "sandbox-preflight-fixture",
+        ])
+        .arg(root)
+        .arg(role)
+        .args(no_desk_argv(Path::new(SANDBOX_PROBE), &[]))
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    command
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn required_sandbox_preflight_uses_its_original_start() {
+    for age in [21, 61, 0] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mut command = sandbox_preflight_fixture(root.path(), "pass");
+        let result = sandbox_refusal_command(
+            Path::new(SANDBOX_EXEC),
+            &mut command,
+            Instant::now() - Duration::from_secs(age),
+        );
+        if age == 61 {
+            assert!(result.is_some_and(|why| why.contains("deadline expired")));
+            assert!(
+                !root.path().join("started").exists(),
+                "expired preflight must not start any child"
+            );
+        } else {
+            assert_eq!(result, None, "age={age}");
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("completed")).unwrap(),
+                "0"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn required_sandbox_preflight_retains_a_real_native_refusal() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let mut command = sandbox_preflight_fixture(root.path(), "refuse");
+    let result = sandbox_refusal_command(
+        Path::new(SANDBOX_EXEC),
+        &mut command,
+        Instant::now() - Duration::from_secs(21),
+    );
+    assert!(root.path().join("started").is_file());
+    assert!(result.is_some_and(|why| why.contains("exited 7 on a try")));
+}
+
 #[test]
 fn an_injected_clock_without_a_transferable_parent_refuses_native_codex_before_effects() {
     struct NoEffects;

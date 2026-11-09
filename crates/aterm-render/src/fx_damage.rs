@@ -145,26 +145,80 @@ fn mark_layer(dirty: &mut [bool], bands: RowBands, layer: &FxLayer) {
     }
 }
 
-/// The index in `other` of `list[i]`'s counterpart: the k-th layer of its id
-/// in `other`, when `list[i]` is the k-th of that id in `list`.
-#[inline]
-fn counterpart(list: &[FxLayer], i: usize, other: &[FxLayer]) -> Option<usize> {
-    let id = list[i].id;
-    let k = list[..i].iter().filter(|l| l.id == id).count();
-    other
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| l.id == id)
-        .nth(k)
-        .map(|(j, _)| j)
-}
-
 /// Mark what the change from `prev`'s layers to `cur`'s repaints.
 fn mark_layer_changes(dirty: &mut [bool], bands: RowBands, prev: &[FxLayer], cur: &[FxLayer]) {
+    if dirty.is_empty() {
+        return;
+    }
+    if prev.is_empty() || cur.is_empty() {
+        for layer in prev.iter().chain(cur) {
+            mark_layer(dirty, bands, layer);
+        }
+        return;
+    }
+    // Equal id sequences pair at the same positions, including each repeated
+    // id's k-th occurrence. Animation needs no index or reorder search.
+    if prev.len() == cur.len() && prev.iter().zip(cur).all(|(a, b)| a.id == b.id) {
+        for (before, after) in prev.iter().zip(cur) {
+            if before != after {
+                mark_layer(dirty, bands, before);
+                mark_layer(dirty, bands, after);
+            }
+        }
+        return;
+    }
+
+    // Bound direct occurrence searches to a small stack set. Larger lists
+    // build one index instead of repeatedly scanning either frame.
+    const STACK_MATCH_MAX: usize = 8;
+    if prev.len().max(cur.len()) <= STACK_MATCH_MAX {
+        let mut pairs = [None; STACK_MATCH_MAX];
+        for (i, layer) in cur.iter().enumerate() {
+            let k = cur[..i].iter().filter(|other| other.id == layer.id).count();
+            pairs[i] = prev
+                .iter()
+                .enumerate()
+                .filter(|(_, other)| other.id == layer.id)
+                .nth(k)
+                .map(|(j, _)| j);
+        }
+        let pairs = &pairs[..cur.len()];
+        for (j, layer) in prev.iter().enumerate() {
+            if !pairs.contains(&Some(j)) {
+                mark_layer(dirty, bands, layer);
+            }
+        }
+        mark_paired_layer_changes(dirty, bands, prev, cur, pairs);
+        return;
+    }
+
+    thread_local! {
+        // Only integer capacity survives a call, never a layer or its art.
+        // The borrow covers only synchronous index and geometry work.
+        static MATCH_SCRATCH: std::cell::RefCell<LayerMatchScratch> = const {
+            std::cell::RefCell::new(LayerMatchScratch {
+                prev_order: Vec::new(),
+                cur_order: Vec::new(),
+                prev_for_cur: Vec::new(),
+            })
+        };
+    }
+    MATCH_SCRATCH.with_borrow_mut(|scratch| scratch.mark(dirty, bands, prev, cur));
+}
+
+/// Mark additions, paired changes and reorder damage after unmatched prior
+/// layers have been marked. Pairing indices use each frame's emission order.
+fn mark_paired_layer_changes(
+    dirty: &mut [bool],
+    bands: RowBands,
+    prev: &[FxLayer],
+    cur: &[FxLayer],
+    pairs: &[Option<usize>],
+) {
     let mut last_kept: Option<usize> = None;
     let mut reordered = false;
-    for (i, layer) in cur.iter().enumerate() {
-        match counterpart(cur, i, prev) {
+    for (layer, &pair) in cur.iter().zip(pairs) {
+        match pair {
             Some(j) if prev[j] == *layer => {
                 reordered |= last_kept.is_some_and(|k| j < k);
                 last_kept = Some(last_kept.map_or(j, |k| k.max(j)));
@@ -176,17 +230,50 @@ fn mark_layer_changes(dirty: &mut [bool], bands: RowBands, prev: &[FxLayer], cur
             None => mark_layer(dirty, bands, layer),
         }
     }
-    for (j, layer) in prev.iter().enumerate() {
-        if counterpart(prev, j, cur).is_none() {
-            mark_layer(dirty, bands, layer);
-        }
-    }
     if reordered {
-        for (i, layer) in cur.iter().enumerate() {
-            if counterpart(cur, i, prev).is_some_and(|j| prev[j] == *layer) {
+        for (layer, &pair) in cur.iter().zip(pairs) {
+            if pair.is_some_and(|j| prev[j] == *layer) {
                 mark_layer(dirty, bands, layer);
             }
         }
+    }
+}
+
+/// Per-render-thread index storage, rebuilt from the current borrowed frames.
+/// Sorting by both id and original index preserves k-th-occurrence pairing
+/// while allowing an in-place unstable sort.
+struct LayerMatchScratch {
+    prev_order: Vec<usize>,
+    cur_order: Vec<usize>,
+    prev_for_cur: Vec<Option<usize>>,
+}
+
+impl LayerMatchScratch {
+    fn mark(&mut self, dirty: &mut [bool], bands: RowBands, prev: &[FxLayer], cur: &[FxLayer]) {
+        self.prev_order.clear();
+        self.prev_order.extend(0..prev.len());
+        self.prev_order.sort_unstable_by_key(|&i| (prev[i].id, i));
+        self.cur_order.clear();
+        self.cur_order.extend(0..cur.len());
+        self.cur_order.sort_unstable_by_key(|&i| (cur[i].id, i));
+        self.prev_for_cur.clear();
+        self.prev_for_cur.resize(cur.len(), None);
+
+        let mut at = 0;
+        for &i in &self.cur_order {
+            while at < self.prev_order.len() && prev[self.prev_order[at]].id < cur[i].id {
+                mark_layer(dirty, bands, &prev[self.prev_order[at]]);
+                at += 1;
+            }
+            if at < self.prev_order.len() && prev[self.prev_order[at]].id == cur[i].id {
+                self.prev_for_cur[i] = Some(self.prev_order[at]);
+                at += 1;
+            }
+        }
+        for &j in &self.prev_order[at..] {
+            mark_layer(dirty, bands, &prev[j]);
+        }
+        mark_paired_layer_changes(dirty, bands, prev, cur, &self.prev_for_cur);
     }
 }
 
@@ -495,6 +582,101 @@ mod tests {
             vec![4, 5],
             "the k-th of an id pairs with the k-th"
         );
+    }
+
+    #[test]
+    fn large_interleaved_duplicates_pair_insertions_and_removals_by_occurrence() {
+        let prev: Vec<_> = (0..32)
+            .map(|i| layer(i % 8, FxSpace::Window, (i * 10) as i32, 5))
+            .collect();
+        let mut cur = prev.clone();
+        cur.remove(0);
+        for (before, after) in [(&prev, &cur), (&cur, &prev)] {
+            let mut dirty = vec![false; 34];
+            mark_layer_changes(&mut dirty, RowBands::new(0, 10), before, after);
+            assert_eq!(marked(&dirty), vec![0, 8, 16, 24]);
+        }
+    }
+
+    #[test]
+    fn large_population_changes_leave_the_unchanged_survivor_clean() {
+        let many: Vec<_> = (0..32)
+            .map(|i| layer(i, FxSpace::Window, (i * 10) as i32, 5))
+            .collect();
+        let one = vec![many[17].clone()];
+        for (before, after) in [(&many, &one), (&one, &many)] {
+            let mut dirty = vec![false; 34];
+            mark_layer_changes(&mut dirty, RowBands::new(0, 10), before, after);
+            assert_eq!(
+                marked(&dirty),
+                (0..32).filter(|&i| i != 17).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Measure stable animation, reorder, identity churn, appearance and
+    /// disappearance. No timing bound: compare the same matching workloads.
+    #[test]
+    #[ignore = "measurement: run with opt-test and --ignored --exact --nocapture"]
+    fn layer_identity_changes_report_damage_work() {
+        const FRAMES: usize = 10_000;
+        for kind in ["move", "reverse", "replace", "add", "remove"] {
+            for count in [1, 8, 32, 128] {
+                let mut prev: Vec<_> = (0..count)
+                    .map(|i| {
+                        let id = if kind == "move" { i / 2 } else { i };
+                        // Even, opaque ids; the odd counterparts are disjoint.
+                        let id = (id as u64)
+                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                            .wrapping_mul(2);
+                        layer(id, FxSpace::Window, (i * 10) as i32, 5)
+                    })
+                    .collect();
+                let mut cur = prev.clone();
+                match kind {
+                    "move" => cur[count / 2].offset.1 += 10,
+                    "reverse" => cur.reverse(),
+                    "replace" => cur.iter_mut().for_each(|layer| layer.id |= 1),
+                    "add" => prev.clear(),
+                    "remove" => cur.clear(),
+                    _ => unreachable!("closed measurement cases"),
+                }
+                let bands = RowBands::new(0, 10);
+                let mut dirty = vec![false; count + 2];
+                let mut step = |frame: usize| {
+                    let (before, after) = if frame & 1 == 0 {
+                        (&prev, &cur)
+                    } else {
+                        (&cur, &prev)
+                    };
+                    dirty.fill(false);
+                    std::hint::black_box(mark_fx_changes(
+                        std::hint::black_box(&mut dirty),
+                        bands,
+                        (std::hint::black_box(before), &[]),
+                        (std::hint::black_box(after), &[]),
+                    ));
+                    std::hint::black_box(&dirty);
+                };
+                for frame in 0..6 {
+                    step(frame);
+                }
+                let start = std::time::Instant::now();
+                for frame in 0..FRAMES {
+                    step(frame);
+                }
+                let elapsed = start.elapsed();
+                let want: Vec<_> = match kind {
+                    "move" => vec![count / 2, count / 2 + 1],
+                    "reverse" if count == 1 => Vec::new(),
+                    _ => (0..count).collect(),
+                };
+                assert_eq!(marked(&dirty), want, "{kind}, {count} layers");
+                println!(
+                    "layer-id damage: kind={kind} layers={count} frames={FRAMES} elapsed={elapsed:?}"
+                );
+            }
+        }
     }
 
     /// The band of a row is i128's quotient on both sides of where the

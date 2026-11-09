@@ -29,7 +29,7 @@ pub(crate) fn push(
         match write(&tip, &bumped) {
             Ok(crate::ledger::RefWrite::Written) => return Ok(bumped),
             Ok(crate::ledger::RefWrite::Conflict) => {}
-            Err(why) => return Err(Refusal::new(
+            Err(why) | Ok(crate::ledger::RefWrite::Transient(why)) => return Err(Refusal::new(
                 "the native bump write did not establish a successful claim",
                 "inspect the native refusal before rerunning; the journaled local bump is retained",
             )

@@ -44,7 +44,7 @@ impl Machine {
 }
 
 struct Node {
-    stop: Arc<AtomicBool>,
+    stop: Arc<NodeStop>,
     relay_stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<ExitCode>>,
     log: Arc<LocalLog>,
@@ -56,7 +56,7 @@ struct Node {
 impl Node {
     fn start(machine: &Machine, listener: TcpListener) -> Self {
         let relay = crate::test_scratch::short_dir("fresh-enrollment-relay");
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(NodeStop::default());
         let relay_stop = Arc::new(AtomicBool::new(false));
         let log = Arc::new(LocalLog::of(&machine.vault));
         let served = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -110,7 +110,7 @@ impl Node {
     }
 
     fn finish(mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.set();
         self.relay_stop.store(true, Ordering::Release);
         assert_eq!(
             self.worker.take().unwrap().join().unwrap(),
@@ -121,7 +121,7 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+        self.stop.set();
         self.relay_stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();

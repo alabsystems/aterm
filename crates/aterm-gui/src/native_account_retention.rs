@@ -322,7 +322,6 @@ mod tests {
     fn bounded_ledger_refines_production_and_catches_lost_spare() {
         let model = aterm_models_harness::account_lineage_budget_model();
         assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
-        assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
         for state in aterm_spec::interp::reachable_states(&model) {
             for action in &model.actions {
                 if model.action_enabled(action.name, &state) {

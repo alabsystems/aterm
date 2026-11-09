@@ -154,9 +154,10 @@ pub struct CcHost {
     pub sdkroot_override: Option<PathBuf>,
     /// The inherited minimum macOS version for a build, independent of installed tool health.
     pub deployment_target_override: Option<std::ffi::OsString>,
-    /// Inherit project compiler configuration, which cannot retain a cached success because
-    /// it can name mutable inputs. Machine setup clears the environment instead, then applies
-    /// the explicit probe inputs and temporary directory.
+    /// Inherit project compiler configuration and retain the caller's directory for compilation.
+    /// These mutable inputs cannot retain a cached success. Machine setup clears the environment
+    /// and compiles in the private probe directory with its explicit probe inputs and temporary
+    /// directory instead.
     pub inherit_environment: bool,
     /// How long each compiler probe may take: [`PROBE_TIMEOUT`] on this machine.
     pub bound: Duration,
@@ -204,6 +205,17 @@ impl CcHost {
     /// Unread selection or compiler state is not permission to choose a fallback. Relative
     /// link targets resolve beside the selection link, as the filesystem resolves them.
     fn developer_dir(&self) -> Result<PathBuf, String> {
+        let dir = self.selected_developer_dir()?;
+        aterm_types::clt_shim::developer_content_dir(&dir).map_err(|error| {
+            format!(
+                "could not resolve developer directory {}: {error}",
+                dir.display()
+            )
+        })
+    }
+
+    /// The override or system selection before resolving an Xcode application root.
+    fn selected_developer_dir(&self) -> Result<PathBuf, String> {
         if let Some(dir) = self.developer_override() {
             return Ok(dir.to_path_buf());
         }
@@ -679,8 +691,10 @@ fn build_probe(cc: &Path, resolved: PathBuf, path_var: Option<&OsStr>, host: &Cc
     build_probe_in(cc, resolved, path_var, host, scratch.path())
 }
 
-/// Compile inside the caller's fresh private directory; a retry creates its own exclusive
-/// output directory instead of depending on removal of a failed attempt's artifact.
+/// Keep source and output in the caller's fresh private directory; a retry creates its own
+/// exclusive output directory instead of depending on removal of a failed attempt's artifact.
+/// Project probes retain their caller's working directory so relative configuration resolves
+/// as it would in a build. Machine probes run in the private directory.
 fn build_probe_in(
     cc: &Path,
     resolved: PathBuf,
@@ -710,7 +724,10 @@ fn build_probe_in(
     }
     let run_cc = |sdkroot: Option<&Path>, program: &Path| {
         let mut cmd = aterm_uds::spawnfd::command(cc);
-        cmd.arg("-o").arg(program).arg(&source).current_dir(dir);
+        cmd.arg("-o").arg(program).arg(&source);
+        if !host.inherit_environment {
+            cmd.current_dir(dir);
+        }
         host.apply_environment(&mut cmd);
         if let Some(path) = path_var {
             cmd.env("PATH", path);
@@ -721,7 +738,7 @@ fn build_probe_in(
         compiler_output(&mut cmd, cc, host.bound)
     };
     let mut result = run_cc(None, &program);
-    if matches!(&result, Ok(out) if !out.status.success())
+    if matches!(&result, Ok(out) if out.status.code().is_some() && !out.status.success())
         && host.sdkroot().is_none()
         && is_system_shim(cc, host)
     {
@@ -797,10 +814,26 @@ fn build_probe_in(
                 }
             }
         }
-        Ok(out) => CcVerdict::Broken {
-            driver: cc.to_path_buf(),
-            why: first_stderr_line(&out),
-        },
+        Ok(out) => compiler_failure(cc, &out),
+    }
+}
+
+/// A nonzero exit is a compiler refusal; termination without an exit code proves no
+/// toolchain defect (for example, another process may have killed the probe).
+fn compiler_failure(driver: &Path, out: &std::process::Output) -> CcVerdict {
+    if out.status.code().is_none() {
+        CcVerdict::Unproven {
+            driver: driver.to_path_buf(),
+            why: format!(
+                "compiler process ended without an exit code: {}",
+                out.status
+            ),
+        }
+    } else {
+        CcVerdict::Broken {
+            driver: driver.to_path_buf(),
+            why: first_stderr_line(out),
+        }
     }
 }
 
@@ -854,7 +887,8 @@ fn compiler_output(
 }
 
 /// Run the query within `bound`. A successful version query retains `driver`; discovery
-/// requires one absolute native path. A captured nonzero exit is Broken with the first stderr line.
+/// requires one absolute native path. A captured nonzero exit is Broken with the first stderr
+/// line; a process terminated without an exit code leaves tool state unproven.
 fn ask(bin: &Path, driver: &Path, query: CcQuery, host: &CcHost) -> CcVerdict {
     let bound = host.bound;
     let mut cmd = aterm_uds::spawnfd::command(bin);
@@ -904,10 +938,7 @@ fn ask(bin: &Path, driver: &Path, query: CcQuery, host: &CcHost) -> CcVerdict {
                 },
             }
         }
-        Some(out) => CcVerdict::Broken {
-            driver: driver.to_path_buf(),
-            why: first_stderr_line(&out),
-        },
+        Some(out) => compiler_failure(driver, &out),
     }
 }
 
@@ -982,6 +1013,111 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn project_compiler_configuration_keeps_its_callers_directory() {
+        const CHILD: &str = "ATERM_CC_PROJECT_DIRECTORY_CHILD";
+        if let Some(root) = std::env::var_os(CHILD).map(PathBuf::from) {
+            let bin = root.join("bin");
+            let host = CcHost {
+                inherit_environment: true,
+                sdkroot_override: Some("project-sdk".into()),
+                bound: FIRST_COMPILE_BOUND,
+                ..plain_host(&root)
+            };
+            assert_eq!(
+                probe_with(Some(bin.as_os_str()), &host),
+                CcVerdict::Ready {
+                    driver: bin.join("cc")
+                }
+            );
+            let isolated = CcHost {
+                inherit_environment: false,
+                ..host
+            };
+            assert!(matches!(
+                probe_with(Some(bin.as_os_str()), &isolated),
+                CcVerdict::Broken { .. }
+            ));
+            assert!(!root.join("probe.c").exists());
+            assert!(!root.join("probe.out").exists());
+            assert!(leftovers(&root.join("tmp")).is_empty());
+            std::fs::write(root.join("checked"), b"yes").unwrap();
+            return;
+        }
+        let root = scratch("project-directory");
+        let sdk = root.join("project-sdk");
+        std::fs::create_dir_all(&sdk).unwrap();
+        std::fs::write(sdk.join("usable"), b"yes").unwrap();
+        script(
+            &root.join("bin/cc"),
+            "[ \"$1\" = --version ] && exit 0\n[ -f \"$SDKROOT/usable\" ] || { echo 'relative SDK unavailable' >&2; exit 23; }\nprintf x > \"$2\"; /bin/chmod +x \"$2\"",
+        );
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        cmd.args([
+            "--exact",
+            "prereq::tests::project_compiler_configuration_keeps_its_callers_directory",
+            "--nocapture",
+        ])
+        .env(CHILD, root.as_path())
+        .current_dir(root.as_path());
+        let out = aterm_uds::deadline::output_within(&mut cmd, FIRST_COMPILE_BOUND).unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(std::fs::read(root.join("checked")).unwrap(), b"yes");
+    }
+
+    #[test]
+    fn a_signalled_probe_is_unknown_in_discovery_and_compilation() {
+        let root = scratch("signalled-compiler");
+        let host = plain_host(&root);
+        for (name, body, interrupted) in [
+            ("killed", "kill -KILL $$", true),
+            ("refused", "echo refused >&2; exit 23", false),
+        ] {
+            let cc = root.join(name).join("cc");
+            script(&cc, body);
+            for verdict in [
+                ask(&cc, &cc, CcQuery::Version, &host),
+                ask(&cc, &cc, CcQuery::Find, &host),
+                build_probe(&cc, cc.clone(), None, &host),
+            ] {
+                assert_eq!(verdict.blocks_builds(), !interrupted, "{verdict:?}");
+                if interrupted {
+                    assert!(matches!(verdict, CcVerdict::Unproven { .. }), "{verdict:?}");
+                } else {
+                    assert!(matches!(verdict, CcVerdict::Broken { .. }), "{verdict:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_killed_compile_does_not_retry_with_an_sdk() {
+        let root = scratch("killed-compiler-sdk");
+        let bin = root.join("bin");
+        let cc = bin.join("cc");
+        script(&cc, "echo attempt >> \"$0.attempts\"; kill -KILL $$");
+        let developer = root.join("developer");
+        std::fs::create_dir_all(developer.join("SDKs/MacOSX.sdk")).unwrap();
+        let host = CcHost {
+            shim_dir: Some(bin),
+            default_developer_dir: developer,
+            ..plain_host(&root)
+        };
+        assert!(matches!(
+            build_probe(&cc, cc.clone(), None, &host),
+            CcVerdict::Unproven { .. }
+        ));
+        assert_eq!(
+            std::fs::read(cc.with_file_name("cc.attempts")).unwrap(),
+            b"attempt\n"
+        );
     }
 
     /// The bound for a probe whose script must answer: a just-written file's first exec
@@ -2582,6 +2718,56 @@ mod tests {
             probe_cached(path, &host, Some(&cache)),
             CcVerdict::NoDeveloperDir
         );
+    }
+
+    #[test]
+    fn xcode_bundle_overrides_resolve_the_compiler_and_its_sdk() {
+        let root = scratch("bundle-override");
+        let bundle = root.join("Alternate.app");
+        let developer = bundle.join("Contents/Developer");
+        script(&developer.join("usr/bin/clang"), "exit 0");
+        let sdk = developer.join("SDKs/MacOSX.sdk");
+        std::fs::create_dir_all(&sdk).unwrap();
+        std::fs::write(sdk.join("usable"), b"yes").unwrap();
+        let shim = root.join("shim");
+        script(
+            &shim.join("xcrun"),
+            "d=$DEVELOPER_DIR; [ -d \"$d/Contents/Developer\" ] && d=$d/Contents/Developer; printf '%s/usr/bin/clang\\n' \"$d\"",
+        );
+        script(
+            &shim.join("cc"),
+            "[ -f \"$SDKROOT/usable\" ] || exit 23; printf x > \"$2\"; /bin/chmod +x \"$2\"",
+        );
+        let mut host = CcHost {
+            shim_dir: Some(shim.clone()),
+            developer_dir_override: Some(bundle),
+            ..plain_host(&root)
+        };
+        let path = Some(shim.as_os_str());
+        assert_eq!(installed_with(path, &host), Some(true));
+        assert_eq!(
+            probe_with(path, &host),
+            CcVerdict::Ready {
+                driver: developer.join("usr/bin/clang")
+            }
+        );
+        host.developer_dir_override = None;
+        std::os::unix::fs::symlink(
+            developer.parent().unwrap().parent().unwrap(),
+            &host.xcode_select_link,
+        )
+        .unwrap();
+        assert_eq!(installed_with(path, &host), Some(true));
+
+        let unread = root.join("unread-bundle");
+        std::fs::create_dir(&unread).unwrap();
+        std::os::unix::fs::symlink("Contents", unread.join("Contents")).unwrap();
+        host.developer_dir_override = Some(unread);
+        assert_eq!(installed_with(path, &host), None);
+        assert!(matches!(
+            probe_with(path, &host),
+            CcVerdict::Unproven { .. }
+        ));
     }
 
     #[test]

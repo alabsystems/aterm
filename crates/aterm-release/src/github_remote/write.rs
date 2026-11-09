@@ -12,6 +12,9 @@ use agh::policy::{RouteRequest, RouteTarget};
 pub enum RefWrite {
     Written,
     Conflict,
+    /// A transport/receive failure with no observed ref effects. The caller
+    /// must re-read its exact preconditions before repeating the transaction.
+    Transient(String),
 }
 
 impl Remote {
@@ -45,7 +48,12 @@ impl Remote {
                 STALL_WINDOW,
             )
             .and_then(agh::write::Outcome::into_result);
-        self.ref_result(result)
+        match result {
+            Err(error) if is_transient(&error) => {
+                Ok(RefWrite::Transient(self.native_write_error(&error)))
+            }
+            result => self.ref_result(result),
+        }
     }
 
     /// Publish one exact local object with the caller's expected old ref.
@@ -114,7 +122,10 @@ impl Remote {
     fn ref_result<T>(&self, result: agh::Result<T>) -> Result<RefWrite, String> {
         match result {
             Ok(_) => Ok(RefWrite::Written),
-            Err(error) if is_conflict(&error) => Ok(RefWrite::Conflict),
+            Err(error) if is_conflict(&error) => {
+                eprintln!("{}", self.native_write_error(&error));
+                Ok(RefWrite::Conflict)
+            }
             Err(error) => Err(self.native_write_error(&error)),
         }
     }
@@ -132,6 +143,10 @@ impl Remote {
 
 fn is_conflict(error: &agh::Error) -> bool {
     error.side_effect == agh::error::SideEffect::None && error.kind == agh::error::Kind::Conflict
+}
+
+fn is_transient(error: &agh::Error) -> bool {
+    error.kind == agh::error::Kind::CouldNotRun && error.side_effect == agh::error::SideEffect::None
 }
 
 /// A scratch-only writer route for actual native local-bare claim controls.
@@ -261,6 +276,18 @@ mod tests {
             agh::Error::new(Kind::Refused, "cannot lock ref 'refs/heads/main'"),
         ] {
             assert!(!is_conflict(&error));
+        }
+    }
+
+    #[test]
+    fn only_a_settled_transport_failure_is_retryable() {
+        assert!(is_transient(&agh::Error::could_not_run("HTTP 503")));
+        for error in [
+            agh::Error::could_not_run("HTTP 503").with_side_effect(SideEffect::Unknown),
+            agh::Error::new(Kind::Conflict, "stale info"),
+            agh::Error::refused("protected"),
+        ] {
+            assert!(!is_transient(&error));
         }
     }
 }

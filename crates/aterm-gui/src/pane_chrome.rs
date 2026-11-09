@@ -984,7 +984,7 @@ impl App {
             .facts
             .iter()
             .find_map(|f| {
-                if f.alt || f.history == 0 || self.visible_session_rect(wid, f.session).is_none() {
+                if f.alt || f.history == 0 || !self.active_tab_shows_session(wid, f.session) {
                     return None;
                 }
                 let lane = scrollbar::lane(
@@ -1111,7 +1111,7 @@ impl App {
             f.session == drag.session
                 && !f.alt
                 && f.history > 0
-                && self.visible_session_rect(wid, f.session).is_some()
+                && self.active_tab_shows_session(wid, f.session)
         }) else {
             return;
         };

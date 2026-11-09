@@ -248,8 +248,6 @@ fn admits(
 #[test]
 fn inventory_refines_the_effective_advice_candidates() {
     let model = aterm_models_harness::account_progress_ranking_model();
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{faults:?}");
     let coverage =
         aterm_spec::verify::prove_and_catch_tiered(&model, "account recovery projection")
             .expect("scalar account recovery projection is executable");

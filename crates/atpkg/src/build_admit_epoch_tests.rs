@@ -85,7 +85,7 @@ fn identity(held: &Held) -> (u64, u64, Vec<u8>) {
 fn epoch_refusal_returns_original_inputs_without_arming_then_keeps_accepted_no_child_custody() {
     let _turn = crate::platform::FORWARDING_TURN.lock().unwrap();
     let world = aterm_tempfile::tempdir().unwrap();
-    let machine = Fixed::new(Reading::of_gib(256, 200, 128));
+    let machine = Fixed::new(concurrent_reading(256, 200, 128));
     let mut seat = cohort_seat(world.path(), &machine);
     seat.own = None;
     let pool = pool(world.path());
@@ -178,7 +178,7 @@ fn full_epoch_table_refuses_before_arm_and_unrelated_root_still_completes() {
     use std::os::unix::fs::DirBuilderExt as _;
     let _turn = crate::platform::FORWARDING_TURN.lock().unwrap();
     let world = aterm_tempfile::tempdir().unwrap();
-    let machine = Fixed::new(Reading::of_gib(256, 200, 128));
+    let machine = Fixed::new(concurrent_reading(256, 200, 128));
     let mut seat = cohort_seat(world.path(), &machine);
     seat.own = None;
     let pool = pool(world.path());
@@ -255,7 +255,7 @@ fn full_epoch_table_refuses_before_arm_and_unrelated_root_still_completes() {
 fn original_no_child_receipt_survives_real_journal_lock_failure_and_recovers_automatically() {
     let _turn = crate::platform::FORWARDING_TURN.lock().unwrap();
     let world = aterm_tempfile::tempdir().unwrap();
-    let machine = Fixed::new(Reading::of_gib(256, 200, 128));
+    let machine = Fixed::new(concurrent_reading(256, 200, 128));
     let mut seat = cohort_seat(world.path(), &machine);
     seat.own = None;
     let pool = pool(world.path());
@@ -331,7 +331,7 @@ fn original_no_child_cleanup_retries_and_settled_history_never_blocks_new_epochs
     use std::os::unix::fs::DirBuilderExt as _;
     let _turn = crate::platform::FORWARDING_TURN.lock().unwrap();
     let world = aterm_tempfile::tempdir().unwrap();
-    let machine = Fixed::new(Reading::of_gib(256, 200, 128));
+    let machine = Fixed::new(concurrent_reading(256, 200, 128));
     let mut seat = cohort_seat(world.path(), &machine);
     seat.own = None;
     let pool = pool(world.path());
@@ -386,7 +386,7 @@ fn original_no_child_cleanup_retries_and_settled_history_never_blocks_new_epochs
 fn revoked_leadership_keeps_original_debt_without_perpetual_immediate_waits() {
     let _turn = crate::platform::FORWARDING_TURN.lock().unwrap();
     let world = aterm_tempfile::tempdir().unwrap();
-    let machine = Fixed::new(Reading::of_gib(256, 200, 128));
+    let machine = Fixed::new(concurrent_reading(256, 200, 128));
     let mut seat = cohort_seat(world.path(), &machine);
     seat.own = None;
     let namespace = namespace(&seat);

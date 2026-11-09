@@ -2367,10 +2367,10 @@ fn removed_labels_overlay_and_local_label_resolution_enforce_node_and_recipient_
 /// F21's split (the design's tests 4 to 6): m22 = A (the admin), m7 = Y, m40 = R, m42 and m44
 /// other members, and m41 = X, whom m22 lets in on side 1 during the split; with `w`, also m43 =
 /// W, whom m7 lets in on side 2 and who puts `w-entry` under m40's epoch.
-pub(super) struct KeyedSplit {
-    pub(super) macs: TwoMacs,
+pub(crate) struct KeyedSplit {
+    pub(crate) macs: TwoMacs,
     pub(super) m40: Paths,
-    pub(super) m41: Paths,
+    pub(crate) m41: Paths,
     pub(super) m43: Option<Paths>,
     pub(super) rec40: Recipient,
     pub(super) rec44: Recipient,
@@ -2387,7 +2387,7 @@ pub(super) struct KeyedSplit {
 /// `[everyone]` epoch it holds. A removal concurrent with its signer's own still holds (F16), so
 /// m22 removes m42 too: after the heal no newest epoch is wrapped to a removed Mac, F16's
 /// coverage rule has nothing to do, and only F21's reseal is due.
-pub(super) fn keyed_split(w: bool) -> KeyedSplit {
+pub(crate) fn keyed_split(w: bool) -> KeyedSplit {
     let macs = two_macs(&[
         (Audience::Everyone, "shared", b"v1".as_slice()),
         (Audience::Everyone, "other", b"o1".as_slice()),
@@ -2441,7 +2441,7 @@ impl KeyedSplit {
     }
 
     /// The heal: every Mac takes every other's records.
-    pub(super) fn heal(&self) {
+    pub(crate) fn heal(&self) {
         let wires: Vec<Vec<u8>> = self
             .all()
             .into_iter()

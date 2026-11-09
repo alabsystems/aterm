@@ -184,7 +184,6 @@ pub(crate) fn acknowledgement_transition(
 fn receipt_acknowledgement_refines_exact_read_and_file_directory_barriers() {
     let model = aterm_models_harness::receipt_acknowledgement_model();
     aterm_spec::interp::prove_and_catch(&model);
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

@@ -95,9 +95,9 @@ pub use control_recovery::{
 };
 pub use enrollment::{admin_cached, admin_cached_until};
 pub use entry::{
-    EntryObservation, EntrySnapshot, EntryVersion, PublicRosterPair, PublicRosterRead,
-    VerifiedEntry, current_public_roster, observe_verified_entry, read_account_bound_entry,
-    read_verified_entry,
+    EntryAdmission, EntryClaim, EntryClaimRelation, EntryObservation, EntryOrigin, EntrySnapshot,
+    EntryVersion, MAX_ENTRY_CLAIM_BYTES, PublicRosterPair, PublicRosterRead, VerifiedEntry,
+    current_public_roster, observe_verified_entry, read_account_bound_entry, read_verified_entry,
 };
 #[path = "client/mailbox_index.rs"]
 mod mailbox_index;
@@ -199,6 +199,8 @@ pub use seat_ask::{
     Seat, accepts_seat, dropped, dropped_words, out_since, out_words, seat, seat_asks, take_seat,
 };
 pub(crate) use steward::local_recipient_denial_held;
+#[cfg(any(test, debug_assertions))]
+pub use steward::test_alab_standing;
 pub(crate) use steward::{AlabRoleContext, AlabRoleObservation, observe_alab_role};
 pub use steward::{
     StewardLease, StewardRevoke, StewardStandbyServer, Stewardship,
@@ -210,8 +212,8 @@ pub use steward::{
 pub use subscriber::mend_subscriber;
 pub use vault_memo::{
     DeskInputs, VaultLook, acknowledged_commons_log_now, desk_inputs,
-    local_swarm_roster_for_log_now, swarm_denial_snapshot_now, swarm_denied_nodes_now,
-    swarm_roster_now_until, trusted_commons_log_now,
+    local_swarm_roster_for_log_now, records_now, swarm_denial_snapshot_now, swarm_denied_nodes_now,
+    swarm_member_heard_now, swarm_roster_now_until, trusted_commons_log_now,
 };
 pub(crate) use vault_memo::{
     local_recipient_denied_under, observe_commons_now, observe_commons_quiet,
@@ -1285,10 +1287,12 @@ impl StateLock {
     /// have renamed one of this user's files to the lock's name). Any other lock is left exactly
     /// as it is, for the observation to refuse as before. `true` when it narrowed one.
     ///
-    /// Only the deny list's and roster's reads call this ([`swarm_denied_nodes`],
-    /// [`swarm_roster_until`] and the deny memo): a listener that cannot read its deny list refuses every
-    /// peer until it can, so a lock an upgrade found wide must not wait for the next vault sync.
-    /// Every other observation reads without repairing anything.
+    /// Called before an observation of the lock by the deny list's and roster's reads
+    /// ([`swarm_denied_nodes`], [`swarm_roster_until`] and the memos), this Mac's own denial
+    /// check, and the membership log's observations for a roster, a signer, a draft and a pass's
+    /// look, among others: a listener that cannot read its deny list refuses every peer until it
+    /// can, so a lock an upgrade found wide must not wait for the next vault sync. An observation
+    /// that does not call this repairs nothing.
     ///
     /// # Errors
     /// The lock is this user's to narrow and the `fchmod` fails.

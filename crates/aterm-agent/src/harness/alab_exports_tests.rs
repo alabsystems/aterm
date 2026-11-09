@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::harness::alab_roster::Placements;
+use crate::harness::alab_roster::test_machine;
 
 fn email(local: &str) -> String {
     format!("{local}@example.test")
@@ -24,7 +25,7 @@ fn account(local: &str, cli: Cli, label: &str, preferred: &[(&str, Option<u64>)]
         joinable: true,
         preferred: preferred
             .iter()
-            .map(|(machine, rank)| ((*machine).to_owned(), *rank))
+            .map(|(machine, rank)| (test_machine(machine), *rank))
             .collect(),
     }
 }
@@ -71,7 +72,7 @@ fn lab() -> Lab {
     );
     by_account.insert(bob.pk.clone(), vec![("m3".to_owned(), "fill".to_owned())]);
     Lab {
-        me: Some("m3".into()),
+        me: Some(test_machine("m3")),
         settled: true,
         accounts: vec![ann, bob, cy, dee],
         aliases: BTreeMap::new(),

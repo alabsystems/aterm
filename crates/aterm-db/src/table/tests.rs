@@ -178,6 +178,18 @@ fn causal() -> Causal<'static> {
 
 #[test]
 fn one_or_two_existing_members_read_signed_ciphertext_without_plaintext_keys() {
+    fn open_now(bootstrap: &Bootstrap) -> Result<Session<'_>> {
+        // An expired journal wait still attempts the kernel lock once. Keep
+        // subsequent session admission on its ordinary budget.
+        let journal = Journal::open_existing_until(
+            bootstrap.journal_dir(),
+            bootstrap.trust(),
+            std::time::Instant::now(),
+        )
+        .map_err(failure)?;
+        Session::from_admitted_journal(bootstrap, journal)
+    }
+
     for count in [1, 2] {
         let lab = Lab::new(&vec![Role::Writer; count]);
         let a = lab.bootstrap(0);
@@ -198,14 +210,14 @@ fn one_or_two_existing_members_read_signed_ciphertext_without_plaintext_keys() {
             wire, other_wire,
             "a restored sequence cannot reuse the record subkey"
         );
-        assert!(
-            Session::open(&a).is_err(),
-            "control observation is locked during the local batch"
-        );
+        let blocked = open_now(&a)
+            .err()
+            .expect("control observation is locked during the local batch");
+        assert!(blocked.is_busy(), "unexpected lock refusal: {blocked}");
         drop(session);
         for n in 0..count {
             let bootstrap = lab.bootstrap(n);
-            let session = Session::open(&bootstrap).unwrap();
+            let session = open_now(&bootstrap).unwrap();
             let record = session.authenticate(scope, &wire).unwrap();
             assert_eq!(record.payload(), b"private-account-metadata");
             assert_eq!(record.authored_ms(), u64::MAX);
@@ -976,6 +988,7 @@ fn a_vault_writer_at_a_session_open_is_busy_not_unready_membership() {
         journal,
         None,
         Some(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+        None,
     )
     .err()
     .expect("a held state lock opens no session");

@@ -21,8 +21,17 @@ use crate::native_settings::SettingsRoute;
 use crate::{App, WindowId};
 
 fn claude_pane(cols: u16) -> (App, WindowId, u64, UnixStream, Hosted) {
+    claude_pane_at(cols, 1.0)
+}
+
+/// [`claude_pane`] on a window put at display `scale` before its first frame
+/// ([`crate::scripted_redraw_fixture::at_scale`]), as a headless `--scale` launch lays it out.
+fn claude_pane_at(cols: u16, scale: f64) -> (App, WindowId, u64, UnixStream, Hosted) {
     let (mut app, wid, session, reader) = app();
     assert!(app.apply_term_resize(wid, 24, cols));
+    if scale != 1.0 {
+        crate::scripted_redraw_fixture::at_scale(&mut app, wid, scale);
+    }
     let hosted = host(&mut app);
     publish_facts(&app, session);
     set_program(&app, session, Some("claude"));
@@ -2117,11 +2126,19 @@ fn lines_b_d_and_e_ignore_the_system_accent() {
 
 /// THE SWITCH AS A PERSON SEES IT: each face (lit, off, turning on, turning off, lit under the
 /// pointer, and lit and off under High Contrast) on the default dark ground and on Default Light's
-/// paper, rendered by the capture route `aterm ctl image` takes, written whole and as the switch's
-/// row round it, twice its size.
+/// paper, rendered by the capture route `aterm ctl image` takes, at 1x and again on a window of its
+/// own put at 2x before its first frame (a render at twice the device px, held to one by
+/// [`crate::scripted_redraw_fixture::drawn_at_2x`]), written to `ATERM_SWITCH_GALLERY`: each
+/// frame whole (`{look}-{state}.png`, `{look}-{state}-2x.png`), the 2x frame's switch row round
+/// the switch (`{look}-{state}-switch-2x.png`), and what the check read of each 2x frame
+/// (`2x.tsv`). Its first state's fakes of a 2x frame are refused (`CONTROL`,
+/// [`crate::scripted_redraw_fixture::refuse_fakes`]).
 #[test]
 fn harness_switch_gallery() {
-    let (dir, _gallery) = crate::scripted_redraw_fixture::gallery_directory("ATERM_SWITCH_GALLERY");
+    use crate::scripted_redraw_fixture as fixture;
+    let (dir, _gallery) = fixture::gallery_directory("ATERM_SWITCH_GALLERY");
+    let mut first = true;
+    let mut readings = format!("{}\n", fixture::At2x::HEAD);
     let scheme = |name: &str| {
         crate::chrome_band::hc_fixtures::STOCK
             .iter()
@@ -2147,72 +2164,87 @@ fn harness_switch_gallery() {
             } else {
                 None
             });
-            let (mut app, wid, session, _reader, _host) = claude_pane(110);
-            if let Some(selector) = theme {
-                app.set_session_theme(
-                    session,
-                    Some(crate::session_theme::SessionTheme {
-                        selector: selector.into(),
-                        origin: crate::session_theme::SessionThemeOrigin::Ctl,
-                    }),
-                );
-            }
-            if matches!(state, "off" | "turning-on" | "off-hc") {
-                policy(&mut app, MASTER_OFF);
-            }
-            let turning = match state {
-                "turning-on" => Some(true),
-                "turning-off" => Some(false),
-                _ => None,
-            };
-            if let Some(on) = turning {
-                app.windows
-                    .get_mut(&wid)
-                    .expect("window")
-                    .claude_lights
-                    .sessions
-                    .entry(session)
-                    .or_default()
-                    .switch_turning = Some((on, Instant::now() + Duration::from_secs(60)));
-            }
-            draw_claude(&app, session, BYPASS);
-            frame(&mut app, wid);
-            let b = switch(&app, wid).expect("the switch");
-            if state == "on-hover" {
-                let (x, y) = px_of(&app, wid, (b.frame_row, b.cols.start + b.cols.len() / 2));
-                app.on_cursor_moved(wid, x, y);
+            let mut drawn = Vec::new();
+            for (scale, file) in [
+                (1.0, format!("{look}-{state}.png")),
+                (2.0, format!("{look}-{state}-2x.png")),
+            ] {
+                let (mut app, wid, session, _reader, _host) = claude_pane_at(110, scale);
+                if let Some(selector) = theme {
+                    app.set_session_theme(
+                        session,
+                        Some(crate::session_theme::SessionTheme {
+                            selector: selector.into(),
+                            origin: crate::session_theme::SessionThemeOrigin::Ctl,
+                        }),
+                    );
+                }
+                if matches!(state, "off" | "turning-on" | "off-hc") {
+                    policy(&mut app, MASTER_OFF);
+                }
+                let turning = match state {
+                    "turning-on" => Some(true),
+                    "turning-off" => Some(false),
+                    _ => None,
+                };
+                if let Some(on) = turning {
+                    app.windows
+                        .get_mut(&wid)
+                        .expect("window")
+                        .claude_lights
+                        .sessions
+                        .entry(session)
+                        .or_default()
+                        .switch_turning = Some((on, Instant::now() + Duration::from_secs(60)));
+                }
+                draw_claude(&app, session, BYPASS);
                 frame(&mut app, wid);
+                let b = switch(&app, wid).expect("the switch");
+                if state == "on-hover" {
+                    let (x, y) = px_of(&app, wid, (b.frame_row, b.cols.start + b.cols.len() / 2));
+                    app.on_cursor_moved(wid, x, y);
+                    frame(&mut app, wid);
+                }
+                let b = switch(&app, wid).expect("the switch");
+                let (w, h, rgba) = rendered(&mut app, wid);
+                let whole = crate::app_introspect::encode_rgba8_png(
+                    &rgba,
+                    u32::try_from(w).expect("a width"),
+                    u32::try_from(h).expect("a height"),
+                )
+                .expect("the frame encodes");
+                std::fs::write(dir.join(file), whole).expect("the PNG");
+                let cut = (
+                    app.win_cell_size(wid),
+                    app.win_pad(wid),
+                    app.win_pad_top(wid) + app.win_head(wid),
+                );
+                drawn.push((b, cut, fixture::Drawn::of(&mut app, wid, (w, h, rgba))));
             }
-            let b = switch(&app, wid).expect("the switch");
-            let (w, h, rgba) = rendered(&mut app, wid);
-            let whole = crate::app_introspect::encode_rgba8_png(
-                &rgba,
-                u32::try_from(w).expect("a width"),
-                u32::try_from(h).expect("a height"),
-            )
-            .expect("the frame encodes");
-            std::fs::write(dir.join(format!("{look}-{state}.png")), whole).expect("the PNG");
-            let (cw, ch) = app.win_cell_size(wid);
-            let left = app.win_pad(wid);
-            let top = app.win_pad_top(wid) + app.win_head(wid);
-            let first = b.cols.start.saturating_sub(3);
-            let last = b.label.as_ref().map_or(b.cols.end, |l| l.end) + 3;
-            let x0 = left + first * cw;
-            let x1 = (left + last * cw).min(w);
+            let [(b1, _, one), (b, ((cw, ch), left, top), two)] = &drawn[..] else {
+                unreachable!("a frame at 1x and at 2x")
+            };
+            assert_eq!(b1, b, "{look} {state}: the switch keeps its cells at 2x");
+            if first {
+                first = false;
+                fixture::refuse_fakes(one, two);
+            }
+            let read = fixture::drawn_at_2x(one, two).unwrap_or_else(|why| {
+                panic!("{look} {state}: the 2x frame is no 2x render: {why}")
+            });
+            readings.push_str(&read.row(&format!("{look}-{state}")));
+            readings.push('\n');
+            let (w, h) = two.size;
+            let first_col = b.cols.start.saturating_sub(3);
+            let last_col = b.label.as_ref().map_or(b.cols.end, |l| l.end) + 3;
+            let x0 = left + first_col * cw;
+            let x1 = (left + last_col * cw).min(w);
             let y0 = (top + b.frame_row * ch).saturating_sub(ch / 2);
             let y1 = (top + (b.frame_row + 1) * ch + ch / 2).min(h);
-            let (cw2, ch2) = (2 * (x1 - x0), 2 * (y1 - y0));
-            let mut crop = Vec::with_capacity(cw2 * ch2 * 4);
-            for y in 0..ch2 {
-                for x in 0..cw2 {
-                    let at = ((y0 + y / 2) * w + x0 + x / 2) * 4;
-                    crop.extend_from_slice(&rgba[at..at + 4]);
-                }
-            }
             let png = crate::app_introspect::encode_rgba8_png(
-                &crop,
-                u32::try_from(cw2).expect("a width"),
-                u32::try_from(ch2).expect("a height"),
+                &two.crop((x0, x1), (y0, y1)),
+                u32::try_from(x1 - x0).expect("a width"),
+                u32::try_from(y1 - y0).expect("a height"),
             )
             .expect("the crop encodes");
             std::fs::write(dir.join(format!("{look}-{state}-switch-2x.png")), png)
@@ -2220,6 +2252,7 @@ fn harness_switch_gallery() {
         }
     }
     crate::chrome_band::install_forced_chrome(before);
+    std::fs::write(dir.join("2x.tsv"), readings).expect("the readings");
 }
 
 #[test]

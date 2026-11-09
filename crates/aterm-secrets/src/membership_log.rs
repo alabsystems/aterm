@@ -1384,6 +1384,25 @@ pub enum Inserted {
     Waiting,
 }
 
+/// Held records of one [`Log`] ([`Log::past_of`]): a set over its order, each record asked of by
+/// one look in its index and one bit test ([`Past::holds`]).
+pub struct Past<'a> {
+    held: &'a BTreeMap<RecordId, usize>,
+    set: Vec<u64>,
+}
+
+impl Past<'_> {
+    /// Whether `id` names a record the log holds and this set holds.
+    #[must_use]
+    pub fn holds(&self, id: &RecordId) -> bool {
+        self.held.get(id).is_some_and(|&at| {
+            self.set
+                .get(at / 64)
+                .is_some_and(|word| (word >> (at % 64)) & 1 == 1)
+        })
+    }
+}
+
 /// The records one Mac holds of one network, each after all its parents.
 ///
 /// The log only grows. A record whose parents have not all arrived waits beside it and lands
@@ -2093,6 +2112,17 @@ impl Log {
                 r.clone()
             })
             .collect()
+    }
+
+    /// The held records [`Log::ancestor_closure`] of `ids` gives (each held one of `ids` and every
+    /// record in its causal past), as a set read by [`Past::holds`] rather than a copy of each
+    /// record. Empty where none of `ids` is held.
+    #[must_use]
+    pub fn past_of(&self, ids: &[RecordId]) -> Past<'_> {
+        Past {
+            held: &self.held,
+            set: self.reach.closure(self.indexes(ids)),
+        }
     }
 
     /// Founding [`Body::Genesis`] or effective [`Body::Admit`] [`RecordId`] that grants `binding`

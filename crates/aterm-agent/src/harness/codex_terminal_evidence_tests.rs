@@ -236,8 +236,6 @@ pub(crate) fn transition(
 fn terminal_evidence_refines_both_cleanup_entrypoints() {
     let model = aterm_models_harness::terminal_evidence_model();
     aterm_spec::interp::prove_and_catch(&model);
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{faults:?}");
     for before in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &before) {

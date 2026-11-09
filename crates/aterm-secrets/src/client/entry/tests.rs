@@ -3,14 +3,14 @@
 
 use super::*;
 
-struct Fixture {
-    _root: aterm_tempfile::TempDir,
-    paths: Paths,
+pub(super) struct Fixture {
+    pub(super) _root: aterm_tempfile::TempDir,
+    pub(super) paths: Paths,
     source: PathBuf,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let root = aterm_tempfile::tempdir().unwrap();
         let paths = Paths::for_home(&root.path().join("admin"));
         let source = root.path().join("test.vault");
@@ -34,14 +34,14 @@ impl Fixture {
         f
     }
 
-    fn publish(&self, change: impl FnOnce(&mut Document)) {
+    pub(super) fn publish(&self, change: impl FnOnce(&mut Document)) {
         let admin = admin_open(&self.paths).unwrap();
         let mut doc = admin.doc.clone();
         change(&mut doc);
         admin_publish(&self.paths, &admin, &doc).unwrap();
     }
 
-    fn read_token(&self) -> Option<VerifiedEntry> {
+    pub(super) fn read_token(&self) -> Option<VerifiedEntry> {
         read_verified_entry(&self.paths, &config(&self.paths).unwrap().unwrap(), "token").unwrap()
     }
 
@@ -58,7 +58,7 @@ impl Fixture {
         ]
     }
 
-    fn bytes(&self) -> Vec<Option<Vec<u8>>> {
+    pub(super) fn bytes(&self) -> Vec<Option<Vec<u8>>> {
         self.tracked()
             .iter()
             .map(|p| std::fs::read(p).ok())

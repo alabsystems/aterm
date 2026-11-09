@@ -1204,6 +1204,14 @@ fn pending_crash_and_contention_reuse_one_candidate_without_old_actor_reuse() {
     assert!(import(&mut pending).is_err());
     assert!(selected(&lab.paths[0]).is_err());
     let lock = PrivateLock::take(&root(&lab.paths[0]), "lock", Duration::ZERO, "busy").unwrap();
+    let before = files(&root(&lab.paths[0]));
+    let error = advance(&lab.paths[0], &lab.paths[0].home.join("config.toml"))
+        .expect_err("the original recovery still owns succession");
+    assert!(
+        error.is_busy(),
+        "local succession contention must use the ordinary retry path: {error}"
+    );
+    assert_eq!(files(&root(&lab.paths[0])), before);
     assert!(PrivateLock::take(&root(&lab.paths[0]), "lock", Duration::ZERO, "busy").is_err());
     drop(lock);
     assert_eq!(
@@ -1213,6 +1221,27 @@ fn pending_crash_and_contention_reuse_one_candidate_without_old_actor_reuse() {
     assert!(
         !next.home.join(".aterm").exists(),
         "no original-home credential mutation"
+    );
+}
+
+#[test]
+fn malformed_succession_lock_is_not_temporary_contention() {
+    let lab = Lab::new(&[Role::Writer]);
+    data(&lab);
+    changed_device(&lab);
+    let selection = reserved(&lab);
+    std::fs::create_dir(root(&lab.paths[0]).join("lock")).unwrap();
+    let before = files(&root(&lab.paths[0]));
+    let error = advance(&lab.paths[0], &lab.paths[0].home.join("config.toml"))
+        .expect_err("a directory cannot stand in for the succession lock");
+    assert!(
+        !error.is_busy(),
+        "damaged local custody must not be reported as a normal retry"
+    );
+    assert_eq!(files(&root(&lab.paths[0])), before);
+    assert_eq!(
+        Selection::read(&lab.paths[0]).unwrap().unwrap().bytes(),
+        selection.bytes()
     );
 }
 

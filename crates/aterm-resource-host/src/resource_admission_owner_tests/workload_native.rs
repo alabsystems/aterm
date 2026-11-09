@@ -112,11 +112,6 @@ fn actual_original_workload_root_and_phases_keep_all_resources_until_retirement(
 }
 #[test]
 #[cfg(target_arch = "aarch64")]
-fn actual_contained_member_uses_native_retirement_and_original_phase() {
-    run_case("contained");
-}
-#[test]
-#[cfg(target_arch = "aarch64")]
 fn actual_complete_contained_population_retains_owners_with_original_fd_limit() {
     run_case("contained-full-population");
 }
@@ -243,9 +238,15 @@ fn host_process() {
         } else {
             1
         },
-        // This stand-in's phase budget fits WITHIN its original whole-attempt
-        // minute, including actual admission/preparation before target GO.
-        timeout_ns: Duration::from_secs(5).as_nanos() as u64,
+        // Full-population native actions use the one-minute hang detector within
+        // their ten-minute attempt. Single-pass phases retain room for admission
+        // and preparation inside their original whole-attempt minute.
+        timeout_ns: if case == "contained-full-population" {
+            HANG
+        } else {
+            Duration::from_secs(5)
+        }
+        .as_nanos() as u64,
     };
     let bytes = invocation.encode().unwrap();
     let (root_input, mut continuation) = std::io::pipe().unwrap();
@@ -471,7 +472,7 @@ fn host_process() {
         ),
         atpkg::lease::Holders::Free
     ));
-    if case.starts_with("contained") {
+    if case == "contained-full-population" {
         println!("contained host soft={original_fd_limit} peak={peak_descriptors}");
         print!(
             "{}",
@@ -715,13 +716,9 @@ fn root() -> i32 {
             ..
         }
     ));
-    let action_count: u8 = if case == "contained-full-population" {
-        68
-    } else {
-        3
-    };
+    let action_count: u8 = 68;
     #[cfg(target_arch = "aarch64")]
-    let _contained = case.starts_with("contained").then(|| {
+    let _contained = (case == "contained-full-population").then(|| {
         contained::run(
             &client,
             &mut control,
@@ -791,7 +788,7 @@ fn root() -> i32 {
     assert!(matches!(drained.decision, host::phase::Decision::Drained));
     let mut census = control.census_snapshot([36; 16], deadline).unwrap();
     let observed = census.next_page(deadline).unwrap().unwrap();
-    if case.starts_with("contained") {
+    if case == "contained-full-population" {
         assert_eq!(
             observed.len(),
             usize::from(action_count),

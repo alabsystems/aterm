@@ -1342,14 +1342,8 @@ pub const NO_DESK: &str = concat!(
 /// The program a sandbox is tried on before a sign-in runs under it ([`sandbox_refusal`]).
 const SANDBOX_PROBE: &str = "/usr/bin/true";
 
-/// How long that try may take.
-#[cfg(not(test))]
-const SANDBOX_PROBE_WAIT: Duration = Duration::from_secs(20);
-/// How long that try may take: the unit tests try the real `sandbox-exec`, which runs
-/// `/usr/bin/true` and exits, so a try a loaded machine holds is waited for by the hang detector,
-/// not read as a refusal.
-#[cfg(test)]
-const SANDBOX_PROBE_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// Hang detector for the required sandbox preflight, including its preparation.
+const SANDBOX_PROBE_WAIT: Duration = Duration::from_secs(60);
 
 /// Why `sandbox` cannot run a child under [`NO_DESK`] here: it is tried on [`SANDBOX_PROBE`],
 /// and anything but its exit 0 within [`SANDBOX_PROBE_WAIT`] is a refusal. `sandbox-exec` exits
@@ -1357,22 +1351,33 @@ const SANDBOX_PROBE_WAIT: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// macOS does not let it nest.
 #[must_use]
 pub fn sandbox_refusal(sandbox: &Path) -> Option<String> {
+    let started = Instant::now();
     use aterm_uds::spawnfd::Stdio;
     let mut cmd = aterm_uds::spawnfd::command(sandbox);
     cmd.args(no_desk_argv(Path::new(SANDBOX_PROBE), &[]))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    sandbox_refusal_command(sandbox, &mut cmd, started)
+}
+
+/// Run the prepared preflight under its original start. Explicitly expired work never starts.
+fn sandbox_refusal_command(
+    sandbox: &Path,
+    cmd: &mut aterm_uds::spawnfd::Command,
+    started: Instant,
+) -> Option<String> {
+    let remaining = SANDBOX_PROBE_WAIT.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Some(format!("{} preflight deadline expired", sandbox.display()));
+    }
+    let until = started.checked_add(SANDBOX_PROBE_WAIT).unwrap_or(started);
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = match cmd.spawn() {
         Ok(child) => ProviderOwner(child),
         Err(e) => return Some(format!("{} did not start ({e})", sandbox.display())),
     };
-    let now = Instant::now();
-    let until = now
-        .checked_add(SANDBOX_PROBE_WAIT)
-        .unwrap_or_else(|| now + Duration::from_secs(60));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,

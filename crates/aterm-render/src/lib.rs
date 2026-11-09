@@ -17357,11 +17357,7 @@ pub fn compute_dirty_rows(
         || prev_input.selection_fg != input.selection_fg
         || prev_input.display_offset != input.display_offset
     {
-        let mut prev_key = Vec::new();
-        let mut cur_key = Vec::new();
         for r in 0..rows {
-            prev_input.selection_row_key(r, &mut prev_key);
-            input.selection_row_key(r, &mut cur_key);
             let materialized = prev_input
                 .cells
                 .get(r)
@@ -17386,7 +17382,9 @@ pub fn compute_dirty_rows(
                             })
                     })
             };
-            if prev_key != cur_key
+            if !prev_input
+                .selection_row_keys(r)
+                .eq(input.selection_row_keys(r))
                 || (0..materialized)
                     .any(|col| selected_at(prev_input, col) != selected_at(input, col))
             {
@@ -22447,16 +22445,8 @@ mod tests {
             "precondition: the sibling pane pins the hull, so the span diff sees nothing"
         );
         assert_ne!(
-            {
-                let mut key = Vec::new();
-                prev.selection_row_key(1, &mut key);
-                key
-            },
-            {
-                let mut key = Vec::new();
-                cur.selection_row_key(1, &mut key);
-                key
-            },
+            prev.selection_row_keys(1).collect::<Vec<_>>(),
+            cur.selection_row_keys(1).collect::<Vec<_>>(),
             "the per-entry key must see the drag the hull hides"
         );
         assert!(

@@ -118,6 +118,7 @@ impl Fixture {
                 self.env.now,
                 &mut None,
                 accounts::SyncTarget {
+                    fleet: None,
                     path: &self.roster,
                     before: None,
                     after: Some(&self.text),

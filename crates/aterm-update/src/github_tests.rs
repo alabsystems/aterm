@@ -1873,7 +1873,9 @@ fn acquire_web_from(
 ) -> (Result<Acquisition, String>, Vec<String>) {
     let heads = std::cell::RefCell::new(Vec::new());
     let mut head = |url: &str| {
-        heads.borrow_mut().push(url.to_string());
+        heads
+            .borrow_mut()
+            .push(url.split_once("?aterm_lookup=").unwrap().0.to_string());
         answer()
     };
     let mut latest = || {
@@ -2545,6 +2547,7 @@ fn nothing_looks_past_a_head_even_when_every_tag_past_it_would_answer() {
     write_ledger(&staging, "v0.9.0", WEB_BUILD, "alabsystems/aterm");
     let mut heads = Vec::new();
     let mut head = |url: &str| -> Result<HeadAnswer, HttpError> {
+        let url = url.split_once("?aterm_lookup=").unwrap().0;
         heads.push(url.to_string());
         Ok(HeadAnswer {
             code: 302,

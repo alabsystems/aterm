@@ -1569,7 +1569,7 @@ mod unix {
                 .map_or_else(|| last.clone(), |line| line.trim().to_string());
             Error::new(
                 Kind::Conflict,
-                "the ref no longer points at the expected sha".to_string(),
+                format!("the ref no longer points at the expected sha: {what}"),
             )
             .with_sub(Sub::GuardFailed { what })
         } else if said("refusing to allow an OAuth App to create or update workflow") {
@@ -1582,8 +1582,11 @@ mod unix {
             }))
         } else if let Some(line) = rejected(op, &stdout) {
             if ref_lock_conflict(op, &line) {
-                Error::new(Kind::Conflict, "the ref changed during the push")
-                    .with_sub(Sub::GuardFailed { what: line })
+                Error::new(
+                    Kind::Conflict,
+                    format!("the ref changed during the push: {line}"),
+                )
+                .with_sub(Sub::GuardFailed { what: line })
             } else if server_rejection(&line) {
                 Error::could_not_run(format!("GitHub receive side failed: {line}"))
                     .with_side_effect(if sent {
@@ -1598,8 +1601,11 @@ mod unix {
             let code = out
                 .code
                 .map_or_else(|| "on a signal".to_string(), |code| code.to_string());
-            let error = Error::could_not_run(format!("git {} exited {code}: {last}", op_word(op)))
-                .with_sub(Sub::Git { exit: out.code });
+            let error = Error::could_not_run(format!(
+                "git {} exited {code}: {stderr}\n{stdout}",
+                op_word(op)
+            ))
+            .with_sub(Sub::Git { exit: out.code });
             if sent
                 && matches!(
                     op,
@@ -1660,7 +1666,12 @@ mod unix {
                     && !ref_lock_conflict(op, line)
                     && !line.ends_with("[remote rejected] (atomic push failure)")
             })
-            .or_else(|| lines.iter().copied().find(|line| server_rejection(line)))
+            .or_else(|| {
+                lines
+                    .iter()
+                    .copied()
+                    .find(|line| server_rejection(line) && !ref_lock_conflict(op, line))
+            })
             .or_else(|| {
                 lines
                     .iter()
@@ -1726,15 +1737,17 @@ mod unix {
         else {
             return false;
         };
-        matches!(
-            reason,
-            "failed"
-                | "failed to update ref"
-                | "failed to update refs"
-                | "transaction failed to start"
-                | "atomic transaction failed"
-                | "unable to migrate objects to permanent storage"
-        )
+        reason.starts_with("cannot lock ref '")
+            || reason.starts_with("failed to lock ")
+            || matches!(
+                reason,
+                "failed"
+                    | "failed to update ref"
+                    | "failed to update refs"
+                    | "transaction failed to start"
+                    | "atomic transaction failed"
+                    | "unable to migrate objects to permanent storage"
+            )
     }
 
     /// Refused: git's credential helper, which routes again from agh's directories, would not
@@ -2513,6 +2526,42 @@ mod unix {
         )
     }
 
+    pub(super) fn inventory_change(
+        updates: &[crate::github::refs::RefUpdate],
+        bytes: &[u8],
+    ) -> Error {
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return Error::protocol("git returned non-UTF-8 refs");
+        };
+        let mut refs = std::collections::BTreeMap::new();
+        for line in text.lines() {
+            let Some((oid, reference)) = line.split_once('\t') else {
+                return Error::protocol("git returned malformed refs");
+            };
+            if !crate::path::is_sha(oid) || refs.insert(reference, oid).is_some() {
+                return Error::protocol("git returned invalid or duplicate refs");
+            }
+        }
+        for update in updates {
+            let observed = refs
+                .get(update.reference.as_str())
+                .copied()
+                .unwrap_or("0000000000000000000000000000000000000000");
+            if observed != update.before {
+                return Error::new(
+                    Kind::Conflict,
+                    format!(
+                        "{} changed during push preparation: expected {}, observed {observed}",
+                        update.reference, update.before
+                    ),
+                );
+            }
+        }
+        Error::could_not_run(
+            "the remote inventory changed outside the requested refs; their expected values are unchanged",
+        )
+    }
+
     enum NativeRefBatch<'a> {
         Ordinary(&'a crate::github::refs::AtomicRefBatch),
         Control {
@@ -3207,11 +3256,11 @@ mod unix {
         }
         let mut final_list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
         final_list.extend(guards.iter().map(|reference| os(*reference)));
-        if checked("remote-final", final_list, scratch)?.stdout != listed.stdout {
-            return Err(Error::new(
-                Kind::Conflict,
-                "the remote ref changed during push preparation",
-            ));
+        let final_refs = checked("remote-final", final_list, scratch)?;
+        if final_refs.stdout != listed.stdout {
+            // The inventory also guards main and sibling control refs, so a
+            // changed inventory does not prove an expected-old mismatch.
+            return Err(inventory_change(batch.updates(), &final_refs.stdout));
         }
         let mut args = vec![
             os("-c"),
@@ -3306,15 +3355,19 @@ mod unix {
                 let partial = batch.updates().iter().any(|u| {
                     observed.get(u.reference.as_str()).copied().unwrap_or(ZERO) == u.after
                 });
-                return Err(Error::new(
-                    Kind::Conflict,
-                    "remote refs changed after an uncertain push",
-                )
-                .with_side_effect(if partial {
-                    SideEffect::Unknown
-                } else {
-                    SideEffect::None
-                }));
+                if partial {
+                    return Err(Error::new(
+                        Kind::OutcomeUnknown,
+                        format!(
+                            "remote refs partially changed after an uncertain push: {}",
+                            error.why
+                        ),
+                    )
+                    .with_side_effect(SideEffect::Unknown));
+                }
+                let mut changed = inventory_change(batch.updates(), &read.stdout);
+                changed.why = format!("{}; prior push: {}", changed.why, error.why);
+                return Err(changed);
             }
             // No ref progress: use elapsed patience, never an attempt count.
             // Repeated healthy reads of BEFORE are not progress and cannot
@@ -3325,6 +3378,10 @@ mod unix {
                         .with_side_effect(SideEffect::None),
                 );
             }
+            children.gh.fx().note_round(&format!(
+                "native push: {}; re-read confirmed all guarded refs unchanged; repeating expected-old push within {:?} budget",
+                error.why, run.budget
+            ))?;
             children.gh.fx().sleep(pause)?;
             pause = (pause * 2).min(std::time::Duration::from_secs(30));
         };
@@ -4078,6 +4135,34 @@ mod tests {
     }
 
     #[test]
+    fn inventory_movement_is_only_a_conflict_when_an_expected_ref_changed() {
+        use crate::error::{Kind, SideEffect};
+        let owner = "a".repeat(40);
+        let updates = vec![crate::github::refs::RefUpdate {
+            reference: crate::git::RELEASE_LEASE_REF.into(),
+            before: owner.clone(),
+            after: "0".repeat(40),
+        }];
+        let moved_main = format!(
+            "{owner}\t{}\n{}\trefs/heads/main\n",
+            crate::git::RELEASE_LEASE_REF,
+            "b".repeat(40)
+        );
+        let error = super::unix::inventory_change(&updates, moved_main.as_bytes());
+        assert_eq!(
+            (error.kind, error.side_effect),
+            (Kind::CouldNotRun, SideEffect::None)
+        );
+        let moved_lease = moved_main.replacen(&owner, &"c".repeat(40), 1);
+        let error = super::unix::inventory_change(&updates, moved_lease.as_bytes());
+        assert_eq!(
+            (error.kind, error.side_effect),
+            (Kind::Conflict, SideEffect::None)
+        );
+        assert!(error.why.contains(&"c".repeat(40)));
+    }
+
+    #[test]
     fn receive_pack_lock_conflicts_match_the_requested_ref_and_expected_object() {
         use crate::error::{Kind, SideEffect};
         use crate::fx::child::ChildOut;
@@ -4199,8 +4284,15 @@ mod tests {
         let hung = ChildOut {
             code: Some(128),
             stdout: Vec::new(),
-            stderr: b"fatal: the remote end hung up unexpectedly\n".to_vec(),
+            stderr:
+                b"fatal: HTTP 503 from receive-pack\nfatal: the remote end hung up unexpectedly\n"
+                    .to_vec(),
         };
+        assert!(
+            super::unix::failed(&push, &hung, &redactor, &slug, true)
+                .why
+                .contains("HTTP 503")
+        );
         let signalled = ChildOut {
             code: None,
             stdout: Vec::new(),
@@ -4241,6 +4333,11 @@ mod tests {
         assert!(error.why.contains("refs/tags/v1"), "{}", error.why);
         for (reason, transient) in [
             ("failed", true),
+            (
+                "cannot lock ref 'refs/tags/v1': unable to create lock file",
+                true,
+            ),
+            ("failed to lock refs", true),
             ("failed to update ref", true),
             ("failed to update refs", true),
             ("transaction failed to start", true),

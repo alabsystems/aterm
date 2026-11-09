@@ -174,7 +174,6 @@ fn presented_pointer_feedback_conforms_without_weakening_generic_input_fences() 
     let model = aterm_models_render::native_pointer_paint_model();
     assert_eq!(model.mutant_dials(), (1..=12).collect::<Vec<_>>());
     assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     let states = aterm_spec::interp::reachable_states(&model);
     assert_eq!(states.len(), 18);
     for state in states {

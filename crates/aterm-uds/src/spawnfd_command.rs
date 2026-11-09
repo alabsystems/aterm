@@ -300,6 +300,16 @@ impl Command {
         self
     }
 
+    /// Replace all arguments, preserving the program and launch configuration.
+    pub fn set_args<I, S>(&mut self, args: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.args.clear();
+        self.args(args)
+    }
+
     /// Set one variable in the child's environment.
     pub fn env(&mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
         self.env.set(key.as_ref(), value.as_ref());

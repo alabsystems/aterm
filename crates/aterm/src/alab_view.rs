@@ -7,10 +7,9 @@
 //! A projection is read as an observer, writes nothing and calls no provider. The first caller in
 //! a process projects once; after that a background thread reads the registry's log and its
 //! inventory every five minutes and projects again only when the inventory moved
-//! (`LabRead::Unchanged`), while every caller gets the held projection at once. Once a projection
-//! names this Mac, an owner-private `named` file beside `settled` records it; while a failed read,
-//! or one that finds this Mac's history of the registry partial, then leaves no projection held,
-//! the source is `pending` (the harness reads no sheet meanwhile)
+//! (`LabRead::Unchanged`), while every caller gets the held projection at once. A failed or partial
+//! read retains an existing projection. Without one the source is pending, so neither naming
+//! nor account discovery can interpret uncertainty as an absent registry binding,
 //! and a caller looks again after 15 seconds. Syncs, the accounts list, mail routes and first-name
 //! creation ask, never a typing path, so typing never waits on it. `[alab] roster = false` in `aterm.toml` turns the source
 //! off on this Mac. A test, a debug build and a build tool's run hold no lab (inert, as the other
@@ -28,13 +27,17 @@
 //! reads them, so no process decodes the journal window for them; the exports read their own
 //! ([`placements`], from `alab_sheet`), once per run of the owner verb.
 
+#[cfg(test)]
+use aterm_agent::machine_name::RegistryNameRead;
 use aterm_agent::{
     ai::connector::{Flow, Region},
     harness::{
         accounts::{Cli, Vendor},
-        alab_roster::{self, Lab, LabAccount, LabMailbox, Part, Placements},
+        alab_roster::{
+            self, Lab, LabAccount, LabMailbox, MachineRef, Part, Placements, SourceSnapshot,
+        },
     },
-    machine_name::{RegistryName, RegistryNameRead},
+    machine_name::RegistryName,
 };
 use aterm_db::alab::{
     Inventory, LabRead, Registry,
@@ -106,11 +109,6 @@ pub(crate) fn roster_policy(config: &Path) -> LocalRosterPolicy {
     }
 }
 
-/// Whether admitted local policy explicitly turns the roster source off.
-fn turned_off(config: &Path) -> bool {
-    matches!(roster_policy(config), LocalRosterPolicy::Disabled)
-}
-
 /// The private directory recording which registry table's inventory a peer matched.
 fn settled_dir() -> Option<PathBuf> {
     Some(aterm_types::dirs::state_dir()?.join("alab"))
@@ -126,28 +124,6 @@ fn settled_in(alab_dir: &Path, table: &[u8; 32]) -> bool {
     !trimmed.iter().any(u8::is_ascii_uppercase)
         && aterm_codec::hex::decode_into(trimmed, &mut decoded)
         && &decoded == table
-}
-
-/// Whether `alab_dir` records that a projection of the lab named this Mac ([`note_named`]).
-fn named_in(alab_dir: &Path) -> bool {
-    aterm_uds::private_file::read_private(alab_dir, "named", 64).is_ok()
-}
-
-/// Record, once, that a projection of the lab named this Mac: while a later read fails, the
-/// harness then reads no sheet ([`alab_roster::Source::pending`]), so a failed look never lets
-/// the sheet path label a row after a machine the lab names. A Mac the lab never named keeps
-/// reading the sheet when its registry cannot be read.
-fn note_named(alab_dir: &Path) {
-    if named_in(alab_dir) {
-        return;
-    }
-    if aterm_types::fs_restricted::ensure_private_dir(alab_dir).is_ok() {
-        let _ = aterm_agent::harness::upgrade_models::write_atomic_mode(
-            &alab_dir.join("named"),
-            "1\n",
-            Some(0o600),
-        );
-    }
 }
 
 /// Whether a peer matched this Mac's inventory of the registry table it holds now.
@@ -304,6 +280,14 @@ pub(crate) fn harness_lab(view: &LabView, settled: bool, logins: &BTreeMap<Strin
     harness_lab_with_placed(view, &placed, settled, logins)
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "LabPreferenceIdentity",
+        action = "Project",
+        project = "aterm::alab_view::preference_model_tests::project"
+    )
+)]
 fn harness_lab_with_placed(
     view: &LabView,
     placed: &BTreeMap<String, String>,
@@ -328,7 +312,16 @@ fn harness_lab_with_placed(
         let preferred = view
             .preferring(&account.pk)
             .into_iter()
-            .filter_map(|p| Some((view.machine_label(&p.machine)?.to_owned(), p.rank)))
+            .filter_map(|p| {
+                let machine = view
+                    .machines
+                    .get(&p.machine)
+                    .filter(|machine| machine.live)?;
+                Some((
+                    MachineRef::from_registry(p.machine.clone(), machine.label.clone()),
+                    p.rank,
+                ))
+            })
             .collect();
         accounts.push(LabAccount {
             pk: account.pk.clone(),
@@ -348,7 +341,9 @@ fn harness_lab_with_placed(
     }
     let mailboxes = named_mailboxes(placed, logins);
     Lab {
-        me: view.my_label().map(str::to_owned),
+        me: view
+            .my_machine()
+            .map(|machine| MachineRef::from_registry(machine.pk.clone(), machine.label.clone())),
         machine_name: registry_name(view),
         settled,
         accounts,
@@ -411,33 +406,26 @@ struct Held {
     addresses: AddressIndex,
     inventory: Option<Inventory>,
     looked: Option<Instant>,
-    /// The last read failed or found this Mac's history of the registry partial, no projection
-    /// is held, and a projection named this Mac before.
-    failed: bool,
-    /// No projection is held after an unreadable or partial registry read. First-name creation
-    /// cannot treat that uncertainty as an absent binding, even before any history witness.
-    naming_pending: bool,
+    /// No complete projection or successful absence has been observed, or an unreadable,
+    /// partial or unchanged read left no projection to use.
+    pending: bool,
 }
 
 /// One look's change to what is held, from what it `read` (a failed read as its error's words),
-/// this Mac's `settled` witness and mailbox `logins`, and whether a projection named this Mac
-/// before (`named`, read only where a failed or partial read leaves nothing held), at `now`.
-/// Returns whether the read's projection names this Mac, which the caller records
-/// ([`note_named`]).
+/// this Mac's `settled` witness and mailbox `logins`, at `now`. Only a complete projection
+/// or a successful absence resolves a first read. Uncertainty retains an existing projection.
 fn look(
     held: &mut Held,
     read: Result<Option<LabRead>, String>,
     settled: bool,
     toml_logins: &BTreeMap<String, String>,
-    named: impl FnOnce() -> bool,
     now: Instant,
-) -> bool {
+) {
     held.looked = Some(now);
-    // A failed read, and one that finds this Mac's history of the registry partial, says nothing
-    // of the lab: what was held stays, and with nothing held a Mac the lab named is pending, so
-    // the sheet path never labels a row after a machine the lab names meanwhile.
-    held.naming_pending = matches!(read, Err(_) | Ok(Some(LabRead::Partial))) && held.lab.is_none();
-    held.failed = held.naming_pending && named();
+    held.pending = matches!(
+        read,
+        Err(_) | Ok(Some(LabRead::Partial | LabRead::Unchanged))
+    ) && held.lab.is_none();
     match read {
         Ok(Some(LabRead::Projected(view, inventory))) => {
             held.inventory = Some(inventory);
@@ -449,7 +437,6 @@ fn look(
                 settled,
                 &logins,
             )));
-            view.my_machine().is_some()
         }
         Ok(Some(LabRead::Unchanged)) => {
             if let Some(lab) = held.lab.as_mut() {
@@ -460,8 +447,11 @@ fn look(
                     lab.settled = settled;
                     lab.mailboxes = mailboxes;
                 }
+            } else {
+                // Request a complete projection on the next look if an inventory token
+                // survived without the projection it described.
+                held.inventory = None;
             }
-            false
         }
         Ok(None) => {
             held.inventory = None;
@@ -469,82 +459,67 @@ fn look(
             held.mail.clear();
             held.addresses = AddressIndex::default();
             held.lab = None;
-            false
         }
         // A partial history keeps what was held; the next look reads again.
-        Ok(Some(LabRead::Partial)) => false,
+        Ok(Some(LabRead::Partial)) => {}
         // A failed read keeps what was held; the next look reads again.
         Err(why) => {
             aterm_log::debug!("lab view: {why}");
-            false
         }
     }
 }
 
 /// Whether a caller looks at the registry at `now`: at the first look, and once [`RETRY_FAILED`]
-/// passed since one that left the source pending (`failed`); the refresher looks otherwise.
-fn due(looked: Option<Instant>, failed: bool, now: Instant) -> bool {
-    looked.is_none_or(|at| failed && now.saturating_duration_since(at) >= RETRY_FAILED)
+/// passed since one that left the source pending; the refresher looks otherwise.
+fn due(looked: Option<Instant>, pending: bool, now: Instant) -> bool {
+    looked.is_none_or(|at| pending && now.saturating_duration_since(at) >= RETRY_FAILED)
 }
 
 struct Cache {
     paths: Paths,
     config: PathBuf,
     held: Mutex<Held>,
+    /// Keep an older in-flight read from replacing a newer projection.
+    refreshing: Mutex<()>,
     refresher: OnceLock<()>,
 }
 
 impl Cache {
-    /// Naming and pending state from one admitted held projection. The caller refreshes before
-    /// this read; tests can inspect a prepared snapshot without opening a live registry.
-    fn naming_projection(&self) -> RegistryNameRead {
-        match roster_policy(&self.config) {
-            LocalRosterPolicy::Unavailable => return RegistryNameRead::Pending,
-            LocalRosterPolicy::Disabled => return RegistryNameRead::Unbound,
-            LocalRosterPolicy::Enabled => {}
-        }
+    /// Read policy while the held view is fixed, then return one immutable decision input.
+    /// Tests inspect prepared state here without opening the live registry.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "LabSourceAvailability",
+            action = "Project",
+            project = "aterm::alab_view::source_model_tests::project"
+        )
+    )]
+    fn projection(&self) -> SourceSnapshot {
         let held = self
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match held.lab.as_ref() {
-            Some(lab) => lab
-                .machine_name
-                .clone()
-                .map_or(RegistryNameRead::Unbound, RegistryNameRead::Bound),
-            None if held.naming_pending => RegistryNameRead::Pending,
-            None => RegistryNameRead::Unbound,
-        }
-    }
-
-    fn current_projection(&self) -> Option<Arc<Lab>> {
-        if !matches!(roster_policy(&self.config), LocalRosterPolicy::Enabled) {
-            return None;
-        }
-        self.held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .lab
-            .clone()
-    }
-
-    fn source_pending(&self) -> bool {
         match roster_policy(&self.config) {
-            LocalRosterPolicy::Unavailable => return true,
-            LocalRosterPolicy::Disabled => return false,
-            LocalRosterPolicy::Enabled => {}
+            LocalRosterPolicy::Unavailable => SourceSnapshot::Pending,
+            LocalRosterPolicy::Disabled => SourceSnapshot::Disabled,
+            LocalRosterPolicy::Enabled => match &held.lab {
+                Some(lab) => SourceSnapshot::Present(lab.clone()),
+                None if held.pending => SourceSnapshot::Pending,
+                None => SourceSnapshot::Absent,
+            },
         }
-        self.held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .failed
     }
 
     /// Project again where the inventory moved since the held projection; where it did not,
     /// only the held lab's `settled` is brought up to date.
     fn refresh(&self) {
+        let _refresh = self
+            .refreshing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let policy = roster_policy(&self.config);
-        if matches!(policy, LocalRosterPolicy::Unavailable) {
+        if !matches!(policy, LocalRosterPolicy::Enabled) {
             return;
         }
         let registry = Registry::at(self.paths.clone());
@@ -553,13 +528,9 @@ impl Cache {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .inventory;
-        let read = if matches!(policy, LocalRosterPolicy::Disabled) {
-            Ok(None)
-        } else {
-            registry
-                .lab(&self.config, was)
-                .map_err(|why| why.to_string())
-        };
+        let read = registry
+            .lab(&self.config, was)
+            .map_err(|why| why.to_string());
         let admitted = matches!(read, Ok(Some(LabRead::Projected(..) | LabRead::Unchanged)));
         // A new projection reads the registry's mailboxes and address rows too: names and
         // patterns, never a value (`mail::sign_in_read`). One that does not read keeps the held
@@ -579,7 +550,6 @@ impl Cache {
             .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let named = || dir.as_deref().is_some_and(named_in);
         if let Some((mail, addresses)) = mail {
             held.mail = mail;
             held.addresses = addresses;
@@ -589,11 +559,7 @@ impl Cache {
         } else {
             mailbox_logins(&held.addresses, &toml)
         };
-        if look(&mut held, read, settled, &logins, named, Instant::now())
-            && let Some(dir) = dir.as_deref()
-        {
-            note_named(dir);
-        }
+        look(&mut held, read, settled, &logins, Instant::now());
     }
 
     fn start_refresher(&'static self) {
@@ -611,42 +577,23 @@ impl Cache {
 }
 
 impl alab_roster::Source for &'static Cache {
-    fn lab(&self) -> Option<Arc<Lab>> {
+    fn snapshot(&self) -> SourceSnapshot {
         let due = {
             let held = self
                 .held
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            due(
-                held.looked,
-                held.failed || held.naming_pending,
-                Instant::now(),
-            )
+            due(held.looked, held.pending, Instant::now())
         };
         if due {
             self.refresh();
             self.start_refresher();
         }
-        self.current_projection()
-    }
-
-    fn pending(&self) -> bool {
-        self.source_pending()
-    }
-
-    fn machine_name(&self) -> RegistryNameRead {
-        // Refresh once through the existing source, then inspect naming and pending status
-        // together. Do not make separate lab()/pending() decisions around a refresh.
-        let _ = self.lab();
-        self.naming_projection()
-    }
-
-    fn turned_off(&self) -> bool {
-        turned_off(&self.config)
+        self.projection()
     }
 
     fn mail(&self) -> Vec<LabMailbox> {
-        if self.lab().is_none() {
+        if self.snapshot().lab().is_none() {
             return Vec::new();
         }
         self.held
@@ -662,7 +609,7 @@ impl alab_roster::Source for &'static Cache {
         parts: &[Part],
         consume: &mut dyn FnMut(Part, &str),
     ) -> Result<(), &'static str> {
-        if self.lab().is_none() {
+        if self.snapshot().lab().is_none() {
             return Err("no lab registry is held here");
         }
         let journal = Journal::local().map_err(|_| "the local reveal journal is unavailable")?;
@@ -700,7 +647,7 @@ impl alab_roster::Source for &'static Cache {
         part: Part,
         consume: &mut dyn FnMut(&str),
     ) -> Result<(), &'static str> {
-        if self.lab().is_none() {
+        if self.snapshot().lab().is_none() {
             return Err("no lab registry is held here");
         }
         let journal = Journal::local().map_err(|_| "the local reveal journal is unavailable")?;
@@ -749,9 +696,9 @@ pub(crate) fn install() {
             addresses: AddressIndex::default(),
             inventory: None,
             looked: None,
-            failed: false,
-            naming_pending: false,
+            pending: true,
         }),
+        refreshing: Mutex::new(()),
         refresher: OnceLock::new(),
     });
     let _ = alab_roster::install(Box::new(cache));
@@ -824,7 +771,7 @@ mod tests {
         );
     }
 
-    fn nothing_held() -> Held {
+    pub(super) fn nothing_held() -> Held {
         Held {
             lab: None,
             placed: BTreeMap::new(),
@@ -832,8 +779,7 @@ mod tests {
             addresses: AddressIndex::default(),
             inventory: None,
             looked: None,
-            failed: false,
-            naming_pending: false,
+            pending: true,
         }
     }
 
@@ -850,26 +796,28 @@ mod tests {
             Ok(Some(naming(Some("m3")))),
             false,
             &BTreeMap::new(),
-            || false,
             Instant::now(),
         );
         let cache = Cache {
             paths: Paths::for_home(dir.path()),
             config: config.clone(),
             held: Mutex::new(held),
+            refreshing: Mutex::new(()),
             refresher: OnceLock::new(),
         };
-        let original = cache.current_projection().unwrap();
+        let observed = cache.projection();
+        let original = observed.lab().unwrap();
         let inventory = cache.held.lock().unwrap().inventory;
-        assert!(!cache.source_pending());
+        assert!(!cache.projection().pending());
 
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(observed.names_this_mac() && !observed.pending());
         assert!(
-            cache.current_projection().is_none(),
+            cache.projection().lab().is_none(),
             "an unavailable current policy must not expose the cached lab"
         );
         assert!(
-            cache.source_pending(),
+            cache.projection().pending(),
             "unknown policy cannot select a sheet instead"
         );
         assert!(Arc::ptr_eq(
@@ -881,23 +829,40 @@ mod tests {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
         for invalid in ["[alab", "[alab]\nroster = 'off'\n"] {
             std::fs::write(&config, invalid).unwrap();
-            assert!(cache.current_projection().is_none());
-            assert!(cache.source_pending());
+            assert!(cache.projection().lab().is_none());
+            assert!(cache.projection().pending());
         }
         std::fs::write(&config, "[alab]\nroster = false\n").unwrap();
-        assert!(cache.current_projection().is_none());
-        assert!(!cache.source_pending(), "explicit off is a known policy");
+        cache.refresh();
+        assert!(
+            cache
+                .held
+                .lock()
+                .unwrap()
+                .lab
+                .as_ref()
+                .is_some_and(|lab| Arc::ptr_eq(lab, &original)),
+            "a disabled background refresh must preserve the view for re-enablement"
+        );
+        assert!(cache.projection().lab().is_none());
+        assert!(
+            !cache.projection().pending(),
+            "explicit off is a known policy"
+        );
         std::fs::write(&config, "[alab]\nroster = true\n").unwrap();
-        assert!(Arc::ptr_eq(&cache.current_projection().unwrap(), &original));
-        assert!(!cache.source_pending());
+        assert!(Arc::ptr_eq(&cache.projection().lab().unwrap(), &original));
+        assert!(!cache.projection().pending());
         std::fs::remove_file(&config).unwrap();
-        assert!(Arc::ptr_eq(&cache.current_projection().unwrap(), &original));
-        assert!(!cache.source_pending(), "real absence keeps its defaults");
+        assert!(Arc::ptr_eq(&cache.projection().lab().unwrap(), &original));
+        assert!(
+            !cache.projection().pending(),
+            "real absence keeps its defaults"
+        );
     }
 
     /// A projection whose facts row binds this Mac to a machine labelled `label` (`None`: the
     /// label is conflicted).
-    fn naming(label: Option<&str>) -> LabRead {
+    pub(super) fn naming(label: Option<&str>) -> LabRead {
         LabRead::Projected(
             Box::new(naming_view(label, MachineNickname::Unset)),
             Inventory([7; 32]),
@@ -918,6 +883,70 @@ mod tests {
             },
         );
         view
+    }
+
+    #[test]
+    fn equal_machine_labels_do_not_transfer_a_preference_between_registry_keys() {
+        use aterm_agent::harness::{accounts::Class, alab_roster};
+        use aterm_db::alab::view::{Account, Machine, Preference};
+
+        let mut view = naming_view(Some("m3"), MachineNickname::Unset);
+        view.machines.insert(
+            "pk-other".into(),
+            Machine {
+                pk: "pk-other".into(),
+                label: Some("m3".into()),
+                nickname: MachineNickname::Unset,
+                aliases: Vec::new(),
+                live: true,
+            },
+        );
+        view.accounts.insert(
+            "account-one".into(),
+            Account {
+                pk: "account-one".into(),
+                realm: Some("claude".into()),
+                label: Some("claude-one".into()),
+                legacy_label: None,
+                login: Some("one@example.test".into()),
+                identity: None,
+                status: Some("active".into()),
+                region: None,
+                flow: None,
+                browser: None,
+                live: true,
+            },
+        );
+        view.preferences.push(Preference {
+            machine: "pk-other".into(),
+            account: "account-one".into(),
+            rank: Some(1),
+        });
+
+        let project = |view: &LabView| {
+            harness_lab_with_placed(view, &BTreeMap::new(), true, &BTreeMap::new())
+        };
+        let foreign = project(&view);
+        assert_eq!(foreign.class_of(&foreign.accounts[0]), Class::Pool);
+        assert!(
+            alab_roster::fleet_for(&foreign, Cli::Claude, None)
+                .unwrap()
+                .accounts
+                .is_empty(),
+            "a different registry key must not enroll an account through a shared label"
+        );
+
+        view.preferences[0].machine = "pk-me".into();
+        let own = project(&view);
+        assert_eq!(own.class_of(&own.accounts[0]), Class::Preferred);
+        assert_eq!(
+            alab_roster::fleet_for(&own, Cli::Claude, None)
+                .unwrap()
+                .accounts
+                .len(),
+            1,
+            "the same label collision must not suppress this machine's own preference"
+        );
     }
 
     #[test]
@@ -1005,37 +1034,35 @@ mod tests {
             Ok(Some(naming(Some("m86")))),
             false,
             &BTreeMap::new(),
-            || false,
             Instant::now(),
         );
         let cache = Cache {
             paths: Paths::for_home(root.path()),
             config: config.clone(),
             held: Mutex::new(held),
+            refreshing: Mutex::new(()),
             refresher: OnceLock::new(),
         };
-        let expected = cache.naming_projection();
+        let expected = cache.projection().machine_name();
         assert!(matches!(&expected, RegistryNameRead::Bound(Ok(_))));
         look(
             &mut cache.held.lock().unwrap(),
             Err("temporarily unavailable".into()),
             false,
             &BTreeMap::new(),
-            || panic!("a held lab keeps its binding"),
             Instant::now(),
         );
-        assert_eq!(cache.naming_projection(), expected);
+        assert_eq!(cache.projection().machine_name(), expected);
         aterm_uds::atomic_file::write(&config, b"[alab\n", 0o600).unwrap();
-        assert_eq!(cache.naming_projection(), RegistryNameRead::Pending);
+        assert_eq!(cache.projection().machine_name(), RegistryNameRead::Pending);
         aterm_uds::atomic_file::write(&config, b"[alab]\nroster = false\n", 0o600).unwrap();
-        assert_eq!(cache.naming_projection(), RegistryNameRead::Unbound);
+        assert_eq!(cache.projection().machine_name(), RegistryNameRead::Unbound);
         std::fs::remove_file(&config).unwrap();
-        assert_eq!(cache.naming_projection(), expected);
+        assert_eq!(cache.projection().machine_name(), expected);
         *cache.held.lock().unwrap() = nothing_held();
-        cache.held.lock().unwrap().naming_pending = true;
-        assert_eq!(cache.naming_projection(), RegistryNameRead::Pending);
-        cache.held.lock().unwrap().naming_pending = false;
-        assert_eq!(cache.naming_projection(), RegistryNameRead::Unbound);
+        assert_eq!(cache.projection().machine_name(), RegistryNameRead::Pending);
+        cache.held.lock().unwrap().pending = false;
+        assert_eq!(cache.projection().machine_name(), RegistryNameRead::Unbound);
         for read in [
             Err("first read unavailable".into()),
             Ok(Some(LabRead::Partial)),
@@ -1045,124 +1072,111 @@ mod tests {
                 read,
                 false,
                 &BTreeMap::new(),
-                || false,
                 Instant::now(),
             );
             assert_eq!(
-                cache.naming_projection(),
+                cache.projection().machine_name(),
                 RegistryNameRead::Pending,
                 "an unread first registry is not proof that no binding exists"
             );
             let held = cache.held.lock().unwrap();
-            assert!(
-                !held.failed,
-                "the harness's older fallback policy is separate"
-            );
+            assert!(held.pending);
             assert!(due(
                 held.looked,
-                held.naming_pending,
+                held.pending,
                 Instant::now() + RETRY_FAILED
             ));
         }
     }
 
-    /// What a look holds. A failed read and a partial history keep the held lab, and with none
-    /// held are pending only on a Mac the lab named; a projection is held and says whether it
-    /// names this Mac; an unchanged read brings the held lab's witness up to date; no lab clears
-    /// what was held. Whether the lab named this Mac is read only where it decides.
-    /// NEGATIVE CONTROL: with a partial history read as no lab, `` a partial history: a Mac the
-    /// lab named is pending `` fails; with `named` dropped from `failed`, `` a failed read: a Mac
-    /// the lab never named reads the sheet `` fails.
     #[test]
-    fn a_look_keeps_the_lab_through_an_unread_history_and_pends_only_where_the_lab_named_this_mac()
-    {
+    fn an_unread_registry_keeps_both_consumers_pending_without_a_history_marker() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let marker_dir = root.path().join("alab");
+        assert!(!marker_dir.exists());
+        for read in [
+            Err("registry is temporarily unreadable".to_owned()),
+            Ok(Some(LabRead::Partial)),
+        ] {
+            let mut held = nothing_held();
+            look(&mut held, read, false, &BTreeMap::new(), Instant::now());
+            let cache = Cache {
+                paths: Paths::for_home(root.path()),
+                config: root.path().join("aterm.toml"),
+                held: Mutex::new(held),
+                refreshing: Mutex::new(()),
+                refresher: OnceLock::new(),
+            };
+            let observed = cache.projection();
+            assert_eq!(observed.machine_name(), RegistryNameRead::Pending);
+            assert!(
+                observed.pending() && !observed.permits_sheet(),
+                "an unread registry must not enable legacy account discovery"
+            );
+        }
+    }
+
+    /// Failed and partial reads preserve the exact projection. Only a successful absence
+    /// clears it; an unchanged read without a projection forces a complete retry.
+    #[test]
+    fn a_look_preserves_a_projection_and_keeps_unknown_absence_pending() {
         let logins = BTreeMap::new();
         let now = Instant::now();
-        let unasked =
-            || -> bool { panic!("`named` is read only where a look leaves nothing held") };
         let failed = || Err::<Option<LabRead>, String>("custody unreadable".into());
         for (read, what) in [
             (failed(), "a failed read"),
             (Ok(Some(LabRead::Partial)), "a partial history"),
+            (
+                Ok(Some(LabRead::Unchanged)),
+                "unchanged without a projection",
+            ),
         ] {
             let mut held = nothing_held();
-            assert!(!look(
-                &mut held,
-                read.clone(),
-                false,
-                &logins,
-                || false,
-                now
-            ));
-            assert!(
-                !held.failed,
-                "{what}: a Mac the lab never named reads the sheet"
-            );
-            let mut held = nothing_held();
-            assert!(!look(&mut held, read, false, &logins, || true, now));
-            assert!(held.failed, "{what}: a Mac the lab named is pending");
+            held.inventory = Some(Inventory([7; 32]));
+            look(&mut held, read.clone(), false, &logins, now);
+            assert!(held.pending, "{what}");
             assert!(held.lab.is_none(), "{what}");
             assert_eq!(held.looked, Some(now), "{what}");
+            if matches!(read, Ok(Some(LabRead::Unchanged))) {
+                assert!(held.inventory.is_none(), "the next look must project again");
+            }
         }
 
         let mut held = nothing_held();
-        assert!(
-            look(
-                &mut held,
-                Ok(Some(naming(Some("m3")))),
-                false,
-                &logins,
-                unasked,
-                now
-            ),
-            "a projection that names this Mac"
-        );
+        look(&mut held, Ok(Some(naming(Some("m3")))), false, &logins, now);
         let lab = held.lab.clone().expect("the projection is held");
-        assert_eq!(lab.me.as_deref(), Some("m3"));
-        assert!(!lab.settled && !held.failed);
+        assert_eq!(
+            lab.me.as_ref().and_then(|me| me.label.as_deref()),
+            Some("m3")
+        );
+        assert_eq!(lab.me.as_ref().map(|me| me.key.as_str()), Some("pk-me"));
+        assert!(!lab.settled && !held.pending);
         assert_eq!(held.inventory, Some(Inventory([7; 32])));
         for (read, what) in [
             (Ok(Some(LabRead::Partial)), "a partial history"),
             (failed(), "a failed read"),
         ] {
-            assert!(!look(&mut held, read, false, &logins, unasked, now));
+            look(&mut held, read, false, &logins, now);
             assert!(
                 held.lab
                     .as_ref()
                     .is_some_and(|kept| Arc::ptr_eq(kept, &lab)),
                 "{what} keeps the lab"
             );
-            assert!(!held.failed, "{what}: a held lab is not pending");
+            assert!(!held.pending, "{what}: a held lab is not pending");
             assert_eq!(held.inventory, Some(Inventory([7; 32])), "{what}");
         }
-        assert!(!look(
-            &mut held,
-            Ok(Some(LabRead::Unchanged)),
-            true,
-            &logins,
-            unasked,
-            now
-        ));
+        look(&mut held, Ok(Some(LabRead::Unchanged)), true, &logins, now);
         assert!(
             held.lab.as_ref().is_some_and(|lab| lab.settled),
             "an unchanged read brings the held lab's witness up to date"
         );
-        assert!(!look(&mut held, Ok(None), true, &logins, unasked, now));
+        look(&mut held, Ok(None), true, &logins, now);
         assert!(
             held.lab.is_none() && held.inventory.is_none() && held.placed.is_empty(),
             "no lab clears what was held"
         );
-        assert!(
-            look(
-                &mut nothing_held(),
-                Ok(Some(naming(None))),
-                false,
-                &logins,
-                unasked,
-                now
-            ),
-            "a conflicted label still binds this Mac and must not authorize a fallback"
-        );
+        assert!(!held.pending, "a successful absence resolves uncertainty");
     }
 
     /// A caller looks at the first look and, while a failed look left the source pending, again
@@ -1283,17 +1297,20 @@ mod tests {
     fn the_roster_source_is_on_unless_turned_off() {
         let dir = aterm_tempfile::TempDir::new().unwrap();
         let config = dir.path().join("aterm.toml");
-        assert!(!turned_off(&config));
+        assert!(matches!(roster_policy(&config), LocalRosterPolicy::Enabled));
         aterm_uds::atomic_file::write(&config, b"[alab]\nroster = true\n", 0o600).unwrap();
-        assert!(!turned_off(&config));
+        assert!(matches!(roster_policy(&config), LocalRosterPolicy::Enabled));
         std::fs::write(&config, "[alab]\nroster = false\n").unwrap();
-        assert!(turned_off(&config));
+        assert!(matches!(
+            roster_policy(&config),
+            LocalRosterPolicy::Disabled
+        ));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).unwrap();
             assert!(
-                !turned_off(&config),
+                matches!(roster_policy(&config), LocalRosterPolicy::Unavailable),
                 "world-writable aterm.toml must not be trusted"
             );
         }
@@ -1328,30 +1345,6 @@ mod tests {
         );
     }
 
-    /// `note_named` records once that the lab named this Mac, owner-private, and `named_in`
-    /// reads it back: a fresh directory, or a witness others can read, records nothing, so a Mac
-    /// the lab never named keeps reading its sheet when the registry cannot be read.
-    /// NEGATIVE CONTROL: `named_in` returning true for a missing file makes the fresh directory
-    /// pending (`never named`).
-    #[test]
-    fn the_named_witness_is_owner_private() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let temp = aterm_tempfile::TempDir::new().unwrap();
-        let alab_dir = temp.path().join("alab");
-        assert!(!named_in(&alab_dir), "never named");
-        note_named(&alab_dir);
-        assert!(named_in(&alab_dir));
-        note_named(&alab_dir);
-        assert!(named_in(&alab_dir), "a second note keeps it");
-        std::fs::set_permissions(
-            alab_dir.join("named"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap();
-        assert!(!named_in(&alab_dir), "a readable witness records nothing");
-    }
-
     /// `settled_in` admits only an owner-private `settled` witness inside a `0700` `alab`
     /// directory and refuses symlinks or group/other-readable files.
     /// NEGATIVE CONTROL: `std::fs::read_to_string` accepted a `0644` file and a symlink target.
@@ -1381,3 +1374,11 @@ mod tests {
         assert!(!settled_in(&alab_dir, &table));
     }
 }
+
+#[cfg(test)]
+#[path = "alab_preference_model_tests.rs"]
+mod preference_model_tests;
+
+#[cfg(test)]
+#[path = "alab_source_model_tests.rs"]
+mod source_model_tests;

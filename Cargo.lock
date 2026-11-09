@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.188.0"
+version = "0.189.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -181,6 +181,7 @@ dependencies = [
  "aterm-mesh-core-islands-no-lost-edit",
  "aterm-mesh-core-islands-p1",
  "aterm-metrics",
+ "aterm-models-harness",
  "aterm-models-session",
  "aterm-net",
  "aterm-netplace",
@@ -192,6 +193,7 @@ dependencies = [
  "aterm-shell-integration",
  "aterm-slog",
  "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-stamp",
  "aterm-sysprobe",
  "aterm-tempfile",

@@ -743,3 +743,110 @@ fn a_peer_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer() {
     assert!(denies(&swarm_roster_now_until(m7, deadline()), "m98"));
     lab.server.stop();
 }
+
+/// When the vault last heard `paths`' Mac, as its status says.
+fn heard(paths: &Paths) -> u64 {
+    match status(paths).unwrap().membership {
+        Membership::In { heard, .. } => heard,
+        other => panic!("a member: {other:?}"),
+    }
+}
+
+/// The node's LAN responder asks whether this Mac is an ALab member no evidence denies at each of
+/// its refreshes, at each route change and before each answer, and its `_alab._tcp` advert at
+/// each watch tick ([`swarm_member_heard_now`]). Its fresh read opens only files the memo stamps;
+/// asked again with no file moved, it opens none and gives the same answer: when the vault last
+/// heard this Mac, a time its caller judges the age of at each ask. While a writer holds the
+/// vault's state lock this Mac is out, as the fresh read finds it. A newer word from the vault, a
+/// revocation and a roster that denies this Mac are each read at the next call. A scratch vault a
+/// test registers as the ALab vault's after a first read is read again, though no file moved.
+///
+/// NEGATIVE CONTROLS (2026-11-09): with the memo stamping none of the files it reads
+/// (`Memo::keyed(|_| Some(Vec::new()), true)`), the next call after the vault's newer word gives
+/// the earlier one (`the vault's newer word at the next call`, `left: Some(1794216841), right:
+/// Some(1794216901)`); with the memo not quiet (`Memo::keyed(observation_inputs, false)`), the call
+/// under the writer is given the answer kept from before it (`a writer holding the vault meets the
+/// read`); keyed by nothing (`&false` for the registration), the registration is not read
+/// (`a registration after a first read`).
+#[test]
+fn the_lan_presence_reads_the_vault_again_only_when_a_file_moved() {
+    let _answering = ServersAnswering::set();
+    let lab =
+        log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    with_a_denied_node(&lab.m22, &lab.m7);
+    let m7 = &lab.m7;
+    assert_eq!(
+        swarm_member_heard_now(m7).unwrap(),
+        None,
+        "a scratch vault is no ALab vault"
+    );
+    test_alab_standing(m7);
+    assert_eq!(
+        swarm_member_heard_now(m7).unwrap(),
+        Some(heard(m7)),
+        "a registration after a first read"
+    );
+
+    let (fresh, read) = reads_during(m7, || steward::swarm_member_heard(m7));
+    assert_eq!(
+        fresh.unwrap(),
+        Some(heard(m7)),
+        "m7 is a member none denies"
+    );
+    let inputs = vault_memo::stamped_files(m7, vault_memo::observation_inputs).expect("the inputs");
+    let unstamped: Vec<_> = read.keys().filter(|path| !inputs.contains(path)).collect();
+    assert!(unstamped.is_empty(), "read but not stamped: {unstamped:#?}");
+    assert_eq!(swarm_member_heard_now(m7).unwrap(), Some(heard(m7)));
+    let (again, read) = reads_during(m7, || swarm_member_heard_now(m7));
+    assert_eq!(again.unwrap(), Some(heard(m7)));
+    let read: Vec<_> = read.into_iter().collect();
+    assert_eq!(read, vec![], "a kept read of unchanged files");
+
+    {
+        let _writer = StateLock::take(m7).unwrap();
+        assert!(
+            swarm_member_heard_now(m7).is_err(),
+            "a writer holding the vault meets the read"
+        );
+    }
+
+    let mut state = load_state(m7).unwrap();
+    state.heard += 60;
+    save_state(m7, &state).unwrap();
+    assert_eq!(
+        swarm_member_heard_now(m7).unwrap(),
+        Some(state.heard),
+        "the vault's newer word at the next call"
+    );
+    let mut revoked = state.clone();
+    revoked.membership = Stored::Revoked;
+    save_state(m7, &revoked).unwrap();
+    assert_eq!(swarm_member_heard_now(m7).unwrap(), None, "revoked");
+    save_state(m7, &state).unwrap();
+    assert_eq!(swarm_member_heard_now(m7).unwrap(), Some(state.heard));
+
+    let admin = admin_open(&lab.m22).unwrap();
+    let mut doc = admin.doc.clone();
+    let roster = SwarmRoster {
+        deny_labels: vec!["m7".to_owned()],
+        ..Default::default()
+    };
+    doc.set_entry(
+        &Audience::Everyone,
+        crate::SWARM_ROSTER_ENTRY,
+        roster.to_toml().as_bytes(),
+    )
+    .unwrap();
+    admin_publish(&lab.m22, &admin, &doc).unwrap();
+    sync(m7, None).expect("m7 syncs");
+    assert!(
+        matches!(status(m7).unwrap().membership, Membership::In { .. }),
+        "m7 is still in the vault; its roster denies it"
+    );
+    assert_eq!(
+        swarm_member_heard_now(m7).unwrap(),
+        None,
+        "m7's denial at the next call"
+    );
+    lab.server.stop();
+}

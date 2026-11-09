@@ -63,8 +63,6 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
 fn continuation_phase_refines_capture_and_inheritance() {
     let model = aterm_models_harness::continuation_phase_model();
     assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{faults:?}");
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

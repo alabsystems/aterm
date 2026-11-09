@@ -7,8 +7,10 @@
 
 use super::*;
 use crate::harness::accounts_sync::run_cli_accounts_sync_with;
+use crate::harness::alab_roster::test_machine;
 use crate::harness::alab_roster::{self, Lab, LabAccount};
 use std::collections::BTreeSet;
+use std::time::SystemTime;
 
 const OWNER: &str = "owner@example.com";
 const WORK: &str = "work@example.com";
@@ -162,7 +164,7 @@ fn lab_account(label: &str, email: &str) -> LabAccount {
         identity: None,
         browser: None,
         joinable: true,
-        preferred: [("m16".to_owned(), Some(1))].into_iter().collect(),
+        preferred: [(test_machine("m16"), Some(1))].into_iter().collect(),
     }
 }
 
@@ -368,7 +370,7 @@ impl Walk {
             .filter_map(|row| Some(lab_account(&row.label, row.expected_identity_email()?)))
             .collect();
         let lab = Lab {
-            me: Some("m16".into()),
+            me: Some(test_machine("m16")),
             settled: true,
             accounts,
             aliases: BTreeMap::new(),
@@ -686,34 +688,37 @@ impl Walk {
         }
     }
 
-    /// Takes `events` from `start`, holding [`Walk::hold`] after each, and the writer to the report
-    /// at the end.
-    fn run(start: Start, events: &[Event], wrong: &mut Vec<(String, String)>) {
-        let walk = Walk::new(start);
+    /// The last of `events` happens to the world the ones before it left, holding [`Walk::hold`]
+    /// after it, and after a sync, that the same sync repeated writes nothing.
+    fn step(&self, start: Start, events: &[Event], wrong: &mut Vec<(String, String)>) {
+        let at = events.len() - 1;
+        let event = events[at];
         let mut found = Vec::new();
-        for (at, event) in events.iter().enumerate() {
-            let before = walk.before_step();
-            let said = walk.happen(*event, &mut found);
-            walk.hold(*event, &before, said.as_ref(), &mut found);
-            if said.is_some() {
-                let settled = walk.fingerprint();
-                let again = match event {
-                    Event::SyncSheet => walk.sync_sheet(),
-                    Event::SyncLab => walk.sync_lab(),
-                    _ => walk.sync_plain(),
-                };
-                if walk.fingerprint() != settled {
-                    found.push(format!(
-                        "a sync repeated with nothing changed wrote: {}{}",
-                        again.1, again.2
-                    ));
-                }
-            }
-            for why in found.drain(..) {
-                wrong.push((why, format!("{start:?} {:?} at {at}", &events[..=at])));
+        let before = self.before_step();
+        let said = self.happen(event, &mut found);
+        self.hold(event, &before, said.as_ref(), &mut found);
+        if said.is_some() {
+            let settled = self.fingerprint();
+            let again = match event {
+                Event::SyncSheet => self.sync_sheet(),
+                Event::SyncLab => self.sync_lab(),
+                _ => self.sync_plain(),
+            };
+            if self.fingerprint() != settled {
+                found.push(format!(
+                    "a sync repeated with nothing changed wrote: {}{}",
+                    again.1, again.2
+                ));
             }
         }
-        let labels: Vec<String> = walk
+        for why in found {
+            wrong.push((why, format!("{start:?} {events:?} at {at}")));
+        }
+    }
+
+    /// At the end of the walk `events`: the writer to the report, for each row.
+    fn end(&self, start: Start, events: &[Event], wrong: &mut Vec<(String, String)>) {
+        let labels: Vec<String> = self
             .records()
             .roster
             .rows
@@ -721,10 +726,337 @@ impl Walk {
             .map(|row| row.label.clone())
             .collect();
         for label in labels {
-            for why in walk.pool.law_wall(&walk.host.host, &label) {
+            for why in self.pool.law_wall(&self.host.host, &label) {
                 wrong.push((why, format!("{start:?} {events:?} at the end")));
             }
         }
+    }
+
+    /// Takes every walk of `tree` on from the world `events` left, depth first: [`Walk::step`] into
+    /// each next event, and [`Walk::end`] where a walk ends. Where they part, it takes the world's
+    /// [`Image`] and lays it again before each branch that is not the first thing done there, a
+    /// walk's end included ([`Walk::restore`]), so a prefix the walks share is taken once, and each
+    /// branch starts from the world that prefix left. How many walks it ended.
+    fn explore(
+        &self,
+        start: Start,
+        tree: &Tree,
+        events: &mut Vec<Event>,
+        wrong: &mut Vec<(String, String)>,
+    ) -> usize {
+        let image = (tree.next.len() + usize::from(tree.ends > 0) > 1).then(|| self.image());
+        let mut ended = 0;
+        if tree.ends > 0 {
+            self.end(start, events, wrong);
+            ended += tree.ends;
+        }
+        for (n, (event, next)) in tree.next.iter().enumerate() {
+            if let Some(image) = &image
+                && (n > 0 || tree.ends > 0)
+            {
+                self.restore(image);
+            }
+            events.push(*event);
+            self.step(start, events, wrong);
+            ended += self.explore(start, next, events, wrong);
+            events.pop();
+        }
+        ended
+    }
+
+    /// The world as it is now.
+    fn image(&self) -> Image {
+        Image {
+            entries: scan(self.pool.tmp.path()),
+            superseded: self.superseded.borrow().clone(),
+        }
+    }
+
+    /// The world `image` took, laid again in place: what came under the pool's root since goes,
+    /// what went comes back, and a file or directory whose bytes, mode or last write changed is
+    /// put back; what holds as it was is left as it is. Then a fresh look must find `image`.
+    fn restore(&self, image: &Image) {
+        let root = self.pool.tmp.path();
+        let now = scan(root);
+        // Each entry the image does not hold, or holds as another kind, before its directory.
+        for (rel, entry) in now.iter().rev() {
+            if image
+                .entries
+                .get(rel)
+                .is_some_and(|kept| kept.kind() == entry.kind())
+            {
+                continue;
+            }
+            let gone = match entry {
+                Entry::Dir { .. } => std::fs::remove_dir(root.join(rel)),
+                Entry::File { .. } | Entry::Link(_) => std::fs::remove_file(root.join(rel)),
+            };
+            gone.unwrap_or_else(|why| panic!("{}: {why}", rel.display()));
+        }
+        // Each entry the image holds, after its directory.
+        for (rel, entry) in &image.entries {
+            let path = root.join(rel);
+            let held = now.get(rel).filter(|held| held.kind() == entry.kind());
+            match entry {
+                Entry::Dir { .. } => {
+                    if held.is_none() {
+                        std::fs::create_dir(&path).expect("a directory");
+                    }
+                }
+                Entry::File {
+                    mode,
+                    modified,
+                    bytes,
+                } => {
+                    let (was_mode, was_modified, was) = match held {
+                        Some(Entry::File {
+                            mode,
+                            modified,
+                            bytes,
+                        }) => (Some(*mode), Some(*modified), Some(bytes)),
+                        _ => (None, None, None),
+                    };
+                    let written = was != Some(bytes);
+                    if written {
+                        if was.is_some() {
+                            std::fs::remove_file(&path).expect("a file to write again");
+                        }
+                        std::fs::write(&path, bytes).expect("a file");
+                    }
+                    if written || was_mode != Some(*mode) {
+                        set_mode(&path, *mode);
+                    }
+                    if written || was_modified != Some(*modified) {
+                        set_modified(&path, *modified);
+                    }
+                }
+                Entry::Link(to) => {
+                    if held != Some(entry) {
+                        if held.is_some() {
+                            std::fs::remove_file(&path).expect("a link to lay again");
+                        }
+                        link(to, &path);
+                    }
+                }
+            }
+        }
+        // Then each directory's mode and last write, which what came and went in it moved.
+        for (rel, entry) in &image.entries {
+            if let Entry::Dir { mode, modified } = entry {
+                let path = root.join(rel);
+                let meta = std::fs::symlink_metadata(&path).expect("a directory");
+                if mode_of(&meta) != *mode {
+                    set_mode(&path, *mode);
+                }
+                if meta.modified().ok() != Some(*modified) {
+                    set_modified(&path, *modified);
+                }
+            }
+        }
+        self.superseded.replace(image.superseded.clone());
+        if let Some(differs) = image.differs(&self.image()) {
+            panic!("the world laid again is not its image: {differs}");
+        }
+    }
+}
+
+/// A walk's world as a step reads it by path: each entry under the pool's root by its path there
+/// (a directory or a file with its permission bits and last write, a file's bytes, a link's
+/// target), and [`Walk::superseded`]. It holds no entry's identity (its inode, its last status
+/// change) and no listing's order: a world laid again from it is a fresh pool's equal only while
+/// the product keeps none of those from one command to the next, as the side-by-side trace of the
+/// two runners found on macOS (2026-11-09).
+#[derive(Clone, PartialEq, Eq)]
+struct Image {
+    entries: BTreeMap<PathBuf, Entry>,
+    superseded: BTreeSet<PathBuf>,
+}
+
+/// One entry under a pool's root: a directory or a file, with its permission bits and last write,
+/// and what a file holds, or a link and what it names.
+#[derive(Clone, PartialEq, Eq)]
+enum Entry {
+    Dir {
+        mode: u32,
+        modified: SystemTime,
+    },
+    File {
+        mode: u32,
+        modified: SystemTime,
+        bytes: Vec<u8>,
+    },
+    Link(PathBuf),
+}
+
+impl Entry {
+    fn kind(&self) -> &'static str {
+        match self {
+            Entry::Dir { .. } => "directory",
+            Entry::File { .. } => "file",
+            Entry::Link(_) => "link",
+        }
+    }
+
+    /// What a failure says of it.
+    fn said(entry: Option<&Entry>) -> String {
+        match entry {
+            None => "nothing".to_owned(),
+            Some(Entry::Dir { mode, modified }) => format!("a directory {mode:o}, {modified:?}"),
+            Some(Entry::File {
+                mode,
+                modified,
+                bytes,
+            }) => format!(
+                "a file {mode:o}, {modified:?}: {}",
+                String::from_utf8_lossy(bytes)
+            ),
+            Some(Entry::Link(to)) => format!("a link to {}", to.display()),
+        }
+    }
+}
+
+impl Image {
+    /// Where `other` is not this image, if it is not: the first path whose entry differs, or the
+    /// directories each says a sign-in moved a row out of.
+    fn differs(&self, other: &Image) -> Option<String> {
+        if self.superseded != other.superseded {
+            return Some(format!(
+                "superseded {:?}, and {:?}",
+                self.superseded, other.superseded
+            ));
+        }
+        let paths: BTreeSet<&PathBuf> = self.entries.keys().chain(other.entries.keys()).collect();
+        paths
+            .into_iter()
+            .find(|rel| self.entries.get(*rel) != other.entries.get(*rel))
+            .map(|rel| {
+                format!(
+                    "{}: {}, and {}",
+                    rel.display(),
+                    Entry::said(self.entries.get(rel)),
+                    Entry::said(other.entries.get(rel))
+                )
+            })
+    }
+}
+
+/// Each entry under `root`, `root` itself the empty path, without following a link.
+fn scan(root: &Path) -> BTreeMap<PathBuf, Entry> {
+    let mut entries = BTreeMap::new();
+    let mut look = vec![PathBuf::new()];
+    while let Some(rel) = look.pop() {
+        let path = root.join(&rel);
+        let meta = std::fs::symlink_metadata(&path).expect("an entry");
+        let modified = meta.modified().expect("a last write");
+        let entry = if meta.file_type().is_symlink() {
+            Entry::Link(std::fs::read_link(&path).expect("a link"))
+        } else if meta.is_dir() {
+            for child in std::fs::read_dir(&path).expect("a directory") {
+                look.push(rel.join(child.expect("an entry").file_name()));
+            }
+            Entry::Dir {
+                mode: mode_of(&meta),
+                modified,
+            }
+        } else if meta.is_file() {
+            Entry::File {
+                mode: mode_of(&meta),
+                modified,
+                bytes: std::fs::read(&path).expect("a file"),
+            }
+        } else {
+            panic!("{}: neither a directory, a file nor a link", rel.display());
+        };
+        entries.insert(rel, entry);
+    }
+    entries
+}
+
+/// An entry's permission bits; where there are none, whether it is read-only.
+fn mode_of(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        meta.permissions().mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        u32::from(meta.permissions().readonly())
+    }
+}
+
+/// `path` given `mode` ([`mode_of`]).
+fn set_mode(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    let permissions = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::Permissions::from_mode(mode)
+    };
+    #[cfg(not(unix))]
+    let permissions = {
+        let mut permissions = std::fs::symlink_metadata(path)
+            .expect("an entry")
+            .permissions();
+        permissions.set_readonly(mode == 1);
+        permissions
+    };
+    std::fs::set_permissions(path, permissions).expect("a mode");
+}
+
+/// `path`'s last write put at `modified`.
+fn set_modified(path: &Path, modified: SystemTime) {
+    #[cfg(unix)]
+    let file = std::fs::File::open(path);
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    };
+    file.and_then(|file| file.set_modified(modified))
+        .expect("a last write");
+}
+
+/// A link at `path` naming `to`.
+fn link(to: &Path, path: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(to, path).expect("a link");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(to, path).expect("a link");
+}
+
+/// Walks as a tree of their events: each walk is a path from the root, and walks that share a
+/// prefix share its nodes.
+#[derive(Default)]
+struct Tree {
+    /// How many walks end here.
+    ends: usize,
+    /// Each event a walk takes next from here, in the order the walks first take it.
+    next: Vec<(Event, Tree)>,
+}
+
+impl Tree {
+    fn of(walks: &[Vec<Event>]) -> Tree {
+        let mut root = Tree::default();
+        for walk in walks {
+            let mut node = &mut root;
+            for event in walk {
+                let at = match node.next.iter().position(|(taken, _)| taken == event) {
+                    Some(at) => at,
+                    None => {
+                        node.next.push((*event, Tree::default()));
+                        node.next.len() - 1
+                    }
+                };
+                node = &mut node.next[at].1;
+            }
+            node.ends += 1;
+        }
+        root
     }
 }
 
@@ -776,16 +1108,23 @@ fn walks_from(start: Start) -> Vec<Vec<Event>> {
 /// said by the report, and no launch takes it; what a receipt counts is what the file holds; a sync
 /// repeated with nothing changed writes nothing; a sync that refuses leaves the roster or names each
 /// change; and the report's `at a weekly limit:` is what the writer does. FLOOR: the walks it takes
-/// are `walks`, so they cannot silently shrink. The walks run one after another on this thread, the
-/// runner's own threads being the only concurrency: their work is file calls, which more threads
-/// here only slow down.
+/// are `walks`, and it ends each of them, so they cannot silently shrink. One pool takes them all
+/// as a [`Tree`] ([`Walk::explore`]): a prefix the walks share is taken once, and each walk that
+/// parts from it starts from the world it left, laid again from its [`Image`]. The walks run one
+/// after another on this thread, the runner's own threads being the only concurrency: their work
+/// is file calls, which more threads here only slow down.
+///
+/// NEGATIVE CONTROL (2026-11-09): with `accounts_pool::check_launch_login_identity` passing every
+/// login, every start but [`Start::Twin`] fails with "a launch would take" at the classes. With
+/// [`Walk::explore`] taking
+/// only the first next event two steps in, `from_two` fails at the walks it ended (87 of 381).
 fn walk_law(start: Start, walks: usize) {
     let taken = walks_from(start);
     assert_eq!(taken.len(), walks, "{start:?}: the walks it takes");
     let mut found = Vec::new();
-    for events in &taken {
-        Walk::run(start, events, &mut found);
-    }
+    let walk = Walk::new(start);
+    let ended = walk.explore(start, &Tree::of(&taken), &mut Vec::new(), &mut found);
+    assert_eq!(ended, walks, "{start:?}: the walks it ended");
     let mut classes = BTreeMap::<String, (usize, String)>::new();
     for (why, at) in found {
         let class: String = why
@@ -809,6 +1148,100 @@ fn walk_law(start: Start, walks: usize) {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// A WORLD LAID AGAIN IS THE ONE ITS IMAGE TOOK: after the default login's bytes and last write
+/// changed, new files and a new directory tree came, a file and a directory with what it held went
+/// and a directory was superseded, and (on unix) the roster's mode changed and a link came,
+/// [`Walk::restore`] puts back each, as read here apart from the images it compares.
+///
+/// NEGATIVE CONTROL (2026-11-09): with [`scan`] looking into no directory under the root, the
+/// restore's own look passes, and this fails at the default login's text. With a restore that
+/// removes nothing, the restore fails its own look ("the world laid again is not its image"), here
+/// and in each walk ([`walk_law`]).
+#[test]
+fn a_world_laid_again_is_the_one_its_image_took() {
+    let walk = Walk::new(Start::Two);
+    let root = walk.pool.tmp.path().to_path_buf();
+    let image = walk.image();
+    let default = walk.default_file();
+    let written = |path: &Path| {
+        std::fs::metadata(path)
+            .expect("a file")
+            .modified()
+            .expect("a last write")
+    };
+    let (login, login_written) = (
+        std::fs::read_to_string(&default).expect("the default login"),
+        written(&default),
+    );
+    let work = root.join("logins/codex/work/auth.json");
+    let work_login = std::fs::read_to_string(&work).expect("work's login");
+    let package = std::fs::read(&walk.pool.old).expect("the old package");
+    let came = walk.home().join("came");
+    law_auth(&default, FAR, Some(FAR));
+    std::fs::create_dir_all(came.join("deeper")).expect("a directory");
+    std::fs::write(came.join("deeper/file"), "came").expect("a file");
+    std::fs::write(walk.home().join(".codex/came.json"), "{}").expect("a file");
+    std::fs::write(root.join("came.txt"), "came").expect("a file");
+    std::fs::remove_file(&work).expect("work's login");
+    std::fs::remove_dir_all(root.join("store/old")).expect("the old package");
+    walk.superseded.borrow_mut().insert(root.join("moved"));
+    #[cfg(unix)]
+    let roster = {
+        use std::os::unix::fs::PermissionsExt as _;
+        let roster = walk
+            .pool
+            .env
+            .accounts_roster_for(Cli::Codex)
+            .expect("a roster");
+        let mode = std::fs::metadata(&roster)
+            .expect("the roster")
+            .permissions()
+            .mode();
+        std::fs::set_permissions(&roster, std::fs::Permissions::from_mode(0o604)).expect("a mode");
+        std::os::unix::fs::symlink("came.txt", root.join("link")).expect("a link");
+        (roster, mode)
+    };
+    walk.restore(&image);
+    assert_eq!(
+        std::fs::read_to_string(&default).expect("the default login"),
+        login
+    );
+    assert_eq!(written(&default), login_written);
+    assert_eq!(
+        std::fs::read_to_string(&work).expect("work's login"),
+        work_login
+    );
+    assert_eq!(
+        std::fs::read(&walk.pool.old).expect("the old package"),
+        package
+    );
+    for gone in [
+        came,
+        walk.home().join(".codex/came.json"),
+        root.join("came.txt"),
+        root.join("link"),
+    ] {
+        assert!(
+            std::fs::symlink_metadata(&gone).is_err(),
+            "{}",
+            gone.display()
+        );
+    }
+    assert!(walk.superseded.borrow().is_empty());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (roster, mode) = roster;
+        assert_eq!(
+            std::fs::metadata(&roster)
+                .expect("the roster")
+                .permissions()
+                .mode(),
+            mode
+        );
+    }
 }
 
 /// [`walk_law`] from each roster: two rows, three, a hold, a custody row, a twin, and a default

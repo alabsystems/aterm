@@ -3,7 +3,9 @@
 
 //! A PLAIN BUILD'S MEMORY CLAIM (`docs/DESIGN-adaptive-build-2026-10-24.md`, BUILD-ADMIT): a
 //! `targo` or `cargo` call that compiles claims the memory it will take in this user's capacity
-//! ledger before the build starts, and holds it until the build ends.
+//! ledger before the build starts, and holds it until the build ends. It also requests a
+//! CPU share and bounds Cargo's jobserver by that grant. A full Release core pool queues
+//! the build even where its memory fits.
 //!
 //! What claims ([`classify`]): `build`, `check`, `test`, `bench`, `doc`, `rustc`, `rustdoc`,
 //! `fix`, `package` with its default compile verification, and the lint (`tippy`, `clippy`,
@@ -32,7 +34,7 @@
 //!
 //! How the hidden verb runs it ([`front_exec`], BUILD-ADMIT's shim hop): the front, which is the
 //! shell's job, claims, hands its claim to a holder that keeps it for the build's life ([`hold`]),
-//! and becomes the build in its own pid with nothing else changed (its signal state put back as
+//! and becomes the build in its own pid with its granted job width (its signal state put back as
 //! it was started with it: `build_admit_exec.rs`), so every reader of that pid, its parent, its
 //! job and its signals finds the build itself. A build started under a cargo that holds its
 //! build lock (a build script's) runs under its verified covering claim; without one, an
@@ -80,6 +82,55 @@ pub const ADMIT_ENV: &str = "ATERM_ADMIT";
 
 /// How each of this module's lines starts.
 const SAYS: &str = "build-admit";
+
+/// Bound Cargo's own jobserver by the grant, including an explicit jobs option.
+/// Arguments after `--` belong to the test binary or compiler and are untouched.
+#[cfg(any(unix, test))]
+fn limited_jobs(args: &[String], cores: u32) -> Vec<String> {
+    let mut args = args.to_vec();
+    let end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let cap = |value: &str| match value.parse::<i64>() {
+        Ok(n) if n > 0 => n.min(i64::from(cores.max(1))).to_string(),
+        Ok(n) if n < 0 => cores.max(1).to_string(),
+        _ => value.to_owned(), // Let Cargo diagnose invalid input.
+    };
+    let mut found = false;
+    let mut i = 0;
+    while i < end {
+        if args[i] == "--jobs" || args[i] == "-j" {
+            found = true;
+            i += 1;
+            if i < end {
+                args[i] = cap(&args[i]);
+            }
+        } else if let Some(value) = args[i].strip_prefix("--jobs=") {
+            args[i] = format!("--jobs={}", cap(value));
+            found = true;
+        } else if let Some(value) = args[i].strip_prefix("-j").filter(|v| !v.is_empty()) {
+            args[i] = format!("-j{}", cap(value.strip_prefix('=').unwrap_or(value)));
+            found = true;
+        }
+        i += 1;
+    }
+    if !found {
+        args.insert(end, format!("--jobs={}", cores.max(1)));
+    }
+    args
+}
+
+#[cfg(unix)]
+fn limit_command(command: &mut aterm_uds::spawnfd::Command, cores: u32) {
+    let Some(args) = command
+        .get_args()
+        .map(|a| a.to_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    if classify(&args, tool_of(Path::new(command.get_program()))).is_some() {
+        command.set_args(limited_jobs(&args, cores));
+    }
+}
 
 /// The variable that points a debug build's [`Seat::live`] at a scratch ledger (its directory),
 /// so a test that runs this binary's front never claims in this user's ledger, which
@@ -191,6 +242,8 @@ pub enum Selection {
 /// WHAT A CALL BUILDS, read for its claim ([`classify`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Build {
+    /// Explicit Cargo job width, including a negative offset from the host's cores.
+    pub jobs: Option<i64>,
     /// The work: `targo test`, `targo trust check`, `cargo build`.
     pub stage: String,
     /// Verify's stage that does the same work or more of it, whose records are this one's
@@ -217,8 +270,6 @@ const VALUED: &[&str] = &[
     "--color",
     "--explain",
     "--target-dir",
-    "-j",
-    "--jobs",
     "--message-format",
     "--lockfile-path",
     "--artifact-dir",
@@ -305,6 +356,7 @@ pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
     let mut targets: Vec<String> = Vec::new();
     let mut dir = None;
     let mut manifest = None;
+    let mut jobs = None;
     while let Some(a) = it.next() {
         if a == "--" {
             break;
@@ -327,6 +379,7 @@ pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
             "-F" | "--features" => shape.push(format!("features {}", value(inline, &mut it)?)),
             "-C" => dir = Some(PathBuf::from(value(inline, &mut it)?)),
             "--manifest-path" => manifest = Some(PathBuf::from(value(inline, &mut it)?)),
+            "-j" | "--jobs" => jobs = value(inline, &mut it)?.parse().ok(),
             f if NAMED_TARGETS.contains(&f) => {
                 targets.push(format!("{f} {}", value(inline, &mut it)?));
             }
@@ -336,7 +389,9 @@ pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
                 value(inline, &mut it)?;
             }
             _ => {
-                if let Some(p) = a.strip_prefix("-p").filter(|p| !p.is_empty()) {
+                if let Some(j) = a.strip_prefix("-j").filter(|j| !j.is_empty()) {
+                    jobs = j.strip_prefix('=').unwrap_or(j).parse().ok();
+                } else if let Some(p) = a.strip_prefix("-p").filter(|p| !p.is_empty()) {
                     named.push(p.to_owned());
                 } else if let Some(f) = a.strip_prefix("-F").filter(|f| !f.is_empty()) {
                     shape.push(format!("features {f}"));
@@ -394,6 +449,7 @@ pub fn classify(args: &[String], tool: Tool) -> Option<Build> {
     variant.sort();
     variant.dedup();
     Some(Build {
+        jobs,
         stage,
         analogue,
         selection,
@@ -893,9 +949,18 @@ fn admit_for(
     let phased = aterm_capacity::phase::phased(need.bytes, run);
     let budget = reading.reachable().unwrap_or(u64::MAX);
     let what = format!("{} {}", key.stage, key.selection());
+    let jobs = build
+        .jobs
+        .or_else(|| std::env::var("CARGO_BUILD_JOBS").ok()?.parse().ok());
+    let cores = match jobs {
+        Some(n) if n > 0 => i64::from(reading.cores).min(n),
+        Some(n) if n < 0 => i64::from(reading.cores).saturating_add(n).max(1),
+        _ => i64::from(reading.cores),
+    } as u32;
     let ask = |alone: bool| {
         let mut n = Need::new(what.clone())
             .mem(phased.mem)
+            .cores(cores)
             .checkout(key.checkout.clone())
             .covers();
         n.run_mem = phased.run_mem;
@@ -1881,6 +1946,9 @@ fn launch_held(
     command: &mut aterm_uds::spawnfd::Command,
 ) -> std::io::Result<(SupervisedChild, Option<std::io::Error>)> {
     use aterm_capacity::cohort::launch::LaunchError;
+    if let Some(held) = held.as_ref() {
+        limit_command(command, held.claim.cores());
+    }
     let Some(held) = held.filter(|held| held.cohort) else {
         return command
             .spawn()
@@ -2318,7 +2386,7 @@ fn usage() -> std::process::ExitCode {
 
 /// THE SHIM HOP'S FRONT: `target` run on `args` as `tool` reads it, in `cwd`, at `seat`, IN THIS
 /// PROCESS'S PID. A call that claims nothing becomes `target` at once ([`exec`]). A claimed one
-/// hands its claim to a holder ([`hand_over`]) and becomes `target` with nothing else changed, so
+/// hands its claim to a holder ([`hand_over`]) and becomes `target` with its granted job width, so
 /// every reader of this pid, its parent, its job and its signals finds the build itself; where
 /// no holder arms, the build runs under the claim here as [`supervise`] runs it, and only where
 /// that cannot start does it run unclaimed, said. An interrupt that ended the wait ends this
@@ -2358,6 +2426,8 @@ fn front_exec_bounded(
             return exec(target, args);
         }
     };
+    let args = limited_jobs(args, held.claim.cores());
+    let args = args.as_slice();
     match hand_over(&held) {
         Ok(()) => {
             let marker = std::env::var_os(aterm_capacity::COVER_ENV)

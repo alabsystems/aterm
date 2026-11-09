@@ -1218,8 +1218,7 @@ fn policy_held(
     held: &accounts::Lock,
 ) -> Result<(Roster, accounts::Logins), String> {
     let path = seat.config_dir.join(cli.accounts().roster_file);
-    let (target, _) = super::cli::roster_target(&path)?;
-    store.recover_sync_held(held, &target)?;
+    store.recover_sync_held(held, &path)?;
     let raw = seat.roster(cli)?;
     let (logins, _) = store.load_logins(seat.now)?;
     Ok((accounts::bound(&raw, &logins), logins))

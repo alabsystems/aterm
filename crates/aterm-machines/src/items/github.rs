@@ -81,13 +81,40 @@ pub fn installed_git_without_atpkg(sys: &dyn System) -> Option<PathBuf> {
     if let Some(git) = git_executable_target(sys, Path::new(CLT_GIT)) {
         return Some(git);
     }
-    sys.read_link(Path::new(XCODE_SELECT_LINK))
+    selected_developer_dir(sys)
         .ok()
-        .filter(|dir| dir.is_absolute())
+        .flatten()
         .into_iter()
         .chain([PathBuf::from(XCODE_DEVELOPER)])
         .map(|dir| dir.join("usr/bin/git"))
         .find_map(|git| git_executable_target(sys, &git))
+}
+
+/// The system selection, resolved beside its link and through an application's developer
+/// contents. Inspect through the port: its `stat` does not follow a final symbolic link.
+fn selected_developer_dir(sys: &dyn System) -> std::io::Result<Option<PathBuf>> {
+    let link = Path::new(XCODE_SELECT_LINK);
+    let dir = match sys.read_link(link) {
+        Ok(dir) if dir.is_absolute() => dir,
+        Ok(dir) => link
+            .parent()
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?
+            .join(dir),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    aterm_types::clt_shim::developer_content_dir_with(&dir, |contents| {
+        let real = sys.canonicalize(contents)?;
+        sys.stat(&real).map(|stat| stat.dir && !stat.symlink)
+    })
+    .map(Some)
 }
 
 /// The nonempty executable target used by Git discovery and settings readers.
@@ -116,17 +143,18 @@ pub fn shims_ask_for_tools(sys: &dyn System) -> bool {
     if !sys.macos() {
         return false;
     }
-    let holds_tools = |dir: &PathBuf| sys.stat(&dir.join("usr/bin")).is_ok_and(|stat| stat.dir);
-    let chosen = sys
-        .read_link(Path::new(XCODE_SELECT_LINK))
-        .ok()
-        .filter(|dir| dir.is_absolute());
-    match chosen {
-        Some(dir) => !holds_tools(&dir),
-        None => ![XCODE_DEVELOPER, crate::items::developer::CLT_DIR]
+    let holds_tools = |dir: &PathBuf| {
+        sys.canonicalize(&dir.join("usr/bin"))
+            .and_then(|real| sys.stat(&real))
+            .is_ok_and(|stat| stat.dir && !stat.symlink)
+    };
+    match selected_developer_dir(sys) {
+        Ok(Some(dir)) => !holds_tools(&dir),
+        Ok(None) => ![XCODE_DEVELOPER, crate::items::developer::CLT_DIR]
             .into_iter()
             .map(PathBuf::from)
             .any(|dir| holds_tools(&dir)),
+        Err(_) => true,
     }
 }
 
@@ -1339,6 +1367,33 @@ mod tests {
         let sys = Fake::root();
         sys.stat_of(default, Stat { dir: true, ..FILE });
         assert_eq!(installed_git(&sys), None);
+
+        // A selected application root, renamed bundle or alias names the same tools.
+        const ROOT: &str = "/Applications/Developer Suite";
+        const ALIAS: &str = "/Applications/Alternate.app";
+        const DEVELOPER: &str = "/Applications/Developer Suite/Contents/Developer";
+        const SELECTED_GIT: &str = "/Applications/Developer Suite/Contents/Developer/usr/bin/git";
+        for selected in [
+            DEVELOPER,
+            ROOT,
+            ALIAS,
+            "../../Applications/Developer Suite",
+            "../../Applications/Alternate.app",
+        ] {
+            let sys = Fake::root();
+            sys.link(XCODE_SELECT_LINK, selected);
+            sys.link(ALIAS, ROOT);
+            sys.stat_of(DEVELOPER, Stat { dir: true, ..FILE });
+            sys.stat_of(SELECTED_GIT, GIT);
+            assert_eq!(
+                installed_git(&sys),
+                Some(PathBuf::from(SELECTED_GIT)),
+                "selected {selected}"
+            );
+            sys.stat_of(CLT_GIT, GIT);
+            assert_eq!(installed_git(&sys), Some(PathBuf::from(CLT_GIT)));
+            assert!(sys.calls().is_empty(), "discovery must spawn nothing");
+        }
     }
 
     #[test]

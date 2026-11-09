@@ -1605,7 +1605,12 @@ impl Bootstrap {
         // files it was observed from. A writer holding the vault meets a fresh read, which finds
         // it busy; with none, files whose stamps have not moved give the observation they gave
         // (`client::observe_commons_quiet`).
-        let current = match client::observe_commons_quiet(paths)? {
+        Self::validate_observation(snapshot, client::observe_commons_quiet(paths)?)
+    }
+
+    /// Whether `observed`, the vault's observation now, is the one `snapshot` was taken under.
+    fn validate_observation(snapshot: &Snapshot, observed: super::Observation) -> Result<()> {
+        let current = match observed {
             super::Observation::Visible(current) => current,
             super::Observation::Unavailable(reason) => {
                 return Err(
@@ -1628,6 +1633,20 @@ impl Bootstrap {
     /// changed, missing, busy or no longer private state grants no authorization.
     pub fn revalidate_custody(&self) -> Result<()> {
         Self::validate_snapshot(&self.paths, &self.snapshot)?;
+        self.revalidate_immutable_custody()
+    }
+
+    /// [`Self::revalidate_custody`], the vault observed through `look`, one look at this
+    /// bootstrap's vault for checks that stand for one moment of it
+    /// ([`client::VaultLook::observe_commons`]); a look at another vault is not taken.
+    ///
+    /// # Errors
+    /// As [`Self::revalidate_custody`].
+    pub fn revalidate_custody_in(&self, look: &client::VaultLook<'_>) -> Result<()> {
+        if look.paths() != &self.paths {
+            return self.revalidate_custody();
+        }
+        Self::validate_observation(&self.snapshot, look.observe_commons()?)?;
         self.revalidate_immutable_custody()
     }
 
@@ -1896,6 +1915,26 @@ impl Bootstrap {
         .map(Option::flatten)
     }
 
+    /// [`Self::access_observed_in`] through `look`, one look at this bootstrap's vault for checks
+    /// that stand for one moment of it: judged under the look's shared observation of the state
+    /// lock and its look at each file, where it looks at this vault and observes that lock;
+    /// otherwise [`Self::access_observed_in`]'s own.
+    ///
+    /// # Errors
+    /// As [`Self::access_observed_in`].
+    pub fn access_observed_in_look(
+        &self,
+        journal: &Journal,
+        look: &client::VaultLook<'_>,
+    ) -> Result<Option<super::roster::Access>> {
+        match look.held() {
+            Some((lock, glance)) if look.paths() == &self.paths => {
+                self.access_in_observed_with(journal, Some(lock), glance)
+            }
+            _ => self.access_observed_in(journal),
+        }
+    }
+
     pub(crate) fn access_in_held(
         &self,
         journal: &Journal,
@@ -1909,6 +1948,16 @@ impl Bootstrap {
         journal: &Journal,
         lock: Option<&client::StateLock>,
     ) -> Result<Option<super::roster::Access>> {
+        self.access_in_observed_with(journal, lock, &fsx::Glance::new())
+    }
+
+    /// [`Self::access_in_observed`], each file looked at through `glance`.
+    fn access_in_observed_with(
+        &self,
+        journal: &Journal,
+        lock: Option<&client::StateLock>,
+        glance: &fsx::Glance,
+    ) -> Result<Option<super::roster::Access>> {
         if journal.trust() != self.trust() {
             return Err(Error::new("Commons access has another trust context"));
         }
@@ -1916,19 +1965,19 @@ impl Bootstrap {
         // fault on one of them that has not moved gives the judgement those files gave, so this
         // Mac keeps the access it held, as a server keeps the role it holds while its device
         // cannot be read; the swarm's checks of this Mac
-        // (`client::local_recipient_denied_in_roster`) read afresh and give such a Mac nothing
+        // (`client::local_recipient_denied_in_roster`), but for its LAN presence, a hint kept as
+        // this is (`client::swarm_member_heard_now`), read afresh and give such a Mac nothing
         // new. Both memos take the caller's own shared observation for theirs
         // (`client::trusted_commons_log_under`), and the access looks at the vault's files once
-        // for both and for the state its log stands on (`fsx::Glance`).
-        let glance = fsx::Glance::new();
+        // for both and for the state its log stands on, through `glance` (`fsx::Glance`).
         if let Some(lock) = lock
-            && client::local_recipient_denied_under(&self.paths, lock, &glance)?
+            && client::local_recipient_denied_under(&self.paths, lock, glance)?
         {
             return Ok(None);
         }
         let trusted = match lock {
             Some(lock) => {
-                client::trusted_commons_log_under(&self.paths, self.trust(), lock, &glance)?
+                client::trusted_commons_log_under(&self.paths, self.trust(), lock, glance)?
             }
             None => client::trusted_commons_log_now(&self.paths, self.trust())?,
         };
@@ -1984,7 +2033,7 @@ impl Bootstrap {
                     &log,
                     heads_digest,
                     lock,
-                    &glance,
+                    glance,
                 )?
             } else {
                 super::roster::current(journal, &self.device.identity)?

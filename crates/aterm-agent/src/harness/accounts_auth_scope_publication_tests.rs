@@ -42,6 +42,7 @@ impl Publication {
                 NOW,
                 &mut None,
                 SyncTarget {
+                    fleet: None,
                     path: &path,
                     before: Some(&before),
                     after: Some(&before),
@@ -122,6 +123,7 @@ impl Publication {
             NOW + 1,
             &mut None,
             SyncTarget {
+                fleet: None,
                 path: &self.path,
                 before: Some(before),
                 after: Some(after),

@@ -5,10 +5,38 @@
 
 use super::*;
 use crate::harness::accounts::rename_tests::{NOW, seed_reference};
+use crate::harness::alab_roster::test_machine;
 use crate::harness::alab_roster::{self, Lab, LabAccount};
+
+#[path = "accounts_native_migration_tests.rs"]
+mod native_migration_tests;
 
 fn email(local: &str) -> String {
     format!("{local}@example.com")
+}
+
+#[test]
+fn native_sync_keeps_the_projection_that_produced_its_fleet() {
+    let initial = Lab {
+        me: Some(test_machine("m22")),
+        accounts: vec![lab_account("one", "claude-one", &[("m22", Some(1))])],
+        ..Lab::default()
+    };
+    let fleet = alab_roster::fleet_for(&initial, Cli::Claude, None).unwrap();
+    let newer = Lab {
+        accounts: vec![lab_account("one", "claude-one", &[("m20", Some(1))])],
+        ..initial
+    };
+    let mut rows = vec![Row {
+        label: "claude-one".into(),
+        email: Some(email("one")),
+        class: Class::Pool,
+        ..Row::default()
+    }];
+    alab_roster::with_lab(newer, || {
+        rows_under_source(Cli::Claude, &fleet, None, &mut rows);
+    });
+    assert_eq!(rows[0].class, Class::Preferred);
 }
 
 fn lab_account(local: &str, label: &str, preferred: &[(&str, Option<u64>)]) -> LabAccount {
@@ -24,7 +52,7 @@ fn lab_account(local: &str, label: &str, preferred: &[(&str, Option<u64>)]) -> L
         joinable: true,
         preferred: preferred
             .iter()
-            .map(|(machine, rank)| ((*machine).to_owned(), *rank))
+            .map(|(machine, rank)| (test_machine(machine), *rank))
             .collect(),
     }
 }
@@ -84,7 +112,7 @@ fn a_sync_from_the_lab_adds_preferred_accounts_and_drops_no_row() {
         })
         .unwrap();
     let lab = Lab {
-        me: Some("m22".into()),
+        me: Some(test_machine("m22")),
         settled: false,
         accounts: vec![
             lab_account("ann", "claude-aaaaaa", &[("m22", Some(1))]),
@@ -104,7 +132,7 @@ fn a_sync_from_the_lab_adds_preferred_accounts_and_drops_no_row() {
                 &store,
                 &roster_path,
                 (&fleet, OptIn::Named),
-                ("m22", Some(&email("ann"))),
+                (test_machine("m22").key.as_str(), Some(&email("ann"))),
                 &BTreeMap::new(),
                 NOW,
                 (&[], &[]),
@@ -212,7 +240,7 @@ fn a_cli_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
         })
         .unwrap();
     let lab = |settled: bool| Lab {
-        me: Some("m16".into()),
+        me: Some(test_machine("m16")),
         settled,
         accounts: vec![LabAccount {
             cli,
@@ -320,7 +348,7 @@ fn a_cli_sync_from_a_lab_that_prefers_nothing_here_keeps_every_row_and_clears_ho
     )
     .unwrap();
     let lab = Lab {
-        me: Some("m16".into()),
+        me: Some(test_machine("m16")),
         settled: true,
         accounts: vec![LabAccount {
             cli,
@@ -476,7 +504,7 @@ impl Bed {
 
 fn lab_of(settled: bool, accounts: Vec<LabAccount>) -> Lab {
     Lab {
-        me: Some("m22".into()),
+        me: Some(test_machine("m22")),
         settled,
         accounts,
         aliases: BTreeMap::new(),
@@ -487,12 +515,8 @@ fn lab_of(settled: bool, accounts: Vec<LabAccount>) -> Lab {
     }
 }
 
-/// Claude Code's sync from a settled lab renames an old-style row (`m22-2`) to its account's lab
-/// label before it reads the fleet ([`sync_accounts_with`]'s `migrate_before_sync`), keeping the
-/// login directory where it is and its records under the new label, so nobody is signed out;
-/// with the lab unsettled the row keeps its label.
-/// NEGATIVE CONTROL: with `sync_accounts_with`'s `migrate_before_sync` call removed, the settled
-/// sync leaves `m22-2` (`renamed before the fleet is read`).
+/// A settled native sync projects legacy labels before composing the final roster, then
+/// publishes their records together. An unsettled lab keeps the legacy label.
 #[test]
 fn claude_codes_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
     let bed = Bed::new(None);
@@ -521,7 +545,7 @@ fn claude_codes_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login()
     let roster = bed.roster();
     assert!(
         roster.row("m22-2").is_none(),
-        "renamed before the fleet is read"
+        "the settled projection uses the native label"
     );
     let row = roster.row("claude-bbbbbb").expect("the account's label");
     assert_eq!(row.dir.as_deref(), Some(login.as_str()), "the login stays");
@@ -531,6 +555,52 @@ fn claude_codes_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login()
         state.accounts.get("claude-bbbbbb").map(|a| a.auth),
         Some(accounts::Auth::Ok),
         "still signed in, under its new label"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_native_publication_does_not_publish_label_migration() {
+    let bed = Bed::new(None);
+    let login = bed.login("m22-2");
+    bed.seed(&[Row {
+        label: "m22-2".into(),
+        dir: Some(login),
+        email: Some(email("bob")),
+        ..Row::default()
+    }]);
+    let fleet_path = bed.roster.parent().unwrap().join(FLEET_ROSTER_FILE);
+    std::os::unix::fs::symlink(bed.store.state_file(), &fleet_path).unwrap();
+    let paths = [
+        bed.roster.clone(),
+        bed.store.state_file(),
+        bed.store.logins_file(),
+        bed.store.ledger_path(),
+        bed.store.wake_path(),
+    ];
+    let image = || {
+        paths
+            .iter()
+            .map(|path| fs::read(path).ok())
+            .collect::<Vec<_>>()
+    };
+    let before = image();
+    let lab = lab_of(
+        true,
+        vec![LabAccount {
+            legacy_label: Some("m22-2".into()),
+            ..lab_account("bob", "claude-bbbbbb", &[("m22", Some(1))])
+        }],
+    );
+    let error = bed
+        .sync(&lab)
+        .err()
+        .expect("overlapping authority must be refused");
+    assert!(error.contains("overlaps"), "{error}");
+    assert_eq!(
+        image(),
+        before,
+        "migration must share the refused publication"
     );
 }
 
@@ -948,7 +1018,7 @@ fn a_first_lab_sync_lists_the_default_login_under_its_lab_label() {
             .unwrap();
         }
         let lab = Lab {
-            me: Some("m16".into()),
+            me: Some(test_machine("m16")),
             settled: true,
             accounts: vec![
                 codex("ann", "codex-aaaaaa", &[("m16", Some(1))]),

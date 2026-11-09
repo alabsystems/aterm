@@ -23,6 +23,9 @@ use crate::release::{
 #[path = "release_scanner_tools.rs"]
 mod scanner_tools;
 
+#[path = "release_export_remedy.rs"]
+mod export_remedy;
+
 #[cfg(all(debug_assertions, not(test)))]
 #[path = "release_cutter_probe.rs"]
 mod cutter_probe;
@@ -2088,6 +2091,7 @@ impl Real {
                 let head = head.ok_or("the engine has no records commit")?;
                 match native.write_ref("refs/heads/main", Some(&tip), &head)? {
                     crate::ledger::RefWrite::Written => Ok(()),
+                    crate::ledger::RefWrite::Transient(why) => Err(why),
                     crate::ledger::RefWrite::Conflict => {
                         Err("the engine main moved before its records could land".into())
                     }
@@ -2120,6 +2124,7 @@ impl Real {
                 let head = head.ok_or("the engine has no audit commit")?;
                 match native.write_ref("refs/heads/main", Some(&tip), &head)? {
                     crate::ledger::RefWrite::Written => Ok(()),
+                    crate::ledger::RefWrite::Transient(why) => Err(why),
                     crate::ledger::RefWrite::Conflict => {
                         Err("the engine's main changed before the audit commit could land".into())
                     }
@@ -5528,12 +5533,7 @@ pub fn export_outcome(
             )
         });
         return Outcome::Refuse(
-            Refusal::new(
-                why,
-                "fix the SOURCE, never the export — patterns: the engine's \
-                 baseline/forbidden-content.txt + publish/forbidden-extra.txt",
-            )
-            .detail(
+            Refusal::new(why, export_remedy::refusal_fix(&findings)).detail(
                 guards
                     .chain(others)
                     .chain(stopped)
@@ -10715,11 +10715,35 @@ mod tests {
         // too where `TMPDIR` holds one (as `$TMPDIR/.ubd/` does where `$TMPDIR` ends in a
         // separator).
         let path = dir.path().join(".").join("qualify.jobs");
+        // This fixture must not publish a Release into the account ledger and cancel an
+        // unrelated main-lane judgment. Its four-core machine and ledger are both private.
+        let ledger_path = dir.path().join("pool-ledger");
+        let ledger = aterm_capacity::Ledger::at(&ledger_path);
+        let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 4));
         let pool = qualify_pool(&path, true, |need| {
-            aterm_capacity::admit(need, aterm_capacity::Admit::Now)
+            assert_eq!(need.rank, aterm_capacity::Rank::Release);
+            aterm_capacity::admit_with(
+                &ledger,
+                &machine,
+                need.cores(4),
+                aterm_capacity::Admit::Now,
+                aterm_capacity::Pace::default(),
+                &mut |_| {},
+            )
         })
         .unwrap();
+        assert_eq!(
+            pool._claim.path().parent().unwrap().canonicalize().unwrap(),
+            ledger_path.canonicalize().unwrap(),
+            "the synthetic Release belongs only to the fixture's ledger"
+        );
+        assert_eq!(ledger.list().unwrap().len(), 1);
+        assert_eq!(
+            pool._claim.record().need.rank,
+            aterm_capacity::Rank::Release
+        );
         let (slots, export) = (pool.jobs.slots(), pool.export);
+        assert_eq!(slots, 4);
         assert_eq!(export, export_share(slots, true));
         let fifo = pool.jobs.path().as_os_str().to_owned();
         assert_eq!(

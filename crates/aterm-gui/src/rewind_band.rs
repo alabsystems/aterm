@@ -120,6 +120,7 @@ pub(crate) fn border_rects(
 
 impl App {
     /// The rewound panes window `wid` shows, with their cells in the terminal grid.
+    #[cfg(all(a11y_tree, test))]
     pub(crate) fn rewound_panes(&self, wid: WindowId) -> Vec<(u64, CellBox)> {
         self.rewound_panes_from_plan(wid, None)
     }
@@ -182,19 +183,28 @@ impl App {
     }
 
     /// Whether window row `row` (in terminal grid rows) of window `wid` lies under the band or the track of the rewound `session`'s pane: rows the last frame claimed as chrome, or, before any frame, that pane's bottom band rows.
-    pub(crate) fn rewind_band_covers(&self, wid: WindowId, session: u64, row: u16) -> bool {
+    pub(crate) fn rewind_band_covers(
+        &self,
+        wid: WindowId,
+        session: u64,
+        row: u16,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> bool {
         let row = usize::from(row);
         let col = self
             .windows
             .get(&wid)
             .map_or(0, |ws| usize::from(ws.last_mouse_window_cell.1));
         self.chrome_owns_terminal_cell(wid, row, col)
-            || self.rewound_panes(wid).iter().any(|(s, pane)| {
-                *s == session
-                    && row >= pane.row
-                    && row < pane.row + pane.rows
-                    && row - pane.row >= pane.rows.saturating_sub(band_rows(pane.rows))
-            })
+            || self
+                .rewound_panes_from_plan(wid, frame_plan)
+                .iter()
+                .any(|(s, pane)| {
+                    *s == session
+                        && row >= pane.row
+                        && row < pane.row + pane.rows
+                        && row - pane.row >= pane.rows.saturating_sub(band_rows(pane.rows))
+                })
     }
 
     /// The Rewind fingerprint of window `wid`'s frame: 0 while no pane it shows is rewound.
@@ -347,12 +357,16 @@ impl App {
 
     /// The focused pane's open Rewind view for window `wid`'s accessibility tree, as a slider over its instants.
     #[cfg(a11y_tree)]
-    pub(crate) fn rewind_a11y(&self, wid: WindowId) -> Option<crate::a11y_tree::GridRewind> {
+    pub(crate) fn rewind_a11y(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> Option<crate::a11y_tree::GridRewind> {
         let session = self.rewound_front(wid)?;
         let view = self.pool.rewind(session).filter(|v| v.shown.is_some())?;
         let words = self.rewind_words(wid, session)?;
         let pane = self
-            .rewound_panes(wid)
+            .rewound_panes_from_plan(wid, frame_plan)
             .into_iter()
             .find(|(s, _)| *s == session)
             .map(|(_, pane)| pane);

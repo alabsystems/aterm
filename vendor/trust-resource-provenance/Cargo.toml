@@ -16,6 +16,7 @@ sha2 = { package = "trust-sha2", path = "../trust-sha2", default-features = fals
 
 [dev-dependencies]
 tempfile = { package = "aterm-tempfile", path = "../../crates/aterm-tempfile" }
+aterm-uds = { path = "../../crates/aterm-uds" }
 
 [package.metadata.aterm-vendor]
 upstream = "https://github.com/alabsystems/trust"

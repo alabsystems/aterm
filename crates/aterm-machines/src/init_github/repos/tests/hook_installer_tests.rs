@@ -94,6 +94,68 @@ fn a_hook_installer_on_a_mac_without_developer_tools_cannot_ask_for_them() {
     tools(&chosen, BETA);
     assert_eq!(developer_dir(&chosen), None);
 
+    // Managed Git does not hide healthy system tools from the installer's shims.
+    const ROOT: &str = "/Applications/Developer Suite";
+    const ALIAS: &str = "/Applications/Alternate.app";
+    const CONTENTS: &str = "/Applications/Developer Suite/Contents/Developer";
+    let prefix = Path::new(&who.home).join("Library/Application Support/aterm/pkg");
+    let store = prefix.join("store/git");
+    let exec = Stat {
+        uid: who.uid,
+        gid: 20,
+        mode: 0o755,
+        dir: false,
+        symlink: false,
+        len: 1,
+    };
+    for selected in [
+        CONTENTS,
+        ROOT,
+        ALIAS,
+        "../../Applications/Developer Suite",
+        "../../Applications/Alternate.app",
+    ] {
+        let sys = Fake::root();
+        sys.link("/var/db/xcode_select_link", selected);
+        sys.link(ALIAS, ROOT);
+        sys.stat_of(CONTENTS, directory(0));
+        tools(&sys, CONTENTS);
+        sys.link(store.join("current").to_str().unwrap(), "12");
+        sys.stat_of(store.join("12.ready").to_str().unwrap(), exec);
+        sys.stat_of(store.join("12/bin/git").to_str().unwrap(), exec);
+        sys.stat_of(prefix.join("bin/git").to_str().unwrap(), exec);
+        let command = installer_command(&sys, &who, &clone);
+        assert!(command.env.contains(&(
+            "PATH".to_owned(),
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                prefix.join("bin").display()
+            ),
+        )));
+        assert!(
+            command.env.iter().all(|(key, _)| key != "DEVELOPER_DIR"),
+            "selected {selected} already holds the tools"
+        );
+        assert!(sys.calls().is_empty(), "selection starts no child");
+    }
+    // A missing, unreadable or looping selection still fences Apple's install dialog,
+    // even when a different developer directory happens to be installed.
+    for failure in ["missing", "unreadable", "loop"] {
+        let sys = Fake::root();
+        sys.link("/var/db/xcode_select_link", ALIAS);
+        sys.link(ALIAS, if failure == "loop" { ALIAS } else { ROOT });
+        if failure == "unreadable" {
+            sys.stat_fails(CONTENTS, std::io::ErrorKind::PermissionDenied);
+        }
+        tools(&sys, CLT);
+        assert_eq!(
+            developer_dir(&sys).as_deref(),
+            Some(NO_DEVELOPER_DIR),
+            "{failure} selection must not borrow another directory"
+        );
+        assert!(sys.calls().is_empty());
+    }
+
     let mut linux = Fake::root();
     linux.linux = true;
     assert_eq!(developer_dir(&linux), None, "no shims off macOS");

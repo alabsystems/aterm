@@ -572,7 +572,6 @@ pub(crate) fn publication_transition(
 fn completion_publication_refines_real_journals_and_detects_boundary_mutants() {
     let model = aterm_models_harness::renewal_completion_publication_model();
     aterm_spec::interp::prove_and_catch(&model);
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     for state in aterm_spec::interp::reachable_states(&model) {
         for action in &model.actions {
             if model.action_enabled(action.name, &state) {

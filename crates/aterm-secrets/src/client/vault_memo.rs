@@ -4,8 +4,9 @@
 //! Vault reads for a reader that asks per connection, per round or every few seconds, whatever
 //! it found: the swarm deny list (a fleet listener, which checks each proved dialer against it,
 //! its node job's watch, which checks every live connection each tick, and the node's Commons
-//! peer checks and census) and the Commons observation (the Commons runtime's presence poll,
-//! the members desk). [`swarm_denied_nodes`](super::swarm_denied_nodes) and
+//! peer checks and census), the Commons observation (the Commons runtime's presence poll,
+//! the members desk) and this Mac's standing as an ALab member (the node's LAN responder and
+//! advert). [`swarm_denied_nodes`](super::swarm_denied_nodes) and
 //! [`observe_commons`](super::observe_commons) read, decrypt and evaluate the vault and its
 //! membership log at every call, tens of milliseconds of CPU on a busy Mac, so each keeps its
 //! last settled answer and reads again when one of the files it reads, or the vault directory's
@@ -89,23 +90,27 @@ pub(crate) fn observe_commons_now(paths: &Paths) -> crate::Result<crate::commons
 /// # Errors
 /// As [`observe_commons`](super::observe_commons).
 pub(crate) fn observe_commons_quiet(paths: &Paths) -> crate::Result<crate::commons::Observation> {
-    static MEMO: Memo<crate::commons::Observation> = Memo::keyed(observation_inputs, true);
-    MEMO.read_keyed(paths, &(), super::observe_commons)
+    OBSERVATION.read_keyed(paths, &(), super::observe_commons)
 }
+
+/// What [`observe_commons_quiet`] and [`VaultLook::observe_commons`] keep.
+static OBSERVATION: Memo<crate::commons::Observation> = Memo::keyed(observation_inputs, true);
 
 /// [`local_recipient_denied`](super::steward::local_recipient_denied) of a fresh read, read again
 /// only when one of the files it reads ([`observation_inputs`]) moved; quiet, as
 /// [`local_swarm_roster_for_log_now`], so a writer holding the vault (the caller's own exclusive
 /// take included) meets a fresh read. Every table session a repair round opens checks this Mac's
-/// own denial under its access (`Bootstrap::access_in_observed`), 18 times a round on each side of
-/// a loopback pair, reading the vault, its log and roster each time: 7% of a quiet round's CPU
-/// (2026-11-08) and a third of its reads of the vault. That access asks it under its own
-/// observation of the state lock, `lock`, which the memo takes for its own as
-/// [`trusted_commons_log_under`] does, and looks up what it kept through the access's `glance`, as
-/// that log's memo does next ([`fsx::Glance`]); a miss reads and stamps afresh, and keeps its
+/// own denial under its access (`Bootstrap::access_in_observed_with`), 18 times a round on each
+/// side of a loopback pair, reading the vault, its log and roster each time: 7% of a quiet round's
+/// CPU (2026-11-08) and a third of its reads of the vault. That access asks it under its caller's
+/// shared observation of the state lock, `lock` (the access's own, or that of the look a session's
+/// admission takes: [`VaultLook`]), which the memo takes for its own as
+/// [`trusted_commons_log_under`] does, and looks up what it kept through that caller's `glance`,
+/// as that log's memo does next ([`fsx::Glance`]); a miss reads and stamps afresh, and keeps its
 /// answer under those stamps. The swarm's checks of this Mac
-/// ([`local_recipient_denied_in_roster`](super::local_recipient_denied_in_roster)) read afresh, so
-/// one that cannot read a file it was settled on takes this Mac as denied. This one, like every
+/// ([`local_recipient_denied_in_roster`](super::local_recipient_denied_in_roster)), but for its
+/// LAN presence ([`swarm_member_heard_now`]), read afresh, so one that cannot read a file it was
+/// settled on takes this Mac as denied. This one, like every
 /// memo here, gives the answer it kept through a read fault on files that have not moved: the
 /// judgement those files gave, so a Mac keeps the table access it held, as a server keeps the
 /// role it holds while its device cannot be read
@@ -122,6 +127,44 @@ pub(crate) fn local_recipient_denied_under(
     MEMO.read_keyed_under(paths, &(), lock, glance, |paths| {
         super::steward::local_recipient_denied(&super::Reads::new(paths))
     })
+}
+
+/// [`swarm_member_heard`](super::steward::swarm_member_heard), read again only when one of the
+/// files it reads ([`observation_inputs`]) moved. The node's LAN responder asks it at each of its
+/// refreshes (one a second), at each route change and before each answer it sends, and its
+/// `_alab._tcp` advert at each tick of the node's watch: each ask read the vault's status, its
+/// envelope again for the signer's chain and its denial evidence again, about a millisecond of
+/// CPU on a vault the owner's size (measured on Linux arm64), of files the vault's subscriber
+/// rewrites about twice a minute.
+///
+/// Quiet, as [`local_swarm_roster_for_log_now`]: while a writer holds the vault's state lock the
+/// fresh read meets it and this Mac is out, as before. What it keeps is when the vault last heard
+/// this Mac, never a verdict at a time: each caller judges that age against its own clock at each
+/// call. A removal, a revocation or a denial rewrites the state, the envelope or the records, so
+/// it is read at the next call. A read that fails is never kept: it is this call's error, and the
+/// next call reads again.
+///
+/// The trade: once an answer is kept, a read fault on files whose stamps have not moved (a
+/// descriptor the process ran out of, an I/O error) is never met, and the kept answer, a member's
+/// included, stands, where a fresh read would have failed and taken this Mac as out. It stands
+/// only until one of those files changes. The LAN presence is a hint whose dial a handshake
+/// judges; the swarm's other checks of this Mac
+/// ([`local_recipient_denied_in_roster`](super::local_recipient_denied_in_roster)) read afresh and
+/// take a fault as a denial.
+///
+/// Keyed by whether a test reads this vault's standing as the ALab vault's
+/// (`client::test_alab_standing`, which a release build lacks), so a registration after a first
+/// read is read afresh.
+///
+/// # Errors
+/// As [`swarm_member_heard`](super::steward::swarm_member_heard).
+pub fn swarm_member_heard_now(paths: &Paths) -> crate::Result<Option<u64>> {
+    static MEMO: Memo<Option<u64>, bool> = Memo::keyed(observation_inputs, true);
+    MEMO.read_keyed(
+        paths,
+        &super::steward::alab_standing_for_tests(paths),
+        super::steward::swarm_member_heard,
+    )
 }
 
 /// [`local_swarm_roster_for_log`](super::local_swarm_roster_for_log), read again only when one
@@ -192,8 +235,9 @@ pub fn trusted_commons_log_now(
 
 /// [`trusted_commons_log_now`] for a caller that holds `lock`: a roster access check
 /// (`commons::roster::log_observation_is_current`) and a table session's access
-/// (`Bootstrap::access_in_observed`), each under its own observation of the vault's state lock,
-/// ask it at nearly every step of a repair round, and each ask opened, observed and closed that
+/// (`Bootstrap::access_in_observed_with`), each under its caller's shared observation of the
+/// vault's state lock (the check's own, or a table session look's: [`VaultLook`]), ask it at
+/// nearly every step of a repair round, and each ask opened, observed and closed that
 /// lock again: with this Mac's own denial check under the same access
 /// ([`local_recipient_denied_under`]), 7.8% of a sustained quiet round's samples over a long log
 /// and 10.4% over a short one (2026-11-08). While `lock` is a shared observation
@@ -257,6 +301,11 @@ static ROSTER: Memo<Option<crate::swarm_roster::SwarmRoster>> = Memo::keyed(inpu
 /// the records were read afresh, with the configuration, the retained history and the records'
 /// selection behind them: the checks took 13.0% of a sustained quiet round's on-CPU samples over
 /// a long log and 10.9% over a short one, their records reads 4.3% and 4.9% (2026-11-08).
+///
+/// A table repair round's local batch takes one for its session's open and the checks it makes at
+/// once after it (`aterm-db`'s `Replica::observe`): the open's custody
+/// (`Bootstrap::revalidate_custody_in`) and access (`Bootstrap::access_observed_in_look`), and the
+/// currency of its peer and of its observation (`Access::is_current_in`).
 pub struct VaultLook<'a> {
     paths: &'a Paths,
     observation: Option<super::Observing>,
@@ -282,6 +331,27 @@ impl<'a> VaultLook<'a> {
     #[must_use]
     pub const fn paths(&self) -> &'a Paths {
         self.paths
+    }
+
+    /// The shared observation of the state lock this look holds, while it still guards the lock
+    /// at the vault's path ([`StateLock::observes`]), and the look at each file it takes: what a
+    /// read under its caller's observation takes ([`trusted_commons_log_under`],
+    /// [`local_recipient_denied_under`]). `None` where the look observes nothing.
+    pub(crate) fn held(&self) -> Option<(&StateLock, &fsx::Glance)> {
+        self.observation
+            .as_ref()
+            .map(super::Observing::lock)
+            .filter(|lock| lock.observes(self.paths))
+            .map(|lock| (lock, &self.glance))
+    }
+
+    /// [`observe_commons_quiet`] through this look: a table session's check of its custody at its
+    /// open (`Bootstrap::revalidate_custody_in`).
+    ///
+    /// # Errors
+    /// As [`observe_commons`](super::observe_commons).
+    pub(crate) fn observe_commons(&self) -> crate::Result<crate::commons::Observation> {
+        self.ask(&OBSERVATION, &(), super::observe_commons)
     }
 
     /// `memo`'s answer for `key` through this look: under its observation and its glance
@@ -363,7 +433,19 @@ impl<'a> VaultLook<'a> {
     }
 }
 
-/// What [`VaultLook::records`] keeps.
+/// Every record this Mac holds ([`load_records`](super::load_records)) from the memo a look's
+/// records ask ([`VaultLook::records`]), as that memo's own call: read again when a file it stamps
+/// moved, and afresh while a writer holds the vault. A Commons frontier pass read them afresh
+/// twice, and a push its witness did not settle once more: 3.2% of a sustained quiet round over a
+/// log of 9,605 records and 3.8% over a short one (2026-11-09).
+///
+/// # Errors
+/// As [`load_records`](super::load_records).
+pub fn records_now(paths: &Paths) -> crate::Result<crate::membership_log::Store> {
+    RECORDS.read_keyed(paths, &(), super::load_records)
+}
+
+/// What [`VaultLook::records`] and [`records_now`] keep.
 static RECORDS: Memo<crate::membership_log::Store> = Memo::keyed(inputs, true);
 
 /// The files [`swarm_denied_nodes`](super::swarm_denied_nodes) and

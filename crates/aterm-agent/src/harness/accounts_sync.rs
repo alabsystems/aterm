@@ -26,6 +26,40 @@ pub mod shared_renewal;
 #[path = "accounts_returned.rs"]
 mod returned;
 
+#[path = "accounts_source_admission.rs"]
+mod source_admission;
+use source_admission::{AutomaticSource, SourceRequest};
+
+/// Changes outside one source admission are supplied by the environment.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSourceCapture",
+    action = "Origin",
+    reason = "The caller supplies explicit input or an automatic source candidate."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSourceCapture",
+    action = "Change",
+    reason = "The source cache may refresh between capture and admission."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountSourceCapture",
+    action = "Config",
+    reason = "An external writer may change the admitted configuration."
+)]
+pub fn source_capture_inputs() {}
+
+/// The identity-completion model enumerates supplied observations before each sync.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "AccountIdentityCompletion",
+    action = "AnotherCase",
+    reason = "Bounded fixture enumeration; the conformance test executes each selected observation."
+)]
+pub fn identity_completion_inputs() {}
+
 /// Table name whose [`SOURCE_KEY`] names this machine's fleet accounts source.
 pub const SOURCE_TABLE: &str = "fleet";
 
@@ -136,10 +170,12 @@ pub struct FleetRoster {
     /// machine or none ([`carry_conflicting`]). Never written or said: [`Self::conflicts`] names
     /// the rows.
     pub(crate) conflicting: BTreeMap<String, SheetConflict>,
-    /// This Mac's machine label, where the lab registry's preferences made this fleet
+    /// This Mac's bound registry identity, where the lab's preferences made this fleet
     /// ([`super::alab_roster::fleet_for`]): a sync then keeps every row it has
     /// ([`super::alab_roster::retain`]) and writes no fleet file beside the roster.
-    pub alab: Option<String>,
+    pub alab: Option<super::alab_roster::MachineRef>,
+    /// The registry projection that produced this native fleet. A sync reads one snapshot.
+    pub(crate) lab_snapshot: Option<std::sync::Arc<super::alab_roster::Lab>>,
     /// The lab's other accounts of this CLI that may join, which this Mac does not prefer, each
     /// under its lab label ([`super::alab_roster::fleet_for`]): never added unasked, only the name the
     /// default login's account takes ([`build_machine_roster`]). Never written or said.
@@ -155,9 +191,19 @@ pub struct FleetRoster {
 }
 
 impl FleetRoster {
-    /// Filter accounts belonging to `machine`, returning rows in slot order.
+    /// Filter by exact native key in preference order, or by a legacy machine label in slot order.
     #[must_use]
     pub fn accounts_for_machine(&self, machine: &str) -> Vec<&FleetAccount> {
+        if self.alab.is_some() {
+            // Registry keys are opaque. Keep the preference order established by fleet_for.
+            let mut rows: Vec<_> = self
+                .accounts
+                .iter()
+                .filter(|account| account.machines.iter().any(|key| key == machine))
+                .collect();
+            rows.sort_by_key(|account| account.class);
+            return rows;
+        }
         let norm = normalize_machine_id(machine).unwrap_or_else(|| machine.to_ascii_lowercase());
         let mut rows: Vec<&FleetAccount> = self
             .accounts
@@ -1322,6 +1368,7 @@ fn parse_sheet(csv_text: &str, source: &str, cli: Cli) -> Result<Sheet, String> 
             conflicts: conflicting.values().cloned().collect(),
             conflicting,
             alab: None,
+            lab_snapshot: None,
             known: Vec::new(),
             keeps_rows: false,
             clashes: Vec::new(),
@@ -2603,6 +2650,20 @@ fn default_identity_hint<'a>(
         })
 }
 
+/// The canonical provider identity of a uniquely identified native fleet account.
+fn native_fleet_identity<'a>(fleet: &'a FleetRoster, account: &FleetAccount) -> Option<&'a str> {
+    let lab = fleet.lab_snapshot.as_deref()?;
+    let mut matches = lab
+        .of(Cli::Claude)
+        .filter(|candidate| accounts::email_matches(&candidate.email, &account.email));
+    let found = matches.next()?;
+    matches
+        .next()
+        .is_none()
+        .then_some(found.identity.as_deref())
+        .flatten()
+}
+
 /// Build the machine's [`Roster`] from `fleet` for `machine`. The row whose email is
 /// `default_email` is the default login's (no `dir`); where none of `machine`'s rows has that
 /// email, the default login holds an account they do not list, and the roster lists it too, as
@@ -2640,6 +2701,7 @@ pub fn build_machine_roster(
     let matches_identity = |acct: &FleetAccount, email: &str| {
         let expected = retained_login_row(existing, &acct.email)
             .and_then(Row::expected_identity_email)
+            .or_else(|| native_fleet_identity(fleet, acct))
             .unwrap_or(&acct.email);
         accounts::email_matches(expected, email)
     };
@@ -2754,7 +2816,8 @@ pub fn build_machine_roster(
             dir,
             email: Some(acct.email.clone()),
             identity_email: retained_login_row(existing, &acct.email)
-                .and_then(|row| row.identity_email.clone()),
+                .and_then(|row| row.identity_email.clone())
+                .or_else(|| native_fleet_identity(fleet, acct).map(str::to_owned)),
             browser,
             held_by: None,
             was: Vec::new(),
@@ -2762,14 +2825,18 @@ pub fn build_machine_roster(
         });
     }
 
-    rows.sort_by_key(|r| (r.dir.is_some(), r.class, r.label.clone()));
+    if fleet.alab.is_some() {
+        rows.sort_by_key(|row| (row.dir.is_some(), row.class));
+    } else {
+        rows.sort_by_key(|row| (row.dir.is_some(), row.class, row.label.clone()));
+    }
 
     Roster { rows }
 }
 
 /// The row the default login (address `de`) takes under the lab's `fleet` where none of this
 /// Mac's preferred accounts is it: the label `kept`, the existing row of that account, gives it
-/// (a sync never renames; [`super::alab_roster::migrate`] does), else the lab's label for the
+/// (after the native sync projects approved legacy renames), else the lab's label for the
 /// account ([`FleetRoster::known`]); none where the lab does not know the account and no row
 /// names it, or another account's row or fleet row holds that label, since the lab is what names
 /// an account here and a label is never taken from the row that holds it. Never a label with a
@@ -2790,7 +2857,7 @@ fn alab_default_account(
     de: &str,
     matches_identity: &dyn Fn(&FleetAccount, &str) -> bool,
 ) -> Option<FleetAccount> {
-    let machine = fleet.alab.clone()?;
+    let machine = fleet.alab.as_ref()?.key.as_str().to_owned();
     let known = fleet.known.iter().find(|a| matches_identity(a, de));
     let label_free = |label: &str| {
         !fleet.accounts.iter().any(|a| a.label == label)
@@ -2981,6 +3048,8 @@ pub enum FleetOrigin {
     /// The lab registry's preferences ([`super::alab_roster`]): every row this machine has stays,
     /// and the accounts it prefers join.
     Alab,
+    /// The expected registry source could not be read. No fallback was selected.
+    AlabPending(String),
     /// No fleet file and no source: `accounts.toml` is the list, as it was written.
     Roster,
     /// Fleet files on this machine that a sync reads and writes back as they hold: the one
@@ -3011,7 +3080,7 @@ impl FleetOrigin {
     #[must_use]
     pub const fn word(&self) -> &'static str {
         match self {
-            Self::Alab => "alab",
+            Self::Alab | Self::AlabPending(_) => "alab",
             Self::Roster => "roster",
             Self::Local {
                 opt_in: Some(OptIn::Discovered),
@@ -3031,7 +3100,7 @@ impl FleetOrigin {
     #[must_use]
     pub fn source(&self) -> Option<String> {
         match self {
-            Self::Alab => Some(super::alab_roster::SOURCE.to_owned()),
+            Self::Alab | Self::AlabPending(_) => Some(super::alab_roster::SOURCE.to_owned()),
             Self::Roster => None,
             Self::Local { files, .. } => files.first().map(|f| f.display().to_string()),
             Self::Key(source) => Some(source.clone()),
@@ -3047,6 +3116,7 @@ impl FleetOrigin {
             Self::Alab => {
                 "the lab registry's preferences for this Mac; every row it has stays".to_owned()
             }
+            Self::AlabPending(why) => why.clone(),
             Self::Roster => "as written here (no fleet source names these accounts)".to_owned(),
             Self::Local {
                 opt_in: Some(OptIn::Discovered),
@@ -3071,11 +3141,10 @@ impl FleetOrigin {
 /// [`FleetOrigin`] of the roster at `roster`, for `home` and the config file `config`.
 #[must_use]
 pub fn fleet_origin(home: Option<&Path>, config: Option<&Path>, roster: &Path) -> FleetOrigin {
-    if matches!(
-        super::alab_roster::chosen(Cli::Claude, Some(roster), None, config),
-        Ok(Some(_))
-    ) {
-        return FleetOrigin::Alab;
+    match super::alab_roster::chosen(Cli::Claude, Some(roster), None, config) {
+        Ok(Some(_)) => return FleetOrigin::Alab,
+        Err(why) => return FleetOrigin::AlabPending(why),
+        Ok(None) => {}
     }
     let beside = fleet_file_beside(roster).filter(|fleet| source_entry_present(fleet));
     let beside_opt_in = beside.as_deref().and_then(fleet_file_opt_in);
@@ -3302,7 +3371,7 @@ fn fleet_takes_discovered(
 /// one whose registry could not be read yet ([`super::alab_roster::pending`]) reads it only once
 /// a read shows the lab does not name it.
 pub(super) fn sheet_read_here() -> bool {
-    !super::alab_roster::names_this_mac() && !super::alab_roster::pending()
+    super::alab_roster::snapshot().permits_sheet()
 }
 
 /// The refusal of a sheet named as a source of `cli`'s pool on a Mac the lab names
@@ -3323,11 +3392,8 @@ fn sheet_refused(source: &str, cli: Cli) -> String {
 /// Whether a sync of `cli` with no source named reads the lab ([`super::alab_roster::chosen`]):
 /// the lab names this Mac, and for Claude Code no `[fleet] accounts_source` in `config` names
 /// another source.
-fn lab_chosen(cli: Cli, roster: &Path, config: &Path) -> bool {
-    matches!(
-        super::alab_roster::chosen(cli, Some(roster), None, Some(config)),
-        Ok(Some(_))
-    )
+fn lab_chosen(cli: Cli, roster: &Path, config: &Path) -> Result<bool, String> {
+    super::alab_roster::chosen(cli, Some(roster), None, Some(config)).map(|fleet| fleet.is_some())
 }
 
 pub(super) fn source_key(config: &Path) -> Option<String> {
@@ -3493,7 +3559,8 @@ pub fn init_accounts_assignment(env: &Env) -> Result<InitAccountsAssignment, Str
     };
     let machine = fleet
         .alab
-        .clone()
+        .as_ref()
+        .map(|machine| machine.key.as_str().to_owned())
         .or_else(|| machine_for(env.config.as_deref(), None))
         .ok_or("could not determine machine id (`m<N>`); pass `--machine m8`")?;
     if fleet.accounts_for_machine(&machine).is_empty()
@@ -3526,12 +3593,23 @@ fn load_fleet_source_for_machine(
 ) -> Result<(FleetRoster, OptIn, Option<PoolSyncCtx>), String> {
     let normalized = source_env(env)?;
     let env = &normalized;
-    if let Some(fleet) = super::alab_roster::chosen(
+    let native = super::alab_roster::chosen(
         Cli::Claude,
         env.accounts_roster().as_deref(),
         source,
         env.config.as_deref(),
-    )? {
+    )?;
+    load_selected_fleet_source(env, source, machine_override, fetch, native)
+}
+
+fn load_selected_fleet_source(
+    env: &Env,
+    source: Option<&str>,
+    machine_override: Option<&str>,
+    fetch: &Fetch<'_>,
+    native: Option<FleetRoster>,
+) -> Result<(FleetRoster, OptIn, Option<PoolSyncCtx>), String> {
+    if let Some(fleet) = native {
         return Ok((fleet, OptIn::Named, None));
     }
     let (chosen, opt_in) = match source.map(str::trim).filter(|s| !s.is_empty()) {
@@ -4722,19 +4800,26 @@ fn rows_under_source(
                 }
             }
         }
-    } else if fleet.alab.is_some() {
-        let lab = super::alab_roster::current();
-        for row in rows {
+    } else if let Some(bound) = &fleet.alab {
+        let lab = fleet.lab_snapshot.as_deref();
+        for row in &mut *rows {
             changed |= row.held_by.take().is_some();
             if let Some(class) = lab
-                .as_deref()
-                .and_then(|lab| Some(lab.class_of(lab.account_of(cli, row)?)))
+                .and_then(|lab| lab.account_of(cli, row))
+                .map(|account| {
+                    if account.preferred_on(&bound.key).is_some() {
+                        Class::Preferred
+                    } else {
+                        Class::Pool
+                    }
+                })
                 .filter(|class| *class != row.class)
             {
                 row.class = class;
                 changed = true;
             }
         }
+        changed |= super::alab_roster::order_rows(lab, cli, &bound.key, rows);
     }
     changed
 }
@@ -5108,6 +5193,27 @@ struct FleetSnapshot {
     bytes: Option<Vec<u8>>,
     // Source merges, initial seeds and removals publish under the same lock as admission.
     publish: Publish,
+}
+
+fn validate_fleet_snapshots(snapshots: &[FleetSnapshot]) -> Result<(), String> {
+    for expected in snapshots {
+        let current = match read_local_source_text(&expected.path) {
+            Ok(text) => Some(text.into_bytes()),
+            Err(why) if why.kind() == io::ErrorKind::NotFound => None,
+            Err(why) => {
+                return Err(format!(
+                    "could not check captured fleet at {}: {why}; nothing was synced",
+                    expected.path.display()
+                ));
+            }
+        };
+        if current != expected.bytes {
+            return Err(
+                "fleet accounts changed after init discovery; nothing was synced".to_owned(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// What a sync does with a fleet file it captured ([`FleetSnapshot`]), under the accounts lock
@@ -5521,8 +5627,7 @@ fn chosen_dirs(
 /// conformance test run this one composition.
 ///
 /// # Errors
-/// The store's logins could not be read, or a locally retained shared row would change or has no
-/// room ([`retain_shared_rows`]).
+/// A locally retained shared row would change or has no room ([`retain_shared_rows`]).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -5539,13 +5644,13 @@ fn chosen_dirs(
         project = "aterm_agent::harness::alab_roster::assignment_tests::labels_transition"
     )
 )]
-pub(super) fn compose_roster(
+pub(super) fn compose_roster_with_logins(
     fleet: &FleetRoster,
     (machine, default_email): (&str, Option<&str>),
     (store, existing): (&accounts::Store, &Roster),
     pool_ctx: Option<&PoolSyncCtx>,
     lab: Option<&super::alab_roster::Lab>,
-    now: i64,
+    logins: &accounts::Logins,
 ) -> Result<Roster, String> {
     let carried = carry_conflicting(fleet, machine, existing);
     let mut roster = build_machine_roster(&carried, machine, store, Some(existing), default_email);
@@ -5553,18 +5658,13 @@ pub(super) fn compose_roster(
         roster = apply_pool_to_claude_roster(roster, existing, store, ctx);
     }
     // The lab's preferences order a pool and never limit it: every row this Mac has stays.
-    if fleet.alab.is_some() {
-        roster = super::alab_roster::retain(roster, existing, lab, Cli::Claude, machine);
+    if let Some(bound) = &fleet.alab {
+        roster = super::alab_roster::retain(roster, existing, lab, Cli::Claude, &bound.key);
     }
     if fleet.keeps_rows {
         roster = keep_discovered_rows(roster, existing);
     }
-    retain_shared_rows(
-        &mut roster,
-        existing,
-        &store.load_logins(now)?.0,
-        fleet.alab.is_some(),
-    )?;
+    retain_shared_rows(&mut roster, existing, logins, fleet.alab.is_some())?;
     Ok(roster)
 }
 
@@ -5833,10 +5933,26 @@ fn persist_accounts_sync(
         (machine, default_email),
         standing_walls,
         now,
-        (ladder, fleet_snapshots),
+        (ladder, fleet_snapshots, None),
     )
 }
 
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountIdentityCompletion",
+        action = "Complete",
+        project = "aterm_agent::harness::accounts_sync::alab_tests::native_migration_tests::completion::completion_transition"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "AccountIdentityCompletion",
+        action = "Repeat",
+        project = "aterm_agent::harness::accounts_sync::alab_tests::native_migration_tests::completion::completion_transition"
+    )
+)]
 fn persist_accounts_sync_with_pool(
     store: &accounts::Store,
     roster_path: &Path,
@@ -5844,7 +5960,7 @@ fn persist_accounts_sync_with_pool(
     (machine, default_email): (&str, Option<&str>),
     standing_walls: &BTreeMap<String, upgrade::StandingWall>,
     now: i64,
-    (ladder, fleet_snapshots): (&[Duration], &[FleetSnapshot]),
+    (ladder, fleet_snapshots, admission): (&[Duration], &[FleetSnapshot], Option<&AutomaticSource>),
 ) -> Result<SyncedAccounts, String> {
     let held = store
         .acquire_within(ladder)
@@ -5858,57 +5974,87 @@ fn persist_accounts_sync_with_pool(
                 ladder.iter().sum::<Duration>().as_millis()
             )
         })?;
+    if let Some(admission) = admission {
+        admission.validate()?;
+    }
+    let recovered = store.recover_sync_held(&held, roster_path)?;
     let (write_to, keep_mode) = super::cli::roster_target(roster_path)?;
-    let recovered = store.recover_sync_held(&held, &write_to)?;
     let fleet_path = roster_path
         .parent()
         .map(|p| p.join(FLEET_ROSTER_FILE))
         .unwrap_or_else(|| PathBuf::from(FLEET_ROSTER_FILE));
-    for expected in fleet_snapshots {
-        let current = match read_local_source_text(&expected.path) {
-            Ok(text) => Some(text.into_bytes()),
-            Err(why) if why.kind() == io::ErrorKind::NotFound => None,
-            Err(why) => {
-                return Err(format!(
-                    "could not check captured fleet at {}: {why}; nothing was synced",
-                    expected.path.display()
-                ));
-            }
-        };
-        if current != expected.bytes {
-            return Err(
-                "fleet accounts changed after init discovery; nothing was synced".to_owned(),
-            );
-        }
-    }
-    let existing = Roster::load(&write_to).map_err(|why| {
+    validate_fleet_snapshots(fleet_snapshots)?;
+    let original_existing = Roster::load(&write_to).map_err(|why| {
         format!(
             "the roster at {} is refused: {why}; the roster is unchanged",
             roster_path.display()
         )
     })?;
-    let lab = fleet
-        .alab
-        .is_some()
-        .then(super::alab_roster::current)
-        .flatten();
-    let mut roster = compose_roster(
+    let lab = fleet.lab_snapshot.as_deref();
+    // Native label migration is part of this publication, not an earlier write. Project
+    // its roster and bindings in memory, then derive the final rows from the same lab.
+    let mut projected_existing = original_existing.clone();
+    let (mut retained_state, _) = store.load(now)?;
+    let (original_logins, _) = store.load_logins(now)?;
+    let mut projected_logins = original_logins.clone();
+    let mut native_moves = Vec::new();
+    let native_fleet = if let Some(lab) = lab {
+        if lab.settled {
+            native_moves =
+                super::alab_roster::renames(lab, Cli::Claude, &original_existing, |label| {
+                    accounts::label_is_retained(&retained_state, &projected_logins, label)
+                })
+                .moved;
+        }
+        for row in &mut projected_existing.rows {
+            // Retention compares provider identities. Complete a missing alias expectation
+            // from the same unique native account before that comparison; the original
+            // roster still fences whether its old authentication applies to this identity.
+            if row.identity_email.is_none() {
+                row.identity_email = lab
+                    .account_of(Cli::Claude, row)
+                    .and_then(|account| account.identity.clone());
+            }
+            if let Some((_, to)) = native_moves.iter().find(|(from, _)| *from == row.label) {
+                row.label.clone_from(to);
+            }
+        }
+        let pairs: Vec<(&str, &str)> = native_moves
+            .iter()
+            .map(|(from, to)| (from.as_str(), to.as_str()))
+            .collect();
+        accounts::move_accounts(&mut retained_state, &mut projected_logins, &pairs)?;
+        super::alab_roster::fleet_for(lab, Cli::Claude, Some(&projected_existing))
+    } else {
+        None
+    };
+    let fleet = native_fleet.as_ref().unwrap_or(fleet);
+    let mut roster = compose_roster_with_logins(
         fleet,
         (machine, default_email),
-        (store, &existing),
+        (store, &projected_existing),
         pool_ctx,
-        lab.as_deref(),
-        now,
+        lab,
+        &projected_logins,
     )?;
+    // A pinned shared row must be compared to its original label and configuration.
+    // A scratch rename cannot grant permission to rewrite that shared authority.
+    retain_shared_rows(
+        &mut roster,
+        &original_existing,
+        &original_logins,
+        lab.is_some(),
+    )?;
+    let existing = projected_existing;
     // Under the lab a default login neither the lab nor a row of this Mac names gets no row
     // (`alab_default_account`): nothing is lost, since the roster never listed it.
     let unnamed_here = |expected: &str| {
         fleet.alab.is_some()
-            && !fleet
-                .accounts
-                .iter()
-                .chain(&fleet.known)
-                .any(|a| accounts::email_matches(&a.email, expected))
+            && !fleet.accounts.iter().chain(&fleet.known).any(|a| {
+                accounts::email_matches(&a.email, expected)
+                    || native_fleet_identity(fleet, a)
+                        .is_some_and(|identity| accounts::email_matches(identity, expected))
+            })
             && !existing.rows.iter().any(|row| row.matches_email(expected))
     };
     // Under the lab a dirless row that names no address (the first `add`'s `main`) is kept as
@@ -5959,8 +6105,8 @@ fn persist_accounts_sync_with_pool(
     // matching its retained provider key and profile; its verified directory follows it.
     let chain = default_relocation(&existing, &roster)?;
     let mut moves = relabel_moves(&existing, &roster, &chain);
-    let (retained, _) = store.load(now)?;
-    let (logins, _) = store.load_logins(now)?;
+    let retained = retained_state;
+    let logins = projected_logins;
     let returns = returned::find(store, &existing, &roster, &retained, &logins, &moves)?;
     moves.extend(
         returns
@@ -5986,6 +6132,9 @@ fn persist_accounts_sync_with_pool(
     // It reads the bindings under the lock this sync holds through publication, as the
     // transaction below reads the ones it edits, whose directory check still refuses a row given
     // a directory another binding retains.
+    // The post-migration roster already carries each relabel's exact directory. Only
+    // genuinely new or repointed rows need directory discovery; a relabel must not turn
+    // an opaque but retained login into a different, empty directory.
     let mut choose = rows_to_choose(&existing, &roster, &chain);
     for found in &returns {
         choose.retain(|label| label != &found.to);
@@ -6010,7 +6159,7 @@ fn persist_accounts_sync_with_pool(
     }
     let roster_toml = format_roster_toml(&roster)
         .map_err(|why| format!("generated roster refused admission: {why}"))?;
-    let (fleet_write_to, fleet_mode) = super::cli::roster_target(&fleet_path)?;
+    let (fleet_write_to, _) = super::cli::roster_target(&fleet_path)?;
     // Source publication must not replace the account authority whose before images
     // the local commit is about to retain, even through an existing path alias.
     let destination = |path: &Path| -> Result<PathBuf, String> {
@@ -6096,6 +6245,26 @@ fn persist_accounts_sync_with_pool(
             .and_then(Row::expected_identity_email)
             .is_some_and(|re| accounts::email_matches(re, de))
     });
+    // Completing an alias's canonical identity changes its authentication context.
+    // A matching observation of the same default login can establish that new context;
+    // old authentication alone cannot. Vendor-policy changes are not this completion.
+    let completed_default_identity = original_existing
+        .row_for_login(None)
+        .zip(roster.row_for_login(None))
+        .is_some_and(|(before, after)| {
+            before.identity_email.is_none()
+                && after.identity_email.is_some()
+                && before.vendor == after.vendor
+                && before
+                    .email
+                    .as_deref()
+                    .zip(after.email.as_deref())
+                    .is_some_and(|(before, after)| accounts::email_matches(before, after))
+                && before
+                    .expected_identity_email()
+                    .zip(after.expected_identity_email())
+                    .is_some_and(|(before, after)| !accounts::email_matches(before, after))
+        });
     // The row the default login held before, where the default login holds another account now
     // (that row's known address is not the default login's) and names another row: the vendor's
     // own sign-in just wrote the default login, so the row it names now holds a login made now,
@@ -6118,7 +6287,10 @@ fn persist_accounts_sync_with_pool(
     // A sync that finds what is already there writes nothing: each file is replaced only where
     // its bytes differ, so a periodic caller rewrites no file and wakes no watcher.
     let roster_held = accounts::roster_text(&write_to)?;
-    let mut changed = recovered || roster_held.as_deref() != Some(roster_toml.as_str());
+    let fleet_held = super::ai_pool::read_bounded_bytes(&fleet_write_to, 4 * 1024 * 1024);
+    let mut changed = recovered
+        || roster_held.as_deref() != Some(roster_toml.as_str())
+        || (fleet.alab.is_none() && fleet_held.as_deref() != Some(fleet_toml.as_bytes()));
     let mut publish_if_changed = |path: &Path, held: Option<&[u8]>, text: &str, mode| {
         if held == Some(text.as_bytes()) {
             return Ok(());
@@ -6127,19 +6299,26 @@ fn persist_accounts_sync_with_pool(
         super::upgrade_models::write_atomic_mode(path, text, mode)
             .map_err(|why| format!("could not write {}: {why}", path.display()))
     };
-    let fleet_held = super::ai_pool::read_bounded_bytes(&fleet_write_to, 4 * 1024 * 1024);
     let mut state_changed = false;
     let mut copy_removed = false;
     // The login directories under the store that moved rows leave and nothing names any longer.
     let left_dirs = std::cell::Cell::new(Vec::<PathBuf>::new());
     let events = store
         .transact_sync_held(&held, now, &mut note, accounts::SyncTarget {
+            fleet: fleet.alab.is_none().then_some((roster_path, fleet_toml.as_str())),
             path: &write_to,
             before: roster_held.as_deref(),
             after: Some(&roster_toml),
             mode: keep_mode,
         }, |state, logins| {
+            if let Some(admission) = admission {
+                admission.validate()?;
+            }
+            validate_fleet_snapshots(fleet_snapshots)?;
             let before = (state.clone(), logins.clone());
+            let native_pairs: Vec<(&str, &str)> = native_moves.iter()
+                .map(|(from, to)| (from.as_str(), to.as_str())).collect();
+            accounts::move_accounts(state, logins, &native_pairs)?;
             for found in &returns {
                 found.recheck(state, &roster)?;
                 found.restore(logins, &found.from);
@@ -6244,6 +6423,17 @@ fn persist_accounts_sync_with_pool(
                 // sessions that ran on the default login (and `active`, where it named the row
                 // the default login held) are its account's now.
                 let bound_elsewhere = logins.get(label).is_some_and(|b| b.dir.is_some());
+                // Identity completion is not a new sign-in. Read the pre-completion
+                // context under its relocated label so an old sign-out or applicable
+                // end cannot be hidden by the new canonical identity.
+                let completed_default_ready = completed_default_identity
+                    && original_existing.row_for_login(None).is_some_and(|before| {
+                        let mut before = before.clone();
+                        before.label.clone_from(label);
+                        state.accounts.get(label).is_some_and(|account| {
+                            account.current_auth(&before) == accounts::Auth::Ok
+                        }) && accounts::login_ended_at(&before, logins, state).is_none()
+                    });
                 let made_now = default_matched
                     && repointed_from.is_some()
                     && !ended_since
@@ -6255,7 +6445,10 @@ fn persist_accounts_sync_with_pool(
                     events.extend(accounts::note_default_login_made_observed(
                         state, logins, default_row, was, now,
                     ));
-                } else if default_matched && unseen_default && !bound_elsewhere {
+                } else if default_matched
+                    && !bound_elsewhere
+                    && (unseen_default || (completed_default_ready && !ended_since))
+                {
                     accounts::note_served_login_for_observed_row(logins, default_row, now);
                     events.extend(accounts::note_auth_for_observed_row(
                         state, logins, default_row, accounts::Auth::Ok, now,
@@ -6316,6 +6509,12 @@ fn persist_accounts_sync_with_pool(
                 events.extend(note_wrong_account_logins(&roster, logins, now));
             }
             for (wall_label, wall) in standing_walls {
+                let wall_label = native_moves.iter()
+                    .find(|(from, _)| from == wall_label)
+                    .map_or(wall_label.as_str(), |(_, to)| to.as_str());
+                let wall_label = moves.iter()
+                    .find(|(from, _)| from == wall_label)
+                    .map_or(wall_label, |(_, to)| to.as_str());
                 if roster.row(wall_label).is_none() {
                     continue;
                 }
@@ -6353,9 +6552,6 @@ fn persist_accounts_sync_with_pool(
                         .and_then(|()| aterm_types::fs_restricted::ensure_private_dir(Path::new(dir)))
                         .map_err(|why| format!("could not create {dir}: {why}"))?;
                 }
-            }
-            if fleet.alab.is_none() {
-                publish_if_changed(&fleet_write_to, fleet_held.as_deref(), &fleet_toml, fleet_mode)?;
             }
             for expected in fleet_snapshots {
                 match expected.publish {
@@ -6462,6 +6658,7 @@ fn run_accounts_sync_with(
 /// The source this sync admitted and whether its publication or recovery wrote data.
 struct SyncPublication {
     machine: String,
+    machine_label: Option<String>,
     roster_path: PathBuf,
     fleet_path: PathBuf,
     fleet_accounts: usize,
@@ -6522,7 +6719,10 @@ impl SyncReport {
             })
             .count();
         InitSynced {
-            machine: self.publication.machine,
+            machine: self
+                .publication
+                .machine_label
+                .unwrap_or(self.publication.machine),
             rows: warm_rows,
             enrolled,
             fleet: self.publication.fleet_accounts,
@@ -6538,6 +6738,16 @@ fn sync_accounts_with(
     machine_override: Option<&str>,
     how: &SyncHow<'_>,
 ) -> Result<SyncReport, String> {
+    sync_accounts_request(env, SourceRequest::Requested(source), machine_override, how)
+}
+
+fn sync_accounts_request(
+    env: &Env,
+    request: SourceRequest<'_>,
+    machine_override: Option<&str>,
+    how: &SyncHow<'_>,
+) -> Result<SyncReport, String> {
+    request.validate()?;
     let normalized = source_env(env)?;
     let env = &normalized;
     let roster_path = env
@@ -6545,23 +6755,21 @@ fn sync_accounts_with(
         .ok_or("no config directory is known (set HOME or XDG_CONFIG_HOME)")?;
     let store = env.accounts_store();
     let recovered_commit = store.recover_sync_within(how.ladder, &roster_path)?;
-    super::alab_roster::migrate_before_sync(
-        Cli::Claude,
-        &store,
-        (&roster_path, env.config.as_deref()),
-        source,
-        env.now,
-        how.ladder,
+    let native = request.chosen(Cli::Claude, &roster_path, env.config.as_deref())?;
+    let (mut fleet, opt_in, pool_ctx) = load_selected_fleet_source(
+        env,
+        request.candidate(),
+        machine_override,
+        how.fetch,
+        native,
     )?;
-    let (mut fleet, opt_in, pool_ctx) =
-        load_fleet_source_for_machine(env, source, machine_override, how.fetch)?;
     fleet.keeps_rows = opt_in == OptIn::Discovered;
     let default_email = read_default_profile_email(env);
     let machine = if let Some(ctx) = &pool_ctx {
         ctx.identity.primary.clone()
     } else if let Some(me) = &fleet.alab {
         // The machine this Mac's facts row binds: the lab's identity, never a host name.
-        me.clone()
+        me.key.as_str().to_owned()
     } else {
         machine_for(env.config.as_deref(), machine_override)
             .ok_or("could not determine machine id (`m<N>`); pass `--machine m8`")?
@@ -6575,47 +6783,56 @@ fn sync_accounts_with(
         && default_email.is_none()
         && !roster_path.exists()
     {
-        let mut state_wrote = false;
-        store
-            .transact_within(how.ladder, env.now, &mut None, |state| {
-                let target_label = Some(ctx.identity.primary.clone());
-                if state.swarm_label != target_label
-                    || state.swarm_aliases != ctx.identity.aliases
-                    || !state.home_accounts.is_empty()
-                {
-                    state.swarm_label = target_label;
-                    state.swarm_aliases.clone_from(&ctx.identity.aliases);
-                    state.home_accounts.clear();
-                    state_wrote = true;
-                }
-                Ok(Vec::new())
-            })
-            .map_err(|why| format!("could not update account state: {why}"))?;
+        request.validate()?;
+        let held = store
+            .acquire_within(how.ladder)
+            .map_err(|why| why.to_string())?
+            .ok_or_else(|| accounts::LOCK_HELD.to_owned())?;
+        request.validate()?;
+        validate_fleet_snapshots(how.fleet_snapshots)?;
         let fleet_path = roster_path
             .parent()
             .map(|p| p.join(FLEET_ROSTER_FILE))
             .unwrap_or_else(|| PathBuf::from(FLEET_ROSTER_FILE));
-        let (fleet_write_to, fleet_mode) = super::cli::roster_target(&fleet_path)?;
         let fleet_toml = fleet.to_toml_for(Some(opt_in));
-        let fleet_wrote = if super::ai_pool::read_bounded_bytes(&fleet_write_to, 4 * 1024 * 1024)
-            .as_deref()
-            != Some(fleet_toml.as_bytes())
-        {
-            super::upgrade_models::write_atomic_mode(&fleet_write_to, &fleet_toml, fleet_mode)
-                .map_err(|why| format!("could not write {}: {why}", fleet_write_to.display()))?;
-            true
-        } else {
-            false
-        };
+        let changed = store
+            .transact_fleet_state_held(
+                &held,
+                env.now,
+                &mut None,
+                (&roster_path, &fleet_toml),
+                |state| {
+                    request.validate()?;
+                    validate_fleet_snapshots(how.fleet_snapshots)?;
+                    if accounts::roster_text(&roster_path)?.is_some() {
+                        return Err(
+                            "account roster appeared after empty-pool planning; sync again".into(),
+                        );
+                    }
+                    let target_label = Some(ctx.identity.primary.clone());
+                    if state.swarm_label != target_label
+                        || state.swarm_aliases != ctx.identity.aliases
+                        || !state.home_accounts.is_empty()
+                    {
+                        state.swarm_label = target_label;
+                        state.swarm_aliases.clone_from(&ctx.identity.aliases);
+                        state.home_accounts.clear();
+                    }
+                    Ok(Vec::new())
+                },
+            )
+            .map_err(|why| format!("could not update account state: {why}"))?;
+        drop(held);
         return read_sync_report(
             env,
             &store,
             SyncPublication {
                 machine,
+                machine_label: None,
                 roster_path,
                 fleet_path,
                 fleet_accounts,
-                changed: state_wrote || fleet_wrote || recovered_commit,
+                changed: changed || recovered_commit,
                 // A pool's fleet reads no sheet, so it skips no sheet conflict.
                 conflicts: Vec::new(),
                 lab: false,
@@ -6662,7 +6879,7 @@ fn sync_accounts_with(
         (&machine, default_email.as_deref()),
         &standing_walls,
         env.now,
-        (how.ladder, how.fleet_snapshots),
+        (how.ladder, how.fleet_snapshots, request.admission()),
     )?;
     let recovered = recover_interrupted_staging_renewals_for(
         Cli::Claude,
@@ -6681,6 +6898,10 @@ fn sync_accounts_with(
         &store,
         SyncPublication {
             machine,
+            machine_label: fleet
+                .alab
+                .as_ref()
+                .and_then(|machine| machine.label.clone()),
             roster_path,
             fleet_path,
             fleet_accounts,
@@ -6777,6 +6998,7 @@ fn write_sync_report(
         publication:
             SyncPublication {
                 machine,
+                machine_label,
                 roster_path,
                 fleet_path,
                 fleet_accounts,
@@ -6805,6 +7027,12 @@ fn write_sync_report(
         o.insert("schema".to_owned(), Value::from(1u64));
         o.insert("kind".to_owned(), Value::from("accounts-sync".to_owned()));
         o.insert("machine".to_owned(), Value::from(machine.clone()));
+        o.insert(
+            "machine_label".to_owned(),
+            machine_label
+                .as_deref()
+                .map_or(Value::Null, |label| Value::from(label.to_owned())),
+        );
         o.insert(
             "roster".to_owned(),
             Value::from(roster_path.display().to_string()),
@@ -6860,7 +7088,8 @@ fn write_sync_report(
     } else {
         let _ = writeln!(
             out,
-            "synced machine `{machine}` ({} accounts on this machine, {} {}){}",
+            "synced machine `{}` ({} accounts on this machine, {} {}){}",
+            machine_label.as_deref().unwrap_or(machine),
             roster.rows.len(),
             fleet_accounts,
             if *lab {
@@ -7341,7 +7570,7 @@ fn default_login_unlisted(
     claim: Option<&mut SyncScheduleClaim<'_>>,
 ) -> bool {
     if configured_source(Some(config), Some(roster_path)).is_none()
-        && !lab_chosen(Cli::Claude, roster_path, config)
+        && !lab_chosen(Cli::Claude, roster_path, config).unwrap_or(false)
     {
         return false;
     }
@@ -8634,7 +8863,11 @@ fn sync_called_for_recording(
     }
     // Where the lab is the source, its projection and this Mac's own default login are what
     // move a roster: read in memory, with no sheet, fleet or pool file.
-    if lab_chosen(Cli::Claude, roster_path, config) {
+    let selected = match lab_chosen(Cli::Claude, roster_path, config) {
+        Ok(selected) => selected,
+        Err(_) => return true,
+    };
+    if selected {
         return lab_sync_due(
             Cli::Claude,
             &accounts::Store::at(state_dir),
@@ -8781,7 +9014,7 @@ fn sync_inputs(home: &Path, state_dir: &Path, roster_path: &Path, now: i64) -> [
     };
     // Where the lab is the source, what it holds stands for the vault's files: no sheet, fleet
     // or pool file is read.
-    if lab_chosen(Cli::Claude, roster_path, &config) {
+    if lab_chosen(Cli::Claude, roster_path, &config).unwrap_or(true) {
         field(
             super::alab_roster::fleet_digest(Cli::Claude)
                 .as_ref()
@@ -8974,6 +9207,9 @@ fn sync_if_missing(
     if roster_path.exists() {
         return true;
     }
+    let Ok(automatic) = AutomaticSource::capture(config) else {
+        return false;
+    };
     let _cooldown = {
         let mut guard = fx
             .sync_cooldown
@@ -9018,8 +9254,6 @@ fn sync_if_missing(
         claude_tmp: None,
         claude_running: None,
     };
-    let mut out = Vec::new();
-    let mut err = Vec::new();
     let how = SyncHow {
         fetch: fx.fetch,
         ladder: &accounts::LOCK_LADDER,
@@ -9027,7 +9261,15 @@ fn sync_if_missing(
         heal: None,
         allow_empty_pool: false,
     };
-    let _ = run_accounts_sync_with((&env, None), (None, None, true), (&mut out, &mut err), &how);
+    let _ = sync_accounts_request(
+        &env,
+        SourceRequest::Automatic {
+            candidate: None,
+            admission: &automatic,
+        },
+        None,
+        &how,
+    );
     roster_path.exists()
 }
 
@@ -9045,7 +9287,7 @@ pub fn has_init_accounts_source(
         .map(|p| p.join("aterm.toml"))
         .unwrap_or_else(|| PathBuf::from("aterm.toml"));
     if configured_source(Some(&config_path), Some(roster_path)).is_some()
-        || lab_chosen(Cli::Claude, roster_path, &config_path)
+        || lab_chosen(Cli::Claude, roster_path, &config_path).unwrap_or(true)
     {
         return true;
     }
@@ -9127,7 +9369,11 @@ fn init_sync_needed(
     now: i64,
     discover: bool,
 ) -> bool {
-    if lab_chosen(Cli::Claude, roster_path, &config_beside(roster_path)) {
+    let selected = match lab_chosen(Cli::Claude, roster_path, &config_beside(roster_path)) {
+        Ok(selected) => selected,
+        Err(_) => return true,
+    };
+    if selected {
         return lab_sync_due(
             Cli::Claude,
             &accounts::Store::at(state_dir),
@@ -9430,15 +9676,10 @@ fn sync_accounts_for_init_with(
     before_sync: impl FnOnce(),
     fetch_uncaptured: &Fetch<'_>,
 ) -> Result<InitSynced, String> {
-    if accounts_sync_off(Some(&config_beside(roster_path))) {
-        return Err(ACCOUNTS_SYNC_OFF.to_owned());
-    }
+    let config_path = config_beside(roster_path);
+    let automatic = AutomaticSource::capture(&config_path)?;
     let recovered_commit =
         accounts::Store::at(state_dir).recover_sync_within(&sync_lock_ladder(), roster_path)?;
-    let config_path = roster_path
-        .parent()
-        .map(|p| p.join("aterm.toml"))
-        .unwrap_or_else(|| PathBuf::from("aterm.toml"));
     let env = Env {
         state: state_dir.to_path_buf(),
         aterm_state: state_dir
@@ -9471,6 +9712,7 @@ fn sync_accounts_for_init_with(
     } = init_accounts_assignment(&env)?
     {
         before_sync();
+        automatic.validate()?;
         return Ok(InitSynced {
             machine,
             rows: 0,
@@ -9481,11 +9723,14 @@ fn sync_accounts_for_init_with(
         });
     }
     // Where the lab is the source nothing in `~/.secrets` is captured or read.
-    if lab_chosen(Cli::Claude, roster_path, &config_beside(roster_path)) {
+    if lab_chosen(Cli::Claude, roster_path, &config_beside(roster_path))? {
         before_sync();
-        let report = sync_accounts_with(
+        let report = sync_accounts_request(
             &env,
-            None,
+            SourceRequest::Automatic {
+                candidate: None,
+                admission: &automatic,
+            },
             None,
             &SyncHow {
                 fetch: fetch_uncaptured,
@@ -9620,9 +9865,12 @@ fn sync_accounts_for_init_with(
             fetch_uncaptured(env, source)
         }
     };
-    let report = sync_accounts_with(
+    let report = sync_accounts_request(
         &env,
-        init_source.as_deref(),
+        SourceRequest::Automatic {
+            candidate: init_source.as_deref(),
+            admission: &automatic,
+        },
         None,
         &SyncHow {
             fetch: &fetch,
@@ -9985,7 +10233,7 @@ fn add_cli_resync_due(why: &mut Vec<String>, cli: Cli, due: &Result<Vec<String>,
     match due {
         Ok(added) if added.is_empty() => {}
         Ok(added) => why.push(format!(
-            "{}'s pool has accounts to add ({})",
+            "{}'s pool has account changes ({})",
             cli.id(),
             added.join(", ")
         )),
@@ -10022,6 +10270,16 @@ fn cli_roster_due<
         })
         .map(|acct| acct.label.clone())
         .collect();
+    if fleet.roster.alab.is_some() {
+        let mut projected = existing.rows.clone();
+        if rows_under_source(cli, &fleet.roster, None, &mut projected) {
+            for (at, row) in projected.iter().enumerate() {
+                if existing.rows.get(at) != Some(row) && !added.contains(&row.label) {
+                    added.push(row.label.clone());
+                }
+            }
+        }
+    }
     if added.is_empty()
         && let Some(ctx) = pool_ctx
     {
@@ -10120,8 +10378,10 @@ pub enum CliSync {
 pub struct CliSynced {
     /// The CLI.
     pub cli: Cli,
-    /// The machine the rows were taken for.
+    /// The native registry key, or legacy machine label, the rows were taken for.
     pub machine: String,
+    /// The registry display label captured with the key; presentation only.
+    pub machine_label: Option<String>,
     /// The roster beside `aterm.toml` (`accounts-<cli>.toml`).
     pub roster: PathBuf,
     /// Where the fleet came from.
@@ -10306,7 +10566,11 @@ impl<'a> ResyncSources<'a> {
         String,
     > {
         if let Some(fleet) = cli_lab_source(cli, self.env, None)? {
-            let machine = fleet.roster.alab.clone();
+            let machine = fleet
+                .roster
+                .alab
+                .as_ref()
+                .map(|machine| machine.key.as_str().to_owned());
             return Ok(Some((fleet, None, machine)));
         }
         let selected = local_cli_source(cli, self.home, &mut |path, pool| {
@@ -10381,7 +10645,11 @@ fn load_cli_fleet_source(
     fetch: &Fetch<'_>,
 ) -> Result<Option<LoadedFleet>, String> {
     if let Some(fleet) = cli_lab_source(cli, env, source)? {
-        let machine = fleet.roster.alab.clone();
+        let machine = fleet
+            .roster
+            .alab
+            .as_ref()
+            .map(|machine| machine.key.as_str().to_owned());
         return Ok(Some((fleet, None, machine)));
     }
     let (chosen, raw) = match source.map(str::trim).filter(|s| !s.is_empty()) {
@@ -10567,6 +10835,14 @@ fn fleet_matches_identity(cli: Cli, row: &Row, account: &FleetAccount) -> bool {
         project = "aterm_agent::harness::accounts_sync::cli_pool_tests::alias_admission_tests::alias_transition"
     )
 )]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::refines(
+        machine = "AccountProviderCommit",
+        action = "Recover",
+        project = "aterm_agent::harness::accounts_sync::cli_pool_tests::provider_commit_tests::transition"
+    )
+)]
 fn sync_cli_with_replan(
     cli: Cli,
     (home, state_dir, config): (&Path, &Path, &Path),
@@ -10656,7 +10932,8 @@ fn sync_cli_with_replan(
     let mut lock = take_writer()?;
     let mut creation_signin = None;
     let mut after_unlock = Some(after_unlock);
-    let mut roster_wrote = false;
+    let roster_wrote;
+    let state_wrote;
     let (
         write_to,
         total,
@@ -10668,8 +10945,9 @@ fn sync_cli_with_replan(
         mut default_login,
     ) = loop {
         let (write_to, keep_mode) = super::cli::roster_target(&roster_path)?;
-        let existing_text = accounts::roster_text(&write_to)?.unwrap_or_default();
-        let existing = Roster::parse_for(cli, &existing_text).map_err(|why| {
+        let existing_image = accounts::roster_text(&write_to)?;
+        let existing_text = existing_image.as_deref().unwrap_or_default();
+        let existing = Roster::parse_for(cli, existing_text).map_err(|why| {
             format!(
                 "the roster at {} is refused: {why}; the roster is unchanged",
                 roster_path.display()
@@ -10721,8 +10999,17 @@ fn sync_cli_with_replan(
             now,
         )?;
         held_changed |= default_login.merged.is_some();
+        if let Some(bound) = &fleet.roster.alab {
+            held_changed |= super::alab_roster::order_rows(
+                fleet.roster.lab_snapshot.as_deref(),
+                cli,
+                &bound.key,
+                &mut merged_existing,
+            );
+        }
         let mut total = merged_existing.len();
         let mut own_row = None;
+        let mut next_image = existing_image.clone();
         if !rows.is_empty() {
             if merged_existing.is_empty() {
                 own_row = first_sync_own_row(cli, &fleet.roster, &store, &mut rows, &mut added);
@@ -10736,12 +11023,20 @@ fn sync_cli_with_replan(
                     );
                 }
             }
-            let text = if held_changed {
+            let text = if held_changed || lab_fleet {
                 let mut all_rows = merged_existing.clone();
                 all_rows.extend(rows.iter().cloned());
+                if let Some(bound) = &fleet.roster.alab {
+                    super::alab_roster::order_rows(
+                        fleet.roster.lab_snapshot.as_deref(),
+                        cli,
+                        &bound.key,
+                        &mut all_rows,
+                    );
+                }
                 accounts::append_rows_for(cli, "", &all_rows)
             } else {
-                accounts::append_rows_for(cli, &existing_text, &rows)
+                accounts::append_rows_for(cli, existing_text, &rows)
             }
             .map_err(|why| {
                 format!("the synced rows do not admit: {why}; the roster is unchanged")
@@ -10771,21 +11066,57 @@ fn sync_cli_with_replan(
                 aterm_types::fs_restricted::ensure_private_dir(Path::new(dir))
                     .map_err(|why| format!("could not create {dir}: {why}"))?;
             }
-            super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode)
-                .map_err(|why| format!("could not write {}: {why}", write_to.display()))?;
-            roster_wrote = true;
+            next_image = Some(text);
             total = merged_existing.len() + rows.len();
             merged_existing.extend(rows);
+            if let Some(bound) = &fleet.roster.alab {
+                super::alab_roster::order_rows(
+                    fleet.roster.lab_snapshot.as_deref(),
+                    cli,
+                    &bound.key,
+                    &mut merged_existing,
+                );
+            }
         } else if held_changed {
             let text = accounts::append_rows_for(cli, "", &merged_existing).map_err(|why| {
                 format!("the synced rows do not admit: {why}; the roster is unchanged")
             })?;
-            if text != existing_text {
-                super::upgrade_models::write_atomic_mode(&write_to, &text, keep_mode)
-                    .map_err(|why| format!("could not write {}: {why}", write_to.display()))?;
-                roster_wrote = true;
-            }
+            next_image = Some(text);
         }
+        // Roster admission and the pool identity it describes share one pending receipt.
+        // A crash must not leave a new roster paired with the previous machine or warm set.
+        roster_wrote = next_image != existing_image;
+        let target = accounts::SyncTarget {
+            path: &write_to,
+            before: existing_image.as_deref(),
+            after: next_image.as_deref(),
+            mode: keep_mode,
+            fleet: None,
+        };
+        state_wrote = if let Some(ctx) = &pool_ctx {
+            store.transact_roster_state_held(&lock, now, &mut None, target, |state| {
+                let home_accounts = merged_existing
+                    .iter()
+                    .filter(|row| row.held_by.is_none() && ctx.is_home_for_row(cli, row))
+                    .map(|row| row.label.clone())
+                    .collect();
+                apply_pool_execution(state, &merged_existing, cli, ctx);
+                let target_label = Some(ctx.identity.primary.clone());
+                if state.swarm_label != target_label
+                    || state.swarm_aliases != ctx.identity.aliases
+                    || state.home_accounts != home_accounts
+                {
+                    state.swarm_label = target_label;
+                    state.swarm_aliases.clone_from(&ctx.identity.aliases);
+                    state.home_accounts = home_accounts;
+                }
+                Ok(Vec::new())
+            })?
+        } else if roster_wrote {
+            store.transact_roster_held(&lock, now, &mut None, target)?
+        } else {
+            false
+        };
         let rows_changed = RowChanges::between(&existing.rows, &merged_existing);
         break (
             write_to,
@@ -10806,6 +11137,12 @@ fn sync_cli_with_replan(
         (&env, &store),
         (&roster_path, &write_to),
         ladder,
+        fleet
+            .roster
+            .lab_snapshot
+            .as_deref()
+            .zip(fleet.roster.alab.as_ref())
+            .map(|(lab, me)| (lab, &me.key)),
         &mut default_login,
     );
     let default_changed = reassigned.is_some();
@@ -10814,32 +11151,6 @@ fn sync_cli_with_replan(
         own_row.clone_from(&default_login.reassigned);
     }
     note_moved_off(&mut default_login, &store, final_rows.clone(), now);
-    let mut state_wrote = false;
-    if let Some(ctx) = &pool_ctx
-        && (total > 0 || store.dir.exists())
-    {
-        let home_accounts: BTreeSet<String> = final_rows
-            .iter()
-            .filter(|row| row.held_by.is_none() && ctx.is_home_for_row(cli, row))
-            .map(|row| row.label.clone())
-            .collect();
-        store
-            .transact_within(ladder, now, &mut None, |state| {
-                state_wrote |= apply_pool_execution(state, &final_rows, cli, ctx);
-                let target_label = Some(ctx.identity.primary.clone());
-                if state.swarm_label != target_label
-                    || state.swarm_aliases != ctx.identity.aliases
-                    || state.home_accounts != home_accounts
-                {
-                    state.swarm_label = target_label;
-                    state.swarm_aliases.clone_from(&ctx.identity.aliases);
-                    state.home_accounts.clone_from(&home_accounts);
-                    state_wrote = true;
-                }
-                Ok(Vec::new())
-            })
-            .map_err(|why| format!("could not update {product} account state: {why}"))?;
-    }
     let recovered = recover_interrupted_staging_renewals_for(
         cli,
         &store,
@@ -10862,6 +11173,11 @@ fn sync_cli_with_replan(
     Ok(CliSync::Synced(Box::new(CliSynced {
         cli,
         machine,
+        machine_label: fleet
+            .roster
+            .alab
+            .as_ref()
+            .and_then(|machine| machine.label.clone()),
         roster: roster_path,
         source: fleet.roster.source.clone(),
         fleet_accounts,
@@ -10888,12 +11204,13 @@ fn follow_default_login(
     (env, store): (&Env, &accounts::Store),
     (configured, path): (&Path, &Path),
     ladder: &[Duration],
+    lab: Option<(&super::alab_roster::Lab, &super::alab_roster::MachineKey)>,
     follow: &mut DefaultLogin,
 ) -> Option<Roster> {
     if cli != Cli::Codex {
         return None;
     }
-    match reassign_codex_default(env, store, configured, path, ladder, || {}) {
+    match reassign_codex_default(env, store, configured, path, ladder, lab, || {}) {
         Ok(Some((roster, label))) => {
             follow.reassigned = Some(label);
             Some(roster)
@@ -10964,6 +11281,7 @@ fn sync_without_source(
         (env, store),
         (roster_path, &write_to),
         ladder,
+        None,
         &mut follow,
     )
     .map_or(existing, |roster| roster.rows);
@@ -11276,6 +11594,7 @@ fn reassign_codex_default(
     configured: &Path,
     path: &Path,
     ladder: &[Duration],
+    lab: Option<(&super::alab_roster::Lab, &super::alab_roster::MachineKey)>,
     before_publish: impl FnOnce(),
 ) -> Result<Option<(Roster, String)>, String> {
     let (target, mode) = super::cli::roster_target(configured)?;
@@ -11318,7 +11637,7 @@ fn reassign_codex_default(
         independent,
         directory,
         left,
-        updated,
+        mut updated,
     } = default_move_admitted(store, &roster, &asked, &logins)?;
     let MoveAsked {
         from,
@@ -11328,6 +11647,9 @@ fn reassign_codex_default(
         email,
         policy,
     } = asked;
+    if let Some((lab, key)) = lab {
+        super::alab_roster::order_rows(Some(lab), Cli::Codex, key, &mut updated.rows);
+    }
     let next_text = accounts::append_rows_for(Cli::Codex, "", &updated.rows)?;
     before_publish();
     let recheck = || -> Result<(), String> {
@@ -11369,6 +11691,7 @@ fn reassign_codex_default(
         env.now,
         &mut None,
         accounts::SyncTarget {
+            fleet: None,
             path,
             before: Some(&text),
             after: Some(&next_text),
@@ -11491,6 +11814,33 @@ fn first_sync_own_row(
 )]
 #[doc(hidden)]
 pub fn account_sync_new_labels_environment() {}
+
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountProviderCommit",
+        action = "Provider",
+        reason = "The caller selects the provider whose real sync is exercised."
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountProviderCommit",
+        action = "Cut",
+        reason = "The test selects a durable replay interruption, not a production mutation."
+    )
+)]
+#[cfg_attr(
+    all(unix, any(test, debug_assertions)),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "AccountProviderCommit",
+        action = "Fault",
+        reason = "The environment supplies a conflicting roster edit or another caller scope."
+    )
+)]
+#[doc(hidden)]
+pub fn account_provider_commit_environment() {}
 
 /// Fixture selection for the provider-realm model, linked by the source audit.
 #[doc(hidden)]
@@ -11685,6 +12035,13 @@ pub(super) fn run_cli_accounts_sync_with(
         o.insert("cli".to_owned(), Value::from(cli.id().to_owned()));
         o.insert("machine".to_owned(), Value::from(synced.machine.clone()));
         o.insert(
+            "machine_label".to_owned(),
+            synced
+                .machine_label
+                .as_deref()
+                .map_or(Value::Null, |label| Value::from(label.to_owned())),
+        );
+        o.insert(
             "roster".to_owned(),
             Value::from(synced.roster.display().to_string()),
         );
@@ -11727,7 +12084,7 @@ pub(super) fn run_cli_accounts_sync_with(
     let _ = writeln!(
         out,
         "synced {product}'s pool for machine `{}` ({} added; {} rows in the roster, {} {elsewhere})",
-        synced.machine,
+        synced.machine_label.as_deref().unwrap_or(&synced.machine),
         synced.added.len(),
         synced.rows,
         synced.fleet_accounts
@@ -11745,7 +12102,7 @@ pub(super) fn run_cli_accounts_sync_with(
             out,
             "the lab prefers no {product} account on `{}`: nothing was added, and every row the \
              roster lists stays",
-            synced.machine
+            synced.machine_label.as_deref().unwrap_or(&synced.machine)
         );
     }
     if !synced.held.is_empty() {
@@ -15034,7 +15391,7 @@ enum Assigning {
     /// reason.
     Unread(accounts::UnreadWhy),
     /// The source, and every name this Mac goes by in it.
-    Names(FleetRoster, Vec<String>),
+    Names(Box<FleetRoster>, Vec<String>),
 }
 
 /// The source `cli`'s sync reads, as far as this machine alone can read it, and every name this
@@ -15067,6 +15424,7 @@ fn assigning_source(cli: Cli, env: &Env) -> Assigning {
         }
         let source = match fleet_origin(env.home.as_deref(), env.config.as_deref(), &roster) {
             FleetOrigin::Alab => return Assigning::Free,
+            FleetOrigin::AlabPending(_) => return Assigning::Unread(UnreadWhy::Source),
             FleetOrigin::Roster | FleetOrigin::Local { .. } if env.home.is_none() => {
                 return Assigning::Unread(UnreadWhy::Source);
             }
@@ -15110,7 +15468,7 @@ fn assigning_source(cli: Cli, env: &Env) -> Assigning {
         return Assigning::Unread(UnreadWhy::NoName);
     };
     match names_of_this_mac(env, &machine) {
-        Some(here) => Assigning::Names(fleet, here),
+        Some(here) => Assigning::Names(Box::new(fleet), here),
         None => Assigning::Unread(UnreadWhy::Source),
     }
 }
@@ -22343,7 +22701,7 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
 
         let mut oversized = format!("{OPT_IN_KEY} = \"named\"\n#");
         oversized.push_str(&"x".repeat(SOURCE_TEXT_MAX_BYTES + 1 - oversized.len()));
-        fs::write(w.fleet_file(), oversized).unwrap();
+        fs::write(w.fleet_file(), &oversized).unwrap();
         assert_eq!(
             configured_source(Some(&w.aterm_toml()), Some(&w.roster())),
             None
@@ -22359,6 +22717,49 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(wit.spawned(), 0, "no renewal started");
         assert!(!w.roster().exists(), "no roster written");
 
+        let store = accounts::Store::at(&w.state);
+        let paths = [
+            w.roster(),
+            store.state_file(),
+            store.logins_file(),
+            store.ledger_path(),
+        ];
+        let images = || {
+            paths
+                .iter()
+                .map(|path| fs::read(path).ok())
+                .collect::<Vec<_>>()
+        };
+        let before = images();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let synced = run_accounts_sync_with(
+            (&w.env(UPKEEP_NOW), None),
+            (Some("~/fleet.csv"), None, false),
+            (&mut out, &mut err),
+            &SyncHow {
+                fetch: &*wit.fetch,
+                ladder: &[],
+                fleet_snapshots: &[],
+                heal: None,
+                allow_empty_pool: false,
+            },
+        );
+        assert_eq!(synced, ExitCode::FAILURE);
+        assert!(String::from_utf8_lossy(&err).contains("sync file exceeds its limit"));
+        assert_eq!(fs::read(w.fleet_file()).unwrap(), oversized.as_bytes());
+        assert_eq!(
+            images(),
+            before,
+            "an unretained image permits no publication"
+        );
+        assert!(!store.sync_needs_recovery());
+    }
+
+    #[test]
+    fn an_explicit_source_opts_in_a_bounded_local_fleet() {
+        let w = World::new();
+        w.write_config("[fleet]\nmachine = \"m1\"\n");
+        let wit = Witness::answering(ONE_ACCOUNT_CSV);
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let synced = run_accounts_sync_with(
             (&w.env(UPKEEP_NOW), None),
@@ -22380,7 +22781,12 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         );
         assert_eq!(fleet_file_opt_in(&w.fleet_file()), Some(OptIn::Named));
         assert_eq!(
-            upkept(),
+            upkeep(
+                &w.home,
+                &w.state,
+                (&w.roster(), UPKEEP_NOW, UpkeepStep::Both),
+                &wit.fx(),
+            ),
             Upkept::Configured {
                 kind: "fleet-file",
                 roster: true,
@@ -27165,6 +27571,10 @@ totp = "JBSWY3DPEHPK3PXP"
 #[cfg(test)]
 #[path = "accounts_sync_cli_tests.rs"]
 mod cli_pool_tests;
+
+#[cfg(test)]
+#[path = "accounts_sync_fleet_publication_tests.rs"]
+mod fleet_publication_tests;
 
 #[cfg(test)]
 #[path = "accounts_sync_codex_identity_tests.rs"]

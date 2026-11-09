@@ -369,6 +369,7 @@ impl Short {
         matches!(
             self,
             Short::Memory { .. }
+                | Short::Cores
                 | Short::Disk { .. }
                 | Short::Load { .. }
                 | Short::Quiet { .. }
@@ -1704,6 +1705,7 @@ pub(crate) fn decide(
                     || held_disk.contains(&o.record.order())
                     || (want_quiet && o.record.need.quiet.is_some())
                     || want_alone == Some(o.record.order())
+                    || (shorts.iter().any(|s| matches!(s, Short::Cores)) && o.record.need.cores > 0)
             })
             .map(|(o, r)| Holder {
                 pid: o.record.pid,

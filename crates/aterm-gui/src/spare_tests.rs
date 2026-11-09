@@ -1721,11 +1721,12 @@ fn adopted_orphan(
     waits: &FixtureWaits,
 ) -> (OwnedEscapeFixture, i32, BsdInfoWithUniqId) {
     let mark = dir.join("orphan-pid");
+    let sleeper = fixture_sleep();
     let launcher = fixture_command(&fixture_shell())
         .arg("-c")
         .arg(r#""$1" 600 & printf '%s\n' "$!" > "$2"; exec "$1" 600"#)
         .arg("launcher")
-        .arg(fixture_sleep())
+        .arg(&sleeper)
         .arg(&mark)
         .setsid(true)
         .spawn()
@@ -1737,6 +1738,26 @@ fn adopted_orphan(
     let pid = waits.pid_in(&mark);
     let birth = bsdinfo_uniq(pid).expect("the orphan-to-be").p_uniqueid;
     owned.daemon = Some((pid, birth));
+    // The shell writes $! before its child necessarily execs. Establish the fixture's
+    // intended executable and ownership marker before killing its parent; otherwise a
+    // scan can correctly find no ownership evidence in a child that is still starting.
+    loop {
+        assert!(
+            bsdinfo_uniq(pid).is_some_and(|info| info.p_uniqueid == birth),
+            "the orphan-to-be must stay alive while it starts"
+        );
+        if let Some(args) = atpkg::caller_shell::process_args(pid as u32)
+            && args.exec_path == sleeper.to_string_lossy()
+            && args.env_var(aterm_types::domain::ENV_PARENT_SESSION_ID) == Some(FIXTURE_SID)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < waits.give_up,
+            "the orphan-to-be never reached its owned executable"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let mut launcher = owned.child.take().expect("the owned launcher");
     launcher.kill().expect("kill the launcher");
     launcher.wait().expect("reap the launcher");

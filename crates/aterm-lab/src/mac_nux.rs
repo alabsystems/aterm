@@ -217,6 +217,9 @@ pub const USAGE: &str = "\
                                    runs. No nonempty password supplied or dialogs pressed. This is
                                    not whole GUI coordinator settlement or every password sheet;
                                    public releases only, --app does not select the updater target
+                  debug-successor  (by name only, alone, no --app) the test-profile app built here,
+                                   a live shell and its same-image QA handoff through LaunchServices;
+                                   requires a new GUI process and retained terminal state in the VM
                   install-sh       tools/install.sh on a terminal as the account at the console: first
                                    byte, end, its last line, the aterm process after its exit (and the
                                    typed steps a person still has), then the opened app's first log line
@@ -502,6 +505,7 @@ pub enum Scenario {
     VaultLocal,
     VaultPhrase,
     Successor,
+    DebugSuccessor,
     InstallSh,
     KillStage,
     KillClt,
@@ -557,9 +561,8 @@ pub const FAULTS: [Scenario; 13] = [
     Scenario::ClockBack,
 ];
 
-/// The row run only by name, never in `all`: `lan-allowed`, whose base holds macOS's Local Network
-/// answer for the app built here ([`crate::mac::Prep::lan_allow`]), so it runs alone.
-pub const BY_NAME: [Scenario; 1] = [Scenario::LanAllowed];
+/// Specialized rows run only by name, never in `all`.
+pub const BY_NAME: [Scenario; 2] = [Scenario::LanAllowed, Scenario::DebugSuccessor];
 
 /// The rows that read a window's accessibility tree (`tree`; `mac_nux_reveal.rs`, one-mesh design
 /// §11 A17c), after [`FAULTS`]': `lab reveal-tab`'s world in the person base, and its negative
@@ -591,6 +594,7 @@ impl Scenario {
             Scenario::VaultLocal => "vault-local",
             Scenario::VaultPhrase => "vault-phrase",
             Scenario::Successor => "successor",
+            Scenario::DebugSuccessor => "debug-successor",
             Scenario::InstallSh => "install-sh",
             Scenario::KillStage => "kill-stage",
             Scenario::KillClt => "kill-clt",
@@ -620,9 +624,8 @@ impl Scenario {
         }
     }
 
-    /// Whether its clone's disk grows to [`FIRST_LAUNCH_DISK_GB`] first: a row that lets a toolset
-    /// pass run, whether the opened app's or `aterm init`'s `base.pkg.toolset` row (whose
-    /// refusal on the image's 4.4 GiB was every earlier init-apply's `base.pkg.toolset failed`).
+    /// Whether its clone needs [`FIRST_LAUNCH_DISK_GB`] for a toolset pass or a test-profile app.
+    /// The image's initial 4.4 GiB left earlier toolset passes without room.
     #[must_use]
     pub const fn grows_disk(self) -> bool {
         matches!(
@@ -631,6 +634,7 @@ impl Scenario {
                 | Scenario::LanAllowed
                 | Scenario::InitApply
                 | Scenario::Successor
+                | Scenario::DebugSuccessor
                 | Scenario::InstallSh
                 | Scenario::PassHeld
                 | Scenario::LaunchRepairs
@@ -765,6 +769,13 @@ pub fn parse(args: &[String], image: String) -> Result<Ask, Fail> {
         Some(list) => parse_scenarios(&list).map_err(|e| Fail::usage(format!("mac nux: {e}")))?,
         None => ALL.to_vec(),
     };
+    if scenarios.contains(&Scenario::DebugSuccessor)
+        && (scenarios != [Scenario::DebugSuccessor] || app.is_some())
+    {
+        return Err(Fail::usage(
+            "mac nux: debug-successor runs alone and builds its own test-profile app; no --app",
+        ));
+    }
     let standard_user = take_flag(&mut a, "--standard-user");
     let lan_allowed = scenarios.contains(&Scenario::LanAllowed);
     let sudo_asks = take_flag(&mut a, "--sudo-asks");
@@ -1873,17 +1884,36 @@ struct App {
     id: String,
 }
 
-const APP_BUILD_ARGS: &[&str] = &[
-    "--unverified",
-    "ship",
-    "dev-app",
-    "--no-install",
-    "--no-link",
-    "--no-pin",
-    "--sign-id",
-    "-",
-    "--out",
-];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppBuildProfile {
+    Release,
+    Test,
+}
+
+impl AppBuildProfile {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Release => "release",
+            Self::Test => "test",
+        }
+    }
+
+    fn args(self) -> Vec<&'static str> {
+        vec![
+            "--unverified",
+            "ship",
+            "dev-app",
+            "--profile",
+            self.name(),
+            "--no-install",
+            "--no-link",
+            "--no-pin",
+            "--sign-id",
+            "-",
+            "--out",
+        ]
+    }
+}
 
 fn app_source() -> Result<aterm_json::Value, String> {
     let git = |dir: &Path, args: &[&str]| -> Result<String, String> {
@@ -1918,6 +1948,7 @@ fn retain_app(
     before: &Result<aterm_json::Value, String>,
     after: &Result<aterm_json::Value, String>,
     app: &App,
+    profile: AppBuildProfile,
 ) -> Result<PathBuf, String> {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -1960,7 +1991,7 @@ fn retain_app(
             .map(|(a, b)| a == b);
         let value = aterm_json::json!({
             "schema":"aterm-mac-nux-app-v1", "created_at_ms":crate::util::now_ms(),
-            "origin":"built-here", "cargo_profile":"release", "build_argv":APP_BUILD_ARGS,
+            "origin":"built-here", "cargo_profile":profile.name(), "build_argv":profile.args(),
             "build_out":bundle.parent().map(|path|path.display().to_string()),
             "source_before":{"value":before.as_ref().ok(),"error":before.as_ref().err()},
             "source_after":{"value":after.as_ref().ok(),"error":after.as_ref().err()},
@@ -2026,17 +2057,18 @@ fn host_run(bin: &str, args: &[&str]) -> Result<(), Fail> {
 /// (no mark, signed ad hoc, not installed or linked); it is renamed `aterm.app`, given the
 /// release's bundle id with no dev display name, and signed again ad hoc with the release's
 /// hardened runtime and entitlements.
-fn build_app(run: &Path) -> Result<PathBuf, Fail> {
+fn build_app(run: &Path, profile: AppBuildProfile) -> Result<PathBuf, Fail> {
     let out = run.join("app");
     println!("mac nux: building the app here (ship dev-app, made release-shaped)");
-    let args = APP_BUILD_ARGS;
+    let args = profile.args();
     // An alias, past the shim: claimed as the build it runs.
     let claim = crate::util::claim_build(
-        args,
+        &args,
         Some(&[
             "--unverified",
             "build",
-            "--release",
+            "--profile",
+            profile.name(),
             "-p",
             "aterm",
             "--bin",
@@ -2046,7 +2078,7 @@ fn build_app(run: &Path) -> Result<PathBuf, Fail> {
     )
     .map_err(|e| Fail::die(format!("ship dev-app: {e}")))?;
     let status = crate::util::status_claimed(
-        crate::util::targo(args).arg(&out).stdin(Stdio::null()),
+        crate::util::targo(&args).arg(&out).stdin(Stdio::null()),
         claim,
     )
     .map_err(|e| Fail::die(format!("targo: {e}")))?;
@@ -2094,6 +2126,7 @@ fn stage_app(
     run: &Path,
     share: &Path,
     record: Option<&Path>,
+    profile: AppBuildProfile,
 ) -> Result<App, Fail> {
     let before = (app.is_none() && record.is_some()).then(app_source);
     let (bundle, how) = match app {
@@ -2106,7 +2139,10 @@ fn stage_app(
             }
             (p.to_path_buf(), format!("--app {}", p.display()))
         }
-        None => (build_app(run)?, "built here, release-shaped".to_owned()),
+        None => (
+            build_app(run, profile)?,
+            format!("built here, {} profile, release-shaped", profile.name()),
+        ),
     };
     host_run(
         "/usr/bin/ditto",
@@ -2132,6 +2168,7 @@ fn stage_app(
             &before,
             &after,
             &app,
+            profile,
         ) {
             Ok(receipt) => format!("retained [app receipt](<{}>)", receipt.display()),
             Err(why) => format!("app retention unavailable: {why}"),
@@ -6617,7 +6654,7 @@ fn retain_raw(g: &Guest, ask: &Ask, scenario: Scenario) -> Result<Option<PathBuf
         r#"collector_uid=$(/usr/bin/id -u)
 [ "$collector_uid" = {collector_uid} ] || exit 5
 set --
-for f in /var/tmp/aterm-nux/*.rec /var/tmp/aterm-nux/*.out /var/tmp/aterm-nux/*.txt /var/tmp/aterm-nux/*.log /var/tmp/aterm-nux/phrase-*/*.out /var/tmp/aterm-nux/phrase-*/*.log /var/tmp/aterm-nux/phrase-*/Library/Logs/aterm/aterm.log "$HOME/Library/Logs/aterm/aterm.log" "$HOME/Library/Application Support/aterm/doctor/"*.json "$HOME/Library/Application Support/aterm/command-line-tools-tab" "$HOME/Library/Application Support/aterm/command-line-tools-tab.children/"*; do
+for f in /var/tmp/aterm-nux/*.rec /var/tmp/aterm-nux/*.out /var/tmp/aterm-nux/*.txt /var/tmp/aterm-nux/*.log /var/tmp/aterm-nux/phrase-*/*.out /var/tmp/aterm-nux/phrase-*/*.log /var/tmp/aterm-nux/phrase-*/Library/Logs/aterm/aterm.log "$HOME/Library/Logs/aterm/aterm.log" "$HOME/Library/Logs/DiagnosticReports/"aterm*.ips "$HOME/Library/Application Support/aterm/doctor/"*.json "$HOME/Library/Application Support/aterm/command-line-tools-tab" "$HOME/Library/Application Support/aterm/command-line-tools-tab.children/"*; do
   [ -f "$f" ] && [ ! -L "$f" ] && [ "$(/usr/bin/stat -f %u "$f")" = "$collector_uid" ] && set -- "$@" "$f"
 done
 [ "$#" -gt 0 ] || exit 4
@@ -6795,6 +6832,7 @@ fn row_body(
         Scenario::VaultLocal => vault_local(g, row),
         Scenario::VaultPhrase => phrase::vault_phrase(g, run, row),
         Scenario::Successor => successor(g, row),
+        Scenario::DebugSuccessor => debug_successor::run(g, row),
         Scenario::InstallSh => install_sh(g, row, None, true),
         Scenario::KillStage => fault::kill_stage(g, row),
         Scenario::KillClt => fault::kill_clt(g, row),
@@ -7006,6 +7044,11 @@ pub fn cmd_nux(args: &[String]) -> Res {
             run,
             &share,
             ask.record.as_deref(),
+            if ask.scenarios == [Scenario::DebugSuccessor] {
+                AppBuildProfile::Test
+            } else {
+                AppBuildProfile::Release
+            },
         )?)
     } else {
         None
@@ -7093,6 +7136,9 @@ mod capture;
 
 #[path = "mac_nux_fault.rs"]
 mod fault;
+
+#[path = "mac_nux_debug_successor.rs"]
+mod debug_successor;
 
 #[path = "mac_nux_lan.rs"]
 mod lan;
@@ -7266,6 +7312,32 @@ mod tests {
                 Scenario::Successor,
                 Scenario::InstallSh
             ]
+        );
+    }
+
+    #[test]
+    fn debug_successor_builds_its_test_image_in_an_explicit_separate_run() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let ask = parse(&args(&["--scenario", "debug-successor"]), "image".into()).unwrap();
+        assert_eq!(ask.scenarios, [Scenario::DebugSuccessor]);
+        assert!(!ALL.contains(&Scenario::DebugSuccessor));
+        for words in [
+            &["--scenario", "debug-successor,successor"][..],
+            &["--scenario", "debug-successor", "--app", "/x/aterm.app"][..],
+        ] {
+            assert!(parse(&args(words), "image".into()).is_err());
+        }
+        assert!(
+            AppBuildProfile::Test
+                .args()
+                .windows(2)
+                .any(|pair| pair == ["--profile", "test"])
+        );
+        assert!(
+            AppBuildProfile::Release
+                .args()
+                .windows(2)
+                .any(|pair| pair == ["--profile", "release"])
         );
     }
 

@@ -3,6 +3,31 @@
 version = 4
 
 [[package]]
+name = "astream-sys"
+version = "0.2.0"
+
+[[package]]
+name = "aterm-dirfd"
+version = "0.0.0"
+dependencies = [
+ "libc 0.2.191",
+]
+
+[[package]]
+name = "aterm-dl"
+version = "0.0.0"
+dependencies = [
+ "libc 0.2.191",
+]
+
+[[package]]
+name = "aterm-durable"
+version = "0.0.0"
+dependencies = [
+ "astream-sys",
+]
+
+[[package]]
 name = "aterm-json"
 version = "0.0.0"
 dependencies = [
@@ -10,16 +35,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-objc"
+version = "0.0.0"
+
+[[package]]
 name = "aterm-serde"
 version = "0.0.0"
+
+[[package]]
+name = "aterm-stamp"
+version = "0.0.0"
+
+[[package]]
+name = "aterm-sysprobe"
+version = "0.0.0"
+dependencies = [
+ "aterm-dl",
+ "aterm-json",
+ "aterm-objc",
+ "libc 0.2.191",
+]
 
 [[package]]
 name = "aterm-tempfile"
 version = "0.0.0"
 
 [[package]]
+name = "aterm-uds"
+version = "0.0.0"
+dependencies = [
+ "astream-sys",
+ "aterm-dirfd",
+ "aterm-durable",
+ "aterm-stamp",
+ "aterm-sysprobe",
+ "aterm-vitals",
+ "libc 0.2.191",
+]
+
+[[package]]
+name = "aterm-vitals"
+version = "0.0.0"
+
+[[package]]
 name = "libc"
 version = "0.2.186"
+
+[[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "trust-resource-provenance"
@@ -28,7 +94,8 @@ dependencies = [
  "aterm-json",
  "aterm-serde",
  "aterm-tempfile",
- "libc",
+ "aterm-uds",
+ "libc 0.2.186",
  "trust-sha2",
 ]
 

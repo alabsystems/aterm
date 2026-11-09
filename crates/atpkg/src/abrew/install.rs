@@ -56,7 +56,10 @@ fn runtime_closure(f: &Formula, read: &dyn Fn(&str) -> Option<Formula>) -> Vec<R
             let declared = direct
                 .iter()
                 .any(|d| d == &record.full_name || Formula::short_name(d) == record.name);
-            out.push(RuntimeDep {
+            // Brew's Dependency.expand is post-order: a dep's
+            // own dependencies are recorded before it (the
+            // order real tabs carry).
+            let entry = RuntimeDep {
                 full_name: record.full_name.clone(),
                 version: record.version.clone(),
                 revision: record.revision,
@@ -64,8 +67,9 @@ fn runtime_closure(f: &Formula, read: &dyn Fn(&str) -> Option<Formula>) -> Vec<R
                 pkg_version: keg_version(&record),
                 declared,
                 compatibility_version: record.compatibility_version,
-            });
+            };
             walk(&record.dependencies.clone(), direct, read, seen, out);
+            out.push(entry);
         }
     }
     let mut seen: BTreeSet<String> = [f.name.clone()].into_iter().collect();
@@ -1739,6 +1743,198 @@ pub(super) struct InstallLink {
     pub directory: bool,
 }
 
+/// What brew's `Keg#link_dir` does with a keg directory:
+/// descend past real prefix dirs (and create them for
+/// database directories), symlink the directory whole, or
+/// prune it entirely.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirMode {
+    Mkpath,
+    Link,
+    Skip,
+}
+
+fn postgresql_dir(rel: &str) -> bool {
+    rel.strip_prefix("postgresql@")
+        .is_some_and(|rest| rest.chars().next().is_some_and(|c| c.is_ascii_digit()))
+}
+
+/// Brew's `LOCALEDIR_RX` over a share-relative path
+/// (`locale/` or `man/` + a locale segment).
+fn locale_dir(rel: &str) -> bool {
+    let mut segments = rel.split('/');
+    if !matches!(segments.next(), Some("locale" | "man")) {
+        return false;
+    }
+    let Some(locale) = segments.next() else {
+        return false;
+    };
+    let (head, tail) = if locale == "C" || locale.starts_with("POSIX") {
+        (true, locale.strip_prefix("POSIX").unwrap_or(""))
+    } else if locale.len() >= 2 && locale[..2].chars().all(|c| c.is_ascii_lowercase()) {
+        (true, &locale[2..])
+    } else {
+        (false, "")
+    };
+    head && (tail.is_empty() || tail.starts_with('_') || tail.starts_with('.'))
+}
+
+fn link_dir_mode(sub: &str, rel: &str) -> DirMode {
+    const SHARE_MKPATH: &[&str] = &[
+        "aclocal",
+        "cps",
+        "doc",
+        "info",
+        "java",
+        "locale",
+        "man",
+        "man/man1",
+        "man/man2",
+        "man/man3",
+        "man/man4",
+        "man/man5",
+        "man/man6",
+        "man/man7",
+        "man/man8",
+        "man/cat1",
+        "man/cat2",
+        "man/cat3",
+        "man/cat4",
+        "man/cat5",
+        "man/cat6",
+        "man/cat7",
+        "man/cat8",
+        "applications",
+        "gnome",
+        "gnome/help",
+        "icons",
+        "mime",
+        "mime/packages",
+        "mime-info",
+        "pixmaps",
+        "postgresql",
+        "sounds",
+    ];
+    match sub {
+        "etc" => DirMode::Mkpath,
+        "bin" | "sbin" => DirMode::Skip,
+        "include" => {
+            if postgresql_dir(rel) {
+                DirMode::Mkpath
+            } else {
+                DirMode::Link
+            }
+        }
+        "share" => {
+            if locale_dir(rel)
+                || rel.starts_with("icons/")
+                || rel.starts_with("zsh")
+                || rel.starts_with("fish")
+                || rel.starts_with("pwsh")
+                || rel.starts_with("lua/")
+                || rel.starts_with("guile/")
+                || postgresql_dir(rel)
+                || rel.starts_with("pypy")
+                || SHARE_MKPATH.contains(&rel)
+            {
+                DirMode::Mkpath
+            } else {
+                DirMode::Link
+            }
+        }
+        "lib" => {
+            let python = rel.len() > 7
+                && rel.starts_with("python")
+                && matches!(rel.as_bytes()[6], b'2' | b'3')
+                && rel.as_bytes()[7] == b'.'
+                && rel[8..].chars().next().is_some_and(|c| c.is_ascii_digit());
+            if matches!(
+                rel,
+                "cps" | "pkgconfig" | "cmake" | "dtrace" | "ghc" | "php"
+            ) || rel.starts_with("gdk-pixbuf")
+                || rel.starts_with("gio")
+                || rel.starts_with("lua")
+                || rel.starts_with("mecab")
+                || rel.starts_with("node")
+                || rel.starts_with("ocaml")
+                || rel.starts_with("perl5/")
+                || postgresql_dir(rel)
+                || rel.starts_with("pypy")
+                || python
+                || rel.starts_with('R')
+                || rel.starts_with("ruby")
+            {
+                DirMode::Mkpath
+            } else {
+                DirMode::Link
+            }
+        }
+        "Frameworks" => {
+            let framework = rel
+                .strip_suffix("/Versions")
+                .unwrap_or(rel)
+                .ends_with(".framework")
+                && !rel.strip_suffix("/Versions").unwrap_or(rel).contains('/');
+            if framework {
+                DirMode::Mkpath
+            } else {
+                DirMode::Link
+            }
+        }
+        _ => DirMode::Link,
+    }
+}
+
+/// Whether brew's file branch skips this keg file outright
+/// (`.DS_Store`, `charset.alias`, icon caches, the info
+/// `dir` index, bytecode under site-packages, and symlinks
+/// that already point at their destination or into another
+/// keg's opt tree at the same relative path).
+fn link_file_skipped(
+    sub: &str,
+    rel: &str,
+    src: &Path,
+    dst: &Path,
+    root: &Path,
+    keg_rel: &str,
+) -> bool {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    if base == ".DS_Store" {
+        return true;
+    }
+    if matches!(sub, "lib") && rel == "charset.alias" {
+        return true;
+    }
+    if sub == "share" {
+        if rel == "locale/locale.alias"
+            || (rel.starts_with("icons/") && rel.ends_with("/icon-theme.cache"))
+        {
+            return true;
+        }
+        if rel.starts_with("info/") && base == "dir" {
+            return true;
+        }
+    }
+    if (base.ends_with(".pyc") || base.ends_with(".pyo")) && keg_rel.contains("/site-packages/") {
+        return true;
+    }
+    if src.is_symlink()
+        && let Ok(resolved) = std::fs::canonicalize(src)
+    {
+        if resolved == dst {
+            return true;
+        }
+        let opt = root.join("opt");
+        if let Ok(under) = resolved.strip_prefix(&opt)
+            && let Some((_, tail)) = under.to_string_lossy().split_once('/')
+            && tail == keg_rel
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn plan_links(
     staged: &Path,
     keg: &Path,
@@ -1746,33 +1942,111 @@ fn plan_links(
     links: &mut Vec<InstallLink>,
 ) -> Result<(), InstallError> {
     fn walk(
+        sub: &str,
+        rel: &str,
         staged: &Path,
         live: &Path,
         dst: &Path,
+        root: &Path,
         links: &mut Vec<InstallLink>,
     ) -> Result<(), InstallError> {
-        for entry in std::fs::read_dir(staged).map_err(|e| format!("abrew: {e}"))? {
-            let entry = entry.map_err(|e| format!("abrew: {e}"))?;
+        let mut entries: Vec<_> = std::fs::read_dir(staged)
+            .map_err(|e| format!("abrew: {e}"))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("abrew: {e}"))?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
             let kind = entry.file_type().map_err(|e| format!("abrew: {e}"))?;
-            let destination = dst.join(entry.file_name());
-            let source = live.join(entry.file_name());
-            if kind.is_dir() {
-                walk(&entry.path(), &source, &destination, links)?;
+            let name = entry.file_name();
+            let rel = if rel.is_empty() {
+                name.to_string_lossy().into_owned()
             } else {
+                format!("{rel}/{}", name.to_string_lossy())
+            };
+            let destination = dst.join(&name);
+            let source = live.join(&name);
+            if kind.is_symlink() || kind.is_file() {
+                if link_file_skipped(
+                    sub,
+                    &rel,
+                    &entry.path(),
+                    &destination,
+                    root,
+                    &format!("{sub}/{rel}"),
+                ) {
+                    continue;
+                }
                 links.push(InstallLink {
                     source,
                     destination,
                     directory: false,
                 });
+            } else if kind.is_dir() {
+                if name.to_string_lossy().ends_with(".app") {
+                    continue;
+                }
+                // A foreign directory symlink in the way is
+                // never walked into or replaced: refuse here,
+                // as activation's snapshot would. Our own
+                // whole-directory link is planned as-is so
+                // link-state probes can judge it.
+                if std::fs::symlink_metadata(&destination).is_ok_and(|m| m.file_type().is_symlink())
+                {
+                    let own = std::fs::canonicalize(&destination)
+                        .ok()
+                        .zip(std::fs::canonicalize(&source).ok())
+                        .is_some_and(|(a, b)| a == b);
+                    if !own {
+                        return Err(InstallError::Failed(format!(
+                            "abrew: refusing foreign link destination {}",
+                            destination.display()
+                        )));
+                    }
+                    links.push(InstallLink {
+                        source,
+                        destination,
+                        directory: true,
+                    });
+                    continue;
+                }
+                // An existing real prefix directory is walked
+                // into, never replaced by a symlink.
+                let real_dst_dir = std::fs::symlink_metadata(&destination)
+                    .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink());
+                if real_dst_dir {
+                    walk(sub, &rel, &entry.path(), &source, &destination, root, links)?;
+                    continue;
+                }
+                match link_dir_mode(sub, &rel) {
+                    DirMode::Skip => {}
+                    DirMode::Mkpath => {
+                        walk(sub, &rel, &entry.path(), &source, &destination, root, links)?;
+                    }
+                    DirMode::Link => links.push(InstallLink {
+                        source,
+                        destination,
+                        directory: true,
+                    }),
+                }
             }
+            // Other file types are never linked (brew's walk
+            // has no branch for them).
         }
         Ok(())
     }
-    for sub in ["bin", "sbin", "lib", "include", "share", "etc"] {
+    for sub in [
+        "bin",
+        "sbin",
+        "lib",
+        "include",
+        "share",
+        "etc",
+        "Frameworks",
+    ] {
         let src = staged.join(sub);
         match std::fs::symlink_metadata(&src) {
             Ok(m) if m.file_type().is_dir() => {
-                walk(&src, &keg.join(sub), &root.join(sub), links)?;
+                walk(sub, "", &src, &keg.join(sub), &root.join(sub), root, links)?;
             }
             Ok(_) => {
                 return Err(format!("abrew: not a physical directory: {}", src.display()).into());
@@ -2213,7 +2487,9 @@ pub fn relink(prefix: &Prefix, f: &Formula) -> Result<usize, InstallError> {
         .installed_one(Kind::Formula, &f.name)
         .ok_or_else(|| InstallError::Failed(format!("abrew: {} is not installed", f.name)))?;
     let (keg, links) = activation_links(prefix, &f.name, &inst.version, f.keg_only)?;
-    let created = links.iter().filter(|l| !l.directory).count();
+    // Brew's count is every keg symlink placed; the plan's
+    // leading entry is the opt link, which brew does not count.
+    let created = links.len().saturating_sub(1);
     activate_keg(prefix, &keg, &links, false)?;
     Ok(created)
 }
@@ -2234,7 +2510,6 @@ pub fn link_destinations(prefix: &Prefix, f: &Formula) -> Result<Vec<PathBuf>, I
     let keg = prefix.keg(&f.name, &inst.version);
     Ok(keg_link_plan(prefix, &keg)?
         .into_iter()
-        .filter(|l| !l.directory)
         .map(|l| l.destination)
         .collect())
 }
@@ -2559,18 +2834,34 @@ pub fn remove_owned_opt_link(prefix: &Prefix, name: &str) -> Result<(), String> 
 }
 
 fn owned_keg_links(prefix: &Prefix, name: &str, include_opt: bool) -> Result<Vec<PathBuf>, String> {
+    let versions: Vec<String> = prefix
+        .installed_one(Kind::Formula, name)
+        .map(|inst| inst.versions)
+        .unwrap_or_default();
+    owned_keg_links_for(prefix, name, &versions, include_opt)
+}
+
+/// The prefix symlinks owned by specific installed versions
+/// of `name`, in brew's `Keg.keg_link_directories` order
+/// (sorted within each directory, as `Find` yields them).
+pub(super) fn owned_keg_links_for(
+    prefix: &Prefix,
+    name: &str,
+    versions: &[String],
+    include_opt: bool,
+) -> Result<Vec<PathBuf>, String> {
     if !super::valid_component(name) {
         return Err("abrew: invalid formula name".to_string());
     }
     check_directory(&prefix.cellar().join(name), &prefix.root).map_err(|e| e.message())?;
     let cellar = prefix.cellar().join(name);
-    let versions: Vec<PathBuf> = prefix
-        .installed_one(Kind::Formula, name)
-        .map(|inst| inst.versions.into_iter().map(|v| cellar.join(v)).collect())
-        .unwrap_or_default();
+    let versions: Vec<PathBuf> = versions.iter().map(|v| cellar.join(v)).collect();
     let mut links = Vec::new();
-    for sub in ["bin", "sbin", "lib", "include", "share", "etc"] {
-        owned_links(&prefix.root.join(sub), &cellar, &versions, &mut links)?;
+    for sub in ["bin", "etc", "include", "lib", "sbin", "share", "var"] {
+        let mut found = Vec::new();
+        owned_links(&prefix.root.join(sub), &cellar, &versions, &mut found)?;
+        found.sort();
+        links.extend(found);
     }
     if include_opt {
         let opt = prefix.opt(name);
@@ -2853,10 +3144,14 @@ pub fn uninstall(
     }
     let targets = uninstall_versions(prefix, &inst, force);
     if dry_run {
-        if force {
-            println!("Would uninstall {short} (all versions)");
-        } else {
-            println!("Would uninstall {short} {}", targets[0]);
+        // Brew: one line per keg, then the links its unlink
+        // would remove.
+        for version in &targets {
+            println!("Would uninstall {short} {version}");
+            let links = owned_keg_links_for(prefix, short, std::slice::from_ref(version), false)?;
+            for link in links {
+                println!("{}", link.display());
+            }
         }
         return Ok(());
     }
@@ -3256,6 +3551,51 @@ mod tests {
     }
 
     #[test]
+    fn plan_links_follows_brew_link_dir_modes() {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let keg = tmp.path().join("keg");
+        let root = tmp.path().join("prefix");
+        let put = |rel: &str| {
+            let path = keg.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"x").unwrap();
+        };
+        put("bin/tool");
+        put("bin/sub/hidden");
+        put("share/doc/demo/readme.md");
+        put("share/man/man1/demo.1");
+        put("share/locale/en/LC_MESSAGES/demo.mo");
+        put("lib/pkgconfig/demo.pc");
+        put("lib/node/demo/index.js");
+        put("include/postgresql@16/pg.h");
+        put("lib/.DS_Store");
+        let mut links = Vec::new();
+        plan_links(&keg, &keg, &root, &mut links).unwrap();
+        let got: Vec<String> = links
+            .iter()
+            .map(|l| {
+                format!(
+                    "{}:{}",
+                    l.destination.strip_prefix(&root).unwrap().display(),
+                    if l.directory { "dir" } else { "file" }
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "bin/tool:file",
+                "lib/node/demo/index.js:file",
+                "lib/pkgconfig/demo.pc:file",
+                "include/postgresql@16/pg.h:file",
+                "share/doc/demo:dir",
+                "share/locale/en/LC_MESSAGES/demo.mo:file",
+                "share/man/man1/demo.1:file",
+            ]
+        );
+    }
+
+    #[test]
     fn bottle_dest_matches_brew_downloads_naming() {
         // Oracle: `brew --cache jq` prints this exact tail
         // (sha256 of the bottle URL, then the bottle filename).
@@ -3334,7 +3674,7 @@ mod tests {
             .iter()
             .map(|d| (d.full_name.as_str(), d.declared))
             .collect();
-        assert_eq!(names, [("mid", true), ("leaf", false), ("shared", true),]);
+        assert_eq!(names, [("leaf", false), ("shared", true), ("mid", true),]);
         let json = runtime_deps_json(&closure);
         assert!(json.contains("\"full_name\": \"mid\", \"version\": \"1\""));
         assert!(json.starts_with('[') && json.ends_with(']'));

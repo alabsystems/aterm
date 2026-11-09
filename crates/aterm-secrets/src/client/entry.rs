@@ -10,6 +10,13 @@
 
 use super::*;
 
+mod admission;
+pub use admission::EntryAdmission;
+mod claim;
+pub use claim::{EntryClaim, EntryClaimRelation, MAX_ENTRY_CLAIM_BYTES};
+mod provenance;
+pub use provenance::EntryOrigin;
+
 const PUBLIC_ROSTER_NAMES: [&str; 2] = crate::entry_class::PUBLIC_ROSTER;
 
 /// Public release-roster bytes observed together in the authenticated, locally applied vault.
@@ -257,8 +264,10 @@ pub struct EntrySnapshot {
     recipient: Recipient,
     seq: u64,
     envelope: [u8; 32],
+    envelope_context: Option<super::version::EnvelopeVersion>,
     log_ids: Option<std::sync::Arc<std::collections::BTreeSet<[u8; 32]>>>,
     mailbox_stamp: [u8; 32],
+    source: provenance::Source,
 }
 
 impl std::fmt::Debug for EntrySnapshot {
@@ -759,6 +768,17 @@ fn read_entry_with_version(
     reading: Reading,
     version: &mut Option<EntryVersion>,
 ) -> crate::Result<Option<(VerifiedEntry, bool)>> {
+    validate_reading(name, reading)?;
+    if expected.signer.is_none() {
+        return Ok(None);
+    }
+    let Some(_observation) = StateLock::observe(paths)? else {
+        return Ok(None);
+    };
+    read_entry_with_version_held(paths, expected, name, reading, version, &_observation)
+}
+
+fn validate_reading(name: &str, reading: Reading) -> crate::Result<()> {
     let materialized = matches!(
         reading,
         Reading::Materialized | Reading::SigningMaterial | Reading::PublicationMaterial
@@ -788,13 +808,7 @@ fn read_entry_with_version(
     if !valid {
         return Err(Error::new("invalid or reserved secret entry name"));
     }
-    if expected.signer.is_none() {
-        return Ok(None);
-    }
-    let Some(_observation) = StateLock::observe(paths)? else {
-        return Ok(None);
-    };
-    read_entry_with_version_held(paths, expected, name, reading, version, &_observation)
+    Ok(())
 }
 
 fn read_entry_with_version_held(
@@ -814,6 +828,51 @@ fn read_entry_with_version_held(
         observation,
         &mut None,
     )
+}
+
+/// Membership checks shared by current and historical log reads.
+fn log_entry_reader_allowed(log: &crate::membership_log::Log, identity: &Identity) -> bool {
+    !log.removes(&identity.recipient())
+        && !super::log_entries::recipient_denied_by_roster_or_log(None, log, &identity.recipient())
+        && !log.audience_left_out_recipient(
+            &crate::membership_log::EpochAudience::Everyone,
+            &identity.recipient(),
+        )
+        && super::log_entries::reads_log(log, identity)
+}
+
+/// The same roster denial applies to current reads and claimed historical reads.
+fn selected_entry_reader_allowed(
+    entries: &[Entry],
+    log: Option<&crate::membership_log::Log>,
+    config: &Config,
+    name: &str,
+    recipient: Recipient,
+) -> bool {
+    if name != crate::SWARM_ROSTER_ENTRY
+        && let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.name == crate::SWARM_ROSTER_ENTRY)
+        && let Ok(text) = std::str::from_utf8(entry.value.as_slice())
+        && let Ok(mut roster) = crate::swarm_roster::SwarmRoster::from_toml(text)
+    {
+        roster.canonicalize();
+        if let Some(log) = log {
+            super::roster::overlay_log_membership(log, None, &mut roster);
+            if super::log_entries::recipient_denied_by_roster_or_log(Some(&roster), log, &recipient)
+            {
+                return false;
+            }
+        }
+        if let Some(member) = roster.member_by_recipient(&recipient.to_bech32()) {
+            if steward::member_is_denied_in_roster(&roster, member) {
+                return false;
+            }
+        } else if roster.is_label_denied(&config.host) {
+            return false;
+        }
+    }
+    true
 }
 
 /// [`read_entry_with_version_held`], also handing out in `trusted` the trusted membership log the
@@ -850,94 +909,86 @@ fn read_entry_held(
     // Selection happens after the shared register and anchor resolution. Reserved readers
     // also retain the roster used below to establish this recipient's policy.
     let requested = [name, crate::SWARM_ROSTER_ENTRY];
-    let (entries, envelope_digest, is_admin, trusted_log) = if state.digest.is_none()
-        && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing
-    {
-        if state.source_identity != Some(source_identity(&config)) {
-            return Ok(None);
-        }
-        let Some(configured) = super::log_entries::trusted_configured_log(paths, &config)? else {
-            return Ok(None);
-        };
-        if configured.log.removes(&identity.recipient())
-            || super::log_entries::recipient_denied_by_roster_or_log(
+    let (entries, envelope_digest, is_admin, trusted_log, selected_log, envelope_context) =
+        if state.digest.is_none() && fsx::kind(&paths.cache_file())? == fsx::Kind::Missing {
+            if state.source_identity != Some(source_identity(&config)) {
+                return Ok(None);
+            }
+            let Some(configured) = super::log_entries::trusted_configured_log(paths, &config)?
+            else {
+                return Ok(None);
+            };
+            if !log_entry_reader_allowed(&configured.log, &identity) {
+                return Ok(None);
+            }
+            let selected = super::log_entries::SelectedVaultEntries::from_log(
+                configured.log.open_selection(
+                    &identity,
+                    if materialized { None } else { Some(&requested) },
+                )?,
+                *configured.log.genesis().id(),
+            );
+            let Some(entries) = selected.entries else {
+                return Ok(None);
+            };
+            let digest = *configured.log.genesis().id();
+            (
+                entries,
+                digest,
+                false,
+                Some(configured.log),
+                selected.log,
                 None,
-                &configured.log,
-                &identity.recipient(),
             )
-            || configured.log.audience_left_out_recipient(
-                &crate::membership_log::EpochAudience::Everyone,
-                &identity.recipient(),
-            )
-            || !super::log_entries::reads_log(&configured.log, &identity)
-        {
-            return Ok(None);
-        }
-        let entries = if materialized {
-            configured.log.open_entries(&identity)?
         } else {
-            configured.log.open_entries_named(&identity, &requested)?
-        };
-        let Some(entries) = entries else {
-            return Ok(None);
-        };
-        let digest = *configured.log.genesis().id();
-        (entries, digest, false, Some(configured.log))
-    } else {
-        if !source_bound(&config, &state) {
-            return Ok(None);
-        }
-        let Some(cached) = read_held_copy(paths, &config, &state)? else {
-            return Ok(None);
-        };
-        let envelope = envelope::parse(&cached)?;
-        let seeded = super::log_entries::trusted_seeded_log(paths, &config, &envelope)?;
-        if !super::log_entries::applied_log_available(
-            &state,
-            seeded.as_ref().map(|(_, digest)| *digest),
-        ) {
-            return Ok(None);
-        }
-        let (entries, _) = super::log_entries::open_entries_with_log(
-            seeded.as_ref().map(|(log, digest)| (log, *digest)),
-            &envelope,
-            &identity,
-            if materialized { None } else { Some(&requested) },
-        )?;
-        let Some(entries) = entries else {
-            return Ok(None);
-        };
-        let trusted_log = seeded.map(|(log, _)| log);
-        // Admin standing reads the base roster. A reserved read of that roster must not ask
-        // for standing again; only the caller returning admin status needs that proof.
-        let admin = matches!(reading, Reading::ReservedAndAdmin)
-            && holds_admin_locker(paths, &config, &envelope, &identity)?;
-        (entries, envelope.digest(), admin, trusted_log)
-    };
-    if name != crate::SWARM_ROSTER_ENTRY
-        && let Some(roster_entry) = entries.iter().find(|e| e.name == crate::SWARM_ROSTER_ENTRY)
-        && let Ok(text) = std::str::from_utf8(roster_entry.value.as_slice())
-        && let Ok(mut r) = crate::swarm_roster::SwarmRoster::from_toml(text)
-    {
-        r.canonicalize();
-        if let Some(log) = &trusted_log {
-            super::roster::overlay_log_membership(log, None, &mut r);
-            if super::log_entries::recipient_denied_by_roster_or_log(
-                Some(&r),
-                log,
-                &identity.recipient(),
+            if !source_bound(&config, &state) {
+                return Ok(None);
+            }
+            let Some(cached) = read_held_copy(paths, &config, &state)? else {
+                return Ok(None);
+            };
+            let envelope = envelope::parse(&cached)?;
+            let seeded = super::log_entries::trusted_seeded_log(paths, &config, &envelope)?;
+            if !super::log_entries::applied_log_available(
+                &state,
+                seeded.as_ref().map(|(_, digest)| *digest),
             ) {
                 return Ok(None);
             }
-        }
-        let my_rec = identity.recipient().to_bech32();
-        if let Some(m) = r.member_by_recipient(&my_rec) {
-            if steward::member_is_denied_in_roster(&r, m) {
+            let selected = super::log_entries::select_entries_with_log(
+                seeded.as_ref().map(|(log, digest)| (log, *digest)),
+                &envelope,
+                &identity,
+                if materialized { None } else { Some(&requested) },
+            )?;
+            let Some(entries) = selected.entries else {
                 return Ok(None);
-            }
-        } else if r.is_label_denied(&config.host) {
-            return Ok(None);
-        }
+            };
+            let trusted_log = seeded.map(|(log, _)| log);
+            // Admin standing reads the base roster. A reserved read of that roster must not ask
+            // for standing again; only the caller returning admin status needs that proof.
+            let admin = matches!(reading, Reading::ReservedAndAdmin)
+                && holds_admin_locker(paths, &config, &envelope, &identity)?;
+            (
+                entries,
+                envelope.digest(),
+                admin,
+                trusted_log,
+                selected.log,
+                Some(super::version::EnvelopeVersion {
+                    seq: state.seq,
+                    digest: envelope.digest(),
+                }),
+            )
+        };
+    if !selected_entry_reader_allowed(
+        &entries,
+        trusted_log.as_ref(),
+        &config,
+        name,
+        identity.recipient(),
+    ) {
+        return Ok(None);
     }
     let entry = entries.iter().find(|entry| entry.name == name);
     if matches!(reading, Reading::PublicRoster)
@@ -956,7 +1007,6 @@ fn read_entry_held(
     let log_ids = trusted_log
         .as_ref()
         .map(|log| std::sync::Arc::new(log.records().map(|record| *record.id()).collect()));
-    *trusted = trusted_log;
     *version = Some(EntryVersion {
         config: config.clone(),
         name: name.into(),
@@ -967,8 +1017,11 @@ fn read_entry_held(
         mailbox_stamp: public_state_stamp(&config, &state, identity.recipient()),
     });
     let Some(entry) = entry else {
+        *trusted = trusted_log;
         return Ok(None);
     };
+    let source = provenance::Source::selected(selected_log, trusted_log.as_ref(), entry)?;
+    *trusted = trusted_log;
     let (value, admin) = if materialized {
         let untracked = matches!(
             reading,
@@ -1000,7 +1053,9 @@ fn read_entry_held(
                 recipient: identity.recipient(),
                 seq: state.seq,
                 envelope: envelope_digest,
+                envelope_context,
                 log_ids,
+                source,
             },
         },
         admin,

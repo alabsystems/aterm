@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::harness::accounts::rename_tests::NOW;
+use crate::harness::alab_roster::test_machine;
 use crate::harness::alab_roster::{self, Lab, LabAccount};
 
 fn email(local: &str) -> String {
@@ -24,16 +25,16 @@ fn lab_account(cli: Cli, local: &str, label: &str, here: bool) -> LabAccount {
         browser: None,
         joinable: true,
         preferred: if here {
-            [("m16".to_owned(), Some(1))].into_iter().collect()
+            [(test_machine("m16"), Some(1))].into_iter().collect()
         } else {
-            [("m3".to_owned(), Some(1))].into_iter().collect()
+            [(test_machine("m3"), Some(1))].into_iter().collect()
         },
     }
 }
 
 fn lab(accounts: Vec<LabAccount>) -> Lab {
     Lab {
-        me: Some("m16".into()),
+        me: Some(test_machine("m16")),
         settled: true,
         accounts,
         aliases: BTreeMap::new(),
@@ -173,6 +174,87 @@ impl Bed {
     }
 }
 
+#[test]
+fn native_sync_preserves_rank_for_existing_and_new_rows_with_an_opaque_key() {
+    let cli = Cli::Codex;
+    let bed = Bed::new();
+    let me = alab_roster::MachineRef::from_registry("PK_m16", Some("m16".into()));
+    let account = |local: &str, rank: u64| {
+        let mut account = lab_account(cli, local, local, true);
+        account.preferred = vec![(me.clone(), Some(rank))];
+        account
+    };
+    let mut lab = Lab {
+        me: Some(me.clone()),
+        accounts: vec![
+            account("alpha", 9),
+            account("zeta", 1),
+            account("middle", 2),
+        ],
+        ..Lab::default()
+    };
+    bed.seed(
+        cli,
+        &[
+            Row {
+                label: "alpha".into(),
+                email: Some(email("alpha")),
+                dir: Some(bed.dir(cli, "alpha", false)),
+                ..Row::default()
+            },
+            Row {
+                label: "zeta".into(),
+                email: Some(email("zeta")),
+                dir: Some(bed.dir(cli, "zeta", false)),
+                ..Row::default()
+            },
+        ],
+    );
+    let report = bed.sync(cli, &lab);
+    assert_eq!(report["machine"], Value::from("PK_m16"));
+    assert_eq!(report["machine_label"], Value::from("m16"));
+    assert!(bed.sync_words(cli, &lab).contains("for machine `m16`"));
+    let labels = || {
+        bed.rows(cli)
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(labels(), ["zeta", "middle", "alpha"]);
+    let due = || {
+        read_cli_resync(
+            cli,
+            &bed.env.state,
+            &bed.toml,
+            NOW,
+            &mut ResyncSources::new(
+                &bed.env,
+                bed.env.home.as_deref().unwrap(),
+                &read_local_source_text,
+            ),
+            &mut Some(true),
+        )
+        .due
+        .unwrap()
+    };
+    lab.accounts[0].preferred[0].1 = Some(0);
+    alab_roster::with_lab(lab.clone(), || {
+        assert!(alab_roster::sync_due(cli, &bed.roster_path(cli), |_| false));
+        assert!(!due().is_empty());
+    });
+    bed.sync(cli, &lab);
+    assert_eq!(labels(), ["alpha", "zeta", "middle"]);
+    alab_roster::with_lab(lab.clone(), || {
+        assert!(!alab_roster::sync_due(cli, &bed.roster_path(cli), |_| {
+            false
+        }));
+        assert!(due().is_empty());
+    });
+    let before = fs::read(bed.roster_path(cli)).unwrap();
+    assert_eq!(bed.sync(cli, &lab)["added"], aterm_json::json!([]));
+    assert_eq!(fs::read(bed.roster_path(cli)).unwrap(), before);
+}
+
 /// A FIRST LAB SYNC NAMES EACH HOLD IT CLEARS AND EACH ORDER IT CHANGES, in its `--json` and its
 /// receipt, a row the lab does not know among them. CONTROL: a sync with nothing left to change
 /// names none.
@@ -307,6 +389,7 @@ fn a_lab_sync_names_no_fleet_file_it_did_not_write() {
         let report = SyncReport {
             publication: SyncPublication {
                 machine: "m16".into(),
+                machine_label: None,
                 roster_path: PathBuf::from("/scratch/accounts.toml"),
                 fleet_path: PathBuf::from("/scratch/fleet-accounts.toml"),
                 fleet_accounts: 2,

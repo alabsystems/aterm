@@ -139,7 +139,7 @@ fn session_actor_if_requested() {
         return;
     };
     let world = PathBuf::from(world);
-    let machine = Fixed::new(Reading::of_gib(256, 200, 128));
+    let machine = Fixed::new(concurrent_reading(256, 200, 128));
     let mut seat = cohort_seat(&world, &machine);
     seat.own = None;
     let _turn = crate::platform::FORWARDING_TURN.lock().unwrap();
@@ -485,7 +485,7 @@ fn fenced_jobs(world: &Path, seat: &Seat<'_>, d: &mut Driver) {
         .mode(0o700)
         .create(&foreign)
         .unwrap();
-    let machine = Fixed::new(Reading::of_gib(256, 200, 128));
+    let machine = Fixed::new(concurrent_reading(256, 200, 128));
     let mut other = cohort_seat(&foreign, &machine);
     other.own = None;
     let mut forbidden = spawnfd::command("/usr/bin/touch");

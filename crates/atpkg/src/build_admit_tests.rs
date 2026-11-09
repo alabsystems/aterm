@@ -8,6 +8,10 @@ use super::*;
 use aterm_capacity::reading::{Proc, Procs};
 use aterm_capacity::{Fixed, Reading};
 
+#[cfg(target_os = "macos")]
+#[path = "build_admit_release_pilot.rs"]
+mod release_pilot;
+
 #[cfg(unix)]
 #[path = "build_admit_native_tests.rs"]
 mod native;
@@ -500,7 +504,14 @@ fn a_test_build_reads_verifys_test_compile_and_a_release_build_does_not() {
 
 /// The acceptance machine for the seats here: 24 GiB, 20 of it available.
 fn machine() -> Fixed {
-    Fixed::new(Reading::of_gib(24, 20, 14))
+    Fixed::new(concurrent_reading(24, 20, 14))
+}
+
+// Leave CPU room for the concurrent actors these custody and memory tests start.
+fn concurrent_reading(physical: u64, available: u64, cores: u32) -> Reading {
+    let mut reading = Reading::of_gib(physical, available, cores);
+    reading.load5 = Some(f64::from(cores));
+    reading
 }
 
 /// A seat on `dir`'s scratch ledger and records, on `machine`, asked by `pid`.
@@ -544,6 +555,132 @@ fn hold(dir: &Path, m: &Fixed, need: Need) -> Claim {
 
 fn test_build() -> Build {
     classify(&words(&["--unverified", "test", "-p", "a"]), Tool::Targo).expect("claims")
+}
+
+#[test]
+fn cargo_jobs_are_bounded_including_explicit_widths_and_keep_child_arguments() {
+    for before in [
+        vec!["--unverified", "test", "--jobs", "99", "--", "-j99"],
+        vec!["--unverified", "test", "--jobs=99", "--", "-j99"],
+        vec!["--unverified", "test", "-j99", "--", "-j99"],
+        vec!["--unverified", "test", "-j=99", "--", "-j99"],
+    ] {
+        let limited = limited_jobs(&words(&before), 3);
+        assert!(
+            limited
+                .iter()
+                .any(|a| a == "3" || a == "--jobs=3" || a == "-j3")
+        );
+        assert_eq!(&limited[limited.len() - 2..], &["--", "-j99"]);
+        assert_ne!(limited, words(&before), "negative control: uncapped argv");
+    }
+    assert_eq!(
+        limited_jobs(&words(&["--unverified", "build", "-j1"]), 3),
+        words(&["--unverified", "build", "-j1"])
+    );
+    assert_eq!(
+        limited_jobs(&words(&["--unverified", "build"]), 3),
+        words(&["--unverified", "build", "--jobs=3"])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn hosted_cargo_uses_its_grant_without_replacing_launch_configuration() {
+    let mut command = aterm_uds::spawnfd::command("targo");
+    command
+        .args(["--unverified", "build", "-j99"])
+        .env("PROBE", "kept")
+        .current_dir("/");
+    limit_command(&mut command, 3);
+    assert!(command.get_args().eq(["--unverified", "build", "-j3"]));
+    assert_eq!(command.get_current_dir(), Some(Path::new("/")));
+    assert!(
+        command
+            .get_envs()
+            .any(|(key, value)| key == "PROBE" && value == Some(std::ffi::OsStr::new("kept")))
+    );
+}
+
+#[test]
+fn explicit_jobs_are_part_of_the_cpu_request_and_a_partial_release_leaves_only_its_spare() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let m = Fixed::new(Reading::of_gib(24, 20, 14));
+    let s = seat(dir.path(), &m, std::process::id().wrapping_add(11));
+    let build = classify(&words(&["--unverified", "build", "-j2"]), Tool::Targo).unwrap();
+    assert_eq!(build.jobs, Some(2));
+    let Admission::Claimed(held) = admit(&build, dir.path(), &s, &mut |_| {}) else {
+        panic!("expected claim");
+    };
+    assert_eq!(held.claim().record().need.cores, 2);
+    drop(held);
+    let release = hold(
+        dir.path(),
+        &m,
+        Need::new("release slices")
+            .rank(aterm_capacity::Rank::Release)
+            .cores(12),
+    );
+    let build = classify(&words(&["--unverified", "build", "--jobs=-1"]), Tool::Targo).unwrap();
+    let Admission::Claimed(held) = admit(&build, dir.path(), &s, &mut |_| {}) else {
+        panic!("expected spare grant");
+    };
+    assert_eq!(held.claim().record().need.cores, 13);
+    assert_eq!(held.claim().cores(), 2);
+    assert_eq!(
+        limited_jobs(
+            &words(&["--unverified", "build", "--jobs=-1"]),
+            held.claim().cores()
+        ),
+        words(&["--unverified", "build", "--jobs=2"])
+    );
+    drop((held, release));
+}
+
+#[test]
+fn plain_build_requests_cores_and_a_release_core_pool_blocks_it() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let m = Fixed::new(Reading::of_gib(24, 20, 14));
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let mut build = test_build();
+    build.jobs = Some(14);
+    let build = match admit(
+        &build,
+        dir.path(),
+        &seat(dir.path(), &m, std::process::id().wrapping_add(11)),
+        &mut |_| {},
+    ) {
+        Admission::Claimed(held) => held,
+        other => panic!("expected claim: {other:?}"),
+    };
+    let mut need = build.claim().record().need.clone();
+    assert_eq!(need.cores, m.read(None).cores);
+    drop(build);
+    let release = hold(
+        dir.path(),
+        &m,
+        Need::new("release slices")
+            .rank(aterm_capacity::Rank::Release)
+            .cores(m.read(None).cores),
+    );
+    match aterm_capacity::Waiter::enter(&ledger, &m, need.clone())
+        .unwrap()
+        .poll(&m)
+    {
+        aterm_capacity::Polled::Waiting(_, short) => {
+            assert!(short.holders.iter().any(|h| h.what == "release slices"));
+            assert!(short.to_string().contains("release slices"));
+        }
+        other => panic!("release must hold the build: {other:?}"),
+    }
+    // Negative control: the old memory-only front competes beside the full release pool.
+    need.cores = 0;
+    assert!(
+        aterm_capacity::admit::try_admit_with(&ledger, &m, need)
+            .unwrap()
+            .is_some()
+    );
+    drop(release);
 }
 
 #[cfg(unix)]

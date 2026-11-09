@@ -101,7 +101,9 @@ impl ClaimStore for Network<'_> {
         {
             Ok(crate::github_remote::RefWrite::Written) => Write::Written(after.into()),
             Ok(crate::github_remote::RefWrite::Conflict) => Write::Race,
-            Err(error) => Write::Offline(error),
+            Err(error) | Ok(crate::github_remote::RefWrite::Transient(error)) => {
+                Write::Offline(error)
+            }
         }
     }
 }

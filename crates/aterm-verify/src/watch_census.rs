@@ -48,6 +48,16 @@ fn summary(why: &str) -> String {
         }
         return preemption.into();
     }
+    if let Some(stopped) = why.lines().find(|line| line.starts_with("watch ")) {
+        if let Some((scope, detail)) = stopped.split_once(" stopped: ") {
+            let kind = detail
+                .split_once(" kind=")
+                .and_then(|(_, tail)| tail.split_whitespace().next())
+                .unwrap_or("stopped");
+            return format!("{scope} {kind}");
+        }
+        return stopped.into();
+    }
     if let Some(signal) = why.lines().rev().find_map(|line| {
         line.split_once("killed by signal ")
             .and_then(|(_, value)| value.split_whitespace().next())
@@ -103,6 +113,22 @@ pub(super) fn run(root: &Path, head: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bootstrap_stop_census_keeps_stage_and_environment_kind() {
+        let cause = |pid| {
+            format!(
+                "sample exit=75\nwatch bootstrap stopped: code=Some(75) kind=environment condition=refusal for {pid}"
+            )
+        };
+        assert_eq!(summary(&cause(41)), "watch bootstrap environment");
+        assert_eq!(summary(&cause(41)), summary(&cause(42)));
+        assert_eq!(
+            summary(
+                "sample exit=75\nwatch stage=tree stopped: code=Some(75) kind=run-stop condition=stopping"
+            ),
+            "watch stage=tree run-stop"
+        );
+    }
 
     #[test]
     fn preemption_census_ranks_conditions_across_distinct_senders() {

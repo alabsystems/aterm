@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::harness::alab_roster::test_machine;
 use aterm_spec::interp::State;
 
 const OLD_TOTP: &str =
@@ -424,7 +425,7 @@ fn a_renamed_rows_old_label_still_names_its_secrets() {
     };
     assert_eq!(read(), None);
     let lab = Lab {
-        me: Some("m22".into()),
+        me: Some(test_machine("m22")),
         accounts: vec![LabAccount {
             pk: "ac-0000000000000001".into(),
             cli: Cli::Claude,
@@ -435,7 +436,7 @@ fn a_renamed_rows_old_label_still_names_its_secrets() {
             identity: None,
             browser: None,
             joinable: true,
-            preferred: vec![("m22".into(), Some(1))],
+            preferred: vec![(test_machine("m22"), Some(1))],
         }],
         ..Lab::default()
     };
@@ -475,7 +476,7 @@ fn a_mac_the_lab_names_reads_no_sheet_for_its_mailbox_labels() {
         "no lab: the sheet names it"
     );
     let lab = Lab {
-        me: Some("m22".into()),
+        me: Some(test_machine("m22")),
         ..Lab::default()
     };
     assert_eq!(with_lab(lab, read), None);

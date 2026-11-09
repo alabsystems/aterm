@@ -226,7 +226,9 @@ pub(super) fn run(
         if marker.exists() {
             fs::remove_file(&marker).unwrap();
         }
-        let held_case = index >= action_count - 1;
+        // Cover inventory cancellation as well as sample cancellation and dropped ownership
+        // in the same full-population fixture, rather than a duplicate short-budget run.
+        let held_case = index == 2 || index >= action_count - 1;
         if held_case {
             fs::write(
                 source.join("hold-contained-target"),
@@ -328,7 +330,7 @@ pub(super) fn run(
             current <= baseline + 1,
             "actually exhausted streams close while original accepted-derived owners remain"
         );
-        if index == action_count - 1 {
+        if held_case {
             fs::remove_file(source.join("hold-contained-target")).unwrap();
         }
     }

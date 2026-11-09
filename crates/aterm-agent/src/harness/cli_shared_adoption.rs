@@ -523,6 +523,7 @@ pub(in crate::harness) fn adopt(
             env.now,
             &mut None,
             accounts::SyncTarget {
+                fleet: None,
                 path: &target,
                 before: before.as_deref(),
                 after: before.as_deref(),
@@ -812,6 +813,7 @@ pub(in crate::harness) fn adopt(
             now,
             &mut None,
             accounts::SyncTarget {
+                fleet: None,
                 path: &target,
                 before: before.as_deref(),
                 after: Some(&after),

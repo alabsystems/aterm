@@ -1372,7 +1372,14 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
         "lock",
         Duration::ZERO,
         "writer succession is active",
-    )?;
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            Error::busy().context("writer succession")
+        } else {
+            error.into()
+        }
+    })?;
     budget.check()?;
     let mut selection = reserve_until(paths, config, &bootstrap, budget.until)?;
     if selection.config != config {

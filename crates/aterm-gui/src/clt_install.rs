@@ -384,13 +384,26 @@ pub(crate) fn c_toolchain_installed() -> Option<bool> {
 
 /// Whether setup's developer tools have arrived: Git and a compiler behind the system
 /// driver. Match init's standard PATH so an unrelated compiler cannot end this watch.
+/// Ignore a project's `DEVELOPER_DIR`, as init's machine-toolchain probe does.
 /// Discovery only reads files; it never invokes Apple's stubs or a compiler.
 pub(crate) fn developer_tools_ready() -> bool {
-    aterm_types::clt_shim::developer_git()
-        && atpkg::prereq::installed_with(
-            Some(std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
-            &atpkg::prereq::CcHost::this_machine(),
-        ) == Some(true)
+    developer_tools_ready_on(
+        aterm_types::clt_shim::developer_git(),
+        std::ffi::OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin"),
+        atpkg::prereq::CcHost::this_machine(),
+    )
+}
+
+fn developer_tools_ready_on(
+    git: bool,
+    path: &std::ffi::OsStr,
+    host: atpkg::prereq::CcHost,
+) -> bool {
+    let host = atpkg::prereq::CcHost {
+        developer_dir_override: None,
+        ..host
+    };
+    git && atpkg::prereq::installed_with(Some(path), &host) == Some(true)
 }
 
 /// What this Mac shows of an install of Apple's Command Line Tools under way, by itself
@@ -2241,6 +2254,49 @@ mod child_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn tools_arrival_ignores_a_projects_developer_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = aterm_tempfile::tempdir().unwrap();
+        let shim = root.path().join("shim");
+        let selected = root.path().join("selected developer");
+        for file in [shim.join("cc"), selected.join("usr/bin/clang")] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"installed executable").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let link = root.path().join("xcode_select_link");
+        std::os::unix::fs::symlink(&selected, &link).unwrap();
+        let host = atpkg::prereq::CcHost {
+            shim_dir: Some(shim.clone()),
+            xcode_select_link: link,
+            default_developer_dir: root.path().join("no-default-tools"),
+            xcode_developer_dir: None,
+            developer_dir_override: Some(root.path().join("missing project Xcode")),
+            ..atpkg::prereq::CcHost::this_machine()
+        };
+        let path = shim.as_os_str();
+        assert_eq!(
+            atpkg::prereq::installed_with(Some(path), &host),
+            Some(false)
+        );
+        assert!(developer_tools_ready_on(true, path, host.clone()));
+        assert!(!developer_tools_ready_on(false, path, host.clone()));
+        std::fs::remove_file(selected.join("usr/bin/clang")).unwrap();
+        let project_clang = host
+            .developer_dir_override
+            .as_ref()
+            .unwrap()
+            .join("usr/bin/clang");
+        std::fs::create_dir_all(project_clang.parent().unwrap()).unwrap();
+        std::fs::write(&project_clang, b"project compiler").unwrap();
+        std::fs::set_permissions(&project_clang, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(atpkg::prereq::installed_with(Some(path), &host), Some(true));
+        assert!(!developer_tools_ready_on(true, path, host));
+    }
 
     #[test]
     fn unattended_setup_starts_the_selected_tools_install_without_another_press() {

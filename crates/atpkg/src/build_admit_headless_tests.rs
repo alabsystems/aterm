@@ -68,7 +68,7 @@ fn headless_host_actor_if_requested() {
     };
     let world = PathBuf::from(world);
     let real = std::env::var_os(REAL).is_some();
-    let machine = Fixed::new(Reading::of_gib(256, 200, 128));
+    let machine = Fixed::new(concurrent_reading(256, 200, 128));
     let mut selected = cohort_seat(&world, &machine);
     selected.own = None;
     let ledger = selected.ledger.as_ref().unwrap();
@@ -243,7 +243,7 @@ fn headless_host_actor_if_requested() {
             .iter()
             .all(|r| r.accounting == aterm_capacity::Accounting::Whole)
     );
-    machine.set(Reading::of_gib(256, 1, 128));
+    machine.set(concurrent_reading(256, 1, 128));
     assert!(
         matches!(
             admit_cohort_job(&test_build(), &world, &selected, &mut |_| {}),
@@ -259,7 +259,7 @@ fn headless_host_actor_if_requested() {
         2,
         "a refused one-shot leaves no waiting claim"
     );
-    machine.set(Reading::of_gib(256, 200, 128));
+    machine.set(concurrent_reading(256, 200, 128));
     if real {
         for (_, _, _, world) in &jobs {
             std::fs::write(world.join("release"), b"host permits completion").unwrap();

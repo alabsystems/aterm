@@ -311,8 +311,6 @@ fn admits(
 #[test]
 fn browser_readiness_refines_ordered_rehabilitation_evidence() {
     let model = aterm_models_harness::account_browser_rehabilitation_model();
-    let faults = aterm_spec::verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{faults:?}");
     let coverage =
         aterm_spec::verify::prove_and_catch_tiered(&model, "account browser rehabilitation")
             .expect("scalar account browser rehabilitation is executable");

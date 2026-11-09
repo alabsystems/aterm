@@ -3,6 +3,29 @@
 
 # aterm-gui: spec recovery from its unit tests
 
+> 2026-11-09, the glass galleries render at 2x (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+> §7 step 2): `quota_row_gallery` (`footer-line-e-quota-row`) and `harness_switch_gallery` write,
+> beside each 1x frame (unchanged, pixel for pixel), a render of the same scene on a window of its
+> own put at display scale 2 before its first frame (`scripted_redraw_fixture::at_scale`,
+> test-only: the scale, the font at twice its device px, the pads and head scaled, the grid kept;
+> it refuses a window already composed, as a cold `--scale 2` launch lays out its first frame),
+> where they wrote a nearest-neighbour doubling of a crop of the 1x frame. Each 2x frame is held to
+> a render of its scene, read against the 1x frame (`scripted_redraw_fixture::drawn_at_2x`): the
+> 1x grid, the 2x metrics, the frame those metrics give the grid and the same letter and digit
+> cells; then, over those cells, more than half with a 2 × 2 block on even pixels that is not one
+> colour (not a doubling), more than half of the inked ones inking a box at least 1.8 times their
+> 1x box across and down (not 1x glyphs at their 1x size), and a share of partial pixels among
+> those the glyphs touch under four fifths of the 1x share (not 1x glyphs resampled). Each
+> gallery writes what it read to a `2x.tsv`, and its first scene holds four fakes each to a
+> refusal and to its own rule, whichever rule is named first (`scripted_redraw_fixture::refuse_fakes`,
+> `CONTROL`): the 2x frame doubled, and the 1x cells drawn in the 2x cells unscaled and resampled
+> (nearest and bilinear). No row's contract
+> changes; the negative controls ran (each pixel rule never refusing; a window composed before
+> `at_scale`). *Revised 2026-11-09 after review:* the first version scaled the 1x scene's own
+> window after its 1x frames, a live change of display scale under which the pet leapt in some 2x
+> frames, and held each 2x frame only to the layout and the block test (`not_drawn_at_2x`), which
+> 1x glyphs resampled into, or pasted unscaled in, the 2x cells pass.
+
 > 2026-11-08, the glass's first reading (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §2.2,
 > §7 step 4): `accounts-outlook-memo` now says that a pane whose own figure is a reading of a row
 > the last replay read nothing of replays at the store's next read, not at the minute, and

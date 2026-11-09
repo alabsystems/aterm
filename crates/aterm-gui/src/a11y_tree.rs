@@ -93,13 +93,14 @@ pub(crate) fn selected_span(
     cells: &aterm_core::render::RenderInput,
     snap: &crate::accessibility::AccessibleSnapshot,
 ) -> Option<GridSpan> {
-    let mut keys: Vec<aterm_core::render::SelectionRowKey> = Vec::new();
+    if !cells.any_selection() {
+        return None;
+    }
     let mut anchor: Option<(usize, usize)> = None;
     let mut focus: Option<(usize, usize)> = None;
     for (row, line) in snap.value().split_inclusive('\n').enumerate() {
-        cells.selection_row_key(row, &mut keys);
-        let Some((lo, hi)) = keys
-            .iter()
+        let Some((lo, hi)) = cells
+            .selection_row_keys(row)
             .filter_map(|key| {
                 let (lo, hi) = (usize::from(key.lo), usize::from(key.hi));
                 let hi = hi.min(snap.cols.saturating_sub(1));
@@ -1387,6 +1388,44 @@ mod tests {
 
     fn node(update: &TreeUpdate, id: NodeId) -> &Node {
         &update.nodes.iter().find(|(n, _)| *n == id).unwrap().1
+    }
+
+    #[test]
+    #[ignore = "measures selection lookup cost; run optimized and alone"]
+    fn unselected_document_lookup_cost() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for (rows, cols) in [(24, 80), (120, 240)] {
+            let mut term = aterm_core::terminal::Terminal::new(rows, cols);
+            for row in 0..rows {
+                term.process(
+                    format!("\x1b[{};1H{}", row + 1, "x".repeat(cols as usize - 1)).as_bytes(),
+                );
+            }
+            let cells = term.cell_frame(rows as usize, cols as usize);
+            let snap = crate::accessibility::AccessibleSnapshot::from_cells(
+                &cells.cells,
+                cols as usize,
+                None,
+            );
+            for sample in 0..5 {
+                let started = Instant::now();
+                let mut selected = 0;
+                for _ in 0..20_000 {
+                    selected += usize::from(
+                        black_box(selected_span(black_box(&cells), black_box(&snap))).is_some(),
+                    );
+                }
+                let elapsed = started.elapsed();
+                assert_eq!(selected, 0);
+                println!(
+                    "rows={rows} cols={cols} bytes={} calls=20000 sample={sample} elapsed_ns={}",
+                    snap.value().len(),
+                    elapsed.as_nanos()
+                );
+            }
+        }
     }
 
     const GEOM: GridGeometry = GridGeometry {

@@ -345,6 +345,27 @@ pub fn local_recipient_denied_in_roster(paths: &Paths) -> bool {
 /// # Errors
 /// A vault writer holds the state lock ([`crate::ErrorKind::VaultBusy`]); nothing was judged.
 pub fn local_recipient_denial_observed(paths: &Paths) -> crate::Result<bool> {
+    match local_recipient_denial_judged(paths) {
+        Ok(denied) => Ok(denied),
+        Err(Unjudged::Busy) => Err(super::vault_busy()),
+        Err(Unjudged::Failed(_)) => Ok(true),
+    }
+}
+
+/// Why [`local_recipient_denial_judged`] judged nothing.
+pub(super) enum Unjudged {
+    /// A vault writer holds the state lock at this moment.
+    Busy,
+    /// The state, its lock or the evidence could not be read: the swarm's check takes this Mac
+    /// as denied, and a memo keeps nothing of it.
+    Failed(crate::Error),
+}
+
+/// What authenticated evidence says of this Mac, as [`local_recipient_denial_observed`] judges
+/// it, with each read that fails before it judges told apart from a judgement: what a memo of the
+/// check keeps ([`super::vault_memo::swarm_member_heard_now`]) is a judgement, never a failed
+/// read taken as one.
+pub(super) fn local_recipient_denial_judged(paths: &Paths) -> Result<bool, Unjudged> {
     // Noncurrent membership must still consult authenticated denial evidence.
     match load_state(paths) {
         Ok(state) => match state.membership {
@@ -364,21 +385,80 @@ pub fn local_recipient_denial_observed(paths: &Paths) -> crate::Result<bool> {
             }
             Stored::None | Stored::Pending | Stored::Plain | Stored::In => {}
         },
-        Err(_) => return Ok(true),
+        Err(error) => return Err(Unjudged::Failed(error)),
     }
-    if StateLock::narrow_owned(paths).is_err() {
-        return Ok(true);
-    }
-    Ok(match StateLock::observe_classified(paths) {
-        Ok(StateObservation::Held(lock)) => local_recipient_denied_in_roster_held(paths, &lock),
+    StateLock::narrow_owned(paths).map_err(Unjudged::Failed)?;
+    match StateLock::observe_classified(paths) {
+        Ok(StateObservation::Held(lock)) => {
+            local_recipient_denial_held(paths, &lock).map_err(Unjudged::Failed)
+        }
         Ok(StateObservation::Absent) => match config(paths) {
-            Ok(None) => false,
-            Ok(Some(config)) if config.signer.is_none() => false,
-            Ok(Some(_)) | Err(_) => true,
+            Ok(None) => Ok(false),
+            Ok(Some(config)) => Ok(config.signer.is_some()),
+            Err(error) => Err(Unjudged::Failed(error)),
         },
-        Ok(StateObservation::Busy) => return Err(super::vault_busy()),
-        Err(_) => true,
-    })
+        Ok(StateObservation::Busy) => Err(Unjudged::Busy),
+        Err(error) => Err(Unjudged::Failed(error)),
+    }
+}
+
+/// When the ALab vault last answered this Mac as one of its members ([`Membership::In`]'s
+/// `heard`, unix seconds), where no authenticated evidence denies it
+/// ([`local_recipient_denial_judged`]); `None` where the vault is no ALab vault ([`alab_vault`]),
+/// this Mac is not in it, or evidence denies it. The swarm judges by it whether this Mac is on
+/// the LAN as a member; the age it allows `heard` is the caller's to judge, at its own time.
+///
+/// # Errors
+/// The status cannot be read ([`status`]), a vault writer holds the state lock, or the denial
+/// check could not read its evidence: nothing was judged, and the swarm takes this Mac as out.
+pub(super) fn swarm_member_heard(paths: &Paths) -> crate::Result<Option<u64>> {
+    let status = status(paths)?;
+    let (Some(config), Membership::In { heard, .. }) = (&status.config, status.membership) else {
+        return Ok(None);
+    };
+    if !alab_vault(config) && !alab_standing_for_tests(paths) {
+        return Ok(None);
+    }
+    match local_recipient_denial_judged(paths) {
+        Ok(denied) => Ok((!denied).then_some(heard)),
+        Err(Unjudged::Busy) => Err(super::vault_busy()),
+        Err(Unjudged::Failed(error)) => Err(error),
+    }
+}
+
+/// The scratch vaults whose standing [`swarm_member_heard`] reads as the ALab vault's
+/// ([`test_alab_standing`]).
+#[cfg(any(test, debug_assertions))]
+static ALAB_STANDING_FOR_TESTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Read the swarm standing of the scratch vault under `paths` ([`swarm_member_heard_now`]) as
+/// the ALab vault's, as a test of a crate that judges this Mac's LAN presence does: a scratch
+/// vault is signed by a test key, never ALab's.
+///
+/// [`swarm_member_heard_now`]: super::swarm_member_heard_now
+#[cfg(any(test, debug_assertions))]
+pub fn test_alab_standing(paths: &Paths) {
+    ALAB_STANDING_FOR_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(paths.dir.clone());
+}
+
+/// Whether a test registered the vault under `paths` as the ALab vault's (`test_alab_standing`);
+/// never in a release build.
+pub(super) fn alab_standing_for_tests(paths: &Paths) -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        ALAB_STANDING_FOR_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&paths.dir)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        let _ = paths;
+        false
+    }
 }
 
 pub(super) fn local_recipient_denied_in_roster_held(paths: &Paths, lock: &StateLock) -> bool {

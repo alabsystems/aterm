@@ -6336,8 +6336,8 @@ mod tests {
     /// them on (`-`: its block leaves a `*.noindex` target unplaced): the source and its
     /// `--target-dir`, named again in `CARGO_TARGET_DIR`, in one scratch under
     /// `~/Library/Caches`, run from that scratch. HOME's `Library` is a folder atpkg never manages
-    /// a workspace in, as it manages none outside HOME, so the front hands the build on and claims
-    /// nothing for it.
+    /// a workspace in, as it manages none outside HOME, so the front does not register its cache.
+    /// An explicit one-job request keeps the resource bound independent of the host's load.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_front_hands_on_a_build_of_a_workspace_atpkg_never_manages() {
@@ -6361,6 +6361,7 @@ mod tests {
             "--release",
             "--locked",
             "--no-default-features",
+            "--jobs=1",
             "--manifest-path",
             manifest.as_str(),
             "--target-dir",
@@ -6383,7 +6384,7 @@ mod tests {
                 .any(|line| line == words.join(" ")),
             "{out:?}"
         );
-        assert!(!target.exists(), "nothing is claimed for it");
+        assert!(!target.exists(), "no managed cache was created for it");
         assert!(
             !world
                 .home

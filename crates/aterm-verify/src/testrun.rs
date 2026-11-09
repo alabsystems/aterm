@@ -1093,6 +1093,7 @@ fn carried_event(carried: &CarriedBinary) -> String {
             "cpu_s": aterm_json::Value::Null, "starved_s": aterm_json::Value::Null,
             "peak_bytes": aterm_json::Value::Null,
             "width": aterm_json::Value::Null, "tests": aterm_json::Value::Null,
+            "test_counts": aterm_json::Value::Null,
             "failures": [],
             "detail": "carried: prior ok with equal executable and complete runtime inputs",
             "evidence": {
@@ -1127,6 +1128,7 @@ fn unstable_carried_event(carried: &CarriedBinary, evidence: &Evidence) -> Strin
             "cpu_s": aterm_json::Value::Null, "starved_s": aterm_json::Value::Null,
             "peak_bytes": aterm_json::Value::Null,
             "width": aterm_json::Value::Null, "tests": aterm_json::Value::Null,
+            "test_counts": aterm_json::Value::Null,
             "failures": [],
             "detail": "not carried: runtime inputs changed after carry selection",
             "evidence": {
@@ -1222,6 +1224,8 @@ fn binary_event(
         Outcome::Fail(Severity::GateFailed)
     };
     let tests = crate::libtest::tests_run(&run.output);
+    let test_counts =
+        crate::libtest::test_counts(&run.output).filter(|counts| run.ok == (counts.failed == 0));
     let usage = run.usage;
     let hung_cases = run.hung.as_ref().map(|hung| {
         hung.running
@@ -1261,6 +1265,7 @@ fn binary_event(
             "starved_s": usage.map(|u| u.starved.as_secs_f64()),
             "peak_bytes": usage.map(|u| u.peak_bytes),
             "width": width, "charge": ran.planned.charge, "tests": tests,
+            "test_counts": test_counts,
             "failures": failures,
             "failures_complete": false,
             "failure_observation_end": run.case_observations.as_ref().map(|o| o.read_end.name()),
@@ -3801,6 +3806,79 @@ exit 0"#,
         run.ok = false;
         run.spawn_error = Some("test executable unavailable".into());
         assert_eq!(parse(&run)["outcome"].as_str(), Some("NOT RUN"));
+    }
+
+    #[test]
+    fn binary_events_report_completed_counts_without_inventing_them() {
+        let binary = Binary {
+            harness: true,
+            header: "test".into(),
+            spec: "-p test --lib".into(),
+            record: rec("/r/test", "test"),
+        };
+        let event = |ok, output: &str| {
+            let run = Run {
+                ok,
+                code: Some(i32::from(!ok)),
+                output: output.into(),
+                ..Run::default()
+            };
+            let (_, line, _) = binary_event(
+                &binary,
+                &Ran::of(run, Duration::ZERO, Duration::ZERO),
+                true,
+                None,
+                false,
+            );
+            aterm_json::from_str::<aterm_json::Value>(line.strip_prefix("verify-event: ").unwrap())
+                .unwrap()
+        };
+        let summary = "running 3 tests\ntest result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        let passed = event(true, summary);
+        assert_eq!(passed["tests"].as_u64(), Some(3));
+        assert_eq!(passed["test_counts"]["passed"].as_u64(), Some(2));
+        assert_eq!(passed["test_counts"]["ignored"].as_u64(), Some(1));
+        assert!(
+            event(false, summary)["test_counts"].is_null(),
+            "the exit contradicts the reported success"
+        );
+        assert!(event(true, "running 3 tests\n")["test_counts"].is_null());
+        let failed = "running 3 tests\ntest result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
+        assert_eq!(
+            event(false, failed)["test_counts"]["failed"].as_u64(),
+            Some(1)
+        );
+        assert!(
+            event(true, failed)["test_counts"].is_null(),
+            "a passing child cannot invent a failed count"
+        );
+        let carried = CarriedBinary {
+            binary,
+            evidence: Evidence {
+                exe_sha256: Some("aa".repeat(32)),
+                content_key: Some("11".repeat(32)),
+                reason: None,
+            },
+            json: false,
+            prior_execution_s: 0.01,
+        };
+        let changed = Evidence {
+            exe_sha256: carried.evidence.exe_sha256.clone(),
+            content_key: None,
+            reason: Some("runtime inputs changed".into()),
+        };
+        for line in [
+            carried_event(&carried),
+            unstable_carried_event(&carried, &changed),
+        ] {
+            let event: aterm_json::Value =
+                aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
+            assert_eq!(
+                event.get("test_counts"),
+                Some(&aterm_json::Value::Null),
+                "a retained candidate ran no tests now"
+            );
+        }
     }
 
     /// A proven hang is a bounded structured FAIL, even when the sampler's error contains the

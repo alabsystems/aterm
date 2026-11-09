@@ -545,13 +545,80 @@ fn write_control_refs(
 ) -> Result<RefWrite> {
     let transaction = ControlRefTransaction::new(owner, changes)
         .map_err(|error| Error::new(error.why.clone()))?;
-    origin.control_transaction(transaction).map_err(Error::new)
+    write_control_transaction(origin, transaction, &mut |line| eprintln!("{line}"))
 }
 
-fn ref_write_description(written: RefWrite) -> &'static str {
+fn write_control_transaction(
+    origin: &dyn Origin,
+    transaction: ControlRefTransaction,
+    log: &mut dyn FnMut(&str),
+) -> Result<RefWrite> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let written = origin
+            .control_transaction(transaction.clone())
+            .map_err(Error::new)?;
+        let RefWrite::Transient(cause) = written else {
+            return Ok(written);
+        };
+        // Read both canonical refs, including the invariant on the sibling
+        // of a single-ref change. Every repeated write still carries its CAS.
+        let reread = |reference| {
+            origin.get(reference).map_err(|why| {
+                Error::new(format!(
+                    "control transaction re-read of {reference} failed after {cause}: {why}"
+                ))
+            })
+        };
+        let lease = reread(RELEASE_LEASE_REF)?;
+        let fence = reread(PUBLISHER_FENCE_REF)?;
+        let unchanged = transaction.changes().iter().all(|change| {
+            let observed = if change.reference == RELEASE_LEASE_REF {
+                &lease
+            } else {
+                &fence
+            };
+            observed == &change.before
+        });
+        let sibling_ok = transaction.changes().len() == 2 || {
+            let change = &transaction.changes()[0];
+            if change.reference == RELEASE_LEASE_REF {
+                fence.is_none()
+            } else if change.after.is_some() {
+                lease.as_deref() == Some(transaction.owner_commit())
+            } else {
+                true
+            }
+        };
+        if !unchanged || !sibling_ok {
+            log(&format!(
+                "control transaction precondition changed after: {cause}"
+            ));
+            return Ok(RefWrite::Conflict);
+        }
+        if attempt == ATTEMPTS {
+            return Err(Error::new(format!(
+                "control transaction exhausted {ATTEMPTS} attempts with expected refs unchanged: {cause}"
+            )));
+        }
+        log(&format!(
+            "control transaction attempt {attempt}/{ATTEMPTS}: {cause}; re-read confirmed expected refs; repeating the same expected-old transaction"
+        ));
+    }
+    unreachable!("bounded control transaction returns on its last attempt")
+}
+
+#[cfg(test)]
+#[path = "publish/control_retry_tests.rs"]
+mod control_retry_tests;
+
+fn ref_write_description(written: RefWrite) -> String {
     match written {
-        RefWrite::Written => "native expected-old transaction completed",
-        RefWrite::Conflict => "native expected-old transaction conflicted without side effects",
+        RefWrite::Written => "native expected-old transaction completed".into(),
+        RefWrite::Conflict => {
+            "native expected-old transaction conflicted without side effects".into()
+        }
+        RefWrite::Transient(cause) => cause,
     }
 }
 
@@ -9154,23 +9221,27 @@ pub fn classify_asset_head(
     }
 }
 
-/// The readability proof.
+/// The readability proof. Four independent HEADs may run together; every
+/// admitted request settles before a refusal returns, without application retries.
 pub fn prove_assets_download_anonymously(
     slug: &str,
     tag: &str,
     names: &[String],
-    head: &mut dyn FnMut(
+    head: &(
+         dyn Fn(
         &str,
-    ) -> std::result::Result<
-        aterm_update_core::HeadAnswer,
-        aterm_update_core::HttpError,
-    >,
+    )
+        -> std::result::Result<aterm_update_core::HeadAnswer, aterm_update_core::HttpError>
+             + Sync
+     ),
 ) -> Result<u32> {
     let (owner, repo) = slug
         .split_once('/')
         .ok_or_else(|| Error::new(format!("not an owner/repo slug: {slug}")))?;
-    let mut issued = 0_u32;
-    for name in names {
+    let issued = std::sync::atomic::AtomicU32::new(0);
+    let timer = crate::cut_timing::Timer::parallel_parent();
+    upload_pool(names, 4, &|name| {
+        let _timing = timer(&format!("anonymous HEAD {name}"));
         let url = aterm_update_core::cdn::release_download_url(owner, repo, tag, name).ok_or_else(
             || {
                 Error::new(format!(
@@ -9184,7 +9255,7 @@ pub fn prove_assets_download_anonymously(
                  anonymous API"
             )));
         }
-        issued += 1;
+        issued.fetch_add(1, Ordering::Relaxed);
         match classify_asset_head(head(&url)) {
             AssetHead::Downloads => {}
             AssetHead::NotServed => {
@@ -9215,8 +9286,9 @@ pub fn prove_assets_download_anonymously(
                 )));
             }
         }
-    }
-    Ok(issued)
+        Ok(())
+    })?;
+    Ok(issued.load(Ordering::Relaxed))
 }
 
 /// Attempts for the evergreen pointer to name this cut once its head PATCH is sent ([`prove_pointer_serves`]).
@@ -9304,7 +9376,7 @@ pub fn prove_pointer_serves(
     let mut last = PointerProbe::NoRelease;
     let mut location = None;
     for attempt in 1..=POINTER_PROBE_ATTEMPTS {
-        last = probe()?;
+        last = crate::cut_timing::measure("evergreen pointer request", &mut *probe)?;
         if let PointerProbe::Tag {
             tag: named,
             location: loc,
@@ -9318,7 +9390,7 @@ pub fn prove_pointer_serves(
             break;
         }
         if attempt < POINTER_PROBE_ATTEMPTS {
-            sleep(POINTER_PROBE_DELAY);
+            crate::cut_timing::measure("evergreen propagation wait", || sleep(POINTER_PROBE_DELAY));
         }
     }
     let Some(location) = location else {
@@ -9526,7 +9598,7 @@ fn prove_channel_assets_download_anonymously(ctx: &CutCtx, slug: &str) -> Result
         slug,
         &ctx.tag,
         &names,
-        &mut aterm_update_core::head_no_redirect,
+        &aterm_update_core::head_no_redirect,
     )?;
     step(
         "",
@@ -9573,6 +9645,21 @@ fn create_channel_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIde
         ctx.tag,
         release_body_post_failure_detail(&out, &notes)
     )))
+}
+
+/// Request-wall throughput includes connection setup and the server's response;
+/// a failed request does not establish how many payload bytes reached GitHub.
+fn upload_observation(name: &str, bytes: u64, wall: f64, success: bool) -> aterm_json::Value {
+    aterm_json::json!({
+        "schema": 1,
+        "event": "cut-upload-transfer",
+        "asset": name,
+        "payload_bytes": bytes,
+        "execution_s": wall,
+        "confirmed_bytes": success.then_some(bytes),
+        "bytes_per_request_second": (success && wall > 0.0).then_some(bytes as f64 / wall),
+        "success": success,
+    })
 }
 
 /// Stop dispatch on failure, but let in-flight one-shot POSTs settle their
@@ -9629,6 +9716,20 @@ mod upload_pool_tests {
     use super::*;
     use std::sync::{Condvar, Mutex, atomic::AtomicUsize, mpsc};
     use std::time::Duration;
+
+    #[test]
+    fn upload_rate_counts_only_confirmed_payload_over_request_wall() {
+        let success = upload_observation("asset.zip", 1024, 2.0, true);
+        assert_eq!(success["confirmed_bytes"].as_u64(), Some(1024));
+        assert_eq!(success["bytes_per_request_second"].as_f64(), Some(512.0));
+        for (wall, succeeded) in [(2.0, false), (0.0, true)] {
+            let event = upload_observation("asset.zip", 1024, wall, succeeded);
+            assert!(event["bytes_per_request_second"].is_null());
+            if !succeeded {
+                assert!(event["confirmed_bytes"].is_null());
+            }
+        }
+    }
 
     /// NEGATIVE CONTROL: the former four-worker cap cannot enter all payloads
     /// while the completion gate is closed.
@@ -9820,6 +9921,9 @@ pub(crate) fn upload_channel_asset(
     }
 
     let endpoint = exact_release_upload_url(slug, release_id, name)?;
+    let bytes = fs::metadata(file)
+        .map_err(|error| Error::new(format!("read upload size for {name}: {error}")))?
+        .len();
     let post = OneShotPost::prepare_binary(&endpoint, file)?;
     let release = release_object_by_id(slug, release_id)?;
     ensure_upload_release_lease(ctx)?;
@@ -9828,7 +9932,18 @@ pub(crate) fn upload_channel_asset(
         validate_channel_release_capability(release.as_ref(), release_id, &ctx.tag, expect_draft)?;
         ctx.persist_upload_intent(name)?
     };
-    let out = post.issue(permit)?;
+    let started = std::time::Instant::now();
+    let out = crate::cut_timing::measure(&format!("upload POST {name}"), || post.issue(permit));
+    println!(
+        "release-event: {}",
+        upload_observation(
+            name,
+            bytes,
+            started.elapsed().as_secs_f64(),
+            out.as_ref().is_ok_and(RunOut::success)
+        )
+    );
+    let out = out?;
     let visible = || {
         release_asset_identity_for_release_id_optional(slug, release_id, name)
             .map(|found| found.is_some())
@@ -11287,26 +11402,30 @@ mod anonymous_readability_tests {
 
     fn run(
         names: &[String],
-        mut answer: impl FnMut(&str, usize) -> std::result::Result<HeadAnswer, HttpError>,
+        answer: impl Fn(&str, usize) -> std::result::Result<HeadAnswer, HttpError> + Sync,
     ) -> (Result<u32>, Vec<String>) {
-        let mut asked = Vec::new();
-        let out = prove_assets_download_anonymously(SLUG, TAG, names, &mut |url| {
+        let asked = std::sync::Mutex::new(Vec::new());
+        let out = prove_assets_download_anonymously(SLUG, TAG, names, &|url| {
+            let mut asked = asked.lock().unwrap();
             asked.push(url.to_string());
             let nth = asked.iter().filter(|u| *u == url).count();
+            drop(asked);
             answer(url, nth)
         });
-        (out, asked)
+        (out, asked.into_inner().unwrap())
     }
 
     #[test]
     fn the_readability_proof_never_asks_the_api_host() {
         let names = names();
-        let (out, asked) = run(&names, |_, _| served());
+        let (out, mut asked) = run(&names, |_, _| served());
         assert_eq!(out.unwrap(), names.len() as u32);
-        let want: Vec<String> = names
+        let mut want: Vec<String> = names
             .iter()
             .map(|n| format!("https://github.com/{SLUG}/releases/download/{TAG}/{n}"))
             .collect();
+        asked.sort();
+        want.sort();
         assert_eq!(asked, want, "one HEAD per required asset, nothing else");
         for url in &asked {
             assert!(
@@ -11324,7 +11443,7 @@ mod anonymous_readability_tests {
     #[test]
     fn a_refusal_is_asked_once_and_is_not_called_a_rate_limit() {
         for code in [403_u16, 429] {
-            let (out, asked) = run(&names(), |_, _| status(code));
+            let (out, asked) = run(&names()[..1], |_, _| status(code));
             out.expect_err("a refused channel is not proved readable");
             assert_eq!(
                 asked.len(),
@@ -11338,10 +11457,78 @@ mod anonymous_readability_tests {
     #[test]
     fn a_404_is_a_final_absence_answer_and_is_never_retried() {
         let names = names();
-        let (out, asked) = run(&names, |_, _| status(404));
+        let (out, asked) = run(&names[..1], |_, _| status(404));
         let refused = out.expect_err("an absent channel is refused").to_string();
         assert_eq!(asked.len(), 1);
         assert!(refused.contains("final absence answer"), "{refused}");
+    }
+
+    /// NEGATIVE CONTROLS: a serial dispatcher cannot open the gate; ignoring
+    /// any one of the four results accepts the corresponding planted absence.
+    #[test]
+    fn concurrent_heads_join_and_refuse_each_missing_asset() {
+        use std::sync::{Condvar, Mutex};
+        let names: Vec<String> = (0..4).map(|n| format!("asset-{n}")).collect();
+        for missing in &names {
+            let entered = (Mutex::new(0), Condvar::new());
+            let finished = std::sync::atomic::AtomicUsize::new(0);
+            let result = prove_assets_download_anonymously(SLUG, TAG, &names, &|url| {
+                let mut count = entered.0.lock().unwrap();
+                *count += 1;
+                entered.1.notify_all();
+                let (count, _) = entered
+                    .1
+                    .wait_timeout_while(count, Duration::from_secs(60), |count| *count < 4)
+                    .unwrap();
+                assert_eq!(*count, 4, "all four HEADs enter before any returns");
+                drop(count);
+                finished.fetch_add(1, Ordering::SeqCst);
+                if url.ends_with(missing) {
+                    status(404)
+                } else {
+                    served()
+                }
+            });
+            assert!(result.unwrap_err().to_string().contains(missing));
+            assert_eq!(finished.load(Ordering::SeqCst), 4);
+        }
+    }
+
+    /// Fixed-service timed model of the production HEAD dispatcher. Both
+    /// schedules ask the same thirteen URLs once. No latency assertion.
+    #[test]
+    #[ignore = "explicit anonymous HEAD scheduling measurement"]
+    fn anonymous_heads_abba() {
+        let mut names = names();
+        names.push(crate::service_qualification::REPORT_ASSET.to_string());
+        let read = |_: &str| {
+            std::thread::sleep(Duration::from_millis(40));
+            served()
+        };
+        for (take, parallel) in [false, true, true, false].into_iter().enumerate() {
+            let start = std::time::Instant::now();
+            let issued = if parallel {
+                prove_assets_download_anonymously(SLUG, TAG, &names, &read).unwrap()
+            } else {
+                names
+                    .iter()
+                    .map(|name| {
+                        prove_assets_download_anonymously(
+                            SLUG,
+                            TAG,
+                            std::slice::from_ref(name),
+                            &read,
+                        )
+                        .unwrap()
+                    })
+                    .sum()
+            };
+            assert_eq!(issued as usize, names.len());
+            println!(
+                "anonymous-heads take={take} parallel={parallel} requests={issued} wall_s={:.6}",
+                start.elapsed().as_secs_f64()
+            );
+        }
     }
 
     #[test]

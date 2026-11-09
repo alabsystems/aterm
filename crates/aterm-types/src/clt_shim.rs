@@ -350,11 +350,49 @@ pub fn installing_mark(shim: &std::path::Path) -> std::path::PathBuf {
     shim.with_extension("installing")
 }
 
+/// Resolve an Xcode application root to its developer contents, leaving a developer directory
+/// unchanged. Like Apple's selector, this recognizes the contents directory rather than an
+/// `.app` suffix, so aliases and renamed bundles work too. The invocation path is preserved.
+///
+/// # Errors
+/// The contents directory could not be inspected for a reason other than absence.
+pub fn developer_content_dir(dir: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    developer_content_dir_with(dir, |contents| {
+        std::fs::metadata(contents).map(|meta| meta.is_dir())
+    })
+}
+
+/// [`developer_content_dir`] with the caller's directory inspection. The inspection must
+/// follow symbolic links, as the native metadata read does; this path policy reads nothing.
+///
+/// # Errors
+/// The inspection failed for a reason other than absence or a non-directory component.
+pub fn developer_content_dir_with(
+    dir: &std::path::Path,
+    is_dir: impl FnOnce(&std::path::Path) -> std::io::Result<bool>,
+) -> std::io::Result<std::path::PathBuf> {
+    let contents = dir.join("Contents/Developer");
+    match is_dir(&contents) {
+        Ok(true) => Ok(contents),
+        Ok(false) => Ok(dir.to_owned()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(dir.to_owned())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// The developer directories a call to `<tool>` is served from, in the order `xcode-select -p`
 /// answers, read without running it: `$DEVELOPER_DIR` (`developer_dir`), the directory
 /// `xcode-select` selected (`selected`, [`XCODE_SELECT_LINK`]'s target), Xcode's own
 /// ([`XCODE_DEVELOPER`]), then the Command Line Tools ([`CLT_DIR`]). Only absolute ones count,
-/// each once.
+/// each once. Application roots resolve to their developer contents; an unread contents
+/// directory retains its original candidate for the tool's own presence check.
 #[must_use]
 pub fn developer_dirs(
     developer_dir: Option<&std::path::Path>,
@@ -370,9 +408,10 @@ pub fn developer_dirs(
     .into_iter()
     .flatten()
     .filter(|dir| dir.is_absolute())
+    .map(|dir| developer_content_dir(dir).unwrap_or_else(|_| dir.to_owned()))
     {
-        if !dirs.iter().any(|known| known == dir) {
-            dirs.push(dir.to_owned());
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
         }
     }
     dirs
@@ -469,6 +508,34 @@ pub fn without_shim(path: &std::ffi::OsStr, shim: &std::path::Path) -> std::ffi:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn xcode_bundle_roots_and_aliases_expose_their_developer_tools() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let root = aterm_tempfile::tempdir().unwrap();
+        let bundle = root.path().join("Developer Suite");
+        let developer = bundle.join("Contents/Developer");
+        let git = developer.join("usr/bin/git");
+        std::fs::create_dir_all(git.parent().unwrap()).unwrap();
+        std::fs::write(&git, b"installed git").unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let alias = root.path().join("Alternate.app");
+        symlink(&bundle, &alias).unwrap();
+        for selected in [&bundle, &alias, &developer] {
+            let dirs = developer_dirs(Some(selected), None);
+            let expected = if selected == &developer {
+                git.clone()
+            } else {
+                selected.join("Contents/Developer/usr/bin/git")
+            };
+            assert_eq!(
+                developer_tool_in("git", &dirs, |path| path.starts_with(root.path())
+                    && developer_executable(path)),
+                Some(expected)
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

@@ -510,9 +510,7 @@ pub fn failure_hints(
                     "{commit} ({subject}) [{rank}]: conflicts in {}",
                     paths.join(", ")
                 ));
-                if !paths.is_empty() && paths.iter().all(|p| p.starts_with("docs/")) {
-                    hints.push(format!("re-make plan only: create a worktree at {}; apply {commit}'s patch excluding docs/; commit, verify land and land that new non-merge commit on main; then --fix <new commit>", line.head()));
-                }
+                hints.extend(reauthor_plan(git, line.head(), &commit, &paths)?);
             }
             Err(stop) => hints.push(format!(
                 "{commit} ({subject}) [{rank}]: carry not judged: {}",
@@ -521,6 +519,50 @@ pub fn failure_hints(
         }
     }
     Ok(hints)
+}
+
+/// A manual recipe only when all conflicts are documentation. Exclude the conflicting
+/// paths, not the whole directory, so every other path of the fix is retained.
+fn reauthor_plan(
+    git: &dyn GitRunner,
+    head: &str,
+    commit: &str,
+    conflicts: &[String],
+) -> Result<Vec<String>, Stop> {
+    if conflicts.is_empty()
+        || !conflicts.iter().all(|path| {
+            path.starts_with("docs/") || path.ends_with(".md") || path.ends_with(".rst")
+        })
+    {
+        return Ok(Vec::new());
+    }
+    let parent = format!("{commit}^");
+    if moved(git, &parent, commit)?
+        .iter()
+        .all(|path| conflicts.contains(path))
+    {
+        return Ok(Vec::new());
+    }
+    let excluded = conflicts
+        .iter()
+        .map(|path| crate::release::shell_word(&format!(":(top,literal,exclude){path}")))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(vec![
+        "re-make plan only (review and run manually; omits only the conflicting documentation):"
+            .into(),
+        format!(
+            "git worktree add -b reauthor-{} <new-worktree> {head}",
+            short(commit)
+        ),
+        "cd <new-worktree>".into(),
+        format!(
+            "git diff --no-ext-diff --no-textconv --no-renames --binary --full-index {parent} {commit} -- . {excluded} | git apply --index"
+        ),
+        format!("git commit -C {commit}"),
+        "Record that new non-merge commit ID, then land it: targo --unverified verify land".into(),
+        format!("Back in the release clone: {RELEASE_COMMAND} --fix <new non-merge commit>"),
+    ])
 }
 
 /// What [`record`] did.
@@ -838,13 +880,20 @@ pub fn carry(git: &dyn GitRunner, line: &Line, fixes: &[Fix]) -> Result<Vec<Hop>
             ));
         }
         let earlier: Vec<&str> = hops.iter().map(|hop| short(&hop.carries)).collect();
-        let before: Vec<String> = earlier
+        let mut before: Vec<String> = hops
             .iter()
-            .map(|sha| format!("carried before it in this run: {sha}"))
+            .map(|hop| {
+                format!(
+                    "carried before it in this run: {} as {}",
+                    short(&hop.carries),
+                    short(&hop.commit)
+                )
+            })
             .collect();
         let tree = match hop_tree(git, &prev, &fix.commit)? {
             Merged::Tree(tree) => tree,
             Merged::Conflict(paths) => {
+                before.extend(reauthor_plan(git, &prev, &fix.commit, &paths)?);
                 let remedy = if earlier.is_empty() {
                     format!(
                         "author it on {} and land it, then `{RELEASE_COMMAND} --fix <that commit>`",

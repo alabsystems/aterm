@@ -181,6 +181,7 @@ impl Bed {
                 NOW + 1,
                 &mut None,
                 accounts::SyncTarget {
+                    fleet: None,
                     path: &self.path,
                     before: Some(&before),
                     after: Some(&after),

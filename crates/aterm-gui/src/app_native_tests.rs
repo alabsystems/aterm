@@ -3929,6 +3929,7 @@ fn retiring_a_withdrawn_stage_releases_only_its_exact_latch_and_rearms_a_replace
             Some(status(Some(withdrawn), 0)),
         ));
         let latch = crate::AutoApplyManualOnly {
+            replacement: None,
             build: withdrawn + u64::from(unrelated == 1),
             dmg_sha256: if unrelated == 2 {
                 [0xcd; 32]
@@ -4253,6 +4254,7 @@ fn arm_applies_each_decision_to_the_retained_intent() {
     );
 
     let latch = crate::AutoApplyManualOnly {
+        replacement: None,
         build: current + 2,
         dmg_sha256: [0xcd; 32],
         activation: false,
@@ -4568,7 +4570,105 @@ fn a_newer_release_starts_the_retire_of_a_converged_activation_latch() {
     ));
     let activation =
         crate::native_updater_service::installed_activation_digest(11, &installed.commit);
+    for failures in 1..=3 {
+        let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            installed.build,
+            &installed.commit,
+            &activation,
+        );
+        ticket.make_current_apply_for_test(&mut app.native_updater_service);
+        assert!(matches!(
+            app.abort_reaped_native_apply_before_reconcile(
+                &ticket,
+                "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+                HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+            ),
+            UpdateOutcome::Failed { .. }
+        ));
+        assert_eq!(
+            app.auto_apply_physical_retry.map(|retry| retry.cycles),
+            Some(failures),
+            "the real returned failures spend the activation's physical budget"
+        );
+    }
+    let latch = app
+        .auto_apply_manual_only
+        .expect("the physical retry latch");
+    let budget = app.auto_apply_physical_retry;
+    assert!(
+        latch.activation
+            && latch.build == installed.build
+            && latch
+                .retry_at
+                .is_some_and(|at| at > std::time::Instant::now()),
+        "PRECONDITION: the old activation is still waiting for its retry window"
+    );
+    assert!(
+        app.auto_apply_structural_verdict.is_none(),
+        "transient failures do not prove structural convergence"
+    );
+    let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+        2,
+        2,
+        Some(status(Some(12), 0)),
+        Some(installed.clone()),
+    ));
+    assert_eq!(
+        app.native_activation_supersede.as_ref().map(|job| (
+            job.activation,
+            job.newer,
+            job.activation_commit.clone()
+        )),
+        Some((11, 12, installed.commit.clone())),
+        "a distinct verified release does not wait for the old activation's physical retry"
+    );
+    assert_eq!(
+        app.auto_apply_manual_only.map(|current| (
+            current.build,
+            current.dmg_sha256,
+            current.activation,
+            current.retry_at
+        )),
+        Some((
+            latch.build,
+            latch.dmg_sha256,
+            latch.activation,
+            latch.retry_at
+        )),
+        "offering new bytes preserves the old artifact's retry deadline"
+    );
+    assert_eq!(app.auto_apply_physical_retry, budget);
+    assert!(
+        app.auto_apply_structural_verdict.is_none(),
+        "offering new bytes must not fabricate a structural verdict"
+    );
+    assert_activation_stage(&app, installed.build, &installed.commit);
+
+    let mut app = App::headless_for_test();
+    let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+        1,
+        1,
+        Some(status(None, 0)),
+        Some(installed.clone()),
+    ));
+    let activation =
+        crate::native_updater_service::installed_activation_digest(11, &installed.commit);
+    let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+        installed.build,
+        &installed.commit,
+        &activation,
+    );
+    ticket.make_current_apply_for_test(&mut app.native_updater_service);
+    let _ = app.abort_reaped_native_apply_before_reconcile(
+        &ticket,
+        "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+        HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+    );
+    let budget = app.auto_apply_physical_retry;
+    assert_eq!(budget.map(|retry| retry.cycles), Some(1));
+    // The current unclassified hold supersedes the old failure's scheduling authority.
     app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+        replacement: None,
         build: 11,
         dmg_sha256: decode_dmg_sha256(&activation).expect("an activation digest"),
         activation: true,
@@ -4585,8 +4685,9 @@ fn a_newer_release_starts_the_retire_of_a_converged_activation_latch() {
             && app
                 .auto_apply_manual_only
                 .is_some_and(|manual| manual.retry_at.is_none()),
-        "a verdict-less latch holds whatever arrives"
+        "an unclassified current latch holds despite older physical failure history"
     );
+    assert_eq!(app.auto_apply_physical_retry, budget);
     let mut app = App::headless_for_test();
     let activation = converge_structurally_on_the_activation(&mut app, &installed, 1);
     app.block_native_auto_apply_environment(
@@ -4626,6 +4727,7 @@ fn only_an_observation_of_the_new_disk_releases_a_superseded_activation_latch() 
         .native_activation_supersede
         .clone()
         .expect("PRECONDITION: the retire started");
+    app.next_native_update_reconcile_sequence = 10;
     app.finish_activation_supersede(ActivationSupersedeCompletion {
         job,
         outcome: Ok(aterm_update::SupersededActivation {
@@ -4637,10 +4739,37 @@ fn only_an_observation_of_the_new_disk_releases_a_superseded_activation_latch() 
         }),
         facts: None,
     });
-    assert!(app.native_activation_supersede.is_none());
+    assert!(
+        app.native_activation_supersede
+            .as_ref()
+            .is_some_and(|job| job.awaiting_facts.is_some()),
+        "an accepted retirement still owes a checked disk observation"
+    );
+    let_the_day_pass(&mut app);
+    assert!(
+        !app.lapse_expired_auto_apply_manual_only(),
+        "even an earned old-artifact resample waits for the retirement's fresh disk facts"
+    );
+    assert!(app.auto_apply_manual_only.is_some() && app.auto_apply_intent.is_none());
+    assert!(
+        matches!(
+            app.reconcile_native_update_facts(reconcile_facts_with_installed(
+                9,
+                3,
+                Some(status(Some(13), 0)),
+                Some(InstalledUpdate {
+                    build: 10,
+                    ..installed.clone()
+                }),
+            )),
+            NativeUpdateFactsResult::IgnoredStale
+        ),
+        "a positively checked read queued before completion cannot release this retirement epoch"
+    );
+    assert_activation_stage(&app, 11, &installed.commit);
     app.finish_native_update_reconcile(
         NativeUpdateReconcilePurpose::Refresh,
-        reconcile_facts_with_installed(3, 3, Some(status(Some(12), 0)), Some(installed.clone())),
+        reconcile_facts_with_installed(10, 3, Some(status(Some(12), 0)), Some(installed.clone())),
     );
     assert!(
         app.auto_apply_manual_only.is_some() && app.auto_apply_intent.is_none(),
@@ -4649,18 +4778,34 @@ fn only_an_observation_of_the_new_disk_releases_a_superseded_activation_latch() 
     assert!(!app.arm_native_auto_apply(11, &activation));
     app.finish_native_update_reconcile(
         NativeUpdateReconcilePurpose::StageAvailable,
+        reconcile_facts_with_installed(11, 4, Some(status(Some(13), 0)), Some(installed.clone())),
+    );
+    assert_eq!(
+        app.native_activation_supersede
+            .as_ref()
+            .map(|job| (job.newer, job.awaiting_facts.is_some())),
+        Some((12, true)),
+        "a still newer download cannot dispatch another retire against stale installed facts"
+    );
+    assert!(matches!(
+        app.apply_native_update(ApplyMode::Immediate),
+        UpdateOutcome::Deferred { .. }
+    ));
+    app.finish_native_update_reconcile(
+        NativeUpdateReconcilePurpose::StageAvailable,
         reconcile_facts_with_installed(
-            4,
-            4,
-            Some(status(Some(12), 0)),
+            12,
+            5,
+            Some(status(Some(13), 0)),
             Some(InstalledUpdate {
                 build: 10,
                 ..installed.clone()
             }),
         ),
     );
+    assert!(app.native_activation_supersede.is_none());
     assert!(app.auto_apply_manual_only.is_none());
-    assert_eq!(app.auto_apply_intent.map(|intent| intent.build), Some(12));
+    assert_eq!(app.auto_apply_intent.map(|intent| intent.build), Some(13));
 }
 
 fn converge_and_start_the_retire(
@@ -4684,18 +4829,14 @@ fn converge_and_start_the_retire(
 }
 
 fn let_the_retry_come_due(app: &mut App) {
-    let verdict = app
-        .auto_apply_structural_verdict
-        .expect("PRECONDITION: the verdict");
-    let retry = verdict
+    let latch = app.auto_apply_manual_only.as_mut().expect("the latch");
+    let replacement = latch.replacement.as_mut().expect("known failure custody");
+    let retry = replacement
         .newer_retry
         .expect("PRECONDITION: a refused release waits out its retry");
-    app.auto_apply_structural_verdict = Some(crate::AutoApplyStructuralVerdict {
-        newer_retry: Some(crate::SupersedeRetry {
-            at: std::time::Instant::now() - std::time::Duration::from_secs(1),
-            ..retry
-        }),
-        ..verdict
+    replacement.newer_retry = Some(crate::SupersedeRetry {
+        at: std::time::Instant::now() - std::time::Duration::from_secs(1),
+        ..retry
     });
 }
 
@@ -4731,17 +4872,30 @@ fn a_refused_supersede_keeps_the_latch_and_says_only_a_refusal_of_the_disk() {
         });
         assert!(app.native_activation_supersede.is_none(), "{kind}");
         assert_eq!(
-            app.auto_apply_manual_only,
-            Some(converged),
-            "{kind}: the latch stands exactly as it was"
+            app.auto_apply_manual_only.map(|latch| (
+                latch.build,
+                latch.dmg_sha256,
+                latch.activation,
+                latch.retry_at
+            )),
+            Some((
+                converged.build,
+                converged.dmg_sha256,
+                converged.activation,
+                converged.retry_at
+            )),
+            "{kind}: the old artifact and its retry deadline stand"
         );
-        let verdict = app.auto_apply_structural_verdict.expect("the verdict");
+        let replacement = app
+            .auto_apply_manual_only
+            .and_then(|latch| latch.replacement)
+            .expect("known failure custody");
         assert_eq!(
-            app.structural_supersede_retry_at(),
-            verdict.newer_retry.map(|retry| retry.at),
+            app.activation_replacement_retry_at(),
+            replacement.newer_retry.map(|retry| retry.at),
             "{kind}: the event loop folds the retry's deadline"
         );
-        assert!(app.structural_supersede_retry_at().is_some(), "{kind}");
+        assert!(app.activation_replacement_retry_at().is_some(), "{kind}");
         assert_eq!(
             app.auto_apply_stranded_announced.is_some(),
             settled,
@@ -4781,13 +4935,16 @@ fn a_refused_release_backs_off_and_a_newer_one_does_not_wait_for_it() {
         .expect("the retry started");
     let before = std::time::Instant::now();
     refuse(&mut app, job, 4, 12);
-    let verdict = app.auto_apply_structural_verdict.expect("the verdict");
-    assert_eq!(verdict.newer_refusals, 2);
+    let replacement = app
+        .auto_apply_manual_only
+        .and_then(|latch| latch.replacement)
+        .expect("known failure custody");
+    assert_eq!(replacement.newer_refusals, 2);
     assert!(
-        verdict
+        replacement
             .newer_retry
             .is_some_and(|retry| retry.at >= before + SUPERSEDE_RETRY_AFTER * 2),
-        "the second refusal in a row waits twice as long: {verdict:?}"
+        "the second refusal in a row waits twice as long: {replacement:?}"
     );
     let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
         5,
@@ -4803,8 +4960,9 @@ fn a_refused_release_backs_off_and_a_newer_one_does_not_wait_for_it() {
         "a still newer release is offered the install path at once"
     );
     assert_eq!(
-        app.auto_apply_structural_verdict
-            .and_then(|verdict| verdict.newer_retry),
+        app.auto_apply_manual_only
+            .and_then(|latch| latch.replacement)
+            .and_then(|replacement| replacement.newer_retry),
         None,
         "12's retry is moot"
     );
@@ -4813,7 +4971,7 @@ fn a_refused_release_backs_off_and_a_newer_one_does_not_wait_for_it() {
         .clone()
         .expect("13's retire");
     refuse(&mut app, job, 6, 13);
-    assert!(app.structural_supersede_retry_at().is_some());
+    assert!(app.activation_replacement_retry_at().is_some());
     let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
         7,
         7,
@@ -4821,9 +4979,49 @@ fn a_refused_release_backs_off_and_a_newer_one_does_not_wait_for_it() {
         Some(installed.clone()),
     ));
     assert_eq!(
-        app.structural_supersede_retry_at(),
+        app.activation_replacement_retry_at(),
         None,
         "a release that left the disk is not retried"
+    );
+    let history = app.auto_apply_manual_only.unwrap().replacement.unwrap();
+    assert_eq!(history.newer_refusals, 3);
+    let_the_day_pass(&mut app);
+    assert!(app.lapse_expired_auto_apply_manual_only());
+    assert!(app.auto_apply_manual_only.is_none());
+    assert_eq!(
+        app.auto_apply_structural_verdict
+            .unwrap()
+            .replacement_history,
+        history,
+        "the earned resample retains offer bookkeeping without current eligibility"
+    );
+    let activation =
+        crate::native_updater_service::installed_activation_digest(11, &installed.commit);
+    let _ = fail_the_activation_structurally(&mut app, &installed, &activation);
+    assert_eq!(
+        app.auto_apply_manual_only.unwrap().replacement,
+        Some(history),
+        "an actual new failure restores the prior offer budget"
+    );
+    let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+        8,
+        8,
+        Some(status(Some(13), 0)),
+        Some(installed.clone()),
+    ));
+    let job = app
+        .native_activation_supersede
+        .clone()
+        .expect("13 is offered again");
+    refuse(&mut app, job, 9, 13);
+    assert_eq!(
+        app.auto_apply_manual_only
+            .unwrap()
+            .replacement
+            .unwrap()
+            .newer_refusals,
+        4,
+        "the earned resample did not replenish the newer-release refusal budget"
     );
 }
 
@@ -4896,8 +5094,9 @@ fn a_newer_release_already_on_disk_at_convergence_supersedes_at_the_first_look()
         let _ = fail_the_activation_structurally(&mut app, &installed, &activation);
     }
     assert_eq!(
-        app.auto_apply_structural_verdict
-            .map(|verdict| verdict.newer_spent),
+        app.auto_apply_manual_only
+            .and_then(|latch| latch.replacement)
+            .map(|replacement| replacement.newer_spent),
         Some(0),
         "no release has been offered the install path yet"
     );
@@ -5521,6 +5720,7 @@ fn the_activation_of_a_failed_download_continues_its_ladder_instead_of_refilling
         "the fixture must actually straddle the swap"
     );
     app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+        replacement: None,
         build: 77,
         dmg_sha256: [0xab; 32],
         activation: false,
@@ -5615,6 +5815,7 @@ fn a_deadlined_manual_only_latch_lapses_but_the_fail_safe_one_does_not() {
     let build = app.native_updater_service.snapshot().current_build + 1;
 
     app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+        replacement: None,
         build,
         dmg_sha256: [0xab; 32],
         activation: false,
@@ -5639,6 +5840,7 @@ fn a_deadlined_manual_only_latch_lapses_but_the_fail_safe_one_does_not() {
     };
     app.auto_apply_physical_retry = Some(spent);
     app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+        replacement: None,
         build,
         dmg_sha256: [0xab; 32],
         activation: false,
@@ -5970,6 +6172,7 @@ fn durable_download_status(app: &App, build: u64) -> DurableUpdateStatus {
 
 #[test]
 fn retiring_a_download_for_its_activation_carries_only_its_own_latch() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     for offset in [-1_i64, 0, 1] {
         let mut app = App::headless_for_test();
         let build = app.native_updater_service.snapshot().current_build + 1;
@@ -5977,6 +6180,7 @@ fn retiring_a_download_for_its_activation_carries_only_its_own_latch() {
         let latched_build = build.saturating_add_signed(offset);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
         app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+            replacement: None,
             build: latched_build,
             dmg_sha256: [0xab; 32],
             activation: false,
@@ -6019,6 +6223,7 @@ fn retiring_a_download_for_its_activation_carries_only_its_own_latch() {
             0 => assert_eq!(
                 app.auto_apply_manual_only,
                 Some(crate::AutoApplyManualOnly {
+                    replacement: None,
                     build,
                     dmg_sha256: activation,
                     activation: true,
@@ -6030,6 +6235,7 @@ fn retiring_a_download_for_its_activation_carries_only_its_own_latch() {
             _ => assert_eq!(
                 app.auto_apply_manual_only,
                 Some(crate::AutoApplyManualOnly {
+                    replacement: None,
                     build: latched_build,
                     dmg_sha256: [0xab; 32],
                     activation: false,
@@ -6042,6 +6248,60 @@ fn retiring_a_download_for_its_activation_carries_only_its_own_latch() {
             app.auto_apply_intent.is_some(),
             offset == -1,
             "the activation arms only where no latch holds it (offset {offset})"
+        );
+    }
+    for proof in ["matched", "other commit", "no receipt"] {
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        stage_one_build_for_test(&mut app, build);
+        let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            build,
+            PREFLIGHT_TEST_COMMIT,
+            &"ab".repeat(32),
+        );
+        ticket.make_current_apply_for_test(&mut app.native_updater_service);
+        let _ = app.abort_reaped_native_apply_before_reconcile(
+            &ticket,
+            "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+            HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+        );
+        let latch = app.auto_apply_manual_only.unwrap();
+        let budget = app.auto_apply_physical_retry;
+        assert!(latch.replacement.is_some());
+        let installed = InstalledUpdate {
+            build,
+            commit: if proof == "other commit" {
+                "fedcba9876543210fedcba9876543210fedcba98"
+            } else {
+                PREFLIGHT_TEST_COMMIT
+            }
+            .to_string(),
+            version: None,
+            receipt_build: (proof != "no receipt").then_some(build),
+            receipt_dmg_sha256: (proof != "no receipt").then(|| "ab".repeat(32)),
+            trial_launches: 0,
+        };
+        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+            11,
+            11,
+            Some(durable_download_status(&app, build)),
+            Some(installed.clone()),
+        ));
+        let carried = app.auto_apply_manual_only.unwrap();
+        assert!(carried.activation);
+        assert_eq!(carried.retry_at, latch.retry_at);
+        assert_eq!(app.auto_apply_physical_retry, budget);
+        assert_eq!(carried.replacement.is_some(), proof == "matched", "{proof}");
+        let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+            12,
+            12,
+            Some(status(Some(build + 1), 0)),
+            Some(installed),
+        ));
+        assert_eq!(
+            app.native_activation_supersede.is_some(),
+            proof == "matched",
+            "{proof}"
         );
     }
 }

@@ -18,6 +18,108 @@ use ledger::testing::Git;
 const VERSION: &str = "0.26.0";
 
 #[test]
+fn dry_carry_judges_real_doc_conflicts_and_clean_hops() {
+    let f = Fixture::merging("dry-carry");
+    run(&f.rival, &["checkout", "-q", "--detach", &f.shas.g]);
+    let base = commit(
+        &f.rival,
+        "base for carry",
+        &[("docs/note.md", "base\n"), ("src/fix.rs", "old\n")],
+    );
+    let head = commit(&f.rival, "line docs", &[("docs/note.md", "line\n")]);
+    run(&f.rival, &["checkout", "-q", "--detach", &base]);
+    let conflict = commit(
+        &f.rival,
+        "fix with conflicting docs",
+        &[("docs/note.md", "main\n"), ("src/fix.rs", "fixed\n")],
+    );
+    run(&f.rival, &["checkout", "-q", "--detach", &base]);
+    let clean = commit(&f.rival, "clean fix", &[("src/fix.rs", "fixed\n")]);
+    let line = Line::start(VERSION, &head, 1);
+    let fix = |commit: &str| Fix {
+        commit: commit.into(),
+        subject: format!("fix {}", &commit[..4]),
+        paths: vec!["src/fix.rs".into()],
+    };
+    let before = run(&f.rival, &["show-ref"]);
+    let head_before = rev(&f.rival, "HEAD");
+    let conflict = fix(&conflict);
+    let stop =
+        line::carry(&Git::new(&f.rival), &line, std::slice::from_ref(&conflict)).unwrap_err();
+    let (dry_code, dry_last, dry) = super::release_flow::real_carry_fixture(
+        &f.rival,
+        &line,
+        std::slice::from_ref(&conflict),
+        true,
+    );
+    println!("docs-conflict dry: {dry_code} {dry_last}");
+    assert_eq!(dry_code, 1, "{dry_last}\n{dry:#?}");
+    assert!(
+        dry.iter()
+            .any(|row| row.contains("WOULD REFUSE") && row.contains(&stop.why))
+    );
+    assert!(dry.iter().any(|row| row.contains(&stop.remedy)));
+    let (real_code, real_last, real) = super::release_flow::real_carry_fixture(
+        &f.rival,
+        &line,
+        std::slice::from_ref(&conflict),
+        false,
+    );
+    println!("docs-conflict real: {real_code} {real_last}");
+    assert_eq!(real_code, 1, "{real_last}\n{real:#?}");
+    assert!(real_last.contains(&stop.why) && real_last.contains(&stop.remedy));
+    let clean = fix(&clean);
+    let (code, last, rows) = super::release_flow::real_carry_fixture(
+        &f.rival,
+        &line,
+        std::slice::from_ref(&clean),
+        true,
+    );
+    println!("clean dry: {code} {last}");
+    assert_eq!(code, 0, "{last}\n{rows:#?}");
+    assert!(last.contains("would go ahead"));
+    let hops = line::carry(&Git::new(&f.rival), &line, &[clean]).unwrap();
+    assert_eq!(hops.len(), 1);
+    assert!(rows.iter().any(|row| row.contains(&hops[0].commit[..9])));
+    assert_eq!(run(&f.rival, &["show-ref"]), before, "carry writes no refs");
+    assert_eq!(rev(&f.rival, "HEAD"), head_before);
+
+    // Execute the printed re-author recipe through its commit, with publication omitted.
+    let recipe = stop
+        .detail
+        .iter()
+        .position(|row| row.starts_with("re-make plan only"))
+        .expect("docs-only conflicts offer a recipe");
+    let destination = f._root.path().join("reauthored");
+    let commands = stop.detail[recipe + 1..recipe + 5].join("\n").replace(
+        "<new-worktree>",
+        &crate::release::shell_word(&destination.display().to_string()),
+    );
+    let output = aterm_uds::spawnfd::command("/bin/sh")
+        .args(["-eu", "-c", &commands])
+        .current_dir(&f.rival)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("src/fix.rs")).unwrap(),
+        "fixed\n"
+    );
+    assert_eq!(
+        fs::read_to_string(destination.join("docs/note.md")).unwrap(),
+        "line\n"
+    );
+    assert_eq!(rev(&destination, "HEAD^"), head);
+    println!(
+        "fixture rows: docs_conflict dry=refused real=refused; clean dry=go-ahead real=1-hop; recipe=code-only; ref_writes=0"
+    );
+}
+
+#[test]
 fn qualify_hints_rank_test_file_then_crate_and_judge_each_patch() {
     let f = Fixture::merging("qualify-hints");
     let base = commit(
@@ -100,7 +202,7 @@ fn qualify_hints_rank_test_file_then_crate_and_judge_each_patch() {
         hints[2].contains(&conflict) && hints[2].contains("[crate]: conflicts in docs/note.md"),
         "{hints:?}"
     );
-    assert!(hints[3].contains("re-make plan only") && hints[3].contains(&head));
+    assert!(hints[3].contains("re-make plan only") && hints[4].contains(&head));
     assert!(!hints.join("\n").contains(&unrelated));
     assert_eq!(rev(&f.rival, "HEAD"), before, "hints never carry a patch");
     // Negative control: neither main fix touches this failing crate.
@@ -859,6 +961,10 @@ fn a_fix_that_conflicts_with_the_head_is_refused_with_its_paths() {
         Reason::Conflict,
     );
     assert!(stop.why.contains("src/c.rs"), "{stop:?}");
+    assert!(
+        stop.detail.is_empty(),
+        "code conflicts have no exclusion recipe"
+    );
     assert_eq!(
         stop.remedy,
         format!(
@@ -876,6 +982,12 @@ fn a_fix_that_conflicts_with_the_head_is_refused_with_its_paths() {
             .remedy
             .contains(&format!("--fix {}`", short(&s.fix_b))),
         "a fix authored on the line's head lacks fix: b2, carried first in this run: {after_b:?}"
+    );
+    assert!(
+        after_b
+            .detail
+            .iter()
+            .any(|row| row.contains(short(&s.fix_b)) && row.contains(" as "))
     );
     assert_eq!(fix.origin_main(), s.tip, "a refused carry pushes nothing");
 }

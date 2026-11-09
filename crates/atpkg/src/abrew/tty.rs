@@ -91,6 +91,11 @@ fn stderr_tty() -> bool {
     }
 }
 
+/// Whether stderr is a terminal (brew's `$stderr.tty?` gate).
+pub(super) fn stderr_is_tty() -> bool {
+    stderr_tty()
+}
+
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 const RED: &str = "\x1b[31m";
@@ -171,6 +176,18 @@ pub(super) fn error(text: &str) -> String {
 /// Brew `Formatter.warning` (yellow, stdout).
 pub(super) fn warning(text: &str) -> String {
     paint(stdout_color(), YELLOW, text)
+}
+
+/// Brew `Tty.default` around text (stdout) — services'
+/// stopped/none status cells.
+pub(super) fn service_default(text: &str) -> String {
+    paint(stdout_color(), DEFAULT, text)
+}
+
+/// Brew `Tty.bold` around a line (stdout) — the services
+/// table header.
+pub(super) fn bold_out(text: &str) -> String {
+    paint(stdout_color(), BOLD, text)
 }
 
 /// Print a `Warning:`-labelled message to stderr with brew's

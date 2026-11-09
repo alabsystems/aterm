@@ -421,6 +421,7 @@ fn a_pathless_writer_does_not_recover_roster_bound_authority() {
             schema: 1,
             id: "a".repeat(32),
             plan: Some(Plan {
+                fleet: None,
                 local_logins: false,
                 roster_path: Some(path.to_str().unwrap().into()),
                 roster_mode: None,
@@ -601,8 +602,16 @@ fn recovery_chooses_the_scope_current_after_acquiring_the_lock() {
                 let path = root.path().join("roster.toml");
                 std::fs::write(&path, "").unwrap();
                 let make_plan = |bound: bool| Plan {
+                    fleet: None,
                     local_logins: false,
-                    roster_path: bound.then(|| path.to_str().unwrap().into()),
+                    roster_path: bound.then(|| {
+                        usage_target(Some(&path))
+                            .unwrap()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .into()
+                    }),
                     roster_mode: None,
                     state: Image {
                         before: read(&store.state_file(), MAX_STATE_BYTES).unwrap(),

@@ -416,7 +416,7 @@ VERIFIER="https://github.com/pinned-org/aterm/releases/download/v0.118.0/aterm-b
 ELF="$BASE/download/v9.9.9/aterm-9.9.9-linux-x86_64"
 sized() { printf 'HTTP/2 302\r\nlocation: https://objects.example/a\r\n\r\nHTTP/2 200\r\ncontent-length: %s\r\n\r\n' "$1"; }
 case "$head$follow $url" in
-"10 $BASE/latest/download/aterm-appcast.toml")
+"10 $BASE/latest/download/aterm-appcast.toml?aterm_lookup="*)
 	printf '%s' "$fmt" | sed "s#%{http_code}#302#; s#%{redirect_url}#$BASE/download/v9.9.9/aterm-appcast.toml#" ;;
 "11 $VERIFIER") sized "$(wc -c <"${STUB_ASSET:?}" | tr -d ' ')" ;;
 "01 $VERIFIER") cat "$STUB_ASSET" ;;

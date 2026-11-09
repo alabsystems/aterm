@@ -385,25 +385,185 @@ fn app_with_lib(tmp: &Path) -> (PathBuf, PathBuf) {
     (lib, app)
 }
 
+/// `sweep`, given what `probe` reads, with this thread's reads memoized ([`read_memo`]), for a
+/// sweep that probes a repository it leaves as it is: a read a probe before it made is answered
+/// from memory and starts no `git` again. First `probe` reads alike with the memo off, while
+/// filling it, and answered from it under [`read_memo::Memo::checking`]: every read of that probe
+/// is one the memo answers, and each answer is the output its `git` gives again, read by read,
+/// whether or not it changes the reading. Once the sweep ends, a probe with the memo off reads as
+/// the first: the sweep starved nothing and left the repository reading as it found it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[track_caller]
+fn memoized<T>(probe: impl Fn() -> RepoRead, sweep: impl FnOnce(&RepoRead) -> T) -> T {
+    let real = probe();
+    let memo = read_memo::on();
+    let filled = probe();
+    assert_eq!(filled, real, "a probe filling the memo");
+    let missed = memo.missed();
+    let answered = memo.checking(&probe);
+    assert_eq!(answered, real, "a probe the memo answered");
+    assert_eq!(
+        memo.missed(),
+        missed,
+        "a probe the memo answered: every read answered from it"
+    );
+    let swept = sweep(&real);
+    drop(memo);
+    assert_eq!(
+        probe(),
+        real,
+        "after the sweep, with the memo off: nothing starved, the repository read as before it"
+    );
+    swept
+}
+
+/// THE READ MEMO ([`read_memo`]) KNOWS A READ BY ITS WHOLE KEY: with no memo held a read runs its
+/// `git` every time; held, a read runs once, counted as missed, and the same read is then answered
+/// with that output without running, while a read in another folder or fed other input runs its
+/// own, and one a signal ended is not kept. The key reads a fed input without moving the file's
+/// offset, so the `git` it feeds still reads all of it. Under [`read_memo::Memo::checking`] an
+/// answer runs its `git` again. While a memo is held a second is refused, and the one held still
+/// answers. NEGATIVE CONTROLS: a checked answer its `git` no longer gives panics; a dropped memo
+/// answers nothing.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_read_memo_knows_a_read_by_its_whole_key() {
+    use read_memo::{Read, through};
+    use std::io::Read as _;
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::{ExitStatus, Output};
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let reads = Reads {
+        deadline: Cell::new(Instant::now() + PROBE_LIMIT),
+        each: Some(PROBE_LIMIT),
+        home: tmp.path(),
+        xdg: None,
+        cut: Cell::new(false),
+        starts: Cell::new(0),
+        held: None,
+        refused: None,
+    };
+    let read = |dir: &str, feed: Option<&std::fs::File>| {
+        read_memo::read(Path::new(dir), &["status"], &reads, false, true, feed)
+    };
+    let said = |text: &str| Output {
+        status: ExitStatus::from_raw(0),
+        stdout: text.into(),
+        stderr: Vec::new(),
+    };
+    let runs = Cell::new(0_u32);
+    let run = |output: Output| {
+        runs.set(runs.get().saturating_add(1));
+        Ok::<_, ()>(output)
+    };
+    let not_run = || -> Result<Output, ()> { panic!("a read the memo holds ran its git") };
+    for _ in 0..2 {
+        assert_eq!(through(read("/a", None), || run(said("a"))), Ok(said("a")));
+    }
+    assert_eq!(runs.get(), 2, "with no memo held, every read runs its git");
+    let memo = read_memo::on();
+    assert_eq!(through(read("/a", None), || run(said("a"))), Ok(said("a")));
+    assert_eq!(
+        through(read("/a", None), not_run),
+        Ok(said("a")),
+        "the same read, answered from memory"
+    );
+    assert_eq!(
+        through(read("/b", None), || run(said("b"))),
+        Ok(said("b")),
+        "a read in another folder runs its own"
+    );
+    let one = open_git_stdin_feed(&tmp.path().join("one"), b"one\n").expect("one");
+    let two = open_git_stdin_feed(&tmp.path().join("two"), b"two\n").expect("two");
+    assert_eq!(
+        through(read("/a", Some(&one)), || run(said("1"))),
+        Ok(said("1"))
+    );
+    assert_eq!(
+        through(read("/a", Some(&two)), || run(said("2"))),
+        Ok(said("2")),
+        "a read fed other input runs its own"
+    );
+    assert_eq!(
+        through(read("/a", Some(&one)), not_run),
+        Ok(said("1")),
+        "a fed read, answered from memory"
+    );
+    let mut fed = String::new();
+    (&one).read_to_string(&mut fed).expect("one");
+    assert_eq!(
+        fed, "one\n",
+        "the key read the input without moving the offset"
+    );
+    let ended = Output {
+        status: ExitStatus::from_raw(9),
+        ..said("")
+    };
+    assert_eq!(through(read("/k", None), || run(ended.clone())), Ok(ended));
+    assert_eq!(
+        through(read("/k", None), || run(said("k"))),
+        Ok(said("k")),
+        "a read a signal ended is not kept"
+    );
+    assert_eq!(
+        runs.get(),
+        8,
+        "each read the memo could not answer ran its git"
+    );
+    assert_eq!(memo.missed(), 6, "the reads the memo could not answer");
+    assert_eq!(
+        memo.checking(|| through(read("/a", None), || run(said("a")))),
+        Ok(said("a"))
+    );
+    assert_eq!(runs.get(), 9, "a checked answer runs its git again");
+    let differs = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        memo.checking(|| through(read("/a", None), || run(said("not a"))))
+    }));
+    assert!(differs.is_err(), "a checked answer its git no longer gives");
+    assert_eq!(
+        through(read("/a", None), not_run),
+        Ok(said("a")),
+        "past the checks, answered without running"
+    );
+    assert_eq!(memo.missed(), 6, "a checked answer is no miss");
+    let nested = std::panic::catch_unwind(read_memo::on);
+    assert!(nested.is_err(), "a second memo on this thread is refused");
+    assert_eq!(
+        through(read("/a", None), not_run),
+        Ok(said("a")),
+        "the memo held still answers"
+    );
+    drop(memo);
+    assert!(
+        matches!(read("/a", None), Read::Off),
+        "a dropped memo answers nothing"
+    );
+}
+
 /// Every read of a probe of `dir` cut in turn ([`read_stall`], on the probe's clock), as far as the
-/// first probe that ends before its cut: none reads clean, `what` naming the work it holds. THE GAP:
-/// a probe that reads fewer on one run than on the next stops the sweep there, and the reads only
-/// the longer run takes are not cut.
+/// first probe that ends before its cut: none reads clean, `what` naming the work it holds. The sweep
+/// runs [`memoized`], so each read the memo answers gives the same output on every run. THE GAP: a
+/// read it cannot answer (one whose fed input it could not read back) may still make one run read
+/// fewer than the next, which stops the sweep there, and the reads only the longer run takes are
+/// not cut.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn never_clean_when_cut(dir: &Path, used: &Used, what: &str) {
-    for k in 0..40 {
-        read_stall::set_after(k, 11_000);
-        let read = probe_session(dir, Some(dir), used, Duration::from_secs(10));
-        let past_the_last_read = read_stall::pending();
-        read_stall::set(0);
-        assert!(
-            !read.is_clean(),
-            "read {k} cut: {read:?} over {what} read as clean"
-        );
-        if past_the_last_read {
-            break;
+    let probe_dir = || probe_session(dir, Some(dir), used, Duration::from_secs(10));
+    memoized(probe_dir, |_| {
+        for k in 0..40 {
+            read_stall::set_after(k, 11_000);
+            let read = probe_dir();
+            let past_the_last_read = read_stall::pending();
+            read_stall::set(0);
+            assert!(
+                !read.is_clean(),
+                "read {k} cut: {read:?} over {what} read as clean"
+            );
+            if past_the_last_read {
+                break;
+            }
         }
-    }
+    });
 }
 
 /// A SUBMODULE'S COMMIT ON NO REMOTE IS WORK (D2-1): a commit made in `vendor/lib` and recorded
@@ -904,37 +1064,39 @@ fn a_statement_read_cut_or_refused_never_unreads_a_clean_reading() {
         .saturating_add(1_000);
     let statement = |read: &RepoRead| read.checked().map(|at| at.statement.clone());
     for dir in [&app, &sub] {
-        let control = probe(dir, Some(dir), PROBE_LIMIT);
-        assert_eq!(statement(&control), Some(Statement::Missing), "{control:?}");
-        // How many reads the probe makes: the first `k` it never reaches (a binary search, as a
-        // probe that never reaches read `k` reaches no later one).
-        let never_reaches = |k: u32| {
-            read_stall::set_after(k, 1);
-            let _ = probe(dir, Some(dir), PROBE_LIMIT);
-            let never = read_stall::pending();
-            read_stall::set(0);
-            never
-        };
-        let (mut lo, mut hi) = (1, 128);
-        assert!(never_reaches(hi), "a probe reads fewer than {hi} times");
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if never_reaches(mid) {
-                hi = mid;
-            } else {
-                lo = mid + 1;
+        let probe_dir = || probe(dir, Some(dir), PROBE_LIMIT);
+        memoized(probe_dir, |control| {
+            assert_eq!(statement(control), Some(Statement::Missing), "{control:?}");
+            // How many reads the probe makes: the first `k` it never reaches (a binary search, as
+            // a probe that never reaches read `k` reaches no later one).
+            let never_reaches = |k: u32| {
+                read_stall::set_after(k, 1);
+                let _ = probe_dir();
+                let never = read_stall::pending();
+                read_stall::set(0);
+                never
+            };
+            let (mut lo, mut hi) = (1, 128);
+            assert!(never_reaches(hi), "a probe reads fewer than {hi} times");
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if never_reaches(mid) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
             }
-        }
-        let reads = lo;
-        read_stall::set_after(reads - 1, starved);
-        let cut = probe(dir, Some(dir), PROBE_LIMIT);
-        read_stall::set(0);
-        assert_eq!(
-            statement(&cut),
-            Some(Statement::Unread),
-            "{}: the last read cut: {cut:?}",
-            dir.display()
-        );
+            let reads = lo;
+            read_stall::set_after(reads - 1, starved);
+            let cut = probe_dir();
+            read_stall::set(0);
+            assert_eq!(
+                statement(&cut),
+                Some(Statement::Unread),
+                "{}: the last read cut: {cut:?}",
+                dir.display()
+            );
+        });
     }
     let refused = Reads {
         deadline: Cell::new(Instant::now() + PROBE_LIMIT),
@@ -1493,35 +1655,35 @@ fn a_probe_cut_at_any_read_is_never_a_clean_repository() {
     scratch_git(&pushed, &["commit", "-q", "-m", "two"]);
     std::fs::write(alone.join("a.txt"), "changed\n").expect("a.txt");
     for work in [&pushed, &alone] {
-        let whole = found(work).expect("the work, read whole");
-        let mut unread = 0;
-        for k in 0..24 {
-            read_stall::set_after(k, 11_000);
-            let read = probe(work, Some(work), Duration::from_secs(10));
-            let past_the_last_read = read_stall::pending();
-            read_stall::set(0);
-            match &read {
-                RepoRead::Clean | RepoRead::Checked(_) | RepoRead::Gone(_) => {
-                    panic!("read {k} cut: read as clean over {whole:?}")
+        let probe_work = || probe(work, Some(work), Duration::from_secs(10));
+        // The control, read with the memo off once the sweep ends ([`memoized`]): the reads past
+        // the last one starve nothing, and the work reads whole again.
+        memoized(probe_work, |real| {
+            let whole = finished(real.clone()).expect("the work, read whole");
+            let mut unread = 0;
+            for k in 0..24 {
+                read_stall::set_after(k, 11_000);
+                let read = probe_work();
+                let past_the_last_read = read_stall::pending();
+                read_stall::set(0);
+                match &read {
+                    RepoRead::Clean | RepoRead::Checked(_) | RepoRead::Gone(_) => {
+                        panic!("read {k} cut: read as clean over {whole:?}")
+                    }
+                    RepoRead::Unread => unread += 1,
+                    RepoRead::Found(_) => {}
                 }
-                RepoRead::Unread => unread += 1,
-                RepoRead::Found(_) => {}
+                if past_the_last_read {
+                    assert_eq!(
+                        read,
+                        RepoRead::Found(whole.clone()),
+                        "read {k} never reached, so nothing was cut"
+                    );
+                    break;
+                }
             }
-            if past_the_last_read {
-                assert_eq!(
-                    read,
-                    RepoRead::Found(whole.clone()),
-                    "read {k} never reached, so nothing was cut"
-                );
-                break;
-            }
-        }
-        assert!(unread > 0, "the first read cut reads as unread");
-        assert_eq!(
-            probe(work, Some(work), Duration::from_secs(10)),
-            RepoRead::Found(whole),
-            "the reads past the last one starve nothing"
-        );
+            assert!(unread > 0, "the first read cut reads as unread");
+        });
     }
 }
 
@@ -1640,32 +1802,34 @@ fn a_clean_probe_cut_at_its_head_read_reads_as_before_the_head_was_read() {
     let starved = u64::try_from(PROBE_LIMIT.as_millis())
         .unwrap_or(u64::MAX)
         .saturating_add(1_000);
-    let mut seen = String::new();
-    for k in 0..24 {
-        read_stall::set_after(k, starved);
-        let read = probe(&work, Some(&work), PROBE_LIMIT);
-        read_stall::set(0);
-        seen.push(match read {
-            RepoRead::Unread => 'u',
-            RepoRead::Clean => 'c',
-            RepoRead::Checked(_) => 'k',
-            RepoRead::Found(w) => panic!("read {k} cut: found {w:?} in a clean repository"),
-            RepoRead::Gone(g) => panic!("read {k} cut: {g:?} read as gone"),
-        });
-    }
-    let (unread, rest) = seen.split_at(seen.find('c').unwrap_or(seen.len()));
-    assert!(
-        !unread.is_empty()
-            && unread.chars().all(|c| c == 'u')
-            && rest.len() > 1
-            && rest.starts_with('c')
-            && rest[1..].chars().all(|c| c == 'k'),
-        "unread before the head read, clean at it, checked past it: {seen}"
-    );
-    assert!(
-        probe(&work, Some(&work), PROBE_LIMIT).checked().is_some(),
-        "the control: nothing starved"
-    );
+    let probe_work = || probe(&work, Some(&work), PROBE_LIMIT);
+    // The control, with nothing starved, reads checked, and reads as it once the sweep ends, with
+    // the memo off ([`memoized`]).
+    memoized(probe_work, |real| {
+        assert!(real.checked().is_some(), "the control: nothing starved");
+        let mut seen = String::new();
+        for k in 0..24 {
+            read_stall::set_after(k, starved);
+            let read = probe_work();
+            read_stall::set(0);
+            seen.push(match read {
+                RepoRead::Unread => 'u',
+                RepoRead::Clean => 'c',
+                RepoRead::Checked(_) => 'k',
+                RepoRead::Found(w) => panic!("read {k} cut: found {w:?} in a clean repository"),
+                RepoRead::Gone(g) => panic!("read {k} cut: {g:?} read as gone"),
+            });
+        }
+        let (unread, rest) = seen.split_at(seen.find('c').unwrap_or(seen.len()));
+        assert!(
+            !unread.is_empty()
+                && unread.chars().all(|c| c == 'u')
+                && rest.len() > 1
+                && rest.starts_with('c')
+                && rest[1..].chars().all(|c| c == 'k'),
+            "unread before the head read, clean at it, checked past it: {seen}"
+        );
+    });
 }
 
 /// A COUNT GIT REFUSED AT A COMMIT `HEAD` NAMES IS NEVER A CLEAN REPOSITORY
@@ -1701,26 +1865,25 @@ fn a_count_git_refused_at_a_commit_head_is_never_a_clean_repository() {
         "the control: the stash"
     );
     std::fs::write(stashed.join(".git/refs/stash"), missing).expect("refs/stash");
-    assert_eq!(
-        probe(&stashed, Some(&stashed), PROBE_LIMIT),
-        RepoRead::Unread,
-        "a stash list git refused"
-    );
     let starved = u64::try_from(PROBE_LIMIT.as_millis())
         .unwrap_or(u64::MAX)
         .saturating_add(1_000);
-    let mut seen = String::new();
-    for k in 0..24 {
-        read_stall::set_after(k, starved);
-        let read = probe(&stashed, Some(&stashed), PROBE_LIMIT);
-        read_stall::set(0);
-        seen.push(if read == RepoRead::Unread { 'u' } else { 'c' });
-    }
-    assert_eq!(
-        seen,
-        "u".repeat(24),
-        "the refused stash list with the k-th read cut, the head read among them"
-    );
+    let probe_stashed = || probe(&stashed, Some(&stashed), PROBE_LIMIT);
+    memoized(probe_stashed, |real| {
+        assert_eq!(real, &RepoRead::Unread, "a stash list git refused");
+        let mut seen = String::new();
+        for k in 0..24 {
+            read_stall::set_after(k, starved);
+            let read = probe_stashed();
+            read_stall::set(0);
+            seen.push(if read == RepoRead::Unread { 'u' } else { 'c' });
+        }
+        assert_eq!(
+            seen,
+            "u".repeat(24),
+            "the refused stash list with the k-th read cut, the head read among them"
+        );
+    });
     let feature = repo(&tmp.path().join("feature"), true);
     let mut history = Vec::new();
     for (name, text) in [("b.txt", "two\n"), ("c.txt", "three\n")] {

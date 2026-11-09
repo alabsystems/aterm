@@ -4659,9 +4659,7 @@ impl App {
                 .front_terminal(wid)
                 .filter(|terminal| terminal.session == target)
                 .map(|_| wid)
-                .or_else(|| {
-                    (pointer && self.visible_session_rect(wid, target).is_some()).then_some(wid)
-                })
+                .or_else(|| (pointer && self.active_tab_shows_session(wid, target)).then_some(wid))
                 .or_else(|| {
                     self.windows.keys().copied().find(|candidate| {
                         self.front_terminal(*candidate)
@@ -9498,7 +9496,11 @@ impl App {
         });
         ImeRecipient {
             surface: self.ime_route(wid),
-            view: self.active_visible_leaf_plan(wid).map(|plan| plan.focused),
+            view: self
+                .windows
+                .get(&wid)
+                .and_then(|ws| ws.tab_set.active())
+                .map(|tab| tab.focus),
             native,
         }
     }

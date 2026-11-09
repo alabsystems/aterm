@@ -2307,16 +2307,12 @@ impl RenderInput {
             .reduce(|(a_lo, a_hi), (b_lo, b_hi)| (a_lo.min(b_lo), a_hi.max(b_hi)))
     }
 
-    /// The lossless per-row selection damage key: one [`SelectionRowKey`] per selection that reaches `frame_row`, with its colours.
+    /// Every selection's [`SelectionRowKey`] on `frame_row`, in list order (the scalar selection alone when [`selections`](Self::selections) is empty), borrowed without allocating.
     #[inline]
-    pub fn selection_row_key(&self, frame_row: usize, out: &mut Vec<SelectionRowKey>) {
-        out.clear();
-        out.extend(self.selection_row_keys(frame_row));
-    }
-
-    /// Every selection's [`SelectionRowKey`] on `frame_row`, in list order (the scalar selection alone when [`selections`](Self::selections) is empty): the one walk behind the row span and the row key.
-    #[inline]
-    fn selection_row_keys(&self, frame_row: usize) -> impl Iterator<Item = SelectionRowKey> + '_ {
+    pub fn selection_row_keys(
+        &self,
+        frame_row: usize,
+    ) -> impl Iterator<Item = SelectionRowKey> + '_ {
         let scalar = if self.selections.is_empty() {
             selection_row_span_of(
                 &self.selection,
@@ -4102,8 +4098,7 @@ mod selection_clip_tests {
             Some((0, 11)),
             "the span is the HULL over both panes — a scan window, not a key"
         );
-        let mut key = Vec::new();
-        input.selection_row_key(1, &mut key);
+        let key: Vec<_> = input.selection_row_keys(1).collect();
         assert_eq!(
             key,
             vec![
@@ -4124,8 +4119,10 @@ mod selection_clip_tests {
             ],
             "the key keeps the two panes' spans and colours separate"
         );
-        input.selection_row_key(2, &mut key);
-        assert!(key.is_empty(), "a row no pane reaches keys empty");
+        assert!(
+            input.selection_row_keys(2).next().is_none(),
+            "a row no pane reaches keys empty"
+        );
     }
 
     #[test]

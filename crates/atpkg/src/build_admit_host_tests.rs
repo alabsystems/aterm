@@ -216,7 +216,7 @@ fn native_table_actor_if_requested() {
     };
     let world = PathBuf::from(world);
     std::fs::write(world.join("phase"), b"starting actor").unwrap();
-    let machine = Fixed::new(Reading::of_gib(256, 200, 128));
+    let machine = Fixed::new(concurrent_reading(256, 200, 128));
     let mut seat = cohort_seat(&world, &machine);
     seat.own = None;
     let ledger = seat.ledger.as_ref().unwrap();
@@ -619,7 +619,7 @@ fn failed_cleanup_ends_a_surviving_member_before_reaping_its_exited_leader() {
         }
     }
     let world = aterm_tempfile::tempdir().unwrap();
-    let machine = Fixed::new(Reading::of_gib(256, 200, 128));
+    let machine = Fixed::new(concurrent_reading(256, 200, 128));
     let seat = cohort_seat(world.path(), &machine);
     let mut admission = held(world.path(), &seat);
     let mut command = spawnfd::command("/bin/cat");

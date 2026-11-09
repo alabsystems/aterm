@@ -341,6 +341,7 @@ fn bound_roster_read_recovers_new_roster_bytes_before_binding() {
                     NOW,
                     &mut None,
                     SyncTarget {
+                        fleet: None,
                         path: &fixture.path,
                         before: Some(&before),
                         after: Some(&after),
@@ -448,6 +449,7 @@ fn publication_between_raw_and_binding_reads_is_refused_including_an_empty_roste
                     NOW,
                     &mut None,
                     SyncTarget {
+                        fleet: None,
                         path: &fixture.path,
                         before: Some(&before),
                         after: Some(&next),

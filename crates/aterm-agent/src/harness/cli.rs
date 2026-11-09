@@ -2664,28 +2664,42 @@ fn source_table_rows(
     let enrolled = local.as_ref().map_or_else(BTreeSet::new, |local| {
         enrolled_under(cli, &local.records.roster, local.home.as_deref())
     });
-    let mut push =
-        |account: &super::accounts_sync::FleetAccount, state: &str, readiness: String| {
-            let region = account.vendor.region.map(|value| value.as_str());
-            let flow = account.vendor.flow.map(|value| value.as_str());
-            json_rows.push(aterm_json::json!({
+    let mut push = |account: &super::accounts_sync::FleetAccount,
+                    state: &str,
+                    readiness: String| {
+        let region = account.vendor.region.map(|value| value.as_str());
+        let flow = account.vendor.flow.map(|value| value.as_str());
+        let machines: Vec<_> = account
+            .machines
+            .iter()
+            .map(|key| {
+                fleet
+                    .roster
+                    .alab
+                    .as_ref()
+                    .filter(|machine| machine.key.as_str() == key)
+                    .map_or(key.as_str(), |machine| machine.display_or_key())
+            })
+            .collect();
+        json_rows.push(aterm_json::json!({
                 "label": account.label,
                 "state": state,
                 "readiness": readiness,
-                "preferred_machines": account.machines,
+                "preferred_machines": machines,
+                "preferred_machine_keys": if fleet.roster.alab.is_some() {Some(&account.machines)} else {None},
                 "class": account.class.as_str(),
                 "region": region,
                 "flow": flow,
             }));
-            text_rows.push((
-                account.label.clone(),
-                state.to_owned(),
-                account.machines.join(","),
-                account.class.as_str().to_owned(),
-                region.or(flow).unwrap_or("-").to_owned(),
-                readiness,
-            ));
-        };
+        text_rows.push((
+            account.label.clone(),
+            state.to_owned(),
+            machines.join(","),
+            account.class.as_str().to_owned(),
+            region.or(flow).unwrap_or("-").to_owned(),
+            readiness,
+        ));
+    };
     for (state, source_rows) in [("active", &fleet.roster.accounts), ("pending", &fleet.held)] {
         for account in source_rows {
             let readiness =
@@ -2739,7 +2753,14 @@ fn source_table_rows(
             }
             let account = super::accounts_sync::FleetAccount {
                 label: row.label.clone(),
-                machines: local.machine.iter().cloned().collect(),
+                machines: fleet
+                    .roster
+                    .alab
+                    .as_ref()
+                    .map(|machine| machine.key.as_str().to_owned())
+                    .or_else(|| local.machine.clone())
+                    .into_iter()
+                    .collect(),
                 class: row.class,
                 email: row.email.clone().unwrap_or_default(),
                 browser: row.browser.clone(),
@@ -13038,6 +13059,7 @@ fn fleet_rows_for_write(
     let origin = fleet_origin(env.home.as_deref(), env.config.as_deref(), path);
     let from = match &origin {
         FleetOrigin::Roster | FleetOrigin::Alab => return Ok(Vec::new()),
+        FleetOrigin::AlabPending(why) => return Err(why.clone()),
         FleetOrigin::Local { files, .. } => return list_in_local_fleet(env, files, asked),
         FleetOrigin::Key(_) => "list the account there",
         FleetOrigin::Vault(_) => {

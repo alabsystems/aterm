@@ -129,6 +129,38 @@ fn vault_read_spans_session_admission_and_ends_with_the_local_batch() {
     );
 }
 
+/// A local batch's admission (its session's open, and the peer and the observation it checks at
+/// once after it: `Replica::observe`) hands one look at the vault
+/// ([`aterm_secrets::client::VaultLook`]) to each of its custody, access and currency checks: none
+/// is made without one ([`crate::table::OWN_CHECKS`]), for a read or for a write, and a batch's own
+/// `Session::peer` still is. That the look serves them, observing the state lock once for all of
+/// them, is `aterm-secrets`' `a_session_look_observes_once_and_judges_as_its_own_calls`; this
+/// pair's access is not log-backed, so its currency checks read the journal alone either way.
+/// NEGATIVE CONTROLS (2026-11-09): with `Replica::observe`'s peer check on its own call
+/// (`Session::peer`), a read's admission asks one (`a read's admission`); with its write opened
+/// by `Session::open_until`, a write's asks two (`a write's admission`).
+#[test]
+fn a_local_batch_is_admitted_through_one_look_at_the_vault() {
+    let p = Pair::new(false, 1);
+    let replica = p.replica(0);
+    let peer = p.lab.bootstrap(1).request().unwrap().binding().actor();
+    let round = replica.round(peer).unwrap();
+    let own = || crate::table::OWN_CHECKS.get();
+    let before = own();
+    let (admitted, batch) = round
+        .local(peer, |session| {
+            let admitted = own() - before;
+            session.peer(peer)?;
+            Ok((admitted, own() - before - admitted))
+        })
+        .unwrap();
+    assert_eq!(admitted, 0, "a read's admission");
+    assert_eq!(batch, 1, "a batch's own check");
+    let before = own();
+    let admitted = round.local_write(peer, |_| Ok(own() - before)).unwrap();
+    assert_eq!(admitted, 0, "a write's admission");
+}
+
 /// Another of this Mac's rounds ingesting into `p`'s first table: a writer's commit, which overtakes
 /// an observer of that table it lands inside.
 fn overtaking_ingest(p: &Pair) -> impl Fn() + 'static {

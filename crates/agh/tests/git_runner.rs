@@ -1727,6 +1727,11 @@ fn native_push_receive_failures_reread_before_retrying() {
                 .count(),
             expected_pushes
         );
+        let notes = gh.fx().retry_notes();
+        assert_eq!(notes.len(), expected_pushes - 1);
+        if let Some(note) = notes.first() {
+            assert!(note.contains(reason), "{note}");
+        }
         // The two preparation reads precede the push; only transient failures
         // earn the third, authoritative read.
         assert_eq!(

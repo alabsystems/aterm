@@ -2823,7 +2823,7 @@ fn a_converged_membership_exchange_reads_the_records_file_once_per_side() {
         assert_eq!((report.sent, report.received, report.deferred), (0, 0, 0));
         assert_eq!(
             loads, 1,
-            "a converged exchange read the records file {loads} times"
+            "a converged exchange asked for the records {loads} times"
         );
     }
 }

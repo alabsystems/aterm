@@ -122,6 +122,9 @@ fn objc_containment_sink(e: &aterm_objc::ContainedException<'_>) {
         e.reason,
         e.call_stack
     );
+    // A fatal callback aborts as soon as this sink returns, before the writer
+    // necessarily runs. Give its diagnostic the same bounded drain as a panic.
+    let _ = flush_within(LOG_FLUSH_EXIT_WAIT);
     aterm_objc::exception::default_sink(e);
 }
 
@@ -1855,6 +1858,45 @@ mod tests {
         assert_eq!(read(&dir.log()), "", "still queued");
         assert!(logger.flush_within(aterm_spec::wait::MUST_HAPPEN));
         assert_eq!(bodies(&dir.log()), lines(1..=1));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_objc_exception_report_is_on_disk_before_the_sink_returns() {
+        const STAGE: &str = "ATERM_TEST_OBJC_REPORT_PATH";
+        if let Some(path) = std::env::var_os(STAGE) {
+            let path = Path::new(&path);
+            let logger = queued_logger(path, LOG_QUEUE_BYTES);
+            assert!(FILE_LOGGER.set(logger).is_ok());
+            assert!(aterm_log::set_logger(logger).is_ok());
+            aterm_log::set_max_level(LevelFilter::Error);
+            objc_containment_sink(&aterm_objc::ContainedException {
+                method: "applicationDidFinishLaunching:",
+                class: "NSException",
+                name: "LaunchException",
+                reason: "launch failed",
+                call_stack: "throw site",
+                ordinal: 1,
+            });
+            let report = read(path);
+            for detail in [
+                "applicationDidFinishLaunching:",
+                "LaunchException",
+                "launch failed",
+                "throw site",
+            ] {
+                assert!(
+                    report.contains(detail),
+                    "queued report lost {detail:?}: {report}"
+                );
+            }
+            return;
+        }
+        let dir = Scratch::new("objc-report");
+        let mut helper = crate::test_alone::StandIn::this_test();
+        helper.command().env(STAGE, dir.log());
+        let ran = helper.spawn().selected();
+        assert_eq!(ran.status.and_then(|s| s.code()), Some(0), "{}", ran.stderr);
     }
 
     /// Landed at the end: a process that `exit`s with a line still queued

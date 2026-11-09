@@ -406,6 +406,27 @@ fn block_machine_cost(arms: &[(bool, std::time::Duration)]) -> std::time::Durati
         .saturating_mul(2)
 }
 
+/// Take a block's arms in ABBA order and return each as `(candidate, wall)` for
+/// [`block_machine_cost`]. `arm` gets the arm's index and whether it records, and returns what
+/// must outlive the timing together with whether to go on. A wall runs from before `arm` starts
+/// to after it returns, so launch counts and the returned value's teardown does not.
+fn take_block_arms<T>(
+    clock: impl Fn() -> std::time::Duration,
+    mut arm: impl FnMut(usize, bool) -> Result<(T, bool), CouldNotRun>,
+) -> Result<Vec<(bool, std::time::Duration)>, CouldNotRun> {
+    let mut arms = Vec::with_capacity(4);
+    for (index, candidate) in [false, true, true, false].into_iter().enumerate() {
+        let started = clock();
+        let (teardown, go_on) = arm(index, candidate)?;
+        arms.push((candidate, clock().saturating_sub(started)));
+        drop(teardown);
+        if !go_on {
+            break;
+        }
+    }
+    Ok(arms)
+}
+
 struct ThroughputObservation {
     ratios: Option<Vec<u64>>,
     dropped_input: u64,
@@ -571,71 +592,70 @@ fn measure_with_control(
                 same_recording,
                 std::time::Duration::from_secs(THROUGHPUT_SPEND_SECS),
                 |pair| {
-                    let mut arms = Vec::with_capacity(4);
-                    for (arm, candidate) in [false, true, true, false].into_iter().enumerate() {
-                        let arm_started = std::time::Instant::now();
-                        let record = candidate && !same_recording;
-                        let take = Take::launch(rig, record, budget)?;
-                        let out = take.home.join("drain.us");
-                        // Observe both endpoints without changing scheduling or timing the probes.
-                        let subject_role_before = Band::observed_role(take.inst.pid());
-                        let driver_role_before = Band::observed_role(0);
-                        let before = cpu_ns(take.inst.pid());
-                        let started = std::time::Instant::now();
-                        take.start_drain(rig, None, bytes, &out)?;
-                        let us = take.drained_us(&out)?;
-                        let sample_wall_us = started.elapsed().as_micros();
-                        let used = before
-                            .zip(cpu_ns(take.inst.pid()))
-                            .and_then(|(before, after)| after.checked_sub(before));
-                        // Diagnostics bracket the command and report polling as well as the drain.
-                        // The verdict still uses only the producer's original drain measurement.
-                        let status = take.inst.ctl.ok(&["temporal", "status"])?;
-                        let completed = take.completed_status(record)?;
-                        let subject_role_after = Band::observed_role(take.inst.pid());
-                        let driver_role_after = Band::observed_role(0);
-                        eprintln!(
-                            "measure-sample: {}",
-                            aterm_json::json!({
-                                "schema": 1, "measurement": "recording-throughput", "pair": pair,
-                                "arm": arm, "recording": record, "same_recording": same_recording, "drain_us": us,
-                                "sample_wall_us": sample_wall_us, "sample_cpu_ns": used,
-                                "role_observation": "read_only_endpoints;not_continuous",
-                                "subject_role_before": {
-                                    "darwin_role": subject_role_before.0, "errno": subject_role_before.1,
-                                },
-                                "driver_role_before": {
-                                    "darwin_role": driver_role_before.0, "errno": driver_role_before.1,
-                                },
-                                "subject_role_after": {
-                                    "darwin_role": subject_role_after.0, "errno": subject_role_after.1,
-                                },
-                                "driver_role_after": {
-                                    "darwin_role": driver_role_after.0, "errno": driver_role_after.1,
-                                },
-                                "dropped_input": field(&completed, "dropped_input"),
-                                "dropped_input_at_receipt": field(&status, "dropped_input"),
-                                "completion_writer_in_flight": field(&completed, "writer_in_flight"),
-                                "completion_writer_queued_bytes": field(&completed, "writer_queued_bytes"),
-                                "writer_in_flight": field(&status, "writer_in_flight"),
-                                "writer_queued_bytes": field(&status, "writer_queued_bytes"),
-                                "writer_role_requested": field(&status, "writer_role_requested"),
-                                "writer_qos_observed": field(&status, "writer_qos_observed"),
-                                "writer_urgent_pressure": field(&status, "writer_urgent_pressure"),
-                                "writer_priority_override": field(&status, "writer_priority_override"),
-                                "pool_used": field(&status, "pool_used"),
-                            })
-                        );
-                        if record {
-                            dropped_input =
-                                dropped_input.saturating_add(recording_drops(&completed)?);
-                        }
-                        if candidate { &mut on } else { &mut off }.push(us);
-                        arms.push((candidate, arm_started.elapsed()));
-                        if dropped_input != 0 {
-                            break;
-                        }
-                    }
+                    let block_started = std::time::Instant::now();
+                    let arms = take_block_arms(
+                        || block_started.elapsed(),
+                        |arm, candidate| {
+                            let record = candidate && !same_recording;
+                            let take = Take::launch(rig, record, budget)?;
+                            let out = take.home.join("drain.us");
+                            // Observe both endpoints without changing scheduling or timing the probes.
+                            let subject_role_before = Band::observed_role(take.inst.pid());
+                            let driver_role_before = Band::observed_role(0);
+                            let before = cpu_ns(take.inst.pid());
+                            let started = std::time::Instant::now();
+                            take.start_drain(rig, None, bytes, &out)?;
+                            let us = take.drained_us(&out)?;
+                            let sample_wall_us = started.elapsed().as_micros();
+                            let used = before
+                                .zip(cpu_ns(take.inst.pid()))
+                                .and_then(|(before, after)| after.checked_sub(before));
+                            // Diagnostics bracket the command and report polling as well as the drain.
+                            // The verdict still uses only the producer's original drain measurement.
+                            let status = take.inst.ctl.ok(&["temporal", "status"])?;
+                            let completed = take.completed_status(record)?;
+                            let subject_role_after = Band::observed_role(take.inst.pid());
+                            let driver_role_after = Band::observed_role(0);
+                            eprintln!(
+                                "measure-sample: {}",
+                                aterm_json::json!({
+                                    "schema": 1, "measurement": "recording-throughput", "pair": pair,
+                                    "arm": arm, "recording": record, "same_recording": same_recording, "drain_us": us,
+                                    "sample_wall_us": sample_wall_us, "sample_cpu_ns": used,
+                                    "role_observation": "read_only_endpoints;not_continuous",
+                                    "subject_role_before": {
+                                        "darwin_role": subject_role_before.0, "errno": subject_role_before.1,
+                                    },
+                                    "driver_role_before": {
+                                        "darwin_role": driver_role_before.0, "errno": driver_role_before.1,
+                                    },
+                                    "subject_role_after": {
+                                        "darwin_role": subject_role_after.0, "errno": subject_role_after.1,
+                                    },
+                                    "driver_role_after": {
+                                        "darwin_role": driver_role_after.0, "errno": driver_role_after.1,
+                                    },
+                                    "dropped_input": field(&completed, "dropped_input"),
+                                    "dropped_input_at_receipt": field(&status, "dropped_input"),
+                                    "completion_writer_in_flight": field(&completed, "writer_in_flight"),
+                                    "completion_writer_queued_bytes": field(&completed, "writer_queued_bytes"),
+                                    "writer_in_flight": field(&status, "writer_in_flight"),
+                                    "writer_queued_bytes": field(&status, "writer_queued_bytes"),
+                                    "writer_role_requested": field(&status, "writer_role_requested"),
+                                    "writer_qos_observed": field(&status, "writer_qos_observed"),
+                                    "writer_urgent_pressure": field(&status, "writer_urgent_pressure"),
+                                    "writer_priority_override": field(&status, "writer_priority_override"),
+                                    "pool_used": field(&status, "pool_used"),
+                                })
+                            );
+                            if record {
+                                dropped_input =
+                                    dropped_input.saturating_add(recording_drops(&completed)?);
+                            }
+                            if candidate { &mut on } else { &mut off }.push(us);
+                            Ok((take, dropped_input == 0))
+                        },
+                    )?;
                     Ok(ThroughputObservation {
                         ratios: block_ratios_milli(&off, &on),
                         dropped_input,
@@ -1177,6 +1197,80 @@ mod tests {
             block_machine_cost(&[(false, std::time::Duration::MAX), (false, secs(1))]),
             std::time::Duration::MAX,
             "the charge saturates rather than wrapping under the limit"
+        );
+    }
+
+    /// A clock the arms advance by hand, so a wall is an exact number rather than a timing.
+    struct HandClock(std::rc::Rc<std::cell::Cell<std::time::Duration>>);
+
+    impl HandClock {
+        fn new() -> Self {
+            Self(std::rc::Rc::default())
+        }
+        fn pass(&self, secs: u64) {
+            self.0
+                .set(self.0.get() + std::time::Duration::from_secs(secs));
+        }
+        fn now(&self) -> impl Fn() -> std::time::Duration {
+            || self.0.get()
+        }
+    }
+
+    /// Advances the clock when dropped, as a take's teardown takes time after its arm is timed.
+    struct TeardownTakes(HandClock, u64);
+
+    impl Drop for TeardownTakes {
+        fn drop(&mut self) {
+            self.0.pass(self.1);
+        }
+    }
+
+    #[test]
+    fn each_arm_is_timed_in_abba_order_from_launch_to_before_its_teardown() {
+        let secs = std::time::Duration::from_secs;
+        let clock = HandClock::new();
+        let mut order = Vec::new();
+        let arms = take_block_arms(clock.now(), |index, candidate| {
+            order.push((index, candidate));
+            clock.pass(10 + 10 * u64::try_from(index).expect("four arms"));
+            Ok((TeardownTakes(HandClock(clock.0.clone()), 1000), true))
+        })
+        .expect("no arm failed");
+        assert_eq!(
+            order,
+            [(0, false), (1, true), (2, true), (3, false)],
+            "the ABBA order is what cancels linear drift"
+        );
+        assert_eq!(
+            arms,
+            [
+                (false, secs(10)),
+                (true, secs(20)),
+                (true, secs(30)),
+                (false, secs(40)),
+            ],
+            "negative control: 1000 s of teardown after each arm is charged to none of them"
+        );
+        assert_eq!(
+            block_machine_cost(&arms),
+            secs(100),
+            "the walls handed over are the ones the charge rule doubles"
+        );
+    }
+
+    #[test]
+    fn a_block_stopped_by_dropped_input_keeps_the_arms_it_took() {
+        let secs = std::time::Duration::from_secs;
+        let clock = HandClock::new();
+        let arms = take_block_arms(clock.now(), |index, _| {
+            clock.pass(5);
+            Ok(((), index != 1))
+        })
+        .expect("no arm failed");
+        assert_eq!(
+            arms,
+            [(false, secs(5)), (true, secs(5))],
+            "the arm that ended the block is still counted and no later arm starts"
         );
     }
 

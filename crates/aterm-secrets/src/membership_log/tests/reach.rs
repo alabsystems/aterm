@@ -768,9 +768,10 @@ fn insert_checks_and_seats_give_the_verdicts_of_the_walks_they_replaced() {
     }
 }
 
-/// `Store::missing` answers what its walk answered, and `Log::ancestor_closure` and
-/// `Log::ancestor_chain` the walked closure, for random `have` lists (held ids and ids the log
-/// never held) and targets on every hand-made log and the live shape.
+/// `Store::missing` answers what its walk answered, `Log::ancestor_closure` and
+/// `Log::ancestor_chain` the walked closure, and `Log::past_of` holds exactly that closure's
+/// records (no id the log never held), for random `have` lists (held ids and ids the log never
+/// held) and targets on every hand-made log and the live shape.
 #[test]
 fn missing_records_and_closures_match_their_walks() {
     let mut rng = Rng(4_096);
@@ -801,6 +802,18 @@ fn missing_records_and_closures_match_their_walks() {
             let closure: Vec<RecordId> =
                 held.ancestor_closure(&have).iter().map(|r| r.id).collect();
             assert_eq!(closure, want);
+            let past = held.past_of(&have);
+            let holds: Vec<RecordId> = held
+                .order
+                .iter()
+                .map(|r| r.id)
+                .filter(|id| past.holds(id))
+                .collect();
+            assert_eq!(holds, want, "a past holds its closure's records");
+            assert!(
+                !past.holds(&[0xee; 32]),
+                "a past holds no id the log never held"
+            );
             let target = held.order[rng.below(n)].id;
             let chain: Vec<RecordId> = held
                 .ancestor_chain(&target)

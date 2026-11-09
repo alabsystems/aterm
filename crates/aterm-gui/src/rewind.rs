@@ -158,7 +158,7 @@ pub(crate) struct RewindView {
 }
 
 impl RewindView {
-    fn new(live_base: u64) -> Self {
+    pub(crate) fn new(live_base: u64) -> Self {
         Self {
             _recording_demand: crate::temporal::consumer_demand(),
             shown: None,
@@ -605,8 +605,12 @@ impl App {
     }
 
     /// The rewound session the pointer is over in window `wid`, if any.
-    pub(crate) fn rewound_under_pointer(&self, wid: WindowId) -> Option<u64> {
-        let session = match self.pointer_route(wid, None) {
+    pub(crate) fn rewound_under_pointer(
+        &self,
+        wid: WindowId,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) -> Option<u64> {
+        let session = match self.pointer_route_with_plan(wid, None, frame_plan) {
             crate::app_mouse::PointerRoute::Front => self.front_terminal(wid)?.session,
             crate::app_mouse::PointerRoute::Pane { session, .. } => session,
             crate::app_mouse::PointerRoute::Nowhere => return None,
@@ -813,7 +817,13 @@ impl App {
     }
 
     /// A left press (`pressed`) or release on the rewound `session` in window `wid`: a press picks the cell and starts a selection on the past screen, a release ends it.
-    pub(crate) fn rewind_press(&mut self, wid: WindowId, session: u64, pressed: bool) {
+    pub(crate) fn rewind_press(
+        &mut self,
+        wid: WindowId,
+        session: u64,
+        pressed: bool,
+        frame_plan: Option<&crate::tab_model::VisibleLeafPlan>,
+    ) {
         if !pressed {
             if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
                 self.finish_selection(wid, false);
@@ -826,7 +836,7 @@ impl App {
         let ((row, col), window_row) = self.windows.get(&wid).map_or(((0, 0), 0), |ws| {
             (ws.last_mouse_cell, ws.last_mouse_window_cell.0)
         });
-        if self.rewind_band_covers(wid, session, window_row) {
+        if self.rewind_band_covers(wid, session, window_row, frame_plan) {
             return;
         }
         let lift = self.pool.rewind(session).map_or(0, |v| v.lift);
@@ -835,7 +845,14 @@ impl App {
         if let Some(view) = self.pool.rewind_mut(session) {
             view.picked = Some((grid_row, col));
         }
+        let drag_pane = self.focused_pane_rect_with_plan(wid, frame_plan);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.staged_drag_pane = Some(drag_pane);
+        }
         self.begin_selection(wid, aterm_core::selection::SelectionType::Simple);
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.staged_drag_pane = None;
+        }
         self.request_redraw_all_windows();
     }
 
@@ -1519,7 +1536,22 @@ impl App {
         if !self.pool.any_rewound() {
             return;
         }
-        for (session, _) in self.rewound_panes(wid) {
+        let mut sessions = Vec::new();
+        if let Some(ws) = self.windows.get(&wid) {
+            let _ = crate::active_tab_shows(ws, |view| {
+                if let Some(session) = self
+                    .view_store
+                    .get(view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+                    && self.pool.rewind(session).is_some_and(|v| v.shown.is_some())
+                {
+                    sessions.push(session);
+                }
+                false
+            });
+        }
+        for session in sessions {
             if let Some(view) = self.pool.rewind_mut(session)
                 && let Some(at) = view.stepped.take()
             {

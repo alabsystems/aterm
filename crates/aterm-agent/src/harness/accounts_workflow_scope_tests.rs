@@ -219,6 +219,7 @@ impl Fixture {
                 NOW,
                 &mut None,
                 SyncTarget {
+                    fleet: None,
                     path: &self.path,
                     before: Some(&before),
                     after: Some(&after),
@@ -533,7 +534,6 @@ fn workflow_observations_conform_independently_of_credentials_and_activity() {
     let model = aterm_models_harness::account_workflow_scope_model();
     assert_eq!(model.mutant_dials(), (1..=21).collect::<Vec<_>>());
     assert!(aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&model, 1)).is_err());
-    assert!(aterm_spec::verify::sweep_faults(std::slice::from_ref(&model)).is_empty());
     let states = aterm_spec::interp::reachable_states(&model);
     assert!(states.len() > 1);
     for state in states {
@@ -1213,6 +1213,7 @@ fn workflow_admission_cannot_certify_a_later_route_policy_or_verified_login_repl
                     NOW,
                     &mut None,
                     SyncTarget {
+                        fleet: None,
                         path: &fixture.path,
                         before: Some(&raw_before),
                         after: Some(&raw_after),

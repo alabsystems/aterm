@@ -8,6 +8,7 @@
 //! every CLI but Claude Code says what a launch does under the pin, or once it ends.
 
 use super::*;
+use crate::harness::alab_roster::test_machine;
 use std::time::Duration;
 
 #[path = "accounts_step_law_tests.rs"]
@@ -4669,7 +4670,7 @@ fn a_renewal_with_no_email_names_a_step_that_keeps_the_roster_admitted() {
         account: None,
     };
     let lab = crate::harness::alab_roster::Lab {
-        me: Some("m16".into()),
+        me: Some(test_machine("m16")),
         settled: true,
         accounts: Vec::new(),
         aliases: BTreeMap::new(),

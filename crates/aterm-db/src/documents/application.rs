@@ -440,27 +440,41 @@ pub(crate) fn peek_declaration(
     }))
 }
 
-/// Whether this Mac holds Commons custody at `paths`, as [`Bootstrap::cached`] says, except that
-/// a vault writer holding the state lock at this moment is busy, which a read observes again,
-/// never "no Commons here": a peek that took it for absence answered as if no table were here.
-/// Like [`Bootstrap::cached`], a visible descriptor establishes this Mac's custody (its device key,
-/// claim, pin and control history) where none is held yet, so a Mac that never opened Commons
-/// reads its catalog's id: alab's empty-view guard counts that catalog's repair rounds
-/// (`alab::command::empty_view_catalog`).
-fn commons_here(paths: &Paths) -> Result<bool> {
+/// Observe a Commons source without equating an unreadable vault with an absent application.
+/// A signed vault with no Commons control entry is a known absence; incomplete application,
+/// missing custody or a current writer must remain an error and retain the caller's view.
+/// Like [`Bootstrap::observe`], an authenticated visible descriptor can establish this Mac's
+/// custody. This creates no application table, catalog or declaration.
+pub(crate) fn observed_bootstrap(paths: &Paths) -> Result<Option<Box<Bootstrap>>> {
     use aterm_secrets::commons::{Unavailable, bootstrap::Availability};
     match Bootstrap::observe(paths).map_err(crate::table::failure)? {
-        Availability::Available(_) => Ok(true),
-        Availability::Unavailable(Unavailable::Busy) => Err(aterm_secrets::Error::of_kind(
-            aterm_secrets::ErrorKind::VaultBusy,
+        Availability::Available(bootstrap) => Ok(Some(bootstrap)),
+        Availability::Unavailable(
+            Unavailable::Unconfigured
+            | Unavailable::Revoked
+            | Unavailable::Dropped
+            | Unavailable::ControlExcluded
+            | Unavailable::ControlNotVisible,
+        ) => Ok(None),
+        Availability::Unavailable(reason) => Err(aterm_secrets::Error::of_kind(
+            if reason == Unavailable::Busy {
+                aterm_secrets::ErrorKind::VaultBusy
+            } else {
+                aterm_secrets::ErrorKind::Other
+            },
             format!(
-                "this {}'s vault is busy: a vault writer holds its state lock",
-                aterm_types::machine_name::OS_NOUN
+                "application custody unavailable ({}): {}",
+                reason.code(),
+                reason.explanation()
             ),
         )
         .into()),
-        Availability::Unavailable(_) => Ok(false),
     }
+}
+
+/// Whether an existing, readable Commons source is available for an application read.
+fn commons_here(paths: &Paths) -> Result<bool> {
+    observed_bootstrap(paths).map(|bootstrap| bootstrap.is_some())
 }
 
 fn pass_current(deadline: std::time::Instant) -> Result<()> {

@@ -72,6 +72,7 @@ impl Bed {
     fn publication(&self, changed: bool) -> SyncPublication {
         SyncPublication {
             machine: "m1".into(),
+            machine_label: None,
             roster_path: self.path.clone(),
             fleet_path: self.path.with_file_name(FLEET_ROSTER_FILE),
             fleet_accounts: 3,
