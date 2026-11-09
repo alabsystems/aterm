@@ -49,7 +49,12 @@ fn accept_answers_a_blocking_kept_out_connection_once_one_comes() {
     let path = root.path().join("accept.sock");
     let listener = UnixListener::bind(&path).expect("bind");
     let server = std::thread::spawn(move || {
-        let accepted = crate::accept(&listener).map(|(stream, _)| stream);
+        let accepted = crate::accept(
+            &listener,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .map(|(stream, _)| stream);
         (accepted, listener)
     });
     let mut client = UnixStream::connect(&path).expect("connect");
@@ -87,6 +92,173 @@ fn accept_answers_a_blocking_kept_out_connection_once_one_comes() {
     let mut byte = [0];
     accepted.read_exact(&mut byte).expect("read");
     assert_eq!(&byte, b"x");
+}
+
+/// A blocking accepted TCP stream waits across the planted connect-to-write gap even though the
+/// helper made its listener nonblocking. NEGATIVE CONTROL: on macOS
+/// [`raw_accept_inherits_nonblocking_and_cannot_wait_for_a_write`] withholds its writer through a
+/// raw accepted read and that read answers `WouldBlock` instead.
+#[cfg(unix)]
+#[test]
+fn a_blocking_tcp_accept_waits_for_a_delayed_write() {
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::time::Duration;
+
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let addr = listener.local_addr().expect("address");
+    let writer = std::thread::spawn(move || {
+        let mut client = TcpStream::connect(addr).expect("connect");
+        std::thread::sleep(Duration::from_millis(300));
+        client.write_all(b"x").expect("the delayed write");
+    });
+    let (mut accepted, _) = crate::accept(
+        &listener,
+        crate::AcceptWait::Until(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+        crate::AcceptedMode::Blocking,
+    )
+    .expect("accept");
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: `F_GETFL` reads the flags of the live accepted test descriptor.
+    let flags = unsafe { libc::fcntl(accepted.as_raw_fd(), libc::F_GETFL) };
+    assert!(
+        flags >= 0 && flags & libc::O_NONBLOCK == 0,
+        "the helper made the TCP stream blocking"
+    );
+    accepted
+        .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+        .expect("read timeout");
+    let mut byte = [0];
+    accepted
+        .read_exact(&mut byte)
+        .expect("the blocking read waits for the delayed write");
+    assert_eq!(&byte, b"x");
+    writer.join().expect("writer");
+}
+
+/// Both listener kinds return a nonblocking stream only when it is explicitly requested. On
+/// Linux the raw accepted stream is blocking, so removing the mode application is the negative
+/// control; on BSD the assertion also records the requested contract independently of inheritance.
+#[cfg(unix)]
+#[test]
+fn requested_nonblocking_mode_is_explicit_for_tcp_and_unix() {
+    use std::net::{TcpListener, TcpStream};
+    use std::os::unix::net::{UnixListener, UnixStream};
+
+    fn is_nonblocking(stream: &impl std::os::fd::AsRawFd) -> bool {
+        // SAFETY: `F_GETFL` reads the flags of the live borrowed test descriptor.
+        let flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "{}", std::io::Error::last_os_error());
+        flags & libc::O_NONBLOCK != 0
+    }
+
+    let tcp = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("TCP bind");
+    let _tcp_client = TcpStream::connect(tcp.local_addr().expect("TCP address")).expect("TCP dial");
+    let (tcp_stream, _) = crate::accept(
+        &tcp,
+        crate::AcceptWait::Ready,
+        crate::AcceptedMode::Nonblocking,
+    )
+    .expect("TCP accept");
+    assert!(is_nonblocking(&tcp_stream), "the TCP stream mode");
+
+    let root = aterm_tempfile::tempdir().expect("a folder");
+    let path = root.path().join("n.sock");
+    let unix = UnixListener::bind(&path).expect("Unix bind");
+    let _unix_client = UnixStream::connect(&path).expect("Unix dial");
+    let (unix_stream, _) = crate::accept(
+        &unix,
+        crate::AcceptWait::Ready,
+        crate::AcceptedMode::Nonblocking,
+    )
+    .expect("Unix accept");
+    assert!(is_nonblocking(&unix_stream), "the Unix stream mode");
+}
+
+/// An absolute deadline already past expires without accepting or starting a fresh wait budget.
+#[cfg(unix)]
+#[test]
+fn accept_until_keeps_its_absolute_deadline() {
+    use std::os::fd::AsFd as _;
+
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    let _queued = std::net::TcpStream::connect(listener.local_addr().expect("address"))
+        .expect("queue a connection");
+    crate::ready::until(
+        listener.as_fd(),
+        crate::ready::Interest::Read,
+        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .expect("the connection reached the accept queue");
+    let error = crate::accept(
+        &listener,
+        crate::AcceptWait::Until(std::time::Instant::now()),
+        crate::AcceptedMode::Blocking,
+    )
+    .expect_err("an expired deadline cannot consume even a queued connection");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+    crate::accept(
+        &listener,
+        crate::AcceptWait::Ready,
+        crate::AcceptedMode::Blocking,
+    )
+    .expect("the expired attempt left the queued connection alone");
+}
+
+/// An interrupted native accept cannot renew or outlive an absolute deadline. The other wait
+/// policies still retry, which is the negative control against treating every interrupt as expiry.
+#[cfg(unix)]
+#[test]
+fn interrupted_accept_keeps_the_same_absolute_deadline() {
+    let error = crate::check_accept_deadline(crate::AcceptWait::Until(std::time::Instant::now()))
+        .expect_err("an expired interrupted accept cannot retry");
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut, "{error}");
+    crate::check_accept_deadline(crate::AcceptWait::Ready).expect("Ready retries an interrupt");
+    crate::check_accept_deadline(crate::AcceptWait::Forever).expect("Forever retries an interrupt");
+}
+
+/// macOS/BSD copies the nonblocking listener's `O_NONBLOCK` onto the accepted socket, so a socket
+/// timeout cannot make the raw accepted read wait while the writer is deliberately withheld. This
+/// is the helper test's platform negative control: changing the helper to return the raw stream
+/// makes the positive test fail in this same way.
+#[cfg(target_os = "macos")]
+#[test]
+fn raw_accept_inherits_nonblocking_and_cannot_wait_for_a_write() {
+    use crate::raw_accept::RawAccept as _;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let addr = listener.local_addr().expect("address");
+    let (connected_tx, connected) = mpsc::channel();
+    let (write_tx, write) = mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        let mut client = TcpStream::connect(addr).expect("connect");
+        connected_tx.send(()).expect("tell the reader");
+        write
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the negative control releases the writer");
+        client.write_all(b"x").expect("the released write");
+    });
+    connected
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .expect("the connection is queued");
+    let (mut accepted, _) = listener.accept_now().expect("raw accept");
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: `F_GETFL` reads the flags of the live accepted test descriptor.
+    let flags = unsafe { libc::fcntl(accepted.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0 && flags & libc::O_NONBLOCK != 0, "raw mode");
+    accepted
+        .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+        .expect("read timeout");
+    let error = accepted
+        .read_exact(&mut [0])
+        .expect_err("the inherited nonblocking mode cannot wait for the withheld write");
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "{error}");
+    write_tx.send(()).expect("release the writer");
+    writer.join().expect("writer");
 }
 
 #[cfg(target_vendor = "apple")]

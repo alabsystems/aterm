@@ -31,12 +31,10 @@ pub(super) fn allowed(
     if cfg.exclude().iter().any(|name| name == program) {
         return Err(format!("{program} is excluded in package settings"));
     }
-    if cfg.links.get(program).is_some_and(|value| {
-        matches!(
-            crate::classify_link(value, aterm_types::dirs::home_dir().as_deref()),
-            crate::LinkTarget::Checkout(_)
-        )
-    }) {
+    if cfg
+        .checkout_path(program, aterm_types::dirs::home_dir().as_deref())
+        .is_some()
+    {
         return Err(format!(
             "{program} is managed from its development checkout"
         ));

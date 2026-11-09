@@ -8,6 +8,13 @@ license.workspace = true
 repository.workspace = true
 description = "Owns-correctness capabilities (ATERM_DESIGN WS-G): an UNFORGEABLE sealed-mint capability + trust tier + effect-gating layer."
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [features]
 # `launcher-mint` exposes the root-authority mint (ATERM_DESIGN §5.4):
 # `Authority::root_authority()` exists only with it (or under this crate's `test`

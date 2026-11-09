@@ -55,7 +55,11 @@ fn serve(
 ) {
     let mut served = false;
     loop {
-        let Ok((conn, _)) = listener.accept() else {
+        let Ok((conn, _)) = aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         let mut reader = super::super::reply_on(&conn);
@@ -585,7 +589,11 @@ fn serve_as_a_child_successor_if_asked() -> bool {
         let _ = std::fs::remove_file(leave);
     };
     loop {
-        let Ok((conn, _)) = listener.accept() else {
+        let Ok((conn, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return true;
         };
         if role == "mute" {
@@ -835,7 +843,11 @@ fn a_fallen_back_stream_asks_the_next_successor_for_its_new_sessions_anchors_onl
     let first = std::thread::spawn(move || {
         let listener = aterm_uds::CtlListener::bind(&first_path).unwrap();
         loop {
-            let Ok((conn, _)) = listener.accept() else {
+            let Ok((conn, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 return;
             };
             let mut reader = super::super::reply_on(&conn);
@@ -905,7 +917,12 @@ fn conn_after(
     let listener = aterm_uds::CtlListener::bind(&sock).unwrap();
     let client = CtlStream::connect(&sock).expect("connect");
     let server = std::thread::spawn(move || {
-        let (conn, _) = listener.accept().expect("accept");
+        let (conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         behave(conn);
     });
     server.join().unwrap();
@@ -936,7 +953,12 @@ fn a_write_that_fails_reads_the_refusal_the_successor_left() {
     let listener = aterm_uds::CtlListener::bind(&sock).unwrap();
     let client = CtlStream::connect(&sock).expect("connect");
     let server = std::thread::spawn(move || {
-        let (conn, _) = listener.accept().expect("accept");
+        let (conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let mut request = String::new();
         std::io::BufReader::new(&conn)
             .read_line(&mut request)
@@ -982,7 +1004,11 @@ fn a_successor_that_closes_on_the_resume_is_asked_again_and_never_a_silent_exit_
         let successor = std::thread::spawn(move || {
             let mut busy = 0;
             loop {
-                let Ok((conn, _)) = listener.accept() else {
+                let Ok((conn, _)) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
                     return;
                 };
                 if busy > 0 {
@@ -1083,7 +1109,11 @@ fn a_busy_successor_is_asked_again_and_the_stream_resumes() {
     let counted = std::sync::Arc::clone(&asks);
     let successor = std::thread::spawn(move || {
         loop {
-            let Ok((conn, _)) = listener.accept() else {
+            let Ok((conn, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 return;
             };
             let mut line = String::new();
@@ -1457,7 +1487,11 @@ fn a_refusal_is_judged_by_the_process_that_gave_it() {
         let (p1_path, p2_sock) = (fixed.clone(), p2.sock.clone());
         let p1 = std::thread::spawn(move || {
             loop {
-                let Ok((conn, _)) = p1_listener.accept() else {
+                let Ok((conn, _)) = aterm_uds::accept(
+                    &p1_listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
                     return;
                 };
                 let mut reader = super::super::reply_on(&conn);
@@ -2360,7 +2394,11 @@ fn serve_by(
     seen: &std::sync::mpsc::Sender<String>,
 ) {
     loop {
-        let Ok((conn, _)) = listener.accept() else {
+        let Ok((conn, _)) = aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         let mut reader = super::super::reply_on(&conn);
@@ -2583,7 +2621,11 @@ fn an_explicit_timeout_bounds_the_wait_for_a_successor() {
     let listener = aterm_uds::CtlListener::bind(&refusing).unwrap();
     let looks = std::thread::spawn(move || {
         let mut looks = 0;
-        while let Ok((conn, _)) = listener.accept() {
+        while let Ok((conn, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             let mut request = String::new();
             let _ = std::io::BufReader::new(&conn).read_line(&mut request);
             if request.starts_with("stop") {

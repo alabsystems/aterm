@@ -333,7 +333,12 @@ mod tests {
         let listener = UnixListener::bind_addr(&at).unwrap();
         let address = &parse(&format!("unix:abstract={name}")).unwrap()[0];
         connect(address, None).unwrap();
-        listener.accept().unwrap();
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
     }
 
     #[cfg(unix)]

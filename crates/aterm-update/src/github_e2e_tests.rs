@@ -192,8 +192,14 @@ fn serve(listener: std::net::TcpListener, assets: Vec<(String, Vec<u8>)>, seen: 
     let assets = std::sync::Arc::new(assets);
     let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(mut conn) = conn else { return };
+        loop {
+            let Ok((mut conn, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
+                return;
+            };
             let (assets, seen, held) = (assets.clone(), seen.clone(), held.clone());
             std::thread::spawn(move || {
                 let mut head = Vec::new();

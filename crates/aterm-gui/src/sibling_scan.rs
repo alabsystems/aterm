@@ -488,7 +488,12 @@ mod tests {
                 if published { " needs=-" } else { "" },
             );
             let server = std::thread::spawn(move || {
-                let (conn, _) = listener.accept().unwrap();
+                let (conn, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap();
                 let mut reader = BufReader::new(conn.try_clone().unwrap());
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();

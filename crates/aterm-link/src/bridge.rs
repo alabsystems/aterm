@@ -15666,7 +15666,12 @@ mod tests {
             let socket = scratch.join("ctl.sock");
             let listener = UnixListener::bind(&socket).unwrap();
             let responder = std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap();
                 let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
@@ -16458,7 +16463,12 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         let (release, held) = std::sync::mpsc::channel::<()>();
         let broker = std::thread::spawn(move || {
-            let (mut c, _) = listener.accept().expect("accept");
+            let (mut c, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mark = Response::Mark {
                 next: 0,
                 head: 0,
@@ -17295,7 +17305,6 @@ mod tests {
                 .to_string_lossy()
                 .into_owned();
             let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind the lane");
-            listener.set_nonblocking(true).expect("nonblocking accept");
             let mut lane = FakeVerbLane {
                 _lease: lease.clone(),
                 _reader: None,
@@ -17376,9 +17385,12 @@ mod tests {
                     if state.stopped {
                         return;
                     }
-                    match listener.accept() {
+                    match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) {
                         Ok((stream, _)) => {
-                            stream.set_nonblocking(false).expect("blocking lane reads");
                             let stream = Arc::new(stream);
                             state.active = Some(Arc::downgrade(&stream));
                             break stream;
@@ -17867,7 +17879,12 @@ mod tests {
         let (producer, seq) = (bridge.producer_id, pin.seq);
         let (judged, wait_judged) = std::sync::mpsc::channel::<()>();
         let broker = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(60)))
                 .unwrap();
@@ -17988,7 +18005,12 @@ mod tests {
         let identity = pin.identity.clone().unwrap();
         let (producer, seq) = (bridge.producer_id, pin.seq);
         let broker = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(60)))
                 .unwrap();
@@ -19231,11 +19253,16 @@ mod tests {
 
         let quiet = lane.dir.path().join("quiet.sock");
         let listener = std::os::unix::net::UnixListener::bind(&quiet).unwrap();
-        listener.set_nonblocking(true).unwrap();
         bridge.cfg.broker = quiet.to_string_lossy().into_owned();
         bridge.run().expect("a bridge with no aterm ends cleanly");
         assert_eq!(
-            listener.accept().map(|_| ()).map_err(|e| e.kind()),
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .map(|_| ())
+            .map_err(|e| e.kind()),
             Err(io::ErrorKind::WouldBlock),
             "the loop redialled for an aterm that is gone"
         );
@@ -23679,7 +23706,6 @@ mod tests {
         let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-near")]);
         let socket = lane.dir.path().join("mute.sock");
         let mute = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-        mute.set_nonblocking(true).unwrap();
         bridge.cfg.broker = socket.to_string_lossy().into_owned();
         bridge.caps = crate::enable::node_rules("f", &bridge.node)
             .into_iter()
@@ -23698,12 +23724,12 @@ mod tests {
             ViewPhase::Seeding,
             "the ask returned before any attach was answered"
         );
-        let (mut dialled, _) = aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the view's reader to dial",
-            || mute.accept().ok(),
-        );
-        dialled.set_nonblocking(false).unwrap();
+        let (mut dialled, _) = aterm_uds::accept(
+            &mute,
+            aterm_uds::AcceptWait::Until(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("the view's reader to dial");
         dialled
             .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
             .unwrap();

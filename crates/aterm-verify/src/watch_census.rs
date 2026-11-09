@@ -25,6 +25,43 @@ fn cause(record: &Record) -> String {
     }
 }
 
+fn summary(why: &str) -> String {
+    if let Some(preemption) = why
+        .lines()
+        .find(|line| line.starts_with("capacity background "))
+    {
+        let condition =
+            if let Some(sender) = preemption.strip_prefix("capacity background preemption: ") {
+                sender
+                    .split_once("; ")
+                    .map_or(sender, |(_, condition)| condition)
+            } else {
+                preemption
+                    .strip_prefix("capacity background stopped before admission: ")
+                    .unwrap_or(preemption)
+            };
+        if condition.starts_with("ledger observation failed:") {
+            return "capacity ledger observation failed".into();
+        }
+        if condition.starts_with("Release claim pid=") {
+            return "Release claim preemption".into();
+        }
+        return preemption.into();
+    }
+    if let Some(signal) = why.lines().rev().find_map(|line| {
+        line.split_once("killed by signal ")
+            .and_then(|(_, value)| value.split_whitespace().next())
+    }) {
+        return format!("child signal={signal}");
+    }
+    why.lines()
+        .rev()
+        .find(|line| line.contains("COULD NOT RUN"))
+        .or_else(|| why.lines().next())
+        .unwrap_or("unknown")
+        .to_owned()
+}
+
 pub(super) fn run(root: &Path, head: &str) -> Result<(), String> {
     // Resolve once so a moving local ref cannot mix snapshots.
     let head = judged::git(
@@ -39,12 +76,7 @@ pub(super) fn run(root: &Path, head: &str) -> Result<(), String> {
         if matches!(record.state.as_str(), "cancelled" | "could-not-run") {
             let why = cause(record);
             // Prefer the tool's refusal over the timing prefix on historical stage rows.
-            let summary = why
-                .lines()
-                .rev()
-                .find(|line| line.contains("COULD NOT RUN"))
-                .or_else(|| why.lines().next())
-                .unwrap_or("unknown");
+            let summary = summary(&why);
             *causes
                 .entry(format!("{}: {}", record.state, summary))
                 .or_default() += 1;
@@ -71,6 +103,30 @@ pub(super) fn run(root: &Path, head: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preemption_census_ranks_conditions_across_distinct_senders() {
+        let ledger = |pid| {
+            format!(
+                "tree: metrics\ncapacity background preemption: signal=15 sender_pid={pid}; ledger observation failed: planted refusal\nverify: COULD NOT RUN — siblings unrun"
+            )
+        };
+        let release = "tree: metrics\ncapacity background preemption: signal=15 sender_pid=43; Release claim pid=44 what=ledger observation failed: test text\nverify: COULD NOT RUN — siblings unrun";
+        assert_eq!(summary(&ledger(41)), "capacity ledger observation failed");
+        assert_eq!(summary(&ledger(42)), summary(&ledger(41)));
+        assert_eq!(summary(release), "Release claim preemption");
+        assert_ne!(summary(release), summary(&ledger(41)));
+        assert_eq!(
+            summary(
+                "capacity background stopped before admission: ledger observation failed: planted; detail"
+            ),
+            "capacity ledger observation failed"
+        );
+        assert_eq!(
+            summary("tree: metrics\naterm-verify: the child was killed by signal 15"),
+            "child signal=15"
+        );
+    }
 
     #[test]
     fn named_cause_wins_and_historical_absence_is_not_attributed() {

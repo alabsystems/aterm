@@ -807,34 +807,42 @@ impl<'a> Session<'a> {
         Self::from_observed_journal(bootstrap, journal, None)
     }
 
+    /// [`Self::observe`] by `deadline`, which bounds each wait of a successor home's predecessor
+    /// observation and stays this session's bound on its later generation checks.
     pub(crate) fn observe_until(
         bootstrap: &'a Bootstrap,
         deadline: std::time::Instant,
-    ) -> Result<Self> {
-        Self::observe_within(bootstrap, deadline, &|| deadline)
-    }
-
-    /// [`Self::observe_until`] under [`crate::generation::Observation::observe_within`]'s two
-    /// bounds. `read_by` also stays this session's bound on its later generation checks.
-    pub(crate) fn observe_within(
-        bootstrap: &'a Bootstrap,
-        read_by: std::time::Instant,
-        wait: &dyn Fn() -> std::time::Instant,
     ) -> Result<Self> {
         let journal =
             Journal::read_existing(bootstrap.journal_dir(), bootstrap.trust()).map_err(failure)?;
         bootstrap.revalidate_custody().map_err(failure)?;
         let generation = if crate::generation::is_candidate(bootstrap.paths()) {
-            Some(crate::generation::Observation::observe_within(
+            Some(crate::generation::Observation::observe(
                 bootstrap.paths(),
-                read_by,
-                wait,
+                deadline,
             )?)
         } else {
-            crate::generation::guard_until(bootstrap.paths(), false, read_by)?;
+            crate::generation::guard_until(bootstrap.paths(), false, deadline)?;
             None
         };
-        Self::with_generation(bootstrap, journal, generation, Some(read_by))
+        Self::with_generation(bootstrap, journal, generation, Some(deadline))
+    }
+
+    /// [`Self::observation`] as this session's home stands now: its control view read again and
+    /// its access judged again, the kept generation checked as each use checks it. Nothing is
+    /// established or observed again, so no holder of a predecessor's custody is waited for.
+    ///
+    /// # Errors
+    /// The control view, the custody or the generation no longer holds, the access is not
+    /// ready, or the control history is incomplete; a vault writer holds a state lock this reads
+    /// at this moment (busy); or the session's generation deadline has passed.
+    pub(crate) fn observation_afresh(&self) -> Result<[u8; 64]> {
+        let journal = Journal::read_existing(self.bootstrap.journal_dir(), self.bootstrap.trust())
+            .map_err(failure)?;
+        self.bootstrap.revalidate_custody().map_err(failure)?;
+        self.generation_guard(false)?;
+        Self::with_generation(self.bootstrap, journal, None, self.generation_deadline)?
+            .observation()
     }
 
     /// Keep the read-only control prefix returned with an established bootstrap.
@@ -859,8 +867,10 @@ impl<'a> Session<'a> {
         Self::from_journal(bootstrap, journal, deadline)
     }
 
-    /// Observe the generation `selection` selected ([`crate::generation::observed_selection_within`]),
-    /// whose established custody is `bootstrap` with its read-only control view `journal`, as
+    /// Observe the generation `selection` observed ([`crate::generation::observe_generation`],
+    /// taken after `bootstrap` was opened, as
+    /// [`crate::documents::application::observed_session`] takes it), whose established custody
+    /// is `bootstrap` with its read-only control view `journal`, as
     /// [`Self::from_observed_journal`] takes them. A successor home keeps `selection`'s
     /// observation of its predecessors rather than observing each of them again: the session's
     /// generation checks, which every store open and read batch runs before it reads, reobserve

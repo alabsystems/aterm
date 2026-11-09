@@ -4168,13 +4168,16 @@ mod tests {
             .expect("a unix QMP socket")
             .to_owned();
         let listener = std::os::unix::net::UnixListener::bind(&qmp).expect("QMP's socket");
-        listener.set_nonblocking(true).expect("nonblocking");
         std::fs::write(&pid_file, format!("{}\n", std::process::id())).expect("the pid file");
         let mut shots = 0u32;
         let mut operations = 12u64;
         let end = Instant::now() + Duration::from_secs(60);
         while Instant::now() < end {
-            let stream = match listener.accept() {
+            let stream = match aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 Ok((stream, _)) => stream,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(20));
@@ -4182,7 +4185,6 @@ mod tests {
                 }
                 Err(e) => panic!("QMP accept: {e}"),
             };
-            stream.set_nonblocking(false).expect("blocking");
             let mut reply = stream.try_clone().expect("a writer");
             let _ = reply.write_all(b"{\"QMP\": {\"version\": {}, \"capabilities\": []}}\n");
             let mut stopped = false;

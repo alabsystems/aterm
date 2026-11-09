@@ -134,7 +134,14 @@ fn a_broker_whose_accept_queue_is_full_is_unknown_never_absent() {
     let e = aterm_uds::holders::scan_listener_holders(&path, &[])
         .expect_err("a scan refused by a full accept queue");
     assert_eq!(e.kind(), std::io::ErrorKind::ConnectionRefused, "{e}");
-    drop(broker.accept().expect("a queued connection"));
+    drop(
+        aterm_uds::accept(
+            &broker,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("a queued connection"),
+    );
     let found =
         aterm_uds::holders::scan_listener_holders(&path, &[]).expect("the scan with room queued");
     assert!(found.holds(std::process::id()), "{found:?}");

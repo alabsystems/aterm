@@ -316,7 +316,11 @@ impl Server {
     /// The accept's error.
     pub(crate) fn run(self) -> io::Result<()> {
         loop {
-            let (stream, _) = match aterm_uds::accept(&self.listener) {
+            let (stream, _) = match aterm_uds::accept(
+                &self.listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 Ok(accepted) => accepted,
                 Err(error) if error.raw_os_error() == Some(libc::ECONNABORTED) => continue,
                 Err(error) => return Err(error),

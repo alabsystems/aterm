@@ -6738,7 +6738,12 @@ fn enrollment_returns_while_the_vault_source_holds_its_post() {
     let (returned2, on_return2) = std::sync::mpsc::channel::<()>();
     let (posted2, on_post2) = std::sync::mpsc::channel::<Vec<u8>>();
     let holder2 = std::thread::spawn(move || {
-        let (mut stream, _) = source.accept().expect("enrollment records posted");
+        let (mut stream, _) = aterm_uds::accept(
+            &source,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("enrollment records posted");
         stream
             .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
             .expect("timeout");

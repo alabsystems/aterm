@@ -103,19 +103,19 @@ impl Endpoint {
     /// # Errors
     /// Changed socket/directory identity, peer credentials, or accept/mode errors.
     pub fn try_accept(&self) -> io::Result<Option<CtlStream>> {
-        loop {
-            self.current()?;
-            match aterm_uds::kept_out(|| self.socket.accept()) {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    same_user(&stream)?;
-                    self.current()?;
-                    return Ok(Some(stream));
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+        self.current()?;
+        match aterm_uds::accept(
+            &self.socket,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
+            Ok((stream, _)) => {
+                same_user(&stream)?;
+                self.current()?;
+                Ok(Some(stream))
             }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
         }
     }
 }

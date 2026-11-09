@@ -5,6 +5,7 @@
 
 use super::{Cmd, Relaying, RunFailed};
 use aterm_uds::spawnfd::{Child, Stdio};
+use aterm_uds::{AcceptWait, AcceptedMode};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
@@ -73,7 +74,8 @@ fn accept(
 ) -> Option<String> {
     let mut first_failure = None;
     loop {
-        let stream = match listener.accept() {
+        let stream = match aterm_uds::accept(listener, AcceptWait::Forever, AcceptedMode::Blocking)
+        {
             Ok((stream, _)) => stream,
             Err(_) if stop.load(Ordering::SeqCst) => return first_failure,
             Err(e)

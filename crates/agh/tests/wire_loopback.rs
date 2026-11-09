@@ -534,7 +534,12 @@ fn a_proxy_that_refuses_connect_is_a_proxy_failure() {
     let port = listener.local_addr().expect("its address").port();
     let (done, heard) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let head = listener.accept().map(|(mut stream, _)| {
+        let head = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .map(|(mut stream, _)| {
             stream
                 .set_read_timeout(Some(common::HANG))
                 .expect("a read timeout");

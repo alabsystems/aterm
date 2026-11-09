@@ -116,7 +116,6 @@ fn owner_crash(pending: bool) {
     let listener =
         aterm_uds::kept_out(|| std::os::unix::net::UnixListener::bind(root.join("handoff.sock")))
             .unwrap();
-    listener.set_nonblocking(true).unwrap();
     let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
     if pending {
         command.env(OWNER_PENDING, "1");
@@ -139,7 +138,11 @@ fn owner_crash(pending: bool) {
     let (mut connection, _) = until_within(
         MUST_HAPPEN,
         "actual detached memory owner connection",
-        || match listener.accept() {
+        || match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok(connection) => Some(connection),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(
@@ -151,9 +154,6 @@ fn owner_crash(pending: bool) {
             Err(error) => panic!("owner socket: {error}"),
         },
     );
-    // Darwin accepts inherit the listener's nonblocking status. The listener's bounded
-    // accept probe must not turn this private readiness stream into a premature WouldBlock.
-    connection.set_nonblocking(false).unwrap();
     connection.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
     connection.set_write_timeout(Some(MUST_HAPPEN)).unwrap();
     assert_eq!(

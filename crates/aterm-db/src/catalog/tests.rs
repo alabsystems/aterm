@@ -47,7 +47,17 @@ impl Pair {
         thread::scope(|threads| {
             let server = threads.spawn(|| {
                 endpoints[1].exchange(
-                    Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
+                    Connection::admit(
+                        aterm_uds::accept(
+                            &listener,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        )
+                        .unwrap()
+                        .0,
+                        LinkScope::Loopback,
+                    )
+                    .unwrap(),
                     Side::Responder,
                     rb,
                 )

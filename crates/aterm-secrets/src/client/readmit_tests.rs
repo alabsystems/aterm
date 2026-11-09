@@ -1719,7 +1719,12 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
                 if ready.second {
                     break;
                 }
-                let (mut stream, _) = source.accept().unwrap();
+                let (mut stream, _) = aterm_uds::accept(
+                    source,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap();
                 stream
                     .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
                     .unwrap();

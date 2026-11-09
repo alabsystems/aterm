@@ -220,11 +220,13 @@ pub(crate) fn quoted(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_uds::{AcceptWait, AcceptedMode};
     #[test]
     fn renewing_a_command_cannot_extend_the_overall_mail_deadline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut server, _) = listener.accept().unwrap();
+        let (mut server, _) =
+            aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
         let mut wire = Wire::for_test(client);
         wire.overall = Some(Instant::now());
         wire.renew(Duration::from_secs(60));

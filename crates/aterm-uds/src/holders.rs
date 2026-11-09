@@ -2629,7 +2629,12 @@ mod listing_tests {
         let l2 = UnixListener::bind(&b).expect("bind b");
         let l3 = UnixListener::bind(&c).expect("bind c through the link");
         let client = UnixStream::connect(&a).expect("connect a");
-        let (accepted, _) = l1.accept().expect("accept");
+        let (accepted, _) = crate::accept(
+            &l1,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let scan = |path: &std::path::Path| {
             super::scan_listener_holders(path, &[]).expect("the listener scan")
         };
@@ -2922,8 +2927,13 @@ mod listing_tests {
         }
         let live = UnixListener::bind(at("live.sock")).expect("a listener");
         assert_eq!(bound("live.sock"), Bound::Stream, "a live listener");
-        live.set_nonblocking(true).expect("a nonblocking listener");
-        let queued = live.accept().map(drop).map_err(|e| e.kind());
+        let queued = crate::accept(
+            &live,
+            crate::AcceptWait::Ready,
+            crate::AcceptedMode::Blocking,
+        )
+        .map(drop)
+        .map_err(|e| e.kind());
         assert_eq!(
             queued,
             Err(std::io::ErrorKind::WouldBlock),

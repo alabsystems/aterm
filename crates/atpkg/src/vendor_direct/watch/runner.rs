@@ -693,6 +693,12 @@ impl Runner {
             self.admit_after = Duration::ZERO;
         }
         self.watch.set_exclude(&gate.exclude);
+        self.queue.retain(|program| {
+            !gate
+                .exclude
+                .iter()
+                .any(|excluded| excluded.as_str() == *program)
+        });
         if self.following.is_some() && self.watch.has_pending() {
             self.harvest(wall);
         }
@@ -1227,6 +1233,37 @@ mod tests {
 
     fn on() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(true))
+    }
+
+    #[test]
+    fn a_new_exclusion_retires_a_queued_pass_without_cancelling_the_running_pass() {
+        let l = layout("queued-exclusion");
+        let time = Time::default();
+        let vendors = Vendors::new("2.1.280");
+        let passes = Passes::default();
+        let mut runner = session(&l, &time, &vendors, "session", &passes, &on());
+        let gate = Arc::new(Mutex::new(Gate {
+            on: true,
+            exclude: Vec::new(),
+        }));
+        let current_gate = Arc::clone(&gate);
+        runner.settings = Box::new(move || current_gate.lock().unwrap().clone());
+        runner.queue.extend(["claude", "codex", "agy"]);
+        runner.step();
+        assert_eq!(passes.launched(), ["claude"]);
+
+        gate.lock().unwrap().exclude = vec!["claude".into(), "codex".into()];
+        runner.step();
+        assert_eq!(passes.launched(), ["claude"]);
+        assert_eq!(runner.following.as_ref().unwrap().program, Some("claude"));
+
+        passes.end.store(true, Ordering::SeqCst);
+        runner.step();
+        assert_eq!(
+            passes.launched(),
+            ["claude", "agy"],
+            "dispatch must honor the current gate without delaying another allowed pass"
+        );
     }
 
     fn window_slice(

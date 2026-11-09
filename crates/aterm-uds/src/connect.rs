@@ -332,7 +332,12 @@ mod tests {
         crate::keep_out_of_children(&listener).unwrap();
         let mut client = until(&path, deadline()).unwrap();
         listener.set_nonblocking(true).unwrap();
-        let (mut server, _) = listener.accept().unwrap();
+        let (mut server, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Ready,
+            crate::AcceptedMode::Blocking,
+        )
+        .unwrap();
         crate::keep_out_of_children(&server).unwrap();
         assert_eq!(crate::peer::peer_uid(&client), Some(crate::peer::our_uid()));
         // SAFETY: both fcntl calls read flags from a live test descriptor.
@@ -400,7 +405,12 @@ mod tests {
         ] {
             let listener = std::net::TcpListener::bind((place, 0)).unwrap();
             let mut client = tcp_within(&listener.local_addr().unwrap(), MUST_HAPPEN).unwrap();
-            let (mut server, _) = listener.accept().unwrap();
+            let (mut server, _) = crate::accept(
+                &listener,
+                crate::AcceptWait::Forever,
+                crate::AcceptedMode::Blocking,
+            )
+            .unwrap();
             assert_eq!(client.peer_addr().unwrap(), listener.local_addr().unwrap());
             // SAFETY: both fcntl calls read flags from a live test descriptor.
             let status = unsafe { libc::fcntl(client.as_raw_fd(), libc::F_GETFL) };
@@ -445,14 +455,19 @@ mod tests {
     #[test]
     fn a_dial_the_partition_cuts_reaches_no_listener_until_the_cut_heals() {
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let addr = listener.local_addr().unwrap();
         let cut = format!("{addr}\n");
         let refused =
             crate::partition::cut_here(&cut, || tcp_within(&addr, MUST_HAPPEN)).unwrap_err();
         assert_eq!(refused.kind(), ErrorKind::HostUnreachable, "{refused}");
         assert_eq!(
-            listener.accept().unwrap_err().kind(),
+            crate::accept(
+                &listener,
+                crate::AcceptWait::Ready,
+                crate::AcceptedMode::Blocking,
+            )
+            .unwrap_err()
+            .kind(),
             ErrorKind::WouldBlock,
             "the cut dial made no connection"
         );

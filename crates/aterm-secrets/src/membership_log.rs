@@ -1452,10 +1452,11 @@ pub struct Log {
     /// (2026-11-08). `hold` lets it go; clones share it until one holds a record.
     #[cfg(unix)]
     generation: Arc<OnceLock<history::Generation>>,
-    /// What every epoch's historical writers read of the held records ([`eval::Historical`]):
-    /// a quiet repair round's history leases each derived it again, 8.5% of such a round over a
-    /// log of 9,605 records (2026-11-08). `hold` lets it go; clones share it until one holds a
-    /// record.
+    /// What every epoch's historical writers, the seats and the known actors read of the held
+    /// records, with the seats found ([`eval::Historical`]): a quiet repair round's history
+    /// leases each derived it again, 8.5% of such a round over a log of 9,605 records
+    /// (2026-11-08), and the searches for its seats 4.2% (2026-11-09). `hold` lets it go; clones
+    /// share it until one holds a record.
     historical: Arc<OnceLock<eval::Historical>>,
 }
 
@@ -2099,21 +2100,21 @@ impl Log {
     /// good by a quorum `Remove`).
     #[must_use]
     pub fn historical_seat_entry(&self, binding: &Binding) -> Option<RecordId> {
-        eval::historical_seat_entry(self.history(), self.weighing(), binding)
+        eval::historical_seat_entry(self.history(), &self.historical, self.weighing(), binding)
     }
 
     /// Whether `binding` holds a founding or effective admitted seat in this log (even if later
     /// retired by an ordinary `Remove`, unless voided out for good by a quorum `Remove`).
     #[must_use]
     pub fn has_historical_seat(&self, binding: &Binding) -> bool {
-        eval::has_historical_seat(self.history(), self.weighing(), binding)
+        self.historical_seat_entry(binding).is_some()
     }
 
     /// Whether `actor` holds a founding or non-void, authorized, non-cut-off admitted seat in
     /// this log (including actors later retired by an ordinary or quorum `Remove`).
     #[must_use]
     pub fn has_known_actor(&self, actor: &MemberId) -> bool {
-        eval::has_known_actor(self.history(), self.weighing(), actor)
+        eval::has_known_actor(self.history(), &self.historical, self.weighing(), actor)
     }
 
     /// Historical Commons writer bindings eligible to authenticate table records sealed under

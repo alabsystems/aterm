@@ -1129,6 +1129,7 @@ fn folder_name(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_uds::{AcceptWait, AcceptedMode};
     #[test]
     fn a_persistent_reader_batches_headers_and_wakes_on_server_idle_events() {
         use std::io::{BufRead, BufReader, Write};
@@ -1136,7 +1137,8 @@ mod tests {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
+            let (socket, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(60)))
                 .unwrap();
@@ -1258,7 +1260,8 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(60)))
                 .unwrap();
@@ -1300,7 +1303,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let raw = b"Subject: example\r\n\r\na1 NO forged completion\r\n";
         let server = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
+            let (socket, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(60)))
                 .unwrap();
@@ -1355,7 +1359,8 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
+            let (socket, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(60)))
                 .unwrap();
@@ -1477,7 +1482,9 @@ mod tests {
                 let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
                 let address = listener.local_addr().unwrap();
                 let server = std::thread::spawn(move || {
-                    let (socket, _) = listener.accept().unwrap();
+                    let (socket, _) =
+                        aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking)
+                            .unwrap();
                     socket
                         .set_read_timeout(Some(std::time::Duration::from_secs(60)))
                         .unwrap();
@@ -1589,7 +1596,8 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
+            let (socket, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(60)))
                 .unwrap();
@@ -1658,7 +1666,8 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
+            let (socket, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(60)))
                 .unwrap();

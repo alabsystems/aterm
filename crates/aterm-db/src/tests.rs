@@ -360,7 +360,12 @@ fn authenticated_lan_exchange_is_symmetric_and_repairs_after_offline_edits() {
     let address = listener.local_addr().unwrap();
     let serve_dir = b.clone();
     let server = thread::spawn(move || {
-        let (tcp, _) = listener.accept().unwrap();
+        let (tcp, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         let connection =
             aterm_net::lan::Connection::admit(tcp, aterm_net::lan::Scope::Loopback).unwrap();
         network::serve_connection(&serve_dir, connection).unwrap()

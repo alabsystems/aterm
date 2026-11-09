@@ -83,7 +83,6 @@ fn lost_attachment_ack_forwards_actual_lifecycle_without_fabricated_attached() {
     use aterm_ctl::resource_admission_transport as transport;
     use aterm_ctl::resource_subgroup_client as remote;
     use aterm_types::resource_subgroup as subgroup;
-    use std::os::fd::AsFd;
     let deadline = || Instant::now() + EXCHANGE;
     let binding = |n| admission::Binding {
         session: "s-ab12".into(),
@@ -94,7 +93,6 @@ fn lost_attachment_ack_forwards_actual_lifecycle_without_fabricated_attached() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let path = scratch.path().join("host");
     let listener = aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(&path)).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let native = aterm_uds::process::read_identity(std::process::id() as i32).unwrap();
     let endpoint = remote::Endpoint {
         path,
@@ -122,18 +120,12 @@ fn lost_attachment_ack_forwards_actual_lifecycle_without_fabricated_attached() {
         fence_targets: vec![],
     };
     let server = std::thread::spawn(move || {
-        let stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => aterm_uds::ready::until(
-                    listener.as_fd(),
-                    aterm_uds::ready::Interest::Read,
-                    deadline(),
-                )
-                .unwrap(),
-                Err(e) => panic!("accept: {e}"),
-            }
-        };
+        let (stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Until(deadline()),
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         assert_eq!(
             transport::read_frame(&stream, deadline()).unwrap(),
             subgroup::hello(&root).unwrap()
@@ -260,7 +252,12 @@ fn connected_inet_stream_is_not_a_private_unix_control() {
     use std::os::fd::AsRawFd;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let stream = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (_accepted, _) = listener.accept().unwrap();
+    let (_accepted, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     assert!(socket(stream.as_raw_fd() as u32).is_err());
     assert!(
         stream.peer_addr().is_ok(),

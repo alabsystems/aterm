@@ -642,7 +642,6 @@ fn serve_inner(home: &Path, account: &str) -> io::Result<()> {
     std::fs::rename(&bound.endpoint.socket, &endpoint.socket)?;
     bound.endpoint = endpoint;
     let _bound = bound;
-    listener.set_nonblocking(true)?;
     let mut owner = Owner {
         home: home.into(),
         credentials,
@@ -661,19 +660,18 @@ fn serve_connections(
 ) -> io::Result<()> {
     let mut idle = Instant::now() + idle_for;
     while Instant::now() < idle {
-        let mut stream = match aterm_uds::kept_out(|| listener.accept()) {
+        let mut stream = match aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Until(idle),
+            aterm_uds::AcceptedMode::Nonblocking,
+        ) {
             Ok((stream, _)) => stream,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                aterm_uds::ready::any_until(&[listener.as_fd()], idle)?;
-                continue;
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => break,
             Err(error) => return Err(error),
         };
         if private_peer(&stream).is_err() {
             continue;
         }
-        stream.set_nonblocking(true)?;
         // An abandoned or partial frame may occupy the admission step only briefly.
         let request = (|| -> io::Result<_> {
             let mut input = DeadlineStream {
@@ -757,7 +755,6 @@ mod tests {
         let endpoint = Endpoint::new(home, "one@proton.me").unwrap();
         let listener = aterm_uds::kept_out(|| CtlListener::bind(&endpoint.socket)).unwrap();
         std::fs::set_permissions(&endpoint.socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         (endpoint, listener)
     }
 
@@ -845,8 +842,12 @@ mod tests {
                 Instant::now() + Duration::from_secs(60),
             )
             .unwrap();
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.set_nonblocking(true).unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Nonblocking,
+            )
+            .unwrap();
             let mut input = DeadlineStream {
                 stream: &mut stream,
                 end: Instant::now() + Duration::from_secs(60),
@@ -869,7 +870,13 @@ mod tests {
         assert!(error.message.contains("outcome is unknown"));
         let listener = server.join().unwrap();
         assert_eq!(
-            listener.accept().unwrap_err().kind(),
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Nonblocking,
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::WouldBlock
         );
     }

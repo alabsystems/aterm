@@ -24,6 +24,13 @@ authors.workspace = true
 repository.workspace = true
 license = "Apache-2.0 AND (MIT OR Apache-2.0)"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [lib]
 proc-macro = true
 path = "src/lib.rs"

@@ -1300,7 +1300,7 @@ struct LaneFlags {
     cancel_stdin: bool,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 fn detached_update(args: &[String], spawner: Option<&str>) -> bool {
     args.first().is_some_and(|verb| verb == "update") && spawner == Some(SPAWNER_DETACHED)
 }
@@ -12722,6 +12722,24 @@ fn update_vendor(
 ) -> bool {
     let program = spec.program;
     let person = door == VendorDoor::Person;
+    if !person {
+        let config = match seams.config.as_deref() {
+            Some(path) => crate::config::load_live(path),
+            None => Some(crate::config::PackagesConfig::default()),
+        };
+        let allowed = config.as_ref().is_some_and(|cfg| {
+            !cfg.unreadable
+                && cfg.enabled()
+                && !cfg.exclude().iter().any(|excluded| excluded == program)
+                && cfg
+                    .checkout_path(program, aterm_types::dirs::home_dir().as_deref())
+                    .is_none()
+        });
+        if !allowed {
+            println!("atpkg: {program} left unchanged by current package settings");
+            return true;
+        }
+    }
     let installed = crate::active_builds(layout);
     if !person
         && !installed.contains_key(program)

@@ -41,6 +41,9 @@ fn which_json_takes_one_tool_and_one_optional_flag() {
 #[path = "vendor_plan_effects_tests.rs"]
 mod vendor_plan_effects;
 
+#[path = "automatic_vendor_policy_tests.rs"]
+mod automatic_vendor_policy;
+
 #[test]
 fn conditional_link_options_are_parsed_without_becoming_bin_paths() {
     let args: Vec<String> = [

@@ -14,7 +14,12 @@ fn private_metadata_consumes_its_json_line_and_refuses_oversized_observations() 
             aterm_json::json!({"version":3,"ready":false,"reason":"x".repeat(size)}).to_string();
         let expected = body.clone();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(3)))
                 .unwrap();

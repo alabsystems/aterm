@@ -491,8 +491,17 @@ fn frontier_full_stores_hold_refused_records_until_capacity_changes() {
                     budgets.within(|| {
                         let mut repair = Repair::default();
                         let result = fixture.endpoints[1].exchange(
-                            Connection::admit(listener.accept().unwrap().0, Scope::Loopback)
-                                .unwrap(),
+                            Connection::admit(
+                                aterm_uds::accept(
+                                    &listener,
+                                    aterm_uds::AcceptWait::Forever,
+                                    aterm_uds::AcceptedMode::Blocking,
+                                )
+                                .unwrap()
+                                .0,
+                                Scope::Loopback,
+                            )
+                            .unwrap(),
                             Side::Responder,
                             &mut repair,
                         );
@@ -785,9 +794,18 @@ fn frontier_native_tls_resumes_after_a_durable_receipt_is_lost() {
     let address = listener.local_addr().unwrap();
     thread::scope(|scope| {
         let server = scope.spawn(|| {
-            let (tcp, _) = Connection::admit(listener.accept().unwrap().0, Scope::Loopback)
+            let (tcp, _) = Connection::admit(
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
                 .unwrap()
-                .into_parts();
+                .0,
+                Scope::Loopback,
+            )
+            .unwrap()
+            .into_parts();
             tcp.set_read_timeout(Some(EXCHANGE)).unwrap();
             tcp.set_write_timeout(Some(EXCHANGE)).unwrap();
             let mut channel = fleet::server_handshake_database_as(
@@ -1150,7 +1168,17 @@ fn frontier_native_tls_repairs_history_past_the_legacy_count() {
     thread::scope(|scope| {
         let server = scope.spawn(|| {
             fixture.endpoints[1].exchange(
-                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    Scope::Loopback,
+                )
+                .unwrap(),
                 Side::Responder,
                 &mut Repair::default(),
             )
@@ -1313,7 +1341,13 @@ fn counted_session(
             run(
                 responder,
                 initiator,
-                listener.accept().unwrap().0,
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap()
+                .0,
                 Side::Responder,
             )
         });
@@ -1765,9 +1799,18 @@ fn released_session(
     let secret = FleetSecret::new(&[51; 32]).unwrap();
     thread::scope(|scope| {
         let answered = scope.spawn(|| {
-            let (tcp, _) = Connection::admit(listener.accept().unwrap().0, Scope::Loopback)
+            let (tcp, _) = Connection::admit(
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
                 .unwrap()
-                .into_parts();
+                .0,
+                Scope::Loopback,
+            )
+            .unwrap()
+            .into_parts();
             tcp.set_read_timeout(Some(EXCHANGE)).unwrap();
             tcp.set_write_timeout(Some(EXCHANGE)).unwrap();
             let handshake = if released == Some(1) {
@@ -1993,7 +2036,13 @@ fn answered(
     };
     thread::scope(|scope| {
         let answered = scope.spawn(|| {
-            let stream = listener.accept().unwrap().0;
+            let stream = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap()
+            .0;
             let answer = || run(responder, initiator, stream, Side::Responder);
             let checked = || match mutant {
                 Some(mutant) => mutants::with(mutant, answer),
@@ -2210,7 +2259,13 @@ fn taped(
     };
     thread::scope(|scope| {
         let answered = scope.spawn(|| {
-            let stream = listener.accept().unwrap().0;
+            let stream = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap()
+            .0;
             crate::control::peer_check::tape::recorded(|| {
                 run(responder, initiator, stream, Side::Responder)
             })
@@ -2357,7 +2412,13 @@ fn session(
     };
     thread::scope(|scope| {
         let answered = scope.spawn(|| {
-            let stream = listener.accept().unwrap().0;
+            let stream = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap()
+            .0;
             let answer = || run(responder, initiator, stream, Side::Responder);
             observe_peer_cache(hook, || match mutant {
                 Some(mutant) => mutants::with(mutant, answer),

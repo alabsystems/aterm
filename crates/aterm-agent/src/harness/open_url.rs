@@ -3717,14 +3717,10 @@ pub(super) fn curl_output(
 }
 
 const CURL_MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
-/// How long one curl run, its input and output included, may take.
-#[cfg(not(test))]
-const CURL_WAIT_BUDGET: Duration = Duration::from_secs(30);
-/// How long one curl run, its input and output included, may take: the unit tests' curls (the
-/// installed one on a `file://` URL, a stand-in script, `sh`) exit on their own, so a first exec
-/// a loaded machine holds is waited for by the hang detector.
-#[cfg(test)]
-const CURL_WAIT_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// Hang detector for one required curl run, including its input and output.
+const CURL_WAIT_BUDGET: Duration = Duration::from_secs(60);
+
+const HTTP_REQUEST_HANG: Duration = Duration::from_secs(60);
 
 fn curl_output_with(
     program: impl AsRef<std::ffi::OsStr>,
@@ -3732,8 +3728,17 @@ fn curl_output_with(
     options: &[(&'static str, &str)],
     var: &dyn Fn(&str) -> Option<OsString>,
 ) -> std::io::Result<std::process::Output> {
-    let now = Instant::now();
-    let deadline = now.checked_add(CURL_WAIT_BUDGET).unwrap_or(now);
+    curl_output_with_started(program, args, options, var, Instant::now())
+}
+
+fn curl_output_with_started(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    options: &[(&'static str, &str)],
+    var: &dyn Fn(&str) -> Option<OsString>,
+    started: Instant,
+) -> std::io::Result<std::process::Output> {
+    let deadline = started.checked_add(CURL_WAIT_BUDGET).unwrap_or(started);
     curl_output_with_until(program, args, options, var, deadline)
 }
 
@@ -3744,6 +3749,12 @@ fn curl_output_with_until(
     var: &dyn Fn(&str) -> Option<OsString>,
     deadline: Instant,
 ) -> std::io::Result<std::process::Output> {
+    if Instant::now() >= deadline {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            super::auth_deadline::EXPIRED,
+        ));
+    }
     let (mut cmd, input) = curl_command(program, args, options, var)?;
     let input = aterm_uds::secret::Secret::from_vec(input.into_bytes());
     aterm_uds::deadline::output_with_input_until(&mut cmd, input, deadline, CURL_MAX_OUTPUT_BYTES)
@@ -3789,14 +3800,31 @@ pub(super) fn curl_output_until(
     ceiling: Duration,
     deadline: Deadline<'_>,
 ) -> std::io::Result<std::process::Output> {
-    let args = curl_args_until(args, ceiling, deadline)?;
+    curl_output_until_started(args, options, ceiling, deadline, Instant::now())
+}
+
+fn curl_output_until_started(
+    args: &[&str],
+    options: &[(&'static str, &str)],
+    ceiling: Duration,
+    deadline: Deadline<'_>,
+    started: Instant,
+) -> std::io::Result<std::process::Output> {
+    let by = deadline.end().min(started + CURL_WAIT_BUDGET);
+    let args = curl_args_until(
+        args,
+        ceiling
+            .saturating_sub(started.elapsed())
+            .min(by.saturating_duration_since(Instant::now())),
+        deadline,
+    )?;
     let refs: Vec<_> = args.iter().map(String::as_str).collect();
     let output = curl_output_with_until(
         aterm_uds::os_path!("curl"),
         &refs,
         options,
         &|name| std::env::var_os(name),
-        deadline.limited(CURL_WAIT_BUDGET).end(),
+        by,
     )?;
     deadline.remaining().map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::TimedOut, super::auth_deadline::EXPIRED)
@@ -3804,12 +3832,12 @@ pub(super) fn curl_output_until(
     Ok(output)
 }
 
-fn https_curl_exchange_by(
+fn https_curl_exchange_until(
     method: &str,
     url: &str,
     cookies: &mut BTreeMap<String, String>,
     form_body: Option<&str>,
-    deadline: Option<Deadline<'_>>,
+    deadline: Deadline<'_>,
 ) -> Result<HttpResponse, &'static str> {
     let cookie_hdr = cookies
         .iter()
@@ -3830,16 +3858,11 @@ fn https_curl_exchange_by(
         "=https",
         "-sS",
         "-i",
-        "--max-time",
-        "15",
         "-X",
         method,
     ];
-    let out = match deadline {
-        Some(deadline) => curl_output_until(&args, &options, Duration::from_secs(15), deadline),
-        None => curl_output(&args, &options),
-    }
-    .map_err(|_| "failed running curl")?;
+    let out = curl_output_until(&args, &options, HTTP_REQUEST_HANG, deadline)
+        .map_err(|_| "failed running curl")?;
     if !out.status.success() {
         return Err("HTTPS request failed");
     }
@@ -3858,7 +3881,7 @@ fn http_exchange_until(
     let result = if url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:") {
         loopback_http_exchange_by(method, url, cookies, form_body, Some(deadline))
     } else if url.starts_with("https://") {
-        https_curl_exchange_by(method, url, cookies, form_body, Some(deadline))
+        https_curl_exchange_until(method, url, cookies, form_body, deadline)
     } else {
         Err("unsupported URL scheme")
     };
@@ -4892,6 +4915,10 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     }
     ExitCode::from(code)
 }
+
+#[cfg(all(test, unix))]
+#[path = "open_url/native_wait_tests.rs"]
+mod native_wait_tests;
 
 #[cfg(test)]
 #[path = "open_url_tests.rs"]

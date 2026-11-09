@@ -708,23 +708,17 @@ pub(crate) fn selected_until(paths: &Paths, deadline: Instant) -> Result<Paths> 
 /// Select a completed generation without repairing current or ancestor custody.
 /// The same completion, policy and current membership checks still apply.
 pub(crate) fn observed_paths_until(paths: &Paths, deadline: Instant) -> Result<Paths> {
-    observed_paths_within(paths, deadline, &|| deadline)
+    Ok(observed_selection_within(paths, deadline, &|| deadline)?.paths)
 }
 
-/// [`observed_paths_until`] under [`Observation::observe_within`]'s two bounds.
-pub(crate) fn observed_paths_within(
-    paths: &Paths,
-    read_by: Instant,
-    wait: &dyn Fn() -> Instant,
-) -> Result<Paths> {
-    Ok(observed_selection_within(paths, read_by, wait)?.paths)
-}
-
-/// The completed generation [`observed_paths_within`] selects, with the observation of its
-/// predecessors that selected it, for a read-only session to keep ([`Session::observe_selected`])
-/// rather than observe every predecessor again: each later use still checks it afresh.
+/// The completed generation [`observed_paths_until`] selects, with the observation of its
+/// predecessors that selected it, for a verified "ready" answer that opens no session
+/// ([`status`], [`lineage_until`]). The observation predates every wait for the selected home's
+/// custody, so a read that opens a session does not keep it: it names the home with
+/// [`observed_generation_until`], opens that custody, then observes the predecessors
+/// ([`observed_session`]).
 ///
-/// [`Session::observe_selected`]: crate::table::Session::observe_selected
+/// [`observed_session`]: crate::documents::application::observed_session
 pub(crate) fn observed_selection_within(
     paths: &Paths,
     read_by: Instant,
@@ -1017,7 +1011,10 @@ fn logical_paths_in(paths: &Paths, observe_only: bool, deadline: Instant) -> Res
 
 /// Names and receipt counts only. Unconfirmed crash tails remain in their
 /// immutable sources and are never counted as imported committed operations.
-pub(crate) fn status(paths: &Paths, deadline: Instant) -> Result<Value> {
+/// With the report comes the home a read of `paths` selects ([`observed_paths_until`], taken once
+/// the sources are read): a report that names its sources is `ready` exactly when that selection
+/// holds, and a caller reads the selected home from it rather than selecting again.
+pub(crate) fn status(paths: &Paths, deadline: Instant) -> Result<(Value, Result<Paths>)> {
     let mut source = paths.clone();
     let mut sources = Vec::new();
     for generation in 0..=MAX_GENERATIONS {
@@ -1051,14 +1048,19 @@ pub(crate) fn status(paths: &Paths, deadline: Instant) -> Result<Value> {
     }
     if sources.is_empty() {
         if fenced(paths)? {
-            return Ok(json!({"state":"pending", "sources":[], "original_writer_fenced":true}));
+            return Ok((
+                json!({"state":"pending", "sources":[], "original_writer_fenced":true}),
+                observed_paths_until(paths, deadline),
+            ));
         }
-        return Ok(Value::Null);
+        return Ok((Value::Null, observed_paths_until(paths, deadline)));
     }
-    Ok(
-        json!({"state":if observed_paths_until(paths, deadline).is_ok() {"ready"} else {"pending"},
+    let selected = observed_paths_until(paths, deadline);
+    Ok((
+        json!({"state":if selected.is_ok() {"ready"} else {"pending"},
         "sources":sources, "original_writer_fenced":true}),
-    )
+        selected,
+    ))
 }
 
 /// Read and authenticate each preserved prefix without importing it or changing

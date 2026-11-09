@@ -290,7 +290,6 @@ impl Server {
         // The keeper spawns every session's program: keep its sockets out of them all.
         let listener = aterm_uds::kept_out(|| UnixListener::bind(&config.socket))?;
         prove_socket_is_ours(dir, &config.socket)?;
-        listener.set_nonblocking(true)?;
         sys::raise_nofile();
         let can_relaunch = config.relaunch != Relauncher::Unavailable;
         Ok(Self {
@@ -439,11 +438,14 @@ impl Server {
 
     fn accept_all(&mut self) {
         while self.dialing.len() < self.dial_checks_max {
-            let stream = match aterm_uds::kept_out(|| self.listener.accept()) {
+            let stream = match aterm_uds::accept(
+                &self.listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 Ok((s, _)) => s,
                 Err(_) => return,
             };
-            let _ = stream.set_nonblocking(false);
             let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
             let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
             let check = self.start_check(&stream);

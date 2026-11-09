@@ -7872,7 +7872,9 @@ mod tests {
         const CHILD: &str = "ATERM_TEST_PGREP_ANCESTOR";
         if let Some(path) = std::env::var_os(CHILD) {
             let path = PathBuf::from(path);
-            let own = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+            let image = std::env::current_exe().unwrap();
+            assert!(aterm_uds::test_binary::is_test_binary(&image));
+            let own = std::fs::metadata(&image).unwrap();
             let linked = std::fs::metadata(&path).unwrap();
             assert_eq!((own.dev(), own.ino()), (linked.dev(), linked.ino()));
             let name = path.file_name().unwrap().to_str().unwrap();
@@ -7908,15 +7910,42 @@ mod tests {
             return;
         }
 
-        let mut scratch = aterm_uds::deadline::KeptUntilRan::new(
-            aterm_tempfile::Builder::new()
-                .prefix("trustd-probe-ancestor-")
-                .tempdir()
-                .unwrap()
-                .keep(),
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix("trustd-probe-ancestor-")
+            .tempdir()
+            .unwrap();
+        let image = std::env::current_exe().unwrap();
+        let (_, hash) = image
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| name.rsplit_once('-'))
+            .expect("original Cargo test image");
+        let named = scratch
+            .path()
+            .join(format!("atpa{}-{hash}", std::process::id()));
+        assert!(
+            aterm_uds::test_binary::is_test_binary(&named),
+            "the ancestor fixture must retain Cargo-name isolation before it starts"
         );
-        let named = scratch.path().join(format!("atpa{}", std::process::id()));
-        std::fs::hard_link(std::env::current_exe().unwrap(), &named).unwrap();
+        let identity = |metadata: &std::fs::Metadata| {
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.nlink(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        let before = identity(&std::fs::metadata(&image).unwrap());
+        std::fs::copy(&image, &named).unwrap();
+        assert_eq!(
+            identity(&std::fs::metadata(&image).unwrap()),
+            before,
+            "fixture preparation must not mutate its active source image"
+        );
+        let mut scratch = aterm_uds::deadline::KeptUntilRan::new(scratch.keep());
         let test = "trust_facts::tests::the_recovery_probe_observes_a_matching_owned_ancestor";
         let mut child = aterm_uds::spawnfd::command(&named);
         child

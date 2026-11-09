@@ -534,7 +534,12 @@ mod tests {
         let (name, index) = loopback();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (accepted, _) = listener.accept().unwrap();
+        let (accepted, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         ensure_binding(&accepted, index, name).unwrap();
         ensure_binding(&accepted, index, name).unwrap();
         restrict_hops(&accepted).unwrap();

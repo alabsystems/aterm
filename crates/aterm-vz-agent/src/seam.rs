@@ -14,6 +14,23 @@ use std::time::{Duration, Instant};
 use crate::system::{Booted, Facts, Identity, RawJob, System};
 use crate::wire::Share;
 
+/// The macOS-only Unix listener adapter. Keeping it beside the seam leaves the shipped musl guest
+/// std-only while every Unix socket accept still goes through the workspace's sanctioned helper.
+struct CommandListener(UnixListener);
+
+impl crate::serve::Listener for CommandListener {
+    type Stream = UnixStream;
+
+    fn accept(&self) -> std::io::Result<Self::Stream> {
+        aterm_uds::accept(
+            &self.0,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .map(|(stream, _)| stream)
+    }
+}
+
 /// A guest that is already up and changes nothing.
 pub struct Seam {
     started: Instant,
@@ -84,7 +101,7 @@ impl System for Seam {
 pub fn run(listen: &Path, watch: &Path, key_disk: &Path, tick: Duration) -> ExitCode {
     let say = |what: String| eprintln!("aterm-vz-agent (seam): {what}");
     let listener = match UnixListener::bind(listen) {
-        Ok(l) => l,
+        Ok(listener) => CommandListener(listener),
         Err(e) => {
             say(format!("could not listen on {}: {e}", listen.display()));
             return ExitCode::FAILURE;

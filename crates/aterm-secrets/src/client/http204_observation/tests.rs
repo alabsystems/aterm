@@ -19,26 +19,16 @@ fn stub_noting_empty(
     response: Vec<u8>,
     mut empty: impl FnMut() + Send + 'static,
 ) -> (String, std::thread::JoinHandle<std::io::Result<()>>) {
-    use std::os::fd::AsFd as _;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/v1/team", listener.local_addr().unwrap());
     let server = std::thread::spawn(move || {
         let until = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         loop {
-            aterm_uds::ready::until(listener.as_fd(), aterm_uds::ready::Interest::Read, until)?;
-            let (mut stream, _) = match listener.accept() {
-                Ok(accepted) => accepted,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(until),
+                aterm_uds::AcceptedMode::Blocking,
+            )?;
             if read_request_head(&mut stream, until)?.is_none() {
                 // A TCP connect followed by an orderly close supplied no HTTP request.
                 // It must not consume this fixture's one response.

@@ -781,7 +781,12 @@ fn session(msgs: &str, transport: &str) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let server = std::thread::spawn(move || {
-                let (s, _) = listener.accept().unwrap();
+                let (s, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap();
                 fake_bus(s, "nofd", &script)
             });
             let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();

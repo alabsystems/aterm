@@ -40,6 +40,10 @@ pub struct Cmd {
     pub cwd: Option<PathBuf>,
     /// Whether [`Cmd::envs`] is the child's whole environment with nothing inherited.
     pub exact_env: bool,
+    /// [`finalize_exact_command`] froze this complete command and its deterministic spawn-time
+    /// environment edits. Public fields remain inspectable, so the receipt is checked again before
+    /// content evidence or spawn trusts it; any later mutation invalidates the receipt.
+    finalized_receipt: Option<Box<FinalizedCommandReceipt>>,
     /// Text written at the head of the child's captured log before it starts ([`Capture::Emit`]).
     pub preamble: Option<String>,
     /// Grace period after a ceiling `SIGTERM` before the child's group is `SIGKILL`ed.
@@ -81,6 +85,7 @@ impl Cmd {
             demoted: false,
             cwd: None,
             exact_env: false,
+            finalized_receipt: None,
             preamble: None,
             term_grace: None,
             waits_count: false,
@@ -106,12 +111,14 @@ impl Cmd {
     /// Write `text` at the head of the captured log before the child starts ([`Cmd::preamble`]).
     #[must_use]
     pub fn preamble(mut self, text: impl Into<String>) -> Self {
+        self.finalized_receipt = None;
         self.preamble = Some(text.into());
         self
     }
 
     #[must_use]
     pub fn arg(mut self, a: impl Into<OsString>) -> Self {
+        self.finalized_receipt = None;
         self.args.push(a.into());
         self
     }
@@ -122,6 +129,7 @@ impl Cmd {
         I: IntoIterator<Item = S>,
         S: Into<OsString>,
     {
+        self.finalized_receipt = None;
         self.args.extend(it.into_iter().map(Into::into));
         self
     }
@@ -130,6 +138,7 @@ impl Cmd {
     /// last, so each variable is named once wherever the command is read back (a rerun line).
     #[must_use]
     pub fn env(mut self, k: impl Into<OsString>, v: impl Into<OsString>) -> Self {
+        self.finalized_receipt = None;
         let (k, v) = (k.into(), v.into());
         match self.envs.iter_mut().find(|(key, _)| *key == k) {
             Some(set) => set.1 = v,
@@ -142,6 +151,7 @@ impl Cmd {
     /// deliberately wins, matching [`std::process::Command`].
     #[must_use]
     pub fn remove_env(mut self, k: impl Into<OsString>) -> Self {
+        self.finalized_receipt = None;
         let k = k.into();
         if !self.remove_envs.contains(&k) {
             self.remove_envs.push(k);
@@ -150,7 +160,8 @@ impl Cmd {
     }
 
     #[must_use]
-    pub const fn capture(mut self, c: Capture) -> Self {
+    pub fn capture(mut self, c: Capture) -> Self {
+        self.finalized_receipt = None;
         self.capture = c;
         self
     }
@@ -159,7 +170,8 @@ impl Cmd {
     /// may be at the desk ([`AWAY_AFTER`]): a compile-only child at the default tier stretches a
     /// typed program's echo, and with nobody there utility QoS only starves the check.
     #[must_use]
-    pub const fn demoted(mut self) -> Self {
+    pub fn demoted(mut self) -> Self {
+        self.finalized_receipt = None;
         self.demoted = true;
         self
     }
@@ -167,7 +179,8 @@ impl Cmd {
     /// At its ceiling, send this child's group `SIGTERM` and give it up to `grace` before
     /// `SIGKILL`.
     #[must_use]
-    pub const fn term_grace(mut self, grace: Duration) -> Self {
+    pub fn term_grace(mut self, grace: Duration) -> Self {
+        self.finalized_receipt = None;
         self.term_grace = Some(grace);
         self
     }
@@ -177,7 +190,8 @@ impl Cmd {
     /// hang its ceiling still ends. Its waits for a core are still left out, as any child's are,
     /// until [`NO_PROGRESS_HANG`] passes with no progress.
     #[must_use]
-    pub const fn counting_waits(mut self) -> Self {
+    pub fn counting_waits(mut self) -> Self {
+        self.finalized_receipt = None;
         self.waits_count = true;
         self
     }
@@ -188,6 +202,65 @@ impl Cmd {
         std::iter::once(self.program.to_string_lossy().into_owned())
             .chain(self.args.iter().map(|a| a.to_string_lossy().into_owned()))
             .collect()
+    }
+
+    /// Whether spawn-time environment policy has been frozen into this exact command.
+    #[must_use]
+    pub(crate) fn runtime_environment_is_finalized(&self) -> bool {
+        match &self.finalized_receipt {
+            Some(receipt) => receipt.matches(self),
+            None => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FinalizedCommandReceipt {
+    program: PathBuf,
+    args: Vec<OsString>,
+    envs: Vec<(OsString, OsString)>,
+    remove_envs: Vec<OsString>,
+    capture: Capture,
+    demoted: bool,
+    cwd: Option<PathBuf>,
+    exact_env: bool,
+    preamble: Option<String>,
+    term_grace: Option<Duration>,
+    waits_count: bool,
+    test_cases: Option<CaseWatch>,
+}
+
+impl FinalizedCommandReceipt {
+    fn capture(command: &Cmd) -> Self {
+        Self {
+            program: command.program.clone(),
+            args: command.args.clone(),
+            envs: command.envs.clone(),
+            remove_envs: command.remove_envs.clone(),
+            capture: command.capture.clone(),
+            demoted: command.demoted,
+            cwd: command.cwd.clone(),
+            exact_env: command.exact_env,
+            preamble: command.preamble.clone(),
+            term_grace: command.term_grace,
+            waits_count: command.waits_count,
+            test_cases: command.test_cases.clone(),
+        }
+    }
+
+    fn matches(&self, command: &Cmd) -> bool {
+        self.program == command.program
+            && self.args == command.args
+            && self.envs == command.envs
+            && self.remove_envs == command.remove_envs
+            && self.capture == command.capture
+            && self.demoted == command.demoted
+            && self.cwd == command.cwd
+            && self.exact_env == command.exact_env
+            && self.preamble == command.preamble
+            && self.term_grace == command.term_grace
+            && self.waits_count == command.waits_count
+            && self.test_cases == command.test_cases
     }
 }
 
@@ -986,6 +1059,211 @@ pub(crate) fn case_observations(path: &Path, json: bool) -> test_progress::Obser
     observations
 }
 
+#[derive(Clone, Debug)]
+enum EnvironmentEdit {
+    Set(OsString, OsString),
+    Remove(OsString),
+}
+
+/// The deterministic environment edits applied after a [`Cmd`]'s own environment. They are
+/// materialized once for content evidence and applied by the spawn path itself, so a release
+/// never keys a command which differs from the one its child receives.
+///
+/// Compiler-width configuration is asked of its real configurator on a probe command. Its
+/// environment edits are lossless; if it ever starts changing argv, program or cwd as well, the
+/// caller cannot represent that in a content proof and must fail the proof closed.
+fn runtime_environment_edits(cmd: &Cmd, env: ExecEnv<'_>) -> Result<Vec<EnvironmentEdit>, String> {
+    let mut edits = Vec::new();
+    if let Some(marker) = crate::memory::cover() {
+        edits.push(EnvironmentEdit::Set(
+            aterm_capacity::COVER_ENV.into(),
+            marker.as_ref().into(),
+        ));
+    }
+    if let Some(jobs) = crate::compile_width::current() {
+        let jobs = cmd
+            .envs
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "CARGO_BUILD_JOBS")
+            .and_then(|(_, value)| crate::parse_build_jobs(Some(value.as_os_str())))
+            .map_or(jobs, |asked| jobs.min(asked));
+        edits.push(EnvironmentEdit::Set(
+            "CARGO_BUILD_JOBS".into(),
+            jobs.to_string().into(),
+        ));
+
+        let sentinel = OsStr::new("aterm-verify-compile-width-environment-probe");
+        let mut probe = aterm_uds::spawnfd::command(sentinel);
+        crate::compile_width::configure(&mut probe);
+        if probe.get_program() != sentinel
+            || probe.get_args().next().is_some()
+            || probe.get_current_dir().is_some()
+        {
+            return Err(
+                "compile-width configuration changes more than the child environment".into(),
+            );
+        }
+        edits.extend(probe.get_envs().map(|(name, value)| match value {
+            Some(value) => EnvironmentEdit::Set(name.to_owned(), value.to_owned()),
+            None => EnvironmentEdit::Remove(name.to_owned()),
+        }));
+    }
+    if let Some(grant) = crate::current_resource_claim()
+        .map(|claim| claim.cores())
+        .filter(|cores| *cores > 0)
+    {
+        let ceiling = |wanted: &str| {
+            cmd.envs
+                .iter()
+                .rev()
+                .find(|(name, _)| name == wanted)
+                .or_else(|| {
+                    if cmd.exact_env {
+                        None
+                    } else {
+                        env.add_env.iter().rev().find(|(name, _)| name == wanted)
+                    }
+                })
+                .and_then(|(_, value)| crate::parse_build_jobs(Some(value.as_os_str())))
+                .map_or(grant, |asked| asked.min(grant))
+        };
+        edits.push(EnvironmentEdit::Set(
+            "CARGO_BUILD_JOBS".into(),
+            ceiling("CARGO_BUILD_JOBS").to_string().into(),
+        ));
+        edits.push(EnvironmentEdit::Set(
+            "RUST_TEST_THREADS".into(),
+            ceiling("RUST_TEST_THREADS").to_string().into(),
+        ));
+        edits.push(EnvironmentEdit::Set("BUILD_SLOT_HELD".into(), "1".into()));
+    }
+    Ok(edits)
+}
+
+fn apply_environment_edits(command: &mut Command, edits: &[EnvironmentEdit]) {
+    for edit in edits {
+        match edit {
+            EnvironmentEdit::Set(name, value) => {
+                command.env(name, value);
+            }
+            EnvironmentEdit::Remove(name) => {
+                command.env_remove(name);
+            }
+        }
+    }
+}
+
+fn apply_cmd_environment_edits(command: &mut Cmd, edits: &[EnvironmentEdit]) {
+    for edit in edits {
+        match edit {
+            EnvironmentEdit::Set(name, value) => {
+                // A recorded process environment may repeat a name. `Command` applies this
+                // runtime edit after every recorded value, so the materialized command must do
+                // the same: remove them all and append the value the child actually receives.
+                command.envs.retain(|(held, _)| held != name);
+                command.envs.push((name.clone(), value.clone()));
+            }
+            EnvironmentEdit::Remove(name) => {
+                command.envs.retain(|(held, _)| held != name);
+            }
+        }
+    }
+}
+
+/// Materialize the exact cwd and environment a command will have after this thread's held
+/// resource claim, memory cover, compiler-width policy and wait accounting are applied.
+///
+/// This is for release content evidence and the command later dispatched. A command which
+/// inherits state, is demoted through `taskpolicy`, or needs a fresh wait-marker directory cannot
+/// be represented ahead of its spawn and is refused. The caller records it as unbounded and
+/// still runs it normally.
+pub(crate) fn finalize_exact_command(mut command: Cmd, env: ExecEnv<'_>) -> Result<Cmd, String> {
+    if !command.exact_env {
+        return Err("the child inherits an environment".into());
+    }
+    if command.demoted {
+        return Err("the child may be wrapped by taskpolicy".into());
+    }
+    if !command.waits_count {
+        return Err("the child needs a per-spawn wait-marker directory".into());
+    }
+    if command.runtime_environment_is_finalized() {
+        return Ok(command);
+    }
+    if command.cwd.is_none() {
+        command.cwd = Some(env.cwd.to_path_buf());
+    }
+    // In an exact command removals precede its explicit environment, so an explicit value wins.
+    command.remove_envs.clear();
+    let edits = runtime_environment_edits(&command, env)?;
+    apply_cmd_environment_edits(&mut command, &edits);
+    command
+        .envs
+        .retain(|(name, _)| name != aterm_toolchain::waits::VAR);
+    command.finalized_receipt = Some(Box::new(FinalizedCommandReceipt::capture(&command)));
+    Ok(command)
+}
+
+/// Turn an inherited-environment command into the exact command this verifier would spawn, then
+/// apply [`finalize_exact_command`]'s run-time edits. The returned command is both the content
+/// evidence and the command which must be dispatched; rebuilding the inherited environment later
+/// would create a time-of-check/time-of-use gap.
+///
+/// A demoted command or one with per-spawn wait markers has process behavior which cannot be
+/// represented by a stable argv/environment receipt and is refused.
+pub(crate) fn materialize_exact_command(mut command: Cmd, env: ExecEnv<'_>) -> Result<Cmd, String> {
+    if command.exact_env {
+        return finalize_exact_command(command, env);
+    }
+    if command.demoted {
+        return Err("the child may be wrapped by taskpolicy".into());
+    }
+    if !command.waits_count {
+        return Err("the child needs a per-spawn wait-marker directory".into());
+    }
+
+    let mut environment: BTreeMap<OsString, (OsString, OsString)> = std::env::vars_os()
+        .map(|(name, value)| (environment_key(&name), (name, value)))
+        .collect();
+    for removed in env.remove_env {
+        if let Some(prefix) = removed.strip_suffix('*') {
+            let prefix = environment_key(OsStr::new(prefix));
+            environment.retain(|name, _| {
+                !name
+                    .as_encoded_bytes()
+                    .starts_with(prefix.as_encoded_bytes())
+            });
+        } else {
+            environment.remove(&environment_key(OsStr::new(removed)));
+        }
+    }
+    for (name, value) in env.add_env {
+        environment.insert(environment_key(name), (name.clone(), value.clone()));
+    }
+    for name in &command.remove_envs {
+        environment.remove(&environment_key(name));
+    }
+    for (name, value) in &command.envs {
+        environment.insert(environment_key(name), (name.clone(), value.clone()));
+    }
+    command.envs = environment.into_values().collect();
+    command.remove_envs.clear();
+    command.exact_env = true;
+    finalize_exact_command(command, env)
+}
+
+fn environment_key(name: &OsStr) -> OsString {
+    #[cfg(windows)]
+    {
+        name.to_string_lossy().to_uppercase().into()
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_owned()
+    }
+}
+
 fn run_captured_inner(
     cmd: &Cmd,
     env: ExecEnv<'_>,
@@ -1019,9 +1297,6 @@ fn run_captured_inner(
         for (k, v) in env.add_env {
             c.env(k, v);
         }
-        if let Some(marker) = crate::memory::cover() {
-            c.env(aterm_capacity::COVER_ENV, &*marker);
-        }
     }
     for k in &cmd.remove_envs {
         c.env_remove(k);
@@ -1029,52 +1304,62 @@ fn run_captured_inner(
     for (k, v) in &cmd.envs {
         c.env(k, v);
     }
-    // A replayed child's recorded environment holds the marker of the run that recorded it, not
-    // the claim its stage holds now: that claim covers it.
-    if cmd.exact_env
-        && let Some(marker) = crate::memory::cover()
-    {
-        c.env(aterm_capacity::COVER_ENV, &*marker);
-    }
-    // A repeatable tree stage owns one combined memory/CPU claim. Its actual grant, never the
-    // machine-wide request, bounds every compiler, libtest and doctest child; an explicit smaller
-    // command or run ceiling remains smaller.
-    if let Some(jobs) = crate::compile_width::current() {
-        let jobs = cmd
-            .envs
-            .iter()
-            .rev()
-            .find(|(name, _)| name == "CARGO_BUILD_JOBS")
-            .and_then(|(_, value)| crate::parse_build_jobs(Some(value.as_os_str())))
-            .map_or(jobs, |asked| jobs.min(asked));
-        c.env("CARGO_BUILD_JOBS", jobs.to_string());
-        crate::compile_width::configure(&mut c);
-    }
-    if let Some(grant) = crate::current_resource_claim()
-        .map(|claim| claim.cores())
-        .filter(|cores| *cores > 0)
-    {
-        let ceiling = |wanted: &str| {
-            cmd.envs
-                .iter()
-                .rev()
-                .find(|(name, _)| name == wanted)
-                .or_else(|| {
-                    if cmd.exact_env {
-                        None
-                    } else {
-                        env.add_env.iter().rev().find(|(name, _)| name == wanted)
-                    }
-                })
-                .and_then(|(_, value)| crate::parse_build_jobs(Some(value.as_os_str())))
-                .map_or(grant, |asked| asked.min(grant))
-        };
-        c.env("CARGO_BUILD_JOBS", ceiling("CARGO_BUILD_JOBS").to_string());
-        c.env(
-            "RUST_TEST_THREADS",
-            ceiling("RUST_TEST_THREADS").to_string(),
-        );
-        c.env("BUILD_SLOT_HELD", "1");
+    // A replayed child's recorded cover and scheduler limits belong to the run that recorded it,
+    // so the held claim's actual values replace them. A release content command has already
+    // materialized those edits through [`finalize_exact_command`]; execute that frozen receipt
+    // instead of recomputing policy after its evidence was taken.
+    let runtime_edits = if cmd.runtime_environment_is_finalized() {
+        Ok(Vec::new())
+    } else {
+        runtime_environment_edits(cmd, env)
+    };
+    match runtime_edits {
+        Ok(edits) => apply_environment_edits(&mut c, &edits),
+        Err(_) => {
+            // Preserve execution if compiler policy ever grows a non-environment mutation. Such a
+            // command's evidence fails closed, while its actual spawn retains the configurator's
+            // full behavior.
+            if let Some(marker) = crate::memory::cover() {
+                c.env(aterm_capacity::COVER_ENV, &*marker);
+            }
+            if let Some(jobs) = crate::compile_width::current() {
+                let jobs = cmd
+                    .envs
+                    .iter()
+                    .rev()
+                    .find(|(name, _)| name == "CARGO_BUILD_JOBS")
+                    .and_then(|(_, value)| crate::parse_build_jobs(Some(value.as_os_str())))
+                    .map_or(jobs, |asked| jobs.min(asked));
+                c.env("CARGO_BUILD_JOBS", jobs.to_string());
+                crate::compile_width::configure(&mut c);
+            }
+            if let Some(grant) = crate::current_resource_claim()
+                .map(|claim| claim.cores())
+                .filter(|cores| *cores > 0)
+            {
+                let ceiling = |wanted: &str| {
+                    cmd.envs
+                        .iter()
+                        .rev()
+                        .find(|(name, _)| name == wanted)
+                        .or_else(|| {
+                            if cmd.exact_env {
+                                None
+                            } else {
+                                env.add_env.iter().rev().find(|(name, _)| name == wanted)
+                            }
+                        })
+                        .and_then(|(_, value)| crate::parse_build_jobs(Some(value.as_os_str())))
+                        .map_or(grant, |asked| asked.min(grant))
+                };
+                c.env("CARGO_BUILD_JOBS", ceiling("CARGO_BUILD_JOBS").to_string());
+                c.env(
+                    "RUST_TEST_THREADS",
+                    ceiling("RUST_TEST_THREADS").to_string(),
+                );
+                c.env("BUILD_SLOT_HELD", "1");
+            }
+        }
     }
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
     let marks = if cmd.waits_count {
@@ -4319,7 +4604,102 @@ mod tests {
             crate::testrun::dispatch_each(1, |_| said(&run(&ask, env_in(&tmp)))),
             [Some("6 1 6".to_owned())]
         );
+        #[cfg(unix)]
+        {
+            let argv = shell_argv(
+                "printf '%s %s %s %s %s' \"$CARGO_BUILD_JOBS\" \"$BUILD_SLOT_HELD\" \
+                 \"$RUST_TEST_THREADS\" \"$ATERM_CAPACITY_COVER\" \"${ATERM_WAITS-unset}\"",
+                "",
+            );
+            let recorded = Cmd::replayed(
+                &argv,
+                &tmp,
+                vec![
+                    ("CARGO_BUILD_JOBS".into(), "13".into()),
+                    ("CARGO_BUILD_JOBS".into(), "12".into()),
+                    ("RUST_TEST_THREADS".into(), "11".into()),
+                    ("BUILD_SLOT_HELD".into(), "stale".into()),
+                    (aterm_capacity::COVER_ENV.into(), "stale".into()),
+                    (aterm_toolchain::waits::VAR.into(), "/stale/waits".into()),
+                ],
+            );
+            assert!(
+                finalize_exact_command(recorded.clone(), env_in(&tmp)).is_err(),
+                "a dynamic per-spawn wait directory cannot be content-keyed"
+            );
+            let _covering = crate::memory::covering(Some("0000000000001-7-0".into()));
+            let finalized = finalize_exact_command(recorded.counting_waits(), env_in(&tmp))
+                .expect("the counting command has a representable exact environment");
+            let value = |name: &str| {
+                finalized
+                    .envs
+                    .iter()
+                    .filter(|(held, _)| held == name)
+                    .map(|(_, value)| value.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(value("CARGO_BUILD_JOBS"), ["6"]);
+            assert_eq!(value("RUST_TEST_THREADS"), ["6"]);
+            assert_eq!(value("BUILD_SLOT_HELD"), ["1"]);
+            assert_eq!(value(aterm_capacity::COVER_ENV), ["0000000000001-7-0"]);
+            assert!(value(aterm_toolchain::waits::VAR).is_empty());
+            assert_eq!(
+                said(&run(&finalized, env_in(&tmp))),
+                "6 1 6 0000000000001-7-0 unset",
+                "the materialized command and the child receive the same post-claim environment"
+            );
+        }
         drop(_resources);
+
+        #[cfg(unix)]
+        {
+            let argv = shell_argv("printf %s \"$CARGO_BUILD_JOBS\"", "");
+            let recorded =
+                Cmd::replayed(&argv, &tmp, vec![("CARGO_BUILD_JOBS".into(), "12".into())])
+                    .counting_waits();
+            let finalized = crate::compile_width::with_jobs(Some(4), || {
+                finalize_exact_command(recorded, env_in(&tmp))
+            })
+            .expect("the compiler-width configurator has a representable environment");
+            assert!(finalized.runtime_environment_is_finalized());
+            assert!(
+                !finalized
+                    .clone()
+                    .env("CARGO_BUILD_JOBS", "99")
+                    .runtime_environment_is_finalized(),
+                "an environment builder mutation must thaw the receipt"
+            );
+            for changed in [
+                finalized.clone(),
+                finalized.clone(),
+                finalized.clone(),
+                finalized.clone(),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, mut command)| {
+                match index {
+                    0 => command.args.push("changed-argv".into()),
+                    1 => command.cwd = Some(tmp.join("changed-cwd")),
+                    2 => command.demoted = true,
+                    3 => command.envs.push(("RAW_MUTATION".into(), "1".into())),
+                    _ => unreachable!(),
+                }
+                command
+            }) {
+                assert!(
+                    !changed.runtime_environment_is_finalized(),
+                    "a public command-field mutation must invalidate the receipt"
+                );
+            }
+            assert_eq!(
+                crate::compile_width::with_jobs(Some(2), || {
+                    said(&run(&finalized, env_in(&tmp)))
+                }),
+                "4",
+                "dispatch must execute the finalized environment, not recompute later policy"
+            );
+        }
         drop(ordinary);
         std::fs::remove_dir_all(&tmp).ok();
     }

@@ -522,31 +522,20 @@ mod native {
 
     fn accept(listener: &UnixListener) -> io::Result<UnixStream> {
         let until = Instant::now() + HANG;
-        loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    // BSD can inherit the listener's O_NONBLOCK on accept. The
-                    // connected protocol uses bounded blocking reads and writes.
-                    stream.set_nonblocking(false)?;
-                    stream.set_read_timeout(Some(HANG))?;
-                    stream.set_write_timeout(Some(HANG))?;
-                    return Ok(stream);
-                }
-                Err(error)
-                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < until =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        let (stream, _) = aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Until(until),
+            aterm_uds::AcceptedMode::Blocking,
+        )?;
+        stream.set_read_timeout(Some(HANG))?;
+        stream.set_write_timeout(Some(HANG))?;
+        Ok(stream)
     }
 
     fn setexec_arm(exe: &Path, root: &Path, manager: bool) -> io::Result<Value> {
         use aterm_secrets::service::{Domain, Launchctl};
         std::fs::DirBuilder::new().mode(0o700).create(root)?;
         let listener = UnixListener::bind(root.join("replace.sock"))?;
-        listener.set_nonblocking(true)?;
         let mut child = None;
         let mut job = None;
         if manager {
@@ -634,7 +623,6 @@ mod native {
         use aterm_secrets::service::{Domain, Launchctl};
         std::fs::DirBuilder::new().mode(0o700).create(root)?;
         let listener = UnixListener::bind(root.join("fallback.sock"))?;
-        listener.set_nonblocking(true)?;
         let uid = aterm_uds::peer::our_uid();
         let domain = if launchctl(&aterm_secrets::service::launchctl_argv(
             uid,
@@ -845,7 +833,6 @@ mod native {
         // The fixture setup already created this private account and admitted it.
         server.wait_held(false)?;
         let listener = UnixListener::bind(root.join("control.sock"))?;
-        listener.set_nonblocking(true)?;
         let mut command = aterm_uds::spawnfd::command(exe);
         command
             .env(ROOT, root)

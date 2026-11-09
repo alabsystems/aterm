@@ -636,7 +636,6 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         std::fs::remove_file(&socket).map_err(|e| e.to_string())?;
     }
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&socket)).map_err(|e| e.to_string())?;
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
     let context = Arc::new(ControlWorkerContext {
         active,
         store,
@@ -667,7 +666,11 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
                     index += 1;
                 }
             }
-            match listener.accept() {
+            match aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 Ok((stream, _)) => {
                     let retained = stream.try_clone()?;
                     let context = Arc::clone(&server_context);

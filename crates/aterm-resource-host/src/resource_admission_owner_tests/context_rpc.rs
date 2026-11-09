@@ -67,7 +67,6 @@ fn host() {
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&socket)).unwrap();
     aterm_uds::atomic_file::set_mode_nofollow(&socket, 0o600).unwrap();
     let _instance = store.publish(&program, &listener).unwrap();
-    listener.set_nonblocking(true).unwrap();
 
     let mut world = World::with_scratch(Scratch::at(&path));
     let (binding, memory, events) = world.queue_sleep(HANG);
@@ -105,7 +104,11 @@ fn host() {
     let mut lookups = 0;
     while !world.owner.idle() {
         world.owner.tick();
-        match aterm_uds::kept_out(|| listener.accept()) {
+        match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((stream, _)) => {
                 let end =
                     crate::runtime::control_deadline(Instant::now() - Duration::from_secs(11));

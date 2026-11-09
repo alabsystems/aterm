@@ -1687,6 +1687,26 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.186.0", "stalled-sequence"),
     ("v0.186.0", "twelve-panes"),
     ("v0.186.0", "variants"),
+    ("v0.187.0", "carried-state"),
+    ("v0.187.0", "claude-code-1049"),
+    ("v0.187.0", "colour-and-shell"),
+    ("v0.187.0", "engine-state"),
+    ("v0.187.0", "fold"),
+    ("v0.187.0", "held-failed"),
+    ("v0.187.0", "held-pane"),
+    ("v0.187.0", "held-withheld"),
+    ("v0.187.0", "history"),
+    ("v0.187.0", "history-carry"),
+    ("v0.187.0", "incident-55x149"),
+    ("v0.187.0", "link-dense"),
+    ("v0.187.0", "link-dense-history"),
+    ("v0.187.0", "lone-workers-list"),
+    ("v0.187.0", "policy-repaint"),
+    ("v0.187.0", "policy-visible"),
+    ("v0.187.0", "shell-integration"),
+    ("v0.187.0", "stalled-sequence"),
+    ("v0.187.0", "twelve-panes"),
+    ("v0.187.0", "variants"),
 ];
 
 const REQUIRED_DESKS: &[(&str, &str)] = &[
@@ -4058,7 +4078,12 @@ pub(super) fn capture_transport(scratch: &std::path::Path) -> TransportCapture {
     let listener = std::os::unix::net::UnixListener::bind(&listen).expect("a plain listener");
     let dialer =
         crate::handoff_rendezvous::dial_for_test(&listen, RZ_SECRET).expect("dial and claim");
-    let (mut accepted, _) = listener.accept().expect("accept the claim");
+    let (mut accepted, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .expect("accept the claim");
     drop(dialer);
     let mut claim_frame = Vec::new();
     accepted
@@ -4222,21 +4247,20 @@ fn stub_parent_grant(
     use std::io::{Read as _, Write as _};
 
     let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if std::time::Instant::now() > until {
-                    return Err("no successor dialled".to_string());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(error) => return Err(format!("accept: {error}")),
+    let (stream, _) = aterm_uds::accept(
+        listener,
+        aterm_uds::AcceptWait::Until(until),
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            "no successor dialled".to_string()
+        } else {
+            format!("accept: {error}")
         }
-    };
+    })?;
     stream
-        .set_nonblocking(false)
-        .and_then(|()| stream.set_read_timeout(Some(std::time::Duration::from_secs(60))))
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
         .map_err(|error| error.to_string())?;
     let mut claim = vec![0u8; expected_claim.len()];
     (&stream)
@@ -4277,7 +4301,6 @@ fn replay_grant_to_this_successor(
     let socket = scratch.join("rz-parent.sock");
     let _ = std::fs::remove_file(&socket);
     let listener = std::os::unix::net::UnixListener::bind(&socket).expect("a stub parent");
-    listener.set_nonblocking(true).expect("a pollable listener");
     let ptys = record
         .grant_sessions
         .iter()

@@ -104,7 +104,12 @@ fn observe(state: &ModelState, polling: bool, variant: u8) -> Vec<(&'static str,
     let server = std::thread::spawn(move || {
         let mut requests = Vec::new();
         loop {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let Some(request) = read_http_request(&mut stream) else {
                 break;
             };
@@ -276,7 +281,12 @@ fn named_usage_refuses_reloaded_and_refreshed_email_changes() {
         let disk = root.path().to_path_buf();
         let old = original.clone();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let request = read_http_request(&mut stream).unwrap();
             if case == 2 {
                 write_auth_doc(
@@ -297,7 +307,12 @@ fn named_usage_refuses_reloaded_and_refreshed_email_changes() {
                     }),
                 );
             }
-            let (mut extra, _) = listener.accept().unwrap();
+            let (mut extra, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             assert!(
                 read_http_request(&mut extra).is_none(),
                 "wrong identity caused another HTTP request"

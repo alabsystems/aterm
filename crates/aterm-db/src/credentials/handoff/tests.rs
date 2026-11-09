@@ -53,7 +53,17 @@ fn round(lab: &Lab, permits: bool) -> (Repair, Repair, [crate::control::Report; 
     let controls = std::thread::scope(|tasks| {
         let receiving = tasks.spawn(|| {
             holder.exchange(
-                Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
+                Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    LinkScope::Loopback,
+                )
+                .unwrap(),
                 Side::Responder,
                 &mut right,
             )

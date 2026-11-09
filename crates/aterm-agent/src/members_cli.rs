@@ -2828,7 +2828,13 @@ mod tests {
         let at = listener.local_addr().expect("its address").to_string();
         let (rang, rings) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            loop {
+                let stream = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .map(|(stream, _)| stream);
                 drop(stream);
                 if rang.send(()).is_err() {
                     break;

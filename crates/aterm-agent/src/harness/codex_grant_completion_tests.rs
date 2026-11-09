@@ -245,7 +245,12 @@ fn malformed_http_200_response_is_retained_exactly_without_stage_publication() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         stream
             .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
             .unwrap();
@@ -332,7 +337,6 @@ fn cancelled_after_durable_arm_returns_owned_no_dispatch_without_post_or_stage_c
     hour_login(&home, now, Some("previous-refresh"));
     let before = std::fs::read(home.join(AUTH_FILE)).unwrap();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let endpoints = Endpoints {
         issuer: format!("http://127.0.0.1:{port}"),
@@ -371,7 +375,13 @@ fn cancelled_after_durable_arm_returns_owned_no_dispatch_without_post_or_stage_c
     assert!(!output.verified && output.durable);
     assert_eq!(seen.lock().unwrap().as_slice(), ["armed", "not-dispatched"]);
     assert_eq!(
-        listener.accept().unwrap_err().kind(),
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap_err()
+        .kind(),
         std::io::ErrorKind::WouldBlock
     );
     assert_eq!(std::fs::read(home.join(AUTH_FILE)).unwrap(), before);
@@ -387,7 +397,12 @@ fn sent_code_request_with_no_response_never_mints_no_dispatch_evidence() {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         stream
             .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
             .unwrap();

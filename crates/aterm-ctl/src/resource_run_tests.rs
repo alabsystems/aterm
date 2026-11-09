@@ -87,7 +87,12 @@ impl Host {
         let listener = aterm_uds::CtlListener::bind(&sock).unwrap();
         let (tx, peer) = mpsc::channel();
         let done = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream.set_read_timeout(Some(HANG)).unwrap();
             stream.set_write_timeout(Some(HANG)).unwrap();
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());

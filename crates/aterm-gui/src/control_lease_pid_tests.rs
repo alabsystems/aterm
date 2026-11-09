@@ -164,9 +164,6 @@ fn a_lease_taken_by_another_process_names_it_whatever_its_holder_says() {
     let dir = crate::test_scratch::short_dir("the lease's socket");
     let sock = dir.path().join("l.sock");
     let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
     let handle = crate::session_store::test_handle(7602);
     let service = Arc::new(LeaseService {
         ctx: Arc::clone(&handle.ctx),
@@ -195,16 +192,12 @@ fn a_lease_taken_by_another_process_names_it_whatever_its_holder_says() {
         .spawn()
         .expect("spawn the forger");
     let child_pid = child.id();
-    let (stream, _) = aterm_spec::wait::until_within(
-        aterm_spec::wait::MUST_HAPPEN,
-        "the forger connects",
-        || match listener.accept() {
-            Ok(connection) => Some(connection),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
-            Err(error) => panic!("accept forger: {error}"),
-        },
-    );
-    stream.set_nonblocking(false).expect("blocking lane stream");
+    let (stream, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Until(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .expect("the forger connects");
     assert!(lanes.admit(stream).is_ok(), "admitted");
     let mut said = String::new();
     child

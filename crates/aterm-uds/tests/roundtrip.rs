@@ -29,11 +29,12 @@ fn bound_socket_accepts_and_streams_lines() {
     let listener = CtlListener::bind(&path).expect("bind");
     let srv_token = token.clone();
     let server = std::thread::spawn(move || {
-        let stream = listener
-            .incoming()
-            .next()
-            .expect("incoming never yields None")
-            .expect("accept");
+        let (stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let mut reader = BufReader::new(stream.try_clone().expect("clone"));
         let mut writer = stream;
         let mut first = String::new();

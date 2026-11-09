@@ -922,7 +922,6 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         &mut state.heard,
     )?);
     let _ = aterm_uds::keep_out_of_children(&listener);
-    listener.set_nonblocking(true)?;
     let (cancelled, cancel) = aterm_uds::kept_out(io::pipe)?;
     let addr = listener.local_addr()?;
     let shared = Arc::new(Shared {
@@ -1863,12 +1862,15 @@ fn accept_loop(
         if ready.second || stop.load(Ordering::SeqCst) {
             return Ok(());
         }
-        match aterm_uds::kept_out(|| listener.accept()) {
+        match aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((stream, peer)) => {
                 if stop.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                stream.set_nonblocking(false)?;
                 dispatch(shared, stream, peer.ip(), refusals);
             }
             Err(e)
@@ -6755,7 +6757,6 @@ mod tests {
         });
         gone.recv_timeout(HANG_DETECTOR).unwrap();
         let replacement = TcpListener::bind(addr).unwrap();
-        replacement.set_nonblocking(true).unwrap();
         Running {
             addr,
             stop: Arc::new(AtomicBool::new(false)),
@@ -6765,7 +6766,13 @@ mod tests {
         }
         .stop();
         assert_eq!(
-            replacement.accept().unwrap_err().kind(),
+            aterm_uds::accept(
+                &replacement,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::WouldBlock,
             "a retired listener's address belongs to its replacement"
         );
@@ -12155,7 +12162,14 @@ mod tests {
     fn accepted(listener: TcpListener) -> std::sync::mpsc::Receiver<TcpStream> {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
+            loop {
+                let Ok((stream, _)) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
+                    continue;
+                };
                 if tx.send(stream).is_err() {
                     return;
                 }
@@ -12185,7 +12199,13 @@ mod tests {
         let stopping = Arc::clone(&stop);
         let peer = std::thread::spawn(move || {
             let mut dials = 0usize;
-            for stream in dropping.incoming() {
+            loop {
+                let stream = aterm_uds::accept(
+                    &dropping,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .map(|(stream, _)| stream);
                 if stopping.load(Ordering::SeqCst) {
                     break;
                 }
@@ -14644,7 +14664,12 @@ mod tests {
         let (tell, told) = std::sync::mpsc::channel();
         let served = std::thread::spawn(move || {
             // The hello `through_broker` checks first, on a connection of its own.
-            let (hello, _) = aterm_uds::accept(&listener).expect("accept hello");
+            let (hello, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept hello");
             let hi = Frame::Hello {
                 protocol: aterm_uds::lan::PROTOCOL,
                 build: "stand-in".into(),
@@ -14654,7 +14679,12 @@ mod tests {
             let theirs = Reader::new(0).frame(&hello, deadline).expect("their hello");
             assert!(matches!(theirs, Some(Frame::Hello { .. })), "{theirs:?}");
             drop(hello);
-            let (stream, _) = aterm_uds::accept(&listener).expect("accept");
+            let (stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             wire::send(&stream, &hi).expect("hello");
             let mut reader = Reader::new(0);
             let theirs = reader.frame(&stream, deadline).expect("their hello");

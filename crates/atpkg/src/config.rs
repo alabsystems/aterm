@@ -184,6 +184,16 @@ pub enum LinkTarget {
 }
 
 impl PackagesConfig {
+    /// The development checkout selected for one program, independent of whether
+    /// its link has already been materialized in the package store.
+    #[must_use]
+    pub(crate) fn checkout_path(&self, program: &str, home: Option<&Path>) -> Option<PathBuf> {
+        match classify_link(self.links.get(program)?, home) {
+            LinkTarget::Checkout(path) => Some(path),
+            LinkTarget::Repo(_) | LinkTarget::Invalid => None,
+        }
+    }
+
     /// The configured install prefix as an absolute path, or `None` for the default.
     #[must_use]
     pub fn prefix_path(&self, home: Option<&Path>) -> Option<PathBuf> {

@@ -130,8 +130,6 @@ fn serve_connection_mode(
     real_child: bool,
 ) -> io::Result<bool> {
     control_auth::peer_check(&stream).map_err(failure)?;
-    // The production lane establishes blocking mode before authentication too.
-    stream.set_nonblocking(false)?;
     stream.set_write_timeout(Some(MUST_HAPPEN))?;
     let _connection = ConnectionScope::enter(
         &context.store,
@@ -286,19 +284,19 @@ fn serve_connection_mode(
 }
 
 fn accept_until(listener: &CtlListener, deadline: Instant) -> io::Result<CtlStream> {
-    loop {
-        match aterm_uds::kept_out(|| listener.accept()) {
-            Ok((stream, _)) => return Ok(stream),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(failure("fixture connection accept hang detector expired"));
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            Err(error) => return Err(error),
+    aterm_uds::accept(
+        listener,
+        aterm_uds::AcceptWait::Until(deadline),
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .map(|(stream, _)| stream)
+    .map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            failure("fixture connection accept hang detector expired")
+        } else {
+            error
         }
-    }
+    })
 }
 
 // These are protocol nonces and a document digest, not credential material.
@@ -509,7 +507,6 @@ fn run_native_host_fixture_inner(
         0o600,
     )?;
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&socket))?;
-    listener.set_nonblocking(true)?;
     let client_token = token.clone();
     let context = ControlWorkerContext {
         active,

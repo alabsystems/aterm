@@ -237,7 +237,12 @@ fn help_fills_what_an_older_server_cannot_say() {
     let srv = std::thread::spawn(move || {
         let mut seen = Vec::new();
         for _ in 0..4 {
-            let (conn, _) = listener.accept().expect("accept");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
             let mut line = String::new();
             r.read_line(&mut line).expect("request");
@@ -308,7 +313,12 @@ fn the_exchange_backstop_refuses_an_older_servers_bare_cast() {
     let sock = scratch.path().join("old.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
-        let (conn, _) = listener.accept().expect("accept");
+        let (conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
         let mut first = String::new();
         r.read_line(&mut first).expect("read request line");
@@ -635,7 +645,12 @@ fn an_over_long_request_never_leaves_the_client() {
             move || {
                 let mut bytes = 0;
                 loop {
-                    let (conn, _) = listener.accept().expect("accept");
+                    let (conn, _) = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .expect("accept");
                     let _ = conn.set_read_timeout(Some(HANG));
                     let _ = conn.set_write_timeout(Some(HANG));
                     let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
@@ -981,7 +996,12 @@ fn a_workers_task_follows_only_the_servers_go() {
     let deadline = Some(std::time::Duration::from_secs(60));
     let serve = |answers: &'static [&'static str], listener: UnixListener| {
         std::thread::spawn(move || {
-            let (conn, _) = listener.accept().expect("accept");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut w = conn.try_clone().expect("clone");
             let mut r = std::io::BufReader::new(conn);
             let mut first = String::new();
@@ -1099,7 +1119,12 @@ fn a_spawn_whose_answer_cannot_be_printed_still_records_its_worker() {
     let go = aterm_types::control_verbs::task_frame_go(task.len());
     let srv = std::thread::spawn(move || {
         for _ in 0..2 {
-            let (conn, _) = listener.accept().expect("accept");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut w = conn.try_clone().expect("clone");
             let mut r = std::io::BufReader::new(conn);
             let mut first = String::new();
@@ -1232,7 +1257,11 @@ fn recording_instance(listener: aterm_uds::CtlListener) -> std::thread::JoinHand
     std::thread::spawn(move || {
         let mut lines = Vec::new();
         loop {
-            let Ok((conn, _)) = listener.accept() else {
+            let Ok((conn, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 return lines;
             };
             let mut line = String::new();
@@ -1372,7 +1401,12 @@ fn a_host_that_took_the_request_ends_the_call() {
     let gone = host.clone();
     let hosted = std::thread::spawn(move || {
         let take = || {
-            let (conn, _) = listener.accept().expect("accept");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut line = String::new();
             BufReader::new(&conn).read_line(&mut line).expect("request");
             (conn, line)
@@ -1806,7 +1840,12 @@ fn a_server_that_stalls_is_a_named_wait_not_eagain() {
     let srv = std::thread::spawn(move || {
         let mut seen = Vec::new();
         for reply in replies {
-            let (conn, _) = listener.accept().expect("accept");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut r = std::io::BufReader::new(conn);
             let mut first = String::new();
             r.read_line(&mut first).expect("request line");
@@ -1874,7 +1913,12 @@ fn a_turn_cut_after_its_verdict_exits_75_never_1() {
     let srv = std::thread::spawn(move || {
         let mut seen = Vec::new();
         for reply in replies {
-            let (conn, _) = listener.accept().expect("accept");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut first = String::new();
             std::io::BufReader::new(&conn)
                 .read_line(&mut first)
@@ -2082,7 +2126,12 @@ fn an_empty_selector_never_reaches_the_socket_and_a_named_one_does() {
     let sock = scratch.path().join("s.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
-        let (conn, _) = listener.accept().expect("accept");
+        let (conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
         let mut line = String::new();
         r.read_line(&mut line).expect("request");
@@ -2886,7 +2935,12 @@ fn mock_instance(
     let _ = std::fs::remove_file(&sock);
     let listener = aterm_uds::CtlListener::bind(&sock).expect("bind mock instance");
     let srv = std::thread::spawn(move || {
-        let (conn, _) = listener.accept().expect("accept");
+        let (conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
         let mut line = String::new();
         loop {
@@ -3019,7 +3073,6 @@ fn discovery_skips_dead_and_foreign_graph_entries_and_dials_the_reachable() {
     let foreign_sock = private.join("a.sock");
     let foreign_listener =
         std::os::unix::net::UnixListener::bind(&foreign_sock).expect("bind foreign");
-    foreign_listener.set_nonblocking(true).expect("nonblocking");
     entry("s-foreign", &foreign_sock, me);
     std::fs::write(public.join("b.sock.token"), "feedbeef\n").expect("token");
     let (reach_sock, srv) = mock_instance(&public, "b.sock", b"OK 1\nlocal s-reach row\n");
@@ -3076,16 +3129,26 @@ fn discovery_skips_dead_and_foreign_graph_entries_and_dials_the_reachable() {
     }
     assert_eq!(srv.join().expect("mock"), "sessions\n");
     assert_eq!(
-        foreign_listener.accept().map(drop).map_err(|e| e.kind()),
+        aterm_uds::accept(
+            &foreign_listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .map(drop)
+        .map_err(|e| e.kind()),
         Err(io::ErrorKind::WouldBlock),
         "the foreign instance was never connected to"
     );
     assert_eq!(foreign_note("ls", &probes), None, "ls says nothing more");
     assert_eq!(foreign_note("instances", &probes), None);
 
-    foreign_listener.set_nonblocking(false).expect("blocking");
     let refuse = std::thread::spawn(move || {
-        let (mut conn, _) = foreign_listener.accept().expect("the explicit dial");
+        let (mut conn, _) = aterm_uds::accept(
+            &foreign_listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("the explicit dial");
         let mut first = String::new();
         let _ = std::io::BufRead::read_line(
             &mut std::io::BufReader::new(conn.try_clone().expect("clone")),
@@ -3162,7 +3225,12 @@ fn a_reply_sent_before_the_peer_hung_up_is_read() {
     let sock = scratch.path().join("mock.sock");
     let listener = aterm_uds::CtlListener::bind(&sock).expect("bind mock instance");
     let srv = std::thread::spawn(move || {
-        let (mut conn, _) = listener.accept().expect("accept");
+        let (mut conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         conn.write_all(b"ERR auth\n").expect("write reply");
     });
     let stream = CtlStream::connect(&sock).expect("connect");
@@ -3201,7 +3269,12 @@ fn probe_deadline_is_total_against_a_trickling_peer() {
     let sock = scratch.path().join("mock.sock");
     let listener = aterm_uds::CtlListener::bind(&sock).expect("bind trickle mock");
     let server = std::thread::spawn(move || {
-        let (mut conn, _) = listener.accept().expect("accept trickle client");
+        let (mut conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept trickle client");
         let mut reader = std::io::BufReader::new(conn.try_clone().expect("clone client"));
         let mut request = String::new();
         reader.read_line(&mut request).expect("read probe request");
@@ -3311,7 +3384,12 @@ fn a_front_door_failure_after_the_send_is_delivered() {
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).expect("bind mock socket");
         std::thread::spawn(move || {
-            let (conn, _) = listener.accept().expect("accept");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
             let mut w = conn;
             let mut lines = Vec::new();
@@ -3332,7 +3410,12 @@ fn a_front_door_failure_after_the_send_is_delivered() {
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
-        let (conn, _) = listener.accept().expect("accept");
+        let (conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let mut reader = std::io::BufReader::new(conn);
         let mut heard = String::new();
         for _ in 0..2 {
@@ -3364,7 +3447,12 @@ fn a_front_door_failure_after_the_send_is_delivered() {
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
-        let (mut conn, _) = listener.accept().expect("accept");
+        let (mut conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let mut hello = [0u8; 14];
         conn.read_exact(&mut hello).expect("auth line");
         conn.write_all(b"ERR auth\n").expect("refusal");
@@ -3401,9 +3489,12 @@ fn a_front_door_forward_nobody_accepts_is_never_sent() {
     assert!(!front_door_delivered(&e), "{e}");
     assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
 
-    listener.set_nonblocking(true).expect("nonblocking");
-    let (mut conn, _) = listener.accept().expect("the queued connection");
-    conn.set_nonblocking(false).expect("blocking");
+    let (mut conn, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Ready,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .expect("the queued connection");
     let mut queued = String::new();
     conn.read_to_string(&mut queued).expect("the queued bytes");
     assert_eq!(
@@ -3439,8 +3530,13 @@ fn a_front_door_ask_counts_an_aterm_only_where_it_answers() {
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
-        'conns: for conn in listener.incoming() {
-            let conn = conn.expect("accept");
+        'conns: loop {
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
             let mut w = conn;
             for (n, answer) in [&b""[..], b"OK version=test\n", b"OK schema=1 fleet=off\n"]
@@ -3484,9 +3580,11 @@ fn a_front_door_ask_reads_a_stopped_aterm_as_that_before_it_sends_or_waits() {
         front_door_ask_at(&path, ("status\n", HANG_DETECTOR), |pid| pid == us),
         FrontDoorAnswer::Stopped(us)
     );
-    listener.set_nonblocking(true).expect("nonblocking");
-    while let Ok((mut conn, _)) = listener.accept() {
-        conn.set_nonblocking(false).expect("blocking");
+    while let Ok((mut conn, _)) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Ready,
+        aterm_uds::AcceptedMode::Blocking,
+    ) {
         let mut sent = String::new();
         conn.read_to_string(&mut sent).expect("the queued bytes");
         assert_eq!(sent, "", "nothing is sent to a stopped aterm");
@@ -4034,8 +4132,14 @@ fn a_forward_whose_host_went_away_is_a_replacement_not_a_refusal() {
     };
     fn serve(listener: UnixListener, reply: String) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                let Ok(mut conn) = conn else { return };
+            loop {
+                let Ok((mut conn, _)) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
+                    return;
+                };
                 let mut line = String::new();
                 if std::io::BufReader::new(&conn)
                     .read_line(&mut line)
@@ -4115,7 +4219,11 @@ fn serve_required_server(
 ) -> io::Result<Vec<String>> {
     use std::io::{BufRead as _, Write as _};
 
-    let (stream, _) = listener.accept()?;
+    let (stream, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )?;
     stream.set_read_timeout(Some(HANG_DETECTOR))?;
     stream.set_write_timeout(Some(HANG_DETECTOR))?;
     ready.send(()).unwrap();
@@ -4253,9 +4361,12 @@ fn a_dead_listen_queue_fails_fast_and_named() {
     let waited = started.elapsed();
     assert_eq!(outcome, ExitCode::from(EXIT_UNREACHABLE));
     assert!(waited < HANG_DETECTOR, "the connect phase took {waited:?}");
-    listener.set_nonblocking(true).expect("nonblocking");
-    let (mut conn, _) = listener.accept().expect("the queued connection");
-    conn.set_nonblocking(false).expect("blocking");
+    let (mut conn, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Ready,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .expect("the queued connection");
     let mut queued = Vec::new();
     conn.read_to_end(&mut queued).expect("the queued bytes");
     assert_eq!(queued, [&b"AUTH deadbeef\n"[..], ACCEPT_PROBE].concat());
@@ -4318,7 +4429,12 @@ fn the_retry_after_a_replaced_listener_sends_the_new_token() {
     let server = {
         let sock = sock.clone();
         std::thread::spawn(move || {
-            let (held, _) = predecessor.accept().expect("accept the first attempt");
+            let (held, _) = aterm_uds::accept(
+                &predecessor,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept the first attempt");
             let mut first = Vec::new();
             let mut held_lines = std::io::BufReader::new(&held);
             for _ in 0..2 {
@@ -4335,7 +4451,12 @@ fn the_retry_after_a_replaced_listener_sends_the_new_token() {
             drop(held_lines);
             drop(held);
             drop(predecessor);
-            let (conn, _) = successor.accept().expect("accept the retry");
+            let (conn, _) = aterm_uds::accept(
+                &successor,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept the retry");
             let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
             let mut w = conn;
             let mut lines = Vec::new();
@@ -4394,9 +4515,14 @@ fn the_token_read_for_a_connection_is_its_listeners() {
     })
     .expect("connect");
     let successor = successor.expect("the read ran");
-    predecessor.set_nonblocking(true).expect("nonblocking");
-    successor.set_nonblocking(true).expect("nonblocking");
-    let holds = |l: &aterm_uds::CtlListener| l.accept().is_ok();
+    let holds = |l: &aterm_uds::CtlListener| {
+        aterm_uds::accept(
+            l,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .is_ok()
+    };
     let holders_token = match (holds(&predecessor), holds(&successor)) {
         (true, false) => "deadbeef",
         (false, true) => "cafef00d",
@@ -4425,9 +4551,14 @@ fn a_token_read_through_the_alias_is_the_connected_instances() {
         read_token_beside(at)
     })
     .expect("connect");
-    first.set_nonblocking(true).expect("nonblocking");
-    second.set_nonblocking(true).expect("nonblocking");
-    let holds = |l: &aterm_uds::CtlListener| l.accept().is_ok();
+    let holds = |l: &aterm_uds::CtlListener| {
+        aterm_uds::accept(
+            l,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .is_ok()
+    };
     let holders_token = match (holds(&first), holds(&second)) {
         (true, false) => "aaaa",
         (false, true) => "bbbb",
@@ -4448,7 +4579,12 @@ fn a_busy_reply_is_reported_as_busy() {
     let sock = dir.join("mock.sock");
     let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
     let server = std::thread::spawn(move || {
-        let (mut conn, _) = listener.accept().expect("accept");
+        let (mut conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         conn.write_all(b"ERR control server busy; retry\n")
             .expect("busy");
     });
@@ -4658,7 +4794,12 @@ fn a_sys_instances_all_run_sends_the_plain_request_to_each_instance() {
     let sock = scratch.path().join("s.sock");
     let listener = UnixListener::bind(&sock).expect("bind mock socket");
     let srv = std::thread::spawn(move || {
-        let (conn, _) = listener.accept().expect("accept");
+        let (conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
         let mut line = String::new();
         r.read_line(&mut line).expect("request");
@@ -4810,7 +4951,11 @@ fn hanging_up_first(
     then: impl FnOnce() + Send + 'static,
 ) -> std::thread::JoinHandle<Vec<String>> {
     std::thread::spawn(move || {
-        if let Ok((conn, _)) = listener.accept() {
+        if let Ok((conn, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             let mut line = String::new();
             let _ = BufReader::new(&conn).read_line(&mut line);
             then();
@@ -4828,7 +4973,11 @@ fn serve_workers(listener: &aterm_uds::CtlListener, sids: &[&str]) -> Vec<String
     let mut lines = Vec::new();
     let mut sids = sids.iter();
     loop {
-        let Ok((conn, _)) = listener.accept() else {
+        let Ok((conn, _)) = aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return lines;
         };
         let mut reader = BufReader::new(&conn);

@@ -171,22 +171,27 @@ fn google_provider_success_redirect_and_lost_body_keep_one_charge_and_one_reques
         let dir=transport::tests::socket_dir();
         aterm_uds::private_file::create_private_dir(dir.path()).unwrap();
         let listener=aterm_uds::kept_out(|| TcpListener::bind("127.0.0.1:0")).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let origin=format!("http://{}",listener.local_addr().unwrap());
         let mut host=google::test_bind_at(dir.path(),b,Limits::default(),origin).unwrap();
         let (done, released)=mpsc::channel();
         thread::scope(|scope| {
             let server=scope.spawn(move || {
-                aterm_uds::ready::until(listener.as_fd(),aterm_uds::ready::Interest::Read,deadline()).unwrap();
-                let (mut stream,_)=aterm_uds::kept_out(|| listener.accept()).unwrap();
-                stream.set_nonblocking(true).unwrap();
+                let (mut stream,_) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Until(deadline()),
+                    aterm_uds::AcceptedMode::Nonblocking,
+                ).unwrap();
                 read_request(&mut stream);
                 stream.set_nonblocking(false).unwrap();
                 stream.set_write_timeout(Some(Duration::from_secs(60))).unwrap();
                 stream.write_all(wire).unwrap();
                 drop(stream);
                 let _=released.recv_timeout(Duration::from_secs(60));
-                assert!(listener.accept().is_err_and(|e|e.kind()==io::ErrorKind::WouldBlock),"unexpected provider retry");
+                assert!(aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                ).is_err_and(|e|e.kind()==io::ErrorKind::WouldBlock),"unexpected provider retry");
             });
             let first=call(dir.path(),&token,INPUT);
             poll_to_finish(&mut host,&first);
@@ -215,7 +220,6 @@ fn google_invalid_request_does_not_contact_provider_or_consume_its_id() {
     let dir = transport::tests::socket_dir();
     aterm_uds::private_file::create_private_dir(dir.path()).unwrap();
     let listener = aterm_uds::kept_out(|| TcpListener::bind("127.0.0.1:0")).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let mut host = google::test_bind_at(
         dir.path(),
         b,
@@ -233,9 +237,12 @@ fn google_invalid_request_does_not_contact_provider_or_consume_its_id() {
     assert_eq!(reply.status, Status::Refused);
     assert!(!reply.entered);
     assert!(
-        listener
-            .accept()
-            .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock)
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock)
     );
     assert_eq!(
         f.source(31, 0)
@@ -256,20 +263,17 @@ fn google_invalid_request_does_not_contact_provider_or_consume_its_id() {
 fn google_one_call_owner_survives_restart_without_replaying_a_logical_request() {
     let (f, broker, _) = fixture();
     let listener = aterm_uds::kept_out(|| TcpListener::bind("127.0.0.1:0")).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let (done, released) = mpsc::channel();
     thread::scope(|scope| {
         let server = scope.spawn(move || {
             for _ in 0..2 {
-                aterm_uds::ready::until(
-                    listener.as_fd(),
-                    aterm_uds::ready::Interest::Read,
-                    deadline(),
+                let (mut stream, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Until(deadline()),
+                    aterm_uds::AcceptedMode::Nonblocking,
                 )
                 .unwrap();
-                let (mut stream, _) = aterm_uds::kept_out(|| listener.accept()).unwrap();
-                stream.set_nonblocking(true).unwrap();
                 read_request(&mut stream);
                 stream.set_nonblocking(false).unwrap();
                 stream
@@ -281,9 +285,12 @@ fn google_one_call_owner_survives_restart_without_replaying_a_logical_request() 
             }
             released.recv_timeout(Duration::from_secs(60)).unwrap();
             assert!(
-                listener
-                    .accept()
-                    .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock)
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock)
             );
         });
         let fresh = || {

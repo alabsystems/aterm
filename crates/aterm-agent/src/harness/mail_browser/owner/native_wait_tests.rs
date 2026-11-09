@@ -23,7 +23,6 @@ impl Provider {
         let endpoint = Endpoint::new(home.path(), "one@proton.me").unwrap();
         let listener = aterm_uds::kept_out(|| CtlListener::bind(&endpoint.socket)).unwrap();
         std::fs::set_permissions(&endpoint.socket, std::fs::Permissions::from_mode(0o600)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let peer = std::thread::spawn({
             let stop = Arc::clone(&stop);
@@ -32,7 +31,11 @@ impl Provider {
                 let until = Instant::now() + Duration::from_secs(60);
                 let (mut received, mut admitted) = (0, 0);
                 loop {
-                    let mut raw = match listener.accept() {
+                    let mut raw = match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Nonblocking,
+                    ) {
                         Ok((stream, _)) => stream,
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                             if stop.load(Ordering::Acquire) {
@@ -45,7 +48,6 @@ impl Provider {
                         Err(error) => panic!("owned mailbox socket: {error}"),
                     };
                     private_peer(&raw).unwrap();
-                    raw.set_nonblocking(true).unwrap();
                     let mut input = DeadlineStream {
                         stream: &mut raw,
                         end: Instant::now() + Duration::from_secs(60),

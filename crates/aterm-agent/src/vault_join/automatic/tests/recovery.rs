@@ -140,7 +140,12 @@ impl Recovery {
         let address = listener.local_addr().unwrap();
         let handle = self.service.handle();
         let served = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream.set_read_timeout(Some(HANG)).unwrap();
             stream.set_write_timeout(Some(HANG)).unwrap();
             handle.serve(&mut stream, "172.20.10.40".parse().unwrap())

@@ -139,7 +139,11 @@ fn an_admitted_ask_rechecks_after_the_real_member_greeting() {
             let dial = |_: &str| -> Result<Box<dyn join::Stream>> {
                 let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
                 let ours = std::net::TcpStream::connect(listener.local_addr()?)?;
-                let (mut theirs, from) = listener.accept()?;
+                let (mut theirs, from) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )?;
                 for stream in [&ours, &theirs] {
                     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
                     stream.set_write_timeout(Some(Duration::from_secs(60)))?;

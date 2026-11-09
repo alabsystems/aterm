@@ -6656,7 +6656,11 @@ fn scratch_server(tag: &str) -> (String, std::thread::JoinHandle<Vec<String>>) {
     let path = sock.to_string_lossy().into_owned();
     let h = std::thread::spawn(move || {
         let mut seen = Vec::new();
-        'conns: while let Ok((stream, _)) = listener.accept() {
+        'conns: while let Ok((stream, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             let mut w = stream.try_clone().unwrap();
             for line in BufReader::new(stream).lines() {
                 let Ok(line) = line else { continue 'conns };
@@ -45141,7 +45145,11 @@ fn the_hosted_loop_presents_the_in_memory_token_and_falls_back_beside() {
     let h = std::thread::spawn(move || {
         let mut seen: Vec<(String, String)> = Vec::new();
         for refuse in [false, true, false] {
-            let Ok((stream, _)) = listener.accept() else {
+            let Ok((stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 break;
             };
             let mut w = stream.try_clone().unwrap();
@@ -45213,7 +45221,11 @@ fn the_windows_disk_resume_presents_the_in_memory_token() {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut seen: Vec<(String, String)> = Vec::new();
-            let Ok((stream, _)) = listener.accept() else {
+            let Ok((stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 return;
             };
             let mut w = stream.try_clone().unwrap();
@@ -45281,7 +45293,11 @@ fn the_windows_sweeps_present_the_in_memory_token_on_its_own_socket() {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut seen: Vec<(String, String)> = Vec::new();
-        while let Ok((stream, _)) = listener.accept() {
+        while let Ok((stream, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             let mut w = stream.try_clone().unwrap();
             let mut r = BufReader::new(stream);
             let mut auth = String::new();

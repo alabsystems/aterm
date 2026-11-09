@@ -12,6 +12,21 @@ license.workspace = true
 repository.workspace = true
 description = "Search primitives for aterm terminal content"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
+# Both current test targets read the monotonic clock for cost diagnostics. The
+# clock and scheduler are not bounded runtime inputs, so neither may carry.
+[package.metadata.aterm.test-inputs.targets.lib]
+bounded = false
+
+[package.metadata.aterm.test-inputs.targets."test:search_suite"]
+bounded = false
+
 [dependencies]
 aterm-types = { workspace = true }
 aterm-hash = { workspace = true }

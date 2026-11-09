@@ -336,9 +336,14 @@ fn atpkg_takes_a_members_unit_over_its_node_services_units_op() {
         super::super::dial_units_at(&watched_at, &unmeshed, here).is_none(),
         "a node that dials no mesh must leave the unit to port 7487"
     );
-    watched.set_nonblocking(true).unwrap();
     assert_eq!(
-        watched.accept().map(|_| ()).map_err(|e| e.kind()),
+        aterm_uds::accept(
+            &watched,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .map(|_| ())
+        .map_err(|e| e.kind()),
         Err(std::io::ErrorKind::WouldBlock),
         "a node that dials no mesh must dial nothing"
     );

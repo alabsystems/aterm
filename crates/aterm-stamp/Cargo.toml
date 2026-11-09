@@ -12,6 +12,13 @@ license.workspace = true
 repository.workspace = true
 description = "The aterm binary's identity record: the version, commit, build and index hint a library reads at run time instead of compiling in."
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 # No dependencies: the record's writer (crates/aterm/build.rs) builds against it too.
 [dependencies]
 

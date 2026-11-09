@@ -5219,9 +5219,14 @@ fn a_dark_issuer_costs_its_member_one_deadline() {
         reads[1].peer, kept,
         "a book that did not come leaves the copy, and it is asked"
     );
-    dark.set_nonblocking(true).unwrap();
     let mut dials = 0;
-    while dark.accept().is_ok() {
+    while aterm_uds::accept(
+        &dark,
+        aterm_uds::AcceptWait::Ready,
+        aterm_uds::AcceptedMode::Nonblocking,
+    )
+    .is_ok()
+    {
         dials += 1;
     }
     assert_eq!(dials, 1, "the issuer was dialled once");
@@ -5235,14 +5240,17 @@ struct Closing {
 
 impl Closing {
     fn on(listener: TcpListener) -> Self {
-        listener.set_nonblocking(true).unwrap();
         let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let running = Arc::new(AtomicBool::new(true));
         let taking = std::thread::spawn({
             let (taken, running) = (Arc::clone(&taken), Arc::clone(&running));
             move || {
                 while running.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Nonblocking,
+                    ) {
                         Ok((stream, _)) => {
                             taken.fetch_add(1, Ordering::SeqCst);
                             drop(stream);
@@ -6699,7 +6707,14 @@ fn a_drive_is_served_by_a_listener_that_hung_up_on_its_first_connection() {
     let serving = std::thread::spawn({
         let host = host.clone();
         move || {
-            drop(listener.accept().unwrap());
+            drop(
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap(),
+            );
             node_listener_on(listener, host, &[FleetOp::Drive])
         }
     });
@@ -6735,9 +6750,12 @@ fn a_dial_takes_one_pass_however_long_its_budget() {
     let hanging = std::thread::spawn({
         let accepted = Arc::clone(&accepted);
         move || {
-            listener.set_nonblocking(true).unwrap();
             while end.try_recv().is_err() {
-                match listener.accept() {
+                match aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Nonblocking,
+                ) {
                     Ok(connection) => {
                         accepted.fetch_add(1, Ordering::SeqCst);
                         drop(connection);
@@ -7188,7 +7206,16 @@ fn a_holder_proves_itself_at_any_level_and_only_another_fleet_or_key_disowns_it(
 fn a_listener_that_hangs_up_in_the_handshake_is_said_to() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let hanging = std::thread::spawn(move || drop(listener.accept().unwrap()));
+    let hanging = std::thread::spawn(move || {
+        drop(
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap(),
+        );
+    });
     let dialled = dial(
         "127.0.0.1",
         None,
@@ -11314,7 +11341,6 @@ fn pushed_facts_under_an_unread_log_are_neither_admitted_nor_pruned() {
 #[test]
 fn an_unread_log_pushes_survey_facts_to_no_one() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let me = identity(&node_of(0x61), 0x61);
     let issuer = identity(&node_of(0x62), 0x62);
     let peer = Peer {
@@ -11343,9 +11369,12 @@ fn an_unread_log_pushes_survey_facts_to_no_one() {
         Err(why.to_owned())
     );
     assert!(
-        listener
-            .accept()
-            .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Nonblocking,
+        )
+        .is_err_and(|e| e.kind() == io::ErrorKind::WouldBlock),
         "an unread log dialed the issuer"
     );
 }

@@ -1086,7 +1086,12 @@ mod tests {
             .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
             .expect("nc");
-        let (stream, _) = listener.accept().expect("accept");
+        let (stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let id = Identity::for_self(IdentityPolicy::Designated).expect("own requirement");
         let refused = verdict(id.check(&stream, WITHIN));
         assert!(

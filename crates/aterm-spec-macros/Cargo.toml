@@ -9,6 +9,13 @@ license.workspace = true
 authors.workspace = true
 description = "Proc macros for aterm TLA+ refinement mapping"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [lib]
 proc-macro = true
 # No unit tests live in src/, so this lib's libtest harness ran 0 tests in every

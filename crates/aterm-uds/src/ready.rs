@@ -921,18 +921,24 @@ mod tests {
     }
 
     /// A LISTENER IS READY WITH A CONNECTION WAITING: [`one`] ends once a connect is queued, and
-    /// a nonblocking accept then finds it.
+    /// a `Ready` accept then finds it.
     #[test]
     fn one_ends_when_a_listener_has_a_connection_to_accept() {
         let root = aterm_tempfile::tempdir().expect("a folder");
         let path = root.path().join("ready.sock");
         let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
-        listener.set_nonblocking(true).expect("nonblocking");
         let (said, heard) = std::sync::mpsc::channel();
         let waiter = std::thread::spawn(move || {
             one(listener.as_fd()).expect("the wait");
-            said.send(listener.accept().is_ok())
-                .expect("the test listens");
+            said.send(
+                crate::accept(
+                    &listener,
+                    crate::AcceptWait::Ready,
+                    crate::AcceptedMode::Blocking,
+                )
+                .is_ok(),
+            )
+            .expect("the test listens");
         });
         let _client = UnixStream::connect(&path).expect("connect");
         assert!(heard.recv_timeout(HANG).expect("the wait ended"));

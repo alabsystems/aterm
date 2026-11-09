@@ -328,9 +328,22 @@ fn a_command_gets_its_cwd_and_exactly_its_env() {
     ];
     let ended = agent.request(&Frame::Exec(exec)).ended();
     assert_eq!(ended.exit, Exit::Exited(0), "{}", ended.err());
+    // The non-Linux test seam now links aterm-uds. CoreFoundation's process initializer adds
+    // this child-owned row before `main`, even when exec receives an otherwise empty envp. It is
+    // not inherited from the agent; keep its exact value in the macOS negative control.
+    #[cfg(target_os = "macos")]
+    let child_owned = format!(
+        "__CF_USER_TEXT_ENCODING=0x{:X}:0x0:0x0\n",
+        std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(agent.dir.path()).unwrap())
+    );
+    #[cfg(not(target_os = "macos"))]
+    let child_owned = "";
     assert_eq!(
         ended.out(),
-        format!("EMPTY=\nHOME=/home/me.guest\ncwd={}\n", cwd.display()),
+        format!(
+            "EMPTY=\nHOME=/home/me.guest\n{child_owned}cwd={}\n",
+            cwd.display()
+        ),
         "nothing of the agent's environment reaches the command"
     );
 }

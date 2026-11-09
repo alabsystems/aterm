@@ -438,7 +438,9 @@ pub(crate) fn accounts_until(
             None
         }
     };
-    let selected = match crate::generation::observed_paths_within(paths, read_by, wait) {
+    // Name the home this read opens; a successor home's predecessors are observed once, after its
+    // own custody is opened below.
+    let selected = match crate::generation::observed_generation_until(paths, read_by) {
         Ok(paths) => paths,
         Err(error) => {
             return stopped(&error).unwrap_or_else(|| {
@@ -478,9 +480,9 @@ pub(crate) fn accounts_until(
         Ok(true) => {}
     }
     // Observation must not establish missing current or predecessor custody.
-    let bootstrap =
+    let (bootstrap, journal) =
         match commons::bootstrap::Bootstrap::established_with_journal_until(paths, wait()) {
-            Ok((bootstrap, _)) => bootstrap,
+            Ok(established) => established,
             Err(error) => {
                 return stopped(&crate::table::failure(error)).unwrap_or_else(|| {
                     failed_observation(now_ms, "Commons custody could not be verified")
@@ -501,30 +503,37 @@ pub(crate) fn accounts_until(
     };
     #[cfg(test)]
     tests::bootstrapped();
-    let session = match crate::table::Session::observe_within(&bootstrap, read_by, wait) {
-        Ok(session) => session,
+    // A successor home's predecessors, observed once, after every wait for this home's custody;
+    // the session keeps that observation for its checks.
+    let selection = match crate::generation::observe_generation(bootstrap.paths(), read_by, wait) {
+        Ok(selection) => selection,
         Err(error) => {
             return stopped(&error).unwrap_or_else(|| {
-                failed_observation(now_ms, "Account access could not be verified")
+                failed_observation(now_ms, "Commons writer recovery is pending")
             });
         }
     };
+    let session =
+        match crate::table::Session::observe_selected(&bootstrap, journal, selection, read_by) {
+            Ok(session) => session,
+            Err(error) => {
+                return stopped(&error).unwrap_or_else(|| {
+                    failed_observation(now_ms, "Account access could not be verified")
+                });
+            }
+        };
     #[cfg(test)]
     tests::observed();
     // The session and table snapshots read beside writers. A newer control
     // history or table witness makes this observation stale; read it afresh.
     // Otherwise changed claims refuse and damaged custody remains a failure.
     let stale = |error: &crate::Error| {
-        stopped(error).or_else(|| {
-            match crate::table::Session::observe_within(&bootstrap, read_by, wait)
-                .and_then(|now| now.observation())
-            {
-                Ok(current) => session
-                    .observation()
-                    .is_ok_and(|previous| current != previous)
-                    .then(|| control_busy(now_ms)),
-                Err(error) => stopped(&error),
-            }
+        stopped(error).or_else(|| match session.observation_afresh() {
+            Ok(current) => session
+                .observation()
+                .is_ok_and(|previous| current != previous)
+                .then(|| control_busy(now_ms)),
+            Err(error) => stopped(&error),
         })
     };
     // A retained enrollment claim can outlive its data directory.
@@ -1353,7 +1362,6 @@ pub(crate) mod tests {
     fn failed_network_refresh_keeps_cache_and_receipts_and_recovery_clears_only_failure() {
         use aterm_secrets::server;
         use std::io::{Read as _, Write as _};
-        use std::os::fd::AsFd as _;
 
         let mut fixture = VaultFixture::new();
         let paths = &fixture.paths;
@@ -1372,14 +1380,12 @@ pub(crate) mod tests {
         let failed = std::thread::spawn(move || {
             // The stopped server left this shared descriptor nonblocking. It has no
             // other acceptor now; wait for the request before its single accept.
-            aterm_uds::ready::until(
-                listener.as_fd(),
-                aterm_uds::ready::Interest::Read,
-                Instant::now() + Duration::from_secs(60),
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(Instant::now() + Duration::from_secs(60)),
+                aterm_uds::AcceptedMode::Blocking,
             )
             .unwrap();
-            let (mut stream, _) = aterm_uds::kept_out(|| listener.accept()).unwrap();
-            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(60)))
                 .unwrap();
@@ -2073,7 +2079,8 @@ pub(crate) mod tests {
     }
 
     thread_local! {
-        /// Run after custody admission, before the table session revalidates it.
+        /// Run after custody admission, before the read observes a successor home's predecessors
+        /// and its table session revalidates the custody.
         static BOOTSTRAPPED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
             const { std::cell::RefCell::new(None) };
         /// Run once [`accounts`] has observed its session.
@@ -2092,6 +2099,10 @@ pub(crate) mod tests {
     /// Run `hook` once this thread's next read has admitted its home's custody.
     pub(crate) fn after_custody(hook: impl FnMut() + 'static) {
         BOOTSTRAPPED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+    /// Run `hook` once this thread's next read has opened its session.
+    pub(crate) fn after_observed(hook: impl FnMut() + 'static) {
+        OBSERVED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     }
     pub(super) fn observed() {
         let hook = OBSERVED.with(|hook| hook.borrow_mut().take());

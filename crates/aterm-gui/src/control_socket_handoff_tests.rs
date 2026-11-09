@@ -79,13 +79,23 @@ fn a_scheduled_committed_predecessor_releases_the_control_socket() {
                 Some(new_token.as_str())
             );
             let client = CtlStream::connect(&plan.sock_path).unwrap();
-            let (accepted, _) = successor.accept().unwrap();
+            let (accepted, _) = aterm_uds::accept(
+                &successor,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             control_auth::peer_check(&accepted).unwrap();
             drop((client, accepted, successor));
         } else {
             assert_eq!(std::fs::read(&plan.token_path).unwrap(), before);
             let client = CtlStream::connect(&plan.sock_path).unwrap();
-            let (accepted, _) = parent.as_ref().unwrap().accept().unwrap();
+            let (accepted, _) = aterm_uds::accept(
+                parent.as_ref().unwrap(),
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             control_auth::peer_check(&accepted).unwrap();
             drop((client, accepted));
         }
@@ -228,14 +238,17 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
 
     exit_tx.send(()).unwrap();
     step(&model, &mut state, "Exit");
-    parent.set_nonblocking(true).unwrap();
     let mut probes = Vec::new();
     until_within(
         MUST_HAPPEN,
         "the worker probes the live listener twice and dials it again",
         || {
             if probes.len() < HELD_DIAL - 1 {
-                match parent.accept() {
+                match aterm_uds::accept(
+                    &parent,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) {
                     Ok((probe, _)) => probes.push(probe),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(error) => panic!("accept the worker's probe: {error}"),
@@ -282,7 +295,12 @@ fn fixed_socket_bind_follows_real_commit_gate_and_parent_exit() {
         Some(successor_token.as_str())
     );
     let client = CtlStream::connect(&plan.sock_path).unwrap();
-    let (accepted, _) = successor.accept().unwrap();
+    let (accepted, _) = aterm_uds::accept(
+        &successor,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     control_auth::peer_check(&accepted).unwrap();
     drop((client, accepted, successor));
     leave(&plan);
@@ -331,7 +349,15 @@ fn failed_candidate_and_unrelated_live_owner_keep_socket_and_token() {
     assert_eq!(dialed, 0, "the successor probed over a live predecessor");
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), before);
     let client = CtlStream::connect(&plan.sock_path).unwrap();
-    drop((client, parent.accept().unwrap()));
+    drop((
+        client,
+        aterm_uds::accept(
+            &parent,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap(),
+    ));
 
     step(&model, &mut state, "Exit");
     step(&model, &mut state, "ForeignBind");
@@ -525,7 +551,12 @@ fn a_transient_handoff_bind_failure_recovers_without_rewriting_credentials() {
     assert_eq!(pauses, [Duration::from_millis(50)]);
     assert_eq!(std::fs::read(&plan.token_path).unwrap(), before);
     let client = CtlStream::connect(&plan.sock_path).unwrap();
-    let (accepted, _) = listener.accept().unwrap();
+    let (accepted, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     control_auth::peer_check(&accepted).unwrap();
     assert_eq!(control_auth::read_token(&plan.sock_path).unwrap(), token);
 
@@ -676,7 +707,12 @@ fn startup_bind_retry_unlinks_a_leftover_and_keeps_a_path_that_turned_live() {
     assert_eq!(attempts, 1);
     let sibling = sibling.expect("the sibling bound during the pause");
     let client = CtlStream::connect(&plan.sock_path).unwrap();
-    let (accepted, _) = sibling.accept().unwrap();
+    let (accepted, _) = aterm_uds::accept(
+        &sibling,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     drop((client, accepted, sibling));
     leave(&plan);
 

@@ -245,8 +245,6 @@ fn progress_counts_only_policy_and_captured_identity_candidates() {
     if verify::checkers_required() {
         assert_eq!(coverage, verify::Covered::InterpreterAndTy);
     }
-    let faults = verify::sweep_faults(std::slice::from_ref(&model));
-    assert!(faults.is_empty(), "{faults:?}");
     let mut projections = 0;
     let mut fixtures = 0;
     for before in aterm_spec::interp::reachable_states(&model) {

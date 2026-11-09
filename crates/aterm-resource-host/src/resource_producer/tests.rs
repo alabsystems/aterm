@@ -53,7 +53,6 @@ fn cached_helper_parent_challenge_and_stale_wrong_answer_refusals() {
     );
     let path = root.join("proof");
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&path)).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let (producer, proof) = UnixStream::pair().unwrap();
     let raw = proof.as_raw_fd();
     let mut command = spawnfd::command(program.path());
@@ -71,18 +70,12 @@ fn cached_helper_parent_challenge_and_stale_wrong_answer_refusals() {
     command.inherit_guards(vec![proof.into()]).unwrap();
     let mut helper = Helper(command.spawn().unwrap());
     drop(command);
-    let channel = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => aterm_uds::ready::until(
-                listener.as_fd(),
-                aterm_uds::ready::Interest::Read,
-                deadline(),
-            )
-            .unwrap(),
-            Err(e) => panic!("accept: {e}"),
-        }
-    };
+    let (channel, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Until(deadline()),
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .expect("accept");
     channel.set_read_timeout(Some(crate::FIXTURE_HANG)).unwrap();
     let peer = aterm_ctl::resource_admission_transport::local_peer(&channel).unwrap();
     assert_eq!(peer.pid, helper.0.id());

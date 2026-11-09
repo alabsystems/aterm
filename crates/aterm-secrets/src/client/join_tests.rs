@@ -3001,7 +3001,12 @@ fn a_join_keeps_its_new_proof_before_its_request_is_answered() {
     assert_ne!(retyped, first);
     let held = std::thread::scope(|scope| {
         let asking = scope.spawn(|| request_join(&mb, &config, Some(retyped.clone()), Asker::Join));
-        let (stream, _) = silent.accept().expect("the request arrives");
+        let (stream, _) = aterm_uds::accept(
+            &silent,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("the request arrives");
         // While its POST is unanswered, an interrupt would leave this proof.
         let held = load_state(&mb).expect("state").proof;
         drop(stream);
@@ -3597,14 +3602,16 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
         });
         assert_eq!(asks.load(Ordering::SeqCst), 0, "the member backoff holds");
         let listener = UnixListener::bind(&socket).expect("private broker binds");
-        listener.set_nonblocking(true).expect("bounded accept");
         let ending = &broker_stop;
         let broker = scope.spawn(move || {
             let mut answered = false;
             while !ending.load(Ordering::SeqCst) {
-                match listener.accept() {
+                match aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) {
                     Ok((stream, _)) => {
-                        stream.set_nonblocking(false).expect("blocking receipt");
                         let deadline = Some(Instant::now() + HANG_DETECTOR);
                         let hello = Reader::new(0).frame(&stream, deadline).expect("hello");
                         assert!(matches!(hello, Some(Frame::Hello { .. })));
@@ -3639,12 +3646,14 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
         assert_eq!(heard.load(Ordering::SeqCst), 0);
         assert_eq!(server.0.as_ref().unwrap().waiting(), 1);
         let peer = UnixListener::bind(&peer_socket).expect("the peer starts later");
-        peer.set_nonblocking(true).unwrap();
         let member = scope.spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                match peer.accept() {
+                match aterm_uds::accept(
+                    &peer,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) {
                     Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false).unwrap();
                         stream.set_read_timeout(Some(HANG_DETECTOR)).unwrap();
                         stream.set_write_timeout(Some(HANG_DETECTOR)).unwrap();
                         assert!(

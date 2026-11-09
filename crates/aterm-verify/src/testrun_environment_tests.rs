@@ -172,7 +172,12 @@ fn event_and_sample(
     );
     ran.planned.width = 3;
     ran.planned.charge = 4;
-    let (_, line, sample) = binary_event(binary, &ran, started, Some(&"ab".repeat(32)));
+    let evidence = crate::test_content::Evidence {
+        exe_sha256: Some("ab".repeat(32)),
+        content_key: Some("cd".repeat(32)),
+        reason: None,
+    };
+    let (_, line, sample) = binary_event(binary, &ran, started, Some(&evidence), false);
     let event: aterm_json::Value =
         aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap();
     assert_eq!(event["schema"].as_u64(), Some(1));
@@ -184,6 +189,11 @@ fn event_and_sample(
     assert_eq!(event["width"].as_u64(), Some(3));
     assert_eq!(event["charge"].as_u64(), Some(4));
     assert_eq!(event["exe_sha256"].as_str(), Some("ab".repeat(32).as_str()));
+    assert_eq!(
+        event["content_key"].as_str(),
+        Some("cd".repeat(32).as_str())
+    );
+    assert_eq!(event["recorded_execution_s"].as_f64(), Some(8.5));
     assert_eq!(event["carried"].as_bool(), Some(false));
     if let Some(sample) = &sample {
         assert_eq!(sample.width, 3);

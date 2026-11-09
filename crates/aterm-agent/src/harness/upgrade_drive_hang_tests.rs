@@ -246,7 +246,12 @@ fn partial_probe_replies_cannot_succeed_through_authentication_fallback() {
         let (done, ended) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let (mut stream, _) = aterm_uds::accept(&serving).unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &serving,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
             stream.set_write_timeout(Some(MUST_HAPPEN)).unwrap();
             let mut reader = std::io::BufReader::new(&stream);
@@ -294,8 +299,11 @@ fn partial_probe_replies_cannot_succeed_through_authentication_fallback() {
             .recv_timeout(MUST_HAPPEN)
             .expect("server closes within hang detector");
         worker.join().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        match aterm_uds::kept_out(|| listener.accept()) {
+        match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((stream, _)) => {
                 assert!(fallback, "{name}: invalid probe attempted fallback");
                 stream.set_read_timeout(Some(MUST_HAPPEN)).unwrap();

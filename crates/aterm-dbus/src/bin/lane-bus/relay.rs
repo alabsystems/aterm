@@ -122,9 +122,13 @@ where
         listen.display(),
         server.display()
     );
-    for client in listener.incoming() {
-        let client = match client {
-            Ok(c) => c,
+    loop {
+        let client = match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
+            Ok((client, _)) => client,
             Err(e) => {
                 eprintln!("lane-bus: accept: {e}");
                 continue;
@@ -157,7 +161,6 @@ where
             let _ = c2.shutdown(std::net::Shutdown::Both);
         });
     }
-    Ok(())
 }
 
 #[cfg(test)]

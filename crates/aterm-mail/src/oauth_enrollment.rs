@@ -3,6 +3,7 @@
 //! One bounded Google authorization, with a loopback receiver bound before navigation.
 
 use super::{Error, ErrorKind, Pending, Secret, Tokens};
+use aterm_uds::{AcceptWait, AcceptedMode};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,9 +60,6 @@ impl Enrollment {
     pub fn bind(client: Client, account: &str) -> Result<Self, Error> {
         let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
             .map_err(|_| error(ErrorKind::Transport))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|_| error(ErrorKind::Transport))?;
         let port = listener
             .local_addr()
             .map_err(|_| error(ErrorKind::Transport))?
@@ -117,7 +115,12 @@ impl Enrollment {
             .port();
         while Instant::now() < end {
             let stopping = stop.load(Ordering::Acquire);
-            match self.listener.accept() {
+            let accept_end = end.min(Instant::now() + Duration::from_millis(20));
+            match aterm_uds::accept(
+                &self.listener,
+                AcceptWait::Until(accept_end),
+                AcceptedMode::Blocking,
+            ) {
                 Ok((mut stream, peer)) if peer.ip().is_loopback() => {
                     let budget = end
                         .saturating_duration_since(Instant::now())
@@ -125,7 +128,7 @@ impl Enrollment {
                     if budget.is_zero() {
                         break;
                     }
-                    ready(&stream, budget)?;
+                    bound_io(&stream, budget)?;
                     let result = request(&mut stream, Instant::now() + budget)
                         .and_then(|request| callback(&request, port, &self.pending.state))
                         .and_then(|code| {
@@ -161,14 +164,10 @@ impl Enrollment {
                     }
                 }
                 Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
                     if stopping {
                         break;
                     }
-                    std::thread::sleep(
-                        Duration::from_millis(20)
-                            .min(end.saturating_duration_since(Instant::now())),
-                    );
                 }
                 Err(_) => return Err(error(ErrorKind::Transport)),
             }
@@ -177,14 +176,9 @@ impl Enrollment {
     }
 }
 
-/// Make an accepted callback stream wait for its bytes. The listener is non-blocking for its
-/// accept loop, and on BSD and macOS a stream `accept` returns inherits that, so a read would
-/// answer `WouldBlock` before the browser's request arrives and the callback would be refused;
-/// a blocking read bounded by `budget` waits for it instead.
-fn ready(stream: &TcpStream, budget: Duration) -> Result<(), Error> {
-    stream
-        .set_nonblocking(false)
-        .map_err(|_| error(ErrorKind::Transport))?;
+/// Bound an accepted callback stream's reads and writes. [`aterm_uds::accept`] already makes its
+/// blocking mode explicit before the browser's request can race the first read.
+fn bound_io(stream: &TcpStream, budget: Duration) -> Result<(), Error> {
     stream
         .set_read_timeout(Some(budget))
         .map_err(|_| error(ErrorKind::Transport))?;
@@ -365,16 +359,9 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let end = Instant::now() + Duration::from_secs(60);
-        let mut server = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < end => {
-                    aterm_uds::deadline::poll_yield();
-                }
-                Err(e) => panic!("accept: {e}"),
-            }
-        };
-        ready(&server, Duration::from_secs(60)).unwrap();
+        let (mut server, _) =
+            aterm_uds::accept(&listener, AcceptWait::Until(end), AcceptedMode::Blocking).unwrap();
+        bound_io(&server, Duration::from_secs(60)).unwrap();
         let (reading, read) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             let reader = scope.spawn(move || {

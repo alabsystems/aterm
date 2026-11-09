@@ -792,7 +792,12 @@ mod tests {
         let server = std::thread::spawn(move || {
             let mut seen = Vec::new();
             for _ in 0..8 {
-                let (conn, _) = listener.accept().expect("accept");
+                let (conn, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .expect("accept");
                 let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
                 let mut line = String::new();
                 r.read_line(&mut line).expect("request");

@@ -15814,7 +15814,13 @@ mod tests {
             let stop = std::sync::Arc::new(AtomicBool::new(false));
             let seen = std::sync::Arc::clone(&stop);
             let closer = std::thread::spawn(move || {
-                for stream in listener.incoming() {
+                loop {
+                    let stream = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .map(|(stream, _)| stream);
                     drop(stream);
                     if seen.load(Ordering::SeqCst) {
                         return;
@@ -17084,7 +17090,15 @@ mod tests {
         let port = listener.local_addr().expect("port").port();
         let (heard, hears) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = heard.send(listener.accept().map(drop).is_ok());
+            let _ = heard.send(
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .map(drop)
+                .is_ok(),
+            );
         });
         let typed = join(&paths, &options(&format!("http://127.0.0.1:{port}/v1/lab")));
         assert!(
@@ -17302,7 +17316,13 @@ mod tests {
         let at = listener.local_addr().expect("address");
         let (heard, hears) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            loop {
+                let stream = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .map(|(stream, _)| stream);
                 drop(stream);
                 if heard.send(()).is_err() {
                     break;

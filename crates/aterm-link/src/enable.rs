@@ -9278,7 +9278,11 @@ mod tests {
         std::fs::create_dir(&p.root).expect("the root");
         let listener = std::os::unix::net::UnixListener::bind(p.sock()).expect("bind");
         let closer = std::thread::spawn(move || {
-            drop(listener.accept());
+            drop(aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ));
             listener
         });
         let polled = poll_reach(&p, "n-a");
@@ -11435,7 +11439,12 @@ mod tests {
         std::fs::write(&token_file, "deadbeef\n").expect("token");
         let serve = |listener: UnixListener, reply: &'static str| {
             std::thread::spawn(move || {
-                let (conn, _) = listener.accept().expect("accept");
+                let (conn, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .expect("accept");
                 let mut lines = BufReader::new(conn.try_clone().expect("clone"));
                 let mut seen = Vec::new();
                 for _ in 0..2 {
@@ -11485,7 +11494,12 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         let replies: Vec<String> = replies.iter().map(|r| (*r).to_string()).collect();
         let server = std::thread::spawn(move || {
-            let (listing, _) = listener.accept().expect("accept the listing");
+            let (listing, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept the listing");
             let mut lines = BufReader::new(listing.try_clone().expect("clone"));
             for _ in 0..2 {
                 lines
@@ -11495,7 +11509,12 @@ mod tests {
             (&listing)
                 .write_all(b"OK 1\n0 s-1 - alive zsh\n")
                 .expect("list");
-            let (conn, _) = listener.accept().expect("accept the proof");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept the proof");
             let mut lines = BufReader::new(conn.try_clone().expect("clone"));
             lines.read_line(&mut String::new()).expect("AUTH");
             let mut seen = Vec::new();

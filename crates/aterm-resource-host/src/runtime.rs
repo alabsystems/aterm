@@ -307,7 +307,6 @@ fn serve(
     active: Arc<AtomicUsize>,
     guis: Arc<AtomicUsize>,
 ) -> io::Result<()> {
-    listener.set_nonblocking(true)?;
     loop {
         match aterm_uds::ready::until(
             std::os::fd::AsFd::as_fd(&listener),
@@ -331,7 +330,11 @@ fn serve(
                 continue;
             }
         }
-        let (stream, _) = match aterm_uds::accept(&listener) {
+        let (stream, _) = match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok(connection) => connection,
             Err(error)
                 if matches!(

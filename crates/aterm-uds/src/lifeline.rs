@@ -696,7 +696,12 @@ mod tests {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
             let near = std::net::TcpStream::connect(listener.local_addr().expect("addr"))
                 .expect("connect");
-            let (far, _) = listener.accept().expect("accept");
+            let (far, _) = crate::accept(
+                &listener,
+                crate::AcceptWait::Forever,
+                crate::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let unrelated = std::net::UdpSocket::bind("127.0.0.1:0").expect("udp");
             let adopted = adopt(std::os::fd::IntoRawFd::into_raw_fd(far)).expect("adopt");
             let closed = close_inherited_copies(&adopted).expect("sweep");

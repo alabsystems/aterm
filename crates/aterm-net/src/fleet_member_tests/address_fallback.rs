@@ -42,9 +42,12 @@ impl Peer {
             let running = Arc::clone(&running);
             let asked = Arc::clone(&asked);
             move || {
-                listener.set_nonblocking(true).unwrap();
                 while drops > 0 && running.load(Ordering::Acquire) {
-                    match listener.accept() {
+                    match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Nonblocking,
+                    ) {
                         Ok(connection) => {
                             drop(connection);
                             drops -= 1;

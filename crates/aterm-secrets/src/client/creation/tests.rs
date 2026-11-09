@@ -201,7 +201,12 @@ fn lost_http_ack_resumes_retained_creation_without_second_put() {
     let worker = std::thread::spawn(move || {
         let mut saved = Vec::new();
         for index in 0..4 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(60)))
                 .unwrap();
@@ -507,7 +512,13 @@ impl Unheld {
         let mut puts: std::collections::VecDeque<(&str, &str)> = puts.iter().copied().collect();
         let worker = std::thread::spawn(move || {
             let mut methods = Vec::new();
-            for stream in listener.incoming() {
+            loop {
+                let stream = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .map(|(stream, _)| stream);
                 if seen.load(Ordering::SeqCst) {
                     return methods;
                 }
@@ -553,7 +564,6 @@ impl Unheld {
                 )
                 .unwrap();
             }
-            methods
         });
         Unheld {
             url: format!("http://{addr}/v1/first"),

@@ -93,7 +93,12 @@ impl Broker {
         let listener = self.listener.try_clone().expect("the listener");
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("one connection");
+            let (stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("one connection");
             // macOS refuses the options (EINVAL) once the peer has closed, and a read or write
             // of a closed peer's stream cannot block, so that refusal needs no detector.
             let _ = stream.set_read_timeout(Some(HANG));
@@ -130,9 +135,12 @@ impl Broker {
     /// The notifier connected once and wrote nothing. `post` has returned, so its connection
     /// waits in the backlog already, closed: nothing here blocks.
     fn connected_silently(&self) {
-        self.listener.set_nonblocking(true).expect("non-blocking");
-        let (mut stream, _) = self.listener.accept().expect("the notifier's connection");
-        stream.set_nonblocking(false).expect("a blocking stream");
+        let (mut stream, _) = aterm_uds::accept(
+            &self.listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("the notifier's connection");
         // As in `serve`: refused once the peer has closed, when a read cannot block.
         let _ = stream.set_read_timeout(Some(HANG));
         let mut bytes = Vec::new();
@@ -142,8 +150,12 @@ impl Broker {
 
     /// No connection is waiting: the notifier never connected.
     fn never_connected(&self) {
-        self.listener.set_nonblocking(true).expect("non-blocking");
-        let err = self.listener.accept().expect_err("no connection");
+        let err = aterm_uds::accept(
+            &self.listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect_err("no connection");
         assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
     }
 }

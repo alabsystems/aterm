@@ -770,7 +770,11 @@ impl Inbox {
             .map_err(|e| format!("could not listen on {}: {e}", path.display()))?;
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
+            if let Ok((mut stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 let mut text = String::new();
                 let _ = (&mut stream).take(1 << 20).read_to_string(&mut text);
                 let _ = tx.send(text);

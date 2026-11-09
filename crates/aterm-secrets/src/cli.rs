@@ -8278,7 +8278,13 @@ mod tests {
             let seen = std::sync::Arc::clone(&stop);
             let server = std::thread::spawn(move || {
                 let mut put = false;
-                for stream in listener.incoming() {
+                loop {
+                    let stream = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .map(|(stream, _)| stream);
                     if seen.load(Ordering::SeqCst) {
                         return;
                     }

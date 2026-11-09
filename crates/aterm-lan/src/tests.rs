@@ -145,7 +145,12 @@ fn a_connect_is_made_by_the_broker_and_passed_back() {
     })
     .unwrap();
     assert_eq!(reached, addr);
-    let (mut server, _) = target.accept().unwrap();
+    let (mut server, _) = aterm_uds::accept(
+        &target,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     server.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
     stream.write_all(b"x").unwrap();
     let mut byte = [0];
@@ -165,7 +170,6 @@ fn a_destination_off_the_local_network_is_refused() {
     let (seam, _root, _) = serve(Seam::default());
     let target = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let addr = target.local_addr().unwrap();
-    target.set_nonblocking(true).unwrap();
     let refused = seam_here(seam, || {
         broker::connect(
             &Target::Addr(addr),
@@ -186,7 +190,13 @@ fn a_destination_off_the_local_network_is_refused() {
         "{refused}"
     );
     assert_eq!(
-        target.accept().unwrap_err().kind(),
+        aterm_uds::accept(
+            &target,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap_err()
+        .kind(),
         std::io::ErrorKind::WouldBlock,
         "the broker dialled nothing"
     );
@@ -643,7 +653,12 @@ fn passed_sockets_read_what_arrives_after_the_pass_every_time() {
             )
         })
         .unwrap();
-        let (mut accepted, _) = target.accept().unwrap();
+        let (mut accepted, _) = aterm_uds::accept(
+            &target,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         accepted.write_all(b"hi").unwrap();
         stream.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
         let mut heard = [0u8; 2];

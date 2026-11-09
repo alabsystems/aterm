@@ -234,7 +234,6 @@ impl Fixture {
             .open(world.join(token_name))?
             .write_all(TOKEN.as_bytes())?;
         let listener = aterm_uds::kept_out(|| UnixListener::bind(&socket))?;
-        listener.set_nonblocking(true)?;
         let mut command = aterm_uds::spawnfd::command(std::env::current_exe()?);
         let error_log = std::fs::OpenOptions::new()
             .create_new(true)
@@ -278,20 +277,11 @@ impl Fixture {
 
     fn accept(&mut self, until: Instant, account: bool) -> io::Result<()> {
         let listener = self.listener.as_ref().expect("listener");
-        let stream = loop {
-            readable(listener.as_raw_fd(), libc::POLLIN, until)?;
-            match aterm_uds::kept_out(|| listener.accept()) {
-                Ok((stream, _)) => break stream,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) => {}
-                Err(error) => return Err(error),
-            }
-        };
-        // Darwin can inherit the listener's O_NONBLOCK: all fake-peer I/O deliberately uses poll.
-        stream.set_nonblocking(true)?;
+        let (stream, _) = aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Until(until),
+            aterm_uds::AcceptedMode::Nonblocking,
+        )?;
         let peer = aterm_uds::peer::peer_audit_token(&stream)
             .ok_or_else(|| io::Error::other("no kernel peer"))?;
         if peer.pid() != self.child.id() {

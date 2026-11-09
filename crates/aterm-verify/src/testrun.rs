@@ -16,6 +16,8 @@ use crate::ladder::{Outcome, Report, Severity};
 use crate::test_plan::{self, Dispatcher, Plan, Planned};
 use crate::test_progress::{Phase, Progress};
 
+pub use crate::test_content::{CarryProof, Evidence, Passed, encode_passed, read_passed};
+
 /// The flag cargo's runner config hands this binary.
 pub const RECORD_FLAG: &str = "--record-test-binary";
 
@@ -1008,93 +1010,65 @@ pub const FAILURE_OUTPUT_BYTES: usize = 2048;
 /// release reader's 64 KiB line cap beside ten full failure blocks and the hang detail.
 const HUNG_CASES_SHOWN: usize = 8;
 
-/// The test binaries a release's resume may carry (A19): each binary that passed before in this
-/// tree, by its spec, with the SHA-256 its executable had then.
-pub type Passed = BTreeMap<String, String>;
-
-/// A `--passed-binaries` file: `<sha256> <spec>` on each line (the spec is the rest of the line),
-/// blank lines ignored.
-///
-/// # Errors
-/// A line with no spec, a digest that is not 64 lowercase hex digits, or one spec twice.
-pub fn read_passed(text: &str) -> Result<Passed, String> {
-    let mut passed = Passed::new();
-    for (n, line) in text
-        .lines()
-        .enumerate()
-        .filter(|(_, l)| !l.trim().is_empty())
-    {
-        let (sha, spec) = line
-            .split_once(' ')
-            .filter(|(sha, spec)| aterm_codec::hex::is_lower(sha, 64) && !spec.trim().is_empty())
-            .ok_or_else(|| format!("line {} is not `<sha256> <spec>`: {line}", n + 1))?;
-        if passed
-            .insert(spec.trim().to_owned(), sha.to_owned())
-            .is_some()
-        {
-            return Err(format!("line {} names {} twice", n + 1, spec.trim()));
-        }
-    }
-    Ok(passed)
-}
-
-/// The SHA-256 of `exe`, lowercase hex, and what reading it took, added to `spent` (nanoseconds).
-fn exe_sha256(exe: &Path, spent: &AtomicU64) -> Option<String> {
-    use std::io::Read as _;
-    let began = Instant::now();
-    let mut file = std::fs::File::open(exe).ok()?;
-    let mut hasher = aterm_digest::Sha256::new();
-    let mut buf = vec![0u8; 1 << 20];
-    let sha = loop {
-        match file.read(&mut buf) {
-            Ok(0) => break Some(aterm_codec::hex::encode_lower(&hasher.finalize())),
-            Ok(n) => hasher.update(&buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break None,
-        }
-    };
-    let nanos = u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX);
-    spent.fetch_add(nanos, Ordering::Relaxed);
-    sha
-}
-
 /// What a release's resume does with its binaries ([`carry`]).
 pub struct Carried {
     /// The binaries that run, in their order.
     pub run: Vec<Binary>,
-    /// The binaries carried, each with its executable's SHA-256.
-    pub carried: Vec<(Binary, String)>,
-    /// The SHA-256 of each binary hashed to decide, by spec.
-    pub known: BTreeMap<String, String>,
+    /// The binaries carried, with current evidence and the prior execution wall.
+    pub carried: Vec<CarriedBinary>,
+    /// The current evidence of every release binary, by spec.
+    pub known: BTreeMap<String, Evidence>,
 }
 
-/// Which of `bins` a release's resume carries, and the SHA-256 of each binary it hashed (`hash`,
-/// for each binary `passed` names): a binary is carried only when `passed` names its spec with
-/// the digest its executable has now and its package is not [`crate::checks::GOLDEN`]'s, whose
-/// test a release's run must show every time ([`decide`]). The rest run, in their order.
+/// A prior success reused without executing this hop.
+pub struct CarriedBinary {
+    pub binary: Binary,
+    pub evidence: Evidence,
+    /// The prior run's global libtest JSON decision, which is part of the reconstructed command.
+    pub json: bool,
+    pub prior_execution_s: f64,
+}
+
+/// Which of `bins` a release carries. `evidence` runs for every binary, including a first run
+/// with an empty `passed` set. A binary is carried only when its prior outcome was `ok` (enforced
+/// by [`read_passed`]), both input sets are bounded, executable and complete content key match,
+/// and its package is not [`crate::checks::GOLDEN`]'s. The rest run, in their original order.
 pub fn carry(
     passed: &Passed,
     bins: Vec<Binary>,
-    hash: impl Fn(&Binary) -> Option<String> + Sync,
+    evidence: impl Fn(&Binary, Option<&CarryProof>) -> Evidence + Sync,
     jobs: usize,
 ) -> Carried {
     let golden = |b: &Binary| {
         b.record.var("CARGO_PKG_NAME").and_then(OsStr::to_str) == Some(crate::checks::GOLDEN.0)
     };
-    let asked: Vec<usize> = (0..bins.len())
-        .filter(|&i| passed.contains_key(&bins[i].spec) && !golden(&bins[i]))
-        .collect();
-    let hashes = pool(bins.len(), &asked, jobs, |i| hash(&bins[i]));
+    let asked: Vec<usize> = (0..bins.len()).collect();
+    let evidence = pool(bins.len(), &asked, jobs, |i| {
+        evidence(&bins[i], passed.get(&bins[i].spec))
+    });
     let mut known = BTreeMap::new();
     let (mut run, mut carried) = (Vec::new(), Vec::new());
-    for (b, sha) in bins.into_iter().zip(hashes) {
-        let sha = sha.flatten();
-        if let Some(sha) = &sha {
-            known.insert(b.spec.clone(), sha.clone());
-        }
-        match sha {
-            Some(sha) if passed.get(&b.spec) == Some(&sha) => carried.push((b, sha)),
-            _ => run.push(b),
+    for (binary, evidence) in bins.into_iter().zip(evidence) {
+        let evidence = evidence.expect("every release binary was assigned to the evidence pool");
+        known.insert(binary.spec.clone(), evidence.clone());
+        let prior = passed.get(&binary.spec);
+        let matches = !golden(&binary)
+            && evidence.bounded()
+            && prior.is_some_and(|prior| {
+                prior.outcome == "ok"
+                    && prior.inputs_bounded
+                    && prior.exe_sha256 == evidence.exe_sha256
+                    && prior.content_key == evidence.content_key
+            });
+        if matches {
+            carried.push(CarriedBinary {
+                json: prior.expect("matched prior proof").json,
+                prior_execution_s: prior.expect("matched prior proof").execution_s,
+                binary,
+                evidence,
+            });
+        } else {
+            run.push(binary);
         }
     }
     Carried {
@@ -1104,9 +1078,12 @@ pub fn carry(
     }
 }
 
-/// The `test-binary-finished` event of a binary a resume carried: it passed before in this tree
-/// with these bytes, and runs no time now.
-fn carried_event(binary: &Binary, sha256: &str) -> String {
+/// The `test-binary-finished` event of a binary a resume carried: its prior execution passed with
+/// exactly this executable and complete bounded runtime-input key. It runs no time in this hop,
+/// while `recorded_execution_s` preserves the prior real wall for the next hop and accounting.
+fn carried_event(carried: &CarriedBinary) -> String {
+    let binary = &carried.binary;
+    let evidence = &carried.evidence;
     format!(
         "verify-event: {}",
         aterm_json::json!({
@@ -1116,8 +1093,56 @@ fn carried_event(binary: &Binary, sha256: &str) -> String {
             "cpu_s": aterm_json::Value::Null, "starved_s": aterm_json::Value::Null,
             "peak_bytes": aterm_json::Value::Null,
             "width": aterm_json::Value::Null, "tests": aterm_json::Value::Null,
-            "failures": [], "detail": "carried: it passed before in this tree with these bytes",
-            "exe_sha256": sha256, "carried": true,
+            "failures": [],
+            "detail": "carried: prior ok with equal executable and complete runtime inputs",
+            "evidence": {
+                "schema": crate::test_content::SCHEMA,
+                "exe_sha256": evidence.exe_sha256,
+                "content_key": evidence.content_key,
+                "inputs_bounded": evidence.bounded(),
+                "input_reason": evidence.reason,
+            },
+            "exe_sha256": evidence.exe_sha256,
+            "content_key": evidence.content_key,
+            "inputs_bounded": evidence.bounded(),
+            "input_reason": evidence.reason,
+            "json": carried.json,
+            "recorded_execution_s": carried.prior_execution_s,
+            "carried": true,
+        })
+    )
+}
+
+/// A candidate which matched before dispatch but did not remain equal through the whole run.
+/// It never executed, so it is NOT RUN rather than a failure. This later row supersedes any
+/// older candidate for the spec and makes the test check incomplete instead of inheriting OK.
+fn unstable_carried_event(carried: &CarriedBinary, evidence: &Evidence) -> String {
+    let binary = &carried.binary;
+    format!(
+        "verify-event: {}",
+        aterm_json::json!({
+            "schema": 1, "event": "test-binary-finished", "test": binary.spec,
+            "outcome": "NOT RUN", "exit_code": aterm_json::Value::Null,
+            "waiting_s": 0.0, "execution_s": 0.0,
+            "cpu_s": aterm_json::Value::Null, "starved_s": aterm_json::Value::Null,
+            "peak_bytes": aterm_json::Value::Null,
+            "width": aterm_json::Value::Null, "tests": aterm_json::Value::Null,
+            "failures": [],
+            "detail": "not carried: runtime inputs changed after carry selection",
+            "evidence": {
+                "schema": crate::test_content::SCHEMA,
+                "exe_sha256": evidence.exe_sha256,
+                "content_key": evidence.content_key,
+                "inputs_bounded": false,
+                "input_reason": evidence.reason,
+            },
+            "exe_sha256": evidence.exe_sha256,
+            "content_key": aterm_json::Value::Null,
+            "inputs_bounded": false,
+            "input_reason": evidence.reason,
+            "json": carried.json,
+            "recorded_execution_s": carried.prior_execution_s,
+            "carried": false,
         })
     )
 }
@@ -1140,7 +1165,8 @@ fn binary_event(
     binary: &Binary,
     ran: &Ran,
     started: bool,
-    exe_sha256: Option<&str>,
+    evidence: Option<&Evidence>,
+    json: bool,
 ) -> (Outcome, String, Option<crate::test_history::Sample>) {
     let run = &ran.run;
     let width = ran.planned.width;
@@ -1256,7 +1282,20 @@ fn binary_event(
             "hang_window_s": run.hung.as_ref().map(|h| h.window.as_secs_f64()),
             "stack_sample": stack_sample,
             "stack_sample_error": stack_sample_error,
-            "exe_sha256": exe_sha256, "carried": false,
+            "evidence": evidence.map(|evidence| aterm_json::json!({
+                "schema": crate::test_content::SCHEMA,
+                "exe_sha256": evidence.exe_sha256,
+                "content_key": evidence.content_key,
+                "inputs_bounded": evidence.bounded(),
+                "input_reason": evidence.reason,
+            })),
+            "exe_sha256": evidence.and_then(|evidence| evidence.exe_sha256.as_deref()),
+            "content_key": evidence.and_then(|evidence| evidence.content_key.as_deref()),
+            "inputs_bounded": evidence.map(Evidence::bounded),
+            "input_reason": evidence.and_then(|evidence| evidence.reason.as_deref()),
+            "json": json,
+            "recorded_execution_s": ran.execution.as_secs_f64(),
+            "carried": false,
         })
     );
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
@@ -1449,6 +1488,19 @@ pub fn binary_cmd(b: &Binary, threads: u32, checkers: bool, watch: Watch) -> Cmd
         hang_after: exec::TEST_BINARY_HANG,
     });
     crate::stages::with_checkers(command, checkers)
+}
+
+/// The exact environment and invocation boundary a test binary crosses. Evidence and
+/// execution both use this constructor; content identity normalizes only the scheduler-controlled
+/// values which `exec` may lower after this [`Cmd`] is built.
+fn final_binary_cmd(
+    ctx: &crate::Ctx,
+    binary: &Binary,
+    threads: u32,
+    checkers: bool,
+    watch: Watch,
+) -> Cmd {
+    crate::test_env::command(ctx, binary_cmd(binary, threads, checkers, watch))
 }
 
 /// The one log cargo would have written for these runs, in declared order, except that a run with
@@ -2057,7 +2109,7 @@ pub(crate) struct RunPlan {
     pub(crate) claims: Claims,
     /// The CPU share the run asked for.
     pub(crate) asked_cores: u32,
-    /// The share the recording pass was granted (a resume's hashing width, [`carry`]).
+    /// The share the recording pass was granted, used for the full binary set's initial plan.
     pub(crate) granted_cores: u32,
     /// The run's checker policy ([`crate::stages::with_checkers`]).
     pub(crate) checkers: bool,
@@ -2127,6 +2179,49 @@ fn plan_from_history(
         })
         .collect();
     test_plan::plan(&seen, share, ceiling, fallback_peak)
+}
+
+/// Remove one binary from a fixed plan after its JSON probe itself ended hung. Every peer keeps
+/// the width, charge, peak, prediction and relative dispatch order the full-set claim was based
+/// on; only cargo-order indexes above the removed binary move down one.
+fn remove_plan_index(plan: &mut Plan, removed: usize) {
+    plan.order.retain(|planned| planned.index != removed);
+    for planned in &mut plan.order {
+        if planned.index > removed {
+            planned.index -= 1;
+        }
+    }
+}
+
+/// Project a fixed full-set plan onto `kept` binaries, identified by their unique Cargo rerun
+/// specs. This is what carry uses: removing an equal-content binary cannot replan a miss more
+/// widely and thereby change the command whose content key was just judged.
+fn project_plan(plan: &Plan, full: &[Binary], kept: &[Binary]) -> Plan {
+    let positions: BTreeMap<_, _> = kept
+        .iter()
+        .enumerate()
+        .map(|(index, binary)| (binary.spec.as_str(), index))
+        .collect();
+    let order: Vec<_> = plan
+        .order
+        .iter()
+        .filter_map(|planned| {
+            let spec = full.get(planned.index)?.spec.as_str();
+            positions
+                .get(spec)
+                .map(|&index| Planned { index, ..*planned })
+        })
+        .collect();
+    assert_eq!(
+        order.len(),
+        kept.len(),
+        "fixed test plan and carried binary set disagree"
+    );
+    Plan {
+        share: plan.share,
+        target: plan.target,
+        order,
+    }
 }
 
 /// The memory claim for the binaries `plan` can run at once.
@@ -2348,7 +2443,7 @@ fn run_planned_observed(
 ) {
     progress.enter(Phase::Planning);
     let RunPlan {
-        bins,
+        mut bins,
         history,
         fallback_peak,
         claims,
@@ -2358,35 +2453,9 @@ fn run_planned_observed(
         preface,
         rerun,
     } = planned;
-    // A release hashes each binary's executable (its record's key for a resume, A19); a dev run
-    // keeps none, so it pays nothing for it.
-    let hashed = AtomicU64::new(0);
-    let hash = |b: &Binary| {
-        ctx.release
-            .then(|| exe_sha256(b.record.exe(), &hashed))
-            .flatten()
-    };
     let listed = bins.len();
-    let Carried {
-        run: mut bins,
-        carried,
-        known,
-    } = match &ctx.passed_binaries {
-        Some(passed) => carry(
-            passed,
-            bins,
-            hash,
-            usize::try_from(granted_cores).unwrap_or(1),
-        ),
-        None => Carried {
-            run: bins,
-            carried: Vec::new(),
-            known: BTreeMap::new(),
-        },
-    };
-    for (binary, sha) in &carried {
-        emit(ctx, &carried_event(binary, sha));
-    }
+    // Plan and claim the complete recorded set. A carry may remove work, but cannot change any
+    // peer's width or charge after that peer's content key has committed to its command.
     let plan = plan_from_history(
         &history,
         &bins,
@@ -2395,8 +2464,8 @@ fn run_planned_observed(
         fallback_peak,
     );
     let claimed = plan_claim(&plan);
-    // The plan's claims replace the one-at-a-time ones, memory before cores as ever: a grant that
-    // moved meanwhile plans the run again, its binaries' peaks still held within this claim.
+    // The full plan's claims replace the recording claims, memory before cores as ever. A moved
+    // grant may change the full plan once, before probing or content evidence exists.
     progress.enter(Phase::ExecutionAdmission);
     let claims = match claim_both(
         ctx,
@@ -2425,9 +2494,8 @@ fn run_planned_observed(
             fallback_peak,
         )
     };
-    // A failed test reruns at the width its binary runs at, which the plan sets, not the run's.
-    // A hung probe can remove a binary and make the remaining plan wider, so keep the common
-    // rerun environment and bind widths only to the plan that actually ran each binary.
+    // A failed test reruns at the width its binary runs at, which the full plan sets. A probe hang
+    // or carry only projects this plan; neither replans the peers after their widths are fixed.
     let rerun_base = rerun;
     let claim = claims.resources.as_ref();
     // The binaries' peaks are kept within the claim, and a claim past what can ever be available
@@ -2436,6 +2504,158 @@ fn run_planned_observed(
         .and(claimed)
         .map(|c| ctx.memory.as_ref().map_or(c, |book| c.min(book.budget())));
     let _held = holding(claim);
+    // A candidate is judged before any harness process starts. Reconstruct the prior run's
+    // global JSON decision, finalize that exact command under this hop's already-fixed width and
+    // held claim, and carry only an equal complete key. The probe below sees misses alone, so a
+    // binary reported as carried has not even run startup code in this hop.
+    let evidenced = AtomicU64::new(0);
+    let verifier = crate::report::running_driver().map(str::to_owned);
+    let new_evidence_builder = || {
+        crate::test_content::EvidenceBuilder::new(
+            ctx.carry_context.clone(),
+            verifier.clone(),
+            ctx.scratch.clone(),
+        )
+    };
+    let candidate_evidence = new_evidence_builder();
+    let widths: BTreeMap<_, _> = plan
+        .order
+        .iter()
+        .map(|planned| (bins[planned.index].spec.clone(), planned.width))
+        .collect();
+    let command_for = |binary: &Binary, json: bool| {
+        let width = widths
+            .get(&binary.spec)
+            .copied()
+            .expect("every release binary is in the fixed test plan");
+        let command = final_binary_cmd(
+            ctx,
+            binary,
+            width,
+            checkers,
+            Watch {
+                json,
+                stop_at_red: ctx.halt.armed(),
+                seed: ctx.test_seed,
+            },
+        );
+        match exec::finalize_exact_command(command.clone(), ctx.exec_env()) {
+            Ok(finalized) => (finalized, None),
+            Err(why) => (command, Some(why)),
+        }
+    };
+    let evidence_for = |builder: &crate::test_content::EvidenceBuilder,
+                        binary: &Binary,
+                        command: &Cmd,
+                        exact_error: Option<&str>| {
+        let began = Instant::now();
+        let mut evidence = if exact_error.is_some() {
+            let mut incomplete = command.clone();
+            incomplete.exact_env = false;
+            builder.evidence(binary, &incomplete)
+        } else {
+            builder.evidence(binary, command)
+        };
+        if let Some(why) = exact_error {
+            evidence.content_key = None;
+            evidence.reason = Some(format!("the exact spawn environment is unbounded: {why}"));
+        }
+        evidenced.fetch_add(
+            u64::try_from(began.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        evidence
+    };
+    let candidate_for = |binary: &Binary, json: bool| {
+        let (command, exact_error) = command_for(binary, json);
+        evidence_for(
+            &candidate_evidence,
+            binary,
+            &command,
+            exact_error.as_deref(),
+        )
+    };
+    let empty_passed = Passed::new();
+    let (carried, known) = if ctx.release {
+        let all = bins;
+        let Carried {
+            run,
+            carried,
+            mut known,
+        } = carry(
+            ctx.passed_binaries.as_ref().unwrap_or(&empty_passed),
+            all.clone(),
+            |binary, prior| {
+                prior.map_or_else(
+                    || Evidence {
+                        exe_sha256: None,
+                        content_key: None,
+                        reason: Some("there is no prior successful execution to carry".into()),
+                    },
+                    |proof| candidate_for(binary, proof.json),
+                )
+            },
+            usize::try_from(claims.granted).unwrap_or(1),
+        );
+        plan = project_plan(&plan, &all, &run);
+        for binary in &run {
+            known.remove(&binary.spec);
+        }
+        bins = run;
+        (carried, known)
+    } else {
+        (Vec::new(), BTreeMap::new())
+    };
+    let evidence = Mutex::new(known);
+    let evidence_of = |b: &Binary| {
+        evidence
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&b.spec)
+            .cloned()
+    };
+    // Carry selection happens before a harness starts, but another miss may mutate a candidate's
+    // declared input later. Delay every carried OK until all probe/dispatch activity ends, then
+    // rehash with a fresh builder. Persistent drift becomes a final NOT RUN row and an incomplete
+    // check; `read-only = true` is the run-wide audit boundary for transient restore writes.
+    let finish_carried = || {
+        let mut drifted = Vec::new();
+        for candidate in &carried {
+            let (command, exact_error) = command_for(&candidate.binary, candidate.json);
+            let after = evidence_for(
+                &new_evidence_builder(),
+                &candidate.binary,
+                &command,
+                exact_error.as_deref(),
+            );
+            if after == candidate.evidence {
+                evidence
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(candidate.binary.spec.clone(), after);
+                emit(ctx, &carried_event(candidate));
+            } else {
+                let changed = Evidence {
+                    exe_sha256: after
+                        .exe_sha256
+                        .or_else(|| candidate.evidence.exe_sha256.clone()),
+                    content_key: None,
+                    reason: Some(
+                        "runtime inputs changed after carry selection; the run-wide read-only \
+                         declaration was violated"
+                            .into(),
+                    ),
+                };
+                evidence
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .insert(candidate.binary.spec.clone(), changed.clone());
+                emit(ctx, &unstable_carried_event(candidate, &changed));
+                drifted.push(candidate.binary.spec.clone());
+            }
+        }
+        drifted
+    };
     let mut preface = preface;
     let mut probe_hung_count = 0_usize;
     let mut probe_samples = Vec::new();
@@ -2462,7 +2682,7 @@ fn run_planned_observed(
                     waiting: Duration::ZERO,
                     execution: elapsed,
                 };
-                let (outcome, event, sample) = binary_event(&binary, &ran, true, None);
+                let (outcome, event, sample) = binary_event(&binary, &ran, true, None, true);
                 let red = mark_red_decided(outcome, ctx.halt.armed(), None);
                 emit(ctx, &event);
                 if red {
@@ -2485,6 +2705,7 @@ fn run_planned_observed(
                     |r, run| decide(ctx, r, run, label, &hung_rerun),
                 );
                 probe_hung_count += 1;
+                remove_plan_index(&mut plan, index);
                 if bins.is_empty() {
                     if let Some(Err(why)) = ctx
                         .test_history
@@ -2495,16 +2716,18 @@ fn run_planned_observed(
                             "  test binaries' history not kept (planning data only): {why}"
                         ));
                     }
+                    let drifted = finish_carried();
                     claimed_said(r, claim);
+                    if !drifted.is_empty() {
+                        r.cannot_run(format!(
+                            "{label} — {} carried candidate(s) changed after selection and were \
+                             not run: {}",
+                            drifted.len(),
+                            drifted.join(", ")
+                        ));
+                    }
                     return;
                 }
-                plan = plan_from_history(
-                    &history,
-                    &bins,
-                    claims.granted,
-                    ctx.test_threads,
-                    fallback_peak,
-                );
                 if ctx.halt.armed() {
                     break None;
                 }
@@ -2526,12 +2749,29 @@ fn run_planned_observed(
         stop_at_red: ctx.halt.armed(),
         seed: ctx.test_seed,
     };
-    let shas = Mutex::new(known);
-    let sha_of = |b: &Binary| {
-        shas.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&b.spec)
-            .cloned()
+    // Misses now have the probe's actual mode. Finalize and retain their exact commands, but do
+    // not hash runtime inputs yet: an earlier admitted binary may legitimately precede this one.
+    // Each miss is hashed immediately before its own spawn below.
+    let commands = if ctx.release {
+        let asked: Vec<usize> = (0..bins.len()).collect();
+        let completed = pool(
+            bins.len(),
+            &asked,
+            usize::try_from(claims.granted).unwrap_or(1),
+            |index| {
+                let binary = &bins[index];
+                let (command, exact_error) = command_for(binary, watch.json);
+                (binary.spec.clone(), command, exact_error)
+            },
+        );
+        let mut commands = BTreeMap::new();
+        for completed in completed.into_iter().flatten() {
+            let (spec, command, exact_error) = completed;
+            commands.insert(spec, (command, exact_error));
+        }
+        commands
+    } else {
+        BTreeMap::new()
     };
     let meter = crate::memory::current();
     let live = || meter.as_ref().and_then(|m| m.live_rate()).unwrap_or(0.0);
@@ -2541,11 +2781,62 @@ fn run_planned_observed(
     let spent = || ceiling.is_some_and(|limit| started.elapsed() >= limit);
     let stop = || spent() || ctx.halted().is_some();
     let dispatch_samples = Mutex::new(Vec::with_capacity(bins.len()));
+    // A successful process whose declared inputs do not bracket its execution has not supplied
+    // a stable verdict for this tree. Keep its unbounded event as a tombstone and make the
+    // aggregate check COULD NOT RUN after every child has settled.
+    let miss_drift = Mutex::new(Vec::new());
     // Hear one binary's end: classify its red before event I/O can hold up the local stop, emit
     // its FAIL before the halt's NOT RUN events, arm that run-wide halt, and keep its sample.
     let ended = |binary: &Binary, ran: &Ran, started: bool, halt: Option<&dyn Fn()>| {
-        let sha = sha_of(binary);
-        let (outcome, event, sample) = binary_event(binary, ran, started, sha.as_deref());
+        if ctx.release && started && ran.run.ok {
+            let (command, exact_error) = commands
+                .get(&binary.spec)
+                .expect("every successful release miss keeps its exact command");
+            let after = evidence_for(
+                &new_evidence_builder(),
+                binary,
+                command,
+                exact_error.as_deref(),
+            );
+            let mut evidence = evidence.lock().unwrap_or_else(PoisonError::into_inner);
+            let before = evidence.get(&binary.spec).cloned();
+            let stable = match before {
+                Some(before) if before == after => after,
+                Some(before) => {
+                    miss_drift
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(binary.spec.clone());
+                    Evidence {
+                        exe_sha256: after.exe_sha256.or(before.exe_sha256),
+                        content_key: None,
+                        reason: Some(
+                            "runtime inputs changed while the test binary ran; its read-only \
+                             declaration was violated"
+                                .into(),
+                        ),
+                    }
+                }
+                None => {
+                    miss_drift
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(binary.spec.clone());
+                    Evidence {
+                        exe_sha256: after.exe_sha256,
+                        content_key: None,
+                        reason: Some(
+                            "runtime inputs were not captured immediately before the test binary ran"
+                                .into(),
+                        ),
+                    }
+                }
+            };
+            evidence.insert(binary.spec.clone(), stable);
+        }
+        let evidence = evidence_of(binary);
+        let (outcome, event, sample) =
+            binary_event(binary, ran, started, evidence.as_ref(), watch.json);
         let red = mark_red_decided(outcome, ctx.halt.armed(), halt);
         emit(ctx, &event);
         if red {
@@ -2577,14 +2868,25 @@ fn run_planned_observed(
                 }
                 env.child_ceiling = Some(left);
             }
-            if sha_of(b).is_none()
-                && let Some(sha) = hash(b)
-            {
-                shas.lock()
+            let (cmd, exact_error) = if ctx.release {
+                let (command, exact_error) = commands
+                    .get(&b.spec)
+                    .cloned()
+                    .expect("every release miss keeps its finalized exact command");
+                (command, exact_error)
+            } else {
+                (
+                    final_binary_cmd(ctx, b, planned.width, checkers, watch),
+                    None,
+                )
+            };
+            if ctx.release {
+                let before = evidence_for(&new_evidence_builder(), b, &cmd, exact_error.as_deref());
+                evidence
+                    .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .insert(b.spec.clone(), sha);
+                    .insert(b.spec.clone(), before);
             }
-            let cmd = crate::test_env::command(ctx, binary_cmd(b, planned.width, checkers, watch));
             let mut run = exec::run_test(&cmd, env, local_halt);
             if cmd.test_cases.as_ref().is_some_and(|w| w.json) {
                 // The raw events were the child's log; every reader takes libtest's report.
@@ -2630,6 +2932,14 @@ fn run_planned_observed(
             Some(left)
         })
         .collect();
+    let mut miss_drift = miss_drift
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    miss_drift.sort();
+    miss_drift.dedup();
+    let carried_drift = finish_carried();
+    let carried_stable = carried.len().saturating_sub(carried_drift.len());
     let mut samples = probe_samples;
     samples.extend(
         dispatch_samples
@@ -2653,23 +2963,37 @@ fn run_planned_observed(
     let accounted = |r: &mut Report| {
         r.raw(summary(&plan, &ran));
         claimed_said(r, claim);
-        if ctx.passed_binaries.is_some() {
+        if ctx.release {
             r.raw(format!(
-                "  test binaries: {} of {listed} carried (each passed before in this tree, its \
-                 executable unchanged); {} run",
-                carried.len(),
-                bins.len() + probe_hung_count
+                "  test binaries: {} of {listed} carried (prior ok, executable and complete \
+                 runtime inputs equal through dispatch); {} run; {} invalidated",
+                carried_stable,
+                bins.len() + probe_hung_count,
+                carried_drift.len()
             ));
         }
         if ctx.release {
+            let evidence = evidence.lock().unwrap_or_else(PoisonError::into_inner);
+            let bounded = evidence.values().filter(|item| item.bounded()).count();
+            let mut unbounded: BTreeMap<&str, usize> = BTreeMap::new();
+            for reason in evidence.values().filter_map(|item| item.reason.as_deref()) {
+                *unbounded.entry(reason).or_default() += 1;
+            }
             r.raw(format!(
-                "  test binaries hashed (SHA-256 of each executable, a resume's key): {} in {} \
-                 summed over workers",
-                shas.lock().unwrap_or_else(PoisonError::into_inner).len(),
+                "  test binaries' content evidence: {bounded} bounded, {} unbounded, {} \
+                 executables hashed in {} summed over workers",
+                listed.saturating_sub(bounded),
+                evidence
+                    .values()
+                    .filter(|item| item.exe_sha256.is_some())
+                    .count(),
                 crate::report::duration(
-                    Duration::from_nanos(hashed.load(Ordering::Relaxed)).as_secs_f64()
+                    Duration::from_nanos(evidenced.load(Ordering::Relaxed)).as_secs_f64()
                 )
             ));
+            for (reason, count) in unbounded.into_iter().take(crate::report::FINDINGS_SHOWN) {
+                r.raw(format!("    unbounded ({count}): {reason}"));
+            }
         }
     };
     let tail = |r: &mut Report| {
@@ -2710,6 +3034,30 @@ fn run_planned_observed(
             "{label} — {} of {} test binaries not run: {words}",
             stopped.len(),
             bins.len()
+        ));
+        return;
+    }
+    if !carried_drift.is_empty() && runs.iter().all(|run| run.ok) {
+        r.raw(preface);
+        accounted(r);
+        r.raw(combined(&bins, &runs).output);
+        tail(r);
+        r.cannot_run(format!(
+            "{label} — {} carried candidate(s) changed after selection and were not run: {}",
+            carried_drift.len(),
+            carried_drift.join(", ")
+        ));
+        return;
+    }
+    if !miss_drift.is_empty() && runs.iter().all(|run| run.ok) {
+        r.raw(preface);
+        accounted(r);
+        r.raw(combined(&bins, &runs).output);
+        tail(r);
+        r.cannot_run(format!(
+            "{label} — runtime inputs changed while {} successful test binary(s) ran: {}",
+            miss_drift.len(),
+            miss_drift.join(", ")
         ));
         return;
     }
@@ -3444,6 +3792,7 @@ exit 0"#,
                 &Ran::of(run.clone(), Duration::ZERO, Duration::ZERO),
                 true,
                 None,
+                false,
             );
             aterm_json::from_str(line.strip_prefix("verify-event: ").unwrap()).unwrap()
         };
@@ -3501,6 +3850,7 @@ exit 0"#,
             &Ran::of(run.clone(), Duration::ZERO, Duration::ZERO),
             true,
             None,
+            true,
         );
         assert_eq!(outcome, Outcome::Fail(Severity::GateFailed));
         assert!(
@@ -3564,10 +3914,10 @@ exit 0"#,
         )
     }
 
-    /// A resume carries a binary only when the spec that passed before names the digest its
-    /// executable has now, and never GOLDEN's package, whose test a release must show every run;
-    /// the rest run in their order, and each binary hashed is known by its digest. Negative
-    /// control: dropping the GOLDEN filter carries `aterm-gpu --lib`.
+    /// A resume carries a binary only when the prior ok names both its current executable and
+    /// complete bounded content key, and never GOLDEN's package. Evidence is computed for every
+    /// binary, including the first run and binaries absent from the prior proof. Negative
+    /// controls: a changed content key and GOLDEN's exact match both run.
     #[test]
     fn a_resume_carries_only_unchanged_binaries_that_passed_and_never_the_golden_package() {
         let bin = |exe: &str, pkg: &str| Binary {
@@ -3582,21 +3932,34 @@ exit 0"#,
             bin("/t/deps/aterm_gpu-3", crate::checks::GOLDEN.0),
             bin("/t/deps/aterm_core-4", "aterm-core"),
         ];
-        let digest = |exe: &Path| match exe.to_str() {
-            Some("/t/deps/aterm_db-1") => "aa".repeat(32),
-            Some("/t/deps/aterm_grid-2") => "bb".repeat(32),
-            Some("/t/deps/aterm_gpu-3") => "cc".repeat(32),
-            _ => "dd".repeat(32),
+        let evidence = |b: &Binary| Evidence {
+            exe_sha256: Some(match b.record.exe().to_str() {
+                Some("/t/deps/aterm_db-1") => "aa".repeat(32),
+                Some("/t/deps/aterm_grid-2") => "bb".repeat(32),
+                Some("/t/deps/aterm_gpu-3") => "cc".repeat(32),
+                _ => "dd".repeat(32),
+            }),
+            content_key: Some(match b.record.exe().to_str() {
+                Some("/t/deps/aterm_db-1") => "11".repeat(32),
+                Some("/t/deps/aterm_grid-2") => "22".repeat(32),
+                Some("/t/deps/aterm_gpu-3") => "33".repeat(32),
+                _ => "44".repeat(32),
+            }),
+            reason: None,
         };
-        let passed = read_passed(&format!(
-            "{} -p aterm-db --lib\n\n{} -p aterm-grid --lib\n{} -p {} --lib\n",
-            "aa".repeat(32),
-            "ee".repeat(32),
-            "cc".repeat(32),
-            crate::checks::GOLDEN.0
-        ))
-        .unwrap();
-        let hashed = Mutex::new(Vec::new());
+        let mut passed = Passed::new();
+        for (index, binary) in bins.iter().take(3).enumerate() {
+            let mut prior =
+                CarryProof::passed(&binary.spec, &evidence(binary), 1.25 + index as f64);
+            if index == 1 {
+                prior.content_key = Some("ee".repeat(32));
+            }
+            passed.insert(binary.spec.clone(), prior);
+        }
+        let mut failed = CarryProof::passed(&bins[3].spec, &evidence(&bins[3]), 2.0);
+        failed.outcome = "FAIL".into();
+        passed.insert(bins[3].spec.clone(), failed);
+        let evidenced = Mutex::new(Vec::new());
         let Carried {
             run,
             carried,
@@ -3604,9 +3967,9 @@ exit 0"#,
         } = carry(
             &passed,
             bins,
-            |b| {
-                hashed.lock().unwrap().push(b.spec.clone());
-                Some(digest(b.record.exe()))
+            |b, _| {
+                evidenced.lock().unwrap().push(b.spec.clone());
+                evidence(b)
             },
             2,
         );
@@ -3614,10 +3977,10 @@ exit 0"#,
         assert_eq!(
             carried
                 .iter()
-                .map(|(b, sha)| (b.spec.as_str(), sha.as_str()))
+                .map(|carried| carried.binary.spec.as_str())
                 .collect::<Vec<_>>(),
-            [("-p aterm-db --lib", "aa".repeat(32).as_str())],
-            "only the unchanged binary that passed"
+            ["-p aterm-db --lib"],
+            "only the exact bounded prior ok"
         );
         assert_eq!(
             specs(&run),
@@ -3626,18 +3989,28 @@ exit 0"#,
                 "-p aterm-gpu --lib",
                 "-p aterm-core --lib"
             ],
-            "a changed executable runs, GOLDEN's package always runs, an unnamed one runs"
+            "a changed key runs, GOLDEN's package always runs, and a direct prior FAIL runs"
         );
-        let mut hashed = hashed.into_inner().unwrap();
-        hashed.sort();
+        let mut evidenced = evidenced.into_inner().unwrap();
+        evidenced.sort();
         assert_eq!(
-            hashed,
-            ["-p aterm-db --lib", "-p aterm-grid --lib"],
-            "only what passed is hashed to decide"
+            evidenced,
+            [
+                "-p aterm-core --lib",
+                "-p aterm-db --lib",
+                "-p aterm-gpu --lib",
+                "-p aterm-grid --lib",
+            ],
+            "every release binary gets evidence on its first run too"
         );
-        assert_eq!(known.get("-p aterm-grid --lib"), Some(&"bb".repeat(32)));
+        assert_eq!(
+            known
+                .get("-p aterm-grid --lib")
+                .and_then(|evidence| evidence.content_key.as_deref()),
+            Some("22".repeat(32).as_str())
+        );
         let event: aterm_json::Value = aterm_json::from_str(
-            carried_event(&carried[0].0, &carried[0].1)
+            carried_event(&carried[0])
                 .strip_prefix("verify-event: ")
                 .unwrap(),
         )
@@ -3645,16 +4018,133 @@ exit 0"#,
         assert_eq!(event["outcome"].as_str(), Some("ok"));
         assert_eq!(event["carried"].as_bool(), Some(true));
         assert_eq!(event["execution_s"].as_f64(), Some(0.0));
+        assert_eq!(event["recorded_execution_s"].as_f64(), Some(1.25));
         assert_eq!(event["exe_sha256"].as_str(), Some("aa".repeat(32).as_str()));
+        assert_eq!(
+            event["content_key"].as_str(),
+            Some("11".repeat(32).as_str())
+        );
+    }
 
-        for bad in [
-            "aa -p x --lib".to_owned(),
-            format!("{} ", "aa".repeat(32)),
-            format!("{} -p x --lib", "AA".repeat(32)),
-            format!("{0} -p x --lib\n{0} -p x --lib", "aa".repeat(32)),
-        ] {
-            assert!(read_passed(&bad).is_err(), "{bad:?}");
+    /// Deterministic release-line timeline for A19. A cfg(test) edit changes the edited target
+    /// and one dependent executable; a fixture changes only its declared reader; a harness or
+    /// verifier context change changes every complete key. The fixture scheduler has one
+    /// execution slot, so the sum is its modeled wall, not a production latency claim. NEGATIVE
+    /// CONTROL: an otherwise equal undeclared reader still runs.
+    #[test]
+    fn fix_hop_line_timeline_runs_only_changed_complete_inputs() {
+        let binary = |name: &str| Binary {
+            harness: false,
+            header: String::new(),
+            spec: format!("-p {name} --lib"),
+            record: rec(&format!("/t/deps/{name}-0000000000000000"), name),
+        };
+        let bins = vec![
+            binary("edited"),
+            binary("dependent"),
+            binary("fixture-reader"),
+            binary("fixture-sibling"),
+        ];
+        let mut base = BTreeMap::new();
+        for (index, binary) in bins.iter().enumerate() {
+            base.insert(
+                binary.spec.clone(),
+                Evidence {
+                    exe_sha256: Some(format!("{:02x}", index + 1).repeat(32)),
+                    content_key: Some(format!("{:02x}", index + 17).repeat(32)),
+                    reason: None,
+                },
+            );
         }
+        let mut prior = Passed::new();
+        for binary in &bins {
+            prior.insert(
+                binary.spec.clone(),
+                CarryProof::passed(&binary.spec, &base[&binary.spec], 1.0),
+            );
+        }
+        let walls = BTreeMap::from([
+            ("-p edited --lib", 12_u64),
+            ("-p dependent --lib", 8),
+            ("-p fixture-reader --lib", 4),
+            ("-p fixture-sibling --lib", 2),
+        ]);
+        let scenario = |evidence: BTreeMap<String, Evidence>| {
+            let result = carry(
+                &prior,
+                bins.clone(),
+                |binary, _| evidence[&binary.spec].clone(),
+                2,
+            );
+            let run = result
+                .run
+                .iter()
+                .map(|binary| binary.spec.clone())
+                .collect::<Vec<_>>();
+            let carried = result
+                .carried
+                .iter()
+                .map(|binary| binary.binary.spec.clone())
+                .collect::<Vec<_>>();
+            let single_slot_wall_s = run.iter().map(|spec| walls[spec.as_str()]).sum::<u64>();
+            (run, carried, single_slot_wall_s)
+        };
+
+        let mut cfg_test = base.clone();
+        for (spec, byte) in [("-p edited --lib", "a1"), ("-p dependent --lib", "a2")] {
+            let evidence = cfg_test.get_mut(spec).unwrap();
+            evidence.exe_sha256 = Some(byte.repeat(32));
+            evidence.content_key = Some(byte.repeat(32));
+        }
+        let (run, carried, wall) = scenario(cfg_test);
+        assert_eq!(run, ["-p edited --lib", "-p dependent --lib"]);
+        assert_eq!(
+            carried,
+            ["-p fixture-reader --lib", "-p fixture-sibling --lib"]
+        );
+        assert_eq!(wall, 20);
+
+        let mut fixture = base.clone();
+        fixture
+            .get_mut("-p fixture-reader --lib")
+            .unwrap()
+            .content_key = Some("b1".repeat(32));
+        let (run, carried, wall) = scenario(fixture);
+        assert_eq!(run, ["-p fixture-reader --lib"]);
+        assert_eq!(
+            carried,
+            [
+                "-p edited --lib",
+                "-p dependent --lib",
+                "-p fixture-sibling --lib"
+            ]
+        );
+        assert_eq!(wall, 4);
+
+        let harness = base
+            .iter()
+            .map(|(spec, evidence)| {
+                let mut evidence = evidence.clone();
+                evidence.content_key = Some("c1".repeat(32));
+                (spec.clone(), evidence)
+            })
+            .collect();
+        let (run, carried, wall) = scenario(harness);
+        assert_eq!(run.len(), 4);
+        assert!(carried.is_empty());
+        assert_eq!(wall, 26);
+
+        let mut unbounded = base.clone();
+        unbounded.insert(
+            "-p fixture-sibling --lib".into(),
+            Evidence {
+                exe_sha256: base["-p fixture-sibling --lib"].exe_sha256.clone(),
+                content_key: None,
+                reason: Some("runtime inputs are undeclared".into()),
+            },
+        );
+        let (run, _, _) = scenario(unbounded);
+        assert_eq!(run, ["-p fixture-sibling --lib"]);
     }
 
     /// A test binary's event lands in a release's events file whole, as its cutter reads it, beside
@@ -3680,7 +4170,17 @@ exit 0"#,
                 env: Vec::new(),
             },
         };
-        let event = carried_event(&binary, &"aa".repeat(32));
+        let evidence = Evidence {
+            exe_sha256: Some("aa".repeat(32)),
+            content_key: Some("11".repeat(32)),
+            reason: None,
+        };
+        let event = carried_event(&CarriedBinary {
+            binary,
+            evidence,
+            json: false,
+            prior_execution_s: 1.0,
+        });
         let initial = std::fs::read_to_string(&at).unwrap();
         let prepared = ctx.events.as_ref().unwrap().prepare(&event);
         emit(&ctx, &event);
@@ -4565,6 +5065,7 @@ exit 0"#,
             &Ran::of(runs[1].clone(), Duration::ZERO, Duration::ZERO),
             true,
             None,
+            false,
         );
         assert_eq!(outcome, Outcome::Fail(Severity::GateFailed), "a proven red");
         let event: aterm_json::Value =
@@ -5021,6 +5522,169 @@ exit 0"#,
         assert_eq!(
             cmd.preamble.as_deref(),
             Some("     Running tests/a.rs (target/debug/deps/a-1)\n")
+        );
+    }
+
+    /// Content evidence is made from the command after the full-set plan and JSON probe have
+    /// fixed it. NEGATIVE CONTROLS: changing either the actual planned width or the probe's final
+    /// JSON mode changes the key; hard-coding a width or keying the pre-probe command fails this.
+    #[test]
+    fn planned_width_and_final_json_mode_are_content_key_inputs() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let root = dir.path().join("workspace");
+        let package = root.join("crates/p");
+        let scratch = root.join("scratch");
+        let executable = root.join("target/debug/deps/p-0000000000000000");
+        std::fs::create_dir_all(package.join("src")).unwrap();
+        std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/p\"]\nresolver = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("trust.lock"), "build = 1\n").unwrap();
+        std::fs::write(
+            package.join("Cargo.toml"),
+            "[package]\nname = \"p\"\nversion = \"0.0.0\"\n\
+             [package.metadata.aterm.test-inputs]\n\
+             bounded = true\ncontent-only = true\nread-only = true\npaths = []\nvolatile-environment = []\n",
+        )
+        .unwrap();
+        std::fs::write(package.join("src/lib.rs"), "pub fn answer() -> u8 { 1 }\n").unwrap();
+        std::fs::write(&executable, b"test executable").unwrap();
+        let binary = Binary {
+            header: format!(
+                "     Running unittests src/lib.rs ({})",
+                executable.display()
+            ),
+            spec: "-p p --lib".into(),
+            record: Record {
+                cwd: package.clone(),
+                argv: vec![executable.into_os_string()],
+                env: vec![
+                    ("CARGO_PKG_NAME".into(), "p".into()),
+                    ("CARGO_MANIFEST_DIR".into(), package.into_os_string()),
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                ],
+            },
+            harness: true,
+        };
+        let ctx = crate::Ctx::new(
+            root,
+            crate::Scope::workspace(),
+            crate::EnvSnapshot::default(),
+            scratch.clone(),
+        );
+        let builder = crate::test_content::EvidenceBuilder::new(
+            Some("11".repeat(32)),
+            Some("22".repeat(32)),
+            scratch,
+        );
+        let keyed = |width, json, seed| {
+            let command = final_binary_cmd(
+                &ctx,
+                &binary,
+                width,
+                false,
+                Watch {
+                    json,
+                    stop_at_red: false,
+                    seed,
+                },
+            );
+            let command = exec::finalize_exact_command(command, ctx.exec_env())
+                .expect("a replayed test command is exact");
+            (builder.evidence(&binary, &command), command)
+        };
+        let (narrow, narrow_command) = keyed(2, false, None);
+        let (wide, _) = keyed(7, false, None);
+        let (json, json_command) = keyed(2, true, None);
+        let (seeded, seeded_command) = keyed(2, false, Some(17));
+        assert!(narrow.bounded(), "{narrow:?}");
+        assert_ne!(narrow.content_key, wide.content_key, "planned width");
+        assert_ne!(narrow.content_key, json.content_key, "final JSON mode");
+        assert_ne!(narrow.content_key, seeded.content_key, "shuffle seed");
+        assert!(
+            narrow_command
+                .argv()
+                .iter()
+                .all(|argument| argument != "json")
+                && json_command
+                    .argv()
+                    .iter()
+                    .any(|argument| argument == "json")
+        );
+        assert!(
+            seeded_command
+                .argv()
+                .iter()
+                .any(|argument| argument == "--shuffle-seed=17")
+        );
+    }
+
+    /// Carry projects the already-claimed full plan; it never widens or reorders the misses.
+    /// NEGATIVE CONTROL: asking the planner again after removing the middle binary would not
+    /// preserve these deliberately distinct widths, charges and predictions.
+    #[test]
+    fn carry_projects_the_fixed_full_plan_without_replanning() {
+        let binary = |name: &str| Binary {
+            header: String::new(),
+            spec: format!("-p {name} --lib"),
+            record: rec(&format!("/r/target/debug/deps/{name}-1"), name),
+            harness: true,
+        };
+        let full = vec![binary("a"), binary("carried"), binary("b")];
+        let plan = Plan {
+            share: 8,
+            target: Duration::from_secs(9),
+            order: vec![
+                Planned {
+                    index: 2,
+                    width: 7,
+                    charge: 8,
+                    peak: 700,
+                    predicted: Some(Duration::from_secs(3)),
+                },
+                Planned {
+                    index: 1,
+                    width: 5,
+                    charge: 6,
+                    peak: 500,
+                    predicted: Some(Duration::from_secs(5)),
+                },
+                Planned {
+                    index: 0,
+                    width: 2,
+                    charge: 3,
+                    peak: 200,
+                    predicted: Some(Duration::from_secs(7)),
+                },
+            ],
+        };
+        let kept = vec![full[0].clone(), full[2].clone()];
+        assert_eq!(
+            project_plan(&plan, &full, &kept),
+            Plan {
+                share: 8,
+                target: Duration::from_secs(9),
+                order: vec![
+                    Planned {
+                        index: 1,
+                        width: 7,
+                        charge: 8,
+                        peak: 700,
+                        predicted: Some(Duration::from_secs(3)),
+                    },
+                    Planned {
+                        index: 0,
+                        width: 2,
+                        charge: 3,
+                        peak: 200,
+                        predicted: Some(Duration::from_secs(7)),
+                    },
+                ],
+            }
         );
     }
 

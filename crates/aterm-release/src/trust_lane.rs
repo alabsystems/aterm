@@ -6367,7 +6367,12 @@ pub mod trustd {
                 let (end_tx, end_rx) = std::sync::mpsc::channel::<()>();
                 let (ended_tx, ended_rx) = std::sync::mpsc::channel::<()>();
                 let trustd = std::thread::spawn(move || {
-                    let (conn, _) = listener.accept().unwrap();
+                    let (conn, _) = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap();
                     let mut w = conn.try_clone().unwrap();
                     let mut lines = BufReader::new(conn).lines();
                     for reply in [
@@ -6444,7 +6449,6 @@ pub mod trustd {
                 .unwrap();
             let sock = d.path().join("k.sock");
             let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-            listener.set_nonblocking(true).unwrap();
             let k = Kept {
                 stop: Arc::new(AtomicBool::new(false)),
                 held: Arc::new(AtomicBool::new(false)),
@@ -6488,7 +6492,13 @@ pub mod trustd {
                 .expect("the stopped worker never ended");
             ending.join().unwrap();
             assert_eq!(
-                listener.accept().unwrap_err().kind(),
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap_err()
+                .kind(),
                 std::io::ErrorKind::WouldBlock,
                 "a worker stopped before startup must not connect"
             );
@@ -15479,8 +15489,14 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
         use std::io::{BufRead as _, BufReader as Reader};
         let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
         std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                let Ok(conn) = conn else { return };
+            loop {
+                let Ok((conn, _)) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
+                    return;
+                };
                 let status = status.clone();
                 std::thread::spawn(move || {
                     let mut w = conn.try_clone().unwrap();
@@ -15689,9 +15705,14 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
         let mute = d.join("mute.sock");
         let listener = std::os::unix::net::UnixListener::bind(&mute).unwrap();
         let _held = std::thread::spawn(move || {
-            let conns: Vec<_> = listener.incoming().take(1).collect();
+            let conn = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("the silent probe connects");
             std::thread::park_timeout(Duration::from_secs(60));
-            drop(conns);
+            drop(conn);
         });
         let silent = trustd::probe(&mute, "aa", Duration::from_millis(200));
         assert_eq!(silent.held, trustd::Held::Silent);
@@ -15736,7 +15757,12 @@ c	100	100	{GIB}	2026-11-01T00:00:00Z		failed
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let mute = std::thread::spawn(move || {
-            let (conn, _) = listener.accept().unwrap();
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             conn.set_read_timeout(Some(Duration::from_secs(60)))
                 .unwrap();
             let mut reader = BufReader::new(conn);

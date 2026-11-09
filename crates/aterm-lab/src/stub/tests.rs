@@ -288,7 +288,12 @@ fn a_prearmed_wall_preserves_the_admitted_scripted_reply() {
 fn wire_answer(stub: &Stub, answer: impl FnOnce(&mut Out<'_>) -> io::Result<()>) -> String {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let mut reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (mut writer, _) = listener.accept().unwrap();
+    let (mut writer, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     reader
         .set_read_timeout(Some(Duration::from_secs(60)))
         .unwrap();

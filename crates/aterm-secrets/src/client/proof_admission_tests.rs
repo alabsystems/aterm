@@ -114,7 +114,11 @@ impl Rig {
                 dials.fetch_add(1, Ordering::SeqCst);
                 let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
                 let ours = std::net::TcpStream::connect(listener.local_addr()?)?;
-                let (mut theirs, _) = listener.accept()?;
+                let (mut theirs, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )?;
                 for stream in [&ours, &theirs] {
                     stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
                     stream.set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;

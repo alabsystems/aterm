@@ -69,7 +69,6 @@ fn native_fleet_registration_finishes_before_discovery_fallback() {
     let issuer_at = code.hint.unwrap();
     let native_calls = Cell::new(0);
     let named = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    named.set_nonblocking(true).unwrap();
     let registered = register_with(
         &[
             ("127.0.0.1".into(), closed_port()),
@@ -91,7 +90,14 @@ fn native_fleet_registration_finishes_before_discovery_fallback() {
     )
     .unwrap();
     assert!(
-        matches!(named.accept(), Err(why) if why.kind() == io::ErrorKind::WouldBlock),
+        matches!(
+            aterm_uds::accept(
+                &named,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ),
+            Err(why) if why.kind() == io::ErrorKind::WouldBlock
+        ),
         "a retained hostname never gets ahead of the queued numeric member"
     );
     assert_eq!(native_calls.get(), 1);
@@ -3336,7 +3342,13 @@ fn a_join_or_init_whose_listen_place_another_program_holds_never_says_it_listens
     let cutter = std::thread::spawn({
         let stop = Arc::clone(&stop);
         move || {
-            for conn in hangs_up.incoming() {
+            loop {
+                let conn = aterm_uds::accept(
+                    &hangs_up,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .map(|(stream, _)| stream);
                 if stop.load(Ordering::SeqCst) {
                     return;
                 }
@@ -3386,7 +3398,11 @@ fn an_init_after_a_leave_waits_out_a_listener_that_cuts_its_probe() {
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
     let cutter = std::thread::spawn(move || {
         for _ in 0..2 {
-            drop(held.accept());
+            drop(aterm_uds::accept(
+                &held,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ));
         }
         let serving = Listener::rereading(held, &state);
         let _ = stopped.recv();
@@ -4838,7 +4854,6 @@ fn a_join_of_a_rotated_code_reads_no_other_member_for_its_holds() {
     };
     ok(join(&member.places, &opts, &code));
     let old = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    old.set_nonblocking(true).unwrap();
     member.write_config(&format!(
         "{}\n[[fleet.peers]]\nhost = \"127.0.0.1:{}\"\n",
         member.config(),
@@ -4859,7 +4874,14 @@ fn a_join_of_a_rotated_code_reads_no_other_member_for_its_holds() {
         "{joined}"
     );
     assert!(
-        matches!(old.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+        matches!(
+            aterm_uds::accept(
+                &old,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+        ),
         "a rotate's join dialled another member: {joined}"
     );
 }
@@ -5965,7 +5987,6 @@ fn a_survey_reads_its_issuers_book_again_within_its_own_deadline() {
     };
     ok(join(&member.places, &opts, &code));
     let silent = serving.take();
-    silent.set_nonblocking(true).unwrap();
     let elsewhere = format!("127.0.0.1:{}", closed_port());
     let read = survey_fleet_in(
         &member.places,
@@ -5981,7 +6002,14 @@ fn a_survey_reads_its_issuers_book_again_within_its_own_deadline() {
         read.peers
     );
     assert!(
-        matches!(silent.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock),
+        matches!(
+            aterm_uds::accept(
+                &silent,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock
+        ),
         "a survey whose deadline is spent dialled the issuer"
     );
 }
@@ -6055,7 +6083,16 @@ fn a_member_past_a_silent_issuer_spends_one_deadline_and_says_its_issuer_did_not
     };
     let host = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let word = host.local_addr().unwrap().to_string();
-    let hanging = std::thread::spawn(move || drop(host.accept().unwrap()));
+    let hanging = std::thread::spawn(move || {
+        drop(
+            aterm_uds::accept(
+                &host,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap(),
+        );
+    });
     // The issuer's read spends none of the deadline here, so a host dial given that read's bound
     // in place of the survey's own deadline would end before it connects.
     let read = with_issuer_read_within(Duration::ZERO, || survey(&word, 2 * HANG));

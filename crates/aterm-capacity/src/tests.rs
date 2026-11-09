@@ -1930,10 +1930,12 @@ fn background_standin() {
 fn overlapping_ordinary_cores_run_before_the_next_background_stage_and_release_ends_its_group() {
     use std::os::unix::process::ExitStatusExt as _;
     let s = scratch("background");
+    let evidence = s.dir.path().join("preemption.log");
     let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
     let mut child = command
         .args(["--exact", "tests::background_standin", "--nocapture"])
         .env("ATERM_TEST_BACKGROUND", s.dir.path())
+        .stderr(std::fs::File::create(&evidence).unwrap())
         .process_group(0)
         .spawn()
         .unwrap();
@@ -1981,7 +1983,24 @@ fn overlapping_ordinary_cores_run_before_the_next_background_stage_and_release_e
         child.try_wait().unwrap()
     });
     assert_eq!(status.signal(), Some(libc::SIGTERM));
+    let evidence = std::fs::read_to_string(evidence).unwrap();
+    assert!(evidence.contains("signal=15 sender_pid="), "{evidence}");
+    assert!(
+        evidence.contains(&format!("Release claim pid={}", std::process::id())),
+        "{evidence}"
+    );
     drop(release);
+}
+
+#[test]
+fn background_stop_evidence_distinguishes_a_failed_observation_from_absence_of_release() {
+    assert!(crate::background::stop_reason(Ok(Vec::new())).is_none());
+    let failure =
+        crate::background::stop_reason(Err(std::io::Error::other("planted ledger failure")))
+            .unwrap();
+    assert!(failure.contains("ledger observation failed"));
+    assert!(failure.contains("planted ledger failure"));
+    assert!(!failure.contains("Release claim"));
 }
 
 /// A claim's reservation is its peak less what its process tree already uses: memory in use

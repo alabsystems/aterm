@@ -145,7 +145,7 @@ impl Stream {
 }
 
 struct Run {
-    child: Result<Child, io::Error>,
+    child: Result<Child, RunError>,
     exit: Option<ExitWait>,
     status: Option<ExitStatus>,
     exited_at: Option<Instant>,
@@ -162,8 +162,12 @@ pub(super) fn prepare(cmd: &mut Command) -> &mut Command {
 }
 
 impl Run {
-    fn start(cmd: &mut Command) -> Self {
-        Self::of(prepare(cmd).spawn())
+    fn start(cmd: &mut Command, deadline: Instant) -> Self {
+        if deadline_now() >= deadline {
+            Self::refused(RunError::TimedOut)
+        } else {
+            Self::of(prepare(cmd).spawn())
+        }
     }
 
     fn of(spawned: io::Result<Child>) -> Self {
@@ -183,14 +187,18 @@ impl Run {
                     failed: None,
                 }
             }
-            Err(error) => Self {
-                child: Err(error),
-                exit: None,
-                status: None,
-                exited_at: None,
-                streams: [Stream::new(None), Stream::new(None)],
-                failed: None,
-            },
+            Err(error) => Self::refused(RunError::Spawn(error)),
+        }
+    }
+
+    fn refused(error: RunError) -> Self {
+        Self {
+            child: Err(error),
+            exit: None,
+            status: None,
+            exited_at: None,
+            streams: [Stream::new(None), Stream::new(None)],
+            failed: None,
         }
     }
 
@@ -248,7 +256,7 @@ impl Run {
             return Err(failed);
         }
         match (self.child, self.status) {
-            (Err(error), _) => Err(RunError::Spawn(error)),
+            (Err(error), _) => Err(error),
             (Ok(_), Some(status)) => {
                 let [stdout, stderr] = self.streams;
                 Ok(Output {
@@ -269,7 +277,9 @@ pub(super) fn outputs_until(
     reap: Duration,
 ) -> Vec<Result<Output, RunError>> {
     run_until(
-        cmds.iter_mut().map(|cmd| Run::start(cmd)).collect(),
+        cmds.iter_mut()
+            .map(|cmd| Run::start(cmd, deadline))
+            .collect(),
         deadline,
         reap,
         None,
@@ -285,7 +295,9 @@ pub(super) fn outputs_until_unless(
     stopped: &mut dyn FnMut() -> bool,
 ) -> Vec<Result<Output, RunError>> {
     run_until(
-        cmds.iter_mut().map(|cmd| Run::start(cmd)).collect(),
+        cmds.iter_mut()
+            .map(|cmd| Run::start(cmd, deadline))
+            .collect(),
         deadline,
         reap,
         Some(stopped),

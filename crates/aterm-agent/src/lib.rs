@@ -1605,7 +1605,12 @@ mod tests {
         let sock = dir.join("c.sock");
         let listener = aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(&sock)).unwrap();
         let accepting = std::thread::spawn(move || {
-            let (far, _) = aterm_uds::accept(&listener).unwrap();
+            let (far, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             answers_late(far, 2).join().unwrap();
         });
         let mut client = RelayClient::connect_local(sock.to_str().unwrap(), "token").unwrap();

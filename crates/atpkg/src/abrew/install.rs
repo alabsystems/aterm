@@ -678,6 +678,24 @@ fn bottle_filename(f: &Formula, tag: &str) -> String {
     )
 }
 
+/// Brew's cached-download path: `downloads/<sha256(url)>--<file>`
+/// under the cache (the name `brew --cache` prints).
+pub(super) fn download_dest(prefix: &Prefix, url: &str, filename: &str) -> PathBuf {
+    prefix.cache().join("downloads").join(format!(
+        "{}--{filename}",
+        super::fetch::sha256_bytes(url.as_bytes())
+    ))
+}
+
+/// The cached bottle file for one of `f`'s bottle entries.
+pub(super) fn bottle_dest(
+    prefix: &Prefix,
+    f: &Formula,
+    bottle: &super::formula::Bottle,
+) -> PathBuf {
+    download_dest(prefix, &bottle.url, &bottle_filename(f, &bottle.tag))
+}
+
 /// Brew's `check_install_sanity` pinned-dependency refusal: any
 /// pinned runtime dep in `top`'s closure that is not at its
 /// latest version blocks the install outright (brew checks
@@ -2674,11 +2692,9 @@ fn fetch_bottle(
         eprintln!("✔︎ Bottle Manifest {} ({})", f.name, keg_version(f));
     }
     let bottle_tag = bottle.tag.clone();
+    let dest = bottle_dest(prefix, f, &bottle);
     let (url, sha) = (bottle.url, bottle.sha256);
     let version = keg_version(f);
-    let dest = prefix
-        .cache()
-        .join(format!("{}-{version}.bottle.tar.gz", f.name));
     if fetch::verify_digest_strict(&dest, &sha).is_err() {
         let mut headers = Vec::new();
         if let Some(repo) = super::api::ghcr_repo_of(&url) {
@@ -2952,11 +2968,23 @@ fn ask_confirm_tty(action: &str) -> Result<(), InstallError> {
 }
 
 pub(super) fn bottle_manifest_dest(prefix: &Prefix, f: &Formula) -> PathBuf {
-    prefix.cache().join(format!(
-        "{}-{}.bottle_manifest.json",
-        f.name,
-        keg_version(f)
-    ))
+    let filename = format!("{}-{}.bottle_manifest.json", f.name, keg_version(f));
+    let url = f
+        .bottle_for(&Machine::this().bottle_tags())
+        .and_then(|bottle| super::api::ghcr_repo_of(&bottle.url))
+        .map(|repo| {
+            let version = keg_version(f);
+            let tag = if f.bottle_rebuild > 0 {
+                format!("{version}-{}", f.bottle_rebuild)
+            } else {
+                version
+            };
+            format!("https://ghcr.io/v2/{repo}/manifests/{tag}")
+        });
+    match url {
+        Some(url) => download_dest(prefix, &url, &filename),
+        None => prefix.cache().join(filename),
+    }
 }
 
 /// Whether a usable bottle manifest is already in the cache
@@ -3079,10 +3107,8 @@ pub fn fetch_only(prefix: &Prefix, f: &Formula) -> Result<PathBuf, InstallError>
             f.name
         )));
     };
+    let dest = bottle_dest(prefix, f, &bottle);
     let (url, sha) = (bottle.url, bottle.sha256);
-    let dest = prefix
-        .cache()
-        .join(format!("{}-{}.bottle.tar.gz", f.name, keg_version(f)));
     if !(dest.exists() && fetch::verify_digest_strict(&dest, &sha).is_ok()) {
         let mut headers: Vec<String> = Vec::new();
         if let Some(repo) = super::api::ghcr_repo_of(&url) {
@@ -3227,6 +3253,33 @@ mod tests {
         // A NUL-bearing file is not text: left byte-identical for the
         // leftover scan to delegate.
         assert_eq!(std::fs::read(&binary).unwrap(), raw);
+    }
+
+    #[test]
+    fn bottle_dest_matches_brew_downloads_naming() {
+        // Oracle: `brew --cache jq` prints this exact tail
+        // (sha256 of the bottle URL, then the bottle filename).
+        let prefix = Prefix::at(std::path::Path::new("/p"));
+        let f = Formula {
+            name: "jq".to_string(),
+            version: "1.8.2".to_string(),
+            bottle_rebuild: 1,
+            ..Formula::default()
+        };
+        let bottle = super::super::formula::Bottle {
+            tag: "arm64_golden_gate".to_string(),
+            url: "https://ghcr.io/v2/homebrew/core/jq/blobs/sha256:d048dd4c28d867e939065a3bc8209f37e2a5be3e2c18d18c8c7da8f4d1629a4a"
+                .to_string(),
+            sha256: "d048dd4c28d867e939065a3bc8209f37e2a5be3e2c18d18c8c7da8f4d1629a4a"
+                .to_string(),
+            cellar: ":any".to_string(),
+        };
+        assert_eq!(
+            bottle_dest(&prefix, &f, &bottle),
+            std::path::PathBuf::from(
+                "/p/cache/downloads/da850b1765922f36315ec227ef66d8780c3508b916b9dde242025e9828e67b26--jq--1.8.2.arm64_golden_gate.bottle.1.tar.gz"
+            )
+        );
     }
 
     #[test]

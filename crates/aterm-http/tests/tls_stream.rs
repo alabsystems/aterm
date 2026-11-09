@@ -109,7 +109,11 @@ fn dribbling_tls_server(step: Duration) -> (u16, mpsc::Receiver<()>) {
     );
     let (dribbling, dribbling_rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let Ok((mut tcp, _)) = listener.accept() else {
+        let Ok((mut tcp, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         let _ = tcp.set_read_timeout(Some(HANG_DETECTOR));
@@ -183,7 +187,11 @@ fn dribbling_handshake_peer(step: Duration) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
-        let Ok((mut tcp, _)) = listener.accept() else {
+        let Ok((mut tcp, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         if tcp.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).is_err() {
@@ -292,7 +300,11 @@ fn answering_tls_server(answer: &'static [u8]) -> u16 {
             .expect("the loopback credentials pair"),
     );
     std::thread::spawn(move || {
-        let Ok((mut tcp, _)) = listener.accept() else {
+        let Ok((mut tcp, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         let _ = tcp.set_read_timeout(Some(HANG_DETECTOR));

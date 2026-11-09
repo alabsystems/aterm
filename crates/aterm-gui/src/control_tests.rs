@@ -3960,7 +3960,12 @@ fn a_stale_graph_entry_answers_no_such_session_without_a_probe() {
     let host = std::thread::spawn(move || {
         let (mut verbs, mut silent, mut looks) = (Vec::new(), 0, 0);
         loop {
-            let (conn, _) = listener.accept().expect("accept");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut reader = BufReader::new(&conn);
             let mut first = String::new();
             if reader.read_line(&mut first).unwrap_or(0) == 0 {
@@ -4585,7 +4590,12 @@ fn a_sibling_replaced_after_the_plan_is_sent_its_own_token() {
     std::fs::remove_file(&sock).expect("unlink the old socket");
     let successor = aterm_uds::CtlListener::bind(&sock).expect("the successor binds");
     let served = std::thread::spawn(move || {
-        let (conn, _) = successor.accept().expect("the forward's connection");
+        let (conn, _) = aterm_uds::accept(
+            &successor,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("the forward's connection");
         let mut reader = BufReader::new(conn.try_clone().expect("clone"));
         let mut probe = String::new();
         reader.read_line(&mut probe).expect("the connect probe");
@@ -4638,7 +4648,12 @@ fn try_proxy_forward_conforms_to_forward_handshake() {
     let listener = aterm_uds::CtlListener::bind(&sock).expect("bind the host");
     let (handshake_tx, handshake_rx) = std::sync::mpsc::channel::<String>();
     let host_side = std::thread::spawn(move || {
-        let (conn, _) = listener.accept().expect("accept the forward");
+        let (conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept the forward");
         let mut reader = BufReader::new(conn.try_clone().expect("clone"));
         let mut probe = String::new();
         reader.read_line(&mut probe).expect("read the handshake");
@@ -19752,9 +19767,6 @@ fn the_harness_tokens_connection_writes_the_log_by_harness_and_the_beside_one_by
     let names = aterm_types::control_socket::token_names_for_sock("c.sock");
     std::fs::write(dir.path().join(&names[0]), format!("{INSTANCE}\n")).expect("beside");
     let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
     let lanes = control_lanes::Lanes::new(control_lanes::LaneLimits {
         rpc: 1,
         wait: 0,
@@ -19784,16 +19796,12 @@ fn the_harness_tokens_connection_writes_the_log_by_harness_and_the_beside_one_by
         (said, log)
     });
     for _ in 0..3 {
-        let (stream, _) = aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the connector connects",
-            || match listener.accept() {
-                Ok(connection) => Some(connection),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
-                Err(error) => panic!("accept: {error}"),
-            },
-        );
-        stream.set_nonblocking(false).expect("blocking lane stream");
+        let (stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Until(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("the connector connects");
         assert!(lanes.admit(stream).is_ok(), "admitted");
     }
     let (said, log) = client.join().expect("the connector's thread");
@@ -22388,7 +22396,6 @@ fn a_driven_proxy_forward_after_handoff_never_uses_the_owners_token() {
         let sid = target.sid.clone();
         let sock = hosting_instance(dir, 77071, &sid, "c0ffee03");
         let sibling = aterm_uds::CtlListener::bind(&sock).expect("bind the new host");
-        sibling.set_nonblocking(true).expect("nonblocking sibling");
         store.write().unwrap().register(target.clone());
         let line = format!("@{} {verb}", sid.as_str());
         let (client, server) = CtlStream::pair().expect("pair");
@@ -22440,7 +22447,14 @@ fn a_driven_proxy_forward_after_handoff_never_uses_the_owners_token() {
             "no pipelined request crossed the boundary"
         );
         assert!(
-            matches!(sibling.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            matches!(
+                aterm_uds::accept(
+                    &sibling,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ),
             "no owner-token connection reached the sibling"
         );
     }

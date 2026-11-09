@@ -1418,7 +1418,11 @@ password_file = '{}'
     let imap_thread = std::thread::spawn(move || {
         let mut code_fetches = 0;
         for _ in 0..2 {
-            let Ok((stream, _)) = imap_listener.accept() else {
+            let Ok((stream, _)) = aterm_uds::accept(
+                &imap_listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 break;
             };
             let mut writer = stream.try_clone().expect("clone");
@@ -1516,7 +1520,11 @@ password_file = '{}'
     let http_listener = TcpListener::bind("127.0.0.1:0").expect("bind http");
     let http_port = http_listener.local_addr().expect("addr").port();
     let http_thread = std::thread::spawn(move || {
-        let Ok((mut stream, _)) = http_listener.accept() else {
+        let Ok((mut stream, _)) = aterm_uds::accept(
+            &http_listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         let mut req_buf = [0u8; 4096];
@@ -2965,7 +2973,11 @@ m27_2_pass = "flat-m27-2-pw"
         let mpit_port = mpit_listener.local_addr().unwrap().port();
         let mpit_thread = std::thread::spawn(move || {
             for expected_path in ["/api/v1/messages", "/api/v1/message/mpit-42"] {
-                let Ok((mut stream, _)) = mpit_listener.accept() else {
+                let Ok((mut stream, _)) = aterm_uds::accept(
+                    &mpit_listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
                     return;
                 };
                 let mut req_buf = [0u8; 4096];
@@ -3040,7 +3052,11 @@ m27_2_pass = "flat-m27-2-pw"
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind basic auth mock");
         let basic_port = basic_listener.local_addr().unwrap().port();
         let basic_thread = std::thread::spawn(move || {
-            let Ok((mut stream, _)) = basic_listener.accept() else {
+            let Ok((mut stream, _)) = aterm_uds::accept(
+                &basic_listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 return;
             };
             let mut req_buf = [0u8; 4096];
@@ -3352,7 +3368,12 @@ Verification code: 390174\r\n";
             "/gmail/v1/users/me/messages/999888",
             "/gmail/v1/users/me/messages/482910",
         ] {
-            let (mut stream, _) = listener.accept().expect("accept");
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut req_buf = [0u8; 2048];
             let n = stream.read(&mut req_buf).unwrap_or(0);
             let req_str = String::from_utf8_lossy(&req_buf[..n]);
@@ -3449,7 +3470,12 @@ fn mailpit_detail_loop_stops_after_200_and_secret_file_extensions_strip_cleanly(
             "/api/v1/message/mpit-2",
             "/api/v1/message/mpit-1",
         ] {
-            let (mut stream, _) = listener.accept().expect("accept");
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut req_buf = [0u8; 2048];
             let n = stream.read(&mut req_buf).unwrap_or(0);
             let req_str = String::from_utf8_lossy(&req_buf[..n]);
@@ -5161,7 +5187,11 @@ fn imap_large_literal_spoofed_tags_and_ipv6_loopback_http_fetch_credentials() {
     let imap_port = imap_listener.local_addr().expect("addr").port();
     let imap_thread = std::thread::spawn(move || {
         for attempt in 0..2 {
-            let Ok((stream, _)) = imap_listener.accept() else {
+            let Ok((stream, _)) = aterm_uds::accept(
+                &imap_listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 break;
             };
             let mut writer = stream.try_clone().expect("clone");
@@ -5256,7 +5286,11 @@ fn imap_large_literal_spoofed_tags_and_ipv6_loopback_http_fetch_credentials() {
     if let Ok(v6_listener) = TcpListener::bind("[::1]:0") {
         let v6_port = v6_listener.local_addr().expect("v6 addr").port();
         let v6_thread = std::thread::spawn(move || {
-            let Ok((mut stream, _)) = v6_listener.accept() else {
+            let Ok((mut stream, _)) = aterm_uds::accept(
+                &v6_listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 return;
             };
             let mut reader = BufReader::new(stream.try_clone().expect("clone"));

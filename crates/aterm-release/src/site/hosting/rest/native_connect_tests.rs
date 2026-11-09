@@ -32,19 +32,22 @@ impl Proxy {
                 let until = Instant::now() + Duration::from_secs(60);
                 let mut calls = 0;
                 loop {
-                    let mut stream = match listener.accept() {
+                    let slice = std::cmp::min(until, Instant::now() + Duration::from_millis(5));
+                    let mut stream = match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Until(slice),
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) {
                         Ok((stream, _)) => stream,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                             if stop.load(Ordering::Acquire) {
                                 return calls;
                             }
                             assert!(Instant::now() < until);
-                            std::thread::sleep(Duration::from_millis(5));
                             continue;
                         }
                         Err(error) => panic!("owned curl proxy: {error}"),
                     };
-                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(60)))
                         .unwrap();

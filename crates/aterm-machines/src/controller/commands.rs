@@ -4039,6 +4039,7 @@ fn init_quiet(sys: &dyn System, paths: &Paths) -> Result<(), ()> {
 mod tests {
     use super::*;
     use crate::port::Fake;
+    use aterm_uds::{AcceptWait, AcceptedMode};
 
     const ROOT: &str = "/ctl/machines";
     const UUID_1: &str = "0A1B2C3D-0000-4000-8000-000000000001";
@@ -6566,7 +6567,8 @@ mod tests {
             use std::net::{Shutdown, TcpListener, TcpStream};
             let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
             let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (mut peer, _) = listener.accept().unwrap();
+            let (mut peer, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             peer.write_all(bytes).unwrap();
             peer.shutdown(Shutdown::Write).unwrap();
             let now = std::time::Instant::now();
@@ -7503,7 +7505,8 @@ mod tests {
         std::fs::write(dir.path().join("custom.sock.token"), "cafef00d\n").unwrap();
         let listener = UnixListener::bind(&explicit_sock).unwrap();
         let server = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
+            let (mut conn, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             let mut reader = BufReader::new(conn.try_clone().unwrap());
             let mut auth = String::new();
             reader.read_line(&mut auth).unwrap();

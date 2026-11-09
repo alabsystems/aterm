@@ -27,7 +27,13 @@ fn refusing_imap() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
     let (connections, logins) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let (c, l) = (Arc::clone(&connections), Arc::clone(&logins));
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
+        loop {
+            let stream = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .map(|(stream, _)| stream);
             let Ok(stream) = stream else { break };
             c.fetch_add(1, Ordering::SeqCst);
             let mut writer = stream.try_clone().expect("clone");
@@ -1181,7 +1187,13 @@ fn a_routed_address_reads_its_own_http_mailbox_with_its_own_login() {
     let seen = Arc::clone(&headers);
     let (read, request_read) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
+        loop {
+            let stream = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .map(|(stream, _)| stream);
             let Ok(stream) = stream else { break };
             let mut writer = stream.try_clone().expect("clone");
             let mut reader = BufReader::new(stream);

@@ -54,6 +54,9 @@ mod changelog;
 #[path = "../../src/channel.rs"]
 #[allow(dead_code)]
 mod channel;
+#[path = "../../src/check_content.rs"]
+#[allow(dead_code)]
+mod check_content;
 #[path = "../../src/check_record.rs"]
 #[allow(dead_code)]
 mod check_record;

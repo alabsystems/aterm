@@ -330,7 +330,12 @@ fn read_response(mut stream: TcpStream, request: String) -> Response {
 fn connected(have: &[RecordId]) -> (TcpStream, JoinHandle<Response>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client = TcpStream::connect_timeout(&listener.local_addr().unwrap(), HANG).unwrap();
-    let (server, _) = listener.accept().unwrap();
+    let (server, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     let query = if have.is_empty() {
         String::new()
     } else {

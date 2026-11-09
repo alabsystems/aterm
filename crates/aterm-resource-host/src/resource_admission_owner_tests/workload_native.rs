@@ -189,7 +189,6 @@ fn host_process() {
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&socket)).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     let _instance = store.publish(&program, &listener).unwrap();
-    listener.set_nonblocking(true).unwrap();
     crate::runtime::test_endpoint_with_store(&path).unwrap();
     // Selected native inputs require private, non-writable ancestors. Keep
     // only the Unix socket name in the short temporary namespace; the owned
@@ -370,7 +369,11 @@ fn host_process() {
             .unwrap();
             cancelled = true;
         }
-        match aterm_uds::kept_out(|| listener.accept()) {
+        match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((stream, _)) => {
                 let image = program.clone();
                 connections.push(std::thread::spawn(move || {

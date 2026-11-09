@@ -409,14 +409,12 @@ impl Renewal {
     }
 
     fn deadline(&self, now: Instant, epoch: u64) -> Instant {
-        self.cutoff()
-            .min(
-                now + Duration::from_secs(
-                    self.epoch_until
-                        .saturating_sub(epoch.saturating_add(LEASE_MARGIN.as_secs())),
-                ),
-            )
-            .min(now + Duration::from_secs(5))
+        self.cutoff().min(
+            now + Duration::from_secs(
+                self.epoch_until
+                    .saturating_sub(epoch.saturating_add(LEASE_MARGIN.as_secs())),
+            ),
+        )
     }
 
     fn finish(
@@ -629,7 +627,9 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
         if proposed >= renewal.next {
             record.updated = now();
             record.lease_until = now() + judged::LEASE;
-            let published = publish_owned(root, record, renewal.deadline(proposed, now()));
+            let published = judged::interruptible(|| {
+                publish_owned(root, record, renewal.deadline(proposed, now()))
+            });
             if let Err(why) = renewal.finish(
                 published,
                 proposed,
@@ -638,7 +638,7 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
                 now(),
             ) {
                 let _ = stop_sample(&mut child);
-                return Err(why.to_string());
+                return Err(format!("judging lease renewal: {why}"));
             }
         }
         stopped.nap(Duration::from_millis(100), &|| false);
@@ -1358,8 +1358,9 @@ fn row(id: &str, code: Option<i32>, text: &str) -> Row {
     }
     red_items.sort();
     red_items.dedup();
-    // Keep bounded evidence in the portable journal; the full log stays in the stable clone.
-    let log = text
+    // Keep the final tail and explicit preemption evidence: later NOT RUN reporting must
+    // not erase the signal sender or the admission condition from the portable journal.
+    let tail = text
         .lines()
         .rev()
         .take(50)
@@ -1368,6 +1369,18 @@ fn row(id: &str, code: Option<i32>, text: &str) -> Row {
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
+    let mut evidence = Vec::new();
+    for line in text
+        .lines()
+        .filter(|line| line.starts_with("capacity background "))
+        .take(16)
+    {
+        if !tail.lines().any(|kept| kept == line) && !evidence.contains(&line) {
+            evidence.push(line);
+        }
+    }
+    evidence.push(&tail);
+    let log = evidence.join("\n");
     Row {
         id: id.into(),
         outcome: outcome.into(),
@@ -1716,6 +1729,23 @@ fn dependency_closure(roots: &BTreeSet<String>, graph: &DependencyGraph) -> BTre
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn preemption_cause_survives_later_not_run_reporting() {
+        let cause = "capacity background preemption: signal=15 sender_pid=42; Release claim pid=43";
+        let output = std::iter::once(cause.to_owned())
+            .chain((0..80).map(|n| format!("NOT RUN sibling {n}")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let sample = Sample {
+            state: "could-not-run".into(),
+            verifier: "sampled-head".into(),
+            inputs: "inputs".into(),
+            rows: vec![row("tree", None, &output)],
+        };
+        let mut record: Record = aterm_toml::from_str("commit='c'\ntree='t'\nhost='h'\nverifier=''\ninputs=''\ntoken='k'\nstate='judging'\nstarted=0\nupdated=1\nlease_until=0\nrows=[]").unwrap();
+        accept_sample_result(&aterm_toml::to_string(&sample).unwrap(), &mut record).unwrap();
+        assert!(record.cause.contains(cause), "{}", record.cause);
+    }
     #[test]
     fn a_planted_signal_is_named_in_the_portable_cause() {
         const CHILD: &str = "ATERM_VERIFY_CAUSE_SIGNAL_CHILD";
@@ -2174,6 +2204,22 @@ mod tests {
                 .is_err()
         );
         assert_eq!(lease.expires, at(180));
+    }
+
+    #[test]
+    fn renewal_uses_the_owned_lease_budget_instead_of_an_unrelated_timeout() {
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let mut lease = Renewal::new(at(120), 1120, start);
+        // A six-second fetch/append/push fits the owned lease. The old five-second cap
+        // rejected it even though sixty seconds remained before cleanup had to begin.
+        assert_eq!(lease.deadline(at(30), 1030), at(90));
+        assert!(at(36) < lease.deadline(at(30), 1030));
+        lease.finish(Ok(()), at(30), 1150, at(36), 1036).unwrap();
+        assert_eq!(lease.expires, at(150));
+        assert_eq!(lease.epoch_until, 1150);
+        assert_eq!(lease.deadline(at(87), 1140), at(87));
+        assert_eq!(lease.deadline(at(119), 1000), at(120));
     }
 
     #[test]

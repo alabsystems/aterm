@@ -10,6 +10,23 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+/// Evidence owned by the observer that actually requests preemption. Exit status alone cannot
+/// distinguish a Release from an unavailable ledger.
+pub(crate) fn stop_reason(rows: io::Result<Vec<crate::Record>>) -> Option<String> {
+    match rows {
+        Ok(rows) => rows
+            .into_iter()
+            .find(|row| row.need.rank == crate::Rank::Release)
+            .map(|row| {
+                format!(
+                    "Release claim pid={} what={:?} checkout={:?}",
+                    row.pid, row.need.what, row.checkout
+                )
+            }),
+        Err(why) => Some(format!("ledger observation failed: {why}")),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Guard {
     stopped: Arc<AtomicBool>,
@@ -38,14 +55,13 @@ impl Guard {
                     while !done.load(Ordering::Acquire) {
                         // A failed ledger read ends repeatable work too: it supplies no authority
                         // to keep background work running beside a release we cannot observe.
-                        if ledger.list().map_or(true, |rows| {
-                            rows.iter().any(|r| r.need.rank == crate::Rank::Release)
-                        }) {
+                        if let Some(why) = stop_reason(ledger.list()) {
                             let pid = std::process::id() as i32;
                             // SAFETY: this live process owns its pid throughout this call. It
                             // authorized cancellation at admission only as a dedicated group
                             // leader; recheck that it has not joined another group since then.
                             if unsafe { libc::getpgrp() } == pid {
+                                eprintln!("capacity background preemption: signal=15 sender_pid={pid}; {why}");
                                 unsafe {
                                     libc::killpg(pid, libc::SIGTERM);
                                 }

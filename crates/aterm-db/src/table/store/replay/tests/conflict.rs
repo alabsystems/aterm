@@ -311,7 +311,17 @@ fn repair_fixture(f: &Fixture, repairs: &mut [crate::control::Repair; 2]) {
     thread::scope(|threads| {
         let server = threads.spawn(|| {
             endpoints[1].exchange(
-                Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
+                Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    LinkScope::Loopback,
+                )
+                .unwrap(),
                 Side::Responder,
                 rb,
             )
@@ -814,7 +824,17 @@ fn tls_transition(state: &State) -> State {
     thread::scope(|threads| {
         let server = threads.spawn(|| {
             eb.exchange(
-                Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
+                Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    LinkScope::Loopback,
+                )
+                .unwrap(),
                 Side::Responder,
                 &mut rb,
             )

@@ -101,7 +101,6 @@ fn host(unknown: bool) {
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&socket)).unwrap();
     aterm_uds::atomic_file::set_mode_nofollow(&socket, 0o600).unwrap();
     let _instance = store.publish(&program, &listener).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let telemetry = crate::resource_telemetry::Telemetry::new().unwrap();
     let mut world = World::with_scratch(Scratch::at(&path));
     let sdk = world.scratch.path.join("fixture-sdk");
@@ -195,7 +194,11 @@ fn host(unknown: bool) {
             drop(stream);
         }
         assert!(Instant::now() < end, "actual member host failed to drain");
-        match aterm_uds::kept_out(|| listener.accept()) {
+        match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((stream, _)) => {
                 let peer = match wire::local_peer(&stream) {
                     Ok(peer) => peer,

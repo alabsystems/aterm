@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "astream-sys"
+version = "0.2.0"
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -137,6 +141,7 @@ dependencies = [
 name = "aterm-dbus-recorder"
 version = "0.0.0"
 dependencies = [
+ "aterm-uds",
  "serde",
  "winnow",
  "zbus",
@@ -146,6 +151,73 @@ dependencies = [
  "zvariant_derive",
  "zvariant_utils",
 ]
+
+[[package]]
+name = "aterm-dirfd"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "aterm-dl"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "aterm-durable"
+version = "0.0.0"
+dependencies = [
+ "astream-sys",
+]
+
+[[package]]
+name = "aterm-json"
+version = "0.0.0"
+dependencies = [
+ "aterm-serde",
+]
+
+[[package]]
+name = "aterm-objc"
+version = "0.0.0"
+
+[[package]]
+name = "aterm-serde"
+version = "0.0.0"
+
+[[package]]
+name = "aterm-stamp"
+version = "0.0.0"
+
+[[package]]
+name = "aterm-sysprobe"
+version = "0.0.0"
+dependencies = [
+ "aterm-dl",
+ "aterm-json",
+ "aterm-objc",
+ "libc",
+]
+
+[[package]]
+name = "aterm-uds"
+version = "0.0.0"
+dependencies = [
+ "astream-sys",
+ "aterm-dirfd",
+ "aterm-durable",
+ "aterm-stamp",
+ "aterm-sysprobe",
+ "aterm-vitals",
+ "libc",
+]
+
+[[package]]
+name = "aterm-vitals"
+version = "0.0.0"
 
 [[package]]
 name = "atomic-waker"

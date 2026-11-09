@@ -644,7 +644,11 @@ fn prove_listener(listener: &CtlListener, path: &Path, birth: Birth) -> io::Resu
         return Err(io::Error::last_os_error());
     }
     let _restore = Restore(fd, flags);
-    let (mut accepted, _) = aterm_uds::kept_out(|| listener.accept())?;
+    let (mut accepted, _) = aterm_uds::accept(
+        listener,
+        aterm_uds::AcceptWait::Ready,
+        aterm_uds::AcceptedMode::Nonblocking,
+    )?;
     if aterm_uds::fdpass::peer_pid(&accepted)? != std::process::id()
         || aterm_uds::peer::peer_uid(&accepted) != Some(aterm_uds::peer::our_uid())
     {
@@ -655,7 +659,6 @@ fn prove_listener(listener: &CtlListener, path: &Path, birth: Birth) -> io::Resu
     // Both private endpoints exist before sending the fixed-size challenge. Refuse a
     // blocked/partial transfer immediately rather than renewing a relative socket timeout.
     client.set_nonblocking(true)?;
-    accepted.set_nonblocking(true)?;
     if Instant::now() >= deadline {
         return Err(io::Error::from(io::ErrorKind::TimedOut));
     }

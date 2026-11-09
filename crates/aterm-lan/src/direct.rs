@@ -239,7 +239,12 @@ mod tests {
             hello.direct.as_deref(),
             Some("macOS allowed com.aterm.aterm (team A66A9P66Z7) on the local network")
         );
-        let (mut far, _) = target.accept().unwrap();
+        let (mut far, _) = aterm_uds::accept(
+            &target,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         stream.write_all(b"ping").unwrap();
         let mut got = [0u8; 4];
         far.set_read_timeout(Some(MUST_HAPPEN)).unwrap();

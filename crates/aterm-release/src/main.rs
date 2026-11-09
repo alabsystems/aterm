@@ -12,6 +12,7 @@ mod buildplan;
 mod bump_claim;
 mod bundle;
 mod changelog;
+mod check_content;
 mod check_record;
 mod checkout_bin;
 mod postlink;

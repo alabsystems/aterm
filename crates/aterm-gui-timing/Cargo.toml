@@ -9,6 +9,13 @@ license.workspace = true
 repository.workspace = true
 description = "aterm-gui's one timing value: the production lengths of the waits a person never sees (the fabric's fence and notice waits, the harness host's cadences, its answers at the loop's turn ends and idle points), or their millisecond test values, chosen once per process."
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [features]
 # Read `ATERM_DEV_FAST_TIMERS` in an optimized build too (`aterm-gui/dev-seams`
 # forwards it). A debug build reads it anyway; a shipped build never does.

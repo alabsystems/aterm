@@ -19,7 +19,12 @@ impl FailingServer {
         let worker = std::thread::spawn(move || {
             let mut requests = Vec::new();
             loop {
-                let (mut stream, _) = listener.accept().unwrap();
+                let (mut stream, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap();
                 if stopped.load(Ordering::SeqCst) {
                     break;
                 }

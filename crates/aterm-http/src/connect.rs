@@ -302,7 +302,12 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
         let addr = listener.local_addr().expect("addr");
         let mut stream = connect_timeout(&addr, MUST_HAPPEN).expect("connects");
-        let (mut peer, _) = listener.accept().expect("accepts");
+        let (mut peer, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accepts");
         peer.write_all(b"x").expect("writes");
         let mut byte = [0u8; 1];
         stream
@@ -347,14 +352,19 @@ mod tests {
     #[test]
     fn a_connect_the_partition_cuts_reaches_no_listener_until_the_cut_heals() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
-        listener.set_nonblocking(true).expect("nonblocking");
         let addr = listener.local_addr().expect("addr");
         let cut = format!("{addr}\n");
         let err = aterm_uds::partition::cut_here(&cut, || connect_timeout(&addr, MUST_HAPPEN))
             .expect_err("cut");
         assert_eq!(err.kind(), io::ErrorKind::HostUnreachable, "{err}");
         assert_eq!(
-            listener.accept().expect_err("nothing came").kind(),
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect_err("nothing came")
+            .kind(),
             io::ErrorKind::WouldBlock,
             "the cut connect made no connection"
         );

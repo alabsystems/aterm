@@ -28,6 +28,9 @@ publish = false
 [workspace]
 
 [dependencies]
+# The workspace's one sanctioned socket accept makes the recorder's accepted TCP mode explicit;
+# zbus/zvariant remain registry oracles outside aterm-dbus's production and test graphs.
+aterm-uds = { path = "../../../aterm-uds" }
 zbus = { version = "=5.16.0", default-features = false, features = ["async-io", "blocking-api"] }
 zbus_macros = "=5.16.0"
 zbus_names = "=4.3.2"

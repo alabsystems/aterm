@@ -951,7 +951,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
         let server = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             tcp.set_read_timeout(Some(NET_TEST_LIVENESS_BOUND)).unwrap();
             tcp.set_write_timeout(Some(NET_TEST_LIVENESS_BOUND))
                 .unwrap();
@@ -1106,7 +1111,12 @@ mod tests {
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
 
         let srv = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let t = accept(tcp, scfg).unwrap();
             t.exporter().to_vec()
         });
@@ -1234,7 +1244,12 @@ mod tests {
         });
 
         let srv = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let t = accept(tcp, scfg).unwrap();
             relay_answers(t, svc_a, ()).unwrap();
         });
@@ -1281,7 +1296,12 @@ mod tests {
         });
 
         let srv = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let t = accept(tcp, scfg).unwrap();
             relay_answers(t, svc_a, ()).unwrap();
         });
@@ -1353,7 +1373,12 @@ mod tests {
         let (entered_tx, entered) = mpsc::channel();
         let (open, gate) = mpsc::channel::<()>();
         let srv = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             tcp.set_read_timeout(Some(HANG)).unwrap();
             let t = accept(tcp, scfg).unwrap();
             let guard = HeldGuard {
@@ -1420,7 +1445,12 @@ mod tests {
         });
         let (relayed_tx, relayed) = mpsc::channel();
         let srv = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let t = accept(tcp, scfg).unwrap();
             let guard = HeldGuard {
                 entered: entered_tx,
@@ -1493,7 +1523,12 @@ mod tests {
         let (line_tx, line) = mpsc::channel();
         let (relayed_tx, relayed) = mpsc::channel();
         let srv = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             line_tx.send(tcp.try_clone().unwrap()).unwrap();
             let t = accept(tcp, scfg).unwrap();
             let _ = relayed_tx.send(relay_answers(t, svc_a, SaysDropped(dropped_tx)));
@@ -1551,7 +1586,12 @@ mod tests {
         let (dropped_tx, dropped) = mpsc::channel();
         let (relayed_tx, relayed) = mpsc::channel();
         let srv = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let t = accept(tcp, scfg).unwrap();
             let _ = relayed_tx.send(relay_answers(t, svc_a, SaysDropped(dropped_tx)));
         });
@@ -1629,7 +1669,12 @@ mod tests {
         };
         let (relayed_tx, relayed) = mpsc::channel();
         let srv = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let t = accept(tcp, scfg).unwrap();
             let _ = relayed_tx.send(relay_answers(t, svc_a, guard));
         });
@@ -1731,7 +1776,12 @@ mod tests {
             svc_b.shutdown(std::net::Shutdown::Write).unwrap();
         });
         let server = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let transport = accept(tcp, scfg).unwrap();
             relay_answers(transport, svc_a, ()).unwrap();
         });
@@ -1863,7 +1913,12 @@ mod tests {
             request == REQUEST
         });
         let server = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             tcp.set_read_timeout(Some(NET_TEST_LIVENESS_BOUND)).unwrap();
             let mut transport = accept(tcp, scfg).unwrap();
             server_ready_tx.send(()).unwrap();
@@ -1927,7 +1982,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
         let srv = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().ok()?;
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .ok()?;
             accept(tcp, scfg).err()
         });
         let mut wrong = cert_fingerprint(TEST_CERT_DER);
@@ -1982,7 +2042,12 @@ mod tests {
         let (written_tx, written_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let peer = std::thread::spawn(move || {
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let mut transport = accept(tcp, scfg).unwrap();
             let stream = transport.stream();
             stream.write_all(&to_send[..FULL]).unwrap();

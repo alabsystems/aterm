@@ -183,7 +183,11 @@ impl Peer {
         let (serving, stopping) = (Arc::clone(&state), Arc::clone(&stop));
         let worker = std::thread::spawn(move || {
             FIXTURE_THREAD.with(|excluded| excluded.set(true));
-            while let Ok((mut stream, _)) = listener.accept() {
+            while let Ok((mut stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 if stopping.load(Ordering::SeqCst) {
                     break;
                 }

@@ -3988,10 +3988,12 @@ fn admit_deciding(
     // release. Ordinary work is deliberately absent: rank and resource reservations order it
     // ahead of the Background admission where their needs overlap.
     let release_arrived = || {
-        background
-            && ledger.list().map_or(true, |rows| {
-                rows.iter().any(|row| row.need.rank == crate::Rank::Release)
-            })
+        if background && let Some(why) = crate::background::stop_reason(ledger.list()) {
+            eprintln!("capacity background stopped before admission: {why}");
+            true
+        } else {
+            false
+        }
     };
     let caller_stopped = stopped;
     let stopped = || caller_stopped() || release_arrived();

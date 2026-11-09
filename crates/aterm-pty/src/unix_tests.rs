@@ -2990,9 +2990,6 @@ fn wrapped_spawn_enforces_network_deny_via_seatbelt() {
     let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
     let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-    listener
-        .set_nonblocking(true)
-        .expect("a listener whose accept never waits");
     let port = listener.local_addr().expect("bound").port().to_string();
     // The control's connect must happen, so nc's connect and idle timeouts are the hang detector,
     // not a one-second budget a loaded host can miss; the denied connect fails at once.
@@ -3010,7 +3007,8 @@ fn wrapped_spawn_enforces_network_deny_via_seatbelt() {
     .into_iter()
     .map(std::ffi::OsString::from)
     .collect();
-    // nc's exit and whether the listener holds its connection, read once nc is reaped. Its printed
+    // nc's exit and whether the listener holds its connection, read with `Ready` once nc is
+    // reaped. Its printed
     // "succeeded" is no witness: nc prints nothing for a connect that failed, so an empty screen
     // cannot tell a failed connect from output the pty never delivered.
     let run = |sandbox_wrap: Option<&str>| {
@@ -3042,7 +3040,11 @@ fn wrapped_spawn_enforces_network_deny_via_seatbelt() {
             std::thread::sleep(std::time::Duration::from_millis(10));
         };
         close_fd(sh.master);
-        let reached = match listener.accept() {
+        let reached = match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok(_) => true,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => false,
             Err(e) => panic!("the listener's accept: {e}"),

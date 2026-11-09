@@ -2209,7 +2209,11 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("loopback");
         let addr = listener.local_addr().expect("addr");
         std::thread::spawn(move || {
-            if let Ok((mut s, _)) = listener.accept() {
+            if let Ok((mut s, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 use std::io::{Read as _, Write as _};
                 let mut hello = [0u8; 512];
                 let _ = s.read(&mut hello);

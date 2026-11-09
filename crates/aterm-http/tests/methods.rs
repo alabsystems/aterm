@@ -65,7 +65,11 @@ fn serve(
     let response = response.to_vec();
     std::thread::spawn(move || {
         for _ in 0..connections {
-            let Ok((mut stream, _)) = listener.accept() else {
+            let Ok((mut stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 return;
             };
             let _ = stream.set_read_timeout(Some(HANG_DETECTOR));
@@ -183,8 +187,11 @@ fn a_body_on_a_get_or_head_is_refused_before_any_connection() {
         assert_eq!(failed.phase, Phase::NotSent);
         assert!(matches!(failed.error, Error::Invalid(_)), "{failed:?}");
     }
-    listener.set_nonblocking(true).unwrap();
-    match listener.accept() {
+    match aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Ready,
+        aterm_uds::AcceptedMode::Blocking,
+    ) {
         Err(error) if error.kind() == ErrorKind::WouldBlock => {}
         other => panic!("a refused request still connected: {other:?}"),
     }

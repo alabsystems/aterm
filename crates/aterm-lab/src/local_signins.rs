@@ -298,8 +298,14 @@ impl BlackHole {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let noted = Arc::clone(&seen);
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
+            loop {
+                let Ok((mut stream, _)) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
+                    continue;
+                };
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                 let mut buf = [0u8; 2048];
                 let n = stream.read(&mut buf).unwrap_or(0);

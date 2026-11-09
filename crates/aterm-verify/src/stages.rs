@@ -902,15 +902,6 @@ fn compile_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
     run.ok
 }
 
-/// [`compile_labeled`], skipped on an empty change cone.
-fn compile_scoped(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) {
-    if ctx.scope.selects_nothing() {
-        r.skip(format!("{label} {EMPTY_CONE}"));
-        return;
-    }
-    compile_labeled(ctx, r, label, cmd);
-}
-
 /// Why a selection-reading stage did nothing on an empty change cone, and the fix.
 pub const EMPTY_CONE: &str = "(the change cone holds no crate — fix: pass -p <crate> or --all)";
 
@@ -2015,34 +2006,474 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         return;
     };
     let borrowed = crate::fmt::borrowed_suffix(ctx, crate::toolchain::TIPPY);
-    for pass in tippy_passes(&ctx.scope) {
-        compile_scoped(
+    if ctx.release {
+        tippy_release_content(ctx, r, &bin, &borrowed);
+    } else {
+        let scope = ctx.scope.clone();
+        let _ = tippy_scope(ctx, r, &bin, &scope, &borrowed);
+    }
+}
+
+fn tippy_scope(
+    ctx: &Ctx,
+    r: &mut Report,
+    bin: &std::path::Path,
+    scope: &Scope,
+    borrowed: &str,
+) -> bool {
+    if scope.selects_nothing() {
+        r.skip(format!("tippy -D warnings{borrowed} {EMPTY_CONE}"));
+        return true;
+    }
+    let mut passed = true;
+    for pass in tippy_passes(scope) {
+        if !compile_labeled(
             ctx,
             r,
             &format!("tippy {} -D warnings{borrowed}", pass.label),
-            &tippy_cmd(ctx, &bin, lint_unified(pass.args)),
-        );
-        crate::red_now(ctx, crate::checks::Check::Lint, r);
+            &tippy_cmd(ctx, bin, lint_unified(pass.args)),
+        ) {
+            passed = false;
+            crate::red_now(ctx, crate::checks::Check::Lint, r);
+            if ctx.halted().is_some() {
+                return false;
+            }
+        }
     }
     if ctx.release
-        && let Some(args) = tippy_gated_args(&ctx.scope, &gated_lint_features(&ctx.root))
-    {
-        compile_scoped(
+        && let Some(args) = tippy_gated_args(scope, &gated_lint_features(&ctx.root))
+        && !compile_labeled(
             ctx,
             r,
             &format!("tippy required-features targets -D warnings{borrowed}"),
-            &tippy_cmd(ctx, &bin, lint_unified(args)),
-        );
+            &tippy_cmd(ctx, bin, lint_unified(args)),
+        )
+    {
+        passed = false;
         crate::red_now(ctx, crate::checks::Check::Lint, r);
+        if ctx.halted().is_some() {
+            return false;
+        }
     }
-    if let Some(args) = tippy_release_args(&ctx.scope) {
-        compile_scoped(
+    if let Some(args) = tippy_release_args(scope)
+        && !compile_labeled(
             ctx,
             r,
             &format!("tippy -p {SHIPPED} --release -D warnings{borrowed}"),
-            &tippy_cmd(ctx, &bin, args),
+            &tippy_cmd(ctx, bin, args),
+        )
+    {
+        passed = false;
+        crate::red_now(ctx, crate::checks::Check::Lint, r);
+    }
+    passed
+}
+
+fn exact_package_tippy_commands(
+    ctx: &Ctx,
+    bin: &std::path::Path,
+    spec: &str,
+) -> Result<Vec<Cmd>, String> {
+    let scope = Scope::crate_only(spec);
+    let mut arguments: Vec<Vec<String>> = tippy_passes(&scope)
+        .into_iter()
+        .map(|pass| lint_unified(pass.args))
+        .collect();
+    if let Some(args) = tippy_gated_args(&scope, &gated_lint_features(&ctx.root)) {
+        arguments.push(lint_unified(args));
+    }
+    if let Some(args) = tippy_release_args(&scope) {
+        arguments.push(args);
+    }
+    arguments
+        .into_iter()
+        .map(|args| {
+            let mut command =
+                crate::compile_account::with_message_format(tippy_cmd(ctx, bin, args));
+            // Content-keyed lint commands use one stable process shape. Utility-QoS wrapping and
+            // per-spawn wait-marker paths are scheduling behavior, not compiler inputs.
+            command.demoted = false;
+            command.waits_count = true;
+            exec::materialize_exact_command(command, ctx.exec_env())
+        })
+        .collect()
+}
+
+fn unbounded_lint_evidence(reason: impl Into<String>) -> crate::lint_content::Evidence {
+    crate::lint_content::Evidence {
+        content_key: None,
+        reason: Some(reason.into()),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LintPackageFinished {
+    spec: String,
+    outcome: &'static str,
+    evidence: crate::lint_content::Evidence,
+    execution_s: f64,
+    carried: bool,
+}
+
+struct LintPackageCandidate {
+    package: crate::lint_content::Package,
+    expected: crate::lint_content::Evidence,
+    execution_s: f64,
+    carried: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LintPackageOutcome {
+    Ok,
+    Fail,
+    NotRun,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LintReadBoundary {
+    PreDispatch,
+    Final,
+}
+
+impl LintPackageOutcome {
+    const fn words(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Fail => "FAIL",
+            Self::NotRun => "NOT RUN",
+        }
+    }
+}
+
+/// The effects around [`schedule_lint_packages`]. Production supplies the real Tippy children,
+/// fresh evidence reads and report events; tests supply deterministic effects to prove the
+/// scheduler starts only misses and never turns an uncertain read into an OK.
+trait LintScheduleOps {
+    /// Run all unbounded packages in one ordinary Tippy batch. The seconds are per package.
+    fn run_unbounded(
+        &mut self,
+        packages: &[crate::lint_content::Package],
+    ) -> (LintPackageOutcome, f64);
+    /// Reconstruct the exact command and freshly hash the package's complete declared inputs.
+    fn prepare(
+        &mut self,
+        package: &crate::lint_content::Package,
+        boundary: LintReadBoundary,
+    ) -> Result<(Vec<Cmd>, crate::lint_content::Evidence), String>;
+    /// Run exactly the commands returned by the immediately preceding [`Self::prepare`].
+    fn run_bounded(
+        &mut self,
+        package: &crate::lint_content::Package,
+        commands: &[Cmd],
+    ) -> (LintPackageOutcome, f64);
+    fn halted(&self) -> bool;
+    fn cannot_run(&mut self, why: String);
+    fn all_carried(&mut self, count: usize);
+    fn finish(&mut self, row: &LintPackageFinished);
+}
+
+/// Execute one content-keyed release-lint partition. No OK is published until every execution
+/// mode has ended and every successful or carried package has passed the final stability read.
+fn schedule_lint_packages(
+    selection: crate::lint_content::Selection,
+    ops: &mut impl LintScheduleOps,
+) {
+    let asked_run = selection.run.len();
+    let asked_carried = selection.carried.len();
+    let (unbounded, bounded): (Vec<_>, Vec<_>) = selection
+        .run
+        .into_iter()
+        .partition(|package| !package.evidence.bounded());
+    let mut finished = Vec::new();
+    let mut candidates = Vec::new();
+
+    if !unbounded.is_empty() {
+        let (outcome, execution_s) = ops.run_unbounded(&unbounded);
+        finished.extend(unbounded.into_iter().map(|package| LintPackageFinished {
+            spec: package.spec,
+            outcome: outcome.words(),
+            evidence: package.evidence,
+            execution_s,
+            carried: false,
+        }));
+    }
+
+    let mut stopped = ops.halted();
+    for package in bounded {
+        if stopped {
+            finished.push(LintPackageFinished {
+                spec: package.spec,
+                outcome: "NOT RUN",
+                evidence: unbounded_lint_evidence(
+                    "an earlier lint package stopped this release lint",
+                ),
+                execution_s: 0.0,
+                carried: false,
+            });
+            continue;
+        }
+        let (commands, immediate) = match ops.prepare(&package, LintReadBoundary::PreDispatch) {
+            Ok(prepared) => prepared,
+            Err(why) => {
+                ops.cannot_run(format!(
+                    "lint package {} changed before dispatch: {why}",
+                    package.spec
+                ));
+                finished.push(LintPackageFinished {
+                    spec: package.spec,
+                    outcome: "NOT RUN",
+                    evidence: unbounded_lint_evidence(format!(
+                        "the exact lint command changed before dispatch: {why}"
+                    )),
+                    execution_s: 0.0,
+                    carried: false,
+                });
+                stopped = true;
+                continue;
+            }
+        };
+        if immediate != package.evidence {
+            ops.cannot_run(format!(
+                "lint package {} inputs changed between planning and dispatch",
+                package.spec
+            ));
+            finished.push(LintPackageFinished {
+                spec: package.spec,
+                outcome: "NOT RUN",
+                evidence: unbounded_lint_evidence(
+                    "lint inputs changed between planning and immediate pre-dispatch hashing",
+                ),
+                execution_s: 0.0,
+                carried: false,
+            });
+            stopped = true;
+            continue;
+        }
+
+        let (outcome, execution_s) = ops.run_bounded(&package, &commands);
+        if outcome == LintPackageOutcome::Ok {
+            candidates.push(LintPackageCandidate {
+                package,
+                expected: immediate,
+                execution_s,
+                carried: false,
+            });
+        } else {
+            finished.push(LintPackageFinished {
+                spec: package.spec,
+                outcome: outcome.words(),
+                evidence: package.evidence,
+                execution_s,
+                carried: false,
+            });
+            stopped = true;
+        }
+    }
+
+    candidates.extend(
+        selection
+            .carried
+            .into_iter()
+            .map(|(package, prior)| LintPackageCandidate {
+                expected: package.evidence.clone(),
+                package,
+                execution_s: prior.execution_s,
+                carried: true,
+            }),
+    );
+
+    // This is deliberately after every execution. A miss may have changed a carried package's
+    // inputs; publishing that package before this read would make the next hop trust stale facts.
+    let mut drifted = false;
+    for candidate in candidates {
+        let current = ops
+            .prepare(&candidate.package, LintReadBoundary::Final)
+            .map(|(_, evidence)| evidence);
+        match current {
+            Ok(evidence) if evidence == candidate.expected => {
+                finished.push(LintPackageFinished {
+                    spec: candidate.package.spec,
+                    outcome: "ok",
+                    evidence,
+                    execution_s: candidate.execution_s,
+                    carried: candidate.carried,
+                });
+            }
+            Ok(_) | Err(_) => {
+                drifted = true;
+                finished.push(LintPackageFinished {
+                    spec: candidate.package.spec,
+                    outcome: "NOT RUN",
+                    evidence: unbounded_lint_evidence(
+                        "lint inputs changed before the run-wide read-only stability check",
+                    ),
+                    execution_s: candidate.execution_s,
+                    carried: false,
+                });
+            }
+        }
+    }
+    if drifted {
+        ops.cannot_run(
+            "lint package inputs changed during the run; no drifting proof was carried".into(),
         );
     }
+    if asked_run == 0 && !drifted {
+        ops.all_carried(asked_carried);
+    }
+    finished.sort_by(|left, right| left.spec.cmp(&right.spec));
+    for row in &finished {
+        ops.finish(row);
+    }
+}
+
+/// Bind a boundary read to the exact package identity whose commands the scheduler dispatches.
+/// Keeping this adapter outside [`RealLintScheduleOps::prepare`] gives its production argument
+/// handoff a direct negative control without replacing the real snapshot implementation.
+fn read_lint_package_evidence(
+    package: &crate::lint_content::Package,
+    commands: &[Cmd],
+    read: impl FnOnce(&str, &str, &[Cmd]) -> crate::lint_content::Evidence,
+) -> crate::lint_content::Evidence {
+    read(&package.spec, &package.dir, commands)
+}
+
+struct RealLintScheduleOps<'a> {
+    ctx: &'a Ctx,
+    report: &'a mut Report,
+    bin: &'a std::path::Path,
+    borrowed: &'a str,
+    pre_snapshot: Option<Result<crate::lint_content::BoundarySnapshot<'a>, String>>,
+    final_snapshot: Option<Result<crate::lint_content::BoundarySnapshot<'a>, String>>,
+}
+
+impl LintScheduleOps for RealLintScheduleOps<'_> {
+    fn run_unbounded(
+        &mut self,
+        packages: &[crate::lint_content::Package],
+    ) -> (LintPackageOutcome, f64) {
+        let specs: Vec<String> = packages
+            .iter()
+            .map(|package| package.spec.clone())
+            .collect();
+        let scope = Scope::packages(&specs);
+        let began = std::time::Instant::now();
+        let passed = tippy_scope(self.ctx, self.report, self.bin, &scope, self.borrowed);
+        let execution_s = began.elapsed().as_secs_f64() / packages.len() as f64;
+        let outcome = if passed {
+            LintPackageOutcome::Ok
+        } else if self.ctx.halted().is_some() {
+            LintPackageOutcome::Fail
+        } else {
+            LintPackageOutcome::NotRun
+        };
+        (outcome, execution_s)
+    }
+
+    fn prepare(
+        &mut self,
+        package: &crate::lint_content::Package,
+        boundary: LintReadBoundary,
+    ) -> Result<(Vec<Cmd>, crate::lint_content::Evidence), String> {
+        let commands = exact_package_tippy_commands(self.ctx, self.bin, &package.spec)?;
+        let ctx = self.ctx;
+        let bin = self.bin;
+        let slot = match boundary {
+            LintReadBoundary::PreDispatch => &mut self.pre_snapshot,
+            LintReadBoundary::Final => &mut self.final_snapshot,
+        };
+        let snapshot = slot
+            .get_or_insert_with(|| crate::lint_content::BoundarySnapshot::new(ctx, bin))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        let evidence = read_lint_package_evidence(package, &commands, |spec, dir, commands| {
+            snapshot.evidence(spec, dir, commands)
+        });
+        Ok((commands, evidence))
+    }
+
+    fn run_bounded(
+        &mut self,
+        package: &crate::lint_content::Package,
+        commands: &[Cmd],
+    ) -> (LintPackageOutcome, f64) {
+        let began = std::time::Instant::now();
+        let mut passed = true;
+        for (index, command) in commands.iter().enumerate() {
+            let label = format!(
+                "tippy -p {} content pass {}/{} -D warnings{}",
+                package.spec,
+                index + 1,
+                commands.len(),
+                self.borrowed
+            );
+            if !compile_labeled(self.ctx, self.report, &label, command) {
+                crate::red_now(self.ctx, crate::checks::Check::Lint, self.report);
+                passed = false;
+                break;
+            }
+        }
+        let execution_s = began.elapsed().as_secs_f64();
+        let outcome = if passed {
+            LintPackageOutcome::Ok
+        } else if self.ctx.halted().is_some() {
+            LintPackageOutcome::Fail
+        } else {
+            LintPackageOutcome::NotRun
+        };
+        (outcome, execution_s)
+    }
+
+    fn halted(&self) -> bool {
+        self.ctx.halted().is_some()
+    }
+
+    fn cannot_run(&mut self, why: String) {
+        self.report.cannot_run(why);
+    }
+
+    fn all_carried(&mut self, count: usize) {
+        self.report.pass(format!(
+            "lint packages: {count} carried by complete content key, 0 ran"
+        ));
+    }
+
+    fn finish(&mut self, row: &LintPackageFinished) {
+        self.report
+            .raw(self.ctx.record_event(&crate::lint_content::event(
+                &row.spec,
+                row.outcome,
+                &row.evidence,
+                row.execution_s,
+                row.carried,
+            )));
+    }
+}
+
+fn tippy_release_content(ctx: &Ctx, r: &mut Report, bin: &std::path::Path, borrowed: &str) {
+    let plan =
+        match crate::lint_content::plan(ctx, |spec| exact_package_tippy_commands(ctx, bin, spec)) {
+            Ok(plan) => plan,
+            Err(why) => {
+                r.raw(format!(
+                    "lint package carry is unavailable ({why}); the complete workspace lint runs"
+                ));
+                let scope = ctx.scope.clone();
+                let _ = tippy_scope(ctx, r, bin, &scope, borrowed);
+                return;
+            }
+        };
+    let empty = crate::lint_content::Passed::new();
+    let selection = plan.select(ctx.passed_lint_packages.as_ref().unwrap_or(&empty));
+    let mut ops = RealLintScheduleOps {
+        ctx,
+        report: r,
+        bin,
+        borrowed,
+        pre_snapshot: None,
+        final_snapshot: None,
+    };
+    schedule_lint_packages(selection, &mut ops);
 }
 
 const CHECKOUT_MARKER: &str = "crates/aterm-gui/Cargo.toml";
@@ -2873,6 +3304,7 @@ fn forge_gate(ctx: &Ctx, r: &mut Report) {
 mod tests {
     use super::*;
     use crate::EnvSnapshot;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::path::PathBuf;
 
     #[test]
@@ -3132,6 +3564,478 @@ mod tests {
             EnvSnapshot::default(),
             PathBuf::from("/tmp"),
         )
+    }
+
+    type PreparedLint = Result<(Vec<Cmd>, crate::lint_content::Evidence), String>;
+
+    struct FakeLintOps {
+        batch_outcome: LintPackageOutcome,
+        batch_seconds: f64,
+        halt_on_batch: bool,
+        halted: bool,
+        prepared_boundaries: Vec<(String, LintReadBoundary)>,
+        prepared: BTreeMap<String, VecDeque<PreparedLint>>,
+        bounded: BTreeMap<String, (LintPackageOutcome, f64)>,
+        batches: Vec<Vec<String>>,
+        ran: Vec<(String, Vec<Vec<String>>)>,
+        cannot_run: Vec<String>,
+        all_carried: Vec<usize>,
+        finished: Vec<LintPackageFinished>,
+    }
+
+    impl FakeLintOps {
+        fn passing() -> Self {
+            Self {
+                batch_outcome: LintPackageOutcome::Ok,
+                batch_seconds: 0.0,
+                halt_on_batch: false,
+                halted: false,
+                prepared_boundaries: Vec::new(),
+                prepared: BTreeMap::new(),
+                bounded: BTreeMap::new(),
+                batches: Vec::new(),
+                ran: Vec::new(),
+                cannot_run: Vec::new(),
+                all_carried: Vec::new(),
+                finished: Vec::new(),
+            }
+        }
+
+        fn prepare_as(
+            &mut self,
+            spec: &str,
+            sequence: impl IntoIterator<
+                Item = Result<(Vec<Cmd>, crate::lint_content::Evidence), String>,
+            >,
+        ) {
+            self.prepared
+                .insert(spec.to_owned(), sequence.into_iter().collect());
+        }
+    }
+
+    impl LintScheduleOps for FakeLintOps {
+        fn run_unbounded(
+            &mut self,
+            packages: &[crate::lint_content::Package],
+        ) -> (LintPackageOutcome, f64) {
+            self.batches.push(
+                packages
+                    .iter()
+                    .map(|package| package.spec.clone())
+                    .collect(),
+            );
+            if self.halt_on_batch && self.batch_outcome != LintPackageOutcome::Ok {
+                self.halted = true;
+            }
+            (self.batch_outcome, self.batch_seconds)
+        }
+
+        fn prepare(
+            &mut self,
+            package: &crate::lint_content::Package,
+            boundary: LintReadBoundary,
+        ) -> Result<(Vec<Cmd>, crate::lint_content::Evidence), String> {
+            self.prepared_boundaries
+                .push((package.spec.clone(), boundary));
+            if let Some(next) = self
+                .prepared
+                .get_mut(&package.spec)
+                .and_then(VecDeque::pop_front)
+            {
+                return next;
+            }
+            Ok((package.commands.clone(), package.evidence.clone()))
+        }
+
+        fn run_bounded(
+            &mut self,
+            package: &crate::lint_content::Package,
+            commands: &[Cmd],
+        ) -> (LintPackageOutcome, f64) {
+            let argv = commands
+                .iter()
+                .map(|command| {
+                    std::iter::once(command.program.to_string_lossy().into_owned())
+                        .chain(
+                            command
+                                .args
+                                .iter()
+                                .map(|arg| arg.to_string_lossy().into_owned()),
+                        )
+                        .collect()
+                })
+                .collect();
+            self.ran.push((package.spec.clone(), argv));
+            self.bounded
+                .get(&package.spec)
+                .copied()
+                .unwrap_or((LintPackageOutcome::Ok, 0.0))
+        }
+
+        fn halted(&self) -> bool {
+            self.halted
+        }
+
+        fn cannot_run(&mut self, why: String) {
+            self.cannot_run.push(why);
+        }
+
+        fn all_carried(&mut self, count: usize) {
+            self.all_carried.push(count);
+        }
+
+        fn finish(&mut self, row: &LintPackageFinished) {
+            self.finished.push(row.clone());
+        }
+    }
+
+    fn lint_evidence(byte: u8) -> crate::lint_content::Evidence {
+        crate::lint_content::Evidence {
+            content_key: Some(format!("{byte:02x}").repeat(32)),
+            reason: None,
+        }
+    }
+
+    fn lint_package(spec: &str, byte: u8) -> crate::lint_content::Package {
+        crate::lint_content::Package {
+            spec: spec.into(),
+            dir: format!("crates/{spec}"),
+            evidence: lint_evidence(byte),
+            commands: vec![Cmd::new("/fixture/tippy").args([
+                "--unverified",
+                "tippy",
+                "-p",
+                spec,
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ])],
+        }
+    }
+
+    fn unbounded_lint_package(spec: &str) -> crate::lint_content::Package {
+        crate::lint_content::Package {
+            spec: spec.into(),
+            dir: format!("crates/{spec}"),
+            evidence: unbounded_lint_evidence("an undeclared build or proc-macro reader"),
+            commands: Vec::new(),
+        }
+    }
+
+    fn lint_proof(
+        package: &crate::lint_content::Package,
+        execution_s: f64,
+    ) -> crate::lint_content::CarryProof {
+        crate::lint_content::CarryProof::passed(&package.spec, &package.evidence, execution_s)
+    }
+
+    /// Real prepare's snapshot adapter receives the same package identity and exact command list
+    /// the scheduler will dispatch. Mutating either field, dropping a command, or returning a
+    /// different snapshot result fails this control.
+    #[test]
+    fn real_lint_prepare_binds_snapshot_evidence_to_its_exact_package() {
+        let package = lint_package("identity@1", 1);
+        let expected = lint_evidence(99);
+        let observed = std::cell::RefCell::new(None);
+        let evidence =
+            read_lint_package_evidence(&package, &package.commands, |spec, dir, commands| {
+                *observed.borrow_mut() = Some((spec.to_owned(), dir.to_owned(), commands.to_vec()));
+                expected.clone()
+            });
+        assert_eq!(
+            observed.into_inner(),
+            Some((
+                package.spec.clone(),
+                package.dir.clone(),
+                package.commands.clone()
+            ))
+        );
+        assert_eq!(evidence, expected);
+    }
+
+    /// The all-hit path still rehashes each package, but starts no Tippy child. Removing the
+    /// carried partition or dispatching it through `run_bounded` fails this control.
+    #[test]
+    fn an_all_carried_lint_starts_no_tippy_child() {
+        let package = lint_package("carried@1", 1);
+        let selection = crate::lint_content::Selection {
+            run: Vec::new(),
+            carried: vec![(package.clone(), lint_proof(&package, 7.0))],
+        };
+        let mut ops = FakeLintOps::passing();
+        schedule_lint_packages(selection, &mut ops);
+
+        assert!(ops.batches.is_empty(), "no unbounded Tippy batch");
+        assert!(ops.ran.is_empty(), "no per-package Tippy child");
+        assert_eq!(ops.all_carried, [1]);
+        assert_eq!(
+            ops.prepared_boundaries,
+            [("carried@1".into(), LintReadBoundary::Final)],
+            "a carry is read only at the fresh final boundary"
+        );
+        assert_eq!(ops.finished.len(), 1);
+        assert!(ops.finished[0].carried);
+        assert_eq!(ops.finished[0].outcome, "ok");
+    }
+
+    /// The production command constructor supplies the scheduler's exact argv, and only the miss
+    /// is dispatched. Mutating the scheduler to run the carried package adds its spec to `ran`;
+    /// mutating the constructor loses the exact `-p <spec>` command asserted here.
+    #[test]
+    fn a_lint_partition_dispatches_only_misses_with_the_exact_package_argv() {
+        let command_ctx = ctx(Scope::workspace());
+        let mut missed = lint_package("missed@1", 2);
+        let fresh_commands = exact_package_tippy_commands(
+            &command_ctx,
+            std::path::Path::new("/fixture/tippy"),
+            &missed.spec,
+        )
+        .expect("exact package command");
+        assert!(
+            fresh_commands
+                .iter()
+                .all(|command| { command.exact_env && command.runtime_environment_is_finalized() })
+        );
+        // The planning command is deliberately stale. Dispatch must use the command rebuilt by
+        // the immediate pre-dispatch read, not this value carried in the selection.
+        missed.commands = vec![Cmd::new("/stale/planning-tippy").args([
+            "--unverified",
+            "tippy",
+            "-p",
+            "wrong-planning-package@1",
+        ])];
+        let fresh_argv: Vec<Vec<String>> = fresh_commands
+            .iter()
+            .map(|command| {
+                std::iter::once(command.program.to_string_lossy().into_owned())
+                    .chain(
+                        command
+                            .args
+                            .iter()
+                            .map(|arg| arg.to_string_lossy().into_owned()),
+                    )
+                    .collect()
+            })
+            .collect();
+        let carried = lint_package("carried@1", 3);
+        let selection = crate::lint_content::Selection {
+            run: vec![missed.clone()],
+            carried: vec![(carried.clone(), lint_proof(&carried, 3.0))],
+        };
+        let mut ops = FakeLintOps::passing();
+        ops.bounded
+            .insert(missed.spec.clone(), (LintPackageOutcome::Ok, 5.0));
+        ops.prepare_as(
+            &missed.spec,
+            [
+                Ok((fresh_commands.clone(), missed.evidence.clone())),
+                Ok((fresh_commands, missed.evidence.clone())),
+            ],
+        );
+        schedule_lint_packages(selection, &mut ops);
+
+        assert_eq!(ops.ran.len(), 1);
+        assert_eq!(ops.ran[0].0, missed.spec);
+        assert_eq!(
+            ops.prepared_boundaries,
+            [
+                ("missed@1".into(), LintReadBoundary::PreDispatch),
+                ("missed@1".into(), LintReadBoundary::Final),
+                ("carried@1".into(), LintReadBoundary::Final),
+            ],
+            "the miss is checked immediately and finally; the carry only finally"
+        );
+        let argv = &ops.ran[0].1;
+        assert_eq!(
+            argv, &fresh_argv,
+            "the child receives the freshly prepared command, never the stale planning command"
+        );
+        assert!(
+            argv.iter()
+                .all(|args| { args.windows(2).any(|pair| pair == ["-p", "missed@1"]) })
+        );
+        assert!(
+            argv.iter()
+                .all(|args| !args.iter().any(|arg| arg == "carried@1"))
+        );
+        assert_eq!(
+            ops.finished
+                .iter()
+                .map(|row| (row.spec.as_str(), row.carried))
+                .collect::<Vec<_>>(),
+            [("carried@1", true), ("missed@1", false)]
+        );
+    }
+
+    /// One ordinary batch has no per-package attribution. If it fails, none of its packages may
+    /// seed an OK and the halt starts no later bounded child.
+    #[test]
+    fn a_failed_unbounded_lint_batch_seeds_no_package_ok() {
+        let selection = crate::lint_content::Selection {
+            run: vec![
+                unbounded_lint_package("reader-a@1"),
+                unbounded_lint_package("reader-b@1"),
+                lint_package("later-bounded@1", 4),
+            ],
+            carried: Vec::new(),
+        };
+        let mut ops = FakeLintOps::passing();
+        ops.batch_outcome = LintPackageOutcome::Fail;
+        ops.batch_seconds = 4.0;
+        ops.halt_on_batch = true;
+        schedule_lint_packages(selection, &mut ops);
+
+        assert_eq!(ops.batches, [["reader-a@1", "reader-b@1"]]);
+        assert!(ops.ran.is_empty(), "the halt starts no bounded child");
+        assert!(ops.finished.iter().all(|row| row.outcome != "ok"));
+        assert_eq!(
+            ops.finished
+                .iter()
+                .map(|row| (row.spec.as_str(), row.outcome))
+                .collect::<Vec<_>>(),
+            [
+                ("later-bounded@1", "NOT RUN"),
+                ("reader-a@1", "FAIL"),
+                ("reader-b@1", "FAIL")
+            ]
+        );
+    }
+
+    /// Both stability reads fail closed. Pre-dispatch drift starts no child and tombstones later
+    /// work; post-run drift replaces successful and carried candidates with unbounded NOT RUN
+    /// rows and gives the aggregate lint a COULD NOT RUN reason.
+    #[test]
+    fn lint_input_drift_before_or_after_execution_is_a_tombstone() {
+        let first = lint_package("first@1", 5);
+        let later = lint_package("later@1", 6);
+        let mut pre = FakeLintOps::passing();
+        pre.prepare_as(
+            &first.spec,
+            [Ok((first.commands.clone(), lint_evidence(90)))],
+        );
+        schedule_lint_packages(
+            crate::lint_content::Selection {
+                run: vec![first.clone(), later],
+                carried: Vec::new(),
+            },
+            &mut pre,
+        );
+        assert!(pre.ran.is_empty());
+        assert_eq!(pre.cannot_run.len(), 1);
+        assert_eq!(
+            pre.prepared_boundaries,
+            [("first@1".into(), LintReadBoundary::PreDispatch)]
+        );
+        assert!(pre.finished.iter().all(|row| {
+            row.outcome == "NOT RUN" && !row.evidence.bounded() && row.evidence.reason.is_some()
+        }));
+
+        let missed = lint_package("missed@1", 7);
+        let carried = lint_package("carried@1", 8);
+        let mut post = FakeLintOps::passing();
+        post.prepare_as(
+            &missed.spec,
+            [
+                Ok((missed.commands.clone(), missed.evidence.clone())),
+                Ok((missed.commands.clone(), lint_evidence(91))),
+            ],
+        );
+        post.prepare_as(
+            &carried.spec,
+            [Ok((carried.commands.clone(), lint_evidence(92)))],
+        );
+        post.bounded
+            .insert(missed.spec.clone(), (LintPackageOutcome::Ok, 6.0));
+        schedule_lint_packages(
+            crate::lint_content::Selection {
+                run: vec![missed],
+                carried: vec![(carried.clone(), lint_proof(&carried, 4.0))],
+            },
+            &mut post,
+        );
+        assert_eq!(post.ran.len(), 1);
+        assert_eq!(post.cannot_run.len(), 1);
+        assert_eq!(
+            post.prepared_boundaries,
+            [
+                ("missed@1".into(), LintReadBoundary::PreDispatch),
+                ("missed@1".into(), LintReadBoundary::Final),
+                ("carried@1".into(), LintReadBoundary::Final),
+            ]
+        );
+        assert!(post.finished.iter().all(|row| {
+            row.outcome == "NOT RUN"
+                && !row.carried
+                && !row.evidence.bounded()
+                && row.evidence.reason.is_some()
+        }));
+    }
+
+    /// Deterministic line timeline for the package scheduler. The four fixture packages take
+    /// 12, 8, 4 and 2 seconds serially. A cfg(test) edit invalidates its package plus its reverse
+    /// dependent; a runtime-only fixture edit changes no lint key; a verifier/context change
+    /// changes every bounded key. The undeclared reader always runs.
+    #[test]
+    fn lint_line_timeline_runs_3_1_4_and_models_22_2_26_seconds() {
+        let base = [
+            lint_package("edited@1", 10),
+            lint_package("dependent@1", 11),
+            lint_package("independent@1", 12),
+        ];
+        let passed = crate::lint_content::Passed::from([
+            (base[0].spec.clone(), lint_proof(&base[0], 12.0)),
+            (base[1].spec.clone(), lint_proof(&base[1], 8.0)),
+            (base[2].spec.clone(), lint_proof(&base[2], 4.0)),
+        ]);
+        let reverse = || {
+            Some(BTreeMap::from([
+                ("edited@1".into(), BTreeSet::from(["dependent@1".into()])),
+                ("dependent@1".into(), BTreeSet::new()),
+                ("independent@1".into(), BTreeSet::new()),
+                ("reader@1".into(), BTreeSet::new()),
+            ]))
+        };
+        let run = |mut packages: Vec<crate::lint_content::Package>| {
+            packages.push(unbounded_lint_package("reader@1"));
+            let selection = crate::lint_content::Plan::fixture(packages, reverse()).select(&passed);
+            let mut ops = FakeLintOps::passing();
+            ops.batch_seconds = 2.0;
+            for (spec, seconds) in [
+                ("edited@1", 12.0),
+                ("dependent@1", 8.0),
+                ("independent@1", 4.0),
+            ] {
+                ops.bounded
+                    .insert(spec.into(), (LintPackageOutcome::Ok, seconds));
+            }
+            schedule_lint_packages(selection, &mut ops);
+            let ran = ops.finished.iter().filter(|row| !row.carried).count();
+            let carried = ops.finished.iter().filter(|row| row.carried).count();
+            let wall: f64 = ops
+                .finished
+                .iter()
+                .filter(|row| !row.carried)
+                .map(|row| row.execution_s)
+                .sum();
+            assert!(ops.finished.iter().all(|row| row.outcome == "ok"));
+            (ran, carried, wall)
+        };
+
+        let cfg_test = run(vec![
+            lint_package("edited@1", 20),
+            base[1].clone(),
+            base[2].clone(),
+        ]);
+        let fixture_only = run(base.to_vec());
+        let context = run(vec![
+            lint_package("edited@1", 30),
+            lint_package("dependent@1", 31),
+            lint_package("independent@1", 32),
+        ]);
+        assert_eq!(cfg_test, (3, 1, 22.0));
+        assert_eq!(fixture_only, (1, 3, 2.0));
+        assert_eq!(context, (4, 0, 26.0));
     }
 
     /// A PURE COMPILE CALL WRITES ITS COMPILE LINE (A1): its Cargo arguments get the message

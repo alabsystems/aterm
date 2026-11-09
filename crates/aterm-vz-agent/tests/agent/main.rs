@@ -20,6 +20,22 @@ use aterm_vz_agent::fake::Fake;
 use aterm_vz_agent::system::System;
 use aterm_vz_agent::wire::{self, Exec, Exit, Frame, Stdin};
 
+/// Test-only Unix adapter; the release guest listens on vsock and keeps no aterm-uds dependency.
+struct TestListener(UnixListener);
+
+impl aterm_vz_agent::serve::Listener for TestListener {
+    type Stream = UnixStream;
+
+    fn accept(&self) -> std::io::Result<Self::Stream> {
+        aterm_uds::accept(
+            &self.0,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .map(|(stream, _)| stream)
+    }
+}
+
 /// The hang detector: a wait for what must happen fails after a minute, never sooner.
 pub const HANG: Duration = Duration::from_secs(60);
 
@@ -69,7 +85,7 @@ impl Agent {
     pub fn new(fake: Fake) -> Self {
         let dir = aterm_tempfile::tempdir().unwrap();
         let sock = dir.path().join("c.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let listener = TestListener(UnixListener::bind(&sock).unwrap());
         let fake = Arc::new(fake);
         let system: Arc<dyn System> = fake.clone();
         std::thread::spawn(move || {

@@ -1197,7 +1197,13 @@ impl StandIn {
         let answering = std::sync::Arc::clone(&reply);
         let (stopping, counting) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&asked));
         let thread = std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            loop {
+                let stream = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .map(|(stream, _)| stream);
                 if stopping.load(Ordering::SeqCst) {
                     return;
                 }
@@ -2797,7 +2803,13 @@ fn silent_server(
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let url = format!("http://{}/v1/alab", listener.local_addr().expect("addr"));
     let thread = std::thread::spawn(move || {
-        for stream in listener.incoming() {
+        loop {
+            let stream = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .map(|(stream, _)| stream);
             if release.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }

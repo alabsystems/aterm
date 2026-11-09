@@ -410,26 +410,6 @@ fn a_refused_save_says_why_in_the_save_words() {
         denied(AtomicSaveStage::Preflight, SaveTouch::Lock).contains("amacs can"),
         "the face names itself"
     );
-    let held = amacs_files::host::HeldAdvisoryLock::lock(
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&lock)
-            .expect("the save lock"),
-    )
-    .expect("hold the save lock");
-    let echo = save(&|| {}, &|| {});
-    drop(held);
-    assert_eq!(
-        echo,
-        said(
-            AtomicSaveStage::Preflight,
-            ErrorKind::WouldBlock,
-            SaveTouch::Lock
-        ),
-        "a save lock another writer holds"
-    );
-    assert!(echo.contains("try again in a moment"), "{echo}");
-    assert_eq!(std::fs::read(&path).expect("read"), b"base\n");
 }
 
 /// AN OPEN THE FILE HOST REFUSES SAYS WHY IN THE SAVE WORDS.

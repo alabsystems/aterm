@@ -71,7 +71,11 @@ fn one_connection<T: Send + 'static>(
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let Ok((stream, _)) = listener.accept() else {
+        let Ok((stream, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         let _ = stream.set_read_timeout(Some(HANG_DETECTOR));
@@ -866,7 +870,6 @@ fn an_exchange_debug_names_its_headers_without_their_values() {
 fn a_secret_header_with_a_reserved_name_is_refused_before_any_connect() {
     for name in ["Proxy-Authorization", "Accept"] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let failed = client()
             .request(Method::Get, &format!("http://127.0.0.1:{port}/s"))
@@ -880,7 +883,13 @@ fn a_secret_header_with_a_reserved_name_is_refused_before_any_connect() {
         );
         assert!(!format!("{failed:?}").contains("canary"), "{name}");
         assert_eq!(
-            listener.accept().map(|_| ()).map_err(|error| error.kind()),
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .map(|_| ())
+            .map_err(|error| error.kind()),
             Err(ErrorKind::WouldBlock),
             "{name}: no connection was opened"
         );

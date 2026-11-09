@@ -33,10 +33,10 @@ impl Scenario {
     }
 
     fn valid(self, code: Option<i32>, image: Option<(u32, u32)>, refused: bool) -> bool {
-        let failed = code.is_some_and(|code| code != 0);
+        let refused_exit = code == Some(1);
         match self {
-            Self::PreRefusal => failed && refused && image.is_none(),
-            Self::PostRefusal => failed && refused && image.is_some(),
+            Self::PreRefusal => refused_exit && refused && image.is_none(),
+            Self::PostRefusal => refused_exit && refused && image.is_some(),
             Self::Warmup | Self::Ordinary | Self::SpaceWorld | Self::NativeOnly => {
                 code == Some(0) && image.is_some()
             }
@@ -57,13 +57,42 @@ impl Scenario {
     }
 }
 
+fn control_refused(stdout: &str, verb: &str) -> bool {
+    let prefix = format!("ctl {verb} -> ");
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .any(|reply| {
+            reply
+                .strip_prefix("aterm-ctl: ")
+                .unwrap_or(reply)
+                .starts_with("ERR ")
+        })
+}
+
+fn record_row(
+    records: &mut impl std::io::Write,
+    progress: &mut impl std::io::Write,
+    row: &str,
+) -> Result<(), String> {
+    records
+        .write_all(row.as_bytes())
+        .map_err(|error| format!("write measurements: {error}"))?;
+    aterm_uds::stdout::reader_gone_is_written(
+        progress
+            .write_all(row.as_bytes())
+            .and_then(|()| progress.flush()),
+    )
+    .map_err(|error| format!("write comparison progress: {error}"))
+}
+
 fn dimensions(path: &Path) -> Result<Option<(u32, u32)>, String> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match crate::util::open_regular_file(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
-    let mut reader = aterm_png::Decoder::new(std::io::Cursor::new(bytes))
+    let mut reader = aterm_png::Decoder::new(file)
         .read_info()
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let size = (reader.info().width, reader.info().height);
@@ -168,8 +197,10 @@ impl<'a> Input<'a> {
         Ok(Self { path, sha256 })
     }
 
-    fn record(&self) -> aterm_json::Value {
-        aterm_json::json!({ "path": self.path, "sha256": self.sha256 })
+    fn record(&self) -> Result<aterm_json::Value, String> {
+        let path = aterm_json::to_value(self.path)
+            .map_err(|error| format!("record comparison input {}: {error}", self.path.display()))?;
+        Ok(aterm_json::json!({ "path": path, "sha256": self.sha256 }))
     }
 
     fn recheck(&self) -> Result<(), String> {
@@ -185,14 +216,19 @@ impl<'a> Input<'a> {
 }
 
 fn measure(before: &Path, after: &Path, aterm: &Path, output: &Path, samples: u32) -> Res {
+    let observer = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| format!("locate comparison observer: {error}"))?;
+    let observer_input = Input::read(&observer)?;
     let before_input = Input::read(before)?;
     let after_input = Input::read(after)?;
     let aterm_input = Input::read(aterm)?;
     let inputs = aterm_json::json!({
-        "schema": 1,
-        "before": before_input.record(),
-        "after": after_input.record(),
-        "aterm": aterm_input.record(),
+        "schema": 2,
+        "observer": observer_input.record()?,
+        "before": before_input.record()?,
+        "after": after_input.record()?,
+        "aterm": aterm_input.record()?,
         "samples": samples,
     });
     crate::util::atomic_write(
@@ -276,9 +312,7 @@ fn measure(before: &Path, after: &Path, aterm: &Path, output: &Path, samples: u3
                         "{stem}: fixture did not establish a ready instance; see its logs"
                     )));
                 }
-                let refused = stdout
-                    .lines()
-                    .any(|line| line.starts_with("ctl spawn split=h ->") && line.contains("ERR "));
+                let refused = control_refused(&stdout, "spawn split=h");
                 let size = dimensions(&image).map_err(|error| format!("{stem}: {error}"))?;
                 let valid = scenario.valid(ran.status.code(), size, refused);
                 failed |= arm == "after" && !valid;
@@ -290,10 +324,8 @@ fn measure(before: &Path, after: &Path, aterm: &Path, output: &Path, samples: u3
                         .code()
                         .map_or_else(|| "signal".into(), |n| n.to_string())
                 );
-                print!("{row}");
-                records
-                    .write_all(row.as_bytes())
-                    .map_err(|e| e.to_string())?;
+                record_row(&mut records, &mut std::io::stdout().lock(), &row)
+                    .map_err(|error| format!("{stem}: {error}"))?;
             }
         }
     }
@@ -303,7 +335,7 @@ fn measure(before: &Path, after: &Path, aterm: &Path, output: &Path, samples: u3
             "instance compare: candidate violates a capture scenario; see measurements.tsv",
         ))
     } else {
-        for input in [before_input, after_input, aterm_input] {
+        for input in [before_input, after_input, aterm_input, observer_input] {
             crate::stop::check()?;
             input.recheck()?;
         }
@@ -314,7 +346,47 @@ fn measure(before: &Path, after: &Path, aterm: &Path, output: &Path, samples: u3
 
 #[cfg(test)]
 mod tests {
-    use super::{Input, Scenario, dimensions, finish, run};
+    use super::{Input, Scenario, control_refused, dimensions, finish, record_row, run};
+
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_progress_reader_preserves_the_measurement_and_the_run() {
+        let (mut progress, reader) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(reader);
+        let mut records = Vec::new();
+        record_row(&mut records, &mut progress, "completed\n").unwrap();
+        assert_eq!(records, b"completed\n");
+    }
+
+    #[test]
+    fn an_unwritable_journal_does_not_announce_an_unrecorded_row() {
+        let mut storage = [];
+        let mut records = std::io::Cursor::new(&mut storage[..]);
+        let mut progress = Vec::new();
+        assert!(record_row(&mut records, &mut progress, "completed\n").is_err());
+        assert!(progress.is_empty());
+    }
+
+    #[test]
+    fn a_progress_write_error_keeps_the_record_but_fails_the_write() {
+        let mut records = Vec::new();
+        let mut storage = [];
+        let mut progress = std::io::Cursor::new(&mut storage[..]);
+        assert!(record_row(&mut records, &mut progress, "completed\n").is_err());
+        assert_eq!(records, b"completed\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unrepresentable_native_input_path_is_an_error_instead_of_a_panic() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"runner\xff".to_vec()));
+        let input = Input {
+            path: &path,
+            sha256: "0".repeat(64),
+        };
+        assert!(input.record().is_err());
+    }
 
     #[test]
     fn replacing_input_bytes_without_changing_length_invalidates_the_identity() {
@@ -370,7 +442,14 @@ mod tests {
             aterm_json::from_str(&std::fs::read_to_string(output.join("inputs.json")).unwrap())
                 .unwrap();
         assert_eq!(inputs["samples"].as_u64(), Some(1));
-        for (arm, path) in [("before", &runner), ("after", &after), ("aterm", &app)] {
+        assert_eq!(inputs["schema"].as_u64(), Some(2));
+        let observer = std::env::current_exe().unwrap();
+        for (arm, path) in [
+            ("before", &runner),
+            ("after", &after),
+            ("aterm", &app),
+            ("observer", &observer),
+        ] {
             let canonical_path = std::fs::canonicalize(path).unwrap();
             assert_eq!(inputs[arm]["path"].as_str(), canonical_path.to_str());
             assert_eq!(
@@ -387,20 +466,75 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_image_is_not_an_absent_image() {
+    fn a_fifo_capture_is_refused_without_waiting_for_a_writer() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let image = scratch.path().join("frame.png");
+        crate::sys::make_fifo(&image).unwrap();
+        let (done, completed) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            done.send(dimensions(&image)).unwrap();
+        });
+        let result = completed
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("a capture FIFO must be refused without waiting for a writer");
+        worker.join().unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn image_validation_distinguishes_absent_valid_and_corrupt_files() {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let image = scratch.path().join("frame.png");
         assert_eq!(dimensions(&image).unwrap(), None);
+        {
+            let mut encoder = aterm_png::Encoder::new(std::fs::File::create(&image).unwrap(), 1, 1);
+            encoder.set_color(aterm_png::ColorType::Rgb);
+            encoder.set_depth(aterm_png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[1, 2, 3]).unwrap();
+            writer.finish().unwrap();
+        }
+        assert_eq!(dimensions(&image).unwrap(), Some((1, 1)));
         std::fs::write(&image, b"not a PNG").unwrap();
         assert!(dimensions(&image).is_err());
     }
 
     #[test]
     fn a_failed_fixture_is_not_an_expected_control_refusal() {
+        for reply in ["ERR refused", "aterm-ctl: ERR refused"] {
+            assert!(control_refused(
+                &format!("ctl spawn split=h -> {reply}\n"),
+                "spawn split=h"
+            ));
+        }
+        assert!(!control_refused(
+            "ctl spawn split=h -> OK payload=ERR refused\n",
+            "spawn split=h"
+        ));
+        assert!(!control_refused(
+            "ctl spawn split=v -> aterm-ctl: ERR refused\n",
+            "spawn split=h"
+        ));
         assert!(!Scenario::PreRefusal.valid(Some(1), None, false));
         assert!(Scenario::PreRefusal.valid(Some(1), None, true));
         assert!(!Scenario::PostRefusal.valid(Some(1), Some((794, 462)), false));
         assert!(Scenario::PostRefusal.valid(Some(1), Some((794, 462)), true));
+        for code in [
+            Some(0),
+            Some(2),
+            Some(7),
+            Some(101),
+            Some(126),
+            Some(127),
+            Some(130),
+            None,
+        ] {
+            assert!(!Scenario::PreRefusal.valid(code, None, true), "{code:?}");
+            assert!(
+                !Scenario::PostRefusal.valid(code, Some((794, 462)), true),
+                "{code:?}"
+            );
+        }
         assert!(!Scenario::NativeOnly.valid(Some(1), None, false));
         assert!(Scenario::NativeOnly.valid(Some(0), Some((794, 462)), false));
     }

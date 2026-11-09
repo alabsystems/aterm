@@ -4161,9 +4161,6 @@ fn a_claim_is_proven_by_its_connections_peer_leading_the_foreground() {
     let dir = crate::test_scratch::short_dir("the claim's socket");
     let sock = dir.path().join("c.sock");
     let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
     let stand_in: fn(u32) -> bool = |_| true;
     let real: fn(u32) -> bool = crate::self_claim::runs_alab_build;
     for (mode, alab_image, want_proven) in [
@@ -4194,16 +4191,12 @@ fn a_claim_is_proven_by_its_connections_peer_leading_the_foreground() {
         assert_eq!(started.rpc, 1, "the request lane starts");
         lanes.publish(service.clone());
         started.activate();
-        let (stream, _) = aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "the claimant connects",
-            || match listener.accept() {
-                Ok(connection) => Some(connection),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
-                Err(error) => panic!("accept claimant: {error}"),
-            },
-        );
-        stream.set_nonblocking(false).expect("blocking lane stream");
+        let (stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Until(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("the claimant connects");
         assert!(lanes.admit(stream).is_ok(), "admitted");
         let said = read_until_done(master);
         let reply = service

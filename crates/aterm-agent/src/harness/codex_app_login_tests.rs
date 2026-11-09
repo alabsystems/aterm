@@ -438,9 +438,6 @@ struct RecordedHttp {
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Option<RecordedHttp> {
-    // A socket accepted from a non-blocking listener is non-blocking on macOS, where a read before
-    // the request arrives would end the read here rather than wait out this timeout.
-    stream.set_nonblocking(false).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -529,7 +526,6 @@ fn query_map(url: &str) -> Vec<(String, String)> {
 #[test]
 fn callback_listener_uses_fallback_without_contacting_an_occupied_port() {
     let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    occupied.set_nonblocking(true).unwrap();
     let port = occupied.local_addr().unwrap().port();
     let fallback = bind_callback_listener(
         &[port, 0],
@@ -537,16 +533,26 @@ fn callback_listener_uses_fallback_without_contacting_an_occupied_port() {
     )
     .unwrap();
     assert_ne!(fallback.local_addr().unwrap().port(), port);
-    assert!(
-        matches!(occupied.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
+    assert!(matches!(
+        aterm_uds::accept(
+            &occupied,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
     let refused =
         bind_callback_listener(&[port], WakeDeadline::after(aterm_spec::wait::MUST_HAPPEN))
             .unwrap_err();
     assert_eq!(refused.kind(), std::io::ErrorKind::AddrInUse);
-    assert!(
-        matches!(occupied.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
-    );
+    assert!(matches!(
+        aterm_uds::accept(
+            &occupied,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
     let expired = bind_callback_listener(&[0], WakeDeadline::after(Duration::ZERO)).unwrap_err();
     assert_eq!(expired.kind(), std::io::ErrorKind::TimedOut);
 }
@@ -669,7 +675,12 @@ fn an_accepted_callback_cannot_finish_its_head_after_the_original_host_slept_pas
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let mut peer = TcpStream::connect(("127.0.0.1", port)).unwrap();
-        let (mut accepted, _) = listener.accept().unwrap();
+        let (mut accepted, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         let wire = format!("GET /auth/callback?code=ok HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
         peer.write_all(wire.as_bytes()).unwrap();
         peer.shutdown(std::net::Shutdown::Write).unwrap();
@@ -723,7 +734,12 @@ fn callback_owner_joins_partial_socket_work_before_original_guards_retire() {
         let scope = lifetime.enter().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut socket, _) = listener.accept().unwrap();
+        let (mut socket, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         peer.write_all(b"G").unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -889,7 +905,12 @@ fn one_operation_cancels_its_accepted_socket_without_closing_the_epoch() {
     let cancellation = scope.cancellation();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (mut socket, _) = listener.accept().unwrap();
+    let (mut socket, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     peer.write_all(b"G").unwrap();
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
@@ -1014,11 +1035,13 @@ pub(crate) fn mock_login_in_home(
     let challenge_for_server = Arc::clone(&expected_challenge);
 
     let server = std::thread::spawn(move || {
-        let _ = listener.set_nonblocking(true);
         while !deadline.passed() {
-            match listener.accept() {
+            match aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(deadline.within(Duration::from_millis(5)).instant()),
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 Ok((mut stream, _)) => {
-                    let _ = stream.set_nonblocking(false);
                     let Some(req) = read_http_request(&mut stream) else {
                         return;
                     };
@@ -1052,9 +1075,7 @@ pub(crate) fn mock_login_in_home(
                     );
                     return;
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                 Err(_) => return,
             }
         }
@@ -1345,7 +1366,12 @@ fn login_case(case: i64) -> [(&'static str, i64); 6] {
     let server_issuer = issuer.clone();
     let server = std::thread::spawn(move || {
         for round in 0..if case == 17 { 2 } else { 1 } {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let Some(request) = read_http_request(&mut stream) else {
                 break;
             };
@@ -1830,21 +1856,16 @@ fn identified_usage_keeps_the_request_identity_when_the_file_changes_before_the_
     )
     .unwrap();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let url = format!("http://{}/usage", listener.local_addr().unwrap());
     let written = path.clone();
     let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(Instant::now() < deadline, "usage request did not arrive");
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("{error}"),
-            }
-        };
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Until(deadline),
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("usage request did not arrive");
         let request = read_http_request(&mut stream).unwrap();
         assert!(
             request
@@ -1919,7 +1940,6 @@ fn identified_usage_uses_the_shared_configuration_and_the_selected_auth_file() {
         .unwrap();
     }
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    listener.set_nonblocking(true).unwrap();
     std::fs::write(
         config_home.join("config.toml"),
         format!(
@@ -1930,19 +1950,12 @@ fn identified_usage_uses_the_shared_configuration_and_the_selected_auth_file() {
     .unwrap();
     let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(60);
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "shared route received no usage request"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => panic!("{error}"),
-            }
-        };
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Until(deadline),
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("shared route received no usage request");
         let request = read_http_request(&mut stream).unwrap();
         assert_eq!(request.target, "/api/codex/usage");
         assert!(
@@ -2038,7 +2051,11 @@ fn native_wham_usage_reads_windows_walls_and_refreshes_expired_or_unauthorized_t
 
     let server = std::thread::spawn(move || {
         for _ in 0..6 {
-            let Ok((mut stream, _)) = listener.accept() else {
+            let Ok((mut stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 break;
             };
             let Some(req) = read_http_request(&mut stream) else {
@@ -2507,7 +2524,11 @@ fn concurrent_disk_rotation_reloads_before_refresh_and_cleartext_remote_endpoint
     let fresh_jwt_srv = fresh_jwt.clone();
     let server = std::thread::spawn(move || {
         for _ in 0..2 {
-            let Ok((mut stream, _)) = listener.accept() else {
+            let Ok((mut stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 break;
             };
             let Some(req) = read_http_request(&mut stream) else {
@@ -2685,7 +2706,12 @@ fn refresh_case(case: i64, early: bool) -> [(&'static str, i64); 6] {
     let posted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let server_posted = Arc::clone(&posted);
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         let Some(request) = read_http_request(&mut stream) else {
             // A refused pre-request observation sends no HTTP. The caller's
             // empty connection wakes this listener without a timing assertion.
@@ -2841,7 +2867,12 @@ fn separately_bounded_responses_retain_large_tokens_across_fresh_file_reads() {
         let mut sent = Vec::new();
         for response in responses {
             assert!(aterm_json::to_vec(&response).unwrap().len() <= MESSAGE_MAX);
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let request = read_http_request(&mut stream).unwrap();
             let body: Value = aterm_json::from_str(&request.body).unwrap();
             sent.push(body["refresh_token"].as_str().unwrap().to_owned());
@@ -2915,7 +2946,12 @@ fn result_case(case: i64) -> [(&'static str, i64); 6] {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         read_http_request(&mut stream).unwrap();
         send_http_json(
             &mut stream,
@@ -3233,7 +3269,12 @@ fn identity_case(case: i64) -> [(&'static str, i64); 5] {
         let posted = Arc::new(AtomicBool::new(false));
         let server_posted = Arc::clone(&posted);
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let Some(request) = read_http_request(&mut stream) else {
                 return;
             };
@@ -3400,7 +3441,12 @@ fn authority_case(case: i64) -> [(&'static str, i64); 6] {
     let server_home = tmp.path().to_path_buf();
     let mut concurrent = initial.clone();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         let request = read_http_request(&mut stream)?;
         if case == 29 {
             concurrent
@@ -3768,7 +3814,11 @@ fn provider_by_request(
     let port = listener.local_addr().expect("addr").port();
     let server = std::thread::spawn(move || {
         let mut seen = Vec::new();
-        while let Ok((mut stream, _)) = listener.accept() {
+        while let Ok((mut stream, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             let Some(request) = read_http_request(&mut stream) else {
                 break;
             };
@@ -5048,7 +5098,11 @@ fn a_lost_refresh_reply_keeps_usage_available_without_reusing_the_token() {
     let port = listener.local_addr().expect("address").port();
     let server = std::thread::spawn(move || {
         let mut seen = Vec::new();
-        while let Ok((mut stream, _)) = listener.accept() {
+        while let Ok((mut stream, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             let Some(request) = read_http_request(&mut stream) else {
                 break;
             };
@@ -5152,7 +5206,12 @@ fn a_refresh_tls_failure_before_sending_can_retry() {
     let port = listener.local_addr().expect("address").port();
     // Close after ClientHello. TLS has not admitted any HTTP request bytes.
     let peer = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("TLS connection");
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("TLS connection");
         stream
             .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
             .expect("timeout");
@@ -5513,7 +5572,12 @@ fn auth_lock_coordinates_refresh_reloads_rotated_tokens_and_refuses_symlinks() {
     let auth_for_server = auth_file.clone();
     let server_jwt_clone = server_jwt.clone();
     let server = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept refresh");
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept refresh");
         let _req = read_http_request(&mut stream).expect("read refresh");
         let probe = AuthLock::try_take(&auth_for_server).expect("probe lock at request");
         saw_for_server.store(probe.is_none(), Ordering::SeqCst);
@@ -5621,7 +5685,11 @@ fn code_exchange_validates_and_clears_refresh_journal_around_publication() {
     let server = std::thread::spawn(move || {
         // Round 0 returns 400 (failed exchange preserves existing journal); round 1 returns 200.
         for round in 0..2 {
-            let Ok((mut stream, _)) = listener.accept() else {
+            let Ok((mut stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 break;
             };
             let Some(_request) = read_http_request(&mut stream) else {

@@ -120,11 +120,17 @@ impl Server {
             beats.clone(),
         );
         let accept = std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            loop {
                 if stop2.load(Ordering::SeqCst) {
                     return;
                 }
-                let Ok(stream) = stream else { continue };
+                let Ok((stream, _)) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
+                    continue;
+                };
                 let (root, served, posted, beats) = (
                     root.clone(),
                     served2.clone(),

@@ -3063,11 +3063,30 @@ mod tests {
         );
     }
 
-    /// The first child cannot finish until the third has run, which a one-after-another run
+    /// An expired batch admits no spawn, including of a missing command. In a live batch,
+    /// the first child cannot finish until the third has run, which a one-after-another run
     /// would reach only at the deadline.
     #[cfg(unix)]
     #[test]
     fn several_children_run_at_once_and_each_answers_for_itself() {
+        for stopped_variant in [false, true] {
+            let mut missing = crate::spawnfd::command("/nonexistent/tool");
+            let expired = Instant::now();
+            let results = if stopped_variant {
+                super::outputs_until_unless(
+                    &mut [&mut missing],
+                    expired,
+                    Duration::ZERO,
+                    &mut || false,
+                )
+            } else {
+                outputs_until(&mut [&mut missing], expired, Duration::ZERO)
+            };
+            assert!(
+                matches!(results.as_slice(), [Err(RunError::TimedOut)]),
+                "an expired batch must not attempt the command's spawn: {results:?}"
+            );
+        }
         let dir = scratch("many");
         let flag = dir.join("flag");
         let holder_file = dir.join("holder");
@@ -3147,7 +3166,9 @@ mod tests {
         let mut missing = crate::spawnfd::command("/nonexistent/tool");
         let both = [pid_file.clone(), grandchild_file.clone()];
         let clock = ClockHeld::until(move || both.iter().all(|file| pid_in(file).is_some()));
-        let results = outputs_until(&mut [&mut wedged, &mut missing], clock.deadline(), HANG);
+        // The missing command's own spawn is observed before the real child's proof
+        // can advance the clock to the deadline.
+        let results = outputs_until(&mut [&mut missing, &mut wedged], clock.deadline(), HANG);
         let waited = clock.since_it_ran();
         drop(clock);
         let child = pid_in(&pid_file);
@@ -3158,8 +3179,8 @@ mod tests {
         };
         assert!(waited < HANG, "the call did not come back: {waited:?}");
         let mut results = results.into_iter();
-        assert!(matches!(results.next(), Some(Err(RunError::TimedOut))));
         assert!(matches!(results.next(), Some(Err(RunError::Spawn(_)))));
+        assert!(matches!(results.next(), Some(Err(RunError::TimedOut))));
         assert!(
             !crate::process::pid_alive(child),
             "pid {child} outlived the call"

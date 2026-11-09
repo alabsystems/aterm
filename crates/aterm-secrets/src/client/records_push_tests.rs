@@ -110,7 +110,13 @@ impl HeldServers {
             ));
             let shared = Arc::clone(&shared);
             listeners.push(std::thread::spawn(move || {
-                for stream in listener.incoming() {
+                loop {
+                    let stream = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .map(|(stream, _)| stream);
                     if shared.held().ended {
                         return;
                     }

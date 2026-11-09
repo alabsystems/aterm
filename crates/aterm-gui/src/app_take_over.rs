@@ -1638,7 +1638,6 @@ mod tests {
         for (age, exit) in [(31, 0), (61, 0), (0, 0), (31, 7)] {
             let held = RefCell::new(Some(aterm_update_core::FileLock::acquire(&gate).unwrap()));
             let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            listener.set_nonblocking(true).unwrap();
             let port = listener.local_addr().unwrap().port();
             let proof = RefCell::new(None);
             let mut released = false;
@@ -1656,24 +1655,16 @@ mod tests {
                 &args,
                 CliVerb::DrivePeer.cap(),
                 || {
-                    let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-                    let mut connected = loop {
-                        match listener.accept() {
-                            Ok((stream, _)) => break stream,
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                assert!(
-                                    Instant::now() < until,
-                                    "owned child did not reach its writer"
-                                );
-                                std::thread::sleep(Duration::from_millis(5));
-                            }
-                            Err(error) => panic!("owned native child proof: {error}"),
-                        }
-                    };
-                    // macOS hands accept() the listener's O_NONBLOCK, so a read
-                    // that comes before the child's write would be WouldBlock,
-                    // not a wait; the read timeout below needs a blocking socket.
-                    connected.set_nonblocking(false).unwrap();
+                    let (mut connected, _) = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Until(
+                            Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                        ),
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .expect("owned child reached its writer");
+                    // The sanctioned accept makes the stream blocking explicitly, so the read
+                    // timeout below waits through the child's planted connect-to-write delay.
                     connected
                         .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
                         .unwrap();

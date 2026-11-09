@@ -303,14 +303,24 @@ fn serve(dir: Option<&str>) -> std::io::Result<()> {
         let r = (|| {
             let l = UnixListener::bind(&path)?;
             let _c = UnixStream::connect(&path)?;
-            l.accept().map(drop)
+            aterm_uds::accept(
+                &l,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .map(drop)
         })();
         let _ = fs::remove_file(&path);
         r
     } else {
         let l = std::net::TcpListener::bind("127.0.0.1:0")?;
         let _c = std::net::TcpStream::connect(l.local_addr()?)?;
-        l.accept().map(drop)
+        aterm_uds::accept(
+            &l,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .map(drop)
     }
 }
 
@@ -1309,8 +1319,16 @@ impl Listener {
         }
         let l = UnixListener::bind(path)?;
         std::thread::spawn(move || {
-            for c in l.incoming() {
-                drop(c);
+            loop {
+                let accepted = aterm_uds::accept(
+                    &l,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                );
+                if accepted.is_err() {
+                    return;
+                }
+                drop(accepted);
             }
         });
         Ok(Listener {

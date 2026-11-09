@@ -239,7 +239,13 @@ fn a_mesh_dialer_meets_an_older_listener_on_atf2() {
         let tcp_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = tcp_listener.local_addr().unwrap();
         let listening = std::thread::spawn(move || {
-            let tcp = tcp_listener.accept().unwrap().0;
+            let tcp = aterm_uds::accept(
+                &tcp_listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap()
+            .0;
             // A listener from before the mesh: it offers `atf/2` and `atf/1` alone.
             server_handshake_as(
                 tcp,
@@ -587,7 +593,13 @@ fn over_tls_the_client_sends_nothing_to_a_listener_its_log_does_not_seat() {
     let addr = tcp_listener.local_addr().unwrap();
     let proving = listener.clone();
     let listening = std::thread::spawn(move || {
-        let tcp = tcp_listener.accept().unwrap().0;
+        let tcp = aterm_uds::accept(
+            &tcp_listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap()
+        .0;
         tcp.set_read_timeout(Some(HANG)).unwrap();
         let config = served_config(false, true);
         let (mut t, _) = accept_tls(tcp, config).unwrap();

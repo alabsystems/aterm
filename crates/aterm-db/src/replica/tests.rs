@@ -415,8 +415,17 @@ fn deferred_membership_records_hold_up_no_table_repair() {
         let address = listener.local_addr().unwrap();
         thread::scope(|threads| {
             let server = threads.spawn(|| {
-                let connection =
-                    Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap();
+                let connection = Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    LinkScope::Loopback,
+                )
+                .unwrap();
                 session(&endpoints[1], connection, Side::Responder, &mut rb)
             });
             let connection =
@@ -506,7 +515,17 @@ fn a_mac_not_crossed_completes_table_sync_with_a_legacy_peer_of_4071_records() {
         let (dialed, answered) = thread::scope(|threads| {
             let server = threads.spawn(|| {
                 endpoints[1].exchange(
-                    Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
+                    Connection::admit(
+                        aterm_uds::accept(
+                            &listener,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        )
+                        .unwrap()
+                        .0,
+                        LinkScope::Loopback,
+                    )
+                    .unwrap(),
                     Side::Responder,
                     &mut rb,
                 )
@@ -656,7 +675,17 @@ fn exchange_round(a: &Endpoint, b: &Endpoint, ra: &mut PeerRepair, rb: &mut Peer
     thread::scope(|threads| {
         let server = threads.spawn(|| {
             b.exchange(
-                Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
+                Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    LinkScope::Loopback,
+                )
+                .unwrap(),
                 Side::Responder,
                 rb,
             )
@@ -699,7 +728,13 @@ fn native_replica_fixture_connect_waits_for_its_original_listener() {
     );
     let connection =
         fixture_connect(address, std::time::Instant::now() - Duration::from_secs(3)).unwrap();
-    let accepted = listener.accept().unwrap().0;
+    let accepted = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap()
+    .0;
     drop((connection, accepted));
 }
 

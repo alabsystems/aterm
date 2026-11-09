@@ -3310,17 +3310,14 @@ fn serve_callback_loop(server: CallbackServer) {
         deadline,
         work,
     } = server;
-    if listener.set_nonblocking(true).is_err() {
-        let _ = tx.send(CallbackOutcome::Failed);
-        done.store(true, Ordering::SeqCst);
-        return;
-    }
     while !callback_stopped(deadline, &cancelled, work.as_ref()) {
-        match listener.accept() {
+        let accept_until = deadline.within(Duration::from_millis(10)).instant();
+        match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Until(accept_until),
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((mut stream, _)) => {
-                if stream.set_nonblocking(false).is_err() {
-                    continue;
-                }
                 // The accepted descriptor retains the original budget through every head read.
                 let target = read_request_target(
                     &mut callback_reader(
@@ -3464,15 +3461,10 @@ fn serve_callback_loop(server: CallbackServer) {
             Err(e)
                 if matches!(
                     e.kind(),
-                    std::io::ErrorKind::WouldBlock
+                    std::io::ErrorKind::TimedOut
                         | std::io::ErrorKind::Interrupted
                         | std::io::ErrorKind::ConnectionAborted
-                ) =>
-            {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
+                ) => {}
             Err(_) => {
                 if callback_stopped(deadline, &cancelled, work.as_ref()) {
                     break;

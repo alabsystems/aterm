@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use aterm_uds::{AcceptWait, AcceptedMode};
 use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,7 +28,11 @@ impl Provider {
                 let until = Instant::now() + HANG;
                 let mut calls = 0;
                 loop {
-                    let mut stream = match listener.accept() {
+                    let mut stream = match aterm_uds::accept(
+                        &listener,
+                        AcceptWait::Ready,
+                        AcceptedMode::Blocking,
+                    ) {
                         Ok((stream, _)) => stream,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             if stop.load(Ordering::Acquire) {
@@ -42,7 +47,6 @@ impl Provider {
                         }
                         Err(error) => panic!("owned HTTP provider: {error}"),
                     };
-                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(HANG)).unwrap();
                     stream.set_write_timeout(Some(HANG)).unwrap();
                     let mut head = Vec::new();

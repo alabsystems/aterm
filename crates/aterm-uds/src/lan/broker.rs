@@ -587,7 +587,12 @@ mod tests {
         let ours = super::super::protocol();
         let listener = crate::kept_out(|| crate::CtlListener::bind(&path)).unwrap();
         let worker = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = crate::accept(
+                &listener,
+                crate::AcceptWait::Forever,
+                crate::AcceptedMode::Blocking,
+            )
+            .unwrap();
             if io::Write::write_all(&mut &stream, &hello(ours)).is_err() {
                 return false;
             }

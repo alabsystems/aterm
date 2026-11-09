@@ -378,7 +378,12 @@ fn exchange(initiator: &Endpoint, responder: &Endpoint, rounds: usize) -> Result
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         let (served, dialed) = std::thread::scope(|s| {
             let server = s.spawn(|| {
-                let (stream, _) = listener.accept().map_err(|e| e.to_string())?;
+                let (stream, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .map_err(|e| e.to_string())?;
                 let conn = Connection::admit(stream, Scope::Loopback).map_err(|e| e.to_string())?;
                 responder
                     .exchange(conn, Side::Responder, &mut theirs)

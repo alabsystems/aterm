@@ -1427,7 +1427,7 @@ fn print_formula_info(prefix: &Prefix, api: &Api, f: &Formula, verbose: bool) {
     let inst = prefix.installed_one(Kind::Formula, &f.name);
     let outdated = inst
         .as_ref()
-        .is_some_and(|i| version_cmp(&i.version, &f.version) == Ordering::Less);
+        .is_some_and(|i| formula_outdated(prefix, i, f));
     // Brew's "(bottled)" and build-dependency display ask whether a
     // bottle pours on THIS machine (stable.bottled? for the local
     // tag) and may pour here (pour_bottle?), not whether any bottle
@@ -1716,10 +1716,24 @@ fn print_formula_info(prefix: &Prefix, api: &Api, f: &Formula, verbose: bool) {
             decorate_dep_names(prefix, api, &f.optional_dependencies, false)
         ));
     }
-    let closure = if inst.is_some() {
-        flat_dependencies(f, false, |n| api.formula(n).ok())
-    } else {
-        std::collections::BTreeSet::new()
+    // Brew reads the Recursive Runtime closure from the
+    // newest keg's tab while the formula is current, and
+    // from the declared graph once it is outdated (an
+    // abrew receipt predating tab closures falls back to
+    // the declared graph, as no brew tab lacks the field).
+    let closure: Vec<String> = match &inst {
+        Some(i) if !outdated => super::prefix::receipt_runtime_deps(
+            &prefix.keg(&i.name, &i.version),
+        )
+        .unwrap_or_else(|| {
+            flat_dependencies(f, false, |n| api.formula(n).ok())
+                .into_iter()
+                .collect()
+        }),
+        Some(_) => flat_dependencies(f, false, |n| api.formula(n).ok())
+            .into_iter()
+            .collect(),
+        None => Vec::new(),
     };
     // Dependents are a terminal-only statistic in brew.
     let dependents = if super::tty::stdout_tty() && inst.is_some() {
@@ -1735,10 +1749,20 @@ fn print_formula_info(prefix: &Prefix, api: &Api, f: &Formula, verbose: bool) {
         if !closure.is_empty() {
             let installed_count = closure
                 .iter()
-                .filter(|d| prefix.installed_one(Kind::Formula, d).is_some())
+                .filter(|d| {
+                    prefix
+                        .installed_one(Kind::Formula, Formula::short_name(d))
+                        .is_some()
+                })
                 .count();
             let counts = if installed_count == closure.len() {
                 format!("all installed {}", super::tty::success("✔"))
+            } else if outdated {
+                format!(
+                    "{installed_count} installed {}, {} not installed",
+                    super::tty::success("✔"),
+                    closure.len() - installed_count
+                )
             } else {
                 format!(
                     "{installed_count} installed {}, {} missing {}",
@@ -1886,8 +1910,8 @@ fn installed_section_rows(
     // [version_scheme, version]: the scheme is a tab fact recorded
     // at install time, with the loaded formula's as fallback.
     let keg_scheme = |inst: &Installed, v: &str, fallback: u64| -> u64 {
-        super::prefix::receipt_word(&prefix.keg(&inst.name, v), "version_scheme")
-            .and_then(|w| (!w.starts_with('+')).then_some(w)?.parse::<u64>().ok())
+        super::prefix::receipt_tab_versions(&prefix.keg(&inst.name, v))
+            .1
             .unwrap_or(fallback)
     };
     let fallback_scheme = |loaded: &Option<Formula>, inst: &Installed| -> u64 {
@@ -1919,8 +1943,7 @@ fn installed_section_rows(
             .as_ref()
             .or_else(|| (other_inst.name == f.name).then_some(f));
         let linked_version = linked_keg_version(prefix, other_inst);
-        let outdated_i =
-            formula.is_some_and(|g| version_cmp(&other_inst.version, &g.version) == Ordering::Less);
+        let outdated_i = formula.is_some_and(|g| formula_outdated(prefix, other_inst, g));
         let core = formula.is_none_or(|g| formula_source(prefix, g).1.is_none());
         let fallback = formula.map_or(0, |g| g.version_scheme);
         let mut ordered_versions: Vec<(u64, &String)> = other_inst
@@ -4289,12 +4312,16 @@ pub(super) fn cmd_info(prefix: &Prefix, api: &Api, args: &[String], rest: &[Stri
     }
     let _ = args;
     if names.is_empty() {
-        println!(
-            "{} formulae, {} casks installed under {}",
-            prefix.installed(Kind::Formula).len(),
-            prefix.installed(Kind::Cask).len(),
-            prefix.root.display()
-        );
+        // Brew's `print_statistics`: keg rack count and the
+        // whole Cellar's `abv`, only when the Cellar exists.
+        let cellar = prefix.cellar();
+        if cellar.is_dir() {
+            println!(
+                "{}, {}",
+                pluralize_with_count("keg", prefix.installed(Kind::Formula).len()),
+                abv(&cellar)
+            );
+        }
         return ExitCode::SUCCESS;
     }
     let mut failures = 0;
@@ -5295,9 +5322,8 @@ pub(super) fn cmd_cache_query(
                         }
                         continue;
                     }
-                    if f.bottle_for(&super::machine::Machine::this().bottle_tags())
-                        .is_none()
-                    {
+                    let Some(bottle) = f.bottle_for(&super::machine::Machine::this().bottle_tags())
+                    else {
                         return from_install(
                             prefix,
                             args,
@@ -5306,12 +5332,8 @@ pub(super) fn cmd_cache_query(
                                 f.name
                             ))),
                         );
-                    }
-                    paths.push(prefix.cache().join(format!(
-                        "{}-{}.bottle.tar.gz",
-                        f.name,
-                        install::keg_version(&f)
-                    )));
+                    };
+                    paths.push(install::bottle_dest(prefix, &f, bottle));
                     continue;
                 }
                 None if want_formula => {
@@ -5360,7 +5382,7 @@ pub(super) fn cmd_cache_query(
                     Ok(c) => c.into_owned(),
                     Err(e) => return from_install(prefix, args, Err(e)),
                 };
-                paths.push(prefix.cache().join(cask::download_name(&c)));
+                paths.push(cask::download_dest(prefix, &c));
             }
             Err(e) => {
                 return failed(&if want_cask {
@@ -6039,6 +6061,426 @@ pub(super) fn cmd_command_not_found_init() -> ExitCode {
     }
 }
 
+/// One resolved `brew unpack` operand.
+enum UnpackJob {
+    Formula(Formula),
+    Cask(Cask),
+}
+
+/// Ruby `Pathname#expand_path` over a `--destdir` value:
+/// `~` expands, a relative path joins the physical cwd, and
+/// `.`/`..` fold lexically (no symlink resolution).
+fn expand_destdir(raw: &str) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let home = || {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+    };
+    let joined = if raw == "~" {
+        home()
+    } else if let Some(tail) = raw.strip_prefix("~/") {
+        home().join(tail)
+    } else {
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir().unwrap_or_default().join(path)
+        }
+    };
+    let mut out = PathBuf::new();
+    for part in joined.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Brew's cached-download narration for `unpack`: the
+/// Downloading line always, the cache location on a hit
+/// (integrity verified after, as in `Resource#stage`).
+fn unpack_download(url: &str, dest: &std::path::Path, sha256: &str) -> Result<(), String> {
+    println!("{}", super::tty::ohai(&format!("Downloading {url}")));
+    let verifiable = !sha256.is_empty() && sha256 != "no_check";
+    if dest.is_file() {
+        println!("Already downloaded: {}", dest.display());
+        if verifiable && let Err(e) = fetch::verify_sha256(dest, sha256) {
+            // Brew clears the known-bad download, then raises.
+            let _ = std::fs::remove_file(dest);
+            return Err(e);
+        }
+        return Ok(());
+    }
+    fetch::curl_to_file(url, dest, &[])?;
+    if verifiable {
+        fetch::verify_sha256(dest, sha256).inspect_err(|_| {
+            let _ = std::fs::remove_file(dest);
+        })?;
+    }
+    Ok(())
+}
+
+/// The cache file brew's download strategy would use:
+/// `<cache>/downloads/<sha256(url)>--<basename>`.
+fn unpack_cache_dest(prefix: &Prefix, url: &str) -> std::path::PathBuf {
+    let base = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .rsplit('/')
+        .next()
+        .filter(|s| super::single_normal_segment(s))
+        .unwrap_or("download");
+    install::download_dest(prefix, url, base)
+}
+
+/// Copy a staged tree into `dst` (brew `cp_r ... preserve:`):
+/// directories recurse, files copy, symlinks are recreated.
+fn copy_unpacked_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    let meta =
+        std::fs::symlink_metadata(src).map_err(|e| format!("abrew: cannot stage unpack: {e}"))?;
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        #[cfg(unix)]
+        {
+            let target =
+                std::fs::read_link(src).map_err(|e| format!("abrew: cannot stage unpack: {e}"))?;
+            std::os::unix::fs::symlink(&target, dst)
+                .map_err(|e| format!("abrew: cannot stage unpack: {e}"))?;
+            return Ok(());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dst;
+            return Err("abrew: cannot stage unpack: symlinks unsupported".to_string());
+        }
+    }
+    if kind.is_dir() {
+        std::fs::create_dir_all(dst).map_err(|e| format!("abrew: cannot stage unpack: {e}"))?;
+        let mut entries: Vec<_> = std::fs::read_dir(src)
+            .map_err(|e| format!("abrew: cannot stage unpack: {e}"))?
+            .collect::<Result<_, _>>()
+            .map_err(|e| format!("abrew: cannot stage unpack: {e}"))?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            copy_unpacked_tree(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+    if kind.is_file() {
+        return crate::metadata_io::copy_regular_file(src, dst)
+            .map(|_| ())
+            .map_err(|e| format!("abrew: cannot stage unpack: {e}"));
+    }
+    Err("abrew: cannot stage unpack: unsupported file type".to_string())
+}
+
+/// `brew unpack`: stage a formula's stable source or a
+/// cask's payload into `<destdir>/<name>-<version>`.
+/// `--patch` proceeds only for a provably patchless API
+/// formula: applying patches is a recipe step abrew does
+/// not perform, so a patched formula refuses first.
+pub(super) fn cmd_unpack(prefix: &Prefix, api: &Api, args: &[String], rest: &[String]) -> ExitCode {
+    let want_formula = has_flag(rest, "--formula", "");
+    let want_cask = has_flag(rest, "--cask", "");
+    let patch = has_flag(rest, "--patch", "");
+    let git = has_flag(rest, "--git", "-g");
+    let force = has_flag(rest, "--force", "-f");
+
+    // Brew resolves every (downcased, de-duplicated) name
+    // before touching the destination directory.
+    let mut names: Vec<String> = Vec::new();
+    for name in operands_without_flag_values(rest, &["--destdir"]) {
+        let lowered = name.to_lowercase();
+        if !names.contains(&lowered) {
+            names.push(lowered);
+        }
+    }
+    let mut jobs: Vec<UnpackJob> = Vec::new();
+    for name in &names {
+        let formula = if want_cask {
+            None
+        } else {
+            match api.formula(name) {
+                Ok(f) => Some((f, true)),
+                Err(_) => tap::lookup(prefix, name).map(|f| (f, false)),
+            }
+        };
+        if let Some((formula, from_api)) = formula {
+            if formula.stable_url.is_empty() || formula.stable_url.ends_with(".git") {
+                return from_install(
+                    prefix,
+                    args,
+                    Err(install::InstallError::Unsupported(format!(
+                        "unpacking {} needs its version-control source, which is not native",
+                        formula.name
+                    ))),
+                );
+            }
+            if patch {
+                let patchless = from_api
+                    && api.formula_value(&formula.name).is_ok_and(|doc| {
+                        doc.get("patches")
+                            .and_then(aterm_json::Value::as_array)
+                            .is_some_and(|patches| patches.is_empty())
+                    });
+                if !patchless {
+                    return from_install(
+                        prefix,
+                        args,
+                        Err(install::InstallError::Unsupported(format!(
+                            "applying {}'s patches is a recipe step and is not native",
+                            formula.name
+                        ))),
+                    );
+                }
+            }
+            jobs.push(UnpackJob::Formula(formula));
+            continue;
+        }
+        if want_formula {
+            return failed(&format!("Error: {}", formula_unavailable(api, name)));
+        }
+        match api.cask(name) {
+            Ok(raw) => {
+                let resolved = match cask::resolve(&raw, super::machine::Machine::this()) {
+                    Ok(c) => c.into_owned(),
+                    Err(e) => return from_install(prefix, args, Err(e)),
+                };
+                if !super::valid_component(&resolved.token)
+                    || !super::valid_cask_version(&resolved.version)
+                {
+                    return failed("abrew: unsupported cask token/version");
+                }
+                if cask::git_raw_plan(&resolved).is_some() {
+                    return from_install(
+                        prefix,
+                        args,
+                        Err(install::InstallError::Unsupported(format!(
+                            "unpacking {} needs its git payload, which is not native",
+                            resolved.token
+                        ))),
+                    );
+                }
+                jobs.push(UnpackJob::Cask(resolved));
+            }
+            Err(_) => {
+                return failed(&format!(
+                    "Error: {}",
+                    if want_cask {
+                        cask_unavailable(name)
+                    } else {
+                        formula_unavailable(api, name)
+                    }
+                ));
+            }
+        }
+    }
+
+    let unpack_dir = match super::valued_flag_last(rest, "--destdir") {
+        Some(dir) => {
+            let dir = expand_destdir(&dir);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    return failed(&format!(
+                        "Error: Permission denied @ dir_s_mkdir - {}",
+                        dir.display()
+                    ));
+                }
+                return failed(&format!("Error: {e} @ dir_s_mkdir - {}", dir.display()));
+            }
+            dir
+        }
+        None => std::env::current_dir().unwrap_or_default(),
+    };
+    if std::fs::metadata(&unpack_dir).is_ok_and(|m| m.permissions().readonly()) {
+        return failed(&format!("Error: Cannot write to {}", unpack_dir.display()));
+    }
+
+    for job in &jobs {
+        let code = match job {
+            UnpackJob::Formula(formula) => unpack_formula(prefix, formula, &unpack_dir, force, git),
+            UnpackJob::Cask(cask) => unpack_cask(prefix, cask, &unpack_dir, force),
+        };
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Brew's destination-exists gate, shared by both kinds.
+fn unpack_stage_gate(stage_dir: &std::path::Path, force: bool) -> Result<(), ExitCode> {
+    let Ok(meta) = std::fs::symlink_metadata(stage_dir) else {
+        return Ok(());
+    };
+    if !force {
+        return Err(failed(&format!(
+            "Error: Destination {} already exists!",
+            stage_dir.display()
+        )));
+    }
+    let removed = if meta.is_dir() && !meta.file_type().is_symlink() {
+        std::fs::remove_dir_all(stage_dir)
+    } else {
+        std::fs::remove_file(stage_dir)
+    };
+    removed.map_err(|e| failed(&format!("abrew: cannot clear {}: {e}", stage_dir.display())))
+}
+
+/// The display name brew's `Formatter.identifier` wraps:
+/// the Ruby `full_name`, which drops the core tap prefixes.
+fn unpack_ident(full_name: &str, name: &str) -> String {
+    let shown = full_name
+        .strip_prefix("homebrew/core/")
+        .or_else(|| full_name.strip_prefix("homebrew/cask/"))
+        .unwrap_or(if full_name.is_empty() {
+            name
+        } else {
+            full_name
+        });
+    super::tty::ident(shown)
+}
+
+fn unpack_formula(
+    prefix: &Prefix,
+    formula: &Formula,
+    unpack_dir: &std::path::Path,
+    force: bool,
+    git: bool,
+) -> ExitCode {
+    let stage_dir = unpack_dir.join(format!("{}-{}", formula.name, formula.version));
+    if let Err(code) = unpack_stage_gate(&stage_dir, force) {
+        return code;
+    }
+    println!(
+        "{}",
+        super::tty::oh1(&format!(
+            "Unpacking {} to: {}",
+            unpack_ident(&formula.full_name, &formula.name),
+            stage_dir.display()
+        ))
+    );
+    let dest = unpack_cache_dest(prefix, &formula.stable_url);
+    if let Err(e) = unpack_download(&formula.stable_url, &dest, &formula.stable_sha256) {
+        return failed(&e);
+    }
+    let staging = match aterm_tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(e) => return failed(&format!("abrew: cannot stage unpack: {e}")),
+    };
+    if let Err(e) = fetch::untar(&dest, staging.path()) {
+        return failed(&e);
+    }
+    // Brew's stage roots at the archive's single top
+    // directory when there is exactly one entry.
+    let root = {
+        let entries: Vec<_> = std::fs::read_dir(staging.path())
+            .map(|read| read.filter_map(Result::ok).collect())
+            .unwrap_or_default();
+        match entries.as_slice() {
+            [only]
+                if only
+                    .file_type()
+                    .is_ok_and(|t| t.is_dir() && !t.is_symlink()) =>
+            {
+                only.path()
+            }
+            _ => staging.path().to_path_buf(),
+        }
+    };
+    // `Formula#stage` seeds the buildpath's fake HOME
+    // before the unpack block copies the tree out.
+    let brew_home = root.join(".brew_home");
+    let seeded = std::fs::create_dir_all(&brew_home)
+        .and_then(|()| std::fs::write(brew_home.join(".gitignore"), "*"))
+        .and_then(|()| {
+            std::fs::write(
+                brew_home.join(".bazelrc"),
+                format!("startup --output_user_root={}/_bazel", brew_home.display()),
+            )
+        });
+    if let Err(e) = seeded {
+        return failed(&format!("abrew: cannot stage unpack: {e}"));
+    }
+    if let Err(e) = copy_unpacked_tree(&root, &stage_dir) {
+        return failed(&e);
+    }
+    if git {
+        println!("{}", super::tty::ohai("Setting up Git repository"));
+        let stage = stage_dir.to_string_lossy().into_owned();
+        for tail in [
+            &["init", "-q"][..],
+            &["add", "-A"][..],
+            &["commit", "-q", "-m", "brew-unpack"][..],
+        ] {
+            let mut full: Vec<&str> = vec!["-C", &stage];
+            full.extend_from_slice(tail);
+            // Brew's `system` calls: failures pass silently.
+            let _ = fetch::run_capture(aterm_uds::os_path!("git"), &full);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn unpack_cask(
+    prefix: &Prefix,
+    cask: &Cask,
+    unpack_dir: &std::path::Path,
+    force: bool,
+) -> ExitCode {
+    let stage_dir = unpack_dir.join(format!("{}-{}", cask.token, cask.version));
+    if let Err(code) = unpack_stage_gate(&stage_dir, force) {
+        return code;
+    }
+    println!(
+        "{}",
+        super::tty::oh1(&format!(
+            "Unpacking {} to: {}",
+            unpack_ident("", &cask.token),
+            stage_dir.display()
+        ))
+    );
+    let file = cask::download_basename(cask);
+    let dest = cask::download_dest(prefix, cask);
+    let sha = cask.sha256.as_deref().unwrap_or("no_check");
+    if let Err(e) = unpack_download(&cask.url, &dest, sha) {
+        return failed(&e);
+    }
+    if let Err(e) = std::fs::create_dir_all(&stage_dir) {
+        return failed(&format!("abrew: cannot stage unpack: {e}"));
+    }
+    let extracted = if let Some(nested) = &cask.nested {
+        match aterm_tempfile::tempdir() {
+            Ok(outer) => fetch::untar(&dest, outer.path()).and_then(|()| {
+                let inner = outer.path().join(nested);
+                if fetch::is_dmg(nested) {
+                    fetch::extract_dmg(&inner, &stage_dir).map_err(|e| e.to_string())
+                } else {
+                    fetch::untar(&inner, &stage_dir)
+                }
+            }),
+            Err(e) => Err(format!("abrew: cannot stage unpack: {e}")),
+        }
+    } else if fetch::is_dmg(&file) {
+        fetch::extract_dmg(&dest, &stage_dir).map_err(|e| e.to_string())
+    } else if cask.naked {
+        fetch::copy_regular(&dest, &stage_dir.join(&file))
+    } else {
+        fetch::untar(&dest, &stage_dir)
+    };
+    match extracted {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => failed(&e),
+    }
+}
+
 pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     let quiet = has_flag(rest, "--quiet", "-q");
     if has_flag(rest, "--list-checks", "") {
@@ -6146,42 +6588,47 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
                 }
             }
             "check_missing_deps" => {
+                // Brew's Missing.deps reads keg tab closures
+                // only (cmd_missing's rule), never the current
+                // declared graph: a dep pours against what the
+                // tab recorded, so an upstream dep change is
+                // outdated-ness, not missing-ness.
                 let mut lines: Vec<String> = Vec::new();
                 let mut all_missing: Vec<String> = Vec::new();
                 for i in &formulae {
-                    let Ok(f) = api.formula(&i.name).or_else(|_| {
-                        tap::lookup(prefix, &i.name).ok_or_else(|| "unloadable".to_string())
-                    }) else {
-                        continue;
-                    };
-                    let missing: Vec<String> =
-                        flat_dependencies(&f, false, |n| api.formula(n).ok())
-                            .into_iter()
-                            .map(|d| Formula::short_name(&d).to_string())
-                            .filter(|d| prefix.installed_one(Kind::Formula, d).is_none())
-                            .collect();
+                    let tab = super::prefix::receipt_runtime_deps(&prefix.keg(&i.name, &i.version))
+                        .unwrap_or_default();
+                    let missing: Vec<String> = tab
+                        .into_iter()
+                        .filter(|full| {
+                            let base = Formula::short_name(full);
+                            !(prefix.cellar().join(base).is_dir() || prefix.opt(base).is_dir())
+                        })
+                        .collect();
                     if !missing.is_empty() {
                         lines.push(format!("{}: {}", i.name, missing.join(" ")));
-                        all_missing.extend(missing);
+                        all_missing.extend(missing.iter().cloned());
                     }
                 }
                 for i in &casks {
-                    let Ok(c) = api.cask(&i.name) else { continue };
+                    let (formula_deps, cask_deps) = super::prefix::receipt_cask_runtime_deps(
+                        &prefix.cask_dir(&i.name, &i.version),
+                    );
                     let mut missing: Vec<String> = Vec::new();
-                    for d in &c.depends_formula {
-                        let short = Formula::short_name(d);
-                        if prefix.installed_one(Kind::Formula, short).is_none() {
-                            missing.push(short.to_string());
+                    for full in &formula_deps {
+                        if !prefix.cellar().join(Formula::short_name(full)).is_dir() {
+                            missing.push(full.clone());
                         }
                     }
-                    for d in &c.depends_cask {
-                        if prefix.installed_one(Kind::Cask, d).is_none() {
-                            missing.push(d.clone());
+                    for full in &cask_deps {
+                        if !prefix.caskroom().join(Formula::short_name(full)).is_dir() {
+                            missing.push(full.clone());
                         }
                     }
+                    missing.sort();
                     if !missing.is_empty() {
                         lines.push(format!("{}: {}", i.name, missing.join(" ")));
-                        all_missing.extend(missing);
+                        all_missing.extend(missing.iter().cloned());
                     }
                 }
                 if !lines.is_empty() {
@@ -6317,6 +6764,12 @@ pub(super) fn cmd_doctor(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCod
         }
         ExitCode::SUCCESS
     } else {
+        if !quiet {
+            // Brew puts its support-tier message here; the
+            // common tier's message is empty, leaving the
+            // blank line.
+            println!();
+        }
         ExitCode::from(1)
     }
 }
@@ -11028,7 +11481,7 @@ fn auto_cleanup_old_versions(
         return Ok((0, 0));
     }
     let mut out: Vec<String> = Vec::new();
-    let result = cleanup_old_versions(prefix, api, dry, scope, &mut out);
+    let result = cleanup_old_versions(prefix, api, dry, true, scope, &mut out);
     for line in &out {
         println!("{line}");
     }
@@ -11069,6 +11522,15 @@ fn hardlink_key(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
 }
 
 fn dir_disk_usage(path: &std::path::Path) -> u64 {
+    dir_count_usage(path).1
+}
+
+/// Brew `Pathname#compute_disk_usage`: (file count, bytes).
+/// Directories (and symlinks to them) add their own size but
+/// no count; other entries count once (`.DS_Store` excluded
+/// from the count only) and hardlinks pay size once.
+fn dir_count_usage(path: &std::path::Path) -> (u64, u64) {
+    let mut count = 0u64;
     let mut total = 0u64;
     let mut seen: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
     let mut stack = vec![path.to_path_buf()];
@@ -11077,16 +11539,36 @@ fn dir_disk_usage(path: &std::path::Path) -> u64 {
             continue;
         };
         if meta.is_dir() {
-            // Brew counts each directory entry's own size too.
             total = total.saturating_add(meta.len());
             if let Ok(entries) = std::fs::read_dir(&p) {
                 stack.extend(entries.flatten().map(|e| e.path()));
             }
-        } else if hardlink_key(&meta).is_none_or(|key| seen.insert(key)) {
+        } else if meta.file_type().is_symlink() && std::fs::metadata(&p).is_ok_and(|m| m.is_dir()) {
             total = total.saturating_add(meta.len());
+        } else {
+            if p.file_name().is_none_or(|n| n != ".DS_Store") {
+                count += 1;
+            }
+            if hardlink_key(&meta).is_none_or(|key| seen.insert(key)) {
+                total = total.saturating_add(meta.len());
+            }
         }
     }
-    total
+    (count, total)
+}
+
+/// Brew `Pathname#abv`: "N files, SIZE" (count only past 1).
+fn abv(path: &std::path::Path) -> String {
+    let (count, bytes) = dir_count_usage(path);
+    if count > 1 {
+        format!(
+            "{} files, {}",
+            format_count(count),
+            disk_usage_readable(bytes)
+        )
+    } else {
+        disk_usage_readable(bytes)
+    }
 }
 
 /// Brew's cleanup prune pass (`prune_prefix_symlinks_and_directories`):
@@ -11221,10 +11703,25 @@ fn collect_broken_links(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>
     }
 }
 
+/// Existing paths listed in a keg's `.keepme` file (brew
+/// `Keg#keepme_refs`): the keg stays while any listed path
+/// still exists.
+fn keg_keepme_refs(dir: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(dir.join(".keepme")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|line| std::path::Path::new(line).exists())
+        .map(str::to_owned)
+        .collect()
+}
+
 fn cleanup_old_versions(
     prefix: &Prefix,
     api: &Api,
     dry: bool,
+    quiet: bool,
     scope: &[&str],
     out: &mut Vec<String>,
 ) -> Result<(usize, u64), String> {
@@ -11246,38 +11743,105 @@ fn cleanup_old_versions(
                 Kind::Formula => prefix.pinned_version(&i.name),
                 Kind::Cask => prefix.cask_pinned_version(&i.name),
             };
-            for v in &i.versions {
-                if *v != i.version
-                    && pinned.as_deref() != Some(v.as_str())
-                    && active.as_deref() != Some(v.as_str())
-                {
-                    let dir = match kind {
-                        Kind::Formula => prefix.keg(&i.name, v),
-                        Kind::Cask => prefix.cask_dir(&i.name, v),
-                    };
-                    if !super::prefix::owned_receipt(&dir, kind, &i.name, v) {
-                        continue;
-                    }
-                    let usage = dir_disk_usage(&dir);
-                    if dry {
-                        out.push(format!(
-                            "Would remove: {} ({})",
-                            dir.display(),
-                            disk_usage_readable(usage)
-                        ));
-                    } else {
-                        out.push(format!(
-                            "Removing: {}... ({})",
-                            dir.display(),
-                            disk_usage_readable(usage)
-                        ));
-                        remove_links_into(prefix, &dir);
-                        std::fs::remove_dir_all(&dir)
-                            .map_err(|e| format!("abrew: cannot remove {}: {e}", dir.display()))?;
-                    }
-                    freed = freed.saturating_add(usage);
-                    removed += 1;
+            // Brew's `Formula#eligible_kegs_for_cleanup`: old
+            // kegs are eligible only once the formula's latest
+            // version is installed; before that every keg
+            // stays (with the Skipping warning). A formula
+            // with no readable record keeps the relative rule
+            // (everything but the newest installed keg).
+            let record = (kind == Kind::Formula)
+                .then(|| {
+                    api.formula(&i.name)
+                        .ok()
+                        .or_else(|| tap::lookup(prefix, &i.name))
+                })
+                .flatten();
+            let eligible = |v: &str| -> bool {
+                if v == "HEAD" || v.starts_with("HEAD-") {
+                    return false;
                 }
+                match &record {
+                    Some(f) => {
+                        let latest = install::keg_version(f);
+                        if !i.versions.iter().any(|have| have == &latest) {
+                            return false;
+                        }
+                        let dir = prefix.keg(&i.name, v);
+                        let scheme = super::prefix::receipt_tab_versions(&dir).1.unwrap_or(0);
+                        scheme < f.version_scheme
+                            || (scheme == f.version_scheme
+                                && version_cmp(v, &latest) == std::cmp::Ordering::Less)
+                    }
+                    None => *v != i.version,
+                }
+            };
+            if let Some(f) = &record {
+                let latest = install::keg_version(f);
+                if !i.versions.iter().any(|have| have == &latest)
+                    && !i.versions.is_empty()
+                    && pinned.is_none()
+                    && !quiet
+                {
+                    let shown = f
+                        .full_name
+                        .strip_prefix("homebrew/core/")
+                        .unwrap_or(&f.name);
+                    super::tty::opoo!(
+                        "Warning: Skipping {shown}: most recent version {latest} not installed"
+                    );
+                }
+            }
+            for v in &i.versions {
+                if !eligible(v) {
+                    continue;
+                }
+                let dir = match kind {
+                    Kind::Formula => prefix.keg(&i.name, v),
+                    Kind::Cask => prefix.cask_dir(&i.name, v),
+                };
+                if !super::prefix::owned_receipt(&dir, kind, &i.name, v) {
+                    continue;
+                }
+                if active.as_deref() == Some(v.as_str()) {
+                    if !quiet {
+                        super::tty::opoo!(
+                            "Warning: Skipping (old) {} due to it being linked",
+                            dir.display()
+                        );
+                    }
+                    continue;
+                }
+                if pinned.as_deref() == Some(v.as_str()) {
+                    if !quiet {
+                        super::tty::opoo!(
+                            "Warning: Skipping (old) {} due to it being pinned",
+                            dir.display()
+                        );
+                    }
+                    continue;
+                }
+                let keepme = keg_keepme_refs(&dir);
+                if !keepme.is_empty() {
+                    if !quiet {
+                        super::tty::opoo!(
+                            "Warning: Skipping {} as it is needed by {}",
+                            dir.display(),
+                            keepme.join(", ")
+                        );
+                    }
+                    continue;
+                }
+                let usage = dir_disk_usage(&dir);
+                if dry {
+                    out.push(format!("Would remove: {} ({})", dir.display(), abv(&dir)));
+                } else {
+                    out.push(format!("Removing: {}... ({})", dir.display(), abv(&dir)));
+                    remove_links_into(prefix, &dir);
+                    std::fs::remove_dir_all(&dir)
+                        .map_err(|e| format!("abrew: cannot remove {}: {e}", dir.display()))?;
+                }
+                freed = freed.saturating_add(usage);
+                removed += 1;
             }
         }
     }
@@ -11297,11 +11861,18 @@ fn prune_downloads(
     let now = std::time::SystemTime::now();
     let mut removed = 0;
     let mut freed = 0u64;
-    let entries = match std::fs::read_dir(prefix.cache()) {
-        Ok(entries) => entries,
-        Err(_) => return Ok((0, 0)),
-    };
-    for entry in entries.flatten() {
+    // Cached downloads live in the `downloads/` subdirectory
+    // (brew's layout); the cache root is still swept so files
+    // cached by older abrew layouts age out too.
+    let mut entries: Vec<std::fs::DirEntry> = Vec::new();
+    for dir in [prefix.cache(), prefix.cache().join("downloads")] {
+        match std::fs::read_dir(&dir) {
+            Ok(read) => entries.extend(read.flatten()),
+            Err(_) => continue,
+        }
+    }
+    entries.sort_by_key(|e| e.path());
+    for entry in entries {
         if !entry
             .file_type()
             .is_ok_and(|t| t.is_file() && !t.is_symlink())
@@ -11637,7 +12208,8 @@ pub(super) fn cmd_cleanup(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCo
         })
         .collect();
     let mut out: Vec<String> = Vec::new();
-    let mut freed = match cleanup_old_versions(prefix, api, dry, &scope, &mut out) {
+    let quiet = has_flag(rest, "--quiet", "-q");
+    let mut freed = match cleanup_old_versions(prefix, api, dry, quiet, &scope, &mut out) {
         Ok((_, bytes)) => bytes,
         Err(error) => return failed(&error),
     };
@@ -12721,7 +13293,7 @@ fn fetch_cask_one(
             Err(e) => Err(from_install(prefix, args, Err(e))),
         };
     }
-    let dest = prefix.cache().join(cask::download_name(c));
+    let dest = cask::download_dest(prefix, c);
     let expected = c.sha256.as_deref().unwrap_or("no_check");
     let reusable = c.sha256.is_some() && fetch::verify_sha256(&dest, expected).is_ok();
     if !reusable && let Err(e) = fetch::curl_to_file(&c.url, &dest, &[]) {
@@ -12736,12 +13308,15 @@ fn fetch_cask_one(
 
 /// The cache file for a cross-platform bottle fetch.
 fn cross_bottle_dest(prefix: &Prefix, f: &Formula, sym: &str) -> std::path::PathBuf {
-    prefix.cache().join(format!(
-        "{}-{}.{}.bottle.tar.gz",
-        f.name,
-        install::keg_version(f),
-        sym
-    ))
+    match f.bottle_files.iter().find(|b| b.tag == sym) {
+        Some(bottle) => install::bottle_dest(prefix, f, bottle),
+        None => prefix.cache().join("downloads").join(format!(
+            "{}--{}.{}.bottle.tar.gz",
+            f.name,
+            install::keg_version(f),
+            sym
+        )),
+    }
 }
 
 pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[String]) -> ExitCode {
@@ -16137,7 +16712,7 @@ fn bundle_cleanup(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
         }
     }
     let mut lines: Vec<String> = Vec::new();
-    if let Err(e) = cleanup_old_versions(prefix, api, true, &[], &mut lines) {
+    if let Err(e) = cleanup_old_versions(prefix, api, true, true, &[], &mut lines) {
         return failed(&e);
     }
     prune_prefix_links(prefix, true, &mut lines);
@@ -16263,7 +16838,7 @@ fn bundle_cleanup_force(
         }
     }
     let mut lines: Vec<String> = Vec::new();
-    match cleanup_old_versions(prefix, api, false, &[], &mut lines) {
+    match cleanup_old_versions(prefix, api, false, true, &[], &mut lines) {
         Ok((_, freed)) => {
             prune_prefix_links(prefix, false, &mut lines);
             for line in &lines {
@@ -16735,6 +17310,33 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn unpack_destdir_expands_like_ruby_expand_path() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(expand_destdir("rel"), cwd.join("rel"));
+        assert_eq!(expand_destdir("a/./b/../c"), cwd.join("a/c"));
+        assert_eq!(expand_destdir("/abs/../x"), std::path::PathBuf::from("/x"));
+        let home = std::env::var_os("HOME").unwrap();
+        assert_eq!(expand_destdir("~"), std::path::PathBuf::from(&home));
+        assert_eq!(
+            expand_destdir("~/src"),
+            std::path::PathBuf::from(&home).join("src")
+        );
+        assert_eq!(
+            unpack_cache_dest(
+                &Prefix::at(std::path::Path::new("/p")),
+                "https://x/y-1.tar.gz?z"
+            )
+            .file_name()
+            .unwrap()
+            .to_string_lossy(),
+            format!(
+                "{}--y-1.tar.gz",
+                fetch::sha256_bytes(b"https://x/y-1.tar.gz?z")
+            )
+        );
+    }
 
     /// `bundle add` appends to what a linked Brewfile holds, and what it cannot read it leaves
     /// alone: writing there follows the link, so an empty read would erase the person's file.
@@ -17984,12 +18586,116 @@ mod tests {
         assert!(prefix.is_disabled());
     }
 
+    #[test]
+    fn doctor_missing_deps_reads_tab_closures_not_declared_graph() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(temp.path());
+        let keg = prefix.keg("demo", "1");
+        std::fs::create_dir_all(&keg).unwrap();
+        prefix
+            .write_receipt_raw(
+                &keg,
+                &[
+                    ("installed_by", "abrew"),
+                    ("name", "demo"),
+                    ("version", "1"),
+                ],
+                &[("runtime_dependencies", r#"[{"full_name":"present"}]"#)],
+            )
+            .unwrap();
+        owned_keg(&prefix, "present", "1");
+        let api = Api::new(prefix.clone());
+        let run = |p: &Prefix| {
+            cmd_doctor(
+                p,
+                &api,
+                &["check_missing_deps".to_string(), "--quiet".to_string()],
+            )
+        };
+        // The tab's only dep is installed: nothing is missing,
+        // whatever the current declared graph says.
+        assert_eq!(run(&prefix), ExitCode::SUCCESS);
+        prefix
+            .write_receipt_raw(
+                &keg,
+                &[
+                    ("installed_by", "abrew"),
+                    ("name", "demo"),
+                    ("version", "1"),
+                ],
+                &[("runtime_dependencies", r#"[{"full_name":"gone"}]"#)],
+            )
+            .unwrap();
+        assert_eq!(run(&prefix), ExitCode::from(1));
+    }
+
+    #[test]
+    fn cleanup_keeps_old_kegs_until_latest_is_installed() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let prefix = Prefix::at(temp.path());
+        prefix.ensure_api_cache().unwrap();
+        let api_dir = prefix.cache().join("api");
+        std::fs::write(
+            api_dir.join("formula-demo.json"),
+            br#"{"name":"demo","versions":{"stable":"2"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            api_dir.join("formula-demo2.json"),
+            br#"{"name":"demo2","versions":{"stable":"3"}}"#,
+        )
+        .unwrap();
+        // demo's latest (2) is installed: keg 1 is eligible.
+        // demo2's latest (3) is not: both kegs stay (brew's
+        // eligible_kegs_for_cleanup gate).
+        for version in ["1", "2"] {
+            owned_keg(&prefix, "demo", version);
+            owned_keg(&prefix, "demo2", version);
+        }
+        let (removed, _) = cleanup_old_versions(
+            &prefix,
+            &Api::new(prefix.clone()),
+            false,
+            true,
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(removed, 1);
+        assert!(!prefix.keg("demo", "1").exists());
+        assert!(prefix.keg("demo", "2").is_dir());
+        assert!(prefix.keg("demo2", "1").is_dir());
+        assert!(prefix.keg("demo2", "2").is_dir());
+    }
+
+    #[test]
+    fn abv_counts_files_like_brew() {
+        let temp = aterm_tempfile::tempdir().unwrap();
+        let dir = temp.path().join("keg");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("only"), b"12345").unwrap();
+        assert!(abv(&dir).ends_with('B'));
+        assert!(!abv(&dir).contains("files"));
+        std::fs::write(dir.join("two"), b"12345").unwrap();
+        std::fs::write(dir.join(".DS_Store"), b"12345").unwrap();
+        // .DS_Store counts toward size but not the file count.
+        assert!(abv(&dir).starts_with("2 files, "), "{}", abv(&dir));
+    }
+
     /// Unix only: a pin is a symlink, which abrew refuses to make elsewhere.
     #[test]
     #[cfg(unix)]
     fn cleanup_preserves_an_older_pin_foreign_versions_and_other_packages() {
         let temp = aterm_tempfile::tempdir().unwrap();
         let prefix = Prefix::at(temp.path());
+        // The wget record's latest (4) is installed, so the
+        // record-backed eligibility rule is what runs.
+        prefix.ensure_api_cache().unwrap();
+        std::fs::write(
+            prefix.cache().join("api/formula-wget.json"),
+            br#"{"name":"wget","versions":{"stable":"4"}}"#,
+        )
+        .unwrap();
         for version in ["1", "2"] {
             owned_keg(&prefix, "wget", version);
         }
@@ -18033,6 +18739,7 @@ mod tests {
                 &prefix,
                 &Api::new(prefix.clone()),
                 true,
+                true,
                 &["wget"],
                 &mut Vec::new()
             )
@@ -18046,6 +18753,7 @@ mod tests {
                 &prefix,
                 &Api::new(prefix.clone()),
                 false,
+                true,
                 &["wget"],
                 &mut Vec::new()
             )
@@ -19288,7 +19996,7 @@ mod tests {
         .unwrap();
         assert_eq!(p.cask_pinned_version("demo").as_deref(), Some("1.0"));
         assert_eq!(
-            cleanup_old_versions(&p, &api, false, &[], &mut Vec::new())
+            cleanup_old_versions(&p, &api, false, true, &[], &mut Vec::new())
                 .unwrap()
                 .0,
             0

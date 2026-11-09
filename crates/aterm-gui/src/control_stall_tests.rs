@@ -498,7 +498,11 @@ fn stand_in_sibling(listener: &std::os::unix::net::UnixListener, store: &super::
     let active: ActiveHandle = Arc::new(Mutex::new(None));
     let mut served = 0;
     while served == 0 {
-        let Ok((mut conn, _)) = listener.accept() else {
+        let Ok((mut conn, _)) = aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return served;
         };
         let _ = conn.set_read_timeout(Some(HANG));

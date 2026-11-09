@@ -126,6 +126,7 @@ pub(super) fn send(
 /// A loopback GitHub for this crate's tests.
 #[cfg(test)]
 pub(crate) mod fixture {
+    use aterm_uds::{AcceptWait, AcceptedMode};
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
@@ -192,7 +193,9 @@ pub(crate) mod fixture {
             let record = Arc::clone(&seen);
             let thread = std::thread::spawn(move || {
                 for reply in replies {
-                    let Ok((stream, _)) = listener.accept() else {
+                    let Ok((stream, _)) =
+                        aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking)
+                    else {
                         return;
                     };
                     let mut reader = BufReader::new(stream);

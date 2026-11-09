@@ -512,9 +512,10 @@ fn account_service_observation_never_repairs_a_selected_generations_ancestor() {
 }
 
 /// A holder of a predecessor's custody stops a read when the wait for a holder ends, however long
-/// the read has left to read, at both points the read takes that custody. The wait is spent here,
-/// so a read that does wait reaches the lock-wait observer, which lets the holder go: that read
-/// then finds the lock free and reads Cached, rather than sitting out the hang detector.
+/// the read has left to read, at the one point the read takes that custody, after the selected
+/// home's. The wait is spent here, so a read that does wait reaches the lock-wait observer, which
+/// lets the holder go: that read then finds the lock free and reads Cached, rather than sitting
+/// out the hang detector.
 #[test]
 fn a_held_predecessor_is_busy_when_the_wait_ends_not_when_the_read_does() {
     use crate::service_state::{accounts_until, control_busy, tests::after_custody};
@@ -535,42 +536,34 @@ fn a_held_predecessor_is_busy_when_the_wait_ends_not_when_the_read_does() {
     import(&mut selection).unwrap();
     let hang_detector = || Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     for lock in ["commons.lock", "commons-device.lock"] {
-        for at_session in [false, true] {
-            let case = format!("{lock}, at_session={at_session}");
-            let holder = Rc::new(RefCell::new(None));
-            let hold = {
-                let (holder, dir) = (holder.clone(), original.dir.clone());
-                move || {
-                    let held = PrivateLock::take(&dir, lock, Duration::ZERO, "held").unwrap();
-                    *holder.borrow_mut() = Some(held);
-                }
-            };
-            if at_session {
-                after_custody(hold);
-            } else {
-                hold();
+        let holder = Rc::new(RefCell::new(None));
+        after_custody({
+            let (holder, dir) = (holder.clone(), original.dir.clone());
+            move || {
+                let held = PrivateLock::take(&dir, lock, Duration::ZERO, "held").unwrap();
+                *holder.borrow_mut() = Some(held);
             }
-            let waited = Rc::new(Cell::new(false));
-            let observer = {
-                let (holder, waited) = (holder.clone(), waited.clone());
-                move |_: &std::fs::File| {
-                    waited.set(true);
-                    drop(holder.borrow_mut().take());
-                }
-            };
-            let read = aterm_uds::file_lock::with_lock_wait_observer(observer, || {
-                accounts_until(
-                    &original,
-                    &selection.config,
-                    1000,
-                    &Instant::now,
-                    hang_detector(),
-                )
-            });
-            assert!(!waited.get(), "{case}: waited past a spent wait");
-            assert_eq!(read, control_busy(1000), "{case}");
-            assert!(holder.borrow_mut().take().is_some(), "{case}: never held");
-        }
+        });
+        let waited = Rc::new(Cell::new(false));
+        let observer = {
+            let (holder, waited) = (holder.clone(), waited.clone());
+            move |_: &std::fs::File| {
+                waited.set(true);
+                drop(holder.borrow_mut().take());
+            }
+        };
+        let read = aterm_uds::file_lock::with_lock_wait_observer(observer, || {
+            accounts_until(
+                &original,
+                &selection.config,
+                1000,
+                &Instant::now,
+                hang_detector(),
+            )
+        });
+        assert!(!waited.get(), "{lock}: waited past a spent wait");
+        assert_eq!(read, control_busy(1000), "{lock}");
+        assert!(holder.borrow_mut().take().is_some(), "{lock}: never held");
     }
     // With nothing held, the same spent wait reads: only a holder uses it up, on any load.
     let read = accounts_until(
@@ -587,7 +580,9 @@ fn a_held_predecessor_is_busy_when_the_wait_ends_not_when_the_read_does() {
 fn recovery_diagnostics_preserve_missing_custody() {
     type Read = fn(&Paths) -> Result<Value>;
     let readers: [(&str, Read); 2] = [
-        ("status", |paths| status(paths, admission_deadline())),
+        ("status", |paths| {
+            status(paths, admission_deadline()).map(|(report, _)| report)
+        }),
         ("inspect", inspect),
     ];
     let mut violations = Vec::new();
@@ -1662,7 +1657,7 @@ fn lost_selector_keeps_original_fenced_and_reuses_the_completed_candidate() {
     std::fs::remove_file(root(&lab.paths[0]).join(STATE)).unwrap();
     assert!(fenced(&lab.paths[0]).unwrap());
     assert_eq!(
-        status(&lab.paths[0], admission_deadline()).unwrap()["state"],
+        status(&lab.paths[0], admission_deadline()).unwrap().0["state"],
         json!("pending")
     );
     assert!(retained.writer().is_err());
@@ -2022,6 +2017,279 @@ fn a_successor_homes_read_observes_its_predecessor_once() {
         assert!(holder.borrow_mut().take().is_some(), "{lock}: never held");
         assert_eq!(read.unwrap(), Some(1), "{lock}");
     }
+}
+
+/// The `recovery-test` table [`data`] declares, which holds one record.
+fn records(bootstrap: &Bootstrap) -> Result<Descriptor> {
+    Descriptor::application(bootstrap.trust(), "recovery-test", "records", 1)
+}
+
+/// How many records `store` holds.
+fn rows(session: &Session<'_>, store: &Store, _: Scope) -> Result<usize> {
+    Ok(store.catalog(session)?.len())
+}
+
+/// A successor home on `lab`: the original's [`data`] and account proposals imported into its
+/// candidate. Returns the data table's scope, the candidate home and the selection's config.
+fn imported_successor(lab: &mut Lab) -> (Scope, Paths, std::path::PathBuf) {
+    let (scope, _) = data(lab);
+    crate::accounts::proposals::Proposals::at(lab.paths[0].clone())
+        .initialize()
+        .unwrap();
+    let mut selection = reserved(lab);
+    let next = move_admitted_candidate(lab);
+    import(&mut selection).unwrap();
+    (scope, next, selection.config.clone())
+}
+
+/// Each read-only reader of a successor home that names the home with no custody
+/// ([`observed_generation_until`]) and opens a session observes the predecessors once, after it
+/// opens the selected home's custody, as the label read does
+/// ([`a_successor_homes_read_observes_its_predecessor_once`]): the account service read,
+/// `observe_store_if_here`, and `aterm db commons-tables` and `commons-inventory`; and
+/// `commons-status` reports `ready` from one verified selection and reads its home from it.
+/// A holder of a predecessor's custody that comes as that one observation judges it neither stops
+/// the read nor makes it wait: the account service read is given a spent wait, so observing again
+/// would read busy, and the others wait for a holder, so observing again would wait on it, which
+/// the lock-wait observer records and lets go. A holder that comes once the selected home's custody
+/// is open and before the predecessors are observed is met, so each reader that keeps its session's
+/// observation took it after that custody: the readers that wait, wait on it (the account service
+/// read's case is [`a_held_predecessor_is_busy_when_the_wait_ends_not_when_the_read_does`]).
+/// ATERM-KI-1107-1, 2026-11-08: these readers observed each predecessor again as their session
+/// opened, and the account read a third time to judge a stale read.
+/// NEGATIVE CONTROL (2026-11-08): on main before the change (b564cfbf88, this test's first moment
+/// alone added), the account read's rows read busy (`Unknown`) and the commons-status,
+/// commons-tables, commons-inventory and `observe_store_if_here` rows each waited on the holder;
+/// the label read's rows passed.
+#[test]
+fn a_successor_homes_readers_observe_their_predecessor_once() {
+    use crate::documents::application::{
+        observe_store_if_declared_within, observe_store_if_here, seams::after_custody,
+    };
+    use crate::generation::seams::{Point, at};
+    use aterm_types::network_state::ServiceAvailability;
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    /// A reader: its name, whether it opens its session through `observed_session` (whose
+    /// `after_custody` seam the second moment holds at), and the read, which says whether it
+    /// reached its result and what it read.
+    type Reader<'r> = (&'static str, bool, Box<dyn Fn() -> (bool, String) + 'r>);
+
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    let (scope, _, config) = imported_successor(&mut lab);
+    let table = aterm_codec::hex::encode_lower(&scope.digest());
+    let hang_detector = || Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let command = |name: &str, options: &[(&'static str, &str)]| {
+        let mut options = options.iter().copied().collect();
+        crate::catalog::command::run_at(name, &mut options, &original, &config)
+    };
+    let readers: [Reader<'_>; 6] = [
+        (
+            "label read",
+            true,
+            Box::new(|| {
+                let read = observe_store_if_declared_within(
+                    &original,
+                    records,
+                    hang_detector(),
+                    &hang_detector,
+                    rows,
+                );
+                (matches!(read, Ok(Some(1))), format!("{read:?}"))
+            }),
+        ),
+        (
+            "account service read",
+            false,
+            Box::new(|| {
+                let read = crate::service_state::accounts_until(
+                    &original,
+                    &config,
+                    1000,
+                    &Instant::now,
+                    hang_detector(),
+                );
+                (
+                    read.availability == ServiceAvailability::Cached,
+                    format!("{read:?}"),
+                )
+            }),
+        ),
+        (
+            "commons-status",
+            false,
+            Box::new(|| {
+                let read = crate::catalog::command::commons_status_until(
+                    &original,
+                    &config,
+                    hang_detector(),
+                );
+                let ok = read.as_ref().is_ok_and(|status| {
+                    status["writer_recovery"]["state"].as_str() == Some("ready")
+                        && status["state"].as_str() != Some("writer-recovery-pending")
+                });
+                (ok, format!("{read:?}"))
+            }),
+        ),
+        (
+            "commons-tables",
+            true,
+            Box::new(|| {
+                let read = command("commons-tables", &[]);
+                let ok = read.as_ref().is_ok_and(|listing| {
+                    listing["tables"].as_array().is_some_and(|tables| {
+                        tables
+                            .iter()
+                            .any(|entry| entry["table"].as_str() == Some(table.as_str()))
+                    })
+                });
+                (ok, format!("{read:?}"))
+            }),
+        ),
+        (
+            "commons-inventory",
+            true,
+            Box::new(|| {
+                let read = command("commons-inventory", &[("--table", table.as_str())]);
+                let ok = read.as_ref().is_ok_and(|inventory| {
+                    inventory["kind"].as_str() == Some("commons-inventory")
+                        && inventory["storage"].as_str() == Some("present")
+                        && inventory["known"]["count"].as_u64() == Some(1)
+                });
+                (ok, format!("{read:?}"))
+            }),
+        ),
+        (
+            "observe_store_if_here",
+            true,
+            Box::new(|| {
+                let read = observe_store_if_here(&original, records, Some(hang_detector()), rows);
+                (matches!(read, Ok(Some(1))), format!("{read:?}"))
+            }),
+        ),
+    ];
+    let mut outcomes = Vec::new();
+    for lock in ["commons.lock", "commons-device.lock"] {
+        for before in [false, true] {
+            for (reader, observed_session, read) in &readers {
+                if before && !observed_session {
+                    continue;
+                }
+                let holder = Rc::new(RefCell::new(None));
+                let held = Rc::new(Cell::new(false));
+                let hold = {
+                    let (holder, held, dir) = (holder.clone(), held.clone(), original.dir.clone());
+                    move || {
+                        let lock = PrivateLock::take(&dir, lock, Duration::ZERO, "held").unwrap();
+                        *holder.borrow_mut() = Some(lock);
+                        held.set(true);
+                    }
+                };
+                if before {
+                    after_custody(hold);
+                } else {
+                    at(Point::BeforeDenial, hold);
+                }
+                let waited = Rc::new(Cell::new(false));
+                let observer = {
+                    let (holder, waited) = (holder.clone(), waited.clone());
+                    move |_: &std::fs::File| {
+                        waited.set(true);
+                        drop(holder.borrow_mut().take());
+                    }
+                };
+                let (ok, detail) = aterm_uds::file_lock::with_lock_wait_observer(observer, read);
+                drop(holder.borrow_mut().take());
+                let moment = if before {
+                    "before it observes"
+                } else {
+                    "as it observes"
+                };
+                outcomes.push((lock, moment, *reader, held.get(), waited.get(), ok, detail));
+            }
+        }
+    }
+    let failed: Vec<_> = outcomes
+        .iter()
+        .filter(|(_, moment, _, held, waited, ok, _)| {
+            !*held || *waited != (*moment == "before it observes") || !*ok
+        })
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "(lock, holder's moment, reader, held, waited, read ok, read): {failed:#?}"
+    );
+}
+
+/// A finding of the account service read's later stages stands beside a holder of a
+/// predecessor's custody: the read judges whether the finding is only stale by reading its own
+/// home again ([`Session::observation_afresh`]), which checks the kept observation of the
+/// predecessors and takes no new one, so the holder, met by no wait, does not turn the finding
+/// into busy. The finding here is a configuration the catalog stage cannot read.
+/// NEGATIVE CONTROL (2026-11-08): with the probe observing the predecessors again first
+/// (`Observation::observe_within(bootstrap.paths(), read_by, wait)`, as `Session::observe_within`
+/// did), the read is `control_busy`.
+#[test]
+fn a_stale_account_read_keeps_its_finding_beside_a_predecessor_holder() {
+    use crate::service_state::{accounts_until, control_busy, tests::after_observed};
+    use std::{cell::RefCell, rc::Rc};
+
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    imported_successor(&mut lab);
+    let unreadable = lab._home.path().join("unreadable-config.toml");
+    fsx::write_atomic(&unreadable, b"[commons\n", 0o600).unwrap();
+    let holder = Rc::new(RefCell::new(None));
+    after_observed({
+        let (holder, dir) = (holder.clone(), original.dir.clone());
+        move || {
+            let held = PrivateLock::take(&dir, "commons.lock", Duration::ZERO, "held").unwrap();
+            *holder.borrow_mut() = Some(held);
+        }
+    });
+    let read = accounts_until(
+        &original,
+        &unreadable,
+        1000,
+        &Instant::now,
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    );
+    assert!(holder.borrow_mut().take().is_some(), "never held");
+    assert_ne!(
+        read,
+        control_busy(1000),
+        "the holder turned the finding into busy"
+    );
+    assert!(read.refresh_failed, "{read:?}");
+    assert_eq!(read.detail, "Shared catalog metadata could not be read");
+}
+
+/// A vault writer that holds the selected home's state lock as `observe_store_if_here` asks
+/// whether this Mac holds Commons makes the read busy, which a reader observes again, not
+/// "nothing declared here": the shared account read took that moment for a Mac that set up no
+/// catalog. Once the writer lets go, the same read reads the table.
+/// NEGATIVE CONTROL (2026-11-08): with `observe_store_if_here` asking `Bootstrap::cached` again,
+/// the held read is `Ok(None)`.
+#[test]
+fn a_vault_writer_keeps_observe_store_if_here_busy_not_undeclared() {
+    use crate::documents::application::observe_store_if_here;
+
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    let (_, next, _) = imported_successor(&mut lab);
+    let hang_detector = || Some(Instant::now() + aterm_spec::wait::MUST_HAPPEN);
+    let writer = client::test_hold_state_lock(&next).unwrap();
+    let busy = observe_store_if_here(&original, records, hang_detector(), rows);
+    drop(writer);
+    assert!(busy.as_ref().is_err_and(Error::is_busy), "{busy:?}");
+    assert_eq!(
+        observe_store_if_here(&original, records, hang_detector(), rows).unwrap(),
+        Some(1)
+    );
 }
 
 /// A generation check whose deadline has passed says it ran out of time, not that the generation

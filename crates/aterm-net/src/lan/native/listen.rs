@@ -383,7 +383,12 @@ mod tests {
                 crate::slots::wait_listener_readable(&listener, aterm_spec::wait::MUST_HAPPEN)
                     .unwrap()
             );
-            let (stream, _) = listener.accept().unwrap();
+            let (stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             socket_policy(&stream, Some(index), true).unwrap();
             #[cfg(target_os = "macos")]
             assert_eq!(

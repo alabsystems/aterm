@@ -8,12 +8,10 @@ use crate::swarm::partition::split::tests as ledgers;
 fn an_in_process_join_post_obeys_the_cut_file_and_its_heal() {
     use std::io::{self, BufReader, Write as _};
     use std::net::TcpListener;
-    use std::os::fd::AsFd as _;
 
     let dir = aterm_tempfile::tempdir().expect("private cut file");
     let cut_file = dir.path().join("cut");
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("loopback");
-    listener.set_nonblocking(true).expect("nonblocking");
     let address = listener.local_addr().expect("listener address");
     let url = format!("http://{address}/v1/lab");
     let recipient = aterm_secrets::age::Identity::from_secret_bytes([1; 32])
@@ -25,23 +23,25 @@ fn an_in_process_join_post_obeys_the_cut_file_and_its_heal() {
     std::fs::write(&cut_file, format!("{address}\n")).expect("cut");
     in_partition(&cut_file, post).expect_err("the other island is unreachable");
     assert_eq!(
-        listener
-            .accept()
-            .expect_err("no connection crossed the cut")
-            .kind(),
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect_err("no connection crossed the cut")
+        .kind(),
         io::ErrorKind::WouldBlock
     );
 
     std::fs::write(&cut_file, "").expect("heal");
     std::thread::scope(|scope| {
         let server = scope.spawn(|| {
-            aterm_uds::ready::until(
-                listener.as_fd(),
-                aterm_uds::ready::Interest::Read,
-                Instant::now() + HANG,
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(Instant::now() + HANG),
+                aterm_uds::AcceptedMode::Blocking,
             )
-            .expect("a healed post must arrive");
-            let (mut stream, _) = aterm_uds::accept(&listener).expect("healed connection");
+            .expect("healed connection");
             stream
                 .set_read_timeout(Some(HANG))
                 .expect("read hang detector");

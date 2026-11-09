@@ -618,7 +618,12 @@ mod tests {
     fn cancellation_wakes_a_silent_socket_and_prevents_writes() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (_peer, _) = listener.accept().unwrap();
+        let (_peer, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         let mut stream = Stream::plain(
             tcp,
             Arc::new(AlwaysAuthorized),
@@ -661,7 +666,13 @@ mod tests {
     fn connected_pair() -> (TcpStream, TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let server = listener.accept().unwrap().0;
+        let server = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap()
+        .0;
         (client, server)
     }
 
@@ -697,7 +708,15 @@ mod tests {
     fn a_revoked_guard_stops_writes_and_reads_on_an_open_socket() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let accepted = std::thread::spawn(move || listener.accept().unwrap().0);
+        let accepted = std::thread::spawn(move || {
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap()
+            .0
+        });
         let client = TcpStream::connect(addr).unwrap();
         let _server = accepted.join().unwrap();
 
@@ -906,7 +925,14 @@ mod tests {
         })
         .unwrap();
         assert!(stream.peer_addr().unwrap().ip().is_loopback());
-        drop(listener.accept().unwrap());
+        drop(
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap(),
+        );
     }
 
     #[test]
@@ -926,7 +952,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), addr);
-        drop(listener.accept().unwrap());
+        drop(
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap(),
+        );
     }
 
     #[test]
@@ -960,7 +993,14 @@ mod tests {
             )
             .unwrap();
         assert!(quiet);
-        drop(listener.accept().unwrap());
+        drop(
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap(),
+        );
     }
 
     #[test]

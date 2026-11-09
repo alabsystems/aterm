@@ -1216,14 +1216,14 @@ mod network_state_tests {
             "needs_update":null,"sent":1,"received":2,"deferred":0}}),
         );
         let value = json!({"state":"writer-recovery-pending","ready":false,
-            "detail":"Local Commons custody or control journal is busy; membership has not been checked",
+            "detail":"Local Commons custody, control journal or vault is busy; membership has not been checked",
             "repairs":{"visibility":"Waiting","observed_at_ms":NOW,
                 "detail":"Waits for the LAN broker, which setup's Mac password installs",
                 "peers":peers}});
         assert_eq!(
             commons_status_text(&value, Some(NOW)),
             "Commons: writer-recovery-pending\n\
-             \x20 Local Commons custody or control journal is busy; membership has not been checked\n\
+             \x20 Local Commons custody, control journal or vault is busy; membership has not been checked\n\
              Repairs (waiting): Waits for the LAN broker, which setup's Mac password installs\n\
              peers 1-4, 6-43: failed 20h ago (lan-held)\n\
              peer 5: failed 20h ago (not-ready)\n\

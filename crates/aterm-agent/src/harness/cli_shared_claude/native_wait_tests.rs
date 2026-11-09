@@ -20,7 +20,6 @@ struct Provider {
 impl Provider {
     fn new(status: u16, body: &'static [u8]) -> Self {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let url = format!(
             "http://{}/api/oauth/profile",
             listener.local_addr().unwrap()
@@ -32,7 +31,11 @@ impl Provider {
                 let until = Instant::now() + Duration::from_secs(60);
                 let mut calls = 0;
                 loop {
-                    let mut stream = match listener.accept() {
+                    let mut stream = match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) {
                         Ok((stream, _)) => stream,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             if stop.load(Ordering::Acquire) {
@@ -44,7 +47,6 @@ impl Provider {
                         }
                         Err(error) => panic!("owned OAuth profile provider: {error}"),
                     };
-                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(60)))
                         .unwrap();

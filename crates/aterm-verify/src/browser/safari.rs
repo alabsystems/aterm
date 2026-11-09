@@ -514,13 +514,13 @@ mod tests {
         listener: &TcpListener,
         done: &dyn Fn() -> bool,
     ) -> std::io::Result<TcpStream> {
-        listener.set_nonblocking(true)?;
         loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(false)?;
-                    return Ok(stream);
-                }
+            match aterm_uds::accept(
+                listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
+                Ok((stream, _)) => return Ok(stream),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && !done() => {
                     std::thread::sleep(Duration::from_millis(1));
                 }
@@ -536,9 +536,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("the inert driver did not receive its connection: {e}"))
     }
 
-    /// A stand-in's connection blocks, though its listener does not and macOS hands an accepted
-    /// socket the listener's `O_NONBLOCK`. NEGATIVE CONTROL: on macOS, a connection accepted
-    /// off the same listener as it is reads `O_NONBLOCK`.
+    /// A stand-in's connection blocks though its listener does not.
     #[cfg(unix)]
     #[test]
     fn a_stand_in_connection_blocks() {
@@ -553,22 +551,6 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let _client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
         assert!(!nonblocking(&accept(&listener)), "a stand-in's connection");
-        #[cfg(target_vendor = "apple")]
-        {
-            let _client = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-            let until = hang_deadline(Instant::now());
-            let raw = loop {
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < until, "no second connection");
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Err(e) => panic!("accept: {e}"),
-                }
-            };
-            assert!(nonblocking(&raw), "macOS's accepted socket, as it is");
-        }
     }
 
     /// Only macOS has a Safari, and only where its driver is.

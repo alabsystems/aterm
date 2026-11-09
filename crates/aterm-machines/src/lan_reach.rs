@@ -354,6 +354,8 @@ impl Ears for Watched {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    use aterm_uds::{AcceptWait, AcceptedMode};
 
     /// Only a vault on the LAN (a `.local` or single-label name, a link-local address or one on
     /// an attached subnet) is reached through the broker; a public URL and a path are not.
@@ -614,7 +616,8 @@ mod tests {
     fn broker_at(socket: &std::path::Path) -> std::thread::JoinHandle<()> {
         let listener = aterm_uds::CtlListener::bind(socket).unwrap();
         std::thread::spawn(move || {
-            let (stream, _) = aterm_uds::accept(&listener).unwrap();
+            let (stream, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             answer_hello(&stream);
         })
     }

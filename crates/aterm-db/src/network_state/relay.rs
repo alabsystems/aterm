@@ -181,7 +181,6 @@ impl Server {
         if meta.mode() & 0o777 != 0o600 {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
-        socket.set_nonblocking(true)?;
         if endpoint_at(dir, &path)? != bound.identity {
             return Err(refused());
         }
@@ -197,11 +196,13 @@ impl Server {
                     {
                         break;
                     }
-                    match aterm_uds::kept_out(|| socket.accept()) {
+                    match aterm_uds::accept(
+                        &socket,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) {
                         Ok((mut client, _)) => {
-                            if client.set_nonblocking(false).is_ok()
-                                && peer::peer_uid(&client) == Some(peer::our_uid())
-                            {
+                            if peer::peer_uid(&client) == Some(peer::our_uid()) {
                                 let _ = serve(&mut client, &source);
                             }
                         }
@@ -1347,22 +1348,17 @@ mod tests {
         let path = dir.join(NAME);
         let listener = CtlListener::bind(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let body = body.to_vec();
         let (release, hold) = std::sync::mpsc::channel();
         let sender = thread::spawn(move || {
             let hang = Instant::now() + Duration::from_secs(60);
-            let mut client = loop {
-                match listener.accept() {
-                    Ok((client, _)) => break client,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        assert!(Instant::now() < hang, "fixture client did not connect");
-                        thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(error) => panic!("fixture listener failed: {error}"),
-                }
-            };
-            client.set_nonblocking(false).unwrap();
+            let mut client = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(hang),
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("fixture client connected")
+            .0;
             let deadline = Instant::now() + EXCHANGE;
             let mut request = [0; REQUEST.len()];
             read_exact(&mut client, &mut request, deadline).unwrap();

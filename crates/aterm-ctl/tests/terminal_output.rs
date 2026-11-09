@@ -64,7 +64,6 @@ fn run(tty: Tty, args: &[&str], reply: &[u8]) -> Seen {
         .expect("a scratch dir");
     let socket = scratch.path().join("peer.sock");
     let listener = UnixListener::bind(&socket).expect("bind");
-    listener.set_nonblocking(true).expect("non-blocking");
     let mut pty = Pty::open();
     let slave = pty.slave.try_clone().expect("a slave copy");
     let mut command = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("aterm-ctl"));
@@ -92,7 +91,11 @@ fn run(tty: Tty, args: &[&str], reply: &[u8]) -> Seen {
     let mut terminal = Vec::new();
     let started = Instant::now();
     let mut connection = loop {
-        match listener.accept() {
+        match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((connection, _)) => break connection,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 pty.drain(&mut terminal);
@@ -108,8 +111,6 @@ fn run(tty: Tty, args: &[&str], reply: &[u8]) -> Seen {
             Err(e) => panic!("accept: {e}"),
         }
     };
-    // An accepted socket inherits the listener's O_NONBLOCK on macOS.
-    connection.set_nonblocking(false).expect("blocking");
     let mut request = String::new();
     BufReader::new(&connection)
         .read_line(&mut request)

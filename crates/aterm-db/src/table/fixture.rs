@@ -166,8 +166,17 @@ fn repair_commons_with(
             std::thread::scope(|tasks| {
                 let incoming = tasks.spawn(|| {
                     endpoints[peer].exchange(
-                        Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback)
-                            .unwrap(),
+                        Connection::admit(
+                            aterm_uds::accept(
+                                &listener,
+                                aterm_uds::AcceptWait::Forever,
+                                aterm_uds::AcceptedMode::Blocking,
+                            )
+                            .unwrap()
+                            .0,
+                            LinkScope::Loopback,
+                        )
+                        .unwrap(),
                         Side::Responder,
                         right,
                     )
@@ -217,6 +226,11 @@ impl Lab {
     }
     pub fn with_foundation(roles: &[Role]) -> Self {
         Self::build(roles, roles.len(), true)
+    }
+    /// A founded lab of `roles` whose Macs past the first `enrolled` joined the vault and never
+    /// opened Commons: no device key, custody or control history.
+    pub fn with_foundation_enrolled(roles: &[Role], enrolled: usize) -> Self {
+        Self::build(roles, enrolled, true)
     }
     /// A lab whose home is `home` (Mac `n`'s at `<home>/m<n>`), enrolled as `roles`: a caller
     /// that must name the home, as `lab reveal-tab` names its lab instance's world.

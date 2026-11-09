@@ -1765,7 +1765,6 @@ mod tests {
             .expect("the fixture dir");
         let socket = dir.path().join("b.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
-        listener.set_nonblocking(true).unwrap();
         let commits = Commits::default();
         let seen = std::sync::Arc::clone(&commits);
         let state = std::sync::Arc::new((
@@ -1788,9 +1787,12 @@ mod tests {
                     if state.stopped {
                         return;
                     }
-                    match listener.accept() {
+                    match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) {
                         Ok((stream, _)) => {
-                            stream.set_nonblocking(false).unwrap();
                             let stream = std::sync::Arc::new(stream);
                             state.active = Some(std::sync::Arc::downgrade(&stream));
                             break stream;

@@ -14,6 +14,22 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
+[package.metadata.aterm.lint-inputs]
+bounded = true
+content-only = true
+read-only = true
+paths = []
+workspace-paths = []
+tools = []
+volatile-environment = []
+
 [lib]
 # A normal library over the compiler's `proc_macro` crate. Most of it calls
 # the proc_macro bridge, which exists only while a macro runs, so the parser is

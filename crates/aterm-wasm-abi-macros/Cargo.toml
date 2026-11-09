@@ -10,6 +10,13 @@ repository.workspace = true
 authors.workspace = true
 description = "#[export] for aterm-wasm-abi: the syn-free attribute that marks what a wasm module shows JS (replaces wasm-bindgen-macro)"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [lib]
 proc-macro = true
 

@@ -273,7 +273,11 @@ pub(super) fn run(
             actual
                 .stdout
                 .windows(b"actual_contained_case".len())
-                .any(|word| word == b"actual_contained_case")
+                .any(|word| word == b"actual_contained_case"),
+            "contained action {index} produced no execution marker: status {:?}; stdout {:?}; stderr {:?}",
+            actual.completion.completed.finished.status,
+            String::from_utf8_lossy(&actual.stdout),
+            String::from_utf8_lossy(&actual.stderr),
         );
         let control::Status::Finished { outcome, cause, .. } =
             actual.completion.completed.finished.status

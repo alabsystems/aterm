@@ -71,7 +71,11 @@ impl Peer {
         let traffic = Arc::new(Mutex::new(Traffic::default()));
         let (stopping, observed) = (Arc::clone(&stop), Arc::clone(&traffic));
         let worker = std::thread::spawn(move || {
-            while let Ok((mut stream, _)) = listener.accept() {
+            while let Ok((mut stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 if stopping.load(Ordering::SeqCst) {
                     break;
                 }

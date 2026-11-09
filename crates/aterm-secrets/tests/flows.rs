@@ -2666,7 +2666,12 @@ fn answer_once(reply: &'static [u8]) -> (String, std::sync::mpsc::Receiver<Strin
     let url = format!("http://{}/v1/alab", listener.local_addr().expect("addr"));
     let (heard, head) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         stream
             .set_read_timeout(Some(HANG_DETECTOR))
             .expect("timeout");

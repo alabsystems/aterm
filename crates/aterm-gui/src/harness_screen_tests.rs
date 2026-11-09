@@ -4074,14 +4074,16 @@ fn the_stats_reading_dials_a_sibling_on_its_auth_line_and_never_blind() {
     let done = std::sync::Arc::new(AtomicBool::new(false));
     let listen = |pid: u32| {
         let listener = UnixListener::bind(sock(pid)).expect("bind");
-        listener.set_nonblocking(true).expect("nonblocking");
         let done = std::sync::Arc::clone(&done);
         std::thread::spawn(move || {
             let mut sent: Vec<Vec<u8>> = Vec::new();
             loop {
-                match listener.accept() {
+                match aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) {
                     Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false).expect("blocking");
                         let mut bytes = Vec::new();
                         let _ = stream.read_to_end(&mut bytes);
                         sent.push(bytes);

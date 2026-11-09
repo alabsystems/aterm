@@ -13,6 +13,18 @@ license.workspace = true
 repository.workspace = true
 description = "aterm buffer-primitives kernel: a text-line Surface over one bounded event-log spine (apply, read_text, snapshot, subscribe/poll, transact)."
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
+# The suite's tiered conformance tests launch the Trust `ty` checker when the
+# release verifier enables spec checkers; that transitive tool is not bounded.
+[package.metadata.aterm.test-inputs.targets."test:buffer_suite"]
+bounded = false
+
 [dependencies]
 # The capability witnesses: `ReadCap`/`WriteCap` are `aterm_cap::Cap<E>`, so
 # only a holder of the launcher-minted `Authority` can call a verb.

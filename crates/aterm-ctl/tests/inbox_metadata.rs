@@ -26,7 +26,6 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
         .unwrap();
     let socket = scratch.path().join("peer.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let mut command = Command::new(aterm_tempfile::bin_exe("aterm-ctl"));
     for (key, _) in std::env::vars_os() {
         if aterm_uds::process::stripped_from_child(&key) {
@@ -44,7 +43,11 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
         .spawn()
         .unwrap();
     let mut connection = loop {
-        match listener.accept() {
+        match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((connection, _)) => break connection,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if let Some(status) = cli.try_wait().unwrap() {
@@ -59,7 +62,6 @@ fn run_verb(verb: &str, args: &[&str], reply: &[u8]) -> Output {
             Err(error) => panic!("accept: {error}"),
         }
     };
-    connection.set_nonblocking(false).unwrap();
     let mut request = String::new();
     BufReader::new(&connection).read_line(&mut request).unwrap();
     connection.write_all(reply).unwrap();

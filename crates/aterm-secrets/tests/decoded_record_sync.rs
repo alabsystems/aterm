@@ -69,7 +69,11 @@ impl Host {
         let stopping = Arc::new(AtomicBool::new(false));
         let (serving, stop) = (Arc::clone(&state), Arc::clone(&stopping));
         let worker = std::thread::spawn(move || {
-            while let Ok((mut stream, _)) = listener.accept() {
+            while let Ok((mut stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }

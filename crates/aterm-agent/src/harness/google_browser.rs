@@ -1005,7 +1005,6 @@ mod tests {
     #[ignore = "uses the pinned headless browser and a local callback that clears its URL"]
     fn native_committed_callback_survives_immediate_query_cleanup() {
         use std::io::{BufRead as _, Write as _};
-        use std::os::fd::AsFd as _;
         let root = aterm_tempfile::tempdir().unwrap();
         let registry=super::super::google_identity::Registry::parse("[[identities]]\nid='callback-fixture'\nemail='fixture@example.invalid'\n[[bindings]]\nprovider='fixture'\naccount='one'\nidentity='callback-fixture'\nexpected_email='fixture@example.invalid'\n").unwrap();
         let identity = registry.resolve("fixture", "one").unwrap().0;
@@ -1020,11 +1019,13 @@ mod tests {
         .unwrap();
         let listener = aterm_uds::kept_out(|| std::net::TcpListener::bind("127.0.0.1:0")).unwrap();
         let address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            aterm_uds::ready::until(listener.as_fd(), aterm_uds::ready::Interest::Read, deadline)
-                .unwrap();
-            let (mut stream, _) = aterm_uds::accept(&listener).unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(deadline),
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();

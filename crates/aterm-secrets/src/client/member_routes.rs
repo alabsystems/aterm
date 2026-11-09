@@ -1146,11 +1146,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn answer_one_hello(listener: &std::os::unix::net::UnixListener) {
         use aterm_uds::lan::wire::{self, Frame, Reader};
-        use std::os::fd::AsFd as _;
-        let dialled = aterm_uds::ready::any_until(&[listener.as_fd()], Instant::now() + HANG)
-            .expect("the broker's wait for a dial");
-        assert!(!dialled.is_empty(), "the worker never dialled its broker");
-        let (stream, _) = listener.accept().expect("the worker's dial");
+        let (stream, _) = aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Until(Instant::now() + HANG),
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("the worker's dial");
         let hello = Reader::new(0)
             .frame(&stream, Some(Instant::now() + HANG))
             .expect("the worker's hello");

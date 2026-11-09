@@ -63,6 +63,7 @@ mod harness_debt;
 pub mod ladder;
 pub mod libtest;
 pub mod libtest_json;
+pub mod lint_content;
 pub mod memory;
 pub mod perf;
 pub mod plan;
@@ -83,6 +84,7 @@ pub mod smoke_stages;
 pub mod soak;
 pub mod stages;
 pub mod status;
+pub mod test_content;
 mod test_env;
 pub mod test_history;
 pub mod test_index;
@@ -672,9 +674,15 @@ pub struct Ctx {
     pub test_history: Option<PathBuf>,
     /// The test binaries a release's resume carries ([`testrun::carry`], `--passed-binaries`).
     pub passed_binaries: Option<testrun::Passed>,
-    /// Where a run writes each `check-finished` and `test-binary-finished` line whole, apart
-    /// from its output, and its check-terminal `run-finished` line (`--events`; later accounting may follow): a release's cutter keeps
-    /// its records from it (A19), and `verify land` its judgment (B10).
+    /// Per-package lint successes a release resume may carry by complete content key.
+    pub passed_lint_packages: Option<lint_content::Passed>,
+    /// The release cutter's frozen verifier, seal and toolchain context, salted into each test
+    /// binary and lint-package content key (`--carry-context`).
+    pub carry_context: Option<String>,
+    /// Where a run writes each `check-finished`, `test-binary-finished` and
+    /// `lint-package-finished` line whole, apart from its output, and its check-terminal
+    /// `run-finished` line (`--events`; later accounting may follow): a release's cutter keeps its
+    /// records from it (A19), and `verify land` its judgment (B10).
     pub events: Option<event_log::EventLog>,
     /// Owner-private directory beside the run log where a hung test binary's raw all-thread
     /// sample is retained. It is created lazily only when the detector fires.
@@ -832,6 +840,8 @@ impl Ctx {
             memory: None,
             test_history: None,
             passed_binaries: None,
+            passed_lint_packages: None,
+            carry_context: None,
             events: None,
             hang_samples: None,
             test_compile_failed: std::sync::atomic::AtomicBool::new(false),
@@ -1105,6 +1115,21 @@ impl Ctx {
     #[must_use]
     pub fn with_passed_binaries(mut self, passed: Option<testrun::Passed>) -> Self {
         self.passed_binaries = passed;
+        self
+    }
+
+    /// Carry prior per-package lint successes into a release lint run.
+    #[must_use]
+    pub fn with_passed_lint_packages(mut self, passed: Option<lint_content::Passed>) -> Self {
+        self.passed_lint_packages = passed;
+        self
+    }
+
+    /// Salt test-binary and lint-package evidence with the release's frozen verifier, seal and
+    /// toolchain context.
+    #[must_use]
+    pub fn with_carry_context(mut self, context: Option<String>) -> Self {
+        self.carry_context = context;
         self
     }
 
@@ -2906,6 +2931,16 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         Some(Ok(passed)) => Some(passed),
         None => None,
     };
+    let passed_lint_packages = match parsed.passed_lint_packages.as_deref().map(|path| {
+        aterm_uds::atomic_file::read_regular_text(&cwd.join(path), 16 * 1024 * 1024)
+            .map_err(|error| error.to_string())
+            .and_then(|text| lint_content::read_passed(&text))
+            .map_err(|why| format!("verify: --passed-lint-packages {}: {why}", path.display()))
+    }) {
+        Some(Err(why)) => return stop(exit::USAGE, why),
+        Some(Ok(passed)) => Some(passed),
+        None => None,
+    };
     let events = match parsed
         .events
         .as_deref()
@@ -3031,6 +3066,8 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_test_threads(parsed.test_threads)
         .with_test_cores(parsed.test_cores)
         .with_passed_binaries(passed_binaries)
+        .with_passed_lint_packages(passed_lint_packages)
+        .with_carry_context(parsed.carry_context.clone())
         .with_events(events)
         .with_quiet(Some(if parsed.background {
             aterm_capacity::Admit::Preemptible

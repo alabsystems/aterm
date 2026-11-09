@@ -619,16 +619,18 @@ struct Seen {
 /// Loopback HTTP server returning 401 when unauthenticated and 403 when authenticated.
 fn git_server(seen: Arc<Seen>, stop: Arc<AtomicBool>) -> (u16, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
-    listener.set_nonblocking(true).expect("nonblocking");
     let port = listener.local_addr().expect("the address").port();
     let thread = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(60);
         while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
-            let Ok((stream, _)) = listener.accept() else {
+            let Ok((stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ) else {
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
             };
-            stream.set_nonblocking(false).expect("blocking");
             stream
                 .set_read_timeout(Some(Duration::from_secs(60)))
                 .expect("a read timeout");

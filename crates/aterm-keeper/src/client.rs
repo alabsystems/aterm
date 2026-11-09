@@ -2277,11 +2277,21 @@ mod tests {
         let keeper = {
             let asked = std::sync::Arc::clone(&asked);
             std::thread::spawn(move || {
-                let (first, _) = listener.accept().expect("the first link");
+                let (first, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .expect("the first link");
                 let first_kinds = kinds_until(&first, Kind::Register);
                 drop(first);
                 closed_tx.send(()).expect("the test waits for the close");
-                let (second, _) = listener.accept().expect("the second link");
+                let (second, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .expect("the second link");
                 let unasked = !asked.load(Ordering::SeqCst);
                 (first_kinds, unasked, kinds_until(&second, Kind::Pending))
             })
@@ -2393,7 +2403,12 @@ mod tests {
             let sock = scratch.path().join("k.sock");
             let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
             let keeper = std::thread::spawn(move || {
-                let (stream, _) = listener.accept().expect("accept");
+                let (stream, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .expect("accept");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(60)))
                     .expect("timeout");
@@ -2459,7 +2474,12 @@ mod tests {
         let sock = scratch.path().join("k.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
         let older = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accept");
+            let (stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             stream
                 .set_read_timeout(Some(Duration::from_secs(60)))
                 .expect("timeout");

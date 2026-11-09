@@ -27,6 +27,8 @@ pub(crate) const WSAESHUTDOWN: i32 = 10058;
 /// `WSAEventSelect` flips the socket non-blocking; the caller parks on the
 /// readiness event and retries.
 pub(crate) const WSAEWOULDBLOCK: i32 = 10035;
+/// Winsock `FIONBIO`: set a socket's nonblocking mode with `ioctlsocket`.
+pub(crate) const FIONBIO: i32 = 0x8004_667e_u32 as i32;
 
 /// `WSAEVENT` — an opaque manual-reset event `HANDLE`.
 pub(crate) type WsaEvent = isize;
@@ -38,6 +40,8 @@ pub(crate) const WSA_WAIT_FAILED: u32 = 0xFFFF_FFFF;
 pub(crate) const WSA_WAIT_TIMEOUT: u32 = 258;
 /// `dwTimeout` sentinel: wait with no deadline.
 pub(crate) const WSA_INFINITE: u32 = 0xFFFF_FFFF;
+/// `WSAPoll` readability for ordinary data and a listening socket's accept queue.
+pub(crate) const POLLRDNORM: i16 = 0x0100;
 
 /// `afunix.h`: `SIO_AF_UNIX_GETPEERPID` = `_WSAIOR(IOC_VENDOR, 256)` —
 /// `IOC_OUT` (0x4000_0000) | `IOC_VENDOR` (0x1800_0000) | 256. Answers the
@@ -58,6 +62,14 @@ pub(crate) struct SockaddrUn {
 pub(crate) struct WsaNetworkEvents {
     pub lNetworkEvents: i32,
     pub _iErrorCode: [i32; 10],
+}
+
+/// `WSAPOLLFD`, whose socket is a `UINT_PTR` on both Windows architectures.
+#[repr(C)]
+pub(crate) struct WsaPollFd {
+    pub fd: RawSocket,
+    pub events: i16,
+    pub revents: i16,
 }
 
 #[repr(C)]
@@ -83,6 +95,8 @@ pub(crate) struct WsaData {
 unsafe extern "system" {
     pub(crate) fn WSAStartup(wVersionRequested: u16, lpWSAData: *mut WsaData) -> i32;
     pub(crate) fn WSAGetLastError() -> i32;
+    pub(crate) fn WSAPoll(fdArray: *mut WsaPollFd, fds: u32, timeout: i32) -> i32;
+    pub(crate) fn ioctlsocket(s: RawSocket, cmd: i32, argp: *mut u32) -> i32;
     pub(crate) fn socket(af: i32, ty: i32, protocol: i32) -> RawSocket;
     pub(crate) fn bind(s: RawSocket, name: *const SockaddrUn, namelen: i32) -> i32;
     pub(crate) fn listen(s: RawSocket, backlog: i32) -> i32;

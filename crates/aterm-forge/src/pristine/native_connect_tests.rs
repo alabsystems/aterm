@@ -25,9 +25,12 @@ impl Provider {
                 let until = Instant::now() + Duration::from_secs(60);
                 let mut calls = 0;
                 loop {
-                    match listener.accept() {
+                    match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) {
                         Ok((mut stream, _)) => {
-                            stream.set_nonblocking(false).unwrap();
                             stream
                                 .set_read_timeout(Some(Duration::from_secs(60)))
                                 .unwrap();

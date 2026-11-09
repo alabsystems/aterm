@@ -494,7 +494,11 @@ pub(super) fn answer(case: Case, number: usize, now: f64) -> Answer {
 /// [`aterm_uds::kept_out`]): a `codex`, `nc` or `lsof` that took a copy could hold the model's
 /// side of a connection open past its answer.
 fn serve(listener: TcpListener, model: Arc<Model>) {
-    while let Ok((conn, _)) = aterm_uds::accept(&listener) {
+    while let Ok((conn, _)) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    ) {
         let model = Arc::clone(&model);
         std::thread::spawn(move || serve_one(conn, &model));
     }
@@ -1045,12 +1049,19 @@ fn reaches(profile: &str, port: u16) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Whether anything connected to the canary since it was bound (`canary` is nonblocking, so the
-/// accept answers at once). A loopback `connect` can return before the listener's queue holds
+/// Whether anything connected to the canary since it was bound (the sanctioned `Ready` accept
+/// answers at once). A loopback `connect` can return before the listener's queue holds
 /// its connection, so `false` means untouched only where nothing can still be on its way, as
 /// after a probe whose connect failed ([`jail_holds`]).
 fn canary_touched(canary: &TcpListener) -> bool {
-    !matches!(aterm_uds::kept_out(|| canary.accept()), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+    !matches!(
+        aterm_uds::accept(
+            canary,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+    )
 }
 
 /// THE JAIL PROBE: whether a child under `profile` reaches the model's `port` and is refused
@@ -2494,7 +2505,6 @@ mod tests {
         let listen = || {
             let listener = aterm_uds::kept_out(|| TcpListener::bind("127.0.0.1:0")).unwrap();
             let port = listener.local_addr().unwrap().port();
-            listener.set_nonblocking(true).unwrap();
             (listener, port)
         };
         let (_model, port) = listen();
@@ -2523,18 +2533,19 @@ mod tests {
     /// Reads `canary` touched once the connection that must reach it is in its queue. A loopback
     /// `connect` (a probe's too) returns once its SYN-ACK is in, while the handshake's last ACK
     /// can still wait behind other loopback traffic, so a nonblocking accept straight after it
-    /// can find nothing. A listener turns readable when a connection waits to be accepted, which
-    /// this waits for in `poll(2)` under the one-minute hang detector.
+    /// can find nothing. The sanctioned accept waits for that queue under the one-minute hang
+    /// detector before taking the connection.
     #[track_caller]
     fn reached(canary: &TcpListener, what: &str) {
-        use std::os::fd::AsFd as _;
-        let ready = aterm_uds::ready::until(
-            canary.as_fd(),
-            aterm_uds::ready::Interest::Read,
-            Instant::now() + MUST_HAPPEN,
+        let accepted = aterm_uds::accept(
+            canary,
+            aterm_uds::AcceptWait::Until(Instant::now() + MUST_HAPPEN),
+            aterm_uds::AcceptedMode::Blocking,
         );
-        assert!(ready.is_ok(), "{what}: the canary's queue ({ready:?})");
-        assert!(canary_touched(canary), "{what}");
+        assert!(
+            accepted.is_ok(),
+            "{what}: the canary's queue ({accepted:?})"
+        );
     }
 
     /// THE CLI CHECKS (review F1): `exec --help` holds only on exit 0 with every flag the cases

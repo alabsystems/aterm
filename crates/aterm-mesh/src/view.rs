@@ -500,7 +500,11 @@ impl Server {
         let our_uid = aterm_uds::peer::our_uid();
         let mut failed = false;
         while !stopped() {
-            let stream = match aterm_uds::accept(&self.listener) {
+            let stream = match aterm_uds::accept(
+                &self.listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 Ok((stream, _)) => stream,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => {

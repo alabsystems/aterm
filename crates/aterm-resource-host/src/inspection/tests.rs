@@ -106,7 +106,12 @@ fn cached_custodian_helper() {
     let cloned = aterm_uds::kept_out(|| listener.try_clone()).unwrap();
     let server = std::thread::spawn(move || {
         for _ in 0..2 {
-            let (stream, _) = aterm_uds::accept(&cloned).unwrap();
+            let (stream, _) = aterm_uds::accept(
+                &cloned,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let deadline = Instant::now() + Duration::from_secs(60);
             let request: Value =
                 aterm_json::from_slice(&wire::read_frame(&stream, deadline).unwrap()).unwrap();

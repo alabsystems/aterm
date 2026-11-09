@@ -27,6 +27,58 @@ fn last_wsa_error() -> io::Error {
     io::Error::from_raw_os_error(unsafe { ffi::WSAGetLastError() })
 }
 
+fn accept_poll_timeout(deadline: Option<Instant>, now: Instant) -> io::Result<(i32, bool)> {
+    let Some(deadline) = deadline else {
+        return Ok((-1, false));
+    };
+    let Some(remaining) = deadline
+        .checked_duration_since(now)
+        .filter(|duration| !duration.is_zero())
+    else {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "accept deadline"));
+    };
+    let millis =
+        remaining.as_millis() + u128::from(!remaining.subsec_nanos().is_multiple_of(1_000_000));
+    Ok((
+        millis.min(i32::MAX as u128) as i32,
+        millis > i32::MAX as u128,
+    ))
+}
+
+/// Wait for one socket to become readable, keeping one absolute deadline across interrupted or
+/// maximum-length Winsock waits. A listener is readable when a connection is queued.
+pub(crate) fn wait_readable(
+    raw: std::os::windows::io::RawSocket,
+    deadline: Option<Instant>,
+) -> io::Result<()> {
+    let raw = RawSocket::try_from(raw)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket does not fit SOCKET"))?;
+    loop {
+        let (timeout, capped) = accept_poll_timeout(deadline, Instant::now())?;
+        let mut fd = ffi::WsaPollFd {
+            fd: raw,
+            events: ffi::POLLRDNORM,
+            revents: 0,
+        };
+        // SAFETY: `fd` is one initialized `WSAPOLLFD` that stays live for the call; its socket is
+        // borrowed by the listener which called this wait.
+        let result = unsafe { ffi::WSAPoll(&raw mut fd, 1, timeout) };
+        if result > 0 {
+            return Ok(());
+        }
+        if result == 0 && capped {
+            continue;
+        }
+        if result == 0 {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "accept deadline"));
+        }
+        let error = last_wsa_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 /// Encode `path` into a `sockaddr_un`, stripping a canonicalize-style verbatim
 /// prefix (`\\?\` / `\\?\UNC\`) first.
 fn encode_sun_path(path: &Path) -> io::Result<(ffi::SockaddrUn, i32)> {
@@ -161,6 +213,7 @@ struct Inner {
     write_timeout_ms: AtomicU64,
     recv_shutdown: AtomicBool,
     send_shutdown: AtomicBool,
+    blocking: AtomicBool,
     #[cfg(test)]
     parked_reads: std::sync::atomic::AtomicUsize,
 }
@@ -218,6 +271,7 @@ impl CtlStream {
             write_timeout_ms: AtomicU64::new(0),
             recv_shutdown: AtomicBool::new(false),
             send_shutdown: AtomicBool::new(false),
+            blocking: AtomicBool::new(true),
             #[cfg(test)]
             parked_reads: std::sync::atomic::AtomicUsize::new(0),
         })))
@@ -259,7 +313,12 @@ impl CtlStream {
         let _ = std::fs::remove_file(&path);
         let listener = CtlListener::bind(&path)?;
         let connector = CtlStream::connect(&path)?;
-        let accepted = listener.accept().map(|(s, ())| s);
+        let accepted = crate::accept(
+            &listener,
+            crate::AcceptWait::Ready,
+            crate::AcceptedMode::Blocking,
+        )
+        .map(|(stream, ())| stream);
         drop(listener);
         let _ = std::fs::remove_file(&path);
         Ok((accepted?, connector))
@@ -364,6 +423,15 @@ impl CtlStream {
             .store(timeout_to_ms(t)?, Ordering::Relaxed);
         Ok(())
     }
+
+    /// Select whether ordinary [`io::Read`] and [`io::Write`] calls wait for readiness. This is
+    /// shared across clones, as a Unix stream's `O_NONBLOCK` file status is.
+    /// # Errors
+    /// None; the underlying socket stays nonblocking for its event-driven implementation.
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.0.blocking.store(!nonblocking, Ordering::Release);
+        Ok(())
+    }
 }
 
 /// std-compatible timeout validation: `Some(0)` is an error, sub-millisecond
@@ -395,6 +463,9 @@ impl io::Read for &CtlStream {
             let err = last_wsa_error();
             match err.raw_os_error() {
                 Some(ffi::WSAEWOULDBLOCK) => {
+                    if !inner.blocking.load(Ordering::Acquire) {
+                        return Err(err);
+                    }
                     #[cfg(test)]
                     inner.parked_reads.fetch_add(1, Ordering::Release);
                     if !wait_interruptible(
@@ -435,6 +506,9 @@ impl CtlStream {
             let err = last_wsa_error();
             match err.raw_os_error() {
                 Some(ffi::WSAEWOULDBLOCK) => {
+                    if !inner.blocking.load(Ordering::Acquire) {
+                        return Err(err);
+                    }
                     if !wait_interruptible(
                         inner.raw,
                         inner.net_ev,
@@ -550,7 +624,7 @@ impl CtlListener {
     /// Accepts one incoming connection.
     /// # Errors
     /// Returns the mapped Winsock error if `accept` fails.
-    pub fn accept(&self) -> io::Result<(CtlStream, ())> {
+    pub(super) fn accept(&self) -> io::Result<(CtlStream, ())> {
         let raw = unsafe { ffi::accept(self.raw, std::ptr::null_mut(), std::ptr::null_mut()) };
         if raw == ffi::INVALID_SOCKET {
             return Err(last_wsa_error());
@@ -558,9 +632,24 @@ impl CtlListener {
         Ok((CtlStream::from_raw(raw)?, ()))
     }
 
-    /// Returns a blocking iterator over incoming connections.
-    pub fn incoming(&self) -> Incoming<'_> {
-        Incoming { listener: self }
+    /// Select whether [`accept`](Self::accept) waits for a queued connection.
+    /// # Errors
+    /// Returns the mapped Winsock error from `ioctlsocket(FIONBIO)`.
+    pub(super) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        let mut value = u32::from(nonblocking);
+        // SAFETY: `self.raw` is this live listener and `value` is a live `u_long` in/out argument
+        // for the duration of the synchronous `FIONBIO` call.
+        if unsafe { ffi::ioctlsocket(self.raw, ffi::FIONBIO, &raw mut value) } == ffi::SOCKET_ERROR
+        {
+            return Err(last_wsa_error());
+        }
+        Ok(())
+    }
+}
+
+impl std::os::windows::io::AsRawSocket for CtlListener {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        self.raw as std::os::windows::io::RawSocket
     }
 }
 
@@ -570,26 +659,102 @@ impl Drop for CtlListener {
     }
 }
 
-/// Iterator returned by [`CtlListener::incoming`].
-#[derive(Debug)]
-pub struct Incoming<'a> {
-    listener: &'a CtlListener,
-}
-
-impl Iterator for Incoming<'_> {
-    type Item = io::Result<CtlStream>;
-
-    fn next(&mut self) -> Option<io::Result<CtlStream>> {
-        Some(self.listener.accept().map(|(s, ())| s))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Hang detector for wake tests.
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
+
+    /// A deadline beyond Winsock's one-call range is a capped slice, not an early expiry.
+    #[test]
+    fn accept_poll_timeout_marks_only_a_long_deadline_as_capped() {
+        let now = Instant::now();
+        let long = now + Duration::from_millis(i32::MAX as u64 + 1_000);
+        let (timeout, capped) = accept_poll_timeout(Some(long), now).expect("a future deadline");
+        assert_eq!(timeout, i32::MAX);
+        assert!(capped, "the caller must wait another slice after this one");
+
+        let short = now + Duration::from_secs(1);
+        let (timeout, capped) = accept_poll_timeout(Some(short), now).expect("a future deadline");
+        assert_eq!(timeout, 1_000);
+        assert!(!capped, "this timeout is the absolute deadline");
+        assert_eq!(
+            accept_poll_timeout(Some(now), now)
+                .expect_err("the deadline is expired")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    /// The sanctioned Windows Unix accept applies the requested logical stream mode: a
+    /// nonblocking read answers immediately, while a blocking read waits across a planted write
+    /// gap. Changing either mode application breaks its corresponding assertion/control.
+    #[test]
+    fn sanctioned_accept_applies_each_requested_stream_mode() {
+        use std::io::{Read as _, Write as _};
+
+        let root = aterm_tempfile::tempdir().expect("a short private directory");
+        let path = root.path().join("a.sock");
+        let listener = CtlListener::bind(&path).expect("bind");
+
+        let empty = CtlStream::connect(&path).expect("connect the empty peer");
+        let (nonblocking, ()) = crate::accept(
+            &listener,
+            crate::AcceptWait::Until(Instant::now() + HANG_DETECTOR),
+            crate::AcceptedMode::Nonblocking,
+        )
+        .expect("accept the empty peer");
+        assert!(
+            !nonblocking.0.blocking.load(Ordering::Acquire),
+            "the requested nonblocking mode is applied before the read"
+        );
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = read_tx.send((&nonblocking).read(&mut [0]));
+        });
+        let result = match read_rx.recv_timeout(HANG_DETECTOR) {
+            Ok(result) => result,
+            Err(error) => {
+                // Release and join a mutant that blocked instead of returning `WouldBlock`.
+                (&empty)
+                    .write_all(b"x")
+                    .expect("release the blocked mutant");
+                reader.join().expect("blocked reader");
+                panic!("the nonblocking read hung: {error}");
+            }
+        };
+        reader.join().expect("nonblocking reader");
+        let error = result.expect_err("an empty nonblocking stream cannot wait");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{error}");
+        drop(empty);
+
+        let delayed_path = path.clone();
+        let writer = std::thread::spawn(move || {
+            let stream = CtlStream::connect(&delayed_path).expect("connect the delayed peer");
+            std::thread::sleep(Duration::from_millis(300));
+            (&stream).write_all(b"x").expect("the delayed write");
+        });
+        let (blocking, ()) = crate::accept(
+            &listener,
+            crate::AcceptWait::Until(Instant::now() + HANG_DETECTOR),
+            crate::AcceptedMode::Blocking,
+        )
+        .expect("accept the delayed peer");
+        assert!(
+            blocking.0.blocking.load(Ordering::Acquire),
+            "the requested blocking mode is applied before the read"
+        );
+        blocking
+            .set_read_timeout(Some(HANG_DETECTOR))
+            .expect("read hang detector");
+        let mut byte = [0];
+        (&blocking)
+            .read_exact(&mut byte)
+            .expect("the blocking stream waits for the delayed write");
+        assert_eq!(&byte, b"x");
+        writer.join().expect("writer");
+    }
 
     /// Non-ASCII UTF-8 paths encode directly within the 107-byte `sun_path` budget.
     #[test]
@@ -619,7 +784,12 @@ mod tests {
 
         let listener = CtlListener::bind(&path).expect("bind in non-ASCII dir");
         let server = std::thread::spawn(move || {
-            let (stream, ()) = listener.accept().expect("accept");
+            let (stream, ()) = crate::accept(
+                &listener,
+                crate::AcceptWait::Until(Instant::now() + HANG_DETECTOR),
+                crate::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut buf = [0u8; 4];
             (&stream).read_exact(&mut buf).expect("read");
             (&stream).write_all(&buf).expect("echo");

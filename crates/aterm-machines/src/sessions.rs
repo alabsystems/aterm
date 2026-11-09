@@ -492,6 +492,7 @@ pub fn scan_local_aterm_sessions() -> crate::protocol::SessionSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_uds::{AcceptWait, AcceptedMode};
     use std::os::unix::net::UnixListener;
 
     fn live_row(pid: u32, line: &str) -> crate::protocol::HostedSession {
@@ -552,31 +553,14 @@ mod tests {
     }
 
     fn accept_fixture(listener: &UnixListener) -> FixtureStream {
-        use std::os::fd::AsFd as _;
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        listener.set_nonblocking(true).unwrap();
-        loop {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "native fixture never connected"
-            );
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(true).unwrap();
-                    return FixtureStream { stream, deadline };
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    aterm_uds::ready::until(
-                        listener.as_fd(),
-                        aterm_uds::ready::Interest::Read,
-                        deadline,
-                    )
-                    .unwrap();
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(error) => panic!("native fixture accept: {error}"),
-            }
-        }
+        let (stream, _) = aterm_uds::accept(
+            listener,
+            AcceptWait::Until(deadline),
+            AcceptedMode::Nonblocking,
+        )
+        .unwrap_or_else(|error| panic!("native fixture accept: {error}"));
+        FixtureStream { stream, deadline }
     }
 
     #[test]
@@ -706,7 +690,8 @@ mod tests {
         std::fs::write(dir.path().join("aterm-4242.token"), "feedbeef\n").unwrap();
         let listener = UnixListener::bind(&sock).unwrap();
         let server = std::thread::spawn(move || {
-            let (conn, _) = listener.accept().unwrap();
+            let (conn, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             let mut reader = BufReader::new(conn.try_clone().unwrap());
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -792,7 +777,8 @@ mod tests {
         std::fs::write(dir.path().join("aterm-77.token"), "abcd\n").unwrap();
         let listener = UnixListener::bind(&sock).unwrap();
         let server = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
+            let (mut conn, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             let mut req = Vec::new();
             let _ = conn.read_to_end(&mut req);
             let mut reply = b"OK 24 80\nOK ".to_vec();

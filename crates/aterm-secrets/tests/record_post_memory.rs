@@ -253,7 +253,12 @@ fn post_client(mut stream: TcpStream, wire: Arc<Vec<u8>>) {
 fn connected(fixture: &Fixture) -> (TcpStream, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client = TcpStream::connect_timeout(&listener.local_addr().unwrap(), HANG).unwrap();
-    let (server, _) = listener.accept().unwrap();
+    let (server, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     let wire = Arc::clone(&fixture.wire);
     let reader = std::thread::spawn(move || post_client(client, wire));
     (server, reader)

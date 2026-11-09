@@ -186,12 +186,12 @@ fn a_worlds_heartbeat_waits_the_hang_detector_at_each_member() {
         },
         |_| true,
     );
-    silent
-        .set_nonblocking(true)
-        .expect("poll the member's place");
-    let (mut dial, _) = aterm_spec::wait::within(HANG, POLL_GAP, || silent.accept().ok())
-        .expect("the heartbeat dials the member");
-    dial.set_nonblocking(false).expect("block on the dial");
+    let (mut dial, _) = aterm_uds::accept(
+        &silent,
+        aterm_uds::AcceptWait::Until(Instant::now() + HANG),
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .expect("the heartbeat dials the member");
     let share = PERSONS_HEARTBEAT_ROUND / (HEARTBEAT_MEMBERS as u32 + 1);
     let held = Instant::now() + share + Duration::from_secs(1);
     let mut hello = [0u8; 4096];
@@ -2784,11 +2784,15 @@ mod any_host_walled {
             let thread = {
                 let (asked, stop) = (Arc::clone(&asked), Arc::clone(&stop));
                 std::thread::spawn(move || {
-                    for stream in listener.incoming() {
+                    loop {
                         if stop.load(Ordering::SeqCst) {
                             return;
                         }
-                        if let Ok(stream) = stream {
+                        if let Ok((stream, _)) = aterm_uds::accept(
+                            &listener,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        ) {
                             Self::serve(stream, &asked, &body);
                         }
                     }

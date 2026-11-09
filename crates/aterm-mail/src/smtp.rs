@@ -327,6 +327,7 @@ fn mail_date(seconds: u64) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_uds::{AcceptWait, AcceptedMode};
     #[test]
     fn smtp_submission_and_uncertain_acknowledgement() {
         use std::io::{BufRead, BufReader, Write};
@@ -335,7 +336,9 @@ mod tests {
             let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
             let address = listener.local_addr().unwrap();
             let server = std::thread::spawn(move || {
-                let (socket, _) = listener.accept().unwrap();
+                let (socket, _) =
+                    aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking)
+                        .unwrap();
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(60)))
                     .unwrap();
@@ -456,7 +459,8 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
+            let (socket, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             socket
                 .set_read_timeout(Some(std::time::Duration::from_secs(60)))
                 .unwrap();
@@ -508,7 +512,8 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
-            let (socket, _) = listener.accept().unwrap();
+            let (socket, _) =
+                aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
             let mut io = BufReader::new(socket);
             io.get_mut().write_all(b"220 fixture\r\n").unwrap();
             let mut line = String::new();

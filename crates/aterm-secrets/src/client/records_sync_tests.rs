@@ -88,7 +88,13 @@ impl RecordsHost {
         );
         let stating = Arc::clone(&bound);
         let worker = std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            loop {
+                let stream = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .map(|(stream, _)| stream);
                 if stopping.load(Ordering::SeqCst) {
                     return;
                 }
@@ -1859,13 +1865,15 @@ fn a_whole_repost_carries_complete_records_only() {
 /// the length, and the second, the whole read, once `held` lets it go. Each request line, in
 /// order.
 fn serve_twice(held: &HeldReads, listener: TcpListener, body: &[u8]) -> Vec<String> {
-    listener.set_nonblocking(true).expect("nonblocking");
     let mut lines = Vec::new();
     for read in 0..2 {
-        let mut stream = aterm_spec::wait::until_within(HANG_DETECTOR, "the pass's GET", || {
-            listener.accept().ok().map(|(stream, _)| stream)
-        });
-        stream.set_nonblocking(false).expect("blocking");
+        let mut stream = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Until(std::time::Instant::now() + HANG_DETECTOR),
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("the pass's GET")
+        .0;
         let (line, _) = read_request(&mut stream).expect("a request");
         lines.push(line);
         if read == 0 {

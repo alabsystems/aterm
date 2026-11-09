@@ -1192,7 +1192,11 @@ fn refusing_broker(sock: &str) {
     };
     let listener = harness::kept(UnixListener::bind(sock).expect("bind the refusing broker"));
     std::thread::spawn(move || {
-        while let Ok((c, _)) = listener.accept() {
+        while let Ok((c, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             let mut c = harness::kept(c);
             std::thread::spawn(move || {
                 while let Ok(Some(p)) = read_frame(&mut c) {

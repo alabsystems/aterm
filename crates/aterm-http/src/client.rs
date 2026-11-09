@@ -1651,7 +1651,12 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/request", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream.set_read_timeout(Some(HANG_DETECTOR)).unwrap();
             stream.set_write_timeout(Some(HANG_DETECTOR)).unwrap();
             let body = read_plain_request(&mut stream);
@@ -1667,7 +1672,15 @@ mod tests {
         let endpoint = format!("https://{}/request", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             for _ in 0..2 {
-                drop(listener.accept().unwrap().0);
+                drop(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                );
             }
         });
         let client = Client::new(

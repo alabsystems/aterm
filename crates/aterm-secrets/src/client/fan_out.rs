@@ -559,7 +559,6 @@ mod tests {
     #[test]
     fn a_records_post_past_its_deadline_dials_nothing() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
-        listener.set_nonblocking(true).expect("nonblocking");
         let url = format!("http://{}/v1/alab", listener.local_addr().expect("addr"));
         let past = Instant::now();
         let answered = transport::post_records_answered_until(
@@ -573,7 +572,12 @@ mod tests {
             crate::ErrorKind::TimedOut
         );
         assert!(
-            listener.accept().is_err(),
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .is_err(),
             "a post past its deadline connected"
         );
     }
@@ -656,7 +660,12 @@ mod tests {
             use std::io::{Read, Write};
             let mut heads = Vec::new();
             for _ in 0..times {
-                let (mut stream, _) = listener.accept().expect("accept");
+                let (mut stream, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .expect("accept");
                 stream
                     .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
                     .expect("timeout");

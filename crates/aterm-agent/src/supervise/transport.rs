@@ -469,7 +469,11 @@ mod tests {
             let mut seen = Vec::new();
             let mut replies = replies.into_iter().peekable();
             'conns: loop {
-                let Ok((stream, _)) = listener.accept() else {
+                let Ok((stream, _)) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
                     break;
                 };
                 let mut w = stream.try_clone().expect("clone");
@@ -516,7 +520,11 @@ mod tests {
         let h = std::thread::spawn(move || {
             let mut seen: Vec<(String, String)> = Vec::new();
             for _ in 0..3 {
-                let Ok((stream, _)) = listener.accept() else {
+                let Ok((stream, _)) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
                     break;
                 };
                 let mut w = stream.try_clone().expect("clone");
@@ -679,7 +687,11 @@ mod tests {
         let (parked_tx, parked_rx) = std::sync::mpsc::channel::<()>();
         // The server says when the await reached it, and keeps its end open until the join.
         let h = std::thread::spawn(move || -> std::io::Result<_> {
-            let (s, _) = listener.accept()?;
+            let (s, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )?;
             let mut r = BufReader::new(s.try_clone()?);
             let mut line = String::new();
             loop {
@@ -732,7 +744,12 @@ mod tests {
             Some("tok".to_string()),
         );
         c.connect().expect("dial");
-        let (server, _) = listener.accept().expect("accept");
+        let (server, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         server
             .shutdown(std::net::Shutdown::Write)
             .expect("the server half-closes toward the client");
@@ -785,7 +802,13 @@ mod tests {
             let (seen, stop) = (Arc::clone(&seen), Arc::clone(&stop));
             std::thread::spawn(move || {
                 let mut serving = Vec::new();
-                for stream in listener.incoming() {
+                loop {
+                    let stream = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .map(|(stream, _)| stream);
                     let Ok(stream) = stream else { break };
                     if stop.load(Ordering::SeqCst) {
                         break;

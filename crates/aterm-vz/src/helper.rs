@@ -1575,7 +1575,12 @@ pub fn serve<M: Machine>(
                 // Each connection kept out of children from its creation, its wait holding none
                 // of this process's spawns back (`aterm_uds::accept`).
                 let incoming = std::iter::repeat_with(|| {
-                    aterm_uds::accept(&listener).map(|(stream, _)| stream)
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .map(|(stream, _)| stream)
                 });
                 for (sid, stream) in (1u64..).zip(incoming) {
                     if done.load(Ordering::SeqCst) {

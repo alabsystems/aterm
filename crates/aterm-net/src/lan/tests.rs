@@ -70,7 +70,13 @@ fn completed_exchange_survives_reset_but_never_revives_a_withdrawn_proof() {
         stream
             .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
-        let mut peer = listener.accept().unwrap().0;
+        let mut peer = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap()
+        .0;
         peer.write_all(b"completed").unwrap();
         let mut bytes = [0; 9];
         stream.read_exact(&mut bytes).unwrap();
@@ -453,7 +459,17 @@ fn loopback_is_explicit_and_the_witness_owns_its_exact_connection() {
     let peer = listener.local_addr().unwrap();
     assert!(Connection::connect(peer, Scope::Lan, Duration::from_secs(1)).is_err());
     let connected = Connection::connect(peer, Scope::Loopback, Duration::from_secs(1)).unwrap();
-    let accepted = Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap();
+    let accepted = Connection::admit(
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap()
+        .0,
+        Scope::Loopback,
+    )
+    .unwrap();
     assert_eq!(
         connected.peer_addr().unwrap(),
         accepted.local_addr().unwrap()
@@ -490,7 +506,12 @@ fn nondefault_socket_routing_cannot_reuse_default_route_evidence() {
     use std::os::fd::AsRawFd;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let _accepted = listener.accept().unwrap();
+    let _accepted = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     let value = 1_i32;
     // SAFETY: value is a readable integer socket option on this owned live fd.
     assert_eq!(
@@ -517,7 +538,17 @@ fn ipv6_loopback_is_local_without_a_fake_lan_zone() {
         Duration::from_secs(1),
     )
     .unwrap();
-    let accepted = Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap();
+    let accepted = Connection::admit(
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap()
+        .0,
+        Scope::Loopback,
+    )
+    .unwrap();
     connection.proof.recheck().unwrap();
     accepted.proof.recheck().unwrap();
     assert!(!unambiguous("[2001:db8::1%3]:80".parse().unwrap()));

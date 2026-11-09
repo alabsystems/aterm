@@ -37,8 +37,14 @@ impl NamingStatus {
         }
     }
 
+    /// Offer an explicit retry for pending or unread publication. Its execution
+    /// rechecks the current policy and canonical number.
     pub(crate) fn retry(&self) -> bool {
-        matches!(&self.publication, Ok(publish::Publication::Owed(owed)) if !owed.is_empty())
+        match &self.publication {
+            Ok(publish::Publication::Owed(owed)) => !owed.is_empty(),
+            Err(_) => true,
+            Ok(_) => false,
+        }
     }
 
     pub(crate) fn text(&self, number: &str) -> String {

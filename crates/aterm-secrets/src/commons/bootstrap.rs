@@ -918,6 +918,24 @@ pub fn writer_here(paths: &Paths) -> bool {
     )
 }
 
+/// What a home that kept its Commons claim and lost its `commons` folder (a partial reset) is
+/// refused with: custody to recover, never one a fresh open makes again.
+const MISSING_COMMONS_DIRECTORY: &str =
+    "established Commons directory is missing; recovery is required";
+
+/// Whether this installation has opened Commons control here: it keeps a claim, a pin, or control
+/// or application history, or its `commons` is a symlink, whose contents cannot be told from here
+/// ([`retains_control`]). `false` on a Mac whose vault names Commons but which no Commons open has
+/// reached yet (an aterm window, `aterm node serve` or the Commons runtime makes the custody when
+/// it first opens Commons here); a device key alone is no custody. Reads names only and creates
+/// nothing.
+///
+/// # Errors
+/// One of those names could not be read.
+pub fn custody_opened(paths: &Paths) -> Result<bool> {
+    retains_control(paths)
+}
+
 fn is_transient_vault_revalidation(error: &Error) -> bool {
     matches!(
         error.kind(),
@@ -1106,12 +1124,25 @@ impl Bootstrap {
     /// within the same deadline; it never waits on a vault writer while holding custody.
     ///
     /// # Errors
-    /// The authenticated vault, existing private custody, descriptor or current control
-    /// history is unavailable, changed, incomplete or busy before the shared deadline.
+    /// This installation has opened no Commons custody yet ([`custody_opened`]), it kept its claim
+    /// and lost its `commons` folder (recovery is required), or the authenticated vault, existing
+    /// private custody, descriptor or current control history is unavailable, changed, incomplete
+    /// or busy before the shared deadline.
     pub fn established_with_journal_until(
         paths: &Paths,
         deadline: std::time::Instant,
     ) -> Result<(Self, Journal)> {
+        if !retains_control(paths)? {
+            return Err(Error::new(
+                "this Mac has opened no Commons custody yet: an aterm window, `aterm node serve` \
+                 or the Commons runtime opens it",
+            ));
+        }
+        if fsx::kind(&paths.dir.join("commons.claim"))? != fsx::Kind::Missing
+            && fsx::kind(&paths.dir.join("commons"))? == fsx::Kind::Missing
+        {
+            return Err(Error::new(MISSING_COMMONS_DIRECTORY));
+        }
         established_files(paths)?;
         loop {
             let snapshot = match super::observe_until(paths, deadline)? {
@@ -1391,9 +1422,7 @@ impl Bootstrap {
             ));
         }
         if retained.is_some() && fsx::kind(&dir)? == fsx::Kind::Missing {
-            return Err(Error::new(
-                "established Commons directory is missing; recovery is required",
-            ));
+            return Err(Error::new(MISSING_COMMONS_DIRECTORY));
         }
         if observe_only {
             aterm_uds::private_file::check_private_dir(&dir)?;

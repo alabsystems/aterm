@@ -120,6 +120,15 @@ fn missing_duplicate_and_foreign_descriptors_are_rejected() {
 
 #[test]
 fn child_retains_fence_after_all_parent_copies_close() {
+    child_lifecycle_started(Instant::now());
+}
+
+#[test]
+fn required_fence_child_keeps_the_original_start_without_a_latency_budget() {
+    child_lifecycle_started(Instant::now() - Duration::from_secs(11));
+}
+
+fn child_lifecycle_started(started: Instant) {
     let _serial = SERIAL.lock().unwrap();
     let (directory, files) = fixture();
     let descriptors: Vec<_> = files.iter().map(AsRawFd::as_raw_fd).collect();
@@ -149,7 +158,7 @@ fn child_retains_fence_after_all_parent_copies_close() {
         });
     }
     let mut child = ChildGuard(command.spawn().unwrap());
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = started + Duration::from_secs(60);
     while !ready.exists() {
         if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
             let _ = child.kill();

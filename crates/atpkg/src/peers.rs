@@ -1193,9 +1193,9 @@ pub fn serve(
     Ok(())
 }
 
-/// Bind `listen`, non-blocking and kept out of every child, then make `units/` (sweeping what
-/// no build holds): a store whose bind fails makes nothing. A store not made yet is left to
-/// the pass that makes it, and a private aterm binds none of the person's ports
+/// Bind `listen` and keep it out of every child, then make `units/` (sweeping what no build
+/// holds): a store whose bind fails makes nothing. A store not made yet is left to the pass
+/// that makes it, and a private aterm binds none of the person's ports
 /// ([`aterm_types::reach::check`]).
 fn open(layout: &Layout, listen: SocketAddr) -> io::Result<TcpListener> {
     aterm_types::reach::check(Reach::Listen(listen))?;
@@ -1206,7 +1206,6 @@ fn open(layout: &Layout, listen: SocketAddr) -> io::Result<TcpListener> {
         ));
     }
     let listener = aterm_uds::kept_out(|| TcpListener::bind(listen))?;
-    listener.set_nonblocking(true)?;
     let units = units_dir(layout);
     crate::platform::make_dirs_born(&units, 0o755)?;
     sweep(&units);
@@ -1251,7 +1250,11 @@ fn answer_until(
     let units = units_dir(layout);
     let slots = Arc::new(Slots::default());
     while running.load(Ordering::Acquire) && !turned_off(layout) {
-        let (conn, from) = match aterm_uds::kept_out(|| listener.accept()) {
+        let (conn, from) = match aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok(accepted) => accepted,
             Err(_) => {
                 std::thread::sleep(ACCEPT_POLL);
@@ -1259,8 +1262,7 @@ fn answer_until(
             }
         };
         let ip = from.ip().to_canonical();
-        // An accepted socket takes the listener's non-blocking mode on BSD and macOS.
-        if !admits(ip) || conn.set_nonblocking(false).is_err() || !slots.take(ip) {
+        if !admits(ip) || !slots.take(ip) {
             continue;
         }
         let (dir, held) = (units.clone(), Arc::clone(&slots));

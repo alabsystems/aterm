@@ -90,11 +90,15 @@ impl Fake {
         let thread = {
             let (state, stop, origins) = (Arc::clone(&state), Arc::clone(&stop), origins.clone());
             std::thread::spawn(move || {
-                for stream in listener.incoming() {
+                loop {
                     if stop.load(Ordering::SeqCst) {
                         break;
                     }
-                    if let Ok(stream) = stream {
+                    if let Ok((stream, _)) = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) {
                         serve(stream, &state, &origins, &public);
                     }
                 }

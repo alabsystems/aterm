@@ -1944,7 +1944,12 @@ mod discovery_proof_tests {
             let node = server.clone();
             let (done, waited) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {
-                let (tcp, _) = listener.accept().unwrap();
+                let (tcp, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap();
                 aterm_net::fleet::server_handshake_as(
                     tcp,
                     &secret_server,

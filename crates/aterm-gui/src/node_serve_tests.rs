@@ -800,7 +800,14 @@ impl MemberPlace {
     /// Once the heartbeat's dial waits here, it is hung up on, as by a member gone dark.
     fn dialed(self) {
         until_dialed(&self.0);
-        drop(self.0.accept().expect("take the heartbeat's dial"));
+        drop(
+            aterm_uds::accept(
+                &self.0,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("take the heartbeat's dial"),
+        );
     }
 }
 

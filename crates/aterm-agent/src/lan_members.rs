@@ -1090,7 +1090,12 @@ mod tests {
             // Prove the actual key twice: a copied or forged discovery claim
             // must not pass the ordinary membership-bound handshake.
             for _ in 0..2 {
-                let (tcp, _) = listener.accept().unwrap();
+                let (tcp, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap();
                 aterm_net::fleet::server_handshake_as(
                     tcp,
                     &server_secret,

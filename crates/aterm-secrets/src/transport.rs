@@ -3156,7 +3156,12 @@ mod tests {
         let server = std::thread::spawn(move || {
             let mut heads = Vec::new();
             for response in responses {
-                let (mut stream, _) = listener.accept().expect("accept");
+                let (mut stream, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .expect("accept");
                 stream
                     .set_read_timeout(Some(HANG_DETECTOR))
                     .expect("timeout");
@@ -3707,7 +3712,12 @@ mod tests {
         let path = root.path().join("broker.sock");
         let listener = aterm_uds::CtlListener::bind(&path).expect("bind");
         let served = std::thread::spawn(move || {
-            let (stream, _) = aterm_uds::accept(&listener).expect("accept");
+            let (stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             wire::send(
                 &stream,
                 &Frame::Hello {
@@ -3786,8 +3796,15 @@ mod tests {
         .expect_err("no broker");
         let words = aterm_uds::lan::Unavailable::NotInstalled.to_string();
         assert!(failed.0.contains(&words), "{failed:?}");
-        listener.set_nonblocking(true).expect("nonblocking");
-        assert!(listener.accept().is_err(), "nothing connected");
+        assert!(
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .is_err(),
+            "nothing connected"
+        );
         drop(listener);
         let (url, server) = stub(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec());
         get_within(&url, HANG_DETECTOR).expect("by address");

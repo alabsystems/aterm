@@ -440,7 +440,12 @@ mod tests {
         let (mut client, reached) =
             dial_any(&[addr], Instant::now() + MUST_HAPPEN, options).unwrap();
         assert_eq!(reached, addr);
-        let (mut server, _) = listener.accept().unwrap();
+        let (mut server, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .unwrap();
         server.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
         client.write_all(b"x").unwrap();
         let mut byte = [0];

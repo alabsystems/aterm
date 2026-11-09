@@ -114,7 +114,17 @@ impl Lab {
         thread::scope(|s| {
             let server = s.spawn(|| {
                 owner.exchange(
-                    Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                    Connection::admit(
+                        aterm_uds::accept(
+                            &listener,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        )
+                        .unwrap()
+                        .0,
+                        Scope::Loopback,
+                    )
+                    .unwrap(),
                     Side::Responder,
                     &mut Repair::default(),
                 )
@@ -246,7 +256,17 @@ fn frontier_large_log_enrollment_reopens_selected_witness() {
     thread::scope(|scope| {
         let server = scope.spawn(|| {
             owner.exchange(
-                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    Scope::Loopback,
+                )
+                .unwrap(),
                 Side::Responder,
                 &mut Repair::default(),
             )

@@ -165,6 +165,56 @@ pub fn generator_args() -> Vec<&'static str> {
     args
 }
 
+/// The candidate and compiler identity of the GUI library test executable that the tree compile
+/// publishes atomically. The release build waits on this index before it considers compiling the
+/// fixture target itself.
+pub(crate) struct GeneratorIndex {
+    tree: PathBuf,
+    path: PathBuf,
+    tree_id: String,
+    compiler: String,
+}
+
+impl GeneratorIndex {
+    /// Locate the test-executable index for `tree` and bind its candidate/compiler identity once.
+    ///
+    /// # Errors
+    /// The candidate is dirty or cannot be identified, or the compiler cannot report its identity.
+    pub(crate) fn new(targo: &Path, tree: &Path) -> Result<Self> {
+        let tree = aterm_verify::physical(tree);
+        let (target, _) = crate::release_steps::verify_layout(&tree);
+        let (tree_id, compiler) =
+            aterm_verify::test_index::identities(&tree, targo).map_err(|e| {
+                Error::new(format!(
+                    "handoff fixtures: cannot identify candidate {}: {e}",
+                    tree.display()
+                ))
+            })?;
+        Ok(Self {
+            tree,
+            path: target.join("verify/test-executables.json"),
+            tree_id,
+            compiler,
+        })
+    }
+
+    fn selected(
+        &self,
+        index: &aterm_verify::test_index::Index,
+    ) -> Option<aterm_verify::test_index::Entry> {
+        index
+            .fixture_binary(&self.tree_id, &self.compiler, &self.tree)
+            .cloned()
+    }
+
+    /// Whether the tree compile has published the exact, still-byte-identical generator binary.
+    pub(crate) fn ready(&self) -> bool {
+        aterm_verify::test_index::Index::read(&self.path)
+            .and_then(|index| self.selected(&index))
+            .is_some()
+    }
+}
+
 /// macOS assesses a first exec by path, even if a later compiler would replace its bytes.
 fn execution_hold(root: &Path, binary: &Path) -> PathBuf {
     let key = aterm_digest::Sha256::digest(binary.as_os_str().as_encoded_bytes());
@@ -223,13 +273,8 @@ pub fn stage(
     let dir = at.join(pins.tag());
     fs::create_dir_all(&dir).map_err(|e| io("cannot create", &dir, e))?;
     let (target, layout) = crate::release_steps::verify_layout(tree);
-    let index_path = target.join("verify/test-executables.json");
-    let (tree_id, compiler) = aterm_verify::test_index::identities(tree, targo)
-        .map_err(|e| io("cannot identify candidate", tree, e))?;
-    let select = |index: &aterm_verify::test_index::Index| {
-        index.fixture_binary(&tree_id, &compiler, tree).cloned()
-    };
-    let previous = aterm_verify::test_index::Index::read(&index_path);
+    let generator_index = GeneratorIndex::new(targo, tree)?;
+    let previous = aterm_verify::test_index::Index::read(&generator_index.path);
     if let Some(previous) = &previous {
         for entry in &previous.binaries {
             if entry.kind == "lib"
@@ -241,7 +286,7 @@ pub fn stage(
             }
         }
     }
-    let entry = match previous.and_then(|i| select(&i)) {
+    let entry = match previous.and_then(|i| generator_index.selected(&i)) {
         Some(entry) => entry,
         None => {
             let mut compile = crate::gates::aterm_gui_lib_compile(targo, tree, &target);
@@ -256,15 +301,15 @@ pub fn stage(
                 )));
             }
             let index = aterm_verify::test_index::Index::from_messages(
-                tree_id.clone(),
-                compiler.clone(),
+                generator_index.tree_id.clone(),
+                generator_index.compiler.clone(),
                 &String::from_utf8_lossy(&output.stdout),
             )
-            .map_err(|e| io("cannot index generator", &index_path, e))?;
-            let entry = select(&index).ok_or_else(|| Error::new("handoff fixtures: compile did not report the candidate's GUI library test binary"))?;
+            .map_err(|e| io("cannot index generator", &generator_index.path, e))?;
+            let entry = generator_index.selected(&index).ok_or_else(|| Error::new("handoff fixtures: compile did not report the candidate's GUI library test binary"))?;
             index
-                .write(&index_path)
-                .map_err(|e| io("cannot save generator index", &index_path, e))?;
+                .write(&generator_index.path)
+                .map_err(|e| io("cannot save generator index", &generator_index.path, e))?;
             entry
         }
     };

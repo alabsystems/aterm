@@ -140,12 +140,16 @@ fn hand_cutter_with_proof(
     };
 }
 
-fn detach(cmd: &mut Command) {
-    crate::credential_wait::ask_no_one(cmd);
+fn detach_process(cmd: &mut Command) {
     #[cfg(unix)]
     // Detached step groups receive the cutter's forwarded stops. They must not inherit a
     // background shell's ignored keys, which would disable those stops before verify starts.
     cmd.setsid(true).default_signals();
+}
+
+fn detach(cmd: &mut Command) {
+    crate::credential_wait::ask_no_one(cmd);
+    detach_process(cmd);
 }
 
 /// Run the anonymous appcast transport through a release step's child launcher. Keeping this
@@ -252,6 +256,26 @@ pub(crate) fn release_state(home: &Path) -> PathBuf {
         .join(RELEASE_STATE)
 }
 
+type VerifyHalf = fn(
+    &Real,
+    &Candidate,
+    &Prover,
+    &crate::check_record::VerifyRun,
+    Option<&Artifact>,
+    &BranchStop,
+) -> Result<Ran, Refusal>;
+type BuildRun =
+    fn(&Real, &Candidate, &Reservation, &Prover, &Path, &BranchStop) -> Result<Artifact, Refusal>;
+type StageFixturesRun = fn(
+    &Real,
+    Step,
+    &Candidate,
+    &Reservation,
+    &Prover,
+    &Path,
+    Option<&BranchStop>,
+) -> Result<String, Refusal>;
+
 /// The real backend.
 pub struct Real {
     prefreeze_claim: Option<aterm_capacity::Claim>,
@@ -261,6 +285,15 @@ pub struct Real {
     pub(crate) arm_inputs: fn(&Path, Option<&Path>),
     /// The kept seal each child is handed ([`crate::build_inputs::handed_path`]).
     pub(crate) handed_inputs: fn() -> Option<PathBuf>,
+    /// Injectable boundary for the tree-half run. Production and tests both enter it through
+    /// [`RealBranches::verify`], so the handoff completion around that call is mutation-covered.
+    verify_half_op: VerifyHalf,
+    /// Injectable build/fixture boundaries. The production [`Real::build_branch`] owns their
+    /// ordering; tests replace only the effects, not that orchestration.
+    build_run_op: BuildRun,
+    await_fixture_index_op:
+        fn(&Real, &Candidate, &Prover, &TreeIndexHandoff, &BranchStop) -> Result<(), Refusal>,
+    stage_fixtures_run_op: StageFixturesRun,
     repo: PathBuf,
     home: PathBuf,
     /// The publication engine this release is named (`--engine`, else the source a release that
@@ -455,6 +488,162 @@ pub(crate) fn export_share(slots: u32, export: bool) -> u32 {
 struct RealBranches<'a> {
     real: &'a Real,
     export: std::sync::Mutex<Vec<aterm_capacity::Token<'a>>>,
+    tree_index: TreeIndexHandoff,
+}
+
+/// The tree branch's one-way handoff to the fixture consumer. The index file itself carries the
+/// candidate, compiler and executable content identity; these bits distinguish "not written yet"
+/// from "the tree ended without usable evidence" without making the build compile beside it.
+#[derive(Default)]
+struct TreeIndexHandoff {
+    expected: std::sync::atomic::AtomicBool,
+    completion: std::sync::atomic::AtomicU8,
+    bundle_finished: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+enum TreeIndexCompletion {
+    #[default]
+    Pending = 0,
+    /// The tree ended without a red; an absent index may use the bounded fallback compile.
+    Compile = 1,
+    /// The tree itself went red (or panicked). No fixture work may start on its behalf.
+    Stopped = 2,
+}
+
+impl TreeIndexHandoff {
+    fn expect(&self) {
+        self.expected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn finish(&self, completion: TreeIndexCompletion) {
+        debug_assert_ne!(completion, TreeIndexCompletion::Pending);
+        self.completion
+            .store(completion as u8, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn expected(&self) -> bool {
+        self.expected.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn completion(&self) -> TreeIndexCompletion {
+        match self.completion.load(std::sync::atomic::Ordering::SeqCst) {
+            1 => TreeIndexCompletion::Compile,
+            2 => TreeIndexCompletion::Stopped,
+            _ => TreeIndexCompletion::Pending,
+        }
+    }
+
+    fn bundle_finished(&self) {
+        self.bundle_finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn bundle_is_finished(&self) -> bool {
+        self.bundle_finished
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Run the optional product build and publish its completion to tree admission. The handoff
+/// belongs to the operation which produces `artifact`, so an all-Fresh build cannot complete
+/// between observations without releasing the tree branch. A failed or absent build publishes
+/// nothing.
+fn build_artifact_with_handoff<T, E>(
+    bundle: bool,
+    tree_index: &TreeIndexHandoff,
+    build: impl FnOnce() -> Result<T, E>,
+) -> Option<Result<T, E>> {
+    let artifact = bundle.then(build);
+    if artifact.as_ref().is_some_and(Result::is_ok) {
+        tree_index.bundle_finished();
+    }
+    artifact
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeIndexAnswer {
+    Ready,
+    Compile,
+    Stopped,
+}
+
+/// Wait for the tree compile's atomically replaced index. `pause` is injected so the ordering
+/// control is deterministic; production yields briefly while the verifier child compiles.
+fn await_tree_index(
+    handoff: &TreeIndexHandoff,
+    mut ready: impl FnMut() -> bool,
+    mut stopped: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
+) -> TreeIndexAnswer {
+    if !handoff.expected() {
+        return TreeIndexAnswer::Compile;
+    }
+    loop {
+        if stopped() {
+            return TreeIndexAnswer::Stopped;
+        }
+        match handoff.completion() {
+            TreeIndexCompletion::Stopped => return TreeIndexAnswer::Stopped,
+            TreeIndexCompletion::Compile => {
+                return if ready() {
+                    TreeIndexAnswer::Ready
+                } else {
+                    TreeIndexAnswer::Compile
+                };
+            }
+            TreeIndexCompletion::Pending if ready() => return TreeIndexAnswer::Ready,
+            TreeIndexCompletion::Pending => {}
+        }
+        pause();
+    }
+}
+
+/// Publish the tree's outcome even if its verifier path panics. A panic is a red in the qualify
+/// graph, so the conservative default forbids fallback fixture work.
+struct FinishTreeIndex<'a> {
+    handoff: &'a TreeIndexHandoff,
+    completion: TreeIndexCompletion,
+}
+
+impl<'a> FinishTreeIndex<'a> {
+    fn new(handoff: &'a TreeIndexHandoff) -> Self {
+        Self {
+            handoff,
+            completion: TreeIndexCompletion::Stopped,
+        }
+    }
+
+    fn observed(&mut self, result: &Result<Ran, Refusal>, stop: &BranchStop) {
+        self.completion = if stop.fired()
+            || interrupt::caught().is_some()
+            || matches!(result, Ok(ran) if ran.code == 1)
+            || matches!(result, Err(refusal) if !refusal.could_not_run)
+        {
+            TreeIndexCompletion::Stopped
+        } else {
+            TreeIndexCompletion::Compile
+        };
+    }
+}
+
+impl Drop for FinishTreeIndex<'_> {
+    fn drop(&mut self) {
+        self.handoff.finish(self.completion);
+    }
+}
+
+fn with_tree_index_completion(
+    handoff: &TreeIndexHandoff,
+    stop: &BranchStop,
+    run: impl FnOnce() -> Result<Ran, Refusal>,
+) -> Result<Ran, Refusal> {
+    let mut finished = FinishTreeIndex::new(handoff);
+    let result = run();
+    finished.observed(&result, stop);
+    result
 }
 
 impl Branches for RealBranches<'_> {
@@ -481,10 +670,17 @@ impl Branches for RealBranches<'_> {
         self.real.side_log(Step::Qualify, branch.name())
     }
 
+    fn expect_tree_index(&self) {
+        self.tree_index.expect();
+    }
+
     fn build_admitted(&self, ended: &dyn Fn() -> bool) {
         let me = std::process::id();
         while !ended() {
-            if interrupt::caught().is_some() || slices_hold_memory(me) {
+            if interrupt::caught().is_some()
+                || slices_hold_memory(me)
+                || self.tree_index.bundle_is_finished()
+            {
                 return;
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -515,7 +711,8 @@ impl Branches for RealBranches<'_> {
         work: BuildWork,
         stop: &BranchStop,
     ) -> Built {
-        self.real.build_branch(c, reserved, prover, work, stop)
+        self.real
+            .build_branch(c, reserved, prover, work, &self.tree_index, stop)
     }
 
     fn verify(
@@ -526,7 +723,13 @@ impl Branches for RealBranches<'_> {
         artifact: Option<&Artifact>,
         stop: &BranchStop,
     ) -> Result<Ran, Refusal> {
-        self.real.verify_half(c, prover, run, artifact, stop)
+        if run.half == crate::check_record::Half::Tree {
+            with_tree_index_completion(&self.tree_index, stop, || {
+                (self.real.verify_half_op)(self.real, c, prover, run, artifact, stop)
+            })
+        } else {
+            (self.real.verify_half_op)(self.real, c, prover, run, artifact, stop)
+        }
     }
 
     fn side_log(&self, side: Side) -> PathBuf {
@@ -717,6 +920,10 @@ impl Real {
             build_inputs: crate::build_inputs::current,
             arm_inputs: crate::build_inputs::arm,
             handed_inputs: crate::build_inputs::handed_path,
+            verify_half_op: Real::verify_half,
+            build_run_op: Real::build_run,
+            await_fixture_index_op: Real::await_fixture_index,
+            stage_fixtures_run_op: Real::stage_fixtures_run_with_stop,
             repo: repo.to_path_buf(),
             home,
             engine_source,
@@ -875,9 +1082,9 @@ impl Real {
                 "not started: another branch went red",
             ));
         }
-        self.apply_prerequisites(cmd)
+        self.finalize_spawn_environment(cmd)
             .map_err(std::io::Error::other)?;
-        detach(cmd);
+        detach_process(cmd);
         let child = cmd.spawn()?;
         let running = match stop {
             Some((stop, sig)) => interrupt::Running::enter_stoppable(child.id(), stop.clone(), sig),
@@ -1055,6 +1262,14 @@ impl Real {
         Ok(())
     }
 
+    /// Apply every environment mutation made at the last boundary before a release child
+    /// spawns. Content evidence calls this same finalizer on a one-use command mirror.
+    fn finalize_spawn_environment(&self, cmd: &mut Command) -> Result<(), String> {
+        self.apply_prerequisites(cmd)?;
+        crate::credential_wait::ask_no_one(cmd);
+        Ok(())
+    }
+
     fn engine_prefix_len(&self) -> usize {
         self.prerequisites
             .as_ref()
@@ -1065,15 +1280,17 @@ impl Real {
         self.configure_child(self.scrubbed(program), prover)
     }
 
-    /// The release's own tree fills idle cores behind its slices. Keep this relative to
-    /// the held Release pool: a global Background claim is cancellable by that same release.
+    /// The release's own tree fills idle cores behind its slices. Tree verification is reached
+    /// only through the qualify graph, but its content plan is made before that graph installs
+    /// the pool. Select the invocation from the half alone so the pre-pool plan predicts the exact
+    /// child that later runs. A global Background claim would be cancellable by this release.
     fn verifier_child(
         &self,
         program: &Path,
         prover: Option<&Prover>,
         half: crate::check_record::Half,
     ) -> Command {
-        let lower = self.pool.is_some() && half == crate::check_record::Half::Tree;
+        let lower = half == crate::check_record::Half::Tree;
         let (program, prefix) = crate::qualify_pilot::invocation(program, lower);
         let mut command = self.child(program, prover);
         command.args(prefix);
@@ -3217,6 +3434,22 @@ impl Real {
         prover: &Prover,
         log: &Path,
     ) -> Result<String, Refusal> {
+        self.stage_fixtures_run_with_stop(step, c, reserved, prover, log, None)
+    }
+
+    /// [`stage_fixtures_run`], with the qualify build branch's stop attached to every fallback
+    /// compiler or generator child. A graph verdict which stops Build therefore ends fixture work
+    /// already in flight. An eligible test-execution red deliberately retains Build and does not
+    /// fire this stop.
+    fn stage_fixtures_run_with_stop(
+        &self,
+        step: Step,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+        log: &Path,
+        stop: Option<&BranchStop>,
+    ) -> Result<String, Refusal> {
         // The generator compiles the clone's working tree, so that tree must be R's.
         if let Some(off) = self.off_tree(&c.commit) {
             return Err(Refusal::new(
@@ -3230,7 +3463,7 @@ impl Real {
         }
         let pins = fixture_pins(c, reserved);
         let root = fixture_root(&self.repo)?;
-        let mut run = |cmd: &mut Command| self.captured(step, prover, log, cmd);
+        let mut run = |cmd: &mut Command| self.captured_with_stop(step, prover, log, cmd, stop);
         crate::fixtures::stage(
             &prover.bin.join("targo"),
             &self.repo,
@@ -3239,20 +3472,37 @@ impl Real {
             &mut run,
         )
         .map(|staged| staged.words(&pins))
-        .map_err(|e| {
-            let text = e.to_string();
-            Refusal::new(
-                text.lines().next().unwrap_or("").to_string(),
-                format!(
-                    "fix it (targo --unverified test -p aterm-gui --lib -- {} with the pins {} \
-                     names): {}",
-                    crate::fixtures::generator_args().join(" "),
-                    crate::gates::HANDOFF_FIXTURE_README,
-                    crate::release::fix_remedy(&c.commit)
-                ),
+        .map_err(|e| fixture_refusal(c, &e.to_string()))
+    }
+
+    /// When this graph runs the tree half, consume the executable index that compile publishes
+    /// before [`stage_fixtures_run`] may choose its fallback compile. A stopped sibling starts no
+    /// new fixture work; a tree that ended without usable evidence permits the bounded fallback.
+    fn await_fixture_index(
+        &self,
+        c: &Candidate,
+        prover: &Prover,
+        handoff: &TreeIndexHandoff,
+        stop: &BranchStop,
+    ) -> Result<(), Refusal> {
+        if !handoff.expected() {
+            return Ok(());
+        }
+        let index = crate::fixtures::GeneratorIndex::new(&prover.bin.join("targo"), &self.repo)
+            .map_err(|e| fixture_refusal(c, &e.to_string()))?;
+        match await_tree_index(
+            handoff,
+            || index.ready(),
+            || stop.fired() || interrupt::caught().is_some(),
+            || std::thread::sleep(std::time::Duration::from_millis(250)),
+        ) {
+            TreeIndexAnswer::Ready | TreeIndexAnswer::Compile => Ok(()),
+            TreeIndexAnswer::Stopped => Err(Refusal::new(
+                "the handoff fixtures stopped before the tree compile supplied their executable",
+                format!("run {RELEASE_COMMAND} again; the other branch's verdict stands"),
             )
-            .detail(text.lines().skip(1).take(8).map(str::to_string))
-        })
+            .could_not_run()),
+        }
     }
 
     /// `verify release` of `run`'s half in the clone at R ([`Branches::verify`]): the tree's in
@@ -3320,22 +3570,69 @@ impl Real {
         })?;
         let mut cmd = self.verifier_child(&frozen.verify.path, Some(prover), run.half);
         self.hand_pool(&mut cmd, true)?;
+        // `spawn_stoppable` applies the signed prerequisite environment at the last boundary.
+        // Build an identical one-use mirror and finalize that mutation now, so content evidence
+        // binds the effective verifier environment without applying PATH prepends twice to the
+        // command which will actually spawn.
+        let content_plan = self
+            .check_content_context(
+                &frozen.verify.path,
+                &frozen.set_sha256,
+                &seal,
+                prover,
+                run.half,
+            )
+            .and_then(|context| crate::check_content::plan(&self.git(), &c.commit, &context))
+            .ok();
+        let item_context = crate::check_content::item_context(&frozen.set_sha256, &seal);
         cmd.arg("release").arg(run.half.flag());
+        if run
+            .checks
+            .iter()
+            .any(|check| matches!(check.as_str(), "test" | "lint"))
+        {
+            cmd.arg("--carry-context").arg(&item_context);
+        }
         if run.strict_subset() {
             cmd.arg("--checks").arg(run.checks.join(","));
         }
         if !run.passed_binaries.is_empty() {
             let path = side("passed-binaries");
-            let mut text = String::new();
-            for (spec, sha256) in &run.passed_binaries {
-                text.push_str(sha256);
-                text.push(' ');
-                text.push_str(spec);
-                text.push('\n');
+            let mut proofs = aterm_verify::testrun::Passed::new();
+            for binary in &run.passed_binaries {
+                if let Some(proof) = binary.proof() {
+                    proofs.insert(proof.spec.clone(), proof);
+                }
             }
+            let text = aterm_verify::testrun::encode_passed(&proofs).map_err(|e| {
+                Refusal::new(
+                    format!("cannot encode prior test-binary content proofs: {e}"),
+                    format!("remove {}, then {RELEASE_COMMAND}", path.display()),
+                )
+                .could_not_run()
+            })?;
             crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o600)
                 .map_err(|e| cannot(&path, e))?;
             cmd.arg("--passed-binaries").arg(&path);
+        }
+        if !run.passed_lint_packages.is_empty() {
+            let path = side("passed-lint-packages");
+            let mut proofs = aterm_verify::lint_content::Passed::new();
+            for package in &run.passed_lint_packages {
+                if let Some(proof) = package.proof() {
+                    proofs.insert(proof.spec.clone(), proof);
+                }
+            }
+            let text = aterm_verify::lint_content::encode_passed(&proofs).map_err(|error| {
+                Refusal::new(
+                    format!("cannot encode prior lint-package content proofs: {error}"),
+                    format!("remove {}, then {RELEASE_COMMAND}", path.display()),
+                )
+                .could_not_run()
+            })?;
+            crate::durable::write_atomic_durable(&path, text.as_bytes(), 0o600)
+                .map_err(|error| cannot(&path, error))?;
+            cmd.arg("--passed-lint-packages").arg(&path);
         }
         // The records are read from verify's own events file, which no child and no other writer
         // shares, never from its output; it starts empty, so it holds this run's alone.
@@ -3369,6 +3666,7 @@ impl Real {
             log: &log,
             run: &run_id,
             asked: &run.checks,
+            content: content_plan.as_ref(),
         };
         // From here until every FAIL it shows is kept, the run reads as a FAIL of R's tree.
         crate::check_record::begin_run(&root, &facts).map_err(|e| {
@@ -3473,16 +3771,27 @@ impl Real {
         reserved: &Reservation,
         prover: &Prover,
         work: BuildWork,
+        tree_index: &TreeIndexHandoff,
         stop: &BranchStop,
     ) -> Built {
         let log = self.side_log(Step::Qualify, Branch::Build.name());
-        let artifact = work
-            .bundle
-            .then(|| self.build_run(c, reserved, prover, &log, stop));
+        let artifact = build_artifact_with_handoff(work.bundle, tree_index, || {
+            (self.build_run_op)(self, c, reserved, prover, &log, stop)
+        });
         let built = artifact.as_ref().is_none_or(Result::is_ok);
         let fixtures = (work.fixtures && built && !stop.fired()).then(|| {
             let log = self.side_log(Step::Qualify, "build-fixtures");
-            self.stage_fixtures_run(Step::Qualify, c, reserved, prover, &log)
+            (self.await_fixture_index_op)(self, c, prover, tree_index, stop).and_then(|()| {
+                (self.stage_fixtures_run_op)(
+                    self,
+                    Step::Qualify,
+                    c,
+                    reserved,
+                    prover,
+                    &log,
+                    Some(stop),
+                )
+            })
         });
         Built { artifact, fixtures }
     }
@@ -4302,6 +4611,20 @@ fn fixture_root(repo: &Path) -> Result<PathBuf, Refusal> {
             )
             .could_not_run()
         })
+}
+
+fn fixture_refusal(c: &Candidate, text: &str) -> Refusal {
+    Refusal::new(
+        text.lines().next().unwrap_or("").to_string(),
+        format!(
+            "fix it (targo --unverified test -p aterm-gui --lib -- {} with the pins {} \
+             names): {}",
+            crate::fixtures::generator_args().join(" "),
+            crate::gates::HANDOFF_FIXTURE_README,
+            crate::release::fix_remedy(&c.commit)
+        ),
+    )
+    .detail(text.lines().skip(1).take(8).map(str::to_string))
 }
 
 fn cut_refusal(gate: &str, why: &str) -> Refusal {
@@ -5557,6 +5880,87 @@ fn hms_local(epoch: u64, offset_at: impl FnOnce(i64) -> Option<i64>) -> String {
         local % 3600 / 60,
         local % 60
     )
+}
+
+impl Real {
+    /// The head immediately before `commit` on this release's line. A base has none: content
+    /// verdicts cross only a fix hop, never into a newly selected line.
+    fn previous_line_head(&self, commit: &str) -> Option<String> {
+        let journal =
+            crate::release::Journal::load(&self.release.join(crate::release::JOURNAL_FILE))
+                .ok()
+                .flatten()?;
+        let line = journal.line();
+        let at = line.hops.iter().position(|hop| hop.commit == commit)?;
+        Some(if at == 0 {
+            line.base
+        } else {
+            line.hops[at - 1].commit.clone()
+        })
+    }
+
+    /// The finalized verifier command context used both before and inside qualify. The actual
+    /// child receives the same prerequisite mutation once in `spawn_stoppable`; this mirror
+    /// receives it once before hashing, so evidence and execution cannot diverge at that seam.
+    fn check_content_context(
+        &self,
+        verifier: &Path,
+        frozen_tools_sha256: &str,
+        seal: &str,
+        prover: &Prover,
+        half: crate::check_record::Half,
+    ) -> Result<String, String> {
+        let mut command = self.verifier_child(verifier, Some(prover), half);
+        self.hand_pool(&mut command, true)
+            .map_err(|refusal| refusal.why)?;
+        self.finalize_spawn_environment(&mut command)?;
+        let half = match half {
+            crate::check_record::Half::Tree => crate::check_content::ReleaseHalf::Tree,
+            crate::check_record::Half::Bundle => crate::check_content::ReleaseHalf::Bundle,
+        };
+        Ok(crate::check_content::context(
+            frozen_tools_sha256,
+            seal,
+            &command,
+            half,
+        ))
+    }
+
+    /// The declared content keys of `commit` under the verifier and build inputs this run uses.
+    fn check_content_plan(
+        &self,
+        commit: &str,
+        seal: &str,
+        prover: &Prover,
+    ) -> Result<crate::check_content::Plan, String> {
+        let frozen = crate::release_tools::recorded(&self.release, commit)?;
+        let context = self.check_content_context(
+            &frozen.verify.path,
+            &frozen.set_sha256,
+            seal,
+            prover,
+            crate::check_record::Half::Tree,
+        )?;
+        crate::check_content::plan(&self.git(), commit, &context)
+    }
+
+    /// Materialize equal OK records from the immediately preceding line head. A failure to
+    /// establish content evidence only makes checks run; it is never a release verdict.
+    fn carry_hop_checks(
+        &self,
+        commit: &str,
+        seal: &str,
+        plan: &crate::check_content::Plan,
+    ) -> Result<crate::check_record::HopCarry, String> {
+        let previous = self
+            .previous_line_head(commit)
+            .ok_or_else(|| "the candidate is the line base, not a fix hop".to_string())?;
+        let git = self.git();
+        let root = crate::check_record::root(&git)?;
+        let tree = crate::check_record::tree_of(&git, commit)?;
+        let previous_tree = crate::check_record::tree_of(&git, &previous)?;
+        crate::check_record::carry_hop(&root, commit, &tree, &previous, &previous_tree, seal, plan)
+    }
 }
 
 impl Backend for Real {
@@ -6895,6 +7299,7 @@ impl Backend for Real {
                     log: &self.logs,
                     run: "product-reuse",
                     asked: &[],
+                    content: None,
                 };
                 crate::check_record::reuse_product(&root, &facts, &product)
             })();
@@ -6903,6 +7308,25 @@ impl Backend for Real {
                     "    measure: product U, linked harnesses and seal unchanged; using recorded verdict"
                 );
             }
+        }
+        let content_error = if self.previous_line_head(&c.commit).is_none() {
+            None
+        } else {
+            match (self.build_inputs)().and_then(|seal| {
+                let plan = self.check_content_plan(&c.commit, &seal, prover)?;
+                self.carry_hop_checks(&c.commit, &seal, &plan)
+            }) {
+                Ok(carried) => {
+                    for line in &carried.lines {
+                        println!("    content record: {line}");
+                    }
+                    None
+                }
+                Err(why) => Some(why),
+            }
+        };
+        if let Some(why) = content_error {
+            println!("    content record: no cross-hop carry ({why})");
         }
         let checks = crate::check_record::checks(&git, &c.commit, executable, self.build_inputs)
             .unwrap_or_else(|e| {
@@ -7268,6 +7692,7 @@ impl Backend for Real {
         Box::new(RealBranches {
             real,
             export: std::sync::Mutex::new(export),
+            tree_index: TreeIndexHandoff::default(),
         })
     }
 
@@ -8512,6 +8937,225 @@ pub(crate) fn measure_bump_launch_to_qualify(controller: fn() -> std::time::Dura
 
 #[cfg(test)]
 mod tests {
+    fn witnessed_fixture_wait(
+        real: &super::Real,
+        _candidate: &super::Candidate,
+        _prover: &super::Prover,
+        handoff: &super::TreeIndexHandoff,
+        _stop: &super::BranchStop,
+    ) -> Result<(), super::Refusal> {
+        assert!(
+            handoff.expected(),
+            "the production build path kept the tree promise"
+        );
+        std::fs::write(real.repo.join("fixture-waited"), b"waited").unwrap();
+        Ok(())
+    }
+
+    fn witnessed_fixture_stage(
+        real: &super::Real,
+        _step: super::Step,
+        _candidate: &super::Candidate,
+        _reserved: &super::Reservation,
+        _prover: &super::Prover,
+        _log: &std::path::Path,
+        stop: Option<&super::BranchStop>,
+    ) -> Result<String, super::Refusal> {
+        assert!(real.repo.join("fixture-waited").is_file());
+        assert!(
+            stop.is_some(),
+            "the production build path attaches its stop"
+        );
+        std::fs::write(real.repo.join("fixture-staged"), b"staged").unwrap();
+        Ok("fixtures staged".into())
+    }
+
+    fn red_tree_verify(
+        _real: &super::Real,
+        _candidate: &super::Candidate,
+        _prover: &super::Prover,
+        _run: &crate::check_record::VerifyRun,
+        _artifact: Option<&super::Artifact>,
+        _stop: &super::BranchStop,
+    ) -> Result<super::Ran, super::Refusal> {
+        Err(super::Refusal::new("tree red", "fix it"))
+    }
+
+    /// The production orchestration, not only its helpers, waits before staging fixtures and
+    /// closes the tree handoff before returning a red. NEGATIVE CONTROLS: removing the wait call
+    /// makes the injected stage observe no marker; removing `with_tree_index_completion` leaves
+    /// the production handoff Pending.
+    #[test]
+    fn production_build_and_tree_wiring_owns_the_fixture_handoff() {
+        use super::*;
+
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut real = Real::new(&repo, Some(&repo.join("engine")), true, false).unwrap();
+        real.await_fixture_index_op = witnessed_fixture_wait;
+        real.stage_fixtures_run_op = witnessed_fixture_stage;
+        let candidate = Candidate {
+            commit: "11".repeat(20),
+            version: "0.0.0".into(),
+            why: "fixture".into(),
+            bump_from: None,
+            carry: Vec::new(),
+        };
+        let reservation = Reservation {
+            build: 1,
+            commit: "22".repeat(20),
+            line: "1 0.0.0".into(),
+        };
+        let prover = Prover {
+            bin: repo.join("prover/bin"),
+            commit: "33".repeat(20),
+            source: "fixture".into(),
+        };
+        let handoff = TreeIndexHandoff::default();
+        handoff.expect();
+        let built = real.build_branch(
+            &candidate,
+            &reservation,
+            &prover,
+            BuildWork {
+                bundle: false,
+                fixtures: true,
+            },
+            &handoff,
+            &BranchStop::default(),
+        );
+        assert!(built.artifact.is_none());
+        assert!(built.fixtures.is_some_and(|result| result.is_ok()));
+        assert!(repo.join("fixture-staged").is_file());
+
+        real.verify_half_op = red_tree_verify;
+        let branches = RealBranches {
+            real: &real,
+            export: std::sync::Mutex::new(Vec::new()),
+            tree_index: TreeIndexHandoff::default(),
+        };
+        branches.tree_index.expect();
+        let stop = BranchStop::default();
+        let run = crate::check_record::VerifyRun {
+            half: crate::check_record::Half::Tree,
+            checks: vec!["test".into()],
+            passed_binaries: Vec::new(),
+            passed_lint_packages: Vec::new(),
+        };
+        assert!(
+            branches
+                .verify(&candidate, &prover, &run, None, &stop)
+                .is_err()
+        );
+        assert_eq!(
+            branches.tree_index.completion(),
+            TreeIndexCompletion::Stopped
+        );
+        assert!(!stop.fired(), "the graph has not classified the red yet");
+    }
+
+    /// Production obtains its artifact through the completion transition itself. NEGATIVE
+    /// CONTROLS: an absent build and a failed build do not release admission; deleting the
+    /// successful transition leaves `bundle_is_finished` false.
+    #[test]
+    fn a_successful_product_build_publishes_completion_before_returning_its_artifact() {
+        use super::*;
+
+        let completed = TreeIndexHandoff::default();
+        let artifact = build_artifact_with_handoff(true, &completed, || Ok::<_, &str>(7));
+        assert_eq!(artifact, Some(Ok(7)));
+        assert!(completed.bundle_is_finished());
+
+        let failed = TreeIndexHandoff::default();
+        assert_eq!(
+            build_artifact_with_handoff(true, &failed, || Err::<u8, _>("red")),
+            Some(Err("red"))
+        );
+        assert!(!failed.bundle_is_finished());
+
+        let absent = TreeIndexHandoff::default();
+        assert_eq!(
+            build_artifact_with_handoff(false, &absent, || Ok::<_, &str>(7)),
+            None
+        );
+        assert!(!absent.bundle_is_finished());
+    }
+
+    /// A scheduled tree gets the opportunity to publish its exact executable index before the
+    /// fixture path may compile. NEGATIVE CONTROLS: the former one-shot miss is `Compile`, not the
+    /// `Ready` answer this handoff reaches; and a tree red published before the graph fires the
+    /// build stop is already `Stopped`, never a fallback compile. A non-red completed tree with no
+    /// index still falls back.
+    #[test]
+    fn fixture_index_waits_for_the_tree_compile_before_fallback() {
+        use super::*;
+        use std::cell::Cell;
+
+        let handoff = TreeIndexHandoff::default();
+        handoff.expect();
+        let probes = Cell::new(0);
+        let pauses = Cell::new(0);
+        let answer = await_tree_index(
+            &handoff,
+            || {
+                let probe = probes.get() + 1;
+                probes.set(probe);
+                probe == 2
+            },
+            || false,
+            || pauses.set(pauses.get() + 1),
+        );
+        assert_eq!(answer, TreeIndexAnswer::Ready);
+        assert_eq!((probes.get(), pauses.get()), (2, 1));
+        let one_shot_miss = TreeIndexAnswer::Compile;
+        assert_ne!(
+            answer, one_shot_miss,
+            "the former one-shot lookup compiles instead of observing the tree's handoff"
+        );
+
+        let missing = TreeIndexHandoff::default();
+        missing.expect();
+        let pauses = Cell::new(0);
+        let answer = await_tree_index(
+            &missing,
+            || false,
+            || false,
+            || {
+                pauses.set(pauses.get() + 1);
+                missing.finish(TreeIndexCompletion::Compile);
+            },
+        );
+        assert_eq!(answer, TreeIndexAnswer::Compile);
+        assert_eq!(pauses.get(), 1);
+
+        let red = TreeIndexHandoff::default();
+        red.expect();
+        let graph_stop = BranchStop::default();
+        let refusal = with_tree_index_completion(&red, &graph_stop, || {
+            Err(Refusal::new("tree tests failed", "fix the tests"))
+        })
+        .unwrap_err();
+        assert_eq!(refusal.why, "tree tests failed");
+        assert!(
+            !graph_stop.fired(),
+            "the graph has not classified the note yet"
+        );
+        assert_eq!(
+            await_tree_index(&red, || false, || graph_stop.fired(), || unreachable!()),
+            TreeIndexAnswer::Stopped,
+            "the tree outcome closes the pre-stop race instead of authorizing fallback"
+        );
+
+        let stopped = TreeIndexHandoff::default();
+        stopped.expect();
+        assert_eq!(
+            await_tree_index(&stopped, || true, || true, || unreachable!()),
+            TreeIndexAnswer::Stopped,
+            "a sibling red starts no new fixture work even when an index exists"
+        );
+    }
+
     /// NEGATIVE CONTROLS: ignoring the shape verdict starts a writer; returning
     /// immediately on the site's refusal leaves the independent tap unrun.
     #[test]
@@ -10007,6 +10651,51 @@ mod tests {
         let dir = aterm_tempfile::tempdir().unwrap();
         let repo = std::env::current_dir().unwrap();
         let mut real = Real::new(&repo, None, true, false).unwrap();
+        let prover = Prover {
+            bin: PathBuf::from("/fixture/trust/bin"),
+            commit: "0".repeat(40),
+            source: "fixture".into(),
+        };
+        let context_outside_pool = real
+            .check_content_context(
+                Path::new("/fixture/verify"),
+                "frozen-tools",
+                "seal",
+                &prover,
+                crate::check_record::Half::Tree,
+            )
+            .unwrap();
+        let mut spawn_mirror = real.verifier_child(
+            Path::new("/fixture/verify"),
+            Some(&prover),
+            crate::check_record::Half::Tree,
+        );
+        real.hand_pool(&mut spawn_mirror, true).unwrap();
+        real.finalize_spawn_environment(&mut spawn_mirror).unwrap();
+        assert_eq!(
+            spawn_mirror
+                .get_envs()
+                .find(|(name, _)| *name == "GIT_TERMINAL_PROMPT")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new("0"))
+        );
+        assert_eq!(
+            spawn_mirror
+                .get_envs()
+                .find(|(name, _)| *name == "GIT_ASKPASS")
+                .and_then(|(_, value)| value),
+            Some(std::ffi::OsStr::new(""))
+        );
+        assert_eq!(
+            context_outside_pool,
+            crate::check_content::context(
+                "frozen-tools",
+                "seal",
+                &spawn_mirror,
+                crate::check_content::ReleaseHalf::Tree,
+            ),
+            "the context uses the same environment finalizer as the verifier spawn"
+        );
         // `<slots>:<fifo>`, each exactly as handed.
         let pool_of = |cmd: &Command| {
             let value = cmd
@@ -10021,9 +10710,6 @@ mod tests {
         real.hand_pool(&mut none, true).unwrap();
         assert_eq!(pool_of(&none), None, "no pool, nothing handed");
         let verifier = Path::new("/frozen/verifier");
-        let plain = real.verifier_child(verifier, None, crate::check_record::Half::Tree);
-        assert_eq!(plain.get_program(), verifier.as_os_str());
-        assert_eq!(plain.get_args().count(), 0);
 
         // Asked for by a spelling no child is handed: a `.` component, and a doubled separator
         // too where `TMPDIR` holds one (as `$TMPDIR/.ubd/` does where `$TMPDIR` ends in a
@@ -10060,6 +10746,40 @@ mod tests {
         assert_eq!(bundle.get_program(), verifier.as_os_str());
         assert_eq!(bundle.get_args().count(), 0);
 
+        let mut actual_tree = real.verifier_child(
+            Path::new("/fixture/verify"),
+            Some(&prover),
+            crate::check_record::Half::Tree,
+        );
+        real.hand_pool(&mut actual_tree, true).unwrap();
+        real.finalize_spawn_environment(&mut actual_tree).unwrap();
+        assert_eq!(
+            context_outside_pool,
+            crate::check_content::context(
+                "frozen-tools",
+                "seal",
+                &actual_tree,
+                crate::check_content::ReleaseHalf::Tree,
+            ),
+            "the pre-pool content plan predicts the finalized pooled tree child"
+        );
+        if cfg!(unix) {
+            let mut omitted_wrapper = real.child("/fixture/verify", Some(&prover));
+            real.hand_pool(&mut omitted_wrapper, true).unwrap();
+            real.finalize_spawn_environment(&mut omitted_wrapper)
+                .unwrap();
+            assert_ne!(
+                context_outside_pool,
+                crate::check_content::context(
+                    "frozen-tools",
+                    "seal",
+                    &omitted_wrapper,
+                    crate::check_content::ReleaseHalf::Tree,
+                ),
+                "omitting nice's program and argv must invalidate tree content evidence"
+            );
+        }
+
         let mut build = command("ship");
         real.hand_pool(&mut build, false).unwrap();
         assert_eq!(pool_of(&build), Some((slots.to_string(), fifo.clone())));
@@ -10070,6 +10790,18 @@ mod tests {
             pool_of(&verify),
             Some((share.to_string(), fifo)),
             "verify is handed the build's FIFO, spelled the same, less the export's share"
+        );
+        assert_eq!(
+            context_outside_pool,
+            real.check_content_context(
+                Path::new("/fixture/verify"),
+                "frozen-tools",
+                "seal",
+                &prover,
+                crate::check_record::Half::Tree,
+            )
+            .unwrap(),
+            "facts before qualify and the verifier inside its pool have one check context"
         );
         let plain = real.child("generator", None);
         assert_eq!(pool_of(&plain), None, "a plain child is handed no pool");

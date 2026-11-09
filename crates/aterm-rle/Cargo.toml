@@ -9,6 +9,13 @@ license.workspace = true
 repository.workspace = true
 description = "Run-Length Encoding container for terminal cell attributes"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [dependencies]
 aterm-alloc = { workspace = true }
 

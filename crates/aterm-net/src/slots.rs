@@ -584,7 +584,6 @@ pub(crate) mod tests {
         const MAX_READY_WAKE: Duration = MUST_HAPPEN;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let waiting_listener = listener.try_clone().unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
         let waiter = std::thread::spawn(move || {
@@ -602,16 +601,18 @@ pub(crate) mod tests {
             "a queued real connection must wake readiness instead of waiting out \
              the {TEST_WAIT:?} test interval ({elapsed:?})"
         );
-        let (accepted, _) = listener
-            .accept()
-            .expect("the readiness event corresponds to an accept-ready connection");
+        let (accepted, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Nonblocking,
+        )
+        .expect("the readiness event corresponds to an accept-ready connection");
         drop((accepted, client));
     }
 
     #[test]
     fn idle_listener_readiness_wait_is_bounded_without_spinning() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let started = Instant::now();
         assert!(!wait_listener_readable(&listener, ACCEPT_POLL).unwrap());
         let elapsed = started.elapsed();
@@ -620,7 +621,13 @@ pub(crate) mod tests {
             "the readiness timeout must retain the {ACCEPT_POLL:?} shutdown bound ({elapsed:?})"
         );
         assert_eq!(
-            listener.accept().unwrap_err().kind(),
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Nonblocking,
+            )
+            .unwrap_err()
+            .kind(),
             io::ErrorKind::WouldBlock
         );
     }
@@ -629,7 +636,12 @@ pub(crate) mod tests {
     fn a_late_watchdog_start_does_not_restart_the_handshake_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (_peer, _) = listener.accept().unwrap();
+        let (_peer, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         tcp.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
         let creator = std::thread::current().id();
         let started = Instant::now();
@@ -657,7 +669,12 @@ pub(crate) mod tests {
     fn a_late_handshake_cannot_outrun_its_delayed_watchdog() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (_peer, _) = listener.accept().unwrap();
+        let (_peer, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         tcp.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
         let started = Instant::now();
         let budget = MUST_HAPPEN * 10;
@@ -688,7 +705,15 @@ pub(crate) mod tests {
     fn finishing_an_early_handshake_wakes_the_watchdog_instead_of_waiting_out_its_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let accepting = std::thread::spawn(move || listener.accept().unwrap().0);
+        let accepting = std::thread::spawn(move || {
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap()
+            .0
+        });
         let tcp = TcpStream::connect(addr).unwrap();
         let _peer = accepting.join().unwrap();
         let watchdog = HandshakeWatchdog::arm(&tcp, MUST_HAPPEN * 10).unwrap();
@@ -719,7 +744,15 @@ pub(crate) mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let accepting = std::thread::spawn(move || listener.accept().unwrap().0);
+        let accepting = std::thread::spawn(move || {
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap()
+            .0
+        });
         let tcp = TcpStream::connect(addr).unwrap();
         let _peer = accepting.join().unwrap();
         tcp.set_read_timeout(Some(Duration::from_millis(5)))
@@ -867,7 +900,6 @@ pub(crate) mod tests {
         const SOCKETS: usize = 2;
         const TURNED_AWAY: usize = 40;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let target = listener.local_addr().unwrap();
         /// Sends the doorman home however the test ends, a failed assertion included.
         struct Done(Arc<AtomicBool>);
@@ -885,7 +917,11 @@ pub(crate) mod tests {
                     if !wait_listener_readable(&listener, ACCEPT_POLL).unwrap() {
                         continue;
                     }
-                    while let Ok((tcp, _)) = listener.accept() {
+                    while let Ok((tcp, _)) = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Nonblocking,
+                    ) {
                         drop(tcp);
                         let _ = turned.send(());
                     }
@@ -1124,28 +1160,26 @@ pub(crate) mod tests {
     fn accept_probe(listener: &TcpListener, probe: &TcpStream) -> SocketAddr {
         let sent_from = probe.local_addr().unwrap();
         let on = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
         let started = Instant::now();
-        let peer = loop {
-            match listener.accept() {
-                Ok((accepted, peer)) => {
-                    drop(accepted);
-                    break peer;
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    assert!(
-                        started.elapsed() < MUST_HAPPEN,
-                        "the connect from {sent_from} never reached the listener on {on} \
-                         (another socket on port {}, bound to {} or a wildcard, would take it)",
-                        on.port(),
-                        sent_from.ip(),
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => panic!("accepting on {on}: {e}"),
+        let peer = match aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Until(started + MUST_HAPPEN),
+            aterm_uds::AcceptedMode::Nonblocking,
+        ) {
+            Ok((accepted, peer)) => {
+                drop(accepted);
+                peer
             }
+            Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                panic!(
+                    "the connect from {sent_from} never reached the listener on {on} \
+                         (another socket on port {}, bound to {} or a wildcard, would take it)",
+                    on.port(),
+                    sent_from.ip(),
+                );
+            }
+            Err(e) => panic!("accepting on {on}: {e}"),
         };
-        listener.set_nonblocking(false).unwrap();
         assert_eq!(
             (peer.ip().to_canonical(), peer.port()),
             (sent_from.ip(), sent_from.port()),
@@ -1280,7 +1314,15 @@ pub(crate) mod tests {
         let pair = || {
             let accepting = {
                 let listener = listener.try_clone().unwrap();
-                std::thread::spawn(move || listener.accept().unwrap().0)
+                std::thread::spawn(move || {
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0
+                })
             };
             let peer = TcpStream::connect(addr).unwrap();
             let tcp = accepting.join().unwrap();
@@ -1420,7 +1462,12 @@ pub(crate) mod tests {
         let accept = |conns: &mut Vec<Conn>, source: IpAddr, deadline: Duration| {
             assert!(slots.make_room(source), "a slot is free");
             let peer = TcpStream::connect(addr).unwrap();
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let watchdog = arm_unauthenticated(&tcp, deadline).unwrap();
             let evictor = watchdog.evictor();
             let id = u64::try_from(conns.len()).unwrap();

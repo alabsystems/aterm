@@ -54,8 +54,9 @@ mod measuring {
                 chain_bytes: CHAIN,
             }),
         ),
-        // Design §14.5 R4: unchanged 0.97 floor, predeclared looks at 8/16/32/64 ABBA blocks.
-        // The exact sign intervals share a 5% error budget; every decided look stops the take.
+        // Design §14.5 R4: unchanged 0.97 floor, predeclared looks at 10/16/32 ABBA blocks whose
+        // exact nested sign test holds a wrong verdict under 2.5% per side; every decided look
+        // stops the take, and past its spend limit the plan starts no block: it ends undecided.
         (
             "recording_keeps_parse_throughput_at_or_above_0_97x",
             Row::Cost(rewind_cost::THROUGHPUT),
@@ -97,8 +98,9 @@ mod measuring {
                 )),
                 Disposition::Unproved => Outcome::Undecided(format!(
                     "REWIND COST UNPROVED: the whole blocks' off/on ratios spread past the bound \
-                     the row judges, so their median's 95% interval holds it and the takes are no \
-                     evidence either way; take it on an unloaded machine.\n  {}",
+                     the row judges at every look it reached within its spend limit, so their \
+                     median's interval holds it (or the machine's load left no look affordable) \
+                     and the takes are no evidence either way; take it on an unloaded machine.\n  {}",
                     report.line
                 )),
             },

@@ -355,6 +355,84 @@ fn a_log_weighs_again_only_after_it_holds_a_weighed_record() {
     }
 }
 
+/// A log's seats and known actors read what it keeps of its history (`eval::Historical`), and
+/// it keeps each seat it found: replayed record by record, on every hand-made log and 200
+/// generated ones, each binding a founder or an `Admit` of the log names finds at every step the
+/// seat a derivation afresh from the records held finds, and each actor is known as one afresh
+/// knows it, asked twice; a step's asks derive what the log keeps once, and the second ask
+/// searches the log's graph again only for a binding with no seat.
+/// NEGATIVE CONTROLS: a log that keeps what it derived across a hold misses a seat a later
+/// `Admit` granted (`what a derivation afresh finds`); a seat search, or a known actor, read from
+/// a derivation of its own derives again (`the asks derive once`); a log that keeps no seat it
+/// found searches for each again (`a seat found is searched for once`).
+#[test]
+fn a_log_finds_each_seat_once_until_it_holds_a_record() {
+    use super::super::eval::{HISTORICALS, SEAT_SEARCHES};
+    for (name, log) in corpus().iter().chain(generated_logs()) {
+        let mut bindings: Vec<crate::commons::binding::Binding> = Vec::new();
+        for record in log.order.iter() {
+            match record.body() {
+                Body::Genesis { founders, .. } => {
+                    bindings.extend(founders.iter().filter_map(|f| f.binding.clone()));
+                }
+                Body::Admit { entrant, .. } => bindings.push(entrant.request.binding().clone()),
+                _ => {}
+            }
+        }
+        bindings.sort();
+        bindings.dedup();
+        let actors: BTreeSet<MemberId> = bindings.iter().map(|b| b.actor()).collect();
+        let mut again = Log::new(log.order[0].clone()).unwrap();
+        again.enforce_seats = log.enforce_seats;
+        for (step, record) in log.order.iter().enumerate() {
+            if step > 0 {
+                again.keep(record.clone());
+            }
+            let weighing = eval::weigh(again.history());
+            let afresh = |binding| {
+                eval::historical_seat_entry(again.history(), &OnceLock::new(), &weighing, binding)
+            };
+            let seats: Vec<_> = bindings.iter().map(afresh).collect();
+            let known: Vec<bool> = actors
+                .iter()
+                .map(|actor| {
+                    eval::has_known_actor(again.history(), &OnceLock::new(), &weighing, actor)
+                })
+                .collect();
+            let derived = HISTORICALS.get();
+            for ask in 0..2 {
+                let before = SEAT_SEARCHES.get();
+                let found: Vec<_> = bindings
+                    .iter()
+                    .map(|binding| again.historical_seat_entry(binding))
+                    .collect();
+                let searched = SEAT_SEARCHES.get() - before;
+                assert_eq!(
+                    found, seats,
+                    "{name}, step {step}, ask {ask}: what a derivation afresh finds"
+                );
+                let knows: Vec<bool> = actors.iter().map(|a| again.has_known_actor(a)).collect();
+                assert_eq!(
+                    knows, known,
+                    "{name}, step {step}, ask {ask}: the known actors"
+                );
+                if ask == 1 {
+                    assert_eq!(
+                        searched,
+                        seats.iter().filter(|seat| seat.is_none()).count(),
+                        "{name}, step {step}: a seat found is searched for once"
+                    );
+                }
+            }
+            assert_eq!(
+                HISTORICALS.get() - derived,
+                1,
+                "{name}, step {step}: the asks derive once"
+            );
+        }
+    }
+}
+
 /// A carried weighing keeps the members at the cutoffs of the quorums that take effect alone, at
 /// most five ids for each of their shares, not a set of members for every cutoff a candidate
 /// names: A admits 64 Macs in a chain, and A and B each remove every one of them at the `Admit`

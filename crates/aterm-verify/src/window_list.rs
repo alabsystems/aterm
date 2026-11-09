@@ -111,13 +111,14 @@ mod tests {
             ));
         std::fs::write(&token, "cafef00d\n").expect("token");
         let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
-        listener.set_nonblocking(true).expect("nonblocking");
         let served = std::thread::spawn(move || {
             let must = aterm_spec::wait::MUST_HAPPEN;
-            let (conn, _) = aterm_spec::wait::until_within(must, "the ask's connection", || {
-                listener.accept().ok()
-            });
-            conn.set_nonblocking(false).expect("blocking");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(Instant::now() + must),
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("the ask's connection");
             conn.set_read_timeout(Some(must)).expect("a hang detector");
             let mut reader = std::io::BufReader::new(conn.try_clone().expect("clone"));
             let mut heard = Vec::new();

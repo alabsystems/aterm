@@ -30,7 +30,11 @@ fn one_shot_peer(body: Vec<u8>) -> (String, mpsc::Receiver<()>) {
     let addr = listener.local_addr().unwrap().to_string();
     let (done, judged) = mpsc::channel();
     std::thread::spawn(move || {
-        let Ok((mut conn, _)) = listener.accept() else {
+        let Ok((mut conn, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         let mut head = Vec::new();
@@ -705,7 +709,11 @@ fn trickling_peer(size: u64, every: Duration) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     std::thread::spawn(move || {
-        let Ok((mut conn, _)) = listener.accept() else {
+        let Ok((mut conn, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         let _ = write!(conn, "HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n\r\n");
@@ -760,7 +768,12 @@ fn a_client_that_trickles_its_request_holds_no_server_slot() {
     let dir = crate::testdir::dir("atpkg-peers-slow-client-");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (conn, _) = listener.accept().unwrap();
+    let (conn, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     let pace = Pace {
         head: Duration::from_millis(300),
         ..QUICK
@@ -971,7 +984,12 @@ fn a_download_takes_a_unit_over_the_mesh_units_stream_first_and_port_7487_after(
     let served = std::thread::spawn({
         let layout = layout.clone();
         move || {
-            let (conn, _) = stream_end.accept().unwrap();
+            let (conn, _) = aterm_uds::accept(
+                &stream_end,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             answer_unit(&conn, &layout).unwrap();
         }
     });
@@ -1030,7 +1048,12 @@ fn a_store_whose_person_turned_sharing_off_answers_no_units_stream() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     client.set_read_timeout(Some(HANG)).unwrap();
-    let (conn, _) = listener.accept().unwrap();
+    let (conn, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     write!(client, "GET /unit/{} HTTP/1.1\r\n\r\n", "0".repeat(64)).unwrap();
     answer_unit(&conn, &layout).unwrap();
     drop(conn);

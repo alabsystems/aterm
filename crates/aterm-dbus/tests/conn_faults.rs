@@ -297,7 +297,12 @@ fn open_within_gives_up_on_a_bus_that_never_answers() {
 
     let (listener, addresses) = listening(scratch.path(), "answering");
     let answered = thread::spawn(move || {
-        let (mut bus, _) = listener.accept().unwrap();
+        let (mut bus, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         bus.set_read_timeout(Some(HANG)).unwrap();
         line(&mut bus);
         bus.write_all(b"OK 8e4f0c2a1b7d6e5f8e4f0c2a1b7d6e5f\r\n")

@@ -300,6 +300,7 @@ pub(crate) fn scanned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_uds::{AcceptWait, AcceptedMode};
 
     /// `ssh` runs the proxy with `/bin/sh -c exec …` after expanding its own `%` tokens: a path
     /// with a blank, a quote or a `%` reaches the shell as one word and unexpanded.
@@ -340,7 +341,8 @@ mod tests {
         let got = aterm_uds::fdpass::recv_with_fds(&theirs, &mut byte, 1).unwrap();
         assert_eq!((got.bytes, byte), (1, [0]));
         let mut passed = std::net::TcpStream::from(got.fds.into_iter().next().expect("a socket"));
-        let (mut accepted, _) = listener.accept().unwrap();
+        let (mut accepted, _) =
+            aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
         passed.write_all(b"SSH-2.0-x\r\n").unwrap();
         let mut heard = [0u8; 11];
         accepted.read_exact(&mut heard).unwrap();

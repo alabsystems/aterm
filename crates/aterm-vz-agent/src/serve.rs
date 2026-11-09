@@ -57,14 +57,6 @@ impl Stream for std::os::unix::net::UnixStream {
     }
 }
 
-impl Listener for std::os::unix::net::UnixListener {
-    type Stream = std::os::unix::net::UnixStream;
-
-    fn accept(&self) -> io::Result<Self::Stream> {
-        std::os::unix::net::UnixListener::accept(self).map(|(s, _)| s)
-    }
-}
-
 /// The largest `Out`/`Err` frame the agent sends.
 const CHUNK: usize = 64 * 1024;
 

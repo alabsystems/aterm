@@ -11,8 +11,12 @@ fn endpoint(statuses: Vec<&'static str>) -> (String, JoinHandle<Vec<String>>) {
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     let socket = path.to_string_lossy().into_owned();
     let server = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        stream.set_nonblocking(false).unwrap();
+        let (stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();

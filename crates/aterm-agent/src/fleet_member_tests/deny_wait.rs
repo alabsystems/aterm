@@ -50,7 +50,6 @@ fn a_drive_retains_its_local_denial_read_error() {
     let pair = fleet_pair("drive-denial-cause");
     let node = member::node_id(&pair.member.places.state).unwrap();
     let listener = pair.member_serving.take();
-    listener.set_nonblocking(true).unwrap();
     let paths = vault_beside(&pair.issuer);
     let source = paths.dir.join("source.toml");
     std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -64,7 +63,14 @@ fn a_drive_retains_its_local_denial_read_error() {
         refused.again,
         "an unavailable local read is not a peer denial"
     );
-    assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    assert!(matches!(
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
     assert!(
         refused.why.contains(&cause),
         "the refusal lost the error from the actual local read: {refused:?}; cause={cause}"
@@ -139,7 +145,6 @@ fn a_drive_enforces_the_denial_committed_while_it_waited() {
     let node = member::node_id(&pair.member.places.state).unwrap();
     let peer_key = own_identity(&pair.member.places).unwrap().key().hex();
     let listener = pair.member_serving.take();
-    listener.set_nonblocking(true).unwrap();
     let paths = vault_beside(&pair.issuer);
     let writer = Rc::new(RefCell::new(Some(
         client::test_hold_state_lock(&paths).unwrap(),
@@ -163,7 +168,14 @@ fn a_drive_enforces_the_denial_committed_while_it_waited() {
     );
     drop(writer.borrow_mut().take());
     assert!(refused);
-    assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    assert!(matches!(
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
 }
 
 #[test]
@@ -272,7 +284,6 @@ fn an_expired_vault_wait_refuses_before_dialing_the_fleet() {
         &issuer,
         ("127.0.0.1", listener.local_addr().unwrap().port()),
     );
-    listener.set_nonblocking(true).unwrap();
     let member = World::new("join-expired-vault-member");
     let paths = vault_beside(&member);
     let writer = client::test_hold_state_lock(&paths).unwrap();
@@ -283,7 +294,14 @@ fn an_expired_vault_wait_refuses_before_dialing_the_fleet() {
     let words = failure_words(joined.unwrap_err());
     assert!(words.contains(DENY_LIST_UNREAD));
     assert!(words.contains(&client::SwarmDenialUnavailable::WriterBusy.to_string()));
-    assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    assert!(matches!(
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
     assert!(!member.places.state.join(KEY_FILE).exists());
     assert_eq!(member.config(), "");
 }
@@ -516,7 +534,6 @@ fn a_drive_whose_roster_stays_unread_is_refused_to_try_again() {
     let pair = fleet_pair("label-expired-vault");
     let paths = labelled_member(&pair);
     let listener = pair.member_serving.take();
-    listener.set_nonblocking(true).unwrap();
     let writer = client::test_hold_state_lock(&paths).unwrap();
     let refused = drive_fleet_in(&pair.issuer.places, "m77", Duration::ZERO)
         .err()
@@ -530,5 +547,12 @@ fn a_drive_whose_roster_stays_unread_is_refused_to_try_again() {
         "{}",
         refused.why
     );
-    assert!(matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+    assert!(matches!(
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock
+    ));
 }

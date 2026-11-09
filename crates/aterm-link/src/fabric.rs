@@ -6332,7 +6332,7 @@ mod tests {
 
     fn native_instance_reply(timeout: std::time::Duration) -> Result<(), String> {
         use std::io::{BufRead as _, Write as _};
-        use std::os::{fd::AsFd as _, unix::fs::PermissionsExt as _};
+        use std::os::unix::fs::PermissionsExt as _;
         let scratch = aterm_tempfile::Builder::new()
             .prefix("fabric-io-")
             .tempdir_in("/tmp")
@@ -6340,20 +6340,19 @@ mod tests {
         let endpoint = scratch.path().join("ctl.sock");
         let listener =
             aterm_uds::kept_out(|| std::os::unix::net::UnixListener::bind(&endpoint)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let token = "ab".repeat(32);
         let name = aterm_types::control_socket::token_names_for_sock("ctl.sock").remove(0);
         let token_path = scratch.path().join(name);
         std::fs::write(&token_path, &token).unwrap();
         std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let server = std::thread::spawn(move || -> std::io::Result<()> {
-            aterm_uds::ready::until(
-                listener.as_fd(),
-                aterm_uds::ready::Interest::Read,
-                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(
+                    std::time::Instant::now() + std::time::Duration::from_secs(60),
+                ),
+                aterm_uds::AcceptedMode::Blocking,
             )?;
-            let (mut stream, _) = aterm_uds::kept_out(|| listener.accept())?;
-            stream.set_nonblocking(false)?;
             stream.set_read_timeout(Some(std::time::Duration::from_secs(60)))?;
             stream.set_write_timeout(Some(std::time::Duration::from_secs(60)))?;
             let mut input = std::io::BufReader::new(stream.try_clone()?);
@@ -7291,47 +7290,52 @@ mod tests {
         let listener = UnixListener::bind(at).expect("bind the broker in front");
         let real = real.to_path_buf();
         let stall = Arc::clone(&stalled);
-        std::thread::spawn(move || {
-            for peer in listener.incoming() {
-                let (Ok(peer), Ok(broker)) = (peer, UnixStream::connect(&real)) else {
-                    return;
-                };
-                let to_peer = Arc::new(Mutex::new(peer.try_clone().expect("the peer's writer")));
-                let back = Arc::clone(&to_peer);
-                let mut from_broker = broker.try_clone().expect("the broker's reader");
-                let peer_end = peer.try_clone().expect("the peer's end");
-                std::thread::spawn(move || {
-                    while let Ok(Some(frame)) = read_frame(&mut from_broker) {
-                        let mut to = back.lock().unwrap_or_else(PoisonError::into_inner);
-                        if write_frame(&mut *to, &frame).is_err() {
-                            break;
-                        }
+        std::thread::spawn(move || loop {
+            let (Ok((peer, _)), Ok(broker)) = (
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ),
+                UnixStream::connect(&real),
+            ) else {
+                return;
+            };
+            let to_peer = Arc::new(Mutex::new(peer.try_clone().expect("the peer's writer")));
+            let back = Arc::clone(&to_peer);
+            let mut from_broker = broker.try_clone().expect("the broker's reader");
+            let peer_end = peer.try_clone().expect("the peer's end");
+            std::thread::spawn(move || {
+                while let Ok(Some(frame)) = read_frame(&mut from_broker) {
+                    let mut to = back.lock().unwrap_or_else(PoisonError::into_inner);
+                    if write_frame(&mut *to, &frame).is_err() {
+                        break;
                     }
-                    let _ = peer_end.shutdown(std::net::Shutdown::Both);
-                });
-                let stall = Arc::clone(&stall);
-                let (mut from_peer, mut to_broker) = (peer, broker);
-                std::thread::spawn(move || {
-                    while let Ok(Some(frame)) = read_frame(&mut from_peer) {
-                        let sent = match decode_request(&frame) {
-                            _ if stall.load(Ordering::SeqCst) => Ok(()),
-                            Some(Request::IdleMarks | Request::GapNotices) if older => {
-                                let refusal = Response::Error {
-                                    code: ERR_REFUSED,
-                                    msg: "malformed request".to_string(),
-                                };
-                                let mut to = to_peer.lock().unwrap_or_else(PoisonError::into_inner);
-                                write_frame(&mut *to, &encode_response(&refusal))
-                            }
-                            _ => write_frame(&mut to_broker, &frame),
-                        };
-                        if sent.is_err() {
-                            break;
+                }
+                let _ = peer_end.shutdown(std::net::Shutdown::Both);
+            });
+            let stall = Arc::clone(&stall);
+            let (mut from_peer, mut to_broker) = (peer, broker);
+            std::thread::spawn(move || {
+                while let Ok(Some(frame)) = read_frame(&mut from_peer) {
+                    let sent = match decode_request(&frame) {
+                        _ if stall.load(Ordering::SeqCst) => Ok(()),
+                        Some(Request::IdleMarks | Request::GapNotices) if older => {
+                            let refusal = Response::Error {
+                                code: ERR_REFUSED,
+                                msg: "malformed request".to_string(),
+                            };
+                            let mut to = to_peer.lock().unwrap_or_else(PoisonError::into_inner);
+                            write_frame(&mut *to, &encode_response(&refusal))
                         }
+                        _ => write_frame(&mut to_broker, &frame),
+                    };
+                    if sent.is_err() {
+                        break;
                     }
-                    let _ = to_broker.shutdown(std::net::Shutdown::Both);
-                });
-            }
+                }
+                let _ = to_broker.shutdown(std::net::Shutdown::Both);
+            });
         });
         stalled
     }
@@ -8595,7 +8599,13 @@ mod tests {
 
         let silent =
             std::os::unix::net::UnixListener::bind(dir.path().join("silent.sock")).expect("bind");
-        let closer = std::thread::spawn(move || drop(silent.accept()));
+        let closer = std::thread::spawn(move || {
+            drop(aterm_uds::accept(
+                &silent,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ));
+        });
         let why = answers(&endpoint("silent.sock")).expect_err("accepted, said nothing");
         assert!(
             why.starts_with("the socket accepted but no broker answered"),
@@ -8606,7 +8616,12 @@ mod tests {
         let other =
             std::os::unix::net::UnixListener::bind(dir.path().join("other.sock")).expect("bind");
         let replier = std::thread::spawn(move || {
-            let (mut c, _) = other.accept().expect("accept");
+            let (mut c, _) = aterm_uds::accept(
+                &other,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             if let Ok(Some(_hello)) = read_frame(&mut c) {
                 let mut reply = encode_response(&Response::Error {
                     code: astream_broker::proto::ERR_REFUSED,
@@ -8638,7 +8653,11 @@ mod tests {
             let sock = dir.path().join("bus.sock");
             let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
             std::thread::spawn(move || {
-                let Ok((mut c, _)) = listener.accept() else {
+                let Ok((mut c, _)) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) else {
                     return;
                 };
                 if let Ok(Some(_hello)) = read_frame(&mut c) {

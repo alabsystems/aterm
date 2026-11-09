@@ -607,8 +607,6 @@ where
     // (`aterm_uds::kept_out`), so it never waits there: the listener is nonblocking, polled every
     // 15 ms for a stop flag, and with none to poll the wait for a connection is
     // `aterm_uds::accept`'s, which holds nothing.
-    listener.set_nonblocking(true)?;
-
     struct UnlinkOnDrop(PathBuf);
     impl Drop for UnlinkOnDrop {
         fn drop(&mut self) {
@@ -623,14 +621,17 @@ where
         if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return Ok(());
         }
-        let accepted = if stop.is_some() {
-            aterm_uds::kept_out(|| listener.accept())
-        } else {
-            aterm_uds::accept(&listener)
-        };
+        let accepted = aterm_uds::accept(
+            &listener,
+            if stop.is_some() {
+                aterm_uds::AcceptWait::Ready
+            } else {
+                aterm_uds::AcceptWait::Forever
+            },
+            aterm_uds::AcceptedMode::Blocking,
+        );
         match accepted {
             Ok((mut stream, _)) => {
-                let _ = stream.set_nonblocking(false);
                 if crate::control_auth::peer_check(&stream).is_err() {
                     aterm_uds::hangup::hang_up(&stream);
                     continue;

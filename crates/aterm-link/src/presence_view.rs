@@ -602,7 +602,12 @@ mod tests {
             g,
         )
         .expect("the reader thread");
-        let (mut c, _) = listener.accept().expect("accept");
+        let (mut c, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let mark = |next, head| Response::Mark {
             next,
             head,

@@ -642,7 +642,11 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let server = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            'conns: while let Ok((stream, _)) = listener.accept() {
+            'conns: while let Ok((stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 let mut w = stream.try_clone().unwrap();
                 for line in BufReader::new(stream).lines() {
                     let Ok(line) = line else { continue 'conns };

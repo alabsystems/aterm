@@ -12,6 +12,13 @@ license.workspace = true
 repository.workspace = true
 description = "Base64, hex, the wire and terminal escapes, CRC-32 (astream-wire's) and DEFLATE for aterm: std and astream-wire only"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [dependencies]
 # The CRC-32 is astream-wire's `hash::crc32_ieee_update` (compile-time
 # slicing-by-8, bounds proved there), the one aterm-png checks chunks with and

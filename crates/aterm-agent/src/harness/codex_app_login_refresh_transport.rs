@@ -213,7 +213,6 @@ mod tests {
     #[test]
     fn absent_budget_invalid_authority_and_failed_arm_never_send() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let doc = document(&format!("http://{}", listener.local_addr().unwrap()));
         let armed = AtomicBool::new(false);
         let result = exchange_owned_refresh(&doc, Deadline::after(Duration::ZERO), || {
@@ -237,7 +236,13 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            listener.accept().unwrap_err().kind(),
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap_err()
+            .kind(),
             std::io::ErrorKind::WouldBlock
         );
     }
@@ -252,7 +257,6 @@ mod tests {
         request_started: impl FnOnce() -> Instant,
     ) -> RefreshExchange {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let issuer = format!("http://{}", listener.local_addr().unwrap());
         let armed = Arc::new(AtomicBool::new(false));
         let check = Arc::clone(&armed);
@@ -261,9 +265,14 @@ mod tests {
         let server = std::thread::spawn(move || {
             let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
             let mut stream = loop {
-                match listener.accept() {
+                let accept_until = until.min(Instant::now() + Duration::from_millis(1));
+                match aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Until(accept_until),
+                    aterm_uds::AcceptedMode::Blocking,
+                ) {
                     Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                         if stopped.load(Ordering::SeqCst) {
                             return;
                         }
@@ -271,15 +280,11 @@ mod tests {
                             Instant::now() < until,
                             "refresh fixture accept did not happen"
                         );
-                        std::thread::sleep(Duration::from_millis(1));
                     }
                     Err(error) => panic!("refresh fixture accept failed: {error}"),
                 }
             };
             assert!(check.load(Ordering::SeqCst), "request preceded durable arm");
-            // BSD accepts may inherit the listener's nonblocking mode. The
-            // fixture reads a complete request under its hang detector.
-            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
                 .unwrap();
@@ -340,7 +345,6 @@ mod tests {
         assert!(received.received_at().is_some());
 
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let doc = document(&format!("http://{}", listener.local_addr().unwrap()));
         let armed = AtomicBool::new(false);
         let result = exchange_owned_refresh_with_clock(
@@ -356,7 +360,13 @@ mod tests {
         assert!(armed.load(Ordering::SeqCst));
         assert!(matches!(result, RefreshExchange::NotSent));
         assert_eq!(
-            listener.accept().unwrap_err().kind(),
+            aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap_err()
+            .kind(),
             std::io::ErrorKind::WouldBlock
         );
     }

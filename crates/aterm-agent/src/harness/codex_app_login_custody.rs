@@ -112,7 +112,6 @@ mod tests {
             let journal_before = std::fs::read(&journal).unwrap();
             std::fs::write(beside_auth(home, suffix), OWNER_MARKER_TEXT).unwrap();
             let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            listener.set_nonblocking(true).unwrap();
             let issuer = format!("http://{}", listener.local_addr().unwrap());
             let snapshot = read_login_snapshot_using(
                 home,
@@ -132,7 +131,13 @@ mod tests {
                 "snapshot refuses before any legacy lock or recovery"
             );
             assert_eq!(
-                listener.accept().unwrap_err().kind(),
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap_err()
+                .kind(),
                 std::io::ErrorKind::WouldBlock
             );
             {
@@ -161,7 +166,13 @@ mod tests {
             );
             assert_eq!(std::fs::read(auth_path_in_home(home)).unwrap(), auth_before);
             assert_eq!(
-                listener.accept().unwrap_err().kind(),
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap_err()
+                .kind(),
                 std::io::ErrorKind::WouldBlock,
                 "managed legacy reader never sends a refresh POST"
             );
@@ -216,7 +227,12 @@ mod tests {
             let served = listener.try_clone().unwrap();
             let target = home.to_owned();
             let publisher = std::thread::spawn(move || {
-                let (mut stream, _) = served.accept().unwrap();
+                let (mut stream, _) = aterm_uds::accept(
+                    &served,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap();
                 stream
                     .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
                     .unwrap();
@@ -260,9 +276,14 @@ mod tests {
             assert!(snapshot.identity.is_none() && snapshot.context.is_none());
             assert_eq!(std::fs::read(auth_path_in_home(home)).unwrap(), before);
             assert!(!beside_auth(home, JOURNAL_SUFFIX).exists());
-            listener.set_nonblocking(true).unwrap();
             assert_eq!(
-                listener.accept().unwrap_err().kind(),
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap_err()
+                .kind(),
                 std::io::ErrorKind::WouldBlock,
                 "a late marker prevents the 401 refresh POST"
             );

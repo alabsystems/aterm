@@ -9,6 +9,13 @@ license.workspace = true
 repository.workspace = true
 description = "Fast non-cryptographic hashing for aterm: FxHash (replaces rustc-hash) and the stable FNV-1a/64 (astream-wire's)"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [dependencies]
 # ONE FNV-1a/64. astream-wire's `hash::fnv1a_64_update`, `FNV1A_64_INIT` and
 # `FNV1A_64_PRIME` are the byte loop, offset basis and prime astream's

@@ -96,7 +96,12 @@ fn a_socket_clock_sample_is_not_an_io_failure_and_sleep_ends_the_original_wait()
     for sleeps in [false, true] {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let mut client = TcpStream::connect_timeout(&listener.local_addr().unwrap(), HANG).unwrap();
-        let (mut peer, _) = listener.accept().unwrap();
+        let (mut peer, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         checked_socket(&peer);
         let slept = Arc::new(AtomicU64::new(0));
         let clock = slept.clone();
@@ -206,7 +211,6 @@ fn zero_and_unrepresentable_budgets_are_already_expired() {
 #[test]
 fn an_expired_connect_does_not_reach_the_listener() {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let now = Instant::now();
     let clock = || now;
     let expired = Deadline::new(Duration::ZERO, &clock);
@@ -215,7 +219,13 @@ fn an_expired_connect_does_not_reach_the_listener() {
         .expect("an expired connection was started");
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert_eq!(
-        listener.accept().unwrap_err().kind(),
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap_err()
+        .kind(),
         io::ErrorKind::WouldBlock
     );
 }
@@ -234,7 +244,12 @@ fn expired_stream_and_its_clone_do_not_send_more_bytes() {
     let (write_error, clone_error, read_error, flush_error, later) = std::thread::scope(|scope| {
         let mut stream = stream;
         let server = scope.spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
+            let (mut socket, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             checked_socket(&socket);
             let mut first = [0; 4];
             socket.read_exact(&mut first).unwrap();
@@ -298,7 +313,12 @@ fn read_to_end_checks_the_deadline_again_after_partial_input() {
         let mut stream = stream;
         stream.observe_read(&read);
         let server = scope.spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
+            let (mut socket, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             checked_socket(&socket);
             socket.write_all(b"x").unwrap();
             sent.send(()).unwrap();

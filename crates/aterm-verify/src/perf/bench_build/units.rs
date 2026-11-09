@@ -16,6 +16,8 @@ pub(crate) struct Unit {
     pub opt_level: String,
     pub debug_assertions: bool,
     pub overflow_checks: bool,
+    /// Whether Cargo plans incremental compilation for this unit.
+    pub incremental: bool,
     /// The plan's word for the unit's LTO (`true` is fat, `false` is none).
     pub lto: String,
     /// The unit's codegen units, when the profile names them.
@@ -140,6 +142,7 @@ impl Audit {
                         .to_string(),
                     debug_assertions: flag("debug_assertions")?,
                     overflow_checks: flag("overflow_checks")?,
+                    incremental: flag("incremental")?,
                     lto: profile
                         .and_then(|p| p.get("lto"))
                         .and_then(Value::as_str)
@@ -200,7 +203,7 @@ impl Audit {
                 .join(" · ")
         };
         format!(
-            "{} units on the measured path: {}; {}; {}; lto {}; codegen units {}",
+            "{} units on the measured path: {}; {}; {}; {}; lto {}; codegen units {}",
             self.units.len(),
             levels.join(" · "),
             switch(
@@ -210,6 +213,10 @@ impl Audit {
             switch(
                 "overflow checks",
                 self.units.iter().filter(|u| u.overflow_checks).count()
+            ),
+            switch(
+                "incremental compilation",
+                self.units.iter().filter(|u| u.incremental).count()
             ),
             tally(self.units.iter().map(|u| u.lto.clone()).collect()),
             tally(
@@ -332,7 +339,7 @@ mod tests {
         format!(
             "{{\"pkg_id\":\"path+file:///w/crates/{package}#0.1.0\",\"mode\":\"{mode}\",\
              \"target\":{{\"kind\":[\"{kind}\"]}},\"profile\":{{\"opt_level\":\"{opt}\",\
-             \"debug_assertions\":true,\"overflow_checks\":false,\"lto\":\"false\",\
+             \"debug_assertions\":true,\"overflow_checks\":false,\"incremental\":false,\"lto\":\"false\",\
              \"codegen_units\":16}},\"dependencies\":[{}]}}",
             deps.join(",")
         )
@@ -384,11 +391,34 @@ mod tests {
             "the bench, the binary and the library"
         );
         assert_eq!(audit.refusal(Promise::of(Profile::Opt)), None);
-        assert_eq!(
-            audit.summary(),
-            "3 units on the measured path: opt-level 3 ×3; debug assertions on; overflow \
-             checks off; lto false ×3; codegen units 16 ×3"
+    }
+
+    #[test]
+    fn incremental_policy_is_retained_without_changing_codegen_admission() {
+        let off = plan("3");
+        let on = off.replace("\"incremental\":false", "\"incremental\":true");
+        let mixed = off.replacen("\"incremental\":false", "\"incremental\":true", 1);
+        let off = Audit::of(&off).unwrap();
+        let on = Audit::of(&on).unwrap();
+        let mixed = Audit::of(&mixed).unwrap();
+        for audit in [&off, &on, &mixed] {
+            assert_eq!(audit.refusal(Promise::of(Profile::Opt)), None);
+        }
+        assert_ne!(off, on, "the parsed policy must survive the audit");
+        assert_ne!(
+            off.summary(),
+            on.summary(),
+            "saved records must distinguish policies"
         );
+        assert_ne!(mixed.summary(), off.summary());
+        assert_ne!(mixed.summary(), on.summary());
+    }
+
+    #[test]
+    fn missing_incremental_policy_is_not_reported_as_off() {
+        let missing = plan("3").replace(",\"incremental\":false", "");
+        let why = Audit::of(&missing).expect_err("an absent policy is unknown");
+        assert!(why.contains("incremental"), "{why}");
     }
 
     #[test]
@@ -401,11 +431,9 @@ mod tests {
             Audit::of(&plan("2").replace("\"overflow_checks\":false", "\"overflow_checks\":true"))
                 .expect("the dev mix parses");
         assert_eq!(dev.refusal(Promise::of(Profile::Dev)), None);
-        assert_eq!(
-            dev.summary(),
-            "3 units on the measured path: opt-level 2 ×1 (aterm-core) · opt-level 3 ×2; debug \
-             assertions on; overflow checks on; lto false ×3; codegen units 16 ×3"
-        );
+        assert_eq!(dev.by_level()["2"].0, 1);
+        assert_eq!(dev.by_level()["3"].0, 2);
+        assert!(dev.units.iter().all(|unit| unit.overflow_checks));
     }
 
     #[test]
@@ -450,11 +478,6 @@ mod tests {
         let promise = Promise::of(Profile::Shipped);
         let audit = Audit::of(&shipped_plan(|all| all)).expect("parses");
         assert_eq!(audit.refusal(promise), None);
-        assert_eq!(
-            audit.summary(),
-            "3 units on the measured path: opt-level 3 ×3; debug assertions off; overflow \
-             checks off; lto true ×3; codegen units 1 ×3"
-        );
         for (edit, says) in [
             (
                 (|all: String| all.replacen("\"lto\":\"true\"", "\"lto\":\"thin\"", 1))

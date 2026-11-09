@@ -342,7 +342,6 @@ pub(crate) fn fake_instance(
     // inherited copy of these sockets (`aterm_uds::kept_out`).
     let listener =
         aterm_uds::kept_out(|| std::os::unix::net::UnixListener::bind(sock)).expect("bind");
-    listener.set_nonblocking(true).expect("nonblocking accept");
     let (cancelled, cancel) = std::io::pipe().expect("server cancellation");
     let active = std::sync::Arc::new(std::sync::Mutex::new(None));
     let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -378,7 +377,11 @@ pub(crate) fn fake_instance(
             if polled < 0 || ready[1].revents != 0 {
                 break;
             }
-            let conn = match aterm_uds::kept_out(|| listener.accept()) {
+            let conn = match aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 Ok((conn, _)) => conn,
                 Err(e)
                     if matches!(
@@ -390,7 +393,6 @@ pub(crate) fn fake_instance(
                 }
                 Err(_) => break,
             };
-            let _ = conn.set_nonblocking(false);
             let Ok(cut) = aterm_uds::kept_out(|| conn.try_clone()) else {
                 continue;
             };

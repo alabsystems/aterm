@@ -123,8 +123,8 @@ pub(super) fn preflight(
     if (!cask.naked
         && !autodetect_naked(cask)
         && git_raw_plan(cask).is_none()
-        && !fetch::archive_supported(&download_name(cask))
-        && !fetch::is_dmg(&download_name(cask)))
+        && !fetch::archive_supported(&download_basename(cask))
+        && !fetch::is_dmg(&download_basename(cask)))
         || cask.artifacts.is_empty()
     {
         return Err(InstallError::Unsupported(format!(
@@ -439,7 +439,7 @@ fn install_inner(
             return Ok(inst.version);
         }
     }
-    let file = download_name(cask);
+    let file = download_basename(cask);
     if (!cask.naked
         && !autodetect_naked(cask)
         && git_raw_plan(cask).is_none()
@@ -486,7 +486,7 @@ fn install_inner(
     }
     prefix.ensure()?;
     let git_plan = git_raw_plan(cask);
-    let dest = prefix.cache().join(&file);
+    let dest = download_dest(prefix, cask);
     // Brew's download-queue narration: one heading for the named
     // cask and a tick once its download is in hand (cached counts).
     // Dependency casks get the tick only; brew fetches them under a
@@ -524,14 +524,7 @@ fn install_inner(
         eprintln!("✔︎ Cask {} ({})", cask.token, cask.version);
     } else if naked {
         std::fs::create_dir_all(&payload).map_err(|e| format!("abrew: {e}"))?;
-        let cached_name = dest
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let base = cached_name
-            .strip_prefix(&format!("{}-", cask.token))
-            .unwrap_or(&cached_name)
-            .to_string();
+        let base = download_basename(cask);
         let staged_file = payload.join(&base);
         fetch::copy_regular(&dest, &staged_file)?;
         for (relative, _, _, _) in &artifacts {
@@ -998,7 +991,7 @@ fn autodetect_naked(cask: &Cask) -> bool {
     if cask.naked || cask.nested.is_some() {
         return false;
     }
-    let file = download_name(cask);
+    let file = download_basename(cask);
     if fetch::archive_supported(&file) || fetch::is_dmg(&file) {
         return false;
     }
@@ -1063,19 +1056,110 @@ fn archive_magic(path: &Path) -> bool {
         || magic == *b"\xfd7zXZ\0"
 }
 
-pub(super) fn download_name(cask: &Cask) -> String {
-    let substituted = cask.url.replace("#{version}", &cask.version);
-    let without_fragment = substituted.split('#').next().unwrap_or(&substituted);
-    let without_query = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment);
-    let base = without_query
-        .rsplit('/')
-        .next()
-        .filter(|s| super::single_normal_segment(s))
-        .unwrap_or("download");
-    format!("{}-{base}", cask.token)
+/// The cask's download URL with `#{version}` interpolated
+/// (the string brew hashes for its cache name).
+fn substituted_url(cask: &Cask) -> String {
+    cask.url.replace("#{version}", &cask.version)
+}
+
+/// Percent-decode (`URI.unescape`): `%XX` bytes, lossy UTF-8.
+fn uri_unescape(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Brew `AbstractFileDownloadStrategy#parse_basename` +
+/// `Utils.safe_filename`: a `response-content-disposition`
+/// filename wins, else the last path/query component with
+/// an extension, else the last path component; control
+/// bytes and separators are stripped. An empty result
+/// falls back to "download" so staging always has a name.
+fn parse_download_basename(url: &str) -> String {
+    let (head, query) = match url.split_once('?') {
+        Some((head, query)) => (head, Some(query)),
+        None => (url, None),
+    };
+    let mut query_values: Vec<String> = Vec::new();
+    if let Some(query) = query {
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let value = uri_unescape(&value.replace('+', " "));
+            if key == "response-content-disposition"
+                && let Some(name) = value
+                    .split("filename=")
+                    .nth(1)
+                    .map(|n| n.trim().trim_matches(['"', '\'']))
+                && !name.is_empty()
+            {
+                let base = name.rsplit('/').next().unwrap_or(name);
+                return safe_filename(base);
+            }
+            query_values.push(value);
+        }
+    }
+    // Only the URI path's segments count, never the host.
+    let path = head.split('#').next().unwrap_or(head);
+    let path = match path.split_once("://") {
+        Some((_, rest)) => match rest.find('/') {
+            Some(at) => &rest[at..],
+            None => "",
+        },
+        None => path,
+    };
+    let segments: Vec<String> = path
+        .split('/')
+        .map(uri_unescape)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let has_ext = |s: &str| match s.rfind('.') {
+        Some(at) => at > 0 && at + 1 < s.len(),
+        None => false,
+    };
+    for candidate in segments.iter().chain(&query_values).rev() {
+        let base = candidate.rsplit('/').next().unwrap_or(candidate);
+        if has_ext(base) {
+            return safe_filename(base);
+        }
+    }
+    safe_filename(segments.last().map_or("", String::as_str))
+}
+
+fn safe_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/')
+        .collect();
+    if cleaned.is_empty() || cleaned == "." || cleaned == ".." {
+        "download".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// The download's display basename (brew `download_name`).
+pub(super) fn download_basename(cask: &Cask) -> String {
+    parse_download_basename(&substituted_url(cask))
+}
+
+/// The cask payload's cached-download path (brew
+/// `downloads/<sha256(url)>--<basename>`).
+pub(super) fn download_dest(prefix: &Prefix, cask: &Cask) -> PathBuf {
+    super::install::download_dest(prefix, &substituted_url(cask), &download_basename(cask))
 }
 
 /// Validate the program mapping independently of payload IO, before download.
@@ -2946,7 +3030,7 @@ mod tests {
         .unwrap();
         let cask = cask(format!("file://{}", archive.display()));
         assert!(cask.sha256.is_none());
-        assert!(!prefix.cache().join(download_name(&cask)).exists());
+        assert!(!download_dest(&prefix, &cask).exists());
         assert_eq!(
             install(&prefix, &cask, false, false, false, false).unwrap(),
             "1"
@@ -3050,6 +3134,32 @@ mod tests {
     }
 
     #[test]
+    fn download_basename_follows_brew_parse_rules() {
+        // Plain path basename, percent-decoded.
+        assert_eq!(
+            parse_download_basename("https://example.com/Firefox%20159.0.dmg"),
+            "Firefox 159.0.dmg"
+        );
+        // The last component WITH an extension wins over a
+        // trailing script name via the query scan as well.
+        assert_eq!(
+            parse_download_basename("https://example.com/download.php?file=foo-1.0.tar.gz"),
+            "foo-1.0.tar.gz"
+        );
+        // response-content-disposition beats both.
+        assert_eq!(
+            parse_download_basename(
+                "https://example.com/x?response-content-disposition=attachment%3B%20filename%3DReal.zip"
+            ),
+            "Real.zip"
+        );
+        // No extension anywhere: last path segment; a bare
+        // host leaves the "download" fallback.
+        assert_eq!(parse_download_basename("https://example.com/get"), "get");
+        assert_eq!(parse_download_basename("https://example.com/"), "download");
+    }
+
+    #[test]
     fn autodetect_naked_admits_single_raw_file_downloads_only() {
         let font = |url: &str, source: &str| {
             let mut c = cask(url.to_string());
@@ -3067,19 +3177,19 @@ mod tests {
             );
         }
         assert_eq!(
-            download_name(&font("https://example.com/download/", "Foo.ttf")),
-            "demo-download"
+            download_basename(&font("https://example.com/download/", "Foo.ttf")),
+            "download"
         );
         assert_eq!(
-            download_name(&font("https://example.com/..", "Foo.ttf")),
-            "demo-download"
+            download_basename(&font("https://example.com/..", "Foo.ttf")),
+            "download"
         );
         assert_eq!(
-            download_name(&font(
+            download_basename(&font(
                 "https://example.com/#{version}/Foo-#{version}.ttf?dl=1#frag",
                 "Foo.ttf"
             )),
-            "demo-Foo-1.ttf"
+            "Foo-1.ttf"
         );
         // Known archives and images are not naked.
         assert!(!autodetect_naked(&font(
@@ -3717,7 +3827,7 @@ mod tests {
             ),
         )
         .unwrap();
-        std::fs::remove_file(prefix.cache().join(download_name(&cask))).unwrap();
+        std::fs::remove_file(download_dest(&prefix, &cask)).unwrap();
         assert!(install(&prefix, &cask, false, false, false, false).is_err());
         assert!(prefix.installed(Kind::Cask).is_empty());
         assert!(!prefix.cask_dir("demo", "1").exists());

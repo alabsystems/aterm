@@ -241,7 +241,12 @@ impl Fixture {
         let peer = peer.parse().unwrap();
         let (ended, end) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream.set_read_timeout(Some(HANG)).unwrap();
             stream.set_write_timeout(Some(HANG)).unwrap();
             let result = handle.serve(&mut stream, peer);

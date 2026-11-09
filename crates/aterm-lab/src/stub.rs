@@ -3914,7 +3914,11 @@ pub fn start(args: Args) -> Result<(u16, Option<u16>), String> {
         proxy_port = Some(ppn);
         let s = Arc::clone(&stub);
         std::thread::spawn(move || {
-            for conn in pl.incoming().flatten() {
+            while let Ok((conn, _)) = aterm_uds::accept(
+                &pl,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 let s = Arc::clone(&s);
                 std::thread::spawn(move || s.black_hole(conn));
             }
@@ -3932,7 +3936,11 @@ pub fn start(args: Args) -> Result<(u16, Option<u16>), String> {
     ));
     let s = Arc::clone(&stub);
     std::thread::spawn(move || {
-        for conn in listener.incoming().flatten() {
+        while let Ok((conn, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             let s = Arc::clone(&s);
             std::thread::spawn(move || s.connection(conn));
         }

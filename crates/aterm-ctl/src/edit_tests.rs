@@ -381,7 +381,12 @@ fn edit_and_await_edit_over_a_real_socket() {
     let window = std::thread::spawn(move || {
         let mut heard = Vec::new();
         for answer in answers {
-            let (conn, _) = listener.accept().expect("accept");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut reader = std::io::BufReader::new(conn.try_clone().expect("clone"));
             let mut writer = conn;
             for reply in ["", "OK version=test\n", answer.as_str()] {

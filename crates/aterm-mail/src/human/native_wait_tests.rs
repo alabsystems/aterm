@@ -26,7 +26,11 @@ impl Provider {
                 let until = Instant::now() + HANG;
                 let mut calls = 0;
                 loop {
-                    let mut stream = match listener.accept() {
+                    let mut stream = match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) {
                         Ok((stream, _)) => stream,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             if stop.load(Ordering::Acquire) {
@@ -41,7 +45,6 @@ impl Provider {
                         }
                         Err(error) => panic!("owned verification provider: {error}"),
                     };
-                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(HANG)).unwrap();
                     stream.set_write_timeout(Some(HANG)).unwrap();
                     let mut head = Vec::new();

@@ -20,6 +20,13 @@ authors.workspace = true
 repository.workspace = true
 license = "MIT AND Apache-2.0"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [lib]
 name = "aterm_lz4"
 path = "src/lib.rs"

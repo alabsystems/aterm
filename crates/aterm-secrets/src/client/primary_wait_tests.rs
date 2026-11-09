@@ -32,7 +32,6 @@ impl NativePrimary {
             Caller::Join => None,
         };
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/v1/native-budget", listener.local_addr().unwrap());
         let mut config = config(&paths).unwrap().unwrap();
         config.source = Source::Url(url.clone());
@@ -48,9 +47,12 @@ impl NativePrimary {
                 let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
                 let mut primaries = 0;
                 loop {
-                    match listener.accept() {
+                    match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) {
                         Ok((mut stream, _)) => {
-                            stream.set_nonblocking(false).unwrap();
                             stream
                                 .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
                                 .unwrap();

@@ -3694,11 +3694,15 @@ pub(crate) fn spawn(
             #[cfg(windows)]
             {
                 let mut accept_backoff: Option<std::time::Duration> = None;
-                for stream in listener.incoming() {
-                    let stream = match stream {
+                loop {
+                    let stream = match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) {
                         Ok(s) => {
                             accept_backoff = None;
-                            s
+                            s.0
                         }
                         Err(e) => {
                             // Descriptor/buffer exhaustion recurs immediately; back off

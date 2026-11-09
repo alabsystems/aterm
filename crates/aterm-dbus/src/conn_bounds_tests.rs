@@ -291,9 +291,12 @@ fn a_joins_handshake_ends_by_the_callers_bound_not_the_default() {
     });
     let outcome = joined.recv_timeout(hang.saturating_duration_since(Instant::now()));
     // The bus answers nothing, and accepts the join only now: its connection waits in the backlog.
-    listener.set_nonblocking(true).unwrap();
-    let (mut bus, _) = listener.accept().expect("the join connected");
-    bus.set_nonblocking(false).unwrap();
+    let (mut bus, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Ready,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .expect("the join connected");
     // A join still waiting hears the bus hang up and ends; one that gave up has hung up already.
     let _ = bus.shutdown(Shutdown::Write);
     worker.join().unwrap();

@@ -9,6 +9,14 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 description = "Executable models of replicated database causality and offline resource conservation"
+
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [dependencies]
 aterm-spec.workspace = true
 [lints]

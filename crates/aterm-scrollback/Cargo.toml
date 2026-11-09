@@ -10,6 +10,13 @@ license.workspace = true
 repository.workspace = true
 description = "Tiered scrollback storage with LZ4 compression"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [features]
 # Headless hot(RAM)+warm(LZ4)+cold(LZ4) scrollback. NO libc / std::fs in the
 # dependency closure (the §2.7 "no-platform" engine invariant). Every compressed

@@ -683,7 +683,12 @@ mod tests {
     fn deadline_worker_does_not_restart_an_expired_exchange() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (_peer, _) = listener.accept().unwrap();
+        let (_peer, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         tcp.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
             .unwrap();
         let creator = thread::current().id();
@@ -716,7 +721,12 @@ mod tests {
         for completed_after in [budget - Duration::from_nanos(1), budget] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let tcp = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            let (mut peer, _) = listener.accept().unwrap();
+            let (mut peer, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             tcp.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
                 .unwrap();
             let creator = thread::current().id();
@@ -881,8 +891,17 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let served = a.clone();
         let server = thread::spawn(move || {
-            let connection =
-                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap();
+            let connection = Connection::admit(
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap()
+                .0,
+                Scope::Loopback,
+            )
+            .unwrap();
             serve_connection(&served, connection).unwrap()
         });
         let credentials = Credentials::load(&b).unwrap();
@@ -934,8 +953,17 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let served = a.clone();
         let server = thread::spawn(move || {
-            let connection =
-                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap();
+            let connection = Connection::admit(
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap()
+                .0,
+                Scope::Loopback,
+            )
+            .unwrap();
             serve_connection(&served, connection).unwrap()
         });
         let credentials = Credentials::load(&b).unwrap();

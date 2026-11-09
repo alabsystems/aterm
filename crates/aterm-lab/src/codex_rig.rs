@@ -257,7 +257,11 @@ pub fn sse(items: Vec<J>) -> String {
 
 /// The fake Responses API on `listener`.
 pub fn serve(listener: TcpListener, log: Arc<Mutex<ApiLog>>, answer: Answer) {
-    for conn in listener.incoming().flatten() {
+    while let Ok((conn, _)) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    ) {
         let (log, answer) = (Arc::clone(&log), Arc::clone(&answer));
         std::thread::spawn(move || serve_one(conn, &log, &answer));
     }

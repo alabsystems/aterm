@@ -90,7 +90,6 @@ impl Offer {
         // bind is exclusive: never unlink or adopt an existing rendezvous.
         let listener = aterm_uds::kept_out(|| CtlListener::bind(&path))?;
         aterm_uds::atomic_file::set_mode_nofollow(&path, 0o600)?;
-        listener.set_nonblocking(true)?;
         let metadata = std::fs::symlink_metadata(&path)?;
         if !metadata.file_type().is_socket() {
             return Err(invalid("app-band guard rendezvous is not a socket"));
@@ -146,9 +145,11 @@ impl Offer {
 
     pub(super) fn transfer(&self, pid: u32, label: &str, deadline: Instant) -> io::Result<()> {
         self.validate()?;
-        ready::until(self.listener.as_fd(), ready::Interest::Read, deadline)?;
-        let (stream, _) = aterm_uds::kept_out(|| self.listener.accept())?;
-        stream.set_nonblocking(true)?;
+        let (stream, _) = aterm_uds::accept(
+            &self.listener,
+            aterm_uds::AcceptWait::Until(deadline),
+            aterm_uds::AcceptedMode::Nonblocking,
+        )?;
         check_peer(&stream, pid)?;
         // The PID file is a readiness rendezvous, never descriptor authority. Require the
         // actual launchd job's current PID as well as the connected kernel credential.

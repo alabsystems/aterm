@@ -78,7 +78,17 @@ pub(crate) fn clock_round(
     std::thread::scope(|tasks| {
         let incoming = tasks.spawn(|| {
             right.exchange(
-                Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap(),
+                Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    LinkScope::Loopback,
+                )
+                .unwrap(),
                 Side::Responder,
                 &mut rb,
             )

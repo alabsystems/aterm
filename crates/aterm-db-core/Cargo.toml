@@ -9,6 +9,13 @@ repository.workspace = true
 authors.workspace = true
 description = "Pure admission and conservation kernels for aterm's replicated application database"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [dev-dependencies]
 aterm-models-db.workspace = true
 aterm-spec.workspace = true

@@ -28,7 +28,6 @@ impl World {
         let dir = crate::test_scratch_dir("alloc");
         let path = dir.path().join(name);
         let listener = aterm_uds::kept_out(|| CtlListener::bind(&path)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         if token {
             let token = dir
                 .path()
@@ -48,10 +47,13 @@ impl World {
         }
     }
     fn accept(&self) -> CtlStream {
-        ready::until(self.listener.as_fd(), Interest::Read, deadline()).unwrap();
-        let (stream, _) = aterm_uds::kept_out(|| self.listener.accept()).unwrap();
-        stream.set_nonblocking(true).unwrap();
-        stream
+        aterm_uds::accept(
+            &self.listener,
+            aterm_uds::AcceptWait::Until(deadline()),
+            aterm_uds::AcceptedMode::Nonblocking,
+        )
+        .unwrap()
+        .0
     }
 }
 
@@ -234,7 +236,14 @@ fn missing_owner_token_and_expired_deadline_do_not_send_auth_or_descriptor() {
         io::ErrorKind::TimedOut
     );
     assert_eq!(peer.read(&mut [0]).unwrap(), 0);
-    assert!(matches!(world.listener.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    assert!(matches!(
+        aterm_uds::accept(
+            &world.listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock
+    ));
 }
 
 #[test]
@@ -305,5 +314,12 @@ fn changing_latest_alias_does_not_retarget_a_pinned_authenticated_exchange() {
         );
         server.join().unwrap();
     });
-    assert!(matches!(other.listener.accept(), Err(e) if e.kind() == io::ErrorKind::WouldBlock));
+    assert!(matches!(
+        aterm_uds::accept(
+            &other.listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock
+    ));
 }

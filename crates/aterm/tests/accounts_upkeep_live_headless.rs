@@ -237,7 +237,11 @@ fn loopback_source(
     let (asked_tx, asked) = std::sync::mpsc::channel();
     let (release, released) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
+        let Ok((mut stream, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         let mut head = Vec::new();

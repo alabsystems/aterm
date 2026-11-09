@@ -13,6 +13,13 @@ description = "aterm's models of the terminal core, the keeper and the selection
 # the suite nor a `mod` of it compiles into nothing.
 autotests = false
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [lib]
 # No unit tests and no doctests live in src/: the models' tests are tests/suite.rs.
 test = false

@@ -244,7 +244,11 @@ fn host() {
             atpkg::lease::holders(&layout.prefix, &subject),
             atpkg::lease::Holders::Held(_)
         );
-        match aterm_uds::kept_out(|| listener.accept()) {
+        match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((stream, _)) => {
                 let image = program.clone();
                 connections.push(std::thread::spawn(move || {

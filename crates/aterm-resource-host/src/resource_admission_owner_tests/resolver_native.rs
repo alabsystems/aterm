@@ -118,7 +118,6 @@ fn host() {
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&socket)).unwrap();
     aterm_uds::atomic_file::set_mode_nofollow(&socket, 0o600).unwrap();
     let _instance = store.publish(&program, &listener).unwrap();
-    listener.set_nonblocking(true).unwrap();
     let mut world = World::with_scratch(Scratch::at(&path));
     let parent = trust_resource_provenance::process::account_home()
         .unwrap()
@@ -258,7 +257,11 @@ fn host() {
                 assert!((1..=resolver::RESOLVER_MAX_QUERIES).contains(&job.resolver_queries));
             }
         }
-        match aterm_uds::kept_out(|| listener.accept()) {
+        match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((stream, _)) => {
                 let end = Instant::now() + HANG;
                 let peer = match wire::local_peer(&stream) {

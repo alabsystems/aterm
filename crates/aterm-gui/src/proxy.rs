@@ -1436,7 +1436,11 @@ mod tests {
             let listener = aterm_uds::CtlListener::bind(&sock).unwrap();
             let (ready, listening) = std::sync::mpsc::channel();
             let host = std::thread::spawn(move || -> std::io::Result<Vec<String>> {
-                let (stream, _) = listener.accept()?;
+                let (stream, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )?;
                 stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
                 stream.set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
                 ready.send(()).unwrap();
@@ -1505,7 +1509,11 @@ mod tests {
             let identity = aterm_uds::listener::listener_at(&sock);
             let (ready, listening) = std::sync::mpsc::channel();
             let host = std::thread::spawn(move || -> std::io::Result<String> {
-                let (stream, _) = listener.accept()?;
+                let (stream, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )?;
                 stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
                 stream.set_write_timeout(Some(aterm_spec::wait::MUST_HAPPEN))?;
                 ready.send(()).unwrap();
@@ -1595,7 +1603,12 @@ mod tests {
         let sock = dir.path().join("refuse.sock");
         let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
         let child = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().expect("accept");
+            let (mut conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut rdr = BufReader::new(conn.try_clone().unwrap());
             let mut first = String::new();
             rdr.read_line(&mut first).unwrap();
@@ -1624,7 +1637,12 @@ mod tests {
             let sock = dir.path().join("surplus.sock");
             let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
             let host = std::thread::spawn(move || {
-                let (conn, _) = listener.accept().expect("accept");
+                let (conn, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .expect("accept");
                 let mut rdr = BufReader::new(conn.try_clone().unwrap());
                 let mut probe = String::new();
                 rdr.read_line(&mut probe).unwrap();
@@ -1676,7 +1694,12 @@ mod tests {
         let sock = dir.path().join("busy.sock");
         let listener = aterm_uds::CtlListener::bind(&sock).expect("bind");
         let look = CtlStream::connect(&sock).expect("connect");
-        let (conn, _) = listener.accept().expect("accept");
+        let (conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         (&conn)
             .write_all(b"ERR control server busy; retry\n")
             .unwrap();
@@ -1708,7 +1731,12 @@ mod tests {
             let listener = aterm_uds::CtlListener::bind(&sock).expect("bind host");
             let (fresh_path, path) = (dir.path().join("fresh.sock"), sock.clone());
             let host = std::thread::spawn(move || {
-                let (conn, _) = listener.accept().expect("accept");
+                let (conn, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .expect("accept");
                 let mut rdr = BufReader::new(conn.try_clone().unwrap());
                 let mut probe = String::new();
                 rdr.read_line(&mut probe).unwrap();
@@ -1733,7 +1761,12 @@ mod tests {
                 drop(rdr);
                 drop(conn);
                 loop {
-                    let (conn, _) = listener.accept().expect("accept a look");
+                    let (conn, _) = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .expect("accept a look");
                     let mut line = String::new();
                     let _ = BufReader::new(&conn).read_line(&mut line);
                     if line.starts_with("stop") {
@@ -1784,7 +1817,12 @@ mod tests {
         let listener = aterm_uds::CtlListener::bind(&sock).expect("bind child");
 
         let child = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().expect("accept");
+            let (mut conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut rdr = BufReader::new(conn.try_clone().unwrap());
             let mut first = String::new();
             rdr.read_line(&mut first).unwrap();

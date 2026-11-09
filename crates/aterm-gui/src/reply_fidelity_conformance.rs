@@ -51,7 +51,12 @@ fn host() -> Host {
     let listener = aterm_uds::CtlListener::bind(&path).expect("bind host");
     let (tx, read) = mpsc::channel();
     let thread = std::thread::spawn(move || {
-        let (mut conn, _) = listener.accept().expect("accept");
+        let (mut conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let mut reader = BufReader::new(conn.try_clone().unwrap());
         let mut probe = String::new();
         let _ = reader.read_line(&mut probe);
@@ -188,7 +193,12 @@ fn real_forward_outcomes_conform_to_reply_fidelity_model() {
     let tokenless = dir.path().join("aterm-77031.sock");
     let listener = aterm_uds::CtlListener::bind(&tokenless).expect("bind the host");
     let heard = std::thread::spawn(move || {
-        let (conn, _) = listener.accept().expect("accept");
+        let (conn, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         crate::test_socket::read_to_end_of_file(&conn, |read| {
             format!("the forward's end ({} bytes read)", read.len())
         })

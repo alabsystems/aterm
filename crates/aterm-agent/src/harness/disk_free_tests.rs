@@ -209,7 +209,12 @@ fn a_cache_with_a_bound_unix_socket_is_kept_whole() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["action"], Value::from("refused"));
     let _client = UnixStream::connect(&socket).expect("socket still reachable");
-    let _server = listener.accept().expect("socket still accepts");
+    let _server = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .expect("socket still accepts");
 }
 
 #[cfg(unix)]
@@ -304,11 +309,12 @@ fn a_socket_added_after_admission_is_kept_and_partial_allocation_is_actual() {
                 .is_socket()
         );
         let _client = UnixStream::connect(&blob).expect("socket still reachable");
-        let _server = listener
-            .as_ref()
-            .expect("injection ran")
-            .accept()
-            .expect("still accepts");
+        let _server = aterm_uds::accept(
+            listener.as_ref().expect("injection ran"),
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("still accepts");
     }
 }
 

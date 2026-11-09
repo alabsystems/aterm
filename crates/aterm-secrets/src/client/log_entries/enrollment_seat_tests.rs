@@ -119,7 +119,7 @@ fn enrollment_refuses_a_seat_whose_kin_holds_a_removed_node_key() {
         .expect("a home holding no vault has no roster to read");
     assert_eq!(
         passed.to_string(),
-        "the vault state is busy or unavailable while reading its roster",
+        "the vault state is unavailable while reading its roster",
         "CONTROL: with the kin's key retired the seat passes the guard"
     );
 }

@@ -109,7 +109,6 @@ fn cached_helper_intake_success_deny_wrong_challenge_and_truncated_bundle() {
     for mode in ["deny", "truncated", "wrongnonce", "success"] {
         let path = root.join(mode);
         let listener = aterm_uds::kept_out(|| CtlListener::bind(&path)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let (producer, proof) = UnixStream::pair().unwrap();
         let mut data = File::options()
             .read(true)
@@ -139,15 +138,12 @@ fn cached_helper_intake_success_deny_wrong_challenge_and_truncated_bundle() {
             .unwrap();
         let mut helper = Helper(command.spawn().unwrap());
         drop(command);
-        let channel = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    ready::until(listener.as_fd(), Interest::Read, deadline()).unwrap()
-                }
-                Err(e) => panic!("accept: {e}"),
-            }
-        };
+        let (channel, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Until(deadline()),
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let (done, held) = std::sync::mpsc::sync_channel(1);
         let echo = if matches!(mode, "success" | "wrongnonce") {
             Some(std::thread::spawn(move || {

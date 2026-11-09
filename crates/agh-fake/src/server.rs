@@ -81,11 +81,15 @@ fn accept(
     state: &Arc<Mutex<State>>,
     stop: &AtomicBool,
 ) {
-    for stream in listener.incoming() {
+    loop {
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        let Ok(stream) = stream else {
+        let Ok((stream, _)) = aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             std::thread::park_timeout(ACCEPT_BACKOFF);
             continue;
         };

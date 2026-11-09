@@ -34,6 +34,11 @@ cells = ["linux-arm"]
 # has no cell and so nothing that reaches aterm-uds does (the design's fact 50).
 aterm-digest = { workspace = true }
 
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+# The macOS-only Unix-socket seam accepts through the workspace's one sanctioned helper. The
+# shipped Linux/musl guest does not resolve or build this dependency.
+aterm-uds = { workspace = true }
+
 [dev-dependencies]
 # Scratch directories for the tests' sockets and fixtures (zero dependencies).
 aterm-tempfile = { workspace = true }

@@ -1969,11 +1969,10 @@ mod tests {
         }
     }
 
-    /// A helper of a bundle check that never answers ends at the deadline, as a
-    /// passing refusal naming the budget, and the call comes back: here every
-    /// `PlistBuddy` blocks opening an Info.plist that is a FIFO nobody writes, and the
-    /// budget is spent before the bundle's walk ([`unanswerable_entry`]) can refuse the
-    /// FIFO, so what it did not reach is left to the helpers.
+    /// An expired bundle-check budget returns passing refusals naming the budget.
+    /// The budget is already spent before the bundle walk ([`unanswerable_entry`])
+    /// can classify the unwritten Info.plist FIFO. No helper is dispatched to open
+    /// it, and the check returns without waiting for a writer.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_bundle_check_helper_that_never_answers_is_a_passing_refusal_at_the_budget() {

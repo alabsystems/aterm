@@ -277,7 +277,12 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let peer =
             std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
-        let (near, _) = listener.accept().expect("accept");
+        let (near, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         peer.shutdown(std::net::Shutdown::Write)
             .expect("the peer's FIN");
         near.set_read_timeout(Some(HANG)).expect("read timeout");
@@ -418,7 +423,12 @@ mod wake_tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let peer =
             std::net::TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
-        let (near, _) = listener.accept().expect("accept");
+        let (near, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         near.set_read_timeout(Some(HANG * 2)).expect("read timeout");
         let reading = near.try_clone().expect("the reader's copy");
         let (started_tx, started) = std::sync::mpsc::channel();

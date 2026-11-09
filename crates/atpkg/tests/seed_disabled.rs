@@ -677,7 +677,6 @@ fn a_window_seed_asks_no_index_and_a_typed_one_does() {
     .unwrap();
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.set_nonblocking(true).unwrap();
     let proxy = format!("http://{}", listener.local_addr().unwrap());
     let asked = std::sync::Arc::new(AtomicUsize::new(0));
     let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -685,7 +684,11 @@ fn a_window_seed_asks_no_index_and_a_typed_one_does() {
         let (asked, stop) = (std::sync::Arc::clone(&asked), std::sync::Arc::clone(&stop));
         std::thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                match listener.accept() {
+                match aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) {
                     Ok((stream, _)) => {
                         asked.fetch_add(1, Ordering::SeqCst);
                         drop(stream);

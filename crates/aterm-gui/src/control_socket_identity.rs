@@ -438,7 +438,12 @@ mod tests {
         assert_eq!(std::env::current_dir().unwrap(), original_dir);
         assert!(received.matches_current(&plan));
         let client = aterm_uds::CtlStream::connect(&plan.sock_path).unwrap();
-        let (accepted, _) = listener.accept().unwrap();
+        let (accepted, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         assert!(crate::control_auth::peer_check(&accepted).is_ok());
         assert_eq!(std::fs::read(&plan.token_path).unwrap(), token.as_bytes());
         let (_absolute_dir, absolute, absolute_listener, absolute_token) = fixture();

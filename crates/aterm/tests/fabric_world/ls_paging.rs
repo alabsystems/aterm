@@ -88,7 +88,11 @@ fn ls(tag: &str, pages: Vec<Page>, extra: &[&str]) -> (String, String, bool) {
     let path = dir.path().join(format!("{tag}.sock"));
     let listener = harness::kept(UnixListener::bind(&path).expect("bind the stub broker"));
     let server = std::thread::spawn(move || {
-        if let Ok((s, _)) = listener.accept() {
+        if let Ok((s, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             answer(harness::kept(s), &pages);
         }
     });

@@ -38,7 +38,12 @@ fn stand_in(
     let path = root.path().join("broker.sock");
     let listener = aterm_uds::CtlListener::bind(&path).unwrap();
     let served = std::thread::spawn(move || {
-        let (stream, _) = aterm_uds::accept(&listener).unwrap();
+        let (stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         wire::send(
             &stream,
             &Frame::Hello {

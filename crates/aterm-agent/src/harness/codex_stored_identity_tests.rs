@@ -155,7 +155,12 @@ fn represented_read(state: &ModelState, variant: u8) -> [(&'static str, i64); 8]
     let server = std::thread::spawn(move || {
         let mut seen = Vec::new();
         for _ in 0..4 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let Some(request) = read_http_request(&mut stream) else {
                 break;
             };

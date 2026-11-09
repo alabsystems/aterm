@@ -244,6 +244,14 @@ mod tests {
 
     #[test]
     fn overflow_snapshot_preserves_seen_total_eof_and_failed_prefix() {
+        if !aterm_uds::test_binary::isolated_lifecycle(
+            "actor::owner::bootstrap_query::capture::tests::overflow_snapshot_preserves_seen_total_eof_and_failed_prefix",
+        ) {
+            return;
+        }
+        // Physical EOF requires the last native writer to close. Create this
+        // pipe only in the owned process, where a parallel test cannot fork
+        // while its writer is open and retain another copy before exec.
         let (mut capture, mut writer) = Capture::pipe().unwrap();
         let chunk = [0x67; wire::MAX_CHUNK];
         for _ in 0..wire::MAX_OUTPUT as usize / chunk.len() {

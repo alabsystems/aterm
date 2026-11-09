@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
-use crate::check_record::{Checks, Failed, Half, State, VerifyRun};
+use crate::check_record::{Binary, Checks, Failed, Half, LintPackage, State, VerifyRun};
 use crate::line::{Admitted, Fix, Hop, Line};
 use crate::provision::{AskWords, Audited, Finding};
 use crate::release::{
@@ -31,6 +31,30 @@ const FIX2: &str = "2222222222222222222222222222222222222222";
 /// Main's movement past the base that is no fix of the line's.
 const N2: &str = "3333333333333333333333333333333333333333";
 const N3: &str = "4444444444444444444444444444444444444444";
+
+fn passed_binary(spec: &str, executable: &str) -> Binary {
+    Binary {
+        spec: spec.into(),
+        sha256: executable.into(),
+        outcome: "ok".into(),
+        content_key: Some("cc".repeat(32)),
+        inputs_bounded: true,
+        input_reason: None,
+        json: Some(false),
+        execution_s: 1.25,
+    }
+}
+
+fn passed_lint_package(spec: &str) -> LintPackage {
+    LintPackage {
+        spec: spec.into(),
+        outcome: "ok".into(),
+        content_key: Some("dd".repeat(32)),
+        inputs_bounded: true,
+        input_reason: None,
+        execution_s: 0.75,
+    }
+}
 
 /// Offline authority/control seam for the launch instrument. Stop at the boundary:
 /// no qualify branch, signature, stage or publication is started. Real freezing,
@@ -105,7 +129,7 @@ struct World {
     /// `measure` (`None` for a tree check), and the check: its outcome word.
     records: BTreeMap<(String, Option<String>, String), &'static str>,
     /// The test binaries a test record that did not pass lists as passed.
-    resume: Vec<(String, String)>,
+    resume: Vec<Binary>,
     /// What the fake `verify release` records for a check it is asked to run, over
     /// `verify_passes` (every asked check ok, else nothing).
     verify_outcomes: BTreeMap<&'static str, &'static str>,
@@ -492,13 +516,17 @@ impl World {
             |check| {
                 let measure = check == aterm_verify::checks::Check::Measure;
                 if measure && executable.is_none() {
-                    return State::Missing { resume: Vec::new() };
+                    return State::Missing {
+                        resume: Vec::new(),
+                        lint_resume: Vec::new(),
+                    };
                 }
                 match record(check.name(), executable.filter(|_| measure)) {
                     Some("ok") => State::Passed,
                     Some("FAIL") => State::Failed { log: log.clone() },
                     _ => State::Missing {
                         resume: self.resume.clone(),
+                        lint_resume: Vec::new(),
                     },
                 }
             },
@@ -6109,7 +6137,7 @@ fn a_resume_runs_only_the_missing_checks_and_carries_the_binaries_that_passed() 
     let mut w = World::new();
     w.verify_outcomes.insert("test", "NOT RUN");
     w.verify_code = 3;
-    let carried = vec![("-p aterm-db --lib".to_owned(), "aa".repeat(32))];
+    let carried = vec![passed_binary("-p aterm-db --lib", &"aa".repeat(32))];
     w.resume.clone_from(&carried);
     let (code, last) = w.run(bump());
     assert_eq!(code, 3, "{last}");
@@ -6371,21 +6399,33 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     let resume = VerifyRun {
         half: Half::Tree,
         checks: vec!["lint".into(), "test".into()],
-        passed_binaries: vec![("-p a --lib".into(), "aa".repeat(32))],
+        passed_binaries: vec![passed_binary("-p a --lib", &"aa".repeat(32))],
+        passed_lint_packages: vec![passed_lint_package("a@1.0.0")],
     };
     let binary = |spec: &str, sha: &str, outcome: &str| {
         format!(
             "verify-event: {}\n",
             aterm_json::json!({"schema":1,"event":"test-binary-finished","test":spec,
-                "outcome":outcome,"exe_sha256":sha,"carried":false})
+                "outcome":outcome,"exe_sha256":sha,"content_key":"cc".repeat(32),
+                "inputs_bounded":true,"input_reason":null,"recorded_execution_s":1.25,
+                "json":false,"carried":false})
+        )
+    };
+    let lint_package = |spec: &str, key: &str, outcome: &str| {
+        format!(
+            "verify-event: {}\n",
+            aterm_json::json!({"schema":1,"event":"lint-package-finished","spec":spec,
+                "outcome":outcome,"content_key":key,"inputs_bounded":true,
+                "input_reason":null,"execution_s":0.75,"carried":false})
         )
     };
     set(
         "3",
         "",
         &format!(
-            "{}{}{}",
+            "{}{}{}{}",
             finished(&[("lint", "ok")]),
+            lint_package("a@1.0.0", &"dd".repeat(32), "ok"),
             binary("-p a --lib", &"aa".repeat(32), "ok"),
             binary("-p b --lib", &"bb".repeat(32), "NOT RUN")
         ),
@@ -6401,20 +6441,32 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
             .unwrap_or_else(|| panic!("{flag} <path>: {said_now}"))
             .to_owned()
     };
-    let (passed, events_file) = (after("--passed-binaries"), after("--events"));
+    let (context, passed, passed_lint, events_file) = (
+        after("--carry-context"),
+        after("--passed-binaries"),
+        after("--passed-lint-packages"),
+        after("--events"),
+    );
     assert_eq!(
         said_now.trim(),
         format!(
-            "{} release --tree --checks lint,test \
-             --passed-binaries {passed} --events {events_file}",
+            "{} release --tree --carry-context {context} --checks lint,test \
+             --passed-binaries {passed} --passed-lint-packages {passed_lint} \
+             --events {events_file}",
             repo_seen.display(),
         ),
         "no measure, so no --app"
     );
-    assert_eq!(
-        std::fs::read_to_string(&passed).unwrap(),
-        format!("{} -p a --lib\n", "aa".repeat(32))
-    );
+    let proofs =
+        aterm_verify::testrun::read_passed(&std::fs::read_to_string(&passed).unwrap()).unwrap();
+    assert_eq!(proofs.len(), 1);
+    assert_eq!(proofs["-p a --lib"].exe_sha256, Some("aa".repeat(32)));
+    assert_eq!(proofs["-p a --lib"].content_key, Some("cc".repeat(32)));
+    let lint_proofs =
+        aterm_verify::lint_content::read_passed(&std::fs::read_to_string(&passed_lint).unwrap())
+            .unwrap();
+    assert_eq!(lint_proofs.len(), 1);
+    assert_eq!(lint_proofs["a@1.0.0"].content_key, Some("dd".repeat(32)));
     let judged = judge(&r);
     assert!(
         !judged.missing.iter().any(|m| m == "lint"),
@@ -6423,7 +6475,7 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
     );
     assert_eq!(
         judged.run(Half::Tree).passed_binaries,
-        [("-p a --lib".to_owned(), "aa".repeat(32))],
+        [passed_binary("-p a --lib", &"aa".repeat(32))],
         "the test record of the killed run lists what passed"
     );
 

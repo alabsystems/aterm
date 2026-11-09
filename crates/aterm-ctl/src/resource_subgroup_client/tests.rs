@@ -162,17 +162,13 @@ fn hello(stream: &CtlStream) {
     transport::write_frame(stream, wire::PREPARE, deadline()).unwrap();
 }
 fn accept(listener: &aterm_uds::CtlListener) -> CtlStream {
-    listener.set_nonblocking(true).unwrap();
-    let deadline = deadline();
-    loop {
-        match aterm_uds::kept_out(|| listener.accept()) {
-            Ok((stream, _)) => return stream,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                ready::until(listener.as_fd(), Interest::Read, deadline).unwrap()
-            }
-            Err(e) => panic!("accept failed: {e}"),
-        }
-    }
+    aterm_uds::accept(
+        listener,
+        aterm_uds::AcceptWait::Until(deadline()),
+        aterm_uds::AcceptedMode::Nonblocking,
+    )
+    .unwrap()
+    .0
 }
 fn no_delegations() -> Delegations {
     Delegations {
@@ -193,7 +189,12 @@ fn wrong_host_birth_refuses_before_any_payload_or_rights() {
         deadline(),
     );
     assert!(matches!(result, Err(SubmitError::NotSubmitted(_))));
-    let (mut stream, _) = listener.accept().unwrap();
+    let (mut stream, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     let mut byte = [0];
     stream.set_nonblocking(true).unwrap();
     ready::until(stream.as_fd(), Interest::Read, deadline()).unwrap();

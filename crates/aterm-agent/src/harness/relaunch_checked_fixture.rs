@@ -455,7 +455,11 @@ impl Endpoint {
                     if result < 0 || ready[1].revents != 0 {
                         break;
                     }
-                    let Ok((stream, _)) = aterm_uds::kept_out(|| listener.accept()) else {
+                    let Ok((stream, _)) = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) else {
                         break;
                     };
                     let _ = stream.set_read_timeout(Some(PATIENCE));

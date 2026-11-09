@@ -130,6 +130,7 @@ fn pump(
 mod tests {
     use super::*;
     use crate::port::{Fake, Ran};
+    use aterm_uds::{AcceptWait, AcceptedMode};
     use std::net::TcpListener;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -155,7 +156,7 @@ mod tests {
 
     /// Accept one connection with a one-minute hang detector on its reads.
     fn accept(l: &TcpListener) -> TcpStream {
-        let (s, _) = l.accept().unwrap();
+        let (s, _) = aterm_uds::accept(l, AcceptWait::Forever, AcceptedMode::Blocking).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
         s
     }
@@ -275,7 +276,6 @@ mod tests {
     #[test]
     fn without_screen_sharing_enabled_in_launchd_nothing_connects() {
         let (l, port) = stand_in();
-        l.set_nonblocking(true).unwrap();
         let disabled = PRINT_DISABLED.replace(
             "\"com.apple.screensharing\" => enabled",
             "\"com.apple.screensharing\" => disabled",
@@ -309,7 +309,10 @@ mod tests {
             assert_eq!(out.lines().count(), 1, "{name}: {out:?}");
             assert!(!read.load(Ordering::SeqCst), "{name}: the input was read");
             assert_eq!(
-                l.accept().map(|_| ()).unwrap_err().kind(),
+                aterm_uds::accept(&l, AcceptWait::Ready, AcceptedMode::Blocking)
+                    .map(|_| ())
+                    .unwrap_err()
+                    .kind(),
                 io::ErrorKind::WouldBlock,
                 "{name}: the relay connected"
             );
@@ -317,7 +320,6 @@ mod tests {
         let fake = enabled();
         let mut out = Vec::new();
         let (input, held_open) = io::pipe().unwrap();
-        l.set_nonblocking(false).unwrap();
         let server = std::thread::spawn(move || drop(accept(&l)));
         assert_eq!(screen(&fake, port, input, &mut out), ExitCode::SUCCESS);
         server.join().unwrap();

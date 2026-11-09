@@ -9,6 +9,18 @@ license.workspace = true
 repository.workspace = true
 description = "Smart semantic selection and text selection state machines for terminal text"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
+# This target's tiered conformance test launches the Trust `ty` checker when
+# the release verifier enables spec checkers; that transitive tool is unbounded.
+[package.metadata.aterm.test-inputs.targets."test:conformance_text_selection"]
+bounded = false
+
 [dependencies]
 aterm-grapheme = { workspace = true }
 aterm-types = { workspace = true }

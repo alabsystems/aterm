@@ -863,7 +863,7 @@ impl Answer {
 }
 
 /// The facts every skip rule reads, read after the commit step and again after each step that changes one, never re-derived per question.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Facts {
     pub cut: Option<CutState>,
     pub engine: EngineRows,
@@ -1224,7 +1224,12 @@ pub trait Branches: Sync {
     fn interrupted(&self) -> bool;
     /// The log a branch's child writes.
     fn branch_log(&self, branch: Branch) -> PathBuf;
-    /// Return once both release slices hold memory, or `ended` says the build ended.
+    /// Tell the build branch that this graph will run the tree compile which publishes its
+    /// content-checked test-executable index. Backends without a separate fixture consumer need
+    /// no state of their own.
+    fn expect_tree_index(&self) {}
+    /// Return once both release slices hold memory, their successful all-Fresh bundle has already
+    /// completed, or `ended` says the build ended.
     /// The measured critical path gets memory before the tree's moldable compile.
     fn build_admitted(&self, ended: &dyn Fn() -> bool);
     /// The export check of R: `pub stage` to the staging tier (`Remote`) or without its push
@@ -6229,6 +6234,13 @@ fn run_graph(
         let starter = tx.clone();
         s.spawn(move || {
             let stop_of = |b: Branch| &stops[b as usize];
+            if plan
+                .tree
+                .as_ref()
+                .is_some_and(|run| run.checks.iter().any(|check| check == "test"))
+            {
+                br.expect_tree_index();
+            }
             if let (Some(work), Some(reserved)) = (plan.build, reserved) {
                 start_branch(
                     s,
@@ -6785,6 +6797,208 @@ fn newer(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct AllFreshHandoff {
+        expected: std::sync::atomic::AtomicBool,
+        admission_waiting: std::sync::atomic::AtomicBool,
+        bundle_finished: std::sync::atomic::AtomicBool,
+        tree_started: std::sync::atomic::AtomicBool,
+        clock: std::sync::atomic::AtomicU64,
+    }
+
+    impl AllFreshHandoff {
+        fn new() -> Self {
+            Self {
+                expected: false.into(),
+                admission_waiting: false.into(),
+                bundle_finished: false.into(),
+                tree_started: false.into(),
+                clock: 1.into(),
+            }
+        }
+
+        fn await_flag(&self, flag: &std::sync::atomic::AtomicBool, what: &str) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hung waiting for {what}"
+                );
+                aterm_uds::deadline::poll_yield();
+            }
+        }
+    }
+
+    impl Branches for AllFreshHandoff {
+        fn say(&self, _line: &str) {}
+
+        fn now(&self) -> u64 {
+            self.clock.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn interrupted(&self) -> bool {
+            false
+        }
+
+        fn branch_log(&self, branch: Branch) -> PathBuf {
+            PathBuf::from(format!("/fixture/{}.log", branch.name()))
+        }
+
+        fn expect_tree_index(&self) {
+            self.expected
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn build_admitted(&self, ended: &dyn Fn() -> bool) {
+            assert!(
+                self.expected.load(std::sync::atomic::Ordering::SeqCst),
+                "the graph declares the tree index before admitting an all-Fresh build"
+            );
+            self.admission_waiting
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !ended()
+                && !self
+                    .bundle_finished
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "hung waiting for build admission"
+                );
+                aterm_uds::deadline::poll_yield();
+            }
+        }
+
+        fn export(
+            &self,
+            _c: &Candidate,
+            _prover: &Prover,
+            _target: StageTarget,
+            _stop: &BranchStop,
+        ) -> Result<Ran, Refusal> {
+            unreachable!("the fixture has no export branch")
+        }
+
+        fn build(
+            &self,
+            _c: &Candidate,
+            _reserved: &Reservation,
+            _prover: &Prover,
+            work: BuildWork,
+            _stop: &BranchStop,
+        ) -> Built {
+            assert!(work.bundle && work.fixtures);
+            self.await_flag(&self.admission_waiting, "the graph's build admission wait");
+            // No slice-hold observation occurs: completion itself is the all-Fresh handoff.
+            self.bundle_finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Built {
+                artifact: None,
+                fixtures: None,
+            }
+        }
+
+        fn verify(
+            &self,
+            _c: &Candidate,
+            _prover: &Prover,
+            run: &crate::check_record::VerifyRun,
+            _artifact: Option<&Artifact>,
+            _stop: &BranchStop,
+        ) -> Result<Ran, Refusal> {
+            assert!(run.checks.iter().any(|check| check == "test"));
+            assert!(
+                self.expected.load(std::sync::atomic::Ordering::SeqCst)
+                    && self
+                        .bundle_finished
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                "the tree starts only after the all-Fresh bundle releases admission"
+            );
+            self.tree_started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Ran {
+                code: 0,
+                detail: Vec::new(),
+            })
+        }
+
+        fn side_log(&self, _side: Side) -> PathBuf {
+            unreachable!("the fixture has no publish branch")
+        }
+
+        fn publish_gate(&self) -> PublishGate {
+            unreachable!("the fixture has no publish branch")
+        }
+
+        fn source(
+            &self,
+            _prover: &Prover,
+            _gate: &PublishGate,
+            _stop: &BranchStop,
+        ) -> Result<Ran, Refusal> {
+            unreachable!("the fixture has no publish branch")
+        }
+
+        fn sign(&self, _args: &[String], _prover: &Prover, _stop: &BranchStop) -> Ran {
+            unreachable!("the fixture has no publish branch")
+        }
+    }
+
+    /// The qualify graph cannot miss a fast all-Fresh bundle between ledger samples: it declares
+    /// the forthcoming test index, waits for build admission, and starts the tree only after
+    /// bundle completion. NEGATIVE CONTROL: removing any of those three graph edges panics or
+    /// reaches the one-minute hang detector instead of starting the tree.
+    #[test]
+    fn an_all_fresh_bundle_releases_the_tree_and_preserves_the_fixture_handoff() {
+        let branches = AllFreshHandoff::new();
+        let candidate = Candidate {
+            commit: "11".repeat(20),
+            version: "0.0.0".into(),
+            why: "fixture".into(),
+            bump_from: None,
+            carry: Vec::new(),
+        };
+        let prover = Prover {
+            bin: PathBuf::from("/fixture/prover/bin"),
+            commit: "22".repeat(20),
+            source: "fixture".into(),
+        };
+        let reservation = Reservation {
+            build: 1,
+            commit: "33".repeat(20),
+            line: "1 0.0.0".into(),
+        };
+        let plan = Plan {
+            build: Some(BuildWork {
+                bundle: true,
+                fixtures: true,
+            }),
+            tree: Some(crate::check_record::VerifyRun {
+                half: crate::check_record::Half::Tree,
+                checks: vec!["test".into()],
+                passed_binaries: Vec::new(),
+                passed_lint_packages: Vec::new(),
+            }),
+            export: None,
+        };
+        let graph = run_graph(&branches, &candidate, &prover, Some(&reservation), &plan);
+        assert!(
+            branches
+                .tree_started
+                .load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(
+            graph
+                .ended
+                .iter()
+                .filter(|(_, ended, _)| *ended == Ended::Passed)
+                .count()
+                == 2,
+            "both build and tree pass: {:?}",
+            graph.ended
+        );
+    }
 
     /// Step 10 distinguishes an unanswered freshness read from an answered channel verdict.
     /// NEGATIVE CONTROLS: a response with no tag and one with the wrong tag remain ordinary

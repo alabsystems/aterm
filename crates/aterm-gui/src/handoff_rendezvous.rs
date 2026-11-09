@@ -855,10 +855,6 @@ impl Rendezvous {
         prove_bound_socket_is_ours(dir, &bound.path).map_err(RendezvousError::Bind)?;
         std::fs::set_permissions(&bound.path, std::fs::Permissions::from_mode(0o600))
             .map_err(|error| RendezvousError::Bind(error.to_string()))?;
-        bound
-            .listener
-            .set_nonblocking(true)
-            .map_err(|error| RendezvousError::Bind(error.to_string()))?;
         Ok(bound)
     }
 
@@ -1006,36 +1002,13 @@ impl Rendezvous {
             let slice = deadline
                 .saturating_duration_since(now)
                 .min(ACCEPT_POLL_SLICE);
-            let mut pollfd = libc::pollfd {
-                fd: self.listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: single initialized `pollfd` owned by `self` with a bounded timeout.
-            let polled = unsafe {
-                libc::poll(
-                    &mut pollfd,
-                    1,
-                    i32::try_from(slice.as_millis()).unwrap_or(0),
-                )
-            };
-            if polled < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(RendezvousError::Accept(error.to_string()));
-            }
-            if polled == 0 {
-                continue;
-            }
-            match aterm_uds::kept_out(|| self.listener.accept()) {
-                Ok((stream, _)) => {
-                    stream
-                        .set_nonblocking(false)
-                        .map_err(|error| RendezvousError::Accept(error.to_string()))?;
-                    return Ok(stream);
-                }
+            match aterm_uds::accept(
+                &self.listener,
+                aterm_uds::AcceptWait::Until(Instant::now() + slice),
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
+                Ok((stream, _)) => return Ok(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => continue,
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -3990,7 +3963,12 @@ mod tests {
         let secret = "c".repeat(CLAIM_HEX_LEN);
         let outcome = std::thread::scope(|scope| {
             let parent = scope.spawn(|| {
-                let (stream, _) = listener.accept().expect("the dial");
+                let (stream, _) = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .expect("the dial");
                 stream
                     .set_read_timeout(Some(Duration::from_secs(60)))
                     .expect("a read bound");

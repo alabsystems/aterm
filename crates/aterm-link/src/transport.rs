@@ -342,7 +342,12 @@ mod tests {
             crate::bridge::ack_remaining(started.elapsed()),
         )
         .unwrap();
-        let (mut peer, _) = listener.accept().unwrap();
+        let (mut peer, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         peer.set_write_timeout(Some(Duration::from_secs(60)))
@@ -383,7 +388,12 @@ mod tests {
         let deadline = Duration::from_millis(50);
         for what in ["hello", "publish"] {
             let (mut conn, _closer) = connect(&path, deadline).expect("connect");
-            let (peer, _) = listener.accept().expect("accept");
+            let (peer, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let served = if what == "hello" {
@@ -427,7 +437,12 @@ mod tests {
         let listener = UnixListener::bind(&sock).expect("bind");
         let (conn, closer) =
             connect(sock.to_str().expect("utf8"), aterm_spec::wait::MUST_HAPPEN).expect("connect");
-        let (mut broker, _) = listener.accept().expect("accept");
+        let (mut broker, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let mark = Response::Mark {
             next: 0,
             head: 0,

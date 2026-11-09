@@ -545,7 +545,13 @@ impl LegacyPeer {
         let stop = Arc::new(AtomicBool::new(false));
         let (counted, stopping) = (Arc::clone(&gets), Arc::clone(&stop));
         let worker = std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            loop {
+                let stream = aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .map(|(stream, _)| stream);
                 if stopping.load(Ordering::SeqCst) {
                     return;
                 }
@@ -697,7 +703,12 @@ fn a_crossed_post_carries_the_query_a_server_before_the_fence_refuses_unread() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let reader = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("a post");
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("a post");
             stream.set_read_timeout(Some(HANG)).expect("timeout");
             let mut head = Vec::new();
             let mut byte = [0u8; 1];
@@ -769,7 +780,12 @@ fn a_header_only_fence_refuses_a_new_crossed_post_without_reading_its_body() {
     let reader = std::thread::spawn(move || {
         let mut read_bodies = Vec::new();
         for turn in 0..2 {
-            let (mut stream, _) = listener.accept().expect("post");
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("post");
             stream.set_read_timeout(Some(HANG)).expect("timeout");
             let mut head = Vec::new();
             let mut byte = [0; 1];

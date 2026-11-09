@@ -47,7 +47,12 @@ fn stub(response: &'static [u8]) -> (String, mpsc::Receiver<(String, Vec<u8>)>) 
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         let observed = read_request(&mut stream);
         let _ = tx.send(observed);
         let _ = stream.write_all(response);
@@ -170,7 +175,11 @@ fn authority_revoked_before_the_write_stops_the_body_leaving_the_process() {
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
+        if let Ok((mut stream, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             let mut seen = Vec::new();
             let _ = stream.read_to_end(&mut seen);
             let _ = tx.send(seen);
@@ -203,7 +212,11 @@ fn a_silent_server_hits_the_deadline_instead_of_hanging() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
-        if let Ok((stream, _)) = listener.accept() {
+        if let Ok((stream, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             std::thread::sleep(HANG_DETECTOR);
             drop(stream);
         }
@@ -229,7 +242,11 @@ fn capturing_stub() -> (u16, mpsc::Receiver<Vec<u8>>) {
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
+        let Ok((mut stream, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         let _ = stream.set_read_timeout(Some(HANG_DETECTOR));
@@ -287,7 +304,11 @@ fn dribbling_tls_peer(step: Duration, steps: usize) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
+        let Ok((mut stream, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) else {
             return;
         };
         if stream.write_all(&[0x16, 0x03, 0x03, 0x40, 0x00]).is_err() {
@@ -339,7 +360,12 @@ fn a_proxy_that_sends_an_interim_response_before_its_connect_answer_still_tunnel
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         let _ = stream.set_read_timeout(Some(HANG_DETECTOR));
         let (head, _) = read_request(&mut stream);
         let _ = stream
@@ -375,7 +401,12 @@ fn userinfo_in_the_proxy_url_authenticates_the_connect() {
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         let _ = stream.set_read_timeout(Some(HANG_DETECTOR));
         let (head, _) = read_request(&mut stream);
         let _ = tx.send(head);
@@ -423,8 +454,11 @@ fn an_https_proxy_is_refused_before_any_byte_reaches_it() {
         matches!(&error, Error::Invalid(message) if message.contains("HTTPS_PROXY")),
         "{error:?}"
     );
-    listener.set_nonblocking(true).unwrap();
-    match listener.accept() {
+    match aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Ready,
+        aterm_uds::AcceptedMode::Blocking,
+    ) {
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
         other => panic!("the client connected to an https:// proxy: {other:?}"),
     }

@@ -16,7 +16,12 @@ const MUST_HAPPEN: Duration = Duration::from_secs(60);
 fn answer_hello_at(path: &std::path::Path, protocol: u32) -> std::thread::JoinHandle<()> {
     let listener = crate::CtlListener::bind(path).unwrap();
     std::thread::spawn(move || {
-        let (stream, _) = crate::accept(&listener).unwrap();
+        let (stream, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .unwrap();
         wire::send(
             &stream,
             &Frame::Hello {
@@ -193,7 +198,12 @@ fn stand_in(
     let path = root.path().join("broker.sock");
     let listener = crate::CtlListener::bind(&path).unwrap();
     let served = std::thread::spawn(move || {
-        let (stream, _) = crate::accept(&listener).unwrap();
+        let (stream, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .unwrap();
         wire::send(
             &stream,
             &Frame::Hello {
@@ -277,7 +287,12 @@ fn admitting_nothing_at(
 ) -> std::thread::JoinHandle<()> {
     let listener = crate::CtlListener::bind(path).unwrap();
     std::thread::spawn(move || {
-        let (stream, _) = crate::accept(&listener).unwrap();
+        let (stream, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .unwrap();
         match told {
             Some(frame) => wire::send(&stream, &frame).unwrap(),
             None => {
@@ -427,7 +442,12 @@ fn a_local_network_dial_comes_back_from_the_broker() {
     };
     let mut client = seam_here(seam, || crate::connect_tcp(&addr, MUST_HAPPEN)).unwrap();
     served.join().unwrap();
-    let (mut server, _) = target.accept().unwrap();
+    let (mut server, _) = crate::accept(
+        &target,
+        crate::AcceptWait::Forever,
+        crate::AcceptedMode::Blocking,
+    )
+    .unwrap();
     server.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
     client.write_all(b"x").unwrap();
     let mut byte = [0];

@@ -261,7 +261,12 @@ fn the_socket_hears_the_protocols_form_and_a_word_that_names_no_session_as_typed
     let srv = std::thread::spawn(move || {
         let mut heard = Vec::new();
         for _ in 0..n {
-            let (conn, _) = listener.accept().expect("accept");
+            let (conn, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             let mut r = std::io::BufReader::new(conn.try_clone().expect("clone"));
             let mut line = String::new();
             r.read_line(&mut line).expect("request");

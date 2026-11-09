@@ -307,7 +307,11 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let accepter = std::thread::spawn(move || {
             for _ in 0..2 {
-                match listener.accept() {
+                match aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) {
                     Ok((mut s, _)) => {
                         let _ = s.write_all(b"x");
                     }

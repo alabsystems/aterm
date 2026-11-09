@@ -19,11 +19,12 @@ aterm-json = { workspace = true }
 aterm-digest = { workspace = true }
 # Hex (ETags, digests, tokens) and base64 (contents answers).
 aterm-codec = { workspace = true }
+# Explicit accepted-stream mode for the cross-platform loopback HTTP servers.
+aterm-uds = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # Optional real smart-HTTP fixture: owned scratch and bounded/cancellable Git CGI children.
 aterm-tempfile = { workspace = true }
-aterm-uds = { workspace = true }
 
 [lints]
 workspace = true

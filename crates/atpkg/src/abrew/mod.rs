@@ -505,7 +505,7 @@ fn canonical_kind_switches(rest: &[String]) -> Vec<String> {
 fn named_arg_types(cmd: &str) -> String {
     let types: &[&str] = match cmd {
         "install" | "reinstall" | "fetch" | "cat" | "log" | "deps" | "info" | "home"
-        | "homepage" | "missing" | "outdated" | "cleanup" => &["formula", "cask"],
+        | "homepage" | "missing" | "outdated" | "cleanup" | "unpack" => &["formula", "cask"],
         "uninstall" | "remove" | "rm" | "link" | "ln" | "unlink" | "list" | "ls" | "upgrade"
         | "tab" | "migrate" => &["installed formula", "installed cask"],
         "search" | "-S" => &["text or regex"],
@@ -606,7 +606,6 @@ fn native_args(
             "sh",
             "style",
             "test",
-            "unpack",
         ];
         if COMMANDS.contains(&cmd)
             || UNSUPPORTED_KNOWN.contains(&cmd)
@@ -744,6 +743,7 @@ fn native_args(
         "outdated" | "upgrade" => &["--minimum-version", "--min-version", "--severity", "--json"],
         "deps" => &["--os", "--arch", "--brewfile"],
         "fetch" | "--cache" => &["--os", "--arch", "--bottle-tag"],
+        "unpack" => &["--destdir"],
         "readall" => &["--os", "--arch"],
         "install" | "reinstall" => &["--bottle-arch", "--cc", "--env"],
         "missing" => &["--hide"],
@@ -841,6 +841,12 @@ fn native_args(
             &[m("--arch"), m("--bottle-tag")],
         ],
         "--prefix" => &[&[m("--unbrewed"), m("--installed")]],
+        "unpack" => &[
+            &[("--git", &["-g"]), m("--patch")],
+            &[("--formula", &["--formulae"]), ("--cask", &["--casks"])],
+            &[("--cask", &["--casks"]), m("--patch")],
+            &[("--cask", &["--casks"]), ("--git", &["-g"])],
+        ],
         _ => &[],
     };
     for group in conflict_groups {
@@ -1683,6 +1689,23 @@ fn native_args(
         "command" => (&[], 1, usize::MAX, true),
         "formula" => (&[], 1, usize::MAX, false),
         "generate-cask-token" => (&[], 1, 1, false),
+        "unpack" => (
+            &[
+                "--destdir",
+                "--patch",
+                "--git",
+                "-g",
+                "--force",
+                "-f",
+                "--formula",
+                "--formulae",
+                "--cask",
+                "--casks",
+            ],
+            1,
+            usize::MAX,
+            true,
+        ),
         "command-not-found-init" => (&[], 0, 0, false),
         "alias" => (&[], 0, 1, false),
         "unalias" => (&[], 1, usize::MAX, false),
@@ -1729,6 +1752,7 @@ fn native_args(
                 && (arg.starts_with("--brewfile=")
                     || arg.starts_with("--os=")
                     || arg.starts_with("--arch=")))
+            || (cmd == "unpack" && arg.starts_with("--destdir="))
             || (matches!(cmd, "fetch" | "--cache")
                 && (arg.starts_with("--os=")
                     || arg.starts_with("--arch=")
@@ -2192,7 +2216,7 @@ fn native_args(
             }
             "info" | "outdated" | "uses" | "dependents" | "home" | "homepage" | "cat" | "deps"
             | "pin" | "unpin" | "uninstall" | "remove" | "rm" | "fetch" | "link" | "ln"
-            | "unlink" | "log" | "tab" | "migrate" | "--cache" => {
+            | "unlink" | "log" | "tab" | "migrate" | "--cache" | "unpack" => {
                 Some("Error: Invalid usage: Options --formula and --cask are mutually exclusive.")
             }
             "desc" | "search" | "-S" | "list" | "ls" => None,
@@ -2946,6 +2970,10 @@ fn dispatch(prefix: &Prefix, args: &[String]) -> ExitCode {
             return commands::cmd_generate_cask_token(&api0, rest);
         }
         "command-not-found-init" => return commands::cmd_command_not_found_init(),
+        "unpack" => {
+            let api0 = api::Api::new(prefix.clone());
+            return commands::cmd_unpack(prefix, &api0, args, rest);
+        }
         "alias" => {
             return match aliases::add_or_show(prefix, operands(rest).first().map(String::as_str)) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -3607,6 +3635,7 @@ const BREW_BUILTIN_COMMANDS: &[&str] = &[
     "which-formula",
 ];
 const BREW_DEVELOPER_COMMANDS: &[&str] = &[
+    "aspell-dictionaries",
     "audit",
     "benchmark",
     "bottle",
@@ -3617,9 +3646,12 @@ const BREW_DEVELOPER_COMMANDS: &[&str] = &[
     "bump-unversioned-casks",
     "bump",
     "cat",
+    "check-bottle-modification",
+    "check-ci-status",
     "contributions",
     "create",
     "debugger",
+    "determine-rebottle-runners",
     "edit",
     "extract",
     "find-appcast",

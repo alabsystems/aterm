@@ -234,21 +234,39 @@ pub(crate) fn observe_store_if_declared_within<T>(
 ) -> Result<Option<T>> {
     pass_current(read_by)?;
     let paths = crate::generation::observed_generation_until(paths, read_by)?;
-    let (bootstrap, journal) =
-        Bootstrap::established_with_journal_until(&paths, wait()).map_err(crate::table::failure)?;
+    observe_selected_if_declared(&paths, descriptor, read_by, wait, action)
+}
+
+/// [`observe_store_if_declared_within`] at `selected`, the home
+/// [`crate::generation::observed_generation_until`] named: its established custody opened, then
+/// its session ([`observed_session`]), then the declared table read.
+fn observe_selected_if_declared<T>(
+    selected: &Paths,
+    descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
+    read_by: std::time::Instant,
+    wait: &dyn Fn() -> std::time::Instant,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> Result<Option<T>> {
+    let (bootstrap, journal) = Bootstrap::established_with_journal_until(selected, wait())
+        .map_err(crate::table::failure)?;
     let session = observed_session(&bootstrap, journal, read_by, wait)?;
     observe_declared_in_session(&session, descriptor(&bootstrap)?, read_by, action)
 }
 
 /// A read-only session of the selected home whose established custody is `bootstrap`, with its
 /// control view `journal`: its predecessors observed now, after that custody was opened, and the
-/// observation kept for the session's checks.
-fn observed_session<'a>(
+/// observation kept for the session's checks. The caller names the home with
+/// [`crate::generation::observed_generation_until`] and opens `bootstrap` (taking any source
+/// reads it holds through the read) before this, so each predecessor is observed once per read,
+/// after every wait the read makes for the selected home's custody.
+pub(crate) fn observed_session<'a>(
     bootstrap: &'a Bootstrap,
     journal: aterm_secrets::commons::journal::Journal,
     read_by: std::time::Instant,
     wait: &dyn Fn() -> std::time::Instant,
 ) -> Result<Session<'a>> {
+    #[cfg(test)]
+    seams::opened();
     let selection = crate::generation::observe_generation(bootstrap.paths(), read_by, wait)?;
     #[cfg(test)]
     seams::selected();
@@ -313,8 +331,9 @@ fn observe_declared_in_session<T>(
 
 /// [`observe_store_if_declared`] on a Mac that may hold no Commons: `None` there too, as
 /// [`peek_catalog`] reads one, since nothing was declared. `deadline` bounds the pass, else
-/// [`admission_deadline`]. This creates nothing, and invalid custody, catalog or declared table
-/// storage remains an error.
+/// [`admission_deadline`]. It creates no table, catalog or declaration, though asking
+/// [`commons_here`] may establish this Mac's custody; invalid custody, catalog or declared table
+/// storage remains an error, and a vault writer's moment is busy, never "no Commons here".
 pub(crate) fn observe_store_if_here<T>(
     paths: &Paths,
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
@@ -322,18 +341,16 @@ pub(crate) fn observe_store_if_here<T>(
     action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
 ) -> Result<Option<T>> {
     let deadline = deadline.unwrap_or_else(admission_deadline);
-    let observed = crate::generation::observed_paths_until(paths, deadline)?;
-    if Bootstrap::cached(&observed)
-        .map_err(crate::table::failure)?
-        .is_none()
-    {
+    let selected = crate::generation::observed_generation_until(paths, deadline)?;
+    if !commons_here(&selected)? {
         return Ok(None);
     }
-    observe_store_if_declared_until(paths, descriptor, deadline, action)
+    observe_selected_if_declared(&selected, descriptor, deadline, &|| deadline, action)
 }
 
-/// This Mac's lab and the catalog it holds, read as an observer that creates nothing: `None`
-/// where there is no Commons here, and an empty catalog where none is held yet.
+/// This Mac's lab and the catalog it holds, read as an observer that creates no table, catalog
+/// or declaration (asking [`commons_here`] may establish this Mac's custody): `None` where there
+/// is no Commons here, and an empty catalog where none is held yet.
 ///
 /// # Errors
 /// Custody, membership or the catalog's storage cannot be read.
@@ -388,8 +405,9 @@ pub(crate) struct Declaration {
     pub elsewhere: bool,
 }
 
-/// What this Mac's catalog says of `descriptor`'s table, read as an observer that creates
-/// nothing ([`Declaration`]). `None` where there is no Commons here.
+/// What this Mac's catalog says of `descriptor`'s table ([`Declaration`]), read as an observer
+/// that creates no table, catalog or declaration (asking [`commons_here`] may establish this
+/// Mac's custody). `None` where there is no Commons here.
 ///
 /// # Errors
 /// Custody, membership or the catalog's storage cannot be read.
@@ -425,6 +443,10 @@ pub(crate) fn peek_declaration(
 /// Whether this Mac holds Commons custody at `paths`, as [`Bootstrap::cached`] says, except that
 /// a vault writer holding the state lock at this moment is busy, which a read observes again,
 /// never "no Commons here": a peek that took it for absence answered as if no table were here.
+/// Like [`Bootstrap::cached`], a visible descriptor establishes this Mac's custody (its device key,
+/// claim, pin and control history) where none is held yet, so a Mac that never opened Commons
+/// reads its catalog's id: alab's empty-view guard counts that catalog's repair rounds
+/// (`alab::command::empty_view_catalog`).
 fn commons_here(paths: &Paths) -> Result<bool> {
     use aterm_secrets::commons::{Unavailable, bootstrap::Availability};
     match Bootstrap::observe(paths).map_err(crate::table::failure)? {
@@ -455,12 +477,28 @@ pub(crate) mod seams {
     use std::cell::RefCell;
 
     thread_local! {
+        /// Run once a read on this thread has opened the selected home's custody, before it
+        /// observes the home's predecessors.
+        static OPENED: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
         /// Run once a read on this thread has selected its generation, before its session opens.
         static SELECTED: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
     }
 
-    /// Run `hook` once this thread's next read ([`super::observe_store_if_declared_within`]) has
-    /// selected its generation, before it opens the selected home's session.
+    /// Run `hook` once this thread's next read through [`super::observed_session`] has opened the
+    /// selected home's custody, before it observes that home's predecessors.
+    pub(crate) fn after_custody(hook: impl FnMut() + 'static) {
+        OPENED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn opened() {
+        let hook = OPENED.with(|slot| slot.borrow_mut().take());
+        if let Some(mut hook) = hook {
+            hook();
+        }
+    }
+
+    /// Run `hook` once this thread's next read through [`super::observed_session`] has selected
+    /// its generation, before it opens the selected home's session.
     pub(crate) fn after_selection(hook: impl FnMut() + 'static) {
         SELECTED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     }

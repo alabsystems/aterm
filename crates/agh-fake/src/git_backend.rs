@@ -185,11 +185,15 @@ impl GitHttpBackend {
         let worker = std::thread::Builder::new()
             .name("git-http-fixture".into())
             .spawn(move || {
-                for stream in listener.incoming() {
+                loop {
                     if owned.stop.load(Ordering::SeqCst) {
                         break;
                     }
-                    let Ok(stream) = stream else {
+                    let Ok((stream, _)) = aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) else {
                         break;
                     };
                     // Register under the same lock Drop takes, then recheck cancellation.

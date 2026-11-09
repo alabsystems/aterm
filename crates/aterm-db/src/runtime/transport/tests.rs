@@ -1866,7 +1866,14 @@ fn a_dial_disowns_its_endpoint_only_on_evidence() {
 
     let hangs_up = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let worker = dial(hangs_up.local_addr().unwrap());
-    drop(hangs_up.accept().unwrap());
+    drop(
+        aterm_uds::accept(
+            &hangs_up,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap(),
+    );
     assert_eq!(
         ended(worker),
         (false, false),

@@ -2629,7 +2629,11 @@ fn serve_seated<H, E>(
             break;
         }
         live.cut_overdue(listening.lifetime);
-        let (tcp, peer) = match aterm_uds::kept_out(|| listener.tcp().accept()) {
+        let (tcp, peer) = match aterm_uds::accept(
+            listener.tcp(),
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok(accepted) => accepted,
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // A readiness error backs off like an accept error below, so neither busy-loops.
@@ -3573,7 +3577,17 @@ mod tests {
     ) -> (A, B) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let listening = std::thread::spawn(move || listen(listener.accept().unwrap().0));
+        let listening = std::thread::spawn(move || {
+            listen(
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap()
+                .0,
+            )
+        });
         let tcp = TcpStream::connect(addr).unwrap();
         tcp.set_read_timeout(Some(HANG)).unwrap();
         let dialed = dial(tcp);
@@ -5837,7 +5851,12 @@ mod tests {
                 let pair_listener = TcpListener::bind("127.0.0.1:0").unwrap();
                 let pair_addr = pair_listener.local_addr().unwrap();
                 let reader = TcpStream::connect_timeout(&pair_addr, HANG).unwrap();
-                let (writer, _) = pair_listener.accept().unwrap();
+                let (writer, _) = aterm_uds::accept(
+                    &pair_listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap();
                 reader
                     .set_read_timeout(Some(Duration::from_millis(2)))
                     .unwrap();
@@ -5899,7 +5918,12 @@ mod tests {
             let mut dialer =
                 TcpStream::connect_timeout(&listener.local_addr().unwrap(), HANG).unwrap();
             dialer.set_read_timeout(Some(HANG)).unwrap();
-            let (tcp, _) = listener.accept().unwrap();
+            let (tcp, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let fd = tcp.as_raw_fd();
             let expected = peer(fd).unwrap();
             let (joined, observation) = std::sync::mpsc::channel();
@@ -5949,7 +5973,12 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let dialer = TcpStream::connect_timeout(&addr, HANG).unwrap();
-        let (accepted, _) = listener.accept().unwrap();
+        let (accepted, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         let accepted_fd = accepted.as_raw_fd();
         let watchdog = arm(&accepted, HANG).unwrap();
         let evictor = watchdog.evictor();
@@ -5961,7 +5990,12 @@ mod tests {
         );
 
         let mut bystander_client = TcpStream::connect_timeout(&addr, HANG).unwrap();
-        let (mut bystander_server, _) = listener.accept().unwrap();
+        let (mut bystander_server, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         bystander_server.set_read_timeout(Some(HANG)).unwrap();
         assert_ne!(
             bystander_client.as_raw_fd(),
@@ -5988,12 +6022,22 @@ mod tests {
         // bystander socket. `dup2` replaces `victim_fd` atomically while `accepted` still owns it
         // so parallel test threads cannot claim `victim_fd` in between.
         let dialer = TcpStream::connect_timeout(&addr, HANG).unwrap();
-        let (accepted, _) = listener.accept().unwrap();
+        let (accepted, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         let victim_fd = accepted.as_raw_fd();
         let watchdog = arm(&accepted, HANG).unwrap();
         let evictor = watchdog.evictor();
         let mut bystander_client = TcpStream::connect_timeout(&addr, HANG).unwrap();
-        let (bystander_server_orig, _) = listener.accept().unwrap();
+        let (bystander_server_orig, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         bystander_server_orig.set_read_timeout(Some(HANG)).unwrap();
         // SAFETY: both `bystander_server_orig` and `accepted` are open descriptors owned by this
         // test; `dup2` atomically closes `accepted`'s descriptor (`victim_fd`) and duplicates

@@ -282,7 +282,12 @@ fn a_selected_reply_survives_concurrent_store_replacement_without_holding_state(
         .insert("team".into(), RecordSlot::new(store));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let (server, _) = listener.accept().unwrap();
+    let (server, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .unwrap();
     let reply = get_records(
         &running.shared,
         &server,

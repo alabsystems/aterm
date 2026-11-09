@@ -633,11 +633,8 @@ pub(crate) struct Supervisor<R: FnMut() -> Option<CtlListener> + Send + 'static>
 
 #[cfg(unix)]
 impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
-    /// Create a supervisor for `listener` (set non-blocking) with replacement factory `rebind`.
+    /// Create a supervisor for `listener` with replacement factory `rebind`.
     pub(crate) fn new(listener: CtlListener, rebind: R, endpoint: Endpoint) -> Self {
-        if let Err(error) = listener.set_nonblocking(true) {
-            aterm_log::warn!("control listener could not be made non-blocking: {error}");
-        }
         stamp_accept();
         Self {
             listener,
@@ -721,11 +718,6 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
                     fresh
                 }
             };
-            if let Err(error) = fresh.set_nonblocking(true) {
-                HEALTH.rebind_failures.fetch_add(1, Ordering::Relaxed);
-                aterm_log::warn!("control listener rebind: fresh socket not usable: {error}");
-                continue;
-            }
             generation += 1;
             let Some(fresh) = endpoint.install(fresh, generation, &current) else {
                 continue;
@@ -935,13 +927,16 @@ fn drain(
 ) -> Option<usize> {
     let mut accepted = 0;
     while accepted < DRAIN_MAX {
-        match aterm_uds::kept_out(|| listener.accept()) {
+        match aterm_uds::accept(
+            listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((stream, _)) => {
                 accepted += 1;
                 *backoff = None;
                 HEALTH.accepts.fetch_add(1, Ordering::Relaxed);
                 stamp_accept();
-                let _ = stream.set_nonblocking(false);
                 serve(stream);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -1110,7 +1105,14 @@ mod tests {
         let expected = if cfg!(target_os = "macos") { 3 } else { 1 };
         assert_eq!(queue_pending(&listener), Some(expected));
         for _ in 0..3 {
-            drop(listener.accept().expect("accept"));
+            drop(
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .expect("accept"),
+            );
         }
         assert_eq!(queue_pending(&listener), Some(0), "a drained queue reads 0");
         drop(clients);
@@ -1343,9 +1345,19 @@ mod tests {
         let path = dir.path().join("h.sock");
         let listener = CtlListener::bind(&path).expect("bind");
         let open = CtlStream::connect(&path).expect("connect");
-        let (open_held, _) = listener.accept().expect("accept");
+        let (open_held, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         let half_closed = CtlStream::connect(&path).expect("connect");
-        let (half_closed_held, _) = listener.accept().expect("accept");
+        let (half_closed_held, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .expect("accept");
         (&half_closed)
             .write_all(b"AUTH ok\nawait idle\n")
             .expect("the request");

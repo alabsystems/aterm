@@ -2571,6 +2571,7 @@ pub(crate) mod tests {
     use crate::port::{Cmd, Fake, Ran, RunFailed, Secret, Stat};
     use aterm_secrets::age::Recipient;
     use aterm_secrets::client::{Config, Probed};
+    use aterm_uds::{AcceptWait, AcceptedMode};
     use std::collections::VecDeque;
 
     /// The row's words without a LAN broker ([`Scripted::broker_absent`]): the broker's own,
@@ -3699,7 +3700,9 @@ pub(crate) mod tests {
             std::thread::scope(|scope| {
                 let stopped = &stopped;
                 scope.spawn(move || {
-                    let (stream, _) = listener.accept().unwrap();
+                    let (stream, _) =
+                        aterm_uds::accept(&listener, AcceptWait::Forever, AcceptedMode::Blocking)
+                            .unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(60)))
                         .unwrap();

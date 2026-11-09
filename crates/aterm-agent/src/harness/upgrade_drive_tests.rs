@@ -32868,7 +32868,11 @@ fn token_server(
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut seen = Vec::new();
-        while let Ok((stream, _)) = listener.accept() {
+        while let Ok((stream, _)) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             let mut w = stream.try_clone().expect("clone");
             let mut r = std::io::BufReader::new(stream);
             let mut auth = String::new();

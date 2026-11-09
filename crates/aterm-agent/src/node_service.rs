@@ -261,7 +261,11 @@ mod mesh_discovery_tests {
         let listener = aterm_uds::CtlListener::bind(&path).unwrap();
         let (end, ends) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
-            while let Ok((stream, _)) = aterm_uds::accept(&listener) {
+            while let Ok((stream, _)) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 let hello = Frame::Hello {
                     protocol: aterm_uds::lan::PROTOCOL,
                     build: "stand-in".into(),

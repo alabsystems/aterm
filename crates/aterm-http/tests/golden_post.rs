@@ -57,7 +57,12 @@ fn recording_listener() -> (u16, mpsc::Receiver<Vec<u8>>) {
     let port = listener.local_addr().unwrap().port();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         stream.set_read_timeout(Some(HANG_DETECTOR)).unwrap();
         let mut seen = read_request(&mut stream);
         let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");

@@ -33,6 +33,13 @@ license.workspace = true
 repository.workspace = true
 description = "winit Key/NamedKey/PhysicalKey -> aterm engine keyboard types (K-2), split out so aterm-types never links winit"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [dependencies]
 # The engine-side keyboard vocabulary this maps INTO. Default features only —
 # aterm-types is platform-free and must stay that way.

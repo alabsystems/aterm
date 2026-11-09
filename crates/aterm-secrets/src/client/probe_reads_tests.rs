@@ -276,7 +276,12 @@ fn serving(answer: Vec<u8>) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{Read, Write};
         let mut heads = Vec::new();
         loop {
-            let (mut stream, _) = listener.accept().expect("accept");
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .expect("accept");
             stream.set_read_timeout(Some(MUST_HAPPEN)).expect("timeout");
             let mut head = Vec::new();
             let mut byte = [0u8; 1];

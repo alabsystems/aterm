@@ -153,7 +153,12 @@ fn a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_with_no_window() {
         stream.set_read_timeout(Some(HANG)).unwrap();
         stream.set_write_timeout(Some(HANG)).unwrap();
         let refused = scope.spawn(|| {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream.set_read_timeout(Some(HANG)).unwrap();
             stream.set_write_timeout(Some(HANG)).unwrap();
             handle.serve(&mut stream, "192.168.1.40".parse().unwrap())
@@ -201,7 +206,12 @@ fn a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_with_no_window() {
     let node = aterm_net::fleet::NodeIdentity::from_seed(&"31".repeat(16), &[31; 32]).unwrap();
     let proof_address = hints[0].address;
     let served = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let (mut stream, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         stream.set_read_timeout(Some(HANG)).unwrap();
         stream.set_write_timeout(Some(HANG)).unwrap();
         handle.serve(&mut stream, "192.168.1.40".parse().unwrap())

@@ -196,7 +196,12 @@ mod tests {
         let listener = UnixListener::bind(path).unwrap();
         let caller =
             UnixStream::connect(listener.local_addr().unwrap().as_pathname().unwrap()).unwrap();
-        let (accepted, _) = listener.accept().unwrap();
+        let (accepted, _) = aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .unwrap();
         (directory, caller, accepted)
     }
 

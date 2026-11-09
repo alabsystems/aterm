@@ -57,6 +57,15 @@ impl Members {
         self.0.iter().map(|m| m.name.clone()).collect()
     }
 
+    /// Each workspace member as the exact `-p` spec Cargo accepts and its repo-relative
+    /// directory. Shared-name packages retain their versioned spec.
+    pub(crate) fn lint_packages(&self) -> Vec<(String, String)> {
+        self.0
+            .iter()
+            .map(|member| (self.spec(&member.name).to_owned(), member.dir.clone()))
+            .collect()
+    }
+
     /// The name of the member whose manifest is in `dir`. A name cannot say this:
     /// `crates/aterm-windows-sys` is excluded from the workspace because it has the name of the
     /// member `crates/aterm-windows-sys-052`.
@@ -994,7 +1003,7 @@ fn normalize_manifest_dir(dir: String) -> String {
     }
 }
 
-fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> Members {
+pub(crate) fn read_members(root: &Path, tools: &Toolchain, path_env: &OsStr) -> Members {
     let Some(out) = targo_tree(
         root,
         &tools.targo,

@@ -19187,8 +19187,14 @@ pub fn run_accounts_serve(
     );
     let _ = out.flush();
 
-    for stream in listener.incoming() {
-        let Ok(mut stream) = stream else {
+    for accepted in std::iter::repeat_with(|| {
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Forever,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+    }) {
+        let Ok((mut stream, _)) = accepted else {
             continue;
         };
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));

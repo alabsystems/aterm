@@ -239,10 +239,20 @@ fn hold(exe: &Path) -> Option<HeldPort> {
     let near = aterm_uds::connect_tcp(&listener.local_addr().expect("its address"), HANG)
         .expect("a connection to it");
     #[cfg(unix)]
-    let (far, _) = aterm_uds::accept(&listener).expect("the connection accepted");
+    let (far, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .expect("the connection accepted");
     // Off Unix a socket reaches a child only when it is made inheritable.
     #[cfg(not(unix))]
-    let (far, _) = listener.accept().expect("the connection accepted");
+    let (far, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .expect("the connection accepted");
     let port = near
         .local_addr()
         .expect("the connection's local end")

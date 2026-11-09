@@ -62,13 +62,19 @@ pub struct Args {
     /// `--timeout`: `Some(None)` is `off`; `None` keeps the default ceiling.
     pub timeout: Option<Option<Duration>>,
     pub log: Option<PathBuf>,
-    /// `--passed-binaries <path>`: with `release` running `test`, the test binaries that passed in
-    /// this tree before, each `<sha256> <spec>` on its own line; one whose executable still
-    /// hashes so is carried, not run again ([`crate::testrun::carry`]).
+    /// `--passed-binaries <path>`: with `release` running `test`, the versioned content proofs of
+    /// prior successful test binaries; only a complete matching proof is carried
+    /// ([`crate::testrun::carry`]).
     pub passed_binaries: Option<PathBuf>,
-    /// `--events <path>`: the file each `check-finished` and `test-binary-finished` line is
-    /// appended to whole, apart from the output its children share ([`crate::event_log`]): what a
-    /// release's cutter keeps its records from, and `verify land` its judgment.
+    /// `--passed-lint-packages <path>`: prior successful per-package lint content proofs.
+    pub passed_lint_packages: Option<PathBuf>,
+    /// `--carry-context <sha256>`: with release test or lint, the cutter's frozen verifier, seal
+    /// and toolchain context. It is part of every item content key.
+    pub carry_context: Option<String>,
+    /// `--events <path>`: the file each `check-finished`, `test-binary-finished` and
+    /// `lint-package-finished` line is appended to whole, apart from the output its children share
+    /// ([`crate::event_log`]): what a release's cutter keeps its records from, and `verify land`
+    /// its judgment.
     pub events: Option<PathBuf>,
 }
 
@@ -205,6 +211,10 @@ where
             "--passed-binaries" => {
                 a.passed_binaries = Some(PathBuf::from(value("--passed-binaries")?));
             }
+            "--passed-lint-packages" => {
+                a.passed_lint_packages = Some(PathBuf::from(value("--passed-lint-packages")?));
+            }
+            "--carry-context" => a.carry_context = Some(value("--carry-context")?),
             "--events" => a.events = Some(PathBuf::from(value("--events")?)),
             p if p.starts_with("-p") && p.len() > 2 => a.packages.push(p[2..].to_string()),
             f if f.starts_with('-') => return usage(format!("unknown flag `{f}`")),
@@ -329,6 +339,34 @@ where
              `release` and its test check"
                 .into(),
         );
+    }
+    if a.passed_lint_packages.is_some() && !(a.release && a.checks.contains(&Check::Lint)) {
+        return usage(
+            "--passed-lint-packages carries package lint proofs into a release's lint run; run \
+             it with `release` and its lint check"
+                .into(),
+        );
+    }
+    if let Some(context) = &a.carry_context {
+        if !(a.release
+            && a.checks
+                .iter()
+                .any(|check| matches!(check, Check::Test | Check::Lint)))
+        {
+            return usage(
+                "--carry-context salts a release's test or lint evidence; run it with `release` \
+                 and one of those checks"
+                    .into(),
+            );
+        }
+        if !aterm_codec::hex::is_lower(context, 64) {
+            return usage("--carry-context takes exactly 64 lowercase hex digits".into());
+        }
+    }
+    if (a.passed_binaries.is_some() || a.passed_lint_packages.is_some())
+        && a.carry_context.is_none()
+    {
+        return usage("prior content proofs require --carry-context <64 lowercase hex>".into());
     }
     Ok(a)
 }
@@ -529,8 +567,16 @@ Options:
                           targets 20 while preserving all running logs)
       --passed-binaries <path>
                           with release and its test check: binaries that passed
-                          in this tree, `<sha256> <spec>` per line; each whose
-                          executable hashes the same is carried, not run again
+                          before, as schema-1 content proofs; only a prior ok
+                          whose executable and complete runtime-input key match
+                          is carried, not run again
+      --passed-lint-packages <path>
+                          with release and lint: prior schema-1 per-package lint
+                          proofs; only a prior ok with the same complete compiler
+                          input key is carried
+      --carry-context <sha256>
+                          with release test or lint: frozen verifier, seal and
+                          toolchain context; required with prior content proofs
       --events <path>     append each check-finished and test-binary-finished
                           line there too, whole
   -h, --help
@@ -624,6 +670,10 @@ mod tests {
         assert!(parse(["release"]).is_err(), "release needs its bundle");
         assert!(parse(["release", "--app", "a", "-p", "x"]).is_err());
         assert!(parse(["release", "cells", "--app", "a", "--cell", "win"]).is_err());
+        assert!(
+            parse(["release", "--checks=test", "--base", "previous-hop"]).is_err(),
+            "a release never narrows its tree to the fix hop's cone"
+        );
     }
 
     /// `--passed-binaries` goes only with a release whose run holds `test`, the whole release's
@@ -642,6 +692,8 @@ mod tests {
             "--checks=test",
             "--passed-binaries",
             "/l/06-verify.passed-binaries",
+            "--carry-context",
+            &"ab".repeat(32),
         ]);
         assert_eq!(a.checks, [Check::Test]);
         assert_eq!(
@@ -649,29 +701,106 @@ mod tests {
             Some(std::path::Path::new("/l/06-verify.passed-binaries"))
         );
         assert!(
-            ok(&["release", "--passed-binaries", "/p", "--app", "/a"])
-                .checks
-                .contains(&Check::Test)
+            ok(&[
+                "release",
+                "--passed-binaries",
+                "/p",
+                "--carry-context",
+                &"ab".repeat(32),
+                "--app",
+                "/a",
+            ])
+            .checks
+            .contains(&Check::Test)
         );
         for args in [
-            &["release", "--checks", "fmt", "--passed-binaries", "/p"][..],
+            &[
+                "release",
+                "--checks",
+                "fmt",
+                "--passed-binaries",
+                "/p",
+                "--carry-context",
+                "abababababababababababababababababababababababababababababababab",
+            ][..],
             &[
                 "release",
                 "--bundle",
                 "--passed-binaries",
                 "/p",
+                "--carry-context",
+                "abababababababababababababababababababababababababababababababab",
                 "--app",
                 "/a",
             ],
-            &["test", "--all", "--passed-binaries", "/p"],
+            &[
+                "test",
+                "--all",
+                "--passed-binaries",
+                "/p",
+                "--carry-context",
+                "abababababababababababababababababababababababababababababababab",
+            ],
         ] {
             assert!(parse(args.iter().copied()).is_err(), "{args:?}");
         }
+        assert!(
+            parse(["release", "--checks=test", "--passed-binaries", "/p",]).is_err(),
+            "proofs without their frozen context are not reusable"
+        );
+        assert!(
+            parse(["release", "--checks=test", "--carry-context", "AA"]).is_err(),
+            "the salt is one canonical SHA-256"
+        );
         assert_eq!(
             ok(&["--base", "abc", "--events", "/e"]).events.as_deref(),
             Some(std::path::Path::new("/e")),
             "a dev run keeps its events (verify land's judgment)"
         );
+    }
+
+    /// Lint package proofs have their own release-only wire and share the frozen item context.
+    /// Negative controls: a dev lint, another release check, and proofs without context are
+    /// refused before a file is read.
+    #[test]
+    fn a_release_resume_accepts_lint_package_proofs_only_for_lint() {
+        let context = "cd".repeat(32);
+        let parsed = ok(&[
+            "release",
+            "--checks=lint",
+            "--passed-lint-packages",
+            "/l/lint.jsonl",
+            "--carry-context",
+            &context,
+        ]);
+        assert_eq!(parsed.checks, [Check::Lint]);
+        assert_eq!(
+            parsed.passed_lint_packages.as_deref(),
+            Some(std::path::Path::new("/l/lint.jsonl"))
+        );
+        assert!(
+            parse([
+                "lint",
+                "--all",
+                "--passed-lint-packages",
+                "/p",
+                "--carry-context",
+                &context,
+            ])
+            .is_err()
+        );
+        assert!(
+            parse([
+                "release",
+                "--checks=fmt",
+                "--passed-lint-packages",
+                "/p",
+                "--carry-context",
+                &context,
+            ])
+            .is_err()
+        );
+        assert!(parse(["release", "--checks=lint", "--passed-lint-packages", "/p",]).is_err());
     }
 
     /// `release --tree` and `release --bundle --app A` run its halves, both its whole set, and

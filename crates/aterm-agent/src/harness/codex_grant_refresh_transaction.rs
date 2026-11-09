@@ -626,10 +626,8 @@ fn deliver<R>(
     Ok((result, revision))
 }
 
-#[cfg(not(test))]
-const REFRESH_BUDGET: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const REFRESH_BUDGET: Duration = aterm_spec::wait::MUST_HAPPEN;
+/// Hang detector for the admitted owner's refresh; native authority is checked separately.
+const REFRESH_BUDGET: Duration = Duration::from_secs(60);
 
 pub(in crate::harness) fn with_refreshed_owner<R>(
     env: &Env,
@@ -734,6 +732,10 @@ pub(in crate::harness) fn fixture_promote_received_response(
     tests::inject_received_response(env, binding, scope);
     assert!(reconcile_retained(env, binding, scope).is_ok());
 }
+
+#[cfg(all(test, unix))]
+#[path = "codex_grant_refresh_transaction/native_wait_tests.rs"]
+mod native_wait_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1043,7 +1045,6 @@ mod tests {
     fn missing_assignment_book_refuses_the_actual_refresh_send_for_both_source_modes() {
         let fixture = super::super::super::maintenance_tests::fixture();
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let document = aterm_json::to_vec(&aterm_json::json!({
             "auth_mode":"chatgpt","tokens":{
                 "access_token":"synthetic-source-guard-access",
@@ -1077,7 +1078,13 @@ mod tests {
             assert!(checked, "the real pre-send admission was reached");
             assert!(result.is_err());
             assert_eq!(
-                listener.accept().unwrap_err().kind(),
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap_err()
+                .kind(),
                 std::io::ErrorKind::WouldBlock
             );
         }

@@ -507,14 +507,17 @@ fn a_worker_redial_that_fails_is_recorded_with_its_dial_cause() {
         b.legacy_projection = true;
         // A plain socket, so closing it leaves the admitted connection's proof standing.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         thread::scope(|scope| {
             let server = scope.spawn(move || {
                 let stream = aterm_spec::wait::until_within(
                     aterm_spec::wait::MUST_HAPPEN,
                     "first application channel",
-                    || match listener.accept() {
+                    || match aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Ready,
+                        aterm_uds::AcceptedMode::Blocking,
+                    ) {
                         Ok((stream, _)) => Some(stream),
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
                         Err(error) => panic!("application listener failed: {error}"),
@@ -522,7 +525,6 @@ fn a_worker_redial_that_fails_is_recorded_with_its_dial_cause() {
                 );
                 // Nothing listens once the first exchange runs, so the worker's redial is refused.
                 drop(listener);
-                stream.set_nonblocking(false).unwrap();
                 let connection = Connection::admit(stream, LinkScope::Loopback).unwrap();
                 let mut repair = PeerRepair::default();
                 b.exchange(connection, Side::Responder, &mut repair)
@@ -572,8 +574,17 @@ fn loopback_round(
     let address = listener.local_addr().unwrap();
     thread::scope(|threads| {
         let server = threads.spawn(|| {
-            let connection =
-                Connection::admit(listener.accept().unwrap().0, LinkScope::Loopback).unwrap();
+            let connection = Connection::admit(
+                aterm_uds::accept(
+                    listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap()
+                .0,
+                LinkScope::Loopback,
+            )
+            .unwrap();
             b.exchange(connection, Side::Responder, rb).unwrap();
         });
         let connection =

@@ -46,7 +46,14 @@ fn the_seam_bin_says_hello_with_its_key_and_its_own_sha256_and_serves_a_command(
     let _running = Running(child);
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(watching.accept().map(|(s, _)| s));
+        let _ = tx.send(
+            aterm_uds::accept(
+                &watching,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .map(|(stream, _)| stream),
+        );
     });
     let accepted = rx
         .recv_timeout(HANG)
@@ -104,7 +111,6 @@ fn the_seam_bin_with_no_key_disk_dials_nothing_and_exits() {
     let not_a_key = dir.path().join("zeros.img");
     std::fs::write(&not_a_key, [0u8; 512]).unwrap();
     let watching = UnixListener::bind(&watch).unwrap();
-    watching.set_nonblocking(true).unwrap();
     let mut child = aterm_uds::spawnfd::command(&exe)
         .arg("--listen")
         .arg(&listen)
@@ -124,7 +130,12 @@ fn the_seam_bin_with_no_key_disk_dials_nothing_and_exits() {
     std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut said).unwrap();
     assert!(said.contains("is no key disk"), "{said}");
     assert!(
-        watching.accept().is_err(),
+        aterm_uds::accept(
+            &watching,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        )
+        .is_err(),
         "it never dialed the watch socket"
     );
 }

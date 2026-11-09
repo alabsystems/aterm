@@ -13,6 +13,16 @@ license.workspace = true
 repository.workspace = true
 description = "Inline-optimized collections for aterm: SmallVec + ArrayVec with zero external deps"
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
+[package.metadata.aterm.test-inputs.targets."test:alloc_suite"]
+bounded = false
+
 [dependencies]
 # None — `#![no_std]`, core + alloc only
 

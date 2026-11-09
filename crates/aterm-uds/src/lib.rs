@@ -100,77 +100,198 @@ pub fn kept_out<T: spawn_lock::Descriptors, E: From<std::io::Error>>(
     spawn_lock::creating(create, |made| made.mark().map_err(E::from))
 }
 
-/// A listener [`accept`] takes connections from: a Unix-domain or a TCP one.
-#[cfg(unix)]
-pub trait Listens: std::os::fd::AsFd {
-    /// The connection one accept answers.
-    type Stream: spawn_lock::Descriptors;
-    /// The peer's address, answered beside it.
-    type Peer: spawn_lock::Descriptors;
-    /// Make the listener's accepts answer at once (`O_NONBLOCK`).
-    ///
-    /// # Errors
-    /// The `fcntl(2)` errno.
-    fn nonblocking(&self) -> std::io::Result<()>;
-    /// One `accept(2)`.
-    ///
-    /// # Errors
-    /// Its errno (`WouldBlock` with no connection waiting).
-    fn accept_now(&self) -> std::io::Result<(Self::Stream, Self::Peer)>;
-    /// Make an accepted connection's I/O wait again (it took the listener's nonblocking mode).
-    ///
-    /// # Errors
-    /// The `fcntl(2)` errno.
-    fn blocking(stream: &Self::Stream) -> std::io::Result<()>;
+/// Whether [`accept`] waits for a connection before answering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcceptWait {
+    /// Answer `WouldBlock` when no connection is already queued.
+    Ready,
+    /// Wait until a connection is queued.
+    Forever,
+    /// Wait until this absolute deadline. Expiry answers `TimedOut`.
+    Until(std::time::Instant),
 }
 
-#[cfg(unix)]
+/// The blocking mode [`accept`] explicitly gives the accepted stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcceptedMode {
+    /// Reads and writes wait, subject to their socket timeouts.
+    Blocking,
+    /// Reads and writes answer `WouldBlock` instead of waiting.
+    Nonblocking,
+}
+
+#[cfg(any(unix, windows))]
+mod raw_accept {
+    use super::AcceptedMode;
+
+    pub trait RawAccept<Stream, Peer> {
+        fn nonblocking(&self) -> std::io::Result<()>;
+        fn accept_now(&self) -> std::io::Result<(Stream, Peer)>;
+        fn accepted_mode(stream: &Stream, mode: AcceptedMode) -> std::io::Result<()>;
+    }
+}
+
+/// A listener [`accept`] takes connections from: a Unix-domain or a TCP one. Sealed so the raw
+/// accept operation stays private to the sanctioned helper.
+#[cfg(any(unix, windows))]
+pub trait Listens: raw_accept::RawAccept<Self::Stream, Self::Peer> {
+    /// The connection one accept answers.
+    type Stream;
+    /// The peer's address, answered beside it.
+    type Peer;
+}
+
+#[cfg(any(unix, windows))]
 macro_rules! listens {
-    ($($listener:ty => $stream:ty, $peer:ty);* $(;)?) => {$(
+    ($listener:ty => $stream:ty, $peer:ty) => {
         impl Listens for $listener {
             type Stream = $stream;
             type Peer = $peer;
+        }
+        impl raw_accept::RawAccept<$stream, $peer> for $listener {
             fn nonblocking(&self) -> std::io::Result<()> {
                 self.set_nonblocking(true)
             }
             fn accept_now(&self) -> std::io::Result<($stream, $peer)> {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the one sanctioned accept normalizes the accepted stream's mode"
+                )]
                 self.accept()
             }
-            fn blocking(stream: &$stream) -> std::io::Result<()> {
-                stream.set_nonblocking(false)
+            fn accepted_mode(stream: &$stream, mode: AcceptedMode) -> std::io::Result<()> {
+                stream.set_nonblocking(matches!(mode, AcceptedMode::Nonblocking))
             }
         }
-    )*};
+    };
 }
 
+#[cfg(any(unix, windows))]
+listens!(std::net::TcpListener => std::net::TcpStream, std::net::SocketAddr);
 #[cfg(unix)]
-listens!(
-    std::os::unix::net::UnixListener => std::os::unix::net::UnixStream, std::os::unix::net::SocketAddr;
-    std::net::TcpListener => std::net::TcpStream, std::net::SocketAddr;
-);
+listens!(std::os::unix::net::UnixListener => std::os::unix::net::UnixStream, std::os::unix::net::SocketAddr);
 
-/// Accept the next connection on `listener` as a blocking `accept` would, the connection kept out
-/// of every child from its creation: the wait for one is a `poll(2)` that holds nothing
-/// ([`ready::one`]), and only the `accept(2)` and its mark hold the spawn lock ([`kept_out`]), so
-/// no spawn waits for a connection to come. The listener is left nonblocking; the connection comes
-/// back blocking.
+#[cfg(any(unix, windows))]
+fn check_accept_deadline(wait: AcceptWait) -> std::io::Result<()> {
+    if let AcceptWait::Until(deadline) = wait
+        && std::time::Instant::now() >= deadline
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "accept deadline",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+impl Listens for win::CtlListener {
+    type Stream = win::CtlStream;
+    type Peer = ();
+}
+
+#[cfg(windows)]
+impl raw_accept::RawAccept<win::CtlStream, ()> for win::CtlListener {
+    fn nonblocking(&self) -> std::io::Result<()> {
+        self.set_nonblocking(true)
+    }
+
+    fn accept_now(&self) -> std::io::Result<(win::CtlStream, ())> {
+        self.accept()
+    }
+
+    fn accepted_mode(stream: &win::CtlStream, mode: AcceptedMode) -> std::io::Result<()> {
+        stream.set_nonblocking(matches!(mode, AcceptedMode::Nonblocking))
+    }
+}
+
+/// Accept one TCP or Unix-domain connection, with both the wait and the accepted stream's mode
+/// stated by the caller. The listener is left nonblocking.
+///
+/// On Unix the connection is kept out of every child from its creation: a wait is a `poll(2)` that
+/// holds nothing ([`ready::one`] / [`ready::until`]), and only the nonblocking `accept(2)` and its
+/// mark hold the spawn lock ([`kept_out`]), so no spawn waits for a connection to come. The stream
+/// mode is then set explicitly: BSD can inherit `O_NONBLOCK` from the listener and Linux does not.
 ///
 /// # Errors
-/// The mode's `fcntl(2)`, the `poll(2)`, the `accept(2)` (other than `EAGAIN` and `EINTR`) or
-/// the mark.
+/// The listener or stream mode, readiness wait, `accept(2)` (other than a retried `EINTR`) or
+/// close-on-fork mark. `Ready` answers `WouldBlock` when no connection is queued, and an expired
+/// `Until` answers `TimedOut`.
 #[cfg(unix)]
-pub fn accept<L: Listens>(listener: &L) -> std::io::Result<(L::Stream, L::Peer)> {
-    listener.nonblocking()?;
+pub fn accept<L>(
+    listener: &L,
+    wait: AcceptWait,
+    mode: AcceptedMode,
+) -> std::io::Result<(L::Stream, L::Peer)>
+where
+    L: Listens + std::os::fd::AsFd,
+    L::Stream: spawn_lock::Descriptors,
+    L::Peer: spawn_lock::Descriptors,
+{
+    check_accept_deadline(wait)?;
+    <L as raw_accept::RawAccept<L::Stream, L::Peer>>::nonblocking(listener)?;
     loop {
-        match kept_out(|| listener.accept_now()) {
+        match kept_out(|| <L as raw_accept::RawAccept<L::Stream, L::Peer>>::accept_now(listener)) {
             Ok(accepted) => {
-                L::blocking(&accepted.0)?;
+                <L as raw_accept::RawAccept<L::Stream, L::Peer>>::accepted_mode(&accepted.0, mode)?;
                 return Ok(accepted);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                ready::one(listener.as_fd())?;
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && wait == AcceptWait::Ready =>
+            {
+                return Err(error);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => match wait {
+                AcceptWait::Ready => unreachable!("the ready case returned above"),
+                AcceptWait::Forever => ready::one(listener.as_fd())?,
+                AcceptWait::Until(deadline) => {
+                    ready::until(listener.as_fd(), ready::Interest::Read, deadline)?;
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                check_accept_deadline(wait)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Windows TCP counterpart of the Unix [`accept`]. A Windows handle reaches a child only when it
+/// is made inheritable, so no spawn lock is needed. `WSAPoll` waits without changing the socket or
+/// competing with another clone's event registration.
+#[cfg(windows)]
+pub fn accept<L>(
+    listener: &L,
+    wait: AcceptWait,
+    mode: AcceptedMode,
+) -> std::io::Result<(L::Stream, L::Peer)>
+where
+    L: Listens + std::os::windows::io::AsRawSocket,
+{
+    check_accept_deadline(wait)?;
+    <L as raw_accept::RawAccept<L::Stream, L::Peer>>::nonblocking(listener)?;
+    loop {
+        match <L as raw_accept::RawAccept<L::Stream, L::Peer>>::accept_now(listener) {
+            Ok(accepted) => {
+                <L as raw_accept::RawAccept<L::Stream, L::Peer>>::accepted_mode(&accepted.0, mode)?;
+                return Ok(accepted);
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && wait == AcceptWait::Ready =>
+            {
+                return Err(error);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let deadline = match wait {
+                    AcceptWait::Ready => unreachable!("the ready case returned above"),
+                    AcceptWait::Forever => None,
+                    AcceptWait::Until(deadline) => Some(deadline),
+                };
+                win::wait_readable(listener.as_raw_socket(), deadline)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                check_accept_deadline(wait)?;
+            }
             Err(error) => return Err(error),
         }
     }

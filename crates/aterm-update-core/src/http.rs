@@ -3542,7 +3542,6 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let ranges = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen = std::sync::Arc::clone(&ranges);
-        listener.set_nonblocking(true).unwrap();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let current = std::sync::Arc::new(std::sync::Mutex::new(None));
         let stopping = std::sync::Arc::clone(&stop);
@@ -3551,7 +3550,11 @@ mod tests {
         let thread = std::thread::spawn(move || {
             let mut n = 0;
             while !stopping.load(std::sync::atomic::Ordering::Acquire) {
-                let mut conn = match listener.accept() {
+                let mut conn = match aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Ready,
+                    aterm_uds::AcceptedMode::Blocking,
+                ) {
                     Ok((conn, _)) => conn,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3560,7 +3563,6 @@ mod tests {
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(_) => return,
                 };
-                conn.set_nonblocking(false).unwrap();
                 {
                     let mut serving = serving.lock().unwrap();
                     *serving = Some(conn.try_clone().unwrap());

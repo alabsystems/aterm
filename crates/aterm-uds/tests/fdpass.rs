@@ -248,7 +248,12 @@ fn peer_pid_is_the_kernel_attested_peer() {
     let path = dir.join("aterm-9.sock");
     let listener = CtlListener::bind(&path).expect("bind");
     let client = CtlStream::connect(&path).expect("connect");
-    let (accepted, _) = listener.accept().expect("accept");
+    let (accepted, _) = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Forever,
+        aterm_uds::AcceptedMode::Blocking,
+    )
+    .expect("accept");
 
     let us = std::process::id();
     assert_eq!(fdpass::peer_pid(&client).expect("client side"), us);

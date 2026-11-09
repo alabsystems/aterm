@@ -13,6 +13,13 @@ description = "Aos hosted execution: versioned task identities, full-copy checkp
 # is not a `mod` of tests/aos_suite.rs never compiles.
 autotests = false
 
+[package.metadata.aterm.test-inputs]
+read-only = true
+bounded = true
+content-only = true
+volatile-environment = []
+paths = []
+
 [lints]
 workspace = true
 

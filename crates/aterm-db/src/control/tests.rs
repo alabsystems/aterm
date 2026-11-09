@@ -138,8 +138,17 @@ fn crossed_native_tls_dials_finish_one_channel_after_both_responders_hold_leases
                 },
                 || {
                     low_endpoint.exchange(
-                        Connection::admit(low_listener.accept().unwrap().0, Scope::Loopback)
-                            .unwrap(),
+                        Connection::admit(
+                            aterm_uds::accept(
+                                &low_listener,
+                                aterm_uds::AcceptWait::Forever,
+                                aterm_uds::AcceptedMode::Blocking,
+                            )
+                            .unwrap()
+                            .0,
+                            Scope::Loopback,
+                        )
+                        .unwrap(),
                         Side::Responder,
                         &mut Repair::default(),
                     )
@@ -156,8 +165,17 @@ fn crossed_native_tls_dials_finish_one_channel_after_both_responders_hold_leases
                 },
                 || {
                     high_endpoint.exchange(
-                        Connection::admit(high_listener.accept().unwrap().0, Scope::Loopback)
-                            .unwrap(),
+                        Connection::admit(
+                            aterm_uds::accept(
+                                &high_listener,
+                                aterm_uds::AcceptWait::Forever,
+                                aterm_uds::AcceptedMode::Blocking,
+                            )
+                            .unwrap()
+                            .0,
+                            Scope::Loopback,
+                        )
+                        .unwrap(),
                         Side::Responder,
                         &mut Repair::default(),
                     )
@@ -224,7 +242,17 @@ fn dial(responder: &Endpoint, initiator: &Endpoint) -> (Result<Report>, Result<R
     thread::scope(|scope| {
         let responded = scope.spawn(|| {
             responder.exchange(
-                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    Scope::Loopback,
+                )
+                .unwrap(),
                 Side::Responder,
                 &mut Repair::default(),
             )
@@ -457,7 +485,17 @@ fn canonical_foundation_grants_no_channel_but_competing_signed_members_can_repai
         let server = scope.spawn(|| {
             endpoints[1]
                 .exchange(
-                    Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                    Connection::admit(
+                        aterm_uds::accept(
+                            &listener,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        )
+                        .unwrap()
+                        .0,
+                        Scope::Loopback,
+                    )
+                    .unwrap(),
                     Side::Responder,
                     &mut Repair::default(),
                 )
@@ -654,7 +692,17 @@ impl Lab {
         thread::scope(|scope| {
             let server = scope.spawn(move || {
                 eb.exchange(
-                    Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                    Connection::admit(
+                        aterm_uds::accept(
+                            &listener,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        )
+                        .unwrap()
+                        .0,
+                        Scope::Loopback,
+                    )
+                    .unwrap(),
                     Side::Responder,
                     b,
                 )
@@ -843,7 +891,17 @@ fn real_tls_rejects_a_copied_witness_without_its_writer_key() {
     thread::scope(|scope| {
         let served = scope.spawn(|| {
             server.exchange(
-                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    Scope::Loopback,
+                )
+                .unwrap(),
                 Side::Responder,
                 &mut Repair::default(),
             )
@@ -886,8 +944,17 @@ fn truncated_native_tls_exchanges_report_the_current_local_phase() {
         let discriminator = FleetSecret::new(&Sha256::digest(&domain)).unwrap();
         thread::scope(|scope| {
             let served = scope.spawn(|| {
-                let connection =
-                    Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap();
+                let connection = Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    Scope::Loopback,
+                )
+                .unwrap();
                 let (tcp, route) = connection.into_parts();
                 tcp.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
                 tcp.set_write_timeout(Some(Duration::from_secs(60)))
@@ -1712,7 +1779,17 @@ fn commons_control_repairs_membership_records_and_tolerates_legacy_peers() {
     thread::scope(|scope| {
         let server = scope.spawn(|| {
             eb.exchange(
-                Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                Connection::admit(
+                    aterm_uds::accept(
+                        &listener,
+                        aterm_uds::AcceptWait::Forever,
+                        aterm_uds::AcceptedMode::Blocking,
+                    )
+                    .unwrap()
+                    .0,
+                    Scope::Loopback,
+                )
+                .unwrap(),
                 Side::Responder,
                 &mut rb,
             )
@@ -1765,7 +1842,17 @@ fn commons_control_repairs_membership_records_and_tolerates_legacy_peers() {
         let server = scope.spawn(|| {
             legacy_b
                 .exchange(
-                    Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                    Connection::admit(
+                        aterm_uds::accept(
+                            &listener,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        )
+                        .unwrap()
+                        .0,
+                        Scope::Loopback,
+                    )
+                    .unwrap(),
                     Side::Responder,
                     &mut rb_leg,
                 )
@@ -1886,8 +1973,17 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
                 thread::scope(|scope| {
                     let server = scope.spawn(|| {
                         eb.exchange(
-                            Connection::admit(listener.accept().unwrap().0, Scope::Loopback)
-                                .unwrap(),
+                            Connection::admit(
+                                aterm_uds::accept(
+                                    &listener,
+                                    aterm_uds::AcceptWait::Forever,
+                                    aterm_uds::AcceptedMode::Blocking,
+                                )
+                                .unwrap()
+                                .0,
+                                Scope::Loopback,
+                            )
+                            .unwrap(),
                             Side::Responder,
                             &mut rb,
                         )
@@ -1983,7 +2079,17 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
         thread::scope(|scope| {
             let s = scope.spawn(|| {
                 eb.exchange(
-                    Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                    Connection::admit(
+                        aterm_uds::accept(
+                            &listener,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        )
+                        .unwrap()
+                        .0,
+                        Scope::Loopback,
+                    )
+                    .unwrap(),
                     Side::Responder,
                     &mut Repair::default(),
                 )
@@ -2181,7 +2287,17 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
         thread::scope(|scope| {
             let server = scope.spawn(|| {
                 e4.exchange(
-                    Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                    Connection::admit(
+                        aterm_uds::accept(
+                            &listener,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        )
+                        .unwrap()
+                        .0,
+                        Scope::Loopback,
+                    )
+                    .unwrap(),
                     Side::Responder,
                     &mut Repair::default(),
                 )
@@ -2234,7 +2350,17 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
         thread::scope(|scope| {
             let server = scope.spawn(|| {
                 e4.exchange(
-                    Connection::admit(listener2.accept().unwrap().0, Scope::Loopback).unwrap(),
+                    Connection::admit(
+                        aterm_uds::accept(
+                            &listener2,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        )
+                        .unwrap()
+                        .0,
+                        Scope::Loopback,
+                    )
+                    .unwrap(),
                     Side::Responder,
                     &mut Repair::default(),
                 )
@@ -2427,7 +2553,17 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
         thread::scope(|scope| {
             let server = scope.spawn(|| {
                 e1.exchange(
-                    Connection::admit(listener.accept().unwrap().0, Scope::Loopback).unwrap(),
+                    Connection::admit(
+                        aterm_uds::accept(
+                            &listener,
+                            aterm_uds::AcceptWait::Forever,
+                            aterm_uds::AcceptedMode::Blocking,
+                        )
+                        .unwrap()
+                        .0,
+                        Scope::Loopback,
+                    )
+                    .unwrap(),
                     Side::Responder,
                     &mut Repair::default(),
                 )

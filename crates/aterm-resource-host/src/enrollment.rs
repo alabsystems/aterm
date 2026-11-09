@@ -233,7 +233,7 @@ fn verify_gui_at(
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
-    use std::os::{fd::AsFd as _, unix::fs::PermissionsExt as _};
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[test]
     fn native_gui_enrollment_waits_for_an_unchanged_authenticated_endpoint() {
@@ -261,7 +261,6 @@ mod tests {
         let endpoint = scratch.path().join("gui.sock");
         let listener = aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(&endpoint)).unwrap();
         std::fs::set_permissions(&endpoint, std::fs::Permissions::from_mode(0o600)).unwrap();
-        listener.set_nonblocking(true).unwrap();
         let token = "ab".repeat(32);
         let token_name = aterm_types::control_socket::token_names_for_sock("gui.sock").remove(0);
         let token_path = scratch.path().join(token_name);
@@ -277,8 +276,11 @@ mod tests {
         let (finished, wait_finished) = std::sync::mpsc::sync_channel(1);
         let server = std::thread::spawn(move || -> io::Result<()> {
             let deadline = Instant::now() + Duration::from_secs(60);
-            aterm_uds::ready::until(listener.as_fd(), aterm_uds::ready::Interest::Read, deadline)?;
-            let (stream, _) = aterm_uds::kept_out(|| listener.accept())?;
+            let (stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(deadline),
+                aterm_uds::AcceptedMode::Blocking,
+            )?;
             assert_eq!(wire::read_line(&stream, deadline)?, format!("AUTH {token}"));
             assert_eq!(wire::read_line(&stream, deadline)?, "version");
             wire::write_all(&stream, b"OK native fixture\n", deadline)?;

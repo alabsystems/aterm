@@ -253,7 +253,6 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
     let dir = harness::sock_dir("stub13");
     let stub = dir.path().join("s.sock").to_string_lossy().into_owned();
     let listener = UnixListener::bind(&stub).expect("bind the stub");
-    listener.set_nonblocking(true).unwrap();
     let (stop, stopping) = std::sync::mpsc::channel();
     let (accepted, acceptance) = std::sync::mpsc::channel();
     struct Stub(
@@ -269,7 +268,11 @@ fn a_broker_that_accepts_but_never_acks_is_stalled_no_ack() {
     let worker = std::thread::spawn(move || {
         let mut streams = Vec::new();
         loop {
-            match listener.accept() {
+            match aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            ) {
                 Ok((stream, _)) => {
                     streams.push(stream);
                     let _ = accepted.send(());

@@ -9,7 +9,12 @@ fn listening_peer(opts: &Opts) -> std::thread::JoinHandle<usize> {
     std::thread::spawn(move || {
         let mut connections = 0;
         loop {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             stream
                 .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
                 .unwrap();

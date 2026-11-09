@@ -624,7 +624,13 @@ fn a_lab_identity_proves_itself_to_no_fleet_member() {
     let port = listener.local_addr().expect("its address").port();
     let (rang, rings) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
+        loop {
+            let stream = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Forever,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .map(|(stream, _)| stream);
             drop(stream);
             if rang.send(()).is_err() {
                 break;

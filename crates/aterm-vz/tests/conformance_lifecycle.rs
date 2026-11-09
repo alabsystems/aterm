@@ -1681,15 +1681,21 @@ fn stand_in_main(state: &Path, parent: u32) -> i32 {
         );
         let _ = out.flush();
     }
-    if let Err(e) = held.listener.set_nonblocking(true) {
-        eprintln!("aterm-vz stand-in: {e}");
-        return 1;
-    }
     let mut open = Vec::new();
     while std::os::unix::process::parent_id() == parent {
-        match held.listener.accept() {
+        match aterm_uds::accept(
+            &held.listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((stream, _)) => open.push(stream),
-            Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => {
+                eprintln!("aterm-vz stand-in: {e}");
+                return 1;
+            }
         }
     }
     drop(open);

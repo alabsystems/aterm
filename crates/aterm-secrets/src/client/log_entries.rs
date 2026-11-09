@@ -1707,15 +1707,31 @@ fn roster_from_doc_or_entry(
     combined
 }
 
+/// This Mac's roster for `log`, read under an observation of its state
+/// ([`observe_for_roster`]): a vault writer at work is busy, which a reader observes again.
 pub fn local_swarm_roster_for_log(
     paths: &Paths,
     log: &Log,
 ) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
-    StateLock::narrow_owned(paths)?;
-    let lock = StateLock::observe(paths)?.ok_or_else(|| {
-        Error::new("the vault state is busy or unavailable while reading its roster")
-    })?;
+    let lock = observe_for_roster(paths)?;
     local_swarm_roster_for_log_held(paths, log, &lock)
+}
+
+/// This Mac's state, observed for a roster read: a vault writer that holds it at this moment is
+/// [`crate::ErrorKind::VaultBusy`], which a reader observes again, never a home without a vault.
+///
+/// # Errors
+/// A vault writer holds the state ([`crate::ErrorKind::VaultBusy`]), this Mac holds no vault
+/// state, or the state is not its owner's alone.
+fn observe_for_roster(paths: &Paths) -> crate::Result<StateLock> {
+    StateLock::narrow_owned(paths)?;
+    match StateLock::observe_classified(paths)? {
+        StateObservation::Held(lock) => Ok(lock),
+        StateObservation::Busy => Err(super::roster::vault_busy()),
+        StateObservation::Absent => Err(Error::new(
+            "the vault state is unavailable while reading its roster",
+        )),
+    }
 }
 
 pub(crate) fn local_swarm_roster_for_log_held(
@@ -1740,9 +1756,9 @@ pub(crate) fn local_swarm_roster_for_log_held(
 /// readers need.
 ///
 /// # Errors
-/// The vault state is busy (where `lock` is `None`), `log` belongs to another vault authority
-/// or omits a head the vault's custody holds, the applied log is unavailable, or the cached
-/// envelope cannot be read.
+/// Where `lock` is `None`, a vault writer holds the state ([`crate::ErrorKind::VaultBusy`]) or
+/// this Mac holds no vault state; `log` belongs to another vault authority or omits a head the
+/// vault's custody holds, the applied log is unavailable, or the cached envelope cannot be read.
 pub(super) fn local_roster_denies_for_log(
     paths: &Paths,
     log: &Log,
@@ -1750,13 +1766,7 @@ pub(super) fn local_roster_denies_for_log(
 ) -> crate::Result<Option<crate::swarm_roster::SwarmRoster>> {
     let (combined, _) = match lock {
         Some(lock) => local_roster_read(paths, log, lock)?,
-        None => {
-            StateLock::narrow_owned(paths)?;
-            let lock = StateLock::observe(paths)?.ok_or_else(|| {
-                Error::new("the vault state is busy or unavailable while reading its roster")
-            })?;
-            local_roster_read(paths, log, &lock)?
-        }
+        None => local_roster_read(paths, log, &observe_for_roster(paths)?)?,
     };
     let Some(mut roster) = combined else {
         return Ok(None);

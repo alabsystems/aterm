@@ -11,6 +11,26 @@ pub const REF: &str = "refs/aterm/judged";
 pub const RETENTION: u64 = 14 * 86400;
 pub const LEASE: u64 = 120;
 
+#[cfg(unix)]
+thread_local! {
+    static INTERRUPTIBLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A lease renewal may use its whole remaining ownership budget because its child I/O can
+/// stop on the controller's interrupt. Leave the interrupt for that controller to report;
+/// terminal publication outside this scope must still run while the interrupt is pending.
+#[cfg(unix)]
+pub fn interruptible<T>(work: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INTERRUPTIBLE.set(self.0);
+        }
+    }
+    let _restore = Restore(INTERRUPTIBLE.replace(true));
+    work()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Row {
     pub id: String,
@@ -73,6 +93,19 @@ fn capture_until(
     if std::time::Instant::now() >= until {
         return Err("journal operation exhausted its deadline".into());
     }
+    #[cfg(unix)]
+    if INTERRUPTIBLE.get() {
+        let watch = aterm_toolchain::interrupt::Watch::enter();
+        return aterm_uds::deadline::output_with_input_until_watching(
+            cmd,
+            aterm_uds::secret::Secret::new(input.unwrap_or_default()),
+            until,
+            512 * 1024 * 1024,
+            || watch.caught().is_some(),
+        )
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "journal renewal interrupted by controller signal".into());
+    }
     aterm_uds::deadline::output_with_input_until(
         cmd,
         aterm_uds::secret::Secret::new(input.unwrap_or_default()),
@@ -113,7 +146,14 @@ pub fn head(
     until: std::time::Instant,
 ) -> Result<Option<String>, String> {
     let git = |root: &Path| command(root, &[]);
-    let run = |tool, args: &[std::ffi::OsString]| crate::remote::run(root, &git, tool, args, until);
+    let run = |tool, args: &[std::ffi::OsString]| {
+        capture_until(
+            &mut crate::remote::command(root, &git, tool, args),
+            None,
+            until,
+        )
+        .map_err(|why| format!("{tool:?} journal transport: {why}"))
+    };
     crate::remote::Remote::open(root, remote, &run)?.fetch(REF)
 }
 
@@ -308,6 +348,51 @@ pub fn append(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn renewal_interrupts_abort_only_scoped_journal_work() {
+        const CHILD: &str = "ATERM_VERIFY_RENEWAL_INTERRUPT_CHILD";
+        const TEST: &str = "judged::tests::renewal_interrupts_abort_only_scoped_journal_work";
+        if std::env::var_os(CHILD).is_some() {
+            let dir = aterm_tempfile::tempdir().unwrap();
+            let root = dir.path();
+            git(root, &["init", "--quiet"]).unwrap();
+            git(root, &["init", "--bare", "--quiet", "remote"]).unwrap();
+            git(root, &["remote", "add", "origin", "remote"]).unwrap();
+            let watch = aterm_toolchain::interrupt::Watch::enter();
+            // SAFETY: raise sends this valid signal to this isolated child test process;
+            // its live Watch owns the disposition and retains it for the controller.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "this isolated child catches non-core SIGTERM in its live Watch to test journal cancellation; it must not die by SIGKILL"
+            )]
+            let raised = unsafe { libc::raise(libc::SIGTERM) };
+            assert_eq!(raised, 0);
+            let stopped = interruptible(|| output(&mut command(root, &["--version"]), None));
+            assert!(stopped.unwrap_err().contains("interrupted"));
+            let stopped_remote = interruptible(|| head(root, "origin", deadline()));
+            assert!(stopped_remote.unwrap_err().contains("interrupted"));
+            assert_eq!(watch.caught(), Some(libc::SIGTERM));
+            // The terminal append's scope must work even with the same signal pending.
+            assert!(
+                output(&mut command(root, &["--version"]), None)
+                    .unwrap()
+                    .contains("git version")
+            );
+            assert_eq!(watch.take(), Some(libc::SIGTERM));
+            return;
+        }
+        let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        cmd.args(["--exact", TEST, "--nocapture"]).env(CHILD, "1");
+        let out = aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(60))
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 
     #[test]
     fn only_decided_verdicts_or_unexpired_claims_exclude_another_sample() {

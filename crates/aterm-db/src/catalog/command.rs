@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::documents::application::observed_session;
 use aterm_json::{Value, json};
 use aterm_secrets::commons::{bootstrap::Bootstrap, journal::Journal};
 
@@ -11,7 +12,7 @@ pub(crate) fn run(command: &str, mut options: BTreeMap<&str, &str>) -> Result<Va
         .ok_or_else(|| Error::new("Commons configuration path is unavailable"))?;
     run_at(command, &mut options, &paths, &config)
 }
-fn run_at(
+pub(crate) fn run_at(
     command: &str,
     options: &mut BTreeMap<&str, &str>,
     paths: &Paths,
@@ -51,7 +52,7 @@ fn run_at(
         if command == "commons-custody" {
             return custody_inspection(paths, config, tables[0], deadline);
         }
-        let selected = crate::generation::observed_paths_until(paths, deadline)?;
+        let selected = crate::generation::observed_generation_until(paths, deadline)?;
         if batch.is_some() {
             let results =
                 retained_inventories_admitted(&selected, config, &tables, None, deadline, || {})?;
@@ -79,39 +80,11 @@ fn run_at(
         if !options.is_empty() {
             return Err(Error::new("unknown Commons table option"));
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let recovery = crate::generation::status(paths, deadline)?;
-        let chosen = crate::generation::observed_paths_until(paths, deadline);
-        let mut value = readiness(chosen.as_ref().unwrap_or(paths), config, deadline)?;
-        let repairs = match crate::network_state::read_live_observation(config) {
-            Ok(observation) => crate::network_state::value(&observation),
-            Err(_) => match crate::network_state::read_history(config) {
-                Ok(observation) => crate::network_state::value(&observation),
-                Err(error) => {
-                    json!({"visibility":"Unavailable", "peers":[], "cause":error.repair_cause().word()})
-                }
-            },
-        };
-        value
-            .as_object_mut()
-            .ok_or_else(|| Error::new("invalid Commons status"))?
-            .insert("repairs".into(), repairs);
-        let history = membership_history(chosen.as_ref().unwrap_or(paths), deadline);
-        value
-            .as_object_mut()
-            .ok_or_else(|| Error::new("invalid Commons status"))?
-            .insert("membership_history".into(), history);
-        if !recovery.is_null() {
-            let fields = value
-                .as_object_mut()
-                .ok_or_else(|| Error::new("invalid Commons status"))?;
-            fields.insert("writer_recovery".into(), recovery);
-            if chosen.is_err() {
-                fields.insert("ready".into(), Value::Bool(false));
-                fields.insert("state".into(), Value::from("writer-recovery-pending"));
-            }
-        }
-        return Ok(value);
+        return commons_status_until(
+            paths,
+            config,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        );
     }
     let descriptor = if matches!(
         command,
@@ -168,10 +141,10 @@ fn run_at(
         );
     }
     let deadline = crate::admission::deadline();
-    let selected = crate::generation::observed_paths_until(paths, deadline)?;
+    let selected = crate::generation::observed_generation_until(paths, deadline)?;
     let paths = &selected;
     let (bootstrap, journal) = observed_bootstrap(paths, deadline)?;
-    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline))?;
+    let session = observed_session(&bootstrap, journal, deadline, &|| deadline)?;
     let directory = Directory::new(paths, bootstrap.trust());
     let policy = Policy::read(config)?;
     let snapshot = directory.observe_with_policy(&session, &policy)?;
@@ -195,6 +168,46 @@ fn run_at(
         "tables":entries, "rings":rings, "inert":snapshot.inert,
         "recovery_reader":snapshot.recovery, "writer_resume_authorized":false}),
     )
+}
+
+/// `aterm db commons-status` by `deadline`, which bounds its writer-recovery report and the
+/// selection it makes, its readiness and its membership history; its repairs read takes none.
+pub(crate) fn commons_status_until(
+    paths: &Paths,
+    config: &Path,
+    deadline: std::time::Instant,
+) -> Result<Value> {
+    let (recovery, chosen) = crate::generation::status(paths, deadline)?;
+    let mut value = readiness(chosen.as_ref().unwrap_or(paths), config, deadline)?;
+    let repairs = match crate::network_state::read_live_observation(config) {
+        Ok(observation) => crate::network_state::value(&observation),
+        Err(_) => match crate::network_state::read_history(config) {
+            Ok(observation) => crate::network_state::value(&observation),
+            Err(error) => {
+                json!({"visibility":"Unavailable", "peers":[], "cause":error.repair_cause().word()})
+            }
+        },
+    };
+    value
+        .as_object_mut()
+        .ok_or_else(|| Error::new("invalid Commons status"))?
+        .insert("repairs".into(), repairs);
+    let history = membership_history(chosen.as_ref().unwrap_or(paths), deadline);
+    value
+        .as_object_mut()
+        .ok_or_else(|| Error::new("invalid Commons status"))?
+        .insert("membership_history".into(), history);
+    if !recovery.is_null() {
+        let fields = value
+            .as_object_mut()
+            .ok_or_else(|| Error::new("invalid Commons status"))?;
+        fields.insert("writer_recovery".into(), recovery);
+        if chosen.is_err() {
+            fields.insert("ready".into(), Value::Bool(false));
+            fields.insert("state".into(), Value::from("writer-recovery-pending"));
+        }
+    }
+    Ok(value)
 }
 
 fn membership_history(paths: &Paths, deadline: std::time::Instant) -> Value {
@@ -407,7 +420,7 @@ fn retained_inventories_admitted(
     // No source guard escapes this function or crosses network I/O.
     let _sources = crate::generation::local_source_reads_until(paths, deadline)?;
     let (bootstrap, journal) = observed_bootstrap(paths, deadline)?;
-    let session = Session::from_observed_journal(&bootstrap, journal, Some(deadline))?;
+    let session = observed_session(&bootstrap, journal, deadline, &|| deadline)?;
     after_admission();
     let directory = Directory::new(paths, bootstrap.trust());
     let policy = Policy::read(config)?;
@@ -606,6 +619,11 @@ fn readiness(paths: &Paths, config: &Path, deadline: std::time::Instant) -> Resu
             }));
         }
         Observation::Visible(_) => {
+            if !aterm_secrets::commons::bootstrap::custody_opened(paths)
+                .map_err(crate::table::failure)?
+            {
+                return Ok(custody_pending(sharing));
+            }
             let Some(pair) =
                 control_observation(Bootstrap::established_with_journal_until(paths, deadline))?
             else {
@@ -614,21 +632,34 @@ fn readiness(paths: &Paths, config: &Path, deadline: std::time::Instant) -> Resu
             pair
         }
     };
-    // The acknowledged prefix, read beside any writer: no lock to find busy.
-    bootstrap
-        .revalidate_custody()
-        .map_err(crate::table::failure)?;
+    // A vault writer can take this Mac's state lock between the reads from here on: each read
+    // that meets one says busy, never a membership verdict it did not judge.
+    #[cfg(test)]
+    tests::reached(tests::Point::Custody);
+    if control_observation(bootstrap.revalidate_custody())?.is_none() {
+        return Ok(control_busy(sharing));
+    }
     let request = bootstrap.request().map_err(crate::table::failure)?;
     let mut role = None;
-    let state = if let Some((log, _)) =
+    let state = if let Some((log, heads)) =
         aterm_secrets::client::trusted_commons_log(bootstrap.paths(), bootstrap.trust())
             .map_err(crate::table::failure)?
     {
         use aterm_secrets::membership_log::EpochAudience;
         let actor = request.binding().actor();
         let recipient = request.binding().recipient();
-        let log_roster = aterm_secrets::client::local_swarm_roster_for_log(bootstrap.paths(), &log)
-            .map_err(crate::table::failure)?;
+        #[cfg(test)]
+        tests::reached(tests::Point::Roster);
+        let log_roster = match control_observation(
+            aterm_secrets::client::local_swarm_roster_for_log(bootstrap.paths(), &log),
+        ) {
+            Ok(Some(log_roster)) => log_roster,
+            Ok(None) => return Ok(control_busy(sharing)),
+            // A vault writer that finished after `log` was read leaves it behind the history the
+            // roster read requires: the log moved, a writer's moment, not this read's failure.
+            Err(_) if log_moved(&bootstrap, &heads) => return Ok(control_busy(sharing)),
+            Err(error) => return Err(error),
+        };
         let membership = log.membership_ref();
         let member = membership.get(&actor);
         // The one removal predicate first; the seat scan below asks more of the seats that share
@@ -648,7 +679,10 @@ fn readiness(paths: &Paths, config: &Path, deadline: std::time::Instant) -> Resu
                             .as_ref()
                             .is_some_and(|r| aterm_secrets::client::member_denied_by_roster(r, m)))
             })
-            || aterm_secrets::client::local_recipient_denied_in_roster(bootstrap.paths());
+            || match local_denial(bootstrap.paths()) {
+                Some(denied) => denied,
+                None => return Ok(control_busy(sharing)),
+            };
         let active_member =
             !excluded_in_log && member.is_some_and(|m| &m.binding == request.binding());
         if !active_member {
@@ -657,28 +691,35 @@ fn readiness(paths: &Paths, config: &Path, deadline: std::time::Instant) -> Resu
                 || log.has_known_actor(&actor)
             {
                 "membership-inactive"
-            } else if let Ok(Some(access)) = bootstrap.access_in(&journal) {
-                role = Some(match access.local().role() {
-                    Role::Reader => "reader",
-                    Role::Writer => "writer",
-                });
-                "ready"
             } else {
-                "enrollment-pending"
+                match access_now(&bootstrap, &journal) {
+                    Ok(Some(Some(access))) => {
+                        role = Some(match access.local().role() {
+                            Role::Reader => "reader",
+                            Role::Writer => "writer",
+                        });
+                        "ready"
+                    }
+                    Ok(None) => return Ok(control_busy(sharing)),
+                    Ok(Some(None)) | Err(_) => "enrollment-pending",
+                }
             }
         } else {
-            match bootstrap.access_in(&journal) {
-                Ok(Some(access)) => {
+            match access_now(&bootstrap, &journal) {
+                Ok(None) => return Ok(control_busy(sharing)),
+                Ok(Some(Some(access))) => {
                     role = Some(match access.local().role() {
                         Role::Reader => "reader",
                         Role::Writer => "writer",
                     });
                     "ready"
                 }
-                Ok(None) if !log.wraps_maximal_audience_to(&EpochAudience::Commons, &recipient) => {
+                Ok(Some(None))
+                    if !log.wraps_maximal_audience_to(&EpochAudience::Commons, &recipient) =>
+                {
                     "history-pending"
                 }
-                Ok(None) | Err(_) => "membership-inactive",
+                Ok(Some(None)) | Err(_) => "membership-inactive",
             }
         }
     } else {
@@ -692,8 +733,9 @@ fn readiness(paths: &Paths, config: &Path, deadline: std::time::Instant) -> Resu
                 let basis_node = journal
                     .node(&basis)
                     .ok_or_else(|| Error::new("current Commons control basis is missing"))?;
-                let roster_denied =
-                    aterm_secrets::client::local_recipient_denied_in_roster(bootstrap.paths());
+                let Some(roster_denied) = local_denial(bootstrap.paths()) else {
+                    return Ok(control_busy(sharing));
+                };
                 let current_binding = !roster_denied && binds_local(basis_node);
                 // A nonmember cannot decrypt the current roster. Public signed
                 // binding evidence distinguishes that case before capsule access;
@@ -709,10 +751,10 @@ fn readiness(paths: &Paths, config: &Path, deadline: std::time::Instant) -> Resu
                     } else {
                         "enrollment-pending"
                     }
-                } else if let Some(access) = bootstrap
-                    .access_in(&journal)
-                    .map_err(crate::table::failure)?
-                {
+                } else if let Some(access) = match access_now(&bootstrap, &journal)? {
+                    Some(access) => access,
+                    None => return Ok(control_busy(sharing)),
+                } {
                     role = Some(match access.local().role() {
                         Role::Reader => "reader",
                         Role::Writer => "writer",
@@ -771,10 +813,67 @@ fn control_observation<T>(read: aterm_secrets::Result<T>) -> Result<Option<T>> {
     }
 }
 
+/// Whether this Mac's vault denies it, as `local_recipient_denied_in_roster` judges it (a state
+/// that cannot be judged denies), except that a vault writer at work is `None`: nothing judged,
+/// which readiness reports as busy ([`control_busy`]).
+fn local_denial(paths: &Paths) -> Option<bool> {
+    #[cfg(test)]
+    tests::reached(tests::Point::Denial);
+    match control_observation(aterm_secrets::client::local_recipient_denial_observed(
+        paths,
+    )) {
+        Ok(Some(denied)) => Some(denied),
+        Ok(None) => None,
+        Err(_) => Some(true),
+    }
+}
+
+/// Whether this Mac's trusted log is no longer the one whose heads digest is `heads`, which
+/// readiness read before its roster: a vault writer finished, or is at work, in between. A read
+/// that cannot say is `false`, so the roster read's own error stands.
+fn log_moved(bootstrap: &Bootstrap, heads: &[u8; 32]) -> bool {
+    match control_observation(aterm_secrets::client::trusted_commons_log(
+        bootstrap.paths(),
+        bootstrap.trust(),
+    )) {
+        Ok(Some(Some((_, now)))) => now != *heads,
+        Ok(Some(None) | None) => true,
+        Err(_) => false,
+    }
+}
+
+/// `bootstrap`'s access through `journal` as this Mac's vault holds it now, `None` where a vault
+/// writer is at work ([`control_observation`]): nothing judged, which readiness reports as busy.
+///
+/// # Errors
+/// The access cannot be read for any other reason.
+fn access_now(
+    bootstrap: &Bootstrap,
+    journal: &Journal,
+) -> Result<Option<Option<aterm_secrets::commons::roster::Access>>> {
+    #[cfg(test)]
+    tests::reached(tests::Point::Access);
+    control_observation(bootstrap.access_observed_in(journal))
+}
+
+/// Readiness on a Mac whose vault names Commons but which has opened no Commons custody yet
+/// ([`aterm_secrets::commons::bootstrap::custody_opened`]): there is nothing to judge membership
+/// by until aterm's next Commons open here makes it, and the read creates none.
+fn custody_pending(sharing: bool) -> Value {
+    json!({
+        "state": "custody-pending",
+        "detail": "This Mac has opened no Commons custody yet: an aterm window, `aterm node serve` or the Commons runtime opens it; membership has not been checked",
+        "membership_checked": false,
+        "ready": false,
+        "sharing_enabled": sharing,
+        "can_initialize_network": false,
+    })
+}
+
 fn control_busy(sharing: bool) -> Value {
     json!({
         "state": "control-busy",
-        "detail": "Local Commons custody or control journal is busy; membership has not been checked",
+        "detail": "Local Commons custody, control journal or vault is busy; membership has not been checked",
         "membership_checked": false,
         "ready": false,
         "sharing_enabled": sharing,
@@ -785,6 +884,207 @@ fn control_busy(sharing: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where in [`readiness`] a hook runs: before each read of this Mac's vault that a vault
+    /// writer can hold.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum Point {
+        /// Before the custody is revalidated.
+        Custody,
+        /// Before the log-backed roster is read.
+        Roster,
+        /// Before this Mac's vault is asked whether it denies this Mac.
+        Denial,
+        /// Before each read of this home's access.
+        Access,
+    }
+
+    /// A hook and the point it waits for; `None` waits for whichever point comes next.
+    type Hook = (Option<Point>, Box<dyn FnOnce()>);
+
+    thread_local! {
+        static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `hook` once this thread's next readiness read reaches `point`, or whichever point it
+    /// reaches next where `point` is `None`. A hook may set the next hook.
+    fn at(point: Option<Point>, hook: impl FnOnce() + 'static) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
+    }
+
+    /// Drop this thread's hook, run or not.
+    fn clear() {
+        HOOK.with(|slot| slot.borrow_mut().take());
+    }
+
+    pub(super) fn reached(point: Point) {
+        let hook = HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|(at, _)| at.is_none_or(|at| at == point))
+            {
+                slot.take()
+            } else {
+                None
+            }
+        });
+        if let Some((_, hook)) = hook {
+            hook();
+        }
+    }
+
+    /// A vault writer that takes this Mac's state lock while readiness reads makes the read busy
+    /// (`control-busy`), which a reader observes again, never a verdict it did not judge, at each
+    /// read it can hold: the custody's revalidation, the log-backed roster, the denial and the
+    /// access. A home whose membership is the control journal's and one whose membership is
+    /// log-backed (F18) are each read at every point their read reaches, the lock let go at the
+    /// read's next point so each row judges the one read it held; with no lock, each is ready.
+    /// NEGATIVE CONTROL (2026-11-08): with readiness asking `local_recipient_denied_in_roster`,
+    /// `Bootstrap::access_in` and `revalidate_custody` with `?` again, and a roster read meeting a
+    /// vault writer answering a plain error, every row fails; with the revalidation's answer
+    /// ignored and a roster or denial read meeting a writer taken as none, every custody, roster
+    /// and denial row reads `ready`.
+    #[test]
+    fn a_vault_writer_during_readiness_is_busy_not_a_membership_verdict() {
+        use aterm_secrets::{client, commons::roster::Role};
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+        };
+
+        let journal = crate::table::tests::Lab::new(&[Role::Writer]);
+        let logged = crate::table::tests::Lab::with_foundation(&[Role::Writer, Role::Writer]);
+        client::seed_vault_genesis(&logged.paths[0], &logged._home.path().join("genesis.v2"))
+            .unwrap();
+        let homes: [(&str, &crate::table::tests::Lab, &[Point]); 2] = [
+            (
+                "journal",
+                &journal,
+                &[Point::Custody, Point::Denial, Point::Access],
+            ),
+            (
+                "log-backed",
+                &logged,
+                &[Point::Custody, Point::Roster, Point::Denial, Point::Access],
+            ),
+        ];
+        let hang_detector = || std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let state = |read: Result<Value>| read.map(|value| value["state"].clone());
+        let mut outcomes = Vec::new();
+        for (home, lab, points) in homes {
+            let paths = &lab.paths[0];
+            let bootstrap = lab.bootstrap(0);
+            let log_backed = client::trusted_commons_log(paths, bootstrap.trust())
+                .unwrap()
+                .is_some();
+            let config = paths.home.join("config.toml");
+            for &point in points {
+                let held = Rc::new(RefCell::new(None));
+                let taken = Rc::new(Cell::new(false));
+                at(Some(point), {
+                    let (held, taken, paths) = (held.clone(), taken.clone(), paths.clone());
+                    move || {
+                        *held.borrow_mut() = Some(client::test_hold_state_lock(&paths).unwrap());
+                        taken.set(true);
+                        // Let go at the read's next point, so no later read's busy answer can
+                        // stand in for this one's.
+                        at(None, move || drop(held.borrow_mut().take()));
+                    }
+                });
+                let busy = state(readiness(paths, &config, hang_detector()));
+                drop(held.borrow_mut().take());
+                clear();
+                let ready = state(readiness(paths, &config, hang_detector()));
+                outcomes.push((home, point, log_backed, taken.get(), busy, ready));
+            }
+        }
+        let failed: Vec<_> = outcomes
+            .iter()
+            .filter(|(home, _, log_backed, held, busy, ready)| {
+                *log_backed != (*home == "log-backed")
+                    || !*held
+                    || busy.as_ref().ok() != Some(&json!("control-busy"))
+                    || ready.as_ref().ok() != Some(&json!("ready"))
+            })
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "(home, point, log-backed, held, read while held, read after): {failed:?}"
+        );
+    }
+
+    /// A vault writer that finishes between readiness's log read and its roster read (here a
+    /// removal of the other member) leaves the log readiness read behind the history its roster
+    /// read requires. The log moved, which readiness reports as busy (`control-busy`) and the next
+    /// read clears, never a failed command.
+    /// NEGATIVE CONTROL (2026-11-08): with the roster read's error returned whether or not the log
+    /// moved, the raced read fails ("the acknowledged membership history is unavailable").
+    #[test]
+    fn a_vault_write_finished_between_the_log_and_roster_reads_is_busy() {
+        use aterm_secrets::{client, commons::roster::Role};
+        use std::{cell::Cell, rc::Rc};
+
+        let lab = crate::table::tests::Lab::with_foundation(&[Role::Writer, Role::Writer]);
+        client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
+        let other = lab.bootstrap(1).request().unwrap().binding().actor();
+        let paths = lab.paths[0].clone();
+        let config = paths.home.join("config.toml");
+        let hang_detector = || std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let state = |read: Result<Value>| read.map(|value| value["state"].clone());
+        let removed = Rc::new(Cell::new(0));
+        at(Some(Point::Roster), {
+            let (paths, removed) = (paths.clone(), removed.clone());
+            move || removed.set(client::remove_member_in_log(&paths, other).unwrap().len())
+        });
+        let raced = state(readiness(&paths, &config, hang_detector()));
+        clear();
+        let next = state(readiness(&paths, &config, hang_detector()));
+        assert!(
+            removed.get() > 0
+                && raced.as_ref().ok() == Some(&json!("control-busy"))
+                && next.as_ref().ok() == Some(&json!("ready")),
+            "records removed: {}, raced read: {raced:?}, next read: {next:?}",
+            removed.get()
+        );
+    }
+
+    /// A Mac whose vault names Commons but which never opened it (no device key, custody or
+    /// control history) reads `custody-pending` and still holds no custody after the read, and an
+    /// established reader (`aterm db commons-tables`) says so in plain words rather than naming a
+    /// missing directory.
+    /// NEGATIVE CONTROL (2026-11-08): with readiness and `established_with_journal_until` not
+    /// asking `custody_opened`, `commons-status` failed ("the directory …/commons: there is no
+    /// such directory").
+    #[test]
+    fn a_mac_that_never_opened_commons_reads_custody_pending_and_creates_nothing() {
+        use aterm_secrets::commons::roster::Role;
+
+        let lab =
+            crate::table::tests::Lab::with_foundation_enrolled(&[Role::Writer, Role::Writer], 1);
+        let paths = &lab.paths[1];
+        let before = crate::tests::files(lab._home.path());
+        let hang_detector = || std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        assert!(matches!(
+            aterm_secrets::commons::observe_until(paths, hang_detector()),
+            Ok(aterm_secrets::commons::Observation::Visible(_))
+        ));
+        let status = commons_status_until(paths, &paths.home.join("config.toml"), hang_detector())
+            .map(|value| (value["state"].clone(), value["membership_checked"].clone()));
+        let established = Bootstrap::established_with_journal_until(paths, hang_detector())
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        let created = crate::tests::files(lab._home.path()) != before;
+        assert!(
+            status.as_ref().ok() == Some(&(json!("custody-pending"), json!(false)))
+                && established.as_ref().is_err_and(
+                    |error| error.starts_with("this Mac has opened no Commons custody yet")
+                )
+                && !created,
+            "status: {status:?}, established: {established:?}, files created: {created}"
+        );
+    }
+
     #[test]
     fn authority_inspection_never_initializes_an_absent_control_record() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -1011,20 +1311,47 @@ mod tests {
         assert!(!lab.paths[1].dir.join("commons/tables").exists());
     }
 
+    /// A Mac that opened Commons and then lost its `commons` folder but kept its claim (a partial
+    /// reset) holds custody to recover, not custody pending: `commons-status` fails naming the
+    /// recovery rather than the missing folder.
+    /// NEGATIVE CONTROL (2026-11-08): without the established open's claim check, the read failed
+    /// ("the directory …/commons: there is no such directory").
+    #[test]
+    fn a_kept_claim_without_its_commons_folder_is_custody_to_recover_not_pending() {
+        use aterm_secrets::commons::roster::Role;
+
+        let lab = crate::table::tests::Lab::with_foundation(&[Role::Writer]);
+        let paths = &lab.paths[0];
+        std::fs::rename(
+            paths.dir.join("commons"),
+            lab._home.path().join("commons-set-aside"),
+        )
+        .unwrap();
+        let hang_detector = || std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+        let status = commons_status_until(paths, &paths.home.join("config.toml"), hang_detector())
+            .map(|value| value["state"].clone())
+            .map_err(|error| error.to_string());
+        assert_eq!(
+            status,
+            Err("established Commons directory is missing; recovery is required".into())
+        );
+    }
+
+    /// A Mac with a device key, whose vault names Commons, that has opened no custody reads
+    /// `custody-pending` (a device key alone is no custody), and the read creates nothing.
     #[test]
     fn status_does_not_establish_visible_but_uninitialized_custody() {
         let lab = crate::table::tests::Lab::new(&[aterm_secrets::commons::roster::Role::Writer]);
         let paths = &lab.paths[0];
         let before = crate::tests::files(lab._home.path());
-        assert!(
-            run_at(
-                "commons-status",
-                &mut BTreeMap::new(),
-                paths,
-                &paths.home.join("config")
-            )
-            .is_err()
-        );
+        let state = run_at(
+            "commons-status",
+            &mut BTreeMap::new(),
+            paths,
+            &paths.home.join("config"),
+        )
+        .map(|value| value["state"].clone());
+        assert_eq!(state.ok(), Some(json!("custody-pending")));
         assert!(crate::tests::files(lab._home.path()) == before);
     }
 

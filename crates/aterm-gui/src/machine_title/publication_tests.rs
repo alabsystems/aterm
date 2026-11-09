@@ -191,6 +191,49 @@ fn a_partial_name_publication_retries_without_rechoosing_and_rejects_a_stale_ret
         crate::machine_rename_sheet::request(&snapshot, &held, &number, &nickname).unwrap(),
         crate::machine_rename_sheet::RenameTo::Synchronize(requested.num)
     );
+
+    // A failed publication observation keeps the explicit retry available. The
+    // execution still reads the current policy before reaching any system port.
+    let good_config = std::fs::read(&scratch.config).unwrap();
+    for (policy, expected) in [
+        (
+            "[identity\n",
+            crate::machine_rename_sheet::RenameTo::Synchronize(requested.num),
+        ),
+        (
+            "[identity]\nname = false\n",
+            crate::machine_rename_sheet::RenameTo::Keep,
+        ),
+    ] {
+        std::fs::write(&scratch.config, policy).unwrap();
+        let preview = aterm_agent::machine_name::rename_preview(
+            &scratch.state,
+            || Ok(LabLabels::default()),
+            || Ok(None),
+            NOW + 1,
+        )
+        .unwrap();
+        let status =
+            naming::NamingStatus::read(&scratch.state, &scratch.config, preview.name(), &names);
+        let unchecked = crate::machine_rename_sheet::Snapshot::named(preview, status);
+        assert_eq!(
+            crate::machine_rename_sheet::request(&unchecked, &held, &number, &nickname).unwrap(),
+            expected,
+        );
+        let calls = names.calls.borrow().len();
+        assert!(matches!(
+            naming::synchronize(&scratch.state, &scratch.config, requested.num, &names),
+            Err(publish::Pending::Policy(_)),
+        ));
+        assert_eq!(names.calls.borrow().len(), calls);
+        assert_eq!(
+            file::read(&scratch.state).unwrap(),
+            Some(edited.name.clone())
+        );
+        assert_eq!(std::fs::read(&scratch.config).unwrap(), policy.as_bytes());
+    }
+    std::fs::write(&scratch.config, good_config).unwrap();
+
     let nick_only = crate::machine_rename_sheet::Field::open(Some("Puffin"), &held.word);
     assert!(
         matches!(

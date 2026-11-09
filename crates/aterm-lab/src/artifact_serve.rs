@@ -357,9 +357,6 @@ fn serve_one(
     budget: &mut u64,
 ) -> io::Result<()> {
     let deadline = deadline.min(Instant::now() + MAX_CONNECTION);
-    // Darwin accepts inherit the listener's nonblocking mode. The bounded
-    // reader and writer below use socket timeouts, so normalize every stream.
-    stream.set_nonblocking(false)?;
     set_wait(&stream, deadline)?;
     let selected = if stream.peer_addr()?.ip() == peer {
         read_head(&mut DeadlineReader {
@@ -500,9 +497,6 @@ pub fn cmd(args: &[String]) -> Res {
         files.push(file);
     }
     let listener = TcpListener::bind(config.bind).map_err(|e| Fail::die(e.to_string()))?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| Fail::die(e.to_string()))?;
     let address = listener
         .local_addr()
         .map_err(|e| Fail::die(e.to_string()))?;
@@ -521,7 +515,11 @@ pub fn cmd(args: &[String]) -> Res {
     let mut budget = MAX_SENT;
     while requests < config.requests && budget != 0 && Instant::now() < deadline {
         check_stop()?;
-        match listener.accept() {
+        match aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Blocking,
+        ) {
             Ok((stream, _)) => {
                 requests += 1;
                 if let Err(error) =
@@ -642,7 +640,7 @@ mod tests {
     }
 
     #[test]
-    fn transfer_keeps_large_immutable_snapshot_complete_on_a_nonblocking_accept() {
+    fn transfer_keeps_large_immutable_snapshot_complete_on_a_sanctioned_blocking_accept() {
         let tmp = aterm_tempfile::TempDir::new().unwrap();
         let input = tmp.path().join("input");
         let expected: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
@@ -661,13 +659,15 @@ mod tests {
         );
         std::fs::write(&input, b"changed after snapshot").unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let mut client = TcpStream::connect(address).unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            // Darwin inherits the listener's mode. Exercise it on every host.
-            stream.set_nonblocking(true).unwrap();
+            let (stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Ready,
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
             let mut budget = MAX_SENT;
             serve_one(
                 stream,

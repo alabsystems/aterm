@@ -231,6 +231,9 @@ thread_local! {
     /// How many derivations of what epochs' historical writers read ([`Historical`]) ran on this
     /// thread, for the pins of what a log keeps.
     pub(super) static HISTORICALS: Cell<usize> = const { Cell::new(0) };
+    /// How many searches of a history's graph for a seat [`historical_seat_entry`] ran on this
+    /// thread, for the pins of what a log keeps.
+    pub(super) static SEAT_SEARCHES: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -869,29 +872,44 @@ pub(super) fn effective_records(history: History<'_>, weighing: &Weighing) -> Ef
 }
 
 /// Founding `Genesis` or effective `Admit` [`RecordId`] that grants `binding` a seat in
-/// `history`, excluding actors taken out for good by an effective quorum `Remove`.
+/// `history`, excluding actors taken out for good by an effective quorum `Remove`. `kept` is the
+/// history's own ([`Historical`]), which nothing it was derived from has changed since: a seat it
+/// found is given again, and any other is searched for in the history's graph by what `kept`
+/// holds or, where it holds nothing yet, what is derived into it under `weighing`, and kept once
+/// found.
 pub(super) fn historical_seat_entry(
     history: History<'_>,
+    kept: &std::sync::OnceLock<Historical>,
     weighing: &Weighing,
     binding: &Binding,
 ) -> Option<RecordId> {
-    Graph::new(history).historical_seat_entry(weighing, binding)
-}
-
-/// Whether `binding` holds a founding or effective admitted seat in `history`, excluding actors
-/// taken out for good by an effective quorum `Remove`.
-pub(super) fn has_historical_seat(
-    history: History<'_>,
-    weighing: &Weighing,
-    binding: &Binding,
-) -> bool {
-    historical_seat_entry(history, weighing, binding).is_some()
+    if let Some(entry) = kept.get().and_then(|historical| historical.seat(binding)) {
+        return Some(entry);
+    }
+    #[cfg(test)]
+    SEAT_SEARCHES.set(SEAT_SEARCHES.get() + 1);
+    let graph = Graph::new(history);
+    let historical = Historical::kept(kept, &graph, weighing);
+    let entry = graph.historical_seat_entry(weighing, historical, binding)?;
+    historical
+        .seats
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(binding.clone(), entry);
+    Some(entry)
 }
 
 /// Whether `actor` holds a founding or non-void, authorized, non-cut-off admitted seat in
-/// `history` (including actors later retired by an ordinary or quorum `Remove`).
-pub(super) fn has_known_actor(history: History<'_>, weighing: &Weighing, actor: &MemberId) -> bool {
-    Graph::new(history).has_known_actor(weighing, actor)
+/// `history` (including actors later retired by an ordinary or quorum `Remove`), read from what
+/// `kept` holds of the history, as [`historical_seat_entry`] reads it.
+pub(super) fn has_known_actor(
+    history: History<'_>,
+    kept: &std::sync::OnceLock<Historical>,
+    weighing: &Weighing,
+    actor: &MemberId,
+) -> bool {
+    let graph = Graph::new(history);
+    graph.has_known_actor(Historical::kept(kept, &graph, weighing), actor)
 }
 
 /// The cutoff of F16's quorum `Remove` of `actor` ([`super::Log::undo_cutoff`]).
@@ -950,8 +968,13 @@ pub(super) fn undo(history: History<'_>, weighing: &Weighing, actor: &MemberId) 
 /// ([`Historical::of_epoch`]). A quiet repair round asks for 16 epochs' writers under one history
 /// lease: over a log of 9,605 records that batch's writers took 4.3% of such a round, most of it
 /// each epoch deriving these again (2026-11-08), and then 8.5% of it, each lease deriving these
-/// again, so the log keeps them for its held records (`Log::hold` lets them go). Each is a record
-/// index or a set of members, recipients and record ids, none a borrow of the records.
+/// again, so the log keeps them for its held records (`Log::hold` lets them go). The same effects,
+/// authorization and standing answer the history's seats ([`historical_seat_entry`]) and known
+/// actors ([`has_known_actor`]). A peer check asks this Mac's log for the peer's seat, as an
+/// admission by a log's witness does: over a log of 9,605 records those searches, each deriving
+/// them and the graph again, took 4.2% of a sustained quiet round, 3.3% of it the peer checks'
+/// (2026-11-09), so the seats found are kept too. Each is a record index or a set of members,
+/// recipients and record ids, none a borrow of the records.
 #[derive(Debug)]
 pub(super) struct Historical {
     effects: Effects,
@@ -964,6 +987,9 @@ pub(super) struct Historical {
     commons_epochs: Vec<usize>,
     /// The recipients of each epoch's counting `Wrap`s, by the epoch's id.
     wrapped: BTreeMap<RecordId, BTreeSet<Recipient>>,
+    /// The seats found in this history so far ([`historical_seat_entry`]), by binding: only
+    /// seats found, so at most one for each founder's and each `Admit` entrant's binding.
+    seats: std::sync::Mutex<BTreeMap<Binding, RecordId>>,
 }
 
 /// One history's graph, with what its epochs' historical writers read of it ([`Historical`]).
@@ -982,7 +1008,7 @@ impl<'a> HistoricalWriters<'a> {
         weighing: &Weighing,
     ) -> Self {
         let graph = Graph::new(history);
-        let historical = kept.get_or_init(|| Historical::of_graph(&graph, weighing));
+        let historical = Historical::kept(kept, &graph, weighing);
         Self { graph, historical }
     }
 
@@ -993,6 +1019,26 @@ impl<'a> HistoricalWriters<'a> {
 }
 
 impl Historical {
+    /// What `kept` holds of `graph`'s history or, where it holds nothing yet, what is derived
+    /// into it under `weighing`: `kept` is the history's own, which nothing it was derived from
+    /// has changed since.
+    fn kept<'k>(
+        kept: &'k std::sync::OnceLock<Self>,
+        graph: &Graph<'_>,
+        weighing: &Weighing,
+    ) -> &'k Self {
+        kept.get_or_init(|| Self::of_graph(graph, weighing))
+    }
+
+    /// The seat found for `binding` in this history, if one was ([`historical_seat_entry`]).
+    fn seat(&self, binding: &Binding) -> Option<RecordId> {
+        self.seats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(binding)
+            .copied()
+    }
+
     fn of_graph(graph: &Graph<'_>, weighing: &Weighing) -> Self {
         #[cfg(test)]
         HISTORICALS.set(HISTORICALS.get() + 1);
@@ -1029,6 +1075,7 @@ impl Historical {
             counts,
             commons_epochs,
             wrapped,
+            seats: std::sync::Mutex::default(),
         }
     }
 
@@ -1042,6 +1089,7 @@ impl Historical {
             counts,
             commons_epochs,
             wrapped,
+            seats: _,
         } = self;
         if epoch_index == 0 || epoch_index >= graph.records.len() || !counts[epoch_index] {
             return None;
@@ -3009,7 +3057,13 @@ impl<'a> Graph<'a> {
         usable
     }
 
-    fn historical_seat_entry(self, weighing: &Weighing, binding: &Binding) -> Option<RecordId> {
+    /// [`historical_seat_entry`] in this graph, by what `historical` holds of its history.
+    fn historical_seat_entry(
+        &self,
+        weighing: &Weighing,
+        historical: &Historical,
+        binding: &Binding,
+    ) -> Option<RecordId> {
         let actor = binding.actor();
         if weighing
             .accepted
@@ -3018,9 +3072,12 @@ impl<'a> Graph<'a> {
         {
             return None;
         }
-        let (effects, authorized) = self.settled(weighing, &mut self.scratch());
-        let all = |_: usize| true;
-        let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
+        let Historical {
+            effects,
+            authorized,
+            standing,
+            ..
+        } = historical;
         if let Some(&entry) = standing.members.get(&actor) {
             let binds = if entry == 0 {
                 self.founders().any(|seat| seat.binding == binding)
@@ -3029,9 +3086,9 @@ impl<'a> Graph<'a> {
                     entry,
                     actor,
                     &effects.out,
-                    &authorized,
+                    authorized,
                     &effects.void,
-                    &standing,
+                    standing,
                 ) && matches!(
                     self.records[entry].body(),
                     Body::Admit { entrant, .. } if entrant.request.binding() == binding
@@ -3049,17 +3106,11 @@ impl<'a> Graph<'a> {
                 .iter()
                 .copied()
                 .filter(|&i| {
-                    self.admit_binds(
-                        i,
-                        actor,
-                        &effects.out,
-                        &authorized,
-                        &effects.void,
-                        &standing,
-                    ) && matches!(
-                        self.records[i].body(),
-                        Body::Admit { entrant, .. } if entrant.request.binding() == binding
-                    )
+                    self.admit_binds(i, actor, &effects.out, authorized, &effects.void, standing)
+                        && matches!(
+                            self.records[i].body(),
+                            Body::Admit { entrant, .. } if entrant.request.binding() == binding
+                        )
                 })
                 .collect();
             matching
@@ -3075,14 +3126,10 @@ impl<'a> Graph<'a> {
         })
     }
 
-    fn has_known_actor(self, weighing: &Weighing, actor: &MemberId) -> bool {
-        if self.founders().any(|seat| seat.member() == *actor) {
-            return true;
-        }
-        let (effects, authorized) = self.settled(weighing, &mut self.scratch());
-        let all = |_: usize| true;
-        let standing = self.standing(&all, &effects.void, &effects.out, &authorized);
-        standing.admits.contains_key(actor)
+    /// [`has_known_actor`] in this graph, by what `historical` holds of its history.
+    fn has_known_actor(&self, historical: &Historical, actor: &MemberId) -> bool {
+        self.founders().any(|seat| seat.member() == *actor)
+            || historical.standing.admits.contains_key(actor)
     }
 
     /// [`Historical::of_epoch`] over this graph alone (the dense oracle's tests).
