@@ -25,7 +25,7 @@ pub(crate) const FIND_BAR_ROWS: usize = if cfg!(windows) { 2 } else { 3 };
 pub(crate) enum FindSeam {
     /// The panel floated to the BOTTOM (content above).
     Top,
-    /// The panel at the TOP (content below), its rule drawn by the splice as a one-pixel rail on the band's last pixel row (a `ChromeRaster`, the message band's seam), clear of every descender.
+    /// The panel at the TOP (content below), its rule drawn by the splice as a one-pixel rail on the band's last pixel row (a `ChromeRaster`), clear of every descender.
     BottomRail,
     /// The panel at the top on a cell too short to keep its words off a rail (`aterm_render::band::seam_can_rail`).
     BottomUnderline,
@@ -527,7 +527,7 @@ fn toggle_on_colors(c: &BandColors) -> ([u8; 3], [u8; 3]) {
     )
 }
 
-/// An off toolbar toggle's resting fill ([`FIND_TOOLBAR`]): the message band's resting chip ([`BandColors::chip_ground`]), stepped on toward the band's words, in 32nds, where it stands less than [`TOGGLE_REST_STEP`]:1 from the band.
+/// An off toolbar toggle's resting fill ([`FIND_TOOLBAR`]): the chrome palette's resting chip ([`BandColors::chip_ground`]), stepped on toward the band's words, in 32nds, where it stands less than [`TOGGLE_REST_STEP`]:1 from the band.
 fn toggle_rest_fill(c: &BandColors) -> [u8; 3] {
     use chrome_band::{contrast, ensure_contrast, mix3};
     if chrome_band::forced_chrome().is_some()
@@ -1787,7 +1787,7 @@ mod tests {
         ));
         assert!(
             contrast(light.chip_ground, light.bar_bg) < TOGGLE_REST_STEP,
-            "CONTROL: Default Light's message-band chip is under the step"
+            "CONTROL: Default Light's resting chip is under the step"
         );
         let dark = chrome_band::band_colors(Theme::default());
         assert_eq!(

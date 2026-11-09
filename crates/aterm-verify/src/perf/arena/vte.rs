@@ -13,7 +13,7 @@ use aterm_uds::spawnfd::Stdio;
 use super::cat::{Term, inner_argv, order, run_in};
 use super::{
     COOLDOWN, Halt, Inbox, Ledger, RepoPin, arena_dir, build_aterm, ghostty_tip, macos_version,
-    pins, preflight, run_ok, sha256_file, spawn_halt,
+    pins, preflight, run_ok, sha256_file,
 };
 use crate::perf::stats::median;
 use crate::perf::trend::utc_date;
@@ -150,28 +150,147 @@ pub(crate) fn run(args: &Args) -> LaneRun {
 }
 
 /// vtebench at the pin, cloned into the arena cache once.
+struct CloneStage {
+    owner: aterm_tempfile::TempDir,
+    destination: PathBuf,
+}
+
+impl CloneStage {
+    fn beside(destination: &Path) -> Result<Self, String> {
+        let destination = std::path::absolute(destination)
+            .map_err(|error| format!("{}: {error}", destination.display()))?;
+        let parent = destination.parent().ok_or_else(|| {
+            format!(
+                "{} has no parent for a private clone stage",
+                destination.display()
+            )
+        })?;
+        let owner = aterm_tempfile::Builder::new()
+            .prefix(".vtebench-clone-")
+            .suffix(".noindex")
+            .tempdir_in(parent)
+            .map_err(|error| {
+                format!(
+                    "cannot make a private clone stage beside {}: {error}",
+                    destination.display()
+                )
+            })?;
+        Ok(Self { owner, destination })
+    }
+
+    fn path(&self) -> &Path {
+        self.owner.path()
+    }
+
+    fn clear(&self) -> Result<(), String> {
+        let entries = std::fs::read_dir(self.path()).map_err(|error| {
+            format!(
+                "cannot reset private vtebench clone stage {}: {error}",
+                self.path().display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "cannot reset private vtebench clone stage {}: {error}",
+                    self.path().display()
+                )
+            })?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+            let removed = if kind.is_dir() && !kind.is_symlink() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            removed.map_err(|error| format!("cannot remove {}: {error}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn publish(self) -> Result<(), String> {
+        if self.destination.exists() {
+            let mut entries = std::fs::read_dir(&self.destination).map_err(|error| {
+                format!(
+                    "refusing to replace the vtebench cache destination {}: {error}",
+                    self.destination.display()
+                )
+            })?;
+            if entries.next().is_some() {
+                return Err(format!(
+                    "refusing to replace nonempty vtebench cache destination {}",
+                    self.destination.display()
+                ));
+            }
+        }
+        std::fs::rename(self.path(), &self.destination).map_err(|error| {
+            format!(
+                "cannot publish vtebench clone at {} without replacing caller files: {error}",
+                self.destination.display()
+            )
+        })?;
+        let _ = self.owner.keep();
+        Ok(())
+    }
+}
+
 fn clone_pin(repo: &str, dir: &Path) -> Result<(), Halt> {
     if dir.is_dir() {
         return Ok(());
     }
-    let out = command(aterm_uds::os_path!("git"))
-        .args(["clone", "-q", repo])
-        .arg(dir)
-        .output()
-        .map_err(|e| spawn_halt("git", &e, "install git (xcode-select --install)"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        let _ = std::fs::remove_dir_all(dir);
-        Err(Halt::skip(
-            format!(
-                "vtebench could not be cloned from {repo} ({}): {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            "check the network",
-        ))
+    let stage = CloneStage::beside(dir)?;
+    let anonymous = aterm_update_core::git_https::is_anonymous_https_url(repo);
+    let cloned = aterm_update_core::git_https::read(
+        anonymous,
+        |_, trace| {
+            stage
+                .clear()
+                .map_err(aterm_update_core::git_https::Failure::local)?;
+            let mut git = command(aterm_uds::os_path!("git"));
+            git.args(["clone", "-q", repo]).arg(stage.path());
+            trace.configure(&mut git);
+            let out = aterm_uds::deadline::output_while_process_progressing(
+                &mut git,
+                Duration::from_secs(60),
+                "vtebench clone",
+            )
+            .map_err(|error| match &error {
+                aterm_uds::deadline::ProgressError::Stalled { .. }
+                | aterm_uds::deadline::ProgressError::Run(
+                    aterm_uds::deadline::RunError::TimedOut,
+                ) => aterm_update_core::git_https::Failure::timeout(error.to_string()),
+                aterm_uds::deadline::ProgressError::Run(aterm_uds::deadline::RunError::Spawn(
+                    error,
+                )) if error.kind() == std::io::ErrorKind::NotFound => {
+                    aterm_update_core::git_https::Failure::local("git is not installed")
+                }
+                _ => aterm_update_core::git_https::Failure::local(error.to_string()),
+            })?;
+            if out.status.success() {
+                Ok(())
+            } else {
+                Err(aterm_update_core::git_https::Failure::diagnostic(
+                    String::from_utf8_lossy(&out.stderr).into_owned(),
+                ))
+            }
+        },
+        |retry| std::thread::sleep(retry.pause),
+    );
+    if let Err(error) = cloned {
+        let fix = if error.error.words() == "git is not installed" {
+            "install git (xcode-select --install)"
+        } else {
+            "check the network"
+        };
+        return Err(Halt::skip(
+            format!("vtebench could not be cloned from {repo}: {error}"),
+            fix,
+        ));
     }
+    stage.publish().map_err(Halt::Fail)?;
+    Ok(())
 }
 
 /// The pinned vtebench checkout in the arena cache, cloned once, at the pin and unmodified.
@@ -433,5 +552,32 @@ mod tests {
         std::fs::write(prefix.with_extension("dat"), "a b\n1 2\n").expect("write");
         assert!(judge_trial("vte 24 80", &prefix, 40, 120, 2).is_err());
         assert!(judge_trial("fail vtebench exited 1", &prefix, 40, 120, 2).is_err());
+    }
+
+    #[test]
+    fn a_clone_stage_publishes_atomically_and_never_removes_a_concurrent_destination() {
+        let root = aterm_tempfile::tempdir().expect("scratch");
+        let destination = root.path().join("vtebench");
+        let stage = CloneStage::beside(&destination).expect("stage");
+        std::fs::write(stage.path().join("clone"), b"complete").expect("staged clone");
+        stage.publish().expect("publish");
+        assert_eq!(
+            std::fs::read(destination.join("clone")).expect("published clone"),
+            b"complete"
+        );
+
+        let destination = root.path().join("raced-vtebench");
+        let stage = CloneStage::beside(&destination).expect("stage");
+        let stage_path = stage.path().to_path_buf();
+        std::fs::write(stage.path().join("partial"), b"mine").expect("partial clone");
+        std::fs::create_dir(&destination).expect("concurrent destination");
+        std::fs::write(destination.join("theirs"), b"keep").expect("concurrent file");
+        let error = stage.publish().expect_err("nonempty destination is final");
+        assert!(error.contains("refusing to replace nonempty"), "{error}");
+        assert_eq!(
+            std::fs::read(destination.join("theirs")).expect("concurrent file preserved"),
+            b"keep"
+        );
+        assert!(!stage_path.exists(), "only the private stage is cleaned");
     }
 }

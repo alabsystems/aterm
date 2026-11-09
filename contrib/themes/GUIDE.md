@@ -138,10 +138,10 @@ Four keys colour aterm's own surfaces rather than the terminal's text. Leave the
 derives each one from the theme; set one when the derived colour is not the one your theme
 means.
 
-- `accent_color` is the chrome accent: the selected tab's rule, the message band's progress
-  meter, the selected rows in Settings, the hue find's highlight is tinted toward, the
-  drop-target ring. Derived, it is the cursor when the cursor has a colour, else the theme's
-  ANSI blue (or cyan, where only cyan carries the band's words), else the grey cursor.
+- `accent_color` is the chrome accent: the selected tab's rule, the selected rows in Settings,
+  the hue find's highlight is tinted toward, the drop-target ring. Derived, it is the cursor
+  when the cursor has a colour, else the theme's ANSI blue (or cyan, where only cyan carries
+  the band's words), else the grey cursor.
 - `active_tab_color` is the selected tab's background. Its label is black or white, whichever
   reads.
 - `border_color` draws split-pane dividers and the seams under the tab strip and over the find
@@ -171,7 +171,8 @@ Each one is a setting you can also make in `aterm.toml`, under the same name.
 - **A font that is not installed** falls to the next rung: your `font_family`, else aterm's own
   default face. It never keeps whatever face was loaded before, so switching to a theme gives the
   same result every time. `aterm theme check` notes such a font (`font_not_installed`, a note:
-  `--strict` still passes), and the window says so once in the message band.
+  `--strict` still passes), and aterm records it once in Settings ▸ Messages (`aterm ctl
+  messages`).
 - **A trial is colours only.** The row highlighted in Settings ▸ Themes, the palette and
   `aterm ctl theme preview` never change the window's face; Settings' live demo draws the face
   Keep would give. Keeping the theme (Keep on the strip, `theme commit`, `theme = ` in

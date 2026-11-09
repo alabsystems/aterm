@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use agh_fake::{
     AssetSpec, CommitSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec,
 };
+use aterm_types::http_retry::Policy;
 use aterm_uds::spawnfd::Command;
 use aterm_update_core::github_rest::{Direct, Origins, Spawn};
 use atpkg_publish::host::rest::{RestHost, STAGED, probe_of};
@@ -352,6 +353,125 @@ fn a_repository_is_unseen_only_when_the_identity_and_an_anonymous_reader_both_ge
         host.repo_seen(&Slug::new("fixture-pub", "down")).is_err(),
         "an owner that does not answer is not an answer"
     );
+}
+
+#[test]
+fn the_anonymous_repository_fallback_retries_only_transient_answers_with_one_bound() {
+    let rig = Rig::new();
+    let host = rig.host();
+    let path = "/repos/fixture-pub/retry-public";
+    rig.fake
+        .add_repo("fixture-pub/retry-public", RepoSpec::public());
+    for status in [404, 504, 504] {
+        rig.fake.fault(
+            Match::api(path),
+            Fault::Status {
+                status,
+                body: String::new(),
+                headers: Vec::new(),
+            },
+        );
+    }
+    let from = rig.fake.seen().len();
+    assert_eq!(
+        host.repo_seen(&Slug::new("fixture-pub", "retry-public")),
+        Ok(true)
+    );
+    assert_eq!(rig.fake.seen().len() - from, 4, "404, 504, 504, then 200");
+
+    let from = rig.fake.seen().len();
+    assert_eq!(
+        host.repo_seen(&Slug::new("fixture-pub", "retry-absent")),
+        Ok(false)
+    );
+    assert_eq!(
+        rig.fake.seen().len() - from,
+        2,
+        "the authenticated and anonymous 404 each answer once"
+    );
+
+    rig.fake.fault(
+        Match::api("/repos/fixture-pub/retry-down"),
+        Fault::Status {
+            status: 404,
+            body: String::new(),
+            headers: Vec::new(),
+        },
+    );
+    rig.fake.fault_always(
+        Match::api("/repos/fixture-pub/retry-down"),
+        Fault::Status {
+            status: 503,
+            body: String::new(),
+            headers: Vec::new(),
+        },
+    );
+    let from = rig.fake.seen().len();
+    let refused = host
+        .repo_seen(&Slug::new("fixture-pub", "retry-down"))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        rig.fake.seen().len() - from,
+        1 + usize::try_from(Policy::STANDARD.attempts()).unwrap()
+    );
+    assert!(refused.contains(&Policy::STANDARD.bound()), "{refused}");
+}
+
+#[test]
+fn an_already_anonymous_repository_read_uses_one_budget_and_one_404_request() {
+    let rig = Rig::new();
+    let host = RestHost::at(None, rig.origins.clone(), rig.origins.web.clone());
+    let path = "/repos/fixture-pub/anonymous-retry";
+    rig.fake
+        .add_repo("fixture-pub/anonymous-retry", RepoSpec::public());
+    for _ in 0..2 {
+        rig.fake.fault(
+            Match::api(path),
+            Fault::Status {
+                status: 504,
+                body: String::new(),
+                headers: Vec::new(),
+            },
+        );
+    }
+    let from = rig.fake.seen().len();
+    assert_eq!(
+        host.repo_seen(&Slug::new("fixture-pub", "anonymous-retry")),
+        Ok(true)
+    );
+    assert_eq!(rig.fake.seen().len() - from, 3, "504, 504, then 200");
+
+    let from = rig.fake.seen().len();
+    assert_eq!(
+        host.repo_seen(&Slug::new("fixture-pub", "anonymous-absent")),
+        Ok(false)
+    );
+    assert_eq!(
+        rig.fake.seen().len() - from,
+        1,
+        "one anonymous 404 is final"
+    );
+
+    let down = "/repos/fixture-pub/anonymous-down";
+    rig.fake.fault_always(
+        Match::api(down),
+        Fault::Status {
+            status: 503,
+            body: String::new(),
+            headers: Vec::new(),
+        },
+    );
+    let from = rig.fake.seen().len();
+    let refused = host
+        .repo_seen(&Slug::new("fixture-pub", "anonymous-down"))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        rig.fake.seen().len() - from,
+        usize::try_from(Policy::STANDARD.attempts()).unwrap()
+    );
+    assert!(refused.contains(&Policy::STANDARD.bound()), "{refused}");
 }
 
 #[test]

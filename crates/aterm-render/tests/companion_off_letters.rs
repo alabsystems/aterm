@@ -2527,18 +2527,19 @@ type WallRun = (
 /// on every page, keys typed past the console (as the gallery types them) and through it; from 300
 /// ms past the first key. Where the line leaves the fitted body the room it takes on the window's
 /// face (`last_row_cols`: four cells under Linux's 13 x 29, three on the gallery's 14 x 26), typed
-/// to its end at once (and on the bundled face's 13 x 29 alone, paused six keys short of it or its
-/// last letters after a run of spaces), it is on glass in every frame to the Enter, and none lays
-/// its box on a lettered cell or its body on letter ink or the caret's cell. Where it leaves less,
-/// a frame's box meets the last letters as they come, and from that frame the companion fades out,
-/// its alpha never rising, and is off the glass a fade (0.45 s) and two frames on. Past the Enter
-/// (to the next line's first key), and past the wrap (to the Enter), it is back on glass within a
-/// second, and no frame lays its box on a lettered cell or its body on ink or the caret: it comes
-/// back by the new caret, and the wrapped line's first row stays clear. The fade itself lies over
-/// the letters as they come, for its 28 frames (on Linux's 13 x 29: box only at three blank cells;
-/// art on up to 39 px of ink at two, 103 at one, 165 and the caret's cell at none, 128 where the
-/// line wraps, each at the fade's alpha, below full; after the pause, 29 at one and none, one of
-/// them at full alpha with its art on no ink).
+/// to its end at once (and on the bundled face's 13 x 29 alone, paused six keys short of it, its
+/// last letters after a run of spaces or walked back into by ten Left arrows, which leave the
+/// companion at its seat off the line, [`OldPath::KeptOffTheLine`]), it is on glass in every frame
+/// to the Enter, and none lays its box on a lettered cell or its body on letter ink or the caret's
+/// cell. Where it leaves less, a frame's box meets the last letters as they come, and from that
+/// frame the companion fades out, its alpha never rising, and is off the glass a fade (0.45 s) and
+/// two frames on. Past the Enter (to the next line's first key), and past the wrap (to the Enter),
+/// it is back on glass within a second, and no frame lays its box on a lettered cell or its body on
+/// ink or the caret: it comes back by the new caret, and the wrapped line's first row stays clear.
+/// The fade itself lies over the letters as they come, for its 28 frames (on Linux's 13 x 29: box
+/// only at three blank cells; art on up to 39 px of ink at two, 103 at one, 165 and the caret's
+/// cell at none, 128 where the line wraps, each at the fade's alpha, below full; after the pause,
+/// 29 at one and none, one of them at full alpha with its art on no ink).
 ///
 /// Where the line leaves no seat, what follows it before the Enter ([`WALL_THENS`]):
 /// - It rests: off the glass from its fade's end to the Enter.
@@ -2563,33 +2564,37 @@ type WallRun = (
 ///   to the Enter (stood at that stand, it blinked back and out every 64 ms to the Enter in the
 ///   effects replay).
 ///
-/// The pause and the gap are replayed where the line seats the companion too, on the bundled
-/// face's 13 x 29 alone (on glass in every frame to the Enter, and on no letter or the caret):
-/// at the gallery's 14 x 26 the effects replay's box overlaps the caret's cell by 12 px there,
-/// which no render on that face has judged.
+/// The pause, the gap and the Left arrows are replayed where the line seats the companion too, on
+/// the bundled face's 13 x 29 alone (on glass in every frame to the Enter, and on no letter or the
+/// caret): at the gallery's 14 x 26 the effects replay's box overlaps the caret's cell by 12 px
+/// there, which no render on that face has judged.
 ///
 /// In each, from the first key past the line (past the pause) to the Enter, at most one frame at
 /// full alpha lays its box on a lettered cell or its body on ink or the caret (measured: one past
 /// the pause at one blank cell and at none; none in the others).
 ///
-/// Negative control (the law reverted, the cat on dark, both ways of typing, every room that
-/// leaves no seat): it stands at the wall on the line's last letters to the Enter, its box on
-/// them in 252 frames or more of the 565 held (two thirds of the fewest; measured 378 at three
-/// cells, its art on ink in none, 381 and 325 at two, 384 and 381 at one, 387 and 384 at none,
-/// the caret's cell in 378; past the gap, 378 at three and 381 at two, one and none), and where the line wraps, typed past the console, its crossing back
-/// lays its box on the wrapped line's first row in 21 frames or more (two thirds of the 31
-/// measured). From the first Left arrow to the Enter it follows the caret along the line's
-/// letters, on them in 190 frames or more (measured 284 of 284); from the end of the pause, in
-/// 252 or more (378 to 388 of 394); and an erase after the line ran to the grid's end leaves it on
-/// them from the first Backspace to the Enter in 22 or more (measured 284 with three, 283 with
-/// six, 33 with twelve, 367 with six while it fades; at the other rooms the reverted body is
-/// clear of them within a few frames of the erase, and no control is taken there). Negative
-/// control of the caret's own steps ([`OldPath::CaretTypesOn`] reverted, the cat on dark, keys
-/// typed past the console, the pause at every room but the wrap): the keys typed on after the
-/// pause find the margin untaken, and it walks over the caret onto the line's last letters at
-/// full alpha, in 17 frames or more over the rooms (measured 25: 11 at three blank cells and 12
-/// at two, on up to 120 and 95 px of their ink, 1 at one and 1 at none), against 2 with the
-/// law. Each floor is two thirds of the fewest measured. Linux arm64, 2026-11-07.
+/// Negative control (the law reverted, the cat on dark, both ways of typing, every room that leaves
+/// no seat): it stands at the wall on the line's last letters to the Enter, its box on them in 252
+/// frames or more of the 565 held (two thirds of the fewest; measured 378 at three cells, its art
+/// on ink in none, 381 and 325 at two, 384 and 381 at one, 387 and 384 at none, the caret's cell in
+/// 378; past the gap, 378 at three and 381 at two, one and none), and where the line wraps, typed
+/// past the console, its crossing back lays its box on the wrapped line's first row in 21 frames or
+/// more (two thirds of the 31 measured). From the first Left arrow to the Enter it follows the
+/// caret along the line's letters, on them in 190 frames or more (measured 284 of 284); from the
+/// end of the pause, in 252 or more (378 to 388 of 394); and an erase after the line ran to the
+/// grid's end leaves it on them from the first Backspace to the Enter in 22 or more (measured 284
+/// with three, 283 with six, 33 with twelve, 367 with six while it fades; at the other rooms the
+/// reverted body is clear of them within a few frames of the erase, and no control is taken there).
+/// Negative control of the seat kept off the line ([`OldPath::KeptOffTheLine`] reverted, the cat on
+/// dark, both ways of typing, the Left arrows at four blank cells, which seat it): it follows the
+/// caret onto the line's letters, on them from the first arrow to the Enter in 186 frames or more
+/// (measured 279 of 284, 264 at full alpha, its art on their ink in 227; with the law, none; Linux
+/// arm64, 2026-11-08). Negative control of the caret's own steps ([`OldPath::CaretTypesOn`]
+/// reverted, the cat on dark, keys typed past the console, the pause at every room but the wrap):
+/// the keys typed on after the pause find the margin untaken, and it walks over the caret onto the
+/// line's last letters at full alpha, in 17 frames or more over the rooms (measured 25: 11 at three
+/// blank cells and 12 at two, on up to 120 and 95 px of their ink, 1 at one and 1 at none), against
+/// 2 with the law. Each floor is two thirds of the fewest measured. Linux arm64, 2026-11-07.
 #[test]
 fn a_last_row_that_holds_no_seat_hides_the_companion() {
     const ROOMS: [i16; 6] = [4, 3, 2, 1, 0, -1];
@@ -2600,7 +2605,7 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
             let unseated = i32::from(room) < seated;
             let judged = match then {
                 LastRowThen::Rests => true,
-                LastRowThen::Paused | LastRowThen::Gapped => {
+                LastRowThen::Paused | LastRowThen::Gapped | LastRowThen::Back => {
                     room >= 0 && (unseated || lays_the_bundled_cell())
                 }
                 _ => room >= 0 && unseated,
@@ -2623,6 +2628,10 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
                 let cat = "rainbow kitty pet";
                 if unseated && control {
                     let old = Some(OldPath::NoSeatHidesTheBody);
+                    runs.push((cat, DARK, (room, then), drive, old));
+                }
+                if !unseated && then == LastRowThen::Back {
+                    let old = Some(OldPath::KeptOffTheLine);
                     runs.push((cat, DARK, (room, then), drive, old));
                 }
                 if then == LastRowThen::Paused && drive == Drive::Ctl {
@@ -2666,6 +2675,15 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
         );
         assert!(w.held >= 150, "fixture: {why} holds {} frames", w.held);
         if control == Some(OldPath::CaretTypesOn) {
+            continue;
+        }
+        if control == Some(OldPath::KeptOffTheLine) {
+            assert!(
+                w.then_on >= 186,
+                "negative control, {why}: seated, from the first Left arrow it lay on the \
+                 letters in only {} frames ({w:?})",
+                w.then_on
+            );
             continue;
         }
         if control.is_some() {

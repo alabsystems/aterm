@@ -1163,7 +1163,9 @@ pub struct WireGate {
 }
 
 impl WireGate {
-    /// The armed paced paint — folded into the host's messages deadline.
+    /// The armed paced paint. The web host folds it into its messages deadline
+    /// ([`crate::drive::state_deadline`]); the native host only takes it when a settle passes it
+    /// ([`crate::drive::drain_and_pace`]).
     #[must_use]
     pub const fn due(&self) -> Option<Instant> {
         self.paint_due

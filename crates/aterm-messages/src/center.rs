@@ -223,14 +223,11 @@ impl Echo {
 /// Where a row stands in a seamless handoff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Carried {
-    /// Posted here, or carried and past the handoff commit.
+    /// Posted here, carried and restated before the handoff commit, or carried and past it.
     No,
-    /// Re-seeded from the carry and not restated since: its hold and its patience wait for the
-    /// handoff commit, under the [`STALE_HANDOFF`] cap.
+    /// Re-seeded from the carry and not restated since: its hold (and, on a band host, its
+    /// patience) waits for the handoff commit, under the [`STALE_HANDOFF`] cap.
     Seeded,
-    /// Re-seeded, then restated before the handoff commit: its hold runs free of the handoff cap,
-    /// and its patience still waits for the commit.
-    Restated,
 }
 
 /// One unretired message with its timers.
@@ -262,13 +259,11 @@ pub struct Live {
     /// `reveal_at` (or the post) + `max(hold, OVERFLOW_PATIENCE_MIN)`; spent only on a band host.
     pub patience_at: Instant,
     /// Where the patience clock runs from: the reveal (or the post), then the last
-    /// demote or handoff commit (a carried row's); a restated hold changes the span,
-    /// never this anchor.
+    /// demote or handoff commit (a carried row's, unless restated since its seed); a restated
+    /// hold changes the span, never this anchor.
     patience_from: Instant,
     /// Details was opened.
     pub seen: bool,
-    /// The last capsule pressed.
-    pub acted: Option<(ActionIndex, Instant)>,
     /// Eligible for the glass: false inside the progress grace.
     pub revealed: bool,
     /// When an unrevealed row becomes eligible.
@@ -326,7 +321,6 @@ impl Live {
             patience_at: at(reveal_at.unwrap_or(now), span.max(OVERFLOW_PATIENCE_MIN)),
             patience_from: reveal_at.unwrap_or(now),
             seen: false,
-            acted: None,
             revealed: reveal_at.is_none(),
             reveal_at,
             reveal_cap: reveal_at.map(|t| at(t, REVEAL_DEFER_MAX)),
@@ -434,12 +428,12 @@ impl Live {
             .saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX))
     }
 
-    /// A restate reached the row: one seeded from the carry becomes [`Carried::Restated`], and
+    /// A restate reached the row: one seeded from the carry leaves it ([`Carried::No`]), and
     /// the answer is whether it was seeded.
     fn restated_before_commit(&mut self) -> bool {
         let seeded = self.carried == Carried::Seeded;
         if seeded {
-            self.carried = Carried::Restated;
+            self.carried = Carried::No;
         }
         seeded
     }
@@ -1194,9 +1188,6 @@ impl MessageCenter {
         if let Some(glyph) = r.glyph {
             row.msg.glyph = glyph;
         }
-        if let Some(excerpt) = r.excerpt {
-            row.msg.excerpt = excerpt;
-        }
         let was_carried = row.restated_before_commit();
         let admitted = r.hold.and_then(|h| {
             let (h, demoted) = admit_restated_hold(&row.msg.need, row.msg.hold, h);
@@ -1397,7 +1388,6 @@ impl MessageCenter {
         let label = intent.label();
         let unix_ms = self.live[i].wall_at(now);
         self.log.record_acted(id, unix_ms, label);
-        self.live[i].acted = Some((action, now));
         self.revision += 1;
         if intent.closes_row() {
             self.retire_at(
@@ -1414,8 +1404,9 @@ impl MessageCenter {
 
     /// Reveal the rows whose grace is over, show the load words that have lasted, retire what is
     /// due (folds only when `holds`: a handoff freeze suspends them, never staleness; a carried
-    /// row spends no patience until [`Self::after_handoff_commit`] restarts it, and on a
-    /// glass-less host no row spends any), end the echoes that are over, and re-rank the queue.
+    /// row not restated since its seed spends no patience until [`Self::after_handoff_commit`]
+    /// restarts it, and on a glass-less host no row spends any), end the echoes that are over,
+    /// and re-rank the queue.
     pub fn settle(&mut self, now: Instant, holds: bool) -> Settled {
         let before = self.glass_signature();
         let mut revealed = false;
@@ -1499,8 +1490,9 @@ impl MessageCenter {
             .min()
     }
 
-    /// Whether `row`'s patience runs: a queued row on a band host, past its handoff commit if it
-    /// was carried. A glass-less host's rows spend none.
+    /// Whether `row`'s patience runs: a queued row on a band host, unless it is a carried row not
+    /// restated since its seed, whose patience waits for the handoff commit. A glass-less host's
+    /// rows spend none.
     fn spends_patience(&self, row: &Live) -> bool {
         self.glass_host == Glass::Band && row.is_queued() && row.carried == Carried::No
     }
@@ -1981,13 +1973,7 @@ impl MessageCenter {
             )));
             h.str(row.msg.glyph.ch().encode_utf8(&mut [0; 4]));
             h.str(&row.msg.title);
-            h.str(
-                row.msg
-                    .detail
-                    .first()
-                    .filter(|_| row.msg.excerpt)
-                    .map_or("", String::as_str),
-            );
+            h.str(row.msg.detail.first().map_or("", String::as_str));
             h.byte(row.activity());
             match &row.msg.meter {
                 Some(m) => {
@@ -2357,12 +2343,10 @@ impl MessageCenter {
                 meter,
                 key: c.key.clone(),
                 origin: crate::model::Origin::Carried,
-                excerpt: c.excerpt,
                 reveal_after: None,
                 finished: c.finished.clone(),
                 loads: Loads::NONE,
                 primary: None,
-                retrospective: c.retrospective,
                 need: crate::need::Need::Unclassified,
             }
             .normalized();
@@ -2460,22 +2444,17 @@ impl MessageCenter {
         gone
     }
 
-    /// The handoff committed: each carried row's patience starts now, restated or not. A row not
-    /// restated since the seed is stilled, loses the handoff cap, and arms its own hold where it
-    /// is live or already at the front ([`Live::on_glass_since`]); a restated one keeps what its
-    /// restate set.
+    /// The handoff committed: each carried row not restated since the seed has its patience
+    /// restart now, is stilled, loses the handoff cap, and arms its own hold where it is live or
+    /// already at the front ([`Live::on_glass_since`]); a restated one keeps what its restate
+    /// set.
     pub fn after_handoff_commit(&mut self, now: Instant) {
         for row in &mut self.live {
-            let seeded = match std::mem::replace(&mut row.carried, Carried::No) {
-                Carried::No => continue,
-                Carried::Seeded => true,
-                Carried::Restated => false,
-            };
-            row.patience_from = now;
-            row.patience_at = at(now, row.hold_span().max(OVERFLOW_PATIENCE_MIN));
-            if !seeded {
+            if std::mem::replace(&mut row.carried, Carried::No) != Carried::Seeded {
                 continue;
             }
+            row.patience_from = now;
+            row.patience_at = at(now, row.hold_span().max(OVERFLOW_PATIENCE_MIN));
             if let Some(meter) = row.msg.meter.as_mut() {
                 meter.busy = false;
             }
@@ -3240,11 +3219,7 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
         cols,
         width,
     } = *lay;
-    let detail0 = msg
-        .detail
-        .first()
-        .filter(|_| msg.excerpt)
-        .map(String::as_str);
+    let detail0 = msg.detail.first().map(String::as_str);
     let echo = matches!(kind, RowKind::Echo(_));
     let mut capsules: Vec<CapsuleSpec> = msg
         .actions
@@ -3267,7 +3242,7 @@ fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLay
     let step = matches!(
         msg.need(),
         crate::need::Need::Now(ask)
-            if msg.excerpt && msg.detail.first().map(String::as_str) == Some(ask.then().words())
+            if msg.detail.first().map(String::as_str) == Some(ask.then().words())
     );
     let spec = RowSpec {
         kind,
@@ -3487,9 +3462,7 @@ fn carried_message(l: &Live, posted_severity: Option<Severity>) -> CarriedMessag
             .as_ref()
             .map_or_else(String::new, |m| m.stats.clone()),
         busy: l.msg.meter.as_ref().is_some_and(|m| m.busy),
-        excerpt: l.msg.excerpt,
         finished: l.msg.finished.clone(),
-        retrospective: l.msg.retrospective,
         wire: l.msg.origin.wire_owned(l.msg.key.as_deref()),
         repeats: l.repeats,
     }
@@ -4619,6 +4592,57 @@ mod tests {
         );
     }
 
+    /// A FLOOD ON A GLASS-LESS HOST TAKES A ROW NOT YET REVEALED BEFORE ONE AT THE FRONT: there
+    /// a revealed row is at the front, so a Live row still in its grace goes before every older
+    /// held row. CONTROL: a band host, whose same rows no commit placed, holds every one queued,
+    /// so the held rows go first there, the oldest of them before the Live one.
+    /// NEGATIVE CONTROL (scratch): keying `evict_past_cap` on the glass (`self.glass.contains`)
+    /// in place of `!is_queued` makes the glass-less half evict the oldest held row.
+    #[test]
+    fn a_glassless_flood_takes_an_unrevealed_row_before_a_revealed_one() {
+        let now = t0();
+        let evicted = |c: &MessageCenter| -> Vec<String> {
+            pending_retired(c)
+                .into_iter()
+                .filter(|(_, how, _, _)| *how == Retired::Evicted)
+                .map(|(_, _, title, _)| title)
+                .collect()
+        };
+        for (mut c, gone, kept, host) in [
+            (glassless(now), "in its grace", "info 0", "glass-less"),
+            (fresh(now), "info 0", "in its grace", "band"),
+        ] {
+            for i in 0..(MAX_LIVE - 1) {
+                let at = u64::try_from(i).expect("a small count");
+                c.post(info(&format!("info {i}")), stamp(at), now + ms(at));
+            }
+            let grace = c
+                .post(
+                    Message::new(tags::SYSTEM, Severity::Info, "in its grace")
+                        .hold(Hold::Live {
+                            stale_after: crate::STALE_TAILED,
+                        })
+                        .in_flight()
+                        .reveal_after(crate::PROGRESS_GRACE),
+                    stamp(900),
+                    now + ms(900),
+                )
+                .id;
+            let row = c.live(grace).unwrap();
+            assert!(
+                !row.revealed && row.is_queued(),
+                "{host}: PRECONDITION: the Live row is in its grace: {row:?}"
+            );
+            assert_eq!(c.live_rows().count(), MAX_LIVE, "{host}");
+            c.post(info("one more"), stamp(901), now + ms(901));
+            assert_eq!(evicted(&c), [gone], "{host}");
+            assert!(
+                c.live_rows().any(|l| l.msg.title == kept),
+                "{host}: {kept:?} stays"
+            );
+        }
+    }
+
     #[test]
     fn act_returns_the_intent_and_details_marks_seen() {
         let now = t0();
@@ -4992,90 +5016,6 @@ mod tests {
             "then each, unseen"
         );
         assert!(retired.iter().all(|(_, how)| *how == Retired::Unseen));
-    }
-
-    #[test]
-    fn a_carried_row_restated_in_the_freeze_spends_no_patience_until_the_commit() {
-        let now = t0();
-        let mut parent = fresh(now);
-        let ids: Vec<MessageId> = (0..2)
-            .map(|i| {
-                parent
-                    .post(
-                        Message::new(tags::SYSTEM, Severity::Info, format!("row {i}")),
-                        stamp(i),
-                        now,
-                    )
-                    .id
-            })
-            .collect();
-        let mut child = fresh(now);
-        child.seed_carried(&parent.carried(), stamp(0), now);
-        let freeze = Duration::from_mins(2);
-        assert!(child.settle(now, false).retired.is_empty());
-        let restated = now + Duration::from_secs(1);
-        assert!(child.restate(
-            ids[0],
-            Restatement {
-                title: Some("row 0, restated".into()),
-                ..Restatement::default()
-            },
-            restated
-        ));
-        let row = child.live(ids[0]).unwrap();
-        assert!(
-            row.is_queued() && row.stale_at.is_none(),
-            "PRECONDITION: the restate took the handoff cap from a queued row: {row:?}"
-        );
-        let mut t = restated;
-        while t <= now + freeze {
-            let settled = child.settle(t, false);
-            assert!(
-                settled.retired.is_empty(),
-                "{:?} into the freeze: {:?}",
-                t - now,
-                settled.retired
-            );
-            let due = child
-                .deadline(false)
-                .expect("the unrestated row's handoff cap is pending");
-            assert!(
-                due > t,
-                "{:?} into the freeze: a wake due {:?} ago would spin the event loop",
-                t - now,
-                t.saturating_duration_since(due)
-            );
-            t += Duration::from_secs(1);
-        }
-        let commit = now + freeze;
-        child.after_handoff_commit(commit);
-        let patience = child
-            .live(ids[0])
-            .unwrap()
-            .hold_span()
-            .max(OVERFLOW_PATIENCE_MIN);
-        assert_eq!(
-            child.live(ids[0]).unwrap().patience_at,
-            commit + patience,
-            "the restated row's patience runs from the commit"
-        );
-        assert_eq!(child.deadline(true), Some(commit + patience));
-        assert!(
-            child
-                .settle(commit + patience - ms(1), true)
-                .retired
-                .is_empty(),
-            "a whole patience from the commit"
-        );
-        let mut retired = child.settle(commit + patience, true).retired;
-        retired.sort_by_key(|(id, _)| *id);
-        assert_eq!(
-            retired,
-            ids.iter()
-                .map(|id| (*id, Retired::Unseen))
-                .collect::<Vec<_>>(),
-            "then each, restated or not, unseen"
-        );
     }
 
     #[test]

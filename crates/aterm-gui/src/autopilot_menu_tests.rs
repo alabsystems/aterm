@@ -3403,8 +3403,9 @@ fn case_c_card(
 /// +05:30, +09:45) and on one that springs forward over midnight, each tick on the work row and
 /// the lanes is one pixel wide at the foot of its painted row, a quarter of the cell tall, at
 /// `x` = the card's text column plus the midnight's own offset from the row's left edge at the
-/// row's grain, floored to the pixel; the painted cell under it draws a level, `┄` or nothing,
-/// never a name, `→`, `↺`, `▕` or `╳`; every midnight whose painted cell draws one has its tick;
+/// row's grain, floored to the pixel; the painted cell under it draws a level, `┄` or (on the
+/// work row) nothing, never a name, `→`, `↺`, `▕` or `╳`, nor a lane's blank ground; every
+/// midnight whose painted cell draws one has its tick;
 /// and each tick of a midnight ahead stands under that day's label on the axis row, where the
 /// label fits before the axis's end. Negative
 /// controls: a card whose plots carry no ticks lays none; the ticks laid from the card's own
@@ -3431,7 +3432,7 @@ fn a_cards_midnight_ticks_stand_at_their_midnights_pixels() {
             if t < spring { -4 * H } else { -3 * H }
         }),
     ];
-    let (mut laid, mut under_label, mut skipped) = (0, 0, 0);
+    let (mut laid, mut under_label, mut skipped, mut bare) = (0, 0, 0, 0);
     let mut out = Vec::new();
     for (clock, offset) in clocks {
         let mut fx = case_c();
@@ -3514,7 +3515,7 @@ fn a_cards_midnight_ticks_stand_at_their_midnights_pixels() {
                         if col - text_start >= cells.len() {
                             continue;
                         }
-                        if glyph == ' ' || line(glyph) {
+                        if (glyph == ' ' && r == work) || line(glyph) {
                             let y = i32::try_from(r).expect("a row") * ch_ + ch_ - ch_ / 4;
                             want.push((i32::try_from(x).expect("px"), y));
                             // A label that would pass the axis's end is not laid (§1.4).
@@ -3532,17 +3533,19 @@ fn a_cards_midnight_ticks_stand_at_their_midnights_pixels() {
                             assert!(
                                 glyph.is_alphanumeric()
                                     || [HANDOFF_MARK, RESET_MARK, NOW_MARK, GAP_MARK, '$']
-                                        .contains(&glyph),
+                                        .contains(&glyph)
+                                    || glyph == ' ',
                                 "{what}: a midnight in {glyph:?}"
                             );
                             skipped += 1;
+                            bare += usize::from(glyph == ' ');
                         }
                     }
                 }
                 let got: Vec<(i32, i32)> = out.iter().map(|t| (t.x, t.y)).collect();
                 assert_eq!(got, want, "{what}");
                 assert!(
-                    out.iter().all(|t| (t.w, t.h) == (1, ch / 4) && t.ink == 0),
+                    out.iter().all(|t| (t.w, t.h) == (1, ch / 4)),
                     "{what}: one pixel wide, a quarter of the cell tall"
                 );
                 laid += out.len();
@@ -3554,8 +3557,91 @@ fn a_cards_midnight_ticks_stand_at_their_midnights_pixels() {
         "{laid} ticks, {under_label} under labels"
     );
     assert!(
-        skipped > 0,
-        "the cards hold midnights in a letter's or a mark's cell"
+        skipped > bare && bare > 0,
+        "the cards hold midnights in a letter's or a mark's cell and on a lane's ground ({bare})"
+    );
+}
+
+/// A CARD'S TICKS READ ON WHAT THEY STAND ON (§1.3, §1.4): on case (c)'s card at 60 and 44 cells
+/// under Cruise, Day and Night, every tick stands at least 3:1 from what is painted under it: the
+/// card's ground (the track, solved there), a measured step (the ground's own ink, a notch through
+/// the step's foot, as far from the step as the step is from the ground) or a lane's out line's
+/// warn wash (the track floored on it); the card holds ticks on all three, and each tick's ink is
+/// that of the cell under it (no projected line of case (c) lies low enough beside a midnight to
+/// ink a tick's foot; `no_midnight_strikes_a_letter` holds line E's that do). NEGATIVE CONTROL: the
+/// track on every tick (as the card first drew them, the Day and Night captures of scene J
+/// measuring 1.0:1 on Night's steps and 2.4:1 on the wash) fails both.
+#[test]
+fn a_cards_ticks_read_on_what_they_stand_on() {
+    use aterm_agent::harness::quota_scenes::case_c;
+    use aterm_effects::color_math::contrast_ratio;
+    /// A look's name and its theme.
+    type Look = (&'static str, aterm_render::Theme);
+    let looks: [Look; 2] = [
+        (
+            "Day",
+            aterm_render::Theme {
+                fg: 0x0020_2020,
+                bg: 0x00F8_FAFD,
+                cursor: 0x0000_0000,
+                selection: 0x00CC_CCEE,
+            },
+        ),
+        (
+            "Night",
+            aterm_render::Theme {
+                fg: 0x00D8_DEE9,
+                bg: 0x0012_1721,
+                cursor: 0x00FF_FFFF,
+                selection: 0x0033_3D4F,
+            },
+        ),
+    ];
+    let palette = Some(CardPalette::Cruise);
+    let (cw, ch) = (8u16, 16u16);
+    let mut on = [0usize; 3];
+    let mut least = [f32::MAX; 3];
+    let mut out = Vec::new();
+    for (look, theme) in looks {
+        let inks = card_tick_inks(theme, palette);
+        let ground = pack(card_inks(theme, palette).0.card_bg);
+        for room in [60, 44] {
+            let (_, rows, rect) = case_c_card(&case_c(), room);
+            let painted = paint(rect, &rows, MenuViewport::default(), None, theme, palette);
+            plot_ticks(rect, &rows, MenuViewport::default(), (cw, ch), &mut out);
+            assert!(!out.is_empty(), "{look} {room}: ticks");
+            for t in &out {
+                let r = usize::try_from(t.y).expect("a row") / usize::from(ch);
+                let col = usize::try_from(t.x).expect("a column") / usize::from(cw);
+                let cell = &painted[r][col];
+                // A measured step's block fills the tick's foot quarter (here no projected line
+                // is low enough to); a warn cell is washed.
+                let step = ('\u{2581}'..='\u{2588}').contains(&cell.ch);
+                let wash = pack(cell.bg) != ground;
+                let want = if step {
+                    TickOn::Fill
+                } else if wash {
+                    TickOn::Wash
+                } else {
+                    TickOn::Ground
+                };
+                assert_eq!(t.ink, want.ink(), "{look} {room}: over {:?}", cell.ch);
+                let under = if step { cell.fg } else { cell.bg };
+                let i = usize::try_from(t.ink / 2).expect("an ink");
+                let ratio = contrast_ratio(inks.color(t.ink), pack(under));
+                least[i] = least[i].min(ratio);
+                on[i] += 1;
+                assert!(
+                    ratio >= aterm_effects::cli_marks::ICON_CONTRAST,
+                    "{look} {room}: a tick over {:?} at {ratio:.2}:1",
+                    cell.ch
+                );
+            }
+        }
+    }
+    assert!(
+        on.iter().all(|&n| n > 0),
+        "ticks on the ground, a step and a wash: {on:?}, least {least:?}"
     );
 }
 
@@ -3624,10 +3710,11 @@ fn a_cards_ticks_are_one_layer_while_it_is_open_and_cost_nothing_at_rest() {
         (layer.clip.x0, layer.clip.y0),
         (px(rect.col, cw), px(rect.row, ch))
     );
-    let track = card_inks(app.overlay_card_theme(wid), None).1.track();
-    assert!(
-        layer.content.palette().iter().all(|ink| ink.color == track),
-        "the track ink"
+    let inks = card_tick_inks(app.overlay_card_theme(wid), None);
+    assert_eq!(
+        layer.content.palette(),
+        inks.palette(),
+        "the inks of what the ticks stand on"
     );
     let scratch = &app.windows[&wid].input_scratch;
     let occluder = layer.chrome.expect("the ticks stand on the card");
@@ -3679,7 +3766,7 @@ fn a_cards_ticks_are_one_layer_while_it_is_open_and_cost_nothing_at_rest() {
     let menu = app.autopilot_menu.as_mut().expect("open");
     let (content, allocations) = crate::work_counts::allocations_in(|| {
         menu.ticks
-            .content((rect, &menu.rows, menu.viewport), cell, track)
+            .content((rect, &menu.rows, menu.viewport), cell, inks)
     });
     assert_eq!(
         allocations, 0,

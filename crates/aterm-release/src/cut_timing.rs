@@ -75,8 +75,15 @@ impl Cost {
     }
 }
 
+#[derive(Clone)]
+struct Frame {
+    id: u64,
+    children: Weak<Mutex<Cost>>,
+    concurrent: bool,
+}
+
 thread_local! {
-    static STACK: RefCell<Vec<(u64, Weak<Mutex<Cost>>)>> = const { RefCell::new(Vec::new()) };
+    static STACK: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
 }
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -92,6 +99,43 @@ pub(crate) fn measure<T>(name: &str, run: impl FnOnce() -> T) -> T {
     let result = run();
     drop(timer);
     result
+}
+
+/// Join independent gates before the caller may consume either verdict. Even a
+/// refusal joins the other gate: no gate outlives its preflight or public step.
+pub(crate) fn independent<A: Send, B: Send>(
+    left: (&str, impl FnOnce() -> A + Send),
+    right: (&str, impl FnOnce() -> B + Send),
+) -> (A, B) {
+    independent_logged(None, left, right)
+}
+
+pub(crate) fn independent_logged<A: Send, B: Send>(
+    log: Option<&std::path::Path>,
+    left: (&str, impl FnOnce() -> A + Send),
+    right: (&str, impl FnOnce() -> B + Send),
+) -> (A, B) {
+    let timer = Timer::parallel_parent();
+    #[cfg(test)]
+    let fixture = crate::github::Fixture::current();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            #[cfg(test)]
+            let _route = fixture.map(crate::github::Fixture::enter);
+            let _gate = timer(left.0).with_log(log);
+            left.1()
+        });
+        let result = {
+            let _gate = timer(right.0).with_log(log);
+            right.1()
+        };
+        (
+            worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            result,
+        )
+    })
 }
 
 pub(crate) struct Timer {
@@ -112,17 +156,32 @@ impl Timer {
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let parent = STACK.with_borrow_mut(|stack| {
             let parent = stack.last().cloned();
-            stack.push((id, Arc::downgrade(&children)));
+            stack.push(Frame {
+                id,
+                children: Arc::downgrade(&children),
+                concurrent: parent.as_ref().is_some_and(|frame| frame.concurrent),
+            });
             parent
         });
+        let parallel = parent.as_ref().is_some_and(|frame| frame.concurrent);
+        if parallel {
+            *children.lock().unwrap() = Cost {
+                own: None,
+                child: None,
+                parallel: true,
+                ..Cost::default()
+            };
+        }
         Self {
             name: name.to_owned(),
             start: Instant::now(),
             at: now(),
-            cpu: aterm_sysprobe::jobs::counters_of(std::process::id()),
+            cpu: (!parallel)
+                .then(|| aterm_sysprobe::jobs::counters_of(std::process::id()))
+                .flatten(),
             children,
-            parent_id: parent.as_ref().map(|(id, _)| *id),
-            parent: parent.map(|(_, cost)| cost),
+            parent_id: parent.as_ref().map(|frame| frame.id),
+            parent: parent.map(|frame| frame.children),
             id,
             log: None,
         }
@@ -135,9 +194,16 @@ impl Timer {
         let parent = STACK.with_borrow(|stack| stack.last().cloned());
         move |name| {
             let mut timer = Timer::new(name);
-            timer.parent_id = parent.as_ref().map(|(id, _)| *id);
-            timer.parent = parent.as_ref().map(|(_, cost)| cost.clone());
+            timer.parent_id = parent.as_ref().map(|frame| frame.id);
+            timer.parent = parent.as_ref().map(|frame| frame.children.clone());
             timer.cpu = None;
+            STACK.with_borrow_mut(|stack| stack.last_mut().unwrap().concurrent = true);
+            *timer.children.lock().unwrap() = Cost {
+                own: None,
+                child: None,
+                parallel: true,
+                ..Cost::default()
+            };
             if let Some(cost) = timer.parent.as_ref().and_then(Weak::upgrade) {
                 let mut cost = cost.lock().unwrap();
                 cost.own = None;
@@ -150,20 +216,27 @@ impl Timer {
 
     /// Keep the same event in the operation's log, including when an error unwinds it.
     pub(crate) fn start(log: &std::path::Path, name: &str) -> Self {
+        Self::new(name).with_log(Some(log))
+    }
+
+    fn with_log(mut self, log: Option<&std::path::Path>) -> Self {
         use std::io::Write as _;
-        let mut timer = Self::new(name);
-        timer.log = Some(log.to_owned());
+        let Some(log) = log else {
+            return self;
+        };
+        self.log = Some(log.to_owned());
+        let timer = &self;
         let event = aterm_json::json!({
-            "schema": 1, "event": "cut-gate-started", "gate": name,
+            "schema": 1, "event": "cut-gate-started", "gate": timer.name,
             "process_id": std::process::id(), "gate_id": timer.id, "parent_gate_id": timer.parent_id,
             "process_image": image_id(),
             "started_at_unix_ms": timer.at,
             "self_cpu_ns": timer.cpu.as_ref().map(|c| c.cpu_ns),
         });
         if let Ok(mut sink) = crate::durable::open_append(log, true) {
-            let _ = writeln!(sink, "release-event: {event}");
+            let _ = sink.write_all(format!("release-event: {event}\n").as_bytes());
         }
-        timer
+        self
     }
 }
 
@@ -200,7 +273,7 @@ impl Drop for Timer {
         };
         let children = *self.children.lock().unwrap();
         let exclusive = cost.excluding(children);
-        STACK.with_borrow_mut(|stack| stack.retain(|(id, _)| *id != self.id));
+        STACK.with_borrow_mut(|stack| stack.retain(|frame| frame.id != self.id));
         if let Some(parent) = self.parent.as_ref().and_then(Weak::upgrade) {
             parent.lock().unwrap().add(cost);
         }
@@ -222,7 +295,7 @@ impl Drop for Timer {
         if let Some(path) = &self.log {
             use std::io::Write as _;
             if let Ok(mut log) = crate::durable::open_append(path, true) {
-                let _ = writeln!(log, "release-event: {event}");
+                let _ = log.write_all(format!("release-event: {event}\n").as_bytes());
             }
         }
     }
@@ -231,6 +304,72 @@ impl Drop for Timer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// NEGATIVE CONTROL: serial evaluation cannot receive the sibling's entry.
+    /// The minute is a hang detector, not a performance assertion.
+    #[test]
+    fn independent_gates_overlap_and_join_even_when_one_refuses() {
+        let (left_send, left_recv) = std::sync::mpsc::channel();
+        let (right_send, right_recv) = std::sync::mpsc::channel();
+        let completed = std::sync::atomic::AtomicBool::new(false);
+        let done = &completed;
+        let (left, right) = independent(
+            ("fixture", move || {
+                left_send.send(()).unwrap();
+                right_recv
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .unwrap();
+                Err::<(), _>("fixture refusal")
+            }),
+            ("policy", move || {
+                right_send.send(()).unwrap();
+                left_recv
+                    .recv_timeout(std::time::Duration::from_secs(60))
+                    .unwrap();
+                done.store(true, Ordering::SeqCst);
+                Ok::<_, &str>(17)
+            }),
+        );
+        assert_eq!(left, Err("fixture refusal"));
+        assert_eq!(right, Ok(17));
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    /// NEGATIVE CONTROL: nested in-process work cannot report process CPU as
+    /// exclusively its own while a sibling is also consuming that counter.
+    #[test]
+    fn logged_parallel_descendants_keep_unknown_cpu_and_their_events() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let log = dir.path().join("after-cut.log");
+        independent_logged(
+            Some(&log),
+            ("site", || {
+                let nested = Timer::start(&log, "hosting");
+                assert!(nested.cpu.is_none());
+            }),
+            ("tap", || ()),
+        );
+        let text = std::fs::read_to_string(log).unwrap();
+        let events: Vec<aterm_json::Value> = text
+            .lines()
+            .map(|line| {
+                aterm_json::from_str(line.strip_prefix("release-event: ").unwrap()).unwrap()
+            })
+            .collect();
+        assert_eq!(events.len(), 6);
+        for event in events
+            .iter()
+            .filter(|event| event["event"].as_str() == Some("cut-gate-finished"))
+        {
+            assert!(event["self_cpu_s"].is_null());
+            assert!(event["child_cpu"]["observed_s"].is_null());
+        }
+        let serial = Timer::new("serial after join");
+        assert!(
+            serial.cpu.is_some(),
+            "joined siblings no longer consume counters"
+        );
+    }
 
     #[test]
     fn arrival_requires_the_execing_pid() {

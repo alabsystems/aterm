@@ -4,10 +4,6 @@
 //! Seamless-handoff carry data (`MessageCenter::carried` / `seed_carried`).
 
 /// One live message as carried across seamless handoff.
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "a plain wire record: each flag is an independent fact the handoff ships"
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CarriedMessage {
     /// The parent's id — the successor keeps it and raises `next_id` past it.
@@ -38,12 +34,8 @@ pub struct CarriedMessage {
     pub stats: String,
     /// Whether the meter was busy ([`crate::model::Meter::busy`]).
     pub busy: bool,
-    /// Whether the band painted `detail[0]` beside the title (`Message::excerpt`).
-    pub excerpt: bool,
     /// Words the row finishes with (`Message::finished`).
     pub finished: Option<String>,
-    /// Whether the row is a record about a previous run (`Message::retrospective`).
-    pub retrospective: bool,
     /// Whether the row is wire-owned ([`crate::model::Origin::wire_owned`]).
     pub wire: bool,
     /// Duplicate posts folded into the row (`Live::repeats`, 1 = posted once).

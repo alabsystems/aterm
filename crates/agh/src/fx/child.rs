@@ -641,6 +641,32 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn original_process_retired(
+        token: aterm_uds::process::Identity,
+        exited_is_retired: bool,
+    ) -> (
+        bool,
+        aterm_uds::process::ProcessPresence,
+        Option<aterm_uds::process::Identity>,
+    ) {
+        use aterm_uds::process::ProcessPresence;
+
+        let identity = aterm_uds::process::read_identity(token.pid);
+        let presence = aterm_uds::process::process_presence(token.pid);
+        let retired = identity.is_some_and(|current| current != token)
+            || match presence {
+                ProcessPresence::Absent => true,
+                ProcessPresence::Exited => exited_is_retired,
+                ProcessPresence::Present | ProcessPresence::Unknown => false,
+            };
+        (retired, presence, identity)
+    }
+
+    /// The owner positively reaps its root and makes every group member unable to run before
+    /// return. An orphaned killed descendant may still be a zombie until its adopter reaps it.
+    /// NEGATIVE CONTROL: killing only the root leaves the same descendant identity `Present`;
+    /// omitting the owning wait leaves the root `Exited`; broad signalling kills the bystander.
+    #[cfg(unix)]
     #[test]
     fn explicit_git_stop_retires_wall_and_progress_children_without_touching_a_bystander() {
         use std::time::Instant;
@@ -668,8 +694,30 @@ mod tests {
             if progress {
                 spec = spec.progressing(Duration::from_secs(60), "owned stop fixture");
             }
+            let mut identities = None;
             let error = super::run_unless(&spec, &mut || {
-                std::fs::read_to_string(&marker).is_ok_and(|text| text.ends_with('\n'))
+                if identities.is_some() {
+                    return true;
+                }
+                let Ok(text) = std::fs::read_to_string(&marker) else {
+                    return false;
+                };
+                if !text.ends_with('\n') {
+                    return false;
+                }
+                let pids: Vec<i32> = text
+                    .split_whitespace()
+                    .map(|pid| pid.parse().expect("pid"))
+                    .collect();
+                assert_eq!(pids.len(), 2);
+                let Some(root) = aterm_uds::process::read_identity(pids[0]) else {
+                    return false;
+                };
+                let Some(descendant) = aterm_uds::process::read_identity(pids[1]) else {
+                    return false;
+                };
+                identities = Some([root, descendant]);
+                true
             })
             .expect_err("explicit stop")
             .into_data();
@@ -677,24 +725,26 @@ mod tests {
                 (error.kind, error.side_effect),
                 (Kind::Interrupted, SideEffect::Unknown)
             );
-            let pids: Vec<u32> = std::fs::read_to_string(&marker)
-                .expect("actual child started")
-                .split_whitespace()
-                .map(|pid| pid.parse().expect("pid"))
-                .collect();
-            assert_eq!(pids.len(), 2);
-            let alive_at_return = pids.iter().any(|pid| aterm_uds::process::pid_alive(*pid));
+            let [root, descendant] = identities.expect("actual children started");
+            let root_at_return = original_process_retired(root, false);
+            let descendant_at_return = original_process_retired(descendant, true);
             std::fs::write(marker.with_extension("release"), b"release").expect("release fixture");
             let until = Instant::now() + Duration::from_secs(60);
-            while pids.iter().any(|pid| aterm_uds::process::pid_alive(*pid))
-                && Instant::now() < until
-            {
+            while !original_process_retired(descendant, true).0 && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(pids.iter().all(|pid| !aterm_uds::process::pid_alive(*pid)));
+            let descendant_after_cleanup = original_process_retired(descendant, true);
             assert!(
-                !alive_at_return,
-                "owned child and descendant retired before return"
+                descendant_after_cleanup.0,
+                "fixture descendant ended: {descendant_after_cleanup:?}"
+            );
+            assert!(
+                root_at_return.0,
+                "owned root was positively reaped before return: {root_at_return:?}"
+            );
+            assert!(
+                descendant_at_return.0,
+                "owned descendant could no longer run before return: {descendant_at_return:?}"
             );
             assert!(bystander.0.try_wait().expect("bystander wait").is_none());
         }

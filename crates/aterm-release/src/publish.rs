@@ -3,10 +3,10 @@
 
 //! Release publication pipeline, GitHub draft/release management, and asset upload verification.
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use aterm_digest::Sha256;
 use aterm_uds::spawnfd::command;
@@ -3366,397 +3366,6 @@ pub fn validate_small_release_asset_size(name: &str, size: u64) -> Result<usize>
     usize::try_from(limit).map_err(|_| Error::new("small release-asset limit does not fit usize"))
 }
 
-/// Read at most `limit + 1` bytes so a metadata/download replacement race is still memory-bounded.
-pub fn read_bounded_release_asset(mut reader: impl std::io::Read, limit: usize) -> Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
-    let take = u64::try_from(limit)
-        .map_err(|_| Error::new("small release-asset limit does not fit u64"))?
-        .saturating_add(1);
-    reader
-        .by_ref()
-        .take(take)
-        .read_to_end(&mut bytes)
-        .map_err(|error| Error::new(format!("read bounded release asset: {error}")))?;
-    if bytes.len() > limit {
-        return Err(Error::new(format!(
-            "release asset exceeded its {limit}-byte in-memory bound while downloading"
-        )));
-    }
-    Ok(bytes)
-}
-
-/// Concurrently drain a child's diagnostic stream to EOF while retaining only a bounded prefix.
-pub fn drain_bounded_diagnostic(
-    mut reader: impl std::io::Read,
-    limit: usize,
-) -> Result<(Vec<u8>, bool)> {
-    let mut retained = Vec::with_capacity(limit.min(8 * 1024));
-    let mut truncated = false;
-    let mut chunk = [0_u8; 8 * 1024];
-    loop {
-        let read = reader
-            .read(&mut chunk)
-            .map_err(|error| Error::new(format!("read child diagnostic stream: {error}")))?;
-        if read == 0 {
-            break;
-        }
-        let remaining = limit.saturating_sub(retained.len());
-        let keep = remaining.min(read);
-        retained.extend_from_slice(&chunk[..keep]);
-        truncated |= keep < read;
-    }
-    Ok((retained, truncated))
-}
-
-fn exact_release_asset_download(slug: &str, id: u64) -> Result<aterm_uds::spawnfd::Child> {
-    exact_release_asset_child(slug, id).map_err(|error| {
-        Error::new(format!(
-            "exact GitHub asset-ID {id} download on {slug} could not start: {error}"
-        ))
-    })
-}
-
-fn exact_release_asset_child(
-    slug: &str,
-    id: u64,
-) -> std::result::Result<aterm_uds::spawnfd::Child, aterm_update_core::github_rest::RestError> {
-    crate::github::open_asset(slug, id)
-}
-
-/// Whether repeating a bounded asset transfer can possibly change its outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AssetTransferFault {
-    Transport,
-    Answered,
-}
-
-/// One failed attempt: its class, and the sentence a human needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TransferAttemptFailure {
-    pub(crate) fault: AssetTransferFault,
-    pub(crate) message: String,
-}
-
-impl TransferAttemptFailure {
-    pub(crate) fn transport(message: impl Into<String>) -> Self {
-        Self {
-            fault: AssetTransferFault::Transport,
-            message: message.into(),
-        }
-    }
-    pub(crate) fn answered(message: impl Into<String>) -> Self {
-        Self {
-            fault: AssetTransferFault::Answered,
-            message: message.into(),
-        }
-    }
-}
-
-/// Sleeps between attempts (so one more attempt than entries), the same 2s/5s shape as [`crate::github::retried`].
-pub(crate) const ASSET_TRANSFER_BACKOFFS: &[u64] = &[2, 5];
-
-/// Decide, from a diagnostic (the CDN curl's stderr, or the REST client's message), whether the transport failed or the server answered; unrecognised is `Answered`.
-#[must_use]
-pub(crate) fn classify_asset_transfer_failure(diagnostic: &str) -> AssetTransferFault {
-    const ANSWERED: &[&str] = &[
-        "http 401",
-        "http 403",
-        "http 404",
-        "http 410",
-        "http 422",
-        "returned error: 401",
-        "returned error: 403",
-        "returned error: 404",
-        "returned error: 410",
-        "not found",
-        "bad credentials",
-        "requires authentication",
-        "resource not accessible",
-        "must have admin rights",
-        "forbidden",
-        "permission",
-        "no such release",
-        "saml enforcement",
-        "refused, never asked",
-        "maximum file size exceeded",
-    ];
-    const TRANSPORT: &[&str] = &[
-        "transfer closed with",
-        "partial file",
-        "unexpected eof",
-        "unexpected end of stream",
-        "recv failure",
-        "send failure",
-        "empty reply from server",
-        "connection reset",
-        "connection refused",
-        "connection closed",
-        "failed to connect",
-        "broken pipe",
-        "operation timed out",
-        "operation too slow",
-        "timed out",
-        "timeout",
-        "ssl connect error",
-        "tls handshake",
-        "handshake failure",
-        "could not resolve host",
-        "temporary failure in name resolution",
-        "network is unreachable",
-        "network is down",
-        "http/2 stream",
-        "http 500",
-        "http 502",
-        "http 503",
-        "http 504",
-        "returned error: 500",
-        "returned error: 502",
-        "returned error: 503",
-        "returned error: 504",
-        "curl reached no answer",
-        "server error",
-    ];
-    let lower: std::borrow::Cow<'_, str> = if diagnostic.bytes().any(|b| b.is_ascii_uppercase()) {
-        std::borrow::Cow::Owned(diagnostic.to_ascii_lowercase())
-    } else {
-        std::borrow::Cow::Borrowed(diagnostic)
-    };
-    if ANSWERED.iter().any(|m| lower.contains(m)) {
-        return AssetTransferFault::Answered;
-    }
-    if TRANSPORT.iter().any(|m| lower.contains(m)) {
-        return AssetTransferFault::Transport;
-    }
-    AssetTransferFault::Answered
-}
-
-/// The bounded retry, with the transfer injected so the loop is testable without a network.
-pub(crate) fn retry_transport_failures<T>(
-    what: &str,
-    backoffs: &[u64],
-    sleep: &mut dyn FnMut(u64),
-    mut attempt: impl FnMut(u32) -> std::result::Result<T, TransferAttemptFailure>,
-) -> Result<T> {
-    let attempts = backoffs.len() + 1;
-    let mut last = String::new();
-    for index in 0..attempts {
-        let n = u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1);
-        match attempt(n) {
-            Ok(value) => return Ok(value),
-            Err(failure) => {
-                last = failure.message;
-                if failure.fault == AssetTransferFault::Answered {
-                    return Err(Error::new(format!(
-                        "{what} failed: {last} — the server answered, so this is not \
-                         a transport fault and was NOT retried"
-                    )));
-                }
-                if let Some(backoff) = backoffs.get(index) {
-                    eprintln!(
-                        "    {what} hit a transport fault (attempt {n}/{attempts}): \
-                         {last} — retrying in {backoff}s"
-                    );
-                    sleep(*backoff);
-                }
-            }
-        }
-    }
-    Err(Error::new(format!(
-        "{what} failed after {attempts} attempts: {last} — a transport fault that \
-         did not clear; `{CUT_COMMAND}` re-enters here without rebuilding"
-    )))
-}
-
-fn attempt_exact_release_asset_transfer(
-    slug: &str,
-    id: u64,
-    expected_size: u64,
-    limit: usize,
-) -> std::result::Result<Vec<u8>, TransferAttemptFailure> {
-    let mut child = exact_release_asset_child(slug, id).map_err(|error| {
-        let message = format!("exact GitHub asset-ID {id} download on {slug}: {error}");
-        if crate::github::definitive(&error) {
-            TransferAttemptFailure::answered(message)
-        } else {
-            TransferAttemptFailure::transport(message)
-        }
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        TransferAttemptFailure::answered("exact GitHub asset-ID download has no stdout pipe")
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        TransferAttemptFailure::answered("exact GitHub asset-ID download has no stderr pipe")
-    })?;
-    let stderr_reader = std::thread::spawn(move || drain_bounded_diagnostic(stderr, 64 * 1024));
-    let bytes = match read_bounded_release_asset(stdout, limit) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stderr_reader.join();
-            let text = error.to_string();
-            return Err(if text.contains("exceeded its") {
-                TransferAttemptFailure::answered(text)
-            } else {
-                TransferAttemptFailure::transport(text)
-            });
-        }
-    };
-    let status = child.wait().map_err(|error| {
-        TransferAttemptFailure::answered(format!(
-            "wait for exact GitHub asset-ID download: {error}"
-        ))
-    })?;
-    let (stderr, stderr_truncated) = match stderr_reader.join() {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(error)) => return Err(TransferAttemptFailure::transport(error.to_string())),
-        Err(_) => {
-            return Err(TransferAttemptFailure::answered(
-                "exact GitHub asset-ID stderr reader panicked",
-            ));
-        }
-    };
-    if !status.success() {
-        let diagnostic = format!(
-            "{}{}",
-            String::from_utf8_lossy(&stderr).trim(),
-            if stderr_truncated {
-                " [diagnostic truncated at 65536 bytes]"
-            } else {
-                ""
-            }
-        );
-        return Err(TransferAttemptFailure {
-            fault: classify_asset_transfer_failure(&diagnostic),
-            message: diagnostic,
-        });
-    }
-    let downloaded_size = u64::try_from(bytes.len()).map_err(|_| {
-        TransferAttemptFailure::answered("downloaded release-asset length does not fit u64")
-    })?;
-    if downloaded_size != expected_size {
-        return Err(TransferAttemptFailure::transport(format!(
-            "API size {expected_size} differs from bounded download size {downloaded_size}"
-        )));
-    }
-    Ok(bytes)
-}
-
-#[cfg(test)]
-mod asset_transport_retry_tests {
-
-    use super::*;
-    use std::cell::RefCell;
-
-    const TRUNCATED: &str = "curl: (18) transfer closed with 1048576 bytes remaining to read";
-
-    fn run(
-        script: Vec<std::result::Result<&'static str, TransferAttemptFailure>>,
-    ) -> (Result<&'static str>, Vec<u32>, Vec<u64>) {
-        let script = RefCell::new(script.into_iter());
-        let seen = RefCell::new(Vec::new());
-        let slept = RefCell::new(Vec::new());
-        let out = retry_transport_failures(
-            "download exact release asset aterm-appcast.toml from alabsystems/aterm",
-            ASSET_TRANSFER_BACKOFFS,
-            &mut |s| slept.borrow_mut().push(s),
-            |n| {
-                seen.borrow_mut().push(n);
-                script
-                    .borrow_mut()
-                    .next()
-                    .expect("the loop asked more times than the script allows")
-            },
-        );
-        (out, seen.into_inner(), slept.into_inner())
-    }
-
-    #[test]
-    fn the_truncated_body_that_killed_two_cuts_is_a_transport_fault_and_a_404_is_not() {
-        assert_eq!(
-            classify_asset_transfer_failure(TRUNCATED),
-            AssetTransferFault::Transport,
-            "the measured killer must be the retried class, or this fix is inert"
-        );
-        for answered in [
-            "HTTP 404: Not Found",
-            "HTTP 403: Resource not accessible by integration",
-            "HTTP 401: Bad credentials",
-            "curl: (22) The requested URL returned error: 404",
-            "the asset API redirected off the asset CDN, to https://example.com; refused, never \
-             asked",
-        ] {
-            assert_eq!(
-                classify_asset_transfer_failure(answered),
-                AssetTransferFault::Answered,
-                "{answered}"
-            );
-        }
-        for transport in [
-            "curl: (56) Recv failure: Connection reset by peer",
-            "curl: (28) SSL connection timeout",
-            "curl: (6) Could not resolve host: release-assets.githubusercontent.com",
-            "HTTP 502: Server Error",
-            "curl: (22) The requested URL returned error: 503",
-            "curl reached no answer (exit 7): curl: (7) Failed to connect to api.github.com",
-        ] {
-            assert_eq!(
-                classify_asset_transfer_failure(transport),
-                AssetTransferFault::Transport,
-                "{transport}"
-            );
-        }
-        assert_eq!(
-            classify_asset_transfer_failure("something nobody has seen yet"),
-            AssetTransferFault::Answered
-        );
-    }
-
-    #[test]
-    fn an_injected_truncated_response_is_retried_with_backoff_and_the_cut_survives() {
-        let (out, seen, slept) = run(vec![
-            Err(TransferAttemptFailure::transport(TRUNCATED)),
-            Ok("appcast bytes"),
-        ]);
-        assert_eq!(
-            out.expect(
-                "a transport hiccup must not end a cut that has already \
-                        built, signed, notarized and stapled"
-            ),
-            "appcast bytes"
-        );
-        assert_eq!(seen, vec![1, 2], "the second ask is what saves the cut");
-        assert_eq!(slept, vec![2], "and it waits before it");
-    }
-
-    #[test]
-    fn a_truncated_response_that_never_clears_is_bounded_and_names_its_class() {
-        let (out, seen, slept) = run(vec![
-            Err(TransferAttemptFailure::transport(TRUNCATED)),
-            Err(TransferAttemptFailure::transport(TRUNCATED)),
-            Err(TransferAttemptFailure::transport(TRUNCATED)),
-        ]);
-        out.expect_err("three truncated bodies is a failure");
-        assert_eq!(seen, vec![1, 2, 3]);
-        assert_eq!(slept, ASSET_TRANSFER_BACKOFFS.to_vec());
-    }
-
-    #[test]
-    fn a_real_404_fails_fast_and_says_it_was_not_retried() {
-        let (out, seen, slept) = run(vec![Err(TransferAttemptFailure::answered(
-            "curl: (22) The requested URL returned error: 404",
-        ))]);
-        out.expect_err("a 404 is a failure");
-        assert_eq!(
-            seen,
-            vec![1],
-            "re-asking for an asset that is not there burns seven seconds and \
-             then reports the 404 as an exhausted retry"
-        );
-        assert!(slept.is_empty(), "and it must not wait to do it");
-    }
-}
-
 pub fn download_release_asset_for_release_id(
     slug: &str,
     release_id: u64,
@@ -3776,11 +3385,24 @@ pub(crate) fn download_release_asset_with_identity_and_recheck(
     mut recheck: impl FnMut() -> Result<(u64, u64)>,
 ) -> Result<Vec<u8>> {
     let limit = validate_small_release_asset_size(name, before.1)?;
-    let bytes = retry_transport_failures(
-        &format!("download exact release asset {name} from {slug}"),
-        ASSET_TRANSFER_BACKOFFS,
-        &mut |seconds| std::thread::sleep(std::time::Duration::from_secs(seconds)),
-        |_attempt| attempt_exact_release_asset_transfer(slug, before.0, before.1, limit),
+    let temp_dir = private_release_asset_temp(&std::env::temp_dir())?;
+    let temp_asset = temp_dir.path().join("asset");
+    let bytes = finish_private_asset_temp(
+        temp_dir,
+        (|| {
+            crate::github::download_asset(slug, before.0, &temp_asset, before.1)?;
+            let bytes = fs::read(&temp_asset).map_err(|error| {
+                Error::new(format!("read exact GitHub asset-ID {}: {error}", before.0))
+            })?;
+            if bytes.len() > limit || u64::try_from(bytes.len()).ok() != Some(before.1) {
+                return Err(Error::new(format!(
+                    "release asset {name} API size {} differs from bounded download size {}",
+                    before.1,
+                    bytes.len()
+                )));
+            }
+            Ok(bytes)
+        })(),
     )?;
     let after = recheck()?;
     if after != before {
@@ -3867,44 +3489,6 @@ pub fn validate_release_asset_download_size(size: u64) -> Result<()> {
     Ok(())
 }
 
-/// Copy and hash an asset without ever writing more than `limit` bytes.
-pub fn copy_bounded_release_asset(
-    mut reader: impl std::io::Read,
-    mut writer: impl std::io::Write,
-    limit: u64,
-) -> Result<(u64, String)> {
-    let mut total = 0_u64;
-    let mut digest = Sha256::new();
-    let mut chunk = [0_u8; 16 * 1024];
-    loop {
-        let remaining = limit.saturating_sub(total);
-        let wanted = remaining.saturating_add(1).min(chunk.len() as u64) as usize;
-        let read = reader
-            .read(&mut chunk[..wanted])
-            .map_err(|error| Error::new(format!("read streamed release asset: {error}")))?;
-        if read == 0 {
-            break;
-        }
-        let read_u64 = u64::try_from(read)
-            .map_err(|_| Error::new("release-asset read length does not fit u64"))?;
-        if read_u64 > remaining {
-            return Err(Error::new(format!(
-                "release asset exceeded its {limit}-byte transfer bound before writing excess bytes"
-            )));
-        }
-        writer
-            .write_all(&chunk[..read])
-            .map_err(|error| Error::new(format!("write streamed release asset: {error}")))?;
-        digest.update(&chunk[..read]);
-        total += read_u64;
-    }
-    writer
-        .flush()
-        .map_err(|error| Error::new(format!("flush streamed release asset: {error}")))?;
-    let sha256 = aterm_codec::hex::encode_lower(&digest.finalize());
-    Ok((total, sha256))
-}
-
 struct PrivateTempDir {
     path: Option<PathBuf>,
 }
@@ -3945,6 +3529,30 @@ impl Drop for PrivateTempDir {
     fn drop(&mut self) {
         if let Some(path) = self.path.take() {
             let _ = fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn private_release_asset_temp(parent: &Path) -> Result<PrivateTempDir> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let sequence = RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    PrivateTempDir::create(parent.join(format!(
+        "aterm-release-asset-{}-{nonce}-{sequence}",
+        std::process::id()
+    )))
+}
+
+fn finish_private_asset_temp<T>(temp: PrivateTempDir, result: Result<T>) -> Result<T> {
+    let cleanup = temp.cleanup();
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Err(cleanup)) => {
+            Err(Error::new(format!("{error}; cleanup failed: {cleanup}")))
         }
     }
 }
@@ -4110,59 +3718,35 @@ fn verify_release_asset_id_matches_local(
             before.1
         )));
     }
-    let mut child = exact_release_asset_download(slug, before.0)?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::new("exact GitHub asset-ID download has no stdout pipe"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| Error::new("exact GitHub asset-ID download has no stderr pipe"))?;
-    let stderr_reader = std::thread::spawn(move || drain_bounded_diagnostic(stderr, 64 * 1024));
-    let (downloaded_size, sha256) =
-        match copy_bounded_release_asset(stdout, std::io::sink(), before.1) {
-            Ok(value) => value,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stderr_reader.join();
-                return Err(error);
+    let temp_dir = private_release_asset_temp(&std::env::temp_dir())?;
+    let temp_asset = temp_dir.path().join("asset");
+    finish_private_asset_temp(
+        temp_dir,
+        (|| {
+            crate::github::download_asset(slug, before.0, &temp_asset, before.1)?;
+            let downloaded_size = fs::metadata(&temp_asset)
+                .map_err(|error| Error::new(format!("stat downloaded release asset: {error}")))?
+                .len();
+            let sha256 = dmg::sha256_file(&temp_asset)?;
+            if downloaded_size != before.1 || dmg::sha256_file(local)? != sha256 {
+                return Err(Error::new(format!(
+                    "release ID {release_id} asset {name} bytes differ from the local \
+                     self-checked artifact"
+                )));
             }
-        };
-    let status = child
-        .wait()
-        .map_err(|error| Error::new(format!("wait for exact GitHub asset-ID download: {error}")))?;
-    let (stderr, truncated) = stderr_reader
-        .join()
-        .map_err(|_| Error::new("exact GitHub asset-ID stderr reader panicked"))??;
-    if !status.success() {
-        return Err(Error::new(format!(
-            "download exact release asset ID {} failed: {}{}",
-            before.0,
-            String::from_utf8_lossy(&stderr).trim(),
-            if truncated {
-                " [diagnostic truncated]"
-            } else {
-                ""
+            if release_asset_identity_for_release_id(slug, release_id, name)? != before {
+                return Err(Error::new(format!(
+                    "release ID {release_id} asset {name} identity changed during exact-ID \
+                     verification"
+                )));
             }
-        )));
-    }
-    if downloaded_size != before.1 || dmg::sha256_file(local)? != sha256 {
-        return Err(Error::new(format!(
-            "release ID {release_id} asset {name} bytes differ from the local self-checked artifact"
-        )));
-    }
-    if release_asset_identity_for_release_id(slug, release_id, name)? != before {
-        return Err(Error::new(format!(
-            "release ID {release_id} asset {name} identity changed during exact-ID verification"
-        )));
-    }
-    Ok(VerifiedReleaseAsset {
-        id: before.0,
-        size: before.1,
-        sha256,
-    })
+            Ok(VerifiedReleaseAsset {
+                id: before.0,
+                size: before.1,
+                sha256,
+            })
+        })(),
+    )
 }
 
 pub fn verify_release_asset_digest_for_release_id_to(
@@ -4220,59 +3804,14 @@ fn verify_release_asset_digest_inner(
             "release asset {name} is not updater-downloadable: {error}"
         ))
     })?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let sequence = RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temp_dir = temp_parent.join(format!(
-        "aterm-release-asset-{}-{nonce}-{sequence}",
-        std::process::id()
-    ));
-    let temp_dir = PrivateTempDir::create(temp_dir)?;
+    let temp_dir = private_release_asset_temp(temp_parent)?;
     let temp_asset = temp_dir.path().join("asset");
     let result = (|| -> Result<VerifiedReleaseAsset> {
-        let file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_asset)
-            .map_err(|error| Error::new(format!("create streamed release asset: {error}")))?;
-        let mut child = exact_release_asset_download(slug, id)?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::new("exact GitHub asset-ID download has no stdout pipe"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::new("exact GitHub asset-ID download has no stderr pipe"))?;
-        let stderr_reader = std::thread::spawn(move || drain_bounded_diagnostic(stderr, 64 * 1024));
-        let (downloaded_size, digest) = match copy_bounded_release_asset(stdout, file, size) {
-            Ok(streamed) => streamed,
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stderr_reader.join();
-                return Err(Error::new(format!("release asset {name}: {error}")));
-            }
-        };
-        let status = child.wait().map_err(|error| {
-            Error::new(format!("wait for exact GitHub asset-ID download: {error}"))
-        })?;
-        let (stderr, stderr_truncated) = stderr_reader
-            .join()
-            .map_err(|_| Error::new("exact GitHub asset-ID stderr reader panicked"))??;
-        if !status.success() {
-            return Err(Error::new(format!(
-                "download exact release asset ID {id} ({name}) from {slug}/{tag} failed: {}{}",
-                String::from_utf8_lossy(&stderr).trim(),
-                if stderr_truncated {
-                    " [diagnostic truncated at 65536 bytes]"
-                } else {
-                    ""
-                }
-            )));
-        }
+        crate::github::download_asset(slug, id, &temp_asset, size)?;
+        let downloaded_size = fs::metadata(&temp_asset)
+            .map_err(|error| Error::new(format!("stat downloaded release asset: {error}")))?
+            .len();
+        let digest = dmg::sha256_file(&temp_asset)?;
         if downloaded_size != size {
             return Err(Error::new(format!(
                 "release asset {name} API size {size} differs from downloaded size {downloaded_size}"
@@ -4304,15 +3843,7 @@ fn verify_release_asset_digest_inner(
             sha256: digest,
         })
     })();
-    let cleanup = temp_dir.cleanup();
-    match (result, cleanup) {
-        (Ok(asset), Ok(())) => Ok(asset),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(cleanup)) => Err(cleanup),
-        (Err(error), Err(cleanup)) => {
-            Err(Error::new(format!("{error}; cleanup failed: {cleanup}")))
-        }
-    }
+    finish_private_asset_temp(temp_dir, result)
 }
 
 /// The anchor the shipped binary must prove it compiled in.
@@ -6584,9 +6115,106 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         Some(checkout) => checkout.source.commit.clone(),
         None => rev_parse(&git, "HEAD")?,
     };
-    let verified = crate::cut_timing::measure("verified release bundle", || {
-        verified_release_bundle(&operator, repo, &source, &version, &toolchain)
-    })?;
+    // COMMIT-BEFORE-CLAIM: these read the fixed source and journal, not one
+    // another's outputs. Join every verdict before claiming the reserved build.
+    let commit_proofs = || {
+        crate::cut_timing::independent(
+            ("verified release bundle", || {
+                verified_release_bundle(&operator, repo, &source, &version, &toolchain)
+            }),
+            ("commit handoff gates", || {
+                crate::cut_timing::independent(
+                    ("handoff fixtures", || {
+                        let git = GitCli::new(&tree);
+                        gates::handoff_fixture_gate_at(
+                            &git,
+                            &native_origin(&tree)?,
+                            &source,
+                            &version,
+                        )
+                    }),
+                    ("handoff policy", || {
+                        let git = GitCli::new(&tree);
+                        gates::handoff_policy_gate_at(
+                            &git,
+                            &native_origin(&tree)?,
+                            &source,
+                            &version,
+                        )
+                    }),
+                )
+            }),
+        )
+    };
+    let availability = || {
+        crate::cut_timing::independent(
+            ("release lock preflight", || {
+                if kind == CutKind::Real {
+                    preflight_release_lease(&native_origin(repo)?)
+                } else {
+                    Ok(())
+                }
+            }),
+            ("channel target preflight", || {
+                if kind == CutKind::Real {
+                    preflight_channel_target(&publish_slug, false)
+                } else {
+                    Ok(())
+                }
+            }),
+        )
+    };
+    let head_and_signature = || {
+        crate::cut_timing::independent(
+            ("channel head and floor", || {
+                verify::scan_head_before_claim(&publish_slug)
+            }),
+            ("signature policy", || {
+                preflight_signature_policy(credentials, RosterDuty::Sign)
+            }),
+        )
+    };
+    let roster_and_ledger = || {
+        crate::cut_timing::independent(
+            ("channel roster", || {
+                if kind == CutKind::Real {
+                    machines::channel_roster_document(&publish_slug)
+                } else {
+                    Ok(None)
+                }
+            }),
+            ("ledger floor", || {
+                if kind == CutKind::Real {
+                    ledger::show_origin_ledger(&git)
+                } else {
+                    gates::read_bounded_string(&tree.join(ledger::LEDGER_FILE), 64 << 20)
+                        .map_err(|e| Error::new(format!("read {}: {e}", ledger::LEDGER_FILE)))
+                }
+            }),
+        )
+    };
+    // All nine leaves read existing state. Only the reconciliation below can
+    // authorize a claim; no preflight writer or claim races these readers.
+    let (commit, (availability, floors)) = crate::cut_timing::independent(
+        ("commit proofs", commit_proofs),
+        ("claim authority", || {
+            crate::cut_timing::independent(
+                ("availability", availability),
+                ("public floors", || {
+                    crate::cut_timing::independent(
+                        ("head and signature", head_and_signature),
+                        ("roster and ledger", roster_and_ledger),
+                    )
+                }),
+            )
+        }),
+    );
+    let (verified, (fixtures, policy)) = commit;
+    let (lock, channel) = availability;
+    let ((head_scan, signature_verdict), (observed_roster, ledger_text)) = floors;
+    let verified = verified?;
+    let fixtures = fixtures?;
+    let policy = policy?;
     step(
         "gate",
         &format!(
@@ -6597,14 +6225,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             crate::release::COMMIT_GATES,
         ),
     );
-    let origin = native_origin(&tree)?;
-    let fixtures = crate::cut_timing::measure("handoff fixtures", || {
-        gates::handoff_fixture_gate_at(&git, &origin, &source, &version)
-    })?;
     step("gate", &gates::handoff_fixtures_line(fixtures.as_ref()));
-    let policy = crate::cut_timing::measure("handoff policy", || {
-        gates::handoff_policy_gate_at(&git, &origin, &source, &version)
-    })?;
     step(
         "gate",
         &format!("handoff policy sealed into the bundle: {policy}"),
@@ -6622,30 +6243,20 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         )));
     }
     if kind == CutKind::Real {
-        crate::cut_timing::measure("release lock preflight", || {
-            preflight_release_lease(&native_origin(repo)?)
-        })?;
+        lock?;
+        channel?;
         step("lock", "release lock is free");
-    }
-    if kind == CutKind::Real {
-        crate::cut_timing::measure("channel target preflight", || {
-            preflight_channel_target(&publish_slug, false)
-        })?;
         step(
             "channel",
             &format!("release channel {publish_slug} is public and writable (pre-claim)"),
         );
     }
 
-    let head_scan = crate::cut_timing::measure("channel head and floor", || {
-        verify::scan_head_before_claim(&publish_slug)
-    })?;
+    let head_scan = head_scan?;
     let newest_channel = head_scan.first();
     let newest_min_build = newest_channel.and_then(|published| published.min_build);
-    let signature_verdict = crate::cut_timing::measure("signature policy", || {
-        preflight_signature_policy(credentials, RosterDuty::Sign)
-    })
-    .map_err(|e| Error::new(format!("{}; nothing was claimed", e.0)))?;
+    let signature_verdict =
+        signature_verdict.map_err(|e| Error::new(format!("{}; nothing was claimed", e.0)))?;
     let signature_policy = signature_verdict.policy.clone();
     step(
         "signature",
@@ -6655,20 +6266,13 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         ),
     );
     let manifest_roster_seq = published_roster_seq(newest_channel)?;
-    let observed_roster = if kind == CutKind::Real {
-        crate::cut_timing::measure("channel roster", || {
-            machines::channel_roster_document(&publish_slug)
-        })
-        .map_err(|e| {
-            Error::new(format!(
-                "cannot read the machine roster on the channel {publish_slug}'s latest \
+    let observed_roster = observed_roster.map_err(|e| {
+        Error::new(format!(
+            "cannot read the machine roster on the channel {publish_slug}'s latest \
                  release ({e}); refusing to reason about the fleet's roster floor — a wrong \
                  answer here burns a build number and strands every client"
-            ))
-        })?
-    } else {
-        None
-    };
+        ))
+    })?;
     let observed_roster_seq = observed_roster.as_ref().map(|(seq, _)| *seq);
     if let Some(document) = signature_verdict.roster.as_ref() {
         machines::roster_lineage_agrees(
@@ -6716,12 +6320,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     let attributed = signature_verdict.cut_attribution();
 
     let now = unix_now();
-    let ledger_text = if kind == CutKind::Real {
-        crate::cut_timing::measure("ledger floor", || ledger::show_origin_ledger(&git))?
-    } else {
-        gates::read_bounded_string(&tree.join(ledger::LEDGER_FILE), 64 << 20)
-            .map_err(|e| Error::new(format!("read {}: {e}", ledger::LEDGER_FILE)))?
-    };
+    let ledger_text = ledger_text?;
     let tail = ledger::tail(&ledger_text)?;
     let reserved = verified.reserved.build;
     let provisional_floor = effective_min_build(opts.min_build, newest_min_build, reserved)?;
@@ -8686,6 +8285,25 @@ fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
 }
 
 fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
+    // SIGN-BEFORE-SELFCHECK and SELFCHECK-BEFORE-TAG remain pipeline edges.
+    // The signed local bytes and the public floor are independent read sets.
+    let (bytes, best) = crate::cut_timing::independent(
+        ("signed bytes and identity", || selfcheck_bytes(ctx)),
+        ("published floor", || best_published(ctx)),
+    );
+    bytes?;
+    let best = best?;
+    step(
+        "",
+        &format!(
+            "manifest bytes parse (shared type + vendored v0.25 fixture) · > published {}",
+            best.map_or("none".to_string(), |b| b.to_string())
+        ),
+    );
+    Ok(())
+}
+
+fn selfcheck_bytes(ctx: &CutCtx) -> Result<()> {
     let manifest = prove_artifacts_on_disk(ctx)?;
     let team = manifest.team_id.clone().unwrap_or_default();
     if ctx.adopted {
@@ -8719,14 +8337,6 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         );
     }
 
-    let best = crate::cut_timing::measure("published floor", || best_published(ctx))?;
-    step(
-        "",
-        &format!(
-            "manifest bytes parse (shared type + vendored v0.25 fixture) · > published {}",
-            best.map_or("none".to_string(), |b| b.to_string())
-        ),
-    );
     Ok(())
 }
 
@@ -9467,118 +9077,6 @@ impl channel::ChannelRelease for LiveChannelRelease<'_> {
     }
 }
 
-const ANON_PROBE_BUDGET: Duration = Duration::from_secs(60);
-
-/// Propagation patience after the head PATCH. A request already in flight may
-/// finish at its own HTTP deadline; no further request starts after this bound.
-pub const POINTER_PROBE_BUDGET: Duration = Duration::from_secs(300);
-
-/// Fast initial probes, then exponential backoff capped at ten seconds. A
-/// changed head resets the gap, never the overall deadline. Tracking requested
-/// sleep also makes injected sleepers a deterministic virtual clock.
-struct PropagationWait {
-    started: Instant,
-    waited: Duration,
-    next: Duration,
-    budget: Duration,
-}
-
-impl PropagationWait {
-    fn new(budget: Duration) -> Self {
-        Self {
-            started: Instant::now(),
-            waited: Duration::ZERO,
-            next: Duration::from_millis(250),
-            budget,
-        }
-    }
-
-    fn wait(&mut self, progress: bool, sleep: &mut dyn FnMut(Duration)) -> bool {
-        let Some(left) = self
-            .budget
-            .checked_sub(self.started.elapsed().max(self.waited))
-            .filter(|d| !d.is_zero())
-        else {
-            return false;
-        };
-        if progress {
-            self.next = Duration::from_millis(250);
-        }
-        let delay = self.next.min(left);
-        // Do not spend the final gap when it cannot lead to another probe.
-        if delay == left {
-            return false;
-        }
-        self.waited += delay;
-        sleep(delay);
-        self.next = (self.next * 2).min(Duration::from_secs(10));
-        self.started.elapsed().max(self.waited) < self.budget
-    }
-}
-
-#[cfg(test)]
-mod propagation_tests {
-    use super::*;
-
-    /// NEGATIVE CONTROLS: fixed long sleeps miss early progress; resetting the
-    /// start on progress makes a flapping pointer wait forever.
-    #[test]
-    fn progress_resets_the_gap_but_never_extends_the_deadline() {
-        let mut wait = PropagationWait::new(Duration::from_secs(60));
-        let mut slept = Vec::new();
-        for _ in 0..6 {
-            assert!(wait.wait(false, &mut |d| slept.push(d)));
-        }
-        assert_eq!(
-            slept,
-            [250, 500, 1000, 2000, 4000, 8000].map(Duration::from_millis)
-        );
-        assert!(wait.wait(true, &mut |d| slept.push(d)));
-        assert_eq!(slept.last(), Some(&Duration::from_millis(250)));
-        while wait.wait(true, &mut |d| slept.push(d)) {}
-        assert!(slept.iter().sum::<Duration>() < Duration::from_secs(60));
-        // Request time consumes the same budget as sleep.
-        let mut expired = PropagationWait::new(Duration::from_secs(60));
-        expired.started -= Duration::from_secs(60);
-        assert!(!expired.wait(true, &mut |_| panic!("expired requests cannot sleep")));
-    }
-}
-
-/// The HTTP status of a refused anonymous probe (403 or 429).
-#[must_use]
-pub fn anon_probe_refusal(stderr: &str) -> Option<u16> {
-    let idx = stderr.find("returned error: ")?;
-    let rest = &stderr[idx + "returned error: ".len()..];
-    let len = rest.bytes().take_while(u8::is_ascii_digit).count();
-    match &rest[..len] {
-        "403" => Some(403),
-        "429" => Some(429),
-        _ => None,
-    }
-}
-
-fn anon_probe(args: &[&str]) -> Result<std::process::Output> {
-    let mut wait = PropagationWait::new(ANON_PROBE_BUDGET);
-    loop {
-        let out = command("curl")
-            .args(args)
-            .env_remove("GH_TOKEN")
-            .env_remove("GITHUB_TOKEN")
-            .env_remove("GH_ENTERPRISE_TOKEN")
-            .env_remove("NETRC")
-            .output()
-            .map_err(|error| Error::new(format!("spawn anonymous probe: {error}")))?;
-        if out.status.success()
-            || anon_probe_refusal(&String::from_utf8_lossy(&out.stderr)).is_some()
-        {
-            return Ok(out);
-        }
-        if !wait.wait(false, &mut std::thread::sleep) {
-            return Ok(out);
-        }
-    }
-}
-
 /// What one credential-free, redirect-refusing HEAD of a release asset's download URL says about whether a stranger can download it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssetHead {
@@ -9628,7 +9126,6 @@ pub fn prove_assets_download_anonymously(
         aterm_update_core::HeadAnswer,
         aterm_update_core::HttpError,
     >,
-    sleep: &mut dyn FnMut(Duration),
 ) -> Result<u32> {
     let (owner, repo) = slug
         .split_once('/')
@@ -9648,54 +9145,36 @@ pub fn prove_assets_download_anonymously(
                  anonymous API"
             )));
         }
-        let mut last;
-        let mut wait = PropagationWait::new(ANON_PROBE_BUDGET);
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            issued += 1;
-            last = classify_asset_head(head(&url));
-            match &last {
-                AssetHead::Downloads => break,
-                AssetHead::Refused(code) => {
-                    return Err(Error::new(format!(
-                        "GitHub's download host answered HTTP {code} to an unauthenticated \
-                         HEAD of {url} — not the API budget (that host has none): a 403 is a \
-                         proxy, a firewall or an abuse block, a 429 is GitHub throttling this \
-                         address. Asked once; it says nothing about whether {slug} is public. \
-                         Check from another network (`curl -sI {url}` answers 302 when the \
-                         asset is served), then `{CUT_COMMAND}` (re-uploads nothing)."
-                    )));
-                }
-                AssetHead::NotServed | AssetHead::Inconclusive(_) => {
-                    if !wait.wait(false, sleep) {
-                        break;
-                    }
-                }
-            }
-        }
-        match last {
+        issued += 1;
+        match classify_asset_head(head(&url)) {
             AssetHead::Downloads => {}
             AssetHead::NotServed => {
                 return Err(Error::new(format!(
                     "the public channel {slug} does not serve {name} to a client with no \
-                     credential: an unauthenticated HEAD of {url} still answered 404 after \
-                     {attempts} attempts within a {}s propagation budget. The authenticated checks \
-                     passed, so the repository is private (GitHub answers 404 on this host \
-                     for one) or the upload never completed. Make {slug} public, then \
-                     `{CUT_COMMAND}`.",
-                    ANON_PROBE_BUDGET.as_secs(),
+                     credential: an unauthenticated HEAD of {url} answered 404. That is a final \
+                     absence answer, not a transient transport failure. The authenticated checks \
+                     passed, so the repository is private (GitHub answers 404 on this host for \
+                     one) or the upload never completed. Make {slug} public, then `{CUT_COMMAND}`.",
                 )));
             }
             AssetHead::Inconclusive(detail) => {
                 return Err(Error::new(format!(
                     "cannot prove a credential-less client can download {name} from {slug}: \
-                     the last of {attempts} unauthenticated HEADs of {url} \
-                     answered {detail} — not a redirect into GitHub's release-asset storage. \
+                     the unauthenticated HEAD of {url} answered {detail} after its own bounded \
+                     transport retries — not a redirect into GitHub's release-asset storage. \
                      Check the network, then `{CUT_COMMAND}`."
                 )));
             }
-            AssetHead::Refused(_) => unreachable!("a refusal returns inside the loop"),
+            AssetHead::Refused(code) => {
+                return Err(Error::new(format!(
+                    "GitHub's download host answered HTTP {code} to an unauthenticated HEAD of \
+                     {url} — not the API budget (that host has none): a 403 is a proxy, a \
+                     firewall or an abuse block, a 429 is GitHub throttling this address. Asked \
+                     once; it says nothing about whether {slug} is public. Check from another \
+                     network (`curl -sI {url}` answers 302 when the asset is served), then \
+                     `{CUT_COMMAND}` (re-uploads nothing)."
+                )));
+            }
         }
     }
     Ok(issued)
@@ -9770,36 +9249,16 @@ pub fn prove_pointer_serves(
     local_manifest: &[u8],
     probe: &mut dyn FnMut() -> Result<PointerProbe>,
     fetch: &mut dyn FnMut(&str) -> Result<Vec<u8>>,
-    sleep: &mut dyn FnMut(Duration),
 ) -> Result<Manifest> {
     let asset = manifest_out::MANIFEST_ASSET;
-    let mut last;
-    let mut location = None;
-    let mut wait = PropagationWait::new(POINTER_PROBE_BUDGET);
-    let mut previous_tag = None;
-    loop {
-        last = probe()?;
-        if let PointerProbe::Tag {
+    let last = probe()?;
+    let location = match &last {
+        PointerProbe::Tag {
             tag: named,
-            location: loc,
-        } = &last
-            && named == tag
-        {
-            location = Some(loc.clone());
-            break;
-        }
-        if matches!(last, PointerProbe::Refused { .. }) {
-            break;
-        }
-        let progress = if let PointerProbe::Tag { tag, .. } = &last {
-            previous_tag.replace(tag.clone()).as_ref() != Some(tag)
-        } else {
-            false
-        };
-        if !wait.wait(progress, sleep) {
-            break;
-        }
-    }
+            location,
+        } if named == tag => Some(location.clone()),
+        _ => None,
+    };
     let Some(location) = location else {
         if let PointerProbe::Refused { code, reason } = &last {
             return Err(Error::new(format!(
@@ -9871,7 +9330,6 @@ fn prove_evergreen_pointer_serves_this_cut(ctx: &CutCtx, slug: &str) -> Result<(
             probe_evergreen_pointer(slug, asset, &aterm_update_core::pointer::canonical_app_tag)
         },
         &mut anonymous_get,
-        &mut std::thread::sleep,
     )?;
     step(
         "",
@@ -9885,36 +9343,18 @@ fn prove_evergreen_pointer_serves_this_cut(ctx: &CutCtx, slug: &str) -> Result<(
 }
 
 fn anonymous_get_optional(location: &str) -> Result<Option<Vec<u8>>> {
-    let served = anon_probe(&[
-        "--silent",
-        "--show-error",
-        "--fail",
-        "--location",
-        "--proto-redir",
-        "=https",
-        "--max-time",
-        "60",
-        location,
-    ])?;
-    if served.status.success() {
-        return Ok(Some(served.stdout));
+    match aterm_update_core::download_bytes(location, 16 << 20) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if aterm_update_core::download_error_is_not_found(&error) => Ok(None),
+        Err(error) => Err(Error::new(format!(
+            "an unauthenticated GET of {location} failed ({error})"
+        ))),
     }
-    let stderr = String::from_utf8_lossy(&served.stderr);
-    if http_status_from_curl_failure(&stderr) == Some(404) {
-        return Ok(None);
-    }
-    Err(Error::new(format!(
-        "an unauthenticated GET of {location} failed ({})",
-        stderr.trim()
-    )))
 }
 
 fn anonymous_get(location: &str) -> Result<Vec<u8>> {
-    anonymous_get_optional(location)?.ok_or_else(|| {
-        Error::new(format!(
-            "an unauthenticated GET of {location} answered 404 for the whole retry budget"
-        ))
-    })
+    anonymous_get_optional(location)?
+        .ok_or_else(|| Error::new(format!("an unauthenticated GET of {location} answered 404")))
 }
 
 /// The head ratchet.
@@ -10012,7 +9452,6 @@ fn prove_channel_assets_download_anonymously(ctx: &CutCtx, slug: &str) -> Result
         &ctx.tag,
         &names,
         &mut aterm_update_core::head_no_redirect,
-        &mut std::thread::sleep,
     )?;
     step(
         "",
@@ -10108,6 +9547,7 @@ pub(crate) fn upload_pool<T: Sync>(
 mod upload_pool_tests {
     use super::*;
     use std::sync::{Condvar, Mutex, atomic::AtomicUsize, mpsc};
+    use std::time::Duration;
 
     /// NEGATIVE CONTROL: losing the caller's thread-local route would let a
     /// request worker use production GitHub instead of the injected fixture.
@@ -11607,29 +11047,21 @@ mod anonymous_readability_tests {
     fn run(
         names: &[String],
         mut answer: impl FnMut(&str, usize) -> std::result::Result<HeadAnswer, HttpError>,
-    ) -> (Result<u32>, Vec<String>, Vec<Duration>) {
+    ) -> (Result<u32>, Vec<String>) {
         let mut asked = Vec::new();
-        let mut slept = Vec::new();
-        let out = prove_assets_download_anonymously(
-            SLUG,
-            TAG,
-            names,
-            &mut |url| {
-                asked.push(url.to_string());
-                let nth = asked.iter().filter(|u| *u == url).count();
-                answer(url, nth)
-            },
-            &mut |d| slept.push(d),
-        );
-        (out, asked, slept)
+        let out = prove_assets_download_anonymously(SLUG, TAG, names, &mut |url| {
+            asked.push(url.to_string());
+            let nth = asked.iter().filter(|u| *u == url).count();
+            answer(url, nth)
+        });
+        (out, asked)
     }
 
     #[test]
     fn the_readability_proof_never_asks_the_api_host() {
         let names = names();
-        let (out, asked, slept) = run(&names, |_, _| served());
+        let (out, asked) = run(&names, |_, _| served());
         assert_eq!(out.unwrap(), names.len() as u32);
-        assert!(slept.is_empty(), "a served channel needs no second look");
         let want: Vec<String> = names
             .iter()
             .map(|n| format!("https://github.com/{SLUG}/releases/download/{TAG}/{n}"))
@@ -11651,7 +11083,7 @@ mod anonymous_readability_tests {
     #[test]
     fn a_refusal_is_asked_once_and_is_not_called_a_rate_limit() {
         for code in [403_u16, 429] {
-            let (out, asked, slept) = run(&names(), |_, _| status(code));
+            let (out, asked) = run(&names(), |_, _| status(code));
             out.expect_err("a refused channel is not proved readable");
             assert_eq!(
                 asked.len(),
@@ -11659,36 +11091,16 @@ mod anonymous_readability_tests {
                 "HTTP {code} was asked {} times",
                 asked.len()
             );
-            assert!(
-                slept.is_empty(),
-                "HTTP {code} slept before refusing: {slept:?}"
-            );
         }
     }
 
     #[test]
-    fn a_404_is_retried_until_the_cdn_converges_and_refused_when_it_never_does() {
+    fn a_404_is_a_final_absence_answer_and_is_never_retried() {
         let names = names();
-        let first = names[0].clone();
-        let (out, asked, slept) = run(&names, |url, nth| {
-            if url.ends_with(&format!("/{first}")) && nth <= 2 {
-                status(404)
-            } else {
-                served()
-            }
-        });
-        assert_eq!(out.unwrap(), names.len() as u32 + 2);
-        assert_eq!(asked.len(), names.len() + 2);
-        assert_eq!(
-            slept,
-            vec![Duration::from_millis(250), Duration::from_millis(500)]
-        );
-
-        let (out, asked, slept) = run(&names, |_, _| status(404));
-        out.expect_err("a channel that never serves is refused");
-        assert_eq!(asked.len(), slept.len() + 1);
-        assert!(slept.iter().sum::<Duration>() < ANON_PROBE_BUDGET);
-        assert!(ANON_PROBE_BUDGET - slept.iter().sum::<Duration>() <= Duration::from_secs(10));
+        let (out, asked) = run(&names, |_, _| status(404));
+        let refused = out.expect_err("an absent channel is refused").to_string();
+        assert_eq!(asked.len(), 1);
+        assert!(refused.contains("final absence answer"), "{refused}");
     }
 
     #[test]
@@ -11738,27 +11150,6 @@ mod anonymous_readability_tests {
             classify_asset_head(Err(HttpError::Transport("curl: (6) DNS".into()))),
             AssetHead::Inconclusive(_)
         ));
-    }
-
-    #[test]
-    fn the_curl_refusal_reader_names_403_and_429_only() {
-        assert_eq!(
-            anon_probe_refusal("curl: (22) The requested URL returned error: 403"),
-            Some(403)
-        );
-        assert_eq!(
-            anon_probe_refusal("curl: (22) The requested URL returned error: 429"),
-            Some(429)
-        );
-        assert_eq!(
-            anon_probe_refusal("curl: (22) The requested URL returned error: 404"),
-            None
-        );
-        assert_eq!(
-            anon_probe_refusal("curl: (56) Recv failure: Connection reset by peer"),
-            None
-        );
-        assert_eq!(anon_probe_refusal(""), None);
     }
 }
 

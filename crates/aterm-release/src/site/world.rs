@@ -243,6 +243,27 @@ pub struct Real {
     pub curl: Arc<dyn Spawn>,
 }
 
+/// A prepared HTTP command run through the site's child owner after removing the release
+/// launcher's inherited variables. The shared transport owns every curl option and retry; this
+/// wrapper preserves the site's cancellation and environment contract.
+struct UnsetSpawn<'a> {
+    unset: &'a [String],
+    inner: &'a dyn Spawn,
+}
+
+impl Spawn for UnsetSpawn<'_> {
+    fn run(
+        &self,
+        command: &mut Command,
+        stdin: Option<&[u8]>,
+    ) -> std::io::Result<std::process::Output> {
+        for name in self.unset {
+            command.env_remove(name);
+        }
+        self.inner.run(command, stdin)
+    }
+}
+
 impl World for Real {
     fn launch(&self) -> Rc<dyn Launch> {
         Rc::clone(&self.launch)
@@ -272,25 +293,16 @@ impl World for Real {
     }
 
     fn live(&mut self, url: &str) -> Result<Vec<u8>, String> {
-        let mut curl = command(aterm_uds::os_path!("curl"));
-        curl.args([
-            "-fsSL",
-            "--max-time",
-            "30",
-            "-H",
-            "Cache-Control: no-cache",
-            "--",
-            url,
-        ]);
-        for name in &self.unset {
-            curl.env_remove(name);
+        if let Some(signal) = self.launch.interrupted() {
+            return Err(format!(
+                "not asked: the sync was interrupted by signal {signal}"
+            ));
         }
-        let out = output(&*self.launch, &mut curl).map_err(|e| format!("cannot run curl: {e}"))?;
-        if out.status.success() {
-            Ok(out.stdout)
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
+        let spawn = UnsetSpawn {
+            unset: &self.unset,
+            inner: &*self.curl,
+        };
+        aterm_update_core::download_bytes_uncached_via(url, 16 << 20, &spawn)
     }
 
     fn build_module(
@@ -424,6 +436,7 @@ impl World for Real {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::sync::Mutex;
 
     fn removed(cmd: &Command) -> Vec<String> {
         cmd.get_envs()
@@ -436,6 +449,41 @@ mod tests {
         cmd.get_envs()
             .find(|(k, _)| *k == name)
             .and_then(|(_, v)| v)
+    }
+
+    #[derive(Default)]
+    struct RecordingSpawn(Mutex<Vec<Vec<String>>>);
+
+    impl Spawn for RecordingSpawn {
+        fn run(
+            &self,
+            cmd: &mut Command,
+            _stdin: Option<&[u8]>,
+        ) -> std::io::Result<std::process::Output> {
+            self.0.lock().unwrap().push(removed(cmd));
+            let mut answer = command(aterm_uds::os_path!("true")).output()?;
+            answer.stdout = b"live bytes".to_vec();
+            Ok(answer)
+        }
+    }
+
+    #[test]
+    fn a_live_read_runs_through_the_sites_child_owner_with_its_environment_removed() {
+        let recorder = Arc::new(RecordingSpawn::default());
+        let mut world = Real {
+            unset: vec!["RELEASE_LAUNCHER_SECRET".to_string()],
+            launch: Rc::new(super::super::Plain),
+            curl: recorder.clone(),
+        };
+        assert_eq!(
+            world.live("https://example.invalid/live").unwrap(),
+            b"live bytes"
+        );
+        let seen = recorder.0.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the site's child owner ran the one attempt");
+        for name in ["RELEASE_LAUNCHER_SECRET", "CURL_HOME", "XDG_CONFIG_HOME"] {
+            assert!(seen[0].iter().any(|removed| removed == name), "{name}");
+        }
     }
 
     #[test]

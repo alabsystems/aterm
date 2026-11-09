@@ -146,14 +146,11 @@ mod worker_held_live_headless;
 #[cfg(unix)]
 mod worker_spawn_live_headless;
 
-/// FOUR TIMES AS MANY TESTS AT ONCE AS CORES, unless the run names its own count
-/// (`RUST_TEST_THREADS`, or `--test-threads`, which libtest reads over it). The live tests here
-/// spend their time waiting on the instances they boot, not computing, so at libtest's one test
-/// per core the binary is idle-bound; and libtest starts tests in name order, so with too few
-/// slots the late-named live tests (`supervise_turn_end_*`, `turn_submit_*`, `worker_held_*`)
-/// queue for one. On 18 cores the binary takes 25-26 s at 18 threads, 16-18 s at 36 and
-/// 12-14 s at 72, and 108 or 171 is no faster than 72. Set at load time because a test binary
-/// has no other say in its thread count: libtest reads the variable after `main` starts.
+/// Standalone runs overlap the private instances' event waits. The verifier always supplies
+/// `RUST_TEST_THREADS` from its width planner, which this constructor leaves alone; libtest's
+/// explicit `--test-threads` overrides either value. The shared subprocess and boot admission
+/// limits still bound actual children independently of the number of waiting test threads.
+/// Set at load time, before libtest reads its environment.
 #[cfg(unix)]
 extern "C" fn widen_test_threads() {
     if std::env::var_os("RUST_TEST_THREADS").is_none() {

@@ -1787,6 +1787,16 @@ impl Backend for World {
             note: format!("{shape}; {}", site.note),
         })
     }
+    fn after_cut_with_fixtures(
+        &mut self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+    ) -> (Result<AfterCut, Refusal>, Result<String, Refusal>) {
+        let distribution = self.after_cut(&c.version);
+        let fixtures = self.land_fixtures(c, reserved, prover);
+        (distribution, fixtures)
+    }
     fn latest(&mut self) -> Result<Option<String>, String> {
         match &self.cut {
             Some(c) if c.finished && !self.latest_lags => Ok(Some(format!("v{}", c.version))),
@@ -2552,6 +2562,24 @@ fn fixtures_staged_and_not_landed_are_landed_by_the_next_run() {
         w.calls
     );
     assert!(w.fixtures_on_main);
+}
+
+/// PUBLIC-BEFORE-READER and READER-INDEPENDENT-OF-DISTRIBUTION.
+/// NEGATIVE CONTROL: the old site-first early return leaves fixtures off main.
+#[test]
+fn distribution_refusal_does_not_block_the_independent_main_reader() {
+    let mut w = World::new();
+    w.site = Ok(crate::site::Outcome::NoDeploy);
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}");
+    assert!(w.cut.as_ref().is_some_and(|cut| cut.finished));
+    assert!(w.fixtures_on_main);
+    assert!(!w.journal().unwrap().has("after-cut"));
+    w.site = Ok(crate::site::Outcome::Synced { deployed: true });
+    w.calls.clear();
+    assert_eq!(w.run(mac()).0, 0);
+    assert_eq!(w.count("land-fixtures"), 0);
+    assert_eq!(w.count("after-cut 0.6.0"), 1);
 }
 
 #[test]

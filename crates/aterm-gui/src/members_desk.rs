@@ -42,7 +42,7 @@ use crate::messages_host::wall_stamp_now;
 /// The key every "Undo m7's removals?" row starts with, the remover's join code after it.
 pub(crate) const UNDO_PREFIX: &str = "members.undo.";
 
-/// How often the lane looks at the desk for a change the band shows.
+/// How often the lane looks at the desk for a change the join entries or undo rows reflect.
 const READ_EVERY: Duration = Duration::from_secs(2);
 
 /// How often the lane reads this Mac's membership again: a new log seat or roster binding lets it
@@ -82,7 +82,8 @@ type Slot = Mutex<Option<Shared>>;
 /// vault ([`spawn_lane`]).
 static LIVE: Slot = Mutex::new(None);
 
-/// Set when the desk changed in a way the band shows; the next park reads it.
+/// Set when the desk changed in a way the join entries or undo rows reflect; the next park reads
+/// it.
 static CHANGED: AtomicBool = AtomicBool::new(false);
 
 /// The "Undo m7's removals?" rows this Mac shows while a member's removal keeps it out, as the
@@ -297,8 +298,8 @@ fn post_allowed(allowed: Allowed, logged: bool) {
 
 /// Start the desk of a windowed macOS instance, off the event loop: read this Mac's membership
 /// every [`LOCAL_EVERY`] ([`Lane::look`]: the desk made once it is a member, dropped once it
-/// left, read again only once its vault moved), and mark each change the band shows
-/// ([`App::follow_member_requests`]). Whether the thread started.
+/// left, read again only once its vault moved), and mark each change the join entries or undo
+/// rows reflect ([`App::follow_member_requests`]). Whether the thread started.
 pub(crate) fn spawn_lane(headless: bool) -> bool {
     if headless || !cfg!(target_os = "macos") {
         return false;

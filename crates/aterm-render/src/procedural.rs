@@ -8,6 +8,8 @@
 mod icons;
 mod symbols;
 
+#[cfg(test)]
+pub(crate) use icons::mark_stroke;
 pub use icons::{IconMetrics, band_icon_coverage, band_icon_width, boxed_icon_metrics};
 
 /// Whether `ch` is a last-resort symbol this module can draw without a font.

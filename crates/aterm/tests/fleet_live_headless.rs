@@ -221,7 +221,16 @@ fn a_worlds_heartbeat_waits_the_hang_detector_at_each_member() {
 fn a_worlds_aterm_serves_a_connection_past_a_persons_lifetime() {
     let (holder, port) = hold_a_port();
     drop(holder);
-    let inst = boot(port);
+    let inst = boot_on_configured(
+        "aflt-clock",
+        &fleet_table(port, "facts"),
+        true,
+        |tmp, cmd| {
+            let clock = tmp.join("fleet-clock");
+            std::fs::create_dir(&clock).expect("the fleet clock");
+            cmd.env("ATERM_DEBUG_FLEET_CLOCK", clock);
+        },
+    );
     let (_, sid) = boot_session(&inst);
     fleet_reads(&inst, &sid, "listening");
     let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect");
@@ -232,7 +241,15 @@ fn a_worlds_aterm_serves_a_connection_past_a_persons_lifetime() {
         .get_ref()
         .set_read_timeout(Some(HANG))
         .expect("bound the reads");
-    std::thread::sleep(aterm_net::fleet::SERVED_WITHIN + Duration::from_secs(2));
+    // An exchange proves the listener finished admission before the clock advances.
+    assert!(ask(peer.stream(), "version").starts_with("OK version="));
+    let clock = inst.tmp.join("fleet-clock/lifetime");
+    std::fs::write(&clock, "32000").expect("advance past a person's lifetime");
+    aterm_spec::wait::until_within(HANG, "the listener judged the advanced clock", || {
+        std::fs::read_to_string(clock.with_extension("seen"))
+            .is_ok_and(|seen| seen == "32000")
+            .then_some(())
+    });
     let reply = ask(peer.stream(), "version");
     assert!(reply.starts_with("OK version="), "{reply:?}");
 }
@@ -333,6 +350,19 @@ fn boot(port: u16) -> Instance {
 }
 
 fn boot_on(prefix: &str, table: &str, guarded: bool) -> Instance {
+    boot_on_configured(prefix, table, guarded, |_, _| {})
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "configures the isolated headless child"
+)]
+fn boot_on_configured(
+    prefix: &str,
+    table: &str,
+    guarded: bool,
+    configure: impl FnOnce(&Path, &mut std::process::Command),
+) -> Instance {
     boot_world(
         prefix,
         |tmp, cmd| {
@@ -347,6 +377,7 @@ fn boot_on(prefix: &str, table: &str, guarded: bool) -> Instance {
             if !guarded {
                 cmd.env_remove(aterm_net::loopback::SEAM);
             }
+            configure(tmp, cmd);
         },
         |_| true,
     )
@@ -2494,6 +2525,18 @@ fn driven_pair_with(
     tags: (&str, &str),
     member_env: &[(&str, &str)],
 ) -> (Instance, Instance, String, String) {
+    driven_pair_configured(tags, member_env, |_, _| {})
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "configures the isolated headless child"
+)]
+fn driven_pair_configured(
+    tags: (&str, &str),
+    member_env: &[(&str, &str)],
+    configure: impl FnOnce(&Path, &mut std::process::Command),
+) -> (Instance, Instance, String, String) {
     let (holder, port) = hold_a_port();
     drop(holder);
     let port_word = port.to_string();
@@ -2544,6 +2587,7 @@ fn driven_pair_with(
                 .env("ATERM_DEBUG_FLEET_RETRY_MS", RETRY_MS)
                 .args(["--lines", "24", "--columns", "80"]);
             cmd.envs(member_env.iter().copied());
+            configure(tmp, cmd);
         },
         |_| true,
     );
@@ -3750,8 +3794,8 @@ fn a_remote_turn_into_a_shell_with_no_integration_is_submitted_by_one_enter() {
     );
 }
 
-/// A drive's typed turn whose keys go slower than its 20 s allows (the driven node holds each key
-/// 400 ms before it goes, `ATERM_DEBUG_TURN_KEY_LAG_MS`: m108 behind m14's drive, 2026-11-04)
+/// A drive's typed turn whose keys go slower than its 20 s allows (each key costs 400 ms on the
+/// injected clock, as on m108 behind m14's drive, 2026-11-04)
 /// lands whole: the keys that fit, then the rest in one write and an Enter; and one whose first
 /// key does not fit writes nothing. Either way the shell's line is as the turn found it, so the
 /// next command runs alone. What it judges is that property, never how soon the shell answers:
@@ -3760,8 +3804,10 @@ fn a_remote_turn_into_a_shell_with_no_integration_is_submitted_by_one_enter() {
 /// `skipped reason=deadline typed=<n>` and leaves those keys in the shell's line.
 #[test]
 fn a_drives_typed_turn_slower_than_its_deadline_lands_whole_or_writes_nothing() {
-    let (issuer, member, worker, target) =
-        driven_pair_with(("afki", "afkm"), &[("ATERM_DEBUG_TURN_KEY_LAG_MS", "400")]);
+    let (issuer, member, worker, target) = driven_pair_with(
+        ("afki", "afkm"),
+        &[("ATERM_DEBUG_TURN_KEY_CLOCK_STEP_MS", "400")],
+    );
     let at = format!("@{worker}");
     ctl_ok(
         &member,
@@ -3859,8 +3905,8 @@ fn composer_line() -> &'static str {
     "follow up on the notes abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVW"
 }
 
-/// The pair of [`driven_pair_with`], the driven node holding each typed key 400 ms before it goes
-/// (`ATERM_DEBUG_TURN_KEY_LAG_MS`), its worker running `turn_submit_live_headless`'s `COMPOSER`
+/// The pair of [`driven_pair_with`], the driven node charging each typed key 400 ms on its clock
+/// (`ATERM_DEBUG_TURN_KEY_CLOCK_STEP_MS`), its worker running `turn_submit_live_headless`'s `COMPOSER`
 /// as Claude Code in `mode`, held from the start (reading nothing) where `held` says.
 struct ComposerDrive {
     issuer: Instance,
@@ -3873,8 +3919,18 @@ struct ComposerDrive {
 
 impl ComposerDrive {
     fn new(tags: (&str, &str), mode: &str, held: bool) -> Self {
-        let (issuer, member, worker, target) =
-            driven_pair_with(tags, &[("ATERM_DEBUG_TURN_KEY_LAG_MS", "400")]);
+        let (issuer, member, worker, target) = driven_pair_configured(
+            tags,
+            &[("ATERM_DEBUG_TURN_KEY_CLOCK_STEP_MS", "400")],
+            |tmp, cmd| {
+                let clock = tmp.join("echo-clock");
+                std::fs::create_dir(&clock).expect("the echo clock");
+                cmd.env("ATERM_DEBUG_ECHO_CLOCK", clock);
+                let barrier = tmp.join("key-barrier");
+                std::fs::create_dir(&barrier).expect("the first-key barrier");
+                cmd.env("ATERM_DEBUG_TURN_KEY_BARRIER", barrier);
+            },
+        );
         let script = member.tmp.join("composer.sh");
         std::fs::write(&script, crate::turn_submit_live_headless::COMPOSER).expect("the stand-in");
         let hold = member.tmp.join("composer.sh.hold");
@@ -4076,13 +4132,12 @@ fn a_drives_typed_turn_into_a_starved_claude_code_lands_whole_once_it_reads() {
         // line, as would a second write of it, and either read back before the turn's time could
         // be out went while the composer showed nothing.
         let mut early = None;
-        let held = std::time::Instant::now() + crate::turn_submit_live_headless::PAST_THE_ECHO_CAP;
-        while seen && early.is_none() && std::time::Instant::now() < held {
+        if seen {
+            crate::turn_submit_live_headless::past_echo_cap(&drive.member, &drive.worker);
             let n = unread(&mut read);
             if n > keys && std::time::Instant::now() < out_after {
                 early = Some(read.clone());
             }
-            std::thread::sleep(POLL_GAP);
         }
         std::fs::remove_file(&drive.hold).expect("feed the stand-in");
         (turn.join().expect("the drive's turn"), seen, early, read)
@@ -4113,6 +4168,8 @@ fn a_drives_typed_turn_into_a_starved_claude_code_lands_whole_once_it_reads() {
 #[test]
 fn a_drives_typed_turn_whose_issuer_goes_part_way_lands_whole_on_the_driven_mac() {
     let drive = ComposerDrive::new(("afhi", "afhm"), "takes plain bracketed", false);
+    let barrier = drive.member.tmp.join("key-barrier").join(&drive.worker);
+    std::fs::write(barrier.with_extension("hold"), "").expect("hold after the first key");
     let line = composer_line();
     let whole = format!("❯ {line}");
     let words = drive.turn_words(line);
@@ -4137,6 +4194,7 @@ fn a_drives_typed_turn_whose_issuer_goes_part_way_lands_whole_on_the_driven_mac(
         whole.starts_with(&part) && part.len() < whole.len(),
         "the issuer went part-way through the typing: {part:?}"
     );
+    std::fs::remove_file(barrier.with_extension("hold")).expect("let the typing finish");
     drive.shows(2, &whole);
     drive.shows(20, "❯");
     assert_eq!(drive.row(23), "", "the rest was pasted");

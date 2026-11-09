@@ -872,6 +872,7 @@ mod native_text_input;
 mod native_ui;
 mod native_update_admission;
 mod native_update_auto_intent;
+mod native_update_lane_hold;
 #[cfg(test)]
 mod native_updater_conformance;
 mod native_updater_service;
@@ -1788,6 +1789,19 @@ fn count_alert_sound_for_test(_window: Option<&Window>) {
 #[cfg(test)]
 fn alert_sounds_on_this_thread() -> u64 {
     ALERT_SOUNDS_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often [`App::request_redraw_all_windows`] ran on this thread: a headless window has no
+    /// OS window to ask, and the call does not pass through [`WindowState::request_redraw`]'s count.
+    static REDRAW_ALL_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How often this thread asked every window for a frame ([`App::request_redraw_all_windows`]).
+#[cfg(test)]
+pub(crate) fn redraw_all_requests_on_this_thread() -> u64 {
+    REDRAW_ALL_REQUESTS.with(std::cell::Cell::get)
 }
 
 /// Test fixture: feed `bytes` to `session`'s engine, as its PTY reader would.
@@ -9115,6 +9129,9 @@ struct AutoApplyIntent {
     dmg_sha256: [u8; 32],
     retry_at: Instant,
     attempts: u8,
+    /// The hold a poll past the ladder named for this intent (`native_update_lane_hold`): it goes
+    /// with the intent, so a new arming starts with none.
+    held: native_update_lane_hold::NamedHold,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9850,8 +9867,9 @@ impl HandoffAttemptArbiter {
 
 #[derive(Debug)]
 enum UpdateHandoffStartError {
+    /// Not this instant: the named hold ([`native_update_lane_hold::LaneHold`]) lifts by itself.
     #[cfg(unix)]
-    ActivityDeferred(String),
+    ActivityDeferred(native_update_lane_hold::LaneHold, String),
     Refused(String),
     Failed(String),
     #[cfg(unix)]
@@ -9872,8 +9890,8 @@ impl UpdateHandoffStartError {
     }
 
     #[cfg(unix)]
-    fn activity(message: impl Into<String>) -> Self {
-        Self::ActivityDeferred(message.into())
+    fn activity(hold: native_update_lane_hold::LaneHold, message: impl Into<String>) -> Self {
+        Self::ActivityDeferred(hold, message.into())
     }
 
     fn refused(message: impl Into<String>) -> Self {
@@ -9905,7 +9923,7 @@ impl UpdateHandoffStartError {
 
     #[cfg(unix)]
     const fn is_activity_deferred(&self) -> bool {
-        matches!(self, Self::ActivityDeferred(_))
+        matches!(self, Self::ActivityDeferred(..))
     }
 
     #[cfg(all(test, unix))]
@@ -9948,7 +9966,7 @@ impl UpdateHandoffStartError {
         match self {
             Self::Refused(message) | Self::Failed(message) => message,
             #[cfg(unix)]
-            Self::ActivityDeferred(message)
+            Self::ActivityDeferred(_, message)
             | Self::ParkMissed(message)
             | Self::CaptureRefused(message)
             | Self::HeldForRead { message, .. } => message,
@@ -9961,7 +9979,7 @@ impl std::fmt::Display for UpdateHandoffStartError {
         match self {
             Self::Refused(message) | Self::Failed(message) => formatter.write_str(message),
             #[cfg(unix)]
-            Self::ActivityDeferred(message)
+            Self::ActivityDeferred(_, message)
             | Self::ParkMissed(message)
             | Self::CaptureRefused(message)
             | Self::HeldForRead { message, .. } => formatter.write_str(message),
@@ -10841,6 +10859,9 @@ struct App {
     relaunch: Option<relaunch_notice::RelaunchNotice>,
     auto_apply_intent: Option<AutoApplyIntent>,
     auto_apply_ladder: Option<AutoApplyLadder>,
+    /// Where the automatic lane's hold lines go (`native_update_lane_hold`): the log, or a test
+    /// App's list. The hold itself is the armed intent's (`AutoApplyIntent::held`).
+    auto_apply_hold_words: native_update_lane_hold::HoldWords,
     auto_apply_manual_only: Option<AutoApplyManualOnly>,
     auto_apply_environment_block: Option<app_native::AutoApplyEnvironmentBlock>,
     auto_overlap_retry: Option<AutoOverlapRetry>,
@@ -14136,6 +14157,8 @@ impl App {
 
     /// Request a redraw of every open window, for global banner state (a messages settle, the update-ready nudge).
     pub(crate) fn request_redraw_all_windows(&self) {
+        #[cfg(test)]
+        REDRAW_ALL_REQUESTS.with(|c| c.set(c.get() + 1));
         for ws in self.windows.values() {
             if let Some(w) = &ws.os_window {
                 w.request_redraw();
@@ -15774,6 +15797,7 @@ impl App {
             relaunch: None,
             auto_apply_intent: None,
             auto_apply_ladder: None,
+            auto_apply_hold_words: native_update_lane_hold::HoldWords::Kept(Vec::new()),
             auto_apply_manual_only: None,
             auto_apply_environment_block: None,
             auto_overlap_retry: None,
@@ -28936,6 +28960,7 @@ pub fn main_entry_with_network(
         relaunch: None,
         auto_apply_intent: None,
         auto_apply_ladder: None,
+        auto_apply_hold_words: native_update_lane_hold::HoldWords::Log,
         auto_apply_manual_only: None,
         auto_apply_environment_block: None,
         auto_overlap_retry: None,
@@ -29681,7 +29706,7 @@ mod backend_slot_tests {
     }
 
     #[test]
-    fn a_discarded_warms_font_refusal_never_reaches_the_band() {
+    fn a_discarded_warms_font_refusal_never_reaches_the_inbox() {
         if !crate::message_inbox::lane_zero_alone() {
             return;
         }

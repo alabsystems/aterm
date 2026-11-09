@@ -337,6 +337,42 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
 /// compile and starts no compile of its own, so the trace holds the test compile's start line
 /// alone. NEGATIVE CONTROL: without the flag the test stage would start a recording pass.
 #[test]
+fn release_compile_prebuilds_the_bundle_drivers_only_after_success() {
+    for (release, succeeds) in [(true, true), (false, true), (true, false)] {
+        let repo = FakeRepo::new();
+        let trace = repo.scratch.join("prebuild-starts");
+        repo.with_stage2_body(&format!(
+            "echo \"$*\" >> {}\nexit {}",
+            sh_quote(&trace.display().to_string()),
+            if succeeds { 0 } else { 101 }
+        ));
+        let ctx = repo
+            .ctx(&[Check::Test], Scope::workspace())
+            .with_checkers_in_tests(release)
+            .with_compile_only(true);
+        let spec = plan::declared(&ctx.scope)
+            .into_iter()
+            .find(|s| s.id == StageId::TestCompile)
+            .unwrap();
+        let _report = stages::run_stage(&ctx, &spec);
+        let starts = fs::read_to_string(&trace).unwrap();
+        assert_eq!(
+            starts.contains("--bin aterm-redraw-conformance"),
+            release && succeeds,
+            "{starts}"
+        );
+        for drive in stages::OBJC_DRIVES {
+            assert_eq!(
+                starts.contains(&format!("--example {}", drive.example)),
+                release && succeeds && cfg!(target_os = "macos"),
+                "{starts}"
+            );
+        }
+        assert!(starts.lines().next().unwrap().contains("--no-run"));
+    }
+}
+
+#[test]
 fn a_failed_test_compile_starts_no_cargo_behind_it() {
     let repo = FakeRepo::new();
     let trace = repo.scratch.join("starts");

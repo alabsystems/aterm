@@ -17,7 +17,9 @@ use agh::github::releases::{
 };
 use agh::model::ReleaseObject;
 use agh::page::ListOpts;
-use agh::policy::{Access, Named, Presence, RefusalCode, RouteRequest, RouteTarget, Tier};
+use agh::policy::{
+    Access, Decision, Named, Presence, RefusalCode, RouteRequest, RouteTarget, Tier,
+};
 use agh::retry::RetryPolicy;
 use agh::{How, Kind, Outcome, Permit, Sub};
 
@@ -27,10 +29,10 @@ use super::{HostError, Probe, Release, ReleaseHost, Replace, Slug};
 /// which every lane write and helper grant names.
 pub(crate) const CALLER: &str = "atpkg-publish";
 
-/// How long a lane's clone or fetch through agh's isolated git may take: four hours, the
-/// Linux unit's `TimeoutStartSec`, in place of agh's ten-minute `GIT_BUDGET`. A lane clone of a
-/// large repository over a slow link outlasts ten minutes, and `RestHost`'s git has this same
-/// limit; a release-tier grant still lives at most `GRANT_MAX`.
+/// How long an authenticated lane clone or fetch through agh's isolated git may take: four hours,
+/// the Linux unit's `TimeoutStartSec`, in place of agh's ten-minute `GIT_BUDGET`. Anonymous reads
+/// instead run while transfer progress continues, with no whole-transfer latency budget; a
+/// release-tier grant still lives at most `GRANT_MAX`.
 pub const LANE_GIT_BUDGET: Duration = Duration::from_secs(4 * 60 * 60);
 
 /// A release host over one agh client.
@@ -464,7 +466,7 @@ impl ReleaseHost for AghHost {
         dir: &Path,
     ) -> Result<(), HostError> {
         let s = self.own_or_refuse(slug)?;
-        let how = How::writer().retry_policy(RetryPolicy::NONE);
+        let how = How::writer().retry_policy(RetryPolicy::STANDARD);
         let release = self.resolve(&s, tag, how.clone())?;
         std::fs::create_dir_all(dir).map_err(|e| {
             HostError::Refused(self.redacted(&format!("mkdir {}: {e}", dir.display())))
@@ -613,41 +615,31 @@ impl ReleaseHost for AghHost {
     }
 
     fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe {
-        let answer = match self.own(slug) {
+        match self.own(slug) {
             Ok(s) => self.fetch_public_own(&s, tag, asset, dest, cap),
             Err(why) => Probe::Unknown(why),
-        };
-        if answer != Probe::Present {
-            let _ = std::fs::remove_file(dest);
         }
-        answer
     }
 
     fn clone_repo(&self, slug: &Slug, dest: &Path) -> Result<(), HostError> {
         let s = self.own_or_refuse(slug)?;
         let named = self.named(&s)?;
-        // A clone killed at its budget leaves a half-made `dest/.git`, which every later run
-        // would take for a clone and fetch into; so a `dest` this clone made goes with it.
-        let fresh = matches!(
-            std::fs::symlink_metadata(dest),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound
-        );
-        let cloned = self.github.run_git(
-            &GitRun::new_clone(&s, dest)
-                .with_named(named)
-                .with_budget(LANE_GIT_BUDGET),
-        );
-        if let Err(e) = cloned {
-            if fresh {
-                let _ = std::fs::remove_dir_all(dest);
-            }
-            return Err(self.write_error(&e));
-        }
-        Ok(())
+        self.github
+            .run_git(
+                &GitRun::new_clone(&s, dest)
+                    .with_named(named)
+                    .with_budget(LANE_GIT_BUDGET),
+            )
+            .map(|_| ())
+            .map_err(|error| self.write_error(&error))
     }
 
     fn retry_pause(&self) -> Duration {
         self.retry_pause
+    }
+
+    fn download_owns_retry(&self) -> bool {
+        true
     }
 
     fn reads_anonymously(&self) -> bool {
@@ -666,7 +658,14 @@ impl ReleaseHost for AghHost {
             matches!(e.kind, Kind::NotFound | Kind::NotVisible)
                 && !matches!(e.sub, Sub::Moved { .. })
         };
-        for how in [How::read(), How::read().anonymous(true)] {
+        let route = RouteRequest::read(RouteTarget::Repo(s.clone()));
+        let routed_anonymous = matches!(self.github.decide(&route), Decision::Anonymous { .. });
+        let hows = if routed_anonymous {
+            vec![How::read()]
+        } else {
+            vec![How::read(), How::read().anonymous(true)]
+        };
+        for how in hows {
             match self.github.repos().how(how).get(&s) {
                 Ok(_) => return Ok(true),
                 Err(e) if unseen(&e) => {}

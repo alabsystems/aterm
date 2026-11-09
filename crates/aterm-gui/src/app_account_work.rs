@@ -774,7 +774,9 @@ mod tests {
         }));
         app.note_update_handoff_activity();
         // A real blocker appearing while the accounts retire must be read now, rather
-        // than discarding the request merely because the earlier activity counter moved.
+        // than discarding the request merely because the earlier activity counter moved. A
+        // Command Line Tools install's tab is that blocker, named as its own hold
+        // (`LaneHold::DeveloperTools`).
         app.land_install_session_for_test(0);
         drop(work);
         let drained = app.take_retired_account_pause().unwrap();
@@ -784,7 +786,7 @@ mod tests {
         app.finish_account_handoff(handoff);
         assert_eq!(
             app.native_updater_service.snapshot().error.as_deref(),
-            Some("a System State Apply or Restore is still pending")
+            Some("a Command Line Tools install's tab is still running")
         );
         assert!(
             app.auto_apply_intent.is_some(),
@@ -847,12 +849,16 @@ mod tests {
             let outcome = app.account_update_start_outcome(
                 &attempt,
                 mode,
-                crate::UpdateHandoffStartError::activity("a tab is still starting"),
+                crate::UpdateHandoffStartError::activity(
+                    crate::native_update_lane_hold::LaneHold::TabStarting,
+                    "a tab is still starting",
+                ),
             );
             assert_eq!(
                 outcome,
                 UpdateOutcome::Deferred {
-                    reason: "a tab is still starting".into()
+                    reason: "a tab is still starting".into(),
+                    hold: crate::native_update_lane_hold::LaneHold::TabStarting,
                 }
             );
             let snapshot = app.native_updater_service.snapshot();

@@ -5262,11 +5262,42 @@ pub(super) fn cmd_cache_query(
                 None => {}
             }
         }
-        if cross_tags.is_some() {
-            return super::unsupported("'--cache' with these arguments is not native");
-        }
         match api.cask(short) {
             Ok(c) => {
+                // brew only shows an API cask's cache file for
+                // the current platform: other combinations warn
+                // and print nothing.
+                if cross_tags.is_some() {
+                    let labels: Vec<(String, String)> = super::machine::os_arch_combinations(
+                        super::valued_flag_last(rest, "--os").as_deref(),
+                        super::valued_flag_last(rest, "--arch").as_deref(),
+                    )
+                    .iter()
+                    .map(|(os, arch)| {
+                        (
+                            os.clone().unwrap_or_else(super::machine::current_os_symbol),
+                            arch.clone().unwrap_or_else(|| {
+                                super::machine::current_arch_symbol().to_string()
+                            }),
+                        )
+                    })
+                    .collect();
+                    let host = (
+                        super::machine::current_os_symbol(),
+                        super::machine::current_arch_symbol().to_string(),
+                    );
+                    if labels != [host.clone()] {
+                        eprintln!(
+                            "Warning: Cask {} was loaded from the API; only showing the cache \
+                             file for the current platform. Set \
+                             `HOMEBREW_NO_INSTALL_FROM_API=1` to show others.",
+                            c.token
+                        );
+                        if !labels.contains(&host) {
+                            continue;
+                        }
+                    }
+                }
                 let c = match cask::resolve(&c, super::machine::Machine::this()) {
                     Ok(c) => c.into_owned(),
                     Err(e) => return from_install(prefix, args, Err(e)),
@@ -11654,6 +11685,13 @@ fn lookup_error(api: &Api, name: &str, kind: &str, e: String) -> String {
 
 enum FetchJob {
     Cask(super::formula::Cask),
+    /// A cask under `--os`/`--arch` simulation: one entry
+    /// per combination (`None` = not supported there),
+    /// labelled by its (os, arch) symbols for brew's warning.
+    CaskSet {
+        token: String,
+        entries: Vec<(String, String, Option<super::formula::Cask>)>,
+    },
     Formula(Formula, Vec<Formula>),
 }
 
@@ -11707,6 +11745,35 @@ fn cross_bottle_tags(rest: &[String]) -> Result<Option<Vec<String>>, String> {
     )))
 }
 
+/// Download one cask artifact into the cache (brew's
+/// `Cask::Download`), announcing completion like `fetch`.
+fn fetch_cask_one(
+    prefix: &Prefix,
+    args: &[String],
+    c: &super::formula::Cask,
+) -> Result<(), ExitCode> {
+    if let Some(plan) = cask::git_raw_plan(c) {
+        return match cask::fetch_git_raw(prefix, c, &plan) {
+            Ok(_) => {
+                eprintln!("✔︎ Cask {} ({})", c.token, c.version);
+                Ok(())
+            }
+            Err(e) => Err(from_install(prefix, args, Err(e))),
+        };
+    }
+    let dest = prefix.cache().join(cask::download_name(c));
+    let expected = c.sha256.as_deref().unwrap_or("no_check");
+    let reusable = c.sha256.is_some() && fetch::verify_sha256(&dest, expected).is_ok();
+    if !reusable && let Err(e) = fetch::curl_to_file(&c.url, &dest, &[]) {
+        return Err(failed(&e));
+    }
+    if let Err(e) = fetch::verify_sha256(&dest, expected) {
+        return Err(failed(&e));
+    }
+    eprintln!("✔︎ Cask {} ({})", c.token, c.version);
+    Ok(())
+}
+
 /// The cache file for a cross-platform bottle fetch.
 fn cross_bottle_dest(prefix: &Prefix, f: &Formula, sym: &str) -> std::path::PathBuf {
     prefix.cache().join(format!(
@@ -11750,8 +11817,8 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
             }
         }
         match api.cask(name) {
-            Ok(c) => {
-                let c = match cask::resolve(&c, super::machine::Machine::this()) {
+            Ok(raw) => {
+                let c = match cask::resolve(&raw, super::machine::Machine::this()) {
                     Ok(c) => c.into_owned(),
                     Err(e) => return from_install(prefix, args, Err(e)),
                 };
@@ -11761,7 +11828,42 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
                 if c.disabled {
                     return failed(&format!("abrew: cask {} is disabled upstream", c.token));
                 }
-                jobs.push(FetchJob::Cask(c));
+                let sim_os = super::valued_flag_last(rest, "--os");
+                let sim_arch = super::valued_flag_last(rest, "--arch");
+                if (sim_os.is_some() || sim_arch.is_some())
+                    && !has_flag(rest, "--all-platforms", "")
+                {
+                    // brew loads the cask per simulation
+                    // combination; unsupported ones warn+skip.
+                    let mut entries = Vec::new();
+                    for (os, arch) in
+                        super::machine::os_arch_combinations(sim_os.as_deref(), sim_arch.as_deref())
+                    {
+                        let os_label = os.clone().unwrap_or_else(super::machine::current_os_symbol);
+                        let arch_label = arch
+                            .clone()
+                            .unwrap_or_else(|| super::machine::current_arch_symbol().to_string());
+                        let machine =
+                            super::machine::Machine::simulated(os.as_deref(), arch.as_deref());
+                        let entry = cask::resolve(&raw, &machine)
+                            .ok()
+                            .map(|c| c.into_owned())
+                            .filter(|c| {
+                                !c.url.is_empty()
+                                    && c.arch.as_deref().is_none_or(|want| {
+                                        (want == "arm64" && arch_label == "arm")
+                                            || (want == "x86_64" && arch_label == "intel")
+                                    })
+                            });
+                        entries.push((os_label, arch_label, entry));
+                    }
+                    jobs.push(FetchJob::CaskSet {
+                        token: c.token.clone(),
+                        entries,
+                    });
+                } else {
+                    jobs.push(FetchJob::Cask(c));
+                }
             }
             Err(e) => {
                 return failed(&lookup_error(
@@ -11790,6 +11892,7 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
     for job in &jobs {
         match job {
             FetchJob::Cask(c) => bucket.push(c.token.clone()),
+            FetchJob::CaskSet { token, .. } => bucket.push(token.clone()),
             FetchJob::Formula(f, deps) => {
                 bucket.push(f.name.clone());
                 bucket.extend(deps.iter().map(|d| d.name.clone()));
@@ -11859,6 +11962,28 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
     };
     for job in &jobs {
         match job {
+            FetchJob::CaskSet { token, entries } => {
+                println!(
+                    "{}",
+                    super::tty::ohai(&format!("Fetching {token} from homebrew/cask"))
+                );
+                let mut seen_urls: Vec<&str> = Vec::new();
+                for (os, arch, entry) in entries {
+                    let Some(c) = entry else {
+                        eprintln!(
+                            "Warning: Cask {token} is not supported on os {os} and arch {arch}"
+                        );
+                        continue;
+                    };
+                    if seen_urls.contains(&c.url.as_str()) {
+                        continue;
+                    }
+                    seen_urls.push(c.url.as_str());
+                    if let Err(code) = fetch_cask_one(prefix, args, c) {
+                        return code;
+                    }
+                }
+            }
             FetchJob::Cask(c) => {
                 if has_flag(rest, "--all-platforms", "") {
                     // brew cannot fetch API casks across platforms;
@@ -11876,23 +12001,9 @@ pub(super) fn cmd_fetch(prefix: &Prefix, api: &Api, args: &[String], rest: &[Str
                     "{}",
                     super::tty::ohai(&format!("Fetching {} from homebrew/cask", c.token))
                 );
-                if let Some(plan) = cask::git_raw_plan(c) {
-                    match cask::fetch_git_raw(prefix, c, &plan) {
-                        Ok(_) => eprintln!("✔︎ Cask {} ({})", c.token, c.version),
-                        Err(e) => return from_install(prefix, args, Err(e)),
-                    }
-                    continue;
+                if let Err(code) = fetch_cask_one(prefix, args, c) {
+                    return code;
                 }
-                let dest = prefix.cache().join(cask::download_name(c));
-                let expected = c.sha256.as_deref().unwrap_or("no_check");
-                let reusable = c.sha256.is_some() && fetch::verify_sha256(&dest, expected).is_ok();
-                if !reusable && let Err(e) = fetch::curl_to_file(&c.url, &dest, &[]) {
-                    return failed(&e);
-                }
-                if let Err(e) = fetch::verify_sha256(&dest, expected) {
-                    return failed(&e);
-                }
-                eprintln!("✔︎ Cask {} ({})", c.token, c.version);
             }
             FetchJob::Formula(f, deps) => {
                 if !with_deps {
@@ -14191,8 +14302,22 @@ fn tap_git(tap: &tap::Tap, args: &[&str]) -> Option<String> {
 
 pub(super) fn cmd_tap_info(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitCode {
     let taps = tap::list(prefix);
+    // brew's `--installed` set always carries the core taps
+    // (reported Not installed when absent), sorted by name.
+    let installed_names = |taps: &[tap::Tap]| -> Vec<String> {
+        let mut names: Vec<String> = vec!["homebrew/cask".into(), "homebrew/core".into()];
+        for tap in taps {
+            if !names.contains(&tap.name()) {
+                names.push(tap.name());
+            }
+        }
+        names.sort();
+        names
+    };
     if has_flag(rest, "--json", "") || rest.iter().any(|s| s.starts_with("--json=")) {
-        let names: Vec<String> = if has_flag(rest, "--installed", "") || operands(rest).is_empty() {
+        let mut names: Vec<String> = if has_flag(rest, "--installed", "") {
+            installed_names(&taps)
+        } else if operands(rest).is_empty() {
             taps.iter().map(|t| t.name()).collect()
         } else {
             operands(rest)
@@ -14204,6 +14329,7 @@ pub(super) fn cmd_tap_info(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
                 })
                 .collect()
         };
+        names.sort();
         let values: Vec<JVal> = names
             .iter()
             .map(|name| tap_json_value(prefix, api, name, taps.iter().find(|t| t.name() == *name)))
@@ -14212,13 +14338,24 @@ pub(super) fn cmd_tap_info(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
         return ExitCode::SUCCESS;
     }
     if has_flag(rest, "--installed", "") {
-        for (i, tap) in taps.iter().enumerate() {
+        let mut failed = false;
+        for (i, name) in installed_names(&taps).iter().enumerate() {
             if i > 0 {
                 println!();
             }
-            print_tap_detail(prefix, tap);
+            match taps.iter().find(|t| &t.name() == name) {
+                Some(tap) => print_tap_detail(prefix, tap),
+                None => {
+                    println!("{name}: Not installed");
+                    failed = true;
+                }
+            }
         }
-        return ExitCode::SUCCESS;
+        return if failed {
+            ExitCode::from(1)
+        } else {
+            ExitCode::SUCCESS
+        };
     }
     let ops = operands(rest);
     if ops.is_empty() {
@@ -14242,17 +14379,23 @@ pub(super) fn cmd_tap_info(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
         println!("{info}");
         return ExitCode::SUCCESS;
     }
+    let mut names: Vec<String> = ops
+        .iter()
+        .map(|op| {
+            tap::parse_tap_name(op)
+                .map(|(user, repo)| format!("{user}/{repo}"))
+                .unwrap_or_else(|| op.to_lowercase())
+        })
+        .collect();
+    names.sort();
     let mut failed = false;
     let mut first = true;
-    for op in &ops {
-        let name = tap::parse_tap_name(op)
-            .map(|(user, repo)| format!("{user}/{repo}"))
-            .unwrap_or_else(|| op.to_lowercase());
+    for name in &names {
         if !first {
             println!();
         }
         first = false;
-        match taps.iter().find(|t| t.name() == name) {
+        match taps.iter().find(|t| t.name() == *name) {
             None => {
                 println!("{name}: Not installed");
                 failed = true;
@@ -14398,6 +14541,14 @@ fn tap_json_value(prefix: &Prefix, api: &Api, name: &str, installed: Option<&tap
 /// would require executing the tap's Ruby.
 fn print_tap_detail(prefix: &Prefix, tap: &tap::Tap) {
     let mut info = format!("{}: Installed", tap.name());
+    // brew prints the trust state unless
+    // HOMEBREW_NO_REQUIRE_TAP_TRUST is set.
+    let no_require =
+        std::env::var_os("HOMEBREW_NO_REQUIRE_TAP_TRUST").is_some_and(|v| !v.is_empty());
+    if !no_require {
+        let trusted = super::trust::TapRef::from_tap(prefix, tap).trusted();
+        info.push_str(if trusted { "\nTrusted" } else { "\nUntrusted" });
+    }
     let contents = tap_contents(tap);
     if contents.is_empty() {
         info.push_str("\nNo commands/casks/formulae");

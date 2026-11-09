@@ -104,11 +104,14 @@ pub fn simulated_bottle_tag(os: Option<&str>, arch: Option<&str>) -> String {
     bottle_tag_symbol(&system, arch)
 }
 
-/// Every (os, arch) combination brew's `os_arch_combinations`
-/// yields, as tag symbols: `all` expands to ALL_OS_OPTIONS /
-/// ARCH_OPTIONS; unset defaults to the host's own.
+/// brew `os_arch_combinations` as (os, arch) value pairs:
+/// `all` expands to ALL_OS_OPTIONS / ARCH_OPTIONS; unset
+/// stays `None` (the host's own, resolved downstream).
 #[must_use]
-pub fn bottle_tag_combinations(os: Option<&str>, arch: Option<&str>) -> Vec<String> {
+pub fn os_arch_combinations(
+    os: Option<&str>,
+    arch: Option<&str>,
+) -> Vec<(Option<String>, Option<String>)> {
     let mut oses: Vec<Option<String>> = Vec::new();
     match os {
         Some("all") => {
@@ -126,10 +129,45 @@ pub fn bottle_tag_combinations(os: Option<&str>, arch: Option<&str>) -> Vec<Stri
     let mut out = Vec::new();
     for os in &oses {
         for arch in &arches {
-            out.push(simulated_bottle_tag(os.as_deref(), arch.as_deref()));
+            out.push((os.clone(), arch.clone()));
         }
     }
     out
+}
+
+/// Every (os, arch) combination as bottle tag symbols.
+#[must_use]
+pub fn bottle_tag_combinations(os: Option<&str>, arch: Option<&str>) -> Vec<String> {
+    os_arch_combinations(os, arch)
+        .iter()
+        .map(|(os, arch)| simulated_bottle_tag(os.as_deref(), arch.as_deref()))
+        .collect()
+}
+
+/// This host's OS as a brew simulation symbol (`linux`, a
+/// macOS release name, or generic `macos`).
+#[must_use]
+pub fn current_os_symbol() -> String {
+    let host = Machine::this();
+    match host.os {
+        Os::Linux => "linux".to_string(),
+        Os::Macos => host
+            .macos_version()
+            .and_then(release)
+            .map(|(_, name, _)| name.to_string())
+            .unwrap_or_else(|| "macos".to_string()),
+        Os::Other => "macos".to_string(),
+    }
+}
+
+/// This host's arch as a brew simulation symbol.
+#[must_use]
+pub fn current_arch_symbol() -> &'static str {
+    if Machine::this().arch() == "x86_64" {
+        "intel"
+    } else {
+        "arm"
+    }
 }
 
 const ARCHES: [&str; 2] = ["arm64", "x86_64"];

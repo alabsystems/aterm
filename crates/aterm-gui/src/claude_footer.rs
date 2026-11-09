@@ -12307,7 +12307,7 @@ mod tests {
 
     /// THE ACCOUNT UNIT READS AND LIGHTS AS ONE (glass design §1.2): line D's words-only unit, the
     /// fallback shown while line E is not the quota row (`quota::tests` hold the row's own),
-    /// `⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 05:00`, reads with one blank between its parts and
+    /// `⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00`, reads with one blank between its parts and
     /// the facts' gap before the next fact; at rest `⎆` takes the marks' ink of its column, the
     /// name and `↺` the lit ink, the figure and time the values', each `·` the quiet ink, the gap
     /// the warn ink; every word regular but `↺` and the gap's, which are bold. Lit, every glyph but
@@ -12338,7 +12338,7 @@ mod tests {
         let rest = compose_rule_spans(&fit, None, rule, blank, (&plain, place), room, None);
         assert_eq!(
             text_of(&rest.cells),
-            " \u{2386} main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 05:00   \
+            " \u{2386} main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 04:00   \
              \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main "
         );
         let unit = rest

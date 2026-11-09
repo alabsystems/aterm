@@ -294,7 +294,7 @@ impl Client {
             limit: usize::MAX,
             guard: None,
             idle: None,
-            backstop: None,
+            backstop: Backstop::Client,
             connect_within: None,
             error: None,
         }
@@ -312,10 +312,17 @@ pub struct RequestBuilder<'a> {
     limit: usize,
     guard: Option<Arc<dyn Guard>>,
     idle: Option<Duration>,
-    backstop: Option<Duration>,
+    backstop: Backstop,
     connect_within: Option<Duration>,
     /// First construction error, surfaced at `send` so the builder stays chainable.
     error: Option<Error>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Backstop {
+    Client,
+    Within(Duration),
+    None,
 }
 
 impl std::fmt::Debug for RequestBuilder<'_> {
@@ -401,7 +408,15 @@ impl RequestBuilder<'_> {
     /// This request's total deadline, in place of the client's timeout.
     #[must_use]
     pub const fn backstop(mut self, total: Duration) -> Self {
-        self.backstop = Some(total);
+        self.backstop = Backstop::Within(total);
+        self
+    }
+
+    /// Remove the whole-request wall deadline. Connect and idle bounds still apply when the
+    /// caller sets them; this is for large transfers whose total bound is earned by progress.
+    #[must_use]
+    pub const fn without_backstop(mut self) -> Self {
+        self.backstop = Backstop::None;
         self
     }
 
@@ -503,7 +518,11 @@ impl RequestBuilder<'_> {
                 method.as_str()
             ))));
         }
-        let mut deadline = Deadline::after(backstop.unwrap_or(client.timeout));
+        let mut deadline = match backstop {
+            Backstop::Client => Deadline::after(client.timeout),
+            Backstop::Within(total) => Deadline::after(total),
+            Backstop::None => Deadline::unbounded(),
+        };
         if let Some(idle) = idle {
             deadline = deadline.with_idle(idle);
         }

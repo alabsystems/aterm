@@ -181,7 +181,7 @@ fn the_units_inks_read_on_every_ground_and_day_stays_vivid() {
                     if stop {
                         // `said` holds the warn ink's glyphs, its blanks not among them.
                         assert!(
-                            said.starts_with('\u{2573}') && said.contains("~Thu12Nov05:00"),
+                            said.starts_with('\u{2573}') && said.contains("~Thu12Nov04:00"),
                             "{what}: the warn ink says the stop in words: {said:?}"
                         );
                     } else {

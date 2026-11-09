@@ -7,25 +7,30 @@
 //! (`me@example.test`, `alt1`, `alt2`, `pool1`): a Claude Code profile, the roster, the accounts
 //! store and `me`'s series ([`seed`]). Its one tab runs the lab's `claude` fixture
 //! ([`crate::fleet_fixture::claude`], by a link of that name), so the footer reads the profile it
-//! was seeded with. Each scene's footer is shot at the three widths of §2.4 and the covered, gap and
-//! never-read scenes' Accounts card at 60 and 44 cells; beside each png the card's rows
-//! (`controls fact-menu`) and a `manifest-<tag>.tsv` row. `--aterm` points the same seeds at
-//! another build (main's, for the shots side by side).
+//! was seeded with. Each scene's footer is shot at the three widths of §2.4, and the Accounts card
+//! of the covered, gap and never-read scenes and of the glass's case (c) (J) at 60 and 44 cells
+//! ([`CARD_SCENES`]); beside each png the card's rows (`controls fact-menu`) and a
+//! `manifest-<tag>.tsv` row. `--aterm` points the same seeds at another build (main's, for the
+//! shots side by side).
 //!
 //! Scenes I, J and K are the harness glass's cases (b), (c) and (d)
 //! (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1, §6 S5, §7), under Cruise, their
 //! accounts `main`, `alt1` and `alt2`: the fixture's `--settings` names the build's own usage tap
 //! (`<aterm> harness tap`) as its statusLine, which the fixture runs with `main`'s seeded figures
 //! as its payload's `rate_limits` ([`crate::fleet_fixture::RATE_LIMITS`]) and prints under its
-//! bottom rule, so line E is the quota row the window draws over the tap's words. The scenes
-//! A to H run no statusLine: their line D carries the account unit as the fallback.
+//! bottom rule, so line E is the quota row the window draws over the tap's words; every glass
+//! scene's reading is this Mac's, so each account's lane holds it. J's card is case (c)'s on the
+//! rainbow's palette (the design's §1.4): its work row's projected line, `→` hand-offs, the names
+//! after them and `╳`, and the lanes' out lines `🭷`, beside the midnights' ticks. The scenes A to
+//! H run no statusLine: their line D carries the account unit as the fallback, and their cards
+//! are Autopilot Off's.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use aterm_agent::harness::account_series;
 use aterm_agent::harness::accounts::{self, Class, TapRead, WindowFig, WindowRead};
 use aterm_agent::harness::tap;
+use aterm_agent::harness::{account_progress, account_series};
 
 use crate::band::Band;
 use crate::instance::{
@@ -43,8 +48,11 @@ const D: i64 = 86_400;
 /// figure yet (case (d)).
 pub const SCENES: [char; 11] = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K'];
 
-/// The scenes whose Accounts card is shot: covered, a gap, an alt never read (§8.2).
-pub const CARD_SCENES: [char; 3] = ['A', 'B', 'C'];
+/// The scenes whose Accounts card is shot: covered, a gap, an alt never read (§8.2), and the glass
+/// design's case (c) under Cruise (J), whose card draws on the rainbow's palette what the grey
+/// cards of Autopilot Off never do beside a midnight's tick: the projected line, `→` hand-offs
+/// and the names after them, `╳`, and each lane's out line `🭷` (its §1.4).
+pub const CARD_SCENES: [char; 4] = ['A', 'B', 'C', 'J'];
 
 /// The footer's three widths of §2.4, as pane columns.
 pub const WIDTHS: [(&str, u16); 3] = [("wide", 170), ("medium", 100), ("narrow", 70)];
@@ -109,6 +117,10 @@ pub struct Plan {
     /// The fixture runs the build's usage tap as its statusLine, its payload's `rate_limits` the
     /// own login's seen figures: line E is the quota row.
     tapped: bool,
+    /// Every login's reading in `seen` was made on this Mac, as a tap's is, so it is a row of
+    /// that login's series too (aterm-agent's `quota_scenes::Fx::read`), which the card's lane
+    /// draws; else only the own login's `series` is written (the scenes A to H).
+    read_here: bool,
     /// The Autopilot mode the instance runs under.
     autopilot: &'static str,
 }
@@ -336,16 +348,19 @@ fn untapped() -> Plan {
         profile: None,
         plans: ME_PLANS,
         tapped: false,
+        read_here: false,
         autopilot: "off",
     }
 }
 
 /// The rest of a plan of the glass scenes I to K: `main`'s plan rows, the usage tap as the
-/// fixture's statusLine, Autopilot Cruise (the design's §1 is under Cruise).
+/// fixture's statusLine, every reading this Mac's, Autopilot Cruise (the design's §1 is under
+/// Cruise).
 fn tapped() -> Plan {
     Plan {
         plans: MAIN_PLANS,
         tapped: true,
+        read_here: true,
         autopilot: "cruise",
         ..untapped()
     }
@@ -398,8 +413,9 @@ fn profile(plan: &Plan, now: i64) -> String {
 
 /// Seed `world` for `plan` at `now`: the profile in its HOME, the roster beside its
 /// `aterm.toml`, a placeholder file in each other login's folder, the store's readings with the
-/// own login active, its series, the plan rows and, where the fixture runs the tap, its
-/// statusLine payload's `rate_limits`. Nothing outside `world` is written.
+/// own login active, its series (and, where every reading is this Mac's, each other login's
+/// week as its series row), the plan rows and, where the fixture runs the tap, its statusLine
+/// payload's `rate_limits`. Nothing outside `world` is written.
 /// # Errors
 /// A file could not be written, or the store refused a reading.
 pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
@@ -476,6 +492,32 @@ pub fn seed(world: &World, plan: &Plan, now: i64) -> Result<(), String> {
         account_series::note(&state_dir, own, &state.machine, None, Some(&fig), at)
             .map_err(|e| io("series", e))?;
     }
+    // Where every reading is this Mac's, each other login's week is its series row too.
+    for (label, seen) in plan
+        .seen
+        .iter()
+        .filter(|(l, _)| plan.read_here && *l != own)
+    {
+        if let Some((pct_x10, reset, read)) = seen.week {
+            let fig = WindowFig {
+                pct_x10,
+                reset: now + reset,
+                at: now + read,
+                by: state.machine.clone(),
+                source: accounts::SOURCE_TAP.into(),
+                epoch_at: None,
+            };
+            account_series::note(
+                &state_dir,
+                label,
+                &state.machine,
+                None,
+                Some(&fig),
+                now + read,
+            )
+            .map_err(|e| io("series", e))?;
+        }
+    }
     // The plans, as earlier footers' gated profile reads wrote them (the own login's only where
     // its profile was read); `pool1`'s was never seen. The instance's own read of the own login
     // writes nothing new for the same tier.
@@ -519,10 +561,12 @@ const HELP: &str =
        [--scenes ABCDEFGHIJK] [--look day|night|both] [--scale 1|2|both]
 
 The accounts outlook on a private headless instance per scene, look and scale, seeded with
-synthetic identities only: the footer at 170, 100 and 70 columns, and the A, B and C scenes'
+synthetic identities only: the footer at 170, 100 and 70 columns, and the A, B, C and J scenes'
 Accounts card at 60 and 44 cells. Scenes I, J and K are the harness glass's line E (its cases
 (b), (c) and (d), under Cruise): the fixture runs the build's usage tap as its statusLine and
-prints its row under the bottom rule, which the glass takes over. Writes
+prints its row under the bottom rule, which the glass takes over. J's card is case (c)'s on the
+Cruise palette: the work row's projected line, its hand-offs, names and gap, and the lanes' out
+lines, beside the midnights' ticks. Writes
 outlook-<tag>-<scene>-<width>-<look>-<scale>x.png, the card's rows beside each card png, and
 manifest-<tag>.tsv.
 ";
@@ -726,9 +770,8 @@ fn shoot(o: &Opts, aterm: &Path, scene: char, look: Look, scale: u8) -> Result<V
         for (what, cols) in CARD_WIDTHS {
             resize(inst, (at, cols), &scratch)?;
             at = cols;
-            let card = open_card(inst, &scratch)?;
             let png = name(what);
-            let note = image(inst, &png)?;
+            let (card, note) = shoot_card(inst, &scratch, &png)?;
             let rows_file = png.with_extension("controls.txt");
             crate::util::write_fresh(&rows_file, &card)
                 .map_err(|e| Fail::die(format!("cannot write {}: {e}", rows_file.display())))?;
@@ -807,11 +850,27 @@ fn resize(inst: &Instance, (from, cols): (u16, u16), scratch: &Path) -> Result<(
     })
 }
 
-/// Open the Accounts card and wait for it to be drawn: `controls fact-menu` names it open on
-/// the account with its rows, and the frame holds still. Its controls text.
+/// Whether `card`, the words of `controls fact-menu`, says the Accounts card is open on the
+/// account with its rows, as the outlook draws them: not while the pane's recovery observer is
+/// busy, a moment (until its next read, a second on) in which the card withdraws every
+/// projection and says so ([`account_progress::OBSERVER_BUSY_FINDING`]), which a capture of a
+/// scene's card is not.
+fn card_shown(card: &str) -> bool {
+    let head = card.lines().next().unwrap_or_default();
+    head.contains("open=true")
+        && head.contains("fact=account")
+        && !head.contains("rows=0")
+        && !card.contains(account_progress::OBSERVER_BUSY_FINDING)
+}
+
+/// Open the Accounts card and shoot it as `png` once it is drawn: `controls fact-menu` says it is
+/// shown ([`card_shown`]), the frame holds still, and its rows are the same after the shot as
+/// before it, so the png and the rows beside it are one card. Its controls text and the image
+/// verb's verdict line. [`SHOWN`] is a hang detector.
 /// # Errors
-/// A refused open, a card that never opened within [`SHOWN`], or the lab was stopped.
-fn open_card(inst: &Instance, scratch: &Path) -> Result<String, Fail> {
+/// A refused open or shot, a card never shown and held still within [`SHOWN`], or the lab was
+/// stopped.
+fn shoot_card(inst: &Instance, scratch: &Path, png: &Path) -> Result<(String, String), Fail> {
     let opened = inst.ctl(&["open", "fact-menu", "account"]);
     if opened.code != 0 {
         return Err(Fail::die(format!(
@@ -822,14 +881,18 @@ fn open_card(inst: &Instance, scratch: &Path) -> Result<String, Fail> {
     let end = Instant::now() + SHOWN;
     loop {
         let card = inst.ctl(&["controls", "fact-menu"]).stdout;
-        let head = card.lines().next().unwrap_or_default();
-        if head.contains("open=true") && head.contains("fact=account") && !head.contains("rows=0") {
+        if card_shown(&card) {
             steady(inst, scratch, "the card", |_| true)?;
-            return Ok(inst.ctl(&["controls", "fact-menu"]).stdout);
+            let before = inst.ctl(&["controls", "fact-menu"]).stdout;
+            let note = image(inst, png)?;
+            if card_shown(&before) && inst.ctl(&["controls", "fact-menu"]).stdout == before {
+                return Ok((before, note));
+            }
         }
         if Instant::now() >= end {
+            let head = card.lines().next().unwrap_or_default();
             return Err(Fail::die(format!(
-                "outlook-captures: the card did not open within {} s: {head}",
+                "outlook-captures: the card was not shown and held still within {} s: {head}",
                 SHOWN.as_secs()
             )));
         }
@@ -1386,6 +1449,126 @@ mod tests {
                 let week = alt1.windows.get(accounts::WEEK_LIMIT).expect("a week");
                 assert_eq!(week.pct_x10, 920, "{scene}");
             }
+        }
+    }
+
+    /// The outlook a window reads from `world` at `now`, on UTC, as its memo reads it
+    /// ([`resolver_cost`]'s reads): the roster, the store, the logins and the series.
+    fn outlook_of(world: &World, now: i64) -> aterm_agent::harness::outlook::Outlook {
+        use aterm_agent::harness::outlook;
+        let roster = accounts::Roster::load(&world.cfg.join("aterm").join("accounts.toml"))
+            .expect("the roster");
+        let dir = harness_state(world);
+        let store = accounts::Store::at(&dir);
+        let (state, _) = store.load(now).expect("the store");
+        let enrolled = accounts::enrolled(&roster);
+        let renewals = store
+            .load_logins(now)
+            .map(|(logins, _)| outlook::renewals_of(&roster, &logins))
+            .unwrap_or_default();
+        let series = outlook::series_of(&dir, &roster, &state.machine, now);
+        outlook::outlook(&outlook::Inputs {
+            roster: &roster,
+            state: &state,
+            enrolled: &enrolled,
+            series: &series,
+            renewals: &renewals,
+            mode: accounts::Mode::Early,
+            credits: false,
+            now,
+            offset: |_| 0,
+        })
+    }
+
+    /// SCENE J'S CARD IS CASE (C)'S, ITS MARKS BESIDE ITS TICKS: J is a card scene under Cruise,
+    /// and seeded at the glass design's now (aterm-agent's `quota_scenes::T5`) the outlook read
+    /// from its world lays the Accounts card at 60 and 44 cells row for row as
+    /// `quota_scenes::case_c` does (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4): a
+    /// work row with the projected line, `→` hand-offs, the names after them and `╳`, and three
+    /// lanes, each with its reading before `▕` and its out line `🭷`, every one with midnights'
+    /// ticks. NEGATIVE CONTROL: a seed that writes only the own login's series (as the scenes A
+    /// to H do) leaves `alt1`'s and `alt2`'s lanes with no reading, so their cards differ.
+    #[test]
+    fn scene_js_card_is_case_cs_its_marks_beside_its_ticks() {
+        use aterm_agent::harness::outlook::{CardInk, CardRow};
+        use aterm_agent::harness::quota_scenes;
+        use aterm_agent::harness::quota_view::{Cell, GAP_MARK, HANDOFF_MARK};
+        let plan = plan('J');
+        assert!(CARD_SCENES.contains(&'J') && plan.autopilot == "cruise");
+        let now = quota_scenes::T5;
+        let world = World::new(crate::instance::CONFIG_OFF).expect("a world");
+        seed(&world, &plan, now).expect("seeded");
+        let ours = outlook_of(&world, now);
+        let case = quota_scenes::case_c().outlook();
+        for room in [60, 44] {
+            let rows = ours.card_rows("main", None, true, room, None);
+            assert_eq!(
+                rows,
+                case.card_rows("main", None, true, room, None),
+                "{room}"
+            );
+            let (work, ticks) = rows
+                .iter()
+                .find_map(|row| match row {
+                    CardRow::Plot { cells, ticks, .. }
+                        if cells.iter().map(|c| c.0).take(4).eq("work".chars()) =>
+                    {
+                        Some((cells, ticks))
+                    }
+                    _ => None,
+                })
+                .expect("the work row");
+            let text: String = work.iter().map(|c| c.0).collect();
+            assert!(
+                [HANDOFF_MARK, GAP_MARK].iter().all(|m| text.contains(*m))
+                    && text.contains("main")
+                    && text.contains("alt1")
+                    && work.iter().any(|c| c.1 == CardInk::Ahead)
+                    && !ticks.is_empty(),
+                "{room}: {text}"
+            );
+            let lanes: Vec<_> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    CardRow::Account { lane, .. } => lane.as_ref(),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(lanes.len(), 3, "{room}");
+            for lane in lanes {
+                let text: String = lane.cells.iter().map(|c| c.0).collect();
+                assert!(
+                    lane.cells.iter().any(|c| c.1 == CardInk::Read)
+                        && lane.cells.contains(&(Cell::Out.glyph(), CardInk::Warn))
+                        && !lane.ticks.is_empty(),
+                    "{room}: {text}"
+                );
+            }
+        }
+    }
+
+    /// A CARD IS SHOT ONCE ITS OBSERVER HAS READ: `controls fact-menu`'s words of an open
+    /// Accounts card with rows say it is shown ([`card_shown`]); the same card while the pane's
+    /// recovery observer is busy, which withdraws its projection until the next read (the first
+    /// capture of J's card at 44 cells, Day, 1x, drew `┄` ahead under `Account observer is
+    /// busy`), does not, nor does a closed card, another fact's or one with no rows. NEGATIVE
+    /// CONTROL: the open card's head alone (all the capture once read) takes the busy card.
+    #[test]
+    fn a_card_is_shown_once_its_observer_has_read() {
+        let head = "fact-menu open=true session=s-1 fact=account rows=17 selected=7";
+        let shown = format!("{head}\nfact-menu plot index=5 text=\"work ▃▅▅▆▕🭶🭶→🭶→→╳→main\"\n");
+        let busy = format!(
+            "{head}\nfact-menu label index=4 text=\"{}\"\n",
+            account_progress::OBSERVER_BUSY_FINDING
+        );
+        assert!(card_shown(&shown), "{shown}");
+        assert!(!card_shown(&busy), "{busy}");
+        for not in [
+            "fact-menu open=false session=s-1 fact=account rows=17 selected=7",
+            "fact-menu open=true session=s-1 fact=model rows=4 selected=0",
+            "fact-menu open=true session=s-1 fact=account rows=0 selected=0",
+        ] {
+            assert!(!card_shown(not), "{not}");
         }
     }
 

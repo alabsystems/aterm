@@ -15,6 +15,12 @@ use crate::slug::Slug;
 
 use super::GIT_BUDGET;
 
+/// An anonymous smart-HTTP child has no whole-transfer latency budget. It may run for as long
+/// as bytes or descendant CPU/I/O keep advancing, but one minute without that evidence ends the
+/// attempt and lets the shared idempotent-read policy decide whether another attempt is allowed.
+#[cfg(unix)]
+const ANONYMOUS_READ_PROGRESS_WINDOW: Duration = Duration::from_secs(60);
+
 /// What the runner runs. There is no free-form argv.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -35,14 +41,16 @@ pub enum GitOp {
         /// Existing source checkout or bare repository.
         dir: PathBuf,
     },
-    /// `git clone --quiet [--depth N] -- <url> <dest>`, `<dest>` absent or empty.
+    /// `git clone --quiet [--depth N] -- <url> <private-stage>`, then atomically publish the
+    /// stage at `<dest>`. `<dest>` must be absent or empty and is never a retry workspace.
     Clone {
         /// Where to.
         dest: PathBuf,
         /// `--depth`.
         depth: Option<u32>,
     },
-    /// `git clone --quiet --mirror -- <url> <dest>`: a bare snapshot of all refs.
+    /// `git clone --quiet --mirror -- <url> <private-stage>`: a bare snapshot of all refs,
+    /// atomically published at `<dest>` after success.
     Mirror {
         /// An absent or empty destination.
         dest: PathBuf,
@@ -145,8 +153,9 @@ pub struct GitRun {
     pub op: GitOp,
     /// How the destination was named: a release-tier owner needs `Named::Literal`.
     pub named: Named,
-    /// The run's wall bound (`GIT_BUDGET` by default), and the upper lifetime supplied to a
-    /// credential grant. [`Self::progress_window`] replaces it only as the execution bound.
+    /// The local, authenticated or mutating run's wall bound (`GIT_BUDGET` by default), and the
+    /// upper lifetime supplied to a credential grant. [`Self::progress_window`] replaces it as
+    /// the execution bound; anonymous network children always use a progress bound.
     pub budget: Duration,
     /// An inactivity window for native progress. When set, child execution is bounded by
     /// output and descendant CPU/I/O progress instead of [`Self::budget`]'s wall clock.
@@ -215,7 +224,7 @@ impl GitRun {
             },
         )
     }
-    /// `op` on `slug`, `Named::Default`, bounded by `GIT_BUDGET`.
+    /// `op` on `slug`, `Named::Default`, with `GIT_BUDGET` for children that use a wall bound.
     fn of(slug: &Slug, op: GitOp) -> GitRun {
         GitRun {
             slug: slug.clone(),
@@ -356,7 +365,8 @@ impl GitRun {
         self
     }
 
-    /// The same run with another bound.
+    /// The same run with another local, authenticated or mutating wall bound and grant lifetime.
+    /// It is not a whole-transfer latency bound for an anonymous network child.
     #[must_use]
     pub fn with_budget(mut self, budget: Duration) -> GitRun {
         self.budget = budget;
@@ -509,10 +519,11 @@ mod unix {
     //! The runner's steps, on unix.
 
     use std::ffi::OsString;
+    use std::io::{Read as _, Seek as _, SeekFrom};
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
-    use super::{GitOp, GitOut, GitRun};
+    use super::{ANONYMOUS_READ_PROGRESS_WINDOW, GitOp, GitOut, GitRun};
     use crate::client::Github;
     use crate::config::Dirs;
     use crate::error::{Error, Forbid, Kind, Result, SideEffect, Sub};
@@ -523,7 +534,9 @@ mod unix {
     use crate::identity::{EnvSource, Source};
     use crate::policy::{Decision, Named, RefusalCode, RouteRequest, RouteTarget, Tier};
     use crate::redact::Redactor;
+    use crate::retry::RetryDecision;
     use crate::slug::Slug;
+    use aterm_types::http_retry::{Cause, GitObservation};
 
     mod ancestry;
 
@@ -692,7 +705,7 @@ mod unix {
             GitOp::CommitRead { .. } => {
                 if run.progress_window.is_some() {
                     return Err(Error::usage(
-                        "commit ancestry requires its finite original wall budget, not a progress-only window",
+                        "commit ancestry owns its finite-work and native no-progress bounds",
                     ));
                 }
                 Ok(())
@@ -829,6 +842,19 @@ mod unix {
         /// The children the runner makes for itself (a fetch's config read, a leased delete's
         /// scratch `init`) send nothing whatever this says: `unsent` lowers their errors.
         reads: bool,
+        /// This read carries no credential and may use the shared anonymous-HTTP retry policy.
+        anonymous_read: bool,
+        /// The private sibling directory a clone or mirror writes before one atomic publish.
+        /// It is absent under replay, where no child or destination is changed.
+        clone_stage: Option<PathBuf>,
+    }
+
+    /// The transport authority attached to one child. A private HTTP trace and the anonymous
+    /// progress bound travel together, so an ordinary or authenticated child cannot acquire
+    /// either independently.
+    enum ChildNetwork<'a> {
+        Ordinary,
+        AnonymousHttp { trace: Option<&'a Path> },
     }
 
     /// A credential-free name for the canonical native operation, narrowed to its internal
@@ -858,7 +884,7 @@ mod unix {
         /// One child through `Fx::git`: `args`, in `cwd` (or the work directory), its request
         /// named `canonical`. An error keeps `Fx::git`'s side effect unless the run only reads.
         fn git(&self, args: &[OsString], cwd: Option<&Path>, canonical: &[u8]) -> Result<ChildOut> {
-            self.git_supplied(args, cwd, canonical, None, None)
+            self.git_supplied(args, cwd, canonical, None, None, ChildNetwork::Ordinary)
         }
 
         fn git_input(
@@ -868,12 +894,26 @@ mod unix {
             canonical: &[u8],
             input: &[u8],
         ) -> Result<ChildOut> {
-            self.git_supplied(args, cwd, canonical, Some(input), None)
+            self.git_supplied(
+                args,
+                cwd,
+                canonical,
+                Some(input),
+                None,
+                ChildNetwork::Ordinary,
+            )
         }
 
         fn config(&self, query: ConfigQuery, input: &[u8], canonical: &[u8]) -> Result<ChildOut> {
             let args: Vec<_> = query.args().iter().map(|arg| os(*arg)).collect();
-            self.git_supplied(&args, None, canonical, Some(input), Some(query))
+            self.git_supplied(
+                &args,
+                None,
+                canonical,
+                Some(input),
+                Some(query),
+                ChildNetwork::Ordinary,
+            )
         }
 
         fn git_supplied(
@@ -883,9 +923,18 @@ mod unix {
             canonical: &[u8],
             input: Option<&[u8]>,
             config_query: Option<ConfigQuery>,
+            network: ChildNetwork<'_>,
         ) -> Result<ChildOut> {
             let mut spec = ChildSpec::new(&self.git).budget(self.budget);
-            if let Some(window) = self.progress_window {
+            let (curl_trace, progress_window) = match network {
+                ChildNetwork::Ordinary => (None, self.progress_window),
+                ChildNetwork::AnonymousHttp { trace } => (
+                    trace,
+                    self.progress_window
+                        .or(Some(ANONYMOUS_READ_PROGRESS_WINDOW)),
+                ),
+            };
+            if let Some(window) = progress_window {
                 spec = spec.progressing(window, waiting_on(canonical));
             }
             if let Some(input) = input {
@@ -900,6 +949,18 @@ mod unix {
             for (name, value) in &self.env {
                 spec.env.push((name.clone(), value.clone()));
             }
+            if let Some(trace) = curl_trace {
+                spec.env.push((
+                    OsString::from("GIT_TRACE_CURL"),
+                    trace.as_os_str().to_os_string(),
+                ));
+                spec.env.push((
+                    OsString::from("GIT_TRACE_CURL_NO_DATA"),
+                    OsString::from("1"),
+                ));
+                spec.env
+                    .push((OsString::from("GIT_TRACE_REDACT"), OsString::from("1")));
+            }
             if let Some(dir) = cwd.or(self.work.as_deref()) {
                 spec = spec.cwd(dir);
             }
@@ -909,6 +970,211 @@ mod unix {
             } else {
                 out
             }
+        }
+
+        /// One remote read, under the shared anonymous-HTTP policy only when this run carries
+        /// no credential. The private curl trace contains headers but no body, and Git's
+        /// redaction is explicitly on; it exists only to recover a Retry-After that Git
+        /// otherwise withholds from stderr.
+        fn remote_read(
+            &self,
+            run: &GitRun,
+            args: &[OsString],
+            cwd: Option<&Path>,
+            canonical: &[u8],
+            input: Option<&[u8]>,
+        ) -> Result<ChildOut> {
+            if !self.anonymous_read {
+                return self.git_supplied(
+                    args,
+                    cwd,
+                    canonical,
+                    input,
+                    None,
+                    ChildNetwork::Ordinary,
+                );
+            }
+            let mut budget = self.gh.retry_policy().for_anonymous_http().budget();
+            let mut attempt = 1u32;
+            loop {
+                let trace = self
+                    .work
+                    .as_deref()
+                    .and_then(Path::parent)
+                    .map(|root| root.join(format!("anonymous-http-{attempt}.trace")));
+                if let Some(trace) = &trace {
+                    let _ = std::fs::remove_file(trace);
+                }
+                let result = self.git_supplied(
+                    args,
+                    cwd,
+                    canonical,
+                    input,
+                    None,
+                    ChildNetwork::AnonymousHttp {
+                        trace: trace.as_deref(),
+                    },
+                );
+                if matches!(&result, Ok(out) if out.code == Some(0)) {
+                    if let Some(trace) = &trace {
+                        let _ = std::fs::remove_file(trace);
+                    }
+                    return result;
+                }
+                let now = self.gh.fx().wall_secs()?;
+                let observed = trace
+                    .as_deref()
+                    .map(|path| git_trace_observation(path, Some(now)))
+                    .unwrap_or_default();
+                let cause = match &result {
+                    Ok(out) => git_output_cause(out, observed),
+                    Err(error) => git_error_cause(error),
+                };
+                let Some(cause) = cause else {
+                    return result;
+                };
+                let retry = match budget.after(attempt, cause) {
+                    RetryDecision::Retry(retry) => retry,
+                    RetryDecision::Exhausted { bound } => {
+                        let error = match result {
+                            Ok(out) => failed(&run.op, &out, self.gh.redactor(), &run.slug, false),
+                            Err(error) => error.with_repo(run.slug.to_string()),
+                        };
+                        return Err(retry_exhausted(error, &bound));
+                    }
+                    RetryDecision::Final => return result,
+                };
+                clear_clone_stage(self.clone_stage.as_deref())?;
+                self.gh.fx().note_retry(retry)?;
+                self.gh.fx().sleep(retry.pause)?;
+                attempt = attempt.saturating_add(1);
+            }
+        }
+    }
+
+    fn retry_exhausted(mut error: Error, bound: &str) -> Error {
+        error.why = format!("{} after {bound}", error.why);
+        error
+    }
+
+    fn git_error_cause(error: &Error) -> Option<Cause> {
+        (error.kind == Kind::CouldNotRun
+            && error.sub == Sub::Local
+            && (error.why.contains(" did not finish in ")
+                || (error.why.contains("no stdout/stderr bytes")
+                    && error.why.contains("made no CPU or I/O progress"))))
+        .then_some(Cause::Timeout)
+    }
+
+    fn git_output_cause(out: &ChildOut, observed: GitObservation) -> Option<Cause> {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        observed.cause(&stderr)
+    }
+
+    /// Read only the tail of Git's private headers-only curl trace, then remove it. A trace
+    /// failure removes Retry-After evidence; it never broadens the retry class.
+    fn git_trace_observation(path: &Path, now_unix_secs: Option<u64>) -> GitObservation {
+        const KEEP: u64 = 256 * 1024;
+        let mut bytes = Vec::new();
+        let read = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::open(path)?;
+            let len = file.metadata()?.len();
+            if len > KEEP {
+                file.seek(SeekFrom::Start(len - KEEP))?;
+            }
+            file.read_to_end(&mut bytes)?;
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(path);
+        if read.is_err() {
+            return GitObservation::default();
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        GitObservation::from_trace_at(&text, now_unix_secs)
+    }
+
+    /// Remove only entries in this run's private clone stage, so the same idempotent read can
+    /// start again. A caller destination is never an attempt's workspace and is never cleaned.
+    fn clear_clone_stage(stage: Option<&Path>) -> Result<()> {
+        let Some(stage) = stage else {
+            return Ok(());
+        };
+        let entries = match std::fs::read_dir(stage) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(Error::local(format!(
+                    "cannot reset the private clone stage: {error}"
+                )));
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                Error::local(format!("cannot reset the private clone stage: {error}"))
+            })?;
+            let path = entry.path();
+            let kind = entry.file_type().map_err(|error| {
+                Error::local(format!("cannot reset the private clone stage: {error}"))
+            })?;
+            let removed = if kind.is_dir() && !kind.is_symlink() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            removed.map_err(|error| {
+                Error::local(format!("cannot reset the private clone stage: {error}"))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// A clone's task-owned sibling directory. Git never writes the caller's destination:
+    /// after success `publish` renames this directory into an absent or still-empty destination.
+    /// A concurrent file makes that rename fail without removing either the file or its parent.
+    struct CloneStage {
+        owner: aterm_tempfile::TempDir,
+        destination: PathBuf,
+    }
+
+    impl CloneStage {
+        fn for_op(op: &GitOp) -> Result<Option<CloneStage>> {
+            let (GitOp::Clone { dest, .. } | GitOp::Mirror { dest }) = op else {
+                return Ok(None);
+            };
+            let destination = std::path::absolute(dest)
+                .map_err(|error| Error::local(format!("{}: {error}", dest.display())))?;
+            let parent = destination.parent().ok_or_else(|| {
+                Error::local(format!(
+                    "{} has no parent for a private clone stage",
+                    destination.display()
+                ))
+            })?;
+            let owner = aterm_tempfile::Builder::new()
+                .prefix(".agh-clone-")
+                .suffix(".noindex")
+                .tempdir_in(parent)
+                .map_err(|error| {
+                    Error::local(format!(
+                        "cannot make a private clone stage beside {}: {error}",
+                        destination.display()
+                    ))
+                })?;
+            Ok(Some(CloneStage { owner, destination }))
+        }
+
+        fn path(&self) -> &Path {
+            self.owner.path()
+        }
+
+        fn publish(self) -> Result<()> {
+            std::fs::rename(self.path(), &self.destination).map_err(|error| {
+                Error::local(format!(
+                    "cannot publish the clone at {} without replacing caller files: {error}",
+                    self.destination.display()
+                ))
+            })?;
+            let _ = self.owner.keep();
+            Ok(())
         }
     }
 
@@ -1521,6 +1787,7 @@ mod unix {
             }
             Decision::Refuse(refusal) => return Err(refusal.into_error(Some(slug))),
         };
+        let anonymous_read = !push && profile.is_none();
         if let Some(name) = profile.as_deref()
             && let Some(error) = not_a_token_file(gh, name, slug)?
         {
@@ -1543,6 +1810,8 @@ mod unix {
                 budget: run.budget,
                 progress_window: run.progress_window,
                 reads: !push,
+                anonymous_read,
+                clone_stage: None,
             };
             let routed = profile.clone();
             return finish(&children, run, &remote, profile, None)
@@ -1605,6 +1874,7 @@ mod unix {
         if matches!(run.op, GitOp::CheckLocal { .. }) {
             env.push((os("GIT_OPTIONAL_LOCKS"), os("0")));
         }
+        let clone_stage = CloneStage::for_op(&run.op)?;
         let children = Children {
             gh,
             git,
@@ -1619,6 +1889,8 @@ mod unix {
             budget: run.budget,
             progress_window: run.progress_window,
             reads: !push,
+            anonymous_read,
+            clone_stage: clone_stage.as_ref().map(|stage| stage.path().to_path_buf()),
         };
         let nonce = guard.as_ref().map(|g| g.grant.nonce.clone());
         let routed = profile.clone();
@@ -1626,7 +1898,13 @@ mod unix {
             .map_err(|error| name_routed_authentication(error, routed.as_deref()));
         drop(guard);
         drop(scratch);
-        result
+        let out = result?;
+        if let Some(stage) = clone_stage {
+            stage
+                .publish()
+                .map_err(|error| error.with_repo(run.slug.to_string()))?;
+        }
+        Ok(out)
     }
 
     /// Step 3: snapshot owned config without entering source repository setup,
@@ -1854,7 +2132,12 @@ mod unix {
         let canonical = crate::fx::canon::git_request(run);
         let step = |name: &str, args: Vec<OsString>, cwd: Option<&Path>| -> Result<ChildOut> {
             let key = [canonical.as_slice(), b"\nstep ", name.as_bytes()].concat();
-            let out = children.git(&args, cwd, &key).map_err(unsent)?;
+            let out = if name == "fetch" {
+                children.remote_read(run, &args, cwd, &key, None)
+            } else {
+                children.git(&args, cwd, &key)
+            }
+            .map_err(unsent)?;
             if out.code != Some(0) {
                 return Err(failed(
                     &run.op,
@@ -1972,9 +2255,10 @@ mod unix {
                     input: Option<&[u8]>|
          -> Result<ChildOut> {
             let key = [canonical.as_slice(), b"\nstep ", name.as_bytes()].concat();
-            let out = match input {
-                Some(input) => children.git_input(&args, cwd, &key, input),
-                None => children.git(&args, cwd, &key),
+            let out = match (name, input) {
+                ("fetch", input) => children.remote_read(run, &args, cwd, &key, input),
+                (_, Some(input)) => children.git_input(&args, cwd, &key, input),
+                (_, None) => children.git(&args, cwd, &key),
             }
             .map_err(unsent)?;
             if out.code != Some(0) {
@@ -3074,8 +3358,11 @@ mod unix {
                 });
             }
             GitOp::Mirror { dest } => {
-                let dest = std::path::absolute(dest)
-                    .map_err(|e| Error::local(format!("{}: {e}", dest.display())))?;
+                let dest = match children.clone_stage.as_ref() {
+                    Some(stage) => stage.clone(),
+                    None => std::path::absolute(dest)
+                        .map_err(|e| Error::local(format!("{}: {e}", dest.display())))?,
+                };
                 (
                     vec![
                         os("clone"),
@@ -3089,8 +3376,11 @@ mod unix {
                 )
             }
             GitOp::Clone { dest, depth } => {
-                let dest = std::path::absolute(dest)
-                    .map_err(|e| Error::local(format!("{}: {e}", dest.display())))?;
+                let dest = match children.clone_stage.as_ref() {
+                    Some(stage) => stage.clone(),
+                    None => std::path::absolute(dest)
+                        .map_err(|e| Error::local(format!("{}: {e}", dest.display())))?,
+                };
                 let mut args = vec![os("clone"), os("--quiet")];
                 if let Some(depth) = depth {
                     args.push(os(format!("--depth={depth}")));
@@ -3230,7 +3520,18 @@ mod unix {
         let started = children.gh.fx().mono()?;
         let mut pause = std::time::Duration::from_secs(1);
         let out = loop {
-            let out = children.git(&args, cwd, &canonical)?;
+            let out = if matches!(
+                run.op,
+                GitOp::Clone { .. }
+                    | GitOp::Mirror { .. }
+                    | GitOp::Fetch { .. }
+                    | GitOp::FetchMain { .. }
+                    | GitOp::LsRemote { .. }
+            ) {
+                children.remote_read(run, &args, cwd, &canonical, None)?
+            } else {
+                children.git(&args, cwd, &canonical)?
+            };
             if out.code == Some(0) {
                 break out;
             }
@@ -3378,6 +3679,137 @@ mod unix {
         fn config_verdict_rejects_unknown_protocol_fields() {
             let slug = Slug::new("fixture-dev", "app").unwrap();
             assert!(screen_projected(br#"{"Allowed":{"keys":1,"extra":true}}"#, &slug).is_err());
+        }
+    }
+
+    #[cfg(test)]
+    mod transport_retry_tests {
+        use super::*;
+
+        #[test]
+        fn private_header_trace_recovers_numeric_retry_after_then_is_removed() {
+            let root = aterm_tempfile::Builder::new()
+                .prefix("agh-git-trace-")
+                .tempdir()
+                .unwrap();
+            let trace = root.path().join("curl.trace");
+            std::fs::write(
+                &trace,
+                b"00:00:00 <= Recv header: HTTP/2 429\r\n\
+                  00:00:00 <= Recv header: Retry-After: 7\r\n",
+            )
+            .unwrap();
+            assert_eq!(
+                git_trace_observation(&trace, None),
+                GitObservation::from_trace(
+                    "00:00:00 <= Recv header: HTTP/2 429\r\n\
+                     00:00:00 <= Recv header: Retry-After: 7\r\n"
+                )
+            );
+            assert!(!trace.exists());
+        }
+
+        #[test]
+        fn private_header_trace_uses_the_run_clock_for_http_date_retry_after() {
+            let root = aterm_tempfile::Builder::new()
+                .prefix("agh-git-trace-date-")
+                .tempdir()
+                .unwrap();
+            let trace = root.path().join("curl.trace");
+            let text = "00:00:00 <= Recv header: HTTP/2 429\r\n\
+                        00:00:00 <= Recv header: Retry-After: Sun, 08 Nov 2026 12:00:00 GMT\r\n";
+            std::fs::write(&trace, text).unwrap();
+            let now = 1_762_600_000;
+
+            assert_eq!(
+                git_trace_observation(&trace, Some(now)),
+                GitObservation::from_trace_at(text, Some(now))
+            );
+            assert!(!trace.exists());
+        }
+
+        /// NEGATIVE CONTROL: publishing directly into `destination`, or clearing it after a
+        /// failed attempt, removes `caller's-file` and fails this assertion.
+        #[test]
+        fn clone_stage_refuses_to_replace_a_concurrent_destination_file() {
+            let root = aterm_tempfile::Builder::new()
+                .prefix("agh-clone-stage-")
+                .tempdir()
+                .unwrap();
+            let destination = root.path().join("destination");
+            let stage = CloneStage::for_op(&GitOp::Clone {
+                dest: destination.clone(),
+                depth: None,
+            })
+            .unwrap()
+            .unwrap();
+            let stage_path = stage.path().to_path_buf();
+            std::fs::write(stage.path().join("downloaded"), b"network bytes").unwrap();
+
+            std::fs::create_dir(&destination).unwrap();
+            std::fs::write(destination.join("caller's-file"), b"keep").unwrap();
+            let error = stage
+                .publish()
+                .expect_err("a nonempty destination wins the publish race");
+
+            assert!(error.why.contains("without replacing caller files"));
+            assert_eq!(
+                std::fs::read(destination.join("caller's-file")).unwrap(),
+                b"keep"
+            );
+            assert!(!destination.join("downloaded").exists());
+            assert!(!stage_path.exists(), "only the task-owned stage is cleaned");
+        }
+
+        #[test]
+        fn clone_stage_publishes_over_the_still_empty_admitted_destination() {
+            let root = aterm_tempfile::Builder::new()
+                .prefix("agh-clone-publish-")
+                .tempdir()
+                .unwrap();
+            let destination = root.path().join("destination");
+            std::fs::create_dir(&destination).unwrap();
+            let stage = CloneStage::for_op(&GitOp::Clone {
+                dest: destination.clone(),
+                depth: None,
+            })
+            .unwrap()
+            .unwrap();
+            std::fs::write(stage.path().join("downloaded"), b"complete").unwrap();
+
+            stage.publish().unwrap();
+
+            assert_eq!(
+                std::fs::read(destination.join("downloaded")).unwrap(),
+                b"complete"
+            );
+        }
+
+        /// NEGATIVE CONTROL: passing the caller destination to the retry cleanup removes its
+        /// file and fails this test.
+        #[test]
+        fn retry_cleanup_removes_only_the_private_clone_stage() {
+            let root = aterm_tempfile::Builder::new()
+                .prefix("agh-clone-retry-cleanup-")
+                .tempdir()
+                .unwrap();
+            let destination = root.path().join("destination");
+            let stage = CloneStage::for_op(&GitOp::Mirror {
+                dest: destination.clone(),
+            })
+            .unwrap()
+            .unwrap();
+            std::fs::write(stage.path().join("partial"), b"partial").unwrap();
+            std::fs::create_dir(&destination).unwrap();
+            std::fs::write(destination.join("caller's-file"), b"keep").unwrap();
+
+            clear_clone_stage(Some(stage.path())).unwrap();
+
+            assert!(std::fs::read_dir(stage.path()).unwrap().next().is_none());
+            assert_eq!(
+                std::fs::read(destination.join("caller's-file")).unwrap(),
+                b"keep"
+            );
         }
     }
 }

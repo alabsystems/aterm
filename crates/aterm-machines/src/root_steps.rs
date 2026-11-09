@@ -136,7 +136,7 @@ pub fn developer_mode(ran: &Ran) -> Option<bool> {
 }
 
 fn developer_mode_now(sys: &dyn System) -> Option<bool> {
-    sys.run_complete_stdout(&status_cmd())
+    sys.run_complete_output(&status_cmd())
         .ok()
         .as_ref()
         .and_then(developer_mode)
@@ -165,7 +165,7 @@ pub fn member(ran: &Ran) -> Option<bool> {
 
 fn member_now(sys: &dyn System, user: &str, group: &str) -> Option<bool> {
     let cmd = Cmd::new(DSEDITGROUP).args(["-o", "checkmember", "-m", user, group]);
-    sys.run_complete_stdout(&cmd).ok().as_ref().and_then(member)
+    sys.run_complete_output(&cmd).ok().as_ref().and_then(member)
 }
 
 /// The root item's definite missing state: an unreadable mode admits no elevation, and an
@@ -756,6 +756,21 @@ mod tests {
             );
             assert!(!owed(&sys).contains(&Owed::Debugger), "{query}");
         }
+        // A mode sentence on stdout cannot override unproven diagnostic capture.
+        let sys = Fake::root();
+        sys.on(
+            STATUS,
+            Ran {
+                status: Some(0),
+                stdout: b"Developer mode is currently disabled.\n".to_vec(),
+                stderr: vec![b' '; aterm_uds::deadline::OUTPUT_KEEP + 1],
+            },
+        );
+        assert!(matches!(
+            DeveloperMode.probe(&sys, &ctx(&[])),
+            Probe::Unusable { .. }
+        ));
+        assert!(!owed(&sys).contains(&Owed::Debugger));
     }
 
     /// A Mac whose mode is already on still needs the root batch when its console account

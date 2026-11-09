@@ -73,6 +73,14 @@ fn count(seen: &[Seen], request: &str) -> usize {
     requests(seen).iter().filter(|r| *r == request).count()
 }
 
+fn retry_after(seconds: u64) -> Fault {
+    Fault::Status {
+        status: 429,
+        body: "rate limited".to_string(),
+        headers: vec![("retry-after".to_string(), seconds.to_string())],
+    }
+}
+
 #[test]
 fn keys_need_a_single_identity() {
     let root = common::scratch("keys-file");
@@ -614,10 +622,7 @@ fn a_refused_delete_of_an_absent_key_is_gone() {
     let permit = permit(&gh);
     // Attempt 1 is refused (a 4xx removes nothing), and the guard before attempt 2 does not
     // find the id: this call removed nothing.
-    fake.fault(
-        Match::api("/user/keys/").method("DELETE"),
-        Fault::SecondaryLimit { retry_after: 1 },
-    );
+    fake.fault(Match::api("/user/keys/").method("DELETE"), retry_after(1));
     let before = fake.seen().len();
     assert_eq!(keys.delete(&permit, 99999).expect("gone"), Deleted::Gone);
     let seen = fake.seen();
@@ -636,10 +641,7 @@ fn a_refused_add_whose_guard_listing_fails_is_the_refusal() {
     let gh = fleet(&fake, &token, "fixture-dev-bot", RetryPolicy::STANDARD);
     let keys = gh.users().keys();
     let permit = permit(&gh);
-    fake.fault(
-        Match::api("/user/keys").method("POST"),
-        Fault::SecondaryLimit { retry_after: 1 },
-    );
+    fake.fault(Match::api("/user/keys").method("POST"), retry_after(1));
     fake.fault_always(Match::api("/user/keys").method("GET"), Fault::Close);
     let error = keys
         .add(&permit, TITLE, &key("refused-add"))
@@ -647,7 +649,7 @@ fn a_refused_add_whose_guard_listing_fails_is_the_refusal() {
     assert_ne!(error.kind, Kind::OutcomeUnknown, "{error:?}");
     assert_eq!(error.sub, Sub::Secondary, "{error:?}");
     assert_eq!(error.side_effect, SideEffect::None);
-    assert_eq!(error.http.as_ref().map(|http| http.status), Some(403));
+    assert_eq!(error.http.as_ref().map(|http| http.status), Some(429));
     assert_eq!(count(&fake.seen(), "POST /user/keys"), 1);
     assert!(fake.keys("fixture-dev-bot").is_empty());
 }
@@ -663,10 +665,7 @@ fn a_422_after_a_refused_add_is_already_exists() {
     fake.add_key("someone-else", "theirs", &key);
     // Attempt 1 is refused, so nothing of this call landed: attempt 2's 422 names a key
     // another account holds.
-    fake.fault(
-        Match::api("/user/keys").method("POST"),
-        Fault::SecondaryLimit { retry_after: 1 },
-    );
+    fake.fault(Match::api("/user/keys").method("POST"), retry_after(1));
     let error = keys
         .add(&permit, TITLE, &key)
         .expect_err("held by another account");

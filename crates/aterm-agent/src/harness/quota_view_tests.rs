@@ -13,7 +13,9 @@ use crate::harness::accounts::{self, Class};
 use crate::harness::footer::FooterFacts;
 use crate::harness::outlook::tests::{SAT8, scenario_b, scenario_c, scenario_d, worst_case};
 use crate::harness::outlook::{Refusal, round_down};
-use crate::harness::quota_scenes::{D, Fx, H, MIN, NOW, SAT7, T5, case_a, case_b, case_c, case_d};
+use crate::harness::quota_scenes::{
+    D, Fx, H, MIN, NOW, SAT7, SAT14, T5, case_a, case_b, case_c, case_d,
+};
 
 /// Both accounts walled now at 97%: the work waits until main's reset.
 fn walled() -> Fx {
@@ -1572,9 +1574,9 @@ fn parts(view: &QuotaView, line: &QuotaLine) -> Parts {
 /// shows; (3) no figure shows without its name; (4) each narrower room's parts are a subset of a
 /// wider one's (names, phrases, a full phrase only where the wider is full) and its chart is
 /// never finer; (5) no rung is finer than 12 cells a day. The design's mocks hold their rungs at
-/// 166, 96 and 66 cells: (a) R1, R3, R6; (b) R2, R5, R7; case (c)'s, R2, R5, R7 too, are
-/// `case_c_lays_r2_r5_r7`'s. Negative control: a T2 that keeps phrase 1 over phrase 2 drops
-/// case (b)'s stop from 77 cells down (invariant 2).
+/// 166, 96 and 66 cells in each case's own test (`case_a_lays_r1_r3_r6`, `case_b_lays_r2_r5_r7`,
+/// `case_c_lays_r2_r5_r7`, `case_d_lays_its_words_full_then_short`). Negative control: a T2 that
+/// keeps phrase 1 over phrase 2 drops case (b)'s stop from 77 cells down (invariant 2).
 #[test]
 fn the_quota_ladder_keeps_its_invariants() {
     for (name, view) in scenarios() {
@@ -1644,51 +1646,6 @@ fn the_quota_ladder_keeps_its_invariants() {
             wider = Some(now);
         }
     }
-    let rung = |fx: Fx, room: usize| {
-        let view = fx.outlook().quota("main", None, true);
-        let line = laid(&view, room).unwrap();
-        (
-            line.text_of(&line.lead),
-            line.per_day,
-            line.text_of(&line.tail),
-        )
-    };
-    let s = |x: &str| x.to_owned();
-    assert_eq!(
-        rung(case_a(), 166),
-        (s("main 40% used"), 12, s("~57% by \u{21ba} Sat 10:00"))
-    );
-    assert_eq!(
-        rung(case_a(), 96),
-        (s("main 40% used"), 8, s("\u{21ba} Sat 10:00"))
-    );
-    assert_eq!(
-        rung(case_a(), 66),
-        (s("main 40%"), 4, s("\u{21ba} Sat 10:00"))
-    );
-    let stop = "\u{2573} ~Thu 12 Nov 04:00";
-    assert_eq!(
-        rung(case_b(), 166),
-        (
-            s("main 63% used"),
-            8,
-            format!("~99% by \u{21ba} Sat 10:00 \u{b7} {stop}\u{2013}Sat 14 Nov 10:00")
-        )
-    );
-    assert_eq!(
-        rung(case_b(), 96),
-        (
-            s("main 63%"),
-            6,
-            format!("\u{21ba} Sat 10:00 \u{b7} {stop}")
-        )
-    );
-    assert_eq!(rung(case_b(), 66), (s("main 63%"), 4, s(stop)));
-    let (lead, per_day, tail) = rung(case_d(), 66);
-    assert_eq!(
-        (lead.as_str(), per_day, tail.as_str()),
-        ("main", 0, NO_FIGURE_FULL)
-    );
 }
 
 /// CASE (C) LAYS R2, R5 AND R7 (§1.3 (c), §2.4) at 166, 96 and 66 cells, R2 by one cell: its 30
@@ -1751,6 +1708,272 @@ fn case_c_lays_r2_r5_r7() {
     let own = view.tail.own.as_ref().unwrap();
     assert_eq!((own.by_reset, own.reset.as_str()), (None, "Sat 10:00"));
     assert_eq!(view.chart.stops, [(T5 + 36 * H + 40 * MIN, SAT7, false)]);
+}
+
+/// A row the design draws (§1.3) at one of its widths: the room, the lead, the chart's cells a
+/// day, the tail, and the whole row cell for cell.
+type Mock = (usize, &'static str, u8, &'static str, &'static str);
+
+/// The lead, the chart's cells a day and the tail `view` lays at `room`.
+fn rung_at(view: &QuotaView, room: usize) -> (String, u8, String) {
+    let line = laid(view, room).unwrap_or_else(|| panic!("nothing fits {room}"));
+    (
+        line.text_of(&line.lead),
+        line.per_day,
+        line.text_of(&line.tail),
+    )
+}
+
+/// `view` lays each of `mocks` at its room as the design draws it.
+fn lays_the_mocks(view: &QuotaView, mocks: &[Mock]) {
+    for &(room, lead, per_day, tail, row) in mocks {
+        let (l, k, t) = rung_at(view, room);
+        assert_eq!(
+            (l.as_str(), k, t.as_str()),
+            (lead, per_day, tail),
+            "at {room}"
+        );
+        assert_eq!(laid(view, room).unwrap().text(), row, "at {room}");
+    }
+}
+
+/// CASE (A) LAYS R1, R3 AND R6 (§1.3 (a), §2.4) at 166, 96 and 66 cells, each row cell for cell
+/// as the design draws it: R1, the widest rung, takes 133 cells; at 96, R3 takes 93 and R2's
+/// T0 would take 101; at 66, R6 takes 56 and R5's 6 cells a day would take 72 (with no phrase 2,
+/// R6's T1 and R7's T2 say the same `↺ Sat 10:00`). Read on this Mac at 30% a day ago, 35% at
+/// Thu 05:00 and 40% now, main runs at 10% a day: the past is `▂` (30%) until the cell that ends
+/// at Thu 05:00, then `▃` (35% and 40%). The fill is held in tenths, rounded down, so where it
+/// meets a half level on a cell's end (Fri 02:00 and Sat 08:00 at 8 cells a day, each of the next
+/// week's steps at 12) the cell keeps the level below. Main's week holds 40 + 41 h × 10/24 =
+/// 57.08% at its reset Sat 10:00, said `~57%`; its next week, from 0 then, holds 52.9% at the
+/// chart's end, and nothing stops. Negative controls, each of which the ladder's checks of lead,
+/// chart grain and tail at the three widths pass: a rung that must leave a cell spare (`<` for
+/// `<=` in [`QuotaView::lay`]) lays R2 at 133 cells; the eighths truncated ([`level`] without its
+/// half) draw R1's past `▂▂▂▂▂▂▂▂▂▂▂▃`.
+#[test]
+fn case_a_lays_r1_r3_r6() {
+    let view = case_a().outlook().quota("main", None, true);
+    let mocks: [Mock; 3] = [
+        (
+            166,
+            "main 40% used",
+            12,
+            "~57% by ↺ Sat 10:00",
+            "main 40% used  ▂▂▂▂▂▃▃▃▃▃▃▃▕🭺🭺🭺🭺🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭸↺▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁\
+             🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹  ~57% by ↺ Sat 10:00",
+        ),
+        (
+            96,
+            "main 40% used",
+            8,
+            "↺ Sat 10:00",
+            "main 40% used  ▂▂▂▃▃▃▃▃▕🭺🭺🭺🭹🭹🭹🭹🭹🭹🭹🭹🭹🭹↺▁▁▁▁▁▁▁▁▁▁▁▁▁▁🭻🭻🭻🭻🭻🭻🭻🭻🭻🭻\
+             🭺🭺🭺🭺🭺🭺🭺🭺🭺🭺🭹🭹🭹🭹🭹🭹🭹🭹  ↺ Sat 10:00",
+        ),
+        (
+            66,
+            "main 40%",
+            4,
+            "↺ Sat 10:00",
+            "main 40%  ▂▃▃▃▕🭺🭹🭹🭹🭹🭹↺▁▁▁▁▁▁▁🭻🭻🭻🭻🭻🭺🭺🭺🭺🭺🭹🭹🭹🭹  ↺ Sat 10:00",
+        ),
+    ];
+    lays_the_mocks(&view, &mocks);
+    let (r1, r2, r3, r5, r6) = (
+        ("main 40% used", 12, "~57% by ↺ Sat 10:00"),
+        ("main 40% used", 8, "~57% by ↺ Sat 10:00"),
+        ("main 40% used", 8, "↺ Sat 10:00"),
+        ("main 40%", 6, "↺ Sat 10:00"),
+        ("main 40%", 4, "↺ Sat 10:00"),
+    );
+    for (room, (lead, k, tail)) in [
+        (133, r1),
+        (132, r2),
+        (101, r2),
+        (100, r3),
+        (72, r5),
+        (71, r6),
+    ] {
+        assert_eq!(
+            rung_at(&view, room),
+            (lead.to_owned(), k, tail.to_owned()),
+            "at {room}"
+        );
+    }
+    let fills: Vec<_> = view
+        .chart
+        .runs
+        .iter()
+        .map(|r| {
+            let knots: Vec<_> = r.knots.iter().map(|k| (k.t - T5, k.x10)).collect();
+            (r.label.as_str(), knots)
+        })
+        .collect();
+    assert_eq!(
+        fills,
+        [(
+            "main",
+            vec![
+                (0, Some(400)),
+                (41 * H, Some(570)),
+                (41 * H, Some(0)),
+                (7 * D, Some(529)),
+            ]
+        )]
+    );
+    assert_eq!(
+        view.tail.own,
+        Some(Own {
+            by_reset: Some(57),
+            reset: "Sat 10:00".into()
+        })
+    );
+    assert!(view.chart.stops.is_empty() && view.tail.verdict.is_none());
+}
+
+/// CASE (B) LAYS R2, R5 AND R7 (§1.3 (b), §2.4) at 166, 96 and 66 cells, each row cell for cell
+/// as the design draws it, with the midnights' ticks under R2's: R2 takes 140 cells and R1's 12
+/// a day would take 172; R5 takes 94 and R4's full lead 99; R7 takes 64 and R6's T1 78. Read on
+/// this Mac at 42% a day ago, 50% from Wed 23:00 and 63% now, main runs at 21% a day (8.75
+/// tenths an hour; the replay takes each instant to the second up). Its week reaches its low
+/// mark (98%, from 97.5% half up) at Sat 08:26, which moves nothing with no other account, and
+/// holds 98.875% at its reset Sat 10:00, said `~99%` (whole percent half up, at most 99: §2.1,
+/// §2.3). Its next week, from 0 then, reaches its low mark at Thu 12 Nov 01:26 and is out at
+/// 04:17, 4 d 18 h 17 min after the reset, said `~Thu 12 Nov 04:00` at the hour's grain of a
+/// start a day or more ahead (§3.2), until its reset Sat 14 Nov 10:00, past the chart's end. At 8
+/// cells a day the fill lands 43 min before the end of its 3-hour cell, which the stop covers
+/// less than half of, so the cell is the line at a projected fill, `▔` (§2.2), and the 4 cells
+/// after it are `╳`. [`QuotaView::sample`], which other crates' tests draw, says the same words.
+/// Negative controls, each of which the ladder's checks of lead, chart grain and tail at the
+/// three widths pass: a rung that must leave a cell spare (`<` for `<=` in [`QuotaView::lay`])
+/// lays R2 at 172 cells; the eighths truncated ([`level`] without its half) draw R2's future
+/// `🭸🭸🭸🭸🭷…`; the sample's first words (`~98%`, `~Thu 12 Nov 05:00`) fail its pin.
+#[test]
+fn case_b_lays_r2_r5_r7() {
+    let view = case_b().outlook().quota("main", None, true);
+    let full = "~99% by ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00";
+    let short = "↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00";
+    let stop = "╳ ~Thu 12 Nov 04:00";
+    let mocks: [Mock; 3] = [
+        (
+            166,
+            "main 63% used",
+            8,
+            full,
+            "main 63% used  ▃▄▄▄▄▄▄▅▕🭸🭸🭷🭷🭷🭷🭶🭶🭶🭶🭶🭶🭶↺▁▁▁▁▁▁🭻🭻🭻🭻🭻🭺🭺🭺🭺🭺🭹🭹🭹🭹🭹🭸🭸🭸🭸\
+             🭷🭷🭷🭷🭷🭶🭶🭶🭶🭶🭶🭶▔╳╳╳╳  ~99% by ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00",
+        ),
+        (
+            96,
+            "main 63%",
+            6,
+            short,
+            "main 63%  ▃▄▄▄▄▅▕🭸🭷🭷🭷🭷🭶🭶🭶🭶🭶↺▁▁▁▁🭻🭻🭻🭻🭺🭺🭺🭹🭹🭹🭹🭸🭸🭸🭷🭷🭷🭷🭶🭶🭶🭶🭶▔╳╳╳  \
+             ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00",
+        ),
+        (
+            66,
+            "main 63%",
+            4,
+            stop,
+            "main 63%  ▄▄▄▅▕🭸🭷🭷🭶🭶🭶↺▁▁▁🭻🭻🭺🭺🭺🭹🭹🭸🭸🭷🭷🭷🭶🭶🭶▔╳╳  ╳ ~Thu 12 Nov 04:00",
+        ),
+    ];
+    lays_the_mocks(&view, &mocks);
+    // The second line of R2's mock: each midnight's tick, in the chart's cells.
+    let r2 = laid(&view, 166).unwrap();
+    let ticks: Vec<i64> = r2.ticks.iter().map(|p| p / CELL_PLACES).collect();
+    assert_eq!(ticks, [2, 11, 19, 27, 35, 43, 51, 59]);
+    // §2.6's titles of a past column and a future one, at 8 cells a day.
+    let utc = Offsets::fixed(0);
+    assert_eq!(
+        view.column_title(8, 1, &utc).as_deref(),
+        Some("Wed 4 Nov 20:00–23:00 · main 50% (read on this Mac)")
+    );
+    assert_eq!(
+        view.column_title(8, 9 + 39, &utc).as_deref(),
+        Some("~Tue 10 Nov 14:00–17:00 · main ~69% (projected)")
+    );
+    let s = |lead: &str, k: u8, tail: &str| (lead.to_owned(), k, tail.to_owned());
+    for (room, rung) in [
+        (172, s("main 63% used", 12, full)),
+        (171, s("main 63% used", 8, full)),
+        (99, s("main 63% used", 6, short)),
+        (98, s("main 63%", 6, short)),
+        (78, s("main 63%", 4, short)),
+        (77, s("main 63%", 4, stop)),
+    ] {
+        assert_eq!(rung_at(&view, room), rung, "at {room}");
+    }
+    // `x10` tenths at 21% a day, to the second up.
+    let at_pace = |x10: i64| (x10 * D + 209) / 210;
+    let reset = SAT7 - T5;
+    let fills: Vec<_> = view
+        .chart
+        .runs
+        .iter()
+        .map(|r| {
+            let knots: Vec<_> = r.knots.iter().map(|k| (k.t - T5, k.x10)).collect();
+            (r.label.as_str(), knots)
+        })
+        .collect();
+    assert_eq!(
+        fills,
+        [(
+            "main",
+            vec![
+                (0, Some(630)),
+                (at_pace(975 - 630), Some(975)),
+                (reset, Some(988)),
+                (reset, Some(0)),
+                (reset + at_pace(975), Some(975)),
+                (reset + at_pace(1000), Some(1000)),
+            ]
+        )]
+    );
+    assert_eq!(at_pace(1000), 4 * D + 18 * H + 17 * MIN + 9);
+    assert_eq!(view.chart.stops, [(SAT7 + at_pace(1000), SAT14, false)]);
+    assert_eq!(
+        view.tail.own,
+        Some(Own {
+            by_reset: Some(99),
+            reset: "Sat 10:00".into()
+        })
+    );
+    let sample = QuotaView::sample();
+    assert_eq!(
+        (&sample.tail, &sample.title, &sample.spoken),
+        (&view.tail, &view.title, &view.spoken)
+    );
+    assert_eq!(sample.fallback(), view.fallback());
+}
+
+/// CASE (D) LAYS ITS WORDS FULL, THEN SHORT (§1.3 (d), §2.4): with this tab's week unread there
+/// is no chart, and its full words take 64 cells, so 166, 96 and 66 lay them alike; from 63
+/// cells down to 24 it says them short, and nothing fits 23. Negative control: a form that must
+/// leave a cell spare (`<` for `<=` in [`QuotaView::lay`]) says the short words at 64 cells,
+/// though the ladder's check at 66 passes.
+#[test]
+fn case_d_lays_its_words_full_then_short() {
+    let view = case_d().outlook().quota("main", None, true);
+    let row = format!("main  {NO_FIGURE_FULL}");
+    for room in [166, 96, 66, 64] {
+        let line = laid(&view, room).unwrap();
+        assert_eq!(
+            (line.text_of(&line.lead).as_str(), line.per_day),
+            ("main", 0),
+            "at {room}"
+        );
+        assert_eq!(line.text(), row, "at {room}");
+    }
+    for room in [63, 24] {
+        assert_eq!(
+            laid(&view, room).unwrap().text(),
+            format!("main  {NO_FIGURE}"),
+            "at {room}"
+        );
+    }
+    assert!(laid(&view, 23).is_none());
 }
 
 /// A PAUSED RECOVERY SHOWS NO FORECAST (moved from the footer's outlook tests): a pane whose

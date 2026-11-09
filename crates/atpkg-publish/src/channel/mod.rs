@@ -128,6 +128,9 @@ pub fn download_retried(
     assets: &[&str],
     dir: &Path,
 ) -> std::result::Result<(), HostError> {
+    if host.download_owns_retry() {
+        return host.download(slug, tag, assets, dir);
+    }
     let mut last = HostError::NotFound;
     for attempt in 0..DOWNLOAD_ATTEMPTS {
         if attempt > 0 {
@@ -142,23 +145,13 @@ pub fn download_retried(
     Err(last)
 }
 
-/// Maximum public-availability probes for a newly uploaded release asset.
-pub const SERVE_PROBES: usize = 13;
-
-/// Probes the download host up to [`SERVE_PROBES`] times until `asset` is [`Probe::Present`].
+/// Probes the public download host once for `asset`.
+///
+/// The host's anonymous transport owns the bounded transient retry policy. In particular, an
+/// answered 404 is absence and is never turned into an availability-poll retry here.
 #[must_use]
 pub fn probe_served(host: &dyn ReleaseHost, slug: &Slug, tag: &str, asset: &str) -> Probe {
-    let mut answer = Probe::Absent;
-    for attempt in 0..SERVE_PROBES {
-        if attempt > 0 {
-            std::thread::sleep(host.retry_pause());
-        }
-        answer = host.probe_public(slug, tag, asset);
-        if answer == Probe::Present {
-            break;
-        }
-    }
-    answer
+    host.probe_public(slug, tag, asset)
 }
 
 /// Parses a future `YYYY-MM-DDTHH:MM:SSZ` freshness horizon after `now_unix` as epoch seconds.
@@ -202,4 +195,18 @@ pub(crate) fn flag_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> R
     args.get(*i)
         .map(String::as_str)
         .ok_or_else(|| Error::usage(format!("{flag} needs a value")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::fake::FakeHost;
+
+    #[test]
+    fn an_answered_public_404_is_not_polled_again() {
+        let host = FakeHost::new();
+        let slug = Slug::new("public", "program");
+        assert_eq!(probe_served(&host, &slug, "v1", "asset"), Probe::Absent);
+        assert_eq!(host.calls(), ["probe public/program v1 asset"]);
+    }
 }

@@ -286,13 +286,19 @@ fn table_pass(paths: &Paths) -> Result<Pass, String> {
 fn pass_line(pass: &Result<Pass, String>) -> String {
     match pass {
         Ok(pass) if !pass.writer => {
-            "lab table: read only here (this Mac is not a current Commons Writer); its needs wait in the ledger\n".to_owned()
+            format!(
+                "lab table: read only here (this {} is not a current Commons Writer); its needs \
+                 wait in the ledger\n",
+                aterm_types::machine_name::OS_NOUN
+            )
         }
         Ok(pass) => format!(
             "lab table: {} posted, {} answered, {} decided here, {} offered, {} swept\n",
             pass.posted, pass.answered, pass.decided, pass.offered, pass.swept
         ),
-        Err(why) => format!("lab table: not reached ({why}); the ledger holds each need until it is\n"),
+        Err(why) => {
+            format!("lab table: not reached ({why}); the ledger holds each need until it is\n")
+        }
     }
 }
 
@@ -343,7 +349,7 @@ fn thread_row(thread: &Thread) -> String {
 
 fn listing(needs: &[Need], all: Option<&Result<Pass, String>>) -> String {
     let mut out = if needs.is_empty() {
-        "no needs on this Mac\n".to_owned()
+        format!("no needs on this {}\n", aterm_types::machine_name::OS_NOUN)
     } else {
         needs.iter().map(row).collect()
     };

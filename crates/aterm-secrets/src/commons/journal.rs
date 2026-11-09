@@ -173,6 +173,12 @@ impl View {
 /// authenticates each acknowledged record once rather than on every read. A
 /// view is reused only for the exact prefix it was built from, extended only by
 /// records that pass the same verification, and rebuilt for anything else.
+/// Where the journal's folder and files stand as the settled `lstat` of each
+/// taken before the read that kept the view showed them ([`witness`]), the view
+/// is taken without reading them again: an append, a checkpoint renamed over, a
+/// new link and a mode, owner or access-list change each move what one shows,
+/// which nothing moves back, and a read is kept only where it opened the very
+/// files the witness saw ([`stands_for`]).
 struct Views {
     /// Most recently requested first. Only lookup and eviction hold this lock.
     kept: Mutex<Vec<Arc<Entry>>>,
@@ -186,7 +192,49 @@ struct Entry {
 struct Cached {
     prefix: Prefix,
     view: Arc<View>,
+    /// The journal as it stood before the read that kept `view`, where it stands for what
+    /// that read found ([`stands_for`]).
+    witnessed: Option<Witness>,
 }
+
+/// What one `lstat` each showed of a journal's folder and of the files a read of it reads
+/// ([`aterm_journal::committed_files`]): the anchor, the checkpoint and the astream file.
+type Witness = [crate::fsx::Seen; 4];
+
+/// The journal in `dir` as `lstat` shows it now ([`Witness`]); `None` where the folder or a file
+/// is missing or cannot be examined, or is not what a read admits (the folder a directory, each
+/// file a regular file).
+fn witness(dir: &Path) -> Option<Witness> {
+    use crate::fsx::{Kind, seen_if_present};
+    let files = aterm_journal::committed_files(dir, NAME);
+    let seen = |path: &Path, kind| {
+        seen_if_present(path)
+            .ok()
+            .flatten()
+            .filter(|seen| seen.kind == kind)
+    };
+    Some([
+        seen(dir, Kind::Dir)?,
+        seen(&files.anchor, Kind::File)?,
+        seen(&files.checkpoint, Kind::File)?,
+        seen(&files.astream, Kind::File)?,
+    ])
+}
+
+/// Whether `seen`, taken before a read that opened `opened`, may stand for what that read found:
+/// it shows the very files the read opened, and none of what it shows changed within
+/// [`crate::fsx::settled`]'s window of `now`. A copy of the journal swapped in for the read,
+/// through a parent renamed aside and back, moves none of the times a witness holds, but each of
+/// its files is another inode, or one moved out of this folder, which moves the folder's times.
+/// The folder's own verdict is the read's: a folder swapped in for that verdict alone, and out
+/// again before the files are opened, is taken as a fresh read made then takes it.
+fn stands_for(seen: &Witness, opened: &aterm_journal::Opened, now: std::time::SystemTime) -> bool {
+    let [_, anchor, checkpoint, astream] = seen;
+    let id = |seen: &crate::fsx::Seen| (seen.stamp.dev, seen.stamp.ino);
+    (id(anchor), id(checkpoint), id(astream)) == (opened.anchor, opened.checkpoint, opened.astream)
+        && seen.iter().all(|seen| crate::fsx::settled(seen, now))
+}
+
 /// Views one process keeps: a running app reads one journal. A test binary
 /// reads one per test, and a test counting verifications needs its view kept
 /// while other tests read theirs.
@@ -232,21 +280,42 @@ impl Views {
     /// prefix it covers. Takes no journal lock; a refused record leaves the kept
     /// view as it was. A slow read or replay holds only its own entry's mutex.
     fn read(&self, dir: &Path, trust: Trust) -> Result<(Arc<View>, Acknowledged)> {
+        self.read_at(dir, trust, std::time::SystemTime::now())
+    }
+
+    /// [`Self::read`], asked at `now`.
+    fn read_at(
+        &self,
+        dir: &Path,
+        trust: Trust,
+        now: std::time::SystemTime,
+    ) -> Result<(Arc<View>, Acknowledged)> {
         let entry = self.entry(dir, trust);
+        // Taken before the journal is read: a change after this moves the next witness, and a
+        // file swapped in for the read is another than this one saw ([`stands_for`]).
+        let seen = witness(dir);
         let mut cached = entry.cached.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(kept) = cached.as_ref()
+            && seen.is_some()
+            && kept.witnessed == seen
+        {
+            return Ok((Arc::clone(&kept.view), kept.prefix.acknowledged()));
+        }
         #[cfg(test)]
         tests::before_view();
-        let committed = aterm_journal::read_committed(
+        let (committed, opened) = aterm_journal::read_committed_opened(
             dir,
             NAME,
             &trust.bytes(),
             LIMITS,
             cached.as_ref().map(|cached| &cached.prefix),
         )?;
+        let witnessed = seen.filter(|seen| stands_for(seen, &opened, now));
         let unknown = || Error::new("control journal view extended an unknown prefix");
         let (prefix, view) = match committed {
             Committed::Unchanged => {
-                let cached = cached.as_ref().ok_or_else(unknown)?;
+                let cached = cached.as_mut().ok_or_else(unknown)?;
+                cached.witnessed = witnessed;
                 return Ok((Arc::clone(&cached.view), cached.prefix.acknowledged()));
             }
             Committed::Extended { records, prefix } => {
@@ -264,6 +333,7 @@ impl Views {
         *cached = Some(Cached {
             prefix,
             view: Arc::clone(&view),
+            witnessed,
         });
         Ok((view, acknowledged))
     }
@@ -358,7 +428,9 @@ impl Journal {
     /// prefix the checkpoint acknowledged when it was read, authenticated as
     /// [`Journal::open_existing`] replays it, and never repairs or writes.
     /// Within one process, records already verified for this directory and
-    /// trust are not verified again; [`Journal::ingest`] refuses on this view.
+    /// trust are not verified again, and a journal whose folder and files have
+    /// not moved since a settled read is not read again ([`Views`]);
+    /// [`Journal::ingest`] refuses on this view.
     pub fn read_existing(dir: &Path, trust: Trust) -> Result<Self> {
         let (view, _) = VIEWS.read(dir, trust)?;
         Ok(Self {

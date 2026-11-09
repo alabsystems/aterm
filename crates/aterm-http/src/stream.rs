@@ -94,6 +94,18 @@ impl Deadline {
         }
     }
 
+    /// A deadline with no caller-visible whole-operation wall bound. Socket operations still
+    /// take their idle cap; the far-future instant is only the finite representation required
+    /// by platform timeout APIs.
+    #[must_use]
+    pub(crate) fn unbounded() -> Self {
+        Self {
+            at: later(Instant::now(), FAR_FUTURE),
+            idle: None,
+            budget: Budget::Request,
+        }
+    }
+
     /// Caps each individual socket call at `idle`.
     #[inline]
     #[must_use]

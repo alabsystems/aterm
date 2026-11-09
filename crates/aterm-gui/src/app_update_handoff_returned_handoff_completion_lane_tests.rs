@@ -945,7 +945,10 @@ fn a_fork_lane_park_miss_is_recorded_as_the_routine_wait_it_is() {
     }
     let mode = ApplyMode::Immediate;
     assert!(!miss.stops_routinely(mode), "{mode:?}: a person asked");
-    let activity = crate::UpdateHandoffStartError::activity("typing");
+    let activity = crate::UpdateHandoffStartError::activity(
+        crate::native_update_lane_hold::LaneHold::Activity,
+        "typing",
+    );
     assert!(activity.stops_routinely(ApplyMode::Immediate));
     let refusal = crate::UpdateHandoffStartError::capture_refused("session 3");
     assert!(refusal.stops_routinely(ApplyMode::Automatic));

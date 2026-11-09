@@ -184,6 +184,15 @@ pub trait ReleaseHost {
         Duration::ZERO
     }
 
+    /// Whether [`Self::download`] already owns the transport's complete transient-retry budget.
+    ///
+    /// Real HTTP hosts return true: callers must not wrap their bounded transport loop in a
+    /// second retry loop. In-memory and other non-transport hosts retain the small host-level
+    /// retry used by deterministic lane models.
+    fn download_owns_retry(&self) -> bool {
+        false
+    }
+
     fn reads_anonymously(&self) -> bool {
         false
     }

@@ -33,7 +33,7 @@ pub(crate) const fn severity_class(severity: Severity) -> u8 {
 pub(crate) fn rank(live: &Live) -> Rank {
     (
         live.msg.is_ask(),
-        severity_class(live.msg.severity).saturating_sub(u8::from(live.msg.retrospective)),
+        severity_class(live.msg.severity),
         matches!(live.msg.hold, Hold::Live { .. } | Hold::Standing(_)),
         Reverse(live.posted_at),
         Reverse(live.id),

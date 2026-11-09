@@ -6,8 +6,9 @@ use super::*;
 use trust_resource_controller::CommandSpec;
 const MAGIC: &[u8; 8] = b"AMEX0002";
 const MAX_ITEMS: usize = 4096;
-// One compiler CPU, its original GNU pair, SDK keeper and read-only locator.
-const MAX_TARGETS: usize = 5;
+// Actual original GNU pair + SDK keeper + readonly source pair + close-only
+// output directory/lock. This bound supplies no description or resource grant.
+const MAX_TARGETS: usize = 7;
 pub(super) struct ExecPlan {
     pub parent: transport::Peer,
     pub command: CommandSpec,
@@ -172,7 +173,7 @@ mod tests {
                 pid: 123,
                 birth: 456,
             },
-            targets: vec![3, 4, 5, 6, 7],
+            targets: vec![3, 4, 5, 6, 7, 8, 9],
             command: CommandSpec {
                 program: b"/native/bin/query".to_vec(),
                 arg0: Some(vec![b'x', 0xff]),
@@ -197,7 +198,7 @@ mod tests {
         old[..8].copy_from_slice(b"AMEX0001");
         assert!(ExecPlan::decode(&old).is_err());
         let mut changed = decoded;
-        changed.targets.push(8);
+        changed.targets.push(10);
         assert!(changed.encode().is_err());
         changed.targets.pop();
         changed.command.arg0.as_mut().unwrap().push(0);

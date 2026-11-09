@@ -1675,6 +1675,9 @@ impl App {
     }
 
     pub(crate) fn settle_native_pointer_press(&mut self, wid: WindowId) {
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.page_buttons = 0;
+        }
         if let Some((_, view)) = self.active_native_view(wid)
             && self
                 .native_runtime
@@ -2449,12 +2452,38 @@ impl App {
         let over_chrome = self.pane_header_at_with(wid, geom, x, y).is_some()
             || self.strip_col_at_with(wid, geom, x, y).is_some()
             || self.band_banner_at(wid, x, y).is_some()
-            || self.find_bar_cell_at(wid, x, y).is_some();
+            || self.find_bar_cell_at(wid, x, y).is_some()
+            || self.stats_owns_pointer(wid);
         let hit = self.native_hover_hit(wid, x, y, over_chrome);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.native_rehover = false;
         }
         self.apply_native_hover(wid, hit.map(|(view, _, key, ..)| (view, key)));
+    }
+
+    pub(crate) fn evict_native_hover_under_stats_lens(&mut self, wid: WindowId) {
+        let Some((x, y)) = self
+            .windows
+            .get(&wid)
+            .filter(|ws| ws.pointer_position_known)
+            .map(|ws| ws.last_cursor_px)
+        else {
+            return;
+        };
+        if !self.stats_lens_at(wid, x, y) {
+            return;
+        }
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.native_rest = None;
+            if ws.hover_pointer || ws.native_text_cursor {
+                ws.hover_pointer = false;
+                ws.native_text_cursor = false;
+                if let Some(w) = &ws.os_window {
+                    w.set_cursor(CursorIcon::Default);
+                }
+            }
+        }
+        self.apply_native_hover(wid, None);
     }
 
     fn pointer_readback(&self, wid: WindowId) -> Option<(i32, u16)> {

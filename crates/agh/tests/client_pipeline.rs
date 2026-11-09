@@ -378,6 +378,65 @@ fn a_read_301_is_followed_once_and_noted() {
     assert_eq!(gh.meter().moved, Some(moved));
 }
 
+/// The 301, its anonymous repository-id lookup, and the retargeted read are one logical read.
+/// A transient failure in either subrequest returns to the outer budget; reverting either
+/// subrequest to its own retry loop consumes the next scripted 301 at the wrong URL and fails.
+#[test]
+fn moved_repository_subrequests_share_the_outer_retry_budget() {
+    let transport = Arc::new(ScriptedTransport::new());
+    let location = format!("{}/repositories/1000/releases", common::base(API));
+    let looked = br#"{"id":1000,"full_name":"fixture-dev/renamed"}"#;
+
+    // Attempt 1: the anonymous id lookup fails. Attempt 2: the moved read fails. Attempt 3:
+    // the whole composite read succeeds.
+    transport.answer(301, &[("location", &location)], b"{}");
+    transport.answer(504, &[], b"{}");
+    transport.answer(301, &[("location", &location)], b"{}");
+    transport.answer(200, &[], looked);
+    transport.answer(504, &[], b"{}");
+    transport.answer(301, &[("location", &location)], b"{}");
+    transport.answer(200, &[], looked);
+    transport.answer(200, &[], b"[]");
+
+    let gh = common::scripted_with_retry(&transport, API, RetryPolicy::STANDARD);
+    let answered = gh
+        .call(&repo_call("/repos/fixture-dev/repo/releases"))
+        .expect("the third composite attempt answers");
+    assert_eq!(answered.requests, 8);
+    assert_eq!(transport.requests().len(), 8);
+    assert_eq!(gh.fx().retry_notes().len(), 2);
+    assert_eq!(gh.fx().slept(), vec![std::time::Duration::from_secs(10); 2]);
+}
+
+/// NEGATIVE CONTROL: an endless move-lookup outage spends exactly one 19-attempt outer budget,
+/// not a fresh 19-attempt budget inside the first 301.
+#[test]
+fn moved_repository_lookup_exhausts_one_composite_budget() {
+    let transport = Arc::new(ScriptedTransport::new());
+    let location = format!("{}/repositories/1000/releases", common::base(API));
+    for _ in 0..19 {
+        transport.answer(301, &[("location", &location)], b"{}");
+        transport.answer(503, &[], b"{}");
+    }
+    transport.answer(200, &[], b"unused");
+
+    let gh = common::scripted_with_retry(&transport, API, RetryPolicy::STANDARD);
+    let error = gh
+        .call(&repo_call("/repos/fixture-dev/repo/releases"))
+        .expect_err("the one shared budget is exhausted");
+    assert!(
+        error
+            .why
+            .contains("19 attempts / 200s total retry-pause bound"),
+        "{}",
+        error.why
+    );
+    assert!(!error.why.contains("1 attempts / 0s"), "{}", error.why);
+    assert_eq!(transport.requests().len(), 38);
+    assert_eq!(transport.remaining(), 1);
+    assert_eq!(gh.fx().retry_notes().len(), 18);
+}
+
 #[test]
 fn a_moved_repository_invisible_anonymously_is_not_visible() {
     let transport = Arc::new(ScriptedTransport::new());
@@ -816,6 +875,21 @@ mod routed {
                 common::scripted_endpoints(API),
             )
         }
+
+        fn github_with_retry(
+            &self,
+            transport: &Arc<ScriptedTransport>,
+            retry: RetryPolicy,
+        ) -> Github {
+            agh::GithubBuilder::new(self.router(|text| text))
+                .transport(transport.clone())
+                .endpoints(common::scripted_endpoints(API))
+                .env(Arc::new(common::env()))
+                .fx(Arc::new(agh::Fx::simulated(common::SIM_START)))
+                .caller("test")
+                .retry(retry)
+                .build()
+        }
     }
 
     fn classic() -> String {
@@ -918,6 +992,71 @@ mod routed {
     }
 
     #[test]
+    fn an_authenticated_asset_read_gives_its_anonymous_hop_the_shared_budget() {
+        let world = World::new("pipeline-hop-retry", Some(&classic()), false);
+        let transport = Arc::new(ScriptedTransport::new());
+        for status in [504, 504, 200] {
+            transport.answer(302, &[("location", "http://127.0.0.1:47404/a?sig=1")], b"");
+            transport.answer(status, &[], b"bytes");
+        }
+        let gh = world.github(&transport);
+        let call = asset_stream().retry(Some(RetryPolicy::STANDARD));
+        gh.call_stream(&call)
+            .expect("the third anonymous CDN attempt answers");
+        assert_eq!(transport.requests().len(), 6);
+        assert_eq!(gh.fx().retry_notes().len(), 2);
+        assert!(
+            transport
+                .requests()
+                .iter()
+                .step_by(2)
+                .all(|request| request.auth_profile.as_deref() == Some("dev"))
+        );
+        assert!(
+            transport
+                .requests()
+                .iter()
+                .skip(1)
+                .step_by(2)
+                .all(|request| request.auth_profile.is_none())
+        );
+
+        let transport = Arc::new(ScriptedTransport::new());
+        transport.answer(302, &[("location", "http://127.0.0.1:47404/a?sig=1")], b"");
+        transport.answer(404, &[], b"missing");
+        transport.answer(200, &[], b"must not run");
+        let gh = world.github(&transport);
+        let error = gh
+            .call_stream(&asset_stream().retry(Some(RetryPolicy::STANDARD)))
+            .expect_err("CDN absence is final");
+        assert_eq!(error.http.as_ref().map(|http| http.status), Some(404));
+        assert_eq!(transport.requests().len(), 2);
+        assert_eq!(transport.remaining(), 1);
+        assert!(gh.fx().retry_notes().is_empty());
+
+        let transport = Arc::new(ScriptedTransport::new());
+        for _ in 0..19 {
+            transport.answer(302, &[("location", "http://127.0.0.1:47404/a?sig=1")], b"");
+            transport.answer(503, &[], b"busy");
+        }
+        transport.answer(200, &[], b"must not run");
+        let gh = world.github(&transport);
+        let error = gh
+            .call_stream(&asset_stream().retry(Some(RetryPolicy::STANDARD)))
+            .expect_err("the anonymous CDN budget is finite");
+        assert!(
+            error
+                .why
+                .contains("19 attempts / 200s total retry-pause bound"),
+            "{}",
+            error.why
+        );
+        assert_eq!(transport.requests().len(), 38);
+        assert_eq!(transport.remaining(), 1);
+        assert_eq!(gh.fx().retry_notes().len(), 18);
+    }
+
+    #[test]
     fn a_routed_read_carries_the_credential_at_the_api_origin_only() {
         let world = World::new("pipeline-routed", Some(&classic()), false);
         let transport = Arc::new(ScriptedTransport::new());
@@ -949,6 +1088,140 @@ mod routed {
             Some(fingerprint.as_str())
         );
         assert!(!gh.meter().fell_to_anonymous);
+    }
+
+    /// NEGATIVE CONTROL: the anonymous outage policy is selected from the routed identity, not
+    /// by globally widening STANDARD. A credentialed read keeps the pre-existing three attempts
+    /// and 2 s / 5 s pauses.
+    #[test]
+    fn credentialed_standard_keeps_its_three_attempt_bound() {
+        let world = World::new("pipeline-credentialed-retry-bound", Some(&classic()), false);
+        let transport = Arc::new(ScriptedTransport::new());
+        // The configured login already binds this route. The read receives three server
+        // failures; a fourth answer proves it is not using the anonymous 19-attempt lane.
+        for _ in 0..3 {
+            transport.answer(503, &[], b"{}");
+        }
+        transport.answer(200, &[], b"unused");
+        let gh = agh::GithubBuilder::new(world.router(|text| text))
+            .transport(transport.clone())
+            .endpoints(common::scripted_endpoints(API))
+            .env(Arc::new(common::env()))
+            .fx(Arc::new(agh::Fx::simulated(common::SIM_START)))
+            .caller("test")
+            .retry(RetryPolicy::STANDARD)
+            .build();
+
+        let error = gh
+            .call(&repo_call("/repos/fixture-dev/repo"))
+            .expect_err("the credentialed three-attempt policy is exhausted");
+        assert!(error.why.contains("3 attempts"), "{}", error.why);
+        assert_eq!(transport.requests().len(), 3);
+        assert_eq!(transport.remaining(), 1);
+        assert_eq!(
+            gh.fx().slept(),
+            vec![
+                std::time::Duration::from_secs(2),
+                std::time::Duration::from_secs(5)
+            ]
+        );
+        assert!(
+            transport
+                .requests()
+                .iter()
+                .all(|request| request.auth_profile.as_deref() == Some("dev"))
+        );
+    }
+
+    #[test]
+    fn a_credentialed_move_gives_its_anonymous_lookup_the_shared_outage_budget() {
+        let world = World::new("pipeline-credentialed-move-retry", Some(&classic()), false);
+        let transport = Arc::new(ScriptedTransport::new());
+        let location = format!("{}/repositories/1000/releases", common::base(API));
+        let looked = br#"{"id":1000,"full_name":"fixture-dev/renamed"}"#;
+        for status in [504, 504] {
+            transport.answer(301, &[("location", &location)], b"{}");
+            transport.answer(status, &[], b"{}");
+        }
+        transport.answer(301, &[("location", &location)], b"{}");
+        transport.answer(200, &[], looked);
+        transport.answer(200, &[], b"[]");
+        let gh = world.github_with_retry(&transport, RetryPolicy::STANDARD);
+
+        let answered = gh
+            .call(&repo_call("/repos/fixture-dev/repo/releases"))
+            .expect("the anonymous lookup survives two 504s");
+        assert_eq!(answered.requests, 7);
+        assert_eq!(transport.requests().len(), 7);
+        assert_eq!(gh.fx().retry_notes().len(), 2);
+        assert_eq!(gh.fx().slept(), vec![std::time::Duration::from_secs(10); 2]);
+        let requests = transport.requests();
+        let identities: Vec<Option<&str>> = requests
+            .iter()
+            .map(|request| request.auth_profile.as_deref())
+            .collect();
+        assert_eq!(
+            identities,
+            [
+                Some("dev"),
+                None,
+                Some("dev"),
+                None,
+                Some("dev"),
+                None,
+                Some("dev"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_credentialed_moves_anonymous_404_is_final_without_a_retry() {
+        let world = World::new("pipeline-credentialed-move-404", Some(&classic()), false);
+        let transport = Arc::new(ScriptedTransport::new());
+        let location = format!("{}/repositories/1000/releases", common::base(API));
+        transport.answer(301, &[("location", &location)], b"{}");
+        transport.answer(404, &[], b"{}");
+        transport.answer(200, &[], b"unused");
+        let gh = world.github_with_retry(&transport, RetryPolicy::STANDARD);
+
+        let error = gh
+            .call(&repo_call("/repos/fixture-dev/repo/releases"))
+            .expect_err("anonymous absence is final");
+        assert_eq!(error.kind, Kind::NotVisible);
+        assert_eq!(transport.requests().len(), 2);
+        assert_eq!(transport.remaining(), 1);
+        assert!(gh.fx().retry_notes().is_empty());
+    }
+
+    #[test]
+    fn a_credentialed_moves_endless_anonymous_5xx_exhausts_one_shared_bound() {
+        let world = World::new("pipeline-credentialed-move-bound", Some(&classic()), false);
+        let transport = Arc::new(ScriptedTransport::new());
+        let location = format!("{}/repositories/1000/releases", common::base(API));
+        for _ in 0..19 {
+            transport.answer(301, &[("location", &location)], b"{}");
+            transport.answer(503, &[], b"{}");
+        }
+        transport.answer(200, &[], b"unused");
+        let gh = world.github_with_retry(&transport, RetryPolicy::STANDARD);
+
+        let error = gh
+            .call(&repo_call("/repos/fixture-dev/repo/releases"))
+            .expect_err("one shared anonymous budget is exhausted");
+        assert!(
+            error
+                .why
+                .contains("19 attempts / 200s total retry-pause bound"),
+            "{}",
+            error.why
+        );
+        assert_eq!(transport.requests().len(), 38);
+        assert_eq!(transport.remaining(), 1);
+        assert_eq!(gh.fx().retry_notes().len(), 18);
+        assert_eq!(
+            gh.fx().slept(),
+            vec![std::time::Duration::from_secs(10); 18]
+        );
     }
 
     #[test]

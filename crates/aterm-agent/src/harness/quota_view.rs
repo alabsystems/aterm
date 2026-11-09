@@ -236,15 +236,25 @@ impl Cell {
         }
     }
 
-    /// A midnight's tick may stand in it (§2.2): it draws a level (a measured step, the projected
-    /// line, a lane's out line), `┄` or nothing, never a letter or a mark (a name, `→`, `↺`, `╳`,
-    /// `$`, `▕`), which a line of ink would strike through.
+    /// A midnight's tick may stand in it on line E's chart or the card's work row (§2.2), and on
+    /// a lane but where it is blank ([`Cell::lane_ticks`]): it draws a level (a measured step,
+    /// the projected line, a lane's out line), `┄` or nothing, never a letter or a mark (a name,
+    /// `→`, `↺`, `╳`, `$`, `▕`), which a line of ink would strike through.
     #[must_use]
     pub const fn ticks(self) -> bool {
         matches!(
             self,
             Cell::Blank | Cell::Read(_) | Cell::Ahead(_) | Cell::Unknown | Cell::Out
         )
+    }
+
+    /// A midnight's tick may stand in it on a card lane (§1.4): only where the lane draws (a
+    /// measured step, the projected line, its out line, `┄`). A lane's blank cell is the card's
+    /// ground, before its week's first reading on this Mac, as the ground after its `↺` is; a
+    /// tick there marks no day on any line and stands alone over the next item's words.
+    #[must_use]
+    pub const fn lane_ticks(self) -> bool {
+        !matches!(self, Cell::Blank) && self.ticks()
     }
 }
 
@@ -344,7 +354,7 @@ impl QuotaLine {
 /// The tail (§2.3): at most two phrases.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Tail {
-    /// Phrase 1, this tab's account: `~98% by ↺ Sat 10:00`, short `↺ Sat 10:00`. None where no
+    /// Phrase 1, this tab's account: `~99% by ↺ Sat 10:00`, short `↺ Sat 10:00`. None where no
     /// reset is ahead, or where the work waits at a wall until this very reset (phrase 2's
     /// `⧗ until Sat 10:00` says it).
     pub own: Option<Own>,
@@ -355,8 +365,9 @@ pub struct Tail {
 /// Phrase 1 (§2.3).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Own {
-    /// The curve at the reset, whole percent, at most 99 (`~98%`): none where the account fills
-    /// or is left before its reset, or nothing is projected (the full form is the short one).
+    /// The curve at the reset, whole percent half up, at most 99 (case (b)'s 98.875% is `~99%`):
+    /// none where the account fills or is left before its reset, or nothing is projected (the
+    /// full form is the short one).
     pub by_reset: Option<u16>,
     /// The reset's words (`Sat 10:00`), exact.
     pub reset: String,
@@ -365,9 +376,9 @@ pub struct Own {
 /// Phrase 2 (§2.3).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Phrase {
-    /// The full form (`╳ ~Thu 12 Nov 05:00–Sat 14 Nov 10:00`).
+    /// The full form (`╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00`).
     pub full: String,
-    /// The short form (`╳ ~Thu 12 Nov 05:00`).
+    /// The short form (`╳ ~Thu 12 Nov 04:00`).
     pub short: String,
     /// Its ink: warn for `╳`, `⧗`, `$`.
     pub ink: Role,
@@ -662,14 +673,21 @@ impl Chart {
     /// The midnights' ticks (§2.2) on a row whose cells from its `lead`-th are `cells`, drawn at
     /// `per_day` cells a day on this chart's clock (the chart itself, or a card lane on it,
     /// [`Burn::cells`]), into `out` (cleared first): each midnight's place from the row's left
-    /// edge ([`Chart::midnights_at`]) where its cell takes a tick ([`Cell::ticks`]), so none
-    /// past the row's last cell (a lane ends at its reset).
-    pub fn ticks(&self, per_day: u8, lead: usize, cells: &[Cell], out: &mut Vec<i64>) {
+    /// edge ([`Chart::midnights_at`]) where its cell takes a tick by `takes` ([`Cell::ticks`] on
+    /// the chart and the work row, [`Cell::lane_ticks`] on a lane), so none past the row's last
+    /// cell (a lane ends at its reset).
+    pub fn ticks(
+        &self,
+        per_day: u8,
+        (lead, takes): (usize, fn(Cell) -> bool),
+        cells: &[Cell],
+        out: &mut Vec<i64>,
+    ) {
         out.clear();
         let lead = i64::try_from(lead).unwrap_or(0) * CELL_PLACES;
         out.extend(
             self.midnights_at(per_day)
-                .filter(|&(cell, _)| cells.get(cell).is_some_and(|c| c.ticks()))
+                .filter(|&(cell, _)| cells.get(cell).is_some_and(|&c| takes(c)))
                 .map(|(_, place)| lead + place),
         );
     }
@@ -2117,8 +2135,9 @@ pub(super) fn whole_spoken(x10: u16) -> u16 {
 impl QuotaView {
     /// Case (b) of the glass design (§1) as a pane's view, built by hand for other crates' tests
     /// of what the window draws from a view: `main` at 63% of its week, its reset Sat 10:00
-    /// (`~98%` by then), a gap projected from ~Thu 12 Nov 05:00 to its next reset, Sat 14 Nov
-    /// 10:00; no chart. The outlook's own tests build views from replays ([`Outlook::quota`]).
+    /// (`~99%` by then), a gap projected from ~Thu 12 Nov 04:00 to its next reset, Sat 14 Nov
+    /// 10:00; no chart. Its words are case (b)'s replay's (`case_b_lays_r2_r5_r7` holds them
+    /// equal); the outlook's own tests build views from replays ([`Outlook::quota`]).
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn sample() -> QuotaView {
@@ -2133,24 +2152,24 @@ impl QuotaView {
             }],
             tail: Tail {
                 own: Some(Own {
-                    by_reset: Some(98),
+                    by_reset: Some(99),
                     reset: "Sat 10:00".into(),
                 }),
                 verdict: Some(Phrase {
-                    full: format!("{GAP_MARK} ~Thu 12 Nov 05:00\u{2013}Sat 14 Nov 10:00"),
-                    short: format!("{GAP_MARK} ~Thu 12 Nov 05:00"),
+                    full: format!("{GAP_MARK} ~Thu 12 Nov 04:00\u{2013}Sat 14 Nov 10:00"),
+                    short: format!("{GAP_MARK} ~Thu 12 Nov 04:00"),
                     ink: Role::Warn,
                     kept: true,
                 }),
             },
             title: format!(
-                "main{SEP}Max 20x{SEP}63% of its week used, read now{SEP}~98% by its reset Sat \
-                 10:00{SEP}next week out ~Thu 12 Nov 05:00 until its reset Sat 14 Nov 10:00{SEP}\
-                 {CLICK}"
+                "main{SEP}Max 20x{SEP}63% of its week used, read now{SEP}~99% by its reset Sat \
+                 10:00{SEP}next week out ~Thu 12 Nov 04:00 until its reset Sat 14 Nov 10:00{SEP}\
+                 at this Mac's last-24 h pace, 21% a day{SEP}{CLICK}"
             ),
             spoken: "Accounts. main, this tab, 63 percent of its week used, resets Saturday \
-                     10:00. Every account out from about Thursday 12 November 05:00 until main's \
-                     reset Saturday 14 November 10:00."
+                     10:00. Next 7 days at 21 percent a day: main; next week out from about \
+                     Thursday 12 November 04:00 until its reset Saturday 14 November 10:00."
                 .into(),
             ..QuotaView::default()
         }
@@ -2228,7 +2247,8 @@ impl QuotaView {
                 );
                 out.chart = from..out.cells.len();
                 out.per_day = per_day;
-                self.chart.ticks(per_day, 0, &chart, &mut out.ticks);
+                self.chart
+                    .ticks(per_day, (0, Cell::ticks), &chart, &mut out.ticks);
             }
             if self.tail.own.is_some() || self.tail.verdict.is_some() {
                 out.gap();
@@ -2311,7 +2331,7 @@ impl QuotaView {
     /// What the pointer on cell `cell` of the chart laid at `per_day` cells a day names (§2.6),
     /// in local time by `offsets`: a past cell its span and the reading it holds (`Wed 4 Nov
     /// 20:00–23:00 · main 50% (read on this Mac)`); a future level its span and the drawn
-    /// account's projected fill (`~Tue 10 Nov 14:00–17:00 · main ~45% (projected)`); a `→` the
+    /// account's projected fill (`~Tue 10 Nov 14:00–17:00 · main ~69% (projected)`); a `→` the
     /// hand-off (`~Fri 08:00 · the work moves from main (98%) to alt1`; `(out)` for a fill the
     /// projection reaches, never 100%; a move where a wall lifts at a named account's reset said
     /// at that reset exactly, `Sat 10:00 · the work moves to main`), and a name after it the

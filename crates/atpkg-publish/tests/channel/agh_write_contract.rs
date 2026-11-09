@@ -232,6 +232,8 @@ pub(super) struct Setup {
     push: bool,
     /// Whether the dev profile's token file is there.
     dev_token: bool,
+    /// Whether fixture-dev's read chain falls back to anonymous.
+    dev_anonymous: bool,
     /// Whether agh.toml grants atpkg-publish `alabsystems/aterm`.
     grant: bool,
 }
@@ -241,12 +243,14 @@ impl Setup {
         slug: SLUG,
         push: true,
         dev_token: true,
+        dev_anonymous: false,
         grant: false,
     };
     pub(super) const RELEASE: Setup = Setup {
         slug: RELEASE_SLUG,
         push: true,
         dev_token: true,
+        dev_anonymous: false,
         grant: true,
     };
 }
@@ -264,14 +268,19 @@ pub(super) struct AghWorld {
 
 /// The agh.toml of the write contract: a dev and a release profile, the two fixture owners,
 /// and, when `grant`, atpkg-publish's `[[writers]]` row.
-fn config_text(tokens: &Path, grant: bool) -> String {
+fn config_text(tokens: &Path, grant: bool, dev_anonymous: bool) -> String {
     let tokens = toml_path(tokens);
+    let dev_read = if dev_anonymous {
+        "[\"dev\", \"anonymous\"]"
+    } else {
+        "[\"dev\"]"
+    };
     let mut text = format!(
         "[profiles.dev]\ntoken_file = \"{tokens}/dev.token\"\ntier = \"dev\"\n\
          login = \"fixture-dev-bot\"\n\n\
          [profiles.release]\ntoken_file = \"{tokens}/release.token\"\ntier = \"release\"\n\
          login = \"fixture-release-bot\"\n\n\
-         [[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = [\"dev\"]\nwrite = \"dev\"\n\n\
+         [[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = {dev_read}\nwrite = \"dev\"\n\n\
          [[owners]]\nname = \"alabsystems\"\ntier = \"release\"\nread = [\"dev\", \"anonymous\"]\n\
          write = \"release\"\n"
     );
@@ -299,6 +308,13 @@ impl AghWorld {
     }
 
     pub(super) fn build(setup: Setup) -> AghWorld {
+        Self::build_with_concurrent_clone_destination(setup, None)
+    }
+
+    fn build_with_concurrent_clone_destination(
+        setup: Setup,
+        concurrent_clone_destination: Option<&'static str>,
+    ) -> AghWorld {
         let fake = FakeGithub::start();
         let root = scratch("write-contract-agh");
         let dirs = Dirs::under(root.path());
@@ -319,7 +335,10 @@ impl AghWorld {
                 .expect("the token file");
             }
         }
-        let router = file_router(&dirs, &config_text(&tokens, setup.grant));
+        let router = file_router(
+            &dirs,
+            &config_text(&tokens, setup.grant, setup.dev_anonymous),
+        );
         let login = if setup.slug == RELEASE_SLUG {
             "fixture-release-bot"
         } else {
@@ -339,7 +358,16 @@ impl AghWorld {
         let env = MapEnv::new()
             .with("PATH", &path)
             .with("HOME", &home.to_string_lossy());
-        let fx = Arc::new(Fx::simulated(SIM_START));
+        let mut fx = Fx::simulated(SIM_START);
+        if let Some(relative) = concurrent_clone_destination {
+            let destination = root.path().join(relative);
+            fx = fx.with_git_child_observer_for_tests(move |_| {
+                std::fs::create_dir_all(&destination).expect("concurrent clone destination");
+                std::fs::write(destination.join("theirs"), b"keep")
+                    .expect("concurrent destination file");
+            });
+        }
+        let fx = Arc::new(fx);
         let github = agh::GithubBuilder::new(router)
             .transport(Arc::new(HttpTransport::direct(Arc::new(env.clone()))))
             .endpoints(endpoints.clone())
@@ -1086,12 +1114,17 @@ fn clone_then_fetch_agh() {
     on_agh(case_clone_then_fetch);
 }
 
-/// A lane's clone and fetch through agh run under the lane's budget, not agh's ten-minute
-/// default, which would kill a large clone over a slow link (`RestHost`'s git has no limit).
+/// A lane's anonymous clone and fetch through agh use a progress-inactivity bound. The lane's
+/// four-hour wall budget remains in the inert field that authenticated reads use, but cannot kill
+/// a large anonymous clone whose transfer keeps advancing.
 #[test]
-fn a_lane_clone_and_fetch_run_under_the_lane_budget() {
+fn a_lane_anonymous_clone_and_fetch_run_while_progress_continues() {
     use atpkg_publish::host::agh::LANE_GIT_BUDGET;
-    let w = AghWorld::new();
+    let w = AghWorld::build(Setup {
+        dev_token: false,
+        dev_anonymous: true,
+        ..Setup::DEV
+    });
     bare_repo(&w.dir().join("work"), &w.remote());
     let dest = w.dir().join("clone");
     w.host.clone_repo(&w.slug(), &dest).expect("the clone");
@@ -1104,7 +1137,8 @@ fn a_lane_clone_and_fetch_run_under_the_lane_budget() {
     assert_eq!(runs.len(), 2, "{runs:?}");
     for spec in &runs {
         assert_eq!(spec.budget, LANE_GIT_BUDGET, "{:?}", spec.args);
-        assert_ne!(spec.budget, agh::git::GIT_BUDGET, "{:?}", spec.args);
+        let progress = spec.progress.as_ref().expect("anonymous progress bound");
+        assert_eq!(progress.window, Duration::from_secs(60), "{:?}", spec.args);
     }
 }
 
@@ -1127,6 +1161,28 @@ fn a_failed_lane_clone_leaves_no_directory_it_made() {
         "no remote laid"
     );
     assert!(kept.is_dir());
+}
+
+/// Agh owns a private sibling stage, not the caller's destination. If another actor creates the
+/// destination after clone admission, publication refuses and the host wrapper must not revive
+/// its obsolete partial-clone cleanup by deleting that actor's files.
+#[test]
+fn a_failed_lane_clone_preserves_a_concurrent_destination() {
+    let w = AghWorld::build_with_concurrent_clone_destination(Setup::DEV, Some("raced"));
+    bare_repo(&w.dir().join("work"), &w.remote());
+    let destination = w.dir().join("raced");
+    let error = w
+        .host
+        .clone_repo(&w.slug(), &destination)
+        .expect_err("the concurrent nonempty destination refuses publication");
+    assert!(
+        error.to_string().contains("without replacing caller files"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("theirs")).expect("concurrent file preserved"),
+        b"keep"
+    );
 }
 
 /// During the swap both hosts write the same staging releases, so a clobber drops the other

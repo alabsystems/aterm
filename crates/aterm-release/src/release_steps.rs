@@ -148,6 +148,35 @@ fn detach(cmd: &mut Command) {
     cmd.setsid(true).default_signals();
 }
 
+/// Run the anonymous appcast transport through a release step's child launcher. Keeping this
+/// adapter below the shared transport means every retry is still a noted, interruptible release
+/// child rather than a curl started behind the step supervisor.
+fn appcast_bytes_with<L>(
+    url: &str,
+    cap: u64,
+    launch: L,
+    fetch: impl FnOnce(&str, u64, &dyn aterm_update_core::github_rest::Spawn) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String>
+where
+    L: crate::site::Launch + Send + Sync,
+{
+    let spawn = crate::github::Launched(launch);
+    fetch(url, cap, &spawn)
+}
+
+fn appcast_bytes<L: crate::site::Launch + Send + Sync>(
+    url: &str,
+    cap: u64,
+    launch: L,
+) -> Result<Vec<u8>, String> {
+    appcast_bytes_with(
+        url,
+        cap,
+        launch,
+        aterm_update_core::download_bytes_uncached_via,
+    )
+}
+
 fn note_child_in(release: &Path, step: Step, pid: u32) -> PathBuf {
     let started = started_of(pid).unwrap_or_default();
     let note = crate::release::child_note(release, pid);
@@ -1110,7 +1139,17 @@ impl Real {
 
     fn align_tap(&self, site_tag: &str) -> Result<String, Refusal> {
         let mut command = self.tap_command(site_tag)?;
-        let ran = self.logged(Step::AfterCut, &mut command);
+        let ran = self.logged_in(
+            Logged {
+                step: Step::AfterCut,
+                log: self.side_log(Step::AfterCut, "tap"),
+                stream: self.verbose,
+                stop: None,
+                push: None,
+                arrivals: false,
+            },
+            &mut command,
+        );
         if ran.code != 0 {
             return Err(Refusal::new(
                 format!(
@@ -3497,25 +3536,9 @@ impl Real {
         {
             return Ok(vec![problem]);
         }
-        let served = self.output_forwarded(command(aterm_uds::os_path!("curl")).args([
-            "-fsSL",
-            "--proto-redir",
-            "=https",
-            "--max-time",
-            "60",
-            "--",
-            &want,
-        ]));
-        let text = match served {
-            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-            Ok(o) => {
-                return Err(format!(
-                    "the appcast at {want} could not be fetched anonymously ({})",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ));
-            }
-            Err(e) => return Err(format!("cannot run curl: {e}")),
-        };
+        let served = appcast_bytes(&want, atpkg::net::MANIFEST_CAP, self.step_children())
+            .map_err(|e| format!("the appcast at {want} could not be fetched anonymously ({e})"))?;
+        let text = String::from_utf8_lossy(&served);
         Ok(appcast_problems(&text, slug, tag, version))
     }
 
@@ -3544,14 +3567,14 @@ impl Real {
         crate::github::get_via(Some(&spawn), path).map_err(|e| e.to_string())
     }
 
-    fn site(&mut self, slug: &str) -> Result<AfterCut, Refusal> {
+    fn site(&self, slug: &str) -> Result<AfterCut, Refusal> {
         if interrupt::caught().is_some() {
             return Err(Refusal::new(
                 "not started: the release was interrupted",
                 format!("{RELEASE_COMMAND} again"),
             ));
         }
-        let log = self.log_path(Step::AfterCut);
+        let log = self.side_log(Step::AfterCut, "site");
         let file = crate::durable::open_append(&log, true).map_err(|e| {
             Refusal::new(
                 format!("cannot open {}: {e}", log.display()),
@@ -3680,6 +3703,23 @@ pub fn site_outcome(
         )
         .detail(detail)),
     }
+}
+
+/// PUBLIC-SHAPE-BEFORE-WRITES: no distribution writer starts without the
+/// public cohort's shape verdict. Both writers join, including on a refusal.
+fn distribute_after_shape(
+    log: &Path,
+    shape: Result<(), Refusal>,
+    site: impl FnOnce() -> Result<AfterCut, Refusal> + Send,
+    tap: impl FnOnce() -> Result<String, Refusal> + Send,
+) -> Result<(AfterCut, String), Refusal> {
+    shape?;
+    let (site, tap) = crate::cut_timing::independent_logged(
+        Some(log),
+        ("after-cut site", site),
+        ("after-cut tap", tap),
+    );
+    Ok((site?, tap?))
 }
 
 fn built_answer(repo: &Path, artifact: Option<&Artifact>, prover: &Prover) -> Answer {
@@ -6951,76 +6991,8 @@ impl Backend for Real {
         reserved: &Reservation,
         prover: &Prover,
     ) -> Result<String, Refusal> {
-        let pins = fixture_pins(c, reserved);
-        let again = || {
-            format!(
-                "run {RELEASE_COMMAND} again, which lands them on the tip it finds (or add them \
-                 by hand: {}, \"By hand\")",
-                crate::gates::HANDOFF_FIXTURE_README
-            )
-        };
-        let git = self.git();
-        let fetched = crate::publish::native_origin(&self.repo)
-            .and_then(|native| native.refresh_main().map_err(crate::ledger::Error::new));
-        if fetched.is_ok()
-            && let Ok(Some(found)) = crate::fixtures::on_commit(&git, "origin/main", &c.version)
-        {
-            return Ok(crate::fixtures::Landed::Already {
-                tip: self
-                    .git_out(&["rev-parse", "origin/main"])
-                    .unwrap_or_default(),
-                desks: found.desks,
-            }
-            .words(&pins));
-        }
-        let root = fixture_root(&self.repo)?;
-        let mut words = Vec::new();
-        let staged = match crate::fixtures::staged(&root, &pins) {
-            Some(staged) => staged,
-            None => {
-                let log = self.step_log(self.step);
-                words.push(self.stage_fixtures_run(self.step, c, reserved, prover, &log)?);
-                crate::fixtures::staged(&root, &pins).ok_or_else(|| {
-                    Refusal::new(
-                        format!(
-                            "v{}'s handoff fixtures were written and are gone",
-                            c.version
-                        ),
-                        again(),
-                    )
-                })?
-            }
-        };
-        let targo = prover.bin.join("targo");
-        let mut reader = crate::fixtures::MainReader::new(&self.repo);
-        let log = self.step_log(self.step);
-        let landed = crate::fixtures::land(
-            &git,
-            &crate::publish::native_origin(&self.repo).map_err(|why| {
-                Refusal::new(
-                    "cannot bind fixture landing to this workspace's native origin",
-                    "restore the configured repository matching Cargo.toml before rerunning",
-                )
-                .detail([why.to_string()])
-            })?,
-            &staged,
-            &pins,
-            &mut |preview| match &mut reader {
-                Ok(reader) => reader.read(&targo, preview, &pins, &mut |cmd| {
-                    self.captured(self.step, prover, &log, cmd)
-                }),
-                Err(why) => crate::fixtures::Reading {
-                    checked: None,
-                    answers: Err(why.to_string()),
-                    checks: format!("COULD NOT RUN: {why}"),
-                },
-            },
-        )
-        .map_err(|e| Refusal::new(e.to_string(), again()))?;
-        words.push(landed.words(&pins));
-        Ok(words.join("; "))
+        self.land_fixtures_shared(c, reserved, prover)
     }
-
     fn audit(&mut self, machine_id: &str, profile: Option<&Path>, dry: bool) -> Vec<Finding> {
         crate::provision::audit(&self.repo, machine_id, profile, dry)
     }
@@ -7251,10 +7223,133 @@ impl Backend for Real {
     }
 
     fn after_cut(&mut self, version: &str) -> Result<AfterCut, Refusal> {
+        self.after_cut_shared(version)
+    }
+
+    fn after_cut_with_fixtures(
+        &mut self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+    ) -> (Result<AfterCut, Refusal>, Result<String, Refusal>) {
+        // FIXTURES-BEFORE-READER: land_fixtures_shared validates or stages the
+        // reserved fixture set before starting the main reader. It reads no
+        // site or tap state; step 8 has already made the release public.
+        let log = self.step_log(Step::AfterCut);
+        crate::cut_timing::independent_logged(
+            Some(&log),
+            ("after-cut distribution", || {
+                self.after_cut_shared(&c.version)
+            }),
+            ("after-cut main reader", || {
+                self.land_fixtures_shared(c, reserved, prover)
+            }),
+        )
+    }
+    fn latest(&mut self) -> Result<Option<String>, String> {
+        let slug = self.slug();
+        let release = self.github_read(&format!("repos/{slug}/releases/latest"))?;
+        Ok(release["tag_name"].as_str().map(str::to_string))
+    }
+}
+
+impl Real {
+    fn land_fixtures_shared(
+        &self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+    ) -> Result<String, Refusal> {
+        let pins = fixture_pins(c, reserved);
+        let again = || {
+            format!(
+                "run {RELEASE_COMMAND} again, which lands them on the tip it finds (or add them \
+                 by hand: {}, \"By hand\")",
+                crate::gates::HANDOFF_FIXTURE_README
+            )
+        };
+        let git = self.git();
+        let fetched = crate::publish::native_origin(&self.repo)
+            .and_then(|native| native.refresh_main().map_err(crate::ledger::Error::new));
+        if fetched.is_ok()
+            && let Ok(Some(found)) = crate::fixtures::on_commit(&git, "origin/main", &c.version)
+        {
+            return Ok(crate::fixtures::Landed::Already {
+                tip: self
+                    .git_out(&["rev-parse", "origin/main"])
+                    .unwrap_or_default(),
+                desks: found.desks,
+            }
+            .words(&pins));
+        }
+        let root = fixture_root(&self.repo)?;
+        let mut words = Vec::new();
+        let staged = match crate::fixtures::staged(&root, &pins) {
+            Some(staged) => staged,
+            None => {
+                let log = self.side_log(self.step, "fixtures");
+                words.push(self.stage_fixtures_run(self.step, c, reserved, prover, &log)?);
+                crate::fixtures::staged(&root, &pins).ok_or_else(|| {
+                    Refusal::new(
+                        format!(
+                            "v{}'s handoff fixtures were written and are gone",
+                            c.version
+                        ),
+                        again(),
+                    )
+                })?
+            }
+        };
+        let targo = prover.bin.join("targo");
+        let mut reader = crate::fixtures::MainReader::new(&self.repo);
+        let log = self.side_log(self.step, "fixtures");
+        let landed = crate::fixtures::land(
+            &git,
+            &crate::publish::native_origin(&self.repo).map_err(|why| {
+                Refusal::new(
+                    "cannot bind fixture landing to this workspace's native origin",
+                    "restore the configured repository matching Cargo.toml before rerunning",
+                )
+                .detail([why.to_string()])
+            })?,
+            &staged,
+            &pins,
+            &mut |preview| match &mut reader {
+                Ok(reader) => reader.read(&targo, preview, &pins, &mut |cmd| {
+                    self.captured(self.step, prover, &log, cmd)
+                }),
+                Err(why) => crate::fixtures::Reading {
+                    checked: None,
+                    answers: Err(why.to_string()),
+                    checks: format!("COULD NOT RUN: {why}"),
+                },
+            },
+        )
+        .map_err(|e| Refusal::new(e.to_string(), again()))?;
+        words.push(landed.words(&pins));
+        Ok(words.join("; "))
+    }
+
+    fn after_cut_shared(&self, version: &str) -> Result<AfterCut, Refusal> {
+        let log = self.step_log(Step::AfterCut);
+        let shape_timing = crate::cut_timing::Timer::start(&log, "after-cut public shape");
         let slug = self.slug();
         let tag = format!("v{version}");
         let read = |s: &Self, t: &str| s.release_json(&slug, t);
-        let mut problems = match read(self, &tag) {
+        let (release, (pointer, site_tag)) = crate::cut_timing::independent_logged(
+            Some(&log),
+            ("after-cut release JSON", || read(self, &tag)),
+            ("after-cut public readers", || {
+                crate::cut_timing::independent_logged(
+                    Some(&log),
+                    ("after-cut latest pointer", || {
+                        self.pointer_problems(&slug, &tag, version)
+                    }),
+                    ("after-cut site election", || self.site_tag(&slug)),
+                )
+            }),
+        );
+        let mut problems = match release {
             Ok(rel) => release_shape(&rel, version),
             Err(why) => {
                 return Err(Refusal::new(
@@ -7264,10 +7359,8 @@ impl Backend for Real {
                 .could_not_run());
             }
         };
-        problems.extend(pointer_verdict(
-            self.pointer_problems(&slug, &tag, version),
-        )?);
-        let site_tag = match self.site_tag(&slug) {
+        problems.extend(pointer_verdict(pointer)?);
+        let site_tag = match site_tag {
             Ok(t) => t,
             Err(why) => {
                 return Err(Refusal::new(
@@ -7281,7 +7374,9 @@ impl Backend for Real {
             }
         };
         if site_tag != tag {
-            match read(self, &site_tag) {
+            match crate::cut_timing::measure("after-cut elected release JSON", || {
+                read(self, &site_tag)
+            }) {
                 Ok(rel) => {
                     let v = site_tag.strip_prefix('v').unwrap_or(&site_tag);
                     problems.extend(
@@ -7299,23 +7394,26 @@ impl Backend for Real {
                 }
             }
         }
-        if !problems.is_empty() {
-            return Err(shape_refusal(&slug, &tag, problems));
-        }
-        let site = self.site(&slug)?;
-        let tap = self.align_tap(&site_tag)?;
+        let shape = if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(shape_refusal(&slug, &tag, problems))
+        };
+        drop(shape_timing);
+        // PUBLIC-BEFORE-DISTRIBUTION: both consume the validated public cohort;
+        // neither consumes the other's output. Join before recording completion.
+        let (site, tap) = distribute_after_shape(
+            &log,
+            shape,
+            || self.site(&slug),
+            || self.align_tap(&site_tag),
+        )?;
         Ok(AfterCut {
             note: format!(
                 "{tag} carries the lean shape as GitHub serves it; {}; {tap}",
                 site.note,
             ),
         })
-    }
-
-    fn latest(&mut self) -> Result<Option<String>, String> {
-        let slug = self.slug();
-        let release = self.github_read(&format!("repos/{slug}/releases/latest"))?;
-        Ok(release["tag_name"].as_str().map(str::to_string))
     }
 }
 
@@ -8226,6 +8324,166 @@ pub(crate) fn measure_bump_launch_to_qualify(controller: fn() -> std::time::Dura
 
 #[cfg(test)]
 mod tests {
+    /// NEGATIVE CONTROLS: ignoring the shape verdict starts a writer; returning
+    /// immediately on the site's refusal leaves the independent tap unrun.
+    #[test]
+    fn public_shape_precedes_writers_and_each_writer_joins_on_refusal() {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let log = dir.path().join("after-cut.log");
+        let calls = AtomicUsize::new(0);
+        let site = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(Refusal::new("site refused", "retry"))
+        };
+        let tap = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok("tap aligned".into())
+        };
+        let refused = distribute_after_shape(
+            &log,
+            Err(Refusal::new("bad public shape", "repair")),
+            site,
+            tap,
+        )
+        .unwrap_err();
+        assert_eq!(refused.why, "bad public shape");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let refused = distribute_after_shape(&log, Ok(()), site, tap).unwrap_err();
+        assert_eq!(refused.why, "site refused");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Credential-free scheduling measurement. The engine child is a native
+    /// no-op at the existing tap seam; reads use agh-fake's loopback server and
+    /// real curl with an injected 40 ms service cost. This is not a real cut.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "explicit loopback cut/after-cut gate scheduling measurement"]
+    fn independent_cut_gate_fixture_walls() {
+        use super::*;
+        use aterm_update_core::github_rest::{Direct, Origins, Spawn};
+        use std::time::Instant;
+        struct Service;
+        impl Spawn for Service {
+            fn run(
+                &self,
+                cmd: &mut Command,
+                stdin: Option<&[u8]>,
+            ) -> std::io::Result<std::process::Output> {
+                std::thread::sleep(std::time::Duration::from_millis(40));
+                Direct.run(cmd, stdin)
+            }
+        }
+        let fake = agh_fake::FakeGithub::start();
+        let token = agh_fake::token("cut-gate-fixture");
+        fake.add_token(&token, "gate-fixture-reader");
+        fake.add_repo("gate-fixture/aterm", agh_fake::RepoSpec::public());
+        let ports = fake.ports();
+        let _route = crate::github::Fixture {
+            origins: Origins::loopback(ports.api, ports.uploads, ports.web, ports.cdn),
+            token: Some(token),
+            spawn: Some(std::sync::Arc::new(Service)),
+        }
+        .enter();
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let engine = dir.path().join("engine");
+        std::fs::create_dir_all(engine.join("bin")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/true", engine.join("bin/pub")).unwrap();
+        let mut real = Real::new(dir.path(), Some(&engine), true, false).unwrap();
+        real.prerequisites = Some(crate::managed_prerequisites::Tools::Simulated);
+        let read = || {
+            crate::github::get("repos/gate-fixture/aterm/releases?per_page=30").unwrap();
+        };
+        let tap = || {
+            real.align_tap("v0.184.0").unwrap();
+        };
+        read();
+        tap();
+        for (take, parallel) in [false, true, true, false].into_iter().enumerate() {
+            let started = Instant::now();
+            if parallel {
+                let commit = || {
+                    crate::cut_timing::independent(
+                        ("bundle", read),
+                        ("handoff", || {
+                            crate::cut_timing::independent(("fixtures", read), ("policy", read));
+                        }),
+                    )
+                };
+                let authority = || {
+                    crate::cut_timing::independent(
+                        ("availability", || {
+                            crate::cut_timing::independent(("lock", read), ("target", read));
+                        }),
+                        ("floors", || {
+                            crate::cut_timing::independent(
+                                ("head and signature", || {
+                                    crate::cut_timing::independent(
+                                        ("head", read),
+                                        ("signature", read),
+                                    );
+                                }),
+                                ("roster and ledger", || {
+                                    crate::cut_timing::independent(
+                                        ("roster", read),
+                                        ("ledger", read),
+                                    );
+                                }),
+                            );
+                        }),
+                    )
+                };
+                crate::cut_timing::independent(("commit", commit), ("authority", authority));
+                crate::cut_timing::independent(("signed bytes", read), ("published floor", read));
+            } else {
+                for _ in 0..11 {
+                    read();
+                }
+            }
+            println!(
+                "gate-fixture step=cut take={take} parallel={parallel} wall_s={:.6}",
+                started.elapsed().as_secs_f64()
+            );
+            let started = Instant::now();
+            let distribution = || {
+                // Public shape precedes both distribution writes.
+                if parallel {
+                    crate::cut_timing::independent(
+                        ("release JSON", read),
+                        ("public readers", || {
+                            crate::cut_timing::independent(("pointer", read), ("election", read));
+                        }),
+                    );
+                } else {
+                    for _ in 0..3 {
+                        read();
+                    }
+                }
+                if parallel {
+                    crate::cut_timing::independent(("site", read), ("tap", tap));
+                } else {
+                    read();
+                    tap();
+                }
+            };
+            let reader = || {
+                read();
+            };
+            if parallel {
+                crate::cut_timing::independent(("distribution", distribution), ("reader", reader));
+            } else {
+                distribution();
+                reader();
+            }
+            println!(
+                "gate-fixture step=after-cut take={take} parallel={parallel} wall_s={:.6}",
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+
     #[test]
     fn an_interrupted_cutter_checkout_is_reconstructed_at_the_same_path() {
         use super::*;
@@ -9608,7 +9866,7 @@ mod tests {
         );
         std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$*\" > tap-invocation\nprintf 'canonical verified alignment\\n'\n").unwrap();
         assert!(real.align_tap("v0.159.0").unwrap().contains("v0.159.0"));
-        let log = std::fs::read_to_string(real.step_log(Step::AfterCut)).unwrap();
+        let log = std::fs::read_to_string(real.side_log(Step::AfterCut, "tap")).unwrap();
         assert!(log.contains("canonical verified alignment"));
     }
 
@@ -9678,6 +9936,95 @@ mod tests {
             "object git inherited fd {fd}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// The appcast adapter hands every transport attempt to `Launched<StepChildren>`'s launch
+    /// boundary. NEGATIVE CONTROL: replacing that adapter with the client's direct spawn leaves
+    /// `started` at zero; starting a later retry after the launch reports an interrupt makes the
+    /// second half fail.
+    #[test]
+    fn appcast_retries_are_release_children_and_an_interrupt_starts_no_later_attempt() {
+        use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        struct Launch {
+            interrupt_after_first: bool,
+            interrupted: AtomicBool,
+            started: Arc<AtomicU32>,
+        }
+
+        impl crate::site::Launch for Launch {
+            fn interrupted(&self) -> Option<i32> {
+                self.interrupted.load(Ordering::SeqCst).then_some(15)
+            }
+
+            fn spawn(
+                &self,
+                command: &mut aterm_uds::spawnfd::Command,
+            ) -> std::io::Result<(aterm_uds::spawnfd::Child, crate::site::Guard)> {
+                if self.interrupted().is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "not started: the release was interrupted",
+                    ));
+                }
+                let child = command.spawn()?;
+                self.started.fetch_add(1, Ordering::SeqCst);
+                if self.interrupt_after_first {
+                    self.interrupted.store(true, Ordering::SeqCst);
+                }
+                Ok((child, Box::new(())))
+            }
+        }
+
+        let fetch = |_: &str,
+                     _: u64,
+                     spawn: &dyn aterm_update_core::github_rest::Spawn|
+         -> Result<Vec<u8>, String> {
+            for _ in 0..3 {
+                let mut command = aterm_uds::spawnfd::command("/bin/sh");
+                command.args(["-c", "printf appcast"]);
+                let output = spawn
+                    .run(&mut command, None)
+                    .map_err(|error| error.to_string())?;
+                if !output.status.success() {
+                    return Err(format!("fixture child exited {}", output.status));
+                }
+            }
+            Ok(b"appcast".to_vec())
+        };
+
+        let started = Arc::new(AtomicU32::new(0));
+        assert_eq!(
+            appcast_bytes_with(
+                "https://example.invalid/appcast",
+                1024,
+                Launch {
+                    interrupt_after_first: false,
+                    interrupted: AtomicBool::new(false),
+                    started: Arc::clone(&started),
+                },
+                fetch,
+            ),
+            Ok(b"appcast".to_vec())
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 3);
+
+        let started = Arc::new(AtomicU32::new(0));
+        let refused = appcast_bytes_with(
+            "https://example.invalid/appcast",
+            1024,
+            Launch {
+                interrupt_after_first: true,
+                interrupted: AtomicBool::new(false),
+                started: Arc::clone(&started),
+            },
+            fetch,
+        )
+        .expect_err("the next retry is not started after the interrupt");
+        assert!(refused.contains("not started"), "{refused}");
+        assert_eq!(started.load(Ordering::SeqCst), 1);
     }
 
     /// The site sync's children keep the release's rules: each leads a session and group of

@@ -14,6 +14,7 @@ use aterm_render::Theme;
 
 use crate::autopilot::AutopilotView;
 use crate::autopilot_timers::TimerChoice;
+use crate::claude_footer::quota::{TickInks, TickOn};
 use crate::claude_lights::{Fact, LandAtGlass};
 use crate::fact_menu::FactAct;
 use crate::menu_viewport::MenuViewport;
@@ -812,7 +813,9 @@ fn text_span(w: usize, rows: &[MenuRow]) -> (usize, usize) {
 /// first), in pixels from the card's top left corner at cells `cell` device pixels: each
 /// [`MenuRow::Plot`]'s ticks on the row it is painted on, from the card's text column as
 /// [`paint_plot`] lays its cells, and none past the text's end, as line E lays its own
-/// ([`crate::claude_footer::quota::push_ticks`]).
+/// ([`crate::claude_footer::quota::push_ticks`]), each in the ink of what it stands on: a glyph
+/// that inks its foot (a measured step, a low projected line), a warn cell's wash, or the card's
+/// ground ([`TickOn`]).
 pub(crate) fn plot_ticks(
     rect: MenuRect,
     rows: &[MenuRow],
@@ -835,14 +838,18 @@ pub(crate) fn plot_ticks(
         .map(|(i, row)| (1 + i - visible.start, row))
         .take_while(|&(r, _)| r + 1 < rect.h)
     {
-        let MenuRow::Plot { ticks, .. } = row else {
+        let MenuRow::Plot { cells, ticks, .. } = row else {
             continue;
         };
         let from = out.len();
         let top = i32::try_from(r)
             .unwrap_or(i32::MAX)
             .saturating_mul(i32::from(cell.1));
-        crate::claude_footer::quota::push_ticks(out, ticks, (top, room), cell);
+        crate::claude_footer::quota::push_ticks(out, ticks, (top, room), cell, |i| {
+            cells
+                .get(i)
+                .map_or(TickOn::Ground, |c| TickOn::of(c.ch, c.ink == PlotInk::Warn))
+        });
         for tick in &mut out[from..] {
             tick.x = tick.x.saturating_add(left);
         }
@@ -859,20 +866,20 @@ pub(crate) struct CardTicks {
 }
 
 impl CardTicks {
-    /// The content of the ticks of `rows` on a card at `rect` ([`plot_ticks`]) in `track`: the
-    /// last frame's where they and the ink are unchanged.
+    /// The content of the ticks of `rows` on a card at `rect` ([`plot_ticks`]) in `inks`: the
+    /// last frame's where they and the inks are unchanged.
     fn content(
         &mut self,
         (rect, rows, viewport): (MenuRect, &[MenuRow], MenuViewport),
         cell: (u16, u16),
-        track: u32,
+        inks: TickInks,
     ) -> Option<Arc<FxContent>> {
         plot_ticks(rect, rows, viewport, cell, &mut self.rects);
         let same = self.content.as_deref().map_or(self.rects.is_empty(), |c| {
-            crate::claude_footer::quota::draws_ticks(c, &self.rects, track)
+            crate::claude_footer::quota::draws_ticks(c, &self.rects, inks)
         });
         if !same {
-            self.content = crate::claude_footer::quota::tick_content(&self.rects, track);
+            self.content = crate::claude_footer::quota::tick_content(&self.rects, inks);
         }
         self.content.clone()
     }
@@ -1014,9 +1021,35 @@ pub(crate) fn paint(
 /// sunset at its orange); the warn ink is floored along its hue to 4.5:1 on the wash.
 pub(crate) const WARN_WASH: f32 = 0.16;
 
+/// A warn cell's ground and ink on a drawn row: a wash of the warn ink ([`WARN_WASH`]) where it
+/// has a hue of its own, the warn ink floored to 4.5:1 on it; `None` where it has none.
+fn warn_wash(c: &crate::tab_menu::MenuColors, glass: &GlassInks) -> Option<([u8; 3], [u8; 3])> {
+    (glass.warn() != glass.lit()).then(|| {
+        let wash = crate::chrome_band::mix3(c.card_bg, unpack(glass.warn()), WARN_WASH);
+        let ink = aterm_effects::color_math::floor_contrast_keeping_hue(
+            glass.warn(),
+            pack(wash),
+            aterm_effects::cli_marks::NAME_CONTRAST,
+        );
+        (wash, unpack(ink))
+    })
+}
+
+/// The inks of the card's midnights' ticks in `theme` under `palette` ([`TickInks`]): the
+/// glass's track on the card's ground, the ground across a glyph that inks a tick's foot, and
+/// the track floored on the warn wash where a warn cell stands on one ([`warn_wash`]).
+pub(crate) fn card_tick_inks(theme: Theme, palette: Option<CardPalette>) -> TickInks {
+    let (c, glass) = card_inks(theme, palette);
+    TickInks::new(
+        glass.track(),
+        pack(c.card_bg),
+        warn_wash(&c, &glass).map(|(wash, _)| pack(wash)),
+    )
+}
+
 /// A drawn row's cells inside the border (its sides are the caller's): each cell in its ink,
 /// a hued one at its column's palette position over the card's own `w` cells, and a warn cell
-/// on its wash ([`WARN_WASH`]).
+/// on its wash ([`warn_wash`]).
 fn paint_plot(
     w: usize,
     (text_start, text_end): (usize, usize),
@@ -1026,16 +1059,7 @@ fn paint_plot(
 ) -> Vec<RenderCell> {
     let cell = crate::chrome_band::cell;
     let busy_bg = crate::chrome_band::mix3(c.card_bg, c.band.accent, 0.10);
-    // A warn cell's ground and ink: on a wash of the warn ink where it has a hue of its own.
-    let warn_on = (glass.warn() != glass.lit()).then(|| {
-        let wash = crate::chrome_band::mix3(c.card_bg, unpack(glass.warn()), WARN_WASH);
-        let ink = aterm_effects::color_math::floor_contrast_keeping_hue(
-            glass.warn(),
-            pack(wash),
-            aterm_effects::cli_marks::NAME_CONTRAST,
-        );
-        (wash, unpack(ink))
-    });
+    let warn_on = warn_wash(c, glass);
     let mut cells = vec![cell(' ', c.band.value, c.card_bg, false, false); w];
     for (col, p) in (text_start..text_end).zip(plot.iter()) {
         let at = field(col, w);
@@ -1767,7 +1791,7 @@ impl App {
             && let Some(content) = menu.ticks.content(
                 (rect, &menu.rows, menu.viewport),
                 cell,
-                card_inks(theme, palette).1.track(),
+                card_tick_inks(theme, palette),
             )
         {
             let px = |cells: usize, side: u16| {

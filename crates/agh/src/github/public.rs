@@ -9,7 +9,6 @@ use crate::download;
 use crate::error::{Error, Kind, Result, Sub};
 use crate::path;
 use crate::policy::{RouteRequest, RouteTarget};
-use crate::retry::RetryPolicy;
 use crate::slug::Slug;
 use crate::wire::{Deadlines, OriginRole, WireKind};
 
@@ -65,7 +64,8 @@ impl<'a> Public<'a> {
         Public { gh }
     }
 
-    /// A HEAD of the asset's web path, anonymous, any status answered, no retry.
+    /// A HEAD of the asset's web path, anonymous, any definitive status answered after the
+    /// shared transient-failure retry budget.
     #[must_use]
     pub fn probe(&self, slug: &Slug, tag: &str, asset: &str) -> Probe {
         let path = match web_path(slug, tag, asset) {
@@ -75,8 +75,7 @@ impl<'a> Public<'a> {
         let call = Call::head(path, anonymous(slug))
             .origin(OriginRole::Web)
             .accept(Accept::Media("*/*".to_string()))
-            .answer_any(true)
-            .retry(Some(RetryPolicy::NONE));
+            .answer_any(true);
         match self.gh.call(&call) {
             Ok(answered) => match answered.status {
                 200 | 302 | 307 => Probe::Present,
@@ -114,17 +113,17 @@ impl<'a> Public<'a> {
             .hop(true)
             .limit(cap)
             .deadlines(Deadlines::for_transfer(cap));
-        let streamed = self.gh.call_stream(&call).map_err(|error| {
-            error.why_if_not_found(|| format!("the download host has no {asset} for {tag}"))
-        })?;
-        let mut body = streamed.body;
-        let written = download::stream_to_file(&mut body, dest, &mut |_| {}).map_err(|error| {
-            if error.sub == Sub::Wire(WireKind::TooLarge) {
-                Error::new(Kind::Invalid, format!("{asset} is over the {cap}-byte cap"))
-            } else {
-                error
-            }
-        });
+        let written = download::call_to_resumable_file(self.gh, &call, dest, cap)
+            .map_err(|error| {
+                if error.sub == Sub::Wire(WireKind::TooLarge) {
+                    Error::new(Kind::Invalid, format!("{asset} is over the {cap}-byte cap"))
+                } else {
+                    error
+                }
+            })
+            .map_err(|error| {
+                error.why_if_not_found(|| format!("the download host has no {asset} for {tag}"))
+            });
         written.map_err(|e| e.with_repo(slug.to_string()))
     }
 }

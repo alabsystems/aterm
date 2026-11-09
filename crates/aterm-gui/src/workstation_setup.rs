@@ -728,23 +728,37 @@ impl App {
     /// lets its offer go, `SystemStateApp::closed`), so nothing holds the handoff.
     #[cfg(unix)]
     pub(crate) fn workstation_setup_holds_handoff(&self) -> bool {
-        let Some(request) = self
+        self.workstation_setup_handoff_hold().is_some()
+    }
+
+    /// What of the offer holds the handoff ([`Self::workstation_setup_holds_handoff`]), as the
+    /// update lane names it: a person's draft is theirs ([`LaneHold::SetupDraft`]), and an
+    /// answer the page is still taking is the page's own ([`LaneHold::SetupAnswer`]).
+    ///
+    /// [`LaneHold::SetupDraft`]: crate::native_update_lane_hold::LaneHold::SetupDraft
+    /// [`LaneHold::SetupAnswer`]: crate::native_update_lane_hold::LaneHold::SetupAnswer
+    #[cfg(unix)]
+    pub(crate) fn workstation_setup_handoff_hold(
+        &self,
+    ) -> Option<crate::native_update_lane_hold::LaneHold> {
+        use crate::native_update_lane_hold::LaneHold;
+        use crate::system_state::OfferHold;
+        let request = self
             .workstation_setup
             .request
             .as_ref()
-            .filter(|request| request.pending())
-        else {
-            return false;
-        };
-        let Some(state) = self
+            .filter(|request| request.pending())?;
+        let state = self
             .native_runtime
             .instance_by_kind(crate::native_app::AppKind::SystemState)
-            .and_then(|instance| self.native_runtime.app(instance))
-        else {
-            return false;
+            .and_then(|instance| self.native_runtime.app(instance))?;
+        let crate::native_app::NativeApp::SystemState(state) = state else {
+            return Some(LaneHold::SetupAnswer);
         };
-        !matches!(state, crate::native_app::NativeApp::SystemState(state)
-            if state.offer_can_restart(request))
+        state.offer_hold(request).map(|hold| match hold {
+            OfferHold::Draft => LaneHold::SetupDraft,
+            OfferHold::Answer => LaneHold::SetupAnswer,
+        })
     }
 
     pub(crate) fn hold_initial_setup_permissions(&mut self) {

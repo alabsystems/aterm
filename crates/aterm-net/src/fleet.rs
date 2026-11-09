@@ -2816,11 +2816,19 @@ pub(crate) struct LiveConnections {
     /// The clock a proof's stamp ([`LiveTenure::proved`]) and the lifetime's cut
     /// ([`LiveConnections::cut_overdue`]) both read.
     now: Box<dyn Fn() -> Instant + Send + Sync>,
+    advance: Option<aterm_types::advance_clock::Clock>,
 }
 
 impl Default for LiveConnections {
     fn default() -> Self {
-        Self::on_clock(Instant::now)
+        let mut live = Self::on_clock(Instant::now);
+        if let Some(path) = aterm_types::dev_seam!("ATERM_DEBUG_FLEET_CLOCK") {
+            live.advance = Some(aterm_types::advance_clock::Clock::new(
+                Some(path),
+                "lifetime",
+            ));
+        }
+        live
     }
 }
 
@@ -2851,6 +2859,7 @@ impl LiveConnections {
         Self {
             fleet_live: Mutex::default(),
             now: Box::new(now),
+            advance: None,
         }
     }
 
@@ -2876,7 +2885,16 @@ impl LiveConnections {
     }
 
     fn cut_overdue(&self, lifetime: Duration) {
-        let now = (self.now)();
+        #[cfg(any(test, debug_assertions))]
+        let lifetime = if aterm_types::negative_control::on("fleet-fixed-lifetime") {
+            SERVED_WITHIN
+        } else {
+            lifetime
+        };
+        let reading = self.advance.as_ref().map(|clock| clock.read());
+        let now = reading
+            .as_ref()
+            .map_or_else(|| (self.now)(), |reading| reading.now);
         self.lock().retain(|live| {
             let overdue = live
                 .proved
@@ -2886,6 +2904,9 @@ impl LiveConnections {
             }
             !overdue
         });
+        if let Some(reading) = reading {
+            reading.observed();
+        }
     }
 
     fn cut_all(&self) {
@@ -2920,7 +2941,11 @@ impl LiveTenure {
     }
 
     fn proved(&self, drive: bool, most: usize) -> bool {
-        let now = (self.live.now)();
+        let now = self
+            .live
+            .advance
+            .as_ref()
+            .map_or_else(|| (self.live.now)(), |clock| clock.read().now);
         let mut held = self.live.lock();
         let Some(source) = held
             .iter()

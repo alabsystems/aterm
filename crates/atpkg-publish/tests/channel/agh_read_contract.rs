@@ -639,10 +639,19 @@ fn case_attempts(w: &dyn World) {
         matches!(retried, Err(HostError::Unreachable(_))),
         "{retried:?}"
     );
-    assert_eq!(w.download_attempts(), DOWNLOAD_ATTEMPTS);
+    let owns_retry = w.host().download_owns_retry();
+    let per_call = if owns_retry {
+        usize::try_from(aterm_types::http_retry::Policy::STANDARD.attempts()).unwrap()
+    } else {
+        DOWNLOAD_ATTEMPTS
+    };
+    assert_eq!(w.download_attempts(), per_call);
     let once = w.host().download(&slug(), "v1", &["a.bin"], dir.path());
     assert!(matches!(once, Err(HostError::Unreachable(_))), "{once:?}");
-    assert_eq!(w.download_attempts(), DOWNLOAD_ATTEMPTS + 1);
+    assert_eq!(
+        w.download_attempts(),
+        per_call + if owns_retry { per_call } else { 1 }
+    );
 }
 
 #[test]
@@ -658,6 +667,76 @@ fn attempts_agh() {
 #[test]
 fn attempts_rest() {
     on_rest(case_attempts);
+}
+
+/// NEGATIVE CONTROL: RestHost's transport owns the retry budget and stages privately. Neither an
+/// exhausted outage nor an answered 404 may remove caller-owned final or legacy-part bytes.
+#[test]
+fn rest_download_failure_and_absence_preserve_caller_owned_files() {
+    for (status, expected) in [(503, "unreachable"), (404, "not-found")] {
+        let w = RestWorld::new();
+        w.put("v1", false, true, &[("a.bin", b"new bytes")]);
+        w.fake.fault_always(
+            Match::api(ASSETS).method("GET"),
+            Fault::Status {
+                status,
+                body: String::new(),
+                headers: Vec::new(),
+            },
+        );
+        let dir = scratch(&format!("rest-preserve-{status}"));
+        let final_path = dir.path().join("a.bin");
+        let old_part = dir.path().join("a.bin.atpkg-part");
+        std::fs::write(&final_path, b"caller's completed bytes").expect("the earlier final");
+        std::fs::write(&old_part, b"caller's unrelated part").expect("the earlier part");
+
+        let result = w.host.download(&slug(), "v1", &["a.bin"], dir.path());
+        match (status, &result) {
+            (404, Err(HostError::NotFound)) => {}
+            (503, Err(HostError::Unreachable(_))) => {}
+            _ => panic!("{expected}: {result:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&final_path).expect("the caller's final survives"),
+            b"caller's completed bytes"
+        );
+        assert_eq!(
+            std::fs::read(&old_part).expect("the caller's part survives"),
+            b"caller's unrelated part"
+        );
+    }
+}
+
+#[test]
+fn tokenless_rest_listing_uses_the_shared_budget_but_a_404_is_final() {
+    let fake = FakeGithub::start();
+    fake.add_repo(SLUG, RepoSpec::public());
+    fake.add_release(SLUG, ReleaseSpec::published("v1", "2026-10-01T00:00:00Z"));
+    let ports = fake.ports();
+    let origins = Origins::loopback(ports.api, ports.uploads, ports.web, ports.cdn);
+    let host = RestHost::at(None, origins.clone(), origins.web.clone());
+    let listing = format!("/repos/{SLUG}/releases?per_page=100");
+    for _ in 0..2 {
+        fake.fault(
+            Match::api(&listing),
+            Fault::Status {
+                status: 504,
+                body: String::new(),
+                headers: Vec::new(),
+            },
+        );
+    }
+    let from = fake.seen().len();
+    assert_eq!(host.releases(&slug()).expect("504, 504, 200").len(), 1);
+    assert_eq!(fake.seen().len() - from, 3);
+
+    let missing = Slug::new("fixture-dev", "absent");
+    let from = fake.seen().len();
+    assert!(matches!(
+        host.releases(&missing),
+        Err(HostError::Unreachable(_))
+    ));
+    assert_eq!(fake.seen().len() - from, 1, "a 404 is never retried");
 }
 
 fn case_probe_public(w: &dyn World) {
@@ -699,7 +778,10 @@ fn case_fetch_public(w: &dyn World) {
         .host()
         .fetch_public(&slug(), "v1", "a.bin", &dest, cap - 1);
     assert!(matches!(capped, Probe::Unknown(_)), "{capped:?}");
-    assert!(!dest.exists());
+    assert_eq!(
+        std::fs::read(&dest).expect("the completed earlier fetch is preserved"),
+        bytes
+    );
     let stale = dir.path().join("stale").join("missing.bin");
     std::fs::create_dir_all(stale.parent().expect("a parent")).expect("the stale dir");
     std::fs::write(&stale, b"stale bytes").expect("the stale file");
@@ -708,7 +790,10 @@ fn case_fetch_public(w: &dyn World) {
             .fetch_public(&slug(), "v1", "missing.bin", &stale, cap),
         Probe::Absent
     );
-    assert!(!stale.exists());
+    assert_eq!(
+        std::fs::read(&stale).expect("absence does not delete caller-owned bytes"),
+        b"stale bytes"
+    );
 }
 
 #[test]
@@ -719,6 +804,20 @@ fn fetch_public_fake() {
 #[test]
 fn fetch_public_agh() {
     on_agh(case_fetch_public);
+}
+
+#[test]
+fn rest_public_fetch_failure_preserves_caller_owned_bytes() {
+    let w = RestWorld::new();
+    let dir = scratch("rest-public-preserve");
+    let dest = dir.path().join("asset.bin");
+    std::fs::write(&dest, b"caller's completed bytes").expect("the earlier fetch");
+    let result = w.host.fetch_public(&slug(), "v1", "missing.bin", &dest, 64);
+    assert!(matches!(result, Probe::Unknown(_)), "{result:?}");
+    assert_eq!(
+        std::fs::read(&dest).expect("the caller's bytes survive the failed read"),
+        b"caller's completed bytes"
+    );
 }
 
 fn case_race(w: &dyn World) {
@@ -972,6 +1071,26 @@ fn agh_repo_seen_answers_false_only_when_both_reads_miss() {
 }
 
 #[test]
+fn agh_repo_seen_does_not_repeat_an_already_anonymous_404() {
+    let w = AghWorld::build(Setup {
+        token: false,
+        writer: false,
+        anonymous: true,
+        ..Setup::PLAN
+    });
+    assert_eq!(w.host.repo_seen(&Slug::new(OWNER, "missing")), Ok(false));
+    let missing = "/repos/fixture-dev/missing";
+    let reads: Vec<bool> = w
+        .fake
+        .seen()
+        .iter()
+        .filter(|seen| seen.path_and_query == missing)
+        .map(|seen| seen.had_authorization)
+        .collect();
+    assert_eq!(reads, [false], "{:?}", w.fake.seen());
+}
+
+#[test]
 fn agh_refuses_a_listed_asset_name_outside_dir() {
     let w = AghWorld::new();
     w.put(
@@ -1046,7 +1165,10 @@ fn agh_one_owner_per_host() {
         matches!(&fetch, Probe::Unknown(why) if why.contains(EXT_SLUG)),
         "{fetch:?}"
     );
-    assert!(!dest.exists());
+    assert_eq!(
+        std::fs::read(&dest).expect("an ownership refusal preserves caller bytes"),
+        b"an earlier fetch's bytes"
+    );
     names_other(w.host.create(&other, "v1", "title", "notes", &[]));
     names_other(w.host.upload(&other, "v1", &[], Replace::Never));
     names_other(w.host.publish_draft(&other, "v1"));
@@ -1066,13 +1188,15 @@ fn agh_download_never_compounds_the_lanes_retry() {
         matches!(retried, Err(HostError::Unreachable(_))),
         "{retried:?}"
     );
-    assert_eq!(w.download_attempts(), DOWNLOAD_ATTEMPTS);
+    let attempts = usize::try_from(aterm_types::http_retry::Policy::STANDARD.attempts()).unwrap();
+    assert_eq!(w.download_attempts(), attempts);
     let once = w.host.download(&slug(), "v1", &["a.bin"], dir.path());
     assert!(matches!(once, Err(HostError::Unreachable(_))), "{once:?}");
-    assert_eq!(w.download_attempts(), DOWNLOAD_ATTEMPTS + 1);
+    assert_eq!(w.download_attempts(), attempts * 2);
     let pauses = RetryPolicy::STANDARD.pauses;
     let slept = w.fx.slept();
     assert!(!slept.iter().any(|d| pauses.contains(d)), "{slept:?}");
+    assert_eq!(slept, vec![Duration::from_secs(10); (attempts - 1) * 2]);
     assert_eq!(w.fake.violations(), Vec::<String>::new());
 }
 
@@ -1094,11 +1218,14 @@ fn agh_download_resolution_never_compounds_the_lanes_retry() {
         matches!(retried, Err(HostError::Unreachable(_))),
         "{retried:?}"
     );
-    assert_eq!(w.resolution_gets(), DOWNLOAD_ATTEMPTS);
+    assert_eq!(
+        w.resolution_gets(),
+        usize::try_from(RetryPolicy::STANDARD.attempts).unwrap()
+    );
     assert_eq!(w.download_attempts(), 0);
     let pauses = RetryPolicy::STANDARD.pauses;
     let slept = w.fx.slept();
-    assert!(!slept.iter().any(|d| pauses.contains(d)), "{slept:?}");
+    assert_eq!(slept, pauses);
     assert_eq!(w.fake.violations(), Vec::<String>::new());
 }
 

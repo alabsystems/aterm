@@ -19,6 +19,9 @@ pub(crate) struct Snapshot {
     /// The restored agents' hold is holding the automatic lane
     /// (`HostHandle::restored_pending`).
     restored_hold: bool,
+    /// The hold the lane named for the staged build past its ladder
+    /// (`App::auto_apply_hold_token`).
+    lane_hold: Option<&'static str>,
     /// The accepted apply is waiting for its account-work epoch to retire.
     account_work_hold: bool,
     applying: bool,
@@ -27,6 +30,11 @@ pub(crate) struct Snapshot {
 
 impl Snapshot {
     pub(crate) fn capture(app: &App) -> Self {
+        Self::capture_with(app, crate::app_update_screen::ApplyPostureEnv::observe(app))
+    }
+
+    /// [`Self::capture`] under the posture inputs `env` (the live ones, or a test's).
+    pub(crate) fn capture_with(app: &App, env: crate::app_update_screen::ApplyPostureEnv) -> Self {
         let updater = app.native_updater_service.snapshot();
         let now = std::time::Instant::now();
         Self {
@@ -42,7 +50,7 @@ impl Snapshot {
             posture: updater
                 .staged
                 .as_ref()
-                .map(|s| app.apply_posture_for(s.build)),
+                .map(|s| app.apply_posture_with(s.build, env)),
             phase: updater
                 .staged
                 .as_ref()
@@ -51,6 +59,10 @@ impl Snapshot {
                 .harness
                 .as_ref()
                 .is_some_and(|host| host.restored_pending(now)),
+            lane_hold: updater
+                .staged
+                .as_ref()
+                .and_then(|s| app.auto_apply_hold_token(s.build)),
             account_work_hold: app.account_drain_pending(),
             applying: updater.phase == UpdaterPhase::Applying,
             retry_scheduled: updater
@@ -73,11 +85,17 @@ impl Snapshot {
         }
     }
 
-    /// What holds this apply (`apply_held=` on the wire), for the same staged artifact.
+    /// What holds this apply (`apply_held=` on the wire), for the same staged artifact: an accepted
+    /// apply's account work; under an automatic posture the restored agents' hold while it holds,
+    /// else the hold the lane last named past its ladder and has not attempted past
+    /// (`native_update_lane_hold::LaneHold::token`).
     pub(crate) fn apply_held(&self, status: &aterm_update::UpdateStatus) -> Option<&'static str> {
         match self.apply_posture(status) {
             "applying" if self.account_work_hold => Some("account-work"),
-            "automatic" | "automatic-idle" if self.restored_hold => Some("restored-agents"),
+            "automatic" | "automatic-idle" if self.restored_hold => {
+                Some(crate::native_update_lane_hold::LaneHold::RestoredAgents.token())
+            }
+            "automatic" | "automatic-idle" => self.lane_hold,
             _ => None,
         }
     }
@@ -335,6 +353,7 @@ mod tests {
             posture: Some(ApplyPosture::Automatic),
             phase: Some(ApplyPhase::PreferOutputGap),
             restored_hold: false,
+            lane_hold: None,
             account_work_hold: false,
             applying: false,
             retry_scheduled: false,
@@ -398,6 +417,7 @@ mod tests {
             posture: Some(ApplyPosture::Automatic),
             phase: Some(ApplyPhase::Land),
             restored_hold: true,
+            lane_hold: None,
             account_work_hold: false,
             applying: false,
             retry_scheduled: true,
@@ -413,6 +433,22 @@ mod tests {
             None,
             "a lane that will not apply by itself is held by nothing"
         );
+
+        snapshot.posture = Some(ApplyPosture::Automatic);
+        snapshot.lane_hold = Some("setup-draft");
+        assert_eq!(
+            snapshot.apply_held(&status),
+            Some("restored-agents"),
+            "the restored agents' hold is said while it holds"
+        );
+        snapshot.restored_hold = false;
+        assert_eq!(
+            snapshot.apply_held(&status),
+            Some("setup-draft"),
+            "the hold the lane named past its ladder is the status's"
+        );
+        snapshot.posture = Some(ApplyPosture::ManualByConfig);
+        assert_eq!(snapshot.apply_held(&status), None);
     }
 
     #[test]
@@ -491,6 +527,7 @@ mod tests {
             posture: None,
             phase: None,
             restored_hold: false,
+            lane_hold: None,
             account_work_hold: false,
             applying: false,
             retry_scheduled: false,

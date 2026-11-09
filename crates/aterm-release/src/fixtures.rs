@@ -835,6 +835,8 @@ impl MainReader {
                 ],
             )?;
         }
+        // The source graph includes private vendor/astream. Keep its credentialed Git
+        // transport; URL syntax alone is not authority to treat a repository as public.
         git_ok(
             &local,
             &["submodule", "update", "--init", "--recursive", "--force"],

@@ -88,11 +88,13 @@ mod complete;
 mod custody;
 pub use complete::{
     CompleteOutputError, CompleteProgressError, MAX_COMPLETE_LISTING_BYTES,
-    MAX_COMPLETE_STDOUT_BYTES, output_until_complete_listing, output_until_complete_stdout,
-    output_until_complete_stdout_from, output_until_complete_stdout_from_observed,
-    output_until_complete_stdout_from_unless, output_until_complete_stdout_observed,
-    output_until_complete_stdout_with_limit, output_until_complete_stdout_with_limit_unless,
-    output_while_process_progressing_complete_stdout, output_within_complete_listing,
+    MAX_COMPLETE_STDOUT_BYTES, output_until_complete_from_unless, output_until_complete_listing,
+    output_until_complete_stdout, output_until_complete_stdout_from,
+    output_until_complete_stdout_from_observed, output_until_complete_stdout_from_unless,
+    output_until_complete_stdout_observed, output_until_complete_stdout_with_limit,
+    output_until_complete_stdout_with_limit_unless,
+    output_while_process_progressing_complete_stdout,
+    output_while_process_progressing_complete_stdout_unless, output_within_complete_listing,
     output_within_complete_stdout_records, output_within_complete_stdout_records_from,
 };
 #[cfg(unix)]

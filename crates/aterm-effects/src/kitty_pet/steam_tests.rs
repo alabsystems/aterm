@@ -51,10 +51,13 @@ enum Ev {
 /// A Left arrow's key in a replay's events: the console reads it as a move along the line.
 const LEFT: char = '\u{2190}';
 
+/// A Right arrow's key in a replay's events: the console reads it as a move along the line.
+const RIGHT: char = '\u{2192}';
+
 /// A drawn frame: when, the companion's alpha on glass and its box (`x0, x1, y0, y1` px), the
 /// lettered cells (`row, col`) the box meets by a pixel or more, and how far (rows) the head law
 /// draws the body down its row and the share of its height it fits it to
-/// ([`EffectsPipeline::companion_head_sink_fit`]).
+/// ([`EffectsPipeline::companion_head_sink_fit`]), and the caret's cell (`row, col`).
 #[derive(Clone, Debug)]
 struct Frame {
     ms: u64,
@@ -62,12 +65,14 @@ struct Frame {
     pet: Option<(i32, i32, i32, i32)>,
     boxed: Vec<(usize, usize)>,
     sink_fit: (f32, f32),
+    caret: (usize, usize),
 }
 
 /// `events` replayed on `cell` px cells, the pane `grid` rows by columns, a frame every
 /// [`FRAME_MS`] to `tail` ms past the last, the laws in `old` reverted. A key's echo lands 2 ms
 /// after it; typed at the window (`ctl` false) the console sees each key (a Backspace as a
-/// delete, [`LEFT`] as a move along the line), as the gallery types it (`aterm ctl key`) none.
+/// delete, [`LEFT`] and [`RIGHT`] as moves along the line), as the gallery types it
+/// (`aterm ctl key`) none.
 fn replay(
     (cell, grid): ((usize, usize), (u16, u16)),
     style: &str,
@@ -137,7 +142,7 @@ fn replay(
                 fx.note_console_input(PetInputKind::Delete);
                 fx.note_keystroke();
             }
-            (0, Ev::Key(LEFT, _)) => {
+            (0, Ev::Key(LEFT | RIGHT, _)) => {
                 fx.note_console_input(PetInputKind::Navigate);
                 fx.note_keystroke();
             }
@@ -176,6 +181,7 @@ fn replay(
                     pet,
                     boxed,
                     sink_fit: fx.companion_head_sink_fit(),
+                    caret: (input.cursor_row, input.cursor_col),
                 });
             }
             _ => {}
@@ -524,19 +530,10 @@ struct LastRow {
     then_from: Option<u64>,
 }
 
-/// The trail gallery's `last-row` on `cell` px cells, the grid as wide as leaves `room` blank
-/// cells past the burst's line on the main screen's last row: the page's rows over it (the row
-/// over the line a letter in every cell), the burst typed from [`TYPING_FROM`] a key every 50 ms,
-/// what `then` says, then an Enter whose answer scrolls the page and prints a new prompt.
-fn last_row(
-    cell: (usize, usize),
-    (room, then): (i16, Then),
-    style: &str,
-    old: &[OldPath],
-    ctl: bool,
-) -> LastRow {
-    let line = ("$ ".len() + BURST_TEXT.len()) as i16;
-    let cols = u16::try_from(line + room).expect("a grid as wide as the line");
+/// The trail gallery's `last-row` page on a grid `cols` wide, [`ROWS`] rows tall: the screen
+/// cleared, each row over the last a letter in every cell ([`LAST_ROW_FULL`], the row over the
+/// last among them) or [`LAST_ROW_RAGGED`]'s, by turns, and the prompt `$ ` on the last.
+fn last_row_page(cols: u16) -> String {
     let mut page = String::from("\x1b[H\x1b[2J");
     for over in (1..usize::from(ROWS)).rev() {
         let text: String = if over % 2 == 1 {
@@ -552,7 +549,23 @@ fn last_row(
         page.push_str("\r\n");
     }
     page.push_str("$ ");
-    let mut ev = vec![(200, Ev::Out(page.into_bytes()))];
+    page
+}
+
+/// The trail gallery's `last-row` on `cell` px cells, the grid as wide as leaves `room` blank
+/// cells past the burst's line on the main screen's last row: the page's rows over it (the row
+/// over the line a letter in every cell), the burst typed from [`TYPING_FROM`] a key every 50 ms,
+/// what `then` says, then an Enter whose answer scrolls the page and prints a new prompt.
+fn last_row(
+    cell: (usize, usize),
+    (room, then): (i16, Then),
+    style: &str,
+    old: &[OldPath],
+    ctl: bool,
+) -> LastRow {
+    let line = ("$ ".len() + BURST_TEXT.len()) as i16;
+    let cols = u16::try_from(line + room).expect("a grid as wide as the line");
+    let mut ev = vec![(200, Ev::Out(last_row_page(cols).into_bytes()))];
     let (last_key, then_from) = if then == Then::Paused {
         let short = BURST_TEXT.len() - PAUSED_SHORT;
         ev.extend(typed(&BURST_TEXT[..short], TYPING_FROM, 50));
@@ -777,12 +790,14 @@ type WallRun = (
 /// cat and the dog, keys typed at the window and as the gallery types them, from 300 ms past the
 /// first key. Where the line leaves the room the body fitted to its row takes (`art_cols` x
 /// [`ROW_FIT`] cells: 3.38 on 13 x 29, 2.82 on 14 x 26, 3.86 on 11 x 28), typed to its end at once,
-/// paused [`PAUSED_SHORT`] keys short of it ([`Then::Paused`]) or its last letters after a run of
-/// spaces ([`Then::Gapped`]), it is on glass in every frame to the Enter (the caret's cell is not
-/// judged here: on 14 x 26 the box overlaps it), and its box meets no lettered cell but by a pose's
-/// swell at the wall, which the grid's end pushes back onto the line
-/// ([`OldPath::StretchOffLetters`] leaves it so), 2 px at most (measured on 11 x 28 at four cells:
-/// 1 px, in 3 frames, and in 7 past the pause; none on the others). Where the line leaves less, a
+/// paused [`PAUSED_SHORT`] keys short of it ([`Then::Paused`]), its last letters after a run of
+/// spaces ([`Then::Gapped`]) or walked back into by ten Left arrows ([`Then::Back`]: the body
+/// keeps its seat off the line, [`OldPath::KeptOffTheLine`]), it is on glass in every frame to the
+/// Enter (the caret's cell is not judged here: on 14 x 26 the box overlaps it), and its box meets
+/// no lettered cell but by a pose's swell at the wall, which the grid's end pushes back onto the
+/// line ([`OldPath::StretchOffLetters`] leaves it so), 2 px at most (measured on 11 x 28 at four
+/// cells: 1 px, in 3 frames, in 7 past the pause and in 13 from the first arrow; none on the
+/// others). Where the line leaves less, a
 /// frame's box meets its last letters as they come, and from that frame the body fades out
 /// ([`FADE_OUT`]), its alpha never rising, and is off the glass a fade and two frames on. Past the
 /// Enter, and where the line wraps past the wrap, it is back on glass within a second
@@ -833,6 +848,12 @@ type WallRun = (
 /// it fades; at the other rooms the reverted body is clear of the letters within 8 frames of the
 /// erase, and no control is taken there).
 ///
+/// Negative control of the seat kept off the line ([`OldPath::KeptOffTheLine`] reverted, the cat,
+/// every face, both ways of typing, the Left arrows at every room that seats the body): it
+/// follows the caret onto the line's letters, its box on them from the first arrow to the Enter
+/// in 142 frames or more, two thirds of the fewest measured (213 to 219 of 219, 198 to 204 of
+/// those at full alpha, reaching 11 to 14 px into them; Linux arm64, 2026-11-08).
+///
 /// Negative control of the caret's own steps ([`OldPath::CaretTypesOn`] reverted, the cat, every
 /// face, typed as the gallery types them, the pause at every room but the wrap): the keys typed
 /// on after the pause, short of the rhythm's [`super::RHYTHM_MOVES`], find the margin untaken,
@@ -852,7 +873,7 @@ fn a_wall_that_holds_no_seat_hides_the_body_on_every_face() {
                 let unseated = f32::from(room) < fitted;
                 let judged = match then {
                     Then::Rests => true,
-                    Then::Paused | Then::Gapped => room >= 0,
+                    Then::Paused | Then::Gapped | Then::Back => room >= 0,
                     _ => room >= 0 && unseated,
                 };
                 if !judged {
@@ -870,6 +891,10 @@ fn a_wall_that_holds_no_seat_hides_the_body_on_every_face() {
                     };
                     if unseated && control {
                         let old = Some(OldPath::NoSeatHidesTheBody);
+                        runs.push((cell, (room, then), STYLES[0], ctl, old));
+                    }
+                    if !unseated && then == Then::Back {
+                        let old = Some(OldPath::KeptOffTheLine);
                         runs.push((cell, (room, then), STYLES[0], ctl, old));
                     }
                     if then == Then::Paused && ctl {
@@ -904,6 +929,15 @@ fn a_wall_that_holds_no_seat_hides_the_body_on_every_face() {
         let fitted = art_cols(cell.0 as u16, cell.1 as u16) * ROW_FIT;
         assert!(s.held >= 150, "fixture: {why} holds {} frames", s.held);
         if control == Some(OldPath::CaretTypesOn) {
+            continue;
+        }
+        if control == Some(OldPath::KeptOffTheLine) {
+            assert!(
+                s.then_on >= 142,
+                "negative control, {why}: seated, from the first Left arrow its box met the \
+                 letters in only {} frames ({s:?})",
+                s.then_on
+            );
             continue;
         }
         if control.is_some() {
@@ -1288,7 +1322,7 @@ fn far_leap(
 /// and 113 to the 290th column from rest, 128 along the row to it, 359 along the row to the
 /// 990th). In every scene the body follows the caret away: off the prompt's rows in 60 frames
 /// or more (90 to 308), and along the row, from the caret's first leap, drawn with its box's
-/// middle past halfway in 34 or more (52 to 105; on the pane [`WIDEST_COLS`] wide it runs to
+/// middle past halfway in 34 or more (52 to 136; on the pane [`WIDEST_COLS`] wide it runs to
 /// the 602nd column). With the law, between the lettered rows the head law holds it, drawn down
 /// or fitted, in 100 frames or more (164 to 469); reverted, the fit lets go where the law reads
 /// nothing, so the control is not held to that (63 frames on the pane [`WIDEST_COLS`] wide).
@@ -1663,5 +1697,389 @@ fn a_flight_re_aimed_keeps_its_take_off_top_while_its_way_is_down_on_every_face(
                  above's letters, a box moved {step} rows in a frame"
             ),
         }
+    }
+}
+
+/// The leaps of [`a_body_outside_the_caret_s_window_stays_on_glass_on_every_face`]: from rest,
+/// along the prompt's row of a pane past the columns the console's map reads at once, from a
+/// column the caret's window leaves once the caret leaps to ten columns short of the pane's end.
+/// Each control's floor ([`FarLeap::bites`], the first) counts the frames off the glass: two
+/// thirds of the fewest measured on Linux arm64, 2026-11-08 (cat and dog, 13 x 29, 14 x 26 and
+/// 11 x 28 px cells, between lettered rows and on a blank page alike): 84, 89, 103, 146, 312, 347
+/// and 53.
+const FAR_ALONG: [FarLeap; 7] = [
+    FarLeap {
+        name: "along the prompt's row from the 20th column to the 290th",
+        grid: (ROWS, WIDE_COLS),
+        typed: false,
+        from: (5, 20),
+        to: (5, 290),
+        bites: [56, 0],
+    },
+    FarLeap {
+        name: "along the prompt's row from the 30th column to the 290th",
+        grid: (ROWS, WIDE_COLS),
+        typed: false,
+        from: (5, 30),
+        to: (5, 290),
+        bites: [59, 0],
+    },
+    FarLeap {
+        name: "along the prompt's row from the 30th column to the 340th",
+        grid: (ROWS, 350),
+        typed: false,
+        from: (5, 30),
+        to: (5, 340),
+        bites: [68, 0],
+    },
+    FarLeap {
+        name: "along the prompt's row from the 30th column to the 503rd",
+        grid: (ROWS, 513),
+        typed: false,
+        from: (5, 30),
+        to: (5, 503),
+        bites: [97, 0],
+    },
+    FarLeap {
+        name: "along the prompt's row from the 30th column to the 590th",
+        grid: (ROWS, 600),
+        typed: false,
+        from: (5, 30),
+        to: (5, 590),
+        bites: [208, 0],
+    },
+    FarLeap {
+        name: "along the prompt's row from the 30th column to the 990th",
+        grid: (ROWS, WIDEST_COLS),
+        typed: false,
+        from: (5, 30),
+        to: (5, 990),
+        bites: [231, 0],
+    },
+    FarLeap {
+        name: "along the prompt's row from the 15th column to the 990th",
+        grid: (ROWS, WIDEST_COLS),
+        typed: false,
+        from: (5, 15),
+        to: (5, 990),
+        bites: [35, 0],
+    },
+];
+
+/// A BODY OUTSIDE THE CARET'S WINDOW STANDS ON THE GROUND THE WINDOW ABOUT IT READS
+/// ([`OldPath::BodysWindowReadsItsGround`]), on every face's cells ([`CELLS`]): the console's
+/// visibility hold judges the ground under the body's box (`PetBrain::ground_clearance`), and
+/// where that box lies outside the window
+/// the map reads about the caret, the window about the body
+/// ([`crate::pet_world::PetWorld::body_window`]) answers it, its cells' ground read with its
+/// glyphs. On a pane past the columns the map reads at once, the caret leaps from rest along the
+/// prompt's row far from the body and back, twice ([`FAR_ALONG`]): from the 20th or the 30th
+/// column to the 290th on a pane [`WIDE_COLS`] wide, from the 30th to ten columns short of the
+/// end of panes 350, 513, 600 and [`WIDEST_COLS`] wide, and from the 15th to the 990th on the
+/// widest, where the body runs to the 602nd column and rests there while the caret is back. From
+/// 600 ms, the cat and the dog, between rows lettered to the margin and on a blank page: every
+/// frame draws the body at full alpha, and it follows the caret away, from the caret's first
+/// leap drawn with its box's middle past halfway in 60 frames or more (measured 89 to 187).
+/// Negative control (the law reverted alone, the cat and the dog, both pages): the window about
+/// the body reads glyphs alone, the hold reads nothing of a box outside the caret's window, goes
+/// blind, and takes the body off the glass, and a hidden body's flight keeps it off until the
+/// flight lands. It is off the glass in each scene's [`FarLeap::bites`] frames or more (measured
+/// 84 and 89 on the wide pane, 103, 146, 312 and 347 on the wider ones from the 30th column, the
+/// fade starting 2.32 or 2.37 s in, 0.82 to 0.87 s past the caret's leap; 53 from the 15th on the
+/// widest, its fade starting at 7.07 s with the body at rest at the 602nd column, Linux arm64,
+/// 2026-11-08), and on the panes 600 and [`WIDEST_COLS`] wide it follows the caret in none
+/// (ATERM-KI-1107-3).
+#[test]
+fn a_body_outside_the_caret_s_window_stays_on_glass_on_every_face() {
+    let mut runs = Vec::new();
+    for scene in FAR_ALONG {
+        for cell in CELLS {
+            for style in STYLES {
+                for page in [Page::Between, Page::Blank] {
+                    for control in [false, true] {
+                        runs.push((scene, cell, style, page, control));
+                    }
+                }
+            }
+        }
+    }
+    let seen = aterm_spec::check::each(&runs, |&(scene, cell, style, page, control)| {
+        let old: &[OldPath] = if control {
+            &[OldPath::BodysWindowReadsItsGround]
+        } else {
+            &[]
+        };
+        let frames = far_leap(cell, style, (scene, page), old, false);
+        let judged = || frames.iter().filter(|f| f.ms >= FROM);
+        let faded: Vec<u64> = judged()
+            .filter(|f| f.alpha < u8::MAX)
+            .map(|f| f.ms)
+            .collect();
+        let off = judged().filter(|f| f.alpha == 0).count();
+        (away(&frames, scene, cell), faded, off)
+    });
+    for (&(scene, cell, style, page, control), (away, faded, off)) in runs.iter().zip(&seen) {
+        let why = format!("{style} on {cell:?} ({}, {page:?})", scene.name);
+        if control {
+            assert!(
+                *off >= scene.bites[0],
+                "negative control, {why}: its window read glyphs alone, the body was off the \
+                 glass in only {off} frames"
+            );
+            continue;
+        }
+        assert!(
+            faded.is_empty() && *away >= 60,
+            "{why}: frames below full alpha at {faded:?} ms, or it followed the caret away in \
+             only {away} frames"
+        );
+    }
+}
+
+/// The row over the prompt of [`a_gap_over_the_body_is_read_about_it_on_every_face`]: three
+/// words 24 cells apart (`abcd`, `efgh`, `ijkl`, the last ending at the 60th column), each gap
+/// wider than the body on any face.
+const GAPPED_ROW_END: u16 = 60;
+
+/// [`a_gap_over_the_body_is_read_about_it_on_every_face`]'s replay on `cell` px cells, a pane
+/// [`ROWS`] rows by `cols` columns: the gapped row ([`GAPPED_ROW_END`]) over the prompt's,
+/// [`TYPING_TEXT`] typed at the window from [`TYPING_FROM`], a key every 60 ms, the laws in `old`
+/// reverted.
+fn under_a_gapped_row(cell: (usize, usize), style: &str, cols: u16, old: &[OldPath]) -> Vec<Frame> {
+    let row = format!("abcd{0}efgh{0}ijkl", " ".repeat(24));
+    debug_assert_eq!(row.len(), usize::from(GAPPED_ROW_END));
+    // Rows counted from 1: the words on the row over the prompt's.
+    let page = format!("\x1b[2J\x1b[{}H{row}\x1b[{}H$ ", PROMPT_ROW, PROMPT_ROW + 1);
+    let mut ev = vec![(0, Ev::Out(page.into_bytes()))];
+    ev.extend(typed(TYPING_TEXT, TYPING_FROM, 60));
+    replay((cell, (ROWS, cols)), style, &ev, 1_600, old, false)
+}
+
+/// The frames from [`FROM`] standing on the row `row` (counted from 0, cells `ch` px tall), once
+/// the head law first holds the box in it (its top at that row's top or under it), whose box's
+/// top rises more than a quarter of a row past that row's top again with its left edge short of
+/// `line_end` px: the body rose whole in a gap of the row above, under its words.
+fn rose_in_a_gap(frames: &[Frame], row: usize, ch: usize, line_end: i32) -> usize {
+    let ch = ch as i32;
+    let top = row as i32 * ch;
+    let feet = (top + ch / 2)..((row as i32 + 2) * ch);
+    let boxes: Vec<(i32, i32)> = frames
+        .iter()
+        .filter(|f| f.ms >= FROM)
+        .filter_map(|f| f.pet)
+        .filter(|p| feet.contains(&p.3))
+        .map(|p| (p.0, p.2))
+        .collect();
+    boxes
+        .iter()
+        .position(|&(_, y0)| y0 >= top)
+        .map_or(0, |held| {
+            boxes[held..]
+                .iter()
+                .filter(|&&(x0, y0)| y0 < top - ch / 4 && x0 < line_end)
+                .count()
+        })
+}
+
+/// A GAP OVER THE BODY IS READ ABOUT IT ([`OldPath::GapReadAboutTheBody`]), on every face's cells
+/// ([`CELLS`]): the head law holds a body in its row across a gap of the row above, a word on
+/// either side of it (`PetBrain::gap_above`, [`OldPath::HeadHeldAcrossGaps`]), and reads each side
+/// from the body's edge as far as the window that reads the cell beside it reaches, so a side
+/// longer than one window reads ([`crate::pet_world::MAX_WORLD_COLS`]) is read that far, not
+/// refused. Three words 24 cells apart on the row over the prompt ([`under_a_gapped_row`]), the
+/// line typed under them, on panes 72, 256, 257, 300 and 1,000 columns wide. From 600 ms, the cat
+/// and the dog: once the law holds the body in the prompt's row, no frame's box rises past it
+/// under the words ([`rose_in_a_gap`]), and the box meets no letter of the row above; the law holds
+/// it, drawn down or fitted, in 150 frames or more (measured 211 on every pane). Negative control
+/// (the law reverted alone, the cat and the dog, the panes past 256 columns): a side read past
+/// one window reads nothing and counts as no ink, no gap, and the body rises whole in each gap,
+/// in 23 frames or more, two thirds of the fewest measured (35 on 11 x 28, 38 on 13 x 29, 43 on
+/// 14 x 26 on each of those panes, as with [`OldPath::HeadHeldAcrossGaps`] reverted on every
+/// pane; held in 175 to 183; on the panes up to 256 columns, where a side is never longer than a
+/// window reads, the same as with the law, Linux arm64, 2026-11-08; ATERM-KI-1107-3).
+#[test]
+fn a_gap_over_the_body_is_read_about_it_on_every_face() {
+    const PANES: [u16; 5] = [72, 256, 257, 300, 1_000];
+    let mut runs = Vec::new();
+    for cols in PANES {
+        for cell in CELLS {
+            for style in STYLES {
+                runs.push((cols, cell, style, false));
+                if usize::from(cols) > crate::pet_world::MAX_WORLD_COLS {
+                    runs.push((cols, cell, style, true));
+                }
+            }
+        }
+    }
+    let prompt = PROMPT_ROW;
+    let seen = aterm_spec::check::each(&runs, |&(cols, cell, style, control)| {
+        let old: &[OldPath] = if control {
+            &[OldPath::GapReadAboutTheBody]
+        } else {
+            &[]
+        };
+        let frames = under_a_gapped_row(cell, style, cols, old);
+        let held = frames
+            .iter()
+            .filter(|f| f.ms >= FROM && (f.sink_fit.0 > 0.0 || f.sink_fit.1 < 1.0))
+            .count();
+        let line_end = i32::from(GAPPED_ROW_END) * cell.0 as i32;
+        (
+            rose_in_a_gap(&frames, prompt, cell.1, line_end),
+            on_letters_of(&frames, prompt - 1),
+            held,
+        )
+    });
+    for (&(cols, cell, style, control), (rose, met, held)) in runs.iter().zip(&seen) {
+        let why = format!("{style} on {cell:?}, a pane {cols} columns wide");
+        if control {
+            assert!(
+                *rose >= 23,
+                "negative control, {why}: a side past one window refused, it rose in a gap in \
+                 only {rose} frames"
+            );
+            continue;
+        }
+        assert!(
+            *rose == 0 && met.is_empty() && *held >= 150,
+            "{why}: it rose in a gap in {rose} frames, met the words at {met:?} ms, or was held \
+             in {held} frames"
+        );
+    }
+}
+
+/// The run of spaces before the last letters of [`walked_through_a_gap`]'s line.
+const WALKED_GAP: usize = 5;
+
+/// [`a_body_kept_off_the_line_clears_the_caret_on_every_face`]'s replay on `cell` px cells, the
+/// laws in `old` reverted, typed at the window or (`ctl`) as the gallery types: on
+/// [`last_row_page`]'s last row, a grid four blank cells wider than the line, a line as long as
+/// [`BURST_TEXT`] that ends in [`WALKED_GAP`] spaces and the first `tail` letters of
+/// `abcdefghijkl` (`echo`, a run of `q`, the gap, the letters), typed from [`TYPING_FROM`] a key
+/// every 50 ms. From 1.5 s past the last key, Left arrows 150 ms apart (each echoed back a cell)
+/// walk the caret back across the letters and the gap to the second `q` before it; 600 ms on, as
+/// many Right arrows (each echoed forward a cell) walk it back to the line's end, and 1.5 s on
+/// an Enter whose answer scrolls the page and prints a new prompt. Its frames, the line's end
+/// (cells), and the first arrow's and the Enter's ms.
+fn walked_through_a_gap(
+    cell: (usize, usize),
+    tail: usize,
+    style: &str,
+    old: &[OldPath],
+    ctl: bool,
+) -> (Vec<Frame>, usize, (u64, u64)) {
+    let lead = BURST_TEXT.len() - "echo ".len() - WALKED_GAP - tail;
+    let text = format!(
+        "echo {}{}{}",
+        "q".repeat(lead),
+        " ".repeat(WALKED_GAP),
+        &"abcdefghijkl"[..tail]
+    );
+    let line = "$ ".len() + text.len();
+    let cols = u16::try_from(line + 4).expect("a grid as wide as the line");
+    let mut ev = vec![(200, Ev::Out(last_row_page(cols).into_bytes()))];
+    ev.extend(typed(&text, TYPING_FROM, 50));
+    let last_key = TYPING_FROM + 50 * (text.len() as u64 - 1);
+    let keys = (tail + WALKED_GAP + 2) as u64;
+    let from = last_key + 1_500;
+    ev.extend((0..keys).map(|k| (from + 150 * k, Ev::Key(LEFT, b"\x08".to_vec()))));
+    let back = from + 150 * keys + 600;
+    ev.extend((0..keys).map(|k| (back + 150 * k, Ev::Key(RIGHT, b"\x1b[C".to_vec()))));
+    let enter = back + 150 * keys + 1_500;
+    ev.push((enter, Ev::Key('\r', b"\r\n".to_vec())));
+    ev.push((enter + 6, Ev::Out(b"Below: pqgyj [ok]\r\n$ ".to_vec())));
+    ev.sort_by_key(|e| e.0);
+    let frames = replay((cell, (ROWS, cols)), style, &ev, 1_600, old, ctl);
+    (frames, line, (from, enter))
+}
+
+/// How many of `frames` from `from` to the Enter (ms) draw the box over the caret's cell at full
+/// alpha, the caret short of the line's end `line` (cells `cw x ch` px), and how many on glass
+/// draw it on a lettered cell.
+fn over_the_caret_and_letters(
+    frames: &[Frame],
+    line: usize,
+    (from, enter): (u64, u64),
+    (cw, ch): (usize, usize),
+) -> (usize, usize) {
+    let (cw, ch) = (cw as i32, ch as i32);
+    let held = frames.iter().filter(|f| (from..enter).contains(&f.ms));
+    let over = |f: &Frame| {
+        let (r, c) = (f.caret.0 as i32, f.caret.1 as i32);
+        f.pet.is_some_and(|(x0, x1, y0, y1)| {
+            x0 < (c + 1) * cw && x1 > c * cw && y0 < (r + 1) * ch && y1 > r * ch
+        })
+    };
+    let caret = held
+        .clone()
+        .filter(|f| f.alpha == u8::MAX && f.caret.1 < line && over(f))
+        .count();
+    let letters = held.filter(|f| f.alpha > 0 && !f.boxed.is_empty()).count();
+    (caret, letters)
+}
+
+/// A BODY KEPT OFF THE LINE CLEARS THE CARET ([`OldPath::KeptOffTheLine`]), on every face's cells
+/// ([`CELLS`]): the law keeps a body where it stands only off the line and clear of the caret
+/// (`PetBrain::kept_off_the_line`), as every stand `PetBrain::ink_safe_col_for` offers clears it,
+/// so it never trades the line's letters for the caret's cell. On a full page's last row the
+/// caret walks back through a gap of the line and out again ([`walked_through_a_gap`], the line
+/// ending in 2, 4, 8 and 12 letters). From the first arrow to the Enter, the cat and the dog,
+/// typed at the window and as the gallery types: no run with the law draws the box over the
+/// caret's cell at full alpha, the caret short of the line's end, or on a lettered cell, in more
+/// frames than the same run with the law reverted, and on each face, over its runs, the law
+/// does both in fewer. Measured (Linux arm64, 2026-11-08), over the caret and on letters, with
+/// the law: 0 and 0 frames on 13 x 29, 0 to 16 and 41 to 243 on 14 x 26, 4 and 7 to 13 on
+/// 11 x 28; reverted: 30 to 57 and 174 to 348, 5 to 18 and 132 to 243, 19 to 63 and 218 to 373.
+/// A body kept wherever its box lay on no ink, the gap and the caret's cell included, stood over
+/// the caret on 14 x 26 in 28 to 75 frames (on letters in 35 to 60).
+#[test]
+fn a_body_kept_off_the_line_clears_the_caret_on_every_face() {
+    const TAILS: [usize; 4] = [2, 4, 8, 12];
+    let mut runs = Vec::new();
+    for cell in CELLS {
+        for style in STYLES {
+            for ctl in [false, true] {
+                for tail in TAILS {
+                    for control in [false, true] {
+                        runs.push((cell, style, ctl, tail, control));
+                    }
+                }
+            }
+        }
+    }
+    let seen = aterm_spec::check::each(&runs, |&(cell, style, ctl, tail, control)| {
+        let old: &[OldPath] = if control {
+            &[OldPath::KeptOffTheLine]
+        } else {
+            &[]
+        };
+        let (frames, line, held) = walked_through_a_gap(cell, tail, style, old, ctl);
+        over_the_caret_and_letters(&frames, line, held, cell)
+    });
+    let mut faces = std::collections::BTreeMap::new();
+    for (pair, seen) in runs.chunks(2).zip(seen.chunks(2)) {
+        let (cell, style, ctl, tail, _) = pair[0];
+        let (law, reverted) = (seen[0], seen[1]);
+        assert!(
+            law.0 <= reverted.0 && law.1 <= reverted.1,
+            "{style} on {cell:?} (ctl {ctl}), the line ending in {tail} letters: with the law \
+             over the caret in {} frames and on letters in {}, reverted in {} and {}",
+            law.0,
+            law.1,
+            reverted.0,
+            reverted.1
+        );
+        let face: &mut [usize; 4] = faces.entry(cell).or_default();
+        face[0] += law.0;
+        face[1] += law.1;
+        face[2] += reverted.0;
+        face[3] += reverted.1;
+    }
+    for (cell, [caret, letters, caret_reverted, letters_reverted]) in faces {
+        assert!(
+            caret < caret_reverted && letters < letters_reverted,
+            "negative control on {cell:?}: with the law over the caret in {caret} frames and on \
+             letters in {letters}, reverted in only {caret_reverted} and {letters_reverted}"
+        );
     }
 }

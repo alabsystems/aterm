@@ -440,11 +440,8 @@ impl std::fmt::Display for DmgError {
 
 #[cfg(any(target_os = "macos", all(test, unix)))]
 const DMG_ATTACH_LIMIT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-#[cfg(all(target_os = "macos", not(test)))]
-const DMG_DETACH_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
-/// Unit tests: the hang detector, since every detach these tests run must finish.
-#[cfg(all(test, unix))]
-const DMG_DETACH_LIMIT: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+#[cfg(any(target_os = "macos", all(test, unix)))]
+const DMG_DETACH_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 #[cfg(target_os = "macos")]
 const DMG_REAP_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -585,11 +582,21 @@ fn run_dmg_helper(
     cmd: &mut aterm_uds::spawnfd::Command,
     within: std::time::Duration,
 ) -> Result<Output, aterm_uds::deadline::RunError> {
-    let deadline = std::time::Instant::now()
+    run_dmg_helper_started(cmd, within, std::time::Instant::now())
+}
+
+#[cfg(target_os = "macos")]
+fn run_dmg_helper_started(
+    cmd: &mut aterm_uds::spawnfd::Command,
+    within: std::time::Duration,
+    started: std::time::Instant,
+) -> Result<Output, aterm_uds::deadline::RunError> {
+    let deadline = started
         .checked_add(within)
-        .unwrap_or_else(|| {
-            std::time::Instant::now() + std::time::Duration::from_secs(365 * 86_400)
-        });
+        .unwrap_or_else(|| started + std::time::Duration::from_secs(365 * 86_400));
+    if std::time::Instant::now() >= deadline {
+        return Err(aterm_uds::deadline::RunError::TimedOut);
+    }
     aterm_uds::deadline::outputs_until(&mut [cmd], deadline, DMG_REAP_LIMIT)
         .pop()
         .unwrap_or(Err(aterm_uds::deadline::RunError::TimedOut))
@@ -853,6 +860,97 @@ mod tests {
             "escaping Finder alias not copied"
         );
         assert_eq!(std::fs::read(dst.join("alias")).unwrap(), b"plist");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "owned helper process; the native detach parent invokes this exact test"]
+    fn dmg_owned_detach_child() {
+        let ready = std::env::var_os("ATERM_TEST_DMG_DETACH_READY").expect("owned ready path");
+        std::fs::write(ready, b"the actual detach fixture ran\n").unwrap();
+        println!("native detach completed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn required_dmg_cleanup_waits_for_its_native_helper() {
+        for age in [
+            std::time::Duration::from_secs(31),
+            std::time::Duration::from_secs(61),
+        ] {
+            let expired = age >= aterm_spec::wait::MUST_HAPPEN;
+            let observed = aterm_tempfile::tempdir().unwrap();
+            let ready = observed.path().join("native-ready");
+            let root = aterm_tempfile::tempdir().unwrap();
+            let retained = root.path().to_path_buf();
+            let image = root.path().join("owned.dmg");
+            std::fs::write(&image, b"owned image fixture").unwrap();
+            let point = root.path().join("mount");
+            std::fs::create_dir(&point).unwrap();
+            let expected_point = point.clone();
+            let calls = std::cell::Cell::new(0);
+            let mut run = |cmd: &mut aterm_uds::spawnfd::Command, within| {
+                calls.set(calls.get() + 1);
+                assert_eq!(cmd.get_program(), "/usr/bin/hdiutil");
+                let args: Vec<_> = cmd.get_args().map(std::ffi::OsStr::to_os_string).collect();
+                assert_eq!(
+                    args,
+                    [
+                        std::ffi::OsString::from("detach"),
+                        std::ffi::OsString::from("-force"),
+                        std::ffi::OsString::from("-quiet"),
+                        expected_point.as_os_str().to_os_string()
+                    ]
+                );
+                let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "abrew::fetch::tests::dmg_owned_detach_child",
+                        "--exact",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("ATERM_TEST_DMG_DETACH_READY", &ready);
+                run_dmg_helper_started(&mut child, within, std::time::Instant::now() - age)
+            };
+            let guard = MountGuard {
+                root: RetainedImage(Some(root)),
+                image,
+                point,
+                run: &mut run,
+                needs_detach: true,
+                uncertain: None,
+            };
+            let result = guard.finish(Ok(()));
+            assert_eq!(
+                calls.get(),
+                1,
+                "an uncertain native helper is never retried"
+            );
+            if !expired {
+                assert_eq!(
+                    std::fs::read(&ready).unwrap(),
+                    b"the actual detach fixture ran\n"
+                );
+                assert!(
+                    result.is_ok(),
+                    "a scheduled native detach helper is not unconfirmed: {result:?}"
+                );
+                assert!(
+                    !retained.exists(),
+                    "only confirmed cleanup releases the image"
+                );
+            } else {
+                assert!(matches!(result, Err(DmgError::Uncertain(_))));
+                assert!(
+                    !ready.exists(),
+                    "an expired hang detector starts no new helper"
+                );
+                assert!(retained.join("owned.dmg").is_file());
+                assert!(retained.join("mount").is_dir());
+                std::fs::remove_dir_all(&retained).unwrap();
+            }
+        }
     }
 
     #[cfg(unix)]

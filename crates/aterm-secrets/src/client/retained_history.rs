@@ -98,13 +98,13 @@ struct CachedHistory {
     prefix: aterm_journal::Prefix,
     history: Arc<History>,
     /// The journal's files and folder as they stood before the read that validated `prefix`.
-    stamps: Option<Arc<super::vault_memo::InputStamps>>,
+    stamps: Option<Arc<super::vault_memo::FileStamps>>,
 }
 
 /// The stamps of the journal's files ([`files`]: the claim, anchor, receipts and checkpoint) and
 /// of the vault folder, taken before a read validates them; `None` where one cannot be read.
-fn stamps(paths: &Paths) -> Option<Arc<super::vault_memo::InputStamps>> {
-    super::vault_memo::stamp_inputs(paths, |paths| Some(files(paths).into())).map(Arc::new)
+fn stamps(paths: &Paths) -> Option<Arc<super::vault_memo::FileStamps>> {
+    super::vault_memo::stamp_files(paths, |paths| Some(files(paths).into())).map(Arc::new)
 }
 
 impl ReadCache {
@@ -149,7 +149,7 @@ impl ReadCache {
         self.1.lookup(lookup);
         // The journal reads its own files, and every ask of it is one read of the journal.
         #[cfg(test)]
-        fsx::count_read(&journal_file(paths, "checkpoint"));
+        fsx::count_read(&journal_files(paths).checkpoint);
         let committed = aterm_journal::read_committed(
             &paths.dir,
             NAME,
@@ -530,20 +530,21 @@ fn claim(paths: &Paths) -> std::path::PathBuf {
     paths.dir.join("records.frontiers")
 }
 
-/// The journal's file of `suffix`, as `aterm_journal` lays out the journal [`NAME`].
-fn journal_file(paths: &Paths, suffix: &str) -> PathBuf {
-    paths.dir.join(format!("{NAME}.{suffix}"))
+/// The journal's files ([`aterm_journal::committed_files`]) for the journal [`NAME`].
+fn journal_files(paths: &Paths) -> aterm_journal::CommittedFiles {
+    aterm_journal::committed_files(&paths.dir, NAME)
 }
 
 /// Every file a read of the acknowledged history reads ([`Paths::acknowledged_history_files`]):
 /// the enrollment claim, then the journal's anchor, its receipts and its checkpoint, which each
 /// acknowledgement replaces.
 pub(super) fn files(paths: &Paths) -> [PathBuf; 4] {
+    let journal = journal_files(paths);
     [
         claim(paths),
-        journal_file(paths, "anchor"),
-        journal_file(paths, "astream"),
-        journal_file(paths, "checkpoint"),
+        journal.anchor,
+        journal.astream,
+        journal.checkpoint,
     ]
 }
 
@@ -582,7 +583,7 @@ impl Enrollment {
 pub(super) fn read_enrollment(reads: &Reads<'_>) -> Result<Enrollment> {
     let paths = reads.paths();
     let Some(ready) = reads.claim()? else {
-        if fsx::kind(&journal_file(paths, "anchor"))? != fsx::Kind::Missing {
+        if fsx::kind(&journal_files(paths).anchor)? != fsx::Kind::Missing {
             return Err(Error::new(
                 "retained membership enrollment needs exclusive recovery",
             ));
@@ -707,7 +708,7 @@ pub(super) fn recover_enrollment(reads: &Reads<'_>) -> Result<bool> {
         return Ok(false);
     }
     let enrolled = claim.is_some();
-    if !enrolled && fsx::kind(&journal_file(paths, "anchor"))? == fsx::Kind::Missing {
+    if !enrolled && fsx::kind(&journal_files(paths).anchor)? == fsx::Kind::Missing {
         return Ok(false);
     }
     let mut journal = aterm_journal::Log::open(&paths.dir, NAME, ANCHOR, true, limits())?;

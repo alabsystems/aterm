@@ -23,7 +23,9 @@ fn landed_child(mark: &std::path::Path) -> (crate::Session, std::fs::File) {
     landed_child_for_owner(mark, 0)
 }
 
-fn landed_child_for_owner(mark: &std::path::Path, owner: u64) -> (crate::Session, std::fs::File) {
+/// The page whose install tab landed a live child for `owner` that travels with a handoff (its
+/// receipt lets the successor recover it), still in this process, and the child's id and output.
+fn landed_source(mark: &std::path::Path, owner: u64) -> (App, u64, std::fs::File) {
     let (mut source, wid) = page();
     source.next_session_id += owner;
     source.workstation_setup.developer_tools_mark = Mark::at(mark.to_path_buf());
@@ -49,6 +51,11 @@ fn landed_child_for_owner(mark: &std::path::Path, owner: u64) -> (crate::Session
     assert!(macos_dialog_up());
     assert!(mark.is_file());
     assert!(!source.system_state_handoff_pending());
+    (source, id, read)
+}
+
+fn landed_child_for_owner(mark: &std::path::Path, owner: u64) -> (crate::Session, std::fs::File) {
+    let (mut source, id, read) = landed_source(mark, owner);
 
     // Move the actual child rather than closing it: the old window's memory goes away,
     // while keeper custody leaves its process, SID, birth and PTY unchanged.
@@ -104,6 +111,38 @@ fn new_receipt(
         claimed,
     )
     .unwrap()
+}
+
+/// An installer that travels with the handoff holds none of it, and a queued setup choice beside
+/// it holds as the setup worker's, never as the install tab's: the lane names what holds.
+#[test]
+fn clt_recovery_a_traveling_installer_beside_a_queued_choice_holds_as_system_state() {
+    use crate::native_update_lane_hold::LaneHold;
+    if !crate::test_alone::alone() {
+        return;
+    }
+    let directory = aterm_tempfile::tempdir().unwrap();
+    let mark = directory.path().join("command-line-tools-tab");
+    let (mut source, _id, _read) = landed_source(&mark, 0);
+    assert!(source.developer_tools_install_active(), "PRECONDITION");
+    assert_eq!(
+        source.system_state_handoff_hold(),
+        None,
+        "an installer that travels holds nothing"
+    );
+    source.receive_system_state_status(
+        Some(source.system_state_host.status_generation_for_test()),
+        crate::system_state::SetupStatus {
+            queued: true,
+            ..crate::system_state::SetupStatus::default()
+        },
+    );
+    assert_eq!(
+        source.system_state_handoff_hold(),
+        Some(LaneHold::SystemState),
+        "the queued choice holds, as the worker's"
+    );
+    assert!(source.system_state_handoff_pending());
 }
 
 #[test]

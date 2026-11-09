@@ -228,7 +228,6 @@ pub(crate) fn restatement_of(msg: &Message) -> Restatement {
         hold: Some(msg.hold),
         severity: Some(msg.severity),
         glyph: Some(msg.glyph),
-        excerpt: Some(msg.excerpt),
         finished: Some(msg.finished.clone()),
     }
 }
@@ -276,7 +275,6 @@ fn route_words(opened: bool, route: &str) -> Restatement {
         detail: Some(lines),
         actions: Some(Vec::new()),
         hold: Some(Hold::For(HOLD_ROUTE)),
-        excerpt: Some(opened),
         severity,
         glyph,
         ..Restatement::default()
@@ -363,7 +361,7 @@ impl App {
         id
     }
 
-    /// Posts `msg` as a `Hold::LogOnly` record without showing a row on the glass.
+    /// Posts `msg` as a `Hold::LogOnly` record, never a live row.
     pub(crate) fn record_message(&mut self, msg: Message) -> MessageId {
         self.post_unsynced(msg.hold(Hold::LogOnly), self.messages_wall.now())
     }
@@ -691,8 +689,8 @@ impl App {
     }
 
     /// Settles messages at `now` without requesting a repaint, returning whether the windows need
-    /// one: the tab strip's waiting fall re-gridded them ([`Self::settle_strip_fall`]), or the
-    /// wire gate's paced paint fell due.
+    /// one: the tab strip's waiting fall re-gridded them ([`Self::settle_strip_fall`]). The wire
+    /// gate's paced paint asks for none: nothing the GUI paints reads the glass.
     pub(crate) fn settle_messages(&mut self, now: Instant) -> bool {
         let strip = self.settle_strip_fall(now);
         if self.messages.settle_digest(wall_stamp_now(), now) {
@@ -702,10 +700,10 @@ impl App {
         self.keep_owed_rows(now);
         let _ = self.messages.settle(now, !self.message_holds_frozen());
         let persist = !self.message_persist_frozen();
-        let (lines, wire) =
+        let (lines, _) =
             drive::drain_and_pace(&mut self.messages, &mut self.wire_gate, now, persist);
         self.append_message_lines(&lines);
-        strip || wire
+        strip
     }
 
     fn persist_messages(&mut self) {
@@ -773,12 +771,11 @@ impl App {
         self.update_handoff_parked() || self.incoming_handoff_pending
     }
 
-    /// Returns the earliest instant the messages next require an event-loop wake.
+    /// Returns the earliest instant the messages next require an event-loop wake. The wire gate's
+    /// paced paint is no term: nothing the GUI paints reads the glass.
     pub(crate) fn messages_deadline(&self) -> Option<Instant> {
-        let state =
-            drive::state_deadline(&self.messages, &self.wire_gate, self.message_holds_frozen());
         [
-            state,
+            self.messages.deadline(!self.message_holds_frozen()),
             self.messages_publish_due_at(),
             self.messages.digest_deadline(),
             self.ripening_deadline(),
@@ -1247,7 +1244,13 @@ impl App {
             self.publish_native_messages_state_if_due(Instant::now());
         }
         if applied.paint == wire::Paint::Now {
-            self.sync_messages();
+            // The wire paints the glass, which no GUI window draws: settle and publish, and ask
+            // every window for a frame only when the tab strip's waiting fall re-gridded them.
+            let now = Instant::now();
+            if self.settle_messages(now) {
+                self.request_redraw_all_windows();
+            }
+            self.publish_native_messages_state_if_due(now);
         }
         if applied.note {
             aterm_log::info!("notice: {}", applied.reply);
@@ -1689,7 +1692,7 @@ pub(crate) enum PersonPass {
     Ended(EchoKind),
 }
 
-/// State of the live `update.progress` band row (`App::update_flow`).
+/// State of the live `update.progress` row (`App::update_flow`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UpdateFlow {
     pub(crate) id: MessageId,
@@ -1697,7 +1700,7 @@ pub(crate) struct UpdateFlow {
     pub(crate) phase: FlowPhase,
 }
 
-/// Lifecycle phase of the live `update.progress` band row.
+/// Lifecycle phase of the live `update.progress` row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FlowPhase {
     Downloading,

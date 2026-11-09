@@ -6,7 +6,7 @@
 
 use agh::classify::{answer, wire};
 use agh::error::{FieldError, Forbid, GithubBody};
-use agh::retry::{Idempotency, RetryPolicy, should_retry};
+use agh::retry::{Idempotency, RetryDecision, RetryPolicy, should_retry};
 use agh::wire::{Method, Phase, WireError, WireKind};
 use agh::{Error, Kind, SideEffect, Sub};
 
@@ -210,12 +210,13 @@ fn rate_limits_carry_reset_and_retry_after() {
         &[
             ("x-ratelimit-remaining", "0"),
             ("x-ratelimit-reset", "1760009999"),
+            ("retry-after", "11"),
         ],
         "",
     );
     assert_eq!(
-        (error.sub.clone(), error.reset),
-        (Sub::Primary, Some(1_760_009_999))
+        (error.sub.clone(), error.reset, error.retry_after),
+        (Sub::Primary, Some(1_760_009_999), Some(11))
     );
 }
 
@@ -294,7 +295,11 @@ fn the_gh_corpus_rows() {
     let server = classify(500, &[], "");
     assert_eq!(server.kind, Kind::Server);
     assert!(server.retriable());
-    assert!(should_retry(&RetryPolicy::STANDARD, Idempotency::Read, 1, &server, false).is_some());
+    let mut budget = RetryPolicy::STANDARD.budget();
+    assert!(matches!(
+        should_retry(&mut budget, Idempotency::Read, 1, &server),
+        RetryDecision::Retry(_)
+    ));
     let bad = classify(
         401,
         &[],
@@ -303,8 +308,8 @@ fn the_gh_corpus_rows() {
     assert_eq!(bad.kind, Kind::Unauthenticated);
     assert!(!bad.retriable());
     assert_eq!(
-        should_retry(&RetryPolicy::STANDARD, Idempotency::Read, 1, &bad, false),
-        None
+        should_retry(&mut budget, Idempotency::Read, 1, &bad),
+        RetryDecision::Final
     );
     let exists = classify(
         422,

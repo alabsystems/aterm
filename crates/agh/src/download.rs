@@ -4,11 +4,12 @@
 
 //! Release asset downloads with SHA-256 verification and atomic `.agh-part` staging.
 
+use std::cell::Cell;
 use std::fs::{File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::client::{Accept, Call, Github};
+use crate::client::{Accept, Call, Github, Streamed};
 use crate::error::{Error, Kind, Result, Sub};
 use crate::github::{How, repo_root};
 use crate::model::{AssetObject, AssetState, Sha256Digest};
@@ -217,7 +218,7 @@ impl Part {
         let path = part_path(dest);
         remove_quietly(&path).map_err(|e| local("cannot remove the old part file", &path, &e))?;
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        options.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
@@ -264,6 +265,23 @@ impl Part {
             return Err(Self::closed(&self.path));
         };
         aterm_durable::durable(file).map_err(|e| local("cannot make durable", &self.path, &e))
+    }
+
+    fn digest(&mut self) -> Result<Sha256Digest> {
+        let (path, file) = self.path_and_file()?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| local("cannot read", path, &e))?;
+        let mut hasher = aterm_digest::Sha256::new();
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => hasher.update(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(local("cannot read", path, &e)),
+            }
+        }
+        Ok(Sha256Digest::from_bytes(hasher.finalize()))
     }
 
     /// Close and rename the part file into `dest`, syncing the parent directory on Unix.
@@ -318,23 +336,154 @@ fn copy(
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => return Err(wire_read(&e)),
         };
-        seen(&buf[..n]);
         out.write_all(&buf[..n]).map_err(|e| wrote(&e))?;
+        seen(&buf[..n]);
         total = total.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
     }
 }
 
-/// Streams `body` to `dest` via a durable part file and returns the byte count.
-pub(crate) fn stream_to_file(
-    body: &mut dyn Read,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PartialBody {
+    start: u64,
+    total: Option<u64>,
+}
+
+fn content_range(value: &str) -> Option<(u64, u64, u64)> {
+    let (unit, value) = value.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse().ok()?;
+    let end = end.parse().ok()?;
+    let total = total.parse().ok()?;
+    (start <= end && end < total).then_some((start, end, total))
+}
+
+fn partial_body(
+    streamed: &Streamed,
+    offset: u64,
+    exact_total: Option<u64>,
+    cap: u64,
+) -> Result<PartialBody> {
+    let (start, total) = match streamed.status {
+        200 => (0, None),
+        206 => {
+            let value = streamed.header("content-range").ok_or_else(|| {
+                Error::protocol("a resumed body answered 206 with no Content-Range")
+            })?;
+            let (start, _, total) = content_range(value).ok_or_else(|| {
+                Error::protocol(format!(
+                    "a resumed body answered an invalid Content-Range: {value}"
+                ))
+            })?;
+            if start != offset {
+                return Err(Error::protocol(format!(
+                    "a resumed body starts at {start}, not the requested {offset}"
+                )));
+            }
+            if total > cap || exact_total.is_some_and(|expected| total != expected) {
+                return Err(Error::protocol(format!(
+                    "a resumed body's total is {total}, outside the expected byte bound"
+                )));
+            }
+            (start, Some(total))
+        }
+        status => {
+            return Err(Error::protocol(format!(
+                "a streamed download answered unexpected HTTP {status}"
+            )));
+        }
+    };
+    Ok(PartialBody { start, total })
+}
+
+fn prepare_file(
+    path: &Path,
+    file: &mut File,
+    streamed: &Streamed,
+    offset: u64,
+    exact_total: Option<u64>,
+    cap: u64,
+) -> Result<PartialBody> {
+    let partial = partial_body(streamed, offset, exact_total, cap)?;
+    let start = partial.start;
+    if start == 0 {
+        file.set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .map_err(|e| local("cannot reset", path, &e))?;
+    } else {
+        let held = file
+            .metadata()
+            .map_err(|e| local("cannot inspect", path, &e))?
+            .len();
+        if held != start {
+            return Err(Error::local(format!(
+                "{}: the resumed prefix changed from {start} to {held} bytes",
+                path.display()
+            )));
+        }
+        file.seek(SeekFrom::Start(start))
+            .map_err(|e| local("cannot resume", path, &e))?;
+    }
+    Ok(partial)
+}
+
+fn prepare_partial(
+    part: &mut Part,
+    streamed: &Streamed,
+    offset: u64,
+    exact_total: Option<u64>,
+    cap: u64,
+) -> Result<PartialBody> {
+    let (path, file) = part.path_and_file()?;
+    prepare_file(path, file, streamed, offset, exact_total, cap)
+}
+
+/// Send `call` into one durable part file, resuming a transiently broken body from the exact
+/// prefix already written. The client's shared progress budget bounds every Range retry.
+pub(crate) fn call_to_resumable_file(
+    gh: &Github,
+    call: &Call,
     dest: &Path,
-    seen: &mut dyn FnMut(&[u8]),
+    cap: u64,
 ) -> Result<u64> {
     refuse_part_name(dest)?;
     refuse_non_file(dest)?;
     let mut part = Part::create(dest)?;
-    let (path, file) = part.path_and_file()?;
-    let written = copy(body, file, seen, &|e| local("cannot write", path, e))?;
+    let offset = Cell::new(0u64);
+    let written = gh.call_stream_resumable_with(
+        call,
+        || offset.get(),
+        |mut streamed| {
+            let partial = prepare_partial(&mut part, &streamed, offset.get(), None, cap)?;
+            offset.set(partial.start);
+            let (path, file) = part.path_and_file()?;
+            let copied = copy(
+                &mut streamed.body,
+                file,
+                &mut |chunk| {
+                    offset.set(
+                        offset
+                            .get()
+                            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX)),
+                    );
+                },
+                &|e| local("cannot write", path, e),
+            )?;
+            let all = partial.start.saturating_add(copied);
+            if let Some(total) = partial.total
+                && all < total
+            {
+                return Err(Error::could_not_run(format!(
+                    "truncated: download sent {all} of {total} bytes"
+                ))
+                .with_sub(Sub::Wire(WireKind::Truncated)));
+            }
+            Ok(all)
+        },
+    )?;
     part.durable()?;
     refuse_non_file(dest)?;
     part.finish(dest)?;
@@ -487,12 +636,47 @@ fn exists_with_other_bytes(dest: &Path) -> Error {
 /// Where the bytes are while they stream.
 enum Dest<'a> {
     File {
-        part: Part,
+        part: Option<Part>,
         dest: PathBuf,
         clobber: bool,
     },
     Memory(Vec<u8>),
-    Writer(&'a mut dyn Write),
+    Writer {
+        _dir: aterm_tempfile::TempDir,
+        path: PathBuf,
+        spool: File,
+        writer: &'a mut dyn Write,
+    },
+}
+
+fn validate_download(name: &str, expect: &Expect, bytes: u64, got: Sha256Digest) -> Result<()> {
+    if bytes > expect.size {
+        return Err(Error::could_not_run(format!(
+            "too_large: asset {name} sent {bytes} bytes, not {}",
+            expect.size
+        ))
+        .with_sub(Sub::Wire(WireKind::TooLarge)));
+    }
+    if bytes < expect.size {
+        return Err(Error::could_not_run(format!(
+            "truncated: asset {name} sent {bytes} of {} bytes",
+            expect.size
+        ))
+        .with_sub(Sub::Wire(WireKind::Truncated)));
+    }
+    if let Some(expected) = expect.digest
+        && expected != got
+    {
+        return Err(Error::new(
+            Kind::Conflict,
+            format!("asset {name}'s bytes do not match its digest"),
+        )
+        .with_sub(Sub::DigestMismatch {
+            expected: expected.to_string(),
+            got: got.to_string(),
+        }));
+    }
+    Ok(())
 }
 
 /// Downloads release asset `asset` into `sink` with size and digest verification.
@@ -561,60 +745,162 @@ fn fetch_inner(
     let call = request(gh, slug, how, asset, expect)?.limit(limit);
     let mut into = match sink {
         Sink::File { path, clobber } => Dest::File {
-            part: Part::create(&path)?,
+            part: Some(Part::create(&path)?),
             dest: path,
             clobber,
         },
         Sink::Bounded(_) => Dest::Memory(Vec::with_capacity(
             usize::try_from(expect.size.min(limit).min(64 * 1024)).unwrap_or(0),
         )),
-        Sink::Writer(writer) => Dest::Writer(writer),
+        Sink::Writer(writer) => {
+            let dir = aterm_tempfile::tempdir()
+                .map_err(|e| Error::local(format!("download spool directory: {e}")))?;
+            let path = dir.path().join("body");
+            let spool = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .map_err(|e| local("cannot create", &path, &e))?;
+            Dest::Writer {
+                _dir: dir,
+                path,
+                spool,
+                writer,
+            }
+        }
     };
-    let streamed = gh.call_stream(&call)?;
-    let mut requests = streamed.requests;
-    let mut body = streamed.body;
-    let mut hasher = aterm_digest::Sha256::new();
-    let mut seen = |chunk: &[u8]| hasher.update(chunk);
-    let bytes = match &mut into {
+    let (bytes, got, mut requests) = match &mut into {
         Dest::File { part, .. } => {
-            let (path, file) = part.path_and_file()?;
-            copy(&mut body, file, &mut seen, &|e| {
-                local("cannot write", path, e)
-            })?
+            let part = part
+                .as_mut()
+                .ok_or_else(|| Error::local("the download part file is absent"))?;
+            let offset = Cell::new(0u64);
+            gh.call_stream_resumable_with(
+                &call,
+                || offset.get(),
+                |mut streamed| {
+                    let partial =
+                        prepare_partial(part, &streamed, offset.get(), Some(expect.size), limit)?;
+                    offset.set(partial.start);
+                    let copied = {
+                        let (path, file) = part.path_and_file()?;
+                        copy(
+                            &mut streamed.body,
+                            file,
+                            &mut |chunk| {
+                                offset.set(offset.get().saturating_add(
+                                    u64::try_from(chunk.len()).unwrap_or(u64::MAX),
+                                ));
+                            },
+                            &|e| local("cannot write", path, e),
+                        )?
+                    };
+                    let bytes = partial.start.saturating_add(copied);
+                    if partial.total.is_some_and(|total| bytes < total) {
+                        return Err(Error::could_not_run(format!(
+                            "truncated: asset {name} sent {bytes} of {} bytes",
+                            expect.size
+                        ))
+                        .with_sub(Sub::Wire(WireKind::Truncated)));
+                    }
+                    let got = part.digest()?;
+                    validate_download(name, expect, bytes, got)?;
+                    Ok((bytes, got, streamed.requests))
+                },
+            )?
         }
-        Dest::Memory(data) => copy(&mut body, data, &mut seen, &|e| {
-            Error::local(format!("cannot hold the bytes: {e}"))
-        })?,
-        Dest::Writer(writer) => copy(&mut body, *writer, &mut seen, &|e| {
-            Error::local(format!("cannot write the bytes: {e}"))
-        })?,
+        Dest::Memory(data) => {
+            let offset = Cell::new(0u64);
+            gh.call_stream_resumable_with(
+                &call,
+                || offset.get(),
+                |mut streamed| {
+                    let partial = partial_body(&streamed, offset.get(), Some(expect.size), limit)?;
+                    if partial.start == 0 {
+                        data.clear();
+                    } else if u64::try_from(data.len()).unwrap_or(u64::MAX) != partial.start {
+                        return Err(Error::local(format!(
+                            "the resumed memory prefix changed from {} to {} bytes",
+                            partial.start,
+                            data.len()
+                        )));
+                    }
+                    offset.set(partial.start);
+                    let copied =
+                        copy(
+                            &mut streamed.body,
+                            data,
+                            &mut |chunk| {
+                                offset.set(offset.get().saturating_add(
+                                    u64::try_from(chunk.len()).unwrap_or(u64::MAX),
+                                ));
+                            },
+                            &|e| Error::local(format!("cannot hold the bytes: {e}")),
+                        )?;
+                    let bytes = partial.start.saturating_add(copied);
+                    if partial.total.is_some_and(|total| bytes < total) {
+                        return Err(Error::could_not_run(format!(
+                            "truncated: asset {name} sent {bytes} of {} bytes",
+                            expect.size
+                        ))
+                        .with_sub(Sub::Wire(WireKind::Truncated)));
+                    }
+                    let got =
+                        Sha256Digest::from_bytes(aterm_digest::Sha256::digest(data.as_slice()));
+                    validate_download(name, expect, bytes, got)?;
+                    Ok((bytes, got, streamed.requests))
+                },
+            )?
+        }
+        Dest::Writer { path, spool, .. } => {
+            let offset = Cell::new(0u64);
+            gh.call_stream_resumable_with(
+                &call,
+                || offset.get(),
+                |mut streamed| {
+                    let partial = prepare_file(
+                        path,
+                        spool,
+                        &streamed,
+                        offset.get(),
+                        Some(expect.size),
+                        limit,
+                    )?;
+                    offset.set(partial.start);
+                    let bytes =
+                        partial.start.saturating_add(copy(
+                            &mut streamed.body,
+                            spool,
+                            &mut |chunk| {
+                                offset.set(offset.get().saturating_add(
+                                    u64::try_from(chunk.len()).unwrap_or(u64::MAX),
+                                ));
+                            },
+                            &|e| Error::local(format!("cannot write the download spool: {e}")),
+                        )?);
+                    if partial.total.is_some_and(|total| bytes < total) {
+                        return Err(Error::could_not_run(format!(
+                            "truncated: asset {name} sent {bytes} of {} bytes",
+                            expect.size
+                        ))
+                        .with_sub(Sub::Wire(WireKind::Truncated)));
+                    }
+                    let got = file_digest_if_size(path, Some(bytes))?
+                        .flatten()
+                        .ok_or_else(|| {
+                            Error::local(format!(
+                                "the download spool {} vanished or changed size",
+                                path.display()
+                            ))
+                        })?;
+                    validate_download(name, expect, bytes, got)?;
+                    Ok((bytes, got, streamed.requests))
+                },
+            )?
+        }
     };
-    if bytes > expect.size {
-        return Err(Error::could_not_run(format!(
-            "too_large: asset {name} sent {bytes} bytes, not {}",
-            expect.size
-        ))
-        .with_sub(Sub::Wire(WireKind::TooLarge)));
-    }
-    if bytes < expect.size {
-        return Err(Error::could_not_run(format!(
-            "truncated: asset {name} sent {bytes} of {} bytes",
-            expect.size
-        ))
-        .with_sub(Sub::Wire(WireKind::Truncated)));
-    }
-    let got = Sha256Digest::from_bytes(hasher.finalize());
     let digest = match expect.digest {
-        Some(expected) if expected != got => {
-            return Err(Error::new(
-                Kind::Conflict,
-                format!("asset {name}'s bytes do not match its digest"),
-            )
-            .with_sub(Sub::DigestMismatch {
-                expected: expected.to_string(),
-                got: got.to_string(),
-            }));
-        }
         Some(_) => DigestCheck::Matched,
         None => {
             let (again, sent) =
@@ -654,6 +940,7 @@ fn fetch_inner(
             dest,
             clobber,
         } => {
+            let part = part.ok_or_else(|| Error::local("the download part file is absent"))?;
             part.durable()?;
             match file_digest_if_size(&dest, Some(bytes))? {
                 None => part.finish(&dest)?,
@@ -667,7 +954,14 @@ fn fetch_inner(
             done.path = Some(dest);
         }
         Dest::Memory(data) => done.data = Some(data),
-        Dest::Writer(_) => {}
+        Dest::Writer {
+            mut spool, writer, ..
+        } => {
+            spool
+                .seek(SeekFrom::Start(0))
+                .and_then(|_| std::io::copy(&mut spool, writer))
+                .map_err(|e| Error::local(format!("cannot write the bytes: {e}")))?;
+        }
     }
     Ok(done)
 }
@@ -768,10 +1062,6 @@ mod tests {
             let err = refuse_non_file(link).expect_err("symlink destination must be refused");
             assert_eq!(err.kind, Kind::Usage, "{}", err.why);
             let err = file_digest(link).expect_err("file_digest must not follow symlinks");
-            assert_eq!(err.kind, Kind::Usage, "{}", err.why);
-            let mut body = std::io::Cursor::new(&b"replacement"[..]);
-            let err = stream_to_file(&mut body, link, &mut |_| {})
-                .expect_err("stream_to_file must refuse symlink destination");
             assert_eq!(err.kind, Kind::Usage, "{}", err.why);
             assert!(
                 std::fs::symlink_metadata(link)

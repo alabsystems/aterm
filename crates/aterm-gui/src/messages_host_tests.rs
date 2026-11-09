@@ -663,7 +663,7 @@ fn the_final_snapshot_leaves_a_held_row_alone() {
     let mut app = App::headless_for_test();
     let id = app.post_message(held_row(&toolchain_words::installed("claude, codex")));
     {
-        let live = app.messages.live(id).expect("held on glass");
+        let live = app.messages.live(id).expect("held live");
         assert!(live.msg.hold.is_held());
         assert_eq!(live.msg.meter, None, "no meter to complete");
         assert_eq!(live.revision, 0);
@@ -696,7 +696,7 @@ fn the_final_snapshot_leaves_a_held_row_alone() {
         app.apply_toolchain_snapshot(None, first_run);
     }
     app.toolchain_pass_ended(true);
-    let live = app.messages.live(id).expect("still on glass, still held");
+    let live = app.messages.live(id).expect("still live, still held");
     assert_eq!(live.revision, 0, "not restated");
     assert_eq!(live.msg.meter, None, "no meter, no 100%");
     assert_eq!(app.messages.log().len(), 1, "the read posted nothing");
@@ -2145,7 +2145,7 @@ fn a_carried_unhealed_stall_never_silences_the_successors_own_watchdog() {
         assert_eq!(
             successor.live_update_health(|k| k == stalled).len(),
             1,
-            "the successor's own stall reaches the band (carried: {carried})"
+            "the successor's own stall is a live row (carried: {carried})"
         );
         let beat = CheckerBeat {
             generation: 2,
@@ -3844,9 +3844,20 @@ fn replied_id(reply: &str, field: &str) -> MessageId {
     MessageId::from_raw(raw.parse().expect("a number")).expect("a nonzero id")
 }
 
+/// Every window's frame asks so far: each one's own and the asks of all of them at once.
+fn frame_asks(app: &App) -> u64 {
+    let own: u64 = app
+        .windows
+        .values()
+        .map(|ws| u64::from(ws.redraw_requests_for_test.get()))
+        .sum();
+    own + crate::redraw_all_requests_on_this_thread()
+}
+
 #[test]
-fn a_wire_progress_flood_repaints_at_most_once_a_frame() {
+fn a_wire_progress_flood_keeps_one_row_per_key_and_repaints_nothing() {
     let mut app = App::headless_for_test();
+    let asks_before = frame_asks(&app);
     let first = notice(&mut app, "progress build pct=0 Building aterm");
     let id = replied_id(&first, "message=");
     for i in 1..500_u32 {
@@ -3866,10 +3877,44 @@ fn a_wire_progress_flood_repaints_at_most_once_a_frame() {
         );
     }
     let due = app.wire_gate.due().expect("a paced paint is armed");
-    let deadline = app.messages_deadline().expect("the loop is due back");
-    assert!(deadline <= due, "the deadline covers the paced paint");
-    assert!(app.settle_messages(due), "the paced paint repaints");
-    assert_eq!(app.wire_gate.due(), None, "taken once");
+    let deadline = app.messages_deadline();
+    let gate = std::mem::take(&mut app.wire_gate);
+    assert_eq!(
+        app.messages_deadline(),
+        deadline,
+        "the paced paint is no term of the deadline: it wakes nothing"
+    );
+    app.wire_gate = gate;
+    assert!(
+        !app.settle_messages(due),
+        "the paced paint asks no repaint: nothing the GUI paints reads the glass"
+    );
+    // The settle took the paint at `due`, so a restatement a whole gap later paints at once.
+    let past = due + aterm_messages::WIRE_PAINT_GAP;
+    let hang = Instant::now() + std::time::Duration::from_secs(60);
+    while Instant::now() < past {
+        assert!(
+            Instant::now() < hang,
+            "the clock passed no paint gap in a minute"
+        );
+        std::thread::sleep(past.saturating_duration_since(Instant::now()));
+    }
+    let asks = frame_asks(&app);
+    let _ = notice(&mut app, "progress build done=65/100 Building aterm");
+    assert!(
+        app.wire_gate.due().is_none(),
+        "PRECONDITION: the restatement past the gap arms no paced paint"
+    );
+    assert_eq!(
+        frame_asks(&app),
+        asks,
+        "a restatement the wire paints at once asks no window for a frame"
+    );
+    assert_eq!(
+        frame_asks(&app),
+        asks_before,
+        "the whole flood asks no window for a frame"
+    );
 }
 
 #[test]
@@ -4092,7 +4137,7 @@ fn a_linux_install_waiting_for_a_start_is_a_notice_and_its_end_takes_it_down() {
     let row = app
         .messages
         .live_by_key(update_words::KEY_AWAITS_START)
-        .expect("the notice is on the band");
+        .expect("the notice is a live row");
     assert_eq!(row.msg.severity, Severity::Info);
     assert_eq!(row.msg.title, aterm_update::INSTALL_AWAITS_START_TITLE);
     assert!(
@@ -4324,7 +4369,7 @@ fn an_owed_warning_is_seen_once_a_window_is_on_screen_and_ends_at_its_hold() {
 }
 
 /// A SETTINGS TAB CLOSED FROM BEHIND SHOWED NOTHING: `settings close` with a terminal in front
-/// leaves the font problem a band row, since Settings never came to the front to show it.
+/// leaves the font problem a live row, since Settings never came to the front to show it.
 #[test]
 fn closing_settings_from_behind_keeps_the_config_row_it_never_showed() {
     use crate::message_reporters::{ConfigFamily, ConfigWarnings};
@@ -4346,7 +4391,7 @@ fn closing_settings_from_behind_keeps_the_config_row_it_never_showed() {
     app.replace_config_messages(messages);
     assert!(
         app.messages.live_by_key(fonts).is_some(),
-        "PRECONDITION: over a terminal the problem is a band row"
+        "PRECONDITION: over a terminal the problem is a live row"
     );
 
     assert!(app.close_settings_tabs());
@@ -4389,7 +4434,7 @@ fn a_refused_font_size_is_a_record_while_settings_is_in_front() {
         .iter()
         .find(|m| m.key.as_deref() == Some(key))
         .expect("the refused size is said");
-    assert_ne!(msg.hold, Hold::LogOnly, "a band row over a terminal");
+    assert_ne!(msg.hold, Hold::LogOnly, "a live row over a terminal");
 
     let mut mixed = shown("font_px = 500.0\n");
     mixed.push(
@@ -4405,12 +4450,12 @@ fn a_refused_font_size_is_a_record_while_settings_is_in_front() {
     assert_ne!(
         msg.hold,
         Hold::LogOnly,
-        "a family with a sentence no row says keeps its band row"
+        "a family with a sentence no row says keeps its live row"
     );
 }
 
 #[test]
-fn a_band_row_that_becomes_its_record_says_its_sentence_once() {
+fn a_live_row_that_becomes_its_record_says_its_sentence_once() {
     use crate::message_reporters::{ConfigFamily, ConfigWarnings, config_record};
     let config = crate::app_config::Config::parse("font_px = 500.0\n").expect("config");
     let mut warns = ConfigWarnings::default();
@@ -4420,21 +4465,21 @@ fn a_band_row_that_becomes_its_record_says_its_sentence_once() {
         &crate::app_config::ThemeCatalog::empty(),
         "font_px = 500.0\n",
     );
-    let band = warns
+    let row = warns
         .into_messages_routed(false)
         .into_iter()
         .find(|m| m.key.as_deref() == Some(ConfigFamily::UnacceptedValues.key()))
         .expect("the refused size is said");
     assert!(
-        band.detail.len() >= 2 && band.detail[1].starts_with(&band.detail[0]),
-        "the band row paints its excerpt first: {:?}",
-        band.detail
+        row.detail.len() >= 2 && row.detail[1].starts_with(&row.detail[0]),
+        "the live row's first detail line heads its sentence: {:?}",
+        row.detail
     );
-    let record = config_record(&band);
+    let record = config_record(&row);
     assert_eq!(record.hold, Hold::LogOnly);
     assert_eq!(
         record.detail,
-        band.detail[1..].to_vec(),
+        row.detail[1..].to_vec(),
         "the record keeps the sentences alone"
     );
 }

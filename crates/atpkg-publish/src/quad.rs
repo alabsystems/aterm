@@ -273,25 +273,42 @@ pub fn fetch_head_with(
             ))
         })?;
     let tag = index_tag(n);
-    let mut last = HostError::NotFound;
-    for attempt in 0..3 {
-        if attempt > 0 {
-            std::thread::sleep(host.retry_pause());
+    download_head_with(host.download_owns_retry(), host.retry_pause(), || {
+        download_quad_files(ctx, slug, &tag, &QUAD_FILES, dest)
+    })
+    .map_err(|e| match e {
+        HostError::Unreachable(_) => {
+            Error::cannot_run(format!("could not download {tag} from {slug}: {e}"))
         }
-        match download_quad_files(ctx, slug, &tag, &QUAD_FILES, dest) {
-            Ok(()) => return Ok((n, verify_dir_with(ctx, dest, freshness)?)),
+        _ => Error::refused(format!(
+            "{tag} on {slug} does not carry the four quad files ({e}) — a client finds no \
+             candidate there either"
+        )),
+    })?;
+    Ok((n, verify_dir_with(ctx, dest, freshness)?))
+}
+
+/// Run a head download. A real HTTP host owns its complete transport budget, including an
+/// authenticated API hop followed by an anonymous CDN hop; wrapping that call would multiply the
+/// stated bound. In-memory and other non-transport hosts retain their legacy three calls.
+fn download_head_with(
+    transport_owns_retry: bool,
+    pause: std::time::Duration,
+    mut download: impl FnMut() -> std::result::Result<(), HostError>,
+) -> std::result::Result<(), HostError> {
+    let attempts = if transport_owns_retry { 1 } else { 3 };
+    let mut last = HostError::NotFound;
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            std::thread::sleep(pause);
+        }
+        match download() {
+            Ok(()) => return Ok(()),
             Err(e @ HostError::Unreachable(_)) => last = e,
-            Err(e) => {
-                return Err(Error::refused(format!(
-                    "{tag} on {slug} does not carry the four quad files ({e}) — a client \
-                     finds no candidate there either"
-                )));
-            }
+            Err(e) => return Err(e),
         }
     }
-    Err(Error::cannot_run(format!(
-        "could not download {tag} from {slug}: {last}"
-    )))
+    Err(last)
 }
 
 #[cfg(test)]
@@ -309,6 +326,31 @@ mod tests {
         assert_eq!(
             head_number(&[rel("atpkg-index-5"), rel("atpkg-index-+99")]),
             Some(5)
+        );
+    }
+
+    #[test]
+    fn a_transport_owned_head_download_has_exactly_one_retry_owner() {
+        let mut authenticated_transport_calls = 0;
+        let result = download_head_with(true, std::time::Duration::ZERO, || {
+            authenticated_transport_calls += 1;
+            Err(HostError::Unreachable("transient".into()))
+        });
+        assert!(matches!(result, Err(HostError::Unreachable(_))));
+        assert_eq!(
+            authenticated_transport_calls, 1,
+            "an authenticated API plus anonymous CDN composite owns one transport budget"
+        );
+
+        let mut model_calls = 0;
+        let result = download_head_with(false, std::time::Duration::ZERO, || {
+            model_calls += 1;
+            Err(HostError::Unreachable("transient".into()))
+        });
+        assert!(matches!(result, Err(HostError::Unreachable(_))));
+        assert_eq!(
+            model_calls, 3,
+            "a model with no transport budget retains its bound"
         );
     }
 }

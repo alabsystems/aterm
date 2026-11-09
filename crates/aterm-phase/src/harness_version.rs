@@ -126,6 +126,77 @@ const fn parse_u16_slice(bytes: &[u8], from: usize, to: usize) -> Option<u16> {
     Some(acc as u16)
 }
 
+/// The source spelling that begins a harness's compiled version declaration.
+pub const SOURCE_DECLARATION_HEAD: &str =
+    "pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(";
+
+/// The `(major, minor)` a harness source file declares: either the current one-line shape
+/// (`HarnessVersion::new(0, 4, "0.4")`) or the three-constant shape it replaced.
+#[must_use]
+pub fn declared_in_source(text: &str) -> Option<(u16, u16)> {
+    let uint = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u16>().ok())
+            .flatten()
+    };
+    let at = text.find(SOURCE_DECLARATION_HEAD)?;
+    let args = text[at + SOURCE_DECLARATION_HEAD.len()..]
+        .split(");")
+        .next()?;
+    let text_arg = args.split('"').nth(1);
+    let mut parts = args.split(',');
+    if let (Some(major), Some(minor), Some(spelled)) = (
+        parts.next().and_then(|a| uint(a.trim())),
+        parts.next().and_then(|a| uint(a.trim())),
+        text_arg,
+    ) {
+        return (HarnessVersion::parse_major_minor(spelled) == Some((major, minor)))
+            .then_some((major, minor));
+    }
+    let constant = |name: &str| -> Option<&str> {
+        let key = format!("pub const {name}: ");
+        let rest = &text[text.find(&key)? + key.len()..];
+        Some(rest.split(';').next()?.split('=').nth(1)?.trim())
+    };
+    let spelled = constant("HARNESS_VERSION")?.trim_matches('"');
+    let parsed = HarnessVersion::parse_major_minor(spelled)?;
+    let major = uint(constant("HARNESS_VERSION_MAJOR")?)?;
+    let minor = uint(constant("HARNESS_VERSION_MINOR")?)?;
+    (parsed == (major, minor)).then_some(parsed)
+}
+
+/// The canonical one-line source declaration for `(major, minor)`.
+#[must_use]
+pub fn source_line((major, minor): (u16, u16)) -> String {
+    format!("{SOURCE_DECLARATION_HEAD}{major}, {minor}, \"{major}.{minor}\");")
+}
+
+/// `text` with its compiled harness version rewritten to `to` in the one-line shape. The
+/// retired three-constant declaration is collapsed when encountered.
+#[must_use]
+pub fn rewrite_source(text: &str, to: (u16, u16)) -> Option<String> {
+    declared_in_source(text)?;
+    let start = text.find(SOURCE_DECLARATION_HEAD)?;
+    let end = start + text[start..].find(");")? + 2;
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str(&source_line(to));
+    out.push_str(&text[end..]);
+    for name in [
+        "HARNESS_VERSION_MAJOR",
+        "HARNESS_VERSION_MINOR",
+        "HARNESS_VERSION",
+    ] {
+        let key = format!("pub const {name}: ");
+        if let Some(at) = out.find(&key) {
+            let line_start = out[..at].rfind("\n\n").map_or(0, |p| p + 1);
+            let line_end = at + out[at..].find(";\n").map_or(out.len() - at, |p| p + 2);
+            out.replace_range(line_start..line_end, "");
+        }
+    }
+    Some(out)
+}
+
 impl PartialOrd for HarnessVersion {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {

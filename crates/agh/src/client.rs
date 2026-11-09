@@ -25,7 +25,7 @@ use crate::policy::{
 };
 use crate::rate::{RateBook, RateSnapshot, book_key_str, resource_for};
 use crate::redact::Redactor;
-use crate::retry::{Idempotency, RetryPolicy, should_retry};
+use crate::retry::{Idempotency, RetryDecision, RetryPolicy, should_retry, transient_cause};
 use crate::slug::Slug;
 use crate::wire::door::AuthHeader;
 use crate::wire::http::HttpTransport;
@@ -34,6 +34,11 @@ use crate::wire::{
     WireResponse, header_in, hop, path_only,
 };
 use crate::write::{Outcome, WriteOp};
+
+fn retry_exhausted(mut failure: Error, bound: &str) -> Error {
+    failure.why = format!("{} after {bound}", failure.why);
+    failure
+}
 
 /// The Accept header.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,7 +124,8 @@ pub struct Call {
     pub hop: bool,
     /// `None`: the client's policy.
     pub retry: Option<RetryPolicy>,
-    /// Hand back any status as an `Answered`, unclassified, with no retry, probe, move, or hop.
+    /// Hand back any definitive status as an `Answered`, with no probe, move, or hop. A
+    /// transient status still enters the call's shared retry budget first.
     pub answer_any: bool,
     /// The write's body (`CallBody::Empty` from `Call::get` and `Call::head`).
     pub(crate) body: CallBody,
@@ -733,6 +739,29 @@ impl Github {
             .map(Got::into_streamed)
     }
 
+    /// Execute a file transfer whose completed prefix earns a bounded Range resume.
+    /// `offset` is the number of durable bytes already held by the caller; `consume` must
+    /// append a validated 206 body or replace the prefix when the server answers 200.
+    pub(crate) fn call_stream_resumable_with<T>(
+        &self,
+        call: &Call,
+        mut offset: impl FnMut() -> u64,
+        mut consume: impl FnMut(Streamed) -> Result<T>,
+    ) -> Result<T> {
+        method_gate(call)?;
+        let decided = self.route(&call.route)?;
+        let mut sent = 0;
+        let mut resume = ProgressResume::new(call.limit, &mut offset);
+        self.run_counted_with(
+            call,
+            &decided,
+            Reading::Stream,
+            &mut sent,
+            Some(&mut resume),
+            &mut |got| consume(got.into_streamed()),
+        )
+    }
+
     /// The router.
     #[inline]
     #[must_use]
@@ -1009,7 +1038,7 @@ impl Github {
         let budget = how.sleep_budget.or(call.sleep_budget);
         let consult_book = how.rate_book && call.rate_book;
         let mut slept = Duration::ZERO;
-        let mut secondary_retried = false;
+        let mut retry_budget = policy.budget();
         let mut attempt = 1u32;
         // What the attempts so far may have done: an error after a retry says at least that,
         // so a later attempt that sent nothing never hides an earlier one that may have landed.
@@ -1026,22 +1055,25 @@ impl Github {
                 }
                 Err(failure) => failure,
             };
-            let Some(pause) = should_retry(
-                &policy,
-                call.idempotency,
-                attempt,
-                &failure,
-                secondary_retried,
-            ) else {
-                return Err(at_least(failure, earlier));
+            let retry = match should_retry(&mut retry_budget, call.idempotency, attempt, &failure) {
+                RetryDecision::Retry(retry) => retry,
+                RetryDecision::Exhausted { bound } => {
+                    return Err(at_least(retry_exhausted(failure, &bound), earlier));
+                }
+                RetryDecision::Final => return Err(at_least(failure, earlier)),
             };
-            if budget.is_some_and(|budget| slept.saturating_add(pause) > budget) {
-                return Err(at_least(failure, earlier));
+            let pause = retry.pause;
+            if let Some(budget) = budget
+                && slept.saturating_add(pause) > budget
+            {
+                let bound = format!("{}s call retry-pause bound", budget.as_secs());
+                return Err(at_least(retry_exhausted(failure, &bound), earlier));
             }
             earlier = stronger(earlier, failure.side_effect);
-            if failure.sub == Sub::Secondary {
-                secondary_retried = true;
-            }
+            self.inner
+                .fx
+                .note_retry(retry)
+                .map_err(|e| at_least(e, earlier))?;
             self.inner
                 .fx
                 .sleep(pause)
@@ -1071,7 +1103,7 @@ impl Github {
         let once = How::write().retry_policy(RetryPolicy::NONE);
         let budget = how.sleep_budget;
         let mut slept = Duration::ZERO;
-        let mut secondary_retried = false;
+        let mut retry_budget = policy.budget();
         let mut so_far = Progress {
             lost: None,
             previous: None,
@@ -1098,22 +1130,30 @@ impl Github {
             if failure.side_effect == SideEffect::Unknown {
                 so_far.lost = Some(failure.clone());
             }
-            let pause = should_retry(
-                &policy,
+            let retry = match should_retry(
+                &mut retry_budget,
                 Idempotency::Converging,
                 so_far.attempt,
                 &failure,
-                secondary_retried,
-            )
-            .filter(|pause| budget.is_none_or(|budget| slept.saturating_add(*pause) <= budget));
-            let Some(pause) = pause else {
-                return so_far.end(Err(failure), Ended::Attempt);
+            ) {
+                RetryDecision::Retry(retry) => retry,
+                RetryDecision::Exhausted { bound } => {
+                    return so_far.end(Err(retry_exhausted(failure, &bound)), Ended::Attempt);
+                }
+                RetryDecision::Final => return so_far.end(Err(failure), Ended::Attempt),
             };
-            if failure.sub == Sub::Secondary {
-                secondary_retried = true;
+            let pause = retry.pause;
+            if let Some(budget) = budget
+                && slept.saturating_add(pause) > budget
+            {
+                let bound = format!("{}s call retry-pause bound", budget.as_secs());
+                return so_far.end(Err(retry_exhausted(failure, &bound)), Ended::Attempt);
             }
             so_far.earlier |= failure.side_effect == SideEffect::Unknown;
             so_far.previous = Some(failure);
+            if let Err(logged) = self.inner.fx.note_retry(retry) {
+                return so_far.end(Err(logged), Ended::Pause);
+            }
             if let Err(paused) = self.inner.fx.sleep(pause) {
                 return so_far.end(Err(paused), Ended::Pause);
             }
@@ -1616,7 +1656,98 @@ struct Prepared {
     deadlines: Deadlines,
 }
 
+const SHORT_RESUMES_PER_CALL: u32 = 16;
+const RESUME_EARNED_AT: u64 = 1 << 20;
+
+struct ProgressResume<'a> {
+    cap: u64,
+    offset: &'a mut dyn FnMut() -> u64,
+    short: u32,
+    all: u64,
+}
+
+impl<'a> ProgressResume<'a> {
+    fn new(cap: u64, offset: &'a mut dyn FnMut() -> u64) -> Self {
+        Self {
+            cap,
+            offset,
+            short: 0,
+            all: 0,
+        }
+    }
+
+    fn begin(&mut self, prepared: &mut Prepared) -> u64 {
+        let offset = (self.offset)();
+        prepared
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("range"));
+        if offset != 0 && offset < self.cap {
+            prepared
+                .headers
+                .push(("Range".to_string(), format!("bytes={offset}-")));
+        }
+        offset
+    }
+
+    fn after(&mut self, before: u64) -> (u64, u64) {
+        let after = (self.offset)();
+        (after.saturating_sub(before), after)
+    }
+
+    fn admit(&mut self, moved: u64, after: u64) -> bool {
+        if after >= self.cap
+            || self.all >= self.budget()
+            || (moved < RESUME_EARNED_AT && self.short >= SHORT_RESUMES_PER_CALL)
+        {
+            return false;
+        }
+        self.all = self.all.saturating_add(1);
+        if moved < RESUME_EARNED_AT {
+            self.short = self.short.saturating_add(1);
+        }
+        true
+    }
+
+    const fn budget(&self) -> u64 {
+        (SHORT_RESUMES_PER_CALL as u64).saturating_add(self.cap / RESUME_EARNED_AT)
+    }
+
+    fn bound(&self) -> String {
+        format!(
+            "{} progress-earned resumes (16 short plus one per MiB of the byte cap)",
+            self.budget()
+        )
+    }
+
+    fn logged_retry(
+        &self,
+        cause: aterm_types::http_retry::Cause,
+    ) -> aterm_types::http_retry::Retry {
+        aterm_types::http_retry::Retry {
+            attempt: u32::try_from(self.all).unwrap_or(u32::MAX),
+            attempts: u32::try_from(self.budget()).unwrap_or(u32::MAX),
+            cause,
+            pause: Duration::ZERO,
+        }
+    }
+}
+
 impl Prepared {
+    /// The successful streamed body's absolute byte cap. A 200 ignored Range and may replace
+    /// the prefix with the whole body; a 206 may carry only the cap remaining after the exact
+    /// offset we requested.
+    fn stream_limit(&self, status: u16) -> u64 {
+        if status != 206 {
+            return self.limit;
+        }
+        let offset = header_in(&self.headers, "range")
+            .and_then(|value| value.strip_prefix("bytes="))
+            .and_then(|value| value.strip_suffix('-'))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        self.limit.saturating_sub(offset)
+    }
+
     fn request(&self) -> WireRequest<'_> {
         WireRequest {
             method: self.method,
@@ -1660,8 +1791,12 @@ impl Prepared {
 enum Flow {
     /// A later step (a move, a hop) produced the answer.
     Done(Box<Got>),
-    /// The error.
-    Retry(Error, u32),
+    /// The error, subrequests beyond the outer attempt, and whether an anonymous subread ran.
+    Retry {
+        error: Error,
+        beyond: u32,
+        anonymous: bool,
+    },
 }
 
 struct Exchange<'a> {
@@ -2307,7 +2442,8 @@ impl Github {
         } else {
             SideEffect::Unknown
         };
-        let error = classify::answer(status, &headers, &head, call.method, call.idempotency)
+        let error = self
+            .classify_answer(status, &headers, &head, call.method, call.idempotency)?
             .unwrap_or_else(|| Error::protocol(format!("GitHub answered {status}")))
             .with_side_effect(side_effect);
         let exchange = Exchange {
@@ -2429,6 +2565,34 @@ impl Github {
         error
     }
 
+    /// Classify one answer with a clock only when `Retry-After` is not delta-seconds. This keeps
+    /// ordinary exchanges off the clock door while admitting a valid HTTP-date deterministically.
+    fn classify_answer(
+        &self,
+        status: u16,
+        headers: &[(String, String)],
+        body: &[u8],
+        method: Method,
+        idempotency: Idempotency,
+    ) -> Result<Option<Error>> {
+        let now = match (status, header_in(headers, "retry-after").map(str::trim)) {
+            (403 | 429, Some(value))
+                if aterm_types::http_retry::retry_after_delay_secs(value, None).is_none() =>
+            {
+                Some(self.inner.fx.wall_secs()?)
+            }
+            _ => None,
+        };
+        Ok(classify::answer_at(
+            status,
+            headers,
+            body,
+            method,
+            idempotency,
+            now,
+        ))
+    }
+
     fn run(&self, call: &Call, decided: &Decided, reading: Reading) -> Result<Got> {
         let mut sent = 0;
         self.run_counted(call, decided, reading, &mut sent)
@@ -2441,7 +2605,19 @@ impl Github {
         reading: Reading,
         sent: &mut u32,
     ) -> Result<Got> {
-        let prepared = self.prepare(call, decided, reading);
+        self.run_counted_with(call, decided, reading, sent, None, &mut Ok)
+    }
+
+    fn run_counted_with<T>(
+        &self,
+        call: &Call,
+        decided: &Decided,
+        reading: Reading,
+        sent: &mut u32,
+        mut resume: Option<&mut ProgressResume<'_>>,
+        consume: &mut impl FnMut(Got) -> Result<T>,
+    ) -> Result<T> {
+        let mut prepared = self.prepare(call, decided, reading);
         let key = book_key_str(&decided.identity);
         let booked = call.origin == OriginRole::Api && self.inner.rate_book.enabled();
         let free = path_only(&call.path) == "/rate_limit";
@@ -2452,12 +2628,27 @@ impl Github {
                 return Err(self.finish_error(refused, call, &prepared.as_, None));
             }
         }
-        let policy = call.retry.unwrap_or(self.inner.retry);
+        let configured = call.retry.unwrap_or(self.inner.retry);
+        // A streamed hop is one composite read whose second request is always rebuilt without
+        // credentials. Select its anonymous budget before the first request so API and CDN
+        // failures consume one bound rather than giving the CDN the credentialed 3-attempt
+        // policy (or opening a nested budget after the redirect).
+        let mut policy = if prepared.as_ == IdentityRef::Anonymous
+            || (call.hop && reading == Reading::Stream && call.method.is_read())
+        {
+            configured.for_anonymous_http()
+        } else {
+            configured
+        };
         let mut requests = 0u32;
         let mut attempt = 1u32;
-        let mut secondary_retried = false;
+        let mut retry_budget = policy.budget();
         let mut slept = Duration::ZERO;
         loop {
+            let mut anonymous_subread = false;
+            let began = resume
+                .as_mut()
+                .map_or(0, |resume| resume.begin(&mut prepared));
             requests = requests.saturating_add(1);
             *sent = requests;
             let failure = match self.send(&prepared)? {
@@ -2475,17 +2666,48 @@ impl Github {
                             self.inner.rate_book.record(key, snapshot);
                         }
                     }
-                    if call.answer_any || is_success(response.status, reading) {
+                    let retry_answer = if call.answer_any {
+                        crate::retry::transient_cause(
+                            &self
+                                .classify_answer(
+                                    response.status,
+                                    &response.headers,
+                                    &[],
+                                    call.method,
+                                    call.idempotency,
+                                )?
+                                .unwrap_or_else(|| {
+                                    Error::protocol(format!("GitHub answered {}", response.status))
+                                })
+                                .with_http(HttpRef {
+                                    status: response.status,
+                                    method: call.method.as_str(),
+                                    path: path_only(&call.path).to_string(),
+                                    request_id: None,
+                                }),
+                        )
+                        .is_some()
+                    } else {
+                        false
+                    };
+                    if (call.answer_any && !retry_answer) || is_success(response.status, reading) {
+                        let stream_limit = prepared.stream_limit(response.status);
                         match prepared.held(&mut response) {
                             Ok(whole) => {
-                                return Ok(Got::of(
+                                let got = Got::of(
                                     response,
                                     whole,
                                     &prepared.as_,
                                     requests,
                                     rate,
-                                    call.limit,
-                                ));
+                                    stream_limit,
+                                );
+                                match consume(got) {
+                                    Ok(value) => return Ok(value),
+                                    Err(error) => {
+                                        self.finish_error(error, call, &prepared.as_, None)
+                                    }
+                                }
                             }
                             Err(wire) => {
                                 let exchange = Exchange {
@@ -2504,14 +2726,17 @@ impl Github {
                     } else {
                         let status = response.status;
                         let (headers, head) = head_of(response);
-                        let classified = classify::answer(
-                            status,
-                            &headers,
-                            &head,
-                            call.method,
-                            call.idempotency,
-                        )
-                        .unwrap_or_else(|| Error::protocol(format!("GitHub answered {status}")));
+                        let classified = self
+                            .classify_answer(
+                                status,
+                                &headers,
+                                &head,
+                                call.method,
+                                call.idempotency,
+                            )?
+                            .unwrap_or_else(|| {
+                                Error::protocol(format!("GitHub answered {status}"))
+                            });
                         let exchange = Exchange {
                             status,
                             headers: &headers,
@@ -2526,8 +2751,16 @@ impl Github {
                             requests,
                         };
                         match self.judge(call, decided, &prepared, failed)? {
-                            Flow::Done(got) => return Ok(*got),
-                            Flow::Retry(error, beyond) => {
+                            Flow::Done(got) => match consume(*got) {
+                                Ok(value) => return Ok(value),
+                                Err(error) => self.finish_error(error, call, &prepared.as_, None),
+                            },
+                            Flow::Retry {
+                                error,
+                                beyond,
+                                anonymous,
+                            } => {
+                                anonymous_subread = anonymous;
                                 requests = requests.saturating_add(beyond);
                                 *sent = requests;
                                 error
@@ -2536,24 +2769,43 @@ impl Github {
                     }
                 }
             };
-            let Some(pause) = should_retry(
-                &policy,
-                call.idempotency,
-                attempt,
-                &failure,
-                secondary_retried,
-            ) else {
-                return Err(failure);
-            };
-            if call
-                .sleep_budget
-                .is_some_and(|budget| slept.saturating_add(pause) > budget)
+            let anonymous_policy = configured.for_anonymous_http();
+            if anonymous_subread && policy != anonymous_policy {
+                policy = anonymous_policy;
+                let Some(widened) = policy.budget_with_paused(slept) else {
+                    return Err(retry_exhausted(failure, &policy.bound()));
+                };
+                retry_budget = widened;
+            }
+            if let Some(resume) = resume.as_mut()
+                && let Some(cause) = transient_cause(&failure)
             {
-                return Err(failure);
+                let (moved, after) = resume.after(began);
+                if moved != 0 {
+                    if !resume.admit(moved, after) {
+                        return Err(retry_exhausted(failure, &resume.bound()));
+                    }
+                    self.inner.fx.note_retry(resume.logged_retry(cause))?;
+                    attempt = 1;
+                    retry_budget = policy.budget();
+                    continue;
+                }
             }
-            if failure.sub == Sub::Secondary {
-                secondary_retried = true;
+            let retry = match should_retry(&mut retry_budget, call.idempotency, attempt, &failure) {
+                RetryDecision::Retry(retry) => retry,
+                RetryDecision::Exhausted { bound } => {
+                    return Err(retry_exhausted(failure, &bound));
+                }
+                RetryDecision::Final => return Err(failure),
+            };
+            let pause = retry.pause;
+            if let Some(budget) = call.sleep_budget
+                && slept.saturating_add(pause) > budget
+            {
+                let bound = format!("{}s call retry-pause bound", budget.as_secs());
+                return Err(retry_exhausted(failure, &bound));
             }
+            self.inner.fx.note_retry(retry)?;
             self.inner.fx.sleep(pause)?;
             slept = slept.saturating_add(pause);
             attempt = attempt.saturating_add(1);
@@ -2590,7 +2842,6 @@ impl Github {
                             && call.follow_moved =>
                     {
                         self.follow_move(call, id, failed, reading)
-                            .map(|got| Flow::Done(Box::new(got)))
                     }
                     _ => Err(failed.error),
                 }
@@ -2605,9 +2856,17 @@ impl Github {
             300..=399 => Err(failed.error),
             404 if call.origin == OriginRole::Api => match repo_of(&call.route) {
                 Some(slug) => self.judge_404(call, decided, prepared, slug, failed),
-                None => Ok(Flow::Retry(failed.error, 0)),
+                None => Ok(Flow::Retry {
+                    error: failed.error,
+                    beyond: 0,
+                    anonymous: false,
+                }),
             },
-            _ => Ok(Flow::Retry(failed.error, 0)),
+            _ => Ok(Flow::Retry {
+                error: failed.error,
+                beyond: 0,
+                anonymous: false,
+            }),
         }
     }
 
@@ -2617,7 +2876,7 @@ impl Github {
         id: u64,
         failed: Failed<'_>,
         reading: Reading,
-    ) -> Result<Got> {
+    ) -> Result<Flow> {
         let Some(old) = repo_of(&call.route).cloned() else {
             return Err(failed.error);
         };
@@ -2630,9 +2889,16 @@ impl Github {
         )
         .follow_moved(false)
         .probe_404(false)
-        .retry(call.retry)
+        // The lookup is one subrequest of this logical read. Its transient failure returns to
+        // the outer call's one retry budget below rather than opening a nested budget.
+        .retry(Some(RetryPolicy::NONE))
         .deadlines(call.deadlines);
-        let looked = match self.call(&lookup) {
+        let lookup_decided = self.route(&lookup.route)?;
+        let mut lookup_sent = 0;
+        let looked = match self
+            .run_counted(&lookup, &lookup_decided, Reading::Whole, &mut lookup_sent)
+            .and_then(Got::into_answered)
+        {
             Ok(looked) => looked,
             Err(error) if error.kind == Kind::NotFound => {
                 return Err(error
@@ -2646,8 +2912,21 @@ impl Github {
                     .with_next("name its new owner/name with -R")
                     .with_repo(old.to_string()));
             }
-            Err(error) if error.repo.is_none() => return Err(error.with_repo(old.to_string())),
-            Err(error) => return Err(error),
+            Err(error) => {
+                let error = if error.repo.is_none() {
+                    error.with_repo(old.to_string())
+                } else {
+                    error
+                };
+                if transient_cause(&error).is_some() {
+                    return Ok(Flow::Retry {
+                        error,
+                        beyond: lookup_sent,
+                        anonymous: true,
+                    });
+                }
+                return Err(error);
+            }
         };
         let full_name = looked
             .json()
@@ -2668,19 +2947,31 @@ impl Github {
         let mut moved = call.clone();
         retarget(&mut moved, &old, &new);
         moved.follow_moved = false;
+        moved.retry = Some(RetryPolicy::NONE);
         let decided = self.route(&moved.route)?;
-        let mut got = self.run(&moved, &decided, reading)?;
+        let mut moved_sent = 0;
+        let mut got = match self.run_counted(&moved, &decided, reading, &mut moved_sent) {
+            Ok(got) => got,
+            Err(error) if transient_cause(&error).is_some() => {
+                return Ok(Flow::Retry {
+                    error,
+                    beyond: lookup_sent.saturating_add(moved_sent),
+                    anonymous: true,
+                });
+            }
+            Err(error) => return Err(error),
+        };
         got.requests = got
             .requests
             .saturating_add(failed.requests)
-            .saturating_add(looked.requests);
+            .saturating_add(lookup_sent);
         got.moved = Some((old, new));
         self.inner
             .meter
             .lock_or_recover()
             .moved
             .clone_from(&got.moved);
-        Ok(got)
+        Ok(Flow::Done(Box::new(got)))
     }
 
     fn hop(
@@ -2730,12 +3021,17 @@ impl Github {
                 let error = classify::wire(&wire, call.method, call.idempotency)
                     .with_tried(vec![redirected]);
                 let error = self.finish_error(error, call, &IdentityRef::Anonymous, None);
-                return Ok(Flow::Retry(error, 1));
+                return Ok(Flow::Retry {
+                    error,
+                    beyond: 1,
+                    anonymous: true,
+                });
             }
         };
         let status = response.status;
         if is_success(status, Reading::Stream) {
-            let mut got = Got::of(response, None, &prepared.as_, requests, None, call.limit);
+            let stream_limit = prepared.stream_limit(status);
+            let mut got = Got::of(response, None, &prepared.as_, requests, None, stream_limit);
             got.hopped = true;
             return Ok(Flow::Done(Box::new(got)));
         }
@@ -2743,7 +3039,7 @@ impl Github {
         let error = if (300..400).contains(&status) {
             Error::protocol("a second redirect")
         } else {
-            classify::answer(status, &headers, &head, call.method, call.idempotency)
+            self.classify_answer(status, &headers, &head, call.method, call.idempotency)?
                 .unwrap_or_else(|| Error::protocol(format!("the hop answered {status}")))
         };
         let error = error.with_tried(vec![
@@ -2759,7 +3055,11 @@ impl Github {
             rate: None,
         };
         let error = self.finish_error(error, call, &IdentityRef::Anonymous, Some(exchange));
-        Ok(Flow::Retry(error, 1))
+        Ok(Flow::Retry {
+            error,
+            beyond: 1,
+            anonymous: true,
+        })
     }
 
     fn judge_404(
@@ -2816,6 +3116,9 @@ impl Github {
                 .with_next(next));
         }
         let probe_path = root.trim_start_matches('/').to_string();
+        // This probe is one subrequest of the outer call: a transient failure returns
+        // `Flow::Retry` to that call's shared budget below. NONE prevents a nested 19/200
+        // budget while the composite anonymous read still retries as one operation.
         let probe = Call::get(root, call.route.clone())
             .probe_404(false)
             .follow_moved(false)
@@ -2859,7 +3162,11 @@ impl Github {
                     .with_tried(vec![sent, probe])
                     .with_next(next))
             }
-            Err(probed) => Ok(Flow::Retry(probed, probe_sent)),
+            Err(probed) => Ok(Flow::Retry {
+                error: probed,
+                beyond: probe_sent,
+                anonymous: prepared.as_ == IdentityRef::Anonymous,
+            }),
         }
     }
 }

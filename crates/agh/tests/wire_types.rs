@@ -174,22 +174,20 @@ fn deadlines() {
         (
             Duration::from_secs(10),
             Duration::from_secs(60),
-            Duration::from_secs(60)
+            Some(Duration::from_secs(60))
         )
     );
+    assert_eq!(Deadlines::for_transfer(0).backstop, None);
+    assert_eq!(Deadlines::for_transfer(u64::MAX).backstop, None);
     assert_eq!(
-        Deadlines::for_transfer(0).backstop,
-        Duration::from_secs(600)
-    );
-    assert_eq!(
-        Deadlines::for_transfer(4_096_000).backstop,
-        Duration::from_secs(1000)
+        Deadlines::for_upload(0).backstop,
+        Some(Duration::from_secs(600))
     );
     assert_eq!(
         Deadlines::JSON
             .with_backstop(Duration::from_secs(5))
             .backstop,
-        Duration::from_secs(5)
+        Some(Duration::from_secs(5))
     );
 }
 

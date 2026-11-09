@@ -1631,25 +1631,15 @@ fn install_issuer_intermediate(
             let name = url.rsplit('/').next().unwrap_or(url);
             let tmp = dir.join("issuer.cer");
             let _ = std::fs::remove_file(&tmp);
-            let out = command("/usr/bin/curl")
-                .args([
-                    "-fsSL",
-                    "--proto",
-                    "=https",
-                    "--proto-redir",
-                    "=https",
-                    "--max-time",
-                    "60",
-                    "-o",
-                    &tmp.to_string_lossy(),
-                    url,
-                ])
-                .output()
-                .map_err(|e| format!("curl: {e}"))?;
-            if !out.status.success() {
-                refused.push(format!("{name}: not downloadable"));
-                continue;
-            }
+            let bytes = match aterm_update_core::download_bytes_uncached(url, 1 << 20) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    refused.push(format!("{name}: not downloadable ({error})"));
+                    continue;
+                }
+            };
+            std::fs::write(&tmp, bytes)
+                .map_err(|error| format!("write {}: {error}", tmp.display()))?;
             let Some(form) = ["DER", "PEM"]
                 .into_iter()
                 .find(|f| cert_subject(&tmp, f).is_some())

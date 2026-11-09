@@ -401,6 +401,7 @@ trait Heads: Sync {
     fn again(
         &self,
         url: &str,
+        _cause: aterm_types::http_retry::Cause,
     ) -> Result<aterm_update_core::HeadAnswer, aterm_update_core::HttpError> {
         self.whole(url)
     }
@@ -437,8 +438,9 @@ impl Heads for Wire {
     fn again(
         &self,
         url: &str,
+        cause: aterm_types::http_retry::Cause,
     ) -> Result<aterm_update_core::HeadAnswer, aterm_update_core::HttpError> {
-        aterm_update_core::head_no_redirect_again(url)
+        aterm_update_core::head_no_redirect_again(url, cause)
     }
 
     fn link_down(&self) {
@@ -517,18 +519,20 @@ fn probe_round(slug: &str, round: &[u64], head: &HeadFn<'_>) -> Vec<HeadVerdict>
     if unreached {
         head.link_down();
     }
-    let rest: Vec<(usize, String)> = firsts
+    let rest: Vec<(usize, String, aterm_types::http_retry::Cause)> = firsts
         .iter()
         .enumerate()
         .filter_map(|(i, first)| match first {
-            Ok((url, FirstHead::Again { .. })) if !unreached => Some((i, url.clone())),
+            Ok((url, FirstHead::Again { cause, .. })) if !unreached => {
+                Some((i, url.clone(), *cause))
+            }
             _ => None,
         })
         .collect();
     let mut again = rest
         .iter()
-        .map(|(i, _)| *i)
-        .zip(fan_out(&rest, &|(_, url)| head.again(url)))
+        .map(|(i, _, _)| *i)
+        .zip(fan_out(&rest, &|(_, url, cause)| head.again(url, *cause)))
         .collect::<std::collections::BTreeMap<_, _>>();
     round
         .iter()
@@ -2923,6 +2927,7 @@ mod tests {
         fn again(
             &self,
             url: &str,
+            _cause: aterm_types::http_retry::Cause,
         ) -> Result<aterm_update_core::HeadAnswer, aterm_update_core::HttpError> {
             self.agains.lock().unwrap().push(walked_build(url));
             (self.rest)(walked_build(url))
@@ -2948,6 +2953,7 @@ mod tests {
             let unreached = |_| FirstHead::Again {
                 answer: Err(refused()),
                 unreached: true,
+                cause: aterm_types::http_retry::Cause::Reset,
             };
             let dead = |_| Err(refused());
             let heads = ScriptedHeads::new(&unreached, &dead);
@@ -2966,6 +2972,7 @@ mod tests {
                     FirstHead::Again {
                         answer: Err(refused()),
                         unreached: true,
+                        cause: aterm_types::http_retry::Cause::Reset,
                     }
                 } else {
                     FirstHead::Settled(up(b))
@@ -2984,6 +2991,7 @@ mod tests {
                     "curl: (28) Operation timed out".into(),
                 )),
                 unreached: false,
+                cause: aterm_types::http_retry::Cause::Timeout,
             };
             let heads = ScriptedHeads::new(&timed_out, &up);
             assert!(f.walk_candidates(&slug, &heads, &fetch).is_ok());
@@ -3101,8 +3109,8 @@ mod tests {
         let (curls, verdicts) = run("online");
         assert_eq!(
             curls,
-            [(1, 1), (2, 1), (4, 3), (8, 1)].into(),
-            "online: the unreached HEAD keeps attempts two and three"
+            [(1, 1), (2, 1), (4, 1), (8, 1)].into(),
+            "online: connection-refused curl exit 7 is final under the narrow retry policy"
         );
         assert_eq!(
             verdicts,

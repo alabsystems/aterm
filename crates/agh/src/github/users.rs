@@ -25,7 +25,7 @@ use crate::write::{Deleted, Effect, Ensured, WriteOp};
 const LEARN_DEADLINES: crate::wire::Deadlines = crate::wire::Deadlines {
     connect: std::time::Duration::from_secs(5),
     idle: std::time::Duration::from_secs(10),
-    backstop: std::time::Duration::from_secs(10),
+    backstop: Some(std::time::Duration::from_secs(10)),
 };
 
 /// The bound a test set on each of `LEARN_DEADLINES`, in milliseconds (0: none set).
@@ -56,7 +56,7 @@ fn learn_deadlines() -> crate::wire::Deadlines {
             return crate::wire::Deadlines {
                 connect: bound,
                 idle: bound,
-                backstop: bound,
+                backstop: Some(bound),
             };
         }
     }

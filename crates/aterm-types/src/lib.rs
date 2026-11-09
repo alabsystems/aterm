@@ -19,6 +19,8 @@ pub use mutex_ext::MutexExt;
 
 mod trust_fmt;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod advance_clock;
 pub mod dev_seam;
 pub mod wait_tally;
 
@@ -33,6 +35,7 @@ mod hyperlink;
 pub mod identity;
 pub mod installed_command;
 pub use hyperlink::HyperlinkData;
+pub mod http_retry;
 pub mod lab_window_guard;
 pub mod machine_name;
 pub mod needs;

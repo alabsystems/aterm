@@ -10,20 +10,36 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aterm_json::Value;
+use aterm_types::http_retry::Policy;
 use aterm_uds::spawnfd::Command;
 #[cfg(any(test, debug_assertions))]
 use aterm_update_core::github_rest::Spawn;
-use aterm_update_core::github_rest::{Client, Method, Origins, RestError, Token};
+use aterm_update_core::github_rest::{Answer, Client, Method, Origins, RestError, Token};
 
 use super::{HostError, Probe, RETRY_PAUSE, Release, ReleaseHost, Replace, Slug};
 
 const PER_PAGE: usize = 100;
+/// An anonymous Git child that produces neither captured bytes nor descendant CPU/I/O progress
+/// for this long is hung. Progress starts another full window; this is not a latency budget.
+const ANONYMOUS_GIT_STALL: Duration = Duration::from_secs(60);
 
 /// Suffix used when staging a replacement asset under [`Replace::Clobber`].
 pub const STAGED: &str = ".atpkg-staged";
 
 /// Environment variable from which git's credential helper reads the token.
 pub const GIT_TOKEN_ENV: &str = "ATPKG_PUBLISH_GIT_TOKEN";
+
+/// An injected Git network attempt. Production owns the real child in [`RestHost::git_attempt`];
+/// tests replace only this leaf so selection, retry and clone publication remain live code.
+#[cfg(any(test, debug_assertions))]
+trait GitTransport: Send + Sync {
+    fn run(
+        &self,
+        args: &[OsString],
+        trace: aterm_update_core::git_https::Trace<'_>,
+        waiting_on: &str,
+    ) -> std::result::Result<(), aterm_update_core::git_https::Failure>;
+}
 
 /// Credentials for the known Git helper. The secret is deliberately absent from argv and Debug.
 pub(crate) struct GitAuth {
@@ -164,6 +180,9 @@ pub struct RestHost {
     /// Tests: variables set on each git (a scratch global config).
     #[cfg(any(test, debug_assertions))]
     git_env: Vec<(OsString, OsString)>,
+    /// Tests: one injected Git network attempt; policy and staging stay in this host.
+    #[cfg(any(test, debug_assertions))]
+    git_transport: Option<Arc<dyn GitTransport>>,
 }
 
 impl std::fmt::Debug for RestHost {
@@ -190,6 +209,8 @@ impl RestHost {
             spawn: None,
             #[cfg(any(test, debug_assertions))]
             git_env: Vec::new(),
+            #[cfg(any(test, debug_assertions))]
+            git_transport: None,
         }
     }
 
@@ -204,6 +225,7 @@ impl RestHost {
             retry_pause: Duration::ZERO,
             spawn: None,
             git_env: Vec::new(),
+            git_transport: None,
         }
     }
 
@@ -240,6 +262,12 @@ impl RestHost {
     fn client(&self, token: Option<Token>) -> Client {
         let client = Client::new(self.origins.clone(), token);
         #[cfg(any(test, debug_assertions))]
+        let client = if self.retry_pause.is_zero() {
+            client.without_retry_wait()
+        } else {
+            client
+        };
+        #[cfg(any(test, debug_assertions))]
         let client = match &self.spawn {
             Some(spawn) => client.with_spawn(Arc::clone(spawn)),
             None => client,
@@ -262,9 +290,78 @@ impl RestHost {
         }
     }
 
+    /// One credential-less repository read under the fleet's anonymous HTTPS budget.
+    fn anonymous_repo_seen(&self, path: &str) -> Result<bool, HostError> {
+        let client = self.client(None);
+        let answer = aterm_types::http_retry::run(
+            Policy::STANDARD,
+            |_| match client.read(path) {
+                Ok(_) => Ok(true),
+                Err(error) if error.is_not_found() => Ok(false),
+                Err(error) => Err(error),
+            },
+            RestError::retry_cause,
+            |retry| {
+                eprintln!("    anonymous GitHub repository read: {retry}");
+                // Fixture hosts use a zero pause; production follows the shared policy exactly.
+                if !self.retry_pause.is_zero() {
+                    std::thread::sleep(retry.pause);
+                }
+            },
+        );
+        answer.map_err(|failure| {
+            if failure.exhausted {
+                HostError::Unreachable(format!(
+                    "anonymous GitHub repository read failed after {}: {}",
+                    failure.bound, failure.error
+                ))
+            } else {
+                host_error(&failure.error)
+            }
+        })
+    }
+
+    /// One successful API GET. A tokenless client owns the fleet-wide anonymous-read budget;
+    /// credentialed/private reads retain their existing single request here.
+    fn read_answer(&self, client: &Client, path: &str) -> Result<Answer, RestError> {
+        if client.has_token() {
+            return client.get(path)?.success();
+        }
+        let answer = aterm_types::http_retry::run(
+            Policy::STANDARD,
+            |_| client.get(path).and_then(Answer::success),
+            RestError::retry_cause,
+            |retry| {
+                eprintln!("    anonymous GitHub API read: {retry}");
+                if !self.retry_pause.is_zero() {
+                    std::thread::sleep(retry.pause);
+                }
+            },
+        );
+        answer.map_err(|failure| {
+            if failure.exhausted {
+                RestError::Transport {
+                    exit: failure.error.curl_exit(),
+                    status: failure.error.status(),
+                    retry_after_secs: failure.error.retry_after_secs(),
+                    message: format!(
+                        "anonymous GitHub API read failed after {}: {}",
+                        failure.bound, failure.error
+                    ),
+                }
+            } else {
+                failure.error
+            }
+        })
+    }
+
+    fn read_value(&self, client: &Client, path: &str) -> Result<Value, RestError> {
+        self.read_answer(client, path)?.json()
+    }
+
     fn object(&self, client: &Client, slug: &Slug, tag: &str) -> Result<Value, HostError> {
         let by_tag = format!("/repos/{slug}/releases/tags/{}", segment(tag));
-        match client.read(&by_tag) {
+        match self.read_value(client, &by_tag) {
             Ok(object) => return Ok(object),
             Err(e) if e.is_not_found() => {}
             Err(e) => return Err(host_error(&e)),
@@ -285,17 +382,32 @@ impl RestHost {
     }
 
     fn listing(&self, client: &Client, slug: &Slug) -> Result<Vec<Value>, HostError> {
-        client
-            .pages(
-                &format!("/repos/{slug}/releases?per_page={PER_PAGE}"),
-                PER_PAGE,
-            )
-            .map_err(|e| match e {
-                RestError::Status { status: 404, .. } => {
-                    HostError::Unreachable(format!("{slug} is not visible to this identity ({e})"))
+        let base = format!("/repos/{slug}/releases?per_page={PER_PAGE}");
+        let mut failed = None;
+        let listed = aterm_update_core::github_pages::all(
+            &client.origins().api,
+            &base,
+            PER_PAGE,
+            |endpoint| match self.read_answer(client, endpoint) {
+                Ok(answer) => aterm_update_core::github_pages::page(
+                    answer.status,
+                    answer.headers,
+                    &answer.body,
+                ),
+                Err(error) => {
+                    let words = error.to_string();
+                    failed = Some(error);
+                    Err(words)
                 }
-                e => host_error(&e),
-            })
+            },
+        )
+        .map_err(|why| failed.take().unwrap_or(RestError::Malformed(why)));
+        listed.map_err(|e| match e {
+            RestError::Status { status: 404, .. } => {
+                HostError::Unreachable(format!("{slug} is not visible to this identity ({e})"))
+            }
+            e => host_error(&e),
+        })
     }
 
     fn id_of(object: &Value) -> Result<u64, HostError> {
@@ -413,6 +525,78 @@ impl RestHost {
         self.git_output(args).map(|_| ())
     }
 
+    /// One canonical tokenless Git-over-HTTPS read under the shared anonymous budget. A
+    /// credentialed or custom-origin operation retains the existing transport.
+    fn git_network(&self, args: &[OsString], url: &str, waiting_on: &str) -> Result<(), HostError> {
+        if !self.canonical_anonymous_git(url)? {
+            return self.git(args);
+        }
+        anonymous_git_read(
+            |_, trace| self.git_attempt(args, trace, waiting_on),
+            |retry| {
+                if !self.retry_pause.is_zero() {
+                    std::thread::sleep(retry.pause);
+                }
+            },
+        )
+    }
+
+    /// Run one anonymous Git attempt. Git/libcurl owns its low-speed detector; the outer process
+    /// watcher ends only a full inactivity window with no captured or descendant progress.
+    fn git_attempt(
+        &self,
+        args: &[OsString],
+        trace: aterm_update_core::git_https::Trace<'_>,
+        waiting_on: &str,
+    ) -> std::result::Result<(), aterm_update_core::git_https::Failure> {
+        #[cfg(any(test, debug_assertions))]
+        if let Some(transport) = &self.git_transport {
+            return transport.run(args, trace, waiting_on);
+        }
+        let mut command = self
+            .git_command(args)
+            .map_err(|error| aterm_update_core::git_https::Failure::local(error.to_string()))?;
+        trace.configure(&mut command);
+        let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
+            &mut command,
+            ANONYMOUS_GIT_STALL,
+            waiting_on,
+        )
+        .map_err(|error| match error {
+            aterm_uds::deadline::CompleteProgressError::Stalled { .. } => {
+                aterm_update_core::git_https::Failure::timeout(error.to_string())
+            }
+            aterm_uds::deadline::CompleteProgressError::Complete(
+                aterm_uds::deadline::CompleteOutputError::Run(
+                    aterm_uds::deadline::RunError::Spawn(error),
+                ),
+            ) => aterm_update_core::git_https::Failure::local(format!("spawn git: {error}")),
+            other => aterm_update_core::git_https::Failure::local(format!("git: {other}")),
+        })?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(aterm_update_core::git_https::Failure::diagnostic(
+            if stderr.is_empty() {
+                format!("git exited {:?}", out.status.code())
+            } else {
+                stderr
+            },
+        ))
+    }
+
+    /// Whether this exact network URL is the production public route with no usable token.
+    fn canonical_anonymous_git(&self, url: &str) -> Result<bool, HostError> {
+        Ok(self.token()?.is_none()
+            && self.origins.web == "https://github.com"
+            && self.git_base == self.origins.web
+            && url
+                .strip_prefix("https://github.com/")
+                .is_some_and(|path| !path.is_empty())
+            && aterm_update_core::git_https::is_anonymous_https_url(url))
+    }
+
     /// `git <args…>` with this host's auth, within [`super::agh::LANE_GIT_BUDGET`], the bound a
     /// lane's clone or fetch through agh has ([`crate::git::output_within`]).
     fn git_output(&self, args: &[OsString]) -> Result<std::process::Output, HostError> {
@@ -463,6 +647,45 @@ impl RestHost {
     fn git_url(&self, slug: &Slug) -> String {
         format!("{}/{slug}.git", self.git_base)
     }
+}
+
+/// One injected anonymous Git read. The shared helper logs every retry; the caller supplies its
+/// clock so fixture transports spend no wall time.
+fn anonymous_git_read<T>(
+    attempt: impl FnMut(
+        u32,
+        aterm_update_core::git_https::Trace<'_>,
+    ) -> std::result::Result<T, aterm_update_core::git_https::Failure>,
+    on_retry: impl FnMut(aterm_types::http_retry::Retry),
+) -> Result<T, HostError> {
+    aterm_update_core::git_https::read(true, attempt, on_retry).map_err(|failure| {
+        HostError::Unreachable(format!("anonymous Git HTTPS read failed: {failure}"))
+    })
+}
+
+/// Publish a complete clone only if `dest` is still absent. Unix uses the workspace's kernel
+/// NOREPLACE primitive, so a concurrent creator is never replaced.
+#[cfg(unix)]
+fn publish_clone_noreplace(from: &Path, dest: &Path) -> std::io::Result<()> {
+    aterm_dirfd::renameat_with(
+        aterm_dirfd::CWD,
+        from,
+        aterm_dirfd::CWD,
+        dest,
+        aterm_dirfd::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn publish_clone_noreplace(from: &Path, dest: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(dest).is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "clone destination already exists",
+        ));
+    }
+    std::fs::rename(from, dest)
 }
 
 fn credential_origin(base: &str) -> Option<&str> {
@@ -612,27 +835,37 @@ impl ReleaseHost for RestHost {
             .collect::<Result<Vec<_>, _>>()?;
         std::fs::create_dir_all(dir)
             .map_err(|e| HostError::Refused(format!("mkdir {}: {e}", dir.display())))?;
-        for (name, (id, size)) in wanted {
-            let part = dir.join(format!("{name}{PART}"));
+        let staged = aterm_tempfile::Builder::new()
+            .prefix(".atpkg-release-download-")
+            .tempdir_in(dir)
+            .map_err(|e| {
+                HostError::Refused(format!(
+                    "make a private download stage in {}: {e}",
+                    dir.display()
+                ))
+            })?;
+        for &(name, (id, size)) in &wanted {
+            let part = staged.path().join(name);
             let path = format!("/repos/{slug}/releases/assets/{id}");
             client
                 .download_asset(&path, &part, size.max(1))
-                .map_err(|e| {
-                    let _ = std::fs::remove_file(&part);
-                    host_error(&e)
-                })?;
+                .map_err(|e| host_error(&e))?;
             let got = std::fs::symlink_metadata(&part)
                 .ok()
                 .filter(std::fs::Metadata::is_file)
                 .map_or(u64::MAX, |m| m.len());
             if got != size {
-                let _ = std::fs::remove_file(&part);
                 return Err(HostError::Unreachable(format!(
                     "{slug} {tag} {name}: GitHub lists {size} bytes, the download holds {got}"
                 )));
             }
-            std::fs::rename(&part, dir.join(name)).map_err(|e| {
-                let _ = std::fs::remove_file(&part);
+        }
+        let mut published = std::collections::BTreeSet::new();
+        for (name, _) in wanted {
+            if !published.insert(name) {
+                continue;
+            }
+            std::fs::rename(staged.path().join(name), dir.join(name)).map_err(|e| {
                 HostError::Refused(format!("place {name} in {}: {e}", dir.display()))
             })?;
         }
@@ -736,10 +969,13 @@ impl ReleaseHost for RestHost {
         {
             return Probe::Unknown(format!("mkdir {}: {e}", parent.display()));
         }
-        match aterm_update_core::download_to(&self.public_url(slug, tag, asset), dest, cap) {
+        match aterm_update_core::download_to_resumable(
+            &self.public_url(slug, tag, asset),
+            dest,
+            cap,
+        ) {
             Ok(()) => Probe::Present,
             Err(e) => {
-                let _ = std::fs::remove_file(dest);
                 if aterm_update_core::download_error_is_not_found(&e) {
                     Probe::Absent
                 } else {
@@ -750,14 +986,74 @@ impl ReleaseHost for RestHost {
     }
 
     fn clone_repo(&self, slug: &Slug, dest: &Path) -> Result<(), HostError> {
-        let mut args: Vec<OsString> = vec!["clone".into(), "--quiet".into(), "--".into()];
-        args.push(self.git_url(slug).into());
-        args.push(dest.as_os_str().to_owned());
-        self.git(&args)
+        let url = self.git_url(slug);
+        if !self.canonical_anonymous_git(&url)? {
+            let mut args: Vec<OsString> = vec!["clone".into(), "--quiet".into(), "--".into()];
+            args.push(url.into());
+            args.push(dest.as_os_str().to_owned());
+            return self.git(&args);
+        }
+        match std::fs::symlink_metadata(dest) {
+            Ok(_) => {
+                return Err(HostError::Refused(format!(
+                    "clone destination {} already exists",
+                    dest.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(HostError::Refused(format!(
+                    "inspect clone destination {}: {error}",
+                    dest.display()
+                )));
+            }
+        }
+        let parent = dest
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let stage = aterm_tempfile::Builder::new()
+            .prefix(".atpkg-anonymous-clone-")
+            .tempdir_in(parent)
+            .map_err(|error| {
+                HostError::Refused(format!(
+                    "make private clone stage beside {}: {error}",
+                    dest.display()
+                ))
+            })?;
+        let cloned = anonymous_git_read(
+            |attempt, trace| {
+                let attempt_dest = stage.path().join(format!("attempt-{attempt}"));
+                let args: Vec<OsString> = vec![
+                    "clone".into(),
+                    "--quiet".into(),
+                    "--".into(),
+                    url.clone().into(),
+                    attempt_dest.as_os_str().to_owned(),
+                ];
+                self.git_attempt(&args, trace, "anonymous GitHub clone")?;
+                Ok(attempt_dest)
+            },
+            |retry| {
+                if !self.retry_pause.is_zero() {
+                    std::thread::sleep(retry.pause);
+                }
+            },
+        )?;
+        publish_clone_noreplace(&cloned, dest).map_err(|error| {
+            HostError::Refused(format!(
+                "publish clone at {} without replacing another entry: {error}",
+                dest.display()
+            ))
+        })
     }
 
     fn retry_pause(&self) -> Duration {
         self.retry_pause
+    }
+
+    fn download_owns_retry(&self) -> bool {
+        true
     }
 
     fn reads_anonymously(&self) -> bool {
@@ -771,27 +1067,31 @@ impl ReleaseHost for RestHost {
             Err(e) if e.is_not_found() => Ok(false),
             Err(e) => Err(host_error(&e)),
         };
-        if ask(self.reader()?)? {
+        if let Some(token) = self.token()?
+            && ask(self.client(Some(token)))?
+        {
             return Ok(true);
         }
-        ask(self.client(None))
+        self.anonymous_repo_seen(&path)
     }
 
     fn fetch_repo(&self, slug: &Slug, dir: &Path) -> Result<(), HostError> {
+        let url = self.git_url(slug);
         let mut args: Vec<OsString> = vec!["-C".into(), dir.as_os_str().to_owned()];
         args.extend(
             ["fetch", "--quiet", "--tags", "--force"]
                 .iter()
                 .map(OsString::from),
         );
-        args.push(self.git_url(slug).into());
+        args.push(url.clone().into());
         args.push("+refs/heads/*:refs/remotes/origin/*".into());
-        self.git(&args).map_err(|e| match e {
-            HostError::Unreachable(why) => {
-                HostError::Unreachable(format!("fetch of {slug}: {why}"))
-            }
-            other => other,
-        })
+        self.git_network(&args, &url, "anonymous GitHub repository fetch")
+            .map_err(|e| match e {
+                HostError::Unreachable(why) => {
+                    HostError::Unreachable(format!("fetch of {slug}: {why}"))
+                }
+                other => other,
+            })
     }
 
     fn fetch_main(&self, slug: &Slug, dir: &Path, into: &str) -> Result<(), HostError> {
@@ -800,8 +1100,7 @@ impl ReleaseHost for RestHost {
         let main = self
             .reader()
             .and_then(|client| {
-                client
-                    .read(&format!("/repos/{slug}/commits/refs/heads/main"))
+                self.read_value(&client, &format!("/repos/{slug}/commits/refs/heads/main"))
                     .map_err(|e| host_error(&e))
             })
             .map_err(|why| {
@@ -817,20 +1116,22 @@ impl ReleaseHost for RestHost {
                     "the host API answered {slug}'s main without a full lowercase commit SHA"
                 ))
             })?;
+        let url = self.git_url(slug);
         let mut args: Vec<OsString> = vec!["-C".into(), dir.as_os_str().to_owned()];
         args.extend(
             ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head"]
                 .iter()
                 .map(OsString::from),
         );
-        args.push(self.git_url(slug).into());
+        args.push(url.clone().into());
         args.push(format!("+refs/heads/main:{into}").into());
-        self.git(&args).map_err(|e| match e {
-            HostError::Unreachable(why) => {
-                HostError::Unreachable(format!("fetch of {slug}'s main: {why}"))
-            }
-            other => other,
-        })?;
+        self.git_network(&args, &url, "anonymous GitHub main fetch")
+            .map_err(|e| match e {
+                HostError::Unreachable(why) => {
+                    HostError::Unreachable(format!("fetch of {slug}'s main: {why}"))
+                }
+                other => other,
+            })?;
         let fetched = self.git_output(&[
             "-C".into(),
             dir.as_os_str().to_owned(),
@@ -1086,5 +1387,240 @@ mod tests {
             !crate::host::ReleaseHost::reads_anonymously(&corrupt_host),
             "corrupt token file must not silently fall back to anonymous reads"
         );
+    }
+
+    fn git_status(status: u16) -> aterm_update_core::git_https::Failure {
+        aterm_update_core::git_https::Failure::diagnostic(format!(
+            "fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: {status}"
+        ))
+    }
+
+    struct ScriptedGit {
+        answers: std::sync::Mutex<
+            std::collections::VecDeque<
+                std::result::Result<(), aterm_update_core::git_https::Failure>,
+            >,
+        >,
+        calls: std::sync::Mutex<Vec<Vec<OsString>>>,
+        race_dest: Option<PathBuf>,
+    }
+
+    impl ScriptedGit {
+        fn new(
+            answers: impl IntoIterator<
+                Item = std::result::Result<(), aterm_update_core::git_https::Failure>,
+            >,
+        ) -> Self {
+            Self {
+                answers: std::sync::Mutex::new(answers.into_iter().collect()),
+                calls: std::sync::Mutex::new(Vec::new()),
+                race_dest: None,
+            }
+        }
+
+        fn racing(
+            answers: impl IntoIterator<
+                Item = std::result::Result<(), aterm_update_core::git_https::Failure>,
+            >,
+            race_dest: PathBuf,
+        ) -> Self {
+            Self {
+                race_dest: Some(race_dest),
+                ..Self::new(answers)
+            }
+        }
+
+        fn calls(&self) -> Vec<Vec<OsString>> {
+            self.calls.lock().expect("script calls").clone()
+        }
+    }
+
+    impl GitTransport for ScriptedGit {
+        fn run(
+            &self,
+            args: &[OsString],
+            trace: aterm_update_core::git_https::Trace<'_>,
+            waiting_on: &str,
+        ) -> std::result::Result<(), aterm_update_core::git_https::Failure> {
+            assert!(trace.path().is_some(), "the anonymous policy owns a trace");
+            assert!(
+                waiting_on.starts_with("anonymous GitHub"),
+                "the progress owner names the read: {waiting_on}"
+            );
+            let attempt = {
+                let mut calls = self.calls.lock().expect("script calls");
+                calls.push(args.to_vec());
+                calls.len()
+            };
+            let answer = self
+                .answers
+                .lock()
+                .expect("script answers")
+                .pop_front()
+                .expect("the RestHost made an extra Git attempt");
+            if args.iter().any(|arg| arg == std::ffi::OsStr::new("clone")) {
+                let attempt_dest = PathBuf::from(args.last().expect("clone destination"));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mode =
+                        std::fs::metadata(attempt_dest.parent().expect("the private clone stage"))
+                            .expect("clone stage metadata")
+                            .permissions()
+                            .mode();
+                    assert_eq!(mode & 0o077, 0, "the retry stage is private");
+                }
+                std::fs::create_dir(&attempt_dest).expect("the clone attempt directory");
+                std::fs::write(
+                    attempt_dest.join("transport-marker"),
+                    if answer.is_ok() {
+                        format!("complete-{attempt}\n")
+                    } else {
+                        format!("partial-{attempt}\n")
+                    },
+                )
+                .expect("the clone attempt marker");
+                if answer.is_ok()
+                    && let Some(dest) = &self.race_dest
+                {
+                    std::fs::create_dir(dest).expect("the racing caller-owned destination");
+                    std::fs::write(dest.join("owner-marker"), "caller-owned\n")
+                        .expect("the caller-owned marker");
+                }
+            }
+            answer
+        }
+    }
+
+    fn scripted_host(script: std::sync::Arc<ScriptedGit>) -> RestHost {
+        let mut host = RestHost::at(None, Origins::github(), "https://github.com".into());
+        host.git_transport = Some(script);
+        host
+    }
+
+    #[test]
+    fn only_tokenless_canonical_github_git_selects_the_anonymous_policy() {
+        let dir = aterm_tempfile::TempDir::new().expect("scratch");
+        let url = "https://github.com/o/r.git";
+        let anonymous = RestHost::at(None, Origins::github(), "https://github.com".into());
+        assert!(anonymous.canonical_anonymous_git(url).unwrap());
+        assert!(
+            !anonymous
+                .canonical_anonymous_git("https://elsewhere.example/o/r.git")
+                .unwrap()
+        );
+
+        let missing = RestHost::at(
+            Some(dir.path().join("missing")),
+            Origins::github(),
+            "https://github.com".into(),
+        );
+        assert!(missing.canonical_anonymous_git(url).unwrap());
+        let blank = dir.path().join("blank");
+        std::fs::write(&blank, " \n\t").expect("blank token");
+        let blank = RestHost::at(Some(blank), Origins::github(), "https://github.com".into());
+        assert!(blank.canonical_anonymous_git(url).unwrap());
+
+        let token = dir.path().join("token");
+        std::fs::write(&token, "github_pat_fixture\n").expect("token");
+        let credentialed =
+            RestHost::at(Some(token), Origins::github(), "https://github.com".into());
+        assert!(!credentialed.canonical_anonymous_git(url).unwrap());
+        let custom = RestHost::at(None, Origins::github(), "https://mirror.example".into());
+        assert!(!custom.canonical_anonymous_git(url).unwrap());
+        let file = RestHost::at(None, Origins::github(), "file:///repos".into());
+        assert!(
+            !file
+                .canonical_anonymous_git("file:///repos/o/r.git")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn anonymous_clone_retries_504_504_200_in_fresh_private_stages() {
+        let script = std::sync::Arc::new(ScriptedGit::new([
+            Err(git_status(504)),
+            Err(git_status(504)),
+            Ok(()),
+        ]));
+        let dir = aterm_tempfile::TempDir::new().expect("scratch");
+        let dest = dir.path().join("clone");
+        scripted_host(std::sync::Arc::clone(&script))
+            .clone_repo(&Slug::new("o", "r"), &dest)
+            .expect("the third attempt succeeds");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("transport-marker")).unwrap(),
+            "complete-3\n"
+        );
+        let calls = script.calls();
+        assert_eq!(calls.len(), 3);
+        let attempts: Vec<PathBuf> = calls
+            .iter()
+            .map(|args| PathBuf::from(args.last().expect("clone destination")))
+            .collect();
+        assert!(attempts.iter().all(|attempt| attempt != &dest));
+        assert!(attempts.iter().all(|attempt| {
+            attempt
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|parent| parent == dir.path())
+        }));
+        assert!(attempts.windows(2).all(|pair| pair[0] != pair[1]));
+        assert!(
+            attempts.iter().all(|attempt| !attempt.exists()),
+            "failed private stages were removed and the complete one moved"
+        );
+    }
+
+    #[test]
+    fn anonymous_fetch_keeps_404_final_bounds_endless_5xx_and_retries_curl_56() {
+        let one_404 = std::sync::Arc::new(ScriptedGit::new([Err(git_status(404)), Ok(())]));
+        let absent = scripted_host(std::sync::Arc::clone(&one_404))
+            .fetch_repo(&Slug::new("o", "r"), Path::new("unused"));
+        assert!(
+            matches!(absent, Err(HostError::Unreachable(_))),
+            "{absent:?}"
+        );
+        assert_eq!(one_404.calls().len(), 1, "404 is an immediate answer");
+
+        let endless = std::sync::Arc::new(ScriptedGit::new(
+            (0..Policy::STANDARD.attempts()).map(|_| Err(git_status(503))),
+        ));
+        let refused = scripted_host(std::sync::Arc::clone(&endless))
+            .fetch_repo(&Slug::new("o", "r"), Path::new("unused"))
+            .expect_err("the shared bound refuses an endless 5xx");
+        assert_eq!(endless.calls().len() as u32, Policy::STANDARD.attempts());
+        assert!(
+            refused.to_string().contains("19 attempts / 200s"),
+            "{refused}"
+        );
+
+        let curl_56 = std::sync::Arc::new(ScriptedGit::new([
+            Err(aterm_update_core::git_https::Failure::diagnostic(
+                "error: RPC failed; curl 56 Recv failure: Connection reset by peer",
+            )),
+            Ok(()),
+        ]));
+        scripted_host(std::sync::Arc::clone(&curl_56))
+            .fetch_repo(&Slug::new("o", "r"), Path::new("unused"))
+            .expect("curl 56 is transient");
+        assert_eq!(curl_56.calls().len(), 2);
+    }
+
+    #[test]
+    fn a_racing_clone_destination_is_never_replaced_or_deleted() {
+        let dir = aterm_tempfile::TempDir::new().expect("scratch");
+        let dest = dir.path().join("clone");
+        let script = std::sync::Arc::new(ScriptedGit::racing([Ok(())], dest.clone()));
+        let refused = scripted_host(std::sync::Arc::clone(&script))
+            .clone_repo(&Slug::new("o", "r"), &dest)
+            .expect_err("the caller wins the destination race");
+        assert!(matches!(refused, HostError::Refused(_)), "{refused:?}");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("owner-marker")).unwrap(),
+            "caller-owned\n"
+        );
+        assert!(!dest.join("transport-marker").exists());
+        assert_eq!(script.calls().len(), 1);
     }
 }

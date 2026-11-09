@@ -1053,7 +1053,8 @@ pub fn ghcr_token(repo: &str) -> Result<String, String> {
     }
     let scope = percent_encode(&format!("repository:{repo}:pull"));
     let url = format!("https://ghcr.io/token?service=ghcr.io&scope={scope}");
-    let bytes = fetch::curl_get(&url, &[])?;
+    let bytes = aterm_update_core::download_bytes_with_accept(&url, 64 << 20, "application/json")
+        .map_err(|error| format!("abrew: download failed ({url}): {error}"))?;
     let v = parse_json(&bytes)?;
     v.get("token")
         .and_then(Value::as_str)

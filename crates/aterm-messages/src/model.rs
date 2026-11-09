@@ -1447,8 +1447,6 @@ pub struct Message {
     pub key: Option<String>,
     /// Where it came from.
     pub origin: Origin,
-    /// Whether the band paints `detail[0]` beside the title (default true).
-    pub excerpt: bool,
     /// `None`: eligible for the glass at post.
     pub reveal_after: Option<Duration>,
     /// The words the row finishes with, which its Complete echo paints in the title's place.
@@ -1457,8 +1455,6 @@ pub struct Message {
     pub loads: Loads,
     /// The load this work is: a download's network, a removal's disk, a build's CPU.
     pub primary: Option<Load>,
-    /// A record about a previous run (`aterm crashed last time`).
-    pub retrospective: bool,
     /// What the message is to the person ([`Need`]).
     pub(crate) need: Need,
 }
@@ -1478,12 +1474,10 @@ impl Message {
             meter: None,
             key: None,
             origin: Origin::Host,
-            excerpt: true,
             reveal_after: None,
             finished: None,
             loads: Loads::NONE,
             primary: None,
-            retrospective: false,
             need: Need::Unclassified,
         }
     }
@@ -1664,20 +1658,6 @@ impl Message {
         self
     }
 
-    /// A record about a previous run ([`Message::retrospective`]).
-    #[must_use]
-    pub const fn retrospective(mut self) -> Self {
-        self.retrospective = true;
-        self
-    }
-
-    /// The band paints the title alone.
-    #[must_use]
-    pub const fn no_excerpt(mut self) -> Self {
-        self.excerpt = false;
-        self
-    }
-
     /// The words the row finishes with, where the closed participle table would read wrong.
     #[must_use]
     pub fn finished_as(mut self, words: impl AsRef<str>) -> Self {
@@ -1840,8 +1820,6 @@ pub struct Restatement {
     pub severity: Option<Severity>,
     /// New glyph.
     pub glyph: Option<Glyph>,
-    /// New excerpt flag ([`Message::excerpt`]).
-    pub excerpt: Option<bool>,
     /// New finished words ([`Message::finished`]; `Some(None)` clears them).
     pub finished: Option<Option<String>>,
 }
@@ -2216,12 +2194,10 @@ mod tests {
             meter: None,
             key: Some(String::new()),
             origin: Origin::Host,
-            excerpt: true,
             reveal_after: None,
             finished: Some("\u{1b}Done".into()),
             loads: Loads::NONE,
             primary: None,
-            retrospective: false,
             need: Need::Unclassified,
         }
         .normalized();

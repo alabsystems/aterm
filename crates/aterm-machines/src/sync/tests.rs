@@ -2172,9 +2172,11 @@ fn outside_the_accounts_own_login_a_pass_refuses_and_reads_nothing() {
 
 /// The subscriber's pass, which runs with no window (after a restart, say), starts the mug when
 /// none runs, and reads it back held; a mug that runs and asks
-/// macOS again itself is left to it, a failed start fails the row for the next pass, and the
-/// window's own passes leave it to the window's watch.
-/// NEGATIVE CONTROL: with `Kind::Awake` out of `sync_items`, no `sync.awake` row is found.
+/// macOS again itself is left to it, a failed start fails the row for the next pass, and a Mac
+/// window's own passes leave it to the window's watch. Elsewhere no window keeps a mug, so its
+/// passes say what the port says (aCaffeine is macOS only), not that the window keeps one.
+/// NEGATIVE CONTROL: with `Kind::Awake` out of `sync_items`, no `sync.awake` row is found; with
+/// the window's arm on every OS, a window's pass off a Mac says the window keeps it awake.
 #[test]
 fn the_subscribers_pass_keeps_this_mac_awake() {
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -2203,9 +2205,18 @@ fn the_subscribers_pass_keeps_this_mac_awake() {
     for trigger in [Trigger::Window, Trigger::Setup] {
         let scratch = aterm_tempfile::tempdir().unwrap();
         let ports = Inert::new(scratch.path());
-        *ports.awake.lock().unwrap() = AwakeRead::Due("no aCaffeine mug runs".to_owned());
+        let off_a_mac = "aCaffeine is macOS only";
+        *ports.awake.lock().unwrap() = if cfg!(target_os = "macos") {
+            AwakeRead::Due("no aCaffeine mug runs".to_owned())
+        } else {
+            AwakeRead::NotApplicable(off_a_mac.to_owned())
+        };
         let pass = ran(ports.pass(trigger, Mode::Apply));
-        assert_eq!(row(&pass.rows, AWAKE).outcome, Outcome::NotApplicable);
+        let read = row(&pass.rows, AWAKE);
+        assert_eq!(read.outcome, Outcome::NotApplicable);
+        if !cfg!(target_os = "macos") {
+            assert_eq!(read.why.as_deref(), Some(off_a_mac), "{trigger:?}");
+        }
         assert!(!ports.applies().contains(&"awake"), "{trigger:?}");
     }
 }
@@ -2238,7 +2249,8 @@ fn the_subscribers_pass_keeps_a_persons_startup_off() {
 /// item whose `aterm` is gone or 0.145.0 would otherwise keep failing every ten seconds until a
 /// window opens (`ATERM-KI-1027-7`). `sync.awake` now retires those dead or post-rename jobs
 /// without starting a mug, including over the person's keep-awake or Enable at Startup off, while
-/// a plan (`--check`) writes nothing and a window's pass leaves retirement to the window's tidy.
+/// a plan (`--check`) writes nothing and a Mac window's pass leaves retirement to the window's
+/// tidy (off a Mac no window tidies one, and no such login item is there to retire).
 #[test]
 fn the_subscribers_pass_retires_old_caffeine_login_items_without_starting_a_mug() {
     // 1. Mug already running (`AwakeRead::Current`): plan reports `Planned` without retiring;
@@ -2296,13 +2308,16 @@ fn the_subscribers_pass_retires_old_caffeine_login_items_without_starting_a_mug(
     let failed = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     assert_eq!(row(&failed.rows, AWAKE).outcome, Outcome::Failed);
 
-    // 4. NEGATIVE CONTROL: `Trigger::Window` leaves retirement to the window's own `TIDY`.
-    let scratch = aterm_tempfile::tempdir().unwrap();
-    let ports = Inert::new(scratch.path());
-    *ports.awake_retired.lock().unwrap() = vec!["com.aterm.aterm.caffeine".to_owned()];
-    let in_win = ran(ports.pass(Trigger::Window, Mode::Apply));
-    assert_eq!(row(&in_win.rows, AWAKE).outcome, Outcome::NotApplicable);
-    assert!(!ports.applies().contains(&"awake-retire"));
+    // 4. NEGATIVE CONTROL: on a Mac, `Trigger::Window` leaves retirement to the window's own
+    //    `TIDY`.
+    if cfg!(target_os = "macos") {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        *ports.awake_retired.lock().unwrap() = vec!["com.aterm.aterm.caffeine".to_owned()];
+        let in_win = ran(ports.pass(Trigger::Window, Mode::Apply));
+        assert_eq!(row(&in_win.rows, AWAKE).outcome, Outcome::NotApplicable);
+        assert!(!ports.applies().contains(&"awake-retire"));
+    }
 }
 
 #[test]

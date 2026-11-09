@@ -16,76 +16,11 @@ use std::path::Path;
 
 use aterm_phase::CliHarness;
 
+pub use aterm_phase::harness_version::{
+    declared_in_source as declared, rewrite_source as rewritten, source_line as version_line,
+};
+
 use crate::ledger::{Error, GitRunner, Origin, Result, git_ok};
-
-/// The marker a harness's version line starts with, in either shape.
-const VER_LINE: &str = "pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(";
-
-/// The `(major, minor)` a harness version file declares: the one-line shape
-/// (`HarnessVersion::new(0, 4, "0.4")`) or the three-constant shape it replaced
-/// (`HARNESS_VERSION_MAJOR`, `HARNESS_VERSION_MINOR` and `HARNESS_VERSION`).
-#[must_use]
-pub fn declared(text: &str) -> Option<(u16, u16)> {
-    let uint = |s: &str| {
-        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-            .then(|| s.parse::<u16>().ok())
-            .flatten()
-    };
-    let at = text.find(VER_LINE)?;
-    let args = text[at + VER_LINE.len()..].split(");").next()?;
-    let text_arg = args.split('"').nth(1);
-    let mut parts = args.split(',');
-    if let (Some(major), Some(minor), Some(spelled)) = (
-        parts.next().and_then(|a| uint(a.trim())),
-        parts.next().and_then(|a| uint(a.trim())),
-        text_arg,
-    ) {
-        return (aterm_phase::HarnessVersion::parse_major_minor(spelled) == Some((major, minor)))
-            .then_some((major, minor));
-    }
-    let constant = |name: &str| -> Option<&str> {
-        let key = format!("pub const {name}: ");
-        let rest = &text[text.find(&key)? + key.len()..];
-        Some(rest.split(';').next()?.split('=').nth(1)?.trim())
-    };
-    let spelled = constant("HARNESS_VERSION")?.trim_matches('"');
-    let parsed = aterm_phase::HarnessVersion::parse_major_minor(spelled)?;
-    let major = uint(constant("HARNESS_VERSION_MAJOR")?)?;
-    let minor = uint(constant("HARNESS_VERSION_MINOR")?)?;
-    (parsed == (major, minor)).then_some(parsed)
-}
-
-/// The one-line shape of a harness version at `(major, minor)`.
-#[must_use]
-pub fn version_line((major, minor): (u16, u16)) -> String {
-    format!("{VER_LINE}{major}, {minor}, \"{major}.{minor}\");")
-}
-
-/// `text` with its declared version rewritten to `to` in the one-line shape (the three-constant
-/// shape collapsed into it); `None` where `text` declares none.
-#[must_use]
-pub fn rewritten(text: &str, to: (u16, u16)) -> Option<String> {
-    declared(text)?;
-    let start = text.find(VER_LINE)?;
-    let end = start + text[start..].find(");")? + 2;
-    let mut out = String::with_capacity(text.len());
-    out.push_str(&text[..start]);
-    out.push_str(&version_line(to));
-    out.push_str(&text[end..]);
-    for name in [
-        "HARNESS_VERSION_MAJOR",
-        "HARNESS_VERSION_MINOR",
-        "HARNESS_VERSION",
-    ] {
-        let key = format!("pub const {name}: ");
-        if let Some(at) = out.find(&key) {
-            let line_start = out[..at].rfind("\n\n").map_or(0, |p| p + 1);
-            let line_end = at + out[at..].find(";\n").map_or(out.len() - at, |p| p + 2);
-            out.replace_range(line_start..line_end, "");
-        }
-    }
-    Some(out)
-}
 
 /// One harness whose sources moved in a release window under an unchanged version.
 #[derive(Debug, Clone, PartialEq, Eq)]

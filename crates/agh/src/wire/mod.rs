@@ -407,23 +407,38 @@ pub struct Deadlines {
     pub connect: Duration,
     /// The longest wait for the next byte.
     pub idle: Duration,
-    /// The whole request's deadline.
-    pub backstop: Duration,
+    /// The whole request's deadline. `None` leaves a large transfer bounded by connect, idle
+    /// and progress rather than elapsed wall time.
+    pub backstop: Option<Duration>,
 }
 
 impl Deadlines {
+    /// The JSON request's whole-request wall bound.
+    pub(crate) const JSON_BACKSTOP: Duration = Duration::from_secs(60);
+
     /// A JSON call: connect 10 s, idle 60 s, backstop 60 s.
     pub const JSON: Deadlines = Deadlines {
         connect: Duration::from_secs(10),
         idle: Duration::from_secs(60),
-        backstop: Duration::from_secs(60),
+        backstop: Some(Self::JSON_BACKSTOP),
     };
 
-    /// A transfer of `bytes`: connect 10 s, idle 60 s, backstop max(600 s, bytes / 4096 s).
+    /// A transfer: connect 10 s and at most 60 s without a byte, with no wall-time deadline.
+    /// File readers impose a progress-earned resume bound instead.
     #[must_use]
-    pub fn for_transfer(bytes: u64) -> Deadlines {
+    pub const fn for_transfer(_bytes: u64) -> Deadlines {
         Deadlines {
-            backstop: Duration::from_secs((bytes / 4096).max(600)),
+            backstop: None,
+            ..Deadlines::JSON
+        }
+    }
+
+    /// An upload keeps the pre-existing wall backstop: max(600 s, bytes / 4096 s). Uploads do
+    /// not use the anonymous read path's Range/progress retry state machine.
+    #[must_use]
+    pub fn for_upload(bytes: u64) -> Deadlines {
+        Deadlines {
+            backstop: Some(Duration::from_secs((bytes / 4096).max(600))),
             ..Deadlines::JSON
         }
     }
@@ -431,7 +446,10 @@ impl Deadlines {
     /// The same deadlines with another backstop.
     #[must_use]
     pub const fn with_backstop(self, backstop: Duration) -> Deadlines {
-        Deadlines { backstop, ..self }
+        Deadlines {
+            backstop: Some(backstop),
+            ..self
+        }
     }
 }
 

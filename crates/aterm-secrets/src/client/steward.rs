@@ -16,6 +16,33 @@
 
 use super::*;
 
+/// Why this machine is no steward and its steward steps idle: it holds no admin key of the ALab
+/// vault, in the word this platform names it by ([`aterm_types::machine_name::OS_NOUN`]).
+#[must_use]
+pub fn no_admin_key() -> String {
+    format!(
+        "this {} holds no admin key of the ALab vault",
+        aterm_types::machine_name::OS_NOUN
+    )
+}
+
+/// Why no steward step runs here while the person keeps this machine's vault sync off.
+fn sync_turned_off() -> String {
+    format!(
+        "sync is off on this {} by your choice (`aterm secrets agent off`), so no pass publishes \
+         to the vault from it: `aterm secrets agent on` lets it",
+        aterm_types::machine_name::OS_NOUN
+    )
+}
+
+/// Why no steward step runs on a machine that has applied no copy of the vault yet.
+fn no_copy_applied() -> String {
+    format!(
+        "this {} has applied no copy of the vault yet",
+        aterm_types::machine_name::OS_NOUN
+    )
+}
+
 /// Whether this Mac is the ALab steward ([`stewardship`]), read from the vault copy it applied
 /// last.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,13 +79,10 @@ pub fn stewardship(paths: &Paths) -> crate::Result<Stewardship> {
     // A steward's publish ends in a sync of this Mac's copy, which the person stopped: the
     // founding by default stands aside for the same record ([`commons_foundable`]).
     if crate::service::subscriber_turned_off(&paths.home) {
-        return no(
-            "sync is off on this Mac by your choice (`aterm secrets agent off`), so no pass \
-             publishes to the vault from it: `aterm secrets agent on` lets it",
-        );
+        return no(&sync_turned_off());
     }
     if read_identity(paths)?.is_none() || fsx::kind(&paths.cache_file())? == fsx::Kind::Missing {
-        return no("this Mac has applied no copy of the vault yet");
+        return no(&no_copy_applied());
     }
     let lock = StateLock::observe(paths)?;
     if lock.is_none() && fsx::kind(&paths.lock_file())? != fsx::Kind::Missing {
@@ -70,7 +94,7 @@ pub fn stewardship(paths: &Paths) -> crate::Result<Stewardship> {
     }
     let state = load_state(paths)?;
     let Some(text) = admin_text_here(paths, &config, &state)? else {
-        return no("this Mac holds no admin key of the ALab vault");
+        return no(&no_admin_key());
     };
     Ok(Stewardship::Steward {
         fleet_code: text
@@ -116,13 +140,10 @@ pub fn steward_revoke_check(paths: &Paths) -> crate::Result<StewardRevoke> {
         return idle("the configured vault is not ALab's, and no other vault is stewarded");
     }
     if crate::service::subscriber_turned_off(&paths.home) {
-        return idle(
-            "sync is off on this Mac by your choice (`aterm secrets agent off`), so no pass \
-             publishes to the vault from it: `aterm secrets agent on` lets it",
-        );
+        return idle(&sync_turned_off());
     }
     if read_identity(paths)?.is_none() || fsx::kind(&paths.cache_file())? == fsx::Kind::Missing {
-        return idle("this Mac has applied no copy of the vault yet");
+        return idle(&no_copy_applied());
     }
     let lock = StateLock::observe(paths)?;
     if lock.is_none() && fsx::kind(&paths.lock_file())? != fsx::Kind::Missing {
@@ -133,7 +154,7 @@ pub fn steward_revoke_check(paths: &Paths) -> crate::Result<StewardRevoke> {
     }
     let state = load_state(paths)?;
     let Some(text) = admin_text_here(paths, &config, &state)? else {
-        return idle("this Mac holds no admin key of the ALab vault");
+        return idle(&no_admin_key());
     };
     let mut candidate = text.doc.clone();
     let local_log = super::log_entries::trusted_local_log(paths, &config)?;
@@ -903,7 +924,7 @@ pub fn steward_lease_check(
     };
     let state = load_state(paths)?;
     let Some(text) = admin_text_here(paths, &config, &state)? else {
-        return idle("this Mac holds no admin key of the ALab vault");
+        return idle(&no_admin_key());
     };
     let Some(policy) = crate::swarm_roster::SwarmPolicy::from_document(&text.doc)? else {
         return idle("no aterm-swarm-policy is published in the vault yet");

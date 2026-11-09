@@ -277,6 +277,10 @@ fn boot_under(
         }
     };
     launch_isolation::apply(&mut cmd, &tmp);
+    // A deliberately mutated test run carries its named controls into its isolated server.
+    if let Some(controls) = std::env::var_os("ATERM_TEST_NEGATIVE_CONTROL") {
+        cmd.env("ATERM_TEST_NEGATIVE_CONTROL", controls);
+    }
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
         .args(launch_isolation::control_sock(&tmp))
         .env(aterm_agent::harness::timings::FAST_SEAM, "1")

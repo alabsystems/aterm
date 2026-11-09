@@ -106,6 +106,33 @@ fn scratch() -> aterm_tempfile::TempDir {
     aterm_tempfile::TempDir::new().unwrap()
 }
 
+/// A client fixture for retry-loop tests whose injected operation never reaches the network.
+fn retry_fixture() -> FixtureGuard {
+    Fixture {
+        origins: Origins::loopback(1, 1, 1, 1),
+        token: None,
+        spawn: None,
+    }
+    .enter()
+}
+
+fn status_error(status: u16, retry_after_secs: Option<u64>) -> RestError {
+    RestError::Status {
+        status,
+        retry_after_secs,
+        message: format!("fixture HTTP {status}"),
+    }
+}
+
+fn curl_error(exit: i32, status: Option<u16>) -> RestError {
+    RestError::Transport {
+        exit: Some(exit),
+        status,
+        retry_after_secs: None,
+        message: format!("fixture curl exit {exit}"),
+    }
+}
+
 fn create_draft(tag: &str) -> RunOut {
     let payload =
         aterm_json::to_vec(&aterm_json::json!({"tag_name": tag, "name": tag, "draft": true}))
@@ -417,11 +444,244 @@ fn the_listing_is_read_whole_and_an_incomplete_page_is_refused() {
     let incomplete = crate::publish::release_listing(SLUG)
         .unwrap_err()
         .to_string();
-    assert!(incomplete.contains("after 3 attempts"), "{incomplete}");
+    assert!(
+        incomplete.contains(&AUTHENTICATED_RETRY_POLICY.bound()),
+        "{incomplete}"
+    );
     assert!(incomplete.contains("advertises more"), "{incomplete}");
     let before = w.fake.seen().len();
     assert!(crate::publish::release_listing("fixture-rel/none").is_err());
     assert_eq!(w.fake.seen().len(), before + 1);
+}
+
+#[test]
+fn two_504s_then_a_200_survive_under_the_shared_retry_policy() {
+    let _routed = retry_fixture();
+    let mut asked = 0;
+    let got = retried(
+        "injected GET",
+        || Ok(()),
+        |_| {
+            asked += 1;
+            if asked < 3 {
+                Err(status_error(504, None))
+            } else {
+                Ok("answer")
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(got, "answer");
+    assert_eq!(asked, 3, "both transient answers must be retried");
+}
+
+#[test]
+fn a_raw_public_channel_read_retries_504s_but_not_absence() {
+    let w = world(false, Recorder::default());
+    w.fake.put_file(
+        SLUG,
+        "main",
+        "Cargo.toml",
+        b"[package]\nversion = \"1.2.3\"\n",
+    );
+    let path = format!("/repos/{SLUG}/contents/Cargo.toml?ref=main");
+    let unavailable = Fault::Status {
+        status: 504,
+        body: "gateway timeout".into(),
+        headers: Vec::new(),
+    };
+    w.fake.fault(Match::api(&path), unavailable.clone());
+    w.fake.fault(Match::api(&path), unavailable);
+    let answer = raw(&path).unwrap();
+    assert_eq!(answer.status, 200);
+    assert_eq!(answer.body, b"[package]\nversion = \"1.2.3\"\n");
+    assert_eq!(
+        w.fake
+            .seen()
+            .iter()
+            .filter(|seen| seen.path_and_query == path)
+            .count(),
+        3
+    );
+
+    let absent = format!("/repos/{SLUG}/contents/absent?ref=main");
+    let before = w.fake.seen().len();
+    assert_eq!(raw(&absent).unwrap().status, 404);
+    assert_eq!(w.fake.seen().len(), before + 1, "a 404 is not retried");
+}
+
+#[test]
+fn definitive_4xx_answers_are_not_retried() {
+    for error in [
+        status_error(400, None),
+        status_error(404, None),
+        status_error(408, None),
+        status_error(429, None),
+        status_error(499, None),
+    ] {
+        let _routed = retry_fixture();
+        let mut asked = 0;
+        let refused = retried::<()>(
+            "injected GET",
+            || Ok(()),
+            |_| {
+                asked += 1;
+                Err(error.clone())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(asked, 1, "{error} must be a final answer: {refused}");
+        assert!(!refused.contains("retry-pause bound"), "{refused}");
+    }
+}
+
+#[test]
+fn an_endless_5xx_stops_at_and_names_the_shared_bound() {
+    let _routed = retry_fixture();
+    let mut asked = 0;
+    let refused = retried::<()>(
+        "injected GET",
+        || Ok(()),
+        |_| {
+            asked += 1;
+            Err(status_error(503, None))
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert_eq!(asked, READ_RETRY_POLICY.attempts());
+    assert!(refused.contains(&READ_RETRY_POLICY.bound()), "{refused}");
+    assert!(refused.contains("HTTP 503"), "{refused}");
+}
+
+#[test]
+fn authenticated_mutations_keep_their_three_attempt_bound() {
+    let _routed = retry_fixture();
+    let mut asked = 0;
+    let refused = retried_via_policy::<()>(
+        None,
+        AUTHENTICATED_RETRY_POLICY,
+        "injected PATCH",
+        || Ok(()),
+        |_| {
+            asked += 1;
+            Err(status_error(503, None))
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert_eq!(asked, 3, "mutation retries did not inherit the read budget");
+    assert!(
+        refused.contains(&AUTHENTICATED_RETRY_POLICY.bound()),
+        "{refused}"
+    );
+}
+
+#[test]
+fn credentialed_reads_keep_their_three_attempt_bound() {
+    let _routed = Fixture {
+        origins: Origins::loopback(1, 1, 1, 1),
+        token: Some("fixture-token".into()),
+        spawn: None,
+    }
+    .enter();
+    let mut asked = 0;
+    let refused = retried::<()>(
+        "credentialed GET",
+        || Ok(()),
+        |_| {
+            asked += 1;
+            Err(status_error(503, None))
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert_eq!(asked, AUTHENTICATED_RETRY_POLICY.attempts());
+    assert!(
+        refused.contains(&AUTHENTICATED_RETRY_POLICY.bound()),
+        "{refused}"
+    );
+}
+
+/// NEGATIVE CONTROL: narrowing the new anonymous classifier must not silently change the
+/// cutter's long-standing authenticated retry classes.
+#[test]
+fn credentialed_reads_keep_their_legacy_transient_classes() {
+    let errors = [
+        status_error(408, None),
+        status_error(429, None),
+        RestError::Transport {
+            exit: Some(1),
+            status: None,
+            retry_after_secs: None,
+            message: "generic transport failure".into(),
+        },
+        RestError::Malformed("incomplete JSON".into()),
+    ];
+    for error in errors {
+        let _routed = Fixture {
+            origins: Origins::loopback(1, 1, 1, 1),
+            token: Some("fixture-token".into()),
+            spawn: None,
+        }
+        .enter();
+        let mut asked = 0;
+        let refused = retried::<()>(
+            "credentialed GET",
+            || Ok(()),
+            |_| {
+                asked += 1;
+                Err(error.clone())
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            asked,
+            AUTHENTICATED_RETRY_POLICY.attempts(),
+            "{error}: {refused}"
+        );
+    }
+}
+
+#[test]
+fn numeric_retry_after_and_curl_transport_exits_use_the_shared_classifier() {
+    assert!(matches!(
+        retry_cause(&status_error(429, Some(7))),
+        Some(Cause::RateLimited { retry_after }) if retry_after == std::time::Duration::from_secs(7)
+    ));
+    assert_eq!(retry_cause(&status_error(429, None)), None);
+    assert_eq!(retry_cause(&curl_error(56, None)), Some(Cause::Reset));
+    assert_eq!(retry_cause(&curl_error(18, None)), Some(Cause::Truncated));
+    assert_eq!(retry_cause(&curl_error(28, None)), Some(Cause::Timeout));
+    assert_eq!(
+        retry_cause(&curl_error(56, Some(504))),
+        Some(Cause::Server(504)),
+        "curl 8.7.1 exit 56 on an HTTP/2 5xx stays transient"
+    );
+    assert_eq!(
+        retry_cause(&curl_error(56, Some(404))),
+        None,
+        "an answered 404 takes precedence over curl exit 56"
+    );
+
+    let _routed = retry_fixture();
+    let mut asked = 0;
+    let got = retried(
+        "rate-limited GET",
+        || Ok(()),
+        |_| {
+            asked += 1;
+            if asked == 1 {
+                Err(status_error(429, Some(7)))
+            } else {
+                Ok("answer")
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!((got, asked), ("answer", 2));
 }
 
 #[test]
@@ -587,9 +847,15 @@ fn a_launched_read_starts_each_curl_through_the_launch_and_none_once_interrupted
     assert_eq!(asked(&w), 1, "nothing was asked after the interrupt");
     let (got, started) = read(false);
     let failed = got.unwrap_err();
-    assert!(failed.contains("after 3 attempts"), "{failed}");
-    assert_eq!(started, 3);
-    assert_eq!(asked(&w), 4);
+    assert!(
+        failed.contains(&AUTHENTICATED_RETRY_POLICY.bound()),
+        "{failed}"
+    );
+    assert_eq!(started, AUTHENTICATED_RETRY_POLICY.attempts());
+    assert_eq!(
+        asked(&w),
+        usize::try_from(AUTHENTICATED_RETRY_POLICY.attempts()).unwrap() + 1
+    );
     assert!(
         w.recorder.spawned().is_empty(),
         "the launch, never the client's own spawn, started them"

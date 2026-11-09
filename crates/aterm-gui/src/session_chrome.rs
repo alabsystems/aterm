@@ -127,7 +127,8 @@ pub(crate) struct ClauseKey {
 pub(crate) struct UpgradeMenu {
     /// The session the upgrade is on (`s-<hex>`): the pane the menu was composed for, which its words name ([`TabMenuEntry::Upgrade`]).
     pub sid: String,
-    /// What it moves, in the band's words (`Claude Code 2.1.281 → 2.1.282`).
+    /// What it moves, in the words its live row says
+    /// ([`aterm_agent::harness::upgrade_drive::Row::move_words`]: `Claude Code 2.1.281 → 2.1.282`).
     pub moving: String,
     /// The target build the words are for.
     pub to: String,

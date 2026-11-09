@@ -5582,7 +5582,7 @@ pub(crate) fn theme_catalog_misses(config: &Config, themes: &ThemeCatalog) -> Ve
     misses
 }
 
-/// [`theme_misses`] for the band's unaccepted-values row, pushed at startup, every reload and every theme-directory change.
+/// [`theme_misses`] for the unaccepted-values row, pushed at startup, every reload and every theme-directory change.
 pub(crate) fn theme_load_notices(config: &Config, themes: &ThemeCatalog) -> Vec<String> {
     prefixed_notices(theme_misses(config, themes))
 }
@@ -5643,7 +5643,7 @@ pub(crate) fn restart_notices(old: &Config, new: &Config) -> Vec<String> {
     out
 }
 
-/// The band's view of [`crate::native_config_language::key_warnings`], added to `warns` in two families, each sentence prefixed `config …`.
+/// The message rows' view of [`crate::native_config_language::key_warnings`], added to `warns` in two families, each sentence prefixed `config …`.
 pub(crate) fn collect_key_notices(
     warns: &mut crate::message_reporters::ConfigWarnings,
     text: &str,
@@ -5772,7 +5772,7 @@ pub(crate) fn ignored_key_notices(text: &str) -> Vec<String> {
     prefixed_notices(crate::native_config_language::key_warnings(text).ignored)
 }
 
-/// The band's view of [`crate::native_config_language::unaccepted_value_warnings`].
+/// The message rows' view of [`crate::native_config_language::unaccepted_value_warnings`].
 pub(crate) fn unaccepted_value_notices(text: &str, already_told: &[String]) -> Vec<String> {
     prefixed_notices(crate::native_config_language::unaccepted_value_warnings(
         text,
@@ -9865,7 +9865,7 @@ mod cfg_engine_tests {
     }
 
     #[test]
-    fn a_theme_that_does_not_load_is_on_the_band_until_its_file_arrives() {
+    fn a_theme_that_does_not_load_is_a_live_row_until_its_file_arrives() {
         const NAME: &str = "Aterm Test Theme 7F1C";
         let dir = std::env::temp_dir().join(format!("aterm-theme-miss-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
@@ -9875,7 +9875,7 @@ mod cfg_engine_tests {
         let row = app
             .messages
             .live_by_key(key)
-            .expect("a theme that does not load is on the band");
+            .expect("a theme that does not load is a live row");
         assert!(
             row.msg.detail.iter().any(|line| line.contains(NAME)),
             "{:?}",

@@ -1229,6 +1229,8 @@ fn the_view_cache_keeps_the_most_recently_read_journals() {
 }
 
 thread_local! {
+    /// The journal reads this thread's view lookups made ([`before_view`]).
+    static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Pause one read after it acquired its cache entry.
     static BEFORE_VIEW: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
@@ -1237,6 +1239,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 pub(super) fn before_view() {
+    READS.with(|reads| reads.set(reads.get() + 1));
     let hook = BEFORE_VIEW.with(|hook| hook.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
@@ -1290,6 +1293,217 @@ fn journal_reads_do_not_wait_for_unrelated_views() {
             1
         );
     });
+}
+
+fn reads() -> usize {
+    READS.with(std::cell::Cell::get)
+}
+
+/// The earliest and the latest change a [`witness`] of the journal in `dir` shows.
+fn changes(dir: &Path) -> (std::time::SystemTime, std::time::SystemTime) {
+    let changed = witness(dir)
+        .unwrap()
+        .map(|seen| seen.stamp.mtime_ns.max(seen.stamp.ctime_ns));
+    let at = |ns: &i128| {
+        std::time::UNIX_EPOCH + std::time::Duration::from_nanos(u64::try_from(*ns).unwrap())
+    };
+    (
+        at(changed.iter().min().unwrap()),
+        at(changed.iter().max().unwrap()),
+    )
+}
+
+/// A settled journal is taken as its last read kept it, with no read, until its folder or a file
+/// moves: then it is read again, and a refusal the read gives stands until a later read admits
+/// it. NEGATIVE CONTROLS: with no witness kept, the second ask reads again; with only the files
+/// witnessed, the folder opened to others is still taken.
+#[test]
+fn a_settled_journal_is_taken_without_a_read_until_its_folder_or_a_file_moves() {
+    use std::os::unix::fs::{FileExt as _, PermissionsExt as _};
+    /// A change to a kept journal, what a read then answers, and what undoes it.
+    struct Change {
+        what: &'static str,
+        make: fn(&Path),
+        refused: bool,
+        undo: fn(&Path),
+    }
+    fn mode(path: &Path, bits: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap();
+    }
+    let fixture = Fixture::new();
+    let dir = tmp();
+    let mut writer = Journal::open(dir.path(), fixture.trust).unwrap();
+    writer.ingest(fixture.nodes[0].bytes()).unwrap();
+    drop(writer);
+    let views = Views::new(1);
+    // The journal stood an hour unchanged at each ask.
+    let later = || std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    let read = || {
+        views
+            .read_at(dir.path(), fixture.trust, later())
+            .map(|(view, _)| view.nodes.len())
+    };
+    let start = reads();
+    assert_eq!(read().unwrap(), 1);
+    assert_eq!(reads() - start, 1, "the first ask reads the journal");
+    assert_eq!(read().unwrap(), 1);
+    assert_eq!(
+        reads() - start,
+        1,
+        "a journal standing as it was read is not read again"
+    );
+
+    let mut writer = Journal::open_existing(dir.path(), fixture.trust).unwrap();
+    writer.ingest(fixture.nodes[1].bytes()).unwrap();
+    drop(writer);
+    // The writer's open reads the process's own views on this thread too.
+    let start = reads();
+    assert_eq!(read().unwrap(), 2, "an append is read");
+    assert_eq!(reads() - start, 1);
+    assert_eq!(read().unwrap(), 2);
+    assert_eq!(reads() - start, 1);
+
+    let changes = [
+        Change {
+            what: "the anchor opened to others",
+            make: |dir| mode(&dir.join("control.anchor"), 0o644),
+            refused: true,
+            undo: |dir| mode(&dir.join("control.anchor"), 0o600),
+        },
+        Change {
+            what: "the folder opened to others",
+            make: |dir| mode(dir, 0o755),
+            refused: true,
+            undo: |dir| mode(dir, 0o700),
+        },
+        Change {
+            what: "a second link to the checkpoint",
+            make: |dir| {
+                std::fs::hard_link(dir.join("control.checkpoint"), dir.join("linked")).unwrap();
+            },
+            refused: true,
+            undo: |dir| std::fs::remove_file(dir.join("linked")).unwrap(),
+        },
+        Change {
+            what: "the astream file's bytes rewritten in place as they were",
+            make: |dir| {
+                let path = dir.join("control.astream");
+                let bytes = std::fs::read(&path).unwrap();
+                let file = OpenOptions::new().write(true).open(&path).unwrap();
+                file.write_all_at(&bytes, 0).unwrap();
+            },
+            refused: false,
+            undo: |_| {},
+        },
+    ];
+    for change in changes {
+        let before = reads();
+        (change.make)(dir.path());
+        assert_eq!(
+            read().is_err(),
+            change.refused,
+            "{}: read again as a fresh read answers",
+            change.what
+        );
+        assert_eq!(reads() - before, 1, "{}: read again", change.what);
+        (change.undo)(dir.path());
+        assert_eq!(read().unwrap(), 2, "{}: undone", change.what);
+        assert_eq!(read().unwrap(), 2, "{}: undone", change.what);
+        let undone = usize::from(change.refused);
+        assert_eq!(
+            reads() - before,
+            1 + undone,
+            "{}: read again once more where it was refused, then kept",
+            change.what
+        );
+    }
+}
+
+/// A read through a copy of the journal swapped in for it keeps no witness: its folder's parent
+/// renamed aside and back moves none of the times the witness holds, so the read is matched to the
+/// witness by the files it opened. NEGATIVE CONTROL: with the opened files left unmatched
+/// (`stands_for` by its settled rule alone), the copy's earlier prefix is taken after the original
+/// returns.
+#[test]
+fn a_journal_read_through_a_copy_swapped_in_is_not_kept() {
+    let fixture = Fixture::new();
+    let base = tmp();
+    let commons = base.path().join("commons");
+    let dir = commons.join("control");
+    let fake = base.path().join("fake");
+    for folder in [&commons, &dir, &fake, &fake.join("control")] {
+        private_file::create_private_dir(folder).unwrap();
+    }
+    let mut writer = Journal::open(&dir, fixture.trust).unwrap();
+    writer.ingest(fixture.nodes[0].bytes()).unwrap();
+    drop(writer);
+    for name in ["control.anchor", "control.checkpoint", "control.astream"] {
+        let bytes = std::fs::read(dir.join(name)).unwrap();
+        private_file::write_private(&fake.join("control"), name, &bytes).unwrap();
+    }
+    let mut writer = Journal::open_existing(&dir, fixture.trust).unwrap();
+    writer.ingest(fixture.nodes[1].bytes()).unwrap();
+    drop(writer);
+    let views = Views::new(1);
+    // The journal stood an hour unchanged at each ask.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+    let aside = base.path().join("aside");
+    {
+        let (commons, fake, aside) = (commons.clone(), fake.clone(), aside.clone());
+        BEFORE_VIEW.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::rename(&commons, &aside).unwrap();
+                std::fs::rename(&fake, &commons).unwrap();
+            }));
+        });
+    }
+    let copy = views.read_at(&dir, fixture.trust, later).unwrap();
+    assert_eq!(copy.0.nodes.len(), 1, "the read found the copy");
+    std::fs::rename(&commons, &fake).unwrap();
+    std::fs::rename(&aside, &commons).unwrap();
+    let start = reads();
+    let returned = views.read_at(&dir, fixture.trust, later).unwrap();
+    assert_eq!(
+        returned.0.nodes.len(),
+        2,
+        "the journal is read again once it returns"
+    );
+    assert_eq!(reads() - start, 1);
+}
+
+/// A read asked within [`crate::fsx::settled`]'s window of any of the journal's changes keeps no
+/// witness, though its earlier changes settled: a later change could leave every stamp as it was.
+/// NEGATIVE CONTROLS: with every witness taken as settled, or one taken as settled where any file
+/// it shows has, the second ask is not read.
+#[test]
+fn a_journal_read_before_it_settled_is_read_again() {
+    let fixture = Fixture::new();
+    let dir = tmp();
+    let mut writer = Journal::open(dir.path(), fixture.trust).unwrap();
+    writer.ingest(fixture.nodes[0].bytes()).unwrap();
+    drop(writer);
+    let views = Views::new(1);
+    let (first, last) = changes(dir.path());
+    assert!(
+        first < last,
+        "the journal's files changed at distinct times"
+    );
+    // The first change has settled at this ask, the last has not.
+    let soon = first + std::time::Duration::from_secs(2);
+    let later = last + std::time::Duration::from_secs(3600);
+    let start = reads();
+    for _ in 0..2 {
+        views.read_at(dir.path(), fixture.trust, soon).unwrap();
+    }
+    assert_eq!(
+        reads() - start,
+        2,
+        "an unsettled journal is read at each ask"
+    );
+    for _ in 0..2 {
+        views.read_at(dir.path(), fixture.trust, later).unwrap();
+    }
+    assert_eq!(reads() - start, 3, "the first settled read is kept");
 }
 
 pub(super) fn before_lock() {

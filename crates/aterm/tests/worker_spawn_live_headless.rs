@@ -63,6 +63,21 @@ fn boot_with_setup(
     extra: &[&str],
     setup: impl FnOnce(&Path) -> Option<PathBuf>,
 ) -> Instance {
+    boot_configured(tag, shell, harness, rc, extra, |tmp, _| setup(tmp))
+}
+
+#[expect(
+    clippy::disallowed_types,
+    reason = "configures the isolated headless child"
+)]
+fn boot_configured(
+    tag: &str,
+    shell: &str,
+    harness: Option<&str>,
+    rc: Option<(&str, &str)>,
+    extra: &[&str],
+    setup: impl FnOnce(&Path, &mut std::process::Command) -> Option<PathBuf>,
+) -> Instance {
     let deferred = extra
         .iter()
         .any(|arg| matches!(*arg, "-e" | "--no-shell-integration"));
@@ -99,7 +114,7 @@ fn boot_with_setup(
                 .env("ATERM_LOG", "info")
                 .args(["--lines", "24", "--columns", "100"])
                 .args(extra);
-            if let Some(shell) = setup(tmp) {
+            if let Some(shell) = setup(tmp, cmd) {
                 cmd.env("SHELL", shell);
             }
         },
@@ -652,16 +667,12 @@ fn a_worker_whose_shell_draws_no_prompt_is_stalled_and_nothing_is_typed() {
     );
 }
 
-/// How long a worker's rc file holds its first prompt below: past the 20 s a launcher used to
-/// give a shell before it stalled the task for good, which is why that test takes this long.
-const LATE_PROMPT: std::time::Duration = std::time::Duration::from_secs(25);
-
 /// A worker whose shell is slow to its first prompt, as a loaded machine makes one (its rc file
 /// holds it here), has not failed: its task stays `working` and the prompt takes its line.
 #[test]
 fn a_worker_whose_first_prompt_comes_late_still_starts() {
     let shell = headless_boot::login_shell();
-    let inst = boot(
+    let inst = boot_configured(
         "late",
         shell.path,
         Some(SUPERVISED),
@@ -670,6 +681,13 @@ fn a_worker_whose_first_prompt_comes_late_still_starts() {
             "[ -n \"$ATERM_TASK_FILE\" ] && \
              while [ ! -e \"$HOME/prompt-cue\" ]; do sleep 0.1; done\n",
         )),
+        &[],
+        |tmp, cmd| {
+            let clock = tmp.join("prompt-clock");
+            std::fs::create_dir(&clock).expect("the prompt clock");
+            cmd.env("ATERM_DEBUG_PROMPT_CLOCK", clock);
+            None
+        },
     );
     let (_, manager) = boot_session(&inst);
     let work = inst.tmp.join("work");
@@ -682,7 +700,18 @@ fn a_worker_whose_first_prompt_comes_late_still_starts() {
     );
     assert!(ok, "spawn agent=claude: {stdout} {stderr}");
     let worker = sid_of(&stdout);
-    std::thread::sleep(LATE_PROMPT);
+    let clock = inst.tmp.join("prompt-clock");
+    until(
+        &inst,
+        &worker,
+        "the launcher is waiting for its prompt",
+        || clock.join(&worker).with_extension("seen").exists(),
+    );
+    std::fs::write(clock.join(&worker), "25000").expect("advance past the former 20 s deadline");
+    until(&inst, &worker, "the launcher judged the late clock", || {
+        std::fs::read_to_string(clock.join(&worker).with_extension("seen"))
+            .is_ok_and(|seen| seen == "25000")
+    });
     let record = ctl_ok(&inst, &[&format!("@{worker}"), "task"]);
     assert!(
         record.contains(" state=working "),
@@ -703,35 +732,10 @@ fn a_worker_whose_first_prompt_comes_late_still_starts() {
 /// nothing.
 #[test]
 fn a_program_worker_concludes_on_its_exit_status_with_its_output_as_its_result() {
-    // Disable monitor mode before Bash's startup loader can fork. Changing it
-    // in .bashrc is too late for the loader's children; interactive Bash also
-    // enables it despite +m in argv. The first rc disables it, then delegates
-    // to the real integration loader. The user rc checks that boundary.
-    // foreground_handback_live_headless exercises actual job control separately.
-    let inst = boot_with_setup(
-        "p",
-        "/bin/bash",
-        Some(SUPERVISED),
-        Some((".bashrc", "case $- in *m*) exit 78 ;; esac\n")),
-        &[],
-        |tmp| {
-            let shell = tmp.join("bin/bash");
-            headless_boot::standin(
-                &shell,
-                "#!/bin/sh\n\
-                case \"$1\" in --rcfile)\n\
-                  export ATERM_TEST_ORIGINAL_RC=\"$2\"; shift 2\n\
-                  exec /bin/bash --rcfile \"$HOME/.early-bashrc\" \"$@\" ;;\n\
-                  *) exec /bin/bash \"$@\" ;; esac\n",
-            );
-            std::fs::write(
-                tmp.join("home/.early-bashrc"),
-                "set +m\n. \"$ATERM_TEST_ORIGINAL_RC\"\n",
-            )
-            .unwrap();
-            Some(shell)
-        },
-    );
+    // This is the worker-result protocol, using one integrated shell. Bash's own
+    // setpgid race must not contaminate the program's exact output; its job-control
+    // behavior is covered by foreground_handback_live_headless.
+    let inst = boot("p", headless_boot::need_zsh(), Some(SUPERVISED), None);
     let (_, manager) = boot_session(&inst);
     let work = inst.tmp.join("work");
     for (task, state, conclusion, exit, said) in [

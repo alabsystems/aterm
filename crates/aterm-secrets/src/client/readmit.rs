@@ -953,9 +953,10 @@ pub(super) fn decide(
     }
 }
 
-/// Why a Mac with no seat, no fleet key and no place on the home ALab LAN gets none by its proof.
-const NO_SEAT: &str = "no seat binds this node key, the Mac did not prove the fleet's key, and it \
-                       asked from off this member's home ALab LAN";
+/// Why a machine with no seat, no fleet key and no place on the home ALab LAN gets none by its
+/// proof.
+const NO_SEAT: &str = "no seat binds this node key, the machine did not prove the fleet's key, and \
+                       it asked from off this member's home ALab LAN";
 
 /// Why a member that cannot sign lets nobody in.
 const NOT_HERE: &str = "this member admits nobody through the membership log";
@@ -965,7 +966,7 @@ const NOT_FRESH: &str = "this member did not read all of the vault's newest reco
                          server or peer answered, one holds records this build cannot take, or \
                          only servers of a build before the crossed fence, which state no \
                          records bound, answered), so it may not know of a removal: another \
-                         member may let the Mac in";
+                         member may let the machine in";
 
 /// Whether this member read all of the vault's newest records from its servers and peers just now
 /// (within [`FRESH_WITHIN`]), a server that states its records bound among those that answered

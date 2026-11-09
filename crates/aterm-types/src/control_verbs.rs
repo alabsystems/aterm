@@ -1049,11 +1049,20 @@ pub const VERBS: &[VerbSpec] = &[
          (installs once aterm is quit and opened again), `manual-config`, `disabled-env`, \
          `retry-wait`, `manual-only`, `handoff-unavailable`, `applying`, `unreconciled`, `none`, \
          `disabled`, `unknown`. `apply_phase`: `prefer-idle`, `prefer-output-gap`, `keys-only`, \
-         then `land` \
-         within a minute of arming; `apply_held=restored-agents` holds the apply (up to 7 min) \
-         while reopened tabs' agents relaunch. `apply_held=account-work` names an accepted \
-         apply waiting for admitted account work to retire. `check` (Owner-only) runs one channel check and \
-         answers the same line. `apply` (Owner-only) queues the staged build on macOS (a \
+         then `land` 55 s after arming, with or without anyone at the Mac. Past `land`, \
+         `apply_held=` names the one hold the apply waits on while it holds (the log says it \
+         once, `held by … since …; it lands when …`): `restored-agents` (up to 7 min while \
+         reopened tabs' agents relaunch), `consent-warmup`, `setup-draft` (a person's setup \
+         draft not yet applied), `setup-answer` (the setup page taking its own answer), \
+         `password-prompt`, `developer-tools`, `system-state`, \
+         `boundary-item`, `tab-starting`, `pane-exited`, `signer-unconfirmed`, `prepark-read`, \
+         `capture-refused`, `policy-read`, `launch-record-renewal`, `activity-revoked`, \
+         `handoff-in-flight`, `updater-busy`, `person-install`, `stage-pending`, \
+         `activation-superseded`. Each lifts by time or at aterm's own next step, but a person's \
+         own draft, prompt or install tab, which holds only while it is there; none waits on \
+         whether anyone is at the Mac. `apply_held=account-work` names an accepted apply \
+         waiting for admitted account work to retire. `check` (Owner-only) runs one channel \
+         check and answers the same line. `apply` (Owner-only) queues the staged build on macOS (a \
          live-session handoff keeps shells) or replaces the executable in place on Linux.",
     )
     .forms(&[

@@ -28,17 +28,10 @@ pub const BUILD_BYTES: usize = 96;
 /// The longest record read or written: [`LINES`] `opened <build>` lines.
 pub const BYTES: usize = LINES * ("opened ".len() + BUILD_BYTES + 1);
 
-/// How long a change of the record waits for another asker's change to end ([`Live`]'s lock): a
-/// change is a short read and one durable write, so a holder past this is stuck, and the change
-/// fails rather than hold the window's loop.
-#[cfg(all(not(target_family = "wasm"), not(test)))]
-pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// [`LOCK_WAIT`] under this crate's tests, whose other asker always lets go once its durable write
-/// is done: the one-minute hang detector, so a write a loaded disk slows is not read as a stuck
-/// holder.
-#[cfg(all(not(target_family = "wasm"), test))]
-pub const LOCK_WAIT: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
+/// Hang detector while a change of the record waits for another asker's durable write
+/// ([`Live`]'s lock). Scheduling delay alone must not spend the automatic ask.
+#[cfg(not(target_family = "wasm"))]
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// This account's record: [`FILE`] in its aterm state root ([`crate::dirs::account_state_dir`]:
 /// `~/Library/Application Support/aterm` on macOS, which `ATERM_STATE_HOME` isolates for a lab
@@ -282,6 +275,25 @@ fn folder(path: &Path) -> &Path {
 pub struct Live;
 
 #[cfg(not(target_family = "wasm"))]
+fn lock_started(path: &Path, started: std::time::Instant) -> io::Result<Held> {
+    let deadline = started + LOCK_WAIT;
+    if std::time::Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Command Line Tools record lock did not finish",
+        ));
+    }
+    let lock = lock_path(path)?;
+    std::fs::create_dir_all(folder(path))?;
+    aterm_uds::file_lock::LockFile::take(
+        &lock,
+        deadline,
+        "another aterm is changing the record of its Command Line Tools ask",
+    )
+    .map(Held::new)
+}
+
+#[cfg(not(target_family = "wasm"))]
 impl Files for Live {
     fn read(&self, path: &Path, max: usize) -> io::Result<Option<String>> {
         match aterm_uds::runs::read_bounded_regular_text(path, max as u64) {
@@ -343,21 +355,34 @@ impl Files for Live {
     }
 
     fn lock(&self, path: &Path) -> io::Result<Held> {
-        let lock = lock_path(path)?;
-        std::fs::create_dir_all(folder(path))?;
-        let deadline = std::time::Instant::now() + LOCK_WAIT;
-        aterm_uds::file_lock::LockFile::take(
-            &lock,
-            deadline,
-            "another aterm is changing the record of its Command Line Tools ask",
-        )
-        .map(Held::new)
+        lock_started(path, std::time::Instant::now())
     }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scheduled_record_writer_does_not_spend_the_automatic_ask() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE);
+        let started = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        drop(lock_started(&path, started).unwrap());
+        assert!(claim(&Live, &path, "owner").unwrap());
+        let held = Live.lock(&path).unwrap();
+        assert!(matches!(
+            lock_started(&path, std::time::Instant::now() - std::time::Duration::from_secs(61)),
+            Err(error) if error.kind() == io::ErrorKind::TimedOut
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "opened owner\n");
+        drop(held);
+        assert!(!claim(&Live, &path, "later").unwrap());
+        forget(&Live, &path, "later").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "opened owner\n");
+        forget(&Live, &path, "owner").unwrap();
+        assert!(claim(&Live, &path, "later").unwrap());
+    }
 
     /// A consumed episode survives updates and historical anonymous/multi-owner records.
     /// Only its exact owner's proven preprompt release can remove a line; unreadable records

@@ -65,6 +65,10 @@ impl System for Spawns<'_> {
         self.note(cmd, None);
         self.live.run_complete_stdout(cmd)
     }
+    fn run_complete_output(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
+        self.note(cmd, None);
+        self.live.run_complete_output(cmd)
+    }
     fn run_complete_stdout_input(&self, cmd: &Cmd, input: &[u8]) -> Result<Ran, RunFailed> {
         self.note(cmd, Some(input));
         self.live.run_complete_stdout_input(cmd, input)

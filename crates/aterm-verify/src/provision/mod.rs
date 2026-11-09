@@ -21,9 +21,6 @@ pub use place::SCRATCH_PREFIX;
 pub use rows::{Anchor, Archive, Engine, Holds, Install, MICROSOFT_TEAM, ROWS, Row, row};
 pub use stock::{CELL_TARGETS, LINUX_LANE_TARGETS};
 
-/// System `curl` binary path.
-pub(crate) const CURL: &str = "/usr/bin/curl";
-
 /// The stamp's file name in a placed row's directory ([`aterm_uds::host::PIN_STAMP`]).
 pub const STAMP: &str = aterm_uds::host::PIN_STAMP;
 
@@ -1031,6 +1028,8 @@ pub struct System {
     repo: PathBuf,
     rustup: stock::System,
     held: std::cell::RefCell<Vec<atpkg::prerequisite::HeldSet>>,
+    #[cfg(test)]
+    fetch_spawn: Option<std::sync::Arc<dyn aterm_update_core::github_rest::Spawn>>,
 }
 
 impl System {
@@ -1041,7 +1040,19 @@ impl System {
             repo: repo.to_path_buf(),
             rustup: stock::System,
             held: std::cell::RefCell::default(),
+            #[cfg(test)]
+            fetch_spawn: None,
         }
+    }
+
+    /// Tests: run the shared provision downloader through `spawn`.
+    #[cfg(test)]
+    fn with_fetch_spawn(
+        mut self,
+        spawn: std::sync::Arc<dyn aterm_update_core::github_rest::Spawn>,
+    ) -> Self {
+        self.fetch_spawn = Some(spawn);
+        self
     }
 }
 
@@ -1049,41 +1060,6 @@ fn tail(text: &[u8], n: usize) -> String {
     let text = String::from_utf8_lossy(text);
     let lines: Vec<&str> = text.trim_end().lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
-}
-
-/// The download of `url` into `dest`.
-pub(crate) fn fetch_spawn(url: &str, dest: &Path, bytes: u64) -> Spawn {
-    let bytes = bytes.to_string();
-    Spawn {
-        program: PathBuf::from(CURL),
-        args: [
-            "-q",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--tlsv1.2",
-            "-sSfL",
-            "--max-filesize",
-            &bytes,
-            "--retry",
-            "0",
-            "--connect-timeout",
-            "30",
-            "--speed-limit",
-            "1024",
-            "--speed-time",
-            "60",
-            "-o",
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .chain([dest.as_os_str().to_owned(), url.into()])
-        .collect(),
-        cwd: dest.parent().unwrap_or(Path::new("/")).to_path_buf(),
-        set: Vec::new(),
-        remove: Vec::new(),
-    }
 }
 
 impl Host for System {
@@ -1110,7 +1086,16 @@ impl Host for System {
     }
 
     fn fetch(&self, url: &str, dest: &Path, bytes: u64) -> Result<(), String> {
-        self.run(&fetch_spawn(url, dest, bytes)).map(|_| ())
+        #[cfg(test)]
+        if let Some(spawn) = &self.fetch_spawn {
+            return aterm_update_core::download_to_resumable_https_only_via(
+                url,
+                dest,
+                bytes,
+                spawn.as_ref(),
+            );
+        }
+        aterm_update_core::download_to_resumable_https_only(url, dest, bytes)
     }
 
     fn developer_id(&self, path: &Path, team: &str) -> Result<(), String> {

@@ -5,7 +5,7 @@
 //! A scripted transport for unit tests: answers queued in order, every request recorded.
 
 use std::collections::VecDeque;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::sync::{Mutex, PoisonError};
 
 use super::{Method, Phase, Transport, WireBody, WireError, WireKind, WireRequest, WireResponse};
@@ -20,6 +20,17 @@ pub enum Scripted {
         headers: Vec<(String, String)>,
         /// Its body.
         body: Vec<u8>,
+    },
+    /// An answered head whose body yields `body` and then fails while it is read.
+    BodyFault {
+        /// Its status.
+        status: u16,
+        /// Its headers, in order.
+        headers: Vec<(String, String)>,
+        /// Bytes yielded before the failure.
+        body: Vec<u8>,
+        /// The wire class the body read must produce.
+        kind: WireKind,
     },
     /// A failed exchange.
     Fail(WireError),
@@ -78,6 +89,25 @@ impl ScriptedTransport {
         });
     }
 
+    /// Queue an answered head whose body yields `body` and then fails as `kind`.
+    pub fn answer_body_fault(
+        &self,
+        status: u16,
+        headers: &[(&str, &str)],
+        body: &[u8],
+        kind: WireKind,
+    ) {
+        self.push(Scripted::BodyFault {
+            status,
+            headers: headers
+                .iter()
+                .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+                .collect(),
+            body: body.to_vec(),
+            kind,
+        });
+    }
+
     /// Every request seen, in order.
     #[must_use]
     pub fn requests(&self) -> Vec<SeenRequest> {
@@ -116,6 +146,35 @@ fn local(detail: &str) -> WireError {
         phase: Phase::NotSent,
         kind: WireKind::Local,
         detail: detail.to_string(),
+    }
+}
+
+struct FaultBody {
+    before: Cursor<Vec<u8>>,
+    kind: WireKind,
+    failed: bool,
+}
+
+impl Read for FaultBody {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.before.read(buf)?;
+        if read != 0 || buf.is_empty() {
+            return Ok(read);
+        }
+        if self.failed {
+            return Ok(0);
+        }
+        self.failed = true;
+        let kind = match self.kind {
+            WireKind::Timeout | WireKind::Idle => std::io::ErrorKind::TimedOut,
+            WireKind::Reset => std::io::ErrorKind::ConnectionReset,
+            WireKind::Truncated => std::io::ErrorKind::UnexpectedEof,
+            _ => std::io::ErrorKind::Other,
+        };
+        Err(std::io::Error::new(
+            kind,
+            format!("scripted {} body failure", self.kind.slug()),
+        ))
     }
 }
 
@@ -163,6 +222,20 @@ impl Transport for ScriptedTransport {
                 status,
                 headers,
                 body: Box::new(Cursor::new(body)),
+            }),
+            Some(Scripted::BodyFault {
+                status,
+                headers,
+                body,
+                kind,
+            }) => Ok(WireResponse {
+                status,
+                headers,
+                body: Box::new(FaultBody {
+                    before: Cursor::new(body),
+                    kind,
+                    failed: false,
+                }),
             }),
         }
     }

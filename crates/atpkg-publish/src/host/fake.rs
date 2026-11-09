@@ -502,7 +502,7 @@ impl FakeHost {
             .and_then(|r| r.assets.get(asset).cloned())
     }
 
-    /// `fetch_public`'s answer, before a `dest` it does not answer present is removed.
+    /// `fetch_public`'s answer. A final failure never removes caller-owned bytes at `dest`.
     fn fetch_public_into(
         &self,
         slug: &Slug,
@@ -771,11 +771,7 @@ impl ReleaseHost for FakeHost {
 
     fn fetch_public(&self, slug: &Slug, tag: &str, asset: &str, dest: &Path, cap: u64) -> Probe {
         self.log(format!("fetch {slug} {tag} {asset}"));
-        let answer = self.fetch_public_into(slug, tag, asset, dest, cap);
-        if answer != Probe::Present {
-            let _ = std::fs::remove_file(dest);
-        }
-        answer
+        self.fetch_public_into(slug, tag, asset, dest, cap)
     }
 
     fn reads_anonymously(&self) -> bool {

@@ -65,6 +65,24 @@ impl Selected {
     }
 }
 
+/// Whether `witnesses` show no pin, and either a regular file at the entry (an intent beside it is
+/// not read) or nothing at the entry and no intent: the entry is then the data ([`data_path`]),
+/// and the witnesses hold all `data_path` looks at.
+const fn is_plain(witnesses: &Witnesses) -> bool {
+    matches!(
+        witnesses,
+        [None, None, None]
+            | [
+                None,
+                Some(fsx::Seen {
+                    kind: fsx::Kind::File,
+                    ..
+                }),
+                _,
+            ]
+    )
+}
+
 fn selection_witnesses(entry: &Path) -> Result<Witnesses> {
     Ok([
         fsx::seen_if_present(&pin_path(entry)?)?,
@@ -74,13 +92,54 @@ fn selection_witnesses(entry: &Path) -> Result<Witnesses> {
 }
 
 /// [`data_path`], for a reader that holds the selection across its read
-/// ([`Selected::confirm`]). With no pin, no intent and a regular file or nothing at the entry, the
-/// witnesses already hold what `data_path` looks at, and the entry is what it answers. A pinned
+/// ([`Selected::confirm`]). Where the witnesses show a plain records file or none ([`is_plain`]),
+/// they already hold what `data_path` looks at, and the entry is what it answers. A pinned
 /// layout whose files all stand as they did when a reader last resolved it answers what it did
 /// then, without being read again ([`Judgements`]).
 pub(crate) fn selected(entry: &Path) -> Result<Selected> {
-    static JUDGEMENTS: Judgements = Judgements::new();
     JUDGEMENTS.selected(entry)
+}
+
+/// The judgements this process's readers share ([`selected`], [`standing`]).
+static JUDGEMENTS: Judgements = Judgements::new();
+
+/// Every file a selection of the data at a records entry is judged by, as it stood when a reader
+/// looked ([`standing`]). Equal only to a look at the same files standing as they were.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Standing {
+    /// The pin, the entry and the intent ([`selection_witnesses`]). Where they show a plain records
+    /// file or none ([`is_plain`]), these are all [`data_path`] looks at.
+    witnesses: Witnesses,
+    /// For anything else the selection takes (a pinned layout, or a transition it can still read
+    /// through), the rest of what it judged ([`Judged`]).
+    judged: Option<Box<Judged>>,
+}
+
+/// What stands at `entry` for a reader that keeps what it read from its selected data while each
+/// file the selection is judged by stands as it was (`client::vault_memo`), so it need not select
+/// the data again to know it would select the same: `None` where the selection refuses them (an
+/// unfinished transition, an unsafe or inconsistent layout, a capacity larger than this reader
+/// holds) or they cannot be seen. One `lstat` of the pin, the entry and the intent decides it for
+/// a plain records file; a pinned layout standing as a reader last judged it is not judged again
+/// ([`Judgements`]).
+pub(crate) fn standing(entry: &Path) -> Option<Standing> {
+    JUDGEMENTS.standing(entry)
+}
+
+/// The files a [`Standing`] of `entry` stands for, besides the parent: the entry, its pin, its
+/// intent, and a layout's header and data file.
+///
+/// # Errors
+/// The entry has no valid name ([`pin_path`]).
+#[cfg(test)]
+pub(crate) fn standing_files(entry: &Path) -> Result<[PathBuf; 5]> {
+    Ok([
+        entry.to_path_buf(),
+        pin_path(entry)?,
+        intent_path(entry)?,
+        entry.join(HEADER),
+        entry.join(DATA),
+    ])
 }
 
 /// [`data_path`], as [`selected`] answers it: for a reader that only names the data file.
@@ -126,10 +185,10 @@ impl Judged {
 
 /// The pinned layouts readers resolved lately, each as it stood ([`Judged`]). A Mac's records
 /// past [`crate::crossing::past_legacy`] sit in such a layout, and each Commons check of a quiet
-/// repair round selects them and stamps its vault memo's inputs by them
-/// (`client::Paths::records_data_file`): resolving it each time opened and read the pin, the
-/// parent, the directory, its header and its data file, 20% of such a round over a log of 9,605
-/// records (2026-11-08, `docs/measured/commons-long-log-rounds-2026-11-07.md`).
+/// repair round judges them for its vault memo's stamps ([`standing`]): resolving it each time
+/// opened and read the pin, the parent, the directory, its header and its data file, 20% of such
+/// a round over a log of 9,605 records (2026-11-08,
+/// `docs/measured/commons-long-log-rounds-2026-11-07.md`).
 struct Judgements(Mutex<VecDeque<Judged>>);
 
 /// The most layouts [`Judgements`] keeps: one for each records entry a process reads.
@@ -143,17 +202,7 @@ impl Judgements {
     fn selected(&self, entry: &Path) -> Result<Selected> {
         let witnesses = selection_witnesses(entry).ok();
         let path = match witnesses {
-            Some(
-                [
-                    None,
-                    None
-                    | Some(fsx::Seen {
-                        kind: fsx::Kind::File,
-                        ..
-                    }),
-                    None,
-                ],
-            ) => entry.to_path_buf(),
+            Some(stood) if is_plain(&stood) => entry.to_path_buf(),
             Some(
                 stood @ [
                     Some(fsx::Seen {
@@ -166,7 +215,10 @@ impl Judgements {
                     }),
                     _,
                 ],
-            ) => self.layout(entry, stood)?,
+            ) => {
+                self.layout(entry, stood)?;
+                entry.join(DATA)
+            }
             _ => data_path(entry)?,
         };
         Ok(Selected {
@@ -176,16 +228,43 @@ impl Judgements {
         })
     }
 
-    /// [`data_path`] of the pinned layout at `entry`, whose pin, entry and intent stood as
-    /// `witnesses` say (a prepared layout keeps its intent, which `data_path` does not read once
-    /// the pin stands), taken from the last judgement of it while its files all stand as they
-    /// did then. A judgement answers for its files only where they stood still across it.
-    fn layout(&self, entry: &Path, witnesses: Witnesses) -> Result<PathBuf> {
+    /// [`standing`]: the shapes [`Self::selected`] tells apart, from the same `lstat`s, with the
+    /// judgement of a pinned layout it would take ([`Self::layout`]), and any other shape judged by
+    /// [`data_path`] afresh.
+    fn standing(&self, entry: &Path) -> Option<Standing> {
+        let witnesses = selection_witnesses(entry).ok()?;
+        let judged = match witnesses {
+            stood if is_plain(&stood) => None,
+            [
+                Some(fsx::Seen {
+                    kind: fsx::Kind::File,
+                    ..
+                }),
+                Some(fsx::Seen {
+                    kind: fsx::Kind::Dir,
+                    ..
+                }),
+                _,
+            ] => Some(Box::new(self.layout(entry, witnesses).ok()?)),
+            _ => {
+                data_path(entry).ok()?;
+                Some(Box::new(Judged::of(entry, witnesses).ok()?))
+            }
+        };
+        Some(Standing { witnesses, judged })
+    }
+
+    /// [`data_path`]'s judgement of the pinned layout at `entry`, whose pin, entry and intent
+    /// stood as `witnesses` say (a prepared layout keeps its intent, which `data_path` does not
+    /// read once the pin stands), as its files stood before it: taken from the last judgement of
+    /// it while its files all stand as they did then. A judgement answers for its files only
+    /// where they stood still across it. Its data file is the one inside the entry.
+    fn layout(&self, entry: &Path, witnesses: Witnesses) -> Result<Judged> {
         let before = Judged::of(entry, witnesses)?;
         if self.0.lock().is_ok_and(|judged| judged.contains(&before)) {
-            return Ok(entry.join(DATA));
+            return Ok(before);
         }
-        let path = data_path(entry)?;
+        data_path(entry)?;
         let after = selection_witnesses(entry).and_then(|stood| Judged::of(entry, stood));
         if after.is_ok_and(|after| after == before)
             && let Ok(mut judged) = self.0.lock()
@@ -194,9 +273,9 @@ impl Judgements {
             if judged.len() >= JUDGED {
                 judged.pop_front();
             }
-            judged.push_back(before);
+            judged.push_back(before.clone());
         }
-        Ok(path)
+        Ok(before)
     }
 }
 
@@ -362,7 +441,7 @@ pub(crate) fn pin_path(entry: &Path) -> Result<PathBuf> {
     side_path(entry, "layout")
 }
 
-fn intent_path(entry: &Path) -> Result<PathBuf> {
+pub(crate) fn intent_path(entry: &Path) -> Result<PathBuf> {
     side_path(entry, "preparing")
 }
 

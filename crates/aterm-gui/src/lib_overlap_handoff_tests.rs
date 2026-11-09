@@ -1725,7 +1725,7 @@ fn access_card_due(app: &mut App, now: std::time::Instant) {
         app.messages
             .live_by_key(super::message_reporters::KEY_FILE_ACCESS)
             .is_none(),
-        "and never a band row"
+        "and never a live row"
     );
     assert_eq!(app.consent_card_message, None);
     assert_eq!(app.consent_card.phase(), CardPhase::Watching { since: now });

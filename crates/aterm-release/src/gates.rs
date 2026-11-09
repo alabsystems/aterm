@@ -2132,6 +2132,8 @@ pub fn submodules_off_gitlink(status: &str) -> Vec<&str> {
 /// After [`place_cut_tree`] creates or moves the cut tree.
 pub fn align_submodules(git: &dyn GitRunner) -> Result<()> {
     let update = ["submodule", "update", "--init", "--recursive", "--checkout"];
+    // This graph includes private vendor/astream. An HTTPS spelling does not make a repository
+    // credential-less; retain the ordinary credentialed Git path for the mixed submodule graph.
     let out = git.git(&[&BYTE_EXACT[..], &update].concat())?;
     if !out.success() {
         return Err(Error::new(format!(
@@ -2180,13 +2182,6 @@ impl std::fmt::Display for PinRefusal {
     }
 }
 
-/// The waits before a failed fetch's second and third attempts: a forge's 5xx or a dropped
-/// connection clears in seconds, and a fetch repeats safely.
-pub const FETCH_RETRIES: [std::time::Duration; 2] = [
-    std::time::Duration::from_secs(10),
-    std::time::Duration::from_secs(30),
-];
-
 /// Every submodule pin is on its declared branch.
 ///
 /// # Errors
@@ -2197,16 +2192,6 @@ pub const FETCH_RETRIES: [std::time::Duration; 2] = [
 pub fn submodules_on_declared_branch(
     git: &dyn GitRunner,
     origin: &dyn crate::ledger::Origin,
-) -> std::result::Result<(), PinRefusal> {
-    on_declared_branch_waiting(git, origin, &FETCH_RETRIES, &mut std::thread::sleep)
-}
-
-/// [`submodules_on_declared_branch`], waiting `retries` between fetch attempts through `wait`.
-fn on_declared_branch_waiting(
-    git: &dyn GitRunner,
-    origin: &dyn crate::ledger::Origin,
-    retries: &[std::time::Duration],
-    wait: &mut dyn FnMut(std::time::Duration),
 ) -> std::result::Result<(), PinRefusal> {
     let unread = |e: Error| PinRefusal::Unread(e.to_string());
     let listing = git_ok(git, &["ls-tree", "-r", "HEAD"])
@@ -2255,22 +2240,14 @@ fn on_declared_branch_waiting(
         } else {
             ("HEAD".to_string(), "HEAD".to_string())
         };
-        let mut fetched = origin.submodule_tip(Path::new(path), &source);
-        let mut attempts = 1;
-        for pause in retries {
-            if fetched.is_ok() {
-                break;
-            }
-            wait(*pause);
-            fetched = origin.submodule_tip(Path::new(path), &source);
-            attempts += 1;
-        }
-        let tip = fetched.map_err(|why| {
-            PinRefusal::Unread(format!(
-                "cannot fetch {path}'s declared branch {branch} from its origin in {attempts} \
-             attempts: {why}, so whether its pin {pin} is on it is unknown"
-            ))
-        })?;
+        let tip = origin
+            .submodule_tip(Path::new(path), &source)
+            .map_err(|failure| {
+                PinRefusal::Unread(format!(
+                    "cannot fetch {path}'s declared branch {branch} from its origin: {failure}, so \
+                 whether its pin {pin} is on it is unknown"
+                ))
+            })?;
         let on = git
             .git(&["-C", path, "merge-base", "--is-ancestor", pin, &tip])
             .map_err(unread)?;
@@ -3659,13 +3636,9 @@ mod submodule_tests {
         git(&bus, &["tag", "main", &side]);
         git(&bus, &["checkout", "-q", "side"]);
         git(&bus, &["branch", "-D", "main"]);
-        let unread = on_declared_branch_waiting(
-            &runner,
-            &fixture_origin::FixtureOrigin(&runner),
-            &FETCH_RETRIES,
-            &mut drop,
-        )
-        .expect_err("a same-named tag cannot stand in for a missing branch");
+        let unread =
+            submodules_on_declared_branch(&runner, &fixture_origin::FixtureOrigin(&runner))
+                .expect_err("a same-named tag cannot stand in for a missing branch");
         assert!(matches!(unread, PinRefusal::Unread(_)), "{unread}");
     }
 
@@ -3710,40 +3683,46 @@ mod submodule_tests {
                 },
             )
         };
-        let mut waited = Vec::new();
-        let unfetched = fake(vec![failed(), failed(), failed()]);
-        let refused = on_declared_branch_waiting(
-            &unfetched,
-            &fixture_origin::FixtureOrigin(&unfetched),
-            &FETCH_RETRIES,
-            &mut |d| {
-                waited.push(d);
-            },
-        )
-        .expect_err("no fetch, no verdict");
+        let unfetched = fake(vec![failed()]);
+        let refused =
+            submodules_on_declared_branch(&unfetched, &fixture_origin::FixtureOrigin(&unfetched))
+                .expect_err("no fetch, no verdict");
         assert!(matches!(refused, PinRefusal::Unread(_)), "{refused}");
-        assert!(refused.to_string().contains("in 3 attempts"), "{refused}");
-        assert_eq!(waited, FETCH_RETRIES);
+        let fetches = unfetched
+            .calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .filter(|call| call.contains(" fetch "))
+            .count();
+        assert_eq!(
+            fetches, 1,
+            "the gate does not wrap its origin transport in another retry budget"
+        );
 
-        // A forge's passing 5xx is retried: the second attempt fetches and the gate decides.
-        let mut waited = Vec::new();
-        let recovered = fake(vec![failed()]);
-        on_declared_branch_waiting(
-            &recovered,
-            &fixture_origin::FixtureOrigin(&recovered),
-            &FETCH_RETRIES,
-            &mut |d| waited.push(d),
-        )
-        .expect("the retried fetch decides");
-        assert_eq!(waited, FETCH_RETRIES[..1]);
-        let fetches = recovered
+        let absent = || {
+            (
+                " fetch ",
+                RunOut {
+                    status: 128,
+                    stdout: vec![],
+                    stderr: b"fatal: unable to access 'https://github.com/o/r.git/': The requested URL returned error: 404".to_vec(),
+                },
+            )
+        };
+        let missing = fake(vec![absent()]);
+        let refused =
+            submodules_on_declared_branch(&missing, &fixture_origin::FixtureOrigin(&missing))
+                .expect_err("404 is final");
+        assert!(matches!(refused, PinRefusal::Unread(_)), "{refused}");
+        let fetches = missing
             .calls
             .lock()
             .expect("calls")
             .iter()
             .filter(|c| c.contains(" fetch "))
             .count();
-        assert_eq!(fetches, 2);
+        assert_eq!(fetches, 1);
 
         let undecided = fake(vec![("merge-base", out(128, ""))]);
         let refused =

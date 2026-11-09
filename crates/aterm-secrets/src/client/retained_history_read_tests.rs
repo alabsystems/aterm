@@ -63,6 +63,33 @@ fn counted(cache: &ReadCache, before: RetainedHistoryReadCounts) -> RetainedHist
     cache.1.snapshot().checked_delta(before).unwrap()
 }
 
+/// A kept history is taken by its journal's files and folder alone: the membership records,
+/// which no read of the journal reads, left a directory the records selection refuses, leave it
+/// unmoved. NEGATIVE CONTROL: with the records' selection stamped beside the journal's files
+/// (`vault_memo::stamp_inputs`, eb0e73e0f1), the read finds no stamps and reads the journal again.
+#[test]
+fn a_kept_history_is_unmoved_by_the_membership_records() {
+    let mut fixture = Receipts::new();
+    fixture.append(1);
+    let cache = ReadCache::new();
+    let first = cache.read(&fixture.paths).unwrap();
+    std::fs::create_dir(fixture.paths.records_file()).unwrap();
+    assert!(crate::records_storage::data_path(&fixture.paths.records_file()).is_err());
+    let before = cache.1.snapshot();
+    assert!(Arc::ptr_eq(&first, &cache.read(&fixture.paths).unwrap()));
+    assert_eq!(
+        counted(&cache, before),
+        RetainedHistoryReadCounts {
+            same_directory: RetainedHistoryReadOutcomes {
+                lookups: 1,
+                unmoved: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    );
+}
+
 #[test]
 fn incremental_reader_keeps_old_snapshots_and_publishes_only_valid_suffixes() {
     let mut fixture = Receipts::new();

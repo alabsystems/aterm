@@ -683,7 +683,7 @@ pub trait Ports: Sync {
     /// Local vault state, roster, or pool entries cannot be read.
     fn steward_revoke(&self) -> Result<StewardRevokeRead, String> {
         Ok(StewardRevokeRead::Idle(
-            "this Mac holds no admin key of the ALab vault".to_owned(),
+            aterm_secrets::client::no_admin_key(),
         ))
     }
 
@@ -700,9 +700,7 @@ pub trait Ports: Sync {
     /// # Errors
     /// Local vault state, policy, or lease entry cannot be read.
     fn steward_lease(&self) -> Result<StewardLeaseRead, String> {
-        Ok(StewardLeaseRead::Idle(
-            "this Mac holds no admin key of the ALab vault".to_owned(),
-        ))
+        Ok(StewardLeaseRead::Idle(aterm_secrets::client::no_admin_key()))
     }
 
     /// Claim, renew, or take over `aterm-swarm-lease` via parent-digest CAS (`sync.steward.lease`).
@@ -719,7 +717,7 @@ pub trait Ports: Sync {
     /// Local vault state, policy, or service state cannot be read.
     fn steward_standby_server(&self) -> Result<StewardStandbyServerRead, String> {
         Ok(StewardStandbyServerRead::Idle(
-            "this Mac holds no admin key of the ALab vault".to_owned(),
+            aterm_secrets::client::no_admin_key(),
         ))
     }
 
@@ -1177,7 +1175,8 @@ impl Item for Synced<'_> {
             Kind::Accounts => "the AI accounts roster",
             Kind::Release => "shared release signing",
             Kind::Fabric => "the message bus (fabric)",
-            Kind::Awake => "aCaffeine keeping this Mac awake",
+            Kind::Awake if cfg!(target_os = "macos") => "aCaffeine keeping this Mac awake",
+            Kind::Awake => "aCaffeine, which keeps a Mac awake",
         }
         .to_owned()
     }
@@ -1397,8 +1396,9 @@ impl Item for Synced<'_> {
                     }
                 )),
             }),
-            // The window keeps the mug itself, at launch and every five minutes.
-            Kind::Awake if self.trigger.in_window() => not_applicable(
+            // A Mac's window keeps the mug itself, at launch and every five minutes. Elsewhere no
+            // window keeps one, and the port says why (aCaffeine is macOS only).
+            Kind::Awake if cfg!(target_os = "macos") && self.trigger.in_window() => not_applicable(
                 "the aterm window keeps this Mac awake at launch and every five minutes",
             ),
             // A person's Enable at Startup off is no mug at login; a window still starts one,

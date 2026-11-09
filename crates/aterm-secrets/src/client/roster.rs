@@ -193,7 +193,10 @@ pub(crate) fn with_roster_observation_or_busy<T>(
 pub(crate) fn vault_busy() -> Error {
     Error::of_kind(
         crate::ErrorKind::VaultBusy,
-        "this Mac's vault is busy: a vault writer holds its state lock",
+        format!(
+            "this {}'s vault is busy: a vault writer holds its state lock",
+            aterm_types::machine_name::OS_NOUN
+        ),
     )
 }
 

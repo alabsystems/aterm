@@ -23,6 +23,7 @@ pub(super) use owner::bootstrap_graph::{
     EnrollmentAttachment as BootstrapGraphAttachment, OutputTransfer as BootstrapGraphOutput,
     Preparing as BootstrapGraphPreparing, Support as BootstrapGraphSupport,
 };
+pub(super) use owner::bootstrap_object::SourceOffer as BootstrapObjectOffer;
 pub(super) use owner::runtime_inputs::Attachment as RuntimeInputsAttachment;
 pub(super) use owner::runtime_inputs::Preparing as RuntimeInputsPreparing;
 pub(super) use owner::workload::MemberOriginalCustody as WorkloadMemberOriginal;
@@ -92,6 +93,20 @@ enum Message {
         stream: aterm_uds::CtlStream,
         started: Instant,
         deadline: Instant,
+        reply: SyncSender<io::Result<()>>,
+    },
+    PrepareBootstrapObject {
+        peer: Peer,
+        request: Box<trust_resource_controller::bootstrap_graph::object::Request>,
+        stream: aterm_uds::CtlStream,
+        started: Instant,
+        deadline: Instant,
+        reply: SyncSender<io::Result<BootstrapObjectOffer>>,
+    },
+    BootstrapObjectSource {
+        peer: Peer,
+        offer: Box<BootstrapObjectOffer>,
+        source: io::Result<[std::os::fd::OwnedFd; 2]>,
         reply: SyncSender<io::Result<()>>,
     },
     RuntimeInputsBegin {
@@ -622,6 +637,39 @@ pub(super) fn bootstrap_graph_output_retain(
     })?;
     receive_reply(read).map_err(|_| unavailable())?
 }
+pub(super) fn prepare_bootstrap_object(
+    peer: Peer,
+    request: trust_resource_controller::bootstrap_graph::object::Request,
+    stream: aterm_uds::CtlStream,
+    started: Instant,
+    deadline: Instant,
+) -> io::Result<BootstrapObjectOffer> {
+    let (write, read) = mpsc::sync_channel(1);
+    send(Message::PrepareBootstrapObject {
+        peer,
+        request: Box::new(request),
+        stream,
+        started,
+        deadline,
+        reply: write,
+    })?;
+    receive_reply_at(read, started).map_err(|_| unavailable())?
+}
+pub(super) fn bootstrap_object_source(
+    peer: Peer,
+    offer: BootstrapObjectOffer,
+    source: io::Result<[std::os::fd::OwnedFd; 2]>,
+) -> io::Result<()> {
+    let (write, read) = mpsc::sync_channel(1);
+    send(Message::BootstrapObjectSource {
+        peer,
+        offer: Box::new(offer),
+        source,
+        reply: write,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+
 pub(super) fn submit_bootstrap_query(
     peer: Peer,
     request: trust_resource_controller::bootstrap_graph::query::Request,
@@ -853,6 +901,26 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
                 } => {
                     let _ =
                         reply.try_send(owner.bootstrap_graph_output_retain(*token, descriptions));
+                }
+                Message::PrepareBootstrapObject {
+                    peer,
+                    request,
+                    stream,
+                    started,
+                    deadline,
+                    reply,
+                } => {
+                    let _ = reply.send(
+                        owner.prepare_bootstrap_object(peer, *request, stream, started, deadline),
+                    );
+                }
+                Message::BootstrapObjectSource {
+                    peer,
+                    offer,
+                    source,
+                    reply,
+                } => {
+                    let _ = reply.send(owner.bootstrap_object_source(peer, *offer, source));
                 }
                 Message::SubmitBootstrapQuery {
                     peer,

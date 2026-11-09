@@ -261,17 +261,17 @@ fn reads_during<T>(paths: &Paths, read: impl FnOnce() -> T) -> (T, BTreeMap<Path
 }
 
 /// A settled observation of `paths` is the fresh one, and a second one of the same files opens
-/// none of them, the records pin included (`Paths::records_data_file` names the data file to stamp
-/// from `records_storage::selected`'s `lstat`s); every file the fresh one reads is among those
-/// whose stamps the memo compares.
+/// none of them, the records pin included (`records_storage::standing` stamps a plain records file
+/// by its `lstat`s); every file the fresh one reads is among those whose stamps the memo compares.
 ///
-/// NEGATIVE CONTROL (2026-11-08): with `Paths::records_data_file` back on
+/// NEGATIVE CONTROL (2026-11-08): with `standing`'s plain records file judged by
 /// `records_storage::data_path`, the second observation opens the missing pin (`a settled
 /// observation of unchanged files`).
 fn settles(paths: &Paths, expected: &str) {
     let (fresh, read) = reads_during(paths, || observe_commons(paths));
     assert_eq!(verdict(&fresh), expected);
-    let inputs = vault_memo::observation_inputs(paths).expect("the inputs");
+    let inputs =
+        vault_memo::stamped_files(paths, vault_memo::observation_inputs).expect("the inputs");
     let unstamped: Vec<_> = read.keys().filter(|path| !inputs.contains(path)).collect();
     assert!(unstamped.is_empty(), "read but not stamped: {unstamped:#?}");
     assert_eq!(verdict(&commons::observe_settled(paths)), expected);
@@ -385,7 +385,7 @@ fn desk_reads_only_stamped_files(paths: &Paths, member: bool) {
         "a member's desk"
     );
     offers.expect("its removals read");
-    let inputs = vault_memo::desk_files(paths).expect("the inputs");
+    let inputs = vault_memo::stamped_files(paths, vault_memo::desk_files).expect("the inputs");
     let unstamped: Vec<_> = read.keys().filter(|path| !inputs.contains(path)).collect();
     assert!(unstamped.is_empty(), "read but not stamped: {unstamped:#?}");
     assert!(
@@ -491,7 +491,7 @@ fn a_custody_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer()
     });
     assert_eq!(verdict(&observed), "visible");
     assert!(!denied.unwrap(), "m7 is not denied");
-    let inputs = vault_memo::observation_inputs(m7).expect("the inputs");
+    let inputs = vault_memo::stamped_files(m7, vault_memo::observation_inputs).expect("the inputs");
     let unstamped: Vec<_> = read.keys().filter(|path| !inputs.contains(path)).collect();
     assert!(unstamped.is_empty(), "read but not stamped: {unstamped:#?}");
 
@@ -541,7 +541,7 @@ fn a_custody_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer()
         )
     });
     assert!(denied.unwrap(), "m7 is denied");
-    let inputs = vault_memo::observation_inputs(m7).expect("the inputs");
+    let inputs = vault_memo::stamped_files(m7, vault_memo::observation_inputs).expect("the inputs");
     let unstamped: Vec<_> = read.keys().filter(|path| !inputs.contains(path)).collect();
     assert!(unstamped.is_empty(), "read but not stamped: {unstamped:#?}");
     assert_ne!(observed, "visible", "m7 denied is out of Commons custody");
@@ -640,9 +640,9 @@ fn a_table_sessions_custody_and_access_keep_their_reads_until_a_file_moves() {
 /// kept roster for the log is given under the writer (`a writer holding the vault meets the
 /// read`); with `local_swarm_roster_for_log_now` keyed by no log's heads (`[0; 32]`), the grown
 /// log gets the roster kept for the log before it (`the roster for another log is read for it`:
-/// `deny_labels: ["m99"]` against `["m98"]`). (2026-11-08): with `Paths::records_data_file` back
-/// on `records_storage::data_path`, the kept reads open the missing pin (`kept reads of unchanged
-/// files`).
+/// `deny_labels: ["m99"]` against `["m98"]`). (2026-11-08): with `records_storage::standing`'s
+/// plain records file judged by `records_storage::data_path`, the kept reads open the missing pin
+/// (`kept reads of unchanged files`).
 #[test]
 fn a_peer_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer() {
     let _answering = ServersAnswering::set();
@@ -663,7 +663,7 @@ fn a_peer_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer() {
     };
     let (for_log, read_for_log) = reads_during(m7, || local_swarm_roster_for_log(m7, &log));
     assert!(denies(&roster, "m99") && denies(&for_log, "m99"));
-    let inputs = vault_memo::inputs(m7).expect("the inputs");
+    let inputs = vault_memo::stamped_files(m7, vault_memo::inputs).expect("the inputs");
     let unstamped: Vec<_> = read
         .keys()
         .chain(read_for_log.keys())

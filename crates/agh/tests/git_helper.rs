@@ -484,6 +484,28 @@ fn whoami_git_explains_without_the_token() {
     );
 }
 
+/// A credential-bearing Git URL is exactly `OWNER/REPO[.git]`: query, fragment and backslash
+/// syntax cannot be folded into a repository name. The helper must quit without a credential,
+/// and the explanatory verb must reject the same spellings.
+#[test]
+fn git_urls_reject_query_fragment_and_backslash_suffixes() {
+    let world = World::canonical("helper-url-suffixes");
+    for suffix in ["?download=1", "#fragment", "\\other"] {
+        let request =
+            format!("protocol=https\nhost=github.com\npath=fixture-dev/app.git{suffix}\n\n");
+        assert_eq!(world.get(MapEnv::new(), &request), QUIT, "{suffix:?}");
+
+        let url = format!("https://github.com/fixture-dev/app.git{suffix}");
+        let (mut ctx, captured) = world.ctx(MapEnv::new());
+        assert_eq!(
+            common::run_cli(&mut ctx, &["whoami", "--git", &url]),
+            2,
+            "{suffix:?}: {}",
+            captured.stderr_text()
+        );
+    }
+}
+
 #[test]
 fn repo_clone_clones_through_the_runner() {
     let world = World::canonical("helper-clone");

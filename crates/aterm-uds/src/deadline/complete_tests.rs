@@ -1,13 +1,124 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Strict stdout draining with injected reads and actual owned native pipes.
+//! Strict stream draining with injected reads and actual owned native pipes.
 
 use super::*;
 use std::io::Cursor;
 use std::time::Duration;
 
 const HANG: Duration = Duration::from_secs(60);
+
+#[cfg(unix)]
+#[test]
+fn complete_output_keeps_both_streams_and_refuses_stderr_overflow() {
+    let sh = crate::deadline::stand_in(std::path::Path::new("/bin/sh"));
+    let dd = crate::deadline::stand_in(std::path::Path::new("/bin/dd"));
+    for size in [OUTPUT_KEEP, OUTPUT_KEEP + 1] {
+        let command = || {
+            let mut command = crate::spawnfd::command(&sh);
+            command
+                .args([
+                    "-c",
+                    "printf 'answer\\n'; \"$1\" if=/dev/zero bs=\"$2\" count=1 1>&2 2>/dev/null",
+                    "sh",
+                ])
+                .arg(&dd)
+                .arg(size.to_string());
+            command
+        };
+        // The existing stdout contract still permits a bounded diagnostic tail.
+        let tail = output_until_complete_stdout(&mut command(), Instant::now() + HANG).unwrap();
+        assert!(tail.status.success());
+        assert_eq!(tail.stdout, b"answer\n");
+        assert_eq!(tail.stderr.len(), OUTPUT_KEEP);
+        let whole = output_until_complete_from_unless(
+            &mut command(),
+            Stdio::null(),
+            Instant::now() + HANG,
+            &mut || false,
+        );
+        if size == OUTPUT_KEEP {
+            let whole = whole.unwrap();
+            assert!(whole.status.success());
+            assert_eq!(whole.stdout, b"answer\n");
+            assert_eq!(whole.stderr, vec![0; size]);
+        } else {
+            assert!(
+                matches!(whole, Err(CompleteOutputError::Run(RunError::Capture(error))) if error.to_string().contains("stderr exceeds"))
+            );
+        }
+    }
+}
+
+#[test]
+fn complete_stderr_requires_eof_and_reports_read_errors() {
+    use std::io::Write as _;
+    for finished in [false, true] {
+        let (input, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"diagnostic").unwrap();
+        let stream =
+            StderrDrain::Complete(drain_complete_with_limit(None, input, 32, "stderr").unwrap());
+        let held = if finished {
+            drop(writer);
+            None
+        } else {
+            Some(writer)
+        };
+        let by = if finished {
+            Instant::now() + HANG
+        } else {
+            Instant::now()
+        };
+        let answer = stream.collect_unless(
+            &Grace {
+                by,
+                until: by,
+                group: None,
+            },
+            &mut None,
+        );
+        if finished {
+            assert_eq!(answer.unwrap(), b"diagnostic");
+        } else {
+            assert!(
+                matches!(answer, Err(CompleteOutputError::Run(RunError::Capture(error))) if error.to_string().contains("stderr did not reach"))
+            );
+        }
+        drop(held);
+    }
+    struct Broken;
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected read failure"))
+        }
+    }
+    let stream =
+        StderrDrain::Complete(drain_complete_with_limit(None, Broken, 32, "stderr").unwrap());
+    let by = Instant::now() + HANG;
+    assert!(
+        matches!(stream.collect_unless(&Grace { by, until: by, group: None }, &mut None),
+        Err(CompleteOutputError::Run(RunError::Capture(error))) if error.to_string().contains("stderr could not be read completely"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn complete_output_cancellation_is_a_post_spawn_refusal() {
+    let mut command = crate::spawnfd::command(crate::deadline::stand_in(std::path::Path::new(
+        "/bin/sleep",
+    )));
+    command.arg("30");
+    assert!(matches!(
+        output_until_complete_from_unless(
+            &mut command,
+            Stdio::null(),
+            Instant::now() + HANG,
+            &mut || true
+        ),
+        Err(CompleteOutputError::Run(RunError::TimedOut))
+    ));
+}
 
 #[cfg(unix)]
 #[test]
@@ -471,6 +582,49 @@ fn a_limited_capture_is_cancelled_when_its_caller_stops() {
         &mut || false,
     )
     .expect("NEGATIVE CONTROL: never stopped, it runs to its end");
+    assert_eq!(output.stdout, b"done\n");
+}
+
+/// A PROGRESS-BOUNDED COMPLETE CAPTURE STILL OBEYS ITS CALLER'S STOP: cancellation is distinct
+/// from an idle child, and a caller that never stops receives the child's complete stdout.
+/// NEGATIVE CONTROL: removing the stop from the progress collector lets the slow child run.
+#[cfg(unix)]
+#[test]
+fn a_progress_capture_is_cancelled_when_its_caller_stops() {
+    let sleep = crate::deadline::stand_in(std::path::Path::new("/bin/sleep"));
+    let mut slow = crate::spawnfd::command(&sleep);
+    slow.arg("30");
+    let mut asked = 0;
+    let stopped = output_while_process_progressing_complete_stdout_unless(
+        &mut slow,
+        HANG,
+        "the cancellable fixture",
+        &mut || {
+            asked += 1;
+            true
+        },
+    );
+    assert!(
+        matches!(
+            stopped,
+            Err(CompleteProgressError::Complete(CompleteOutputError::Run(
+                RunError::TimedOut
+            )))
+        ),
+        "{stopped:?}"
+    );
+    assert!(asked > 0, "the caller's stop was asked");
+
+    let echo = crate::deadline::stand_in(std::path::Path::new("/bin/echo"));
+    let mut quick = crate::spawnfd::command(&echo);
+    quick.arg("done");
+    let output = output_while_process_progressing_complete_stdout_unless(
+        &mut quick,
+        HANG,
+        "the complete fixture",
+        &mut || false,
+    )
+    .expect("NEGATIVE CONTROL: a caller that never stops receives complete output");
     assert_eq!(output.stdout, b"done\n");
 }
 

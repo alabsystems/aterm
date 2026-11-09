@@ -12,6 +12,9 @@ use std::{
 };
 use wire::query;
 
+#[path = "object_gate.rs"]
+mod object_gate;
+pub(in crate::actor::owner) use object_gate::ObjectOperation;
 const MAX_QUERIES: u64 = 128;
 enum ClosedQuery {
     Complete(bootstrap_query::Completed),
@@ -31,6 +34,9 @@ pub(super) struct State {
     failed: bool,
     retained: Vec<bootstrap_query::Retained>,
     running: Option<Box<bootstrap_query::Query>>,
+    object_active: Option<wire::object::Request>,
+    object_running: Option<Box<super::super::bootstrap_object::Object>>,
+    object_retained: Vec<super::super::bootstrap_object::Retained>,
 }
 impl State {
     pub(super) fn new(command: &mut spawnfd::Command) -> io::Result<Self> {
@@ -91,6 +97,9 @@ impl State {
             failed: false,
             retained: Vec::new(),
             running: None,
+            object_active: None,
+            object_running: None,
+            object_retained: Vec::new(),
         })
     }
     pub(super) fn check_key(&self, key: &wire::Key) -> io::Result<()> {
@@ -103,7 +112,7 @@ impl State {
     }
     pub(super) fn enrollment_allowed(&self, key: &wire::Key) -> io::Result<()> {
         self.check_key(key)?;
-        if self.active.is_some() {
+        if self.active.is_some() || self.object_active.is_some() {
             return Err(refused("Bootstrap SDK operation is still unresolved"));
         }
         Ok(())
@@ -114,9 +123,12 @@ impl State {
         Ok(())
     }
     pub(super) fn native_queries_drained(&self) -> bool {
-        self.running.is_none() && self.preparation_finished()
+        self.running.is_none() && self.object_running.is_none() && self.preparation_finished()
     }
     pub(super) fn sampling_group(&self) -> io::Result<Option<i32>> {
+        if let Some(object) = &self.object_running {
+            return object.sampling_group();
+        }
         self.running
             .as_ref()
             .map_or(Ok(None), |query| query.sampling_group())
@@ -134,6 +146,7 @@ impl State {
             return Err(refused("Bootstrap SDK operation still owns native work"));
         }
         self.retained.clear();
+        self.object_retained.clear();
         Ok(())
     }
     fn directory_current(&self) -> io::Result<()> {
@@ -222,6 +235,7 @@ impl Owner {
             .min(root.deadline);
         time(deadline)?;
         if state.active.is_some()
+            || state.object_active.is_some()
             || request.key.sequence != state.next
             || state.next > MAX_QUERIES
             || state.operations.contains(&request.key.operation)
@@ -430,6 +444,7 @@ impl Owner {
         Ok(())
     }
     pub(in crate::actor::owner) fn tick_bootstrap_queries(&mut self) {
+        self.tick_bootstrap_objects();
         let mut closed = Vec::new();
         for job in self.jobs.values_mut() {
             if let Some(token) = Self::poll_bootstrap_query(&self.fence, &self.journal, job) {
@@ -456,6 +471,7 @@ impl Owner {
         key: &wire::Key,
     ) -> io::Result<()> {
         self.bootstrap_graph_context(peer, key)?;
+        self.refresh_bootstrap_object(peer, key)?;
         let job_key = (
             key.query.binding.session.clone(),
             key.query.binding.root_attempt,

@@ -3,6 +3,8 @@
 
 //! Definitions and sets for `aterm-verify` checks.
 
+use std::path::Path;
+
 use crate::plan::StageId;
 
 /// One check, as named on the command line.
@@ -423,6 +425,40 @@ pub fn pulled(wanted: &[Check], holds: impl Fn(&str) -> bool) -> Vec<(Check, &'s
         .collect()
 }
 
+fn forge_pull_reason(
+    wanted: &[Check],
+    alone: bool,
+    packages: impl FnOnce() -> Result<Vec<String>, String>,
+    touches: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if alone || wanted != DEV {
+        return None;
+    }
+    match packages() {
+        Ok(packages) => packages.into_iter().find(|package| touches(package)),
+        Err(_) => Some("the fork roster is unreadable (fail-closed)".to_string()),
+    }
+}
+
+/// Why a dev selection pulls [`Check::Forge`], if it does. A touched package is read from the
+/// fork policy or absorbed-crate registry; an unreadable registry pulls Forge fail-closed so its
+/// own diagnostic is the verdict. Explicit individual checks and release selections run exactly
+/// what they name.
+#[must_use]
+pub fn forge_pull(
+    wanted: &[Check],
+    alone: bool,
+    root: &Path,
+    touches: impl Fn(&str) -> bool,
+) -> Option<String> {
+    forge_pull_reason(
+        wanted,
+        alone,
+        || aterm_census::scan_set::fork_packages(root),
+        touches,
+    )
+}
+
 /// `wanted`, plus what it [`pulled`], in [`CHECKS`] order; `alone` is `wanted` as it is
 /// ([`crate::cli::Args::wanted`]).
 #[must_use]
@@ -626,6 +662,44 @@ pub fn list_table() -> String {
 mod tests {
     use super::*;
     use crate::scope::Scope;
+
+    #[test]
+    fn a_dev_selection_touching_a_fork_pulls_forge_and_nothing_weaker_does() {
+        let packages = || Ok(vec!["aterm-window".to_string(), "vendored".to_string()]);
+        assert_eq!(
+            forge_pull_reason(&DEV, false, packages, |p| p == "aterm-window"),
+            Some("aterm-window".to_string())
+        );
+        assert_eq!(
+            forge_pull_reason(&DEV, false, packages, |p| p == "dependent-only"),
+            None,
+            "a dependent in the cone did not itself change the fork"
+        );
+        assert_eq!(
+            forge_pull_reason(
+                &[Check::Lint],
+                false,
+                || panic!("a non-dev check must not parse the fork registries"),
+                |_| true,
+            ),
+            None,
+            "an explicitly narrow check stays narrow"
+        );
+        assert_eq!(
+            forge_pull_reason(
+                &DEV,
+                true,
+                || panic!("an exact release/as-release set must not parse the fork registries"),
+                |_| true,
+            ),
+            None,
+            "release/as-release selections pull nothing"
+        );
+        assert!(
+            forge_pull_reason(&DEV, false, || Err("bad policy".into()), |_| false).is_some(),
+            "an unreadable authority must schedule the check that diagnoses it"
+        );
+    }
 
     /// The release is its tree half then its bundle half, which share no check, and a release
     /// check is in the bundle half exactly when it plans a timed stage: the tree half runs nothing

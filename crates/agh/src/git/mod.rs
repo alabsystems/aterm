@@ -48,7 +48,8 @@ pub(crate) use run::run;
 /// The username the helper answers: GitHub ignores it for a token, and a fixed one keeps
 /// the Basic credential's shape known to the Redactor.
 pub const GIT_USERNAME: &str = "x-access-token";
-/// The most a git run may take, unless `GitRun::with_budget` says otherwise: 10 minutes.
+/// The default wall bound for local, authenticated and mutating Git children: 10 minutes.
+/// Anonymous network reads use a progress-inactivity window instead.
 pub const GIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
 /// The longest a grant lives: 15 minutes.
 pub const GRANT_MAX: std::time::Duration = std::time::Duration::from_secs(900);

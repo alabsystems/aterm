@@ -364,7 +364,7 @@ pub(crate) enum CliVerb {
 }
 
 impl CliVerb {
-    /// The verb's word in a message key and a document name: one row per verb on the band, so a
+    /// The verb's word in a message key and a document name: one live row per verb, so a
     /// rerun replaces its own outcome.
     pub(crate) const fn key(self) -> &'static str {
         match self {

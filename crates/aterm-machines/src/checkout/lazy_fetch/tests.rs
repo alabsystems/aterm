@@ -309,15 +309,14 @@ fn stand_in(dir: &Path, name: &str, native: &str, prelude: &str) -> PathBuf {
 /// NEGATIVE CONTROLS, stand-ins over the same git that refuse the option: one drops the
 /// variable and fetches the object, so its read succeeds and names the blob, and is refused;
 /// one also bars file transport and fails without evidence that lazy fetching was disabled,
-/// and is refused too. A native git admitted for its option need not print the older variable
-/// refusal message when the variable alone stops a read.
+/// and is refused too. The selected guard is applied to the protected read itself while the
+/// matching control remains unguarded.
 #[test]
 fn a_native_git_guard_prevents_lazy_fetch_and_reads_without_evidence_are_not_admitted() {
     let off = crate::items::github::need_native_git_barring_lazy_fetch();
     let native = crate::items::github::need_native_git();
     let live = Live::new();
     let dir = aterm_tempfile::tempdir().unwrap();
-    let obeying = stand_in(dir.path(), "variable-git", native, "");
     let ignoring = stand_in(
         dir.path(),
         "ignoring-git",
@@ -338,22 +337,11 @@ fn a_native_git_guard_prevents_lazy_fetch_and_reads_without_evidence_are_not_adm
     let read = |git: &Path| asked(&live, &|| Cmd::new(git)).unwrap();
 
     assert_eq!(of(Path::new(native)), Some(off));
-    let shown = read(&obeying);
-    assert_eq!(
-        shown.no_fetch,
-        !shown.read.success(),
-        "{}",
+    let shown = asked_with_guard(&live, &|| Cmd::new(native), off).unwrap();
+    assert!(
+        shown.read.status.is_some_and(|code| code != 0) && shown.no_fetch,
+        "the selected {off:?} guard prevents fetching: {}",
         shown.read.describe()
-    );
-    if off == NoLazyFetch::Variable {
-        assert!(
-            shown.no_fetch,
-            "the selected variable guard prevents fetching"
-        );
-    }
-    assert_eq!(
-        of(&obeying),
-        shown.no_fetch.then_some(NoLazyFetch::Variable)
     );
 
     assert_eq!(of(&ignoring), None);

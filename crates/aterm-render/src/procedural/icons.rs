@@ -41,6 +41,14 @@ pub const fn band_icon_width(cell_w: usize, spill: bool) -> usize {
     if spill { cell_w * 3 } else { cell_w }
 }
 
+/// The stroke the ring family's marks (`○ ◌ ◈` and the rest of [`BandIcon::is_glass_mark`]
+/// but `⤓`) are drawn with in a cell of their own, whole pixels: the face's stem held to its
+/// share of the family's radius.
+#[cfg(test)]
+pub(crate) fn mark_stroke(cell_w: usize, cell_h: usize, m: IconMetrics) -> f32 {
+    Shape::fit(cell_w, cell_h, m, false, BandIcon::Ring).mark_t()
+}
+
 /// Row-major `band_icon_width(cell_w, spill) × cell_h` 8-bit coverage bitmap for `icon`.
 #[must_use]
 pub fn band_icon_coverage(
@@ -59,12 +67,17 @@ pub fn band_icon_coverage(
     for y in 0..cell_h {
         for x in 0..w {
             let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-            let d = shape.distance(icon, px, py).max(shape.top - py);
-            let cov = (0.5 - d).clamp(0.0, 1.0);
-            buf[y * w + x] = (cov * 255.0).round() as u8;
+            buf[y * w + x] = coverage(shape.distance(icon, px, py).max(shape.top - py));
         }
     }
     buf
+}
+
+/// The coverage, of 255, a pixel whose centre lies `d` pixels outside a shape's edge is laid
+/// at (inside where `d` is negative): a ramp a pixel wide centred on the edge, so a pixel is at
+/// half ink or more (128) exactly where its centre is on or inside the edge.
+fn coverage(d: f32) -> u8 {
+    ((0.5 - d).clamp(0.0, 1.0) * 255.0).round() as u8
 }
 /// The most of an icon's half height its stroke may take (about a fifth of the icon), whole pixels: [`Shape::fit`] holds the face's stem to it at the icon's own half height (the capitals', held to the cell's width, or `⤓`'s [`Shape::tall`]) and [`Shape::mark_t`] at the ring family's own radius.
 const STROKE_SHARE: f32 = 0.44;
@@ -87,6 +100,9 @@ struct Shape {
     /// of this, not of `half`, whose share in a narrow cell (Iosevka's half-em) is under both
     /// weights' stems and would draw a bold `⤓` at the regular stem.
     tall: f32,
+    /// `◌`'s dots ([`Self::ring_dots`]), placed once per raster: placing them draws them to
+    /// judge whether they stand apart.
+    dots: std::cell::OnceCell<RingDots>,
     /// The half height `⏸`'s and `!`'s bars span: the capitals' where the row up to the ceiling
     /// allows, held to the room as [`Self::half`] is. `half` leaves a pixel and a half under the
     /// ceiling for the badges (their rings, the warning triangle, `↻`'s head), which reach past
@@ -170,6 +186,7 @@ impl Shape {
             ring,
             tall,
             flat: (cap * 0.5).min(cy - top).min(room - 0.5).max(half),
+            dots: std::cell::OnceCell::new(),
         }
     }
 
@@ -397,13 +414,7 @@ impl Shape {
                 self.mark_ring(px, py)
                     .min(self.mark_disc(px, py).max(px - split))
             }
-            BandIcon::DottedRing => {
-                let ((r, cyr), t) = (self.mark_frame(), self.mark_t());
-                let on = r - t * 0.5;
-                let step = std::f32::consts::FRAC_PI_4;
-                let k = ((py - cyr).atan2(px - self.cx) / step).round() * step;
-                (px - (self.cx + on * k.cos())).hypot(py - (cyr + on * k.sin())) - t * 0.5
-            }
+            BandIcon::DottedRing => self.dotted_ring(px, py),
             BandIcon::SlashedRing => {
                 let ((r, cyr), t) = (self.mark_frame(), self.mark_t());
                 let k = (r - t * 0.5) * std::f32::consts::FRAC_1_SQRT_2;
@@ -438,16 +449,7 @@ impl Shape {
                 self.mark_ring(px, py)
                     .min((px - self.cx).hypot(py - cyr) - dot)
             }
-            BandIcon::InsetDiamond => {
-                use std::f32::consts::{FRAC_1_SQRT_2, SQRT_2};
-                let ((r, cyr), t) = (self.mark_frame(), self.mark_t());
-                let diamond =
-                    |a: f32| ((px - self.cx).abs() + (py - cyr).abs() - a) * FRAC_1_SQRT_2;
-                let inner = (r - SQRT_2 * t - (1.0 + SQRT_2)).max(0.5);
-                self.mark_outline(diamond(r))
-                    .min(diamond(inner))
-                    .max(self.mark_box(px, py))
-            }
+            BandIcon::InsetDiamond => self.inset_diamond(px, py),
             BandIcon::House => {
                 let (r, cyr) = self.mark_frame();
                 let (l, rt, top, floor) = (self.cx - r, self.cx + r, cyr - r, cyr + r);
@@ -652,10 +654,213 @@ impl Shape {
         self.t.min((r * STROKE_SHARE).round()).max(1.0)
     }
 
-    /// `○`: the family's disc as a ring one stroke wide ([`Self::mark_t`]), its outer edge the disc's.
+    /// `○`: the family's disc as a ring one stroke wide ([`Self::mark_t`]), its outer edge the
+    /// disc's pushed out by what the stroke lacks of covering a whole pixel at the ring's top
+    /// ([`Self::ring_lack`]), cut to the family's box ([`Self::mark_box`]).
     fn mark_ring(&self, px: f32, py: f32) -> f32 {
         let ((r, cyr), t) = (self.mark_frame(), self.mark_t());
-        ((px - self.cx).hypot(py - cyr) - (r - t * 0.5)).abs() - t * 0.5
+        let d = (px - self.cx).hypot(py - cyr);
+        (d - r - self.ring_lack())
+            .max(r - t - d)
+            .max(self.mark_box(px, py))
+    }
+
+    /// What `○`'s stroke, one [`Self::mark_t`] across inside the disc's edge, lacks of covering a
+    /// whole pixel at the ring's top (pixels; none where one is whole): of the pixels in the
+    /// stroke's rows in the column nearest the ring's centre, the least by which one falls short
+    /// of lying half a pixel inside both of the stroke's edges. Only a stroke one pixel across
+    /// can lack any (a wider one always holds a row whose centre is half a pixel inside it), and
+    /// only on an even ring, whose centre is a pixel edge: the top's two pixels sit half a pixel
+    /// either side of the axis, where the disc's edge has curved down through them, so each would
+    /// be laid at 242 on a ring 6 px across and at 234 on one of 4.
+    fn ring_lack(&self) -> f32 {
+        let ((r, cyr), t) = (self.mark_frame(), self.mark_t());
+        let x = (self.cx - 0.5).round() + 0.5 - self.cx;
+        let top = cyr - r;
+        (0..t as usize)
+            .map(|j| {
+                let d = x.hypot(top + 0.5 + j as f32 - cyr);
+                (d - r).max(r - t - d) + 0.5
+            })
+            .fold(f32::INFINITY, f32::min)
+            .max(0.0)
+    }
+
+    /// `◌`: `○`'s ring drawn as dots ([`Self::ring_dots`]), each standing clear of its
+    /// neighbours, cut to the family's box ([`Self::mark_box`]).
+    fn dotted_ring(&self, px: f32, py: f32) -> f32 {
+        let dots = self.dots.get_or_init(|| self.ring_dots());
+        dots.at
+            .iter()
+            .map(|&at| self.ring_dot(px, py, at, dots.w, dots.grow))
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// One of `◌`'s dots: a disc centred at `at`, `w` pixels across and grown by `grow` past
+    /// that, cut to the family's box ([`Self::mark_box`]).
+    fn ring_dot(&self, px: f32, py: f32, (x, y): (f32, f32), w: f32, grow: f32) -> f32 {
+        ((px - x).hypot(py - y) - w * 0.5 - grow).max(self.mark_box(px, py))
+    }
+
+    /// `◌`'s dots: eight on `○`'s stroke, or the four of them on the axes, each standing apart from
+    /// the rest as drawn ([`Self::stand_apart`]). A dot `w` pixels across has its centre on the
+    /// centre line of a stroke `w` wide inside the disc's edge, so it lies on `○`'s stroke, at one
+    /// of eight places an eighth of a turn apart starting on the right-hand axis. The dots are the
+    /// widest, from the stroke's width ([`Self::mark_t`]) down to two pixels, whose eight stand
+    /// apart once they keep their places and grow together by what the dot nearest to covering a
+    /// pixel whole lacks of it (nothing unless they are two pixels across and every one is off the
+    /// pixel grid: 0.14 px on a 16 × 32 cell at stem 2). The room between places does not settle
+    /// it: on a ring 16 px across with a four-pixel stroke, four-pixel dots leave 0.59 px between
+    /// neighbours' edges on the chord between their places, and still meet corner to corner through
+    /// pixels over half ink. Where the stroke is one pixel, or no wider dots stand apart (a
+    /// two-pixel stroke on a ring of 7 or 8 px, Menlo 14 bold's), the dots are one pixel across,
+    /// each on a whole pixel: of the four pixels around its place, the one nearest it whose centre
+    /// stays on the stroke, a tie (the diagonals of a ring 11 px across lie as near two pixels)
+    /// going clockwise. An even ring's centre is a pixel corner, so its axis places lie on pixel
+    /// edges; there all eight places first turn clockwise by the angle (`asin(½ / on)`) that
+    /// carries the axis ones half a pixel onto a row or column of pixel centres, a few hundredths
+    /// of a pixel inside the centre itself, which the snap then takes; the eight stay one rotation
+    /// of the ring. A one-pixel
+    /// stroke on a ring 6 px across is a loop of sixteen pixels, so eight dots and their gaps fill
+    /// it, every other pixel (left unturned, its diagonals take the pixels beside its axis dots and
+    /// touch them). The loops of rings 4 and 5 px across have twelve pixels or fewer, where eight
+    /// dots touch: on those `◌` is its four axis dots.
+    fn ring_dots(&self) -> RingDots {
+        use std::f32::consts::FRAC_1_SQRT_2 as H;
+        const WAYS: [(f32, f32); 8] = [
+            (1.0, 0.0),
+            (H, H),
+            (0.0, 1.0),
+            (-H, H),
+            (-1.0, 0.0),
+            (-H, -H),
+            (0.0, -1.0),
+            (H, -H),
+        ];
+        let ((r, cyr), t) = (self.mark_frame(), self.mark_t());
+        let pixel = |v: f32| v.floor() + 0.5;
+        let place = |on: f32, (c, s): (f32, f32)| (self.cx + on * c, cyr + on * s);
+        let mut w = t;
+        while w > 1.0 {
+            let on = r - w * 0.5;
+            let at = WAYS.map(|way| place(on, way));
+            let lack = at
+                .iter()
+                .map(|&(x, y)| (x - pixel(x)).hypot(y - pixel(y)) - (w * 0.5 - 0.5))
+                .fold(f32::INFINITY, f32::min);
+            let dots = RingDots {
+                at: at.to_vec(),
+                w,
+                grow: lack.max(0.0),
+            };
+            if self.stand_apart(&dots) {
+                return dots;
+            }
+            w -= 1.0;
+        }
+        let on = r - 0.5;
+        let turn = if self.cx.fract() == 0.0 {
+            (0.5 / on).asin()
+        } else {
+            0.0
+        };
+        let (sin, cos) = turn.sin_cos();
+        let dot = |(c, s): (f32, f32)| {
+            let (c, s) = (c * cos - s * sin, s * cos + c * sin);
+            let (x, y) = place(on, (c, s));
+            let (x0, y0) = (pixel(x - 0.5), pixel(y - 0.5));
+            [
+                (x0, y0),
+                (x0 + 1.0, y0),
+                (x0, y0 + 1.0),
+                (x0 + 1.0, y0 + 1.0),
+            ]
+            .into_iter()
+            .min_by_key(|&(qx, qy)| {
+                let (dx, dy) = (qx - self.cx, qy - cyr);
+                let off = (dx.hypot(dy) - on).abs() > 0.5;
+                let far = ((qx - x).hypot(qy - y) * 1024.0).round() as i32;
+                (off, far, c * dy - s * dx < 0.0)
+            })
+            .unwrap_or((x, y))
+        };
+        let eight = RingDots {
+            at: WAYS.map(dot).to_vec(),
+            w: 1.0,
+            grow: 0.0,
+        };
+        if self.stand_apart(&eight) {
+            eight
+        } else {
+            RingDots {
+                at: eight.at.into_iter().step_by(2).collect(),
+                w: 1.0,
+                grow: 0.0,
+            }
+        }
+    }
+
+    /// Whether `dots`, laid as [`Self::dotted_ring`] lays them, stand apart: each lays some
+    /// pixel at half ink or more ([`coverage`]), and none of those pixels is beside, over, under
+    /// or corner to corner with one another dot lays so. A dot's own such pixels, the pixel
+    /// centres in a disc cut to a box, are one group, so the dots lay as many groups as there
+    /// are dots, a pixel under half ink between each and the next.
+    fn stand_apart(&self, dots: &RingDots) -> bool {
+        let reach = (dots.w * 0.5 + dots.grow).ceil() as i32 + 1;
+        let inked: Vec<Vec<(i32, i32)>> = dots
+            .at
+            .iter()
+            .map(|&at| {
+                let (x0, y0) = (at.0.floor() as i32, at.1.floor() as i32);
+                (y0 - reach..=y0 + reach)
+                    .flat_map(|y| (x0 - reach..=x0 + reach).map(move |x| (x, y)))
+                    .filter(|&(x, y)| {
+                        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                        coverage(self.ring_dot(px, py, at, dots.w, dots.grow)) >= 128
+                    })
+                    .collect()
+            })
+            .collect();
+        let near = |a: &[(i32, i32)], b: &[(i32, i32)]| {
+            a.iter().any(|p| {
+                b.iter()
+                    .any(|q| (p.0 - q.0).abs().max((p.1 - q.1).abs()) <= 1)
+            })
+        };
+        inked.iter().all(|a| !a.is_empty())
+            && inked
+                .iter()
+                .enumerate()
+                .all(|(i, a)| inked[i + 1..].iter().all(|b| !near(a, b)))
+    }
+
+    /// `◈`: `◆`'s outline one stroke wide ([`Self::mark_t`]) with a small filled diamond at its
+    /// centre, cut to the family's box ([`Self::mark_box`]). A band one pixel across on the
+    /// diagonal holds a pixel whole only where its centre line runs through pixel centres, which
+    /// the band just inside `◆`'s edge never does (it peaked at 202 or 218), so an outline one
+    /// pixel across is drawn in whole pixels instead: the pixels whose centres sit one sum of
+    /// offsets `|dx| + |dy|` from the ring's centre form a staircase (that sum is a whole number
+    /// on either parity of ring), and the outline is the outermost staircase `◆` inks at least
+    /// half, `◆`'s outline as `○` is `●`'s, laid crisp. Its dot is the staircases out to the
+    /// drawn dot's edge, at least the innermost, crisp too, a clear staircase standing between it
+    /// and the outline. On a ring 4 px across there is no room for one: the dot's staircase is
+    /// the one inside the outline's, and the two fill the ring's twelve pixels whole, so `◈`
+    /// reads filled there, apart from `◉` (the effort menu's row above it), whose centre is
+    /// under half ink on that ring.
+    fn inset_diamond(&self, px: f32, py: f32) -> f32 {
+        use std::f32::consts::{FRAC_1_SQRT_2, SQRT_2};
+        let ((r, cyr), t) = (self.mark_frame(), self.mark_t());
+        let sum = (px - self.cx).abs() + (py - cyr).abs();
+        let diamond = |a: f32| (sum - a) * FRAC_1_SQRT_2;
+        let inner = (r - SQRT_2 * t - (1.0 + SQRT_2)).max(0.5);
+        let ink = if t > 1.0 {
+            self.mark_outline(diamond(r)).min(diamond(inner))
+        } else {
+            let low = if self.cx.fract() == 0.0 { 1.0 } else { 0.0 };
+            let (outline, dot) = (r.floor(), inner.floor().max(low));
+            ((sum - outline).abs() - 0.5).min(sum - dot - 0.5)
+        };
+        ink.max(self.mark_box(px, py))
     }
 
     /// The band one stroke wide ([`Self::mark_t`]) just inside a shape whose signed distance at the pixel is `d`: its outline, drawn as `○` is from `●`.
@@ -664,7 +869,7 @@ impl Shape {
         (d + t * 0.5).abs() - t * 0.5
     }
 
-    /// The family's box ([`Self::mark_frame`]): the disc's ink box, which the marks drawn in it (`◈ ⌂`) are cut to, so a corner's tip never inks a pixel the disc does not.
+    /// The family's box ([`Self::mark_frame`]): the disc's ink box, which the marks drawn in it (`○` and the marks drawn on it, `◌ ◈ ⌂ ◆ ⎇ ⎆`) are cut to, so neither a corner's tip nor a stroke or dot grown to cover whole pixels inks a row or column the disc does not.
     fn mark_box(&self, px: f32, py: f32) -> f32 {
         let (r, cyr) = self.mark_frame();
         rect(px, py, self.cx - r, cyr - r, self.cx + r, cyr + r)
@@ -675,6 +880,14 @@ impl Shape {
         let (x, y) = self.p(0.0, v);
         (px - x).hypot(py - y) - r
     }
+}
+
+/// `◌`'s dots ([`Shape::ring_dots`]): their centres (eight, or the four of them on the axes),
+/// each dot `w` pixels across and grown by `grow` past that.
+struct RingDots {
+    at: Vec<(f32, f32)>,
+    w: f32,
+    grow: f32,
 }
 
 /// The ring family's radius about a centre `frac` (`0` or `0.5`) past a pixel edge: the face's `●`'s half height `ring` held to `half` and `room`, a diameter of the other parity rounded a half pixel down.
@@ -900,11 +1113,19 @@ mod tests {
                 assert_eq!(buf.len(), cw * ch);
                 let ink: u32 = buf.iter().map(|&c| u32::from(c)).sum();
                 assert!(ink > 255, "{icon:?} at {cw}x{ch} draws ink");
-                if !matches!(icon, BandIcon::Pause | BandIcon::Alert) {
-                    assert!(
-                        buf.iter().any(|&c| c > 0 && c < 255),
-                        "{icon:?} at {cw}x{ch} is antialiased"
-                    );
+                let crisp = buf.iter().all(|&c| c == 0 || c == 255);
+                match icon {
+                    BandIcon::Pause | BandIcon::Alert => {}
+                    BandIcon::DottedRing if crisp => assert!(
+                        matches!(buf.iter().filter(|&&c| c == 255).count(), 4 | 8),
+                        "{icon:?} at {cw}x{ch} is crisp only as its four or eight one-pixel dots"
+                    ),
+                    BandIcon::InsetDiamond if crisp => assert_eq!(
+                        Shape::fit(cw, ch, m, false, icon).mark_t(),
+                        1.0,
+                        "{icon:?} at {cw}x{ch} is crisp only as one-pixel staircases"
+                    ),
+                    _ => assert!(!crisp, "{icon:?} at {cw}x{ch} is antialiased"),
                 }
                 for y in (0..ch).filter(|_| !icon.is_glass_mark()) {
                     assert_eq!(buf[y * cw], 0, "{icon:?} {cw}x{ch}: left column ({y})");
@@ -1525,7 +1746,7 @@ mod tests {
                         tall: (m.cap * 0.5)
                             .min(shape.cy - shape.top - 1.5)
                             .max(shape.half),
-                        ..shape
+                        ..Shape::fit(cw, ch, m, spill, icon)
                     };
                     let draw = |fitted: &Shape| -> Vec<u8> {
                         (0..w * ch)
@@ -1941,20 +2162,162 @@ mod tests {
         }
     }
 
-    /// LINE D'S STROKED MARKS REACH THEIR FULL INK AT EVERY MEASURED 1X FACE: `⌂`, `⎇` and `⎆`
-    /// each lay at least one pixel at full coverage, as the filled `◆` does, so the darkest
-    /// pixel of each is its cell's own ink (on line D `GlassInks::mark`, floored to 4.5:1 on
-    /// paper) and never a blend of it into the ground. A review read these three at 1.8:1 to
-    /// 2.3:1 on Day at 1x beside `◆`'s 4.5:1; that capture's scene drew their font glyphs, not
-    /// these icons. NEGATIVE CONTROL (run once, restored): an outline band centred on the
-    /// shape's edge, `d.abs() - t / 2` in [`Shape::mark_outline`], lays `⌂` with no pixel at
-    /// full coverage and fails.
+    /// Faces measured at 2x (`Renderer::icon_metrics`) whose ring family's stroke is one pixel,
+    /// which [`FACES`] has none of: the system mono, SF Mono, at 16 and 18 px (8 and 9 pt), and
+    /// Courier New at 24, 26 and 32 px (12, 13 and 16 pt): `[cell w, cell h, baseline, cap,
+    /// stem, head, disc]`. Their rings are 10, 11, 11, 12 and 14 px across.
+    const THIN_2X_FACES: [(&str, [f32; 7]); 5] = [
+        ("SF Mono 16 px", [10.0, 19.0, 16.0, 12.0, 1.325, 2.0, 12.0]),
+        ("SF Mono 18 px", [11.0, 21.0, 17.0, 13.0, 1.494, 2.0, 13.0]),
+        (
+            "Courier New 24 px",
+            [14.0, 27.0, 20.0, 14.0, 0.988, 3.0, 11.0],
+        ),
+        (
+            "Courier New 26 px",
+            [16.0, 29.0, 21.0, 15.0, 1.067, 2.0, 12.0],
+        ),
+        (
+            "Courier New 32 px",
+            [19.0, 36.0, 27.0, 19.0, 1.314, 4.0, 14.0],
+        ),
+    ];
+
+    /// A 2x face no font in [`FACES`] has, where `◌`'s dots stand apart only as drawn: the 17 ×
+    /// 32 cell at stem 3.69 with a `●` of 16 px, a ring 16 px across with a stroke of 4. Four-pixel
+    /// dots there leave 0.59 px between neighbours' edges on the chord between their places and
+    /// still meet corner to corner through pixels over half ink: `[cell w, cell h, baseline, cap,
+    /// stem, head, disc]`.
+    const WIDE_STROKE_2X_FACE: (&str, [f32; 7]) = (
+        "17 × 32 stem 3.69 disc 16",
+        [17.0, 32.0, 26.0, 20.0, 3.69, 3.0, 16.0],
+    );
+
+    /// The groups a raster `w` wide lays at half ink or more, each pixel joined to its eight
+    /// neighbours: how many dots stand apart with a pixel under half ink between them.
+    fn half_ink_groups(buf: &[u8], w: usize) -> usize {
+        let mut seen: Vec<bool> = buf.iter().map(|&c| c < 128).collect();
+        let mut groups = 0;
+        for start in 0..buf.len() {
+            if seen[start] {
+                continue;
+            }
+            groups += 1;
+            seen[start] = true;
+            let mut stack = vec![start];
+            while let Some(i) = stack.pop() {
+                let (x, y) = (i % w, i / w);
+                for ny in y.saturating_sub(1)..=y + 1 {
+                    for nx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                        let j = ny * w + nx;
+                        if j < buf.len() && !seen[j] {
+                            seen[j] = true;
+                            stack.push(j);
+                        }
+                    }
+                }
+            }
+        }
+        groups
+    }
+
+    /// `◌` STANDS APART ON EVERY RING AND STROKE THE FAMILY DRAWS: on rings 4 to 44 px across,
+    /// at each stroke [`Shape::mark_t`] gives them (one pixel from a ring of 4, up to ten on one
+    /// of 44, as `round(0.44·r)` allows: 217 pairs, each drawn in cells one and two pixels wider
+    /// than its `●`), `◌`
+    /// lays a pixel at full ink, is hollow and lighter than `○`, at half ink only where `○` is,
+    /// and its pixels at half ink or more fall into eight 8-connected groups (four on rings of 4
+    /// and 5 px), each a single whole pixel where the stroke is one pixel. NEGATIVE CONTROLS
+    /// (each run once, restored): one-pixel dots left unturned on an even ring lay four groups on
+    /// a ring of 6 px; wider dots chosen by their places' chord (`2·on·sin 22.5° ≥ w + ½`)
+    /// instead of as drawn fuse into one group on a ring of 16 px with a stroke of 4.
     #[test]
-    fn the_stroked_marks_reach_full_ink_on_every_small_face() {
-        for (name, [cw, ch, baseline, cap, stem, head, disc]) in
-            SMALLEST_FACES.into_iter().chain(SMALL_FACES)
-        {
-            let (cw, ch) = (cw as usize, ch as usize);
+    fn the_dotted_ring_stands_apart_on_every_ring_and_stroke() {
+        let ink = |b: &[u8]| b.iter().map(|&c| u32::from(c)).sum::<u32>();
+        let mut seen = std::collections::BTreeSet::new();
+        for disc in 4..=44u8 {
+            for (wider, stem) in [1, 2]
+                .into_iter()
+                .flat_map(|k| (1..=10u8).map(move |s| (k, s)))
+            {
+                let cap = f32::from(disc) + 2.0;
+                let m = IconMetrics {
+                    baseline: cap + 4.0,
+                    cap,
+                    stem: f32::from(stem),
+                    head: 1.0,
+                    disc: f32::from(disc),
+                };
+                let (cw, ch) = (usize::from(disc + wider), usize::from(disc) + 10);
+                let draw = |icon| band_icon_coverage(icon, cw, ch, m, false);
+                let (ring, dots) = (draw(BandIcon::Ring), draw(BandIcon::DottedRing));
+                let (x0, x1, y0, y1) = ink_box(&ring, cw);
+                let t = Shape::fit(cw, ch, m, false, BandIcon::Ring).mark_t();
+                let at = format!(
+                    "{cw}x{ch} disc {disc} stem {stem}: ring {} px, stroke {t}",
+                    x1 - x0
+                );
+                seen.insert((x1 - x0, t as u8));
+                let n = if x1 - x0 >= 6 { 8 } else { 4 };
+                assert_eq!(dots.iter().max(), Some(&255), "{at}: ◌'s darkest pixel");
+                assert!(
+                    dots[(y0 + y1) / 2 * cw + (x0 + x1) / 2] < 128,
+                    "{at}: ◌ is hollow"
+                );
+                assert!(ink(&dots) < ink(&ring), "{at}: ◌ is lighter than ○");
+                assert!(
+                    dots.iter().zip(&ring).all(|(&d, &r)| d < 128 || r >= 128),
+                    "{at}: ◌'s dots lie on ○'s stroke"
+                );
+                assert_eq!(
+                    half_ink_groups(&dots, cw),
+                    n,
+                    "{at}: ◌'s {n} dots stand apart"
+                );
+                assert!(
+                    t > 1.0
+                        || dots.iter().all(|&c| c == 0 || c == 255)
+                            && dots.iter().filter(|&&c| c == 255).count() == n,
+                    "{at}: ◌'s {n} one-pixel dots are each a whole pixel"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 217, "the rings and strokes swept: {seen:?}");
+    }
+
+    /// EVERY GLASS MARK REACHES ITS FULL INK ON EVERY MEASURED FACE: each of the glass's marks
+    /// ([`BandIcon::is_glass_mark`]) lays at least one pixel at full coverage in its own cell on
+    /// every face measured at 1x ([`SMALLEST_FACES`], [`SMALL_FACES`], [`BOLD_FACES`]: 25) and at
+    /// 2x ([`FACES`], [`THIN_2X_FACES`]: 11), and on [`WIDE_STROKE_2X_FACE`], so its darkest pixel
+    /// is its cell's own ink (`GlassInks::mark`, floored to 4.5:1 on paper) and never a blend of it
+    /// into the ground; the filled `●` and `◆` are the controls. A review read the font's `⌂`, `⎇`
+    /// and `⎆` at 1.8:1 to 2.3:1 on Day at 1x beside `◆`'s 4.5:1, and measured here `○` and `◉`
+    /// peaked at 242 and `◌` at 158 on rings 6 px across (`◌` at 128 on Menlo 8's ring of 4), `◌`
+    /// at 220 on the 2x 16 × 32 cell at stem 2, and `◈` at 202 or 218 wherever its outline is one
+    /// pixel across. Each keeps its shape: `○` and `◌` hollow (under half ink at the centre) and
+    /// `○` lighter than `●`; `◌` lighter than `○`, on its stroke, and as dots that stand apart, a
+    /// pixel under half ink between each and the next: eight on a ring 6 px or more across, four on
+    /// rings of 4 and 5 px, and where the stroke is one pixel each a single whole pixel; `◈` with
+    /// its dot and, where its outline is one pixel across, on a ring 5 px or more across hollow
+    /// where `◆` is whole, its dot whole and standing clear of the outline by a pixel under half
+    /// ink, and on a ring of 4 its dot whole where `◉`'s centre is under half. NEGATIVE CONTROLS
+    /// (each run once, restored): an outline band centred on the shape's edge, `d.abs() - t / 2` in
+    /// [`Shape::mark_outline`], lays `⌂` with no pixel at full coverage on SF Mono 8; with no
+    /// [`Shape::ring_lack`] `○` peaks at 242 on SF Mono 9; one-pixel dots left at their (turned)
+    /// places lay `◌` at 242 there; one-pixel dots left unturned on an even ring lay four groups
+    /// there; wider dots left ungrown lay `◌` at 220 on the 2x 16 × 32 cell at stem 2; `◈`'s
+    /// one-pixel outline drawn as a wider one's is lays it at 218 on SF Mono 8; that outline on the
+    /// staircase nearest the band's centre line fills `◈` where `◆` is whole on SF Mono 9; eight
+    /// one-pixel dots kept on a ring of 4 or 5 px lay eight whole pixels, touching in pairs, on SF
+    /// Mono 8; dots kept at the stroke's width fuse into one group on Menlo 14 bold; wider dots
+    /// chosen by their places' chord (`2·on·sin 22.5° ≥ w + ½`) instead of as drawn fuse into one
+    /// group on [`WIDE_STROKE_2X_FACE`]; a diagonal dot taken to its nearest pixel off the stroke
+    /// lays a whole pixel where `○` is under half on SF Mono 18 px; and `◈`'s dot on a ring of 4
+    /// drawn soft leaves it at 37 on Menlo 8.
+    #[test]
+    fn every_glass_mark_reaches_full_ink_on_every_measured_face() {
+        type Face = (String, usize, usize, IconMetrics);
+        let face = |name: String, [cw, ch, baseline, cap, stem, head, disc]: [f32; 7]| -> Face {
             let m = IconMetrics {
                 baseline,
                 cap,
@@ -1962,17 +2325,98 @@ mod tests {
                 head,
                 disc,
             };
-            for icon in [
-                BandIcon::Diamond,
-                BandIcon::House,
-                BandIcon::Fork,
-                BandIcon::Enter,
-            ] {
-                let peak = band_icon_coverage(icon, cw, ch, m, false)
+            (name, cw as usize, ch as usize, m)
+        };
+        let faces: Vec<Face> = SMALLEST_FACES
+            .into_iter()
+            .chain(SMALL_FACES)
+            .map(|(name, f)| face(format!("1x {name}"), f))
+            .chain(
+                BOLD_FACES
                     .into_iter()
-                    .max()
-                    .unwrap_or(0);
-                assert_eq!(peak, 255, "{name} {cw}x{ch} {icon:?}: its darkest pixel");
+                    .map(|(name, f, _)| face(format!("1x {name} bold"), f)),
+            )
+            .chain(
+                FACES
+                    .into_iter()
+                    .map(|(cw, ch, m)| (format!("2x stem {}", m.stem), cw, ch, m)),
+            )
+            .chain(
+                THIN_2X_FACES
+                    .into_iter()
+                    .chain([WIDE_STROKE_2X_FACE])
+                    .map(|(name, f)| face(format!("2x {name}"), f)),
+            )
+            .collect();
+        assert_eq!(faces.len(), 37, "25 faces at 1x and 12 at 2x");
+        let ink = |b: &[u8]| b.iter().map(|&c| u32::from(c)).sum::<u32>();
+        for (name, cw, ch, m) in faces {
+            let at = format!("{name} {cw}x{ch}");
+            let draw = |icon| band_icon_coverage(icon, cw, ch, m, false);
+            for icon in BandIcon::ALL.into_iter().filter(|i| i.is_glass_mark()) {
+                let peak = draw(icon).into_iter().max().unwrap_or(0);
+                assert_eq!(peak, 255, "{at} {icon:?}: its darkest pixel");
+            }
+            let (disc, ring, dots) = (
+                draw(BandIcon::Disc),
+                draw(BandIcon::Ring),
+                draw(BandIcon::DottedRing),
+            );
+            let (inset, filled, fisheye) = (
+                draw(BandIcon::InsetDiamond),
+                draw(BandIcon::Diamond),
+                draw(BandIcon::Fisheye),
+            );
+            let (x0, x1, y0, y1) = ink_box(&disc, cw);
+            let mid = (y0 + y1) / 2 * cw + (x0 + x1) / 2;
+            let thin = Shape::fit(cw, ch, m, false, BandIcon::Ring).mark_t() == 1.0;
+            assert!(ring[mid] < 128, "{at}: ○ is hollow");
+            assert!(dots[mid] < 128, "{at}: ◌ is hollow");
+            assert!(ink(&ring) < ink(&disc), "{at}: ○ is lighter than ●");
+            assert!(ink(&dots) < ink(&ring), "{at}: ◌ is lighter than ○");
+            assert!(
+                dots.iter().zip(&ring).all(|(&d, &r)| d == 0 || r > 0),
+                "{at}: ◌'s dots lie on ○'s line"
+            );
+            assert!(
+                dots.iter().zip(&ring).all(|(&d, &r)| d < 128 || r >= 128),
+                "{at}: ◌'s dots lie on ○'s stroke"
+            );
+            let n = if x1 - x0 >= 6 { 8 } else { 4 };
+            assert_eq!(
+                half_ink_groups(&dots, cw),
+                n,
+                "{at}: ◌'s {n} dots stand apart, a pixel under half ink between each and the next"
+            );
+            assert!(
+                !thin
+                    || dots.iter().all(|&c| c == 0 || c == 255)
+                        && dots.iter().filter(|&&c| c == 255).count() == n,
+                "{at}: ◌'s {n} one-pixel dots are each a whole pixel"
+            );
+            assert!(inset[mid] > 0, "{at}: ◈ has its dot");
+            if thin && x1 - x0 >= 5 {
+                assert!(
+                    inset
+                        .iter()
+                        .zip(&filled)
+                        .any(|(&i, &f)| f == 255 && i < 128),
+                    "{at}: ◈ is hollow where ◆ is whole"
+                );
+                let row = &inset[mid..mid - (x0 + x1) / 2 + x1];
+                let gap = row.iter().position(|&c| c < 128);
+                assert!(
+                    row[0] == 255 && gap.is_some_and(|k| row[k..].contains(&255)),
+                    "{at}: ◈'s whole dot stands clear of its outline {row:?}"
+                );
+            } else if thin {
+                assert!(
+                    inset[mid] == 255 && fisheye[mid] < 128,
+                    "{at}: with no room for a gap, ◈'s dot fills its outline whole ({}) where ◉'s \
+                     centre is under half ink ({})",
+                    inset[mid],
+                    fisheye[mid]
+                );
             }
         }
     }

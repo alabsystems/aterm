@@ -537,7 +537,7 @@ pub enum RowState {
     Closed,
 }
 
-/// One heard request, as the band shows it.
+/// One heard request, as a member's window reads it for its join entries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     /// Its handle on this desk.
@@ -553,7 +553,7 @@ pub struct Row {
     /// What it is doing.
     pub state: RowState,
     /// The membership log removed this Mac (by its recipient or its writer key): who did and
-    /// when, so the band asks "Allow again?" instead of showing a new Mac (F16).
+    /// when, so a member reads it as a removed Mac, not a new one (F16).
     pub removed: Option<client::RemovedNote>,
     /// A person pressed "Allow again": the run restores the Mac a plain removal took out.
     pub restore: bool,
@@ -1044,7 +1044,7 @@ impl Desk {
         Ok(Answer::Asking)
     }
 
-    /// The rows the band shows, oldest first: none that lapsed ([`Desk::lapsed`]).
+    /// The heard requests' rows, oldest first: none that lapsed ([`Desk::lapsed`]).
     #[must_use]
     pub fn rows(&self, now: Instant) -> Vec<Row> {
         self.heard

@@ -155,7 +155,7 @@ impl RestoreReport {
     }
 }
 
-/// How many keeper-recovered sessions landed on each rung (the band row, the recovery census).
+/// How many keeper-recovered sessions landed on each rung (the message row, the recovery census).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RungCounts {
     pub(crate) exact: u32,
@@ -221,7 +221,7 @@ impl RestoreTally {
         }
     }
 
-    /// The history lines the restored screens could not bring back, the band row's count (every line of a blank screen's is said apart, in words).
+    /// The history lines the restored screens could not bring back, the message row's count (every line of a blank screen's is said apart, in words).
     pub(crate) const fn screens_history_lost(&self) -> u64 {
         self.history_lost.saturating_sub(self.meta_history_lost)
     }

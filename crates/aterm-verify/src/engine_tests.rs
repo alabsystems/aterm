@@ -5,7 +5,10 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use super::{Commit, Kind, Named, bounded, engine_copy, named, native, release_dir};
+use super::{
+    Commit, Kind, Named, PATIENCE, REMOTE_PATIENCE, bounded, bounded_remote_with, engine_copy,
+    named, native, release_dir,
+};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let mut cmd = aterm_uds::fixture_git::git();
@@ -293,4 +296,31 @@ fn a_readers_child_ends_with_the_verify_run() {
     end.store(true, Ordering::SeqCst);
     let ended = bounded(&mut child()).expect_err("a child of a run that is ending is ended");
     assert!(!ended.to_string().is_empty(), "{ended}");
+}
+
+/// AN ENGINE ORIGIN'S AGH CHILD IS PROGRESS-BOUNDED, NOT WALL-BOUNDED: the selector hands the
+/// networked child to the progress-aware wait while local Git retains the finite wall hang
+/// detector. NEGATIVE CONTROL: routing both through the old local wait changes the first answer.
+#[test]
+fn an_engine_origin_agh_child_is_progress_bounded() {
+    assert_eq!(
+        REMOTE_PATIENCE,
+        PATIENCE.saturating_add(aterm_types::http_retry::Policy::STANDARD.max_total_pause()),
+        "one valid Retry-After plus the next request's hang detector fits"
+    );
+    let mut command = aterm_uds::spawnfd::command("not-started-by-the-injected-waits");
+    let agh = bounded_remote_with(
+        crate::remote::Tool::Agh,
+        &mut command,
+        |_| "wall",
+        |_| "progress",
+    );
+    assert_eq!(agh, "progress");
+    let git = bounded_remote_with(
+        crate::remote::Tool::Git,
+        &mut command,
+        |_| "wall",
+        |_| "progress",
+    );
+    assert_eq!(git, "wall");
 }

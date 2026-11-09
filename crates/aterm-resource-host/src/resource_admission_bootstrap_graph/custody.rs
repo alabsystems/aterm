@@ -19,7 +19,63 @@ struct Attempt {
     gnu: Option<[OwnedFd; 2]>,
     control: Option<OwnedFd>,
     output_requested: Option<wire::OutputAttachment>,
-    output: Option<[OwnedFd; 2]>,
+    output: Option<Arc<[OwnedFd; 2]>>,
+}
+
+/// Only State's already accepted original output offer creates this borrow.
+/// It extends the SAME close-only directory/lock descriptions, never reopens
+/// a lock or reconstructs its lineage from metadata or an object request.
+pub(in crate::actor::owner) struct OriginalOutput {
+    request: wire::OutputAttachment,
+    path: PathBuf,
+    descriptions: Arc<[OwnedFd; 2]>,
+}
+impl OriginalOutput {
+    pub(in crate::actor::owner) fn check_current(&self) -> io::Result<()> {
+        wire::transport::check_output(
+            &self.request,
+            &self.descriptions.each_ref().map(AsFd::as_fd),
+        )?;
+        for fd in self.descriptions.iter() {
+            let original = std::fs::File::from(fd.try_clone()?);
+            trust_resource_provenance::require_no_acl_grants(&original)?;
+            let metadata = original.metadata()?;
+            if metadata.uid() != aterm_uds::peer::our_uid() || metadata.mode() & 0o022 != 0 {
+                return Err(refused(
+                    "original object output has unsupported owner/permissions",
+                ));
+            }
+        }
+        let named = std::fs::symlink_metadata(&self.path)?;
+        if !named.is_dir()
+            || self.path.canonicalize()? != self.path
+            || (named.dev(), named.ino()) != (self.request.root.device, self.request.root.inode)
+        {
+            return Err(refused("original enrolled output directory changed"));
+        }
+        Ok(())
+    }
+
+    pub(in crate::actor::owner) fn inherited(&self) -> io::Result<[OwnedFd; 2]> {
+        self.check_current()?;
+        Ok([
+            self.descriptions[0].try_clone()?,
+            self.descriptions[1].try_clone()?,
+        ])
+    }
+
+    pub(in crate::actor::owner) fn attachment(&self) -> &wire::OutputAttachment {
+        &self.request
+    }
+
+    pub(in crate::actor::owner) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    pub(in crate::actor::owner) fn directory(&self) -> io::Result<std::os::fd::BorrowedFd<'_>> {
+        self.check_current()?;
+        Ok(self.descriptions[0].as_fd())
+    }
 }
 pub(crate) struct Support {
     pub(crate) context: trust_resource_controller::ContextReply,
@@ -99,6 +155,52 @@ impl OutputTransfer {
     }
 }
 impl State {
+    pub(super) fn enrolled(&self, key: &wire::Key) -> io::Result<&wire::Enrollment> {
+        let attempt = self
+            .attempt
+            .as_ref()
+            .ok_or_else(|| refused("object has no original enrollment"))?;
+        if &attempt.request.key != key
+            || !attempt.active.load(Ordering::Acquire)
+            || attempt.gnu.is_none()
+            || attempt.control.is_none()
+        {
+            return Err(refused("object lost its original active enrollment"));
+        }
+        Ok(&attempt.request)
+    }
+    pub(super) fn original_output(&self, key: &wire::Key) -> io::Result<OriginalOutput> {
+        let attempt = self
+            .attempt
+            .as_ref()
+            .ok_or_else(|| refused("object operation has no original enrollment"))?;
+        if &attempt.request.key != key
+            || !attempt.active.load(Ordering::Acquire)
+            || attempt.gnu.is_none()
+            || attempt.control.is_none()
+        {
+            return Err(refused("object operation lost its original enrolled graph"));
+        }
+        let request = attempt
+            .output_requested
+            .as_ref()
+            .ok_or_else(|| refused("object operation has no accepted output offer"))?;
+        let descriptions = attempt
+            .output
+            .as_ref()
+            .ok_or_else(|| refused("object operation has no retained original output"))?;
+        if &request.key != key {
+            return Err(refused("object operation has a foreign output key"));
+        }
+        let original = OriginalOutput {
+            request: request.clone(),
+            path: PathBuf::from(OsStr::from_bytes(&attempt.request.output)),
+            descriptions: Arc::clone(descriptions),
+        };
+        original.check_current()?;
+        Ok(original)
+    }
+
     pub(super) fn preparation_finished(&self) -> bool {
         self.attempt
             .as_ref()
@@ -309,7 +411,7 @@ impl Owner {
         }
         // The selected original SDK's unsafe sender contract preserves actual
         // OutputLock lineage. These observations never construct a lock/lease.
-        attempt.output = Some(descriptions);
+        attempt.output = Some(Arc::new(descriptions));
         Ok(context)
     }
 }

@@ -148,6 +148,22 @@ pub(crate) const fn automatic_park_refusal(
     }
 }
 
+/// The hold [`automatic_park_refusal`]'s refusal names, read in its order: the two holds no
+/// phase relaxes, else the terminal's own activity, which only a phase before `Land` reads.
+#[must_use]
+pub(crate) const fn park_refusal_hold(
+    facts: ActivityFacts,
+) -> crate::native_update_lane_hold::LaneHold {
+    use crate::native_update_lane_hold::LaneHold;
+    if facts.consent_warmup {
+        LaneHold::ConsentWarmup
+    } else if facts.harness_restored_pending {
+        LaneHold::RestoredAgents
+    } else {
+        LaneHold::Activity
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ArmFacts {
     pub(crate) enabled: bool,

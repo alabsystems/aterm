@@ -4660,6 +4660,7 @@ impl App {
             #[cfg(target_os = "macos")]
             if self.launch_record_renewal_in_flight() {
                 return Err(crate::UpdateHandoffStartError::activity(
+                    crate::native_update_lane_hold::LaneHold::LaunchRecordRenewal,
                     "a launch-record renewal's handoff is in flight; the update follows it",
                 ));
             }
@@ -4677,32 +4678,42 @@ impl App {
             Ok(latch) => latch,
             Err(reason) => {
                 #[cfg(unix)]
-                return Err(crate::UpdateHandoffStartError::activity(reason));
+                return Err(crate::UpdateHandoffStartError::activity(
+                    crate::native_update_lane_hold::LaneHold::BoundaryItem,
+                    reason,
+                ));
                 #[cfg(not(unix))]
                 return Err(crate::UpdateHandoffStartError::refused(reason));
             }
         };
         #[cfg(target_os = "macos")]
-        if self.workstation_setup_holds_handoff() {
+        if let Some(hold) = self.workstation_setup_handoff_hold() {
             return Err(crate::UpdateHandoffStartError::activity(
-                "the Mac setup offer has unfinished input or work",
+                hold,
+                if hold == crate::native_update_lane_hold::LaneHold::SetupDraft {
+                    "the Mac setup offer has a person's draft in it"
+                } else {
+                    "the Mac setup offer's own answer is still being taken"
+                },
             ));
         }
         #[cfg(target_os = "macos")]
         if self.askpass_sheet.is_some() {
             return Err(crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::PasswordPrompt,
                 "a sudo password prompt is still open",
             ));
         }
-        if self.system_state_handoff_pending() {
+        if let Some(hold) = self.system_state_handoff_hold() {
+            let words = if hold == crate::native_update_lane_hold::LaneHold::DeveloperTools {
+                "a Command Line Tools install's tab is still running"
+            } else {
+                "a System State Apply or Restore is still pending"
+            };
             #[cfg(unix)]
-            return Err(crate::UpdateHandoffStartError::activity(
-                "a System State Apply or Restore is still pending",
-            ));
+            return Err(crate::UpdateHandoffStartError::activity(hold, words));
             #[cfg(not(unix))]
-            return Err(crate::UpdateHandoffStartError::refused(
-                "a System State Apply or Restore is still pending",
-            ));
+            return Err(crate::UpdateHandoffStartError::refused(words));
         }
         // A System State Stop whose save has not landed would die with the
         // handoff's `_exit`: it gets the bounded wait a quit gives it, here,
@@ -4714,6 +4725,7 @@ impl App {
         if !self.tab_spawns.is_empty() {
             #[cfg(unix)]
             return Err(crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::TabStarting,
                 "a new tab is still starting",
             ));
             #[cfg(not(unix))]
@@ -5071,6 +5083,7 @@ impl App {
             && !self.automatic_update_activity_quiet(std::time::Instant::now())
         {
             return Err(crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::Activity,
                 "terminal activity has not reached the automatic-update quiet epoch",
             ));
         }
@@ -5256,9 +5269,10 @@ impl App {
                         true,
                     );
                 }
-                return Err(crate::UpdateHandoffStartError::activity(format!(
-                    "{reason}; the terminal was left untouched"
-                )));
+                return Err(crate::UpdateHandoffStartError::activity(
+                    crate::native_update_lane_hold::LaneHold::RosterConfirmation,
+                    format!("{reason}; the terminal was left untouched"),
+                ));
             }
             return Err(crate::UpdateHandoffStartError::failed(format!(
                 "{reason}; the terminal was left untouched"
@@ -5432,11 +5446,13 @@ impl App {
                 || handoff_masters_have_activity(&live)
         }) {
             return Err(crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::Activity,
                 "input or PTY output arrived before automatic reader park",
             ));
         }
         if mode.is_automatic() && handoff_masters_closed(&live) {
             return Err(crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::PaneExited,
                 "a session's command has exited but its pane is still open",
             ));
         }
@@ -5446,7 +5462,10 @@ impl App {
             self.video_request_live(),
             std::time::Duration::ZERO,
         ) {
-            return Err(crate::UpdateHandoffStartError::activity(reason));
+            return Err(crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::Recording,
+                reason,
+            ));
         }
         let fork_park_misses = self.fork_park_misses_of(target_build);
         let park_policy = self.park_policy(apply_attempt.as_ref());
@@ -5491,6 +5510,7 @@ impl App {
         if mode.is_automatic() && handoff_masters_closed(&live) {
             self.rollback_overlap(None, &live);
             return Err(crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::PaneExited,
                 "a PTY session closed during automatic reader park",
             ));
         }
@@ -5932,7 +5952,7 @@ impl App {
         self.start_handoff_history_imports();
     }
 
-    /// Says what the history imports left behind once they settle, in one band row, posting only a change from [`Self::say_carried_history_loss`].
+    /// Says what the history imports left behind once they settle, in one row, posting only a change from [`Self::say_carried_history_loss`].
     #[cfg(unix)]
     pub(crate) fn settle_handoff_history(
         &mut self,
@@ -8387,10 +8407,10 @@ impl App {
                     true,
                 );
             }
-            return Err(crate::UpdateHandoffStartError::activity(format!(
-                "{}; the app was not relaunched",
-                known.reason
-            )));
+            return Err(crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::RosterConfirmation,
+                format!("{}; the app was not relaunched", known.reason),
+            ));
         }
         if !mode.is_automatic() {
             return Ok(());
@@ -8415,9 +8435,10 @@ impl App {
                             true,
                         );
                     }
-                    return Err(crate::UpdateHandoffStartError::activity(format!(
-                        "{reason}; the app was not relaunched"
-                    )));
+                    return Err(crate::UpdateHandoffStartError::activity(
+                        crate::native_update_lane_hold::LaneHold::RosterConfirmation,
+                        format!("{reason}; the app was not relaunched"),
+                    ));
                 }
                 Err(crate::UpdateHandoffStartError::failed(format!(
                     "{reason}; the app was not relaunched"
@@ -8611,7 +8632,7 @@ impl App {
         // read's answer): the read it waited for answers no later press.
         self.sessionless_waited.person = None;
         let stopped = match &outcome {
-            UpdateOutcome::Deferred { reason } => Some(reason.clone()),
+            UpdateOutcome::Deferred { reason, .. } => Some(reason.clone()),
             UpdateOutcome::Blocked { reasons } => {
                 Some(reasons.join(crate::native_ui::FACT_SEPARATOR))
             }
@@ -8783,10 +8804,10 @@ impl App {
                     true,
                 );
             }
-            return Some(crate::UpdateHandoffStartError::activity(format!(
-                "{}; the update was not handed over",
-                known.reason
-            )));
+            return Some(crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::RosterConfirmation,
+                format!("{}; the update was not handed over", known.reason),
+            ));
         }
         let own_read = *self.sessionless_waited.of(mode);
         let passing = self
@@ -9033,6 +9054,15 @@ impl App {
             self.record_update_switch_stopped(routine, &detail);
         }
         if let Some(surfaced) = surfaced {
+            // An automatic attempt that came back held (its overlap revoked by activity, its
+            // signer waiting for a check) is held as a poll's would be: named on the intent
+            // the lane armed again, for `update status`.
+            if pending.mode.is_automatic()
+                && let (crate::native_app::UpdateOutcome::Deferred { reason, hold }, Some(build)) =
+                    (&surfaced, attempted_build)
+            {
+                self.note_returned_auto_apply_hold(build, *hold, reason);
+            }
             let source = if pending.mode.is_automatic() {
                 "automatic handoff"
             } else {
@@ -9118,7 +9148,10 @@ fn preverify_read_activity(
         waiter.acts(),
     );
     aterm_log::info!("update apply: {reason}");
-    crate::UpdateHandoffStartError::activity(reason)
+    crate::UpdateHandoffStartError::activity(
+        crate::native_update_lane_hold::LaneHold::PolicyRead,
+        reason,
+    )
 }
 
 #[cfg(unix)]

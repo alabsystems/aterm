@@ -107,6 +107,12 @@ fn source_dependencies(doc: &aterm_json::Value) -> Result<Vec<String>> {
 /// HTTPS formula metadata and anonymous, digest-addressed GHCR archives.
 pub struct Official;
 
+/// Formula API documents are small; this matches abrew's existing in-memory response cap.
+const FORMULA_DOCUMENT_CAP: u64 = 64 << 20;
+/// The previous source downloader admitted archives up to 16 GiB. The shared resumable lane
+/// retains that cap while replacing its one-shot curl.
+const SOURCE_ARCHIVE_CAP: u64 = 16 << 30;
+
 fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
@@ -120,9 +126,10 @@ impl Source for Official {
         if !valid_name(name) {
             return Err(Error::refused("invalid upstream formula name"));
         }
-        let bytes = fetch::curl_get(
+        let bytes = aterm_update_core::download_bytes_with_accept(
             &format!("https://formulae.brew.sh/api/formula/{name}.json"),
-            &[],
+            FORMULA_DOCUMENT_CAP,
+            "application/json",
         )
         .map_err(Error::cannot_run)?;
         let doc = aterm_json::from_slice(&bytes)
@@ -154,7 +161,12 @@ impl Source for Official {
                     "official Git source URL is not a kernel.org source archive",
                 ));
             }
-            return fetch::curl_to_file(&bottle.url, path, &[]).map_err(Error::cannot_run);
+            return aterm_update_core::download_to_resumable_https_only(
+                &bottle.url,
+                path,
+                SOURCE_ARCHIVE_CAP,
+            )
+            .map_err(Error::cannot_run);
         }
         let repo = api::ghcr_repo_of(&bottle.url)
             .filter(|repo| repo.starts_with("homebrew/core/"))
@@ -398,6 +410,22 @@ fn qualify(result: &BottleOutcome) -> Result<()> {
     qualify_staged(result, &stage, row)
 }
 
+/// One public Git qualification read. The caller supplies the child so tests can inject exact
+/// HTTP outcomes; this function owns the sole anonymous-HTTPS retry budget.
+fn anonymous_git_qualification<T>(
+    attempt: impl FnMut(
+        u32,
+        aterm_update_core::git_https::Trace<'_>,
+    ) -> std::result::Result<T, aterm_update_core::git_https::Failure>,
+    on_retry: impl FnMut(aterm_types::http_retry::Retry),
+) -> Result<T> {
+    aterm_update_core::git_https::read(true, attempt, on_retry).map_err(|failure| {
+        Error::cannot_run(format!(
+            "GNU Git qualification anonymous HTTPS read: {failure}"
+        ))
+    })
+}
+
 pub(crate) fn qualify_staged(
     result: &BottleOutcome,
     stage: &Path,
@@ -430,6 +458,52 @@ pub(crate) fn qualify_staged(
             )));
         }
         Ok(out)
+    };
+    let anonymous_read = |args: &[&str]| -> Result<std::process::Output> {
+        anonymous_git_qualification(
+            |_, trace| {
+                let mut cmd = aterm_uds::spawnfd::command(&git);
+                cmd.env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", work.path())
+                    .env("GIT_CONFIG_GLOBAL", &global)
+                    .args(["-c", "core.hooksPath=/dev/null", "-c", "credential.helper="])
+                    .args(args)
+                    .current_dir(work.path());
+                trace.configure(&mut cmd);
+                let out = aterm_uds::deadline::output_until(
+                    &mut cmd,
+                    std::time::Instant::now() + std::time::Duration::from_secs(60),
+                )
+                .map_err(|error| match error {
+                    aterm_uds::deadline::RunError::TimedOut => {
+                        aterm_update_core::git_https::Failure::timeout(
+                            "GNU Git qualification did not finish in 60 seconds",
+                        )
+                    }
+                    other => aterm_update_core::git_https::Failure::local(format!(
+                        "GNU Git qualification: {other}"
+                    )),
+                })?;
+                if out.status.success() {
+                    Ok(out)
+                } else {
+                    let said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    Err(aterm_update_core::git_https::Failure::diagnostic(
+                        if said.is_empty() {
+                            format!(
+                                "GNU Git qualification {} exited {:?}",
+                                args.first().unwrap_or(&""),
+                                out.status.code()
+                            )
+                        } else {
+                            said
+                        },
+                    ))
+                }
+            },
+            |retry| std::thread::sleep(retry.pause),
+        )
     };
     let version = run(&["--no-lazy-fetch", "--version"])?;
     if String::from_utf8_lossy(&version.stdout).trim() != format!("git version {}", result.version)
@@ -487,7 +561,7 @@ pub(crate) fn qualify_staged(
             "GNU Git local clone/checkout did not preserve its input",
         ));
     }
-    run(&["ls-remote", "https://github.com/git/git.git", "HEAD"])?;
+    anonymous_read(&["ls-remote", "https://github.com/git/git.git", "HEAD"])?;
     if Triple::host() == Some(result.triple) {
         let layout = atpkg::store::Layout {
             prefix: work.path().join("native-client-acceptance"),
@@ -573,6 +647,7 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::triple::{AARCH64_UNKNOWN_LINUX_GNU, X86_64_UNKNOWN_LINUX_GNU};
+    use std::cell::Cell;
     use std::sync::Mutex;
 
     struct Fixture {
@@ -712,5 +787,79 @@ mod tests {
         assert_eq!(source_dependencies(&doc).unwrap(), ["expat", "zlib"]);
         assert!(source_dependencies(&aterm_json::json!({})).is_err());
         assert!(source_dependencies(&aterm_json::json!({"uses_from_macos": [false]})).is_err());
+    }
+
+    fn public_git_status(status: u16) -> aterm_update_core::git_https::Failure {
+        aterm_update_core::git_https::Failure::diagnostic(format!(
+            "fatal: unable to access 'https://github.com/git/git.git/': The requested URL returned error: {status}"
+        ))
+    }
+
+    /// NEGATIVE CONTROLS: the qualification's public `ls-remote` takes the shared anonymous
+    /// transport, so transient service failures recover but an absent repository is final.
+    #[test]
+    fn public_git_qualification_retries_two_504s_but_never_a_404() {
+        let calls = Cell::new(0_u32);
+        let mut retries = Vec::new();
+        let answer = anonymous_git_qualification(
+            |attempt, _| {
+                calls.set(calls.get() + 1);
+                if attempt < 3 {
+                    Err(public_git_status(504))
+                } else {
+                    Ok(200)
+                }
+            },
+            |retry| retries.push(retry),
+        )
+        .expect("the third public read answers");
+        assert_eq!(answer, 200);
+        assert_eq!(calls.get(), 3);
+        assert_eq!(retries.len(), 2);
+
+        calls.set(0);
+        let absent = anonymous_git_qualification(
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Err::<(), _>(public_git_status(404))
+            },
+            |_| panic!("404 must be final"),
+        )
+        .expect_err("404 is an immediate refusal");
+        assert_eq!(calls.get(), 1);
+        assert!(!absent.to_string().contains("19 attempts"), "{absent}");
+    }
+
+    #[test]
+    fn public_git_qualification_names_its_bound_and_recovers_curl_56() {
+        let calls = Cell::new(0_u32);
+        let exhausted = anonymous_git_qualification(
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Err::<(), _>(public_git_status(503))
+            },
+            |_| {},
+        )
+        .expect_err("an endless outage is bounded");
+        assert_eq!(calls.get(), 19);
+        assert!(exhausted.to_string().contains("19 attempts / 200s"));
+
+        calls.set(0);
+        let answer = anonymous_git_qualification(
+            |attempt, _| {
+                calls.set(calls.get() + 1);
+                if attempt == 1 {
+                    Err(aterm_update_core::git_https::Failure::diagnostic(
+                        "error: RPC failed; curl 56 Recv failure: Connection reset by peer",
+                    ))
+                } else {
+                    Ok(200)
+                }
+            },
+            |_| {},
+        )
+        .expect("curl exit 56 is transient");
+        assert_eq!(answer, 200);
+        assert_eq!(calls.get(), 2);
     }
 }

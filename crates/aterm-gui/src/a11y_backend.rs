@@ -128,7 +128,7 @@ mod tests {
     }
 
     #[test]
-    fn the_notice_joins_the_bands_title_and_detail_then_the_reason() {
+    fn the_notice_joins_the_rows_title_and_detail_then_the_reason() {
         let msg = crate::message_reporters::a11y_publisher_dead(
             "Handshake(\"Server GUID mismatch\")",
             true,

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per-frame message-band driver shared across native and web hosts.
+//! Per-frame message-band driver for the web host. The native host has no band: it calls only
+//! [`drain_and_pace`], for the drain.
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -75,7 +76,7 @@ pub fn afford(grids: impl IntoIterator<Item = u16>, reserved: u16) -> u16 {
         .unwrap_or(MAX_ROWS)
 }
 
-/// Returns the next instant the band's state or wire gate needs a wake.
+/// Returns the next instant the center's state or the wire gate needs a wake.
 #[must_use]
 pub fn state_deadline(center: &MessageCenter, gate: &WireGate, frozen: bool) -> Option<Instant> {
     [center.deadline(!frozen), gate.due()]

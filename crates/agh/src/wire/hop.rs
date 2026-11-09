@@ -48,9 +48,12 @@ pub fn rebuild(
     if !endpoints.asset_hosts().contains(&origin) {
         return Err(leaves(&origin.base()));
     }
-    let mut headers = Vec::with_capacity(2);
+    let mut headers = Vec::with_capacity(3);
     if let Some(accept) = super::header_in(&original.headers, "accept") {
         headers.push(("Accept".to_string(), accept.to_string()));
+    }
+    if let Some(range) = super::header_in(&original.headers, "range") {
+        headers.push(("Range".to_string(), range.to_string()));
     }
     headers.push(("User-Agent".to_string(), user_agent.to_string()));
     Ok(WireRequest::new(

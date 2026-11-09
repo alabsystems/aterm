@@ -28908,9 +28908,15 @@ mod tests {
                 }
             }
             assert!(ink > 2, "{icon:?}: the icon draws ({ink} px)");
+            let thin = procedural::mark_stroke(cw, ch, r.icon_metrics(false)) == 1.0;
             assert!(
-                partial || matches!(icon, BandIcon::Pause | BandIcon::Alert),
-                "{icon:?}: antialiased edges"
+                partial
+                    || matches!(icon, BandIcon::Pause | BandIcon::Alert)
+                    || (icon == BandIcon::DottedRing && matches!(ink, 4 | 8))
+                    || (icon == BandIcon::InsetDiamond && thin),
+                "{icon:?}: antialiased edges, or ◌'s four or eight dots each a whole pixel ({ink} \
+                 px), or ◈ with a one-pixel stroke ({thin}) as whole staircases \
+                 (procedural::icons holds it to that)"
             );
             let regular = r.chrome_icon_key(drawn_in.chrome_raster(0), &drawn_in.cells[0], 0);
             assert_eq!(

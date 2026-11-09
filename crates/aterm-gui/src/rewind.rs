@@ -417,7 +417,7 @@ pub(crate) const fn withheld(ev: &crate::input::InputEvent) -> bool {
     )
 }
 
-/// Whether a withheld `ev` was a person reaching for the program (a press, text, a paste, a click or a wheel), which the message band answers.
+/// Whether a withheld `ev` was a person reaching for the program (a press, text, a paste, a click or a wheel), which [`App::note_rewind_withheld`] records.
 pub(crate) fn noticed(ev: &crate::input::InputEvent) -> bool {
     use crate::input::InputEvent as E;
     use aterm_types::keyboard::KeyEventType as T;
@@ -795,7 +795,7 @@ impl App {
             .unwrap_or(0)
     }
 
-    /// A person's key or press the rewound `session` withheld: say so once on the message band.
+    /// A person's key or press the rewound `session` withheld: say so once, in a posted message keyed by [`read_only_key`].
     pub(crate) fn note_rewind_withheld(&mut self, session: u64) {
         let Some(view) = self.pool.rewind(session) else {
             return;
@@ -1551,7 +1551,7 @@ fn recording(session: &crate::Session) -> bool {
         > 0
 }
 
-/// The message-band key of `session`'s read-only notice.
+/// The message key of `session`'s read-only notice.
 fn read_only_key(session: u64) -> String {
     format!("session.rewind-read-only.{session}")
 }

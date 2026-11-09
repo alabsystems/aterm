@@ -65,7 +65,6 @@ fn five_kinds(now: Instant) -> (MessageCenter, MessageId) {
     );
     c.post(
         Message::new(tags::CRASH, Severity::Error, "aterm crashed last time")
-            .retrospective()
             .hold(Hold::For(Duration::from_secs(60))),
         stamp(),
         now - ms(3000),
@@ -106,36 +105,6 @@ fn five_kinds_keep_the_download_on_the_glass_at_every_width() {
         for col in [0, cols / 2, cols - 1] {
             assert_eq!(p.hit(2, col), Hit::Overflow, "{cols}/{col}");
         }
-    }
-}
-
-#[test]
-fn a_retrospective_error_ranks_with_the_warnings() {
-    let now = Instant::now();
-    for (retro, want_top) in [
-        (true, "Misspelled setting"),
-        (false, "aterm crashed last time"),
-    ] {
-        let mut c = MessageCenter::new(MessageLog::empty(), now);
-        c.post(
-            Message::new(tags::CONFIG, Severity::Warn, "Misspelled setting"),
-            stamp(),
-            now,
-        );
-        let mut crash = Message::new(tags::CRASH, Severity::Error, "aterm crashed last time");
-        if retro {
-            crash = crash.retrospective();
-        }
-        assert_eq!(crash.retrospective, retro);
-        c.post(crash, stamp(), now + ms(1));
-        c.post(
-            Message::new(tags::FABRIC, Severity::Info, "a third"),
-            stamp(),
-            now + ms(2),
-        );
-        c.commit_rows(now + ms(3), 2);
-        let p = present(&c, 120);
-        assert_eq!(p.rows[0].title.1, want_top, "retrospective {retro}");
     }
 }
 
@@ -353,7 +322,7 @@ fn a_carried_row_keeps_its_rank_and_its_measured_fill() {
         now,
     );
     parent.post(
-        Message::new(tags::CRASH, Severity::Error, "aterm crashed last time").retrospective(),
+        Message::new(tags::CRASH, Severity::Error, "aterm crashed last time"),
         stamp(),
         now + ms(1),
     );
@@ -380,28 +349,22 @@ fn a_carried_row_keeps_its_rank_and_its_measured_fill() {
         .id;
     parent.commit_rows(now + ms(3), 3);
     let carry = parent.carried();
-    assert!(
-        carry
-            .live
-            .iter()
-            .any(|m| m.title == "aterm crashed last time" && m.retrospective),
-        "the carry ships the flag"
-    );
     let later = now + ms(10);
     let mut child = MessageCenter::new(MessageLog::empty(), later);
     child.seed_carried(&carry, stamp(), later);
     child.commit_rows(later, 3);
-    let crash = child
-        .live_rows()
-        .find(|l| l.msg.title == "aterm crashed last time")
-        .expect("the crash row is carried");
-    assert!(crash.msg.retrospective, "it stays a past run's record");
+    assert!(
+        child
+            .live_rows()
+            .any(|l| l.msg.title == "aterm crashed last time"),
+        "the crash row is carried"
+    );
     let p = present(&child, 120);
     let titles: Vec<&str> = p.rows.iter().map(|r| r.title.1.as_str()).collect();
     let pos = |t: &str| titles.iter().position(|x| *x == t).unwrap();
     assert!(
-        pos("Misspelled setting") < pos("aterm crashed last time"),
-        "the past run ranks below now: {titles:?}"
+        pos("aterm crashed last time") < pos("Misspelled setting"),
+        "the Error keeps its rank above the Warn: {titles:?}"
     );
     let meter = child.live(pass).unwrap().msg.meter.clone().unwrap();
     assert_eq!(meter.fill_permille, Some(356), "the measured fill stands");

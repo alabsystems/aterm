@@ -10,6 +10,11 @@ mod settings_keep_tests;
 #[path = "app_native_settings_press_tests.rs"]
 mod settings_press_tests;
 
+// The lane meets the setup offer in the handoff preflight, which runs on macOS only.
+#[cfg(target_os = "macos")]
+#[path = "app_native_lane_hold_tests.rs"]
+mod lane_hold_tests;
+
 #[test]
 fn messages_quiet_gap_folds_mixed_split_feedback_and_visibility() {
     use crate::native_app::AppViewState;
@@ -3024,7 +3029,7 @@ fn a_linux_build_held_for_a_person_is_said_once_and_leaves_with_its_stage() {
         NativeUpdateReconcilePurpose::StageAvailable,
         Some(build),
     );
-    let (title, detail) = held(&app).expect("the held build is on the band");
+    let (title, detail) = held(&app).expect("the held build is a live row");
     assert!(title.contains(&format!("1.0.{build}")), "{title}");
     assert!(detail.contains("aterm update apply"), "{detail}");
     assert!(
@@ -4188,6 +4193,7 @@ fn arm_applies_each_decision_to_the_retained_intent() {
         dmg_sha256: [0xab; 32],
         retry_at: std::time::Instant::now() + std::time::Duration::from_secs(23),
         attempts: 3,
+        held: crate::native_update_lane_hold::NamedHold::default(),
     };
     app.auto_apply_intent = Some(retained);
     assert!(!app.arm_native_auto_apply(current + 1, &"ab".repeat(32)));
@@ -4340,7 +4346,7 @@ fn a_fork_lane_park_miss_is_booked_as_a_refusal_not_a_failure() {
 
     let outcome = app.fork_park_miss_outcome(&ticket, ApplyMode::AutomaticPastGrace, miss.clone());
     assert!(
-        matches!(&outcome, UpdateOutcome::Deferred { reason } if *reason == miss),
+        matches!(&outcome, UpdateOutcome::Deferred { reason, .. } if *reason == miss),
         "the automatic lane defers: {outcome:?}"
     );
     assert!(
@@ -6406,7 +6412,7 @@ fn a_stage_waiting_for_its_roster_confirmation_is_held_and_never_a_failure() {
         HandoffFailureLane::classify(ApplyMode::Automatic, outcome, death, false),
     );
     assert!(
-        matches!(&surfaced, UpdateOutcome::Deferred { reason } if reason.contains(&wait)),
+        matches!(&surfaced, UpdateOutcome::Deferred { reason, .. } if reason.contains(&wait)),
         "a deferral, not a failure: {surfaced:?}"
     );
     app.surface_update_apply_outcome_for_target("automatic handoff", surfaced, false, build);
@@ -7620,6 +7626,7 @@ fn absent_auto_apply_intent_contributes_no_event_loop_deadline() {
         dmg_sha256: [0xab; 32],
         retry_at: retry,
         attempts: 1,
+        held: crate::native_update_lane_hold::NamedHold::default(),
     };
     assert_eq!(
         crate::fold_auto_apply_deadline(Some(intent), None),

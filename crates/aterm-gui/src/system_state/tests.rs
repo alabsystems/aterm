@@ -226,7 +226,12 @@ fn an_untouched_setup_offer_can_restart_without_being_answered() {
     let request = Request::new(Plan::default(), send);
     let mut page = SystemStateApp::new(Plan::default());
     assert!(page.offer(request.clone()));
-    assert!(page.offer_can_restart(&request));
+    assert!(page.offer_hold(&request).is_none());
+    page.status.busy = true;
+    assert!(
+        page.offer_hold(&request).is_none(),
+        "the worker's busy status is not the offer's: an untouched offer still restarts"
+    );
     assert!(
         receive.try_recv().is_err(),
         "checking never answers the offer"
@@ -244,7 +249,7 @@ fn an_untouched_setup_offer_can_restart_without_being_answered() {
 
 #[test]
 fn setup_offer_restart_preserves_drafts_and_pending_work() {
-    let mutations: [fn(&mut SystemStateApp); 10] = [
+    let mutations: [fn(&mut SystemStateApp); 9] = [
         |page| page.plan.selection = Selection::none(),
         |page| page.url.insert("/draft"),
         |page| page.url.insert(" "),
@@ -263,7 +268,6 @@ fn setup_offer_restart_preserves_drafts_and_pending_work() {
         },
         |page| page.actions.push_back(SystemStateAction::Restore),
         |page| page.stopping = true,
-        |page| page.status.busy = true,
     ];
     for (index, mutate) in mutations.into_iter().enumerate() {
         let (send, receive) = mpsc::channel();
@@ -271,7 +275,21 @@ fn setup_offer_restart_preserves_drafts_and_pending_work() {
         let mut page = SystemStateApp::new(Plan::default());
         assert!(page.offer(request.clone()));
         mutate(&mut page);
-        assert!(!page.offer_can_restart(&request), "draft/work case {index}");
+        assert!(
+            !page.offer_hold(&request).is_none(),
+            "draft/work case {index}"
+        );
+        // The first six are a person's draft, theirs while it is there; the last three are the
+        // page's own work, which it settles by itself.
+        assert_eq!(
+            page.offer_hold(&request),
+            Some(if index < 6 {
+                OfferHold::Draft
+            } else {
+                OfferHold::Answer
+            }),
+            "draft/work case {index}"
+        );
         assert!(request.pending());
         assert!(receive.try_recv().is_err());
     }
@@ -285,14 +303,14 @@ fn setup_offer_restart_rechecks_the_current_offer_and_late_edits() {
     let other = Request::new(Plan::default(), other_send);
     let mut page = SystemStateApp::new(Plan::default());
     assert!(page.offer(request.clone()));
-    assert!(!page.offer_can_restart(&other));
-    assert!(page.offer_can_restart(&request));
+    assert!(!page.offer_hold(&other).is_none());
+    assert!(page.offer_hold(&request).is_none());
     page.url.insert("/late-draft");
-    assert!(!page.offer_can_restart(&request));
+    assert!(!page.offer_hold(&request).is_none());
     page.url = TextInputState::new(page.submitted.vault_url.clone());
-    assert!(page.offer_can_restart(&request));
+    assert!(page.offer_hold(&request).is_none());
     page.closed(CloseScope::Tab);
-    assert!(!page.offer_can_restart(&request));
+    assert!(!page.offer_hold(&request).is_none());
 }
 
 #[test]

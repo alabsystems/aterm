@@ -16,6 +16,133 @@ fn fixture() -> (aterm_tempfile::TempDir, Paths) {
 }
 
 #[test]
+fn a_busy_initial_vault_is_observed_without_spending_a_custody_deadline() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    client::create(
+        &paths,
+        home.path().join("team.vault").to_str().unwrap(),
+        None,
+        Some("m1"),
+    )
+    .unwrap();
+    let expected = Bootstrap::required(&paths).unwrap().trust();
+    let writer = client::test_hold_state_lock(&paths).unwrap();
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(61);
+    let cached = Bootstrap::cached_started(&paths, past);
+    let observed = Bootstrap::observe_started(&paths, past);
+    let required = Bootstrap::required_started(&paths, past);
+    drop(writer);
+    assert_eq!(required.err().unwrap().kind(), crate::ErrorKind::VaultBusy);
+    assert!(
+        cached.is_ok_and(|bootstrap| bootstrap.is_none()),
+        "an actually busy vault is unavailable, not a timed-out custody admission"
+    );
+    assert!(
+        matches!(
+            observed,
+            Ok(Availability::Unavailable(super::super::Unavailable::Busy))
+        ),
+        "the initial observation preserves the actual busy reason"
+    );
+    assert_eq!(
+        Bootstrap::cached(&paths).unwrap().unwrap().trust(),
+        expected
+    );
+}
+
+#[test]
+fn a_required_bootstrap_waits_for_a_scheduled_local_custody_writer() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    client::create(
+        &paths,
+        home.path().join("team.vault").to_str().unwrap(),
+        None,
+        Some("m1"),
+    )
+    .unwrap();
+    let expected = Bootstrap::required(&paths).unwrap().trust();
+    let actual = Bootstrap::required_started(
+        &paths,
+        std::time::Instant::now() - std::time::Duration::from_secs(2),
+    );
+    assert_eq!(actual.unwrap().trust(), expected);
+    let held = CustodyLock::acquire_commons_custody(&paths, "commons.lock", true).unwrap();
+    assert!(
+        Bootstrap::required_started(
+            &paths,
+            std::time::Instant::now() - std::time::Duration::from_secs(61)
+        )
+        .is_err()
+    );
+    assert!(Bootstrap::required_until(&paths, std::time::Instant::now()).is_err());
+    drop(held);
+    assert_eq!(Bootstrap::required(&paths).unwrap().trust(), expected);
+}
+
+fn scheduled_custody_observation(read: impl Fn(&Paths, std::time::Instant) -> Result<Trust>) {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(home.path());
+    client::create(
+        &paths,
+        home.path().join("team.vault").to_str().unwrap(),
+        None,
+        Some("m1"),
+    )
+    .unwrap();
+    let expected = Bootstrap::required(&paths).unwrap().trust();
+    let held = std::rc::Rc::new(std::cell::RefCell::new(Some(
+        CustodyLock::acquire_commons_custody(&paths, "commons.lock", true).unwrap(),
+    )));
+    let release = std::rc::Rc::clone(&held);
+    let observed = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = std::rc::Rc::clone(&observed);
+    let actual = while_held(
+        move || {
+            count.set(count.get() + 1);
+            drop(release.borrow_mut().take());
+        },
+        || {
+            read(
+                &paths,
+                std::time::Instant::now() - std::time::Duration::from_secs(2),
+            )
+        },
+    );
+    drop(held.borrow_mut().take());
+    assert_eq!(actual.unwrap(), expected);
+    assert_eq!(observed.get(), 1, "the actual custody writer was observed");
+    let held = CustodyLock::acquire_commons_custody(&paths, "commons.lock", true).unwrap();
+    assert!(
+        read(
+            &paths,
+            std::time::Instant::now() - std::time::Duration::from_secs(61)
+        )
+        .is_err()
+    );
+    drop(held);
+    assert_eq!(read(&paths, std::time::Instant::now()).unwrap(), expected);
+}
+
+#[test]
+fn a_cached_bootstrap_waits_for_a_scheduled_local_custody_writer() {
+    scheduled_custody_observation(|paths, started| {
+        Ok(Bootstrap::cached_started(paths, started)?.unwrap().trust())
+    });
+}
+
+#[test]
+fn an_observed_bootstrap_waits_for_a_scheduled_local_custody_writer() {
+    scheduled_custody_observation(|paths, started| {
+        match Bootstrap::observe_started(paths, started)? {
+            Availability::Available(bootstrap) => Ok(bootstrap.trust()),
+            Availability::Unavailable(reason) => Err(reason.failure("fixture unavailable")),
+        }
+    });
+}
+
+#[test]
 fn local_denial_observation_finishes_while_bootstrap_holds_device_custody() {
     use crate::{swarm_roster::SwarmRoster, text::Audience};
     let home = aterm_tempfile::tempdir().unwrap();

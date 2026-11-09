@@ -34,16 +34,24 @@ pub type RunGit<'a> = &'a dyn Fn(&mut Command) -> std::io::Result<std::process::
 /// named the origin. Its objects are in `at` when it returns.
 pub type Import<'a> = &'a dyn Fn(&Path, &Path) -> Result<String, String>;
 
-/// How long a reader waits on each child: a hang detector, since agh's import of the origin's
-/// main into an empty repository takes one to two seconds (1.19-1.76 s on m19, 2026-11-07).
+/// The finite wall hang detector for a reader's local Git child, and the request component of
+/// [`REMOTE_PATIENCE`]. Agh's import of the origin's main into an empty repository ordinarily
+/// takes one to two seconds (1.19-1.76 s on m19, 2026-11-07).
 pub const PATIENCE: Duration = Duration::from_secs(120);
 
-/// Runs `cmd` within [`PATIENCE`], its whole stdout kept up to
+/// An Agh child may legitimately be quiet through the shared policy's largest admitted
+/// `Retry-After`, then spend [`PATIENCE`] making its next request. This remains an inactivity
+/// window: output or descendant progress renews it, so it is not a transfer latency budget.
+pub const REMOTE_PATIENCE: Duration =
+    PATIENCE.saturating_add(aterm_types::http_retry::Policy::STANDARD.max_total_pause());
+
+/// Runs a local Git `cmd` within [`PATIENCE`], its whole stdout kept up to
 /// [`aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES`] (16 MiB) and refused past it, never cut
 /// short, and ended once a verify run in this process is ending ([`crate::exec::ending`]: an
-/// interrupt, or the halt at its first red), so a stalled fetch never holds a stage or outlives
-/// the run: the [`RunGit`] of a reader outside a release. The largest file a reader here reads
-/// is the ledger, 0.18 MB on 2026-11-07.
+/// interrupt, or the halt at its first red), so a stalled local child never holds a stage or
+/// outlives the run: the [`RunGit`] of a reader outside a release. Networked Agh import uses the
+/// progress-aware [`bounded_remote`] instead. The largest file a reader here reads is the ledger,
+/// 0.18 MB on 2026-11-07.
 ///
 /// # Errors
 /// git could not start, did not end in time, was ended, or printed more than the bound.
@@ -55,6 +63,36 @@ pub fn bounded(cmd: &mut Command) -> std::io::Result<std::process::Output> {
         &mut crate::exec::ending,
     )
     .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// Wait on one child of the native import. Local Git has the reader's finite wall hang detector;
+/// Agh owns a network transfer whose retry pauses and useful transfer progress must not consume a
+/// latency budget, so it has an inactivity detector instead. Both observe the verify run ending.
+fn bounded_remote(
+    tool: crate::remote::Tool,
+    cmd: &mut Command,
+) -> std::io::Result<std::process::Output> {
+    bounded_remote_with(tool, cmd, bounded, |cmd| {
+        aterm_uds::deadline::output_while_process_progressing_complete_stdout_unless(
+            cmd,
+            REMOTE_PATIENCE,
+            "publication engine origin read",
+            &mut crate::exec::ending,
+        )
+        .map_err(|e| std::io::Error::other(e.to_string()))
+    })
+}
+
+fn bounded_remote_with<T>(
+    tool: crate::remote::Tool,
+    cmd: &mut Command,
+    local: impl FnOnce(&mut Command) -> T,
+    network: impl FnOnce(&mut Command) -> T,
+) -> T {
+    match tool {
+        crate::remote::Tool::Git => local(cmd),
+        crate::remote::Tool::Agh => network(cmd),
+    }
 }
 
 /// `<git common dir>/aterm-release` of the clone at `repo`: its release journal, run claim and
@@ -366,7 +404,7 @@ impl OriginMain {
 pub fn native(at: &Path, _by: &Path) -> Result<String, String> {
     let run = |tool, args: &[OsString]| {
         let mut cmd = crate::remote::command(at, &in_dir, tool, args);
-        bounded(&mut cmd).map_err(|e| format!("{tool:?} remote operation: {e}"))
+        bounded_remote(tool, &mut cmd).map_err(|e| format!("{tool:?} remote operation: {e}"))
     };
     crate::remote::Remote::open(at, "origin", &run)?.refresh_main()
 }

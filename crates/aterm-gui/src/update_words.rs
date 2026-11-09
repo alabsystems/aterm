@@ -269,7 +269,6 @@ fn flow(title: String, phase: &str, meter: Meter, hold: Hold) -> Message {
     row(Severity::Info, title)
         .glyph(glyph(mark))
         .line(phase)
-        .no_excerpt()
         .meter(meter)
         .hold(hold)
         .key(KEY_PROGRESS)
@@ -383,7 +382,6 @@ pub(crate) fn staged(version: &str, build: u64, posture: Option<ApplyPosture>) -
         Some(install) => row(Severity::Info, title)
             .glyph(glyph(MOVING_IN))
             .lines(staged_detail_lines(posture))
-            .no_excerpt()
             .action(install)
             .hold(Hold::For(HOLD_STAGED_MANUAL))
             .key(KEY_PROGRESS),
@@ -1048,7 +1046,7 @@ pub(crate) fn needs_install_because(
     let msg = row(severity, sanitize_for_tty(title, 80));
     let msg = match cause {
         Some(cause) => msg.line(cause).sentence(detail),
-        None => msg.sentence(detail).no_excerpt(),
+        None => msg.sentence(detail),
     }
     .action(Intent::ApplyUpdate { build })
     .key(KEY_OUTCOME);
@@ -1089,7 +1087,7 @@ pub(crate) fn failed(title: &str, detail: &str, actionable: bool) -> Message {
     if actionable {
         msg
     } else {
-        msg.action(software_update()).no_excerpt()
+        msg.action(software_update())
     }
 }
 
@@ -1612,7 +1610,7 @@ mod tests {
         let entry = dev_build_entry(ALL_WRITES);
         let msg = entry.message().expect("the words pass the rule");
         assert_eq!(msg.severity, Severity::Warn);
-        assert_eq!(msg.hold, Hold::LogOnly, "an entry is never a band row");
+        assert_eq!(msg.hold, Hold::LogOnly, "an entry is never a live row");
         assert_eq!(entry.key(), "update.review.dev-build.writes");
         assert_ne!(
             msg.key.as_deref(),
@@ -1750,19 +1748,11 @@ mod tests {
             1234,
         );
         assert_ne!(stopped.hold, Hold::LogOnly, "a row");
-        assert!(stopped.excerpt, "its cause is painted");
         assert_eq!(
             stopped.detail.first().map(String::as_str),
             Some("disk full")
         );
         assert_eq!(stopped.actions, [Intent::ApplyUpdate { build: 1234 }]);
-        let bare = needs_install(
-            "Couldn't install aterm v0.92.0",
-            INSTALL_FROM_MENU,
-            Severity::Warn,
-            1234,
-        );
-        assert!(!bare.excerpt);
         for (said, want) in [
             ("No space left on device", Some("disk full")),
             ("ENOSPC", Some("disk full")),
@@ -1921,10 +1911,6 @@ mod tests {
         assert_eq!(m.glyph.ch(), MOVING_IN);
         assert_eq!(m.severity, Severity::Info);
         assert_eq!(m.detail, vec![DOWNLOADING]);
-        assert!(
-            !m.excerpt,
-            "the title says the phase; the word is the log's"
-        );
         assert_eq!(m.reveal_after, Some(PROGRESS_GRACE));
         assert_eq!(
             stats_of(&m),
@@ -1966,7 +1952,6 @@ mod tests {
         assert_eq!(m.glyph.ch(), FLOW_GLYPH, "checking is the working mark");
         assert_eq!(m.detail, vec![CHECKING]);
         assert!(busy(&m), "checking has no fraction: the row moves");
-        assert!(!m.excerpt);
         let cause = "zip sha256 mismatch: expected ab12, got cd34 — see                      https://github.com/alabsystems/aterm/releases/tag/v0.48.0 for the assets";
         let m = progress(
             &P::Failed {
@@ -2171,7 +2156,6 @@ mod tests {
                 assert_eq!(m.glyph.ch(), MOVING_IN, "a build to install (ruling 303)");
                 assert_eq!(m.severity, Severity::Info, "a decision, not a confirmation");
                 assert_eq!(m.hold, Hold::For(HOLD_STAGED_MANUAL));
-                assert!(!m.excerpt, "the capsule is the press");
                 assert!(!busy(&m), "a ready row waits; it does not move");
             } else {
                 let title = if posture == P::TrialSpent {
@@ -2530,7 +2514,6 @@ mod tests {
         let i = installing("9.9.9");
         assert_eq!(i.detail, vec![INSTALLING]);
         assert!(busy(&i));
-        assert!(!i.excerpt);
         assert_eq!(
             i.hold,
             Hold::Live {
@@ -2539,7 +2522,6 @@ mod tests {
         );
         let f = finishing("9.9.9");
         assert_eq!(f.detail, vec![FINISHING]);
-        assert!(!f.excerpt, "a reassurance changes nothing the person does");
         assert!(busy(&f));
         assert_eq!(f.key, i.key);
         let l = landed("9.9.9", 7, 0, None);
@@ -2875,7 +2857,6 @@ mod tests {
         assert_eq!(stopped.hold, Hold::Default, "the warning's hold");
         assert_eq!(stopped.actions, vec![Intent::ApplyUpdate { build: 7 }]);
         assert_eq!(stopped.glyph.ch(), NEEDS_YOU);
-        assert!(!stopped.excerpt, "the capsule is the press");
         assert_ne!(stopped.key, Some(KEY_PROGRESS.to_string()));
         let installed = needs_install(
             &crate::app_update_screen::update_installed_title(Some("9.9.9")),
@@ -2889,7 +2870,6 @@ mod tests {
         let ready = staged("9.9.9", 7, Some(ApplyPosture::ManualByConfig));
         assert_eq!(installed.title, ready.title, "one sentence…");
         assert_eq!(installed.glyph, ready.glyph, "…one mark");
-        assert!(!installed.excerpt, "the capsule is the press");
         assert_eq!(
             installed.detail,
             [crate::app_update_screen::UPDATE_INSTALLED_DETAIL]
@@ -2904,9 +2884,7 @@ mod tests {
             crate::App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
             true,
         );
-        assert!(blocked.excerpt, "a blocker the person clears is painted");
         assert!(blocked.actions.is_empty(), "its words are the press");
-        assert!(!failed("x", "handoff proof ended TimedOut", false).excerpt);
     }
 
     #[test]

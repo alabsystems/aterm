@@ -885,6 +885,13 @@ pub trait System: Sync {
         ))
     }
 
+    /// Run `_cmd` with complete bounded stdout and stderr, refusing either partial stream.
+    fn run_complete_output(&self, _cmd: &Cmd) -> Result<Ran, RunFailed> {
+        Err(RunFailed::Refused(
+            "complete output is not implemented by this backend".into(),
+        ))
+    }
+
     /// Feed `_input` via a private stdin pipe and capture complete bounded stdout.
     fn run_complete_stdout_input(&self, _cmd: &Cmd, _input: &[u8]) -> Result<Ran, RunFailed> {
         Err(RunFailed::Refused(
@@ -1906,6 +1913,42 @@ pub fn responsible_window() -> Option<String> {
     }
 }
 
+enum CompleteStreams {
+    Stdout,
+    Both,
+}
+
+fn complete_capture(live: &Live, cmd: &Cmd, streams: CompleteStreams) -> Result<Ran, RunFailed> {
+    if cmd.keep_on_timeout {
+        return Err(RunFailed::Refused(
+            "complete output cannot keep timed-out partial output".into(),
+        ));
+    }
+    if !cmd.program.is_absolute() {
+        return Err(RunFailed::Refused(format!(
+            "{} is not an absolute path",
+            cmd.program.display()
+        )));
+    }
+    live.capture_current()?;
+    let (program, args) = live.argv(cmd)?;
+    let mut child = fixed_command(&program, &args, &live.child_env(cmd), cmd.cwd.as_deref());
+    let stdin = open_stdin_file(cmd.stdin.as_deref())?;
+    let capture = match streams {
+        CompleteStreams::Stdout => aterm_uds::deadline::output_until_complete_stdout_from_unless,
+        CompleteStreams::Both => aterm_uds::deadline::output_until_complete_from_unless,
+    };
+    let out = capture(&mut child, stdin, deadline_after(cmd.budget), &mut || {
+        live.stopped().is_some()
+    })
+    .map_err(|error| live.capture_failure(RunFailed::from_complete_output(error, cmd.budget)))?;
+    Ok(Ran {
+        status: out.status.code(),
+        stdout: out.stdout,
+        stderr: out.stderr,
+    })
+}
+
 impl System for Live {
     fn keyboard_service_observations(&self) -> Result<Vec<KeyboardServiceObservation>, String> {
         #[cfg(target_os = "macos")]
@@ -2042,36 +2085,11 @@ impl System for Live {
     }
 
     fn run_complete_stdout(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
-        if cmd.keep_on_timeout {
-            return Err(RunFailed::Refused(
-                "complete stdout cannot keep timed-out partial output".into(),
-            ));
-        }
-        if !cmd.program.is_absolute() {
-            return Err(RunFailed::Refused(format!(
-                "{} is not an absolute path",
-                cmd.program.display()
-            )));
-        }
-        self.capture_current()?;
-        let (program, args) = self.argv(cmd)?;
-        let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
-        let stdin = open_stdin_file(cmd.stdin.as_deref())?;
-        let deadline = deadline_after(cmd.budget);
-        let out = aterm_uds::deadline::output_until_complete_stdout_from_unless(
-            &mut child,
-            stdin,
-            deadline,
-            &mut || self.stopped().is_some(),
-        )
-        .map_err(|error| {
-            self.capture_failure(RunFailed::from_complete_output(error, cmd.budget))
-        })?;
-        Ok(Ran {
-            status: out.status.code(),
-            stdout: out.stdout,
-            stderr: out.stderr,
-        })
+        complete_capture(self, cmd, CompleteStreams::Stdout)
+    }
+
+    fn run_complete_output(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
+        complete_capture(self, cmd, CompleteStreams::Both)
     }
 
     fn run_complete_stdout_input(&self, cmd: &Cmd, input: &[u8]) -> Result<Ran, RunFailed> {
@@ -4337,6 +4355,27 @@ mod fake {
             Ok(reply)
         }
 
+        fn run_complete_output(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
+            if cmd.keep_on_timeout {
+                return Err(RunFailed::Refused(
+                    "complete output cannot keep timed-out partial output".into(),
+                ));
+            }
+            let reply = self.run(cmd)?;
+            if let Some(why) = self.strict_refusals.lock().unwrap().get(&cmd.display()) {
+                return Err(RunFailed::AfterStart(why.clone()));
+            }
+            for (name, bytes) in [("stdout", &reply.stdout), ("stderr", &reply.stderr)] {
+                if bytes.len() > aterm_uds::deadline::OUTPUT_KEEP {
+                    return Err(RunFailed::AfterStart(format!(
+                        "complete {name} exceeds {} bytes",
+                        aterm_uds::deadline::OUTPUT_KEEP
+                    )));
+                }
+            }
+            Ok(reply)
+        }
+
         fn run_complete_stdout_input(&self, cmd: &Cmd, _input: &[u8]) -> Result<Ran, RunFailed> {
             super::complete_input::admit(cmd)?;
             self.run_complete_stdout(cmd)
@@ -5643,6 +5682,32 @@ mod tests {
         ] {
             assert_eq!(walk_answer(reply, "accessibility"), want, "{reply}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_output_refuses_a_diagnostic_tail_that_would_change_root_admission() {
+        let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+        let dd = aterm_uds::deadline::stand_in(Path::new("/bin/dd"));
+        let script = "printf 'Developer mode is currently enabled.\\n' >&2; \
+            \"$1\" if=/dev/zero bs=\"$2\" count=1 1>&2 2>/dev/null; \
+            printf '\\nDeveloper mode is currently disabled.\\n' >&2";
+        let command = Cmd::new(sh)
+            .args(["-c", script, "status-stand-in"])
+            .arg(dd)
+            .arg(aterm_uds::deadline::OUTPUT_KEEP.to_string())
+            .budget(Duration::from_secs(60));
+        let live = Live::new();
+        let tail = live.run_complete_stdout(&command).unwrap();
+        assert_eq!(tail.status, Some(0));
+        assert_eq!(
+            crate::root_steps::developer_mode(&tail),
+            Some(false),
+            "negative control: the diagnostic tail lost the contradictory earlier status"
+        );
+        assert!(
+            matches!(live.run_complete_output(&command), Err(RunFailed::AfterStart(why)) if why.contains("stderr exceeds"))
+        );
     }
 
     #[test]

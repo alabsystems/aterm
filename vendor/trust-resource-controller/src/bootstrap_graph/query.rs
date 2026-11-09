@@ -38,14 +38,14 @@ impl OperationKey {
         }
         Ok(())
     }
-    fn write(&self, e: &mut Encoder) -> io::Result<()> {
+    pub(super) fn write(&self, e: &mut Encoder) -> io::Result<()> {
         self.validate()?;
         self.graph.write(e)?;
         e.number(self.sequence);
         e.0.extend(self.operation);
         Ok(())
     }
-    fn read(d: &mut Decoder<'_>) -> io::Result<Self> {
+    pub(super) fn read(d: &mut Decoder<'_>) -> io::Result<Self> {
         let value = Self { graph: Key::read(d)?, sequence: d.number()?, operation: d.array()? };
         value.validate()?;
         Ok(value)

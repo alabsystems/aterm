@@ -32,7 +32,7 @@ const _: () = assert!(STALLED_AFTER_S == 6 * 3_600);
 
 const DONE_SHOWN_S: u64 = 10 * 60;
 
-/// How long a move that failed after its exit (a Codex `/exit`, a Claude Code SIGTERM) stays in the host's summary (band row, `upgrade=` column, tab mark) once no process is left to vet it by.
+/// How long a move that failed after its exit (a Codex `/exit`, a Claude Code SIGTERM) stays in the host's summary (its message, `upgrade=` column, tab mark) once no process is left to vet it by.
 pub const EXITED_FAILURE_SHOWN_S: u64 = 24 * 3_600;
 
 /// The keyed attention owner the host raises on a stalled tab.

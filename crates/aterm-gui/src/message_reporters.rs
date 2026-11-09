@@ -659,11 +659,9 @@ pub(crate) const CRASH_EXCERPT: &str = "a crash report was saved";
 pub(crate) fn crash_message(evidence: &crate::logging::CrashEvidence) -> Message {
     let path = evidence.path.display().to_string();
     Message::new(tags::CRASH, Severity::Error, "aterm crashed last time")
-        .retrospective()
         .line(CRASH_EXCERPT)
         .line(format!("crash log at {path}"))
         .lines(evidence.head.iter().cloned())
-        .no_excerpt()
         .action(Intent::OpenPath { path })
         .notice(NoticeKind::LastRun)
         .key(KEY_CRASH)
@@ -680,7 +678,6 @@ pub(crate) fn killed_message(evidence: &crate::logging::KillEvidence) -> Message
         .line(KILLED_EXCERPT)
         .line("Force Quit, running out of memory or a system watchdog ends a process this way")
         .line(format!("its last lines are in {log}"))
-        .no_excerpt()
         .action(Intent::OpenPath { path: log })
         .notice(NoticeKind::LastRun)
         .key(KEY_CRASH)
@@ -791,7 +788,6 @@ pub(crate) fn keeper_recovered_message(
         ));
     }
     message
-        .no_excerpt()
         .action(Intent::EndRecovered)
         .notice(NoticeKind::LastRun)
         .key(KEY_CRASH)
@@ -1057,13 +1053,10 @@ pub(crate) fn journal_reopened_message(
         .lines(journal_behind_quit_line(quit_windows, windows))
         .line(reopened.class.sentence())
         .lines(evidence_lines);
-    if reopened.class.crashed() {
-        msg = msg.retrospective();
-    }
     if let Some(path) = open {
         msg = msg.action(Intent::OpenPath { path });
     }
-    let msg = msg.no_excerpt().key(KEY_CRASH);
+    let msg = msg.key(KEY_CRASH);
     if quiet {
         msg.record()
     } else {
@@ -1141,7 +1134,7 @@ pub(crate) fn journal_note_message(
             .line(format!("its last lines are in {log}"))
             .action(Intent::OpenPath { path: log });
     }
-    msg.no_excerpt().key(KEY_CRASH_JOURNAL)
+    msg.key(KEY_CRASH_JOURNAL)
 }
 
 pub(crate) const KEY_RESTORED_AGENTS: &str = "harness.restored";
@@ -1179,7 +1172,6 @@ pub(crate) fn harness_without_socket(cause: &str, fix: Option<&str>) -> Message 
     .glyph(Glyph::or_fallback('\u{26a0}'))
     .line(format!("{cause}, so {HARNESS_BOXES_UNANSWERED}"))
     .lines(fix.map(str::to_string))
-    .no_excerpt()
     .hold(Hold::For(HOLD_LAUNCH))
     .key(KEY_HARNESS_NO_SOCKET)
 }
@@ -1341,7 +1333,7 @@ pub(crate) fn restored_agents_not_resumed(
         Then::step(step),
         Span::Launch,
     );
-    msg.no_excerpt().now(ask).key(KEY_RESTORED_AGENTS)
+    msg.now(ask).key(KEY_RESTORED_AGENTS)
 }
 
 pub(crate) const KEY_RESTORED_HELD: &str = "harness.restored-held";
@@ -1364,7 +1356,6 @@ pub(crate) fn launch_load_failure(notice: &str) -> Message {
         rows.into_iter().next().filter(|row| !row.is_empty())
     };
     let mut msg = Message::new(tags::CONFIG, Severity::Error, title);
-    let painted = error.is_some();
     if let Some(error) = error {
         msg = msg.line(error);
     }
@@ -1382,12 +1373,10 @@ pub(crate) fn launch_load_failure(notice: &str) -> Message {
         Then::press(Mover::open_config_editor(None), "Fix aterm.toml"),
         Span::Launch,
     );
-    let msg = msg
-        .lines(diagnostic_lines(notice))
+    msg.lines(diagnostic_lines(notice))
         .action(Intent::OpenConfigEditor { line: None })
         .now(ask)
-        .key(KEY_LAUNCH_LOAD);
-    if painted { msg } else { msg.no_excerpt() }
+        .key(KEY_LAUNCH_LOAD)
 }
 
 /// Builds a log record when a GPU-only appearance setting has no effect under the CPU renderer.
@@ -1428,7 +1417,6 @@ pub(crate) fn gpu_lost() -> Message {
     Message::new(tags::RENDER, Severity::Error, "GPU lost")
         .line("windows opened for the backdrop cannot redraw")
         .line("open a new window or restart aterm to get a visible one back")
-        .no_excerpt()
         .action(Intent::NewWindow)
         .now(Ask::standing(
             StandingWhy::Spent {
@@ -1821,10 +1809,6 @@ pub(crate) fn config_lane_error(words: &str) -> Message {
             all.extend(rows.iter().cloned());
             toml_words(&all)
         });
-    let painted = match &toml {
-        Some(words) => words.is_some(),
-        None => known,
-    };
     let excerpt = if known { cause } else { first.as_str() };
     let lost = head
         .strip_prefix("Config reconciliation failed; ")
@@ -1842,7 +1826,6 @@ pub(crate) fn config_lane_error(words: &str) -> Message {
     let msg = msg
         .action(Intent::OpenConfigEditor { line: None })
         .key(KEY_CONFIG_LANE);
-    let msg = if painted { msg } else { msg.no_excerpt() };
     let why = match title {
         "Couldn't read your settings" => "aterm.toml is not valid TOML",
         "Couldn't save settings changes" => "your settings changes were not written",
@@ -1891,7 +1874,6 @@ pub(crate) fn new_tab_failed(error: &str) -> Message {
         error,
         Then::step("Open the tab again"),
     )
-    .no_excerpt()
 }
 
 /// Builds the error message when `New Window` fails to spawn a shell.
@@ -1903,7 +1885,6 @@ pub(crate) fn new_window_failed(error: &str) -> Message {
         error,
         Then::step("Open the window again"),
     )
-    .no_excerpt()
 }
 
 /// Builds the feedback message when a pane split is refused for insufficient room.
@@ -1938,7 +1919,6 @@ pub(crate) fn split_failed(error: &str) -> Message {
         error,
         Then::step("Split the pane again"),
     )
-    .no_excerpt()
 }
 
 const SPLIT_FAILED: &str = "Couldn't split the pane";
@@ -1979,7 +1959,6 @@ pub(crate) fn rewind_read_only(shown: &str) -> Message {
         "the program did not get that input",
         Then::step("Press Esc to type into the program"),
     )
-    .no_excerpt()
 }
 
 /// Builds the message when Rewind cannot open or step the focused pane.
@@ -1991,7 +1970,6 @@ pub(crate) fn rewind_failed(why: &str) -> Message {
         why,
         Then::step("Choose View > Rewind Pane again"),
     )
-    .no_excerpt()
 }
 
 /// Builds the message when View > Export Pane History… writes nothing, saying `why`.
@@ -2003,7 +1981,6 @@ pub(crate) fn pane_history_export_failed(why: &str) -> Message {
         why,
         Then::step("Choose View > Export Pane History… again"),
     )
-    .no_excerpt()
 }
 
 /// Builds the message when View > Export Pane History… has no save panel to ask where.
@@ -2016,7 +1993,6 @@ pub(crate) fn pane_history_export_has_no_panel() -> Message {
          writes the file under the state directory's rewind/ folder",
         Then::step("Run `aterm ctl rewind export` in this pane"),
     )
-    .no_excerpt()
 }
 
 /// Builds the error message when session restore stops after failing to create a window.
@@ -2028,7 +2004,6 @@ pub(crate) fn restore_stopped_early() -> Message {
         "some saved tabs were not restored",
         Then::step("Open the missing tabs again"),
     )
-    .no_excerpt()
 }
 
 /// Builds the error message when a shell handed across a seamless update cannot be adopted.
@@ -2040,7 +2015,6 @@ pub(crate) fn shell_lost_in_update(error: &str) -> Message {
         error,
         Then::step("Open a new tab for its work"),
     )
-    .no_excerpt()
 }
 
 pub(crate) const KEY_INTEGRATION_LOST: &str = "session.integration";
@@ -2187,11 +2161,7 @@ pub(crate) fn integration_lost(tabs: &[LostTab]) -> Option<Message> {
     if !line.is_empty() {
         msg = msg.line(line);
     }
-    Some(
-        msg.no_excerpt()
-            .finished_as(INTEGRATION_BACK)
-            .key(KEY_INTEGRATION_LOST),
-    )
+    Some(msg.finished_as(INTEGRATION_BACK).key(KEY_INTEGRATION_LOST))
 }
 
 /// Extracts the session IDs listed on the technical detail lines of an [`integration_lost`] row.
@@ -2217,7 +2187,6 @@ pub(crate) fn integration_rekey_waits(place: &str, sid: &str) -> Message {
     )
     .line(format!("{place}: it comes back at the shell's next prompt"))
     .line(format!("session {sid}"))
-    .no_excerpt()
     .record()
     .hold(Hold::LogOnly)
     .key(&format!("{KEY_INTEGRATION_LOST}.{sid}"))
@@ -2232,7 +2201,6 @@ pub(crate) fn restored_tab_failed(error: &str) -> Message {
         &format!("shell did not start: {error}"),
         Then::step("Open the tab again"),
     )
-    .no_excerpt()
 }
 
 pub(crate) const KEY_FOLDER_NOT_FOUND: &str = "spawn.folder-not-found";
@@ -2361,7 +2329,6 @@ pub(crate) fn log_did_not_open(path: &str) -> Message {
         path,
         Then::step("Open the log from the Finder"),
     )
-    .no_excerpt()
 }
 
 /// Builds the interactive decision row prompting for Full Disk Access. Nothing posts it (System State's Full Disk Access row carries the need): it is a test fixture of a decision row with two capsules.
@@ -2377,7 +2344,6 @@ pub(crate) fn file_access_question(words: &crate::consent_card::NeedWords) -> Me
         ))
         .line(FDA_AFTER)
         .line(FDA_DETAIL)
-        .no_excerpt()
         .action(Intent::OpenSystemPane {
             pane: PANE_FULL_DISK_ACCESS.to_string(),
         })
@@ -2804,7 +2770,7 @@ pub(crate) fn agent_upgrade_waiting(product: &str, waiting: &[&str]) -> Option<M
     } else {
         "nothing to do: each starts on its own at a quiet moment in its tab"
     });
-    Some(msg.no_excerpt().hold(Hold::LogOnly).key(KEY_AGENT_UPGRADE))
+    Some(msg.hold(Hold::LogOnly).key(KEY_AGENT_UPGRADE))
 }
 
 /// Builds the log record for a single tab waiting for its agent upgrade.
@@ -2833,7 +2799,6 @@ pub(crate) fn agent_upgrade_waiting_in(
     Message::new(tags::HARNESS, Severity::Info, title)
         .line(row.waiting_line(&from))
         .line(format!("{place} \u{00b7} {}", clean(&row.move_words())))
-        .no_excerpt()
         .hold(Hold::LogOnly)
         .key(KEY_AGENT_UPGRADE)
 }
@@ -7172,7 +7137,7 @@ pub(crate) fn agent_upgrade_word_refused(
                 msg.detail.insert(0, words.to_string());
                 msg
             }
-            None => msg.no_excerpt(),
+            None => msg,
         }
     };
     if again && !tab.is_empty() && !to.is_empty() {
@@ -7221,7 +7186,6 @@ pub(crate) fn agent_upgrade_held(
         &format!("{why}, so nothing was written for {shown}"),
         Then::step(then),
     )
-    .no_excerpt()
 }
 
 /// Why an owner's upgrade word was refused, short enough for the top rule's label slot
@@ -7428,9 +7392,7 @@ pub(crate) fn packages_verb_row(verb: PackagesVerb) -> Message {
     };
     Message::new(tags::TOOLCHAIN, Severity::Info, verb.title())
         .glyph(Glyph::or_fallback(glyph))
-        .loads(crate::toolchain_words::PASS_LOADS)
         .primary_load(primary)
-        .no_excerpt()
         .meter(aterm_messages::Meter {
             load,
             ..aterm_messages::Meter::busy("")
@@ -7445,8 +7407,6 @@ pub(crate) fn packages_verb_row(verb: PackagesVerb) -> Message {
 pub(crate) fn packages_waiting_row(verb: PackagesVerb) -> Message {
     Message::new(tags::TOOLCHAIN, Severity::Info, WAITING_FOR_ALAB)
         .glyph(Glyph::or_fallback('\u{23f8}'))
-        .loads(crate::toolchain_words::PASS_LOADS)
-        .no_excerpt()
         .meter(aterm_messages::Meter::busy(""))
         .working(Duration::from_secs(crate::ATPKG_WAIT_LOCK_SECS) + Duration::from_mins(5))
         .key(crate::toolchain_words::KEY_PASS)

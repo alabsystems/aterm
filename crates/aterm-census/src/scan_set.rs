@@ -103,6 +103,37 @@ pub fn reviewed_forks(root: &Path) -> Result<Vec<ReviewedFork>, String> {
     Ok(out)
 }
 
+/// The Cargo package names whose source trees carry fork obligations: every reviewed vendored
+/// fork and every absorbed upstream crate. The policy and each absorbed crate's own manifest are
+/// the authorities; callers never maintain a second roster.
+///
+/// # Errors
+/// The fork ledger or an absorbed crate's manifest cannot be read or parsed.
+pub fn fork_packages(root: &Path) -> Result<Vec<String>, String> {
+    if !root.join(FORK_LEDGER).is_file() {
+        return Err(format!(
+            "cannot read {FORK_LEDGER}: the authoritative fork ledger is missing (fail-closed)"
+        ));
+    }
+    let mut packages: Vec<String> = reviewed_forks(root)?
+        .into_iter()
+        .map(|fork| fork.package)
+        .collect();
+    for row in ABSORBED_CRATES {
+        let package = load_manifest(root, row.path)?.name;
+        if package.is_empty() {
+            return Err(format!(
+                "{}/Cargo.toml has no package.name for absorbed fork `{}` (fail-closed)",
+                row.path, row.upstream
+            ));
+        }
+        packages.push(package);
+    }
+    packages.sort_unstable();
+    packages.dedup();
+    Ok(packages)
+}
+
 fn intern(s: &str) -> &'static str {
     static NAMES: std::sync::OnceLock<std::sync::Mutex<BTreeSet<&'static str>>> =
         std::sync::OnceLock::new();
@@ -2019,6 +2050,26 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::*;
     use crate::scan_set::test_fixtures::synth_tree;
+
+    #[test]
+    fn the_forge_package_roster_comes_from_both_authoritative_registries() {
+        let files = test_fixtures::workspace_manifests(&[]);
+        let root = test_fixtures::disk_tree("aterm-fork-packages", "both", &files);
+        let packages = fork_packages(&root).expect("the fixture registries parse");
+        assert!(packages.contains(&test_fixtures::FIXTURE_FORK.0.to_string()));
+        for row in ABSORBED_CRATES {
+            assert!(
+                packages.contains(&test_fixtures::member_name(row).to_string()),
+                "{} is in the absorbed registry: {packages:?}",
+                row.path
+            );
+        }
+        let absent = test_fixtures::synth_tree("aterm-fork-packages", "absent", &[]);
+        assert!(
+            fork_packages(&absent).is_err(),
+            "a missing authority must pull Forge fail-closed, not look like an empty roster"
+        );
+    }
 
     fn with_src(mut files: Vec<(String, String)>) -> Vec<(String, String)> {
         let dirs: Vec<String> = files

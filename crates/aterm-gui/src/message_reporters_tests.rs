@@ -342,7 +342,7 @@ fn who_set_it_is_the_records_last_line_never_its_title() {
 }
 
 #[test]
-fn only_an_interrupt_stands_on_the_band() {
+fn only_an_interrupt_is_a_standing_row() {
     use aterm_agent::harness::upgrade::{Agent, GAVE_UP, Phase};
     use aterm_agent::harness::upgrade_drive::{Attention, HeldBy, Row};
     const NOW: u64 = 1_790_311_076;
@@ -630,7 +630,7 @@ fn a_tab_held_aside_is_said_by_whose_hand_holds_it() {
 }
 
 #[test]
-fn the_owners_upgrade_now_is_answered_on_the_glass() {
+fn the_owners_upgrade_now_is_answered_by_a_notice() {
     use aterm_agent::harness::upgrade::{Phase, Request};
     use aterm_agent::harness::upgrade_drive::Row;
     const NOW: u64 = 1_790_311_076;
@@ -2225,7 +2225,7 @@ fn a_retired_spelling_is_a_record_and_never_counted_as_an_unknown_key() {
 }
 
 #[test]
-fn an_afresh_moves_band_row_names_its_marks_command() {
+fn an_afresh_moves_row_names_its_marks_command() {
     use aterm_agent::harness::upgrade::Phase;
     use aterm_agent::harness::upgrade_drive::Row;
     const NOW: u64 = 1_790_311_076;
@@ -2574,7 +2574,7 @@ fn a_stall_is_the_same_by_its_words_wherever_its_tab_now_stands() {
     let (a, b) = ("s-c543f4e0edd3439e5791", "s-0df27d3bf4b3b704621e");
     let row_a = agent_upgrade_stalled(&refused(a), NOW, "in tab 2");
     let row_b = agent_upgrade_stalled(&refused(b), NOW, "in tab 5");
-    assert_ne!(row_a.title, row_b.title, "the band tells them apart");
+    assert_ne!(row_a.title, row_b.title, "the titles tell them apart");
     assert!(
         row_a.detail[..=STALL_MOVE_LINE]
             .iter()
@@ -3156,7 +3156,7 @@ fn disk_full_faults(msg: &Message, cause: DiskFullCause, left: &str) -> Vec<Stri
     let mut out: Vec<String> = ask.fault().map(str::to_owned).into_iter().collect();
     let (why, then) = (ask.why().words(), ask.then().words().to_owned());
     if msg.detail.first() != Some(&then) {
-        out.push("the band does not open on the step".to_owned());
+        out.push("the detail does not open on the step".to_owned());
     }
     if msg.detail.get(1) != Some(&why) {
         out.push("Details do not show the cause".to_owned());
@@ -3621,7 +3621,7 @@ fn the_disk_full_alert_states_its_cause_once_and_shows_its_step() {
         "1.0 MiB",
     );
     assert!(
-        spent.contains(&"the band does not open on the step".to_owned())
+        spent.contains(&"the detail does not open on the step".to_owned())
             && spent.contains(&"says aterm took all it may on 2 lines".to_owned()),
         "{spent:?}"
     );

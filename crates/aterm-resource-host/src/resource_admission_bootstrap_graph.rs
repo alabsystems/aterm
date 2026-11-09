@@ -19,10 +19,11 @@ use trust_resource_controller::bootstrap_graph as wire;
 
 #[path = "resource_admission_bootstrap_graph/custody.rs"]
 mod input_custody;
+pub(super) use input_custody::OriginalOutput;
 pub(crate) use input_custody::{EnrollmentAttachment, OutputTransfer, Preparing, Support};
 #[path = "resource_admission_bootstrap_graph/query_gate.rs"]
 mod query_gate;
-pub(super) use query_gate::QueryOperation;
+pub(super) use query_gate::{ObjectOperation, QueryOperation};
 
 pub(super) const MAX_ROOT_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 

@@ -38,22 +38,21 @@ fn get(limit: u64) -> WireRequest<'static> {
     )
 }
 
-/// The kept names in the order `twenty_headers` sends them.
+/// The kept names in the order [`mixed_headers`] sends them.
 fn sent_order() -> Vec<&'static str> {
     KEPT_HEADERS.iter().rev().copied().collect()
 }
 
-/// Twenty headers: the fifteen kept ones in upper case and in reverse order, among five that
-/// are not.
-fn twenty_headers() -> Vec<(String, String)> {
+/// Every kept header in upper case and reverse order, interleaved with dropped headers.
+fn mixed_headers() -> Vec<(String, String)> {
     let mut headers = Vec::new();
     for (i, name) in KEPT_HEADERS.iter().enumerate().rev() {
-        headers.push((name.to_ascii_uppercase(), format!("v{i}")));
+        headers.push((name.to_ascii_uppercase(), format!("value-{name}")));
         if i % 3 == 0 {
             headers.push((format!("X-Dropped-{i}"), "d".to_string()));
         }
     }
-    assert_eq!(headers.len(), 20);
+    assert_eq!(headers.len(), KEPT_HEADERS.len() + 6);
     headers
 }
 
@@ -103,7 +102,7 @@ fn gh_keeps_the_kept_headers_and_reads_the_body() {
     let transport = ScriptedTransport::new();
     transport.push(Scripted::Answer {
         status: 200,
-        headers: twenty_headers(),
+        headers: mixed_headers(),
         body: b"{\"login\":\"x\"}".to_vec(),
     });
     let mut answer = fx
@@ -112,7 +111,7 @@ fn gh_keeps_the_kept_headers_and_reads_the_body() {
         .expect("an answer");
     let names: Vec<&str> = answer.headers.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, sent_order());
-    assert_eq!(answer.header("etag"), Some("v1"));
+    assert_eq!(answer.header("etag"), Some("value-etag"));
     let mut body = Vec::new();
     answer.body.read_to_end(&mut body).expect("the body");
     assert_eq!(body, b"{\"login\":\"x\"}");
@@ -157,7 +156,7 @@ fn gh_stream_cuts_the_headers_and_leaves_the_body() {
     let transport = ScriptedTransport::new();
     transport.push(Scripted::Answer {
         status: 200,
-        headers: twenty_headers(),
+        headers: mixed_headers(),
         body: b"streamed".to_vec(),
     });
     let mut answer = fx
@@ -166,7 +165,7 @@ fn gh_stream_cuts_the_headers_and_leaves_the_body() {
         .expect("an answer");
     let names: Vec<&str> = answer.headers.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(names, sent_order());
-    assert_eq!(answer.header("etag"), Some("v1"));
+    assert_eq!(answer.header("etag"), Some("value-etag"));
     let mut body = Vec::new();
     answer.body.read_to_end(&mut body).expect("the body");
     assert_eq!(body, b"streamed");

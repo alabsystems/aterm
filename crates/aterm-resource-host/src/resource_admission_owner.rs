@@ -27,6 +27,9 @@ use std::{
 #[path = "resource_admission_bootstrap_graph.rs"]
 pub(super) mod bootstrap_graph;
 
+#[path = "resource_admission_bootstrap_object.rs"]
+pub(super) mod bootstrap_object;
+
 #[path = "resource_admission_bootstrap_query.rs"]
 mod bootstrap_query;
 #[path = "resource_admission_compiler.rs"]

@@ -1905,7 +1905,7 @@ impl<'a> Releases<'a> {
         )
         .origin(OriginRole::Uploads)
         .query("name", name)
-        .deadlines(Deadlines::for_transfer(file.len));
+        .deadlines(Deadlines::for_upload(file.len));
         let ours = file.sha256;
         let mut others = 0u32;
         // What the guard's DELETE of this call's own left asset may have done: every error

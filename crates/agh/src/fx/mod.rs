@@ -9,14 +9,14 @@ pub mod child;
 mod sim;
 pub mod tape;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 #[cfg(any(unix, test))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aterm_types::MutexExt;
+use aterm_types::{MutexExt, http_retry::Retry};
 
 /// A real elapsed native validation phase, observed only on a simulated client.
 /// The span includes dispatch and result checking; it is not CPU time inside Git.
@@ -70,6 +70,8 @@ pub const DOOR_GH: &str = "gh";
 pub const DOOR_SLEEP: &str = "sleep";
 /// stdout's door: an emit of the bytes as rendered.
 pub const DOOR_STDOUT: &str = "stdout";
+/// One admitted HTTP retry's cause and bounded wait: an emit of its diagnostic line.
+pub const DOOR_RETRY: &str = "retry";
 /// The exit's door: an emit of the exit code in decimal.
 pub const DOOR_EXIT: &str = "exit";
 /// A routing decision's door (design §21.3): an exchange, the decision's inputs out and the
@@ -1219,6 +1221,35 @@ impl Fx {
         }
     }
 
+    /// Every admitted retry's diagnostic, in order: simulated only, empty in every other mode.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn retry_notes(&self) -> Vec<String> {
+        match &self.seam {
+            Seam::Simulated(clock) => clock.retry_notes(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Log one admitted HTTP retry with its exact cause, and put that derived output on a tape.
+    ///
+    /// # Errors
+    ///
+    /// A replay whose retry decision or cause differs from the recording.
+    pub(crate) fn note_retry(&self, retry: Retry) -> Result<()> {
+        let line = format!("agh: retry {retry}");
+        #[cfg(any(test, debug_assertions))]
+        if let Seam::Simulated(clock) = &self.seam {
+            clock.note_retry(line);
+            return Ok(());
+        }
+
+        self.emit_taped(DOOR_RETRY, line.as_bytes())?;
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, "{line}");
+        Ok(())
+    }
+
     /// A routing decision. Live and simulated: `decide()`. Recording a `mode credentialed`
     /// tape: `decide()`, taped as an exchange at `DOOR_ROUTE` (`canon::route_request`,
     /// `canon::route_reply`). Replaying one: the tape's decision for the same inputs, and
@@ -1464,6 +1495,12 @@ impl Fx {
                 child::check(spec)?;
                 let _ordinal = clock.log(spec);
                 #[cfg(unix)]
+                if let Some(answer) = clock.next_git() {
+                    return answer.ok_or_else(|| {
+                        Error::local("scripted Git transport has no answer queued")
+                    });
+                }
+                #[cfg(unix)]
                 let observer = clock.git_child_observer();
                 #[cfg(unix)]
                 let started = observer.map(|_| std::time::Instant::now());
@@ -1633,6 +1670,28 @@ impl Fx {
         };
         clock.script(children);
         self
+    }
+
+    /// Tests: answer each accepted simulated Git child from `answers`, without running Git.
+    /// An installed script is fail-closed: one more child than answers is a local error.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    #[must_use]
+    pub fn with_git_answers_for_tests(self, answers: Vec<child::ChildOut>) -> Fx {
+        let Seam::Simulated(clock) = &self.seam else {
+            panic!("scripted Git answers require simulated Fx");
+        };
+        clock.script_git(answers);
+        self
+    }
+
+    /// Tests: the number of injected Git answers not consumed, or `None` when real Git runs.
+    #[cfg(all(unix, any(test, debug_assertions)))]
+    #[must_use]
+    pub fn git_answers_remaining_for_tests(&self) -> Option<usize> {
+        match &self.seam {
+            Seam::Simulated(clock) => clock.git_remaining(),
+            _ => None,
+        }
     }
 
     /// Tests: every spec `child` or `git` accepted (one `child::check` passed) under a simulated

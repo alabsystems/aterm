@@ -70,15 +70,6 @@ pub(crate) fn outcome(result: Result<String, Halt>) -> LaneRun {
     }
 }
 
-/// A program this box lacks is a box fact; any other spawn error is a failure.
-fn spawn_halt(what: &str, e: &std::io::Error, fix: &str) -> Halt {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        Halt::skip(format!("{what} is not installed"), fix)
-    } else {
-        Halt::Fail(format!("could not run {what}: {e}"))
-    }
-}
-
 /// The arena lanes' options, parsed and range-checked.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct Args {
@@ -411,6 +402,34 @@ pub(crate) struct Ghostty {
     pub sha256: String,
 }
 
+/// A Ghostty tip DMG is measured in tens of MiB. Bound a replacement before its pinned digest is
+/// checked, without making an elapsed-time budget stand in for transfer progress.
+const GHOSTTY_DMG_CAP: u64 = 1 << 30;
+
+/// Fetch the pinned DMG into its quarantine path. The shared transport keeps its own resumable
+/// `<quarantine>.part` on a transient failure; only the caller's digest check can move
+/// `quarantine` onto the arena's cache path.
+fn download_ghostty_dmg_with(
+    url: &str,
+    quarantine: &Path,
+    fetch: impl FnOnce(&str, &Path, u64) -> Result<(), String>,
+) -> Result<(), Halt> {
+    fetch(url, quarantine, GHOSTTY_DMG_CAP).map_err(|why| {
+        Halt::skip(
+            format!("the pinned ghostty dmg could not be downloaded: {why}"),
+            "check the network, or pass --dmg PATH",
+        )
+    })
+}
+
+fn download_ghostty_dmg(url: &str, quarantine: &Path) -> Result<(), Halt> {
+    download_ghostty_dmg_with(
+        url,
+        quarantine,
+        aterm_update_core::download_to_resumable_https_only,
+    )
+}
+
 pub(crate) fn ghostty_tip(pins: &Pins, dmg: Option<&Path>) -> Result<Ghostty, Halt> {
     let tip = &pins.ghostty.tip;
     let arena = arena_dir()?;
@@ -422,22 +441,7 @@ pub(crate) fn ghostty_tip(pins: &Pins, dmg: Option<&Path>) -> Result<Ghostty, Ha
             if !d.is_file() {
                 eprintln!("downloading {}", tip.artifact);
                 let part = d.with_extension("part");
-                let out = command(aterm_uds::os_path!("curl"))
-                    .args(["-sSfL", "-o"])
-                    .arg(&part)
-                    .arg(&tip.artifact)
-                    .output()
-                    .map_err(|e| spawn_halt("curl", &e, "install curl, or pass --dmg PATH"))?;
-                if !out.status.success() {
-                    return Err(Halt::skip(
-                        format!(
-                            "the pinned ghostty dmg could not be downloaded ({}): {}",
-                            out.status,
-                            String::from_utf8_lossy(&out.stderr).trim()
-                        ),
-                        "check the network, or pass --dmg PATH",
-                    ));
-                }
+                download_ghostty_dmg(&tip.artifact, &part)?;
                 if sha256_file(&part)? != tip.artifact_sha256 {
                     let _ = std::fs::remove_file(&part);
                     return Err(Halt::Fail(format!(
@@ -945,6 +949,42 @@ mod tests {
         let p = pins().expect("manifest.toml parses into the typed pins");
         assert_eq!(p.ghostty.tip.artifact_sha256.len(), 64);
         assert_eq!(p.harness.vtebench.commit.len(), 40);
+    }
+
+    /// The arena hands the unverified bytes to the shared, bounded transport at a quarantine
+    /// path. NEGATIVE CONTROL: an injected refusal is returned without creating or naming the
+    /// final cache path; changing the call to target the cache directly breaks these assertions.
+    #[test]
+    fn the_ghostty_dmg_uses_the_bounded_resumable_quarantine_transport() {
+        let root = Scratch::new("ghostty-fetch").expect("scratch");
+        let cached = root.path().join("Ghostty-tip.dmg");
+        let quarantine = cached.with_extension("part");
+        let mut asked = None;
+        let result = download_ghostty_dmg_with(
+            "https://example.invalid/Ghostty.dmg",
+            &quarantine,
+            |url, destination, cap| {
+                asked = Some((url.to_string(), destination.to_path_buf(), cap));
+                Err("HTTP 504 after 19 attempts / 200s total retry-pause bound".to_string())
+            },
+        );
+        let Halt::Skip { why, fix } = result.expect_err("the injected transport refused") else {
+            panic!("a transport refusal is a skip")
+        };
+        assert_eq!(
+            asked,
+            Some((
+                "https://example.invalid/Ghostty.dmg".to_string(),
+                quarantine,
+                GHOSTTY_DMG_CAP,
+            ))
+        );
+        assert!(why.contains("HTTP 504 after 19 attempts / 200s"), "{why}");
+        assert!(fix.contains("--dmg"), "{fix}");
+        assert!(
+            !cached.exists(),
+            "unverified bytes never reach the cache path"
+        );
     }
 
     #[test]

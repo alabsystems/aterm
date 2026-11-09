@@ -10,8 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use aterm_json::Value;
+use aterm_types::http_retry::{Budget, Cause, Decision, Policy, Retry};
 use aterm_uds::secret::Secret;
-use aterm_uds::spawnfd::{Child, Command, Stdio};
+use aterm_uds::spawnfd::{Command, Stdio};
 
 use crate::http::{VENDOR_ENV_SCRUB, VendorScratch, curl_command};
 
@@ -35,6 +36,11 @@ const STALL_SECS: &str = "300";
 const HEADERS_CAP: u64 = 1 << 20;
 /// The variables a GitHub token is exported in.
 const TOKEN_ENV: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
+/// Short partial transfers may earn this many immediate resumes. Beyond it, every resume must
+/// have advanced by at least [`RESUME_EARNED_AT`].
+const SHORT_RESUMES: u32 = 16;
+/// Progress that earns another large-transfer attempt after [`SHORT_RESUMES`] short ones.
+const RESUME_EARNED_AT: u64 = 1 << 20;
 
 /// The origins a client talks to: the api and uploads origins carry the token.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -364,10 +370,8 @@ impl Exchange {
     /// [`RestError::Malformed`] for an answer over its cap; [`RestError::Transport`] when curl
     /// reached no answer.
     pub fn answer(self) -> Result<Answer, RestError> {
-        if self.exit == Some(63)
-            || self.stderr.contains("Maximum file size exceeded")
-            || self.body.len() as u64 > JSON_CAP
-        {
+        let retry_after_secs = retry_after_header(&self.headers, "retry-after");
+        if answer_exceeds_cap(self.exit, self.status, &self.stderr, self.body.len() as u64) {
             return Err(RestError::Malformed(format!(
                 "GitHub's answer exceeds its {JSON_CAP}-byte cap"
             )));
@@ -378,13 +382,25 @@ impl Exchange {
                 headers: self.headers,
                 body: self.body,
             }),
-            (exit, _) => Err(RestError::Transport(format!(
-                "curl reached no answer ({}): {}",
-                exit.map_or_else(|| "ended by a signal".to_string(), |c| format!("exit {c}")),
-                self.stderr.trim()
-            ))),
+            (exit, status) => Err(RestError::Transport {
+                exit,
+                status,
+                retry_after_secs,
+                message: format!(
+                    "curl reached no answer ({}): {}",
+                    exit.map_or_else(|| "ended by a signal".to_string(), |c| format!("exit {c}")),
+                    self.stderr.trim()
+                ),
+            }),
         }
     }
+}
+
+fn answer_exceeds_cap(exit: Option<i32>, status: Option<u16>, stderr: &str, body_len: u64) -> bool {
+    !matches!(status, Some(400..=599))
+        && (exit == Some(63)
+            || body_len > JSON_CAP
+            || stderr.contains("Maximum file size exceeded"))
 }
 
 /// An HTTP answer.
@@ -406,6 +422,13 @@ impl Answer {
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// A valid `Retry-After` as a delay in seconds. HTTP-date values are measured from now;
+    /// malformed values are not a retry instruction for the bounded anonymous-read policy.
+    #[must_use]
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        retry_after_header(&self.headers, "retry-after")
     }
 
     /// GitHub's own words for this answer.
@@ -460,10 +483,14 @@ impl Answer {
                 self.header("location")
                     .map_or(std::borrow::Cow::Borrowed("no Location"), origin_of)
             ))),
-            status => Err(RestError::Status {
-                status,
-                message: self.message(),
-            }),
+            status => {
+                let retry_after_secs = self.retry_after_secs();
+                Err(RestError::Status {
+                    status,
+                    retry_after_secs,
+                    message: self.message(),
+                })
+            }
         }
     }
 
@@ -474,6 +501,23 @@ impl Answer {
         aterm_json::from_slice(&self.body)
             .map_err(|_| RestError::Malformed("GitHub's answer is not JSON".into()))
     }
+}
+
+/// Header `name` as a `Retry-After` delay measured from `now_unix_secs`.
+fn retry_after_header_at(
+    headers: &[(String, String)],
+    name: &str,
+    now_unix_secs: Option<u64>,
+) -> Option<u64> {
+    headers
+        .iter()
+        .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+        .and_then(|value| aterm_types::http_retry::retry_after_delay_secs(value, now_unix_secs))
+}
+
+fn retry_after_header(headers: &[(String, String)], name: &str) -> Option<u64> {
+    retry_after_header_at(headers, name, aterm_time::unix_secs())
 }
 
 /// The scheme and host/port of `url`, never its userinfo, path, or query (a CDN URL's signature).
@@ -506,12 +550,23 @@ fn origin_of(url: &str) -> std::borrow::Cow<'_, str> {
 pub enum RestError {
     /// Refused here before curl ran.
     Local(String),
-    /// curl reached no answer.
-    Transport(String),
+    /// curl reached no usable answer.
+    Transport {
+        /// curl's exit code, when a child ran and exited normally.
+        exit: Option<i32>,
+        /// The HTTP status curl observed before the transport failed, when it reported one.
+        status: Option<u16>,
+        /// A valid `Retry-After` response header, converted to seconds.
+        retry_after_secs: Option<u64>,
+        /// The diagnostic.
+        message: String,
+    },
     /// GitHub answered a status the call does not take, in its own words.
     Status {
         /// The status.
         status: u16,
+        /// A valid `Retry-After` response header, converted to seconds.
+        retry_after_secs: Option<u64>,
         /// GitHub's message ([`Answer::message`]).
         message: String,
     },
@@ -522,12 +577,96 @@ pub enum RestError {
 }
 
 impl RestError {
-    /// The HTTP status GitHub answered, for [`RestError::Status`].
+    /// The HTTP status GitHub answered, including one observed before a transport failure.
     #[must_use]
     pub const fn status(&self) -> Option<u16> {
         match self {
             Self::Status { status, .. } => Some(*status),
+            Self::Transport { status, .. } => *status,
             _ => None,
+        }
+    }
+
+    /// curl's exit code for a transport failure, when one ran to an exit.
+    #[must_use]
+    pub const fn curl_exit(&self) -> Option<i32> {
+        match self {
+            Self::Transport { exit, .. } => *exit,
+            _ => None,
+        }
+    }
+
+    /// A valid `Retry-After` response header, converted to seconds.
+    #[must_use]
+    pub const fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::Status {
+                retry_after_secs, ..
+            }
+            | Self::Transport {
+                retry_after_secs, ..
+            } => *retry_after_secs,
+            _ => None,
+        }
+    }
+
+    /// The shared anonymous-read policy's transient cause, when asking this idempotent read
+    /// again can change the result. An answered 4xx takes precedence over curl's exit code.
+    #[must_use]
+    pub const fn retry_cause(&self) -> Option<Cause> {
+        match self {
+            Self::Status {
+                status,
+                retry_after_secs,
+                ..
+            } => Cause::from_http(*status, *retry_after_secs),
+            Self::Transport {
+                exit,
+                status,
+                retry_after_secs,
+                ..
+            } => Cause::from_curl(*exit, *status, *retry_after_secs),
+            Self::Local(_) | Self::Redirect(_) | Self::Malformed(_) => None,
+        }
+    }
+
+    /// Curl could not continue a partial response because the server declined the requested
+    /// range. One fresh request can still complete the same idempotent read.
+    fn resume_refused(&self) -> bool {
+        self.curl_exit() == Some(33) && !self.status().is_some_and(|status| status >= 400)
+    }
+
+    /// Preserve this error's classification while naming the retry bound that was exhausted.
+    fn after_bound(self, bound: &str) -> Self {
+        let suffix = format!(" after {bound}");
+        match self {
+            Self::Transport {
+                exit,
+                status,
+                retry_after_secs,
+                mut message,
+            } => {
+                message.push_str(&suffix);
+                Self::Transport {
+                    exit,
+                    status,
+                    retry_after_secs,
+                    message,
+                }
+            }
+            Self::Status {
+                status,
+                retry_after_secs,
+                mut message,
+            } => {
+                message.push_str(&suffix);
+                Self::Status {
+                    status,
+                    retry_after_secs,
+                    message,
+                }
+            }
+            other => other,
         }
     }
 
@@ -541,10 +680,11 @@ impl RestError {
 impl std::fmt::Display for RestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Local(m) | Self::Transport(m) | Self::Redirect(m) | Self::Malformed(m) => {
-                f.write_str(m)
-            }
-            Self::Status { status, message } => write!(f, "HTTP {status}: {message}"),
+            Self::Local(m) | Self::Redirect(m) | Self::Malformed(m) => f.write_str(m),
+            Self::Transport { message, .. } => f.write_str(message),
+            Self::Status {
+                status, message, ..
+            } => write!(f, "HTTP {status}: {message}"),
         }
     }
 }
@@ -601,8 +741,58 @@ fn not_started(e: std::io::Error) -> RestError {
     if e.kind() == std::io::ErrorKind::Interrupted {
         RestError::Local(format!("curl not started: {e}"))
     } else {
-        RestError::Transport(format!("cannot start curl: {e}"))
+        RestError::Transport {
+            exit: None,
+            status: None,
+            retry_after_secs: None,
+            message: format!("cannot start curl: {e}"),
+        }
     }
+}
+
+/// Record every admitted retry, then observe the shared policy's pause. Unit tests inject the
+/// operation and do not spend wall time on the production backoff.
+fn wait_before_retry(what: &str, retry: Retry, wait: bool) {
+    crate::http::note_retry(format!("anonymous HTTPS read ({what}): {retry}"));
+    #[cfg(test)]
+    let _ = wait;
+    #[cfg(not(test))]
+    if wait {
+        let pause = if aterm_types::dev_seam!(aterm_types::domain::ENV_DEV_FAST_TIMERS).is_some() {
+            retry.pause / 1000
+        } else {
+            retry.pause
+        };
+        if !pause.is_zero() {
+            std::thread::sleep(pause);
+        }
+    }
+}
+
+/// A regular file's length, or zero when no file exists yet.
+fn staged_len(path: &Path) -> Result<u64, RestError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(meta.len()),
+        Ok(_) => Err(RestError::Local(format!(
+            "the staged GitHub asset {} is not a regular file",
+            path.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(RestError::Local(format!(
+            "inspect staged GitHub asset {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// The finite number of progress-earned resumes for a transfer capped at `cap`: sixteen short
+/// advances, then no more than one resume for each whole MiB the completed payload can hold.
+const fn progress_resume_bound(cap: u64) -> u64 {
+    (SHORT_RESUMES as u64).saturating_add(cap / RESUME_EARNED_AT)
+}
+
+const fn progress_earns_resume(moved: u64, short: u32, resumes: u64, cap: u64) -> bool {
+    resumes < progress_resume_bound(cap) && (moved >= RESUME_EARNED_AT || short < SHORT_RESUMES)
 }
 
 /// At most `cap + 1` bytes of `path`; a file curl never wrote (no answer, or an empty one) is empty.
@@ -680,6 +870,7 @@ pub struct Client {
     origins: Origins,
     token: Option<Token>,
     spawn: Arc<dyn Spawn>,
+    wait_for_retry: bool,
 }
 
 impl std::fmt::Debug for Client {
@@ -699,6 +890,7 @@ impl Client {
             origins,
             token,
             spawn: Arc::new(Direct),
+            wait_for_retry: true,
         }
     }
 
@@ -706,6 +898,16 @@ impl Client {
     #[must_use]
     pub fn with_spawn(self, spawn: Arc<dyn Spawn>) -> Client {
         Client { spawn, ..self }
+    }
+
+    /// Test/dev seam: record retries but spend no wall time on their pauses.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn without_retry_wait(self) -> Client {
+        Client {
+            wait_for_retry: false,
+            ..self
+        }
     }
 
     /// The origins.
@@ -968,108 +1170,329 @@ impl Client {
             )),
             status => Err(RestError::Status {
                 status,
+                retry_after_secs: answer.retry_after_secs(),
                 message: answer.message(),
             }),
         }
     }
 
-    /// The anonymous CDN curl for `url`.
-    fn cdn_command(&self, url: &str, to: Option<(&str, u64)>) -> Command {
-        let cap = to.map(|(_, cap)| cap.to_string());
+    /// One status-reporting, redirect-refusing CDN transfer into `staged`. `offset` resumes a
+    /// partial transfer and `remaining_cap` bounds only the response remainder, keeping the
+    /// completed file within the caller's total cap.
+    fn cdn_download_attempt(
+        &self,
+        url: &str,
+        staged: &Path,
+        headers: &Path,
+        remaining_cap: u64,
+        offset: u64,
+    ) -> Result<(), RestError> {
+        let path_arg = |path: &Path| {
+            path.to_str()
+                .map(str::to_string)
+                .ok_or_else(|| RestError::Local(format!("{} is not UTF-8", path.display())))
+        };
+        let staged_arg = path_arg(staged)?;
+        let headers_arg = path_arg(headers)?;
+        let total_cap = remaining_cap.saturating_add(offset);
+        let cap = remaining_cap.to_string();
+        let offset = offset.to_string();
+        let _ = std::fs::remove_file(headers);
         let mut args = vec![
-            "-sS",
-            "--globoff",
-            "--fail",
-            "-L",
-            "--max-redirs",
-            "0",
-            "--connect-timeout",
-            CONNECT_SECS,
-            "--speed-limit",
-            STALL_BYTES,
-            "--speed-time",
-            STALL_SECS,
-            "-H",
-            "Accept: application/octet-stream",
+            "-sS".to_string(),
+            "--globoff".to_string(),
+            "--fail".to_string(),
+            "-L".to_string(),
+            "--max-redirs".to_string(),
+            "0".to_string(),
+            "--connect-timeout".to_string(),
+            CONNECT_SECS.to_string(),
+            "--speed-limit".to_string(),
+            STALL_BYTES.to_string(),
+            "--speed-time".to_string(),
+            STALL_SECS.to_string(),
+            "-H".to_string(),
+            "Accept: application/octet-stream".to_string(),
+            "-D".to_string(),
+            headers_arg,
+            "-o".to_string(),
+            staged_arg,
+            "-w".to_string(),
+            "%{http_code}".to_string(),
+            "--max-filesize".to_string(),
+            cap,
         ];
+        if offset != "0" {
+            args.extend(["--continue-at".to_string(), offset]);
+        }
         if self.origins.https() {
-            args.extend(["--proto", "=https", "--proto-redir", "=https"]);
+            args.extend(["--proto", "=https", "--proto-redir", "=https"].map(String::from));
         }
-        if let (Some((dest, _)), Some(cap)) = (to, cap.as_deref()) {
-            args.extend(["-o", dest, "--max-filesize", cap]);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self
+            .spawn
+            .run(&mut curl(&argv, url), None)
+            .map_err(not_started)?;
+        let status = String::from_utf8_lossy(&out.stdout);
+        let status = status
+            .trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|status| *status != 0);
+        let headers = read_capped(headers, HEADERS_CAP)
+            .map(|dump| last_block(&String::from_utf8_lossy(&dump)))
+            .map_err(|e| RestError::Local(format!("read the asset CDN's headers: {e}")))?;
+        let retry_after_secs = retry_after_header(&headers, "retry-after");
+        if out.status.success() {
+            return match status {
+                Some(200..=299) => Ok(()),
+                Some(status) => Err(RestError::Status {
+                    status,
+                    retry_after_secs,
+                    message: format!("the asset CDN answered HTTP {status}"),
+                }),
+                None => Err(RestError::Malformed(
+                    "the asset CDN answered no readable HTTP status".into(),
+                )),
+            };
         }
-        curl(&args, url)
+        Err(cdn_failure(
+            out.status.code(),
+            status,
+            retry_after_secs,
+            &String::from_utf8_lossy(&out.stderr),
+            total_cap,
+        ))
     }
 
-    /// The bytes of the asset at `asset_path`, streaming.
-    /// # Errors
-    /// As [`Client::asset_location`]; [`RestError::Transport`] when curl could not be started.
-    pub fn open_asset(&self, asset_path: &str) -> Result<Child, RestError> {
-        let location = self.asset_location(asset_path)?;
-        self.cdn_command(&location, None)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| RestError::Transport(format!("cannot start curl: {e}")))
-    }
-
-    /// Download the asset at `asset_path` into `dest`, at most `cap` bytes.
+    /// Download the asset at `asset_path` into `dest`, at most `cap` bytes. The API location
+    /// and the anonymous CDN transfer both use the shared retry policy. Bytes stay in a private
+    /// sibling staging directory and are atomically renamed onto `dest` only after a complete
+    /// transfer. A transient failure after progress resumes at that byte; sixteen short advances
+    /// plus one for every whole MiB under `cap` bound progress-earned attempts, while failures
+    /// without progress use [`Policy::STANDARD`].
     /// # Errors
     /// As [`Client::asset_location`]; [`RestError::Local`] for a non-UTF-8 `dest`; then
     /// [`RestError::Malformed`] over the cap, [`RestError::Status`] for the CDN's HTTP error,
     /// [`RestError::Redirect`] for a CDN that redirects again, and [`RestError::Transport`]
     /// otherwise.
     pub fn download_asset(&self, asset_path: &str, dest: &Path, cap: u64) -> Result<(), RestError> {
-        let location = self.asset_location(asset_path)?;
-        let dest_arg = dest
-            .to_str()
-            .ok_or_else(|| RestError::Local(format!("{} is not UTF-8", dest.display())))?;
-        let out = self
-            .spawn
-            .run(
-                &mut self.cdn_command(&location, Some((dest_arg, cap))),
-                None,
-            )
-            .map_err(not_started);
-        let failure = match out {
-            Err(e) => e,
-            Ok(out) if out.status.success() => return Ok(()),
-            Ok(out) => cdn_failure(
-                out.status.code(),
-                &String::from_utf8_lossy(&out.stderr),
-                cap,
-            ),
-        };
-        let _ = std::fs::remove_file(dest);
-        Err(failure)
+        self.download_asset_via(
+            asset_path,
+            dest,
+            cap,
+            |location, staged, headers, remaining_cap, offset| {
+                self.cdn_download_attempt(location, staged, headers, remaining_cap, offset)
+            },
+        )
+    }
+
+    /// [`Client::download_asset`] with its CDN transfer injected. The production method and the
+    /// negative controls exercise this same state machine.
+    fn download_asset_via(
+        &self,
+        asset_path: &str,
+        dest: &Path,
+        cap: u64,
+        mut transfer: impl FnMut(&str, &Path, &Path, u64, u64) -> Result<(), RestError>,
+    ) -> Result<(), RestError> {
+        if cap == 0 {
+            return Err(RestError::Local(
+                "refused a zero-byte GitHub asset download cap".into(),
+            ));
+        }
+        if dest.to_str().is_none() {
+            return Err(RestError::Local(format!("{} is not UTF-8", dest.display())));
+        }
+        let parent = dest
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let scratch = aterm_tempfile::Builder::new()
+            .prefix(".aterm-github-asset-")
+            .tempdir_in(parent)
+            .map_err(|e| {
+                RestError::Local(format!(
+                    "make a sibling staging directory for {}: {e}",
+                    dest.display()
+                ))
+            })?;
+        let staged = scratch.path().join("asset");
+        let headers = scratch.path().join("headers");
+
+        let mut idle_failures = 0_u32;
+        let mut idle_budget = Budget::new(Policy::STANDARD);
+        let mut progress_resumes = 0_u64;
+        let mut short_resumes = 0_u32;
+        let mut restarted_fresh = false;
+        loop {
+            let mut before = staged_len(&staged)?;
+            if before >= cap {
+                std::fs::remove_file(&staged).map_err(|e| {
+                    RestError::Local(format!(
+                        "reset full partial GitHub asset {}: {e}",
+                        staged.display()
+                    ))
+                })?;
+                before = 0;
+            }
+            let location = match self.asset_location(asset_path) {
+                Ok(location) => location,
+                Err(error) => {
+                    let Some(cause) = error.retry_cause() else {
+                        return Err(error);
+                    };
+                    idle_failures = idle_failures.saturating_add(1);
+                    match idle_budget.after(idle_failures, cause) {
+                        Decision::Retry(retry) => {
+                            wait_before_retry("GitHub asset location", retry, self.wait_for_retry);
+                            continue;
+                        }
+                        Decision::Exhausted => {
+                            return Err(error.after_bound(&idle_budget.bound()));
+                        }
+                    }
+                }
+            };
+            let remaining_cap = cap.saturating_sub(before);
+            match transfer(&location, &staged, &headers, remaining_cap, before) {
+                Ok(()) => {
+                    let size = staged_len(&staged)?;
+                    if size > cap {
+                        return Err(RestError::Malformed(format!(
+                            "the asset exceeds its {cap}-byte cap"
+                        )));
+                    }
+                    return std::fs::rename(&staged, dest).map_err(|e| {
+                        RestError::Local(format!(
+                            "place downloaded GitHub asset at {}: {e}",
+                            dest.display()
+                        ))
+                    });
+                }
+                Err(error) => {
+                    let mut after = staged_len(&staged)?;
+                    if before > 0 && !restarted_fresh && error.resume_refused() {
+                        std::fs::remove_file(&staged).map_err(|e| {
+                            RestError::Local(format!(
+                                "restart a GitHub asset whose CDN refused Range: {e}"
+                            ))
+                        })?;
+                        restarted_fresh = true;
+                        idle_failures = 0;
+                        idle_budget = Budget::new(Policy::STANDARD);
+                        crate::http::note_retry(format!(
+                            "anonymous HTTPS read (GitHub asset CDN): the CDN refused a Range \
+                             resume after {before} bytes — retrying once from byte zero"
+                        ));
+                        continue;
+                    }
+                    if error.status().is_some_and(|status| status >= 400) && after > before {
+                        if before == 0 {
+                            let _ = std::fs::remove_file(&staged);
+                        } else {
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .open(&staged)
+                                .and_then(|file| file.set_len(before))
+                                .map_err(|e| {
+                                    RestError::Local(format!(
+                                        "discard the asset CDN's error body: {e}"
+                                    ))
+                                })?;
+                        }
+                        after = before;
+                    }
+                    if after > cap {
+                        return Err(RestError::Malformed(format!(
+                            "the asset exceeds its {cap}-byte cap"
+                        )));
+                    }
+                    let Some(cause) = error.retry_cause() else {
+                        return Err(error);
+                    };
+                    let moved = after.saturating_sub(before);
+                    if moved > 0 && after < cap {
+                        if !progress_earns_resume(moved, short_resumes, progress_resumes, cap) {
+                            let bound =
+                                format!("{} progress-earned resumes", progress_resume_bound(cap));
+                            return Err(error.after_bound(&bound));
+                        }
+                        progress_resumes = progress_resumes.saturating_add(1);
+                        if moved < RESUME_EARNED_AT {
+                            short_resumes = short_resumes.saturating_add(1);
+                        }
+                        crate::http::note_retry(format!(
+                            "anonymous HTTPS read (GitHub asset CDN): attempt made {moved} bytes \
+                             of progress, then failed ({cause}) — resuming ({progress_resumes}/{})",
+                            progress_resume_bound(cap)
+                        ));
+                        idle_failures = 0;
+                        idle_budget = Budget::new(Policy::STANDARD);
+                        continue;
+                    }
+                    if after >= cap {
+                        let _ = std::fs::remove_file(&staged);
+                    }
+                    idle_failures = idle_failures.saturating_add(1);
+                    match idle_budget.after(idle_failures, cause) {
+                        Decision::Retry(retry) => {
+                            wait_before_retry("GitHub asset CDN", retry, self.wait_for_retry);
+                        }
+                        Decision::Exhausted => {
+                            return Err(error.after_bound(&idle_budget.bound()));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
 /// What a failed CDN curl means.
-fn cdn_failure(exit: Option<i32>, stderr: &str, cap: u64) -> RestError {
+fn cdn_failure(
+    exit: Option<i32>,
+    status: Option<u16>,
+    retry_after_secs: Option<u64>,
+    stderr: &str,
+    cap: u64,
+) -> RestError {
     let said = stderr.trim();
+    let answered_status = status.or_else(|| {
+        said.rsplit_once("returned error: ")
+            .and_then(|(_, tail)| tail.get(..3))
+            .filter(|code| code.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|code| code.parse().ok())
+    });
+    if let Some(status @ 400..=599) = answered_status {
+        return RestError::Status {
+            status,
+            retry_after_secs,
+            message: format!("the asset CDN refused it ({said})"),
+        };
+    }
     match exit {
+        Some(47) => {
+            RestError::Redirect(format!("the asset CDN redirected again; refused ({said})"))
+        }
         Some(63) => RestError::Malformed(format!("the asset exceeds its {cap}-byte cap")),
         _ if said.contains("Maximum file size exceeded") => {
             RestError::Malformed(format!("the asset exceeds its {cap}-byte cap"))
         }
         Some(22) => RestError::Status {
-            status: said
-                .rsplit_once("returned error: ")
-                .and_then(|(_, tail)| tail.get(..3))
-                .filter(|code| code.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|code| code.parse().ok())
-                .unwrap_or(0),
+            status: answered_status.unwrap_or(0),
+            retry_after_secs,
             message: format!("the asset CDN refused it ({said})"),
         },
-        Some(47) => {
-            RestError::Redirect(format!("the asset CDN redirected again; refused ({said})"))
-        }
-        _ => RestError::Transport(format!(
-            "the asset CDN download failed ({}): {said}",
-            exit.map_or_else(|| "ended by a signal".to_string(), |c| format!("exit {c}"))
-        )),
+        _ => RestError::Transport {
+            exit,
+            status,
+            retry_after_secs,
+            message: format!(
+                "the asset CDN download failed ({}): {said}",
+                exit.map_or_else(|| "ended by a signal".to_string(), |c| format!("exit {c}"))
+            ),
+        },
     }
 }
 

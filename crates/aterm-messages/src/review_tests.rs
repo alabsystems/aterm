@@ -443,7 +443,6 @@ fn a_flood_keeps_every_bound() {
                                     ..Meter::default()
                                 })
                             }),
-                            excerpt: rng.chance(10).then(|| rng.chance(50)),
                             finished: rng
                                 .chance(10)
                                 .then(|| rng.chance(50).then(|| rand_str(&mut rng, 300))),

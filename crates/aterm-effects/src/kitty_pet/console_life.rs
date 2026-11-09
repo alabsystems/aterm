@@ -1142,6 +1142,9 @@ impl PetBrain {
         if self.console.world.is_none() {
             self.console.world = Some(self.console.spare_world.take().unwrap_or_default());
         }
+        // The window about the body reads its cells' ground
+        // ([`OldPath::BodysWindowReadsItsGround`]).
+        let body_ground = !self.old_path(OldPath::BodysWindowReadsItsGround);
         let Some(world) = &mut self.console.world else {
             return;
         };
@@ -1198,6 +1201,7 @@ impl PetBrain {
             },
             ..reserve
         };
+        world.read_the_bodys_ground(body_ground);
         world.observe_with_exclusions_near(input, facts, pane, seen, centre);
         if world.stamp().is_some()
             && (prior_stamp != world.stamp()
@@ -10187,7 +10191,7 @@ mod tests {
         Reuse,
         /// A split's focused pane: a damage-consuming refill every frame.
         Refill,
-        /// A window with a chrome row (a tab strip, the message band): the
+        /// A window with a chrome row (the tab strip): the
         /// last frame's row prepend undone, a damage-consuming refill, and the
         /// row prepended again once the pet has observed the engine rows
         /// ([`Twin::observe`]).

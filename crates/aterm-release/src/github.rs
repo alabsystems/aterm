@@ -5,9 +5,11 @@
 
 use std::io::Write as _;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aterm_json::Value;
-use aterm_uds::spawnfd::{Child, Command, Stdio};
+use aterm_types::http_retry::{Budget, Cause, Decision, Policy};
+use aterm_uds::spawnfd::{Command, Stdio};
 use aterm_update_core::github_rest::{
     Answer, Body, Client, Method, Origins, Prepared, Request, RestError, Spawn, Token,
 };
@@ -18,8 +20,19 @@ use crate::ledger::{Error, Result, RunOut};
 /// JSON envelope.
 pub(crate) const ACCEPT_RAW: &str = "application/vnd.github.raw";
 
-/// The backoffs between [`retried`]'s attempts, in seconds.
-const BACKOFFS: [u64; 2] = [2, 5];
+/// The bounded policy shared by anonymous HTTPS reads in the cutter and verifier.
+const READ_RETRY_POLICY: Policy = Policy::STANDARD;
+
+/// The cutter's pre-existing bound for idempotent authenticated mutations. Anonymous reads get
+/// the incident-sized budget above; broadening a metadata PATCH or guarded DELETE to nineteen
+/// attempts is neither necessary nor part of the anonymous-read policy.
+const AUTHENTICATED_RETRY_POLICY: Policy = Policy::new(
+    3,
+    [Duration::from_secs(2), Duration::from_secs(5)],
+    Duration::from_secs(5),
+    Duration::from_secs(7),
+);
+const AUTHENTICATED_BACKOFFS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5)];
 
 /// A test's GitHub: agh-fake's origins, the token (if any), and the spawn curl runs through.
 #[cfg(test)]
@@ -145,27 +158,33 @@ fn api_path(path: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Whether asking again cannot change `e`: GitHub's definitive answer (a 4xx but 408 and 429), a
-/// redirect refused, or a refusal made here before curl ran.
+/// The shared anonymous-read policy's transient cause, when `e` is one.
 #[must_use]
-pub(crate) fn definitive(e: &RestError) -> bool {
+pub(crate) fn retry_cause(e: &RestError) -> Option<Cause> {
+    e.retry_cause()
+}
+
+/// Whether the cutter's pre-existing authenticated policy knows another attempt cannot help.
+/// Anonymous reads intentionally use the narrower shared classifier in [`retry_cause`].
+#[must_use]
+fn authenticated_definitive(e: &RestError) -> bool {
     match e {
         RestError::Local(_) | RestError::Redirect(_) => true,
         RestError::Status { status, .. } => {
             (400..500).contains(status) && !matches!(status, 408 | 429)
         }
-        RestError::Transport(_) | RestError::Malformed(_) => false,
+        RestError::Transport { .. } | RestError::Malformed(_) => false,
     }
 }
 
-/// Wait `seconds` between attempts, ending early once an interrupt is caught (no wait under a
+/// Wait `duration` between attempts, ending early once an interrupt is caught (no wait under a
 /// test's `Fixture`).
-fn pause(seconds: u64) {
+fn pause(duration: Duration) {
     #[cfg(test)]
     if FIXTURE.with(|f| f.borrow().is_some()) {
         return;
     }
-    let until = crate::durable::deadline_after(std::time::Duration::from_secs(seconds));
+    let until = crate::durable::deadline_after(duration);
     while crate::interrupt::caught().is_none() {
         let left = until.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
@@ -175,10 +194,10 @@ fn pause(seconds: u64) {
     }
 }
 
-/// `attempt`, made up to three times, `before_each` before every one.
+/// `attempt`, made within [`READ_RETRY_POLICY`], `before_each` before every one.
 /// # Errors
-/// `before_each`'s; a definitive failure at once; an interrupt caught before an attempt; the last
-/// failure after three attempts.
+/// `before_each`'s; a final failure at once; an interrupt caught before an attempt; the last
+/// transient failure once the bounded policy is exhausted.
 pub(crate) fn retried<T>(
     what: &str,
     before_each: impl FnMut() -> Result<()>,
@@ -191,11 +210,46 @@ pub(crate) fn retried<T>(
 fn retried_via<T>(
     spawn: Option<&Arc<dyn Spawn>>,
     what: &str,
+    before_each: impl FnMut() -> Result<()>,
+    attempt: impl FnMut(&Client) -> std::result::Result<T, RestError>,
+) -> Result<T> {
+    let client = client_via(spawn)?;
+    if client.has_token() {
+        retried_authenticated_with_client(
+            &client,
+            AUTHENTICATED_RETRY_POLICY,
+            what,
+            before_each,
+            attempt,
+        )
+    } else {
+        retried_with_client(&client, READ_RETRY_POLICY, what, before_each, attempt)
+    }
+}
+
+/// The common retry loop with the caller's operation-appropriate `policy`.
+fn retried_via_policy<T>(
+    spawn: Option<&Arc<dyn Spawn>>,
+    policy: Policy,
+    what: &str,
+    before_each: impl FnMut() -> Result<()>,
+    attempt: impl FnMut(&Client) -> std::result::Result<T, RestError>,
+) -> Result<T> {
+    let client = client_via(spawn)?;
+    retried_authenticated_with_client(&client, policy, what, before_each, attempt)
+}
+
+/// The cutter's existing authenticated retry semantics. These deliberately remain broader than
+/// the anonymous classifier: transport/malformed answers, HTTP 408 and headerless 429 get the
+/// long-standing three attempts, while definitive 4xx and local refusals stop immediately.
+fn retried_authenticated_with_client<T>(
+    client: &Client,
+    policy: Policy,
+    what: &str,
     mut before_each: impl FnMut() -> Result<()>,
     mut attempt: impl FnMut(&Client) -> std::result::Result<T, RestError>,
 ) -> Result<T> {
-    let client = client_via(spawn)?;
-    let attempts = BACKOFFS.len() + 1;
+    let attempts = policy.attempts();
     let mut last = String::new();
     for n in 1..=attempts {
         if let Some(signal) = crate::interrupt::caught() {
@@ -209,26 +263,82 @@ fn retried_via<T>(
             )));
         }
         before_each()?;
-        match attempt(&client) {
+        match attempt(client) {
             Ok(value) => return Ok(value),
-            Err(e) if definitive(&e) => {
-                return Err(Error::new(format!("GitHub {what} failed: {e}")));
+            Err(error) if authenticated_definitive(&error) => {
+                return Err(Error::new(format!("GitHub {what} failed: {error}")));
             }
-            Err(e) => {
-                last = e.to_string();
-                if let Some(backoff) = BACKOFFS.get(n - 1) {
+            Err(error) => {
+                last = error.to_string();
+                if n < attempts {
+                    let pause_for = AUTHENTICATED_BACKOFFS[usize::from(n != 1)];
                     eprintln!(
-                        "    GitHub {what} failed (attempt {n}/{attempts}): {last} — retrying in \
-                         {backoff}s"
+                        "    GitHub {what} failed (attempt {n}/{attempts}): {last} — retrying in {}s",
+                        pause_for.as_secs()
                     );
-                    pause(*backoff);
+                    pause(pause_for);
                 }
             }
         }
     }
     Err(Error::new(format!(
-        "GitHub {what} failed after {attempts} attempts: {last}"
+        "GitHub {what} failed after {}: {last}",
+        policy.bound()
     )))
+}
+
+/// The retry loop after the caller has selected the operation's authority and policy.
+fn retried_with_client<T>(
+    client: &Client,
+    policy: Policy,
+    what: &str,
+    mut before_each: impl FnMut() -> Result<()>,
+    mut attempt: impl FnMut(&Client) -> std::result::Result<T, RestError>,
+) -> Result<T> {
+    let mut budget = Budget::new(policy);
+    let mut n = 1;
+    let mut last = String::new();
+    loop {
+        if let Some(signal) = crate::interrupt::caught() {
+            let after = if last.is_empty() {
+                String::new()
+            } else {
+                format!(" (the last attempt: {last})")
+            };
+            return Err(Error::new(format!(
+                "GitHub {what} not asked: the release was interrupted by signal {signal}{after}"
+            )));
+        }
+        before_each()?;
+        match attempt(client) {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                if let Some(signal) = crate::interrupt::caught() {
+                    return Err(Error::new(format!(
+                        "GitHub {what} not asked: the release was interrupted by signal \
+                         {signal} (the last attempt: {e})"
+                    )));
+                }
+                let Some(cause) = retry_cause(&e) else {
+                    return Err(Error::new(format!("GitHub {what} failed: {e}")));
+                };
+                last = e.to_string();
+                match budget.after(n, cause) {
+                    Decision::Retry(retry) => {
+                        eprintln!("    GitHub {what}: {retry}: {last}");
+                        pause(retry.pause);
+                    }
+                    Decision::Exhausted => {
+                        return Err(Error::new(format!(
+                            "GitHub {what} failed after {}: {last}",
+                            budget.bound()
+                        )));
+                    }
+                }
+            }
+        }
+        n = n.saturating_add(1);
+    }
 }
 
 /// The JSON document at `path` (`repos/{slug}/…`), [`retried`].
@@ -299,9 +409,13 @@ pub(crate) fn send(
     before_each: impl FnMut() -> Result<()>,
 ) -> Result<Answer> {
     let path = api_path(path);
-    retried(&format!("{} {path}", method.name()), before_each, |c| {
-        c.send(method, &path, json).and_then(Answer::success)
-    })
+    retried_via_policy(
+        None,
+        AUTHENTICATED_RETRY_POLICY,
+        &format!("{} {path}", method.name()),
+        before_each,
+        |c| c.send(method, &path, json).and_then(Answer::success),
+    )
 }
 
 /// One `method` `path` with `json`, a 2xx required, asked once: the caller re-reads the object to
@@ -319,27 +433,47 @@ pub(crate) fn send_once(
         .and_then(Answer::success)
 }
 
-/// The raw bytes of `path` (a `contents` read, [`ACCEPT_RAW`]), whatever the status, asked once.
+/// The raw bytes of `path` (a `contents` read, [`ACCEPT_RAW`]), whatever the final status,
+/// [`retried`] for a transient answer.
 /// # Errors
-/// The client's, and a transport failure.
-pub(crate) fn raw(path: &str) -> std::result::Result<Answer, RestError> {
-    let client = client().map_err(|e| RestError::Local(e.to_string()))?;
-    let url = client.api(&api_path(path));
-    client
-        .exchange(&Request {
-            accept: ACCEPT_RAW,
-            ..Request::get(&url)
-        })?
-        .answer()
+/// As [`retried`]. A final 4xx remains an [`Answer`] so a caller can distinguish absence.
+pub(crate) fn raw(path: &str) -> Result<Answer> {
+    let path = api_path(path);
+    retried(
+        &format!("GET raw {path}"),
+        || Ok(()),
+        |client| {
+            let url = client.api(&path);
+            let answer = client
+                .exchange(&Request {
+                    accept: ACCEPT_RAW,
+                    ..Request::get(&url)
+                })?
+                .answer()?;
+            if Cause::from_http(answer.status, answer.retry_after_secs()).is_some() {
+                return Err(RestError::Status {
+                    status: answer.status,
+                    retry_after_secs: answer.retry_after_secs(),
+                    message: answer.message(),
+                });
+            }
+            Ok(answer)
+        },
+    )
 }
 
-/// The bytes of asset `id` of `slug`, streaming: the asset API's redirect, checked against the
-/// asset CDN's origins, then an anonymous curl of the CDN with its stdout and stderr piped.
+/// Download asset `id` of `slug` through the shared bounded API/CDN transport.
 /// # Errors
-/// The client's; the asset API's answer when it is not a redirect onto the CDN.
-pub(crate) fn open_asset(slug: &str, id: u64) -> std::result::Result<Child, RestError> {
-    let client = client().map_err(|e| RestError::Local(e.to_string()))?;
-    client.open_asset(&format!("/repos/{slug}/releases/assets/{id}"))
+/// The client's, the asset API's final answer, the CDN's final answer, or a local file refusal.
+pub(crate) fn download_asset(slug: &str, id: u64, dest: &std::path::Path, cap: u64) -> Result<()> {
+    let client = client()?;
+    client
+        .download_asset(&format!("/repos/{slug}/releases/assets/{id}"), dest, cap)
+        .map_err(|error| {
+            Error::new(format!(
+                "download exact GitHub asset-ID {id} on {slug}: {error}"
+            ))
+        })
 }
 
 /// A one-shot POST, built and checked: the caller persists its intent, then [`run_once`]s it.

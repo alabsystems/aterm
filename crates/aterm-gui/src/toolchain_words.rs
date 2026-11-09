@@ -84,7 +84,7 @@ fn row(severity: Severity, title: impl AsRef<str>) -> Message {
         .record()
 }
 
-/// A record's words rebuilt unclassified at the default hold, for a test that needs them on the band.
+/// A record's words rebuilt unclassified at the default hold, for a test that needs them live.
 #[cfg(test)]
 pub(crate) fn held_row(record: &Message) -> Message {
     let mut row = Message::new(record.tag.clone(), record.severity, record.title.clone());
@@ -92,20 +92,15 @@ pub(crate) fn held_row(record: &Message) -> Message {
     row.detail = record.detail.clone();
     row.actions = record.actions.clone();
     row.key = record.key.clone();
-    row.excerpt = record.excerpt;
     row.finished = record.finished.clone();
     row
 }
 
 fn live_row(title: impl AsRef<str>, stale_after: Duration) -> Message {
     Message::new(tags::TOOLCHAIN, Severity::Info, title)
-        .loads(PASS_LOADS)
         .primary_load(Load::Network)
         .working(stale_after)
 }
-
-/// The loads a pass row may show over its life ([`pass_load`] and the announcement's network).
-pub(crate) const PASS_LOADS: [Load; 3] = [Load::Network, Load::Disk, Load::Cpu];
 
 fn record(severity: Severity, title: impl AsRef<str>, detail: String) -> Message {
     row(severity, title).line(detail)
@@ -206,7 +201,6 @@ pub(crate) fn announced(detail: &str) -> Message {
     live_row(INSTALLING_ALAB, STALE_ANNOUNCE)
         .glyph(glyph(DOWN))
         .line(size.unwrap_or_default())
-        .no_excerpt()
         .meter(Meter {
             stats,
             load: Some(Load::Network),
@@ -382,34 +376,16 @@ pub(crate) enum FirstRunShort {
     Nothing,
 }
 
-fn actionable_cause(cause: &str) -> bool {
-    let lower = cause.to_ascii_lowercase();
-    [
-        atpkg::flow::DISK_REFUSAL_HEAD,
-        "no space left",
-        "disk full",
-        "not enough space",
-        "enospc",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
 /// A first run that ended short.
 pub(crate) fn first_run_short(how: FirstRunShort, cause: &str) -> Message {
     let (severity, title) = match how {
         FirstRunShort::Failed => (Severity::Warn, ALAB_INSTALL_FAILED),
         FirstRunShort::Nothing => (Severity::Warn, PACKAGES_NOT_INSTALLED),
     };
-    let msg = Message::new(tags::PACKAGES, severity, title)
+    Message::new(tags::PACKAGES, severity, title)
         .action(packages())
-        .key(KEY_PASS);
-    let msg = msg.lines(whole_reason(cause));
-    if actionable_cause(cause) {
-        msg
-    } else {
-        msg.no_excerpt()
-    }
+        .key(KEY_PASS)
+        .lines(whole_reason(cause))
 }
 
 /// A plain text posted from outside the process (`aterm ctl appnotice <lane> <text>`), e.g. an `aterm pkg install claude` run in a terminal.
@@ -1002,7 +978,6 @@ pub(crate) fn snapshot_words(
             message: Box::new(
                 live_row(INSTALLING_ALAB, STALE_TAILED)
                     .glyph(glyph(DOWN))
-                    .no_excerpt()
                     .in_flight()
                     .key(KEY_PASS),
             ),
@@ -1050,7 +1025,6 @@ pub(crate) fn snapshot_words(
         .glyph(glyph(DOWN))
         .line(detail)
         .lines(downloaded)
-        .no_excerpt()
         .meter(Meter {
             fill_permille: fill,
             stats,
@@ -1348,13 +1322,8 @@ mod tests {
         );
         assert_eq!(failed.actions, vec![packages()]);
         assert_eq!(failed.detail, ["could not reach the index"]);
-        assert!(
-            !failed.excerpt,
-            "a cause the person cannot fix rides behind Details"
-        );
         assert_eq!(attention(&failed), Ok(Attention::Failure));
         let full = first_run_short(FirstRunShort::Failed, "trust: No space left on device");
-        assert!(full.excerpt, "a full disk is the person's to fix: painted");
         assert_eq!(
             full.detail,
             ["trust: No space left on device"],
@@ -1366,13 +1335,7 @@ mod tests {
         }
         .to_string();
         let refused = first_run_short(FirstRunShort::Failed, &refusal);
-        assert!(
-            refused.excerpt,
-            "the disk check's refusal is painted: {refusal}"
-        );
         assert_eq!(refused.detail, [refusal.as_str()]);
-        let stderr = format!("atpkg: bootstrap install trust failed: {refusal} (continuing)");
-        assert!(first_run_short(FirstRunShort::Failed, &stderr).excerpt);
         let long = "net pass could not finish: the index at \
                     https://packages.example.invalid/alab/index.json answered 503 Service \
                     Unavailable three times in a row, and the mirror list had no other \
@@ -1414,7 +1377,6 @@ mod tests {
         let m = announced("installing 2 program(s) (about 1 GB)");
         assert_eq!(m.title, INSTALLING_ALAB);
         assert_eq!(m.detail, vec!["about 1 GB"]);
-        assert!(!m.excerpt, "the title alone on the glass");
         assert_eq!(m.glyph.ch(), DOWN);
         assert_eq!(m.severity, Severity::Info);
         assert_eq!(
@@ -1653,7 +1615,6 @@ mod tests {
             vec!["trust \u{00b7} extracting", "512 MB / 1.2 GB downloaded"],
             "program and phase behind Details, and the download rollup with them"
         );
-        assert!(!m.excerpt);
         assert!(m.actions.is_empty(), "work in flight carries no capsule");
         assert!(
             !m.meter.as_ref().is_some_and(|x| x.busy),

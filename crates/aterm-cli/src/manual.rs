@@ -1771,7 +1771,7 @@ THE FOOTER
   after the session's first frame or its last claim of line E with no claim since (the
   grace is the session's, so a tab shown again keeps its state), and always for agy, a
   CLI with no line E, or a harness switched off. That unit is words only:
-  `⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 05:00`, then without the reset, then the
+  `⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00`, then without the reset, then the
   name and figure, then the name, each shorter form only after the other facts gave way.
   Line E is the row Claude Code prints from aterm's usage tap under the bottom rule:
   `week 63% used · resets Sat 10:00` (`week 63% used` with no reset to say,
@@ -1795,8 +1795,8 @@ THE FOOTER
     not projected (after an unread account the work would reach, or the whole week with
     no pace yet, a paused recovery or a tab the rotation cannot move). Ticks at the foot
     of its level cells mark local midnights.
-  * at most two phrases: `~98% by ↺ Sat 10:00` (or `↺ Sat 10:00`), then the verdict:
-    `╳ ~Thu 12 Nov 05:00–Sat 14 Nov 10:00` (a stop, to the vendor reset that resumes
+  * at most two phrases: `~99% by ↺ Sat 10:00` (or `↺ Sat 10:00`), then the verdict:
+    `╳ ~Thu 12 Nov 04:00–Sat 14 Nov 10:00` (a stop, to the vendor reset that resumes
     the work, or `–~<when>`; `╳ from ~Wed 16:00` where nothing ends it in reach),
     `⧗ until Sat 10:00` (the work waits at a wall now), `? alt2 unread from ~Sat 06:00`,
     `$ ~Sat 06:00` (credits) or `no pace yet`.
@@ -2377,7 +2377,8 @@ CHOOSING ONE
   (the highlighted row is tried live; Keep or Revert), the theme row in Settings ▸
   Appearance and View ▸ Choose Theme… (a highlighted row previews, Enter keeps it,
   Esc reverts) all write this one key. A name that resolves to nothing draws
-  Default; the listing, `aterm ctl theme` and the window's notice band say why.
+  Default; the listing, `aterm ctl theme`, Settings' theme row and Settings ▸
+  Messages say why.
   Settings' Follow system switch writes a pair (`dark:Default,light:Default Light`
   when no theme was set).
 
@@ -2932,9 +2933,11 @@ fn update_page_tail() -> String {
         r#"
 HOW aterm UPDATES
   On a Mac, aterm checks about every 2 minutes, downloads a new version, checks its
-  signature, and installs it by itself within a minute while an aterm window is
-  open; your shells keep running (turn "{install}" off in Settings ▸ Software Update
-  to install only when you press the button). A terminal-only machine uses this verb
+  signature, and installs it by itself within a minute while aterm is open, whether
+  or not anyone is at the Mac; your shells keep running (turn "{install}" off in
+  Settings ▸ Software Update to install only when you press the button). If
+  something must finish first (a setup draft, a password prompt), `aterm ctl update
+  status` names it as `apply_held=`. A terminal-only machine uses this verb
   to learn it is behind. A running zsh, bash or fish takes the new build's shell
   integration at its next prompt.
 

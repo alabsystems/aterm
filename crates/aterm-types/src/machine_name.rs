@@ -36,6 +36,14 @@ pub use settle::{
 };
 pub use sizes::{disk_size, label_form, label_form_keeping, memory_size};
 
+/// The word a message names the machine it runs on by, after "this": "Mac" on macOS, "machine"
+/// elsewhere, where no Mac is there to name. Not a nickname ([`nouns::NOUNS`] are those).
+pub const OS_NOUN: &str = if cfg!(target_os = "macos") {
+    "Mac"
+} else {
+    "machine"
+};
+
 /// The most digits a [`Number`] has: `m999999`, which fits NetBIOS's 15 bytes and the
 /// macOS name rule's `m[1-9][0-9]?…` pattern.
 pub const NUMBER_MAX_DIGITS: usize = 6;

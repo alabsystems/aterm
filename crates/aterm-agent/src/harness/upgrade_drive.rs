@@ -373,7 +373,7 @@ pub fn ladder_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, 
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeProgress",
         action = "OwnerAsks",
-        reason = "The owner's Now from the tab menu, the band or `aterm harness upgrade --now` (`upgrade_status::Ask::Now`): the owner's step. The Tier-1 binds hand the reducer `Request::Now` exactly there."
+        reason = "The owner's Now from the tab menu, the upgrade's message or `aterm harness upgrade --now` (`upgrade_status::Ask::Now`): the owner's step. The Tier-1 binds hand the reducer `Request::Now` exactly there."
     )
 )]
 #[cfg_attr(

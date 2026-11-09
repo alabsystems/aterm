@@ -964,7 +964,11 @@ fn a_reader_hears_the_row_in_words() {
 /// NO MIDNIGHT STRIKES A LETTER (§1.3, §2.2): over cases (a) to (d), each laid in the rooms of
 /// 170, 100 and 70 columns, a local midnight's tick stands only in a chart cell that draws a
 /// level, `┄` or nothing, at its midnight's exact place, at the foot of the cell and a quarter of
-/// it tall, so only `▕` stands a whole cell high and no tick meets a `▔` to read as `T`.
+/// it tall, so only `▕` stands a whole cell high and no tick meets a `▔` to read as `T`; one
+/// on a glyph that inks its foot quarter (a measured step, the projected line at level 1 `▁` or
+/// 2 `🭻`, which cases (a) and (b) draw after their reset) takes the ground's ink, a notch
+/// through it, and every other the track's ([`super::TickInks`]). NEGATIVE CONTROL (the ink):
+/// the track on every tick, or the ground on the measured steps alone, strikes the low line.
 /// NEGATIVE CONTROL: case (c) at 70 columns has midnights in a hand-off's name or mark (`→main`,
 /// `→alt1`), which a full-height hairline at every midnight (as S5 first drew them) struck
 /// through.
@@ -973,8 +977,7 @@ fn no_midnight_strikes_a_letter() {
     use aterm_agent::harness::quota_view::CELL_PLACES;
     use aterm_core::render::{FxItem, FxRect};
     let (cw, ch) = (8u16, 16u16);
-    let mut struck = 0;
-    let mut ticks = 0;
+    let (mut struck, mut ticks, mut crossed) = (0, 0, 0);
     for (name, view) in quota_scenes::cases() {
         for room in [166, 96, 66] {
             let mut line = QuotaLine::default();
@@ -995,9 +998,21 @@ fn no_midnight_strikes_a_letter() {
                 struck += placed.len() - kept.len();
             }
             let mut laid = Vec::new();
-            super::push_ticks(&mut laid, &line.ticks, (0, line.chart.len()), (cw, ch));
+            let chart = &line.cells[line.chart.clone()];
+            super::push_ticks(
+                &mut laid,
+                &line.ticks,
+                (0, line.chart.len()),
+                (cw, ch),
+                |i| {
+                    chart
+                        .get(i)
+                        .map_or(super::TickOn::Ground, |c| super::TickOn::of(c.0, false))
+                },
+            );
+            let inks = super::TickInks::new(0x0088_8888, 0x00F8_FAFD, None);
             let rects: Vec<FxRect> =
-                super::tick_content(&laid, 0x0088_8888).map_or_else(Vec::new, |content| {
+                super::tick_content(&laid, inks).map_or_else(Vec::new, |content| {
                     content
                         .items()
                         .iter()
@@ -1021,11 +1036,27 @@ fn no_midnight_strikes_a_letter() {
                     "({name}) in {room}: a tick over {glyph:?}"
                 );
                 assert_eq!((r.w, r.h, r.y), (1, ch / 4, i32::from(ch - ch / 4)));
+                let low = role == Role::Line && ['\u{2581}', '\u{1fb7b}'].contains(&glyph);
+                let on = if role == Role::Mark || low {
+                    super::TickOn::Fill
+                } else {
+                    super::TickOn::Ground
+                };
+                assert_eq!(
+                    r.ink,
+                    on.ink(),
+                    "({name}) in {room}: the ground's ink over {glyph:?}, else the track's"
+                );
+                crossed += usize::from(low);
                 ticks += 1;
             }
         }
     }
     assert!(ticks > 0, "the cases have midnights to tick");
+    assert!(
+        crossed > 0,
+        "the cases have midnights on a low projected line"
+    );
     assert!(
         struck > 0,
         "NEGATIVE CONTROL: case (c) at 70 columns has a midnight in a letter's cell"

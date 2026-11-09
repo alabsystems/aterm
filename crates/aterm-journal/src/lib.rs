@@ -66,6 +66,11 @@ pub struct Limits {
     /// Maximum application body size including its local receipt metadata.
     pub record_bytes: usize,
 }
+/// The suffixes of a journal's anchor, astream and checkpoint names (`<name>.<suffix>`).
+const ANCHOR: &str = "anchor";
+const ASTREAM: &str = "astream";
+const CHECKPOINT: &str = "checkpoint";
+
 struct Layout {
     name: String,
     anchor: String,
@@ -93,9 +98,9 @@ impl Layout {
         }
         Ok(Self {
             name: name.into(),
-            anchor: format!("{name}.anchor"),
-            astream: format!("{name}.astream"),
-            checkpoint: format!("{name}.checkpoint"),
+            anchor: format!("{name}.{ANCHOR}"),
+            astream: format!("{name}.{ASTREAM}"),
+            checkpoint: format!("{name}.{CHECKPOINT}"),
             lock: format!("{name}.lock"),
             archive_prefix: format!("{name}-"),
             limits,
@@ -915,6 +920,43 @@ pub enum Committed {
     },
 }
 
+/// The files [`read_committed`] reads in a journal's folder.
+pub struct CommittedFiles {
+    /// The anchor the journal was created under.
+    pub anchor: PathBuf,
+    /// The checkpoint naming the acknowledged prefix.
+    pub checkpoint: PathBuf,
+    /// The astream file holding the records.
+    pub astream: PathBuf,
+}
+
+/// The files [`read_committed`] reads in `dir` for the journal `name`. A reader that keeps what a
+/// read found can watch these and `dir` to tell when another read could find something else: a
+/// writer appends to the astream file and renames each new checkpoint over the last. Nothing is
+/// checked here; an invalid `name` names files [`read_committed`] refuses.
+#[must_use]
+pub fn committed_files(dir: &Path, name: &str) -> CommittedFiles {
+    let file = |suffix: &str| dir.join(format!("{name}.{suffix}"));
+    CommittedFiles {
+        anchor: file(ANCHOR),
+        checkpoint: file(CHECKPOINT),
+        astream: file(ASTREAM),
+    }
+}
+
+/// What a read of a journal ([`read_committed_opened`]) opened, each file by the `(dev, ino)` of
+/// its open descriptor. Each is a private open, which refuses a file with a second link, so a file
+/// another folder holds for the read is another inode, or one moved out of the journal's folder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Opened {
+    /// The anchor's.
+    pub anchor: (u64, u64),
+    /// The checkpoint's whose acknowledgement the read took.
+    pub checkpoint: (u64, u64),
+    /// The astream file's.
+    pub astream: (u64, u64),
+}
+
 /// Read an established journal's acknowledged prefix without taking any lock,
 /// so it works beside a live writer. The checkpoint is read first; then exactly
 /// the bytes it counts are read from the astream file and must hash to it. A
@@ -947,25 +989,39 @@ pub fn read_committed(
     limits: Limits,
     known: Option<&Prefix>,
 ) -> io::Result<Committed> {
+    read_committed_opened(dir, name, anchor, limits, known).map(|(committed, _)| committed)
+}
+
+/// [`read_committed`], with the files it opened ([`Opened`]): for a reader that keeps what it
+/// read while a witness of the paths stands, which must be a witness of those very files.
+/// # Errors
+/// As [`read_committed`].
+pub fn read_committed_opened(
+    dir: &Path,
+    name: &str,
+    anchor: &[u8],
+    limits: Limits,
+    known: Option<&Prefix>,
+) -> io::Result<(Committed, Opened)> {
     let layout = Layout::new(name, anchor, limits)?;
     // One directory verdict for the three files, as in `Log::intact`.
     let judged = private_file::JudgedDir::judge(dir)
         .map_err(|_| io::Error::other("journal anchor is not private"))?;
-    match judged.read(&layout.anchor, 4096) {
-        Ok(bytes) if bytes == anchor => {}
+    let anchor_opened = match judged.read_with_metadata(&layout.anchor, 4096) {
+        Ok((bytes, metadata)) if bytes == anchor => (metadata.dev(), metadata.ino()),
         Ok(_) => return Err(io::Error::other("journal anchor changed")),
         Err(PrivateFileError::Missing) => {
             return Err(io::Error::other("established journal anchor is missing"));
         }
         Err(_) => return Err(io::Error::other("journal anchor is not private")),
-    }
+    };
     // A writer's save renames a new checkpoint over the name, so an open that
     // got the old inode just before reads the checkpoint it replaced, whose
     // descriptor is left no link. The name then holds the newer checkpoint:
     // read it again. A second link is refused, at the open or after it.
     let malformed = || io::Error::other("journal checkpoint is malformed or not private");
     let mut relinked = 0;
-    let checkpoint = loop {
+    let (checkpoint, checkpoint_opened) = loop {
         let (file, _) = judged.open(&layout.checkpoint).map_err(|_| malformed())?;
         #[cfg(test)]
         tests::read_step(tests::Reading::Opened);
@@ -974,7 +1030,8 @@ pub fn read_committed(
             .take(41)
             .read_to_end(&mut bytes)
             .map_err(|_| malformed())?;
-        match file.metadata().map_err(|_| malformed())?.nlink() {
+        let metadata = file.metadata().map_err(|_| malformed())?;
+        match metadata.nlink() {
             0 if relinked < 3 => {
                 relinked += 1;
                 #[cfg(test)]
@@ -988,7 +1045,7 @@ pub fn read_committed(
         if bytes.len() != 40 {
             return Err(malformed());
         }
-        break bytes;
+        break (bytes, (metadata.dev(), metadata.ino()));
     };
     let mut length = [0; 8];
     length.copy_from_slice(&checkpoint[..8]);
@@ -1013,6 +1070,11 @@ pub fn read_committed(
         length,
         digest,
     };
+    let opened = Opened {
+        anchor: anchor_opened,
+        checkpoint: checkpoint_opened,
+        astream: acknowledged.identity,
+    };
     let mut bytes = vec![
         0;
         usize::try_from(length)
@@ -1028,7 +1090,7 @@ pub fn read_committed(
             .as_ref()
             .is_some_and(|saved| saved.as_ref() == bytes.as_slice())
     {
-        return Ok(Committed::Unchanged);
+        return Ok((Committed::Unchanged, opened));
     }
     #[cfg(test)]
     tests::hashing();
@@ -1054,8 +1116,8 @@ pub fn read_committed(
             "acknowledged journal history changed; preserve it for authenticated repair",
         ));
     }
-    match extends {
-        Some(known) if known.acknowledged.length == length => Ok(Committed::Unchanged),
+    let committed = match extends {
+        Some(known) if known.acknowledged.length == length => Committed::Unchanged,
         Some(known) => {
             let records = decode(&bytes[hashed..], known.records, &layout)?;
             let max_record_bytes = records
@@ -1064,7 +1126,7 @@ pub fn read_committed(
                 .max()
                 .unwrap_or(0)
                 .max(known.max_record_bytes);
-            Ok(Committed::Extended {
+            Committed::Extended {
                 prefix: Prefix {
                     acknowledged,
                     records: known.records + records.len() as u64,
@@ -1072,12 +1134,12 @@ pub fn read_committed(
                     bytes: (bytes.len() <= PREFIX_BYTES).then(|| Arc::from(bytes)),
                 },
                 records,
-            })
+            }
         }
         None => {
             let records = decode(&bytes, 0, &layout)?;
             let max_record_bytes = records.iter().map(|r| r.body.len()).max().unwrap_or(0);
-            Ok(Committed::Rebuilt {
+            Committed::Rebuilt {
                 prefix: Prefix {
                     acknowledged,
                     records: records.len() as u64,
@@ -1085,9 +1147,10 @@ pub fn read_committed(
                     bytes: (bytes.len() <= PREFIX_BYTES).then(|| Arc::from(bytes)),
                 },
                 records,
-            })
+            }
         }
-    }
+    };
+    Ok((committed, opened))
 }
 
 /// Decode whole, in-order records from attested bytes. Every frame must be

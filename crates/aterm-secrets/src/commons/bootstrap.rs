@@ -123,10 +123,12 @@ pub(crate) fn established_trust(paths: &Paths) -> Result<Option<Trust>> {
     Ok(Some(trust))
 }
 
-/// How long an observation waits for another local holder of `commons.lock`.
-/// Holders do no network I/O and finish in milliseconds, so one that outlasts
-/// this is stuck or one of many back to back: the observation is refused as busy.
+/// Fallback custody wait for direct snapshot opens without a shared deadline.
+/// Default custody admissions use [`REQUIRED_WAIT`]; their initial vault look is nonblocking.
 const CUSTODY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A required observation waits for local work under one shared hang detector.
+const REQUIRED_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Serializes custody observations independently of the removable control log.
 /// The lock is never replaced, and never held during network I/O.
@@ -924,11 +926,15 @@ fn is_transient_vault_revalidation(error: &Error) -> bool {
 }
 
 impl Bootstrap {
-    /// Observe the authenticated vault cache offline. An unavailable vault or
+    /// Observe the authenticated vault cache offline without waiting on its initial writer. An unavailable vault or
     /// invisible control entry returns None without creating custody. A visible
     /// descriptor may establish local custody; it does not grant membership.
     pub fn cached(paths: &Paths) -> Result<Option<Self>> {
-        match Self::observe(paths)? {
+        Self::cached_started(paths, std::time::Instant::now())
+    }
+
+    fn cached_started(paths: &Paths, started: std::time::Instant) -> Result<Option<Self>> {
+        match Self::observe_started(paths, started)? {
             Availability::Unavailable(_) => Ok(None),
             Availability::Available(bootstrap) => Ok(Some(*bootstrap)),
         }
@@ -981,14 +987,21 @@ impl Bootstrap {
         }
     }
 
-    /// Explain an unavailable vault without a second observation. An available
+    /// Explain an unavailable vault without waiting on its initial writer. An available
     /// descriptor opens the existing custody or creates its first local pin;
     /// it never substitutes a new network for missing established history.
     pub fn observe(paths: &Paths) -> Result<Availability> {
+        Self::observe_started(paths, std::time::Instant::now())
+    }
+
+    fn observe_started(paths: &Paths, started: std::time::Instant) -> Result<Availability> {
         match super::observe(paths)? {
             super::Observation::Unavailable(reason) => Ok(Availability::Unavailable(reason)),
-            super::Observation::Visible(snapshot) => Self::from_snapshot(paths, &snapshot)
-                .map(|bootstrap| Availability::Available(Box::new(bootstrap))),
+            super::Observation::Visible(snapshot) => {
+                let deadline = Self::observation_deadline(started)?;
+                Self::open_snapshot(paths, &snapshot, false, Some(deadline))
+                    .map(|bootstrap| Availability::Available(Box::new(bootstrap)))
+            }
         }
     }
 
@@ -1019,10 +1032,24 @@ impl Bootstrap {
 
     /// Open Commons or report the specific unavailable vault boundary.
     pub fn required(paths: &Paths) -> Result<Self> {
-        match Self::observe(paths)? {
+        Self::required_started(paths, std::time::Instant::now())
+    }
+
+    fn required_started(paths: &Paths, started: std::time::Instant) -> Result<Self> {
+        match Self::observe_started(paths, started)? {
             Availability::Available(bootstrap) => Ok(*bootstrap),
             Availability::Unavailable(reason) => Err(reason.failure("Commons unavailable")),
         }
+    }
+
+    fn observation_deadline(started: std::time::Instant) -> Result<std::time::Instant> {
+        let deadline = started + REQUIRED_WAIT;
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::new(
+                "Commons required observation did not finish before its hang detector",
+            ));
+        }
+        Ok(deadline)
     }
 
     /// [`Self::required`] with the shared local lock deadline of
@@ -1282,6 +1309,7 @@ impl Bootstrap {
             project = "aterm_secrets::commons::bootstrap::tests::history_transition"
         )
     )]
+    #[cfg(test)]
     fn from_snapshot(paths: &Paths, snapshot: &Snapshot) -> Result<Self> {
         Self::open_snapshot(paths, snapshot, false, None)
     }

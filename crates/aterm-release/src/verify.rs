@@ -733,18 +733,9 @@ pub fn post_publish(
 }
 
 fn head_status(url: &str) -> Result<String> {
-    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("curl"))
-        .args(["-sS", "-o", "/dev/null", "-I", "-L", "-w", "%{http_code}"])
-        .arg(url)
-        .output()
-        .map_err(|e| Error::new(format!("spawn curl: {e}")))?;
-    if !out.status.success() {
-        return Err(Error::new(format!(
-            "curl -I {url} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    aterm_update_core::vendor_content_length(url)
+        .map(|_| "200".to_string())
+        .map_err(|error| Error::new(format!("HEAD {url} failed: {error}")))
 }
 
 /// `targo --unverified ship verify [vX.Y.Z]`.

@@ -12,9 +12,7 @@ use atpkg::net::MANIFEST_CAP;
 use atpkg::{Channel, Program};
 
 use super::mirror::{self, MirrorOptions};
-use super::{
-    Log, SERVE_PROBES, Scratch, download_retried, flag_value, horizon, host_error, probe_served,
-};
+use super::{Log, Scratch, download_retried, flag_value, horizon, host_error, probe_served};
 use crate::api::{Baseline, Build, Delta, IndexRequest, Indexer, Published, TripleDrop, Yank};
 use crate::artifact::{pkgdoc, upload};
 use crate::ctx::Ctx;
@@ -1383,8 +1381,7 @@ fn publish_quad(
         )),
         other => {
             return Err(Error::refused(format!(
-                "{tag} was published to {slug} but {} still answers {other:?} after \
-                 {SERVE_PROBES} probes — is the repo public?",
+                "{tag} was published to {slug} but {} answers {other:?} — is the repo public?",
                 slug.download_url(&tag, QUAD_FILES[0])
             )));
         }

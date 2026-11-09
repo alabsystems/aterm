@@ -48,6 +48,9 @@ harness = false
 # `verify census` (the census and its guards): the walks themselves; `verify
 # export-scan`: the export scan (`aterm_census::export_scan`).
 aterm-census = { workspace = true }
+# The landing-time harness debt check reads the same authoritative source registry and compiled
+# version declaration parser as the release gate.
+aterm-phase = { workspace = true }
 # `verify forge` (the third-party surface policy) and `verify cells` (forge's
 # cell list and its resolver). A path dep: the root [workspace.dependencies]
 # table has no `aterm-forge` row.

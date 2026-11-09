@@ -886,10 +886,87 @@ mod presses {
             None,
             "window blur settles an armed native control press"
         );
+        assert_eq!(
+            split.app.windows[&wid].page_buttons, 0,
+            "window blur clears held page_buttons capture"
+        );
         split.app.on_focus(wid, true);
         present_mixed(&mut split.app, wid);
+        point_at(&mut split.app, wid, split.terminal_view);
+        assert!(
+            matches!(
+                split.app.pointer_route(wid, None),
+                crate::app_mouse::PointerRoute::Pane { session, .. } if session == split.terminal
+            ),
+            "after window blur settled page_buttons, pointer over terminal sibling routes to terminal pane"
+        );
 
-        // 3. Press the native control, then switch focus to the terminal sibling: `sync_window`
+        // 3. Hovering a native control and opening a stats lens over it evicts common().hovered,
+        // shields refresh_native_hover_for_frame while open, and restores hover when closed.
+        split.app.on_cursor_moved(wid, cx, cy);
+        assert_eq!(
+            split
+                .app
+                .native_runtime
+                .view_state(split.page)
+                .unwrap()
+                .common()
+                .hovered,
+            Some(key.clone()),
+            "moving onto uncovered native control sets common().hovered"
+        );
+        {
+            let ws = split.app.windows.get_mut(&wid).unwrap();
+            ws.stats_lens.open = Some(crate::stats_lens::Lens {
+                focus: crate::stats_paint::Instrument::Cpu,
+                bar: crate::stats_paint::Bar::Global,
+                how: crate::stats_lens::Opened::Pinned,
+            });
+            ws.stats_lens.rect = Some((0, 0, 2_000, 1_000));
+            ws.native_rehover = true;
+        }
+        split.app.evict_native_hover_under_stats_lens(wid);
+        assert_eq!(
+            split
+                .app
+                .native_runtime
+                .view_state(split.page)
+                .unwrap()
+                .common()
+                .hovered,
+            None,
+            "opening stats lens over hovered native control evicts common().hovered"
+        );
+        present_mixed(&mut split.app, wid);
+        split.app.refresh_native_hover_for_frame(wid);
+        assert_eq!(
+            split
+                .app
+                .native_runtime
+                .view_state(split.page)
+                .unwrap()
+                .common()
+                .hovered,
+            None,
+            "refresh_native_hover_for_frame keeps native control unhovered while stats lens owns pointer"
+        );
+        assert!(split.app.close_stats_lens(wid));
+        split.app.windows.get_mut(&wid).unwrap().stats_lens.rect = None;
+        present_mixed(&mut split.app, wid);
+        split.app.refresh_native_hover_for_frame(wid);
+        assert_eq!(
+            split
+                .app
+                .native_runtime
+                .view_state(split.page)
+                .unwrap()
+                .common()
+                .hovered,
+            Some(key.clone()),
+            "closing stats lens and refreshing frame hover restores common().hovered under still pointer"
+        );
+
+        // 4. Press the native control, then switch focus to the terminal sibling: `sync_window`
         // must settle the armed native control press on the outgoing view.
         split.app.on_cursor_moved(wid, cx, cy);
         split

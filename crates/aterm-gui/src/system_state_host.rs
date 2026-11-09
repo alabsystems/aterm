@@ -831,11 +831,31 @@ impl App {
     /// Queued setup and Restore still belong to this worker. A live installer with no
     /// recoverable custody receipt keeps its prompt guard here until exit or detachment.
     pub(crate) fn system_state_handoff_pending(&self) -> bool {
+        self.system_state_handoff_hold().is_some()
+    }
+
+    /// What of [`Self::system_state_handoff_pending`] holds, as the update lane names it: an
+    /// Apply the worker has not taken, a Restore or a queued choice is the worker's
+    /// ([`LaneHold::SystemState`]); else an installer tab that cannot travel with the handoff is
+    /// its own ([`LaneHold::DeveloperTools`]). An installer whose receipt lets it travel holds
+    /// nothing.
+    ///
+    /// [`LaneHold::SystemState`]: crate::native_update_lane_hold::LaneHold::SystemState
+    /// [`LaneHold::DeveloperTools`]: crate::native_update_lane_hold::LaneHold::DeveloperTools
+    pub(crate) fn system_state_handoff_hold(
+        &self,
+    ) -> Option<crate::native_update_lane_hold::LaneHold> {
         let host = &self.system_state_host;
-        host.pending_apply.is_some()
+        if host.pending_apply.is_some()
             || host.operation == Some(SetupOperation::Restore)
             || host.latest_status.queued
-            || self.developer_tools_install_holds_handoff()
+        {
+            Some(crate::native_update_lane_hold::LaneHold::SystemState)
+        } else if self.developer_tools_install_holds_handoff() {
+            Some(crate::native_update_lane_hold::LaneHold::DeveloperTools)
+        } else {
+            None
+        }
     }
 
     /// An update's handoff is about to end this process: what a Stop still

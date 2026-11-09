@@ -372,7 +372,7 @@ fn laid_in(shown: &[Row], row: Row, now: u64) -> Option<Vec<Row>> {
     Some(rows)
 }
 
-/// One stalled tab's entry: a band row, or a record.
+/// One stalled tab's entry: a live row, or a record.
 #[derive(Debug)]
 struct StallRow {
     /// The row.
@@ -1254,8 +1254,8 @@ impl App {
             let spot = self.upgrade_spot(&row.tab);
             let msg = message_reporters::agent_upgrade_stalled_at(row, now, &spot);
             if let Some(id) = self.stall_already_shown(&msg) {
-                // Still on the band (carried): brought to this build's words
-                // — and buttons — where they differ. Off it: the owner saw it,
+                // Still live (carried): brought to this build's words
+                // — and buttons — where they differ. Gone: the owner saw it,
                 // and it stays down.
                 if self.messages.live(id).is_some_and(|l| {
                     l.msg.title != msg.title
@@ -2266,7 +2266,7 @@ mod tests {
             assert_eq!(
                 app.upgrade_view.stalled.get(&sid_a).map(|s| s.to.as_str()),
                 Some("2.1.283"),
-                "the band row names the same move"
+                "the stall row names the same move"
             );
             let done = finished(finished_as, &sid_a);
             assert_eq!(
@@ -2293,7 +2293,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tabs_band_row_and_column_name_the_same_move() {
+    fn a_tabs_stall_row_and_column_name_the_same_move() {
         let now = now_s();
         let ended = |session: &str, to: &str, minted: u64, exited: u64, tab: &str| Row {
             session: session.to_string(),

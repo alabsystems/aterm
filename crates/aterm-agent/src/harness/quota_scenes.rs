@@ -211,7 +211,9 @@ pub fn case_a() -> Fx {
 }
 
 /// The glass design's case (b): one Max 20x account at 63% of its week at Thu 17:00, its reset
-/// Sat 10:00, read here from 42% a day before (50% by 23:00, flat overnight): 21% a day.
+/// Sat 10:00, read here from 42% a day before (50% by 23:00, flat overnight): 21% a day, about
+/// 99% by its reset (98.875%), and its next week out from Thu 12 Nov 04:17 until its reset Sat
+/// 14 Nov 10:00 (§1.3 (b)).
 pub fn case_b() -> Fx {
     let mut fx = Fx::new(&[("main", Class::Preferred)]);
     fx.now = T5;

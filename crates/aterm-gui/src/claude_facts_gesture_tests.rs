@@ -444,7 +444,7 @@ fn hovering_any_part_of_the_account_lights_the_whole_unit() {
     let account = fact_hit(&app, wid, Fact::Account);
     assert_eq!(
         glyphs(&app, wid, &account),
-        "\u{2386}main63%\u{b7}\u{21ba}Sat10:00\u{b7}\u{2573}~Thu12Nov05:00",
+        "\u{2386}main63%\u{b7}\u{21ba}Sat10:00\u{b7}\u{2573}~Thu12Nov04:00",
         "one fact from the mark to the verdict's last word"
     );
     assert_eq!(
@@ -1122,7 +1122,27 @@ fn open_stats_lens_shields_claude_glass_hover_and_restores_on_close() {
         "open stats lens clears hand cursor from covered Claude glass target"
     );
 
-    // Closing the stats lens and composing the next frame restores the hover under the still pointer.
+    // Shrinking or moving the open stats lens card so it no longer covers `(bx, by)` while
+    // remaining open immediately restores the hover on the next frame composition.
+    app.windows.get_mut(&wid).unwrap().stats_lens.rect = Some((1_500, 0, 200, 200));
+    frame(&mut app, wid);
+    app.refresh_glass_cursor_for_frame(wid);
+    assert_eq!(
+        app.windows[&wid].claude_lights.hover,
+        Some((session, Target::Fact(Fact::Branch))),
+        "shrinking stats lens away from pointer restores hover even while lens remains open"
+    );
+    assert!(
+        app.windows[&wid].hover_pointer,
+        "shrinking stats lens away from pointer restores hand cursor"
+    );
+
+    // Covering `(bx, by)` again and then closing the stats lens also restores hover on close.
+    app.windows.get_mut(&wid).unwrap().stats_lens.rect = Some((0, 0, 2_000, 2_000));
+    app.note_band_covered(wid);
+    app.evict_stale_glass_hover(wid);
+    app.refresh_glass_cursor_for_frame(wid);
+    assert_eq!(app.windows[&wid].claude_lights.hover, None);
     {
         let ws = app.windows.get_mut(&wid).unwrap();
         ws.stats_lens.open = None;

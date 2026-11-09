@@ -3815,7 +3815,7 @@ pub fn unit_name(facts: &FooterFacts) -> Option<&str> {
 
 /// Line D's account unit (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.2, §5.2): its
 /// forms, widest first, each a `⎆`-led segment and the parts attached to it in their tones
-/// (`⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 05:00`). None while line E is the glass's quota
+/// (`⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00`). None while line E is the glass's quota
 /// row ([`FooterFacts::line_e`]), which names the account itself.
 ///
 /// The forms are the pane's quota view's ([`super::quota_view::QuotaView::fallback`]: name,

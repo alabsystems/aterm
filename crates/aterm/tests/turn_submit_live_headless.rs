@@ -15,11 +15,17 @@ use headless_boot::{Instance, boot_session, ctl, ctl_ok, field, status, type_lin
 
 const HANG: Duration = Duration::from_secs(60);
 const HANG_MS: &str = "timeout=60000";
-/// Longer than a `turn` gives the echo of a text its program has read.
-pub(crate) const PAST_THE_ECHO_CAP: Duration = Duration::from_millis(TURN_ECHO_CAP_MS + 1_000);
-/// Shorter than the cap by less than a `late` stand-in's draw comes after its read, so a line
-/// read this long after its typing is drawn past the cap.
-const INSIDE_THE_ECHO_CAP: Duration = Duration::from_millis(TURN_ECHO_CAP_MS - 1_000);
+/// Advance the isolated server's echo clock and wait for a decision that still waits for input.
+pub(crate) fn past_echo_cap(inst: &Instance, sid: &str) {
+    let path = inst.tmp.join("echo-clock").join(sid);
+    let tick = (TURN_ECHO_CAP_MS + 1_000).to_string();
+    std::fs::write(&path, &tick).expect("advance the echo clock");
+    aterm_spec::wait::until_within(HANG, "the advanced echo still waits", || {
+        std::fs::read_to_string(path.with_extension("seen"))
+            .is_ok_and(|seen| seen == tick)
+            .then_some(())
+    });
+}
 
 /// Claude Code's frame around a composer, a logo that repaints whatever the input loop does, and
 /// that loop, which reads nothing while `$0.hold` stands. Its first word is `takes` for a
@@ -66,7 +72,10 @@ while :; do
   chunk=$(dd bs=256 count=1 2>/dev/null; printf x)
   chunk=${chunk%x}
   [ -z "$chunk" ] && exit 0
-  [ "$2" = late ] && sleep 1.5
+  if [ "$2" = late ]; then
+    : > "$0.read"
+    while [ -e "$0.draw" ]; do sleep 0.02; done
+  fi
   if [ "$3" = bracketed ]; then
     chunk=$carry$chunk
     carry=
@@ -207,8 +216,11 @@ pub(crate) fn start(
 fn boot(prefix: &str) -> (Instance, std::path::PathBuf) {
     let inst = headless_boot::boot_with(
         prefix,
-        |_, cmd| {
+        |tmp, cmd| {
             cmd.args(["--lines", "24", "--columns", "80"]);
+            let clock = tmp.join("echo-clock");
+            std::fs::create_dir(&clock).expect("the echo clock");
+            cmd.env("ATERM_DEBUG_ECHO_CLOCK", clock);
         },
         |_| true,
     );
@@ -332,7 +344,9 @@ fn a_line_claude_code_has_not_read_is_pressed_once_its_composer_shows_it() {
         for sid in [&ignores, &takes] {
             typed(&inst, sid);
         }
-        std::thread::sleep(PAST_THE_ECHO_CAP);
+        for sid in [&ignores, &takes] {
+            past_echo_cap(&inst, sid);
+        }
         std::fs::remove_file(&hold).expect("feed the stand-ins");
 
         let verdict = ignored.join().expect("the ignored turn");
@@ -364,12 +378,25 @@ fn a_line_read_before_any_look_is_pressed_once_its_composer_shows_it() {
     std::fs::write(&hold, "").expect("hold the stand-in");
     let (_, late) = boot_session(&inst);
     start(&inst, &late, &script, true, "ignores late");
+    let clock = inst.tmp.join("echo-clock").join(&late);
+    std::fs::write(clock.with_extension("hold"), "").expect("hold the first echo look");
+    std::fs::write(script.with_extension("sh.draw"), "").expect("hold the echo drawing");
 
     std::thread::scope(|scope| {
         let ignored = scope.spawn(|| follow_up(&inst, &late, 1, 2_000));
         typed(&inst, &late);
-        std::thread::sleep(INSIDE_THE_ECHO_CAP);
+        aterm_spec::wait::until_within(HANG, "the server reaches its first echo look", || {
+            clock.with_extension("ready").exists().then_some(())
+        });
         std::fs::remove_file(&hold).expect("feed the stand-in");
+        aterm_spec::wait::until_within(HANG, "the program reads before the first look", || {
+            script.with_extension("sh.read").exists().then_some(())
+        });
+        std::fs::write(&clock, (TURN_ECHO_CAP_MS + 1_000).to_string())
+            .expect("advance past the original echo cap");
+        std::fs::remove_file(clock.with_extension("hold")).expect("allow the first look");
+        past_echo_cap(&inst, &late);
+        std::fs::remove_file(script.with_extension("sh.draw")).expect("draw the late echo");
 
         let verdict = ignored.join().expect("the turn");
         assert!(

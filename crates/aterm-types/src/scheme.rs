@@ -91,7 +91,7 @@ pub struct ColorScheme {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ChromeColors {
-    /// `accent_color`: the active-tab rule, the message band's meter, Settings' selected rows, the find highlight's hue.
+    /// `accent_color`: the active-tab rule, Settings' selected rows, the find highlight's hue.
     #[cfg_attr(
         feature = "serde",
         serde(default, skip_serializing_if = "Option::is_none")
@@ -2153,7 +2153,7 @@ pub const THEME_KEYS: [ThemeKeySpec; 30] = [
         group: ThemeKeyGroup::Chrome,
         config_key: Some("accent_color"),
         when_omitted: "the cursor when it has colour, else the theme's ANSI blue or cyan",
-        description: "The chrome accent: the active-tab rule, the message band's meter, Settings' selected rows, the find highlight's hue. Each surface holds it to 3:1 on its own ground.",
+        description: "The chrome accent: the active-tab rule, Settings' selected rows, the find highlight's hue. Each surface holds it to 3:1 on its own ground.",
         example: "#7aa2f7",
     },
     ThemeKeySpec {

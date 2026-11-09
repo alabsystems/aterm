@@ -2928,8 +2928,9 @@ fn cmd_serve_units(rest: &[String]) -> ExitCode {
                 return match crate::peers::turn_off(&layout) {
                     Ok(()) => {
                         println!(
-                            "atpkg: serve-units: off — this Mac keeps and serves no toolset \
-                             archive until `aterm pkg serve-units --on`"
+                            "atpkg: serve-units: off — this {} keeps and serves no toolset \
+                             archive until `aterm pkg serve-units --on`",
+                            aterm_types::machine_name::OS_NOUN
                         );
                         ExitCode::SUCCESS
                     }
@@ -2943,9 +2944,10 @@ fn cmd_serve_units(rest: &[String]) -> ExitCode {
                 return match crate::peers::turn_on(&layout) {
                     Ok(()) => {
                         println!(
-                            "atpkg: serve-units: on — aterm serves this Mac's toolset archives \
+                            "atpkg: serve-units: on — aterm serves this {}'s toolset archives \
                              to its fleet members while it runs, and keeps each one it installs \
-                             while it serves"
+                             while it serves",
+                            aterm_types::machine_name::OS_NOUN
                         );
                         ExitCode::SUCCESS
                     }
@@ -2969,10 +2971,11 @@ fn cmd_serve_units(rest: &[String]) -> ExitCode {
         }
     }
     match crate::peers::serve(&layout, listen, |bound| {
+        let machine = aterm_types::machine_name::OS_NOUN;
         println!(
-            "atpkg: serve-units: serving this Mac's toolset archives on {bound} — its fleet \
-             members take them unasked, another Mac with `[packages] peers = [\"<this Mac's \
-             address>:{}\"]`; Ctrl-C stops",
+            "atpkg: serve-units: serving this {machine}'s toolset archives on {bound} — its fleet \
+             members take them unasked, another machine with `[packages] peers = [\"<this \
+             {machine}'s address>:{}\"]`; Ctrl-C stops",
             bound.port()
         );
     }) {
@@ -2983,8 +2986,9 @@ fn cmd_serve_units(rest: &[String]) -> ExitCode {
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             match crate::peers::serving(&layout) {
                 Some(at) => eprintln!(
-                    "atpkg: serve-units: this Mac already serves its toolset archives on {at} \
-                     (aterm serves them while it runs)"
+                    "atpkg: serve-units: this {} already serves its toolset archives on {at} \
+                     (aterm serves them while it runs)",
+                    aterm_types::machine_name::OS_NOUN
                 ),
                 None => eprintln!("atpkg: serve-units: {listen}: {e}"),
             }

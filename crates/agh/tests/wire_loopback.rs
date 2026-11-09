@@ -272,7 +272,7 @@ fn a_closed_hop_is_retried_from_the_api_origin() {
             FakeOrigin::Cdn
         ]
     );
-    assert_eq!(gh.fx().slept(), [Duration::from_secs(2)]);
+    assert_eq!(gh.fx().slept(), [Duration::from_secs(10)]);
     assert_clean(&fake);
 }
 
@@ -350,7 +350,7 @@ fn a_hang_past_the_idle_is_idle() {
 }
 
 #[test]
-fn a_closed_connection_is_truncated_and_retried_to_three_requests() {
+fn a_closed_connection_is_truncated_and_retried_to_the_shared_bound() {
     let fake = fake_with_repo();
     fake.fault_always(Match::api("/repos/fixture-dev/repo"), Fault::Close);
     let gh = anonymous(&fake);
@@ -361,21 +361,22 @@ fn a_closed_connection_is_truncated_and_retried_to_three_requests() {
         )
         .expect_err("closed every time");
     assert_eq!(error.sub, Sub::Wire(WireKind::Truncated));
-    assert_eq!(fake.seen().len(), 3);
-    assert_eq!(gh.meter().requests, 3);
-    assert_eq!(
-        gh.fx().slept(),
-        [Duration::from_secs(2), Duration::from_secs(5)]
-    );
+    assert_eq!(fake.seen().len(), 19);
+    assert_eq!(gh.meter().requests, 19);
+    assert_eq!(gh.fx().slept(), [Duration::from_secs(10); 18]);
     assert_clean(&fake);
 }
 
 #[test]
-fn a_secondary_limit_is_waited_out_then_answered() {
+fn a_429_with_retry_after_is_waited_out_then_answered() {
     let fake = fake_with_repo();
     fake.fault(
         Match::api("/repos/fixture-dev/repo"),
-        Fault::SecondaryLimit { retry_after: 1 },
+        Fault::Status {
+            status: 429,
+            body: "rate limited".to_string(),
+            headers: vec![("retry-after".to_string(), "1".to_string())],
+        },
     );
     let gh = anonymous(&fake);
     let answer = gh

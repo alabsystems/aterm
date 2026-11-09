@@ -288,54 +288,8 @@ fn a_record_retires_recorded() {
 }
 
 #[test]
-fn no_excerpt_rows_lay_out_without_detail0() {
+fn an_unrevealed_row_is_not_carried() {
     let now = t0();
-    let mut c = fresh(now);
-    let id = c
-        .post(
-            warn("aterm crashed last time")
-                .line("crash log at /x/crash.log")
-                .no_excerpt(),
-            stamp(),
-            now,
-        )
-        .id;
-    c.commit_rows(now, 3);
-    let p = present(&c, 160);
-    assert_eq!(p.rows[0].detail, None, "the title alone");
-    assert_eq!(
-        c.live(id).unwrap().msg.detail,
-        vec!["crash log at /x/crash.log".to_string()],
-        "the line still rides Details and the log"
-    );
-    let before = c.fingerprint(160);
-    c.restate(
-        id,
-        Restatement {
-            excerpt: Some(true),
-            ..Restatement::default()
-        },
-        now,
-    );
-    assert!(present(&c, 160).rows[0].detail.is_some());
-    assert_ne!(c.fingerprint(160), before);
-}
-
-#[test]
-fn a_carried_row_keeps_its_excerpt_flag() {
-    let now = t0();
-    let mut parent = fresh(now);
-    let id = parent
-        .post(warn("quiet").line("hidden").no_excerpt(), stamp(), now)
-        .id;
-    parent.commit_rows(now, 3);
-    let carry = parent.carried();
-    assert!(!carry.live[0].excerpt);
-    let mut child = fresh(now);
-    child.seed_carried(&carry, stamp(), now);
-    assert!(!child.live(id).unwrap().msg.excerpt);
-    child.commit_rows(now, 3);
-    assert_eq!(present(&child, 160).rows[0].detail, None);
     let mut parent = fresh(now);
     parent.post(download(1).reveal_after(PROGRESS_GRACE), stamp(), now);
     assert!(parent.carried().live.is_empty());

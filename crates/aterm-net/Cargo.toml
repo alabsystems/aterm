@@ -13,6 +13,10 @@ description = "aterm L3 — the fleet: a mutual, exporter-bound proof of one fle
 [lints]
 workspace = true
 
+[features]
+# Let optimized isolated lab instances advance the fleet lifetime clock.
+dev-seams = ["aterm-types/dev-seams"]
+
 [dependencies]
 # The portable local-socket type the relay bridges to (Unix: a pure std
 # UnixStream alias — zero behavioral change; Windows: AF_UNIX over winsock),

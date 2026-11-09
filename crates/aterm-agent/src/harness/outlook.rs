@@ -38,7 +38,7 @@ use super::accounts::{
     self, Advice, Class, Condition, Me, Mode, Mover, Point, Roster, State, StayWhy, TapRead,
     WindowRead,
 };
-use super::quota_view::{Burn, CELL_PLACES, Chart, GAP_MARK, HANDOFF_MARK, RESET_MARK, Role};
+use super::quota_view::{Burn, CELL_PLACES, Cell, Chart, GAP_MARK, HANDOFF_MARK, RESET_MARK, Role};
 
 /// The week's pace looks back this far ([`Demand::week`]).
 pub const WEEK_LOOKBACK_S: i64 = 24 * 3600;
@@ -4068,7 +4068,7 @@ impl Outlook {
             WORK_WORD.chars().map(|c| (c, CardInk::Axis)).collect();
         cells.extend(drawn.iter().map(|c| (c.glyph(), CardInk::of(c.role()))));
         let mut ticks = Vec::new();
-        chart.ticks(k, WORK_WORD.len(), &drawn, &mut ticks);
+        chart.ticks(k, (WORK_WORD.len(), Cell::ticks), &drawn, &mut ticks);
         let said = self.card_work_said(tab, movable);
         CardRow::Plot {
             cells,
@@ -4260,7 +4260,8 @@ impl Outlook {
                     let mut drawn = lead.clone();
                     drawn.extend(cells.iter().map(|c| (c.glyph(), CardInk::of(c.role()))));
                     let mut ticks = Vec::new();
-                    view.chart.ticks(k, WORK_WORD.len(), &cells, &mut ticks);
+                    view.chart
+                        .ticks(k, (WORK_WORD.len(), Cell::lane_ticks), &cells, &mut ticks);
                     CardLane {
                         cells: drawn,
                         spoken: self.lane_said(l),

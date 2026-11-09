@@ -57,7 +57,8 @@ pub(crate) struct UpdateState {
     checking: bool,
     /// When the last check completed ([`UpdateProjection::checked_line`]).
     checked_at: Option<i64>,
-    /// The automatic lane's download in flight, which the band does not show.
+    /// The automatic lane's download in flight, which posts no live row: this page says it
+    /// ([`Self::quiet_download`]).
     downloading: Option<QuietDownload>,
     /// A dev-marked copy ([`Self::with_dev_build`]).
     dev_build: Option<DevBuildPage>,

@@ -24,7 +24,8 @@ use crate::wire::{
 };
 
 /// Lowercase sorted response headers retained across live, record, and replay modes.
-pub const KEPT_HEADERS: [&str; 15] = [
+pub const KEPT_HEADERS: [&str; 16] = [
+    "content-range",
     "content-type",
     "etag",
     "link",

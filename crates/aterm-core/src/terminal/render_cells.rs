@@ -3118,8 +3118,8 @@ mod tests {
         );
     }
 
-    /// One frame of a window with a host chrome row (a tab strip, the message
-    /// band) in the native redraw's order: undo the last frame's prepend,
+    /// One frame of a window with a host chrome row (the tab strip) in the
+    /// native redraw's order: undo the last frame's prepend,
     /// refill, prepend this frame's `band` row. The refilled engine rows must be
     /// the rows a full extract resolves, and the band must sit above them.
     fn banded_step(

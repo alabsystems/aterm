@@ -431,7 +431,10 @@ fn commons_here(paths: &Paths) -> Result<bool> {
         Availability::Available(_) => Ok(true),
         Availability::Unavailable(Unavailable::Busy) => Err(aterm_secrets::Error::of_kind(
             aterm_secrets::ErrorKind::VaultBusy,
-            "this Mac's vault is busy: a vault writer holds its state lock",
+            format!(
+                "this {}'s vault is busy: a vault writer holds its state lock",
+                aterm_types::machine_name::OS_NOUN
+            ),
         )
         .into()),
         Availability::Unavailable(_) => Ok(false),

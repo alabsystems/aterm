@@ -706,6 +706,16 @@ type KeptDigests =
 /// it replaced.
 const SETTLED_NS: i128 = 2_000_000_000;
 
+/// Whether what `seen` shows last changed [`SETTLED_NS`] or more before `now`, so that a change
+/// made after `now` moves a stamp a later `lstat` shows, on a clock that ticks this coarsely or
+/// finer. Only then may a reader keep what it read while the path's [`Seen`] stands.
+pub(crate) fn settled(seen: &Seen, now: std::time::SystemTime) -> bool {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i128::try_from(since.as_nanos()).ok())
+        .is_some_and(|now| seen.stamp.mtime_ns.max(seen.stamp.ctime_ns) <= now - SETTLED_NS)
+}
+
 /// [`digest_while_seen`] with its digests in `kept`, asked at `now`, reading with `read` what
 /// `reader` reads.
 fn digest_while_seen_in(
@@ -729,15 +739,9 @@ fn digest_while_seen_in(
     let Some((opened, digest)) = read(path)? else {
         return Ok(None);
     };
-    let settled = |seen: &Seen| {
-        now.duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|since| i128::try_from(since.as_nanos()).ok())
-            .is_some_and(|now| seen.stamp.mtime_ns.max(seen.stamp.ctime_ns) <= now - SETTLED_NS)
-    };
     if let Some(seen) = before
         && opened == seen.stamp
-        && settled(&seen)
+        && settled(&seen, now)
         && let Ok(mut kept) = kept.lock()
     {
         kept.retain(|(at, by, ..)| !(at == path && *by == reader));

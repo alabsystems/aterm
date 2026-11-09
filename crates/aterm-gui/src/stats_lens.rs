@@ -6009,12 +6009,15 @@ impl crate::App {
     pub(crate) fn splice_stats_lens(&mut self, wid: crate::WindowId) {
         let Some((lg, lens, f)) = self.lens_frame(wid) else {
             if let Some(ws) = self.windows.get_mut(&wid) {
+                let had_rect = ws.stats_lens.rect.take().is_some();
                 ws.stats_lens.retire_input();
                 ws.lens_card = None;
-                ws.stats_lens.rect = None;
                 ws.stats_lens.open = None;
                 ws.stats_lens.leave_due = None;
                 ws.stats_lens.shell = None;
+                if had_rect {
+                    ws.native_rehover = true;
+                }
             }
             return;
         };
@@ -6084,6 +6087,7 @@ impl crate::App {
             self.note_band_covered(wid);
             self.evict_stale_glass_hover(wid);
         }
+        self.evict_native_hover_under_stats_lens(wid);
     }
 
     /// The open lens laid out, not drawn, for the accessibility tree.
@@ -6185,6 +6189,7 @@ impl crate::App {
         ws.stats_lens.leave_due = None;
         ws.stats_lens.rest = None;
         if was {
+            ws.native_rehover = true;
             self.request_window_redraw(wid);
         }
         was

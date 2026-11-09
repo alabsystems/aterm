@@ -45,8 +45,13 @@ pub(super) struct SimClock {
     start_unix_secs: u64,
     /// The time slept so far, and each sleep in order.
     simulated_time: Mutex<(Duration, Vec<Duration>)>,
+    /// Every admitted HTTP retry diagnostic, in order.
+    retry_notes: Mutex<Vec<String>>,
     /// The children `Fx::child` answers from, in order.
     scripted: Mutex<VecDeque<ScriptedChild>>,
+    /// Installed scripted answers for `Fx::git`; `None` runs the real child.
+    #[cfg(unix)]
+    scripted_git: Mutex<Option<VecDeque<ChildOut>>>,
     /// Every spec `Fx::child` or `Fx::git` accepted (one `child::check` passed), in call order.
     run: Mutex<Vec<ChildSpec>>,
     #[cfg(unix)]
@@ -63,7 +68,10 @@ impl SimClock {
         SimClock {
             start_unix_secs,
             simulated_time: Mutex::new((Duration::ZERO, Vec::new())),
+            retry_notes: Mutex::new(Vec::new()),
             scripted: Mutex::new(VecDeque::new()),
+            #[cfg(unix)]
+            scripted_git: Mutex::new(None),
             run: Mutex::new(Vec::new()),
             #[cfg(unix)]
             git_hook: Mutex::new(None),
@@ -106,6 +114,22 @@ impl SimClock {
             .clone()
     }
 
+    /// Record one admitted HTTP retry diagnostic.
+    pub(super) fn note_retry(&self, line: String) {
+        self.retry_notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(line);
+    }
+
+    /// Every admitted HTTP retry diagnostic so far.
+    pub(super) fn retry_notes(&self) -> Vec<String> {
+        self.retry_notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Queue `children` after any already scripted.
     pub(super) fn script(&self, children: Vec<ScriptedChild>) {
         self.scripted
@@ -120,6 +144,36 @@ impl SimClock {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .pop_front()
+    }
+
+    #[cfg(unix)]
+    pub(super) fn script_git(&self, answers: Vec<ChildOut>) {
+        let mut scripted = self
+            .scripted_git
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert!(scripted.is_none(), "one scripted Git transport");
+        *scripted = Some(answers.into());
+    }
+
+    /// `None`: real Git; `Some(Some(answer))`: the next injected answer; `Some(None)`: an
+    /// installed script was exhausted.
+    #[cfg(unix)]
+    pub(super) fn next_git(&self) -> Option<Option<ChildOut>> {
+        let mut scripted = self
+            .scripted_git
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        scripted.as_mut().map(VecDeque::pop_front)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn git_remaining(&self) -> Option<usize> {
+        self.scripted_git
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(VecDeque::len)
     }
 
     /// Log the accepted spec and return its index under the same lock.

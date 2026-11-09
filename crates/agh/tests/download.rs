@@ -7,10 +7,12 @@
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use agh::download::{DigestCheck, Expect, Sink, part_path};
 use agh::model::{AssetObject, Sha256Digest};
 use agh::wire::WireKind;
+use agh::wire::scripted::ScriptedTransport;
 use agh::{Github, How, Kind, Sub};
 use agh_fake::{
     AssetSpec, Change, DigestSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, RepoSpec,
@@ -209,15 +211,19 @@ fn an_open_asset_is_not_uploaded() {
 }
 
 #[test]
-fn a_truncated_cdn_body_is_truncated_and_the_part_file_goes() {
+fn a_truncated_cdn_body_restarts_when_the_range_is_ignored() {
     let w = World::new("dl-truncated");
     let asset = w.asset(AssetSpec::uploaded("a.bin", BYTES));
+    w.fake.clear_seen();
     w.fake.fault(Match::cdn(), Fault::TruncateBody { at: 4 });
     let dest = w.dest("a.bin");
-    let error = w.file(&dest, &asset, false).expect_err("truncated");
-    assert_eq!(error.kind, Kind::CouldNotRun);
-    assert_eq!(error.sub, Sub::Wire(WireKind::Truncated));
-    nothing_remains(&dest);
+    let done = w
+        .file(&dest, &asset, false)
+        .expect("the full 200 replaces the partial prefix");
+    assert_eq!(std::fs::read(&dest).expect("the completed asset"), BYTES);
+    assert_eq!(done.bytes, BYTES.len() as u64);
+    assert_eq!(w.gh.fx().retry_notes().len(), 1);
+    assert!(!part_path(&dest).exists());
     w.fake.assert_clean();
 }
 
@@ -259,6 +265,152 @@ fn bounded_and_writer_sinks_hold_the_bytes() {
     assert_eq!(written.bytes, BYTES.len() as u64);
     assert_eq!(written.data, None);
     w.fake.assert_clean();
+}
+
+#[test]
+fn a_writer_resumes_its_spool_and_exposes_only_the_complete_body() {
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer_body_fault(200, &[], b"first ", WireKind::Reset);
+    transport.answer(206, &[("Content-Range", "bytes 6-9/10")], b"body");
+    let gh = common::scripted(&transport, 47_201);
+    let got = digest(b"first body");
+    let asset = AssetObject {
+        id: 7,
+        name: "a.bin".to_string(),
+        size: 10,
+        digest: Some(got.to_string()),
+        state: "uploaded".to_string(),
+        content_type: "application/octet-stream".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+        browser_download_url: String::new(),
+        download_count: 0,
+        raw: aterm_json::json!({}),
+    };
+    let mut out = Vec::new();
+    let done = gh
+        .releases(&common::slug(APP))
+        .download(
+            &asset,
+            Sink::Writer(&mut out),
+            Expect {
+                size: 10,
+                digest: Some(got),
+                limit: 10,
+            },
+        )
+        .expect("the range completes the spool");
+    assert_eq!(out, b"first body");
+    assert_eq!(done.requests, 2);
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1]
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("range"))
+            .map(|(_, value)| value.as_str()),
+        Some("bytes=6-")
+    );
+    assert_eq!(gh.fx().retry_notes().len(), 1);
+}
+
+#[test]
+fn a_bounded_memory_asset_resumes_from_its_completed_prefix() {
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer_body_fault(200, &[], b"first ", WireKind::Timeout);
+    transport.answer(206, &[("Content-Range", "bytes 6-9/10")], b"body");
+    let gh = common::scripted(&transport, 47_203);
+    let got = digest(b"first body");
+    let asset = AssetObject {
+        id: 9,
+        name: "memory.bin".to_string(),
+        size: 10,
+        digest: Some(got.to_string()),
+        state: "uploaded".to_string(),
+        content_type: "application/octet-stream".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+        browser_download_url: String::new(),
+        download_count: 0,
+        raw: aterm_json::json!({}),
+    };
+    let done = gh
+        .releases(&common::slug(APP))
+        .download(
+            &asset,
+            Sink::Bounded(10),
+            Expect {
+                size: 10,
+                digest: Some(got),
+                limit: 10,
+            },
+        )
+        .expect("the range completes the memory body");
+    assert_eq!(done.data.as_deref(), Some(b"first body".as_slice()));
+    assert_eq!(done.requests, 2);
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1]
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("range"))
+            .map(|(_, value)| value.as_str()),
+        Some("bytes=6-")
+    );
+    assert_eq!(gh.fx().retry_notes().len(), 1);
+}
+
+#[test]
+fn a_file_asset_resumes_and_hashes_the_complete_prefix_plus_range() {
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer_body_fault(200, &[], b"first ", WireKind::Reset);
+    transport.answer(206, &[("Content-Range", "bytes 6-9/10")], b"body");
+    let gh = common::scripted(&transport, 47_202);
+    let bytes = b"first body";
+    let got = digest(bytes);
+    let asset = AssetObject {
+        id: 8,
+        name: "range.bin".to_string(),
+        size: 10,
+        digest: Some(got.to_string()),
+        state: "uploaded".to_string(),
+        content_type: "application/octet-stream".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+        browser_download_url: String::new(),
+        download_count: 0,
+        raw: aterm_json::json!({}),
+    };
+    let root = aterm_tempfile::tempdir().expect("scratch");
+    let dest = root.path().join("range.bin");
+    let done = gh
+        .releases(&common::slug(APP))
+        .download(
+            &asset,
+            Sink::File {
+                path: dest.clone(),
+                clobber: false,
+            },
+            Expect {
+                size: 10,
+                digest: Some(got),
+                limit: 10,
+            },
+        )
+        .expect("the range completes the asset");
+    assert_eq!(std::fs::read(&dest).expect("asset"), bytes);
+    assert_eq!(done.sha256, got);
+    assert_eq!(done.requests, 2);
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1]
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("range"))
+            .map(|(_, value)| value.as_str()),
+        Some("bytes=6-")
+    );
+    assert_eq!(gh.fx().retry_notes().len(), 1);
 }
 
 #[test]

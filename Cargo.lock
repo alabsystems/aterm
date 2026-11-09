@@ -149,7 +149,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.183.0"
+version = "0.184.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -2182,6 +2182,7 @@ dependencies = [
  "aterm-json",
  "aterm-models-capacity",
  "aterm-models-misc",
+ "aterm-phase",
  "aterm-png",
  "aterm-pty",
  "aterm-serde",
@@ -2441,6 +2442,7 @@ dependencies = [
  "aterm-census",
  "aterm-codec",
  "aterm-digest",
+ "aterm-dirfd",
  "aterm-durable",
  "aterm-json",
  "aterm-models-atpkg",

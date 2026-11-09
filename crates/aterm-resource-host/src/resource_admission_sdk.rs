@@ -30,6 +30,8 @@ pub(super) struct Keeper {
     held: Arc<trust_resource_provenance::program::HeldProgram>,
     bootstrap_query_compiler:
         std::sync::OnceLock<Arc<trust_resource_provenance::program::HeldProgram>>,
+    bootstrap_object_driver:
+        std::sync::OnceLock<Option<Arc<trust_resource_provenance::program::HeldProgram>>>,
     workload_compiler: std::sync::OnceLock<Arc<trust_resource_provenance::program::HeldProgram>>,
     workload_linker: std::sync::OnceLock<Arc<trust_resource_provenance::program::HeldProgram>>,
 }
@@ -168,6 +170,55 @@ impl Keeper {
                 .get()
                 .ok_or_else(|| refused("Bootstrap query compiler not retained before Root GO"))?,
         };
+        held.validate(deadline)?;
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(Arc::clone(held))
+    }
+
+    /// Capture this distinct object's input before the SAME Root can execute.
+    /// A genuinely absent optional tool leaves readonly query75 available, but
+    /// can never be opened later in response to an object request.
+    pub(super) fn capture_bootstrap_object_input(&self, deadline: Instant) -> io::Result<()> {
+        if self.bootstrap_object_driver.get().is_some() {
+            return Err(refused("Bootstrap object driver already captured"));
+        }
+        self.validate()?;
+        let selected = self.execution.join("bin/tippy-driver");
+        let held = match std::fs::symlink_metadata(&selected) {
+            Ok(_) => Some(self.capture_workload_program("tippy-driver", deadline)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        self.bootstrap_object_driver
+            .set(held)
+            .map_err(|_| refused("Bootstrap object driver capture raced"))?;
+        self.validate()?;
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        Ok(())
+    }
+
+    /// Only the actual early-selected driver can issue the distinct object
+    /// profile. A pathname, request digest or current file cannot fill absence.
+    pub(super) fn bootstrap_object_program(
+        &self,
+        deadline: Instant,
+    ) -> io::Result<Arc<trust_resource_provenance::program::HeldProgram>> {
+        self.validate()?;
+        let held = self
+            .bootstrap_object_driver
+            .get()
+            .ok_or_else(|| refused("Bootstrap object driver not captured before Root GO"))?
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "original SDK has no captured object driver",
+                )
+            })?;
         held.validate(deadline)?;
         if Instant::now() >= deadline {
             return Err(io::ErrorKind::TimedOut.into());
@@ -338,6 +389,7 @@ impl Keeper {
             build,
             held: Arc::new(held),
             bootstrap_query_compiler: std::sync::OnceLock::new(),
+            bootstrap_object_driver: std::sync::OnceLock::new(),
             workload_compiler: std::sync::OnceLock::new(),
             workload_linker: std::sync::OnceLock::new(),
         };
@@ -360,6 +412,9 @@ impl Keeper {
         native_inputs::validate(&self.held, started)?;
         if let Some(compiler) = self.bootstrap_query_compiler.get() {
             native_inputs::validate(compiler, started)?;
+        }
+        if let Some(Some(driver)) = self.bootstrap_object_driver.get() {
+            native_inputs::validate(driver, started)?;
         }
         if let Some(compiler) = self.workload_compiler.get() {
             native_inputs::validate(compiler, started)?;

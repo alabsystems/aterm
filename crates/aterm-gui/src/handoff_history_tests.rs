@@ -684,7 +684,7 @@ fn a_scrollback_cleared_before_the_import_stays_cleared_and_is_not_counted() {
     assert_eq!(
         loss_summary(&[report]),
         LossSummary::default(),
-        "no band row for a clear"
+        "no row for a clear"
     );
 }
 

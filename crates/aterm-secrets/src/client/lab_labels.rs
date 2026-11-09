@@ -113,22 +113,25 @@ fn lab_labels_with_clock(
     match state.membership {
         Stored::Revoked | Stored::Plain => return Ok(LabLabels::default()),
         Stored::Pending | Stored::None => {
-            return Err(Error::new(
-                "this Mac is still joining its fleet, so it holds no copy of the lab's labels yet",
-            ));
+            return Err(Error::new(format!(
+                "this {} is still joining its fleet, so it holds no copy of the lab's labels yet",
+                aterm_types::machine_name::OS_NOUN
+            )));
         }
         Stored::In if state.failed || !state.pending.is_empty() => {
-            return Err(Error::new(
-                "this Mac's last vault apply did not finish, so its copy of the lab's labels is \
+            return Err(Error::new(format!(
+                "this {}'s last vault apply did not finish, so its copy of the lab's labels is \
                  not whole",
-            ));
+                aterm_types::machine_name::OS_NOUN
+            )));
         }
         Stored::In => {}
     }
     let Some(lock) = held else {
-        return Err(Error::new(
-            "this Mac's vault holds no applied copy, so the lab's labels are not read",
-        ));
+        return Err(Error::new(format!(
+            "this {}'s vault holds no applied copy, so the lab's labels are not read",
+            aterm_types::machine_name::OS_NOUN
+        )));
     };
     let me = identity.recipient().to_bech32();
     let roster = super::roster::swarm_roster_held(paths, &lock)?;
@@ -171,7 +174,10 @@ fn observe_within(
         if remaining.is_zero() {
             return Err(Error::of_kind(
                 crate::ErrorKind::VaultBusy,
-                "this Mac's vault is busy: a writer still holds its state lock",
+                format!(
+                    "this {}'s vault is busy: a writer still holds its state lock",
+                    aterm_types::machine_name::OS_NOUN
+                ),
             ));
         }
         std::thread::sleep(backoff.min(remaining));

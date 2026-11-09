@@ -175,7 +175,7 @@ impl App {
         };
     }
 
-    /// Record unattended background download progress without raising a band row,
+    /// Record unattended background download progress without posting a live row,
     /// republishing whole-MB progress to open Settings views and returning `true` when handled quietly.
     fn note_quiet_update_progress(&mut self, progress: &aterm_update::Progress) -> bool {
         use aterm_update::Progress as P;
@@ -739,7 +739,7 @@ impl App {
                     ));
                 }
             }
-            crate::native_app::UpdateOutcome::Deferred { reason } => {
+            crate::native_app::UpdateOutcome::Deferred { reason, .. } => {
                 aterm_log::info!("update apply ({source}) deferred: {reason}");
                 self.retire_update_installing();
                 if open_details {
@@ -1274,7 +1274,7 @@ fn apply_ledger_verdict(outcome: &UpdateOutcome) -> ApplyLedgerVerdict {
         #[cfg(any(unix, test))]
         UpdateOutcome::CaptureRefused { message } => ApplyLedgerVerdict::Failed(message.clone()),
         UpdateOutcome::Blocked { reasons } => ApplyLedgerVerdict::Refused(reasons.join(" · ")),
-        UpdateOutcome::Deferred { reason } => ApplyLedgerVerdict::Refused(reason.clone()),
+        UpdateOutcome::Deferred { reason, .. } => ApplyLedgerVerdict::Refused(reason.clone()),
         UpdateOutcome::Accepted => ApplyLedgerVerdict::Silent,
         #[cfg(any(unix, test))]
         UpdateOutcome::InstalledNeedsRelaunch { .. } => ApplyLedgerVerdict::Silent,
@@ -1452,6 +1452,7 @@ pub(crate) mod tests {
             dmg_sha256: [0xab; 32],
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
             attempts: 0,
+            held: crate::native_update_lane_hold::NamedHold::default(),
         });
     }
 
@@ -1720,6 +1721,7 @@ pub(crate) mod tests {
                 "manual",
                 UpdateOutcome::Deferred {
                     reason: "typing gap".to_string(),
+                    hold: crate::native_update_lane_hold::LaneHold::Activity,
                 },
                 false,
             );
@@ -2195,6 +2197,7 @@ pub(crate) mod tests {
             dmg_sha256: [0xab; 32],
             retry_at: later,
             attempts: 0,
+            held: crate::native_update_lane_hold::NamedHold::default(),
         });
         app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
             build,
@@ -2230,6 +2233,7 @@ pub(crate) mod tests {
                 dmg_sha256: digest,
                 retry_at: later,
                 attempts: 0,
+                held: crate::native_update_lane_hold::NamedHold::default(),
             });
             assert_eq!(app.automatic_apply_retry_scheduled(build), exact);
             assert!(!app.automatic_apply_retry_scheduled(build + 1));
@@ -2264,7 +2268,7 @@ pub(crate) mod tests {
         assert!(!app.automatic_apply_retry_scheduled(build));
     }
 
-    /// Scheduled automatic retries post no band row; stopped lanes and manual failures do.
+    /// Scheduled automatic retries post no row; stopped lanes and manual failures do.
     #[test]
     fn a_scheduled_retry_is_silent_and_a_stopped_lane_names_the_menu() {
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -2291,6 +2295,7 @@ pub(crate) mod tests {
             dmg_sha256: [0xab; 32],
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
             attempts: 0,
+            held: crate::native_update_lane_hold::NamedHold::default(),
         });
         app.clear_messages_for_test();
         app.surface_update_apply_outcome("automatic", failed(), false);
@@ -2301,6 +2306,7 @@ pub(crate) mod tests {
             dmg_sha256: [0xab; 32],
             retry_at: std::time::Instant::now() + std::time::Duration::from_secs(600),
             attempts: 0,
+            held: crate::native_update_lane_hold::NamedHold::default(),
         });
         app.clear_messages_for_test();
         app.surface_update_apply_outcome("automatic", failed(), false);
@@ -2486,6 +2492,7 @@ pub(crate) mod tests {
             (
                 UpdateOutcome::Deferred {
                     reason: "the terminal is busy".to_string(),
+                    hold: crate::native_update_lane_hold::LaneHold::Activity,
                 },
                 Refused("the terminal is busy".to_string()),
             ),

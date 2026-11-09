@@ -7,7 +7,6 @@ use crate::{channel, ledger, manifest_out, publish, verify};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use channel::{ChannelRelease, HeadPatchValue};
 use ledger::{Error, Result, RunOut};
@@ -495,7 +494,6 @@ impl ChannelRelease for FakeChannel<'_> {
             &self.local_appcast,
             &mut || Ok(github.pointer()),
             &mut |url| github.fetch(url),
-            &mut |_| {},
         )
         .map(|_| ())
     }
@@ -782,7 +780,7 @@ fn a_refused_upload_whose_object_is_there_is_converged_and_still_named_by_the_jo
 }
 
 #[test]
-fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
+fn a_stale_pointer_answer_is_not_polled_again() {
     let mut github = FakeGithub::with_previous_release();
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
@@ -793,36 +791,7 @@ fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
         location: download_url(PREVIOUS, manifest_out::MANIFEST_ASSET),
     };
 
-    let lag = 12;
-    let (mut asked, mut slept) = (0, Vec::new());
-    publish::prove_pointer_serves(
-        SLUG,
-        TAG,
-        &local_appcast,
-        &mut || {
-            asked += 1;
-            Ok(if asked <= lag {
-                stale()
-            } else {
-                github.pointer()
-            })
-        },
-        &mut |url| github.fetch(url),
-        &mut |d| slept.push(d),
-    )
-    .expect("a pointer that moves within the bound is proved");
-    assert_eq!(
-        &slept[..3],
-        &[
-            Duration::from_millis(250),
-            Duration::from_millis(500),
-            Duration::from_secs(1)
-        ]
-    );
-    assert!(slept.iter().all(|d| *d <= Duration::from_secs(10)));
-    assert_eq!(slept.len(), lag);
-
-    let (mut asked, mut slept) = (0, Vec::new());
+    let mut asked = 0;
     let err = publish::prove_pointer_serves(
         SLUG,
         TAG,
@@ -832,51 +801,14 @@ fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
             Ok(stale())
         },
         &mut |url| github.fetch(url),
-        &mut |d| slept.push(d),
     )
-    .expect_err("a pointer that never moves is refused");
+    .expect_err("a stale pointer answer is final for this proof");
     assert!(
         err.to_string()
             .contains(&format!("names {PREVIOUS}, not {TAG}")),
         "{err}"
     );
-    assert_eq!(asked, slept.len() + 1);
-    let waited = slept.iter().sum::<Duration>();
-    assert!(waited < publish::POINTER_PROBE_BUDGET);
-    assert!(publish::POINTER_PROBE_BUDGET - waited <= Duration::from_secs(10));
-}
-
-/// NEGATIVE CONTROL: the former ten-second poll gap misses a pointer ready at
-/// one second. No wall-clock latency assertion or real network is involved.
-#[test]
-fn a_pointer_is_proved_as_soon_as_fast_probes_observe_it() {
-    use std::cell::Cell;
-    let mut github = FakeGithub::with_previous_release();
-    let id = github.source_release(true);
-    let (_dir, files, local) = dist();
-    channel::publish_on_channel(&mut FakeChannel::new(&mut github, id, local.clone(), files))
-        .unwrap();
-    let ready = github.pointer();
-    let elapsed = Cell::new(Duration::ZERO);
-    publish::prove_pointer_serves(
-        SLUG,
-        TAG,
-        &local,
-        &mut || {
-            Ok(if elapsed.get() >= Duration::from_secs(1) {
-                ready.clone()
-            } else {
-                PointerProbe::Tag {
-                    tag: PREVIOUS.into(),
-                    location: download_url(PREVIOUS, manifest_out::MANIFEST_ASSET),
-                }
-            })
-        },
-        &mut |url| github.fetch(url),
-        &mut |delay| elapsed.set(elapsed.get() + delay),
-    )
-    .unwrap();
-    assert_eq!(elapsed.get(), Duration::from_millis(1750));
+    assert_eq!(asked, 1);
 }
 
 #[test]
@@ -1105,7 +1037,6 @@ fn a_non_app_release_holding_latest_is_taken_over() {
             &local_appcast,
             &mut || Ok(github.pointer()),
             &mut |url| github.fetch(url),
-            &mut |_| {},
         )
         .expect_err("the gate never calls a non-app head this cut");
         assert!(err.to_string().contains("not an app release"), "{err}");

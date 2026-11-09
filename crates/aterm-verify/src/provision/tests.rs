@@ -2033,32 +2033,122 @@ fn a_row_found_in_place_is_marked_used() {
 }
 
 #[test]
-fn the_download_is_capped_at_the_pins_size_and_reads_no_curlrc() {
-    let dest = Path::new("/scratch/.provision-x/download/a.tar.gz");
-    let spawn = fetch_spawn("https://example.invalid/a.tar.gz", dest, 2_628_460);
-    let words: Vec<String> = spawn
-        .args
-        .iter()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(spawn.program, Path::new(CURL));
-    assert_eq!(words[0], "-q", "{words:?}");
-    let cap = words
-        .iter()
-        .position(|w| w == "--max-filesize")
-        .expect("a cap");
-    assert_eq!(words[cap + 1], "2628460");
-    for (flag, value) in [
-        ("--proto", "=https"),
-        ("--proto-redir", "=https"),
-        ("-o", "/scratch/.provision-x/download/a.tar.gz"),
-    ] {
-        let i = words.iter().position(|w| w == flag).expect(flag);
-        assert_eq!(words[i + 1], value, "{flag}");
+fn the_system_fetch_uses_the_shared_https_only_transport() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let dest = scratch.path().join("archive");
+    let error = System::new(&repo())
+        .fetch("http://example.invalid/archive", &dest, 2_628_460)
+        .unwrap_err();
+    assert!(
+        error.contains("refusing asset URL with non-https scheme"),
+        "the shared transport must reject the negative control before starting curl: {error}"
+    );
+    assert!(!dest.exists());
+    assert!(!dest.with_extension("part").exists());
+}
+
+struct FetchScript {
+    statuses: std::sync::Mutex<std::collections::VecDeque<u16>>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl FetchScript {
+    fn new(statuses: impl IntoIterator<Item = u16>) -> Self {
+        Self {
+            statuses: std::sync::Mutex::new(statuses.into_iter().collect()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
+}
+
+impl aterm_update_core::github_rest::Spawn for FetchScript {
+    fn run(
+        &self,
+        command: &mut aterm_uds::spawnfd::Command,
+        _stdin: Option<&[u8]>,
+    ) -> std::io::Result<std::process::Output> {
+        use std::io::Write as _;
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let status = self.statuses.lock().unwrap().pop_front().unwrap_or(200);
+        if status == 200 {
+            let args: Vec<_> = command.get_args().collect();
+            let output = args
+                .iter()
+                .position(|arg| *arg == "-o")
+                .and_then(|index| args.get(index + 1))
+                .expect("the shared downloader's output path");
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(output)?
+                .write_all(&[u8::try_from(status % 256).unwrap()])?;
+        }
+        #[cfg(unix)]
+        let exit = {
+            use std::os::unix::process::ExitStatusExt as _;
+            std::process::ExitStatus::from_raw(
+                match status {
+                    200 => 0,
+                    404 => 22,
+                    _ => 56,
+                } << 8,
+            )
+        };
+        #[cfg(windows)]
+        let exit = {
+            use std::os::windows::process::ExitStatusExt as _;
+            std::process::ExitStatus::from_raw(match status {
+                200 => 0,
+                404 => 22,
+                _ => 56,
+            })
+        };
+        Ok(std::process::Output {
+            status: exit,
+            stdout: Vec::new(),
+            stderr: format!("curl fixture\naterm-http-meta:{status}\t\n").into_bytes(),
+        })
+    }
+}
+
+#[test]
+fn provision_fetch_retries_two_504s_but_never_a_404() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let transient = std::sync::Arc::new(FetchScript::new([504, 504, 200]));
+    let dest = scratch.path().join("retried");
+    System::new(&repo())
+        .with_fetch_spawn(transient.clone())
+        .fetch("https://example.invalid/retried", &dest, 1024)
+        .unwrap();
+    assert_eq!(transient.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(std::fs::read(&dest).unwrap().len(), 1);
+
+    let absent = std::sync::Arc::new(FetchScript::new([404, 200]));
+    let dest = scratch.path().join("absent");
+    System::new(&repo())
+        .with_fetch_spawn(absent.clone())
+        .fetch("https://example.invalid/absent", &dest, 1024)
+        .unwrap_err();
     assert_eq!(
-        words.last().map(String::as_str),
-        Some("https://example.invalid/a.tar.gz")
+        absent.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "404 is a final answer"
+    );
+
+    let endless = std::sync::Arc::new(FetchScript::new(std::iter::repeat_n(503, 19).chain([200])));
+    let dest = scratch.path().join("endless");
+    let refused = System::new(&repo())
+        .with_fetch_spawn(endless.clone())
+        .fetch("https://example.invalid/endless", &dest, 1024)
+        .unwrap_err();
+    assert_eq!(
+        endless.calls.load(std::sync::atomic::Ordering::SeqCst),
+        19,
+        "the answer after the bound must remain unused"
+    );
+    assert!(
+        refused.contains("19 attempts / 200s total retry-pause bound"),
+        "{refused}"
     );
 }
 

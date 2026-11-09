@@ -1189,3 +1189,26 @@ src/fleet_fixture.rs	a_run_hands_the_payload_and_shows_the_first_line	fixture-st
 src/outlook_captures.rs	the_seeds_are_synthetic_and_stay_in_their_world	outlook-glass-seeds	
 src/outlook_captures.rs	the_tapped_scenes_hand_the_tap_the_stores_week	outlook-glass-seeds	
 ```
+
+## 32. Added 2026-11-08: case (c)'s Accounts card among the captures
+
+`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4, §7. The captures of scenes A–C showed the
+card's midnight ticks only on Autopilot Off's grey cards with `┄` ahead, so `outlook-captures`
+also shoots scene J's card (case (c) under Cruise): a work row with the projected line, `→`
+hand-offs, names and `╳`, and lanes with their out lines, beside the ticks. The glass scenes'
+other logins were read on this Mac, so their readings are series rows too (as aterm-agent's
+`quota_scenes::Fx::read` writes them) and each lane holds its reading before `▕`. A card is shot
+once its pane's recovery observer has read (the first J capture at 44 cells, Day, 1x, caught
+it busy, `┄` ahead), and its rows are the same after the shot as before it. Read the same way as
+§1.
+
+```tsv
+id	kind	functions	statement	subsumes	difficulty	blocking_gaps
+outlook-card-scene-j	contract	outlook_captures::{CARD_SCENES,plan,seed,card_shown,shoot_card}	J ∈ CARD_SCENES and plan(J).autopilot = "cruise". plan(c).read_here ⇔ c ∈ {I, J, K}; seed then writes, for each seen login other than the own one with a week (pct_x10, reset, read), a series fig row {pct_x10, reset: now + reset, at: now + read, src tap} at now + read, so the outlook read from J's world at quota_scenes::T5 on UTC (roster, store, logins, series, Mode::Early) lays card_rows("main", None, true, r, None) equal to quota_scenes::case_c()'s for r ∈ {60, 44}: a work row holding `→`, `╳`, `main`, `alt1`, the projected line and ticks, and three lanes each with a read cell, the out line (Cell::Out, warn) and ticks. card_shown(t) ⇔ t's first line has open=true, fact=account and no rows=0, and t holds no account_progress::OBSERVER_BUSY_FINDING. shoot_card opens the card, and shoots the frame only once card_shown holds and the frame is steady, keeping the shot where `controls fact-menu` reads the same after it as before; SHOWN bounds it as a hang detector.	-	1	-
+```
+
+```tsv
+file	test	primary	also
+src/outlook_captures.rs	scene_js_card_is_case_cs_its_marks_beside_its_ticks	outlook-card-scene-j	outlook-glass-seeds
+src/outlook_captures.rs	a_card_is_shown_once_its_observer_has_read	outlook-card-scene-j	
+```

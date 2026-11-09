@@ -86,6 +86,23 @@ fn curl_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String> 
     crate::run_operation_command(&mut cmd).map_err(|e| format!("spawn curl: {e}"))
 }
 
+/// Runs one prepared anonymous curl attempt through `spawn`.
+///
+/// The shared downloader still owns the command, response classification, retry budget, and
+/// progress accounting. This seam lets an embedding operation retain its child-lifetime contract
+/// and lets tests inject transport answers without replacing the policy.
+#[cfg_attr(trust_verify, trust::skip)]
+fn curl_fetch_via(
+    args: &[&str],
+    url: &str,
+    spawn: &dyn crate::github_rest::Spawn,
+) -> Result<std::process::Output, String> {
+    let mut cmd = curl_command(args, url);
+    spawn
+        .run(&mut cmd, None)
+        .map_err(|e| format!("spawn curl: {e}"))
+}
+
 /// [`curl_fetch`] that retires its owned child when either source or operation stops.
 #[cfg(unix)]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -151,17 +168,22 @@ fn curl_fetch_until(
     })
 }
 
-/// Number of attempts for requests whose body is captured from curl's stdout.
-const CURL_ATTEMPTS: u32 = 3;
+/// Number of attempts admitted by the shared anonymous-read policy.
+#[cfg(all(test, unix))]
+const READ_ATTEMPTS: u32 = aterm_types::http_retry::Policy::STANDARD.attempts();
 
-/// Duration for which the process holds a link down after exhausting attempts reaching no host.
-const LINK_DOWN_HOLDS: std::time::Duration = std::time::Duration::from_secs(30);
+/// Curl writes this response metadata to stderr after its own diagnostic. Keeping it off stdout
+/// leaves small response bodies byte-exact, and captures the status even when macOS curl 8.7.1
+/// exits 56 for an HTTP/2 5xx instead of 22.
+const CURL_META_PREFIX: &str = "aterm-http-meta:";
+const CURL_META_WRITE_OUT: &str = "%{stderr}\naterm-http-meta:%{http_code}\t%header{retry-after}\n";
 
 /// Timestamp when a request in this process last spent its attempts on an unreachable link.
 static LINK_DOWN_SINCE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
 
 /// What an attempt says of the link ([`link_after`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum Link {
     /// It reached no host, with nothing left to try.
     Down,
@@ -202,6 +224,7 @@ fn reached_no_host(exit: Option<i32>, handshake: Handshake) -> bool {
 }
 
 /// Classifies link reachability and whether another attempt should run.
+#[cfg(test)]
 fn link_after(
     exit: Option<i32>,
     handshake: Handshake,
@@ -223,22 +246,6 @@ fn link_after(
     }
 }
 
-/// Updates [`LINK_DOWN_SINCE`] and returns whether the request should make another attempt.
-#[cfg_attr(trust_verify, trust::skip)]
-fn attempt_again(exit: Option<i32>, handshake: Handshake, attempt: u32, attempts: u32) -> bool {
-    let mut since = LINK_DOWN_SINCE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let known_down = since.is_some_and(|at| at.elapsed() <= LINK_DOWN_HOLDS);
-    let (link, again) = link_after(exit, handshake, attempt, attempts, known_down);
-    match link {
-        Link::Down => *since = Some(std::time::Instant::now()),
-        Link::Reached => *since = None,
-        Link::Unknown => {}
-    }
-    again
-}
-
 /// Hold the link down from now ([`LINK_DOWN_SINCE`]).
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn note_link_down() {
@@ -247,30 +254,35 @@ pub fn note_link_down() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
 }
 
-/// Returns the backoff duration before `attempt`.
-fn backoff_before(attempt: u32) -> std::time::Duration {
-    let production = match attempt {
-        0 | 1 => return std::time::Duration::ZERO,
-        n => std::time::Duration::from_secs(1 << (n - 2)),
-    };
-    if aterm_types::dev_seam!(aterm_types::domain::ENV_DEV_FAST_TIMERS).is_some() {
-        production / 1000
-    } else {
-        production
-    }
+/// Make an admitted anonymous-read retry visible even when the embedding process has not
+/// installed a logger. Cutter and verifier are standalone tools, so their stderr is the one
+/// observation channel every production invocation owns.
+pub(crate) fn note_retry(message: impl std::fmt::Display) {
+    let message = message.to_string();
+    let _ = write_retry_line(&mut std::io::stderr().lock(), &message);
+    aterm_log::warn!("{message}");
 }
 
-/// Sleep out [`backoff_before`] `attempt`.
-fn back_off_before(attempt: u32) {
-    let pause = backoff_before(attempt);
-    if !pause.is_zero() {
+fn write_retry_line(writer: &mut impl std::io::Write, message: &str) -> std::io::Result<()> {
+    writeln!(writer, "{message}")
+}
+
+/// Log and wait for one retry admitted by the shared anonymous-read policy.
+fn wait_before_retry(retry: aterm_types::http_retry::Retry) {
+    wait_before_retry_via(retry, true);
+}
+
+/// The retry wait, with the clock suppressed beside an injected child transport.
+fn wait_before_retry_via(retry: aterm_types::http_retry::Retry, wait: bool) {
+    note_retry(format!("anonymous HTTPS read: {retry}"));
+    let pause = if aterm_types::dev_seam!(aterm_types::domain::ENV_DEV_FAST_TIMERS).is_some() {
+        retry.pause / 1000
+    } else {
+        retry.pause
+    };
+    if wait && !pause.is_zero() {
         std::thread::sleep(pause);
     }
-}
-
-/// Returns whether HTTP status `code` is a transient server-side error worth retrying.
-fn transient_status(code: &str) -> bool {
-    matches!(code, "408" | "500" | "502" | "503" | "504")
 }
 
 /// HTTP status and optional `Location` header from a redirect-refusing HEAD request.
@@ -308,19 +320,27 @@ const SMALL_CONNECT_SECS: &str = "5";
 /// The status and `Location` of one hop of `url`, anonymously, without following it.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn head_no_redirect(url: &str) -> Result<HeadAnswer, HttpError> {
-    head_no_redirect_with(url, &head_args(), CURL_ATTEMPTS)
+    head_no_redirect_with(url, &head_args(), aterm_types::http_retry::Policy::STANDARD)
 }
 
 /// A HEAD for a background discovery hint.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn head_no_redirect_quick(url: &str) -> Result<HeadAnswer, HttpError> {
-    head_no_redirect_with(url, &head_args_with_timeout("5"), 1)
+    head_no_redirect_with(
+        url,
+        &head_args_with_timeout("5"),
+        aterm_types::http_retry::Policy::NONE,
+    )
 }
 
 #[cfg_attr(trust_verify, trust::skip)]
-fn head_no_redirect_with(url: &str, args: &[&str], attempts: u32) -> Result<HeadAnswer, HttpError> {
+fn head_no_redirect_with(
+    url: &str,
+    args: &[&str],
+    policy: aterm_types::http_retry::Policy,
+) -> Result<HeadAnswer, HttpError> {
     require_https_url(url).map_err(HttpError::Transport)?;
-    head_attempts(url, args, 1, attempts)
+    head_attempts(url, args, 1, aterm_types::http_retry::Budget::new(policy))
 }
 
 /// Outcome of the first attempt of [`head_no_redirect`], separated from its retries.
@@ -334,6 +354,8 @@ pub enum FirstHead {
         answer: Result<HeadAnswer, HttpError>,
         /// It reached no host.
         unreached: bool,
+        /// Why the shared policy permits another attempt.
+        cause: aterm_types::http_retry::Cause,
     },
 }
 
@@ -341,40 +363,72 @@ pub enum FirstHead {
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn head_no_redirect_first(url: &str) -> FirstHead {
     match require_https_url(url) {
-        Ok(()) => head_attempt(url, &head_args(), 1, CURL_ATTEMPTS),
+        Ok(()) => head_attempt(url, &head_args()),
         Err(e) => FirstHead::Settled(Err(HttpError::Transport(e))),
     }
 }
 
 /// [`head_no_redirect`]'s attempts after the first, each after its backoff.
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn head_no_redirect_again(url: &str) -> Result<HeadAnswer, HttpError> {
+pub fn head_no_redirect_again(
+    url: &str,
+    first_cause: aterm_types::http_retry::Cause,
+) -> Result<HeadAnswer, HttpError> {
     require_https_url(url).map_err(HttpError::Transport)?;
-    head_attempts(url, &head_args(), 2, CURL_ATTEMPTS)
+    let mut budget =
+        aterm_types::http_retry::Budget::new(aterm_types::http_retry::Policy::STANDARD);
+    match budget.after(1, first_cause) {
+        aterm_types::http_retry::Decision::Retry(retry) => wait_before_retry(retry),
+        aterm_types::http_retry::Decision::Exhausted => {
+            return Err(head_exhausted(url, budget.bound(), None));
+        }
+    }
+    head_attempts(url, &head_args(), 2, budget)
 }
 
-/// Attempts `from..=attempts` of a HEAD of `url`, each after its backoff; the last settles.
+/// Attempts a HEAD of `url` until it settles or the shared budget is exhausted.
 #[cfg_attr(trust_verify, trust::skip)]
 fn head_attempts(
     url: &str,
     args: &[&str],
     from: u32,
-    attempts: u32,
+    mut budget: aterm_types::http_retry::Budget,
 ) -> Result<HeadAnswer, HttpError> {
     let mut attempt = from;
     loop {
-        back_off_before(attempt);
-        match head_attempt(url, args, attempt, attempts) {
+        match head_attempt(url, args) {
             FirstHead::Settled(answer) => return answer,
-            FirstHead::Again { .. } => attempt += 1,
+            FirstHead::Again { answer, cause, .. } => match budget.after(attempt, cause) {
+                aterm_types::http_retry::Decision::Retry(retry) => {
+                    wait_before_retry(retry);
+                    attempt = attempt.saturating_add(1);
+                }
+                aterm_types::http_retry::Decision::Exhausted => {
+                    return Err(head_exhausted(url, budget.bound(), Some(&answer)));
+                }
+            },
         }
     }
 }
 
-/// Runs attempt `attempt` of `attempts` for a HEAD request.
+fn head_exhausted(
+    url: &str,
+    bound: String,
+    answer: Option<&Result<HeadAnswer, HttpError>>,
+) -> HttpError {
+    let last = match answer {
+        Some(Ok(answer)) => format!("last answer HTTP {}", answer.code),
+        Some(Err(error)) => format!("last failure: {error}"),
+        None => "the server-requested delay was outside the bound".to_string(),
+    };
+    HttpError::Transport(format!(
+        "anonymous HEAD {url} stopped after {bound}: {last}"
+    ))
+}
+
+/// Runs one HEAD request and classifies its answer through the shared policy.
 #[cfg_attr(trust_verify, trust::skip)]
-fn head_attempt(url: &str, args: &[&str], attempt: u32, attempts: u32) -> FirstHead {
-    let last = attempt >= attempts;
+fn head_attempt(url: &str, args: &[&str]) -> FirstHead {
     let out = match curl_fetch(args, url) {
         Ok(out) => out,
         Err(e) => return FirstHead::Settled(Err(HttpError::Transport(e))),
@@ -386,40 +440,40 @@ fn head_attempt(url: &str, args: &[&str], attempt: u32, attempts: u32) -> FirstH
     };
     let handshake = handshake_in(trailer);
     let exit = out.status.code();
-    let again = attempt_again(exit, handshake, attempt, attempts);
-    if !out.status.success() {
-        let answer = Err(HttpError::Transport(format!(
+    let code = trailer.split_whitespace().next().unwrap_or("");
+    let numeric = (!code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| code.parse::<u16>().ok())
+        .flatten()
+        .filter(|status| *status != 0);
+    let retry_after = last_block_header(headers, "retry-after").and_then(|value| {
+        aterm_types::http_retry::retry_after_delay_secs(&value, aterm_time::unix_secs())
+    });
+    let cause = aterm_types::http_retry::Cause::from_curl(exit, numeric, retry_after);
+    let answer = if !out.status.success() {
+        Err(HttpError::Transport(format!(
             "curl HEAD {} failed ({}): {}",
             url,
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
-        )));
-        return if again {
-            FirstHead::Again {
-                answer,
-                unreached: reached_no_host(exit, handshake),
-            }
-        } else {
-            FirstHead::Settled(answer)
-        };
-    }
-    let code = trailer.split_whitespace().next().unwrap_or("");
-    let Some(numeric) = (!code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| code.parse::<u16>().ok())
-        .flatten()
-    else {
-        return FirstHead::Settled(Err(HttpError::Malformed(format!(
+        )))
+    } else if let Some(numeric) = numeric {
+        Ok(HeadAnswer {
+            code: numeric,
+            location: location_header(headers),
+        })
+    } else {
+        Err(HttpError::Malformed(format!(
             "the release host answered HTTP {code} to HEAD {url}"
-        ))));
+        )))
     };
-    let answer = Ok(HeadAnswer {
-        code: numeric,
-        location: location_header(headers),
-    });
-    if !last && transient_status(code) {
+    if let Some(cause) = cause {
         FirstHead::Again {
             answer,
-            unreached: false,
+            // Timeouts are explicitly transient even when the TLS handshake never finished.
+            // DNS/proxy/connect failures are not classified as retryable and settle above.
+            unreached: reached_no_host(exit, handshake)
+                && !matches!(cause, aterm_types::http_retry::Cause::Timeout),
+            cause,
         }
     } else {
         FirstHead::Settled(answer)
@@ -455,8 +509,12 @@ fn require_https_url(url: &str) -> Result<(), String> {
 }
 
 /// Option list for [`download_bytes`].
-const fn download_bytes_args(cap: &str) -> [&str; 11] {
-    [
+fn download_bytes_args<'a>(
+    cap: &'a str,
+    accept_header: &'a str,
+    extra_header: Option<&'a str>,
+) -> Vec<&'a str> {
+    let mut args = vec![
         "-fsSL",
         "--proto-redir",
         "=https",
@@ -467,40 +525,124 @@ const fn download_bytes_args(cap: &str) -> [&str; 11] {
         "--max-filesize",
         cap,
         "-H",
-        "Accept: application/octet-stream",
-    ]
+        accept_header,
+        "--write-out",
+        CURL_META_WRITE_OUT,
+    ];
+    if let Some(header) = extra_header {
+        args.extend(["-H", header]);
+    }
+    args
 }
 
 /// Download a small asset's bytes (e.g. a manifest) into memory, capped at `max_filesize`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_bytes(asset_url: &str, max_filesize: u64) -> Result<Vec<u8>, String> {
+    download_bytes_with_headers(
+        asset_url,
+        max_filesize,
+        "application/octet-stream",
+        None,
+        None,
+    )
+}
+
+/// Download a small asset with an explicit HTTP `Accept` media type.
+///
+/// This is the shared anonymous-read path for GitHub API documents as well as release assets.
+/// Header control bytes are refused before curl is spawned.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn download_bytes_with_accept(
+    asset_url: &str,
+    max_filesize: u64,
+    accept: &str,
+) -> Result<Vec<u8>, String> {
+    download_bytes_with_headers(asset_url, max_filesize, accept, None, None)
+}
+
+/// Download a small asset while requiring revalidation instead of a cached intermediary answer.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn download_bytes_uncached(asset_url: &str, max_filesize: u64) -> Result<Vec<u8>, String> {
+    download_bytes_with_headers(
+        asset_url,
+        max_filesize,
+        "application/octet-stream",
+        Some("Cache-Control: no-cache"),
+        None,
+    )
+}
+
+/// [`download_bytes_uncached`] with each prepared curl command run by `spawn`.
+///
+/// This retains an embedding operation's child cancellation and environment policy while the
+/// shared anonymous-read transport retains the retry policy and verdicts.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn download_bytes_uncached_via(
+    asset_url: &str,
+    max_filesize: u64,
+    spawn: &dyn crate::github_rest::Spawn,
+) -> Result<Vec<u8>, String> {
+    download_bytes_with_headers(
+        asset_url,
+        max_filesize,
+        "application/octet-stream",
+        Some("Cache-Control: no-cache"),
+        Some(spawn),
+    )
+}
+
+#[cfg_attr(trust_verify, trust::skip)]
+fn download_bytes_with_headers(
+    asset_url: &str,
+    max_filesize: u64,
+    accept: &str,
+    extra_header: Option<&str>,
+    spawn: Option<&dyn crate::github_rest::Spawn>,
+) -> Result<Vec<u8>, String> {
     require_https_url(asset_url)?;
+    if accept.is_empty() || !accept.is_ascii() || accept.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err("refusing invalid HTTP Accept media type".to_string());
+    }
     let cap = max_filesize.to_string();
-    let mut attempt: u32 = 0;
+    let accept_header = format!("Accept: {accept}");
+    let mut attempt: u32 = 1;
+    let mut budget =
+        aterm_types::http_retry::Budget::new(aterm_types::http_retry::Policy::STANDARD);
     loop {
-        attempt += 1;
-        back_off_before(attempt);
-        let out = curl_fetch(&download_bytes_args(&cap), asset_url)?;
-        let again = attempt_again(
-            out.status.code(),
-            Handshake::Unknown,
-            attempt,
-            CURL_ATTEMPTS,
-        );
+        let args = download_bytes_args(&cap, &accept_header, extra_header);
+        let out = match spawn {
+            Some(spawn) => curl_fetch_via(&args, asset_url, spawn),
+            None => curl_fetch(&args, asset_url),
+        }?;
         if out.status.success() {
             return Ok(out.stdout);
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
+        if let Some(cause) = curl_retry_cause(out.status.code(), &stderr) {
+            match budget.after(attempt, cause) {
+                aterm_types::http_retry::Decision::Retry(retry) => {
+                    wait_before_retry(retry);
+                    attempt = attempt.saturating_add(1);
+                    continue;
+                }
+                aterm_types::http_retry::Decision::Exhausted => {
+                    return Err(format!(
+                        "curl asset download failed after {}: {}",
+                        budget.bound(),
+                        curl_diagnostic(&stderr)
+                    ));
+                }
+            }
+        }
         if let Some(verdict) = classify_asset_failure(asset_url, &stderr) {
             return Err(verdict);
         }
-        if !again {
-            return Err(format!(
-                "curl asset download failed ({}): {}",
-                out.status,
-                stderr.trim()
-            ));
-        }
+        return Err(format!(
+            "curl asset download failed ({}): {}",
+            out.status,
+            curl_diagnostic(&stderr)
+        ));
     }
 }
 
@@ -569,9 +711,51 @@ fn classify_asset_failure(url: &str, stderr: &str) -> Option<String> {
     }
 }
 
+/// Curl's final HTTP status and `Retry-After` delay, from [`CURL_META_WRITE_OUT`].
+fn curl_http_meta(stderr: &str) -> (Option<u16>, Option<u64>) {
+    let Some(line) = stderr
+        .lines()
+        .rev()
+        .find(|line| line.starts_with(CURL_META_PREFIX))
+    else {
+        return (None, None);
+    };
+    let fields = line[CURL_META_PREFIX.len()..].split_once('\t');
+    let (status, retry_after) = fields.unwrap_or((line, ""));
+    let status = status.parse::<u16>().ok().filter(|status| *status != 0);
+    let retry_after =
+        aterm_types::http_retry::retry_after_delay_secs(retry_after, aterm_time::unix_secs());
+    (status, retry_after)
+}
+
+/// The diagnostic without curl's machine-readable trailer.
+fn curl_diagnostic(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|line| !line.starts_with(CURL_META_PREFIX))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// Classify one curl failure through the shared anonymous-read policy.
+#[must_use]
+pub fn curl_retry_cause(exit: Option<i32>, stderr: &str) -> Option<aterm_types::http_retry::Cause> {
+    let (written_status, retry_after) = curl_http_meta(stderr);
+    let status = written_status.or_else(|| curl_http_error_code_text(stderr));
+    aterm_types::http_retry::Cause::from_curl(exit, status, retry_after)
+}
+
 /// Extracts the HTTP status code curl reports for a `-f` failure.
 #[must_use]
 fn curl_http_error_code(stderr: &str) -> Option<u16> {
+    curl_http_meta(stderr)
+        .0
+        .or_else(|| curl_http_error_code_text(stderr))
+}
+
+fn curl_http_error_code_text(stderr: &str) -> Option<u16> {
     let idx = stderr.find("returned error: ")?;
     let rest = &stderr[idx + "returned error: ".len()..];
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
@@ -583,10 +767,6 @@ pub const RELEASE_ASSET_DOWNLOAD_BOUND: u64 = 2_147_483_648;
 
 #[cfg(test)]
 const _: () = assert!(RELEASE_ASSET_DOWNLOAD_BOUND > 800_000_000);
-
-fn download_max_time_secs(max_filesize: u64) -> u64 {
-    (max_filesize / 65_536).clamp(600, 21_600)
-}
 
 /// Download an asset (e.g. a DMG) to a file, following the storage redirect.
 #[cfg_attr(trust_verify, trust::skip)]
@@ -649,7 +829,7 @@ fn keep_partial_after_failure(url: &str, stderr: &str, before: u64, after: u64) 
 }
 
 fn range_refused(exit_code: Option<i32>, stderr: &str) -> bool {
-    exit_code == Some(33) || curl_http_error_code(stderr) == Some(416)
+    exit_code == Some(33) && !curl_http_error_code(stderr).is_some_and(|status| status >= 400)
 }
 
 /// How long a resumable attempt may run under 4 KiB/s before curl calls it stalled
@@ -684,7 +864,6 @@ const RESUME_KEEPALIVE_SECS: &str = "2";
 
 fn download_resume_args<'a>(
     cap: &'a str,
-    max_time: &'a str,
     dest: &'a str,
     offset: Option<&'a str>,
     stall: StallBound,
@@ -701,12 +880,12 @@ fn download_resume_args<'a>(
         stall.secs(),
         "--keepalive-time",
         RESUME_KEEPALIVE_SECS,
-        "--max-time",
-        max_time,
         "--max-filesize",
         cap,
         "-H",
         "Accept: application/octet-stream",
+        "--write-out",
+        CURL_META_WRITE_OUT,
         "-o",
         dest,
     ];
@@ -717,17 +896,17 @@ fn download_resume_args<'a>(
     args
 }
 
-const HTTPS_ONLY_ARGS: [&str; 2] = ["--proto", "=https"];
+/// Signed/vendor HTTPS downloads also retain verify provision's TLS 1.2 floor.
+const HTTPS_ONLY_ARGS: [&str; 3] = ["--proto", "=https", "--tlsv1.2"];
 
 fn download_resume_args_https_only<'a>(
     cap: &'a str,
-    max_time: &'a str,
     dest: &'a str,
     offset: Option<&'a str>,
     stall: StallBound,
 ) -> Vec<&'a str> {
     let mut args: Vec<&str> = HTTPS_ONLY_ARGS.to_vec();
-    args.extend(download_resume_args(cap, max_time, dest, offset, stall));
+    args.extend(download_resume_args(cap, dest, offset, stall));
     args
 }
 
@@ -735,23 +914,33 @@ fn download_resume_args_https_only<'a>(
 /// URL ([`next_attempt`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NextAttempt {
-    /// Continue from the `.part`.
-    Resume,
+    /// Continue from the `.part`; the completed prefix earned another attempt.
+    Resume(aterm_types::http_retry::Cause),
     /// The same offset again after curl's own backoff.
-    Retry,
+    Retry(aterm_types::http_retry::Cause),
     /// Return the failure.
     Stop,
 }
 
 fn next_attempt(exit: Option<i32>, stderr: &str, moved: bool) -> NextAttempt {
-    if filesize_exceeded(exit, stderr) || download_error_is_local_write(stderr) {
+    if download_error_is_local_write(stderr) {
+        return NextAttempt::Stop;
+    }
+    if curl_http_error_code(stderr).is_some_and(|status| status >= 400) {
+        return match curl_retry_cause(exit, stderr) {
+            Some(cause) if moved => NextAttempt::Resume(cause),
+            Some(cause) => NextAttempt::Retry(cause),
+            None => NextAttempt::Stop,
+        };
+    }
+    if filesize_exceeded(exit, stderr) {
         NextAttempt::Stop
-    } else if moved {
-        NextAttempt::Resume
-    } else if matches!(exit, Some(5 | 6 | 28))
-        || curl_http_error_code(stderr).is_some_and(|code| transient_status(&code.to_string()))
-    {
-        NextAttempt::Retry
+    } else if let Some(cause) = curl_retry_cause(exit, stderr) {
+        if moved {
+            NextAttempt::Resume(cause)
+        } else {
+            NextAttempt::Retry(cause)
+        }
     } else {
         NextAttempt::Stop
     }
@@ -762,8 +951,12 @@ const SHORT_RESUMES_PER_CALL: u32 = 16;
 const RESUME_EARNED_AT: u64 = 1 << 20;
 
 fn resume_allowed(moved: u64, short: u32, all: u32, cap: u64) -> bool {
-    let budget = u64::from(SHORT_RESUMES_PER_CALL).saturating_add(cap / RESUME_EARNED_AT);
+    let budget = resume_budget(cap);
     u64::from(all) < budget && (moved >= RESUME_EARNED_AT || short < SHORT_RESUMES_PER_CALL)
+}
+
+const fn resume_budget(cap: u64) -> u64 {
+    (SHORT_RESUMES_PER_CALL as u64).saturating_add(cap / RESUME_EARNED_AT)
 }
 
 fn clear_sink(file: &Path, sink: Sink) {
@@ -825,6 +1018,7 @@ pub fn download_to_resumable_until(
         ResumeLane::Release,
         Sink::Part,
         Some(stop),
+        None,
     )
     .map_err(|e| e.to_string())
 }
@@ -842,6 +1036,29 @@ pub fn download_to_resumable_https_only(
         max_filesize,
         ResumeLane::HttpsOnly,
         Sink::Part,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// [`download_to_resumable_https_only`] with each prepared curl command run by `spawn`.
+///
+/// The shared downloader retains HTTPS enforcement, progress accounting, response
+/// classification, and its one bounded retry budget; `spawn` controls only child execution.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn download_to_resumable_https_only_via(
+    asset_url: &str,
+    dest: &Path,
+    max_filesize: u64,
+    spawn: &dyn crate::github_rest::Spawn,
+) -> Result<(), String> {
+    download_to_resumable_with_stop(
+        asset_url,
+        dest,
+        max_filesize,
+        ResumeLane::HttpsOnly,
+        Sink::Part,
+        None,
+        Some(spawn),
     )
     .map_err(|e| e.to_string())
 }
@@ -878,7 +1095,7 @@ fn download_to_resumable_with(
     lane: ResumeLane,
     sink: Sink,
 ) -> Result<(), HttpError> {
-    download_to_resumable_with_stop(asset_url, dest, max_filesize, lane, sink, None)
+    download_to_resumable_with_stop(asset_url, dest, max_filesize, lane, sink, None, None)
 }
 
 /// [`download_to_resumable_with`], ended early once `stop` is set
@@ -891,6 +1108,7 @@ fn download_to_resumable_with_stop(
     lane: ResumeLane,
     sink: Sink,
     stop: Option<&std::sync::atomic::AtomicBool>,
+    spawn: Option<&dyn crate::github_rest::Spawn>,
 ) -> Result<(), HttpError> {
     require_https_url(asset_url).map_err(HttpError::Transport)?;
     let part = match sink {
@@ -907,10 +1125,11 @@ fn download_to_resumable_with_stop(
     let mut retried_fresh = false;
     let mut resumes: u32 = 0;
     let mut short_resumes: u32 = 0;
-    let mut idle: u32 = 0;
+    let mut idle_failures: u32 = 0;
+    let mut idle_budget =
+        aterm_types::http_retry::Budget::new(aterm_types::http_retry::Policy::STANDARD);
     let mut stall = StallBound::Quick;
     let mut call_began: Option<u64> = None;
-    let started = std::time::Instant::now();
     loop {
         let existing = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
         let plan = resume_plan(existing, max_filesize);
@@ -922,19 +1141,21 @@ fn download_to_resumable_with_stop(
         };
         let began = *call_began.get_or_insert(existing);
         let cap = plan.remaining_cap.to_string();
-        let max_time = download_max_time_secs(max_filesize).to_string();
         let offset_text = plan.offset.to_string();
         let offset = (plan.offset > 0).then_some(offset_text.as_str());
         let args = if lane == ResumeLane::Release {
-            download_resume_args(&cap, &max_time, part_s, offset, stall)
+            download_resume_args(&cap, part_s, offset, stall)
         } else {
-            download_resume_args_https_only(&cap, &max_time, part_s, offset, stall)
+            download_resume_args_https_only(&cap, part_s, offset, stall)
         };
         let attempt_began = std::time::Instant::now();
         let attempt = match stop {
             _ if lane == ResumeLane::VendorDirect => vendor_fetch(&args, asset_url),
             Some(stop) => curl_fetch_until(&args, asset_url, stop),
-            None => curl_fetch(&args, asset_url),
+            None => match spawn {
+                Some(spawn) => curl_fetch_via(&args, asset_url, spawn),
+                None => curl_fetch(&args, asset_url),
+            },
         };
         let out = match attempt {
             Err(_) if stop.is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire)) => {
@@ -952,46 +1173,89 @@ fn download_to_resumable_with_stop(
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if plan.offset > 0 && !retried_fresh && range_refused(out.status.code(), &stderr) {
+                note_retry(format!(
+                    "anonymous HTTPS read: the server refused a Range resume after {} bytes — \
+                     retrying once from byte zero",
+                    plan.offset
+                ));
                 clear_sink(&part, sink);
                 retried_fresh = true;
                 call_began = Some(0);
-                idle = 0;
+                idle_failures = 0;
+                idle_budget =
+                    aterm_types::http_retry::Budget::new(aterm_types::http_retry::Policy::STANDARD);
                 continue;
             }
             let after = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+            let cause = curl_retry_cause(out.status.code(), &stderr);
             let verdict = if lane == ResumeLane::VendorDirect {
                 vendor_download_verdict(out.status.code(), &stderr, asset_url, max_filesize)
             } else {
                 None
             }
-            .or_else(|| classify_asset_failure(asset_url, &stderr).map(HttpError::Transport));
+            .or_else(|| {
+                cause
+                    .is_none()
+                    .then(|| classify_asset_failure(asset_url, &stderr))
+                    .flatten()
+                    .map(HttpError::Transport)
+            });
             if verdict.is_none() {
                 let moved = keep_partial(existing, after);
                 let moved_bytes = after.saturating_sub(existing);
                 stall = StallBound::after(moved_bytes, attempt_began.elapsed());
+                let mut exhausted_bound: Option<String> = None;
                 match next_attempt(out.status.code(), &stderr, moved) {
-                    NextAttempt::Resume
-                        if resume_allowed(moved_bytes, short_resumes, resumes, max_filesize)
-                            && started.elapsed().as_secs()
-                                < download_max_time_secs(max_filesize) =>
-                    {
-                        resumes += 1;
-                        if moved_bytes < RESUME_EARNED_AT {
-                            short_resumes += 1;
-                        }
-                        idle = 0;
-                        continue;
-                    }
-                    NextAttempt::Retry => {
-                        idle += 1;
-                        if attempt_again(out.status.code(), Handshake::Unknown, idle, CURL_ATTEMPTS)
-                        {
-                            back_off_before(idle + 1);
+                    NextAttempt::Resume(cause) => {
+                        if resume_allowed(moved_bytes, short_resumes, resumes, max_filesize) {
+                            note_retry(format!(
+                                "anonymous HTTPS read: attempt made {moved_bytes} bytes of \
+                                 progress, then failed ({cause}) — resuming ({}/{})",
+                                resumes + 1,
+                                resume_budget(max_filesize)
+                            ));
+                            resumes += 1;
+                            if moved_bytes < RESUME_EARNED_AT {
+                                short_resumes += 1;
+                            }
+                            idle_failures = 0;
+                            idle_budget = aterm_types::http_retry::Budget::new(
+                                aterm_types::http_retry::Policy::STANDARD,
+                            );
                             continue;
                         }
+                        exhausted_bound = Some(format!(
+                            "the {} progress-earned resume bound",
+                            resume_budget(max_filesize)
+                        ));
                     }
-                    NextAttempt::Resume | NextAttempt::Stop => {}
+                    NextAttempt::Retry(cause) => {
+                        idle_failures = idle_failures.saturating_add(1);
+                        match idle_budget.after(idle_failures, cause) {
+                            aterm_types::http_retry::Decision::Retry(retry) => {
+                                wait_before_retry_via(retry, spawn.is_none());
+                                continue;
+                            }
+                            aterm_types::http_retry::Decision::Exhausted => {
+                                exhausted_bound = Some(idle_budget.bound());
+                            }
+                        }
+                    }
+                    NextAttempt::Stop => {}
                 }
+                if sink == Sink::Part
+                    && !keep_partial_after_failure(asset_url, &stderr, began, after)
+                {
+                    let _ = std::fs::remove_file(&part);
+                }
+                let bound = exhausted_bound
+                    .map(|bound| format!(" after {bound}"))
+                    .unwrap_or_default();
+                return Err(HttpError::Transport(format!(
+                    "curl download failed{bound} ({}): {}",
+                    out.status,
+                    curl_diagnostic(&stderr)
+                )));
             }
             if sink == Sink::Part && !keep_partial_after_failure(asset_url, &stderr, began, after) {
                 let _ = std::fs::remove_file(&part);
@@ -999,11 +1263,6 @@ fn download_to_resumable_with_stop(
             if let Some(verdict) = verdict {
                 return Err(verdict);
             }
-            return Err(HttpError::Transport(format!(
-                "curl download failed ({}): {}",
-                out.status,
-                stderr.trim()
-            )));
         }
         if sink == Sink::Dest {
             return Ok(());
@@ -1145,22 +1404,67 @@ impl CurlRun<'_> {
 /// What one vendor-lane attempt decided.
 #[derive(Debug, PartialEq, Eq)]
 enum Step<T> {
-    /// Another attempt may cure it.
-    Retry,
+    /// Another attempt may cure it; `exhausted` is the refusal when the shared bound is spent.
+    Retry {
+        cause: aterm_types::http_retry::Cause,
+        exhausted: HttpError,
+    },
     /// The answer, or a verdict no further attempt changes.
     Done(Result<T, HttpError>),
+}
+
+fn admit_vendor_retry(
+    attempt: u32,
+    budget: &mut aterm_types::http_retry::Budget,
+    cause: aterm_types::http_retry::Cause,
+    exhausted: HttpError,
+) -> Result<(), HttpError> {
+    admit_vendor_retry_via(attempt, budget, cause, exhausted, wait_before_retry)
+}
+
+fn admit_vendor_retry_via(
+    attempt: u32,
+    budget: &mut aterm_types::http_retry::Budget,
+    cause: aterm_types::http_retry::Cause,
+    exhausted: HttpError,
+    mut on_retry: impl FnMut(aterm_types::http_retry::Retry),
+) -> Result<(), HttpError> {
+    match budget.after(attempt, cause) {
+        aterm_types::http_retry::Decision::Retry(retry) => {
+            on_retry(retry);
+            Ok(())
+        }
+        aterm_types::http_retry::Decision::Exhausted => Err(HttpError::Transport(format!(
+            "{exhausted} after {}",
+            budget.bound()
+        ))),
+    }
 }
 
 fn vendor_get_step(
     run: &CurlRun<'_>,
     headers: &str,
-    last: bool,
     url: &str,
     cap: u64,
     sent_etag: Option<&str>,
     body: impl FnOnce() -> Result<Vec<u8>, HttpError>,
 ) -> Step<VendorResponse> {
+    let trailer = vendor_trailer(run.stdout);
+    let status = trailer.as_ref().map(|(code, _)| *code);
+    let retry_after = last_block_header(headers, "retry-after").and_then(|value| {
+        aterm_types::http_retry::retry_after_delay_secs(&value, aterm_time::unix_secs())
+    });
     if run.exit != Some(0) {
+        let exhausted = run.failure("GET", url);
+        if let Some(code @ 400..=599) = status {
+            if let Some(cause) = aterm_types::http_retry::Cause::from_http(code, retry_after) {
+                return Step::Retry { cause, exhausted };
+            }
+            return Step::Done(Err(HttpError::VendorStatus {
+                code,
+                url: url.to_string(),
+            }));
+        }
         if filesize_exceeded(run.exit, run.stderr) {
             return Step::Done(Err(HttpError::VendorRefused(format!(
                 "vendor document {url} exceeds its {cap}-byte cap"
@@ -1169,20 +1473,25 @@ fn vendor_get_step(
         if let Some(refusal) = vendor_curl_refusal(run.exit, run.stderr, url) {
             return Step::Done(Err(refusal));
         }
-        return if last {
-            Step::Done(Err(run.failure("GET", url)))
-        } else {
-            Step::Retry
+        return match aterm_types::http_retry::Cause::from_curl(run.exit, status, retry_after) {
+            Some(cause) => Step::Retry { cause, exhausted },
+            None => Step::Done(Err(exhausted)),
         };
     }
-    let Some((code, effective_url)) = vendor_trailer(run.stdout) else {
+    let Some((code, effective_url)) = trailer else {
         return Step::Done(Err(HttpError::Malformed(format!(
             "the vendor host answered an unreadable status for {url}: {}",
             run.stdout.trim()
         ))));
     };
-    if !last && transient_status(&code.to_string()) {
-        return Step::Retry;
+    if let Some(cause) = aterm_types::http_retry::Cause::from_http(code, retry_after) {
+        return Step::Retry {
+            cause,
+            exhausted: HttpError::VendorStatus {
+                code,
+                url: url.to_string(),
+            },
+        };
     }
     let etag = etag_header(headers);
     Step::Done(match (code, sent_etag) {
@@ -1203,33 +1512,52 @@ fn vendor_get_step(
 
 /// A HEAD attempt: `Ok(None)` is a final 200 that names no single positive `Content-Length`
 /// (npm's registry answers its tarballs so), which [`vendor_range_step`] sizes instead.
-fn vendor_head_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<Option<u64>> {
-    if run.exit != Some(0) {
-        if let Some(refusal) = vendor_curl_refusal(run.exit, run.stderr, url) {
-            return Step::Done(Err(refusal));
-        }
-        return if last {
-            Step::Done(Err(run.failure("HEAD", url)))
-        } else {
-            Step::Retry
-        };
-    }
+fn vendor_head_step(run: &CurlRun<'_>, url: &str) -> Step<Option<u64>> {
     let (headers, trailer) = match run.stdout.rfind('\n') {
         Some(i) => (&run.stdout[..i], run.stdout[i + 1..].trim()),
         None => ("", run.stdout.trim()),
     };
-    let code = trailer.split_whitespace().next().unwrap_or("");
-    if !last && transient_status(code) {
-        return Step::Retry;
-    }
-    let Some(code) = (!code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| code.parse::<u16>().ok())
+    let code_text = trailer.split_whitespace().next().unwrap_or("");
+    let code = (!code_text.is_empty() && code_text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| code_text.parse::<u16>().ok())
         .flatten()
-    else {
+        .filter(|status| *status != 0);
+    let retry_after = last_block_header(headers, "retry-after").and_then(|value| {
+        aterm_types::http_retry::retry_after_delay_secs(&value, aterm_time::unix_secs())
+    });
+    if run.exit != Some(0) {
+        let exhausted = run.failure("HEAD", url);
+        if let Some(code @ 400..=599) = code {
+            if let Some(cause) = aterm_types::http_retry::Cause::from_http(code, retry_after) {
+                return Step::Retry { cause, exhausted };
+            }
+            return Step::Done(Err(HttpError::VendorStatus {
+                code,
+                url: url.to_string(),
+            }));
+        }
+        if let Some(refusal) = vendor_curl_refusal(run.exit, run.stderr, url) {
+            return Step::Done(Err(refusal));
+        }
+        return match aterm_types::http_retry::Cause::from_curl(run.exit, code, retry_after) {
+            Some(cause) => Step::Retry { cause, exhausted },
+            None => Step::Done(Err(exhausted)),
+        };
+    }
+    let Some(code) = code else {
         return Step::Done(Err(HttpError::Malformed(format!(
-            "the vendor host answered HTTP {code} to HEAD {url}"
+            "the vendor host answered HTTP {code_text} to HEAD {url}"
         ))));
     };
+    if let Some(cause) = aterm_types::http_retry::Cause::from_http(code, retry_after) {
+        return Step::Retry {
+            cause,
+            exhausted: HttpError::VendorStatus {
+                code,
+                url: url.to_string(),
+            },
+        };
+    }
     if code != 200 {
         return Step::Done(Err(HttpError::VendorStatus {
             code,
@@ -1250,38 +1578,59 @@ fn content_range_total(headers: &str) -> Option<u64> {
 }
 
 /// A one-byte ranged GET's attempt (`Range: bytes=0-0`): the total its final 206 names.
-fn vendor_range_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<u64> {
+fn vendor_range_step(run: &CurlRun<'_>, url: &str) -> Step<u64> {
     let no_size = || {
         HttpError::Malformed(format!(
             "the vendor host sent no usable Content-Length for {url}, and no \
              `Content-Range: bytes 0-0/<size>` to a one-byte range"
         ))
     };
+    let (headers, trailer) = match run.stdout.rfind('\n') {
+        Some(i) => (&run.stdout[..i], run.stdout[i + 1..].trim()),
+        None => ("", run.stdout.trim()),
+    };
+    let code_text = trailer.split_whitespace().next().unwrap_or("");
+    let code = (!code_text.is_empty() && code_text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| code_text.parse::<u16>().ok())
+        .flatten()
+        .filter(|status| *status != 0);
+    let retry_after = last_block_header(headers, "retry-after").and_then(|value| {
+        aterm_types::http_retry::retry_after_delay_secs(&value, aterm_time::unix_secs())
+    });
     if run.exit != Some(0) {
+        let exhausted = run.failure("GET", url);
+        if let Some(code @ 400..=599) = code {
+            if let Some(cause) = aterm_types::http_retry::Cause::from_http(code, retry_after) {
+                return Step::Retry { cause, exhausted };
+            }
+            return Step::Done(Err(HttpError::VendorStatus {
+                code,
+                url: url.to_string(),
+            }));
+        }
         if filesize_exceeded(run.exit, run.stderr) {
             return Step::Done(Err(no_size()));
         }
         if let Some(refusal) = vendor_curl_refusal(run.exit, run.stderr, url) {
             return Step::Done(Err(refusal));
         }
-        return if last {
-            Step::Done(Err(run.failure("GET", url)))
-        } else {
-            Step::Retry
+        return match aterm_types::http_retry::Cause::from_curl(run.exit, code, retry_after) {
+            Some(cause) => Step::Retry { cause, exhausted },
+            None => Step::Done(Err(exhausted)),
         };
     }
-    let (headers, trailer) = match run.stdout.rfind('\n') {
-        Some(i) => (&run.stdout[..i], run.stdout[i + 1..].trim()),
-        None => ("", run.stdout.trim()),
-    };
-    let code = trailer.split_whitespace().next().unwrap_or("");
-    if !last && transient_status(code) {
-        return Step::Retry;
-    }
-    match (!code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
-        .then(|| code.parse::<u16>().ok())
-        .flatten()
+    if let Some(code) = code
+        && let Some(cause) = aterm_types::http_retry::Cause::from_http(code, retry_after)
     {
+        return Step::Retry {
+            cause,
+            exhausted: HttpError::VendorStatus {
+                code,
+                url: url.to_string(),
+            },
+        };
+    }
+    match code {
         Some(206) => Step::Done(content_range_total(headers).ok_or_else(no_size)),
         Some(200) => Step::Done(Err(no_size())),
         Some(code) => Step::Done(Err(HttpError::VendorStatus {
@@ -1289,7 +1638,7 @@ fn vendor_range_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<u64> {
             url: url.to_string(),
         })),
         None => Step::Done(Err(HttpError::Malformed(format!(
-            "the vendor host answered HTTP {code} to a ranged GET of {url}"
+            "the vendor host answered HTTP {code_text} to a ranged GET of {url}"
         )))),
     }
 }
@@ -1300,6 +1649,15 @@ fn vendor_download_verdict(
     url: &str,
     cap: u64,
 ) -> Option<HttpError> {
+    if let Some(code @ 400..=599) = curl_http_error_code(stderr) {
+        if curl_retry_cause(exit, stderr).is_some() {
+            return None;
+        }
+        return Some(HttpError::VendorStatus {
+            code,
+            url: url.to_string(),
+        });
+    }
     if filesize_exceeded(exit, stderr) {
         return Some(HttpError::VendorRefused(format!(
             "vendor payload {url} exceeds its {cap}-byte cap"
@@ -1308,11 +1666,7 @@ fn vendor_download_verdict(
     if let Some(refusal) = vendor_curl_refusal(exit, stderr, url) {
         return Some(refusal);
     }
-    let code = curl_http_error_code(stderr).filter(|_| exit == Some(22))?;
-    (!matches!(code, 408 | 429 | 500..=599)).then(|| HttpError::VendorStatus {
-        code,
-        url: url.to_string(),
-    })
+    None
 }
 
 /// A vendor GET's time budget: curl's connect and whole-transfer bounds (seconds), and how
@@ -1321,19 +1675,19 @@ fn vendor_download_verdict(
 struct VendorBounds {
     connect_secs: &'static str,
     max_secs: &'static str,
-    attempts: u32,
+    policy: aterm_types::http_retry::Policy,
 }
 
 const LANE_BOUNDS: VendorBounds = VendorBounds {
     connect_secs: SMALL_CONNECT_SECS,
     max_secs: "60",
-    attempts: CURL_ATTEMPTS,
+    policy: aterm_types::http_retry::Policy::STANDARD,
 };
 
 const HINT_BOUNDS: VendorBounds = VendorBounds {
     connect_secs: "5",
     max_secs: "15",
-    attempts: 1,
+    policy: aterm_types::http_retry::Policy::NONE,
 };
 
 fn vendor_get_args<'a>(
@@ -1588,10 +1942,9 @@ fn vendor_get_within(
     };
     let curl_cap = vendor_curl_cap(cap).to_string();
     let args = vendor_get_args(bounds, &curl_cap, body_s, headers_s, condition.as_deref());
-    let mut attempt: u32 = 0;
+    let mut attempt: u32 = 1;
+    let mut budget = aterm_types::http_retry::Budget::new(bounds.policy);
     loop {
-        attempt += 1;
-        back_off_before(attempt);
         let _ = std::fs::remove_file(&body);
         let _ = std::fs::remove_file(&headers);
         let out = vendor_fetch(&args, url).map_err(HttpError::Transport)?;
@@ -1608,14 +1961,17 @@ fn vendor_get_within(
         let step = vendor_get_step(
             &run,
             &String::from_utf8_lossy(&dump),
-            !attempt_again(run.exit, handshake_in(run.stdout), attempt, bounds.attempts),
             url,
             cap,
             if_none_match,
             || read_capped(&body, cap, url),
         );
-        if let Step::Done(result) = step {
-            return result;
+        match step {
+            Step::Retry { cause, exhausted } => {
+                admit_vendor_retry(attempt, &mut budget, cause, exhausted)?;
+                attempt = attempt.saturating_add(1);
+            }
+            Step::Done(result) => return result,
         }
     }
 }
@@ -1632,34 +1988,7 @@ fn vendor_get_within(
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn vendor_content_length(url: &str) -> Result<u64, HttpError> {
     require_https_url(url).map_err(HttpError::VendorRefused)?;
-    let args = vendor_head_args();
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-        back_off_before(attempt);
-        let out = vendor_fetch(&args, url).map_err(HttpError::Transport)?;
-        let (stdout, stderr) = (
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-        let run = CurlRun {
-            exit: out.status.code(),
-            stdout: &stdout,
-            stderr: &stderr,
-        };
-        let last = !attempt_again(run.exit, handshake_in(run.stdout), attempt, CURL_ATTEMPTS);
-        match vendor_head_step(&run, last, url) {
-            Step::Retry => {}
-            Step::Done(Ok(Some(size))) => return Ok(size),
-            Step::Done(Ok(None)) => return vendor_range_length(url),
-            Step::Done(Err(e)) => return Err(e),
-        }
-    }
-}
-
-/// [`vendor_content_length`]'s ranged GET.
-#[cfg_attr(trust_verify, trust::skip)]
-fn vendor_range_length(url: &str) -> Result<u64, HttpError> {
+    let head_args = vendor_head_args();
     let scratch = VendorScratch::new().map_err(HttpError::Transport)?;
     let body = scratch.0.join("body");
     let Some(body_s) = body.to_str() else {
@@ -1667,25 +1996,88 @@ fn vendor_range_length(url: &str) -> Result<u64, HttpError> {
             "non-UTF-8 temporary directory".to_string(),
         ));
     };
-    let args = vendor_range_args(body_s);
-    let mut attempt: u32 = 0;
+    let range_args = vendor_range_args(body_s);
+    vendor_content_length_steps(
+        url,
+        || {
+            let out = match vendor_fetch(&head_args, url) {
+                Ok(out) => out,
+                Err(error) => return Step::Done(Err(HttpError::Transport(error))),
+            };
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            vendor_head_step(
+                &CurlRun {
+                    exit: out.status.code(),
+                    stdout: &stdout,
+                    stderr: &stderr,
+                },
+                url,
+            )
+        },
+        || {
+            let _ = std::fs::remove_file(&body);
+            let out = match vendor_fetch(&range_args, url) {
+                Ok(out) => out,
+                Err(error) => return Step::Done(Err(HttpError::Transport(error))),
+            };
+            let (stdout, stderr) = (
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            );
+            vendor_range_step(
+                &CurlRun {
+                    exit: out.status.code(),
+                    stdout: &stdout,
+                    stderr: &stderr,
+                },
+                url,
+            )
+        },
+        wait_before_retry,
+    )
+}
+
+/// One logical size read across its HEAD and optional one-byte range phases. Successful phase
+/// transitions consume an attempt too: the whole read, not each transport shape, owns the shared
+/// nineteen-attempt / 200-second pause budget.
+fn vendor_content_length_steps(
+    url: &str,
+    mut head: impl FnMut() -> Step<Option<u64>>,
+    mut range: impl FnMut() -> Step<u64>,
+    mut on_retry: impl FnMut(aterm_types::http_retry::Retry),
+) -> Result<u64, HttpError> {
+    let policy = aterm_types::http_retry::Policy::STANDARD;
+    let mut budget = aterm_types::http_retry::Budget::new(policy);
+    let mut attempt: u32 = 1;
     loop {
-        attempt += 1;
-        back_off_before(attempt);
-        let _ = std::fs::remove_file(&body);
-        let out = vendor_fetch(&args, url).map_err(HttpError::Transport)?;
-        let (stdout, stderr) = (
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-        let run = CurlRun {
-            exit: out.status.code(),
-            stdout: &stdout,
-            stderr: &stderr,
-        };
-        let last = !attempt_again(run.exit, handshake_in(run.stdout), attempt, CURL_ATTEMPTS);
-        if let Step::Done(result) = vendor_range_step(&run, last, url) {
-            return result;
+        match head() {
+            Step::Retry { cause, exhausted } => {
+                admit_vendor_retry_via(attempt, &mut budget, cause, exhausted, &mut on_retry)?;
+                attempt = attempt.saturating_add(1);
+            }
+            Step::Done(Ok(Some(size))) => return Ok(size),
+            Step::Done(Ok(None)) => break,
+            Step::Done(Err(error)) => return Err(error),
+        }
+    }
+
+    attempt = attempt.saturating_add(1);
+    if attempt > policy.attempts() {
+        return Err(HttpError::Transport(format!(
+            "vendor size read for {url} needs its ranged GET after {}",
+            budget.bound()
+        )));
+    }
+    loop {
+        match range() {
+            Step::Retry { cause, exhausted } => {
+                admit_vendor_retry_via(attempt, &mut budget, cause, exhausted, &mut on_retry)?;
+                attempt = attempt.saturating_add(1);
+            }
+            Step::Done(result) => return result,
         }
     }
 }
@@ -1694,7 +2086,7 @@ fn vendor_range_length(url: &str) -> Result<u64, HttpError> {
 /// # Errors
 /// [`HttpError::VendorRefused`] for a non-https URL or a zero cap (before any spawn), a
 /// payload over its cap, or a [`vendor_curl_refusal`]; [`HttpError::VendorStatus`] for a
-/// status no retry changes (anything but 408, 429 and 5xx); [`HttpError::Transport`] for
+/// status no retry changes (anything but 5xx, or 429 with `Retry-After`); [`HttpError::Transport`] for
 /// everything else, the network included.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn vendor_download_to(url: &str, dest: &Path, cap: u64) -> Result<(), HttpError> {
@@ -1793,15 +2185,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn curl_write_out_recovers_http2_5xx_from_exit_56_without_retrying_404() {
+        use aterm_types::http_retry::Cause;
+        let meta = |status, retry_after| {
+            format!(
+                "curl: (56) HTTP/2 stream was reset\n{}{}\t{}\n",
+                super::CURL_META_PREFIX,
+                status,
+                retry_after
+            )
+        };
+        assert_eq!(
+            super::curl_retry_cause(Some(56), &meta(504, "")),
+            Some(Cause::Server(504))
+        );
+        assert_eq!(super::curl_retry_cause(Some(56), &meta(404, "")), None);
+        assert_eq!(
+            super::curl_retry_cause(Some(22), &meta(429, "17")),
+            Some(Cause::RateLimited {
+                retry_after: std::time::Duration::from_secs(17),
+            })
+        );
+        assert_eq!(
+            super::curl_diagnostic(&meta(504, "")),
+            "curl: (56) HTTP/2 stream was reset"
+        );
+    }
+
     use super::{Handshake, Link, link_after};
     use super::{
         HttpError, LANE_BOUNDS, NextAttempt, RELEASE_ASSET_DOWNLOAD_BOUND, StallBound, curl_argv,
-        download_bytes_args, download_max_time_secs, download_resume_args,
-        download_resume_args_https_only, download_to_resumable, download_to_resumable_https_only,
-        head_args, keep_partial, keep_partial_after_failure, location_header, next_attempt,
-        part_path, range_refused, resume_allowed, resume_plan, transient_status, vendor_get_args,
+        download_bytes_args, download_resume_args, download_resume_args_https_only,
+        download_to_resumable, download_to_resumable_https_only, head_args, keep_partial,
+        keep_partial_after_failure, location_header, next_attempt, part_path, range_refused,
+        resume_allowed, resume_plan, vendor_get_args,
     };
     use aterm_uds::spawnfd::Command;
+
+    /// NEGATIVE CONTROL: a retry written only through `aterm_log` disappears in standalone
+    /// cutter/verifier processes that installed no logger.
+    #[test]
+    fn an_admitted_retry_is_always_one_complete_stderr_line() {
+        let retry = aterm_types::http_retry::Retry {
+            attempt: 2,
+            attempts: 19,
+            cause: aterm_types::http_retry::Cause::Server(504),
+            pause: std::time::Duration::from_secs(10),
+        };
+        let mut line = Vec::new();
+        super::write_retry_line(&mut line, &format!("anonymous HTTPS read: {retry}")).unwrap();
+        assert_eq!(
+            String::from_utf8(line).unwrap(),
+            "anonymous HTTPS read: attempt 2/19 failed (HTTP 504) — retrying in 10s\n"
+        );
+    }
 
     #[test]
     fn argv_puts_q_first_and_end_of_options_right_before_the_url() {
@@ -1846,25 +2284,9 @@ mod tests {
     }
 
     #[test]
-    fn the_download_ceiling_is_derived_from_the_size_cap() {
-        assert_eq!(download_max_time_secs(775_000_000), 11_825);
-        assert_eq!(download_max_time_secs(RELEASE_ASSET_DOWNLOAD_BOUND), 21_600);
-        assert_eq!(download_max_time_secs(8 << 30), 21_600);
-        assert_eq!(download_max_time_secs(1024), 600);
-        assert_eq!(download_max_time_secs(0), 600);
-    }
-
-    #[test]
     fn the_asset_download_bounds_the_stall_not_the_transfer() {
         let cap = RELEASE_ASSET_DOWNLOAD_BOUND.to_string();
-        let max_time = download_max_time_secs(RELEASE_ASSET_DOWNLOAD_BOUND).to_string();
-        let args = download_resume_args(
-            &cap,
-            &max_time,
-            "/tmp/aterm.dmg.part",
-            None,
-            StallBound::Quick,
-        );
+        let args = download_resume_args(&cap, "/tmp/aterm.dmg.part", None, StallBound::Quick);
         let value_of = |flag: &str| {
             let i = args
                 .iter()
@@ -1872,10 +2294,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("{flag} present in {args:?}"));
             args[i + 1]
         };
-        assert_eq!(
-            value_of("--max-time"),
-            "21600",
-            "the wall clock must be the derived ceiling, never the fixed 600 s: {args:?}"
+        assert!(
+            !args.contains(&"--max-time"),
+            "a large transfer is bounded by byte progress and stalls, never latency: {args:?}"
         );
         assert_eq!(value_of("--connect-timeout"), "30");
         assert_eq!(value_of("--speed-limit"), "4096");
@@ -1883,6 +2304,10 @@ mod tests {
         assert_eq!(value_of("--max-filesize"), cap);
         assert_eq!(value_of("-o"), "/tmp/aterm.dmg.part");
         assert!(!args.contains(&"--"), "no caller-side `--`: {args:?}");
+
+        let signed_vendor =
+            download_resume_args_https_only(&cap, "/tmp/aterm.dmg.part", None, StallBound::Quick);
+        assert!(signed_vendor.starts_with(&["--proto", "=https", "--tlsv1.2"]));
     }
 
     #[test]
@@ -1894,12 +2319,13 @@ mod tests {
         );
         let cap = "16777216";
         assert!(
-            !download_bytes_args(cap).contains(&"--retry"),
+            !download_bytes_args(cap, "Accept: application/octet-stream", None)
+                .contains(&"--retry"),
             "the buffer the Ed25519 check reads must hold ONE attempt's bytes: {:?}",
-            download_bytes_args(cap)
+            download_bytes_args(cap, "Accept: application/octet-stream", None)
         );
         for stall in [StallBound::Quick, StallBound::Patient] {
-            let file = download_resume_args(cap, "600", "/tmp/x", None, stall);
+            let file = download_resume_args(cap, "/tmp/x", None, stall);
             assert!(
                 !file.contains(&"--retry"),
                 "a file lane continues its bytes itself: {file:?}"
@@ -1909,12 +2335,20 @@ mod tests {
 
     #[test]
     fn only_transient_server_statuses_are_retried_in_process() {
-        for code in ["408", "500", "502", "503", "504"] {
-            assert!(transient_status(code), "{code} is transient");
-        }
-        for code in ["200", "204", "301", "401", "403", "404", "429", "418", ""] {
+        for code in ["500", "501", "502", "503", "504", "599"] {
             assert!(
-                !transient_status(code),
+                aterm_types::http_retry::Cause::from_http(code.parse().unwrap(), None).is_some(),
+                "{code} is transient"
+            );
+        }
+        for code in [
+            "200", "204", "301", "401", "403", "404", "408", "429", "418", "600", "",
+        ] {
+            assert!(
+                code.parse::<u16>()
+                    .ok()
+                    .and_then(|status| { aterm_types::http_retry::Cause::from_http(status, None) })
+                    .is_none(),
                 "{code} is a verdict, not a blip — retrying it is wrong"
             );
         }
@@ -2009,15 +2443,9 @@ mod tests {
         let cap = "1024";
         let lanes: [Vec<&str>; 4] = [
             head_args().to_vec(),
-            download_bytes_args(cap).to_vec(),
-            download_resume_args(cap, "600", "/tmp/x", None, StallBound::Quick),
-            download_resume_args_https_only(
-                cap,
-                "600",
-                "/tmp/x.part",
-                Some("4"),
-                StallBound::Quick,
-            ),
+            download_bytes_args(cap, "Accept: application/octet-stream", None),
+            download_resume_args(cap, "/tmp/x", None, StallBound::Quick),
+            download_resume_args_https_only(cap, "/tmp/x.part", Some("4"), StallBound::Quick),
         ];
         for lane in &lanes {
             assert!(
@@ -2263,7 +2691,7 @@ mod tests {
         let dump = "HTTP/2 200\r\netag: \"new\"\r\ncontent-length: 7\r\n\r\n";
         for sent in [None, Some("\"old\"")] {
             assert_eq!(
-                vendor_get_step(&ok, dump, false, URL, 64, sent, || Ok(b"{}".to_vec())),
+                vendor_get_step(&ok, dump, URL, 64, sent, || Ok(b"{}".to_vec())),
                 Step::Done(Ok(VendorResponse::Body {
                     bytes: b"{}".to_vec(),
                     etag: Some("\"new\"".into()),
@@ -2280,7 +2708,6 @@ mod tests {
             vendor_get_step(
                 &not_modified,
                 "HTTP/2 304\r\netag: \"e2\"\r\n\r\n",
-                false,
                 URL,
                 64,
                 Some("\"e\""),
@@ -2295,7 +2722,6 @@ mod tests {
             vendor_get_step(
                 &not_modified,
                 "HTTP/2 304\r\n\r\n",
-                false,
                 URL,
                 64,
                 Some("\"e\""),
@@ -2329,10 +2755,10 @@ mod tests {
             ),
         ] {
             let code: u16 = stdout[..3].parse().unwrap();
-            let Step::Done(Err(err)) =
-                vendor_get_step(&run(Some(0), stdout, ""), "", true, URL, 64, sent, no_body)
-            else {
-                panic!("{stdout}: a final status is an error");
+            let step = vendor_get_step(&run(Some(0), stdout, ""), "", URL, 64, sent, no_body);
+            let err = match step {
+                Step::Done(Err(err)) | Step::Retry { exhausted: err, .. } => err,
+                other => panic!("{stdout}: a final status is an error, got {other:?}"),
             };
             assert_eq!(
                 err,
@@ -2348,19 +2774,20 @@ mod tests {
         }
         let mangled = run(Some(0), "<html>portal</html>", "");
         assert!(matches!(
-            vendor_get_step(&mangled, "", false, URL, 64, None, no_body),
+            vendor_get_step(&mangled, "", URL, 64, None, no_body),
             Step::Done(Err(HttpError::Malformed(_)))
         ));
         let over = || Err(HttpError::VendorRefused("over".into()));
         assert_eq!(
-            vendor_get_step(&ok, dump, false, URL, 64, None, over),
+            vendor_get_step(&ok, dump, URL, 64, None, over),
             Step::Done(Err(HttpError::VendorRefused("over".into())))
         );
     }
 
     #[test]
-    fn a_vendor_get_attempt_retries_only_the_network() {
+    fn a_vendor_get_attempt_retries_only_shared_transient_causes() {
         use super::{Step, vendor_get_step};
+        use aterm_types::http_retry::Cause;
         const URL: &str = "https://downloads.claude.ai/claude-code-releases/latest";
         let dns = run(Some(6), "", "curl: (6) Could not resolve host");
         let busy = run(
@@ -2368,14 +2795,56 @@ mod tests {
             "503 https://downloads.claude.ai/claude-code-releases/latest",
             "",
         );
-        for transient in [&dns, &busy] {
-            assert_eq!(
-                vendor_get_step(transient, "", false, URL, 64, None, no_body),
-                Step::Retry
-            );
+        assert!(matches!(
+            vendor_get_step(&busy, "", URL, 64, None, no_body),
+            Step::Retry {
+                cause: Cause::Server(503),
+                ..
+            }
+        ));
+        let capped_504 = run(
+            Some(63),
+            "504 https://downloads.claude.ai/claude-code-releases/latest",
+            "curl: (63) Maximum file size exceeded",
+        );
+        assert!(matches!(
+            vendor_get_step(&capped_504, "", URL, 64, None, no_body),
+            Step::Retry {
+                cause: Cause::Server(504),
+                ..
+            }
+        ));
+        let capped_404 = run(
+            Some(63),
+            "404 https://downloads.claude.ai/claude-code-releases/latest",
+            "curl: (63) Maximum file size exceeded",
+        );
+        assert_eq!(
+            vendor_get_step(&capped_404, "", URL, 64, None, no_body),
+            Step::Done(Err(HttpError::VendorStatus {
+                code: 404,
+                url: URL.into(),
+            }))
+        );
+        for (exit, stderr, cause) in [
+            (56, "curl: (56) Recv failure", Cause::Reset),
+            (28, "curl: (28) Operation timed out", Cause::Timeout),
+            (18, "curl: (18) transfer closed", Cause::Truncated),
+        ] {
+            assert!(matches!(
+                vendor_get_step(
+                    &run(Some(exit), "", stderr),
+                    "",
+                    URL,
+                    64,
+                    None,
+                    no_body
+                ),
+                Step::Retry { cause: got, .. } if got == cause
+            ));
         }
         assert!(matches!(
-            vendor_get_step(&dns, "", true, URL, 64, None, no_body),
+            vendor_get_step(&dns, "", URL, 64, None, no_body),
             Step::Done(Err(HttpError::Transport(ref m))) if m.contains("exit 6") && m.contains("resolve")
         ));
         for (exit, stderr) in [
@@ -2393,18 +2862,16 @@ mod tests {
             ),
         ] {
             let Step::Done(Err(HttpError::VendorRefused(message))) =
-                vendor_get_step(&run(exit, "", stderr), "", false, URL, 64, None, no_body)
+                vendor_get_step(&run(exit, "", stderr), "", URL, 64, None, no_body)
             else {
                 panic!("{exit:?} is a verdict on the first attempt");
             };
             assert!(message.contains(URL), "{message}");
         }
-        for last_run in [&dns, &busy, &run(None, "", "")] {
-            assert_ne!(
-                vendor_get_step(last_run, "", true, URL, 64, None, no_body),
-                Step::Retry
-            );
-        }
+        assert!(matches!(
+            vendor_get_step(&run(None, "", ""), "", URL, 64, None, no_body),
+            Step::Done(Err(HttpError::Transport(_)))
+        ));
     }
 
     #[test]
@@ -2415,12 +2882,12 @@ mod tests {
         let chain = "HTTP/2 302\r\nlocation: https://release-assets.githubusercontent.com/x\r\n\
                      content-length: 0\r\n\r\nHTTP/2 200\r\ncontent-length: 1631\r\n\r\n\n200";
         assert_eq!(
-            vendor_head_step(&run(Some(0), chain, ""), false, URL),
+            vendor_head_step(&run(Some(0), chain, ""), URL),
             Step::Done(Ok(Some(1631)))
         );
         let gone = "HTTP/2 302\r\ncontent-length: 5\r\n\r\nHTTP/2 404\r\n\r\n\n404";
         assert_eq!(
-            vendor_head_step(&run(Some(0), gone, ""), false, URL),
+            vendor_head_step(&run(Some(0), gone, ""), URL),
             Step::Done(Err(HttpError::VendorStatus {
                 code: 404,
                 url: URL.into()
@@ -2428,34 +2895,32 @@ mod tests {
         );
         let no_length = "HTTP/2 200\r\ncontent-type: text/plain\r\n\r\n\n200";
         assert_eq!(
-            vendor_head_step(&run(Some(0), no_length, ""), false, URL),
+            vendor_head_step(&run(Some(0), no_length, ""), URL),
             Step::Done(Ok(None)),
             "a 200 naming no length is sized by a ranged GET"
         );
         assert!(matches!(
-            vendor_head_step(&run(Some(0), "HTTP/2 200\r\n\r\n\nabc", ""), false, URL),
+            vendor_head_step(&run(Some(0), "HTTP/2 200\r\n\r\n\nabc", ""), URL),
             Step::Done(Err(HttpError::Malformed(_)))
         ));
         let busy = "HTTP/2 503\r\n\r\n\n503";
         assert_eq!(
-            vendor_head_step(&run(Some(0), busy, ""), false, URL),
-            Step::Retry
-        );
-        assert_eq!(
-            vendor_head_step(&run(Some(0), busy, ""), true, URL),
-            Step::Done(Err(HttpError::VendorStatus {
-                code: 503,
-                url: URL.into()
-            }))
+            vendor_head_step(&run(Some(0), busy, ""), URL),
+            Step::Retry {
+                cause: aterm_types::http_retry::Cause::Server(503),
+                exhausted: HttpError::VendorStatus {
+                    code: 503,
+                    url: URL.into(),
+                },
+            }
         );
         let dns = run(Some(6), "", "curl: (6) Could not resolve host");
-        assert_eq!(vendor_head_step(&dns, false, URL), Step::Retry);
         assert!(matches!(
-            vendor_head_step(&dns, true, URL),
+            vendor_head_step(&dns, URL),
             Step::Done(Err(HttpError::Transport(_)))
         ));
         assert!(matches!(
-            vendor_head_step(&run(Some(60), "", "curl: (60) SSL"), false, URL),
+            vendor_head_step(&run(Some(60), "", "curl: (60) SSL"), URL),
             Step::Done(Err(HttpError::VendorRefused(_)))
         ));
     }
@@ -2471,13 +2936,13 @@ mod tests {
         let npm = "HTTP/2 206\r\ncontent-type: application/octet-stream\r\n\
                    content-range: bytes 0-0/55485055\r\ncontent-length: 1\r\n\r\n\n206 0.05";
         assert_eq!(
-            vendor_range_step(&run(Some(0), npm, ""), false, URL),
+            vendor_range_step(&run(Some(0), npm, ""), URL),
             Step::Done(Ok(55_485_055))
         );
         let hop = "HTTP/2 302\r\ncontent-range: bytes 0-0/9\r\n\r\n\
                    HTTP/2 206\r\ncontent-range: bytes 0-0/7\r\n\r\n\n206";
         assert_eq!(
-            vendor_range_step(&run(Some(0), hop, ""), false, URL),
+            vendor_range_step(&run(Some(0), hop, ""), URL),
             Step::Done(Ok(7)),
             "the final hop's"
         );
@@ -2493,7 +2958,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    vendor_range_step(&run(Some(0), bad, ""), false, URL),
+                    vendor_range_step(&run(Some(0), bad, ""), URL),
                     Step::Done(Err(HttpError::Malformed(_)))
                 ),
                 "{bad:?}"
@@ -2503,7 +2968,6 @@ mod tests {
             matches!(
                 vendor_range_step(
                     &run(Some(63), "", "curl: (63) Maximum file size exceeded"),
-                    false,
                     URL
                 ),
                 Step::Done(Err(HttpError::Malformed(_)))
@@ -2511,15 +2975,49 @@ mod tests {
             "a host that ignores the range and sends the payload is no size"
         );
         assert_eq!(
-            vendor_range_step(&run(Some(0), "HTTP/2 404\r\n\r\n\n404", ""), false, URL),
+            vendor_range_step(&run(Some(0), "HTTP/2 404\r\n\r\n\n404", ""), URL),
             Step::Done(Err(HttpError::VendorStatus {
                 code: 404,
                 url: URL.into()
             }))
         );
         assert_eq!(
-            vendor_range_step(&run(Some(0), "HTTP/2 503\r\n\r\n\n503", ""), false, URL),
-            Step::Retry
+            vendor_range_step(&run(Some(0), "HTTP/2 503\r\n\r\n\n503", ""), URL),
+            Step::Retry {
+                cause: aterm_types::http_retry::Cause::Server(503),
+                exhausted: HttpError::VendorStatus {
+                    code: 503,
+                    url: URL.into(),
+                },
+            }
+        );
+        assert!(matches!(
+            vendor_range_step(
+                &run(
+                    Some(63),
+                    "HTTP/2 504\r\n\r\n\n504",
+                    "curl: (63) Maximum file size exceeded"
+                ),
+                URL
+            ),
+            Step::Retry {
+                cause: aterm_types::http_retry::Cause::Server(504),
+                ..
+            }
+        ));
+        assert_eq!(
+            vendor_range_step(
+                &run(
+                    Some(63),
+                    "HTTP/2 404\r\n\r\n\n404",
+                    "curl: (63) Maximum file size exceeded"
+                ),
+                URL
+            ),
+            Step::Done(Err(HttpError::VendorStatus {
+                code: 404,
+                url: URL.into(),
+            }))
         );
         let args = super::vendor_range_args("/scratch/body");
         for (flag, value) in [
@@ -2540,7 +3038,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vendor_payload_failure_is_a_verdict_only_when_it_recurs() {
+    fn a_vendor_payload_failure_retries_only_shared_transient_causes() {
         use super::vendor_download_verdict as verdict;
         const URL: &str =
             "https://downloads.claude.ai/claude-code-releases/2.1.280/darwin-arm64/claude";
@@ -2553,7 +3051,7 @@ mod tests {
             verdict(Some(1), "", URL, 9),
             Some(HttpError::VendorRefused(_))
         ));
-        for code in [403, 404, 410] {
+        for code in [403, 404, 408, 410, 429] {
             assert_eq!(
                 verdict(Some(22), &http(code), URL, 9),
                 Some(HttpError::VendorStatus {
@@ -2562,9 +3060,25 @@ mod tests {
                 })
             );
         }
-        for code in [408, 429, 500, 503] {
+        for code in [500, 503] {
             assert_eq!(verdict(Some(22), &http(code), URL, 9), None, "{code}");
         }
+        let limited = format!("{}\n{}429\t17", http(429), super::CURL_META_PREFIX);
+        assert_eq!(verdict(Some(22), &limited, URL, 9), None);
+        let capped = |code| {
+            format!(
+                "curl: (63) Maximum file size exceeded\n{}{code}\t",
+                super::CURL_META_PREFIX
+            )
+        };
+        assert_eq!(verdict(Some(63), &capped(504), URL, 9), None);
+        assert_eq!(
+            verdict(Some(63), &capped(404), URL, 9),
+            Some(HttpError::VendorStatus {
+                code: 404,
+                url: URL.into(),
+            })
+        );
         assert_eq!(
             verdict(Some(28), "curl: (28) Operation timed out", URL, 9),
             None
@@ -2679,7 +3193,7 @@ mod tests {
 
     #[test]
     fn the_small_lanes_bound_the_connect_ahead_of_the_url_guard() {
-        let small = super::download_bytes_args("5000000");
+        let small = super::download_bytes_args("5000000", "Accept: application/octet-stream", None);
         let quick = super::head_args_with_timeout("5");
         let head = head_args();
         for lane in [&head[..], &quick[..], &small[..]] {
@@ -2751,9 +3265,9 @@ mod tests {
     #[test]
     fn only_a_resumed_attempt_carries_a_range() {
         let quick = StallBound::Quick;
-        let fresh = download_resume_args("100", "600", "/s/a.tar.zst.part", None, quick);
+        let fresh = download_resume_args("100", "/s/a.tar.zst.part", None, quick);
         assert!(!fresh.contains(&"--continue-at"), "{fresh:?}");
-        let resumed = download_resume_args("60", "600", "/s/a.tar.zst.part", Some("40"), quick);
+        let resumed = download_resume_args("60", "/s/a.tar.zst.part", Some("40"), quick);
         assert_eq!(resumed.len(), fresh.len() + 2);
         assert_eq!(resumed[fresh.len()], "--continue-at");
         assert_eq!(
@@ -2768,13 +3282,100 @@ mod tests {
             "--speed-time",
             "--keepalive-time",
             "--connect-timeout",
-            "--max-time",
         ] {
             assert!(resumed.contains(&flag), "{flag} must survive: {resumed:?}");
         }
+        let connect = resumed
+            .iter()
+            .enumerate()
+            .filter(|(_, arg)| **arg == "--connect-timeout")
+            .collect::<Vec<_>>();
+        assert_eq!(connect.len(), 1, "one connect bound: {resumed:?}");
+        assert_eq!(resumed[connect[0].0 + 1], "30");
         assert!(
             !resumed.contains(&"--"),
             "no caller-side end-of-options marker"
+        );
+    }
+
+    #[test]
+    fn one_vendor_size_budget_spans_head_and_range_and_a_404_is_final() {
+        use std::cell::Cell;
+
+        use aterm_types::http_retry::{Cause, Policy};
+
+        use super::{Step, vendor_content_length_steps};
+
+        const URL: &str = "https://vendor.example/archive.tgz";
+        fn transient<T>(status: u16) -> Step<T> {
+            Step::Retry {
+                cause: Cause::Server(status),
+                exhausted: HttpError::VendorStatus {
+                    code: status,
+                    url: "https://vendor.example/archive.tgz".into(),
+                },
+            }
+        }
+
+        let heads = Cell::new(0u32);
+        let ranges = Cell::new(0u32);
+        let mut retries = Vec::new();
+        let refused = vendor_content_length_steps(
+            URL,
+            || {
+                let call = heads.get() + 1;
+                heads.set(call);
+                if call <= 2 {
+                    transient(504)
+                } else {
+                    Step::Done(Ok(None))
+                }
+            },
+            || {
+                ranges.set(ranges.get() + 1);
+                transient(503)
+            },
+            |retry| retries.push(retry),
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(heads.get(), 3, "two HEAD retries, then the range fallback");
+        assert_eq!(
+            ranges.get(),
+            16,
+            "the whole read stops at nineteen requests"
+        );
+        assert_eq!(heads.get() + ranges.get(), Policy::STANDARD.attempts());
+        assert_eq!(retries.len(), 17, "the exhausted request is not retried");
+        assert!(refused.contains(&Policy::STANDARD.bound()), "{refused}");
+
+        heads.set(0);
+        ranges.set(0);
+        retries.clear();
+        let absent = vendor_content_length_steps(
+            URL,
+            || {
+                heads.set(heads.get() + 1);
+                Step::Done(Ok(None))
+            },
+            || {
+                ranges.set(ranges.get() + 1);
+                Step::Done(Err(HttpError::VendorStatus {
+                    code: 404,
+                    url: URL.into(),
+                }))
+            },
+            |retry| retries.push(retry),
+        )
+        .unwrap_err();
+        assert_eq!((heads.get(), ranges.get()), (1, 1));
+        assert!(retries.is_empty(), "an answered 404 is never retried");
+        assert_eq!(
+            absent,
+            HttpError::VendorStatus {
+                code: 404,
+                url: URL.into()
+            }
         );
     }
 
@@ -2789,14 +3390,14 @@ mod tests {
         };
         for stall in [StallBound::Quick, StallBound::Patient] {
             for args in [
-                download_resume_args("100", "600", "/s/a.part", Some("40"), stall),
-                download_resume_args_https_only("100", "600", "/s/a.part", None, stall),
+                download_resume_args("100", "/s/a.part", Some("40"), stall),
+                download_resume_args_https_only("100", "/s/a.part", None, stall),
             ] {
                 assert!(!args.contains(&"--retry"), "{args:?}");
                 assert_eq!(value_of(&args, "--speed-limit"), "4096");
                 assert_eq!(value_of(&args, "--keepalive-time"), "2");
                 assert_eq!(value_of(&args, "--connect-timeout"), "30");
-                assert_eq!(value_of(&args, "--max-time"), "600");
+                assert!(!args.contains(&"--max-time"), "{args:?}");
                 assert_eq!(value_of(&args, "--max-filesize"), "100");
                 assert_eq!(value_of(&args, "--proto-redir"), "=https");
                 assert_eq!(
@@ -2832,27 +3433,40 @@ mod tests {
         let reset = "curl: (56) Recv failure: Connection reset by peer";
         let closed = "curl: (18) transfer closed with 123 bytes remaining to read";
         for (exit, stderr) in [(28, stall), (56, reset), (18, closed)] {
-            assert_eq!(next_attempt(Some(exit), stderr, true), Resume, "{stderr}");
+            assert!(
+                matches!(next_attempt(Some(exit), stderr, true), Resume(_)),
+                "{stderr}"
+            );
         }
-        assert_eq!(next_attempt(Some(28), stall, false), Retry);
-        assert_eq!(next_attempt(Some(56), reset, false), Stop);
-        assert_eq!(next_attempt(Some(18), closed, false), Stop);
+        assert!(matches!(next_attempt(Some(28), stall, false), Retry(_)));
+        assert!(matches!(next_attempt(Some(56), reset, false), Retry(_)));
+        assert!(matches!(next_attempt(Some(18), closed, false), Retry(_)));
         let full = "curl: (23) Failure writing output to destination";
         let over = "curl: (63) Maximum file size exceeded";
         for moved in [true, false] {
             assert_eq!(next_attempt(Some(23), full, moved), Stop);
             assert_eq!(next_attempt(Some(63), over, moved), Stop);
         }
+        let capped_504 = format!("{over}\n{}504\t", super::CURL_META_PREFIX);
+        assert!(matches!(
+            next_attempt(Some(63), &capped_504, false),
+            Retry(aterm_types::http_retry::Cause::Server(504))
+        ));
+        let capped_404 = format!("{over}\n{}404\t", super::CURL_META_PREFIX);
+        assert_eq!(next_attempt(Some(63), &capped_404, false), Stop);
         assert_eq!(
             next_attempt(Some(6), "curl: (6) Could not resolve host", false),
-            Retry
+            Stop
         );
         assert_eq!(
             next_attempt(Some(5), "curl: (5) Could not resolve proxy", false),
-            Retry
+            Stop
         );
-        assert_eq!(next_attempt(Some(22), &curl_err(503), false), Retry);
-        assert_eq!(next_attempt(Some(22), &curl_err(408), false), Retry);
+        assert!(matches!(
+            next_attempt(Some(22), &curl_err(503), false),
+            Retry(aterm_types::http_retry::Cause::Server(503))
+        ));
+        assert_eq!(next_attempt(Some(22), &curl_err(408), false), Stop);
         assert_eq!(
             next_attempt(Some(7), "curl: (7) Failed to connect", false),
             Stop
@@ -3274,7 +3888,7 @@ mod tests {
         const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
         let resumes = u64::from(super::SHORT_RESUMES_PER_CALL)
             + u64::try_from(run.size).unwrap() / super::RESUME_EARNED_AT;
-        let ceiling = usize::try_from((resumes + 2) * u64::from(super::CURL_ATTEMPTS)).unwrap();
+        let ceiling = usize::try_from((resumes + 2) * u64::from(super::READ_ATTEMPTS)).unwrap();
         let dir = run.dir.path().to_path_buf();
         let moved = |run: &Transfer| {
             let size = |name: &str| std::fs::metadata(dir.join(name)).map_or(0, |m| m.len());
@@ -3421,11 +4035,11 @@ mod tests {
     #[test]
     fn the_vendor_lane_pins_https_on_the_first_hop_and_every_redirect() {
         let quick = StallBound::Quick;
-        let plain = download_resume_args("100", "600", "/s/claude.part", None, quick);
-        let pinned = download_resume_args_https_only("100", "600", "/s/claude.part", None, quick);
-        assert_eq!(&pinned[..2], ["--proto", "=https"]);
+        let plain = download_resume_args("100", "/s/claude.part", None, quick);
+        let pinned = download_resume_args_https_only("100", "/s/claude.part", None, quick);
+        assert_eq!(&pinned[..3], ["--proto", "=https", "--tlsv1.2"]);
         assert_eq!(
-            &pinned[2..],
+            &pinned[3..],
             &plain[..],
             "everything after the pin is the plain argv"
         );
@@ -3435,8 +4049,7 @@ mod tests {
             .expect("redirect pin present");
         assert_eq!(pinned[redir + 1], "=https");
         assert!(!plain.contains(&"--proto"), "{plain:?}");
-        let resumed =
-            download_resume_args_https_only("60", "600", "/s/claude.part", Some("40"), quick);
+        let resumed = download_resume_args_https_only("60", "/s/claude.part", Some("40"), quick);
         assert_eq!(resumed.len(), pinned.len() + 2);
         assert_eq!(&resumed[resumed.len() - 2..], ["--continue-at", "40"]);
         let dir = crate::test_scratch_dir("vendor-lane");
@@ -3513,8 +4126,12 @@ mod tests {
             "curl 33: server refuses ranges"
         );
         assert!(
-            range_refused(Some(22), "curl: (22) The requested URL returned error: 416"),
-            "416: the offset is past what the upstream object now holds"
+            range_refused(Some(33), &format!("{}200\t", super::CURL_META_PREFIX)),
+            "curl 33 after a non-error answer still permits the one fresh request"
+        );
+        assert!(
+            !range_refused(Some(22), "curl: (22) The requested URL returned error: 416"),
+            "an answered 416 is a final 4xx, never a fresh-attempt instruction"
         );
         assert!(
             !range_refused(Some(28), "curl: (28) Operation too slow"),

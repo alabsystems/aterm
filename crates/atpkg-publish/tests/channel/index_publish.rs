@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use atpkg_publish::api::{Baseline, Delta, IndexRequest};
+use atpkg_publish::channel::Log;
 use atpkg_publish::channel::index::{Outcome, parse_delta, publish_with};
-use atpkg_publish::channel::{Log, SERVE_PROBES};
 use atpkg_publish::ctx::HostChoice;
 use atpkg_publish::error::{Error, Result};
 use atpkg_publish::host::fake::{FakeFail, FakeHost, FakeOp};
@@ -333,20 +333,6 @@ fn an_index_the_download_host_does_not_serve_after_its_create_fails_the_run() {
     rig.route(Arc::new(Faulty::unserved(host, index_tag(22), usize::MAX)));
     let (e, _) = refused(&rig, &request(&rig, "out", true, Delta::default()));
     assert!(e.to_string().contains("is the repo public?"), "{e}");
-}
-
-#[test]
-fn an_index_the_download_host_serves_late_is_published() {
-    let mut rig = live("idx-served-late");
-    let host = rig.host.clone();
-    rig.route(Arc::new(Faulty::unserved(
-        host,
-        index_tag(22),
-        SERVE_PROBES - 1,
-    )));
-    let (r, log) = publish(&rig, &request(&rig, "out", true, Delta::default()));
-    r.unwrap_or_else(|e| panic!("{e}\n{}", log.text()));
-    assert!(log.contains("published atpkg-index-22"), "{}", log.text());
 }
 
 fn own_then(label: &str, shape: impl Fn(&Rig, &Path)) -> Rig {

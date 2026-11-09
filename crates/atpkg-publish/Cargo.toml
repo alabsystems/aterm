@@ -45,6 +45,7 @@ aterm-update-core = { workspace = true }
 # The epoch-clock read, and RFC3339 parsing of `valid_until`.
 aterm-time = { workspace = true }
 aterm-types = { workspace = true }
+aterm-dirfd = { workspace = true }
 # How each write is finished: durable (F_FULLFSYNC) or ordered (F_BARRIERFSYNC).
 aterm-durable = { workspace = true }
 # The client's TOML parser, for what the typed client structs cannot answer (the head

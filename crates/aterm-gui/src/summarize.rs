@@ -601,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn a_summary_whose_tab_did_not_open_is_said_on_the_band() {
+    fn a_summary_whose_tab_did_not_open_is_said_in_a_live_row() {
         let said = |app: &App| {
             app.messages
                 .live_by_key("harness.summarize")
@@ -611,7 +611,7 @@ mod tests {
         assert_eq!(app.summarize_in_new_tab(), Ok(()));
         assert!(!app.tab_spawns.summary_pending(), "released");
         assert_eq!(app.summarize_in_new_tab(), Ok(()));
-        assert!(said(&app).is_some(), "the failed start is said on the band");
+        assert!(said(&app).is_some(), "the failed start is a live row");
         let mut app = workers_app();
         let ctx = app.pool.get(0).expect("the stub").ctx.clone();
         ctx.meta.lock().unwrap().role = Some("operator".to_string());

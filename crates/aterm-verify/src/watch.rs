@@ -270,6 +270,8 @@ fn attempt(opts: &Options) -> Result<(), String> {
     if foreground_waiting(root)? {
         return Ok(());
     }
+    // verify watch follows the invoking checkout's arbitrary remote, which may be private. URL
+    // shape alone is no authority to classify this read as credential-less.
     git(root, &["fetch", "--quiet", "origin", &opts.branch])?;
     let commit = git(root, &["rev-parse", "FETCH_HEAD^{commit}"])?;
     let tree = git(root, &["rev-parse", &format!("{commit}^{{tree}}")])?;
@@ -553,6 +555,8 @@ fn judge(root: &Path, record: &mut Record) -> Result<(), String> {
         return Err("watch workspace is dirty; preserving its work".into());
     }
     git(root, &["checkout", "--quiet", "--detach", &record.commit])?;
+    // vendor/astream is private. Its URL may be HTTPS, but only caller authority—not URL shape—
+    // can say a read is anonymous.
     git(root, &["submodule", "update", "--init", "vendor/astream"])?;
     git(root, &["config", "submodule.recurse", "true"])?;
     record.inputs = source_inputs(root)?;

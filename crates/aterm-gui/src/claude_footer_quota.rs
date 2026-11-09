@@ -181,7 +181,8 @@ impl QuotaRow {
     }
 
     /// The row composed from `key` ([`compose_cells`]), its midnights' ticks over its chart
-    /// ([`push_ticks`]) in the track ink.
+    /// ([`push_ticks`]) in the inks of what each stands on ([`TickInks`]: the pane's ground, or a
+    /// glyph that inks the tick's foot; line E has no wash).
     fn compose(&mut self, key: QuotaKey) {
         if self.key == Some(key) {
             return;
@@ -190,13 +191,24 @@ impl QuotaRow {
         crate::work_counts::footer_rule_composed();
         compose_cells(&self.line, &key, &mut self.cells);
         let mut ticks = Vec::new();
+        let chart = self
+            .line
+            .cells
+            .get(self.line.chart.clone())
+            .unwrap_or_default();
         push_ticks(
             &mut ticks,
             &self.line.ticks,
             (0, self.line.chart.len()),
             key.cell,
+            |i| {
+                chart
+                    .get(i)
+                    .map_or(TickOn::Ground, |c| TickOn::of(c.0, false))
+            },
         );
-        self.ticks = tick_content(&ticks, key.glass.track());
+        let inks = TickInks::new(key.glass.track(), key.glass.key().ground, None);
+        self.ticks = tick_content(&ticks, inks);
         self.key = Some(key);
     }
 
@@ -306,15 +318,93 @@ fn compose_cells(line: &QuotaLine, key: &QuotaKey, out: &mut Vec<RenderCell>) {
     out.resize(key.cells.max(out.len()), blank);
 }
 
+/// What a midnight's tick stands on (§1.3, §1.4, §2.2), which its ink is read against
+/// ([`TickInks`], whose palette base it names, [`Self::ink`]): the row's ground (a blank cell, `┄`,
+/// the projected line above the tick's foot quarter), a glyph that inks that quarter (a measured
+/// step, whose block fills it from level 2 and half of it at level 1, or the projected line at
+/// level 1, `▁`, or 2, `🭻`, which lies inside it), or the warn wash a card lane's out line stands
+/// on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TickOn {
+    Ground,
+    Fill,
+    Wash,
+}
+
+impl TickOn {
+    /// Its ink's palette base in [`TickInks::palette`] (a rect reads the entry there and the
+    /// next).
+    pub(crate) const fn ink(self) -> u32 {
+        match self {
+            TickOn::Ground => 0,
+            TickOn::Fill => 2,
+            TickOn::Wash => 4,
+        }
+    }
+
+    /// What a tick stands on in a cell that draws `glyph`, on a warn wash or not: a measured
+    /// step (`▁` to `█`) or the projected line at level 2 (`🭻`, level 1 being `▁`) inks the
+    /// tick's foot quarter; any other glyph stands clear of it, on the wash or the ground.
+    pub(crate) fn of(glyph: char, wash: bool) -> Self {
+        if ('\u{2581}'..='\u{2588}').contains(&glyph) || glyph == '\u{1fb7b}' {
+            TickOn::Fill
+        } else if wash {
+            TickOn::Wash
+        } else {
+            TickOn::Ground
+        }
+    }
+}
+
+/// The inks of a row's midnights' ticks by what each stands on, in [`TickOn`]'s order (§1.3):
+/// the glass's track on the ground (Claude's rule grey floored to 3:1 there); the ground's own
+/// ink across a glyph that inks the tick's foot, a notch through a measured step or a low
+/// projected line that stands from it as far as it stands from the ground (a mark is floored to
+/// 3:1 on a dark ground and 4.5:1 on Day, a letter to 4.5:1, §4.1), where the track, solved on
+/// the ground alone, can take a step's luminance (1.0:1 on Night's violet steps) or strike
+/// through the line; and the track floored to 3:1 on a warn wash, which would hold it near
+/// 2.4:1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TickInks(pub(crate) [u32; 3]);
+
+impl TickInks {
+    /// The inks of ticks drawn in `track` on a row of `ground` (`0x00RRGGBB` each), its warn cells
+    /// on `wash` where they stand on one.
+    pub(crate) fn new(track: u32, ground: u32, wash: Option<u32>) -> Self {
+        let on_wash = wash.map_or(track, |wash| {
+            aterm_effects::color_math::floor_contrast_keeping_hue(
+                track,
+                wash,
+                aterm_effects::cli_marks::ICON_CONTRAST,
+            )
+        });
+        TickInks([track, ground & 0x00FF_FFFF, on_wash])
+    }
+
+    /// The colour a tick of palette base `ink` ([`TickOn::ink`]) draws in.
+    #[cfg(test)]
+    pub(crate) fn color(self, ink: u32) -> u32 {
+        let at = usize::try_from(ink / 2).unwrap_or(0);
+        self.0.get(at).copied().unwrap_or(self.0[0])
+    }
+
+    /// The layer's palette: each ink twice, as a rect reads its base entry and the next.
+    pub(crate) fn palette(self) -> [FxInk; 6] {
+        let [ground, fill, wash] = self.0.map(|ink| FxInk::over(ink, 255));
+        [ground, ground, fill, fill, wash, wash]
+    }
+}
+
 /// A drawn row's midnights' ticks (§1.3, §1.4, §2.2: line E's chart, the Accounts card's work
 /// row and lanes) into `out`: one at each of `places` (from the row's left edge,
 /// [`CELL_PLACES`] a cell, each in a cell that takes one, [`Chart::ticks`]) that falls before the
 /// row's `room`-th cell, one device pixel wide at the foot of a cell `cw` by `ch` pixels on the
-/// row whose top is `top`, a quarter of the cell tall, at its exact place. A tick, not a
-/// full-height hairline: only `▕` stands a whole cell high, so now never reads as one more
-/// midnight, and no tick meets a `▔` at a cell's head to read as `T`; on a card lane, whose top
-/// quarter stays clear under its item's words, a tick at the foot stands a cell's height from
-/// them. Nothing in a cell of no size.
+/// row whose top is `top`, a quarter of the cell tall, at its exact place, in the ink of what
+/// `on` says it stands on in its cell (counted from the row's left edge, [`TickInks`]). A tick,
+/// not a full-height hairline: only `▕` stands a whole cell high, so now never reads as one
+/// more midnight, and no tick meets a `▔` at a cell's head to read as `T`; on a card lane,
+/// whose top quarter stays clear under its item's words, a tick at the foot stands a cell's
+/// height from them. Nothing in a cell of no size.
 ///
 /// [`Chart::ticks`]: aterm_agent::harness::quota_view::Chart::ticks
 pub(crate) fn push_ticks(
@@ -322,6 +412,7 @@ pub(crate) fn push_ticks(
     places: &[i64],
     (top, room): (i32, usize),
     (cw, ch): (u16, u16),
+    on: impl Fn(usize) -> TickOn,
 ) {
     if cw == 0 || ch == 0 {
         return;
@@ -335,35 +426,34 @@ pub(crate) fn push_ticks(
         places
             .iter()
             .filter(|&&place| (0..end).contains(&place))
-            .filter_map(|&place| i32::try_from(place * i64::from(cw) / CELL_PLACES).ok())
-            .map(|x| FxRect {
-                x,
-                y,
-                w: 1,
-                h,
-                ink: 0,
+            .filter_map(|&place| {
+                let x = i32::try_from(place * i64::from(cw) / CELL_PLACES).ok()?;
+                let cell = usize::try_from(place / CELL_PLACES).ok()?;
+                Some(FxRect {
+                    x,
+                    y,
+                    w: 1,
+                    h,
+                    ink: on(cell).ink(),
+                })
             }),
     );
 }
 
-/// `ticks` ([`push_ticks`]) as a layer's content in `track`, the glass's track ink (§1.3);
-/// `None` with no tick.
-pub(crate) fn tick_content(ticks: &[FxRect], track: u32) -> Option<Arc<FxContent>> {
+/// `ticks` ([`push_ticks`]) as a layer's content in `inks` (§1.3); `None` with no tick.
+pub(crate) fn tick_content(ticks: &[FxRect], inks: TickInks) -> Option<Arc<FxContent>> {
     (!ticks.is_empty()).then(|| {
         Arc::new(FxContent::new(
             ticks.iter().map(|&r| FxItem::Rect(r)).collect(),
-            vec![FxInk::over(track, 255); 2],
+            inks.palette().to_vec(),
         ))
     })
 }
 
-/// Whether `content` draws `ticks` in `track` as [`tick_content`] seals them, so a frame whose
+/// Whether `content` draws `ticks` in `inks` as [`tick_content`] seals them, so a frame whose
 /// ticks have not moved hands the content on and seals none.
-pub(crate) fn draws_ticks(content: &FxContent, ticks: &[FxRect], track: u32) -> bool {
-    content
-        .palette()
-        .iter()
-        .all(|ink| *ink == FxInk::over(track, 255))
+pub(crate) fn draws_ticks(content: &FxContent, ticks: &[FxRect], inks: TickInks) -> bool {
+    content.palette() == inks.palette()
         && content.items().len() == ticks.len()
         && content
             .items()

@@ -31,7 +31,7 @@ impl HttpTransport {
             client: Client::new(
                 Trust::PlatformVerifier,
                 ProxyMode::Environment,
-                Deadlines::JSON.backstop,
+                Deadlines::JSON_BACKSTOP,
             ),
             env,
         }
@@ -45,7 +45,7 @@ impl HttpTransport {
             client: Client::new(
                 Trust::Roots(Vec::new()),
                 ProxyMode::Direct,
-                Deadlines::JSON.backstop,
+                Deadlines::JSON_BACKSTOP,
             ),
             env,
         }
@@ -199,6 +199,21 @@ fn kind_of(phase: Phase, error: &aterm_http::Error) -> WireKind {
         aterm_http::Error::Invalid(_) => WireKind::Local,
         aterm_http::Error::Protocol(_) => WireKind::Protocol,
         aterm_http::Error::TooLarge { .. } => WireKind::TooLarge,
+        aterm_http::Error::Io(e) if e.kind() == K::TimedOut => {
+            if phase == Phase::Sent {
+                WireKind::Idle
+            } else {
+                WireKind::Timeout
+            }
+        }
+        aterm_http::Error::Io(e)
+            if matches!(
+                e.kind(),
+                K::ConnectionReset | K::ConnectionAborted | K::BrokenPipe
+            ) =>
+        {
+            WireKind::Reset
+        }
         aterm_http::Error::Io(e) if phase == Phase::NotSent => {
             let message = e.to_string();
             if message.starts_with("proxy") {
@@ -257,11 +272,14 @@ impl crate::wire::Transport for HttpTransport {
             let (name, value) = auth.parts();
             builder = builder.secret_header(name, Secret::new(value.expose()));
         }
-        let builder = builder
+        let mut builder = builder
             .limit(usize::try_from(limit).unwrap_or(usize::MAX))
             .idle(deadlines.idle)
-            .backstop(deadlines.backstop)
             .connect_within(deadlines.connect);
+        builder = match deadlines.backstop {
+            Some(backstop) => builder.backstop(backstop),
+            None => builder.without_backstop(),
+        };
         let body = match body {
             WireBody::Empty => Body::Empty,
             WireBody::Bytes(bytes) => Body::Bytes(bytes),
@@ -365,7 +383,7 @@ mod tests {
             (
                 Phase::NotSent,
                 io(K::TimedOut, "dns: no answer within 100ms"),
-                WireKind::Dns,
+                WireKind::Timeout,
             ),
             (
                 Phase::NotSent,
@@ -405,6 +423,13 @@ mod tests {
             ),
             (Phase::Answered, io(K::InvalidData, "x"), WireKind::Protocol),
             (Phase::Sent, io(K::ConnectionReset, "x"), WireKind::Reset),
+            (Phase::NotSent, io(K::ConnectionReset, "x"), WireKind::Reset),
+            (
+                Phase::NotSent,
+                io(K::ConnectionAborted, "x"),
+                WireKind::Reset,
+            ),
+            (Phase::NotSent, io(K::BrokenPipe, "x"), WireKind::Reset),
         ];
         for (phase, error, kind) in rows {
             assert_eq!(kind_of(phase, &error), kind, "{phase:?} {error:?}");

@@ -546,15 +546,8 @@ pub struct CarriedMessage {
     pub stats: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub busy: bool,
-    #[serde(
-        default = "carried_excerpt",
-        skip_serializing_if = "is_carried_excerpt"
-    )]
-    pub excerpt: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub retrospective: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wire: bool,
     #[serde(
@@ -576,18 +569,6 @@ const fn is_carried_repeats(repeats: &u32) -> bool {
     *repeats == 1
 }
 
-const fn carried_excerpt() -> bool {
-    true
-}
-
-#[allow(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde's skip_serializing_if hands the field by reference"
-)]
-const fn is_carried_excerpt(excerpt: &bool) -> bool {
-    *excerpt
-}
-
 impl From<&aterm_messages::CarriedMessage> for CarriedMessage {
     fn from(m: &aterm_messages::CarriedMessage) -> Self {
         Self {
@@ -605,9 +586,7 @@ impl From<&aterm_messages::CarriedMessage> for CarriedMessage {
             fill_permille: m.fill_permille,
             stats: m.stats.clone(),
             busy: m.busy,
-            excerpt: m.excerpt,
             finished: m.finished.clone(),
-            retrospective: m.retrospective,
             wire: m.wire,
             repeats: m.repeats,
         }
@@ -631,9 +610,7 @@ impl From<&CarriedMessage> for aterm_messages::CarriedMessage {
             fill_permille: m.fill_permille,
             stats: m.stats.clone(),
             busy: m.busy,
-            excerpt: m.excerpt,
             finished: m.finished.clone(),
-            retrospective: m.retrospective,
             wire: m.wire,
             repeats: m.repeats,
         }

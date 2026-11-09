@@ -1503,6 +1503,19 @@ enum Submission {
     Offer,
 }
 
+/// What keeps the launch's offer from being made again after a handoff
+/// ([`SystemStateApp::offer_hold`]).
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OfferHold {
+    /// A person's draft in it (a group pressed, a vault address or password typed), which the
+    /// successor could not carry: theirs, while it is there.
+    Draft,
+    /// The page's own answer, a queued page action or a Stop is under way, or the offer is not
+    /// the page's to give again: the page settles it by itself.
+    Answer,
+}
+
 #[derive(Debug)]
 pub(crate) enum SystemStateAction {
     /// Submit this plan as the next run, with its vault password once. While
@@ -3831,24 +3844,37 @@ impl SystemStateApp {
         self.request.as_ref().is_some_and(Request::pending)
     }
 
-    /// An unanswered offer with no draft or work can be recreated after a handoff.
-    /// This answers nothing: the successor reads the durable plan and offers it again.
+    /// What keeps `request` from being recreated after a handoff: the page's own answer, a queued
+    /// page action or a Stop under way, or an offer that is not the page's to give again
+    /// ([`OfferHold::Answer`], which the page settles by itself); else a person's draft in it
+    /// ([`OfferHold::Draft`], theirs while it is there). `None` for an unanswered offer with
+    /// neither, which can be recreated: this answers nothing, and the successor reads the durable
+    /// plan and offers it again.
+    ///
+    /// What the setup worker is doing is not the offer's: a busy status (a run going, a Check)
+    /// holds the page's own answer ([`Self::tick_at`]) and never the offer, since a run goes on
+    /// through a handoff (cut off at the Commit by no crash, resumed by the successor), and the
+    /// work a handoff must not drop holds it by itself (`App::system_state_handoff_pending`: an
+    /// Apply the worker has not taken, a Restore, a queued choice). A busy status once made an
+    /// untouched offer hold a staged update for as long as the worker ran (from 0.148.0
+    /// until UPD1).
     #[cfg(any(unix, test))]
-    pub(crate) fn offer_can_restart(&self, request: &Request) -> bool {
+    pub(crate) fn offer_hold(&self, request: &Request) -> Option<OfferHold> {
         let Some(offered) = self.request.as_ref() else {
-            return false;
+            return Some(OfferHold::Answer);
         };
         let plan = request.initial();
-        offered.same_offer(request)
+        if !(offered.same_offer(request)
             && offered.pending()
             && self.answer_waits
             && self.awaiting.is_none()
             && self.actions.is_empty()
-            && !self.stopping
-            && !self.status.busy
-            && self.plan == *plan
-            && self.url.value() == plan.vault_url
-            && !self.vault_draft()
+            && !self.stopping)
+        {
+            return Some(OfferHold::Answer);
+        }
+        (self.plan != *plan || self.url.value() != plan.vault_url || self.vault_draft())
+            .then_some(OfferHold::Draft)
     }
 
     /// A vault address or password typed and not joined yet.

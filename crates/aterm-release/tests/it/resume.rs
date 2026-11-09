@@ -633,49 +633,6 @@ fn release_asset_digest_replay_uses_the_updater_download_bound() {
     );
     assert!(publish::validate_small_release_asset_size("aterm-0.55.0.dmg", 1).is_err());
     assert_eq!(
-        publish::read_bounded_release_asset(std::io::Cursor::new(vec![7_u8; 64]), 64).unwrap(),
-        vec![7_u8; 64]
-    );
-    assert!(
-        publish::read_bounded_release_asset(std::io::Cursor::new(vec![7_u8; 65]), 64).is_err(),
-        "a response that grows after metadata preflight stays memory-bounded"
-    );
-    let (diagnostic, truncated) =
-        publish::drain_bounded_diagnostic(std::io::Cursor::new(vec![b'e'; 1024 * 1024]), 1024)
-            .unwrap();
-    assert_eq!(diagnostic.len(), 1024);
-    assert!(
-        truncated,
-        "noisy stderr is drained but retained only to cap"
-    );
-
-    let mut exact_sink = Vec::new();
-    let (size, digest) = publish::copy_bounded_release_asset(
-        std::io::Cursor::new(b"exact bytes"),
-        &mut exact_sink,
-        11,
-    )
-    .unwrap();
-    assert_eq!(size, 11);
-    assert_eq!(exact_sink, b"exact bytes");
-    assert_eq!(
-        digest,
-        "e38e581aade78b64cc86f7ac9f3555ca78c2dcca747942a7f1d9b3275a834f75"
-    );
-
-    let mut bounded_sink = Vec::new();
-    publish::copy_bounded_release_asset(
-        std::io::Cursor::new(vec![9_u8; 1025]),
-        &mut bounded_sink,
-        1024,
-    )
-    .unwrap_err();
-    assert!(
-        bounded_sink.len() <= 1024,
-        "the over-limit probe byte must never reach disk"
-    );
-
-    assert_eq!(
         publish::parse_release_asset_identity_rows("", "v0.55.0", "asset.toml").unwrap(),
         None
     );

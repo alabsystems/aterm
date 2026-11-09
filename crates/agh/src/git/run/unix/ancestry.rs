@@ -5,13 +5,13 @@
 //! A commit-only object view: reuse immutable objects, never fetch a tree or
 //! treat a shallow boundary, graft, replacement or ref as negative evidence.
 
+use aterm_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-use aterm_json::{Value, json};
-
-use super::{ChildOut, Children, Error, GitRun, Kind, Result, os, screened};
+use super::{
+    ANONYMOUS_READ_PROGRESS_WINDOW, ChildOut, Children, Error, GitRun, Kind, Result, os, screened,
+};
 use crate::git::{AncestryQuery, CommitRead};
 use crate::github::How;
 use crate::policy::RouteTarget;
@@ -29,7 +29,6 @@ struct Reader<'a, 'gh> {
     run: &'a GitRun,
     source: PathBuf,
     view: Option<PathBuf>,
-    began: Duration,
     acquired: usize,
     api_bytes: usize,
     serial: usize,
@@ -38,14 +37,6 @@ struct Reader<'a, 'gh> {
 }
 
 impl Reader<'_, '_> {
-    fn remaining(&self) -> Result<Duration> {
-        self.run
-            .budget
-            .checked_sub(self.children.gh.fx().mono()?.saturating_sub(self.began))
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| Error::local("commit ancestry exhausted its original deadline"))
-    }
-
     fn git(
         &mut self,
         name: &str,
@@ -54,7 +45,6 @@ impl Reader<'_, '_> {
         input: Option<&[u8]>,
     ) -> Result<ChildOut> {
         let mut children = self.children.clone();
-        children.budget = self.remaining()?;
         children.env.push((os("GIT_NO_LAZY_FETCH"), os("1")));
         self.serial += 1;
         let key = [
@@ -68,12 +58,10 @@ impl Reader<'_, '_> {
         }
         all.extend(args);
         let cwd = if source { None } else { self.view.as_deref() };
-        let out = match input {
+        match input {
             Some(bytes) => children.git_input(&all, cwd, &key, bytes),
             None => children.git(&all, cwd, &key),
-        }?;
-        self.remaining()?;
-        Ok(out)
+        }
     }
 
     fn checked(
@@ -184,7 +172,6 @@ impl Reader<'_, '_> {
                 "commit acquisition count bound reached; ancestry unknown",
             ));
         }
-        let remaining = self.remaining()?;
         let mut call = self
             .how
             .get(
@@ -196,12 +183,9 @@ impl Reader<'_, '_> {
                 RouteTarget::Repo(self.run.slug.clone()),
             )
             .limit((BODY_MAX * 4) as u64)
-            .deadlines(
-                crate::wire::Deadlines::JSON.with_backstop(remaining.min(Duration::from_secs(60))),
-            );
+            .deadlines(crate::wire::Deadlines::JSON);
         call.follow_moved = false;
         let answer = self.children.gh.call(&call)?;
-        self.remaining()?;
         self.api_bytes = self
             .api_bytes
             .checked_add(answer.body.len())
@@ -250,7 +234,6 @@ impl Reader<'_, '_> {
 
     fn contained(&mut self, query: &AncestryQuery) -> Result<bool> {
         self.read(&[query.ancestor.clone(), query.descendant.clone()])?;
-        self.remaining()?;
         if query.ancestor == query.descendant {
             return Ok(true);
         }
@@ -263,7 +246,6 @@ impl Reader<'_, '_> {
         let mut seen = BTreeSet::from([query.descendant.clone()]);
         let mut bytes = 0_usize;
         while !pending.is_empty() {
-            self.remaining()?;
             let batch = (0..pending.len().min(128))
                 .filter_map(|_| pending.pop_front())
                 .collect::<Vec<_>>();
@@ -301,8 +283,7 @@ impl Reader<'_, '_> {
         // still require unrelated ancestor-side history before answering; it
         // is unnecessary for this complete negative and must not trigger a
         // whole-history acquisition. Missing descendant parents still fail
-        // above, as do every original work and deadline bound.
-        self.remaining()?;
+        // above, as do every original work and no-progress bound.
         Ok(false)
     }
 }
@@ -321,13 +302,20 @@ pub(super) fn read(
             "commit ancestry requires the routed identity or explicit --anonymous",
         ));
     }
+    // This operation is bounded by exact object, byte and walk counts below. An anonymous
+    // reader's local Git children therefore use an inactivity window, just like its network
+    // children, rather than turning a long but progressing original-parent walk into a timeout.
+    let mut children = children.clone();
+    if anonymous && children.progress_window.is_none() {
+        children.progress_window = Some(ANONYMOUS_READ_PROGRESS_WINDOW);
+    }
+    let children = &children;
     let source = screened(children, run, dir)?;
     let mut reader = Reader {
         children,
         run,
         source,
         view: children.scratch_git.clone(),
-        began: children.gh.fx().mono()?,
         acquired: 0,
         api_bytes: 0,
         serial: 0,
@@ -335,7 +323,11 @@ pub(super) fn read(
             .named(run.named.clone())
             .as_profile(profile.map(str::to_owned))
             .anonymous(anonymous)
-            .retry_policy(crate::retry::RetryPolicy::NONE),
+            .retry_policy(if anonymous {
+                crate::retry::RetryPolicy::ANONYMOUS_HTTP
+            } else {
+                crate::retry::RetryPolicy::NONE
+            }),
         local_only: false,
     };
     let common = reader.checked(
@@ -386,7 +378,6 @@ pub(super) fn read(
         let contained = reader.contained(query)?;
         queries.push(json!({"ancestor":query.ancestor, "descendant":query.descendant, "contained":contained}));
     }
-    reader.remaining()?;
     let value = json!({"schema":1,"scope":"commit-parent-ancestry-only-v1","commits":request.commits(),"queries":queries,
         "acquired_commits":reader.acquired,"api_body_bytes":reader.api_bytes,"refs_written":false,"checkout_complete":false});
     Ok(ChildOut {
@@ -411,7 +402,6 @@ pub(super) fn witnessed_local_path(
         run,
         source: source.to_path_buf(),
         view: children.scratch_git.clone(),
-        began: children.gh.fx().mono()?,
         acquired: 0,
         api_bytes: 0,
         serial: 0,

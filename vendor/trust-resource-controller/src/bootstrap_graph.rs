@@ -32,6 +32,7 @@ pub const HOST_STORE_TARGET_FD: u32 = 7;
 /// declaration is emitted only by the integrated native entry/client.
 pub const BOOTSTRAP_GRAPH_PROTOCOL_MARKER: [u8; 64] = marker();
 pub mod query;
+pub mod object;
 const fn marker() -> [u8; 64] {
     let mut bytes = [0; 64];
     let magic = *b"TRUSTBGRAPH00001";

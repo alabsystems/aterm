@@ -34,6 +34,7 @@ pub mod exec;
 pub mod export_scan;
 pub mod findings;
 pub mod fmt;
+mod harness_debt;
 pub mod ladder;
 pub mod libtest;
 pub mod libtest_json;
@@ -2167,6 +2168,21 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
     let names: Vec<&str> = own.iter().map(|c| c.name()).collect();
     let holds = |p: &str| ctx.scope.includes_crate(p);
     let pulled = checks::pulled(&checks::DEV, holds);
+    let pulled_without_forge = checks::with_pulled(&checks::DEV, false, holds);
+    let looks_like_forge_pull = !ctx.release
+        && own.contains(&Check::Forge)
+        && own
+            .iter()
+            .copied()
+            .filter(|check| *check != Check::Forge)
+            .eq(pulled_without_forge.iter().copied());
+    let forge = looks_like_forge_pull
+        .then(|| checks::forge_pull(&checks::DEV, false, &ctx.root, |p| ctx.scope.touches(p)))
+        .flatten();
+    let mut pulled_set = pulled_without_forge;
+    if forge.is_some() {
+        pulled_set = checks::with(&pulled_set, Check::Forge);
+    }
     let is = |set: &[Check]| own.len() == set.len() && set.iter().all(|c| own.contains(c));
     let mut what = if ctx.release {
         if is(&checks::RELEASE) {
@@ -2180,9 +2196,13 @@ pub fn header(ctx: &Ctx, cone: Option<&str>) -> String {
         }
     } else if own == checks::DEV {
         "dev".to_string()
-    } else if !pulled.is_empty() && own == checks::with_pulled(&checks::DEV, false, holds) {
-        let (added, by): (Vec<&str>, Vec<&str>) =
+    } else if (!pulled.is_empty() || forge.is_some()) && own == pulled_set {
+        let (mut added, mut by): (Vec<&str>, Vec<&str>) =
             pulled.iter().map(|(c, p)| (c.name(), *p)).unzip();
+        if let Some(reason) = forge.as_deref() {
+            added.push(Check::Forge.name());
+            by.push(reason);
+        }
         format!(
             "dev + {} (the selection holds {})",
             added.join(" + "),
@@ -2739,6 +2759,28 @@ pub fn head_commit(root: &Path, path_env: &OsStr) -> Option<String> {
     (out.status.success() && !head.is_empty()).then_some(head)
 }
 
+/// The checks a parsed invocation runs after selection-sensitive pulls. This is the one planner
+/// used by [`run_cli`]: tests exercise it directly so a check cannot be implemented correctly but
+/// left disconnected from the command that lands changes.
+fn planned_checks(parsed: &cli::Args, scope: &Scope, root: &Path) -> (Vec<Check>, bool) {
+    let mut wanted = parsed.wanted(|package| scope.includes_crate(package));
+    if checks::forge_pull(
+        &parsed.checks,
+        parsed.release || parsed.as_release,
+        root,
+        |package| scope.touches(package),
+    )
+    .is_some()
+    {
+        wanted = checks::with(&wanted, Check::Forge);
+    }
+    let cells_pulled = checks::pulls_cells(&wanted, parsed.release, !scope.selects_nothing());
+    if cells_pulled {
+        wanted = checks::with(&wanted, Check::Cells);
+    }
+    (wanted, cells_pulled)
+}
+
 /// The whole CLI, in-process.
 #[must_use]
 pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
@@ -2931,13 +2973,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         let (scope, said) = changed::cone(&base, &sel);
         (scope, Some(said))
     };
-    let wanted = parsed.wanted(|p| scope.includes_crate(p));
-    let cells_pulled = checks::pulls_cells(&wanted, parsed.release, !scope.selects_nothing());
-    let wanted = if cells_pulled {
-        checks::with(&wanted, Check::Cells)
-    } else {
-        wanted
-    };
+    let (wanted, cells_pulled) = planned_checks(&parsed, &scope, &root);
     let mut ctx = Ctx::new_with_tools(root, scope, env, scratch.clone(), tools)
         .with_checks(&wanted)
         .with_release(parsed.release)
@@ -3286,6 +3322,9 @@ pub use aterm_uds::host::host_user_cache;
 #[cfg(all(test, unix))]
 mod quiet_interrupt_tests;
 
+#[cfg(all(test, unix))]
+mod forge_pull_e2e_tests;
+
 #[cfg(test)]
 mod timing_test_machine;
 
@@ -3310,6 +3349,57 @@ mod memory_claim_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_production_planner_pulls_forge_only_for_a_dev_touch_of_a_fork() {
+        let manifest_dir = aterm_tempfile::manifest_dir();
+        let root = manifest_dir
+            .parent()
+            .and_then(Path::parent)
+            .expect("aterm-verify is two directories below the workspace root");
+        let parsed = |words: &[&str]| {
+            let parsed = cli::parse(words.iter().copied()).expect("the invocation parses");
+            let scope = Scope::packages(&parsed.packages);
+            planned_checks(&parsed, &scope, root).0
+        };
+
+        let fork = parsed(&["-p", "aterm-window"]);
+        assert!(fork.contains(&Check::Forge), "default dev plan: {fork:?}");
+        assert!(
+            checks::stages_of(&fork).contains(&plan::StageId::Forge),
+            "`verify -p aterm-window` must carry the Forge stage that runs OB-7: {fork:?}"
+        );
+        let unrelated = parsed(&["-p", "aterm-types"]);
+        assert!(
+            !unrelated.contains(&Check::Forge),
+            "an unrelated package does not pay for Forge: {unrelated:?}"
+        );
+        let explicit_lint = parsed(&["lint", "-p", "aterm-window"]);
+        assert!(
+            !explicit_lint.contains(&Check::Forge),
+            "an explicitly narrow non-dev invocation stays exact: {explicit_lint:?}"
+        );
+
+        let dev = cli::parse(std::iter::empty::<&str>()).expect("default invocation parses");
+        let vendored_seed = Scope::changed("origin/main", vec!["aterm-gui".into()], true)
+            .with_seeds(vec!["aterm-window".into()]);
+        let changed = planned_checks(&dev, &vendored_seed, root).0;
+        assert!(
+            changed.contains(&Check::Forge),
+            "a touched vendored seed need not itself be a workspace cone member: {changed:?}"
+        );
+        let dependent_only = Scope::changed(
+            "origin/main",
+            vec!["aterm-window".into(), "aterm-gui".into()],
+            true,
+        )
+        .with_seeds(vec!["aterm-gui".into()]);
+        let dependent = planned_checks(&dev, &dependent_only, root).0;
+        assert!(
+            !dependent.contains(&Check::Forge),
+            "a fork merely present in the dependent cone was not touched: {dependent:?}"
+        );
+    }
 
     #[test]
     fn background_runs_admit_their_disk_as_background() {

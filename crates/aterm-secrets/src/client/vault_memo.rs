@@ -215,9 +215,10 @@ pub fn swarm_roster_now_until(
 /// The files [`swarm_denied_nodes`](super::swarm_denied_nodes) and
 /// [`swarm_roster_until`](super::swarm_roster_until) take their answer from: the configured source
 /// (`source.toml`), the state lock the deny list observes (`.lock`, whose presence and mode decide
-/// that read), the applied state (`state.toml`), this Mac's identity, the held envelope (`vault`),
-/// the membership records entry, the layout pin that selects its data (`records.layout`) and that
-/// data, and the membership history this Mac acknowledged ([`Paths::acknowledged_history_files`]).
+/// that read), the applied state (`state.toml`), this Mac's identity, the held envelope (`vault`)
+/// and the membership history this Mac acknowledged ([`Paths::acknowledged_history_files`]); and,
+/// stamped apart ([`stamp_inputs`]), every file the selection of the membership records' data is
+/// judged by.
 /// The vault folder holds others that change every few seconds and that these reads never open
 /// (the vault server's `served/`, the rest of `commons/`, the jobs' logs, the needs and answers
 /// queues), so a change to them reads nothing again.
@@ -229,9 +230,6 @@ pub(super) fn inputs(paths: &Paths) -> Option<Vec<PathBuf>> {
         paths.state_file(),
         paths.identity_file(),
         paths.cache_file(),
-        paths.records_file(),
-        crate::records_storage::pin_path(&paths.records_file()).ok()?,
-        paths.records_data_file().ok()?,
         claim,
         anchor,
         receipts,
@@ -338,18 +336,53 @@ struct DirectoryStamp {
     mode: u32,
 }
 
+/// The vault directory and each of a set of files as they stood ([`stamp_files`]).
 #[derive(PartialEq, Eq)]
-pub(super) struct InputStamps {
+pub(super) struct FileStamps {
     directory: Option<DirectoryStamp>,
     files: Vec<Option<Stamp>>,
 }
 
-/// The directory and each of `inputs`' stamps, without following a final symlink. A missing
-/// path has no stamp. An unsafe directory or metadata error requires a fresh read.
+/// [`FileStamps`] of a memo's inputs, with the membership records' selection ([`stamp_inputs`]).
+#[derive(PartialEq, Eq)]
+pub(super) struct InputStamps {
+    stamps: FileStamps,
+    /// Every file the selection of the membership records' data is judged by, which each read
+    /// these stamps stand for reads ([`inputs`] and the sets that extend it).
+    records: crate::records_storage::Standing,
+}
+
+/// Every file `inputs`' stamps stand for: its own and the membership records' selection's
+/// ([`records_storage::standing_files`](crate::records_storage::standing_files)).
+#[cfg(test)]
+pub(super) fn stamped_files(
+    paths: &Paths,
+    inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
+) -> Option<Vec<PathBuf>> {
+    let mut files = inputs(paths)?;
+    files.extend(crate::records_storage::standing_files(&paths.records_file()).ok()?);
+    Some(files)
+}
+
+/// [`stamp_files`] of `inputs`, with the membership records' selection as it stands
+/// ([`records_storage::standing`](crate::records_storage::standing)). Records the selection
+/// refuses require a fresh read.
 pub(super) fn stamp_inputs(
     paths: &Paths,
     inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
 ) -> Option<InputStamps> {
+    Some(InputStamps {
+        stamps: stamp_files(paths, inputs)?,
+        records: crate::records_storage::standing(&paths.records_file())?,
+    })
+}
+
+/// The directory and each of `files`' stamps, without following a final symlink. A missing path
+/// has no stamp. An unsafe directory or a metadata error requires a fresh read.
+pub(super) fn stamp_files(
+    paths: &Paths,
+    files: fn(&Paths) -> Option<Vec<PathBuf>>,
+) -> Option<FileStamps> {
     let directory = match std::fs::symlink_metadata(&paths.dir) {
         Ok(meta) if meta.is_dir() => Some(DirectoryStamp {
             dev: meta.dev(),
@@ -362,7 +395,7 @@ pub(super) fn stamp_inputs(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(_) => return None,
     };
-    let files = inputs(paths)?
+    let files = files(paths)?
         .iter()
         .map(|path| match std::fs::symlink_metadata(path) {
             Ok(meta) => Some(Some(Stamp {
@@ -376,7 +409,7 @@ pub(super) fn stamp_inputs(
             Err(_) => None,
         })
         .collect::<Option<Vec<_>>>()?;
-    Some(InputStamps { directory, files })
+    Some(FileStamps { directory, files })
 }
 
 struct Held<T, K> {
@@ -717,6 +750,94 @@ mod tests {
         assert_eq!(reads.load(Ordering::SeqCst), 2);
         std::fs::rename(&data, paths.records_file().join("saved-current")).unwrap();
         assert!(memo.read(&paths, |p| lines(p, &reads)).is_err());
+    }
+
+    /// A pinned layout standing as it was is read once, and read again by a reader that holds
+    /// fewer records than the layout pins, which the selection refuses (`check_capacity`).
+    /// NEGATIVE CONTROL: with the capacity left out of a layout's judgement
+    /// (`records_storage::Judged`), the memo answers the records it read under the larger one.
+    #[test]
+    fn a_pinned_layout_is_read_again_under_a_smaller_record_capacity() {
+        fn budget(held: usize) -> crate::membership_log::RecordBudgets {
+            crate::membership_log::RecordBudgets {
+                weighed: 16,
+                keyed: 128,
+                held,
+            }
+        }
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = vault(root.path());
+        let memo = Memo::new(inputs);
+        let reads = AtomicUsize::new(0);
+        let expected = Some(vec!["m60".to_owned()]);
+        budget(64).within(|| {
+            drop(crate::records_storage::write_path(&paths.records_file(), true).unwrap());
+            assert_eq!(memo.read(&paths, |p| lines(p, &reads)).unwrap(), expected);
+            assert_eq!(memo.read(&paths, |p| lines(p, &reads)).unwrap(), expected);
+        });
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "a standing layout is read once"
+        );
+        assert!(
+            budget(32)
+                .within(|| memo.read(&paths, |p| lines(p, &reads)))
+                .is_err(),
+            "a reader holding fewer records than the layout pins reads it again and refuses it"
+        );
+    }
+
+    /// Records the selection refuses stamp nothing, as the selection reads nothing from them: a
+    /// pinned layout whose header is not one, and a records entry left a directory with no pin (an
+    /// unfinished transition). So no read keeps an answer by them, and nothing takes their stamps
+    /// for settled (`client::MembersAsked::still_asking`). Records it reads through are stamped,
+    /// a plain records file with a preparation's intent beside it too. NEGATIVE CONTROLS: a pinned
+    /// layout stood without its judgement (`records_storage::Judgements::layout`) stamps the header
+    /// that is not one; every shape stood as a plain records file stamps the directory with no pin;
+    /// with a plain file only where no intent stands beside it (eb0e73e0f1), a file with an intent
+    /// beside it is unjudged.
+    #[test]
+    fn records_the_selection_refuses_are_unjudged() {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let paths = vault(root.path());
+        assert!(
+            stamp_inputs(&paths, inputs).is_some(),
+            "a records file is judged"
+        );
+        let intent = crate::records_storage::intent_path(&paths.records_file()).unwrap();
+        fsx::write_atomic(&intent, b"a preparation cut short\n", 0o600).unwrap();
+        assert!(
+            crate::records_storage::data_path(&paths.records_file()).is_ok(),
+            "the selection reads a records file through an intent beside it"
+        );
+        assert!(
+            stamp_inputs(&paths, inputs).is_some(),
+            "a records file with an intent beside it is judged"
+        );
+        std::fs::remove_file(&intent).unwrap();
+        drop(crate::records_storage::write_path(&paths.records_file(), true).unwrap());
+        assert!(
+            stamp_inputs(&paths, inputs).is_some(),
+            "a pinned layout is judged"
+        );
+        fsx::write_atomic(
+            &paths.records_file().join("layout"),
+            b"not a layout\n",
+            0o600,
+        )
+        .unwrap();
+        assert!(
+            stamp_inputs(&paths, inputs).is_none(),
+            "a layout whose header is not one is unjudged"
+        );
+        let unfinished = Paths::for_home(&root.path().join("unfinished"));
+        fsx::ensure_private_dir(&unfinished.dir).unwrap();
+        std::fs::create_dir(unfinished.records_file()).unwrap();
+        assert!(
+            stamp_inputs(&unfinished, inputs).is_none(),
+            "an entry left a directory with no pin is unjudged"
+        );
     }
 
     /// A signed vault's warm deny list has the same directory refusal as a fresh read, and

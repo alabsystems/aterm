@@ -283,6 +283,7 @@ impl Recipe {
                 // SAME paid preparation and original Keeper; no path-selected
                 // SDK/compiler or late-capture fallback is permitted at query.
                 sdk.capture_bootstrap_query_inputs(deadline)?;
+                sdk.capture_bootstrap_object_input(deadline)?;
                 arguments.splice(
                     0..0,
                     [

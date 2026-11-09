@@ -1822,6 +1822,10 @@ impl TypingPace {
         now: std::time::Instant,
         deadline: std::time::Instant,
     ) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        if aterm_types::negative_control::on("typing-no-remainder") {
+            return now < deadline;
+        }
         let per = self.per_key(typed, now, deadline);
         u32::try_from(rest.max(1))
             .ok()
@@ -1834,15 +1838,46 @@ impl TypingPace {
     }
 }
 
-/// A debug build's `ATERM_DEBUG_TURN_KEY_LAG_MS`: how long each typed key of a turn takes to go,
-/// a loaded worker's lag (m108's keys behind m14's drive went at about 5 a second, 2026-11-04),
-/// so a live drive can type slower than its deadline ([`TypingPace`]). A shipped build (neither
-/// `debug_assertions` nor the `dev-seams` feature) reads nothing and lags no key, and the name is
-/// in `ENV_DENY_VARS`, so no shell an aterm starts hands it to an aterm inside it.
-fn typed_key_lag() -> std::time::Duration {
-    aterm_types::dev_seam!("ATERM_DEBUG_TURN_KEY_LAG_MS")
-        .and_then(|ms| ms.to_str().and_then(|ms| ms.parse::<u64>().ok()))
-        .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis)
+/// The typing planner's clock. A live test advances it after each delivered key instead of
+/// sleeping for the same simulated service time. Holds use native time and give that time back;
+/// after typing, the remaining virtual budget becomes the native budget for the remainder.
+struct TypingClock {
+    elapsed: std::time::Duration,
+    step: std::time::Duration,
+}
+
+impl TypingClock {
+    fn new(step: std::time::Duration) -> Self {
+        Self {
+            elapsed: std::time::Duration::ZERO,
+            step,
+        }
+    }
+
+    fn live() -> Self {
+        let step = aterm_types::dev_seam!("ATERM_DEBUG_TURN_KEY_CLOCK_STEP_MS")
+            .and_then(|ms| ms.to_str().and_then(|ms| ms.parse::<u64>().ok()))
+            .map_or(std::time::Duration::ZERO, std::time::Duration::from_millis);
+        Self::new(step)
+    }
+
+    fn at(&self, native: std::time::Instant) -> std::time::Instant {
+        native.checked_add(self.elapsed).unwrap_or(native)
+    }
+
+    fn now(&self) -> std::time::Instant {
+        self.at(std::time::Instant::now())
+    }
+
+    fn delivered(&mut self) {
+        self.elapsed = self.elapsed.saturating_add(self.step);
+    }
+
+    fn native(&self, virtual_time: std::time::Instant) -> std::time::Instant {
+        virtual_time
+            .checked_sub(self.elapsed)
+            .unwrap_or(virtual_time)
+    }
 }
 
 /// When the echo's settle after a turn's last write ends at the latest: early enough that the
@@ -2006,24 +2041,40 @@ impl TypingHold {
         tick: std::time::Duration,
         deadline: &mut std::time::Instant,
     ) -> Result<aterm_core::grid::Cursor, &'static str> {
+        let clock = aterm_types::advance_clock::Clock::new(
+            aterm_types::dev_seam!("ATERM_DEBUG_TYPING_CLOCK"),
+            ctx.self_id.as_str(),
+        );
         let mut since = None;
         loop {
             let look = self.look(&term_lock(term), ctx, sent);
             match look {
                 Look::Held(cursor) => {
                     if let Some(since) = since {
-                        let waited = hold_wait_now().saturating_duration_since(since);
+                        let waited =
+                            hold_wait_now(clock.read().now).saturating_duration_since(since);
                         *deadline = deadline.checked_add(waited).unwrap_or(*deadline);
                     }
                     return Ok(cursor);
                 }
                 Look::Stop(why) => return Err(why),
                 Look::Wait => {
-                    let now = hold_wait_now();
+                    let reading = clock.read();
+                    let now = hold_wait_now(reading.now);
                     if now >= *deadline {
                         return Err("deadline");
                     }
+                    #[cfg(any(test, debug_assertions))]
+                    if aterm_types::negative_control::on("typing-latency-budget")
+                        && since.is_some_and(|since| {
+                            now.saturating_duration_since(since)
+                                >= std::time::Duration::from_millis(150)
+                        })
+                    {
+                        return Err("negative control: echo latency budget");
+                    }
                     since.get_or_insert(now);
+                    reading.observed();
                     let _ = sub.wait(tick.min(*deadline - now));
                 }
             }
@@ -2043,12 +2094,12 @@ pub(crate) fn set_hold_wait_for_test(hand: Option<Box<dyn Fn() -> std::time::Ins
     HOLD_WAIT_FOR_TEST.with(|slot| *slot.borrow_mut() = hand);
 }
 
-fn hold_wait_now() -> std::time::Instant {
+fn hold_wait_now(native: std::time::Instant) -> std::time::Instant {
     #[cfg(test)]
     if let Some(now) = HOLD_WAIT_FOR_TEST.with(|slot| slot.borrow().as_ref().map(|hand| hand())) {
         return now;
     }
-    std::time::Instant::now()
+    native
 }
 
 fn keys_unread(ctx: &SessionCtx) -> bool {
@@ -3193,8 +3244,8 @@ fn turn_attempt(
                 ECHO_SETTLE,
                 (submit != "none").then(|| Duration::from_millis(submit_window_ms)),
             );
-            let mut due = Instant::now();
-            let key_lag = typed_key_lag();
+            let mut clock = TypingClock::live();
+            let mut due = clock.now();
             let keys = typed_key_events(head);
             // The writes of the rest after each key: from the next key on, or past the cap.
             let counts = rest_write_counts(text);
@@ -3209,14 +3260,18 @@ fn turn_attempt(
                 })
                 .collect();
             for ((at, ev), rest) in keys.into_iter().zip(rest_after) {
-                let now = Instant::now();
+                let now = clock.now();
                 if due > now {
                     std::thread::sleep(due - now);
                 }
-                if !pace.fits(typed_keys, rest, Instant::now(), deadline) {
+                if !pace.fits(typed_keys, rest, clock.now(), deadline) {
                     // Nothing written yet: the turn can still end as it found the composer.
                     if typed_keys == 0 {
                         return typed_cut(term, "deadline", 0, 0, turn_id);
+                    }
+                    #[cfg(any(test, debug_assertions))]
+                    if aterm_types::negative_control::on("typing-no-remainder") {
+                        return typed_cut(term, "deadline", typed_keys, 0, turn_id);
                     }
                     rest_at = at;
                     break;
@@ -3227,14 +3282,17 @@ fn turn_attempt(
                 if let Some(h) = &mut hold {
                     let digit = is_digit_key(&ev);
                     let before = deadline;
-                    match h.held(
+                    let mut native_deadline = clock.native(deadline);
+                    let held = h.held(
                         term,
                         ctx,
                         &sub,
                         sent_from.filter(|_| digit).map(Sent::key),
                         cadence,
-                        &mut deadline,
-                    ) {
+                        &mut native_deadline,
+                    );
+                    deadline = clock.at(native_deadline);
+                    match held {
                         Ok(cursor) => {
                             sent_from = Some(cursor);
                             if !presses_in_rest(&ev) {
@@ -3258,18 +3316,23 @@ fn turn_attempt(
                 if typed_keys == 0 {
                     note_ctl_input();
                 }
-                let pressed_at = Instant::now();
+                let pressed_at = clock.now();
                 due = pressed_at + cadence;
                 pace.pressed(pressed_at, deadline);
                 let first = !wrote.replace(true);
-                if !key_lag.is_zero() {
-                    std::thread::sleep(key_lag);
-                }
                 if !(io.key)(ev) {
                     return undelivered(first, KEY_DELIVERY_FAILED);
                 }
+                clock.delivered();
                 committed.get_or_insert_with(crate::control::CommittedInput::enter);
                 typed_keys += 1;
+                if typed_keys == 1
+                    && let Some(path) = aterm_types::dev_seam!("ATERM_DEBUG_TURN_KEY_BARRIER")
+                {
+                    let barrier =
+                        aterm_types::advance_clock::Clock::new(Some(path), ctx.self_id.as_str());
+                    barrier.read().observed();
+                }
             }
             // The rest of the text, past the cap or from the key the pace stopped before, as
             // typing it would have gone: each run its keys' bytes in one write, its Tabs and line
@@ -3280,10 +3343,11 @@ fn turn_attempt(
             // first, and goes only where the rest and the submit fit, as a first key does.
             if typed_keys == 0
                 && !writes.is_empty()
-                && !pace.fits(0, writes.len() - 1, Instant::now(), deadline)
+                && !pace.fits(0, writes.len() - 1, clock.now(), deadline)
             {
                 return typed_cut(term, "deadline", 0, 0, turn_id);
             }
+            deadline = clock.native(deadline);
             for write in writes {
                 if exited(store) {
                     return "ERR exited\n".to_string();
@@ -3439,6 +3503,10 @@ fn turn_attempt(
             )
         });
         let composer_key = if auto_mode && !submit_verify_block && read_as_claude(ctx) {
+            let clock = aterm_types::advance_clock::Clock::new(
+                aterm_types::dev_seam!("ATERM_DEBUG_ECHO_CLOCK"),
+                ctx.self_id.as_str(),
+            );
             let look = || {
                 let t = crate::term_lock_whole_when(term, finishing, |_| true);
                 (composer_verify_key(&t, text), t.content_seq())
@@ -3448,11 +3516,14 @@ fn turn_attempt(
                 let Some(echo) = echo.as_mut() else {
                     return Ok(false);
                 };
+                let reading = clock.read();
                 let Some(until) =
-                    echo.look(crate::input_stall::input_unread(&ctx.sink), Instant::now())
+                    echo.look(crate::input_stall::input_unread(&ctx.sink), reading.now)
                 else {
                     return Ok(false);
                 };
+                let until = reading.wait_until(until);
+                reading.observed();
                 let Some(id) = arm(WatcherSpec::SeqAdvanced { after }) else {
                     return Err(format!("ERR {WAITS_FULL}\n"));
                 };
@@ -3988,7 +4059,10 @@ impl EchoWait {
     /// Where the wait ends after a look at `now` that finds the program's input `unread`, or
     /// `None` once that has passed.
     fn look(&mut self, unread: bool, now: std::time::Instant) -> Option<std::time::Instant> {
-        if self.unread || unread {
+        let restart = self.unread || unread;
+        #[cfg(any(test, debug_assertions))]
+        let restart = restart && !aterm_types::negative_control::on("echo-from-typing");
+        if restart {
             self.until = self.hung_by.min(now + Self::CAP);
         }
         self.unread = unread;
@@ -11163,12 +11237,32 @@ mod composer_verify_tests {
 mod typing_pace_tests {
     use std::time::{Duration, Instant};
 
-    use super::{TypingPace, press_by};
+    use super::{TypingClock, TypingPace, press_by};
 
     const SETTLE: Duration = Duration::from_millis(150);
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
+    }
+
+    #[test]
+    fn the_key_clock_charges_delivery_and_preserves_a_holds_returned_time() {
+        let base = Instant::now();
+        let deadline = base + ms(20_000);
+        let mut clock = TypingClock::new(ms(400));
+        for _ in 0..3 {
+            clock.delivered();
+        }
+        assert_eq!(clock.at(base), base + ms(1_200));
+        assert_eq!(clock.native(deadline), deadline - ms(1_200));
+        assert_eq!(
+            clock.at(clock.native(deadline) + ms(2_000)),
+            deadline + ms(2_000)
+        );
+        let mut native = TypingClock::new(Duration::ZERO);
+        native.delivered();
+        assert_eq!(native.at(base), base);
+        assert_eq!(native.native(deadline), deadline);
     }
 
     /// The pace is the keys' own: keys going every 1.5 s in a 20 s turn stop while the next

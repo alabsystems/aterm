@@ -1127,6 +1127,30 @@ fn test_compile(ctx: &Ctx, spec: &StageSpec, r: &mut Report) {
     } else if let Some(part) = spec.part.as_ref().filter(|p| p.shaped()) {
         shape_after(ctx, part, &artifacts, began);
     }
+    // Only the closing workspace compile owns the bundle drivers. This runs in
+    // qualify's tree branch, beside the release build, never in its build branch.
+    if compiled && cut.is_none() && crate::plan::folds_measuring(ctx) {
+        for args in appkit_prebuild_args() {
+            let label = format!("appkit prebuild: targo {}", args.join(" "));
+            let cmd = main_build_cmd(ctx, args);
+            if !compile_labeled(ctx, r, &label, &cmd) {
+                ctx.test_compile_failed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                break;
+            }
+        }
+    }
+}
+
+/// Build the exact units the bundle's AppKit rows will build again. Cargo's
+/// fingerprints, rather than a saved verdict, decide whether they are fresh.
+#[must_use]
+pub fn appkit_prebuild_args() -> Vec<Vec<String>> {
+    let mut builds = vec![redraw_conformance_build_args()];
+    if cfg!(target_os = "macos") {
+        builds.push(objc_drives_build_args());
+    }
+    builds
 }
 
 /// The closing call `part` keeps again each refusal its plan read ([`crate::shape::Part::refused`],
@@ -2034,12 +2058,10 @@ fn in_checkout(ctx: &Ctx, r: &mut Report, what: &str) -> bool {
     here
 }
 
-/// Every walk of [`aterm_census::CENSUSES`], each once, holding `capture-privacy` to the
-/// baseline of the engine's commit ([`census_baseline`]).
+/// Every walk of [`aterm_census::CENSUSES`], each once, after Census's shared checkout
+/// prerequisite has passed and holding `capture-privacy` to the baseline of the engine's commit
+/// ([`census_baseline`]).
 fn walks(ctx: &Ctx, r: &mut Report, check: &str) {
-    if !in_checkout(ctx, r, check) {
-        return;
-    }
     let selected: Vec<&aterm_census::Census> = aterm_census::CENSUSES.iter().collect();
     let root = ctx.root.clone();
     let var = engine_vars(ctx);
@@ -2247,7 +2269,39 @@ fn libc_oracle(ctx: &Ctx, r: &mut Report) {
 }
 
 fn census(ctx: &Ctx, r: &mut Report) {
+    if !in_checkout(ctx, r, "census") {
+        return;
+    }
     walks(ctx, r, "census");
+    match crate::harness_debt::judge(
+        &ctx.root,
+        ctx.head_at_start.as_deref().unwrap_or("HEAD"),
+        &ctx.path_env,
+    ) {
+        Ok(crate::harness_debt::Judgement::Clear { version, baseline }) => {
+            r.pass(format!(
+                "harness landing debt since public v{version}: none ({})",
+                &baseline[..12]
+            ));
+        }
+        Ok(crate::harness_debt::Judgement::Owed {
+            version,
+            baseline,
+            debts,
+        }) => {
+            r.fail(format!(
+                "harness landing debt since public v{version}: {} harness version{} owed",
+                debts.len(),
+                if debts.len() == 1 { " is" } else { "s are" }
+            ));
+            r.raw(format!("public baseline: {baseline}"));
+            for debt in debts {
+                r.raw(debt.line());
+            }
+            r.raw("fix: targo --unverified ship harness-bump".to_string());
+        }
+        Err(why) => r.cannot_run(format!("harness landing debt — {why}")),
+    }
 }
 
 /// `targo --unverified run --profile test -q -p aterm-models --bin spec-check`, in the main target once the test compile is done ([`MAIN_PROFILE`]; the bin links every domain's models through `aterm_models::link_all`); under `release` with `-- --full`, which adds the minutes-class `ay` row.
@@ -2820,6 +2874,70 @@ mod tests {
     use super::*;
     use crate::EnvSnapshot;
     use std::path::PathBuf;
+
+    #[test]
+    fn census_reports_harness_debt_as_a_gate_failure() {
+        let temp = aterm_tempfile::TempDir::new().expect("scratch repository");
+        let root = temp.path();
+        let git = |args: &[&str]| {
+            let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
+                .current_dir(root)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "A"]);
+        git(&["config", "user.email", "a@example.invalid"]);
+        let version_file = aterm_phase::CliHarness::ClaudeCode.version_file();
+        let source = "crates/aterm-agent/src/harness/upgrade_drive.rs";
+        for path in [version_file, source, CHECKOUT_MARKER] {
+            std::fs::create_dir_all(root.join(path).parent().expect("parent")).expect("mkdir");
+        }
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n[workspace.package]\nversion = \"0.1.0\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(
+            root.join(version_file),
+            format!("{}\n", aterm_phase::harness_version::source_line((0, 1))),
+        )
+        .expect("version source");
+        std::fs::write(root.join(source), "fn drive() {}\n").expect("harness source");
+        std::fs::write(root.join(CHECKOUT_MARKER), "").expect("checkout marker");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "public release"]);
+        git(&["tag", "-am", "public release", "v0.1.0"]);
+        std::fs::write(root.join(source), "fn drive() { changed(); }\n")
+            .expect("changed harness source");
+        git(&["add", "."]);
+        git(&["commit", "-qm", "unbumped harness source"]);
+
+        let ctx = Ctx::new(
+            root.to_path_buf(),
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            root.join("scratch"),
+        );
+        let mut report = Report::new("census");
+        census(&ctx, &mut report);
+        let rows: Vec<_> = report.outcomes().collect();
+        // NEGATIVE CONTROL: removing Census's harness-debt call leaves no debt-labelled gate
+        // failure even though the source changed after the public tag.
+        assert!(
+            rows.iter().any(|(outcome, label)| {
+                *outcome == Outcome::Fail(Severity::GateFailed)
+                    && label.contains("harness landing debt since public v0.1.0")
+            }),
+            "production Census stage did not report the debt: {rows:?}"
+        );
+    }
 
     /// THE CENSUS WALK HOLDS CAPTURES TO THE BASELINE OF THE ENGINE'S COMMIT: a capture holding a
     /// word only the named engine's committed baseline lists is a `capture-privacy` finding of
@@ -3921,7 +4039,8 @@ mod tests {
         crate::standin_body(
             &targo,
             &format!(
-                "test \"$HOME\" = '{}' || exit 17\n\
+                "case \" $* \" in *' build '*) exit 0;; esac\n\
+                 test \"$HOME\" = '{}' || exit 17\n\
                  test \"$ATERM_RELEASE_RUN\" = 1 || exit 18\n\
                  case \"$*\" in *--unit-graph*) echo '{{\"version\":1}}';; esac",
                 home.display()

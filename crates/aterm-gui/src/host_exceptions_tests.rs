@@ -2669,7 +2669,7 @@ fn a_lost_logins_notices_are_one_row_in_their_latest_words_closed_fixed_once_it_
         .expect("the ask")
         .id;
     assert!(app.messages.mark_seen(read, Instant::now()));
-    assert!(asks(&app).is_empty(), "read: off the band");
+    assert!(asks(&app).is_empty(), "read: no longer a live ask");
     told(&mut app, "s-1", Some(notice(&notice::LOGIN_SIGN_IN)));
     assert_eq!(
         asks(&app),
@@ -2708,7 +2708,7 @@ fn a_lost_logins_notices_are_one_row_in_their_latest_words_closed_fixed_once_it_
     assert_eq!(asks(&app), [mr::notice_ask_key("s-1", Some("si"))]);
     assert_eq!(rows(&app, "s-1").len(), 2, "a new loss, a new row");
     back(&mut app, "s-1");
-    assert!(asks(&app).is_empty(), "resolved off the band");
+    assert!(asks(&app).is_empty(), "resolved: no longer a live ask");
     let row = rows(&app, "s-1");
     assert_eq!(
         (row.len(), row[0].state, row[0].severity),
@@ -2748,7 +2748,7 @@ fn tell_notice(app: &mut App, sid: &str, text: Option<&notice::NoticeText>) {
     });
 }
 
-/// The keys of the live asks on the band.
+/// The keys of the live asks.
 fn notice_asks(app: &App) -> Vec<String> {
     app.messages
         .live_rows()
@@ -3434,7 +3434,7 @@ fn a_stall_on_a_call_that_made_no_progress_names_its_pid_and_passes_the_door() {
 }
 
 /// A palette set the owner's config refused is one digest line for every tab, naming the setting:
-/// never a band row, and later refusals, a session's own or another's, add nothing.
+/// never a live row, and later refusals, a session's own or another's, add nothing.
 #[test]
 fn a_refused_palette_set_is_one_line_naming_the_setting() {
     let mut app = App::headless_for_test();
@@ -4059,7 +4059,7 @@ fn a_lost_login_is_its_tabs_ask_and_the_accounts_say_lines() {
 }
 
 /// A silent usage tap is one `harness.accounts.no-tap` line for the machine, held while any tab
-/// is silent and raised at most once a day; never a band row or a tab mark.
+/// is silent and raised at most once a day; never a live row or a tab mark.
 #[test]
 fn a_silent_usage_tap_is_one_line_once_a_day_and_ends_with_the_last_tab() {
     let mut app = App::headless_for_test();

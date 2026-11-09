@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Complete-stdout capture for child processes with bounded output.
+//! Complete capture for child processes with bounded output.
 
 use super::{
     DRAIN_GRACE, ExitWait, Grace, OUTPUT_KEEP, PipeEnd, ProcessProgressProbe, ProgressWindow,
@@ -23,7 +23,8 @@ pub const MAX_COMPLETE_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 /// some 22 MB on a Mac with three, and refuses one past this rather than count it short).
 pub const MAX_COMPLETE_LISTING_BYTES: usize = 64 * 1024 * 1024;
 
-/// Why a call requiring complete stdout cannot use the child's output.
+/// Why a call requiring complete output cannot use the child's output. Stdout failures
+/// have their own variants; stderr proof failures use [`RunError::Capture`].
 #[derive(Debug)]
 pub enum CompleteOutputError {
     /// The child creation, post-creation capture, wait or deadline refusal.
@@ -203,6 +204,7 @@ fn capture_retained<T: Send + 'static>(
         stdout_reader,
         &mut reaped,
         &mut None,
+        StderrCapture::Tail,
     ) {
         Ok(output) => owned.finish(output),
         Err(error) => Err(RetainedOutputError {
@@ -299,7 +301,24 @@ pub fn output_while_process_progressing_complete_stdout(
     window: Duration,
     waiting_on: impl Into<String>,
 ) -> Result<Output, CompleteProgressError> {
-    capture_progress(cmd, window, waiting_on.into(), drain_stdout)
+    capture_progress(cmd, window, waiting_on.into(), drain_stdout, None)
+}
+
+/// As [`output_while_process_progressing_complete_stdout`], observing `stopped` at least every
+/// [`STOP_TICK`]. A cancelled child is ended and reaped, publishes no partial output, and is a
+/// post-spawn [`RunError::TimedOut`] inside [`CompleteProgressError::Complete`], distinct from a
+/// child whose process and output evidence actually stalled.
+///
+/// # Errors
+/// As [`output_while_process_progressing_complete_stdout`], or cancellation after process
+/// creation.
+pub fn output_while_process_progressing_complete_stdout_unless(
+    cmd: &mut Command,
+    window: Duration,
+    waiting_on: impl Into<String>,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<Output, CompleteProgressError> {
+    capture_progress(cmd, window, waiting_on.into(), drain_stdout, Some(stopped))
 }
 
 /// Capture complete stdout with an explicit inclusive limit no larger than
@@ -498,13 +517,63 @@ pub fn output_until_complete_stdout_from_unless(
     capture(cmd, stdin, deadline, || {}, drain_stdout, Some(stopped))
 }
 
+/// Capture both stdout and stderr to proven EOF, each within [`OUTPUT_KEEP`] bytes.
+/// Cancellation, deadlines and child ownership follow
+/// [`output_until_complete_stdout_from_unless`]. No partial stream is published.
+///
+/// # Errors
+/// The same child and stdout refusals as [`output_until_complete_stdout_from_unless`].
+/// A stderr read failure, overflow or missing EOF is a post-spawn [`RunError::Capture`].
+pub fn output_until_complete_from_unless(
+    cmd: &mut Command,
+    stdin: Stdio,
+    deadline: Instant,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<Output, CompleteOutputError> {
+    capture_streams(
+        cmd,
+        stdin,
+        deadline,
+        || {},
+        drain_stdout,
+        Some(stopped),
+        StderrCapture::Complete,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum StderrCapture {
+    Tail,
+    Complete,
+}
+
 fn capture(
     cmd: &mut Command,
     stdin: Stdio,
     deadline: Instant,
     on_started: impl FnOnce(),
     stdout_reader: impl FnOnce(Option<PipeEnd>, std::process::ChildStdout) -> io::Result<CompleteDrain>,
+    stopped: Option<&mut dyn FnMut() -> bool>,
+) -> Result<Output, CompleteOutputError> {
+    capture_streams(
+        cmd,
+        stdin,
+        deadline,
+        on_started,
+        stdout_reader,
+        stopped,
+        StderrCapture::Tail,
+    )
+}
+
+fn capture_streams(
+    cmd: &mut Command,
+    stdin: Stdio,
+    deadline: Instant,
+    on_started: impl FnOnce(),
+    stdout_reader: impl FnOnce(Option<PipeEnd>, std::process::ChildStdout) -> io::Result<CompleteDrain>,
     mut stopped: Option<&mut dyn FnMut() -> bool>,
+    stderr_capture: StderrCapture,
 ) -> Result<Output, CompleteOutputError> {
     #[cfg(unix)]
     cmd.process_group(0);
@@ -523,6 +592,7 @@ fn capture(
         stdout_reader,
         &mut reaped,
         &mut stopped,
+        stderr_capture,
     )
 }
 
@@ -531,6 +601,7 @@ fn capture_progress(
     window: Duration,
     waiting_on: String,
     stdout_reader: impl FnOnce(Option<PipeEnd>, std::process::ChildStdout) -> io::Result<CompleteDrain>,
+    mut stopped: Option<&mut dyn FnMut() -> bool>,
 ) -> Result<Output, CompleteProgressError> {
     #[cfg(unix)]
     cmd.process_group(0);
@@ -546,14 +617,27 @@ fn capture_progress(
     let mut probe = ProcessProgressProbe::default();
     let mut left = |pid, bytes| progress.remaining(deadline_now(), bytes, probe.read(pid));
     let mut timed_out = || RunError::TimedOut;
+    let can_stop = stopped.is_some();
+    let cancelled = std::cell::Cell::new(false);
+    let mut observe_stop = || {
+        let stop = stopped.as_mut().is_some_and(|stop| stop());
+        cancelled.set(cancelled.get() || stop);
+        stop
+    };
+    let mut stop: Option<&mut dyn FnMut() -> bool> =
+        can_stop.then_some(&mut observe_stop as &mut dyn FnMut() -> bool);
     match collect_started_with(
         owned.child,
         stdout_reader,
         &mut reaped,
-        &mut None,
+        &mut stop,
         &mut left,
         &mut timed_out,
+        StderrCapture::Tail,
     ) {
+        Err(error @ CompleteOutputError::Run(RunError::TimedOut)) if cancelled.get() => {
+            Err(CompleteProgressError::Complete(error))
+        }
         Err(CompleteOutputError::Run(RunError::TimedOut)) => {
             Err(CompleteProgressError::Stalled { window, waiting_on })
         }
@@ -580,6 +664,7 @@ fn collect_started(
     stdout_reader: impl FnOnce(Option<PipeEnd>, std::process::ChildStdout) -> io::Result<CompleteDrain>,
     reaped: &mut bool,
     stopped: &mut Option<&mut dyn FnMut() -> bool>,
+    stderr_capture: StderrCapture,
 ) -> Result<Output, CompleteOutputError> {
     let mut left = |_, _| deadline.saturating_duration_since(deadline_now());
     let mut timed_out = || RunError::TimedOut;
@@ -590,6 +675,7 @@ fn collect_started(
         stopped,
         &mut left,
         &mut timed_out,
+        stderr_capture,
     )
 }
 
@@ -600,6 +686,7 @@ fn collect_started_with(
     stopped: &mut Option<&mut dyn FnMut() -> bool>,
     left: &mut dyn FnMut(u32, u64) -> Duration,
     overrun: &mut dyn FnMut() -> RunError,
+    stderr_capture: StderrCapture,
 ) -> Result<Output, CompleteOutputError> {
     let stdout = match child.stdout.take() {
         Some(stream) => match stdout_reader(pipe_end(&stream), stream) {
@@ -612,25 +699,15 @@ fn collect_started_with(
             return Err(CompleteOutputError::StdoutIncomplete);
         }
     };
-    let stderr = match child
-        .stderr
-        .take()
-        .map(|stream| {
-            let pipe = pipe_end(&stream);
-            drain(stream, pipe, "stderr")
-        })
-        .transpose()
-    {
+    let stderr = match StderrDrain::start(child.stderr.take(), stderr_capture) {
         Ok(stderr) => stderr,
         Err(error) => {
             return Err(CompleteOutputError::Run(RunError::Capture(error)));
         }
     };
     let mut exit = ExitWait::new(child);
-    let captured = |stdout: &CompleteDrain, stderr: &Option<super::Drain>| {
-        stdout
-            .bytes()
-            .saturating_add(stderr.as_ref().map_or(0, super::Drain::bytes))
+    let captured = |stdout: &CompleteDrain, stderr: &StderrDrain| {
+        stdout.bytes().saturating_add(stderr.bytes())
     };
     let status = loop {
         if stopped.as_mut().is_some_and(|stop| stop()) {
@@ -666,16 +743,78 @@ fn collect_started_with(
         group: Some(child.id()),
     };
     let stdout = stdout.collect_unless(&grace, stopped)?;
-    let stderr = stderr
-        .map(|stream| stream.collect_unless(&grace, stopped))
-        .transpose()
-        .map_err(CompleteOutputError::Run)?
-        .unwrap_or_default();
+    let stderr = stderr.collect_unless(&grace, stopped)?;
     Ok(Output {
         status,
         stdout,
         stderr,
     })
+}
+
+enum StderrDrain {
+    Tail(Option<super::Drain>),
+    Complete(CompleteDrain),
+}
+
+impl StderrDrain {
+    fn start(stream: Option<std::process::ChildStderr>, mode: StderrCapture) -> io::Result<Self> {
+        match (mode, stream) {
+            (StderrCapture::Tail, stream) => stream
+                .map(|stream| {
+                    let pipe = pipe_end(&stream);
+                    drain(stream, pipe, "stderr")
+                })
+                .transpose()
+                .map(Self::Tail),
+            (StderrCapture::Complete, Some(stream)) => {
+                drain_complete_with_limit(pipe_end(&stream), stream, OUTPUT_KEEP, "stderr")
+                    .map(Self::Complete)
+            }
+            (StderrCapture::Complete, None) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "stderr pipe is absent",
+            )),
+        }
+    }
+
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Tail(stream) => stream.as_ref().map_or(0, super::Drain::bytes),
+            Self::Complete(stream) => stream.bytes(),
+        }
+    }
+
+    fn collect_unless(
+        self,
+        grace: &Grace,
+        stopped: &mut Option<&mut dyn FnMut() -> bool>,
+    ) -> Result<Vec<u8>, CompleteOutputError> {
+        match self {
+            Self::Tail(stream) => stream
+                .map(|stream| stream.collect_unless(grace, stopped))
+                .transpose()
+                .map(Option::unwrap_or_default)
+                .map_err(CompleteOutputError::Run),
+            Self::Complete(stream) => stream.collect_unless(grace, stopped).map_err(|error| {
+                let error = match error {
+                    CompleteOutputError::Run(error) => return CompleteOutputError::Run(error),
+                    CompleteOutputError::StdoutRead(error) => io::Error::new(
+                        error.kind(),
+                        format!("stderr could not be read completely: {error}"),
+                    ),
+                    CompleteOutputError::StdoutTooLarge { limit } => io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("stderr exceeds the complete-capture limit of {limit} bytes"),
+                    ),
+                    CompleteOutputError::StdoutIncomplete => io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "stderr did not reach proven EOF",
+                    ),
+                };
+                CompleteOutputError::Run(RunError::Capture(error))
+            }),
+        }
+    }
 }
 
 fn observe_started(child: &mut Child, observer: impl FnOnce()) {
@@ -778,11 +917,21 @@ fn drain_stdout_with_limit(
     stream: impl Read + Send + 'static,
     limit: usize,
 ) -> io::Result<CompleteDrain> {
+    drain_complete_with_limit(pipe, stream, limit, "stdout")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn drain_complete_with_limit(
+    pipe: Option<PipeEnd>,
+    stream: impl Read + Send + 'static,
+    limit: usize,
+    name: &str,
+) -> io::Result<CompleteDrain> {
     let (finished, ended) = mpsc::sync_channel(1);
     let total = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&total);
     std::thread::Builder::new()
-        .name("child-complete-stdout".into())
+        .name(format!("child-complete-{name}"))
         .spawn(move || {
             let result = read_stdout_counted(stream, limit, &counted);
             let _ = finished.send(result);

@@ -547,7 +547,8 @@ usage: targo --unverified lab <command> [tag] [args]
   outlook-captures --out DIR [--aterm ATERM] [--tag NAME] [--scenes ABCDEFGHIJK] [--look day|night|both] [--scale 1|2|both]
                                  the accounts outlook's footer at three widths and Accounts card at 60 and 44 cells, one
                                  headless instance per scene, look and scale, seeded with synthetic identities only; I, J
-                                 and K: line E's quota row over the fixture's usage-tap statusLine, under Cruise
+                                 and K: line E's quota row over the fixture's usage-tap statusLine, under Cruise; the card
+                                 of A, B, C and J (case (c), Cruise: hand-offs, gap and out lines beside the ticks)
   outlook-perf --main ATERM --out DIR [--aterm ATERM] [--pairs N]
                                  the outlook against another build on scene A: paired typing and idle takes, and the
                                  resolver's own read and replay cost

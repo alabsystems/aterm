@@ -636,6 +636,48 @@ impl Git<'_> {
         output(self.launch, &mut git)
     }
 
+    fn anonymous_https_read(
+        &self,
+        anonymous_https: bool,
+        dir: &Path,
+        args: &[&str],
+        mut prepare: impl FnMut(u32) -> Result<(), String>,
+        on_retry: impl FnMut(aterm_types::http_retry::Retry),
+    ) -> Result<String, aterm_types::http_retry::RunError<aterm_update_core::git_https::Failure>>
+    {
+        aterm_update_core::git_https::read(
+            anonymous_https,
+            |attempt, trace| {
+                prepare(attempt).map_err(aterm_update_core::git_https::Failure::local)?;
+                let mut git = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+                git.arg("-C")
+                    .arg(dir)
+                    .args(args)
+                    .envs(self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                trace.configure(&mut git);
+                match output(self.launch, &mut git) {
+                    Ok(answer) if answer.status.success() => {
+                        Ok(String::from_utf8_lossy(&answer.stdout).into_owned())
+                    }
+                    Ok(answer) => {
+                        let stderr = String::from_utf8_lossy(&answer.stderr).trim().to_string();
+                        Err(aterm_update_core::git_https::Failure::diagnostic(
+                            if stderr.is_empty() {
+                                format!("git {} exited {:?}", args.join(" "), answer.status.code())
+                            } else {
+                                stderr
+                            },
+                        ))
+                    }
+                    Err(error) => Err(aterm_update_core::git_https::Failure::local(format!(
+                        "cannot run git: {error}"
+                    ))),
+                }
+            },
+            on_retry,
+        )
+    }
+
     fn ok(&self, dir: &Path, args: &[&str]) -> bool {
         self.run(dir, args).is_ok_and(|o| o.status.success())
     }
@@ -1172,7 +1214,9 @@ fn steps(
     halt(launch, "the clone")?;
     say(out, &format!("cloning {} (shallow)", env.clone_url));
     let clone_arg = clone.to_string_lossy().into_owned();
-    git.out(
+    let anonymous_clone = is_public_release_clone(&env.clone_url, slug);
+    git.anonymous_https_read(
+        anonymous_clone,
         &scratch.dir,
         &[
             "clone",
@@ -1182,19 +1226,38 @@ fn steps(
             &env.clone_url,
             &clone_arg,
         ],
+        |_| {
+            if clone.exists() {
+                std::fs::remove_dir_all(&clone)
+                    .map_err(|error| format!("remove incomplete clone: {error}"))?;
+            }
+            Ok(())
+        },
+        |retry| {
+            say(out, &format!("git clone {}: {retry}", env.clone_url));
+            world.sleep(retry.pause.as_secs());
+        },
     )
     .map_err(|e| {
+        let e = e.to_string();
         child_failed(
             "git clone",
             format!("clone of {} failed: {}", env.clone_url, last_line(&e)),
         )
     })?;
     if git.line(&clone, &["rev-parse", "HEAD"]).as_deref() != Some(commit.as_str()) {
-        git.out(
+        git.anonymous_https_read(
+            anonymous_clone,
             &clone,
             &["fetch", "--quiet", "--depth", "1", "origin", &commit],
+            |_| Ok(()),
+            |retry| {
+                say(out, &format!("git fetch {commit}: {retry}"));
+                world.sleep(retry.pause.as_secs());
+            },
         )
         .map_err(|e| {
+            let e = e.to_string();
             child_failed(
                 "git fetch",
                 format!(
@@ -2102,6 +2165,14 @@ fn steps(
     Ok(Outcome::Synced { deployed })
 }
 
+/// Whether `url` is the canonical credential-less clone of the public release repository.
+/// An arbitrary no-userinfo HTTPS URL may still name a private repository through a credential
+/// helper, so URL shape alone is deliberately insufficient.
+fn is_public_release_clone(url: &str, slug: &str) -> bool {
+    url == format!("https://github.com/{slug}.git")
+        && aterm_update_core::git_https::is_anonymous_https_url(url)
+}
+
 /// The live copies the comparison reads, or `None` when one could not be fetched.
 fn fetch_live(world: &mut dyn World, url: &str) -> Option<BTreeMap<&'static str, String>> {
     let mut live = BTreeMap::new();
@@ -2220,6 +2291,22 @@ pub fn report(ended: &Result<Outcome, Failure>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_canonical_public_release_clone_is_anonymous() {
+        assert!(is_public_release_clone(
+            "https://github.com/alabsystems/aterm.git",
+            "alabsystems/aterm"
+        ));
+        assert!(!is_public_release_clone(
+            "https://github.com/private/aterm.git",
+            "alabsystems/aterm"
+        ));
+        assert!(!is_public_release_clone(
+            "https://token@github.com/alabsystems/aterm.git",
+            "alabsystems/aterm"
+        ));
+    }
 
     #[test]
     fn an_installer_uses_the_site_file_bound() {

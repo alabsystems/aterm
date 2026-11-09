@@ -1676,8 +1676,21 @@ fn note_launch(ctx: &SessionCtx, note: String) {
 /// holds it, and its stall ends this wait as a lead's mark does ([`task_moved_on`]).
 pub(crate) fn await_prompt(work: &Launch, settle: Duration) -> Result<PromptFence, String> {
     let sub = crate::session_watch::Subscription::single(&work.ctx.watchers);
+    let clock = aterm_types::advance_clock::Clock::new(
+        aterm_types::dev_seam!("ATERM_DEBUG_PROMPT_CLOCK"),
+        work.ctx.self_id.as_str(),
+    );
     let mut held = Held::default();
+    #[cfg(any(test, debug_assertions))]
+    let began = clock.read().now;
     loop {
+        let reading = clock.read();
+        #[cfg(any(test, debug_assertions))]
+        if aterm_types::negative_control::on("worker-prompt-deadline")
+            && reading.now.saturating_duration_since(began) >= Duration::from_secs(20)
+        {
+            return Err("negative control: first prompt timed out".to_owned());
+        }
         if account_preparation_cancelled(work) {
             return Err(PREPARATION_CANCELLED.to_string());
         }
@@ -1697,7 +1710,7 @@ pub(crate) fn await_prompt(work: &Launch, settle: Duration) -> Result<PromptFenc
         };
         let rest = match prompt {
             Some(prompt) => {
-                let left = held.look(prompt.generation, Instant::now(), settle);
+                let left = held.look(prompt.generation, reading.now, settle);
                 if left.is_zero() {
                     return Ok(prompt);
                 }
@@ -1708,6 +1721,7 @@ pub(crate) fn await_prompt(work: &Launch, settle: Duration) -> Result<PromptFenc
                 FIRST_PROMPT_LOOK
             }
         };
+        reading.observed();
         let _ = sub.wait(rest);
     }
 }

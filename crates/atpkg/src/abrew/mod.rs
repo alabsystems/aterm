@@ -1464,6 +1464,9 @@ fn native_args(
             false,
         ),
         "untap" => (&[], 1, usize::MAX, false),
+        // Not native, but its --os/--arch values validate
+        // (brew errors) before the not-native refusal.
+        "readall" => (&["--os", "--arch"], 0, usize::MAX, false),
         "tap-info" => (
             &["--json", "--json=v1", "--installed"],
             0,
@@ -1715,7 +1718,7 @@ fn native_args(
     // symbols plus macos/linux, and only :arm/:intel arches.
     // OptionParser consumes the next token as the value even
     // when it spells another switch; the last spelling wins.
-    if matches!(cmd, "deps" | "fetch" | "--cache") {
+    if matches!(cmd, "deps" | "fetch" | "--cache" | "readall") {
         let last_value = |flag: &str| {
             let mut value = None;
             let mut args = rest.iter().take_while(|arg| arg.as_str() != "--");
@@ -1729,7 +1732,7 @@ fn native_args(
             value
         };
         // --cache and fetch accept "all" (every tag).
-        let cache_all = matches!(cmd, "--cache" | "fetch");
+        let cache_all = matches!(cmd, "--cache" | "fetch" | "readall");
         if cmd == "deps" && last_value("--os") == Some("all") {
             return Err(InstallError::Failed(
                 "Error: Invalid usage: `brew deps --os=all` is not supported.".to_string(),
@@ -4696,15 +4699,15 @@ mod admission_tests {
         // Real brew commands abrew does not implement are known,
         // not unknown: they refuse as not native (and delegate
         // under the reroute) instead of claiming no such command.
-        for known in ["vulns", "readall"] {
-            assert!(
-                matches!(
-                    native_args(known, &argv(&[])),
-                    Err(InstallError::Unsupported(m)) if m == format!("'{known}' is not native")
-                ),
-                "{known}"
-            );
-        }
+        assert!(native_args("readall", &argv(&[])).is_ok());
+        assert_eq!(
+            native_args("readall", &argv(&["--os=plan9"])),
+            Err(InstallError::Failed("Error: Unknown OS: plan9".to_string()))
+        );
+        assert!(matches!(
+            native_args("vulns", &argv(&[])),
+            Err(InstallError::Unsupported(m)) if m == "'vulns' is not native"
+        ));
         assert!(native_args("missing", &argv(&["--hide="])).is_ok());
         assert!(matches!(
             native_args("search", &argv(&[])),

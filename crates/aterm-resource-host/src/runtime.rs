@@ -401,6 +401,9 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
         Some("native-bootstrap-graph-v1") if hello["version"].as_u64() == Some(3) => {
             crate::bootstrap_graph_transport::serve(stream, peer, &hello, deadline)
         }
+        Some("native-bootstrap-object-compile-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::bootstrap_graph_transport::object(stream, peer, &hello, deadline)
+        }
         Some("native-bootstrap-sdk-query-v1") if hello["version"].as_u64() == Some(3) => {
             crate::bootstrap_graph_transport::query(stream, peer, &hello, deadline)
         }

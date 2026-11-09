@@ -2307,9 +2307,11 @@ pub(crate) enum UpdateOutcome {
         build: u64,
         message: String,
     },
-    /// Automatic apply observed input/output before reader park.
+    /// Not this instant: the automatic lane keeps its intent and polls again, and `hold` names
+    /// what holds it (`native_update_lane_hold`).
     Deferred {
         reason: String,
+        hold: crate::native_update_lane_hold::LaneHold,
     },
     Blocked {
         reasons: Vec<String>,

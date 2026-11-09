@@ -2090,7 +2090,7 @@ impl App {
         }
     }
 
-    /// A LINUX BUILD HELD FOR A PERSON IS ON THE BAND.
+    /// A LINUX BUILD HELD FOR A PERSON IS A LIVE ROW.
     pub(crate) fn say_linux_held_stage(&mut self) {
         let snapshot = self.native_updater_service.snapshot();
         let running = snapshot.current_build;
@@ -7770,12 +7770,12 @@ impl App {
         }
         match decision {
             ArmDecision::Clear => {
-                self.auto_apply_intent = None;
+                let _ = self.drop_auto_apply_intent();
                 self.settle_update_wait_on_person();
                 false
             }
             ArmDecision::SuppressManualOnly => {
-                self.auto_apply_intent = None;
+                let _ = self.drop_auto_apply_intent();
                 self.settle_update_wait_on_person();
                 self.restate_staged_bar_posture(build);
                 false
@@ -7823,11 +7823,12 @@ impl App {
                             .as_secs()
                     ),
                 }
-                self.auto_apply_intent = Some(crate::AutoApplyIntent {
+                self.rearm_auto_apply_intent(crate::AutoApplyIntent {
                     build,
                     dmg_sha256,
                     retry_at: now,
                     attempts: 0,
+                    held: crate::native_update_lane_hold::NamedHold::default(),
                 });
                 self.restate_staged_bar_posture(build);
                 true
@@ -7903,6 +7904,123 @@ impl App {
         );
     }
 
+    /// What the lane's own work holds it on, when a poll finds work active
+    /// (`PollDecision::Wait(WaitReason::WorkActive)`).
+    fn work_hold(
+        &self,
+        applying: bool,
+    ) -> (crate::native_update_lane_hold::LaneHold, &'static str) {
+        use crate::native_update_lane_hold::LaneHold;
+        if self.native_updater_service.snapshot().active.is_some() {
+            (
+                LaneHold::UpdaterBusy,
+                "the updater's own check or download is running",
+            )
+        } else if self.person_apply_is_held() {
+            (
+                LaneHold::PersonInstall,
+                "a person's Install waits for the candidate's pre-park read",
+            )
+        } else if applying || self.update_handoff_in_flight() {
+            (
+                LaneHold::HandoffInFlight,
+                "an update handoff is already in flight",
+            )
+        } else {
+            (LaneHold::UpdaterBusy, "the updater's own work is running")
+        }
+    }
+
+    /// A poll in `phase` did not attempt `intent`'s build because of `hold`, whose refusal said
+    /// `reason`. Past the ladder (`Land`) the hold is named on the intent once as it begins or
+    /// changes, never per poll: one info line saying what holds it, since when and what lifts it,
+    /// and `apply_held=` while it holds. It writes no standing refusal: the lanes that keep one
+    /// (the roster wait, a failure's retry schedule, a preflight block) keep theirs
+    /// authoritative, and a hold ends with nothing left to withdraw.
+    pub(crate) fn note_auto_apply_hold(
+        &mut self,
+        phase: crate::native_update_auto_intent::ApplyPhase,
+        intent: &mut crate::AutoApplyIntent,
+        hold: crate::native_update_lane_hold::LaneHold,
+        reason: &str,
+        now: std::time::Instant,
+    ) {
+        if phase != crate::native_update_auto_intent::ApplyPhase::Land {
+            return;
+        }
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        if let Some(line) = intent.held.hold(intent.build, hold, reason, now, now_unix) {
+            self.auto_apply_hold_words.say(line);
+        }
+    }
+
+    /// An attempt that left the process came back held (`UpdateOutcome::Deferred`): the hold is
+    /// named on the intent the lane armed again for `build`, as a poll names one.
+    #[cfg(unix)]
+    pub(crate) fn note_returned_auto_apply_hold(
+        &mut self,
+        build: u64,
+        hold: crate::native_update_lane_hold::LaneHold,
+        reason: &str,
+    ) {
+        let now = std::time::Instant::now();
+        let Some(mut intent) = self
+            .auto_apply_intent
+            .filter(|intent| intent.build == build)
+        else {
+            return;
+        };
+        let phase = self.automatic_apply_phase(now);
+        self.note_auto_apply_hold(phase, &mut intent, hold, reason, now);
+        self.auto_apply_intent = Some(intent);
+    }
+
+    /// `intent` attempted, or the lane let it go: a hold it named is over, said once.
+    fn end_auto_apply_hold(
+        &mut self,
+        intent: &mut crate::AutoApplyIntent,
+        now: std::time::Instant,
+    ) {
+        if let Some(line) = intent.held.release(intent.build, now) {
+            self.auto_apply_hold_words.say(line);
+        }
+    }
+
+    /// The lane drops its promise: the armed intent goes, and a hold it named is over, said once.
+    /// Every drop of an armed intent goes through here.
+    pub(crate) fn drop_auto_apply_intent(&mut self) -> Option<crate::AutoApplyIntent> {
+        let mut intent = self.auto_apply_intent.take()?;
+        self.end_auto_apply_hold(&mut intent, std::time::Instant::now());
+        Some(intent)
+    }
+
+    /// Arm `next`: an intent armed for the same build and artifact passes on the hold it was
+    /// named under (the lane still tries to land those bytes), and any other is dropped first.
+    pub(crate) fn rearm_auto_apply_intent(&mut self, mut next: crate::AutoApplyIntent) {
+        match self.auto_apply_intent {
+            Some(armed) if armed.build == next.build && armed.dmg_sha256 == next.dmg_sha256 => {
+                next.held = armed.held;
+            }
+            Some(_) => {
+                let _ = self.drop_auto_apply_intent();
+            }
+            None => {}
+        }
+        self.auto_apply_intent = Some(next);
+    }
+
+    /// The token `update status` prints as `apply_held=` for the hold the armed intent for
+    /// `build` was named under.
+    #[must_use]
+    pub(crate) fn auto_apply_hold_token(&self, build: u64) -> Option<&'static str> {
+        self.auto_apply_intent
+            .filter(|intent| intent.build == build)
+            .and_then(|intent| intent.held.current())
+            .map(|held| held.hold.token())
+    }
+
     fn announce_restored_hold(&mut self, now: std::time::Instant) {
         let holding = self
             .harness
@@ -7964,11 +8082,12 @@ impl App {
             .filter(|intent| intent.build == build && intent.dmg_sha256 == dmg_sha256)
             .map(|intent| intent.attempts);
         if rearm || attempts.is_some() {
-            self.auto_apply_intent = Some(crate::AutoApplyIntent {
+            self.rearm_auto_apply_intent(crate::AutoApplyIntent {
                 build,
                 dmg_sha256,
                 retry_at: wait.reread_at,
                 attempts: attempts.unwrap_or(0),
+                held: crate::native_update_lane_hold::NamedHold::default(),
             });
         }
         if renewed {
@@ -8255,25 +8374,33 @@ impl App {
                 // posture that now holds. A person's wait was a wait for this lane,
                 // so it ends here too, with its standing row and the overdue notice's
                 // exemption.
-                if let Some(intent) = self.auto_apply_intent.take() {
+                if let Some(intent) = self.drop_auto_apply_intent() {
                     self.restate_staged_bar_posture(intent.build);
                 }
                 self.settle_update_wait_on_person();
                 return;
             }
-            PollDecision::Wait(WaitReason::Deadline) => return,
-            PollDecision::Wait(
-                reason @ (WaitReason::WorkActive | WaitReason::Activity | WaitReason::StagePending),
-            ) => {
-                intent.retry_at = match reason {
-                    WaitReason::Activity => {
-                        crate::automatic_update_activity_retry_at(std::time::Instant::now())
+            PollDecision::Wait(reason) => {
+                let (hold, words, retry_at) = match reason {
+                    // Not due yet: the hold named last stands, and nothing is said.
+                    WaitReason::Deadline => return,
+                    WaitReason::StagePending => (
+                        crate::native_update_lane_hold::LaneHold::StagePending,
+                        "the staged download is not yet the armed artifact",
+                        now + std::time::Duration::from_secs(2),
+                    ),
+                    WaitReason::Activity => (
+                        crate::native_update_lane_hold::LaneHold::Activity,
+                        "terminal input/output is still inside the quiet epoch",
+                        crate::automatic_update_activity_retry_at(std::time::Instant::now()),
+                    ),
+                    WaitReason::WorkActive => {
+                        let (hold, words) = self.work_hold(applying);
+                        (hold, words, now + std::time::Duration::from_secs(2))
                     }
-                    WaitReason::WorkActive | WaitReason::StagePending => {
-                        now + std::time::Duration::from_secs(2)
-                    }
-                    WaitReason::Deadline => unreachable!("matched above"),
                 };
+                self.note_auto_apply_hold(phase, &mut intent, hold, words, now);
+                intent.retry_at = retry_at;
                 self.auto_apply_intent = Some(intent);
                 return;
             }
@@ -8287,12 +8414,26 @@ impl App {
             staged.build == attempt_build && staged.is_installed_activation()
         });
         if self.capture_refusal_holds(attempt_build, intent.dmg_sha256, activation, now) {
+            self.note_auto_apply_hold(
+                phase,
+                &mut intent,
+                crate::native_update_lane_hold::LaneHold::CaptureRefusal,
+                "the park's capture refused this desk",
+                now,
+            );
             intent.retry_at = self.capture_refusal_reprobe_at(now);
             self.auto_apply_intent = Some(intent);
             return;
         }
         #[cfg(unix)]
         if let Some(retry_at) = self.roster_wait_holds(attempt_build, intent.dmg_sha256, now) {
+            self.note_auto_apply_hold(
+                phase,
+                &mut intent,
+                crate::native_update_lane_hold::LaneHold::RosterConfirmation,
+                "the stage's signer has not been confirmed by an update check",
+                now,
+            );
             intent.retry_at = retry_at;
             self.auto_apply_intent = Some(intent);
             return;
@@ -8307,10 +8448,19 @@ impl App {
                     && read.running_for(attempt_build, now)
             })
         {
+            self.note_auto_apply_hold(
+                phase,
+                &mut intent,
+                crate::native_update_lane_hold::LaneHold::PreparkRead,
+                "the candidate's pre-park read is still running",
+                now,
+            );
             intent.retry_at = now + PREVERIFY_READ_POLL;
             self.auto_apply_intent = Some(intent);
             return;
         }
+        // The attempt takes the intent; this poll keeps it, and the hold it was named under,
+        // until the outcome says what comes of it.
         intent.build = attempt_build;
         self.auto_apply_intent = None;
         let outcome = self.apply_native_update(if attempt_phase == ApplyPhase::PreferIdle {
@@ -8318,23 +8468,38 @@ impl App {
         } else {
             ApplyMode::AutomaticPastGrace
         });
-        if let UpdateOutcome::Deferred { reason } = outcome {
-            // A deferral is the ladder saying "not this instant". It returned
-            // before `begin_apply_preflight` (no park, launch, ticket or budget),
-            // so it is re-polled on the quiet cadence and not logged per poll;
-            // the phase change is (`announce_apply_phase`). A path that re-armed
-            // its own intent keeps it. A fork-lane park that missed its budget
-            // was already surfaced by `fork_park_miss_outcome`.
-            if self.auto_apply_intent.is_none() {
-                intent.retry_at = std::time::Instant::now() + crate::AUTOMATIC_UPDATE_QUIET_EPOCH;
-                self.auto_apply_intent = Some(intent);
+        if let UpdateOutcome::Deferred { reason, hold } = outcome {
+            // A deferral is "not this instant": it returned before
+            // `begin_apply_preflight` (no park, launch, ticket or budget), so it
+            // is re-polled on the quiet cadence. A poll is not logged; a hold past
+            // the ladder is, once as it begins and once as it ends
+            // (`note_auto_apply_hold`), and the phase change is
+            // (`announce_apply_phase`). A path that re-armed its own intent keeps
+            // it, with the hold this poll's was named under when it is for the same
+            // bytes. A fork-lane park that missed its budget was already surfaced by
+            // `fork_park_miss_outcome`.
+            let mut kept = match self.auto_apply_intent {
+                None => crate::AutoApplyIntent {
+                    retry_at: std::time::Instant::now() + crate::AUTOMATIC_UPDATE_QUIET_EPOCH,
+                    ..intent
+                },
+                Some(rearmed) => {
+                    self.auto_apply_intent = Some(intent);
+                    self.rearm_auto_apply_intent(rearmed);
+                    self.auto_apply_intent.unwrap_or(rearmed)
+                }
+            };
+            if kept.build == intent.build {
+                self.note_auto_apply_hold(phase, &mut kept, hold, &reason, now);
             }
+            self.auto_apply_intent = Some(kept);
             aterm_log::debug!(
                 "automatic update retained exact intent after a deferral in {attempt_phase:?}: \
                  {reason}"
             );
             return;
         }
+        self.end_auto_apply_hold(&mut intent, std::time::Instant::now());
         intent.attempts = intent.attempts.saturating_add(1);
         self.update_waits_on_person = match &outcome {
             UpdateOutcome::Blocked { reasons } => {
@@ -8369,7 +8534,7 @@ impl App {
                 AttemptDisposition::Complete,
                 UpdateOutcome::InstalledNeedsRelaunch { build, message },
             ) => {
-                self.auto_apply_intent = None;
+                let _ = self.drop_auto_apply_intent();
                 self.surface_update_apply_outcome(
                     "automatic",
                     UpdateOutcome::InstalledNeedsRelaunch { build, message },
@@ -8449,7 +8614,7 @@ impl App {
                 );
             }
             (AttemptDisposition::ManualOnly, UpdateOutcome::Failed { message }) => {
-                self.auto_apply_intent = None;
+                let _ = self.drop_auto_apply_intent();
                 let activation = self
                     .native_updater_service
                     .snapshot()
@@ -8517,7 +8682,7 @@ impl App {
                 );
             }
             (_, outcome) => {
-                self.auto_apply_intent = None;
+                let _ = self.drop_auto_apply_intent();
                 if self
                     .auto_apply_structural_verdict
                     .is_some_and(|verdict| verdict.build == intent.build)
@@ -8678,7 +8843,7 @@ impl App {
             if let Some(retired_build) = retired
                 && self.native_updater_service.retire_stage_for_activation()
             {
-                self.auto_apply_intent = None;
+                let _ = self.drop_auto_apply_intent();
                 self.carry_manual_only_latch_across_swap(
                     retired_build,
                     installed.build,
@@ -8716,7 +8881,7 @@ impl App {
                 installed.as_ref(),
             );
             if disposition != DurableStageDisposition::Unchanged {
-                self.auto_apply_intent = None;
+                let _ = self.drop_auto_apply_intent();
                 self.publish_native_update_state();
                 match disposition {
                     DurableStageDisposition::InstalledNeedsRelaunch { build } => {
@@ -8856,7 +9021,7 @@ impl App {
         dmg_sha256: [u8; 32],
         cause: EnvironmentBlockCause,
     ) {
-        self.auto_apply_intent = None;
+        let _ = self.drop_auto_apply_intent();
         self.auto_apply_environment_block = Some(AutoApplyEnvironmentBlock {
             build,
             dmg_sha256,
@@ -9099,6 +9264,7 @@ impl App {
                     "the installed build {} is being replaced by the verified build {}",
                     job.activation, job.newer
                 ),
+                hold: crate::native_update_lane_hold::LaneHold::ActivationSupersede,
             };
         }
         if !mode.is_automatic()
@@ -9117,12 +9283,14 @@ impl App {
         }
         if mode.is_automatic() {
             let now = std::time::Instant::now();
+            let facts = self.automatic_activity_facts(mode, now);
             if let Some(reason) = crate::native_update_auto_intent::automatic_park_refusal(
                 self.automatic_phase_for(mode, now),
-                self.automatic_activity_facts(mode, now),
+                facts,
             ) {
                 return UpdateOutcome::Deferred {
                     reason: reason.to_string(),
+                    hold: crate::native_update_auto_intent::park_refusal_hold(facts),
                 };
             }
         }
@@ -9231,8 +9399,8 @@ impl App {
                 UpdateOutcome::Accepted
             }
             #[cfg(unix)]
-            crate::UpdateHandoffStartError::ActivityDeferred(reason) => {
-                UpdateOutcome::Deferred { reason }
+            crate::UpdateHandoffStartError::ActivityDeferred(hold, reason) => {
+                UpdateOutcome::Deferred { reason, hold }
             }
             crate::UpdateHandoffStartError::Refused(message) => UpdateOutcome::Blocked {
                 reasons: vec![message],
@@ -9668,11 +9836,15 @@ impl App {
             "automatic",
             UpdateOutcome::Deferred {
                 reason: message.clone(),
+                hold: crate::native_update_lane_hold::LaneHold::ActivityRevoked,
             },
             false,
             attempt.target_build(),
         );
-        UpdateOutcome::Deferred { reason: message }
+        UpdateOutcome::Deferred {
+            reason: message,
+            hold: crate::native_update_lane_hold::LaneHold::ActivityRevoked,
+        }
     }
 
     #[cfg(any(unix, test))]
@@ -9721,11 +9893,12 @@ impl App {
         });
         self.auto_apply_manual_only = None;
         self.anchor_auto_apply_ladder(build, now);
-        self.auto_apply_intent = Some(crate::AutoApplyIntent {
+        self.rearm_auto_apply_intent(crate::AutoApplyIntent {
             build,
             dmg_sha256,
             retry_at: now + delay,
             attempts: cycles,
+            held: crate::native_update_lane_hold::NamedHold::default(),
         });
         Some(delay)
     }
@@ -9790,11 +9963,12 @@ impl App {
             .auto_apply_intent
             .filter(|intent| intent.build == build)
             .map_or(1, |intent| intent.attempts);
-        self.auto_apply_intent = Some(crate::AutoApplyIntent {
+        self.rearm_auto_apply_intent(crate::AutoApplyIntent {
             build,
             dmg_sha256,
             retry_at: self.capture_refusal_reprobe_at(now),
             attempts,
+            held: crate::native_update_lane_hold::NamedHold::default(),
         });
         aterm_log::warn!(
             "update auto-apply: build {build} was refused by the park's capture ({detail}); \
@@ -9976,7 +10150,10 @@ impl App {
             }
             self.restate_staged_bar_posture(attempt.target_build());
             publish(self);
-            return UpdateOutcome::Deferred { reason: message };
+            return UpdateOutcome::Deferred {
+                reason: message,
+                hold: crate::native_update_lane_hold::LaneHold::RosterConfirmation,
+            };
         }
         if !lane.charges_the_automatic_lane() {
             publish(self);
@@ -9989,7 +10166,10 @@ impl App {
             aterm_log::info!(
                 "update apply: activity revoked the overlap; automatic retry in {delay:?}"
             );
-            return UpdateOutcome::Deferred { reason: message };
+            return UpdateOutcome::Deferred {
+                reason: message,
+                hold: crate::native_update_lane_hold::LaneHold::ActivityRevoked,
+            };
         }
         if lane == HandoffFailureLane::Refused
             && let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256())
@@ -10037,7 +10217,7 @@ impl App {
                 &message,
             );
         }
-        self.auto_apply_intent = None;
+        let _ = self.drop_auto_apply_intent();
         self.restate_staged_bar_posture(attempt.target_build());
         publish(self);
         UpdateOutcome::Failed { message }
@@ -10085,7 +10265,7 @@ impl App {
                 Some(self.settle_rearmed_apply_failure(&attempt, message, lane, Some(facts)))
             }
             ReturnedApplyDisposition::InstalledNeedsRelaunch { build } => {
-                self.auto_apply_intent = None;
+                let _ = self.drop_auto_apply_intent();
                 if let HandoffFailureLane::Physical(shape) = lane
                     && let Some(dmg_sha256) = decode_dmg_sha256(attempt.target_dmg_sha256())
                 {
@@ -10106,7 +10286,7 @@ impl App {
                 })
             }
             ReturnedApplyDisposition::Retired => {
-                self.auto_apply_intent = None;
+                let _ = self.drop_auto_apply_intent();
                 if self.auto_apply_manual_only.is_some_and(|manual| {
                     manual.build == attempt.target_build()
                         && decode_dmg_sha256(attempt.target_dmg_sha256()) == Some(manual.dmg_sha256)

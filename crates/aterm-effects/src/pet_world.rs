@@ -198,6 +198,59 @@ enum Forgive {
     AnyCaret,
 }
 
+/// Which of a window's prefix tables a clearance reads ([`PetWorld::clearance_on`]): the cells
+/// that are not [`PetCell::Clear`], or those that are [`PetCell::Unknown`] or
+/// [`PetCell::Protected`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plane {
+    Blocked,
+    Protected,
+}
+
+/// The window about the body's cells as the caret's window classifies its own
+/// ([`PetWorld::body_window`], [`read_cell`]): the live plane's prefix tables (row `r`'s at
+/// `(r + 1) * (MAX_WORLD_COLS + 1)`, as the caret's window lays them), the ground plane's where a
+/// transient cell lies in the window, and the live caret's ring cells in it, window-local. The
+/// clearance readers read them where the caret's window does not read a rectangle whole
+/// ([`PetWorld::clearance_on`]).
+#[derive(Clone, Debug)]
+struct BodyCells {
+    /// Whether the window read its cells this observation: not with
+    /// [`crate::kitty_pet::OldPath::BodysWindowReadsItsGround`] reverted
+    /// ([`PetWorld::read_the_bodys_ground`]), which reads its glyphs alone.
+    read: bool,
+    blocked: Vec<u16>,
+    protected: Vec<u16>,
+    ground_split: bool,
+    ground_blocked: Vec<u16>,
+    ground_protected: Vec<u16>,
+    carets: [CaretCell; 9],
+    carets_len: u8,
+    ground_carets: [CaretCell; 9],
+    ground_carets_len: u8,
+}
+
+impl BodyCells {
+    const fn new() -> Self {
+        Self {
+            read: false,
+            blocked: Vec::new(),
+            protected: Vec::new(),
+            ground_split: false,
+            ground_blocked: Vec::new(),
+            ground_protected: Vec::new(),
+            carets: [CaretCell::EMPTY; 9],
+            carets_len: 0,
+            ground_carets: [CaretCell::EMPTY; 9],
+            ground_carets_len: 0,
+        }
+    }
+}
+
+/// How many entries a window's prefix table holds: a row of zeros, then one row per window row,
+/// [`MAX_WORLD_COLS`] + 1 entries each.
+const BODY_PREFIX_LEN: usize = (MAX_BODY_ROWS + 1) * (MAX_WORLD_COLS + 1);
+
 /// The terminal's rectangle in the supplied frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Terminal pane rectangle in the supplied frame.
@@ -458,6 +511,11 @@ pub struct PetWorld {
     /// window ([`Self::coverage`]) reads across the window's columns.
     body: PetPane,
     body_glyphs: Vec<Option<PetGlyph>>,
+    /// The window about the body's cells, classified as the caret's window classifies its own.
+    body_cells: BodyCells,
+    /// Whether the window about the body reads its cells' ground as well as its glyphs
+    /// ([`Self::read_the_bodys_ground`]).
+    body_ground: bool,
     /// Map-local cells only the live caret's 3x3 ring protects ([`Forgive`]).
     caret_cells: [CaretCell; 9],
     caret_cells_len: u8,
@@ -509,6 +567,8 @@ impl PetWorld {
             coverage: PetPane::EMPTY,
             body: PetPane::EMPTY,
             body_glyphs: Vec::new(),
+            body_cells: BodyCells::new(),
+            body_ground: true,
             caret_cells: [CaretCell::EMPTY; 9],
             caret_cells_len: 0,
             stamp: None,
@@ -529,6 +589,7 @@ impl PetWorld {
         self.stamp = None;
         self.coverage = PetPane::EMPTY;
         self.body = PetPane::EMPTY;
+        self.body_cells.read = false;
         self.ground_split = false;
         self.caret_cells_len = 0;
         self.ground_caret_cells_len = 0;
@@ -790,7 +851,7 @@ impl PetWorld {
             cols,
         };
         if input.display_offset == 0 {
-            self.read_body(input, pane, blanked, (keep, landing));
+            self.read_body(input, pane, reserve, (keep, landing));
         }
         let track_ground = any_selection || !overlays.is_empty();
         const PREFIX_LEN: usize = (MAX_WORLD_ROWS + 1) * (MAX_WORLD_COLS + 1);
@@ -806,15 +867,7 @@ impl PetWorld {
         self.protected_prefix[..=cols].fill(0);
         let mut n_caret_cells = 0usize;
         let mut n_ground_caret_cells = 0usize;
-        let mut implicit_bg = input.default_bg;
-        let mut implicit = RenderCell {
-            bg: [
-                (implicit_bg >> 16) as u8,
-                (implicit_bg >> 8) as u8,
-                implicit_bg as u8,
-            ],
-            ..RenderCell::default()
-        };
+        let mut implicit = Implicit::new(input.default_bg);
         let mut spans_buf = [(0, 0); MAX_REGIONS];
         let mut overlay_spans_buf = [(0, 0); MAX_REGIONS];
         let mut typed_spans_buf = [(0, 0); MAX_REGIONS];
@@ -912,6 +965,12 @@ impl PetWorld {
                 bi += 1;
             }
             let blanked_spans = &blanked_spans_buf[..n_blanked];
+            let row_reserve = RowReserve {
+                protected: spans,
+                overlays: overlay_spans,
+                typed: typed_spans,
+                blanked: blanked_spans,
+            };
             let mut scan = RowScan::new(input, frame_r);
             let cursor_row_near = input.cursor_visible
                 && input.display_offset == 0
@@ -925,61 +984,29 @@ impl PetWorld {
                 next_c += 1;
                 let local_c = cov_col + c;
                 let frame_c = frame_col_base + c;
-                let default_bg = scan.default_bg(frame_c);
-                if implicit_bg != default_bg {
-                    implicit_bg = default_bg;
-                    implicit.bg = [
-                        (default_bg >> 16) as u8,
-                        (default_bg >> 8) as u8,
-                        default_bg as u8,
-                    ];
-                }
-                // Glass the host blanks after this look ([`PetReserve::blanked`]) shows none of
-                // the program's ink under it: the pet reads the blank the person will see.
-                let glass_blank = span_contains(blanked_spans, local_c);
-                let cell = match row.get(frame_c) {
-                    Some(c) if !glass_blank => c,
-                    _ => &implicit,
-                };
-                row_strokes += usize::from(cell.ch == RULE_STROKE);
-                let selected = any_selection
-                    && input.selection_contains_cell(
-                        frame_r,
-                        frame_c,
-                        matches!(row.get(frame_c + 1), Some(n) if n.wide),
-                        cell.wide,
-                    );
-                if selected {
+                let read = read_cell(
+                    &mut scan,
+                    (input, row.as_slice(), &mut implicit),
+                    (frame_c, local_c),
+                    (c, cols),
+                    (row_reserve, any_selection, cursor_row_near),
+                    if c > 0 { row_glyphs[c - 1] } else { None },
+                );
+                let (cursor, lasting, transient) = (read.cursor, read.lasting, read.transient);
+                row_strokes += usize::from(read.stroke);
+                if read.selected {
                     sel_r0 = sel_r0.min(local_r);
                     sel_c0 = sel_c0.min(local_c);
                     sel_r1 = sel_r1.max(local_r);
                     sel_c1 = sel_c1.max(local_c);
                 }
-                let cursor = cursor_row_near && frame_c.abs_diff(input.cursor_col) <= 1;
-                let read = read_glyph(
-                    &mut scan,
-                    (input, row.as_slice(), &implicit),
-                    cell,
-                    (c, cols, frame_c),
-                    (glass_blank, span_contains(blanked_spans, local_c + 1)),
-                    if c > 0 { row_glyphs[c - 1] } else { None },
-                );
-                let (glyph, speck, line) = (read.glyph, read.speck, read.line);
-                row_glyphs[c] = read.class;
-                let lasting = line != LineSize::SingleWidth
-                    || span_contains(spans, local_c)
-                    || scan.image(frame_c).is_some();
-                let transient = selected || span_contains(overlay_spans, local_c);
-                let others = lasting || transient;
-                let hull_ink = (glyph && !speck)
-                    || (default_bg > 0x00FF_FFFF || cell.bg != implicit.bg)
-                    || span_contains(typed_spans, local_c);
-                let painted = hull_ink || speck;
-                if hull_ink {
+                row_glyphs[c] = read.glyph.class;
+                let painted = read.painted();
+                if read.hull_ink {
                     hull_lo = hull_lo.min(c as u16);
                     hull_hi = c as u16 + 1;
                 }
-                if cursor && !others && n_caret_cells < self.caret_cells.len() {
+                if cursor && !(lasting || transient) && n_caret_cells < self.caret_cells.len() {
                     self.caret_cells[n_caret_cells] = CaretCell {
                         row: r,
                         col: c,
@@ -987,13 +1014,7 @@ impl PetWorld {
                     };
                     n_caret_cells += 1;
                 }
-                let class = if others || cursor {
-                    PetCell::Protected
-                } else if painted {
-                    PetCell::Ink
-                } else {
-                    PetCell::Clear
-                };
+                let class = read.class();
                 row_cells[c] = class;
                 let prev_row_blocked = row_blocked;
                 let prev_row_protected = row_protected;
@@ -1030,17 +1051,7 @@ impl PetWorld {
                         row_ground_protected = prev_row_protected;
                     }
                     if self.ground_split {
-                        let ground_class = if transient {
-                            if lasting || cursor {
-                                PetCell::Protected
-                            } else if painted {
-                                PetCell::Ink
-                            } else {
-                                PetCell::Clear
-                            }
-                        } else {
-                            class
-                        };
+                        let ground_class = read.ground_class();
                         row_ground_blocked += u16::from(ground_class != PetCell::Clear);
                         row_ground_protected += u16::from(matches!(
                             ground_class,
@@ -1163,13 +1174,17 @@ impl PetWorld {
     /// budget, the pane's rows the console asks for about the body (as many as [`MAX_BODY_ROWS`]),
     /// over as many columns as the map reads about the body's centre (in a flight to another row
     /// whose landing the caret's window does not read whole, about that landing), read for their
-    /// glyphs alone ([`Self::locomotion_ink_in_span`], [`Self::last_letter_in_span`],
+    /// glyphs ([`Self::locomotion_ink_in_span`], [`Self::last_letter_in_span`],
     /// [`Self::ink_row_bits`], [`Self::ink_at`], [`Self::letter_at`] and
-    /// [`Self::locomotion_ink_at`]). Where the caret's window ([`Self::coverage`]) reads those
-    /// columns, the window leaves out the rows it reads, and reads none where it reads them all
-    /// (every pane within the budget). Where it does not (a pane past [`MAX_WORLD_COLS`]), the
-    /// window reads the rows it reads too, for a span's columns past it. No rows where the frame is
-    /// scrolled into history, or where the console asked for none
+    /// [`Self::locomotion_ink_at`]) and their cells, classified as the caret's window classifies
+    /// its own ([`BodyCells`]), which the clearance readers read where the caret's window does not
+    /// read a rectangle whole ([`Self::clearance_on`]); for their glyphs alone where the console
+    /// asks for no more ([`Self::read_the_bodys_ground`],
+    /// [`crate::kitty_pet::OldPath::BodysWindowReadsItsGround`] reverted). Where the caret's window
+    /// ([`Self::coverage`]) reads those columns, the window leaves out the rows it reads, and reads
+    /// none where it reads them all (every pane within the budget). Where it does not (a pane past
+    /// [`MAX_WORLD_COLS`]), the window reads the rows it reads too, for a span's columns past it.
+    /// No rows where the frame is scrolled into history, or where the console asked for none
     /// ([`crate::kitty_pet::OldPath::WorldReadsTheBodysRows`]).
     #[inline]
     #[must_use]
@@ -1251,17 +1266,22 @@ impl PetWorld {
         }
     }
 
-    /// Reads the glyphs of the window about the body the pane's rows `keep` ask for
-    /// (`first..end`, and the body's centre column), or the cells about a flight's `landing`,
-    /// where the caret's window reads `coverage` ([`body_window_about`], [`Self::body_window`]),
-    /// counted with the cells it examined ([`Self::examined_cells`]).
+    /// Reads the window about the body the pane's rows `keep` ask for (`first..end`, and the
+    /// body's centre column), or the cells about a flight's `landing`, where the caret's window
+    /// reads `coverage` ([`body_window_about`], [`Self::body_window`]): its glyphs, and its cells
+    /// classified as the caret's window classifies its own ([`read_cell`], [`BodyCells`]) under
+    /// the host's `reserve`, its chrome, overlays, typed glyphs and blanked glass, as that window
+    /// reads them; its glyphs alone where the console asks for no more
+    /// ([`Self::read_the_bodys_ground`]). Counted with the cells it examined
+    /// ([`Self::examined_cells`]).
     fn read_body(
         &mut self,
         input: &RenderInput,
         pane: PetPane,
-        blanked: &[PetRect],
+        reserve: PetReserve<'_>,
         (keep, landing): (Option<(usize, usize, usize)>, Option<PetPane>),
     ) {
+        const STRIDE: usize = MAX_WORLD_COLS + 1;
         let body = body_window_about(pane, self.coverage, keep, landing);
         if body.rows == 0 {
             return;
@@ -1271,53 +1291,184 @@ impl PetWorld {
             self.body_glyphs
                 .resize(MAX_BODY_ROWS * MAX_WORLD_COLS, None);
         }
-        let implicit = RenderCell::default();
-        let mut spans_buf = [(0, 0); MAX_REGIONS];
+        let ground = self.body_ground;
+        let any_selection = input.any_selection();
+        let track_ground = any_selection || !reserve.overlays.is_empty();
+        let glyphs = &mut self.body_glyphs;
+        let cells = &mut self.body_cells;
+        cells.read = ground;
+        cells.ground_split = false;
+        if ground {
+            if cells.blocked.is_empty() {
+                cells.blocked.resize(BODY_PREFIX_LEN, 0);
+                cells.protected.resize(BODY_PREFIX_LEN, 0);
+            }
+            cells.blocked[..=cols].fill(0);
+            cells.protected[..=cols].fill(0);
+        }
+        let (mut n_carets, mut n_ground_carets) = (0usize, 0usize);
+        let mut implicit = Implicit::new(input.default_bg);
+        let mut bufs = [[(0, 0); MAX_REGIONS]; 4];
         let mut r = 0;
         while r < body.rows {
             let local_r = first + r;
             let frame_r = pane.row + local_r;
-            let out = &mut self.body_glyphs[r * MAX_WORLD_COLS..r * MAX_WORLD_COLS + cols];
+            let prefix_row = (r + 1) * STRIDE;
+            let out = &mut glyphs[r * MAX_WORLD_COLS..r * MAX_WORLD_COLS + cols];
+            let (mut row_blocked, mut row_protected) = (0u16, 0u16);
+            let (mut row_ground_blocked, mut row_ground_protected) = (0u16, 0u16);
+            if ground {
+                cells.blocked[prefix_row] = 0;
+                cells.protected[prefix_row] = 0;
+                if cells.ground_split {
+                    cells.ground_blocked[prefix_row] = 0;
+                    cells.ground_protected[prefix_row] = 0;
+                }
+            }
             let Some(row) = input.cells.get(frame_r) else {
                 out.fill(None);
+                if ground {
+                    let mut c = 0;
+                    while c < cols {
+                        let index = prefix_row + c + 1;
+                        row_blocked += 1;
+                        row_protected += 1;
+                        cells.blocked[index] = cells.blocked[index - STRIDE] + row_blocked;
+                        cells.protected[index] = cells.protected[index - STRIDE] + row_protected;
+                        if cells.ground_split {
+                            row_ground_blocked += 1;
+                            row_ground_protected += 1;
+                            cells.ground_blocked[index] =
+                                cells.ground_blocked[index - STRIDE] + row_ground_blocked;
+                            cells.ground_protected[index] =
+                                cells.ground_protected[index - STRIDE] + row_ground_protected;
+                        }
+                        c += 1;
+                    }
+                }
                 r += 1;
                 continue;
             };
-            let mut n_spans = 0;
-            for &rect in blanked {
-                if let Some(span) = exclusion_span(rect, local_r, pane.cols) {
-                    spans_buf[n_spans] = span;
-                    n_spans += 1;
+            let mut lens = [0usize; 4];
+            for (k, rects) in [
+                reserve.protected,
+                reserve.overlays,
+                reserve.ink,
+                reserve.blanked,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                for &rect in rects {
+                    if let Some(span) = exclusion_span(rect, local_r, pane.cols) {
+                        bufs[k][lens[k]] = span;
+                        lens[k] += 1;
+                    }
                 }
             }
-            let spans = &spans_buf[..n_spans];
+            let [protected, overlays, typed, blanked] = &bufs;
+            let row_reserve = RowReserve {
+                protected: &protected[..lens[0]],
+                overlays: &overlays[..lens[1]],
+                typed: &typed[..lens[2]],
+                blanked: &blanked[..lens[3]],
+            };
             let mut scan = RowScan::new(input, frame_r);
+            let caret_row_near = input.cursor_visible
+                && input.display_offset == 0
+                && frame_r.abs_diff(input.cursor_row) <= 1;
             let mut before = None;
             let mut c = 0;
             while c < cols {
                 let local_c = col + c;
                 let frame_c = pane.col + local_c;
-                let glass_blank = span_contains(spans, local_c);
-                let cell = match row.get(frame_c) {
-                    Some(cell) if !glass_blank => cell,
-                    _ => &implicit,
-                };
-                let read = read_glyph(
+                let read = read_cell(
                     &mut scan,
-                    (input, row.as_slice(), &implicit),
-                    cell,
-                    (c, cols, frame_c),
-                    (glass_blank, span_contains(spans, local_c + 1)),
+                    (input, row.as_slice(), &mut implicit),
+                    (frame_c, local_c),
+                    (c, cols),
+                    (row_reserve, any_selection, caret_row_near),
                     before,
                 );
-                out[c] = read.class;
-                before = read.class;
+                out[c] = read.glyph.class;
+                before = read.glyph.class;
+                if ground {
+                    let painted = read.painted();
+                    if read.cursor
+                        && !(read.lasting || read.transient)
+                        && n_carets < cells.carets.len()
+                    {
+                        cells.carets[n_carets] = CaretCell {
+                            row: r,
+                            col: c,
+                            blank: !painted,
+                        };
+                        n_carets += 1;
+                    }
+                    let class = read.class();
+                    let (prev_row_blocked, prev_row_protected) = (row_blocked, row_protected);
+                    let index = prefix_row + c + 1;
+                    row_blocked += u16::from(class != PetCell::Clear);
+                    row_protected +=
+                        u16::from(matches!(class, PetCell::Unknown | PetCell::Protected));
+                    cells.blocked[index] = cells.blocked[index - STRIDE] + row_blocked;
+                    cells.protected[index] = cells.protected[index - STRIDE] + row_protected;
+                    if track_ground {
+                        if read.cursor
+                            && read.transient
+                            && !read.lasting
+                            && n_ground_carets < cells.ground_carets.len()
+                        {
+                            cells.ground_carets[n_ground_carets] = CaretCell {
+                                row: r,
+                                col: c,
+                                blank: !painted,
+                            };
+                            n_ground_carets += 1;
+                        }
+                        if read.transient && !cells.ground_split {
+                            cells.ground_split = true;
+                            if cells.ground_blocked.is_empty() {
+                                cells.ground_blocked.resize(BODY_PREFIX_LEN, 0);
+                                cells.ground_protected.resize(BODY_PREFIX_LEN, 0);
+                            }
+                            cells.ground_blocked[..index].copy_from_slice(&cells.blocked[..index]);
+                            cells.ground_protected[..index]
+                                .copy_from_slice(&cells.protected[..index]);
+                            row_ground_blocked = prev_row_blocked;
+                            row_ground_protected = prev_row_protected;
+                        }
+                        if cells.ground_split {
+                            let ground_class = read.ground_class();
+                            row_ground_blocked += u16::from(ground_class != PetCell::Clear);
+                            row_ground_protected += u16::from(matches!(
+                                ground_class,
+                                PetCell::Unknown | PetCell::Protected
+                            ));
+                            cells.ground_blocked[index] =
+                                cells.ground_blocked[index - STRIDE] + row_ground_blocked;
+                            cells.ground_protected[index] =
+                                cells.ground_protected[index - STRIDE] + row_ground_protected;
+                        }
+                    }
+                }
                 c += 1;
             }
             r += 1;
         }
+        cells.carets_len = n_carets as u8;
+        cells.ground_carets_len = n_ground_carets as u8;
         self.examined_cells += body.rows * cols;
         self.body = body;
+    }
+
+    /// Whether the window about the body ([`Self::body_window`]) reads its cells' ground as well
+    /// as its glyphs from the next observation on ([`BodyCells`]): the console's, so that its
+    /// verdicts on the body read where it is drawn ([`Self::clearance_on`]). `false` reads its
+    /// glyphs alone ([`crate::kitty_pet::OldPath::BodysWindowReadsItsGround`] reverted).
+    #[inline]
+    pub(crate) const fn read_the_bodys_ground(&mut self, on: bool) {
+        self.body_ground = on;
     }
 
     /// Actual glyph/decorated-cell occupancy, independent of caret/selection protection.
@@ -1512,12 +1663,7 @@ impl PetWorld {
     #[inline]
     #[must_use]
     pub const fn clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
-        self.clearance_in(
-            self.blocked_prefix.as_slice(),
-            Forgive::Nothing,
-            rect,
-            margin,
-        )
+        self.clearance_in(Plane::Blocked, Forgive::Nothing, rect, margin)
     }
 
     /// [`Self::clearance`] for a resident admitted behind ordinary text.
@@ -1525,12 +1671,7 @@ impl PetWorld {
     #[must_use]
     /// [`Self::clearance`] admitting ordinary text (`Clear` or `UnderText`).
     pub const fn under_text_clearance(&self, rect: PetRect, margin: f32) -> Option<bool> {
-        self.clearance_in(
-            self.protected_prefix.as_slice(),
-            Forgive::Nothing,
-            rect,
-            margin,
-        )
+        self.clearance_in(Plane::Protected, Forgive::Nothing, rect, margin)
     }
 
     /// As [`Self::clearance`].
@@ -1538,12 +1679,7 @@ impl PetWorld {
     #[must_use]
     /// [`Self::clearance`] ignoring live caret ring cells that would otherwise be clear.
     pub const fn clearance_past_caret(&self, rect: PetRect, margin: f32) -> Option<bool> {
-        self.clearance_in(
-            self.blocked_prefix.as_slice(),
-            Forgive::BlankCaret,
-            rect,
-            margin,
-        )
+        self.clearance_in(Plane::Blocked, Forgive::BlankCaret, rect, margin)
     }
 
     /// [`Self::clearance_past_caret`] as a two-valued, fail-closed answer.
@@ -1564,12 +1700,7 @@ impl PetWorld {
         rect: PetRect,
         margin: f32,
     ) -> Option<bool> {
-        self.clearance_in(
-            self.protected_prefix.as_slice(),
-            Forgive::AnyCaret,
-            rect,
-            margin,
-        )
+        self.clearance_in(Plane::Protected, Forgive::AnyCaret, rect, margin)
     }
 
     /// [`Self::under_text_clearance_past_caret`] over the part of `rect` this map sees.
@@ -1608,12 +1739,12 @@ impl PetWorld {
     #[inline]
     const fn clearance_in(
         &self,
-        prefix: &[u16],
+        plane: Plane,
         forgive: Forgive,
         rect: PetRect,
         margin: f32,
     ) -> Option<bool> {
-        self.clearance_on(prefix, false, forgive, rect, margin)
+        self.clearance_on(plane, false, forgive, rect, margin)
     }
 
     #[inline]
@@ -1637,49 +1768,31 @@ impl PetWorld {
         r1: usize,
         c1: usize,
     ) -> usize {
-        if matches!(forgive, Forgive::Nothing) {
-            return 0;
+        let window = (r0, c0, r1, c1);
+        forgiven_in(
+            &self.caret_cells,
+            self.caret_cells_len as usize,
+            forgive,
+            window,
+        ) + if ground && self.ground_split {
+            forgiven_in(
+                &self.ground_caret_cells,
+                self.ground_caret_cells_len as usize,
+                forgive,
+                window,
+            )
+        } else {
+            0
         }
-        let any_caret = matches!(forgive, Forgive::AnyCaret);
-        let mut count = 0;
-        let len = self.caret_cells_len as usize;
-        let mut i = 0;
-        while i < len {
-            let cell = self.caret_cells[i];
-            if (any_caret || cell.blank)
-                && cell.row >= r0
-                && cell.row < r1
-                && cell.col >= c0
-                && cell.col < c1
-            {
-                count += 1;
-            }
-            i += 1;
-        }
-        if ground && self.ground_split {
-            let glen = self.ground_caret_cells_len as usize;
-            let mut j = 0;
-            while j < glen {
-                let cell = self.ground_caret_cells[j];
-                if (any_caret || cell.blank)
-                    && cell.row >= r0
-                    && cell.row < r1
-                    && cell.col >= c0
-                    && cell.col < c1
-                {
-                    count += 1;
-                }
-                j += 1;
-            }
-        }
-        count
     }
 
-    /// [`Self::clearance_in`] on the live plane, or (`ground`) the ground plane.
+    /// [`Self::clearance_in`] on the live plane, or (`ground`) the ground plane: read in the
+    /// caret's window ([`Self::coverage`]) where it reads the rectangle and its margin whole, else
+    /// in the window about the body where that reads them whole ([`Self::body_clearance`]).
     #[inline]
     const fn clearance_on(
         &self,
-        prefix: &[u16],
+        plane: Plane,
         ground: bool,
         forgive: Forgive,
         rect: PetRect,
@@ -1690,8 +1803,20 @@ impl PetWorld {
         }
         match self.window(rect, margin) {
             Window::Degenerate => Some(false),
-            Window::Outside => None,
+            Window::Outside => self.body_clearance(plane, ground, forgive, rect, margin),
             Window::Cells(r0, c0, r1, c1) => {
+                let (blocked, protected) = if ground {
+                    self.ground_prefixes()
+                } else {
+                    (
+                        self.blocked_prefix.as_slice(),
+                        self.protected_prefix.as_slice(),
+                    )
+                };
+                let prefix = match plane {
+                    Plane::Blocked => blocked,
+                    Plane::Protected => protected,
+                };
                 let blocked = self.blocked(prefix, r0, c0, r1, c1) as usize;
                 if blocked == 0
                     || matches!(forgive, Forgive::Nothing)
@@ -1705,42 +1830,64 @@ impl PetWorld {
         }
     }
 
+    /// [`Self::clearance_on`] where the caret's window does not read the rectangle and its margin
+    /// whole: read in the window about the body ([`Self::body_window`]) where it reads them whole
+    /// and has read its cells ([`BodyCells`]), as the caret's window reads its own, the live
+    /// caret's ring cells in it forgiven as `forgive` says; `None` elsewhere, a cell neither
+    /// window reads being no cell read. On a pane within the map's budget the caret's window
+    /// reads every cell and this reads none.
+    #[inline]
+    const fn body_clearance(
+        &self,
+        plane: Plane,
+        ground: bool,
+        forgive: Forgive,
+        rect: PetRect,
+        margin: f32,
+    ) -> Option<bool> {
+        let cells = &self.body_cells;
+        if !cells.read {
+            return None;
+        }
+        let Window::Cells(r0, c0, r1, c1) = window_in(self.body, rect, margin) else {
+            return None;
+        };
+        let split = ground && cells.ground_split;
+        let prefix = match (plane, split) {
+            (Plane::Blocked, false) => cells.blocked.as_slice(),
+            (Plane::Protected, false) => cells.protected.as_slice(),
+            (Plane::Blocked, true) => cells.ground_blocked.as_slice(),
+            (Plane::Protected, true) => cells.ground_protected.as_slice(),
+        };
+        let blocked = self.blocked(prefix, r0, c0, r1, c1) as usize;
+        let carets = cells.carets_len as usize
+            + if split {
+                cells.ground_carets_len as usize
+            } else {
+                0
+            };
+        if blocked == 0 || matches!(forgive, Forgive::Nothing) || blocked > carets {
+            return Some(blocked == 0);
+        }
+        let window = (r0, c0, r1, c1);
+        let forgiven = forgiven_in(&cells.carets, cells.carets_len as usize, forgive, window)
+            + if split {
+                forgiven_in(
+                    &cells.ground_carets,
+                    cells.ground_carets_len as usize,
+                    forgive,
+                    window,
+                )
+            } else {
+                0
+            };
+        Some(blocked == forgiven)
+    }
+
     /// The half-open map-local cell window a rectangle and its margin touch.
     #[inline]
     const fn window(&self, rect: PetRect, margin: f32) -> Window {
-        if !rect.valid() || !margin.is_finite() || margin < 0.0 {
-            return Window::Degenerate;
-        }
-        let (r0, c0) = (
-            rect.row - margin + EDGE_SLACK,
-            rect.col - margin + EDGE_SLACK,
-        );
-        let (r1, c1) = (
-            rect.row + rect.rows + margin - EDGE_SLACK,
-            rect.col + rect.cols + margin - EDGE_SLACK,
-        );
-        if !r1.is_finite() || !c1.is_finite() {
-            return Window::Degenerate;
-        }
-        if r0 < self.coverage.row as f32
-            || c0 < self.coverage.col as f32
-            || r1 > (self.coverage.row + self.coverage.rows) as f32
-            || c1 > (self.coverage.col + self.coverage.cols) as f32
-        {
-            return Window::Outside;
-        }
-        let (r0, c0) = (r0.floor() as usize, c0.floor() as usize);
-        // A valid rectangle touches at least the cell it starts in, however thin.
-        let r1_ceil = r1.ceil() as usize;
-        let r1 = if r1_ceil > r0 { r1_ceil } else { r0 + 1 };
-        let c1_ceil = c1.ceil() as usize;
-        let c1 = if c1_ceil > c0 { c1_ceil } else { c0 + 1 };
-        Window::Cells(
-            r0 - self.coverage.row,
-            c0 - self.coverage.col,
-            r1 - self.coverage.row,
-            c1 - self.coverage.col,
-        )
+        window_in(self.coverage, rect, margin)
     }
 
     /// Cells the supplied prefix table counts in a map-local window.
@@ -1792,13 +1939,7 @@ impl PetWorld {
     /// [`Self::clear`] on the ground plane (ignoring live selection and transient overlays).
     pub const fn ground_clear(&self, rect: PetRect, margin: f32) -> bool {
         matches!(
-            self.clearance_on(
-                self.ground_prefixes().0,
-                true,
-                Forgive::Nothing,
-                rect,
-                margin,
-            ),
+            self.clearance_on(Plane::Blocked, true, Forgive::Nothing, rect, margin),
             Some(true)
         )
     }
@@ -1812,13 +1953,7 @@ impl PetWorld {
         rect: PetRect,
         margin: f32,
     ) -> Option<bool> {
-        self.clearance_on(
-            self.ground_prefixes().1,
-            true,
-            Forgive::AnyCaret,
-            rect,
-            margin,
-        )
+        self.clearance_on(Plane::Protected, true, Forgive::AnyCaret, rect, margin)
     }
 
     /// THE GROUND UNDER A CAT ([`Self::under_text_clearance_past_caret`]).
@@ -3281,6 +3416,154 @@ fn read_glyph(
     }
 }
 
+/// The cell a frame's row reads where the frame holds none there or the host blanks it
+/// ([`PetReserve::blanked`]): a blank on the row's live default background.
+struct Implicit {
+    bg: u32,
+    cell: RenderCell,
+}
+
+impl Implicit {
+    #[inline]
+    fn new(bg: u32) -> Self {
+        Self {
+            bg,
+            cell: RenderCell {
+                bg: [(bg >> 16) as u8, (bg >> 8) as u8, bg as u8],
+                ..RenderCell::default()
+            },
+        }
+    }
+
+    /// The implicit cell on the default background `bg`.
+    #[inline]
+    const fn on(&mut self, bg: u32) -> &RenderCell {
+        if self.bg != bg {
+            self.bg = bg;
+            self.cell.bg = [(bg >> 16) as u8, (bg >> 8) as u8, bg as u8];
+        }
+        &self.cell
+    }
+}
+
+/// The host's rectangles ([`PetReserve`]) across one pane row, as the pane-local column spans
+/// they cover there ([`exclusion_span`]): its chrome, its transient overlays, the person's typed
+/// glyphs, and the glass it blanks.
+#[derive(Clone, Copy)]
+struct RowReserve<'s> {
+    protected: &'s [(usize, usize)],
+    overlays: &'s [(usize, usize)],
+    typed: &'s [(usize, usize)],
+    blanked: &'s [(usize, usize)],
+}
+
+/// What the map reads of one cell of a frame's row ([`read_cell`]), in the caret's window and in
+/// the window about the body alike.
+#[derive(Clone, Copy)]
+struct CellRead {
+    /// Its glyph ([`read_glyph`]).
+    glyph: GlyphRead,
+    /// It draws [`RULE_STROKE`].
+    stroke: bool,
+    /// The selection holds it.
+    selected: bool,
+    /// The live caret's 3x3 ring holds it.
+    cursor: bool,
+    /// What protects it for good: a line drawn other than single-width, the host's chrome, an
+    /// image.
+    lasting: bool,
+    /// What protects it for now: the selection, the host's transient overlays.
+    transient: bool,
+    /// Ink of a row's hull: a glyph that is no speck, a coloured background, a typed glyph.
+    hull_ink: bool,
+}
+
+impl CellRead {
+    /// Whether it shows anything at all: hull ink or a speck.
+    #[inline]
+    const fn painted(self) -> bool {
+        self.hull_ink || self.glyph.speck
+    }
+
+    /// Its class on the live plane.
+    #[inline]
+    const fn class(self) -> PetCell {
+        if self.lasting || self.transient || self.cursor {
+            PetCell::Protected
+        } else if self.painted() {
+            PetCell::Ink
+        } else {
+            PetCell::Clear
+        }
+    }
+
+    /// Its class on the GROUND PLANE, which no transient protection reaches.
+    #[inline]
+    const fn ground_class(self) -> PetCell {
+        if self.lasting || self.cursor {
+            PetCell::Protected
+        } else if self.painted() {
+            PetCell::Ink
+        } else {
+            PetCell::Clear
+        }
+    }
+}
+
+/// What the map reads of the frame's cell at its column `frame_c` (the pane's `local_c`) on the
+/// row `scan` reads, `row`'s cells: the window's column `c` of `cols`, `implicit` the cell that
+/// stands in where the frame holds none or the host blanks it, `reserve` the host's spans on the
+/// row, `any_selection` whether the frame selects anything, `caret_row_near` whether the live
+/// caret's ring reaches the row, and `before` what the window read of the cell before it.
+#[inline]
+fn read_cell(
+    scan: &mut RowScan<'_>,
+    (input, row, implicit): (&RenderInput, &[RenderCell], &mut Implicit),
+    (frame_c, local_c): (usize, usize),
+    (c, cols): (usize, usize),
+    (reserve, any_selection, caret_row_near): (RowReserve<'_>, bool, bool),
+    before: Option<PetGlyph>,
+) -> CellRead {
+    let frame_r = scan.row;
+    let default_bg = scan.default_bg(frame_c);
+    let implicit = implicit.on(default_bg);
+    // Glass the host blanks after this look ([`PetReserve::blanked`]) shows none of the
+    // program's ink under it: the pet reads the blank the person will see.
+    let glass_blank = span_contains(reserve.blanked, local_c);
+    let cell = match row.get(frame_c) {
+        Some(c) if !glass_blank => c,
+        _ => implicit,
+    };
+    let selected = any_selection
+        && input.selection_contains_cell(
+            frame_r,
+            frame_c,
+            matches!(row.get(frame_c + 1), Some(n) if n.wide),
+            cell.wide,
+        );
+    let glyph = read_glyph(
+        scan,
+        (input, row, implicit),
+        cell,
+        (c, cols, frame_c),
+        (glass_blank, span_contains(reserve.blanked, local_c + 1)),
+        before,
+    );
+    CellRead {
+        glyph,
+        stroke: cell.ch == RULE_STROKE,
+        selected,
+        cursor: caret_row_near && frame_c.abs_diff(input.cursor_col) <= 1,
+        lasting: glyph.line != LineSize::SingleWidth
+            || span_contains(reserve.protected, local_c)
+            || scan.image(frame_c).is_some(),
+        transient: selected || span_contains(reserve.overlays, local_c),
+        hull_ink: (glyph.glyph && !glyph.speck)
+            || (default_bg > 0x00FF_FFFF || cell.bg != implicit.bg)
+            || span_contains(reserve.typed, local_c),
+    }
+}
+
 /// Whether a column `col` lies in one of `spans` (`lo..hi`).
 #[inline]
 const fn span_contains(spans: &[(usize, usize)], col: usize) -> bool {
@@ -3365,6 +3648,70 @@ const fn body_window_about(
         rows: end - first,
         cols,
     }
+}
+
+/// The half-open cell window, local to the window `w`, a rectangle and its margin touch:
+/// [`Window::Outside`] where `w` does not read them all.
+#[inline]
+const fn window_in(w: PetPane, rect: PetRect, margin: f32) -> Window {
+    if !rect.valid() || !margin.is_finite() || margin < 0.0 {
+        return Window::Degenerate;
+    }
+    let (r0, c0) = (
+        rect.row - margin + EDGE_SLACK,
+        rect.col - margin + EDGE_SLACK,
+    );
+    let (r1, c1) = (
+        rect.row + rect.rows + margin - EDGE_SLACK,
+        rect.col + rect.cols + margin - EDGE_SLACK,
+    );
+    if !r1.is_finite() || !c1.is_finite() {
+        return Window::Degenerate;
+    }
+    if r0 < w.row as f32
+        || c0 < w.col as f32
+        || r1 > (w.row + w.rows) as f32
+        || c1 > (w.col + w.cols) as f32
+    {
+        return Window::Outside;
+    }
+    let (r0, c0) = (r0.floor() as usize, c0.floor() as usize);
+    // A valid rectangle touches at least the cell it starts in, however thin.
+    let r1_ceil = r1.ceil() as usize;
+    let r1 = if r1_ceil > r0 { r1_ceil } else { r0 + 1 };
+    let c1_ceil = c1.ceil() as usize;
+    let c1 = if c1_ceil > c0 { c1_ceil } else { c0 + 1 };
+    Window::Cells(r0 - w.row, c0 - w.col, r1 - w.row, c1 - w.col)
+}
+
+/// How many of the first `len` caret ring cells of `carets` lie in the window-local
+/// `[r0..r1, c0..c1)` and `forgive` forgives.
+#[inline]
+const fn forgiven_in(
+    carets: &[CaretCell; 9],
+    len: usize,
+    forgive: Forgive,
+    (r0, c0, r1, c1): (usize, usize, usize, usize),
+) -> usize {
+    if matches!(forgive, Forgive::Nothing) {
+        return 0;
+    }
+    let any_caret = matches!(forgive, Forgive::AnyCaret);
+    let mut count = 0;
+    let mut i = 0;
+    while i < len {
+        let cell = carets[i];
+        if (any_caret || cell.blank)
+            && cell.row >= r0
+            && cell.row < r1
+            && cell.col >= c0
+            && cell.col < c1
+        {
+            count += 1;
+        }
+        i += 1;
+    }
+    count
 }
 
 /// Whether the window `w` reads the pane row `row`'s columns `first..end`, every one of them.
@@ -4441,6 +4788,63 @@ mod tests {
     /// letter at row 62 in the pane's last column is read. On a pane 100 rows by 72 columns,
     /// the caret at row 45 (the caret's window rows 12..76), rows 9..18 read rows 9..12, and rows
     /// 70..82 read rows 76..82.
+    /// The window about the body answers the clearance readers on a pane past the map's rows alone
+    /// ([`PetWorld::body_clearance`]): on panes 80 x 100, 100 x 80 and 160 x 72 (rows by columns),
+    /// the caret four rows short of the foot and the body's rows at the top, outside the caret's
+    /// window, a box on letters there is not clear and one on blank cells is, on the live plane
+    /// and the ground. With the window reading its glyphs alone
+    /// ([`crate::kitty_pet::OldPath::BodysWindowReadsItsGround`] reverted) it reads neither, and
+    /// the ground reader counts neither clear; its glyphs read the same either way.
+    #[test]
+    fn the_window_about_the_body_reads_its_ground_past_the_maps_rows() {
+        for (rows, cols) in [(80, 100), (100, 80), (160, 72)] {
+            let mut term = Terminal::new(rows, cols);
+            term.process(format!("\x1b[4;10Hxyz\x1b[{};40H", rows - 4).as_bytes());
+            let (input, facts) = snapshot(&mut term);
+            let pane = PetPane::full(&input);
+            for ground in [true, false] {
+                let mut world = PetWorld::default();
+                world.read_the_bodys_ground(ground);
+                assert!(world.observe_with_exclusions_near(
+                    &input,
+                    &facts,
+                    pane,
+                    PetReserve::protected(&[]),
+                    (None, Some((0, 10, 12)), None),
+                ));
+                let why = format!("{rows} x {cols}, its ground read {ground}");
+                assert_eq!(
+                    world.coverage(),
+                    PetPane {
+                        row: usize::from(rows) - MAX_WORLD_ROWS,
+                        col: 0,
+                        rows: MAX_WORLD_ROWS,
+                        cols: usize::from(cols)
+                    },
+                    "{why}"
+                );
+                assert_eq!(
+                    world.body_window(),
+                    PetPane {
+                        row: 0,
+                        col: 0,
+                        rows: 10,
+                        cols: usize::from(cols)
+                    },
+                    "{why}"
+                );
+                let on = PetRect::new(2.0, 9.0, 2.0, 3.0);
+                let clear = PetRect::new(5.0, 20.0, 2.0, 3.0);
+                let read = |clear: bool| ground.then_some(clear);
+                assert_eq!(world.clearance(on, 0.0), read(false), "{why}");
+                assert_eq!(world.clearance(clear, 0.0), read(true), "{why}");
+                assert!(!world.ground_clear(on, 0.0), "{why}");
+                assert_eq!(world.ground_clear(clear, 0.0), ground, "{why}");
+                assert_eq!(world.locomotion_ink_in_span(3, 9, 12), Some(true), "{why}");
+            }
+        }
+    }
+
     #[test]
     fn the_window_about_the_body_reads_its_rows_past_the_maps_columns() {
         let mut term = Terminal::new(100, 300);

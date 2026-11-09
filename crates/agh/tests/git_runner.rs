@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use agh::config::{self, Dirs};
 use agh::fx::Fx;
-use agh::fx::child::ChildSpec;
+use agh::fx::child::{ChildOut, ChildSpec};
 use agh::git::{FetchBatch, FetchRow, GitRun, HelperCommand};
 use agh::identity::MapEnv;
 use agh::policy::{Named, RefusalCode, Router};
@@ -127,8 +127,9 @@ fn native_cli_stop(ancestry: bool) {
         let pid = std::fs::read_to_string(&marker)
             .expect("actual Git started")
             .trim()
-            .parse::<u32>()
+            .parse::<i32>()
             .expect("Git pid");
+        let git_identity = aterm_uds::process::read_identity(pid).expect("running Git identity");
         fixture.child.terminate().expect("TERM only the actual CLI");
         let until = Instant::now() + Duration::from_secs(60);
         let status = loop {
@@ -138,15 +139,32 @@ fn native_cli_stop(ancestry: bool) {
             assert!(Instant::now() < until, "CLI stop hang detector");
             std::thread::sleep(Duration::from_millis(10));
         };
-        let git_alive_at_return = aterm_uds::process::pid_alive(pid);
+        let git_identity_at_return = aterm_uds::process::read_identity(pid);
+        let git_presence_at_return = aterm_uds::process::process_presence(pid);
+        let git_reaped_at_return = git_identity_at_return
+            .is_some_and(|current| current != git_identity)
+            || git_presence_at_return == aterm_uds::process::ProcessPresence::Absent;
         std::fs::write(&fixture.release, b"release").expect("cooperative fixture cleanup");
+        let git_no_longer_runs = || {
+            let identity = aterm_uds::process::read_identity(pid);
+            let presence = aterm_uds::process::process_presence(pid);
+            identity.is_some_and(|current| current != git_identity)
+                || matches!(
+                    presence,
+                    aterm_uds::process::ProcessPresence::Exited
+                        | aterm_uds::process::ProcessPresence::Absent
+                )
+        };
         let until = Instant::now() + Duration::from_secs(60);
-        while aterm_uds::process::pid_alive(pid) && Instant::now() < until {
+        while !git_no_longer_runs() && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(!aterm_uds::process::pid_alive(pid), "fixture ended");
+        assert!(git_no_longer_runs(), "fixture ended");
         assert_eq!(status.code(), Some(130));
-        assert!(!git_alive_at_return, "Git retired before CLI return");
+        assert!(
+            git_reaped_at_return,
+            "Git was positively reaped before CLI return: {git_presence_at_return:?} {git_identity_at_return:?}"
+        );
     }
 }
 
@@ -2506,6 +2524,45 @@ fn a_fetch_accepts_benign_main_and_linked_worktree_config() {
 }
 
 #[test]
+fn a_fetch_refuses_http_routing_and_auth_in_shared_worktree_config() {
+    let world = World::canonical("git-fetch-shared-http-screen");
+    let (gh, _bare, main, linked) = configured_worktrees(&world);
+    let slug = common::slug("fixture-dev/app");
+    let before = [&main, &linked].map(|dir| host_git(dir, &["for-each-ref"]));
+    for (key, value) in [
+        ("http.proxy", "http://127.0.0.1:1"),
+        ("http.extraHeader", "Authorization: Fixture shared"),
+        ("http.sslCAInfo", "/nowhere"),
+        ("http.curloptResolve", "github.com:443:127.0.0.1"),
+    ] {
+        host_git(&main, &["config", "--local", "--no-includes", key, value]);
+        for (index, dir) in [&main, &linked].into_iter().enumerate() {
+            for operation in [GitRun::check_local(&slug, dir), GitRun::fetch(&slug, dir)] {
+                let error = gh
+                    .run_git(&operation)
+                    .expect_err("shared HTTP routing or authentication config")
+                    .into_data();
+                assert_eq!(error.kind, Kind::Refused, "{key}: {}", error.why);
+                assert_eq!(
+                    error.sub,
+                    Sub::GitConfig {
+                        key: "http.*".to_string()
+                    },
+                    "{key}"
+                );
+            }
+            assert_eq!(
+                host_git(dir, &["for-each-ref"]),
+                before[index],
+                "{key} moved {}'s refs",
+                dir.display()
+            );
+        }
+        host_git(&main, &["config", "--local", "--unset-all", key]);
+    }
+}
+
+#[test]
 fn a_fetch_refuses_rewrites_in_each_worktree_config_without_following_includes() {
     let world = World::canonical("git-fetch-worktree-screen");
     let (gh, _bare, main, linked) = configured_worktrees(&world);
@@ -3810,6 +3867,210 @@ fn runs_agh_s_helper(spec: &ChildSpec) -> bool {
             && env_of(spec, &format!("GIT_CONFIG_VALUE_{i}"))
                 .is_some_and(|value| value.to_string_lossy().contains("auth git-credential"))
     })
+}
+
+fn git_answer(code: i32, stdout: &[u8], stderr: &str) -> ChildOut {
+    ChildOut {
+        code: Some(code),
+        stdout: stdout.to_vec(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+fn scripted_anonymous_git(world: &World, answers: Vec<ChildOut>) -> (Github, Arc<Fx>) {
+    let fx = Arc::new(Fx::simulated(live_start()).with_git_answers_for_tests(answers));
+    let gh = git_builder(
+        Router::empty(),
+        common::endpoints(&world.fake),
+        &world.dirs,
+        git_env(),
+        live_start(),
+    )
+    .retry(RetryPolicy::STANDARD)
+    .fx(fx.clone())
+    .build();
+    (gh, fx)
+}
+
+#[test]
+fn anonymous_git_two_504s_then_success_logs_each_retry() {
+    let world = World::canonical("git-retry-504");
+    let transient = "error: RPC failed; HTTP 504 curl 22 The requested URL returned error: 504\n";
+    let (gh, fx) = scripted_anonymous_git(
+        &world,
+        vec![
+            git_answer(128, b"", transient),
+            git_answer(128, b"", transient),
+            git_answer(0, b"abc\trefs/heads/main\n", ""),
+        ],
+    );
+    let out = gh
+        .run_git(&GitRun::public_refs(&common::slug("fixture-anon/app")))
+        .expect("the third smart-HTTP read succeeds");
+    assert!(out.stdout.contains("refs/heads/main"));
+    assert_eq!(fx.children_run().len(), 3);
+    assert_eq!(fx.retry_notes().len(), 2);
+    assert!(
+        fx.retry_notes()
+            .iter()
+            .all(|note| note.contains("HTTP 504"))
+    );
+    for spec in fx.children_run() {
+        let progress = spec
+            .progress
+            .as_ref()
+            .expect("anonymous network reads use an inactivity bound");
+        assert_eq!(progress.window, Duration::from_secs(60));
+        assert!(
+            progress
+                .waiting_on
+                .starts_with("git ls-remote fixture-anon/app"),
+            "{}",
+            progress.waiting_on
+        );
+        assert_eq!(
+            env_of(&spec, "GIT_TRACE_CURL_NO_DATA").map(OsString::as_os_str),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            env_of(&spec, "GIT_TRACE_REDACT").map(OsString::as_os_str),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert!(env_of(&spec, "GIT_TRACE_CURL").is_some());
+    }
+}
+
+/// A clone attempt owns a private sibling stage. Retrying clears only that stage and success
+/// publishes it once. NEGATIVE CONTROL: handing Git the caller destination makes both captured
+/// targets equal `destination` and fails this test.
+#[test]
+fn anonymous_clone_retries_in_a_task_owned_stage_then_publishes() {
+    let world = World::canonical("git-clone-retry-stage");
+    let transient = "error: RPC failed; HTTP 504 curl 22 The requested URL returned error: 504\n";
+    let (gh, fx) = scripted_anonymous_git(
+        &world,
+        vec![git_answer(128, b"", transient), git_answer(0, b"", "")],
+    );
+    let destination = world.path().join("destination");
+
+    gh.run_git(&GitRun::new_clone(
+        &common::slug("fixture-anon/app"),
+        &destination,
+    ))
+    .expect("the retried clone publishes its stage");
+
+    let children = fx.children_run();
+    assert_eq!(children.len(), 2);
+    let targets: Vec<PathBuf> = children
+        .iter()
+        .map(|spec| PathBuf::from(spec.args.last().expect("clone destination").as_os_str()))
+        .collect();
+    assert_eq!(targets[0], targets[1], "one owned stage spans the retries");
+    assert_ne!(targets[0], destination, "Git never writes the caller path");
+    assert_eq!(targets[0].parent(), destination.parent());
+    assert!(
+        destination.is_dir(),
+        "success atomically published the stage"
+    );
+    assert!(!targets[0].exists(), "the staging name moved into place");
+    assert_eq!(fx.retry_notes().len(), 1);
+}
+
+/// The automatic progress window is confined to credential-free network reads. A routed read
+/// keeps the caller's wall bound, which also remains the credential grant lifetime.
+#[test]
+fn authenticated_git_keeps_its_wall_bound() {
+    let world = World::canonical("git-authenticated-wall-bound");
+    let fx = Arc::new(
+        Fx::simulated(live_start()).with_git_answers_for_tests(vec![git_answer(
+            0,
+            b"abc\trefs/heads/main\n",
+            "",
+        )]),
+    );
+    let gh = git_builder(
+        world.router.clone(),
+        common::endpoints(&world.fake),
+        &world.dirs,
+        git_env(),
+        live_start(),
+    )
+    .fx(fx.clone())
+    .build();
+    let wall = Duration::from_secs(4 * 60 * 60);
+    gh.run_git(&GitRun::ls_remote(&common::slug("fixture-dev/app"), None).with_budget(wall))
+        .expect("the routed read succeeds");
+
+    let children = fx.children_run();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].budget, wall);
+    assert_eq!(children[0].progress, None);
+}
+
+#[test]
+fn anonymous_git_404_is_final_and_does_not_consume_the_next_answer() {
+    let world = World::canonical("git-retry-404");
+    let (gh, fx) = scripted_anonymous_git(
+        &world,
+        vec![
+            git_answer(
+                128,
+                b"",
+                "fatal: unable to access 'https://github.com/x/y.git/': The requested URL returned error: 404\n",
+            ),
+            git_answer(0, b"abc\trefs/heads/main\n", ""),
+        ],
+    );
+    let error = gh
+        .run_git(&GitRun::public_refs(&common::slug("fixture-anon/app")))
+        .expect_err("404 is final");
+    assert_eq!(error.kind, Kind::CouldNotRun);
+    assert_eq!(fx.children_run().len(), 1);
+    assert_eq!(fx.git_answers_remaining_for_tests(), Some(1));
+    assert!(fx.retry_notes().is_empty());
+}
+
+#[test]
+fn anonymous_git_endless_5xx_stops_at_and_names_the_shared_bound() {
+    let world = World::canonical("git-retry-bound");
+    let transient = "error: RPC failed; HTTP 503 curl 22 The requested URL returned error: 503\n";
+    let mut answers = vec![git_answer(128, b"", transient); 19];
+    answers.push(git_answer(0, b"abc\trefs/heads/main\n", ""));
+    let (gh, fx) = scripted_anonymous_git(&world, answers);
+    let error = gh
+        .run_git(&GitRun::public_refs(&common::slug("fixture-anon/app")))
+        .expect_err("the bound stops an endless outage");
+    assert!(
+        error
+            .why
+            .contains("19 attempts / 200s total retry-pause bound"),
+        "{}",
+        error.why
+    );
+    assert_eq!(fx.children_run().len(), 19);
+    assert_eq!(fx.git_answers_remaining_for_tests(), Some(1));
+    assert_eq!(fx.retry_notes().len(), 18);
+}
+
+#[test]
+fn anonymous_git_connection_reset_is_transient() {
+    let world = World::canonical("git-retry-reset");
+    let (gh, fx) = scripted_anonymous_git(
+        &world,
+        vec![
+            git_answer(
+                128,
+                b"",
+                "error: RPC failed; curl 56 Recv failure: Connection reset by peer\n",
+            ),
+            git_answer(0, b"abc\trefs/heads/main\n", ""),
+        ],
+    );
+    gh.run_git(&GitRun::public_refs(&common::slug("fixture-anon/app")))
+        .expect("the reset is retried");
+    assert_eq!(fx.children_run().len(), 2);
+    assert_eq!(fx.retry_notes().len(), 1);
+    assert!(fx.retry_notes()[0].contains("connection reset"));
 }
 
 /// An anonymous run gets no helper of agh's, only the reset of every other helper, so nothing

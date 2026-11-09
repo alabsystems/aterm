@@ -883,7 +883,7 @@ fn a_credentialed_recording_keeps_its_timeout() {
     for (n, (line, backstop)) in [
         (
             &["--timeout", "1s", "repo", "view", APP][..],
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
         ),
         (&["repo", "view", APP][..], Deadlines::JSON.backstop),
         (

@@ -2914,7 +2914,7 @@ pub(crate) fn ignored_key_warnings(source: &str) -> Vec<String> {
     lines
 }
 
-/// [`ignored_key_warnings`] in two halves, from one walk: the band's view (`app_config::collect_key_notices`).
+/// [`ignored_key_warnings`] in two halves, from one walk: the message rows' view (`app_config::collect_key_notices`).
 pub(crate) fn key_warnings(source: &str) -> KeyWarnings {
     let Some(analysis) = key_analysis(source) else {
         return KeyWarnings::default();

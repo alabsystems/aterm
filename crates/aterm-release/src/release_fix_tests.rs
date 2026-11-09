@@ -17,6 +17,11 @@ fn git(repo: &Path, args: &[&str]) -> String {
 fn an_unfetched_fix_is_fetched_before_admission_and_other_fixes_still_refuse() {
     let temp = aterm_tempfile::tempdir().unwrap();
     let root = temp.path();
+    // A fix is admitted onto a release line, which needs a git >= `line::MIN_GIT`: on an older
+    // one the test is COULD NOT RUN, as the line's own tests are, not a failed unwrap.
+    if let Err(stop) = crate::line::git_ready(&GitCli::new(root)) {
+        aterm_spec::host::could_not_run(stop.why);
+    }
     let seed = root.join("seed");
     // The fixture commits under its own identity: a test's scratch HOME has none.
     crate::ledger::testing::init(

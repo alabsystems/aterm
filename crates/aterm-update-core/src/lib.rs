@@ -30,6 +30,7 @@ aterm_durable::plain_durable_flushes_in_tests!();
 
 pub mod cdn;
 pub mod codesign;
+pub mod git_https;
 pub mod github_pages;
 pub mod github_rest;
 /// The successor's signed handoff policy: the release cutter seals it into
@@ -63,11 +64,13 @@ mod sys;
 pub use hash::sha256_file;
 pub use http::{
     CURL_SEAM, DOWNLOAD_STOPPED, FirstHead, HeadAnswer, HttpError, RELEASE_ASSET_DOWNLOAD_BOUND,
-    VendorResponse, download_bytes, download_error_is_local_write, download_error_is_not_found,
-    download_error_is_rate_limit, download_to, download_to_resumable,
-    download_to_resumable_https_only, download_to_resumable_until, head_no_redirect,
-    head_no_redirect_again, head_no_redirect_first, head_no_redirect_quick, note_link_down,
-    vendor_content_length, vendor_download_to, vendor_get, vendor_get_hint,
+    VendorResponse, curl_retry_cause, download_bytes, download_bytes_uncached,
+    download_bytes_uncached_via, download_bytes_with_accept, download_error_is_local_write,
+    download_error_is_not_found, download_error_is_rate_limit, download_to, download_to_resumable,
+    download_to_resumable_https_only, download_to_resumable_https_only_via,
+    download_to_resumable_until, head_no_redirect, head_no_redirect_again, head_no_redirect_first,
+    head_no_redirect_quick, note_link_down, vendor_content_length, vendor_download_to, vendor_get,
+    vendor_get_hint,
 };
 pub use manifest::{Manifest, SUPPORTED_SCHEMA};
 pub use privatedir::ensure_private_dir;

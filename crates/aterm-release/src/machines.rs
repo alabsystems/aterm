@@ -169,7 +169,7 @@ pub(crate) fn roster_lineage_agrees(
 
 /// A web-route answer that means the asset is absent, never a failed route.
 fn is_absent(error: &str) -> bool {
-    error.contains("returned error: 404")
+    aterm_update_core::download_error_is_not_found(error)
 }
 
 /// One anonymous download of `url`, at most `cap` bytes, sending `accept` as its Accept header.
@@ -246,38 +246,16 @@ fn anonymous_fetch(
     cap: usize,
     accept: Option<&str>,
 ) -> std::result::Result<Vec<u8>, String> {
-    let cap_s = cap.to_string();
-    let accept = accept.map(|media| format!("Accept: {media}"));
-    let mut command = aterm_uds::spawnfd::command(aterm_uds::os_path!("curl"));
-    command.args([
-        "-fsSL",
-        "--proto",
-        "=https",
-        "--proto-redir",
-        "=https",
-        "--max-time",
-        "60",
-        "--max-filesize",
-        &cap_s,
-    ]);
-    if let Some(header) = &accept {
-        command.args(["-H", header]);
-    }
-    let out = command
-        .arg(url)
-        .output()
-        .map_err(|e| format!("failed to run curl: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("curl {url}: {}", err.trim()));
-    }
-    if out.stdout.len() > cap {
-        return Err(format!("{url}: exceeded the {cap}-byte cap"));
-    }
-    if out.stdout.is_empty() {
+    let cap = u64::try_from(cap).map_err(|_| format!("{url}: byte cap is too large"))?;
+    let bytes = aterm_update_core::download_bytes_with_accept(
+        url,
+        cap,
+        accept.unwrap_or("application/octet-stream"),
+    )?;
+    if bytes.is_empty() {
         return Err(format!("{url}: zero bytes"));
     }
-    Ok(out.stdout)
+    Ok(bytes)
 }
 
 /// The cut-time gate: prove that `signing_pubkey` belongs to a machine the roster authorizes, and return the attribution the manifest will carry.
@@ -420,10 +398,12 @@ mod tests {
     /// A fetch that answers from `routes` (URL prefix → answer) and records each URL asked.
     fn routed<'a>(
         routes: &'a [(&'a str, std::result::Result<&'a [u8], &'a str>)],
-        asked: &'a std::cell::RefCell<Vec<String>>,
+        asked: &'a std::cell::RefCell<Vec<(String, Option<String>)>>,
     ) -> impl Fn(&str, usize, Option<&str>) -> std::result::Result<Vec<u8>, String> + 'a {
-        move |url, _cap, _accept| {
-            asked.borrow_mut().push(url.to_owned());
+        move |url, _cap, accept| {
+            asked
+                .borrow_mut()
+                .push((url.to_owned(), accept.map(str::to_owned)));
             let (_, answer) = routes
                 .iter()
                 .find(|(prefix, _)| url.starts_with(prefix))
@@ -452,7 +432,14 @@ mod tests {
             latest_asset(&fetch, "o/r", "roster", 64),
             Ok(b"bytes".to_vec())
         );
-        assert_eq!(*asked.borrow(), [WEB, LIST, ASSET]);
+        assert_eq!(
+            *asked.borrow(),
+            [
+                (WEB.to_string(), None),
+                (LIST.to_string(), Some("application/vnd.github+json".into())),
+                (ASSET.to_string(), Some("application/octet-stream".into())),
+            ]
+        );
     }
 
     /// NEGATIVE CONTROL: a 404 is the asset's absence, so the API route is never asked and the
@@ -461,12 +448,12 @@ mod tests {
     fn a_web_route_404_is_absence_and_asks_nothing_more() {
         let asked = std::cell::RefCell::new(Vec::new());
         let fetch = routed(
-            &[(WEB, Err("curl: (22) The requested URL returned error: 404"))],
+            &[(WEB, Err("HTTP 404: the release does not carry this asset"))],
             &asked,
         );
         let error = latest_asset(&fetch, "o/r", "roster", 64).unwrap_err();
         assert!(is_absent(&error), "{error}");
-        assert_eq!(*asked.borrow(), [WEB]);
+        assert_eq!(*asked.borrow(), [(WEB.to_string(), None)]);
     }
 
     #[test]

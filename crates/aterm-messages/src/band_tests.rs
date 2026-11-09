@@ -798,7 +798,6 @@ fn words_on_a_fill_wear_the_rows_crisp_ink_in_every_frame() {
             let start = if life == "glide" { 200 } else { 950 };
             let row = |fill: u16| {
                 Message::new(tags::UPDATE, Severity::Info, "Downloading aterm v0.91.0")
-                    .no_excerpt()
                     .meter(Meter {
                         fill_permille: Some(fill),
                         stats: "31 MB / 74 MB".into(),

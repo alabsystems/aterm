@@ -229,7 +229,7 @@ pub(crate) mod over_the_fake {
     use agh::config::Dirs;
     use agh::fx::canon;
     use agh::fx::tape::{self, TapeEndpoints, TapeHeader, TapeMode};
-    use agh::fx::{DOOR_EXIT, DOOR_GH, DOOR_SLEEP, DOOR_STDOUT};
+    use agh::fx::{DOOR_EXIT, DOOR_GH, DOOR_RETRY, DOOR_SLEEP, DOOR_STDOUT};
     use agh::wire::scripted::ScriptedTransport;
     use agh_fake::{FakeGithub, ReleaseSpec, RepoSpec};
     use astream_effects::EffectRecord;
@@ -546,21 +546,26 @@ pub(crate) mod over_the_fake {
             EffectRecord::Exchange { request, .. } => request.clone(),
             other => panic!("not an exchange: {other:?}"),
         };
-        records.insert(
-            at,
-            EffectRecord::Exchange {
-                door: DOOR_SLEEP.to_string(),
-                request: b"2000000000".to_vec(),
-                reply: Vec::new(),
-            },
-        );
-        records.insert(
-            at,
-            EffectRecord::Exchange {
-                door: DOOR_GH.to_string(),
-                request,
-                reply: canon::reply(502, &[], b""),
-            },
+        records.splice(
+            at..at,
+            [
+                EffectRecord::Exchange {
+                    door: DOOR_GH.to_string(),
+                    request,
+                    reply: canon::reply(502, &[], b""),
+                },
+                EffectRecord::Emit {
+                    door: DOOR_RETRY.to_string(),
+                    bytes:
+                        b"agh: retry attempt 1/19 failed (HTTP 502) \xe2\x80\x94 retrying in 10s"
+                            .to_vec(),
+                },
+                EffectRecord::Exchange {
+                    door: DOOR_SLEEP.to_string(),
+                    request: b"10000000000".to_vec(),
+                    reply: Vec::new(),
+                },
+            ],
         );
         let q = w.tape("retried");
         std::fs::write(&q, tape::render(&header, &records)).expect("the tape");

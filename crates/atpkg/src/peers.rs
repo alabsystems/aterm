@@ -1156,7 +1156,8 @@ pub fn share(layout: &Layout, how: &Share<'_>) {
         let at = listener.local_addr().unwrap_or(how.listen);
         record_serving(layout, at);
         say(format!(
-            "LAN toolset sharing: serving this Mac's toolset archives to its fleet members on {at}"
+            "LAN toolset sharing: serving this {}'s toolset archives to its fleet members on {at}",
+            aterm_types::machine_name::OS_NOUN
         ));
         answer_until(&listener, layout, how.running, &mut admits);
         drop(listener);

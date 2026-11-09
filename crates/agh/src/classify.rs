@@ -31,12 +31,21 @@ fn primary(error: Error, headers: &[(String, String)]) -> Error {
     }
 }
 
-fn secondary(error: Error, headers: &[(String, String)]) -> Error {
-    let error = error.with_sub(Sub::Secondary);
-    match number(headers, "retry-after") {
+fn with_retry_after(
+    error: Error,
+    headers: &[(String, String)],
+    now_unix_secs: Option<u64>,
+) -> Error {
+    match header(headers, "retry-after")
+        .and_then(|value| aterm_types::http_retry::retry_after_delay_secs(value, now_unix_secs))
+    {
         Some(secs) => error.with_retry_after(secs),
         None => error,
     }
+}
+
+fn secondary(error: Error, headers: &[(String, String)], now_unix_secs: Option<u64>) -> Error {
+    with_retry_after(error.with_sub(Sub::Secondary), headers, now_unix_secs)
 }
 
 /// The scopes a comma-separated scope header lists, trimmed, empty entries dropped.
@@ -94,6 +103,20 @@ pub fn answer(
     method: Method,
     idempotency: Idempotency,
 ) -> Option<Error> {
+    answer_at(status, headers, body, method, idempotency, None)
+}
+
+/// [`answer`] with an injected Unix clock for an HTTP-date `Retry-After`. Delta-seconds need no
+/// clock; a date is admitted only when `now_unix_secs` is present and the shared parser accepts it.
+#[must_use]
+pub fn answer_at(
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    method: Method,
+    idempotency: Idempotency,
+    now_unix_secs: Option<u64>,
+) -> Option<Error> {
     let _ = (method, idempotency);
     if (200..300).contains(&status) || status == 304 {
         return None;
@@ -120,7 +143,7 @@ pub fn answer(
                     .any(|w| w.eq_ignore_ascii_case(b"secondary rate limit"))
             }) =>
         {
-            secondary(of(Kind::RateLimited), headers)
+            secondary(of(Kind::RateLimited), headers, now_unix_secs)
         }
         403 => forbidden(of(Kind::Forbidden), headers, &github),
         404 | 410 => of(Kind::NotFound),
@@ -132,8 +155,14 @@ pub fn answer(
         {
             of(Kind::Conflict).with_sub(Sub::AlreadyExists)
         }
-        429 if spent(headers) => primary(of(Kind::RateLimited), headers),
-        429 => secondary(of(Kind::RateLimited), headers),
+        // A primary-limit answer may carry both the reset epoch and Retry-After. Preserve both:
+        // the shared anonymous-read classifier admits a 429 only from the latter.
+        429 if spent(headers) => with_retry_after(
+            primary(of(Kind::RateLimited), headers),
+            headers,
+            now_unix_secs,
+        ),
+        429 => secondary(of(Kind::RateLimited), headers, now_unix_secs),
         451 => of(Kind::Forbidden).with_sub(Sub::Forbid(Forbid::Blocked)),
         500..=599 => of(Kind::Server),
         402..=499 => of(Kind::Invalid),

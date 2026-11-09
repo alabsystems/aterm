@@ -942,7 +942,7 @@ fn a_restore_over_the_cell_budget_takes_the_meta_rung() {
     });
     assert_eq!(tally.ledger().history_lost, held + 12, "the ledger's");
     assert_eq!(tally.ledger().history_short, 2);
-    assert_eq!(tally.screens_history_lost(), 12, "the band row's");
+    assert_eq!(tally.screens_history_lost(), 12, "the message row's");
 }
 
 #[test]

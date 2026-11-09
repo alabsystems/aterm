@@ -1793,6 +1793,28 @@ pub enum OldPath {
     /// 290th column rose into a row lettered two over its own in 1 or 2 frames of each run
     /// (Linux arm64, 2026-11-08).
     WorldReadsTheBodysRows = 1 << 36,
+    /// The window about the body reads its cells' ground as the caret's window reads its own
+    /// (`PetWorld::read_body`), and the clearance readers read it where the caret's window does
+    /// not read their rectangle whole (`PetWorld::body_clearance`): the console's visibility hold
+    /// judges the body where it is drawn ([`PetBrain::console_frame_pass`]). Reverted, the window
+    /// about the body reads its glyphs alone: on a pane past the map's columns a body at rest
+    /// outside the caret's window had its ground read nowhere, the hold went blind and hid it
+    /// 0.75 s on (the console's `VETO_BLIND` and `VETO_DWELL`), and a flight it then set off on
+    /// stayed off the glass until it landed: off the glass in 84 to 347 frames of a caret's leaps
+    /// along the row of a pane 300 to 1,000 columns wide (ATERM-KI-1107-3).
+    BodysWindowReadsItsGround = 1 << 40,
+    /// The gap in the row above that holds a body in its row ([`PetBrain::gap_above`]) reads each
+    /// side from the body's edge as far as the window that reads the cell beside it reaches
+    /// ([`PetBrain::read_about`]). Reverted, a side longer than one window reads read nothing and
+    /// was no ink: on a pane past the map's columns no gap held a body there, and the head law let
+    /// it rise whole in each gap as if [`Self::HeadHeldAcrossGaps`] were reverted
+    /// (ATERM-KI-1107-3).
+    GapReadAboutTheBody = 1 << 41,
+    /// A body standing off the line of the caret's row, clear of its letters and of the caret,
+    /// keeps where it stands while the stand by a caret walked back into the line lies on them
+    /// ([`PetBrain::kept_off_the_line`]); reverted, it follows the caret onto the letters
+    /// (ATERM-KI-1107-4).
+    KeptOffTheLine = 1 << 42,
     /// A flight re-aimed in the air keeps the box's top a held body took off with
     /// ([`PetBrain::left_top`]) only while its way has never gone up ([`PetBrain::rebase`]).
     /// Reverted, the top outlived a flight up turned back down: a body fitted between rows
@@ -1948,7 +1970,7 @@ pub enum OldPath {
 
 impl OldPath {
     /// Every law.
-    pub const EVERY: [Self; 59] = [
+    pub const EVERY: [Self; 62] = [
         Self::WatchFromTheLine,
         Self::FirstKeysAhead,
         Self::LookAheadAtTopSpeed,
@@ -1986,6 +2008,9 @@ impl OldPath {
         Self::FitCentredAtTheWall,
         Self::CrossingRisesIntoTheLine,
         Self::WorldReadsTheBodysRows,
+        Self::BodysWindowReadsItsGround,
+        Self::GapReadAboutTheBody,
+        Self::KeptOffTheLine,
         Self::TurnKeepsTheTakeOffTop,
         Self::NoSeatHidesTheBody,
         Self::CaretTypesOn,
@@ -5216,10 +5241,83 @@ impl PetBrain {
         let row = f32::from(caret.0);
         let stand = self.ink_stand_for(want, row, width, cols, rows, Some(caret));
         let stand = self.clear_of_letters_above(stand, want, caret, (rows, cols), width);
+        let stand = self.kept_off_the_line(stand, caret, width);
         if let Some(station) = self.console_station(stand, (rows, cols), width) {
             return station;
         }
         stand
+    }
+
+    /// A BODY OFF THE LINE STAYS OFF IT AS THE CARET GOES BACK INTO IT
+    /// ([`OldPath::KeptOffTheLine`]): where the caret stands in its row's line, a letter on its
+    /// cell or after it, and the stand by it (`stand`, on the caret's row) still lays the body on
+    /// that row's letters (nothing took it off them: no clear stand along the row or on a row
+    /// beside, [`Self::ink_stand_for`], and no seat within reach,
+    /// [`Self::clear_of_letters_above`]), a body standing on the caret's row keeps where it stands
+    /// while the box it draws at rest there ([`Self::rest_box_cols`]) lies on none of that row's
+    /// ink, off the line (past its last letter with the stand short of the body, or short of its
+    /// first with the stand past it), and clears the caret by [`STATION_LEAD`] as every stand
+    /// [`Self::ink_safe_col_for`] offers does; until the caret's stand comes clear of the letters
+    /// (the caret back at the line's end, the line erased short of the stand, an Enter or a wrap
+    /// that takes the caret off the row). So it never keeps a body over the caret to keep it off
+    /// the letters, nor in a gap between the line's words, where the caret walked back comes to it,
+    /// nor from a stand that takes it further off the line. A full page's last row is such a row:
+    /// the row over it lettered in every cell and none under it, a line that leaves the body a seat
+    /// at the wall leaves none by a caret walked back into it. Reverted, the body followed the
+    /// caret onto the line's letters: ten Left arrows from 1.5 s past the last key stood it by the
+    /// caret on them to the Enter, its box on them in 213 to 219 of the 219 frames from the first
+    /// arrow, 198 to 204 of those at full alpha, reaching 11 to 14 px into them, and its flight off
+    /// the seat rose into the row over the line in 20 or 21 (the trail gallery's `last-row`, a line
+    /// four blank cells short of the grid's end on 13 x 29, 14 x 26 and 11 x 28 px cells and three
+    /// on 14 x 26, the cat and the dog; rendered on 13 x 29, its box on them in 279 of 284 frames,
+    /// 264 at full alpha, Linux arm64, 2026-11-08). A body kept wherever its box lay on no ink,
+    /// gaps and the caret's cell included, traded letters for the caret: on the same row with four
+    /// blank cells at the wall, a line ending in five spaces and 2, 4, 8 or 12 letters, the caret
+    /// walked back through the gap and out again, it stood over the caret's cell in 28 to 75 frames
+    /// at full alpha on 14 x 26 px cells, where reverted it stood there in 5 to 18
+    /// (`a_body_kept_off_the_line_clears_the_caret_on_every_face`).
+    #[inline]
+    fn kept_off_the_line(&self, stand: (f32, f32), (cr, cc): (u16, u16), width: f32) -> (f32, f32) {
+        let row = f32::from(cr);
+        if self.old_path(OldPath::KeptOffTheLine)
+            || self.flight.is_some()
+            || self.console_places_body()
+            || !width.is_finite()
+            || width <= 0.0
+            || (stand.1 - row).abs() >= 0.5
+            || (self.row - row).abs() >= 0.5
+            || (self.col - stand.0).abs() < 1e-3
+        {
+            return stand;
+        }
+        // A box edge read off whole px may fall a rounding short of the cell edge it stands on.
+        const SLACK: f32 = 1e-3;
+        let caret = f32::from(cc);
+        let Some((first, end)) = self.ink_span(row) else {
+            return stand;
+        };
+        if end <= caret + 0.5
+            || !matches!(self.observed_ink_overlaps(stand.0, row, width), Some(true))
+        {
+            return stand;
+        }
+        let cells = ((self.last_cell_w, self.last_cell_h), self.last_grid);
+        let Some((x0, x1)) = self.rest_box_cols((self.col, self.row), cells, width) else {
+            return stand;
+        };
+        // Past the line's end or short of its start, with the stand back toward the line.
+        let off_the_line = (x0 + SLACK >= end && stand.0 < self.col)
+            || (x1 - SLACK <= first && stand.0 > self.col);
+        let clears_the_caret =
+            x0 + SLACK >= caret + STATION_LEAD || x1 - SLACK <= caret - STATION_LEAD;
+        if off_the_line
+            && clears_the_caret
+            && matches!(self.observed_ink_in_span(row, x0, x1), Some(false))
+        {
+            (self.col, self.row)
+        } else {
+            stand
+        }
     }
 
     /// THE PROGRAM'S ROW IS ITS OWN. The hand's Enter hands the caret to the
@@ -13042,15 +13140,37 @@ impl PetBrain {
     /// (the blank, or a background's fill, past a prompt segment's or an echo's last letter),
     /// no gap: a body held fitted there stayed a token to the row's end. Reverted by
     /// [`OldPath::LineEndIsNoGap`]: any ink along the row.
+    ///
+    /// Each side is read from the body's edge as far as the window that reads the cell beside
+    /// it reaches ([`Self::read_about`], [`OldPath::GapReadAboutTheBody`]): on a pane past the
+    /// map's columns a side longer than one window reads ([`crate::pet_world::MAX_WORLD_COLS`])
+    /// is read that far, not refused, so a word past it is the gap's; ink further off than that
+    /// window reads is not read, and counts as none. Reverted, such a side read nothing and was
+    /// no ink: no gap, and the law let a body there rise whole in each gap as if it were reverted
+    /// itself (ATERM-KI-1107-3).
     #[inline]
     const fn gap_above(&self, above: f32, cols: u16, (a, b): (f32, f32)) -> bool {
         let cols = cols as f32;
         if self.old_path(OldPath::LineEndIsNoGap) {
             return matches!(self.observed_ink_in_span(above, 0.0, cols), Some(true));
         }
-        let before = a >= 1.0 && matches!(self.observed_ink_in_span(above, 0.0, a), Some(true));
-        let after =
-            b + 1.0 <= cols && matches!(self.observed_ink_in_span(above, b, cols), Some(true));
+        let about = !self.old_path(OldPath::GapReadAboutTheBody);
+        let before = a >= 1.0 && {
+            let (x, y) = if about {
+                self.read_about(above, (0.0, a), (a - 1.0, a))
+            } else {
+                (0.0, a)
+            };
+            matches!(self.observed_ink_in_span(above, x, y), Some(true))
+        };
+        let after = b + 1.0 <= cols && {
+            let (x, y) = if about {
+                self.read_about(above, (b, cols), (b, b + 1.0))
+            } else {
+                (b, cols)
+            };
+            matches!(self.observed_ink_in_span(above, x, y), Some(true))
+        };
         before && after
     }
 
@@ -13207,7 +13327,8 @@ impl PetBrain {
         }
         let wall = (limit, row);
         let head = head_seat_from(limit, width, !self.old_path(OldPath::SeatClearsTheStretch));
-        let inked = self.rest_box_inked(wall, sense, width)?;
+        let grid = (sense.cols, sense.rows);
+        let inked = self.rest_box_inked(wall, ((sense.cell_w, sense.cell_h), grid), width)?;
         if row >= 0.5
             && self
                 .observed_last_letter(row - 1.0, head, limit + width - INK_PAD)
@@ -13224,18 +13345,37 @@ impl PetBrain {
         )
     }
 
-    /// Whether the box a body standing at `(col, row)` draws at rest there meets a lettered cell
-    /// of `row`: its fit, at its place in its whole box by the wall
-    /// ([`Self::fitted_to_the_wall`]), no pose's stretch. `None` where the letter reader certifies
-    /// nothing there.
+    /// Whether the box a body standing at `(col, row)` draws at rest there
+    /// ([`Self::rest_box_cols`], on the `cells` px cells of the grid they give) meets a lettered
+    /// cell of `row`. `None` where the letter reader certifies nothing there.
     #[inline]
-    fn rest_box_inked(&self, (col, row): (f32, f32), sense: &PetSense, width: f32) -> Option<bool> {
-        if sense.cell_w == 0 || sense.cell_h == 0 {
+    fn rest_box_inked(
+        &self,
+        (col, row): (f32, f32),
+        cells: ((u16, u16), (u16, u16)),
+        width: f32,
+    ) -> Option<bool> {
+        let (x0, x1) = self.rest_box_cols((col, row), cells, width)?;
+        self.observed_ink_in_span(row, x0, x1)
+    }
+
+    /// The columns (cells, `x0..x1`) the box a body standing at `(col, row)` draws at rest there
+    /// spans ([`Self::rest_box_inked`]): its fit, at its place in its whole box by the wall
+    /// ([`Self::fitted_to_the_wall`]), no pose's stretch, on `cell_w x cell_h` px cells of a
+    /// `cols x rows` grid. `None` on a cell of no size.
+    #[inline]
+    fn rest_box_cols(
+        &self,
+        (col, row): (f32, f32),
+        ((cell_w, cell_h), (cols, rows)): ((u16, u16), (u16, u16)),
+        width: f32,
+    ) -> Option<(f32, f32)> {
+        if cell_w == 0 || cell_h == 0 {
             return None;
         }
         let (x0, x1, ..) = drawn_body_px(
             (
-                col + self.fitted_to_the_wall_at(col, self.fit, sense.cols, width),
+                col + self.fitted_to_the_wall_at(col, self.fit, cols, width),
                 row,
             ),
             Stance {
@@ -13244,11 +13384,11 @@ impl PetBrain {
                 lift: 0.0,
                 from: StretchFrom::Centre,
             },
-            (sense.cell_w, sense.cell_h),
-            (sense.cols, sense.rows),
+            (cell_w, cell_h),
+            (cols, rows),
         );
-        let inv_cw = 1.0 / f32::from(sense.cell_w);
-        self.observed_ink_in_span(row, x0 as f32 * inv_cw, x1 as f32 * inv_cw)
+        let inv_cw = 1.0 / f32::from(cell_w);
+        Some((x0 as f32 * inv_cw, x1 as f32 * inv_cw))
     }
 
     /// The sense the tick goes on with ([`Self::wall_seat`]), and the stand a body the law hid

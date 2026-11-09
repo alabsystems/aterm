@@ -55,6 +55,84 @@ fn answer(
     Ok(aterm_json::from_str(&out.stdout).unwrap())
 }
 
+/// The explicit-public commit reader owns the same bounded retry policy as every other
+/// anonymous API read. NEGATIVE CONTROL: restoring `RetryPolicy::NONE` in the ancestry reader
+/// refuses on the first injected 504, so neither the three calls nor the two retry records exist.
+#[test]
+fn explicit_public_commit_acquisition_retries_two_504s_then_succeeds() {
+    let world = World::canonical("commit-ancestry-retry");
+    let donor = bare_repo(world.path(), "donor");
+    let first = host_git(&donor, &["rev-parse", "main"]);
+    let tree = host_git(&donor, &["rev-parse", "main^{tree}"]);
+    let store = world.path().join("store.git");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            &donor.to_string_lossy(),
+            &store.to_string_lossy(),
+        ],
+    );
+    let second = host_git(
+        &donor,
+        &["commit-tree", &tree, "-p", &first, "-m", "second"],
+    );
+    api_commit(&world, &donor, &second);
+    let path = format!("/repos/fixture-dev/app/git/commits/{second}");
+    for _ in 0..2 {
+        world.fake.fault(
+            Match::api(&path),
+            Fault::Status {
+                status: 504,
+                body: "temporary gateway failure".into(),
+                headers: Vec::new(),
+            },
+        );
+    }
+
+    let gh = world.client(git_env()).build();
+    let out = gh
+        .run_git(
+            &GitRun::commit_read(
+                &common::slug("fixture-dev/app"),
+                &store,
+                request(&first, &second),
+                true,
+            )
+            .with_budget(Duration::from_secs(1)),
+        )
+        .expect("the third acquisition succeeds after twenty seconds of recorded retry waits");
+    let result: Value = aterm_json::from_str(&out.stdout).unwrap();
+    assert_eq!(result["queries"][0]["contained"], json!(true));
+    assert_eq!(result["acquired_commits"], json!(1));
+    assert_eq!(
+        world
+            .fake
+            .seen()
+            .iter()
+            .filter(|seen| seen.path_and_query == path)
+            .count(),
+        3
+    );
+    assert_eq!(gh.fx().retry_notes().len(), 2);
+    assert!(
+        gh.fx()
+            .retry_notes()
+            .iter()
+            .all(|note| note.contains("HTTP 504"))
+    );
+    let children = gh.fx().children_run();
+    assert!(!children.is_empty());
+    assert!(children.iter().all(|child| {
+        child
+            .progress
+            .as_ref()
+            .is_some_and(|progress| progress.window == Duration::from_secs(60))
+    }));
+}
+
 #[test]
 fn moving_tip_acquires_only_exact_commits_not_large_trees_or_blob_history() {
     let world = World::canonical("commit-ancestry-moving");
@@ -258,8 +336,8 @@ fn missing_parent_positive_is_acquired_without_changing_the_original_shallow_bou
 }
 
 #[test]
-fn progress_only_execution_cannot_extend_the_finite_ancestry_contract() {
-    let world = World::canonical("commit-ancestry-wall");
+fn a_caller_cannot_replace_commit_ancestry_s_owned_progress_bound() {
+    let world = World::canonical("commit-ancestry-progress-owned");
     let store = bare_repo(world.path(), "source");
     let first = host_git(&store, &["rev-parse", "main"]);
     let gh = world.client(git_env()).build();

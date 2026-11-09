@@ -660,7 +660,7 @@ pub(crate) enum Fact {
     /// `Σ 6m33s ↑20M ↓82k`.
     Usage,
     /// The account: line E's quota row, in three parts ([`RowPart`]), or where line E is not the
-    /// glass's, line D's fallback unit (`⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 05:00`), one
+    /// glass's, line D's fallback unit (`⎆ main 63% · ↺ Sat 10:00 · ╳ ~Thu 12 Nov 04:00`), one
     /// unit.
     Account,
 }
@@ -4010,10 +4010,10 @@ impl App {
     ) {
         let band_active = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid)
             || self.close_band(wid).is_some()
-            || self
-                .windows
-                .get(&wid)
-                .is_some_and(|ws| ws.stats_lens.open.is_some() && ws.stats_lens.rect.is_some());
+            || self.windows.get(&wid).is_some_and(|ws| {
+                ws.pointer_position_known
+                    && self.stats_lens_at(wid, ws.last_cursor_px.0, ws.last_cursor_px.1)
+            });
         let focused = self.focused_session_id(wid);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;

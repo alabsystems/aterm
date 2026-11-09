@@ -2465,19 +2465,21 @@ impl Ports for Live {
     }
 }
 
-/// `sync.requests`'s read: where this Mac's `needs` stand, and whether the pass is due (Commons
-/// on, this Mac a Writer). A ledger it cannot read is said, not the read's failure: the pass
-/// still runs, so the custodian's half decides for the lab and the member's half fails the item
-/// naming the ledger.
+/// `sync.requests`'s read: where this machine's `needs` stand, and whether the pass is due
+/// (Commons on, this machine a Writer), each named in its platform's word
+/// ([`aterm_types::machine_name::OS_NOUN`]). A ledger it cannot read is said, not the read's
+/// failure: the pass still runs, so the custodian's half decides for the lab and the member's half
+/// fails the item naming the ledger.
 fn requests_read(
     needs: Result<Vec<aterm_secrets::need::Need>, String>,
     enabled: impl FnOnce() -> Result<bool, String>,
     writer: impl FnOnce() -> bool,
 ) -> Result<RequestsRead, String> {
+    use aterm_types::machine_name::OS_NOUN;
     let standing = match needs {
         Ok(needs) => aterm_secrets::need::status_line(&needs)
-            .unwrap_or_else(|| "no needs on this Mac".to_owned()),
-        Err(why) => format!("this Mac's need ledger cannot be read ({why})"),
+            .unwrap_or_else(|| format!("no needs on this {OS_NOUN}")),
+        Err(why) => format!("this {OS_NOUN}'s need ledger cannot be read ({why})"),
     };
     if !enabled()? {
         return Ok(RequestsRead::Idle(format!(
@@ -2486,7 +2488,7 @@ fn requests_read(
     }
     if !writer() {
         return Ok(RequestsRead::Idle(format!(
-            "this Mac is not a Commons Writer, so the lab's table is not reached ({standing})"
+            "this {OS_NOUN} is not a Commons Writer, so the lab's table is not reached ({standing})"
         )));
     }
     Ok(RequestsRead::Due(standing))
@@ -2510,7 +2512,10 @@ fn requests_pass(
             "{} posted, {} answered, {} decided here, {} offered, {} swept",
             pass.posted, pass.answered, pass.decided, pass.offered, pass.swept
         ),
-        Err(why) => format!("this Mac's pass failed: {why}"),
+        Err(why) => format!(
+            "this {}'s pass failed: {why}",
+            aterm_types::machine_name::OS_NOUN
+        ),
     };
     match custodian {
         Ok(None) => {}
@@ -2834,7 +2839,10 @@ mod tests {
         assert!(requests_read(Ok(Vec::new()), || Err("aterm.toml".to_owned()), || true).is_err());
         assert_eq!(
             requests_read(Ok(Vec::new()), || Ok(true), || true),
-            Ok(RequestsRead::Due("no needs on this Mac".to_owned()))
+            Ok(RequestsRead::Due(format!(
+                "no needs on this {}",
+                aterm_types::machine_name::OS_NOUN
+            )))
         );
     }
 

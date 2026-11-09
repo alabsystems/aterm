@@ -164,7 +164,7 @@ fn messages_read(app: &App) -> String {
 }
 
 /// The Allow entry takes only a person's own press: `notice act` (how a script, a fleet drive's
-/// `ctl --host … notice act` and a harness answer reach a band row, which the entry is not) and
+/// `ctl --host … notice act` and a harness answer reach a live row, which the entry is not) and
 /// a control client's gesture are refused, and no phrase shows; the person's own press shows
 /// it. The entry is Info, for later, and nothing is on screen.
 #[test]
@@ -184,7 +184,7 @@ fn the_allow_row_refuses_a_press_through_ctl_a_fleet_drive_or_a_harness_answer()
         alerts(&app)
     );
 
-    // The entry is in the digest, not a band row `notice act` presses: refused.
+    // The entry is in the digest, not a live row `notice act` presses: refused.
     let acted =
         app.take_notice(wire::NoticeRequest::parse(&format!("act {id} Allow")).expect("act"));
     assert!(acted.starts_with("ERR notice:"), "{acted}");
@@ -648,7 +648,7 @@ fn the_undo_row_offers_undo_until_this_mac_signed() {
     assert_eq!(row.key.as_deref(), Some("members.undo.abcd-efgh-ijkl-mn23"));
     let signed = undo_notice(&offer(true));
     assert!(signed.actions.is_empty(), "{:?}", signed.actions);
-    // Both rows stand on the band: a complete ask, keyed.
+    // Both rows are live: a complete ask, keyed.
     let mut app = App::headless_for_test();
     for row in [row, signed] {
         let posted = app.post_unsynced(row, wall_stamp_now());

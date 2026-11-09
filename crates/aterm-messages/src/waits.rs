@@ -148,7 +148,6 @@ pub fn paste_row(
             ..Meter::default()
         })
         .action(Intent::StopPaste { session })
-        .no_excerpt()
         .finished_as(format!("Pasted {size}"))
         .reveal_after(grace_left)
 }
@@ -183,7 +182,6 @@ pub fn rewrap_row(session: u64, done: u64, total: u64, grace_left: Duration) -> 
             }),
             ..Meter::default()
         })
-        .no_excerpt()
         .finished_as(REWRAPPED)
         .reveal_after(grace_left)
 }
@@ -303,11 +301,7 @@ impl SessionWait {
             WaitKind::Paste => {
                 let row = paste_row(self.session, self.series, s.done, s.total, grace_left);
                 match self.unread_for(s) {
-                    Some(stuck) => {
-                        let mut row = row.line(unread_words(stuck));
-                        row.excerpt = true;
-                        row
-                    }
+                    Some(stuck) => row.line(unread_words(stuck)),
                     None => row,
                 }
             }
@@ -413,15 +407,14 @@ mod tests {
         let WaitStep::Post(row) = w.step(&sample(0, total, 2_000, true)) else {
             panic!("posted");
         };
-        assert!(!row.excerpt && row.detail.is_empty(), "{row:?}");
+        assert!(row.detail.is_empty(), "{row:?}");
         let WaitStep::Restate(row) = w.step(&sample(0, total, 4_900, true)) else {
             panic!("restated");
         };
-        assert!(!row.excerpt, "under the bound: {row:?}");
+        assert!(row.detail.is_empty(), "under the bound: {row:?}");
         let WaitStep::Restate(row) = w.step(&sample(0, total, 39_000, true)) else {
             panic!("restated");
         };
-        assert!(row.excerpt);
         assert_eq!(row.detail, ["not read for 37 s"]);
         assert_eq!(row.title, "Pasting 12 MB", "the title is the job's");
         let figure_at = |row: &Message, cols: usize| {
@@ -449,12 +442,12 @@ mod tests {
         let WaitStep::Restate(row) = w.step(&sample(1_000_000, total, 39_250, true)) else {
             panic!("restated");
         };
-        assert!(!row.excerpt && row.detail.is_empty(), "{row:?}");
+        assert!(row.detail.is_empty(), "{row:?}");
         let mut steady = SessionWait::paste(3, 2);
         for i in 0..40u64 {
             let step = steady.step(&sample(i * 100_000, total, 2_000 + i * 250, true));
             if let WaitStep::Post(row) | WaitStep::Restate(row) = step {
-                assert!(!row.excerpt, "{i}: {row:?}");
+                assert!(row.detail.is_empty(), "{i}: {row:?}");
             }
         }
     }

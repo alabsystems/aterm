@@ -202,9 +202,10 @@ pub(crate) use steward::local_recipient_denial_held;
 pub(crate) use steward::{AlabRoleContext, AlabRoleObservation, observe_alab_role};
 pub use steward::{
     StewardLease, StewardRevoke, StewardStandbyServer, Stewardship,
-    local_recipient_denial_observed, local_recipient_denied_in_roster, steward_alab_policy_role,
-    steward_ensure_lease, steward_ensure_standby_server, steward_finish_revokes,
-    steward_lease_check, steward_revoke_check, steward_standby_server_check, stewardship,
+    local_recipient_denial_observed, local_recipient_denied_in_roster, no_admin_key,
+    steward_alab_policy_role, steward_ensure_lease, steward_ensure_standby_server,
+    steward_finish_revokes, steward_lease_check, steward_revoke_check,
+    steward_standby_server_check, stewardship,
 };
 pub use subscriber::mend_subscriber;
 pub use vault_memo::{
@@ -12363,14 +12364,48 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
     admin_open_with_candidates(paths, &[])
 }
 
+/// Allowance for the required primary response when opening an admin session.
+const ADMIN_OPEN_HANG: Duration = Duration::from_secs(60);
+
+fn fetch_admin_primary(
+    source: &Source,
+    reader: Option<&str>,
+    started: Instant,
+) -> crate::Result<Fetched> {
+    let left = (started + ADMIN_OPEN_HANG).saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(Error::new(
+            "admin primary response did not finish before its hang detector",
+        ));
+    }
+    match source {
+        Source::Url(url) => transport::fetch_within_as(url, None, left, reader),
+        Source::Path(_) => transport::fetch_as(source, None, left, reader),
+    }
+}
+
+#[cfg(test)]
+#[path = "client/admin_open_wait_tests.rs"]
+mod admin_open_wait_tests;
+
 /// [`admin_open`], also probing candidate servers (`aterm-swarm-policy`'s `servers`, live ALab
 /// peers, and `extra_urls`) when `config.source` is unreachable, empty, or lagging behind a
 /// descendant head on a peer server (`docs/DESIGN-fluid-swarm-2026-10-28.md` F6).
 ///
 /// # Errors
-/// Vault configuration or admin locker is missing, unreadable, or refused by verification, or no
-/// reachable server or local cache holds a verified copy of the vault.
+/// Vault configuration or admin locker is missing, unreadable, or refused by verification;
+/// no verified envelope is available;
+/// the primary response exhausts its hang detector, or its fetch fails and no candidate supplies
+/// a verified envelope; or the authenticated history or admin authorization refuses the opening.
 pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate::Result<Admin> {
+    admin_open_with_candidates_started(paths, extra_urls, Instant::now())
+}
+
+fn admin_open_with_candidates_started(
+    paths: &Paths,
+    extra_urls: &[String],
+    started: Instant,
+) -> crate::Result<Admin> {
     let config = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
     let pin = config
         .signer
@@ -12406,7 +12441,7 @@ pub fn admin_open_with_candidates(paths: &Paths, extra_urls: &[String]) -> crate
         .into_iter()
         .flatten()
     };
-    let served = match transport::fetch_as(&config.source, None, Duration::from_secs(30), reader) {
+    let served = match fetch_admin_primary(&config.source, reader, started) {
         Ok(Fetched::Body(bytes)) => {
             let mut chosen = bytes;
             if matches!(config.source, Source::Url(_))

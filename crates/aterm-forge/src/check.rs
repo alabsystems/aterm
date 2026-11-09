@@ -778,6 +778,15 @@ fn ledger_findings(root: &Path) -> Vec<String> {
                 )
             })
             .collect();
+    if !root.join(POLICY_FILE).is_file() {
+        out.push(format!(
+            "{POLICY_FILE} is missing — it is the authoritative fork and carve ledger, even when \
+             the tree has only absorbed forks or no vendored `[patch.crates-io]` rows. Fix: \
+             restore its `[forge]` method header and the `[[fork]]`/`[[carved]]` rows that \
+             describe this tree."
+        ));
+        return out;
+    }
     let vendored: Vec<policy::PatchEntry> = match policy::patch_entries(root) {
         Ok(all) => all
             .into_iter()
@@ -788,17 +797,6 @@ fn ledger_findings(root: &Path) -> Vec<String> {
             return out;
         }
     };
-    if !root.join(POLICY_FILE).is_file() {
-        if !vendored.is_empty() {
-            out.push(format!(
-                "{POLICY_FILE} is missing, but {} vendored fork(s) are patched in — the ledger \
-                 is where their redistribution obligations are recorded. Fix: restore it, one \
-                 `[[fork]]` block per vendored `[patch.crates-io]` entry.",
-                vendored.len()
-            ));
-        }
-        return out;
-    }
     let ledger = match policy::load(root) {
         Ok(p) => p,
         Err(e) => {
@@ -1702,6 +1700,12 @@ windows-sys-052 = { package = \"windows-sys\", path = \"crates/aterm-windows-sys
             ),
             ("NOTICE", ""),
             ("deny.toml", "[licenses]\nallow = []\n"),
+            (
+                "vendor/forge.toml",
+                "[forge]\n\
+                 loc_method = \"rs-physical-all-files-v1\"\n\
+                 graph_method = \"cargo-tree-normal-no-dedupe-locked-offline-v1\"\n",
+            ),
             (
                 "tree",
                 "while [ $# -gt 0 ]; do\n\

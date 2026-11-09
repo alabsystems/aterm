@@ -2288,11 +2288,11 @@ fn under_off_a_restart_is_refused_and_nothing_is_typed() {
     );
 }
 
-/// How long the fake stalls on each digit it reads while its `starved-<version>` file stands.
+/// How far the fake advances the typing clock at each digit it holds unread on screen.
 #[cfg(target_os = "macos")]
 const STARVED_S: usize = 2;
 
-/// How long it stalls on each `;` then: past the host's own settle for a typed text's echo, 5 s.
+/// How far it advances at each `;`: past the host's 5 s settle for a typed text's echo.
 #[cfg(target_os = "macos")]
 const STARVED_TAIL_S: usize = 6;
 
@@ -2459,10 +2459,17 @@ fn stage_fake_under(inst: &Instance, version: &str, asked: bool, prelude: &str) 
          }}\n\
          cr=$(printf '\\r'); nl=$(printf '\\n.'); nl=${{nl%.}}\n\
          draw\n\
+         clock=\"$tmp/typing-clock/{session}\"; clock_ms=0\n\
+         stall() {{\n\
+         \x20 rm -f \"$clock.seen\"\n\
+         \x20 while [ \"$(cat \"$clock.seen\" 2>/dev/null)\" != \"$clock_ms\" ]; do sleep 0.02; done\n\
+         \x20 clock_ms=$((clock_ms + $1)); printf '%s' \"$clock_ms\" > \"$clock\"\n\
+         \x20 while [ \"$(cat \"$clock.seen\" 2>/dev/null)\" != \"$clock_ms\" ]; do sleep 0.02; done\n\
+         }}\n\
          while IFS= read -r -n 1 -d '' c; do\n\
          \x20 [ -e \"$tmp/starved-$VERSION\" ] && case \"$c\" in\n\
-         \x20 [0-9]) echo >> \"$tmp/stalled-$VERSION\"; sleep {STARVED_S} ;;\n\
-         \x20 ';') printf '%s\\n' \"$buf\" >> \"$tmp/stalled-tail-$VERSION\"; sleep {STARVED_TAIL_S} ;;\n\
+         \x20 [0-9]) echo >> \"$tmp/stalled-$VERSION\"; stall $(({STARVED_S} * 1000)) ;;\n\
+         \x20 ';') printf '%s\\n' \"$buf\" >> \"$tmp/stalled-tail-$VERSION\"; stall $(({STARVED_TAIL_S} * 1000)) ;;\n\
          \x20 esac\n\
          \x20 case \"$c\" in\n\
          \x20 \"$cr\"|\"$nl\") take \"$buf\"; draw ;;\n\
@@ -2476,6 +2483,7 @@ fn stage_fake_under(inst: &Instance, version: &str, asked: bool, prelude: &str) 
          \x20 esac\n\
          done\n",
         image = claude_image(inst).display(),
+        session = inst.sid,
         ready = row("\"$m\""),
         carry = row("'carrying on'"),
         prompt = "printf '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\\n' \"$line\" >> \"$T\"",
@@ -2602,10 +2610,20 @@ fn upgrade_until<T>(
 /// launch read, the activation wake armed, and the 2.1.282 build staged for [`land`].
 #[cfg(target_os = "macos")]
 fn at_the_notice(tag: &str) -> (Instance, PathBuf) {
-    let inst = boot_upgrade(
+    let inst = boot_on(
         tag,
         "relaunch = false\nupgrade_ask = true\n",
+        40,
         Some(SHORT_SETTLE_S),
+        true,
+        |tmp| {
+            let clock = tmp.join("typing-clock");
+            std::fs::create_dir(&clock).expect("the typing clock");
+            vec![(
+                "ATERM_DEBUG_TYPING_CLOCK",
+                clock.to_string_lossy().into_owned(),
+            )]
+        },
     );
     let current = stage_upgrade_fake(&inst, "2.1.281", true);
     let newer = stage_upgrade_fake(&inst, "2.1.282", true);
@@ -2693,26 +2711,28 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
 }
 
 /// A notice typed into an agent the machine starves still lands whole and upgrades the session.
-/// The fake stalls on each digit it reads, as a loaded machine stalls a real agent between
+/// The fake holds each digit it reads, as a loaded machine stalls a real agent between
 /// renders, and on each `;`, one of which ends the notice past its last digit. The turn's
 /// timeout is a hang detector for an echo, never a render budget that cuts the notice part-way
 /// and leaves aterm's words in the prompt for a person to clear (2026-10-24, load 46), and the
 /// host waits before the guarded Enter for the last key to be drawn. The controls: the digits'
 /// stalls outlast the render budget the turn was given before (150 ms a digit), and a stall
 /// longer than the host's own echo settle came after the last digit, where only the submit's
-/// wait covers it. The stalls add up to less than the timeout, so the host's giving each wait's
-/// time back to it is held by the control tests' starved program, on its fake clock, not here.
+/// wait covers it. Each barrier advances the server's typing clock before the fake draws the
+/// byte. The server must judge that advance while the echo is absent before the fake draws it.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_notice_typed_into_a_starved_agent_lands_whole_and_upgrades_it() {
     let (inst, newer) = at_the_notice("vs");
     std::fs::write(inst.tmp.join("starved-2.1.281"), "").expect("starve the running build");
     land(&inst, &newer);
-    let got = upgrade_until(
-        &inst,
-        Instant::now(),
-        || launches(&inst),
-        |got| got.len() >= 2,
+    let got = aterm_spec::wait::until_within(
+        HANG,
+        "the new build launched after the clock barriers",
+        || {
+            let got = launches(&inst);
+            (got.len() >= 2).then_some(got)
+        },
     );
     assert_eq!(
         got.len(),

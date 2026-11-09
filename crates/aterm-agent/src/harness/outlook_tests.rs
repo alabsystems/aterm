@@ -2527,12 +2527,12 @@ fn instant_of(place: i64, per_day: u8, now: i64) -> Option<i64> {
     }
 }
 
-/// Whether a card cell may hold a midnight's tick (§2.2): one that draws a level (a measured
-/// step, the projected line, a lane's out line), `┄` or nothing; never a name, `→`, `↺`, `▕`,
-/// `╳` or `$`.
-fn takes_tick(cell: (char, CardInk)) -> bool {
+/// Whether a card cell may hold a midnight's tick (§1.4, §2.2): one that draws a level (a
+/// measured step, the projected line, a lane's out line) or `┄`, or, on the work row only,
+/// nothing (a lane's blank cell is the card's ground); never a name, `→`, `↺`, `▕`, `╳` or `$`.
+fn takes_tick(cell: (char, CardInk), lane: bool) -> bool {
     use crate::harness::quota_view::Cell;
-    cell.0 == ' '
+    (cell.0 == ' ' && !lane)
         || matches!(cell.1, CardInk::Read | CardInk::Ahead | CardInk::Track)
         || cell == (Cell::Out.glyph(), CardInk::Warn)
 }
@@ -2541,13 +2541,16 @@ fn takes_tick(cell: (char, CardInk)) -> bool {
 /// (c)'s card at 60 and 44 cells (6 and 4 cells a day), on clocks that put each midnight at
 /// another place in its cell (UTC, +05:30, +09:45) and on one that springs forward over midnight
 /// ([`springs`]), the work row and every lane hold, for each local midnight whose cell draws a
-/// level, `┄` or nothing, one tick at exactly that midnight's place, and nothing else: no tick in
-/// a cell that holds a name, `→`, `↺`, `▕`, `╳` or `$`, and none past a lane's `↺`; the spring
-/// day's tick stands where that day begins, an hour after the 00:00 it never had; the axis and
-/// the legend have none. Negative controls: the card with no ticks (as S6 drew it) misses every
-/// midnight; ticks at every midnight's cell, whatever it holds, strike `→alt1` and the lanes'
-/// `↺`; a tick at its cell's left edge reads as an earlier instant; a spring day placed at the
-/// 00:00 it never had reads as Saturday 23:00.
+/// level or `┄` (or, on the work row, nothing), one tick at exactly that midnight's place, and
+/// nothing else: no tick in a cell that holds a name, `→`, `↺`, `▕`, `╳` or `$`, none on a
+/// lane's blank cell (`alt1` and `alt2` are read only now, so yesterday's midnight falls on
+/// their ground) and none past a lane's `↺`; the spring day's tick stands where that day
+/// begins, an hour after the 00:00 it never had; the axis and the legend have none. Negative
+/// controls: the card with no ticks (as S6 drew it) misses every midnight; ticks at every
+/// midnight's cell, whatever it holds, strike `→alt1` and the lanes' `↺`; a lane that admits a
+/// blank cell (`Cell::ticks` for `Cell::lane_ticks`, as the card first drew its lanes) stands
+/// a tick on `alt1`'s ground; a tick at its cell's left edge reads as an earlier instant; a
+/// spring day placed at the 00:00 it never had reads as Saturday 23:00.
 #[test]
 fn the_cards_midnights_tick_where_a_level_is_drawn() {
     use crate::harness::quota_view::CELL_PLACES;
@@ -2562,6 +2565,7 @@ fn the_cards_midnights_tick_where_a_level_is_drawn() {
         ("spring", springs),
     ];
     let (mut ticks, mut skipped, mut letters, mut spring, mut past_reset) = (0, 0, 0, 0, 0);
+    let mut ground = 0;
     for (clock, offset) in clocks {
         let mut fx = crate::harness::quota_scenes::case_c();
         fx.offset = offset;
@@ -2593,6 +2597,7 @@ fn the_cards_midnights_tick_where_a_level_is_drawn() {
             );
             for (name, cells, places) in drawn {
                 let what = format!("{clock} {room} {name}");
+                let lane = name != "work";
                 let text: String = cells.iter().map(|c| c.0).collect();
                 // Each tick: a midnight's own instant, in a cell that takes one.
                 let at: Vec<i64> = places
@@ -2600,7 +2605,7 @@ fn the_cards_midnights_tick_where_a_level_is_drawn() {
                     .map(|&place| {
                         let cell = usize::try_from(place / CELL_PLACES).expect("a cell");
                         assert!(
-                            takes_tick(cells[cell]),
+                            takes_tick(cells[cell], lane),
                             "{what}: a tick over {:?} in {text}",
                             cells[cell].0
                         );
@@ -2619,10 +2624,11 @@ fn the_cards_midnights_tick_where_a_level_is_drawn() {
                         })
                         .expect("a cell");
                     match cells.get(cell) {
-                        Some(&c) if takes_tick(c) => want.push(m),
+                        Some(&c) if takes_tick(c, lane) => want.push(m),
                         Some(&(ch, _)) => {
                             skipped += 1;
                             letters += usize::from(ch.is_alphanumeric() || ch == HANDOFF_MARK);
+                            ground += usize::from(ch == ' ');
                         }
                         None => past_reset += 1,
                     }
@@ -2641,9 +2647,9 @@ fn the_cards_midnights_tick_where_a_level_is_drawn() {
         "{ticks} ticks, {spring} on the spring day"
     );
     assert!(
-        skipped > 0 && letters > 0 && past_reset > 0,
-        "the cases hold midnights in a letter's or a mark's cell ({letters} of {skipped}) and \
-         past a lane's reset ({past_reset})"
+        skipped > 0 && letters > 0 && ground > 0 && past_reset > 0,
+        "the cases hold midnights in a letter's or a mark's cell ({letters} of {skipped}), on a \
+         lane's ground ({ground}) and past a lane's reset ({past_reset})"
     );
 }
 

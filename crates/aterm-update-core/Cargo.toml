@@ -56,6 +56,9 @@ aterm-json = { workspace = true }
 # `aterm_uds::spawnfd::command` builds every child: no descriptor above stdio leaks, and on
 # Windows a console-less caller gives its curl and certutil children a windowless console.
 aterm-uds = { workspace = true }
+# A private sibling staging directory keeps retried GitHub asset bytes off the destination until
+# one complete transfer can be atomically renamed into place.
+aterm-tempfile = { workspace = true }
 
 # getuid(2), fsync(2), and the open flags and errno values std does not name.
 [target.'cfg(unix)'.dependencies]
@@ -66,8 +69,6 @@ libc = { workspace = true }
 aterm-digest = { workspace = true }
 
 [dev-dependencies]
-# Exclusive private directories for file-hash fixtures, removed on drop.
-aterm-tempfile = { workspace = true }
 # The loopback GitHub the REST lane's tests run real curl against (src/github_rest_tests.rs).
 agh-fake = { workspace = true }
 # The roster tests sign synthetic fixtures, which needs ring's `alloc`; default features in

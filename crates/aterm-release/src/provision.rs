@@ -1024,17 +1024,17 @@ fn promote_public_pair_held(
 #[cfg(unix)]
 fn fetch_channel_candidate(slug: &str) -> std::result::Result<Candidate, String> {
     let bytes =
-        curl_fetch(&release_asset_url(slug, roster::ROSTER_ASSET), 65_536).map_err(|e| {
+        anonymous_fetch(&release_asset_url(slug, roster::ROSTER_ASSET), 65_536).map_err(|e| {
             // Only the body's clean 404 means no roster is published yet; any other
             // failure (429/403, a timeout, a private repo) is "cannot tell", and the mint
             // gate refuses on it.
-            if e.contains("returned error: 404") {
+            if aterm_update_core::download_error_is_not_found(&e) {
                 format!("{NO_CHANNEL_ROSTER}: {e}")
             } else {
                 e
             }
         })?;
-    let sig = curl_fetch(&release_asset_url(slug, roster::ROSTER_SIG_ASSET), 4_096)
+    let sig = anonymous_fetch(&release_asset_url(slug, roster::ROSTER_SIG_ASSET), 4_096)
         .map_err(|e| format!("roster present but its signature could not be fetched: {e}"))?;
     admit_candidate(pins::PAPER_MASTER_PUBKEYS, bytes, sig)
 }
@@ -1051,34 +1051,13 @@ fn release_asset_url(slug: &str, asset: &str) -> String {
 
 /// One bounded anonymous download.
 #[cfg(unix)]
-fn curl_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
-    let cap_s = cap.to_string();
-    let out = command(aterm_uds::os_path!("curl"))
-        .args([
-            "-fsSL",
-            "--proto",
-            "=https",
-            "--proto-redir",
-            "=https",
-            "--max-time",
-            "60",
-            "--max-filesize",
-            &cap_s,
-            url,
-        ])
-        .output()
-        .map_err(|e| format!("failed to run curl: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("curl {url}: {}", err.trim()));
-    }
-    if out.stdout.len() > cap {
-        return Err(format!("{url}: exceeded the {cap}-byte cap"));
-    }
-    if out.stdout.is_empty() {
+fn anonymous_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
+    let cap = u64::try_from(cap).map_err(|_| format!("{url}: byte cap is too large"))?;
+    let bytes = aterm_update_core::download_bytes(url, cap)?;
+    if bytes.is_empty() {
         return Err(format!("{url}: zero bytes"));
     }
-    Ok(out.stdout)
+    Ok(bytes)
 }
 
 /// Take the roster pair's writer lock.

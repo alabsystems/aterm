@@ -1496,6 +1496,14 @@ pub trait Backend {
     /// ([`crate::publish::discard_signed`]); what could not be removed.
     fn discard_signed(&mut self, version: &str, build: u64) -> Vec<String>;
     fn after_cut(&mut self, version: &str) -> Result<AfterCut, Refusal>;
+    /// Distribution and the main reader consume the public release independently.
+    /// Both join before returning; each successful half keeps its own completion.
+    fn after_cut_with_fixtures(
+        &mut self,
+        c: &Candidate,
+        reserved: &Reservation,
+        prover: &Prover,
+    ) -> (Result<AfterCut, Refusal>, Result<String, Refusal>);
     /// The channel head tag. Transport errors are distinct from a successful response whose
     /// document names no tag, so step 10 can report only the former as COULD NOT RUN.
     fn latest(&mut self) -> Result<Option<String>, String>;
@@ -5792,7 +5800,19 @@ impl Run<'_> {
         let v = self.version();
         let mut notes = Vec::new();
         if !self.after_cut_complete() {
-            match self.b.after_cut(&v) {
+            let work = if self.facts.fixtures.yes {
+                None
+            } else {
+                self.fixture_work()?
+            };
+            let (result, fixtures) = match &work {
+                Some((c, reserved, p)) => {
+                    let (distribution, fixtures) = self.b.after_cut_with_fixtures(c, reserved, p);
+                    (distribution, Some(fixtures))
+                }
+                None => (self.b.after_cut(&v), None),
+            };
+            match result {
                 Ok(done) => {
                     if let Some(journal) = &mut self.journal {
                         journal.done.retain(|fact| fact != SITE_DEFERRED);
@@ -5803,6 +5823,15 @@ impl Run<'_> {
                 }
                 Err(r) => return self.refuse(r),
             }
+            if let Some(fixtures) = fixtures {
+                match fixtures {
+                    Ok(note) => {
+                        notes.push(note);
+                        self.refresh();
+                    }
+                    Err(r) => return self.refuse(r),
+                }
+            }
         }
         if !self.facts.fixtures.yes {
             notes.push(self.land_fixtures()?);
@@ -5812,8 +5841,24 @@ impl Run<'_> {
     }
 
     fn land_fixtures(&mut self) -> Result<String, Halt> {
-        let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
+        let Some((c, reserved, p)) = self.fixture_work()? else {
             return Ok(String::new());
+        };
+        match self.b.land_fixtures(&c, &reserved, &p) {
+            Ok(note) => {
+                self.refresh();
+                Ok(note)
+            }
+            Err(r) => {
+                self.refuse(r)?;
+                Ok(String::new())
+            }
+        }
+    }
+
+    fn fixture_work(&mut self) -> Result<Option<(Candidate, Reservation, Prover)>, Halt> {
+        let (Some(c), Some(p)) = (self.cand.clone(), self.prover.clone()) else {
+            return Ok(None);
         };
         let claimed = self.facts.cut.as_ref().map(|cut| cut.build);
         let mut reserved = self.reservation().filter(|r| Some(r.build) == claimed);
@@ -5840,18 +5885,9 @@ impl Run<'_> {
                     crate::gates::HANDOFF_FIXTURE_README
                 ),
             ))?;
-            return Ok(String::new());
+            return Ok(None);
         };
-        match self.b.land_fixtures(&c, &reserved, &p) {
-            Ok(note) => {
-                self.refresh();
-                Ok(note)
-            }
-            Err(r) => {
-                self.refuse(r)?;
-                Ok(String::new())
-            }
-        }
+        Ok(Some((c, reserved, p)))
     }
 
     fn site_complete(&self) -> bool {

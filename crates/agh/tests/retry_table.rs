@@ -2,16 +2,17 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `should_retry` and the pipeline's retries (the plan's §4.6.15, §8), on the simulated clock.
+//! The shared retry budget and the client pipeline, over an injected transport.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use agh::policy::{RouteRequest, RouteTarget};
-use agh::retry::{Idempotency, RetryPolicy, should_retry};
+use agh::retry::{Idempotency, RetryDecision, RetryPolicy, should_retry, transient_cause};
 use agh::wire::scripted::{Scripted, ScriptedTransport};
 use agh::wire::{Phase, WireError, WireKind};
 use agh::{Call, Error, Kind, Sub};
+use aterm_types::http_retry::Cause;
 
 use crate::common;
 
@@ -32,135 +33,75 @@ fn server() -> Error {
     Error::new(Kind::Server, "x")
 }
 
-fn wire_error() -> Error {
-    Error::could_not_run("x").with_sub(Sub::Wire(WireKind::Reset))
+fn wire_error(kind: WireKind) -> Error {
+    Error::could_not_run("x").with_sub(Sub::Wire(kind))
 }
 
-fn secondary(retry_after: Option<u64>) -> Error {
-    let error = Error::new(Kind::RateLimited, "x").with_sub(Sub::Secondary);
-    match retry_after {
-        Some(secs) => error.with_retry_after(secs),
-        None => error,
+#[test]
+fn the_shared_budget_stops_at_nineteen_attempts() {
+    let mut budget = RetryPolicy::ANONYMOUS_HTTP.budget();
+    for attempt in 1..19 {
+        assert!(matches!(
+            should_retry(&mut budget, Idempotency::Read, attempt, &server()),
+            RetryDecision::Retry(retry) if retry.pause == Duration::from_secs(10)
+        ));
+    }
+    assert_eq!(
+        should_retry(&mut budget, Idempotency::Read, 19, &server()),
+        RetryDecision::Exhausted {
+            bound: "19 attempts / 200s total retry-pause bound".to_string()
+        }
+    );
+}
+
+#[test]
+fn a_one_shot_never_enters_the_retry_budget() {
+    let mut budget = RetryPolicy::ANONYMOUS_HTTP.budget();
+    assert_eq!(
+        should_retry(&mut budget, Idempotency::OneShot, 1, &server()),
+        RetryDecision::Final
+    );
+    assert_eq!(
+        should_retry(
+            &mut budget,
+            Idempotency::OneShot,
+            1,
+            &wire_error(WireKind::Reset)
+        ),
+        RetryDecision::Final
+    );
+}
+
+#[test]
+fn only_the_four_native_wire_classes_are_transient() {
+    for (kind, cause) in [
+        (WireKind::Timeout, Cause::Timeout),
+        (WireKind::Idle, Cause::Timeout),
+        (WireKind::Reset, Cause::Reset),
+        (WireKind::Truncated, Cause::Truncated),
+    ] {
+        assert_eq!(transient_cause(&wire_error(kind)), Some(cause), "{kind:?}");
+    }
+    for kind in [
+        WireKind::Dns,
+        WireKind::Connect,
+        WireKind::Proxy,
+        WireKind::Tls,
+        WireKind::Trust,
+        WireKind::TooLarge,
+        WireKind::Protocol,
+        WireKind::Revoked,
+        WireKind::Local,
+    ] {
+        assert_eq!(transient_cause(&wire_error(kind)), None, "{kind:?}");
     }
 }
 
 #[test]
-fn should_retry_stops_at_the_attempt_budget() {
-    let p = RetryPolicy::STANDARD;
-    assert_eq!(
-        should_retry(&p, Idempotency::Read, 3, &server(), false),
-        None
-    );
-    assert_eq!(
-        should_retry(&p, Idempotency::Read, 4, &server(), false),
-        None
-    );
-    assert_eq!(
-        should_retry(&RetryPolicy::NONE, Idempotency::Read, 1, &server(), false),
-        None
-    );
-}
-
-#[test]
-fn should_retry_never_repeats_a_one_shot() {
-    let p = RetryPolicy::STANDARD;
-    assert_eq!(
-        should_retry(&p, Idempotency::OneShot, 1, &server(), false),
-        None
-    );
-    assert_eq!(
-        should_retry(&p, Idempotency::OneShot, 1, &wire_error(), false),
-        None
-    );
-}
-
-#[test]
-fn should_retry_waits_out_one_secondary_limit() {
-    let p = RetryPolicy::STANDARD;
-    assert_eq!(
-        should_retry(&p, Idempotency::Read, 1, &secondary(Some(1)), false),
-        Some(Duration::from_secs(1))
-    );
-    assert_eq!(
-        should_retry(&p, Idempotency::Read, 1, &secondary(Some(60)), false),
-        Some(Duration::from_secs(60))
-    );
-    assert_eq!(
-        should_retry(&p, Idempotency::Read, 1, &secondary(None), false),
-        Some(Duration::from_secs(60))
-    );
-    assert_eq!(
-        should_retry(&p, Idempotency::Read, 1, &secondary(Some(61)), false),
-        None
-    );
-    assert_eq!(
-        should_retry(&p, Idempotency::Read, 1, &secondary(Some(1)), true),
-        None
-    );
-    assert_eq!(
-        should_retry(&p, Idempotency::Converging, 1, &secondary(Some(5)), false),
-        Some(Duration::from_secs(5))
-    );
-}
-
-#[test]
-fn should_retry_never_sleeps_on_a_primary_limit_or_a_pre_refusal() {
-    let p = RetryPolicy::STANDARD;
-    for sub in [Sub::Primary, Sub::PreRefused] {
-        let error = Error::new(Kind::RateLimited, "x").with_sub(sub);
-        assert_eq!(should_retry(&p, Idempotency::Read, 1, &error, false), None);
-    }
-}
-
-#[test]
-fn should_retry_pauses_on_server_and_wire_failures() {
-    let p = RetryPolicy::STANDARD;
-    for error in [server(), wire_error()] {
-        assert_eq!(
-            should_retry(&p, Idempotency::Read, 1, &error, false),
-            Some(Duration::from_secs(2))
-        );
-        assert_eq!(
-            should_retry(&p, Idempotency::Read, 2, &error, false),
-            Some(Duration::from_secs(5))
-        );
-    }
-    let long = RetryPolicy {
-        attempts: 5,
-        ..RetryPolicy::STANDARD
-    };
-    assert_eq!(
-        should_retry(&long, Idempotency::Read, 4, &server(), false),
-        Some(Duration::from_secs(5))
-    );
-}
-
-#[test]
-fn should_retry_refuses_everything_else() {
-    let p = RetryPolicy::STANDARD;
-    let others = [
-        Error::new(Kind::Unauthenticated, "x"),
-        Error::new(Kind::NotFound, "x"),
-        Error::new(Kind::Forbidden, "x"),
-        Error::new(Kind::Invalid, "x"),
-        Error::new(Kind::Conflict, "x"),
-        Error::could_not_run("x").with_sub(Sub::Protocol),
-        Error::could_not_run("x").with_sub(Sub::Local),
-    ];
-    for error in others {
-        assert_eq!(
-            should_retry(&p, Idempotency::Read, 1, &error, false),
-            None,
-            "{error}"
-        );
-    }
-}
-
-#[test]
-fn two_server_errors_then_success_is_three_requests() {
+fn two_504s_then_200_succeed_and_log_each_retry_cause() {
     let transport = Arc::new(ScriptedTransport::new());
-    transport.answer(500, &[], b"{}");
-    transport.answer(500, &[], b"{}");
+    transport.answer(504, &[], b"{}");
+    transport.answer(504, &[], b"{}");
     transport.answer(200, &[], b"{\"id\":1}");
     let gh = common::scripted(&transport, API);
     let answered = gh.call(&standard_get()).expect("the third attempt answers");
@@ -168,70 +109,153 @@ fn two_server_errors_then_success_is_three_requests() {
     assert_eq!(transport.requests().len(), 3);
     assert_eq!(
         gh.fx().slept(),
-        vec![Duration::from_secs(2), Duration::from_secs(5)]
+        vec![Duration::from_secs(10), Duration::from_secs(10)]
+    );
+    assert_eq!(
+        gh.fx().retry_notes(),
+        vec![
+            "agh: retry attempt 1/19 failed (HTTP 504) — retrying in 10s",
+            "agh: retry attempt 2/19 failed (HTTP 504) — retrying in 10s",
+        ]
     );
 }
 
 #[test]
-fn three_server_errors_are_the_error() {
+fn a_404_is_not_retried_or_logged() {
     let transport = Arc::new(ScriptedTransport::new());
-    for _ in 0..3 {
-        transport.answer(502, &[], b"{}");
+    transport.answer(404, &[], b"{}");
+    transport.answer(200, &[], b"{}");
+    let gh = common::scripted(&transport, API);
+    let error = gh.call(&standard_get()).expect_err("the object is absent");
+    assert_eq!(error.http.as_ref().map(|http| http.status), Some(404));
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(transport.remaining(), 1);
+    assert!(gh.fx().slept().is_empty());
+    assert!(gh.fx().retry_notes().is_empty());
+}
+
+#[test]
+fn endless_5xx_stops_at_and_names_the_shared_bound() {
+    let transport = Arc::new(ScriptedTransport::new());
+    for _ in 0..19 {
+        transport.answer(503, &[], b"{}");
     }
+    transport.answer(200, &[], b"{}");
     let gh = common::scripted(&transport, API);
     let error = gh.call(&standard_get()).expect_err("the budget is spent");
     assert_eq!(error.kind, Kind::Server);
-    assert_eq!(transport.requests().len(), 3);
+    assert!(
+        error
+            .why
+            .contains("19 attempts / 200s total retry-pause bound"),
+        "{}",
+        error.why
+    );
+    assert_eq!(transport.requests().len(), 19);
+    assert_eq!(transport.remaining(), 1);
+    assert_eq!(gh.fx().retry_notes().len(), 18);
 }
 
 #[test]
-fn a_401_is_one_request() {
+fn a_429_retries_only_with_a_valid_retry_after() {
     let transport = Arc::new(ScriptedTransport::new());
-    transport.answer(401, &[], br#"{"message":"Bad credentials"}"#);
+    transport.answer(429, &[("retry-after", "1")], b"{}");
+    transport.answer(200, &[], b"{}");
     let gh = common::scripted(&transport, API);
-    let error = gh.call(&standard_get()).expect_err("unauthenticated");
-    assert_eq!(error.kind, Kind::Unauthenticated);
-    assert_eq!(transport.requests().len(), 1);
-    assert!(gh.fx().slept().is_empty());
+    gh.call(&standard_get()).expect("the retry answers");
+    assert_eq!(transport.requests().len(), 2);
+    assert_eq!(gh.fx().slept(), vec![Duration::from_secs(1)]);
+    assert_eq!(
+        gh.fx().retry_notes(),
+        vec!["agh: retry attempt 1/19 failed (HTTP 429 Retry-After 1s) — retrying in 1s"]
+    );
+
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer(
+        429,
+        &[("retry-after", "Thu, 09 Oct 2025 08:53:27 GMT")],
+        b"{}",
+    );
+    transport.answer(200, &[], b"{}");
+    let gh = common::scripted(&transport, API);
+    gh.call(&standard_get())
+        .expect("an HTTP-date Retry-After is admitted by the injected clock");
+    assert_eq!(transport.requests().len(), 2);
+    assert_eq!(gh.fx().slept(), vec![Duration::from_secs(7)]);
+    assert_eq!(gh.fx().retry_notes().len(), 1);
+
+    // NEGATIVE CONTROL: GitHub can mark the same 429 as a spent primary limit. Dropping its
+    // Retry-After while retaining only X-RateLimit-Reset turns this required retry into a final
+    // answer and leaves the scripted 200 unread.
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer(
+        429,
+        &[
+            ("x-ratelimit-remaining", "0"),
+            ("x-ratelimit-reset", "1760009999"),
+            ("retry-after", "1"),
+        ],
+        b"{}",
+    );
+    transport.answer(200, &[], b"{}");
+    let gh = common::scripted(&transport, API);
+    gh.call(&standard_get())
+        .expect("a primary-limit 429 still obeys its valid Retry-After");
+    assert_eq!(transport.requests().len(), 2);
+    assert_eq!(gh.fx().slept(), vec![Duration::from_secs(1)]);
+
+    for retry_after in [None, Some("not an HTTP date")] {
+        let transport = Arc::new(ScriptedTransport::new());
+        match retry_after {
+            Some(value) => transport.answer(429, &[("retry-after", value)], b"{}"),
+            None => transport.answer(429, &[], b"{}"),
+        }
+        transport.answer(200, &[], b"{}");
+        let gh = common::scripted(&transport, API);
+        let error = gh
+            .call(&standard_get())
+            .expect_err("a valid Retry-After is required");
+        assert_eq!(error.kind, Kind::RateLimited);
+        assert_eq!(transport.requests().len(), 1);
+        assert!(gh.fx().retry_notes().is_empty());
+    }
 }
 
 #[test]
-fn a_secondary_limit_is_waited_out_once() {
+fn a_404_stays_final_even_with_a_valid_retry_after_date() {
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer(
+        404,
+        &[("retry-after", "Thu, 09 Oct 2025 08:53:27 GMT")],
+        b"{}",
+    );
+    transport.answer(200, &[], b"{}");
+    let gh = common::scripted(&transport, API);
+    let error = gh.call(&standard_get()).expect_err("absence is final");
+    assert_eq!(error.http.as_ref().map(|http| http.status), Some(404));
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(transport.remaining(), 1);
+    assert!(gh.fx().retry_notes().is_empty());
+}
+
+#[test]
+fn a_403_secondary_limit_is_not_the_429_retry_class() {
     let transport = Arc::new(ScriptedTransport::new());
     transport.answer(
         403,
         &[("retry-after", "1")],
-        br#"{"message":"You have exceeded a secondary rate limit"}"#,
+        br#"{"message":"secondary rate limit"}"#,
     );
     transport.answer(200, &[], b"{}");
     let gh = common::scripted(&transport, API);
-    gh.call(&standard_get()).expect("the retry answers");
-    assert_eq!(gh.fx().slept(), vec![Duration::from_secs(1)]);
-    assert_eq!(transport.requests().len(), 2);
+    let error = gh.call(&standard_get()).expect_err("403 is final");
+    assert_eq!(error.kind, Kind::RateLimited);
+    assert_eq!(transport.requests().len(), 1);
+    assert!(gh.fx().retry_notes().is_empty());
 }
 
 #[test]
-fn a_second_secondary_limit_is_the_error() {
-    let transport = Arc::new(ScriptedTransport::new());
-    for _ in 0..2 {
-        transport.answer(403, &[("retry-after", "1")], b"{}");
-    }
-    transport.answer(200, &[], b"{}");
-    let gh = common::scripted(&transport, API);
-    let error = gh
-        .call(&standard_get())
-        .expect_err("one secondary wait only");
-    assert_eq!(
-        (error.kind, error.sub.clone()),
-        (Kind::RateLimited, Sub::Secondary)
-    );
-    assert_eq!(error.retry_after, Some(1));
-    assert_eq!(transport.requests().len(), 2);
-    assert_eq!(transport.remaining(), 1);
-}
-
-#[test]
-fn a_wire_failure_is_retried() {
+fn a_reset_is_retried_and_logged() {
     let transport = Arc::new(ScriptedTransport::new());
     transport.push(Scripted::Fail(WireError {
         phase: Phase::Sent,
@@ -242,11 +266,15 @@ fn a_wire_failure_is_retried() {
     let gh = common::scripted(&transport, API);
     let answered = gh.call(&standard_get()).expect("the retry answers");
     assert_eq!(answered.requests, 2);
-    assert_eq!(gh.fx().slept(), vec![Duration::from_secs(2)]);
+    assert_eq!(gh.fx().slept(), vec![Duration::from_secs(10)]);
+    assert_eq!(
+        gh.fx().retry_notes(),
+        vec!["agh: retry attempt 1/19 failed (connection reset (curl exit 56)) — retrying in 10s"]
+    );
 }
 
 #[test]
-fn a_one_shot_failing_at_sent_is_never_retried() {
+fn a_one_shot_failing_after_send_is_never_retried() {
     let transport = Arc::new(ScriptedTransport::new());
     transport.push(Scripted::Fail(WireError {
         phase: Phase::Sent,
@@ -263,14 +291,16 @@ fn a_one_shot_failing_at_sent_is_never_retried() {
         (Kind::CouldNotRun, Sub::Wire(WireKind::Reset))
     );
     assert_eq!(transport.requests().len(), 1);
-    assert!(gh.fx().slept().is_empty());
+    assert!(gh.fx().retry_notes().is_empty());
 }
 
 #[test]
-fn a_probe_s_server_error_is_retried_as_the_call_s() {
+fn repository_visibility_probes_share_the_outer_calls_retry_budget() {
     let transport = Arc::new(ScriptedTransport::new());
     transport.answer(404, &[], b"{}");
-    transport.answer(503, &[], b"{}");
+    transport.answer(504, &[], b"{}");
+    transport.answer(404, &[], b"{}");
+    transport.answer(504, &[], b"{}");
     transport.answer(404, &[], b"{}");
     transport.answer(200, &[], b"{\"id\":1}");
     let gh = common::scripted(&transport, API);
@@ -283,10 +313,38 @@ fn a_probe_s_server_error_is_retried_as_the_call_s() {
     let error = gh.call(&call).expect_err("the release is absent");
     assert_eq!(error.kind, Kind::NotFound);
     let paths: Vec<String> = transport.requests().into_iter().map(|s| s.url).collect();
-    assert_eq!(paths.len(), 4);
+    assert_eq!(paths.len(), 6);
     assert!(paths[1].ends_with("/repos/fixture-dev/repo"), "{paths:?}");
     assert!(paths[2].ends_with("/releases/7"), "{paths:?}");
-    assert_eq!(gh.fx().slept(), vec![Duration::from_secs(2)]);
+    assert!(paths[3].ends_with("/repos/fixture-dev/repo"), "{paths:?}");
+    assert!(paths[4].ends_with("/releases/7"), "{paths:?}");
+    assert!(paths[5].ends_with("/repos/fixture-dev/repo"), "{paths:?}");
+    assert_eq!(
+        gh.fx().retry_notes(),
+        vec![
+            "agh: retry attempt 1/19 failed (HTTP 504) — retrying in 10s",
+            "agh: retry attempt 2/19 failed (HTTP 504) — retrying in 10s",
+        ]
+    );
+
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer(404, &[], b"{}");
+    transport.answer(404, &[], b"{}");
+    transport.answer(200, &[], b"{}");
+    let gh = common::scripted(&transport, API);
+    let slug = common::slug("fixture-dev/repo");
+    let call = Call::get(
+        "/repos/fixture-dev/repo/releases/7",
+        RouteRequest::read(RouteTarget::Repo(slug)),
+    )
+    .retry(Some(RetryPolicy::STANDARD));
+    let error = gh
+        .call(&call)
+        .expect_err("the repository probe's 404 is final");
+    assert_eq!(error.kind, Kind::NotVisible);
+    assert_eq!(transport.requests().len(), 2);
+    assert_eq!(transport.remaining(), 1);
+    assert!(gh.fx().retry_notes().is_empty());
 }
 
 #[test]
@@ -301,4 +359,109 @@ fn the_client_policy_applies_when_the_call_names_none() {
         .expect_err("the test client's policy is NONE");
     assert_eq!(error.kind, Kind::Server);
     assert_eq!(transport.requests().len(), 1);
+    assert!(!error.why.contains("retry-pause bound"), "{}", error.why);
+}
+
+#[test]
+fn public_head_retries_transient_statuses_but_not_absence() {
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer(504, &[], b"");
+    transport.answer(504, &[], b"");
+    transport.answer(200, &[], b"");
+    let gh = common::scripted_with_retry(&transport, API, RetryPolicy::STANDARD);
+    assert_eq!(
+        gh.public()
+            .probe(&common::slug("fixture-dev/repo"), "v1", "a.bin"),
+        agh::github::Probe::Present
+    );
+    assert_eq!(transport.requests().len(), 3);
+    assert_eq!(gh.fx().retry_notes().len(), 2);
+
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer(404, &[], b"");
+    transport.answer(200, &[], b"");
+    let gh = common::scripted_with_retry(&transport, API, RetryPolicy::STANDARD);
+    assert_eq!(
+        gh.public()
+            .probe(&common::slug("fixture-dev/repo"), "v1", "missing.bin"),
+        agh::github::Probe::Absent
+    );
+    assert_eq!(transport.requests().len(), 1);
+    assert_eq!(transport.remaining(), 1);
+    assert!(gh.fx().retry_notes().is_empty());
+}
+
+#[test]
+fn public_body_resumes_from_the_completed_prefix() {
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer_body_fault(200, &[], b"first ", WireKind::Reset);
+    transport.answer(206, &[("Content-Range", "bytes 6-9/10")], b"body");
+    let gh = common::scripted(&transport, API);
+    let root = aterm_tempfile::tempdir().expect("scratch");
+    let dest = root.path().join("a.bin");
+    assert_eq!(
+        gh.public()
+            .fetch(
+                &common::slug("fixture-dev/repo"),
+                "v1",
+                "a.bin",
+                &dest,
+                1024,
+            )
+            .expect("the resumed body"),
+        10
+    );
+    assert_eq!(
+        std::fs::read(&dest).expect("the completed file"),
+        b"first body"
+    );
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1]
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("range"))
+            .map(|(_, value)| value.as_str()),
+        Some("bytes=6-")
+    );
+    assert_eq!(gh.fx().retry_notes().len(), 1);
+}
+
+#[test]
+fn endless_short_public_progress_stops_at_the_progress_bound() {
+    let transport = Arc::new(ScriptedTransport::new());
+    transport.answer_body_fault(200, &[], b"x", WireKind::Truncated);
+    for offset in 1..=16 {
+        let range = format!("bytes {offset}-{offset}/1024");
+        transport.answer_body_fault(
+            206,
+            &[("Content-Range", range.as_str())],
+            b"x",
+            WireKind::Truncated,
+        );
+    }
+    transport.answer(200, &[], b"whole");
+    let gh = common::scripted(&transport, API);
+    let root = aterm_tempfile::tempdir().expect("scratch");
+    let dest = root.path().join("a.bin");
+    let error = gh
+        .public()
+        .fetch(
+            &common::slug("fixture-dev/repo"),
+            "v1",
+            "a.bin",
+            &dest,
+            1024,
+        )
+        .expect_err("the body never completes");
+    assert!(
+        error.why.contains("16 progress-earned resumes"),
+        "{}",
+        error.why
+    );
+    assert_eq!(transport.requests().len(), 17);
+    assert_eq!(transport.remaining(), 1);
+    assert_eq!(gh.fx().retry_notes().len(), 16);
+    assert!(!dest.exists());
 }

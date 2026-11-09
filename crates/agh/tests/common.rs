@@ -181,7 +181,23 @@ pub fn scripted_endpoints(api: u16) -> Endpoints {
 
 /// Builds an anonymous [`Github`] client over a scripted `transport`.
 pub fn scripted(transport: &Arc<agh::wire::scripted::ScriptedTransport>, api: u16) -> Github {
-    github_over(Router::empty(), transport.clone(), scripted_endpoints(api))
+    scripted_with_retry(transport, api, RetryPolicy::NONE)
+}
+
+/// Builds an anonymous [`Github`] client over a scripted `transport` with `retry`.
+pub fn scripted_with_retry(
+    transport: &Arc<agh::wire::scripted::ScriptedTransport>,
+    api: u16,
+    retry: RetryPolicy,
+) -> Github {
+    GithubBuilder::new(Router::empty())
+        .transport(transport.clone())
+        .endpoints(scripted_endpoints(api))
+        .env(Arc::new(env()))
+        .fx(Arc::new(Fx::simulated(SIM_START)))
+        .caller("test")
+        .retry(retry)
+        .build()
 }
 
 /// `path`'s mode set to `mode`.

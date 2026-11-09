@@ -198,3 +198,50 @@ pub(crate) fn query(
     // loan/native subgroup and accepted stream until native/ACK closure.
     crate::actor::submit_bootstrap_query(peer, request, stream.try_clone()?, started, deadline)
 }
+
+/// Distinct object protocol. The actor retains the actual operation and stream
+/// before Prepared, so partial source delivery cannot disappear from settlement.
+pub(crate) fn object(
+    stream: &CtlStream,
+    peer: Peer,
+    hello: &aterm_json::Value,
+    deadline: Instant,
+) -> io::Result<()> {
+    let started = Instant::now();
+    let mut channel = Channel::new(stream.try_clone()?)?;
+    let request = wire::object::Request::decode(&channel.receive(deadline)?)?;
+    let expected: aterm_json::Value =
+        aterm_json::from_slice(&request.hello()?).map_err(|_| refused())?;
+    if *hello != expected || transport::local_peer(stream)? != peer {
+        return Err(refused());
+    }
+    time(deadline)?;
+    let offer = crate::actor::prepare_bootstrap_object(
+        peer,
+        request,
+        stream.try_clone()?,
+        started,
+        deadline,
+    )?;
+    let source = (|| {
+        let request = offer.request();
+        channel.send(
+            &wire::object::Event::Prepared(Box::new(offer.prepared().clone()))
+                .encode(request, offer.digest())?,
+            offer.deadline(),
+        )?;
+        wire::object::transport::receive_source(&mut channel, request, offer.deadline(), || {
+            time(offer.deadline())?;
+            if transport::local_peer(stream)? != peer
+                || crate::actor::bootstrap_graph_context(peer, request.key.graph.clone())?
+                    != *offer.context()
+            {
+                return Err(refused());
+            }
+            Ok(())
+        })
+    })();
+    // Failed transfer is also delivered to the same owning slot, so lexical
+    // no-launch cleanup can close work only after real pipe/socket shutdown.
+    crate::actor::bootstrap_object_source(peer, offer, source)
+}

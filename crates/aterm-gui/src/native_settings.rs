@@ -6554,7 +6554,7 @@ impl SettingsApp {
             }
             #[cfg(any(unix, test))]
             UpdateOutcome::InstalledNeedsRelaunch { message, .. } => message,
-            UpdateOutcome::Deferred { reason } => format!("Not installed yet · {reason}"),
+            UpdateOutcome::Deferred { reason, .. } => format!("Not installed yet · {reason}"),
             UpdateOutcome::Blocked { reasons } => {
                 format!("Before it can apply: {}", reasons.join(FACT_SEPARATOR))
             }

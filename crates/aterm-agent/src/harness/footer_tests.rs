@@ -2889,7 +2889,7 @@ fn the_facts_are_set_as_a_line_of_type() {
     };
     check(
         &unit,
-        "\u{2386} main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 05:00   \
+        "\u{2386} main 63% \u{b7} \u{21ba} Sat 10:00 \u{b7} \u{2573} ~Thu 12 Nov 04:00   \
          \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main",
     );
     assert!(set_facts(&[]).glyphs.is_empty());

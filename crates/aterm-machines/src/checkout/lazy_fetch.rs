@@ -111,6 +111,16 @@ struct Probe {
 /// git said, or `hash-object` named no object. Missing, oversized or incomplete traces and an
 /// unsuccessful local-fetch control also establish no capability and return an error.
 fn asked(sys: &dyn System, git: &dyn Fn() -> Cmd) -> Result<Probe, String> {
+    asked_with_guard(sys, git, NoLazyFetch::Variable)
+}
+
+/// [`asked`] with the host-selected guard on the protected read. The control remains
+/// unguarded, so it still proves that the same object and trace path can fetch.
+fn asked_with_guard(
+    sys: &dyn System,
+    git: &dyn Fn() -> Cmd,
+    guard: NoLazyFetch,
+) -> Result<Probe, String> {
     const WHY: &str = "cannot see whether Git obeys GIT_NO_LAZY_FETCH";
     let base = git();
     let other_user = base.user.as_ref().filter(|user| user.uid != sys.euid());
@@ -170,7 +180,7 @@ fn asked(sys: &dyn System, git: &dyn Fn() -> Cmd) -> Result<Probe, String> {
     }
     let mut url = OsString::from("remote.origin.url=");
     url.push(promisor.as_os_str());
-    let read = |value: &str, name: &str| -> Result<(Ran, std::path::PathBuf, u32), String> {
+    let read = |protected: bool, name: &str| -> Result<(Ran, std::path::PathBuf, u32), String> {
         let path = scratch.path().join(name);
         let path_text = path
             .to_str()
@@ -182,9 +192,15 @@ fn asked(sys: &dyn System, git: &dyn Fn() -> Cmd) -> Result<Probe, String> {
             sys.chown(&path, user.uid, user.gid)
                 .map_err(|error| format!("{WHY}: cannot own trace ({error})"))?;
         }
-        let ran = run(isolated()
-            .env("GIT_NO_LAZY_FETCH", value)
-            .env("GIT_TRACE2_EVENT", path_text)
+        let command = isolated()
+            .env("GIT_NO_LAZY_FETCH", if protected { "1" } else { "0" })
+            .env("GIT_TRACE2_EVENT", path_text);
+        let command = if protected && guard == NoLazyFetch::Flag {
+            command.arg("--no-lazy-fetch")
+        } else {
+            command
+        };
+        let ran = run(command
             .args(["-c", "remote.origin.promisor=true", "-c"])
             .arg(&url)
             .arg("--git-dir")
@@ -198,7 +214,7 @@ fn asked(sys: &dyn System, git: &dyn Fn() -> Cmd) -> Result<Probe, String> {
             .map_err(|error| format!("{WHY}: cannot read trace ({error})"))?;
         trace::observe(&bytes, object, code).map_err(|why| format!("{WHY}: {why}"))
     };
-    let (subject, path, uid) = read("1", "subject.trace")?;
+    let (subject, path, uid) = read(true, "subject.trace")?;
     let code = subject.status.ok_or_else(|| {
         format!(
             "{WHY}: Git read did not exit normally ({})",
@@ -218,7 +234,7 @@ fn asked(sys: &dyn System, git: &dyn Fn() -> Cmd) -> Result<Probe, String> {
             no_fetch: false,
         });
     }
-    let (control, path, uid) = read("0", "control.trace")?;
+    let (control, path, uid) = read(false, "control.trace")?;
     if !control.success() || control.out().trim() != "blob" {
         return Err(format!(
             "{WHY}: local-fetch control failed ({})",
